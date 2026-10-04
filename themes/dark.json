@@ -1,0 +1,89 @@
+{
+  "name": "dark",
+  "description": "Default dark theme",
+  "dark": true,
+  "vars": {
+    "blue": "#7aa2f7",
+    "cyan": "#2ac3de",
+    "purple": "#bb9af7",
+    "green": "#9ece6a",
+    "red": "#f7768e",
+    "yellow": "#e0af68",
+    "gray": "#6b7280",
+    "dimgray": "#4b5563",
+    "slate": "#374151",
+    "lav": "#c0caf5",
+    "mist": "#9ca3b0",
+    "sky": "#7dcfff"
+  },
+  "colors": {
+    "text": "",
+    "muted": "gray",
+    "dim": "dimgray",
+    "accent": "blue",
+    "border": "dimgray",
+    "borderAccent": "blue",
+    "borderMuted": "slate",
+    "success": "green",
+    "error": "red",
+    "warning": "yellow",
+    "selectedBg": "#232a3a",
+    "userBg": "#171c26",
+    "userText": "#e5e7eb",
+    "toolPendingBg": "#141922",
+    "toolSuccessBg": "#131b19",
+    "toolErrorBg": "#231517",
+    "toolTitle": {
+      "fg": "lav",
+      "bold": true
+    },
+    "toolOutput": "mist",
+    "thinkingText": {
+      "fg": "#8b93a3",
+      "italic": true
+    },
+    "mdHeading": {
+      "fg": "blue",
+      "bold": true
+    },
+    "mdLink": {
+      "fg": "sky",
+      "underline": true
+    },
+    "mdLinkUrl": "gray",
+    "mdCode": "yellow",
+    "mdCodeBlock": "lav",
+    "mdCodeBorder": "dimgray",
+    "mdQuote": {
+      "fg": "mist",
+      "italic": true
+    },
+    "mdQuoteBorder": "dimgray",
+    "mdHr": "dimgray",
+    "mdBullet": "blue",
+    "diffAdded": "green",
+    "diffRemoved": "red",
+    "diffContext": "gray",
+    "thinkOff": "dimgray",
+    "thinkMinimal": "gray",
+    "thinkLow": "blue",
+    "thinkMedium": "cyan",
+    "thinkHigh": "purple",
+    "thinkXhigh": "red",
+    "shellMode": "cyan",
+    "statusBg": "#1a1b26",
+    "statusSep": "dimgray",
+    "statusModel": "purple",
+    "statusPath": "blue",
+    "statusGitClean": "green",
+    "statusGitDirty": "yellow",
+    "statusContext": "cyan",
+    "statusTokens": "lav",
+    "statusRate": "sky",
+    "statusApproval": "yellow",
+    "statusSandbox": "green",
+    "statusLearning": "purple",
+    "statusSession": "gray",
+    "statusTime": "gray"
+  }
+}

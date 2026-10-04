@@ -1,0 +1,2407 @@
+//! Interactive controller: owns the terminal, the conversation view, the composer and the overlays, and
+//! runs agent turns. Rendering is inline (scrollback-native, see `ui::term`): finished messages are
+//! committed to the terminal's own scrollback, and only the live tail and the composer are repainted.
+//!
+//! Configuration is never edited here. Overlays emit semantic events (`OverlayEvent`); this module
+//! persists them through `settings_store` (which validates the merged configuration before writing),
+//! reloads the effective config, and applies the result live. A change that does not touch the agent
+//! (theme, status line, approval) is applied in place; one that does (model, provider, sandbox, …) makes
+//! the controller rebuild the agent around the same session.
+use crate::{
+    agent::{self, Agent, Decision, Ui, context, make_backend},
+    config::types::{Approval, Config, Outcome},
+    learn::auto,
+    llm::{
+        catalog,
+        model_config::{ModelSelection, ProviderSpec, ROLES, UiConfig},
+    },
+    repl::{self, OutputFormat, PrintExit, PrintUi},
+    storage::{
+        paths::Layout,
+        session::{Session, SessionMeta},
+        settings_store::{self, Change, Scope},
+        skills,
+        store::Store,
+    },
+    tools::ToolOutput,
+    ui::{
+        composer::{CommandEntry, CommandKind, Composer, ComposerCtx, ComposerEvent},
+        markdown::truncate_spans,
+        keys::{Action, Keymap},
+        overlay::{DrawCtx, OverlayEvent, models::ModelOverlay, providers::ProviderOverlay, settings::SettingsOverlay},
+        settings_schema,
+        status::{Phase, StatusData},
+        statusline,
+        term::{InlineTerminal, OverlayTerminal, Viewport},
+        text,
+        theme::{Sym, ThemeManager, Tok},
+        transcript::{Transcript, TranscriptCtx, TurnStats},
+        welcome::{self, WelcomeInfo},
+        Rows,
+    },
+};
+use anyhow::{Result, ensure};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read};
+use fs2::FileExt;
+use ratatui::text::{Line, Span};
+use serde_json::{Value, json};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fs::File,
+    path::Path,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex, MutexGuard, atomic::{AtomicBool, Ordering}},
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
+
+/// How long a keystroke may go unnoticed while the UI is idle; also the animation frame time.
+const TICK: Duration = Duration::from_millis(80);
+/// A git call may never hold the interface hostage.
+const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+const GIT_TTL: Duration = Duration::from_secs(5);
+/// Learning state is a store query, so it is refreshed on a timer, not per keystroke.
+const STATUS_TTL: Duration = Duration::from_secs(2);
+/// Streaming text repaints at most this often; tool events always repaint.
+const PAINT_EVERY: Duration = Duration::from_millis(40);
+
+pub struct Options {
+    pub session: Option<Session>,
+    pub prompt: String,
+    pub interactive: bool,
+    /// Command-line flag overrides, layered on top of the config files every time the config is reloaded.
+    pub overlay: toml::Table,
+    /// Startup messages for the transcript (learning monitor results, paused state, …).
+    pub notices: Vec<String>,
+}
+
+/// Run the inline interface, or answer a single piped message.
+pub fn run_interactive(layout: Layout, config: Config, options: Options) -> Result<()> {
+    if !options.interactive { return run_plain(layout, config, options); }
+    let mut app = App::new(layout, config, options.overlay)?;
+    let mut shell = Shell::new(&app, options.prompt)?;
+    for notice in &options.notices { shell.transcript.notice("Learning", notice); }
+    let outcome = drive(&mut app, &mut shell, options.session);
+    let resume = shell.finish();
+    schedule(&app);
+    if let Some(id) = resume { eprintln!("dial: session {} · continue with `dial -c`", short(&id)); }
+    outcome
+}
+
+/// Piped text uses the same status contract as explicit print mode.
+fn run_plain(layout: Layout, config: Config, options: Options) -> Result<()> {
+    let code = run_print(layout, config, options, OutputFormat::Text, Vec::new())?;
+    if code != 0 { return Err(PrintExit(code).into()); }
+    Ok(())
+}
+
+/// Run one turn without terminal control sequences; JSON modes reserve stdout for their protocol.
+pub fn run_print(layout: Layout, config: Config, options: Options, format: OutputFormat, allowed: Vec<String>) -> Result<i32> {
+    let started = Instant::now();
+    let mut ui = PrintUi::new(format, allowed);
+    config.require_model()?;
+    let _compute = if config.uses_local_compute() { Some(auto::compute_lock(&layout)?) } else { None };
+    let app = App::new(layout, config, options.overlay)?;
+    let session = match options.session {
+        Some(session) => session,
+        None => Session::create(&app.layout, SessionMeta { model: app.config.model.clone() })?,
+    };
+    let session_id = session.id().to_owned();
+    let mut agent = app.make_agent(session)?;
+    ui.system(&session_id, &app.config.model, &app.layout.project_root, &agent.tool_names());
+    for notice in &options.notices { ui.notice(notice); }
+    let completed_before = agent.metrics().turns_completed;
+    let result = agent.turn(options.prompt.trim(), &mut ui);
+    ui.set_completed(agent.metrics().turns_completed > completed_before);
+    schedule(&app);
+    match result {
+        Ok(report) => ui.finish(Some(&report), None, Some(&session_id), started.elapsed()),
+        Err(error) => {
+            let error = format!("{error:#}");
+            eprintln!("error: {error}");
+            ui.finish(None, Some(&error), Some(&session_id), started.elapsed())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Application state. The agent borrows `config` and `store` for its whole lifetime, so changes
+// to either are applied between agents (see `drive`).
+// ---------------------------------------------------------------------------
+
+struct App {
+    layout: Layout,
+    config: Config,
+    overlay: toml::Table,
+    store: Option<Store>,
+    store_error: Option<String>,
+    interrupt: Arc<AtomicBool>,
+    compute: RefCell<Option<File>>,
+}
+
+impl App {
+    fn new(layout: Layout, config: Config, overlay: toml::Table) -> Result<Self> {
+        let mut app = Self { layout, config, overlay, store: None, store_error: None, interrupt: repl::install_sigint(), compute: RefCell::new(None) };
+        app.reopen_store();
+        Ok(app)
+    }
+
+    fn open_store(config: &Config) -> Result<Store> {
+        ensure!(config.improve.enabled, "automatic improvement is disabled");
+        Store::open(&config.state_dir, &config.model, &config.use_case, &config.harness)
+    }
+
+    fn make_agent(&self, session: Session) -> Result<Agent<'_>> {
+        let mut serving = self.config.clone();
+        if let Some(store) = &self.store { crate::learn::improve::apply_pinned_model(&mut serving, store)?; }
+        let backend = make_backend(&serving)?;
+        Agent::interactive(&self.config, backend, self.layout.clone(), session, None, self.store.as_ref(), self.interrupt.clone())
+    }
+
+    /// Adopt a freshly loaded, validated configuration and keep the per-model store in step.
+    fn adopt(&mut self, config: Config) {
+        self.config = config;
+        if !self.config.uses_local_compute() { self.compute.get_mut().take(); }
+        self.reopen_store();
+    }
+
+    fn reopen_store(&mut self) {
+        if !self.config.improve.enabled || self.config.model.is_empty() { self.store = None; self.store_error = None; return; }
+        match Self::open_store(&self.config) {
+            Ok(store) => { self.store = Some(store); self.store_error = None; }
+            Err(error) => { self.store = None; self.store_error = Some(format!("self-improvement recording disabled: {error:#}")); }
+        }
+    }
+
+    /// The effective configuration as the files and the command-line flags define it right now.
+    fn reload(&self) -> Result<Config> { Config::load(&self.layout, Some(self.overlay.clone())) }
+}
+
+fn short(id: &str) -> String { id.chars().take(8).collect() }
+
+fn session_age(started: &str) -> String {
+    let Some(stamp) = started.get(..19).and_then(|s| std::ffi::CString::new(s).ok()) else { return started.to_owned(); };
+    // SAFETY: both strings are NUL-terminated; strptime/timegm receive a valid writable tm.
+    let seconds = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::strptime(stamp.as_ptr(), c"%Y-%m-%dT%H:%M:%S".as_ptr(), &mut tm).is_null() { return started.to_owned(); }
+        libc::time(std::ptr::null_mut()).saturating_sub(libc::timegm(&mut tm)).max(0) as u64
+    };
+    if seconds < 60 { "now".into() }
+    else if seconds < 3600 { format!("{}m ago", seconds / 60) }
+    else if seconds < 86400 { format!("{}h ago", seconds / 3600) }
+    else { format!("{}d ago", seconds / 86400) }
+}
+
+fn schedule(app: &App) {
+    let Some(store) = &app.store else { return };
+    match auto::maybe_spawn(&app.layout, &app.config, store) {
+        Ok(true) => eprintln!("dial: improvement queued; it starts when local compute is idle"),
+        Ok(false) => {}
+        Err(error) => eprintln!("dial: could not schedule improvement: {error:#}"),
+    }
+}
+
+/// What must be rebuilt when the configuration changes. `ui` and `approval` apply in place; everything
+/// else (model, providers, sandbox, harness, learning) needs a new agent.
+fn agent_key(config: &Config) -> String {
+    let mut table = toml::Table::try_from(config).unwrap_or_default();
+    table.remove("ui");
+    table.remove("approval");
+    table.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// The session loop: build an agent, run the shell until it quits or the config demands a rebuild.
+// ---------------------------------------------------------------------------
+
+enum Step { Done, Quit, Rebuild(Box<Config>) }
+
+fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) -> Result<()> {
+    if !onboard(app, shell)? { return Ok(()); }
+    let resumed = session.is_some();
+    let mut session = match session {
+        Some(session) => session,
+        None => Session::create(&app.layout, SessionMeta { model: app.config.model.clone() })?,
+    };
+    let mut todo: Option<Value> = None;
+    let mut approval = app.config.approval;
+    let mut plan_mode = false;
+    let mut permission_rules = None;
+    let mut session_cost = None;
+    shell.begin(app, &session, resumed);
+    loop {
+        let step = {
+            let mut agent = app.make_agent(session)?;
+            if let Some(snapshot) = &todo { agent.restore_todo(snapshot)?; }
+            agent.set_approval(approval);
+            agent.set_session_cost(session_cost);
+            agent.set_plan_mode(plan_mode);
+            if let Some(rules) = permission_rules.take() { agent.set_permission_rules(rules); }
+            let step = shell.run(app, &mut agent);
+            session = std::mem::replace(agent.session_mut(), Session::ephemeral());
+            todo = Some(agent.todo().snapshot());
+            approval = agent.approval();
+            plan_mode = agent.plan_mode();
+            permission_rules = Some(agent.permission_rules().to_vec());
+            session_cost = agent.session_cost();
+            step
+        };
+        shell.session_id = session.id().to_owned();
+        match step? {
+            Step::Quit | Step::Done => break,
+            Step::Rebuild(config) => {
+                app.adopt(*config);
+                shell.after_adopt(app);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// First run (or a provider that cannot be used): let the user pick a model before any agent exists.
+fn onboard(app: &mut App, shell: &mut Shell) -> Result<bool> {
+    loop {
+        let ready = !app.config.model.trim().is_empty() && make_backend(&app.config).is_ok();
+        if ready { return Ok(true); }
+        shell.note("Welcome to dial", if app.config.model.trim().is_empty() {
+            "Pick a model to start: local MLX models and running LM Studio / Ollama servers are discovered automatically; Providers adds hosted APIs."
+        } else {
+            "The selected provider cannot be used yet (missing credentials?). Set it up in Providers."
+        });
+        let which = if app.config.model.trim().is_empty() { Which::Models } else { Which::Providers };
+        let outcome = shell.run_overlay(app, which)?;
+        match outcome.latest {
+            Some(config) => { app.adopt(config); shell.after_adopt(app); }
+            None => {
+                if shell.auth_job.is_some() {
+                    shell.note("ChatGPT", "Sign-in continues in your browser; select a model after it completes.");
+                    continue;
+                }
+                shell.note("No model selected", "Run dial again and choose one (Alt-M), or run `dial setup -m <mlx-model>`.");
+                shell.flush()?;
+                return Ok(false);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Discovery: one background scan, cached until the user asks for a refresh.
+// ---------------------------------------------------------------------------
+
+struct Catalog {
+    /// (newest request id, its result). A superseded scan never overwrites a newer one.
+    slot: Arc<Mutex<(u64, Option<catalog::Discovery>)>>,
+    request: u64,
+    worker: Option<JoinHandle<()>>,
+    generation: u64,
+}
+
+fn shared<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> { mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) }
+
+impl Catalog {
+    fn new() -> Self { Self { slot: Arc::new(Mutex::new((0, None))), request: 0, worker: None, generation: 0 } }
+
+    fn get(&self) -> Option<catalog::Discovery> { shared(&self.slot).1.clone() }
+
+    /// Reap a finished scan so a new request can start; bumps `generation` when one completed.
+    fn collect(&mut self) {
+        if !self.worker.as_ref().is_some_and(JoinHandle::is_finished) { return; }
+        self.worker = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn start(&mut self, app: &App) {
+        self.collect();
+        if self.worker.is_some() || self.get().is_some() { return; }
+        self.scan(app);
+    }
+
+    fn refresh(&mut self, app: &App) {
+        self.collect();
+        self.scan(app);
+    }
+
+    fn scan(&mut self, app: &App) {
+        let layout = app.layout.clone();
+        let configured = app.config.providers.clone();
+        let mut selections = vec![app.config.selection()];
+        selections.extend(app.config.model_roles.values().cloned());
+        self.launch(move || catalog::discover(&layout, &configured, &selections));
+    }
+
+    fn launch(&mut self, discover: impl FnOnce() -> catalog::Discovery + Send + 'static) {
+        self.request += 1;
+        let request = self.request;
+        shared(&self.slot).0 = request;
+        let slot = self.slot.clone();
+        self.worker = Some(std::thread::spawn(move || {
+            let found = discover();
+            let mut slot = shared(&slot);
+            if slot.0 == request { slot.1 = Some(found); }
+        }));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Git and learning status, cached so a repaint never spawns a process.
+// ---------------------------------------------------------------------------
+
+/// Refresh optional status on a worker, keeping the last value while a query is pending.
+struct StatusCache<T> {
+    at: Option<Instant>,
+    worker: Option<JoinHandle<T>>,
+    value: T,
+}
+
+impl<T: Default> Default for StatusCache<T> {
+    fn default() -> Self { Self { at: None, worker: None, value: T::default() } }
+}
+
+impl<T: Send + 'static> StatusCache<T> {
+    fn refresh(&mut self, ttl: Duration, query: impl FnOnce() -> T + Send + 'static) {
+        if self.worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+            if let Ok(value) = self.worker.take().unwrap().join() { self.value = value; }
+            self.at = Some(Instant::now());
+        }
+        if self.worker.is_some() || self.at.is_some_and(|at| at.elapsed() < ttl) { return; }
+        self.at = Some(Instant::now());
+        self.worker = std::thread::Builder::new().name("dial-status".into()).spawn(query).ok();
+    }
+}
+
+#[derive(Default)]
+struct Git { cache: StatusCache<(String, Option<(u32, u32, u32)>)> }
+
+impl Git {
+    fn read(&mut self, root: &Path) -> (String, Option<(u32, u32, u32)>) {
+        let root = root.to_owned();
+        self.cache.refresh(GIT_TTL, move || {
+            let branch = git_output(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).map(|b| b.trim().to_owned()).filter(|b| !b.is_empty() && b != "HEAD");
+            let counts = branch.as_ref().and_then(|_| git_output(&root, &["status", "--porcelain=v1", "--untracked-files=normal"])).map(|out| parse_status(&out));
+            (branch.unwrap_or_default(), counts)
+        });
+        self.cache.value.clone()
+    }
+}
+
+/// (staged, modified, untracked) from `git status --porcelain=v1`.
+fn parse_status(output: &str) -> (u32, u32, u32) {
+    let (mut staged, mut modified, mut untracked) = (0, 0, 0);
+    for line in output.lines() {
+        let mut chars = line.chars();
+        let (x, y) = (chars.next().unwrap_or(' '), chars.next().unwrap_or(' '));
+        if x == '?' && y == '?' { untracked += 1; continue; }
+        if x != ' ' && x != '?' { staged += 1; }
+        if y != ' ' && y != '?' { modified += 1; }
+    }
+    (staged, modified, untracked)
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Option<String> {
+    let mut child = Command::new("git").arg("-C").arg(root).args(args)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    String::from_utf8(child.wait_with_output().ok()?.stdout).ok()
+}
+
+#[derive(Default)]
+struct Learning { cache: StatusCache<(Option<i64>, String)> }
+
+impl Learning {
+    fn read(&mut self, app: &App) {
+        let state_dir = app.layout.state_dir.clone();
+        let config = app.config.clone();
+        let available = app.store.is_some();
+        self.cache.refresh(STATUS_TTL, move || {
+            let store = available.then(|| Store::open_read_only(&state_dir).ok()).flatten();
+            let label = improvement_label(&config, store.as_ref());
+            let version = store.as_ref().and_then(|store| store.active().ok()).map(|version| version.id);
+            (version, label)
+        });
+    }
+}
+
+fn improvement_label(config: &Config, store: Option<&Store>) -> String {
+    if !config.improve.enabled { return "learning off".into(); }
+    if store.is_some_and(|s| !auto::enabled(config, s).unwrap_or(false)) { return "learning paused".into(); }
+    let state = store
+        .and_then(|store| store.get_meta("auto_status").ok().flatten())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| value.get("state").and_then(Value::as_str).map(str::to_owned));
+    match state.as_deref() {
+        Some("queued") => "improvement queued".into(),
+        Some("running") => "improving".into(),
+        Some("failed") => "learning failed".into(),
+        Some("disabled") => "learning paused".into(),
+        Some(_) => "learning idle".into(),
+        None if store.is_none() => "learning unavailable".into(),
+        None => "learning idle".into(),
+    }
+}
+
+
+/// `HH:MM`-style local time without a date library.
+fn local_time(format: &str) -> String {
+    let Ok(format) = std::ffi::CString::new(format) else { return String::new() };
+    // SAFETY: `localtime_r` and `strftime` write only into the zeroed `tm` and the bounded buffer.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() { return String::new(); }
+        let mut buffer = [0u8; 64];
+        let written = libc::strftime(buffer.as_mut_ptr().cast(), buffer.len(), format.as_ptr(), &tm);
+        String::from_utf8_lossy(&buffer[..written]).into_owned()
+    }
+}
+
+/// Dark or light terminal background from `COLORFGBG` (`fg;bg`, bg index < 8 is dark); `None` = unknown.
+fn terminal_dark(value: Option<&str>) -> Option<bool> {
+    let background = value?.rsplit(';').next()?.trim().parse::<u32>().ok()?;
+    Some(background < 8 || background == 16)
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+/// Name and one-line description of every built-in slash command, in the order the list shows them.
+const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    ("help", "list commands and shortcuts"),
+    ("model", "choose the main model and assign roles"),
+    ("providers", "set up providers, keys and endpoints"),
+    ("settings", "all options: appearance, tools, learning"),
+    ("theme", "list or switch the color theme"),
+    ("hotkeys", "show the key bindings in effect"),
+    ("new", "start a fresh session"),
+    ("sessions", "search and resume sessions"),
+    ("resume", "search sessions or resume a unique id prefix"),
+    ("fork", "copy this conversation into a new session"),
+    ("rename", "name this session: /rename <title>"),
+    ("export", "export conversation: /export [path] [--html]"),
+    ("tree", "browse session forks"),
+    ("copy", "copy the last assistant answer"),
+    ("plan", "toggle read-only planning mode"),
+    ("profile", "list/select capability profile: /profile [name|off]"),
+    ("reasoning", "show or set reasoning level: /reasoning [level]"),
+    ("thinking", "show or set thinking: /thinking [level|on|off]"),
+    ("permissions", "list rules; allow/deny [--persist] <tool> [prefix]; remove <number>"),
+    ("cost", "show this session's API cost"),
+    ("jobs", "show live subagents: /jobs [id]"),
+    ("message", "steer a live subagent: /message <id> <text>"),
+    ("cancel", "cancel a live subagent: /cancel <id>"),
+    ("compact", "summarize older messages to free context"),
+    ("undo", "drop the last turn and restore its file changes"),
+    ("rollback", "restore files changed in the last n turns"),
+    ("clear", "clear the screen and repaint the conversation"),
+    ("todo", "show the task list"),
+    ("skills", "list available skills"),
+    ("memory", "show project memory"),
+    ("commands", "list custom commands"),
+    ("search", "search past sessions"),
+    ("context", "show token usage"),
+    ("approval", "ask, auto or readonly"),
+    ("outcome", "record your verdict on the last answer (0-100)"),
+    ("improve", "automatic self-improvement status"),
+    ("exit", "quit"),
+];
+
+/// Built-ins always win at dispatch, so a custom command with a built-in's name is never offered.
+fn command_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> Vec<CommandEntry> {
+    let mut entries: Vec<CommandEntry> = BUILTIN_COMMANDS.iter().map(|(name, description)| CommandEntry {
+        name: (*name).into(), description: (*description).into(), kind: CommandKind::Builtin,
+        args_hint: matches!(*name, "resume" | "search" | "rollback" | "approval" | "outcome" | "theme").then(|| match *name {
+            "resume" => "[id]", "search" => "<query>", "rollback" => "[n]", "approval" => "[ask|auto|readonly]", "outcome" => "<0-100> [note]", _ => "[name]",
+        }.to_owned()),
+    }).collect();
+    let reserved = |name: &str| BUILTIN_COMMANDS.iter().any(|(builtin, _)| *builtin == name) || matches!(name, "quit" | "q" | "?" | "models" | "roles");
+    for def in custom.iter().filter(|def| !reserved(&def.name)) {
+        if entries.iter().any(|e| e.name == def.name) { continue; }
+        entries.push(CommandEntry {
+            name: def.name.clone(),
+            description: if def.description.trim().is_empty() { "custom command".into() } else { def.description.clone() },
+            kind: CommandKind::Custom, args_hint: None,
+        });
+    }
+    for skill in skills {
+        entries.push(CommandEntry {
+            name: format!("skill:{}", skill.name),
+            description: if skill.description.trim().is_empty() { "run this skill".into() } else { skill.description.clone() },
+            kind: CommandKind::Skill, args_hint: Some("[task]".into()),
+        });
+    }
+    entries
+}
+
+// ---------------------------------------------------------------------------
+// Configuration changes as data (pure, so they can be tested without a terminal)
+// ---------------------------------------------------------------------------
+
+/// The settings writes that make `selection` the model for `role` (`main` or a helper role).
+fn selection_changes(config: &Config, selection: &ModelSelection, role: &str) -> Result<Vec<Change>> {
+    ensure!(!selection.model.trim().is_empty(), "a model id is required");
+    let mut changes = Vec::new();
+    let set = |path: String, value: toml::Value| Change::Set { path, value };
+    if role == "main" {
+        changes.push(set("model".into(), selection.model.clone().into()));
+        changes.push(set("provider".into(), selection.provider.clone().into()));
+        if config.model_profile.as_ref().is_some_and(|name| config.model_profiles.get(name).is_some_and(|profile|profile.provider!=selection.provider || profile.model!=selection.model)) {
+            // An explicit empty marker clears a profile inherited from the other settings layer.
+            changes.push(set("model_profile".into(),"".into()));
+        }
+        match &selection.base_url {
+            Some(base) => {
+                changes.push(set("endpoint.base_url".into(), base.clone().into()));
+                // An empty variable name clears an inherited one (the loader treats it as unset).
+                changes.push(set("endpoint.api_key_env".into(), selection.api_key_env.clone().unwrap_or_default().into()));
+                changes.push(set("endpoint.allow_insecure".into(), selection.allow_insecure.into()));
+                if !config.providers.contains_key(&selection.provider) {
+                    let prefix = format!("providers.{}", selection.provider);
+                    changes.push(set(format!("{prefix}.label"), selection.provider.clone().into()));
+                    changes.push(set(format!("{prefix}.base_url"), base.clone().into()));
+                    if let Some(variable) = &selection.api_key_env { changes.push(set(format!("{prefix}.api_key_env"), variable.clone().into())); }
+                    changes.push(set(format!("{prefix}.enabled"), true.into()));
+                    changes.push(set(format!("{prefix}.allow_insecure"), selection.allow_insecure.into()));
+                }
+            }
+            None => changes.push(Change::Remove { path: "endpoint".into() }),
+        }
+        if let Some(window) = selection.context_window { changes.push(set("context_window".into(), i64::from(window).into())); }
+    } else {
+        ensure!(ROLES.iter().any(|(name, _)| *name == role) && role != "main", "unknown model role {role:?}");
+        let prefix = format!("model_roles.{role}");
+        changes.push(set(format!("{prefix}.provider"), selection.provider.clone().into()));
+        changes.push(set(format!("{prefix}.model"), selection.model.clone().into()));
+        match &selection.base_url {
+            Some(base) => {
+                changes.push(set(format!("{prefix}.base_url"), base.clone().into()));
+                changes.push(set(format!("{prefix}.api_key_env"), selection.api_key_env.clone().unwrap_or_default().into()));
+                changes.push(set(format!("{prefix}.allow_insecure"), selection.allow_insecure.into()));
+            }
+            None => changes.push(Change::Remove { path: format!("{prefix}.base_url") }),
+        }
+        changes.push(match selection.context_window {
+            Some(window) => set(format!("{prefix}.context_window"), i64::from(window).into()),
+            None => Change::Remove { path: format!("{prefix}.context_window") },
+        });
+    }
+    Ok(changes)
+}
+
+/// Make `role` follow the main model again. In the project layer an explicit marker is needed so a
+/// global assignment does not show through.
+fn clear_role_changes(role: &str, scope: Scope) -> Result<Vec<Change>> {
+    ensure!(ROLES.iter().any(|(name, _)| *name == role) && role != "main", "the main model cannot be cleared");
+    Ok(match scope {
+        Scope::Global => vec![Change::Remove { path: format!("model_roles.{role}") }],
+        Scope::Project => vec![
+            Change::Set { path: format!("model_roles.{role}.provider"), value: "inherit".into() },
+            Change::Set { path: format!("model_roles.{role}.model"), value: "".into() },
+        ],
+    })
+}
+
+fn reasoning_profile(config: &Config) -> Result<Option<crate::llm::profiles::ModelProfile>> {
+    if let Some(profile)=config.active_model_profile() { return Ok(Some(profile.clone())); }
+    if config.provider.as_deref()==Some(crate::llm::chatgpt::PROVIDER) { return crate::llm::chatgpt::model_profile(&config.user_dir,&config.model); }
+    Ok(None)
+}
+
+fn reasoning_changes(config: &Config, args: &str) -> Result<(Vec<Change>,String)> {
+    use crate::llm::profiles::{ReasoningEffort,ReasoningApi};
+    let mut profile=reasoning_profile(config)?.ok_or_else(||anyhow::anyhow!("reasoning metadata is unavailable; open /models and rescan, or select an explicit /profile"))?;
+    let supported=profile.capabilities.reasoning_efforts.iter().map(|effort|effort.as_str()).collect::<Vec<_>>().join(" | ");
+    let label=if matches!(profile.capabilities.reasoning,ReasoningApi::AnthropicBudget | ReasoningApi::AnthropicAdaptive) && matches!(args,"on" | "off") {
+        profile.thinking=Some(args=="on"); args.into()
+    } else {
+        let effort=match args {
+            "on"=>profile.reasoning_effort.filter(|effort|*effort!=ReasoningEffort::None)
+                .or_else(||profile.capabilities.reasoning_efforts.iter().copied().find(|effort|*effort!=ReasoningEffort::None)),
+            "off"=>Some(ReasoningEffort::None),
+            level=>serde_json::from_value::<ReasoningEffort>(serde_json::json!(level)).ok(),
+        }.filter(|effort|profile.capabilities.reasoning_efforts.contains(effort))
+            .ok_or_else(||anyhow::anyhow!("supported reasoning levels for {}: {supported}",config.model))?;
+        profile.reasoning_effort=Some(effort);
+        profile.thinking=Some(effort!=ReasoningEffort::None);
+        effort.as_str().to_owned()
+    };
+    profile.validate()?;
+    let name=config.model_profile.clone().or_else(||config.active_model_profile().and_then(|_|config.model_profiles.iter().find(|(_,saved)|saved.provider==profile.provider && saved.model==profile.model).map(|(name,_)|name.clone())))
+        .unwrap_or_else(|| {
+            use sha2::{Digest,Sha256};
+            format!("reasoning_{}",&format!("{:x}",Sha256::digest(format!("{}/{}",profile.provider,profile.model)))[..16])
+        });
+    Ok((vec![Change::Set { path:format!("model_profiles.{name}"),value:toml::Value::try_from(profile)? },
+        Change::Set { path:"model_profile".into(),value:name.into() }],label))
+}
+
+fn provider_changes(id: &str, spec: &ProviderSpec) -> Vec<Change> {
+    let set = |field: &str, value: toml::Value| Change::Set { path: format!("providers.{id}.{field}"), value };
+    let mut changes = vec![
+        set("label", spec.label.clone().into()), set("base_url", spec.base_url.clone().into()),
+        set("enabled", spec.enabled.into()), set("allow_insecure", spec.allow_insecure.into()),
+    ];
+    changes.push(match &spec.api_key_env {
+        Some(variable) => set("api_key_env", variable.clone().into()),
+        None => Change::Remove { path: format!("providers.{id}.api_key_env") },
+    });
+    changes
+}
+
+// ---------------------------------------------------------------------------
+// The shell: everything visible and interactive
+// ---------------------------------------------------------------------------
+
+struct Shell {
+    auth_job: Option<AuthJob>,
+    term: InlineTerminal,
+    themes: ThemeManager,
+    keys: Keymap,
+    composer: Composer,
+    transcript: Transcript,
+    status: StatusData,
+    ui: UiConfig,
+    catalog: Catalog,
+    git: Git,
+    learning: Learning,
+    commands: Vec<context::CommandDef>,
+    scope: Scope,
+    tools_expanded: bool,
+    started: Instant,
+    last_trajectory: Option<i64>,
+    startup: Option<String>,
+    /// The configured approval mode last applied to the agent (session cycling may differ from it).
+    cfg_approval: Approval,
+    dark: Option<bool>,
+    session_id: String,
+    title: String,
+    turn_output_tokens: u64,
+}
+
+enum Which { Settings, Models, Providers }
+
+#[derive(Default)]
+struct OverlayOutcome {
+    /// The effective config after the last successful change made inside the overlay.
+    latest: Option<Config>,
+    /// A request from inside the overlay to open another one (`open:models`, `open:providers`, …).
+    next: Option<String>,
+}
+
+impl Shell {
+    fn new(app: &App, startup: String) -> Result<Shell> {
+        let mut term = InlineTerminal::enter()?;
+        term.clear_screen()?;
+        let dark = terminal_dark(std::env::var("COLORFGBG").ok().as_deref());
+        let (keys, warnings) = Keymap::load(&app.layout.user_dir);
+        let themes = ThemeManager::new(&app.layout.user_dir, &app.config.ui, dark);
+        let history = settings_store::load_history(&app.layout, app.config.ui.history_limit).unwrap_or_default();
+        let commands = context::discover_commands(&app.layout);
+        let mut shell = Shell {
+            auth_job: None,
+            term, themes, keys, composer: Composer::new(history, app.config.ui.history_limit), transcript: Transcript::new(),
+            status: StatusData::default(), ui: app.config.ui.clone(), catalog: Catalog::new(), git: Git::default(),
+            learning: Learning::default(), commands, scope: Scope::Global, tools_expanded: false, started: Instant::now(),
+            last_trajectory: None, startup: (!startup.trim().is_empty()).then_some(startup), cfg_approval: app.config.approval,
+            dark, session_id: String::new(), title: format!("dial · {}", app.layout.project_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+            turn_output_tokens: 0,
+        };
+        for warning in warnings { shell.note("Key bindings", &warning); }
+        if let Some(error) = shell.themes.last_error() { let error = error.to_owned(); shell.note("Theme", &error); }
+        if let Some(error) = &app.store_error { shell.note("Learning", error); }
+        shell.refresh_commands(app);
+        Ok(shell)
+    }
+
+    fn refresh_commands(&mut self, app: &App) {
+        let found = skills::discover(&app.layout);
+        self.composer.set_commands(command_entries(&self.commands, &found));
+        let paths = ignore::WalkBuilder::new(&app.layout.project_root).follow_links(false).require_git(false).build()
+            .filter_map(|entry| entry.ok()).filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .filter_map(|entry| entry.path().strip_prefix(&app.layout.project_root).ok().map(|p| p.to_string_lossy().into_owned()))
+            .filter(|path| !path.chars().any(|c| c.is_control() || c.is_whitespace())).collect();
+        self.composer.set_files(paths);
+    }
+
+    /// Welcome banner and, for a resumed session, its earlier conversation.
+    fn begin(&mut self, app: &App, session: &Session, resumed: bool) {
+        self.session_id = session.id().to_owned();
+        let (cols, _) = self.term.size();
+        if self.ui.welcome {
+            let recent: Vec<(String, String)> = Session::list(&app.layout, 3).unwrap_or_default().into_iter()
+                .filter(|s| s.id != session.id()).map(|s| (s.title, s.started.chars().take(10).collect())).collect();
+            let keys = &self.keys;
+            let tips = if self.ui.tips { vec![
+                "/ for commands".to_owned(),
+                format!("{} to pick a model · {} for providers", keys.label(Action::ModelSelect), keys.label(Action::ProviderSetup)),
+                format!("{} for settings · {} to search history", keys.label(Action::Settings), keys.label(Action::HistorySearch)),
+                "/theme to change the look".to_owned(),
+            ] } else { Vec::new() };
+            let selection = app.config.selection();
+            let info = WelcomeInfo {
+                version: env!("CARGO_PKG_VERSION").into(), provider: selection.provider.clone(),
+                model: selection.display_name().trim_start_matches(&format!("{}/", selection.provider)).to_owned(),
+                project: app.layout.project_root.display().to_string(), tips, recent,
+            };
+            let rows = welcome::rows(&info, cols, self.themes.current());
+            self.term.commit(rows);
+        }
+        if resumed { replay(&mut self.transcript, &session.messages()); }
+    }
+
+    fn after_adopt(&mut self, app: &App) {
+        self.ui = app.config.ui.clone();
+        self.cfg_approval = app.config.approval;
+        self.catalog.refresh(app);
+        self.refresh_commands(app);
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        self.auth_job.take();
+        // Whatever is still pending belongs in the scrollback before the live region is erased.
+        let _ = self.flush();
+        self.term.leave();
+        (!self.session_id.is_empty()).then(|| self.session_id.clone())
+    }
+
+    /// Commit everything finalized so the conversation survives in scrollback.
+    fn flush(&mut self) -> Result<()> {
+        self.transcript.finish_turn();
+        self.paint(None)
+    }
+
+    // ----- painting -------------------------------------------------------------------------
+
+    fn paint(&mut self, panel: Option<Rows>) -> Result<()> {
+        self.status.tick = (self.started.elapsed().as_millis() / 83) as u64;
+        self.status.clock = local_time("%H:%M");
+        self.status.mode = self.composer.mode();
+        let (cols, rows) = self.term.size();
+        let Shell { term, themes, keys, composer, transcript, status, ui, tools_expanded, title, .. } = self;
+        let theme = themes.current();
+        let tctx = TranscriptCtx { theme, ui, tick: status.tick, tools_expanded: *tools_expanded };
+        let settled = transcript.take_settled(cols, &tctx);
+        if !settled.is_empty() { term.commit(settled); }
+        let cctx = ComposerCtx { theme, keys, ui, status };
+        let (bottom, cursor) = match panel {
+            Some(rows) => (rows, None),
+            None => { let view = composer.view(cols, &cctx); (view.rows, Some(view.cursor)) }
+        };
+        let room = (rows as usize).saturating_sub(bottom.len()).max(1);
+        let (spilled, mut live) = transcript.live(cols, &tctx, room);
+        if !spilled.is_empty() { term.commit(spilled); }
+        let above = live.len() as u16;
+        live.extend(bottom);
+        term.paint(&Viewport { rows: &live, cursor: cursor.map(|(row, col)| (above + row, col)), title: Some(title.as_str()) })
+    }
+
+    fn refresh_status(&mut self, app: &App, agent: &Agent<'_>) {
+        let selection = app.config.selection();
+        let (branch, counts) = self.git.read(&app.layout.project_root);
+        self.learning.read(app);
+        let status = &mut self.status;
+        status.provider = selection.provider.clone();
+        status.model = selection.display_name().trim_start_matches(&format!("{}/", selection.provider)).to_owned();
+        status.project_path = app.layout.project_root.display().to_string();
+        if agent.plan_mode() { status.model.push_str(" [plan]"); }
+        status.branch = branch;
+        status.git_counts = counts;
+        status.session = short(agent.session().id());
+        status.prompt_tokens = (agent.last_prompt_tokens > 0).then_some(agent.last_prompt_tokens);
+        status.context_window = agent.context_window();
+        status.approval = format!("{:?}", agent.approval()).to_lowercase();
+        status.sandbox = format!("{:?}", app.config.sandbox.mode).to_lowercase();
+        status.version = self.learning.cache.value.0;
+        status.learning = self.learning.cache.value.1.clone();
+        status.role.clear();
+    }
+
+    // ----- idle loop ----------------------------------------------------------------------
+
+    fn run(&mut self, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
+        let mut dirty = true;
+        let mut previous_status = None;
+        loop {
+            if let Some(result)=AuthJob::collect(&mut self.auth_job) {
+                self.note("ChatGPT",match result { Ok(message)=>message,Err(error)=>format!("{error:#}") });
+                self.catalog.refresh(app); dirty=true;
+            }
+            {
+                let mut bridge = Bridge { shell:self, interrupt:app.interrupt.clone(), started:Instant::now(),
+                    last_paint:Instant::now()-PAINT_EVERY, failed:false, pending:Vec::new(), next_id:0 };
+                agent.pump_subagents(&mut bridge);
+                if bridge.failed { anyhow::bail!("terminal draw failed"); }
+            }
+            if self.startup.is_none() { self.startup = self.composer.take_follow_up(); }
+            self.refresh_status(app, agent);
+            if self.themes.reload_if_changed() { self.after_theme_reload(); dirty = true; }
+            self.status.phase = Phase::Idle;
+            self.status.clock = local_time("%H:%M");
+            let status = statusline::preview_row(&self.ui, &self.status, self.themes.current(), self.term.size().0);
+            if dirty || previous_status.as_ref() != Some(&status) { self.paint(None)?; }
+            previous_status = Some(status);
+            dirty = false;
+            if let Some(text) = self.startup.take() {
+                dirty = true;
+                match self.submit(app, agent, text)? { Step::Done => continue, other => return Ok(other) }
+            }
+            let (left, right) = statusline::segments(&self.ui);
+            let status_pending = self.git.cache.worker.is_some() || self.learning.cache.worker.is_some() || self.auth_job.is_some();
+            let timeout = if status_pending { TICK }
+                else if left.iter().chain(&right).any(|s| s == "time") { Duration::from_secs(1) } else { STATUS_TTL };
+            if !poll(timeout)? { continue; }
+            dirty = true;
+            match read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    let event = {
+                        let ctx = ComposerCtx { theme: self.themes.current(), keys: &self.keys, ui: &self.ui, status: &self.status };
+                        self.composer.handle_key(key, &ctx)
+                    };
+                    let step = match event {
+                        ComposerEvent::None | ComposerEvent::Interrupt => Step::Done,
+                        ComposerEvent::Exit => Step::Quit,
+                        ComposerEvent::Submit(text) => self.submit(app, agent, text)?,
+                        ComposerEvent::Action(action) => self.on_action(action, app, agent)?,
+                    };
+                    if !matches!(step, Step::Done) { return Ok(step); }
+                }
+                Event::Paste(text) => self.composer.handle_paste(&text),
+                Event::Resize(..) => self.term.on_resize(),
+                _ => {}
+            }
+        }
+    }
+
+    fn after_theme_reload(&mut self) {
+        if let Some(error) = self.themes.last_error() { let error = error.to_owned(); self.note("Theme", &error); }
+    }
+
+    fn save_history(&self, app: &App) {
+        let _ = settings_store::save_history(&app.layout, &self.composer.history(), self.ui.history_limit);
+    }
+
+    fn on_action(&mut self, action: Action, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
+        match action {
+            Action::ModelSelect | Action::ModelRoles => self.open(app, agent, Which::Models),
+            Action::ProviderSetup => self.open(app, agent, Which::Providers),
+            Action::Settings => self.open(app, agent, Which::Settings),
+            Action::ToolsExpand => {
+                self.tools_expanded = !self.tools_expanded;
+                self.note("Tools", if self.tools_expanded { "tool output expanded for new output (clear repaints history)" } else { "tool output collapsed" });
+                Ok(Step::Done)
+            }
+            Action::ToolsToggle => {
+                self.ui.show_tools = !self.ui.show_tools;
+                self.note("Tools", if self.ui.show_tools { "tool activity shown" } else { "tool activity hidden (errors still show)" });
+                Ok(Step::Done)
+            }
+            Action::ThinkingToggle => {
+                self.ui.show_thinking = !self.ui.show_thinking;
+                self.note("Reasoning", if self.ui.show_thinking { "reasoning text shown" } else { "reasoning text collapsed" });
+                Ok(Step::Done)
+            }
+            Action::ApprovalCycle => {
+                let next = match agent.approval() { Approval::Ask => Approval::Auto, Approval::Auto => Approval::Readonly, Approval::Readonly => Approval::Ask };
+                agent.set_approval(next);
+                self.note("Approval", format!("{next:?}").to_lowercase());
+                Ok(Step::Done)
+            }
+            Action::DisplayReset => { self.display_reset(); Ok(Step::Done) }
+            Action::EditExternal => { self.edit_externally(); Ok(Step::Done) }
+            _ => Ok(Step::Done),
+        }
+    }
+
+    /// Erase the screen and scrollback, then repaint the whole conversation from the transcript.
+    fn display_reset(&mut self) {
+        if self.term.clear_screen().is_err() { return; }
+        let (cols, _) = self.term.size();
+        let Shell { term, themes, transcript, ui, status, tools_expanded, .. } = self;
+        let ctx = TranscriptCtx { theme: themes.current(), ui, tick: status.tick, tools_expanded: *tools_expanded };
+        // Only what already reached scrollback is replayed; the still-streaming tail stays live.
+        let rows = transcript.committed_rows(cols, &ctx);
+        term.commit(rows);
+    }
+
+    /// Edit the draft in `$VISUAL`/`$EDITOR` on the real terminal.
+    fn edit_externally(&mut self) {
+        let editor = std::env::var("VISUAL").ok().filter(|v| !v.trim().is_empty())
+            .or_else(|| std::env::var("EDITOR").ok().filter(|v| !v.trim().is_empty()));
+        let Some(editor) = editor else {
+            self.note("Editor", "set $VISUAL or $EDITOR to edit the draft externally");
+            return;
+        };
+        let path = std::env::temp_dir().join(format!("dial-draft-{}-{}.md", std::process::id(), self.started.elapsed().as_nanos()));
+        if std::fs::write(&path, self.composer.draft()).is_err() { return; }
+        let ran = self.term.suspend(|| {
+            // The editor setting may carry arguments (`code --wait`), so it goes through the shell.
+            Command::new("/bin/sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("dial-editor").arg(&path).status()
+        });
+        match ran {
+            Ok(Ok(status)) if status.success() => {
+                if let Ok(text) = std::fs::read_to_string(&path) { self.composer.set_draft(text.trim_end_matches('\n')); }
+            }
+            Ok(Ok(status)) => self.note("Editor", format!("editor exited with {status}; draft unchanged")),
+            Ok(Err(error)) => self.note("Editor", format!("could not start the editor: {error}")),
+            Err(error) => self.note("Editor", format!("terminal error: {error:#}")),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- submitting -----------------------------------------------------------------------
+
+    fn submit(&mut self, app: &App, agent: &mut Agent<'_>, text: String) -> Result<Step> {
+        let trimmed = text.trim().to_owned();
+        if trimmed.is_empty() { return Ok(Step::Done); }
+        self.save_history(app);
+        if trimmed.starts_with('/') { return self.command(app, agent, &trimmed); }
+        let (shell, include) = if let Some(command) = trimmed.strip_prefix("!!") { (Some(command), false) }
+            else { (trimmed.strip_prefix('!'), true) };
+        if let Some(command) = shell.map(str::trim).filter(|c| !c.is_empty()) {
+            return self.run_user_shell(app, agent, command, include);
+        }
+        self.run_turn(app, agent, &trimmed)
+    }
+
+    /// `!cmd`: the user's own shell command, run in the project under the configured sandbox. Its output
+    /// joins the conversation so the model can refer to it.
+    fn run_user_shell(&mut self, app: &App, agent: &mut Agent<'_>, command: &str, include: bool) -> Result<Step> {
+        use crate::tools::{self, Workspace};
+        let allowed = {
+            let mut bridge = Bridge { shell: self, interrupt: app.interrupt.clone(), started: Instant::now(),
+                last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
+            agent.approve_user_shell(command, &mut bridge)
+        };
+        if !allowed { self.note("Shell", "command denied by approval policy"); return Ok(Step::Done); }
+        self.transcript.push_user(&format!("{}{command}", if include { "!" } else { "!!" }));
+        let started = Instant::now();
+        app.layout.ensure_state_outside_project()?;
+        let ws = Workspace::new(&app.layout.project_root)
+            .and_then(|ws| tools::apply_sandbox_config(ws, &app.config.sandbox, Some((app.layout.state_dir.as_path(), app.layout.user_dir.as_path()))))
+            .and_then(|ws| Ok(ws.with_artifacts(tools::artifact::ArtifactStore::new(&app.layout.state_dir.join("artifacts"))?)));
+        let output = match ws {
+            Ok(ws) => {
+                app.interrupt.store(false, Ordering::SeqCst);
+                self.composer.set_busy(true);
+                let mut bridge = Bridge { shell: self, interrupt: app.interrupt.clone(), started,
+                    last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
+                bridge.tool_call("bash", command);
+                let output = std::thread::scope(|scope| {
+                    let (tx, rx) = std::sync::mpsc::sync_channel(16);
+                    let cancel = app.interrupt.clone();
+                    scope.spawn(move || {
+                        let on_output = |chunk: &[u8]| { let _ = tx.send(Ok(chunk.to_vec())); };
+                        let result = tools::shell::bash_tool_streaming(&ws, &json!({"command":command}), 120, &on_output, &cancel);
+                        let output = match result { Ok(output) => output, Err(text) => ToolOutput { text, is_error:true } };
+                        let _ = tx.send(Err(output));
+                    });
+                    loop {
+                        match rx.recv_timeout(Duration::from_millis(80)) {
+                            Ok(Ok(chunk)) => bridge.tool_output("bash", &String::from_utf8_lossy(&chunk)),
+                            Ok(Err(output)) => break output,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bridge.heartbeat(),
+                            Err(_) => break ToolOutput { text:"shell worker disconnected".into(), is_error:true },
+                        }
+                    }
+                });
+                bridge.tool_result("bash", &output);
+                bridge.shell.composer.set_busy(false);
+                output
+            },
+            Err(error) => ToolOutput { text: format!("{error:#}"), is_error: true },
+        };
+        self.transcript.finish_turn();
+        if include {
+            agent.session_mut().append(json!({"role": "user", "content": format!("I ran `{command}` myself:\n{}", agent::guard::clip_middle(&output.text, 8000))}))?;
+        }
+        Ok(Step::Done)
+    }
+
+    fn run_turn(&mut self, app: &App, agent: &mut Agent<'_>, text: &str) -> Result<Step> {
+        repl::clear_interrupt();
+        self.transcript.push_user(text);
+        self.composer.set_busy(true);
+        self.status.phase = Phase::Working;
+        let ready = self.wait_compute(app).and_then(|ready| if ready { self.prepare_local(app) } else { Ok(false) });
+        match ready {
+            Ok(true) => {}
+            Ok(false) => { self.composer.set_busy(false); return Ok(Step::Done); }
+            Err(error) => {
+                self.transcript.error(&format!("{error:#}"));
+                self.composer.set_busy(false);
+                return Ok(Step::Done);
+            }
+        }
+        let started = Instant::now();
+        self.turn_output_tokens = 0;
+        self.status.output_tokens = 0;
+        self.status.activity = "thinking".into();
+        let (result, failed, streamed_tokens) = {
+            let mut bridge = Bridge { shell: self, interrupt: app.interrupt.clone(), started, last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
+            bridge.repaint(true);
+            let result = agent.turn(text, &mut bridge);
+            (result, bridge.failed, bridge.shell.turn_output_tokens)
+        };
+        app.interrupt.store(false, Ordering::SeqCst);
+        self.composer.set_busy(false);
+        self.save_history(app);
+        self.status.activity.clear();
+        let elapsed = started.elapsed().as_secs_f64();
+        self.refresh_status(app, agent);
+        match &result {
+            Ok(report) => {
+                if report.interrupted { self.note("Interrupted", "the turn stopped at the next safe point"); }
+                if report.trajectory.is_some() { self.last_trajectory = report.trajectory; }
+            }
+            Err(error) => self.transcript.error(&format!("{error:#}")),
+        }
+        self.transcript.finish_turn();
+        if self.ui.show_turn_stats && result.is_ok() {
+            self.transcript.turn_stats(TurnStats {
+                clock: local_time("%Y-%m-%d %H:%M:%S"), elapsed_secs: elapsed, prompt_tokens: self.status.prompt_tokens,
+                output_tokens: (streamed_tokens > 0).then_some(streamed_tokens), tokens_per_second: self.status.tokens_per_second,
+            });
+        }
+        self.schedule_improvement(app);
+        if failed { anyhow::bail!("terminal draw failed; the screen was restored"); }
+        Ok(Step::Done)
+    }
+
+    fn schedule_improvement(&mut self, app: &App) {
+        let Some(store) = &app.store else { return };
+        match auto::maybe_spawn(&app.layout, &app.config, store) {
+            Ok(true) => self.note("Improvement",
+                if app.config.uses_local_compute() { "queued; local training waits until this session releases compute" } else { "queued in the background; this session keeps the admitted version" }),
+            Ok(false) => {}
+            Err(error) => self.note("Improvement", format!("could not schedule: {error:#}")),
+        }
+    }
+
+    // ----- asking the user ------------------------------------------------------------------
+
+    /// A modal choice drawn in place of the composer. `None` means the user cancelled.
+    fn ask(&mut self, title: &str, body: &str, options: &[(&str, char)]) -> Option<usize> {
+        let mut selected = 0usize;
+        loop {
+            let (cols, _) = self.term.size();
+            let rows = panel_rows(self.themes.current(), cols, title, body, options, selected);
+            if self.paint(Some(rows)).is_err() { return None; }
+            if !poll(TICK).unwrap_or(false) { continue; }
+            match read() {
+                Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    match key.code {
+                        KeyCode::Up => selected = (selected + options.len() - 1) % options.len(),
+                        KeyCode::Down | KeyCode::Tab => selected = (selected + 1) % options.len(),
+                        KeyCode::Enter => return Some(selected),
+                        KeyCode::Esc => return None,
+                        KeyCode::Char('c') if ctrl => return None,
+                        KeyCode::Char(c) if !ctrl => {
+                            if let Some(index) = options.iter().position(|(_, hotkey)| hotkey.eq_ignore_ascii_case(&c)) { return Some(index); }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Event::Resize(..)) => self.term.on_resize(),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn wait_compute(&mut self, app: &App) -> Result<bool> {
+        if !app.config.uses_local_compute() || app.compute.borrow().is_some() { return Ok(true); }
+        let lock = auto::lock_file(&app.layout.user_dir.join("compute.lock"))?;
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => { *app.compute.borrow_mut() = Some(lock); return Ok(true); }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+            self.status.phase = Phase::WaitingCompute;
+            self.paint(None)?;
+            if poll(TICK)? {
+                match read()? {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        let ctx = ComposerCtx { theme: self.themes.current(), keys: &self.keys, ui: &self.ui, status: &self.status };
+                        match self.composer.handle_key(key, &ctx) {
+                            ComposerEvent::Interrupt | ComposerEvent::Exit => {
+                                self.note("Cancelled", "Local compute is occupied by another session or an improvement cycle.");
+                                return Ok(false);
+                            }
+                            ComposerEvent::Submit(text) => self.startup = Some(text),
+                            ComposerEvent::Action(Action::EditExternal) => self.edit_externally(),
+                            _ => {}
+                        }
+                    }
+                    Event::Paste(text) => self.composer.handle_paste(&text),
+                    Event::Resize(..) => self.term.on_resize(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn prepare_local(&mut self, app: &App) -> Result<bool> {
+        if app.config.endpoint.is_some() { return Ok(true); }
+        if !app.config.python.is_file() || !app.config.worker.is_file() {
+            let choice = self.ask("Set up local MLX",
+                "Installs a private Python environment with uv under your Dial home directory. Downloads need network access.",
+                &[("Install MLX runtime", 'y'), ("Cancel", 'n')]);
+            if choice != Some(0) { return Ok(false); }
+            self.status.phase = Phase::Setup;
+            self.note("MLX", "installing the local runtime…");
+            self.paint(None)?;
+            crate::setup::ensure_runtime(&app.layout)?;
+            ensure!(app.config.python.is_file() && app.config.worker.is_file(), "custom Python/worker paths are missing; update them or use the default local setup paths");
+        }
+        if !Path::new(&app.config.model).exists() {
+            let needs_pin = app.store.as_ref().map(|s| s.get_meta("serving_capabilities")).transpose()?.flatten().is_none();
+            if needs_pin {
+                self.status.phase = Phase::Setup;
+                self.note("MLX", "resolving the local model; the first use may download weights…");
+                self.paint(None)?;
+                let caps = crate::learn::worker::capabilities(&app.config)?;
+                ensure!(caps["inference"] == true, "local model is not supported by this MLX runtime");
+                if let Some(store) = &app.store { store.set_meta("serving_capabilities", &caps.to_string())?; }
+            }
+        }
+        Ok(true)
+    }
+
+    // ----- overlays -------------------------------------------------------------------------
+
+    fn open(&mut self, app: &App, agent: &mut Agent<'_>, which: Which) -> Result<Step> {
+        let mut which = which;
+        loop {
+            let outcome = self.run_overlay(app, which)?;
+            let mut step = Step::Done;
+            if let Some(config) = outcome.latest { step = self.config_changed(app, agent, config); }
+            match (outcome.next.as_deref(), &step) {
+                (Some("open:models"), Step::Done) => which = Which::Models,
+                (Some("open:providers"), Step::Done) => which = Which::Providers,
+                (Some("open:settings"), Step::Done) => which = Which::Settings,
+                _ => return Ok(step),
+            }
+        }
+    }
+
+    /// Apply a freshly loaded config: UI and approval in place, everything else by rebuilding the agent.
+    fn config_changed(&mut self, app: &App, agent: &mut Agent<'_>, fresh: Config) -> Step {
+        self.ui = fresh.ui.clone();
+        if let Err(error) = self.themes.apply_config(&fresh.ui, self.dark) { self.note("Theme", &error); }
+        if fresh.approval != self.cfg_approval {
+            self.cfg_approval = fresh.approval;
+            agent.set_approval(fresh.approval);
+        }
+        if agent_key(&fresh) != agent_key(&app.config) { Step::Rebuild(Box::new(fresh)) } else { Step::Done }
+    }
+
+    fn run_overlay(&mut self, app: &App, which: Which) -> Result<OverlayOutcome> {
+        self.catalog.start(app);
+        let effective = app.reload().unwrap_or_else(|_| app.config.clone());
+        let discovery = self.catalog.get();
+        let mut overlay = match which {
+            Which::Settings => {
+                let (values, global, project) = settings_tables(app, &effective);
+                let themes = self.themes.names().into_iter().filter(|e| e.error.is_none()).map(|e| e.name).collect();
+                ActiveOverlay::Settings(SettingsOverlay::new(values, project, global, self.scope, themes))
+            }
+            Which::Models => ActiveOverlay::Models(ModelOverlay::new(discovery, role_rows(&effective), self.scope)),
+            Which::Providers => {
+                let user_dir = app.layout.user_dir.clone();
+                let has_key = Box::new(move |url: &str| catalog::credential_token(&user_dir, url).ok().flatten().is_some());
+                let mut providers = ProviderOverlay::new(discovery, effective.providers.clone(), has_key, self.scope);
+                providers.set_chatgpt_accounts(crate::llm::chatgpt::accounts(&app.layout.user_dir).unwrap_or_default());
+                providers.set_chatgpt_pending(self.auth_job.is_some());
+                ActiveOverlay::Providers(providers)
+            }
+        };
+        let Shell { term, themes, keys, status, catalog, scope, dark, auth_job, .. } = self;
+        let mut env = OverlayEnv { app, themes, keys, status, catalog, scope, dark: *dark, latest: None, next: None, seen_generation: 0, auth_job };
+        env.seen_generation = env.catalog.generation;
+        term.with_overlay(|ot| run_overlay(ot, &mut env, &mut overlay))?;
+        env.themes.restore();
+        Ok(OverlayOutcome { latest: env.latest, next: env.next })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slash commands
+// ---------------------------------------------------------------------------
+
+impl Shell {
+    fn note(&mut self, title: &str, text: impl AsRef<str>) { self.transcript.notice(title, text.as_ref()); }
+
+    /// Persist settings writes, reload the effective config and apply it live.
+    fn persist(&mut self, app: &App, agent: &mut Agent<'_>, changes: &[Change], scope: Scope) -> Result<Step> {
+        settings_store::save_config(&app.layout, scope, changes)?;
+        let fresh = app.reload()?;
+        Ok(self.config_changed(app, agent, fresh))
+    }
+
+    fn help_text(&self, app: &App) -> String {
+        let found = skills::discover(&app.layout);
+        let mut lines = vec!["Commands".to_owned()];
+        for entry in command_entries(&self.commands, &found) {
+            let name = match &entry.args_hint { Some(hint) => format!("/{} {hint}", entry.name), None => format!("/{}", entry.name) };
+            lines.push(format!("  {name:<28} {}", entry.description));
+        }
+        lines.push(String::new());
+        lines.push("Keys (remap in keybindings.toml; /hotkeys shows all)".into());
+        for action in [Action::ModelSelect, Action::ProviderSetup, Action::Settings, Action::HistorySearch, Action::Newline,
+            Action::ToolsExpand, Action::ApprovalCycle, Action::DisplayReset, Action::EditExternal, Action::Interrupt, Action::Exit] {
+            lines.push(format!("  {:<22} {}", self.keys.labels(action), action.describe()));
+        }
+        lines.push("  !<command>             run a shell command yourself (output joins the conversation)".into());
+        lines.push("  !!<command>            run without adding output to the conversation".into());
+        lines.push("  Busy: Enter steers · Alt-Enter queues follow-up · Up edits last queued item · Esc cancels that edit".into());
+        lines.join("\n")
+    }
+
+    fn hotkeys_text(&self) -> String {
+        let mut lines = Vec::new();
+        let mut group = "";
+        for row in self.keys.hotkeys() {
+            if row.group != group { if !lines.is_empty() { lines.push(String::new()); } lines.push(row.group.to_owned()); group = row.group; }
+            lines.push(format!("  {:<24} {:<22} {}{}", row.id, row.keys, row.description, if row.customized { "  (customized)" } else { "" }));
+        }
+        lines.push(String::new());
+        lines.push(format!("Remap in {}/keybindings.toml, for example:  \"app.model.select\" = \"Ctrl+K\"", app_home_hint()));
+        lines.join("\n")
+    }
+
+    /// Show a different session's conversation: clear the screen and replay it from the session file.
+    fn show_session(&mut self, session: &Session) {
+        let _ = self.term.clear_screen();
+        self.transcript = Transcript::new();
+        replay(&mut self.transcript, &session.messages());
+        self.session_id = session.id().to_owned();
+    }
+
+    fn pick_session(&mut self, app: &App, query: &str, tree: bool, direct: bool) -> Result<Option<Session>> {
+        let mut sessions = Session::list(&app.layout, usize::MAX)?;
+        if sessions.is_empty() { self.note("Sessions", "no sessions yet"); return Ok(None); }
+        if direct && !query.is_empty() {
+            let matches: Vec<_> = sessions.iter().filter(|s| s.id.starts_with(query)).collect();
+            if matches.len() == 1 { return Session::open(&matches[0].path).map(Some); }
+            if matches.len() > 1 { anyhow::bail!("ambiguous session prefix {query:?}"); }
+        }
+        if tree {
+            let ancestry = |s: &crate::storage::session::SessionInfo| {
+                let mut chain = vec![s.id.clone()];
+                let mut parent = s.parent_id.as_deref();
+                while let Some(id) = parent {
+                    if chain.iter().any(|p| p == id) { break; }
+                    chain.push(id.to_owned());
+                    parent = sessions.iter().find(|s| s.id == id).and_then(|s| s.parent_id.as_deref());
+                }
+                chain.reverse();
+                chain
+            };
+            let order: HashMap<_, _> = sessions.iter().map(|s| (s.id.clone(), ancestry(s))).collect();
+            sessions.sort_by(|a, b| order[&a.id].cmp(&order[&b.id]));
+        }
+        let searchable: Vec<_> = sessions.iter().map(|s| format!("{} {} {} {} {} {}",
+            s.id, s.title, s.first_message, s.started, s.path.display(), s.model)).collect();
+        let mut filter = query.to_owned();
+        let mut selected = 0usize;
+        loop {
+            let found: Vec<_> = searchable.iter().enumerate().filter(|(_, s)| text::fuzzy(&filter, s).is_some()).map(|(i, _)| i).collect();
+            selected = selected.min(found.len().saturating_sub(1));
+            let (cols, height) = self.term.size();
+            let visible = (height as usize).saturating_sub(6).max(1);
+            let start = selected.saturating_sub(visible - 1);
+            let theme = self.themes.current();
+            let mut rows = vec![Line::from(Span::styled(text::ellipsize(
+                &format!("{}  /{}  ({} matches)", if tree { "Session tree" } else { "Sessions" }, text::one_line(&filter), found.len()), cols as usize, theme.ascii()), theme.fg(Tok::Accent)))];
+            for (position, &index) in found.iter().enumerate().skip(start).take(visible) {
+                let session = &sessions[index];
+                let branch = session.parent_id.as_ref().map(|id| format!("fork of {} ", short(id))).unwrap_or_default();
+                let label = format!("{} {}  {}  {} msgs  {}  {}{}",
+                    if position == selected { ">" } else { " " }, short(&session.id),
+                    session_age(&session.started), session.messages, session.model, branch, session.title);
+                rows.push(Line::from(Span::styled(text::ellipsize(&text::one_line(&label), cols as usize, theme.ascii()),
+                    theme.fg(if position == selected { Tok::Accent } else { Tok::Text }))));
+            }
+            rows.push(Line::from(Span::styled(text::clip("Type to filter · Up/Down · Enter resume · Esc cancel", cols as usize), theme.fg(Tok::Dim))));
+            self.paint(Some(rows))?;
+            match read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+                    KeyCode::Up => selected = selected.saturating_sub(1),
+                    KeyCode::Down => selected = (selected + 1).min(found.len().saturating_sub(1)),
+                    KeyCode::PageUp => selected = selected.saturating_sub(visible),
+                    KeyCode::PageDown => selected = (selected + visible).min(found.len().saturating_sub(1)),
+                    KeyCode::Enter => if let Some(&index) = found.get(selected) { return Session::open(&sessions[index].path).map(Some); },
+                    KeyCode::Backspace => { filter.pop(); selected = 0; }
+                    KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => { filter.push(c); selected = 0; }
+                    _ => {}
+                },
+                Event::Paste(value) => { filter.push_str(&text::one_line(&value)); selected = 0; }
+                Event::Resize(..) => self.term.on_resize(),
+                _ => {}
+            }
+        }
+    }
+
+    fn copy_answer(&mut self, agent: &Agent<'_>) {
+        use std::io::Write;
+        let messages = agent.session().messages();
+        let Some(answer) = messages.iter().rev().filter(|m| m["role"] == "assistant")
+            .find_map(|m| m["content"].as_str().filter(|s| !s.is_empty())) else {
+                self.note("Copy", "no assistant answer yet"); return;
+            };
+        for (program, args) in [("pbcopy", &[][..]), ("wl-copy", &[][..]), ("xclip", &["-selection", "clipboard"][..])] {
+            let Ok(mut child) = Command::new(program).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { continue };
+            let wrote = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(answer.as_bytes()).is_ok());
+            if child.wait().is_ok_and(|status| status.success()) && wrote { self.note("Copy", "answer copied"); return; }
+        }
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(answer);
+        let mut stdout = std::io::stdout().lock();
+        let sent = write!(stdout, "\x1b]52;c;{encoded}\x07").and_then(|_| stdout.flush());
+        drop(stdout);
+        match sent {
+            Ok(()) => self.note("Copy", "clipboard sent via OSC52 (terminal support required)"),
+            Err(error) => self.note("Copy", format!("{error}")),
+        }
+    }
+
+    fn command(&mut self, app: &App, agent: &mut Agent<'_>, line: &str) -> Result<Step> {
+        let Some(rest) = line.strip_prefix('/') else { return self.run_turn(app, agent, line) };
+        let (name, args) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(name, args)| (name, args.trim()));
+        match name {
+            "exit" | "quit" | "q" => return Ok(Step::Quit),
+            "help" | "?" => { let text = self.help_text(app); self.note("Help", text); }
+            "model" | "models" | "roles" => return self.open(app, agent, Which::Models),
+            "profile" => {
+                if args.is_empty() {
+                    self.note("Profiles", app.config.model_profiles.iter().map(|(name, profile)| format!("{name}: {} / {}", profile.provider, profile.model)).collect::<Vec<_>>().join("\n"));
+                } else {
+                    let changes = if args == "off" { vec![Change::Remove { path: "model_profile".into() }] }
+                        else { vec![Change::Set { path: "model_profile".into(), value: args.into() }] };
+                    match self.persist(app, agent, &changes, Scope::Project) {
+                        Ok(step) => return Ok(step),
+                        Err(error) => self.note("Profile", format!("not changed: {error:#}")),
+                    }
+                }
+            }
+            "reasoning" | "thinking" => {
+                if args.is_empty() {
+                    match reasoning_profile(&app.config) {
+                        Ok(Some(profile))=>self.note("Reasoning",format!("{}: {}\nAvailable: {}\nSet with /reasoning <level> or /thinking <level>",app.config.model,
+                            profile.reasoning_effort.map(|effort|effort.as_str()).unwrap_or("provider default"),
+                            profile.capabilities.reasoning_efforts.iter().map(|effort|effort.as_str()).collect::<Vec<_>>().join(" | "))),
+                        Ok(None)=>self.note("Reasoning","Open /models and rescan to load this model's reasoning levels, or select an explicit /profile"),
+                        Err(error)=>self.note("Reasoning",format!("{error:#}")),
+                    }
+                } else {
+                    match reasoning_changes(&app.config,args).and_then(|(changes,effort)|self.persist(app,agent,&changes,Scope::Project).map(|step|(step,effort))) {
+                        Ok((step,effort))=>{ self.note("Reasoning",format!("{} reasoning set to {effort}",app.config.model)); return Ok(step); },
+                        Err(error)=>self.note("Reasoning",format!("not changed: {error:#}")),
+                    }
+                }
+            }
+            "providers" => return self.open(app, agent, Which::Providers),
+            "settings" => return self.open(app, agent, Which::Settings),
+            "hotkeys" => { let text = self.hotkeys_text(); self.note("Hotkeys", text); }
+            "improve" => self.note("Improvement", improve_summary(app)),
+            "clear" => self.display_reset(),
+            "theme" => return self.theme_command(app, agent, args),
+            "new" => match Session::create(&app.layout, SessionMeta { model: app.config.model.clone() }) {
+                Ok(session) => { let id = session.id().to_owned(); agent.swap_session(session); self.session_id = id.clone(); self.note("Session", format!("new session {}", short(&id))); }
+                Err(error) => self.note("Session", format!("error: {error:#}")),
+            },
+            "sessions" | "resume" | "tree" => {
+                match self.pick_session(app, args, name == "tree", name == "resume") {
+                    Ok(Some(session)) => {
+                        self.show_session(&session);
+                        agent.swap_session(session);
+                        self.note("Session", format!("resumed {}", short(agent.session().id())));
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.note("Sessions", format!("{error:#}")),
+                }
+            }
+            "rename" => match agent.session_mut().rename(args) {
+                Ok(()) => self.note("Session", format!("renamed to {}", agent.session().title())),
+                Err(error) => self.note("Session", format!("{error:#}")),
+            },
+            "export" => {
+                let html = args.split_whitespace().any(|a| a == "--html");
+                let path = args.split_whitespace().filter(|a| *a != "--html").collect::<Vec<_>>().join(" ");
+                let path = if path.is_empty() { format!("session-{}.{}", agent.session().id(), if html { "html" } else { "md" }) } else { path };
+                match agent.session().export(Path::new(&path), html) {
+                    Ok(()) => self.note("Export", format!("saved {path}")),
+                    Err(error) => self.note("Export", format!("{error:#}")),
+                }
+            }
+            "copy" => self.copy_answer(agent),
+            "plan" => {
+                let next = match args {
+                    "" => !agent.plan_mode(), "on" => true, "off" => false,
+                    _ => { self.note("Plan", "usage: /plan [on|off]"); return Ok(Step::Done); }
+                };
+                agent.set_plan_mode(next);
+                self.note("Plan", if next { "read-only planning enabled" } else { "planning disabled" });
+            }
+            "permissions" => {
+                if let Some(rest) = args.strip_prefix("remove ") {
+                    let mut words = rest.split_whitespace();
+                    let index = words.next().and_then(|s| s.parse::<usize>().ok()).and_then(|n| n.checked_sub(1));
+                    let persist = words.any(|s| s == "--persist");
+                    match index {
+                        Some(index) => match agent.remove_permission_rule(index, persist) {
+                            Ok(()) => self.note("Permissions", "rule removed"),
+                            Err(error) => self.note("Permissions", format!("{error:#}")),
+                        },
+                        None => self.note("Permissions", "usage: /permissions remove <number> [--persist]"),
+                    }
+                } else if args.starts_with("allow ") || args.starts_with("deny ") {
+                    use crate::agent::approval::{Effect, PermissionRule};
+                    let mut words = args.split_whitespace();
+                    let effect = if words.next() == Some("allow") { Effect::Allow } else { Effect::Deny };
+                    let first = words.next().unwrap_or("");
+                    let persist = first == "--persist";
+                    let tool = if persist { words.next().unwrap_or("") } else { first };
+                    let rule = PermissionRule { effect, tool: tool.into(), command_prefix: words.map(str::to_owned).collect() };
+                    match agent.add_permission_rule(rule, persist) {
+                        Ok(()) => self.note("Permissions", if persist { "rule saved" } else { "session rule added" }),
+                        Err(error) => self.note("Permissions", format!("{error:#}")),
+                    }
+                } else if args.is_empty() {
+                    let rules = agent.permission_rules().iter().enumerate().map(|(i, rule)|
+                        format!("{}: {:?} {} {}", i + 1, rule.effect, rule.tool, rule.command_prefix.join(" "))).collect::<Vec<_>>();
+                    self.note("Permissions", if rules.is_empty() { "no allow/deny rules".into() } else { rules.join("\n") });
+                } else { self.note("Permissions", "usage: /permissions; /permissions allow|deny [--persist] <tool> [prefix words]; /permissions remove <number> [--persist]"); }
+            }
+            "cost" => self.note("Cost", agent.session_cost().map(|cost| format!("${cost:.6} USD")).unwrap_or_else(|| "pricing unavailable for this session".into())),
+            "jobs" => {
+                let mut bridge = Bridge { shell:self, interrupt:app.interrupt.clone(), started:Instant::now(),
+                    last_paint:Instant::now()-PAINT_EVERY, failed:false, pending:Vec::new(), next_id:0 };
+                let result=agent.subagent_status(if args.is_empty(){None}else{Some(args)},&mut bridge);
+                match result { Ok(value)=>self.note("Jobs",value.to_string()),Err(error)=>self.note("Jobs",format!("{error:#}")) }
+            }
+            "message" => {
+                let result=match args.split_once(char::is_whitespace) {
+                    Some((id,text))=>agent.subagent_message(id,text.trim()),
+                    None=>Err(anyhow::anyhow!("usage: /message <id> <text>")),
+                };
+                match result {Ok(value)=>self.note("Jobs",value.to_string()),Err(error)=>self.note("Jobs",format!("{error:#}"))}
+            }
+            "cancel" => {
+                match agent.cancel_subagent(args) {Ok(value)=>self.note("Jobs",value.to_string()),Err(error)=>self.note("Jobs",format!("{error:#}"))}
+            }
+            "fork" => match agent.session().fork(&app.layout) {
+                Ok(session) => { let id = session.id().to_owned(); agent.swap_session(session); self.session_id = id.clone(); self.note("Session", format!("forked into {}", short(&id))); }
+                Err(error) => self.note("Session", format!("error: {error:#}")),
+            },
+            "compact" => {
+                if !self.wait_compute(app)? { return Ok(Step::Done); }
+                self.composer.set_busy(true);
+                self.status.phase = Phase::Compacting;
+                self.status.activity = "compacting".into();
+                let result = {
+                    let mut bridge = Bridge { shell: self, interrupt: app.interrupt.clone(), started: Instant::now(), last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
+                    bridge.repaint(true);
+                    agent.compact(&mut bridge)
+                };
+                self.composer.set_busy(false);
+                if let Err(error) = result { self.transcript.error(&format!("{error:#}")); }
+            }
+            "undo" => {
+                if let (Some(trajectory), Some(store)) = (self.last_trajectory, app.store.as_ref()) {
+                    let outcome = Outcome { trajectory, score: 0.0, source: "user:undo".into(), reference: None };
+                    if let Err(error) = store.outcome(&outcome) { self.note("Undo", format!("could not record undo feedback: {error:#}")); }
+                }
+                let mut lines = Vec::new();
+                if let Some(checkpoints) = agent.checkpoints() {
+                    match checkpoints.rollback(1) {
+                        Ok(report) => lines.push(format!("restored {} file(s), removed {}", report.restored.len(), report.removed.len())),
+                        Err(error) => lines.push(format!("rollback: {error:#}")),
+                    }
+                }
+                match agent.session_mut().rewind(1) {
+                    Ok(dropped) => lines.push(format!("dropped {dropped} message(s)")),
+                    Err(error) => lines.push(format!("rewind: {error:#}")),
+                }
+                self.note("Undo", lines.join("\n"));
+            }
+            "rollback" => {
+                let turns = args.parse().unwrap_or(1);
+                match agent.checkpoints() {
+                    Some(checkpoints) => match checkpoints.rollback(turns) {
+                        Ok(report) => self.note("Rollback", format!("restored {:?}, removed {:?}", report.restored, report.removed)),
+                        Err(error) => self.note("Rollback", format!("{error:#}")),
+                    },
+                    None => self.note("Rollback", "checkpoints unavailable"),
+                }
+            }
+            "todo" => self.note("Todo", agent.todo().render()),
+            "skills" => {
+                let found = skills::discover(&app.layout);
+                if found.is_empty() { self.note("Skills", "no skills (add .dial/skills/<name>/SKILL.md)"); }
+                else { self.note("Skills", found.iter().map(|skill| format!("{}: {}", skill.name, skill.description)).collect::<Vec<_>>().join("\n")); }
+            }
+            "memory" => {
+                let result = crate::storage::provenance::ProvenanceMemory::open(&app.layout)
+                    .and_then(|memory| memory.recall(args, None, 20, 24000))
+                    .and_then(|result| serde_json::to_string_pretty(&result).map_err(Into::into));
+                match result { Ok(text) => self.note("Memory", text), Err(error) => self.note("Memory", format!("error: {error:#}")) }
+            }
+            "commands" => {
+                let text = if self.commands.is_empty() { "no custom commands (add .dial/commands/<name>.md)".to_owned() }
+                    else { self.commands.iter().map(|def| format!("/{}  {}", def.name, def.description)).collect::<Vec<_>>().join("\n") };
+                self.note("Commands", text);
+            }
+            "search" => match Session::search(&app.layout, args, 8) {
+                Ok(hits) if hits.is_empty() => self.note("Search", "no matches"),
+                Ok(hits) => self.note("Search", hits.iter().map(|hit| format!("{} [{}] {}", short(&hit.session_id), hit.role, hit.snippet)).collect::<Vec<_>>().join("\n")),
+                Err(error) => self.note("Search", format!("error: {error:#}")),
+            },
+            "context" => self.note("Context", format!("last prompt: {} tokens (window {}), session {} messages",
+                agent.last_prompt_tokens, agent.context_window(), agent.session().messages().len())),
+            "approval" => {
+                match args {
+                    "ask" => agent.set_approval(Approval::Ask),
+                    "auto" => agent.set_approval(Approval::Auto),
+                    "readonly" => agent.set_approval(Approval::Readonly),
+                    "" => {}
+                    _ => { self.note("Approval", "usage: /approval ask|auto|readonly"); return Ok(Step::Done); }
+                }
+                self.note("Approval", format!("{:?}", agent.approval()).to_lowercase());
+            }
+            "outcome" => {
+                let (score, comment) = args.split_once(char::is_whitespace).map_or((args, ""), |(score, comment)| (score, comment.trim()));
+                match (score.parse::<f64>().ok(), self.last_trajectory, app.store.as_ref()) {
+                    (Some(score), Some(trajectory), Some(store)) => {
+                        let outcome = Outcome { trajectory, score, source: "user".into(), reference: (!comment.is_empty()).then(|| comment.to_owned()) };
+                        match store.outcome(&outcome) {
+                            Ok(()) => self.note("Outcome", format!("recorded {score} for trajectory {trajectory}")),
+                            Err(error) => self.transcript.error(&format!("{error:#}")),
+                        }
+                    }
+                    (None, _, _) => self.note("Outcome", "usage: /outcome <0-100> [note]"),
+                    (_, None, _) => self.note("Outcome", "no completed turn to score yet"),
+                    (_, _, None) => self.note("Outcome", "self-improvement is not configured, so there is nowhere to record this"),
+                }
+            }
+            other if other.starts_with("skill:") => {
+                let skill = &other["skill:".len()..];
+                let known = skills::discover(&app.layout).into_iter().any(|s| s.name == skill);
+                if !known { self.note("Skill", format!("unknown skill {skill:?}; /skills lists them")); return Ok(Step::Done); }
+                let task = if args.is_empty() { String::new() } else { format!(" Task: {args}") };
+                return self.run_turn(app, agent, &format!("Use the \"{skill}\" skill (load it with the skill tool first).{task}"));
+            }
+            _ => match self.commands.iter().find(|def| def.name == name) {
+                Some(def) => { let prompt = context::expand_command(def, args); return self.run_turn(app, agent, &prompt); }
+                None => self.note("Command", format!("unknown command /{name}; /help lists commands")),
+            },
+        }
+        Ok(Step::Done)
+    }
+
+    fn theme_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        if args.is_empty() {
+            let active = self.themes.current().name().to_owned();
+            let mut lines: Vec<String> = self.themes.names().into_iter().map(|entry| {
+                let mark = if entry.name == active { "●" } else { " " };
+                match entry.error { Some(error) => format!("{mark} {}  (cannot load: {error})", entry.name), None => format!("{mark} {}{}", entry.name, if entry.builtin { "" } else { "  (custom)" }) }
+            }).collect();
+            lines.push(String::new());
+            lines.push("/theme <name> switches (saved globally). Custom themes are JSON files in:".into());
+            lines.push(format!("  {}", self.themes.dir().display()));
+            lines.push("Create a custom JSON theme in that directory; it reloads live.".into());
+            self.note("Themes", lines.join("\n"));
+            return Ok(Step::Done);
+        }
+        if self.themes.names().iter().all(|entry| entry.name != args) && args != "auto" {
+            self.note("Theme", format!("unknown theme {args:?}; /theme lists them"));
+            return Ok(Step::Done);
+        }
+        let changes = [Change::Set { path: "ui.theme".into(), value: args.to_owned().into() }];
+        match self.persist(app, agent, &changes, Scope::Global) {
+            Ok(step) => { self.note("Theme", format!("switched to {args}")); Ok(step) }
+            Err(error) => { self.note("Theme", format!("not changed: {error:#}")); Ok(Step::Done) }
+        }
+    }
+}
+
+fn app_home_hint() -> String {
+    std::env::var("DIAL_HOME").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "~/.dial".into())
+}
+
+fn improve_summary(app: &App) -> String {
+    let Some(store) = &app.store else {
+        return format!("self-improvement recording is unavailable: {}", app.store_error.as_deref().unwrap_or("no store"));
+    };
+    let version = store.active().map(|active| format!("v{}", active.id)).unwrap_or_else(|error| format!("unavailable ({error:#})"));
+    let state = store.get_meta("auto_status").ok().flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| value.get("state").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| "idle".into());
+    let due = auto::due(&app.config, store).unwrap_or(false);
+    let enabled = auto::enabled(&app.config, store).unwrap_or(false);
+    format!("{} · version {version} · {state} · cycle {}\nlearning records stay in {}",
+        if enabled { "automatic improvement enabled" } else { "automatic improvement paused" },
+        if due { "due" } else { "waiting for the interval" },
+        app.config.state_dir.display())
+}
+
+enum ActiveOverlay { Settings(SettingsOverlay), Models(ModelOverlay), Providers(ProviderOverlay) }
+
+impl ActiveOverlay {
+    fn draw(&mut self, frame: &mut ratatui::Frame, ctx: &DrawCtx) {
+        match self { Self::Settings(o) => o.draw(frame, ctx), Self::Models(o) => o.draw(frame, ctx), Self::Providers(o) => o.draw(frame, ctx) }
+    }
+    fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
+        match self { Self::Settings(o) => o.handle(event, keys), Self::Models(o) => o.handle(event, keys), Self::Providers(o) => o.handle(event, keys) }
+    }
+    fn banner(&mut self, message: String, is_error: bool) {
+        match self { Self::Models(o) => o.set_status(message, is_error), Self::Providers(o) => o.set_status(message, is_error), Self::Settings(_) => {} }
+    }
+}
+
+struct AuthJob {
+    receiver: std::sync::mpsc::Receiver<Result<String>>,
+    cancel: Arc<AtomicBool>,
+}
+impl Drop for AuthJob { fn drop(&mut self) { self.cancel.store(true, Ordering::SeqCst); } }
+impl AuthJob {
+    fn collect(slot: &mut Option<Self>) -> Option<Result<String>> {
+        let result=slot.as_ref().and_then(|job|match job.receiver.try_recv() {
+            Ok(result)=>Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty)=>None,
+            Err(_)=>Some(Err(anyhow::anyhow!("ChatGPT account worker stopped unexpectedly"))),
+        });
+        if result.is_some() { slot.take(); }
+        result
+    }
+}
+
+struct OverlayEnv<'a> {
+    auth_job: &'a mut Option<AuthJob>,
+    app: &'a App,
+    themes: &'a mut ThemeManager,
+    keys: &'a Keymap,
+    status: &'a StatusData,
+    catalog: &'a mut Catalog,
+    scope: &'a mut Scope,
+    dark: Option<bool>,
+    latest: Option<Config>,
+    next: Option<String>,
+    seen_generation: u64,
+}
+
+fn settings_tables(app: &App, effective: &Config) -> (toml::Table, toml::Table, toml::Table) {
+    let values = toml::Table::try_from(effective).unwrap_or_default();
+    let layer = |scope| settings_store::load_layer(&app.layout, scope).unwrap_or_default();
+    (values, layer(Scope::Global), layer(Scope::Project))
+}
+
+fn role_rows(config: &Config) -> Vec<(String, Option<ModelSelection>)> {
+    ROLES.iter().map(|(role, _)| {
+        let selection = if *role == "main" { (!config.model.is_empty()).then(|| config.selection()) } else { config.model_roles.get(*role).cloned() };
+        ((*role).to_owned(), selection)
+    }).collect()
+}
+
+impl OverlayEnv<'_> {
+    fn start_chatgpt(&mut self, overlay: &mut ActiveOverlay, action: impl FnOnce(Arc<AtomicBool>) -> Result<String> + Send + 'static) {
+        if self.auth_job.is_some() { self.report(overlay, Err(anyhow::anyhow!("A ChatGPT account action is already running; use Cancel pending sign-in in the provider menu to start again"))); return; }
+        let cancel=Arc::new(AtomicBool::new(false)); let worker_cancel=Arc::clone(&cancel);
+        let (send,receiver)=std::sync::mpsc::channel();
+        std::thread::spawn(move || { let _=send.send(action(worker_cancel)); });
+        *self.auth_job=Some(AuthJob { receiver,cancel });
+        if let ActiveOverlay::Providers(providers)=overlay { providers.set_chatgpt_pending(true); }
+        self.report(overlay, Ok("Waiting for ChatGPT in your browser; sign-in continues if you close this panel".into()));
+    }
+    fn collect_auth(&mut self, overlay: &mut ActiveOverlay) {
+        let result=AuthJob::collect(self.auth_job);
+        if let Some(result)=result {
+            if let ActiveOverlay::Providers(providers)=overlay {
+                providers.set_chatgpt_pending(false);
+                providers.set_chatgpt_accounts(crate::llm::chatgpt::accounts(&self.app.layout.user_dir).unwrap_or_default());
+            }
+            self.report(overlay,result); self.catalog.refresh(self.app);
+        }
+    }
+    /// Persist, then reload the effective config (files plus command-line flags) and apply the UI part live.
+    fn save(&mut self, changes: &[Change], scope: Scope) -> Result<Config> {
+        settings_store::save_config(&self.app.layout, scope, changes)?;
+        let fresh = self.app.reload()?;
+        if let Err(error) = self.themes.apply_config(&fresh.ui, self.dark) {
+            // The setting was saved and is valid JSON-wise; the theme itself is what failed. Surface it.
+            self.latest = Some(fresh.clone());
+            return Err(anyhow::anyhow!("saved, but the theme could not load: {error}"));
+        }
+        self.latest = Some(fresh.clone());
+        Ok(fresh)
+    }
+
+    fn effective_value(config: &Config, path: &str) -> toml::Value {
+        let table = toml::Table::try_from(config).unwrap_or_default();
+        settings_schema::get(&table, path).cloned().unwrap_or_else(|| toml::Value::String(String::new()))
+    }
+
+    /// Returns true when the overlay should close.
+    fn apply(&mut self, event: OverlayEvent, overlay: &mut ActiveOverlay) -> bool {
+        match event {
+            OverlayEvent::None => {}
+            OverlayEvent::Close => return true,
+            OverlayEvent::Set { path, value, scope } => {
+                *self.scope = scope;
+                self.setting(overlay, &path, &[Change::Set { path: path.clone(), value }], scope);
+            }
+            OverlayEvent::Unset { path, scope } => {
+                *self.scope = scope;
+                self.setting(overlay, &path, &[Change::Remove { path: path.clone() }], scope);
+            }
+            OverlayEvent::AssignModel { role, selection, scope } => {
+                *self.scope = scope;
+                let config = self.latest.clone().unwrap_or_else(|| self.app.config.clone());
+                let outcome = selection_changes(&config, &selection, &role).and_then(|changes| self.save(&changes, scope));
+                self.report(overlay, outcome.map(|_| if role == "main" { format!("switched to {}", selection.display_name()) } else { format!("{role} set to {}", selection.display_name()) }));
+                self.refresh_roles(overlay);
+            }
+            OverlayEvent::ClearRole { role, scope } => {
+                *self.scope = scope;
+                let outcome = clear_role_changes(&role, scope).and_then(|changes| self.save(&changes, scope));
+                self.report(overlay, outcome.map(|_| format!("{role} follows the main model")));
+                self.refresh_roles(overlay);
+            }
+            OverlayEvent::AddProvider { id, spec, scope } => {
+                *self.scope = scope;
+                let outcome = self.save(&provider_changes(&id, &spec), scope);
+                self.report(overlay, outcome.map(|_| format!("provider {id} added")));
+                self.catalog.refresh(self.app);
+            }
+            OverlayEvent::RemoveProvider { id, scope } => {
+                *self.scope = scope;
+                let outcome = self.save(&[Change::Remove { path: format!("providers.{id}") }], scope);
+                self.report(overlay, outcome.map(|_| format!("provider {id} removed")));
+                self.catalog.refresh(self.app);
+            }
+            OverlayEvent::SaveCredential { provider, base_url, mut token } => {
+                let verified = matches!(provider.as_str(), "openai" | "anthropic");
+                let outcome = catalog::verify_and_save_credential(&self.app.layout.user_dir, &provider, &base_url, &mut token);
+                let success = if verified {
+                    format!("{provider} API key verified and saved (owner-only file)")
+                } else {
+                    "API key saved (owner-only file)".to_owned()
+                };
+                self.report(overlay, outcome.map(|_| success));
+                self.catalog.refresh(self.app);
+            }
+            OverlayEvent::OpenRouterLogin => {
+                let outcome = match crate::llm::auth::openrouter_login() {
+                    Ok(mut key) => catalog::verify_and_save_credential(
+                        &self.app.layout.user_dir,
+                        "openrouter",
+                        catalog::OPENROUTER_BASE_URL,
+                        key.as_mut_string(),
+                    )
+                    .map(|()| "OpenRouter sign-in verified; key saved locally".to_owned()),
+                    Err(error) => Err(error),
+                };
+                self.report(overlay, outcome);
+                self.catalog.refresh(self.app);
+            }
+            OverlayEvent::ChatGptLogin { client_id } => {
+                let dir=self.app.layout.user_dir.clone();
+                self.start_chatgpt(overlay, move |cancel| crate::llm::chatgpt::login(&dir,client_id.as_deref(),cancel));
+            }
+            OverlayEvent::ChatGptCancel => {
+                self.auth_job.take();
+                if let ActiveOverlay::Providers(providers)=overlay { providers.set_chatgpt_pending(false); }
+                self.report(overlay,Ok("Cancelled pending ChatGPT sign-in".into()));
+            }
+            OverlayEvent::ChatGptSelect { client_id } => {
+                let dir=self.app.layout.user_dir.clone();
+                self.start_chatgpt(overlay, move |_| crate::llm::chatgpt::select_account(&dir,&client_id).map(|_| "ChatGPT account selected; choose an available model in /models".into()));
+            }
+            OverlayEvent::ChatGptSignOut { client_id } => {
+                let dir=self.app.layout.user_dir.clone();
+                self.start_chatgpt(overlay, move |cancel| crate::llm::chatgpt::sign_out(&dir,&client_id,cancel));
+            }
+            OverlayEvent::RemoveCredential { base_url } => {
+                let outcome = catalog::remove_credential(&self.app.layout.user_dir, &base_url);
+                self.report(overlay, outcome.map(|_| "API key removed".to_owned()));
+                self.catalog.refresh(self.app);
+            }
+            OverlayEvent::Refresh => self.catalog.refresh(self.app),
+            OverlayEvent::PreviewTheme(Some(name)) => { let _ = self.themes.preview(&name); }
+            OverlayEvent::PreviewTheme(None) => self.themes.restore(),
+            OverlayEvent::Action(action) => {
+                if action.starts_with("open:") { self.next = Some(action); return true; }
+            }
+        }
+        false
+    }
+
+    fn setting(&mut self, overlay: &mut ActiveOverlay, path: &str, changes: &[Change], scope: Scope) {
+        let ActiveOverlay::Settings(settings) = overlay else { return };
+        match self.save(changes, scope) {
+            Ok(fresh) => {
+                settings.settled(path, Ok(Self::effective_value(&fresh, path)));
+                let (values, global, project) = settings_tables(self.app, &fresh);
+                settings.replace_values(values, project, global);
+            }
+            Err(error) => settings.settled(path, Err(format!("{error:#}"))),
+        }
+    }
+
+    fn report(&mut self, overlay: &mut ActiveOverlay, outcome: Result<String>) {
+        match outcome { Ok(message) => overlay.banner(message, false), Err(error) => overlay.banner(format!("{error:#}"), true) }
+    }
+
+    fn refresh_roles(&mut self, overlay: &mut ActiveOverlay) {
+        if let (ActiveOverlay::Models(models), Some(config)) = (overlay, &self.latest) { models.set_roles(role_rows(config)); }
+    }
+}
+
+fn run_overlay(ot: &mut OverlayTerminal<'_>, env: &mut OverlayEnv<'_>, overlay: &mut ActiveOverlay) -> Result<()> {
+    loop {
+        env.collect_auth(overlay);
+        env.catalog.collect();
+        if env.catalog.generation != env.seen_generation {
+            env.seen_generation = env.catalog.generation;
+            if let Some(discovery) = env.catalog.get() {
+                match overlay {
+                    ActiveOverlay::Models(models) => models.set_discovery(discovery),
+                    ActiveOverlay::Providers(providers) => providers.set_discovery(discovery),
+                    ActiveOverlay::Settings(_) => {}
+                }
+            }
+        }
+        if env.themes.reload_if_changed() { /* the next draw uses the reloaded theme */ }
+        {
+            let themes = &*env.themes;
+            let status = env.status;
+            let preview = |cfg: &UiConfig, width: u16| statusline::preview_row(cfg, status, themes.current(), width);
+            ot.draw(|frame| {
+                let ctx = DrawCtx { theme: themes.current(), keys: env.keys, status, preview_status: &preview };
+                overlay.draw(frame, &ctx);
+            })?;
+        }
+        if !poll(TICK)? { continue; }
+        let event = read()?;
+        if matches!(event, Event::Resize(..)) { continue; }
+        let outcome = overlay.handle(&event, env.keys);
+        if env.apply(outcome, overlay) { return Ok(()); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The agent <-> screen bridge
+// ---------------------------------------------------------------------------
+
+struct Bridge<'a> {
+    shell: &'a mut Shell,
+    interrupt: Arc<AtomicBool>,
+    started: Instant,
+    last_paint: Instant,
+    failed: bool,
+    /// (id, tool name, started) of tool calls awaiting their result, oldest first.
+    pending: Vec<(String, String, Instant)>,
+    next_id: u64,
+}
+
+impl Bridge<'_> {
+    fn repaint(&mut self, force: bool) {
+        if self.failed || (!force && self.last_paint.elapsed() < PAINT_EVERY) { return; }
+        self.last_paint = Instant::now();
+        self.pump();
+        self.shell.status.elapsed_secs = self.started.elapsed().as_secs_f64();
+        if self.shell.paint(None).is_err() { self.failed = true; self.interrupt.store(true, Ordering::SeqCst); }
+    }
+
+    fn set_activity(&mut self, activity: &str) {
+        if self.shell.status.activity != activity { self.shell.status.activity = activity.to_owned(); }
+    }
+
+    /// Drain pending keys so Ctrl-C/Esc reach the agent and the next draft stays editable.
+    fn pump(&mut self) {
+        while let Ok(true) = poll(Duration::ZERO) {
+            let Ok(event) = read() else { break };
+            match event {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    let shell = &mut *self.shell;
+                    let ctx = ComposerCtx { theme: shell.themes.current(), keys: &shell.keys, ui: &shell.ui, status: &shell.status };
+                    match shell.composer.handle_key(key, &ctx) {
+                        ComposerEvent::Interrupt | ComposerEvent::Exit => self.interrupt.store(true, Ordering::SeqCst),
+                        ComposerEvent::Action(Action::ToolsExpand) => shell.tools_expanded = !shell.tools_expanded,
+                        ComposerEvent::Action(Action::ToolsToggle) => shell.ui.show_tools = !shell.ui.show_tools,
+                        ComposerEvent::Action(Action::ThinkingToggle) => shell.ui.show_thinking = !shell.ui.show_thinking,
+                        ComposerEvent::Action(Action::EditExternal) => shell.edit_externally(),
+                        _ => {}
+                    }
+                }
+                Event::Paste(text) => self.shell.composer.handle_paste(&text),
+                Event::Resize(..) => self.shell.term.on_resize(),
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Ui for Bridge<'_> {
+    fn take_steering(&mut self) -> Vec<String> {
+        self.pump();
+        let messages = self.shell.composer.take_steering();
+        for message in &messages { self.shell.transcript.push_user(message); }
+        if !messages.is_empty() { self.repaint(true); }
+        messages
+    }
+
+    fn usage(&mut self, prompt: Option<u64>, output: Option<u64>, seconds: f64) {
+        let status = &mut self.shell.status;
+        status.prompt_tokens = prompt;
+        if let Some(tokens) = output {
+            self.shell.turn_output_tokens = self.shell.turn_output_tokens.saturating_add(tokens);
+            status.output_tokens = self.shell.turn_output_tokens;
+            status.tokens_per_second = (seconds > 0.0 && tokens > 0).then_some(tokens as f64 / seconds);
+        }
+        self.repaint(true);
+    }
+    fn reasoning_delta(&mut self, text: &str) {
+        self.shell.transcript.thinking_delta(text);
+        self.set_activity("reasoning");
+        self.repaint(false);
+    }
+    fn tool_arguments_delta(&mut self, _index: u64, _id: &str, name: &str, _delta: &str) {
+        self.set_activity(if name.is_empty() { "generating tool" } else { name });
+        self.repaint(false);
+    }
+    fn tool_output(&mut self, name: &str, text: &str) {
+        if let Some((id, _, _)) = self.pending.iter().rev().find(|(_, tool, _)| tool == name) {
+            self.shell.transcript.tool_delta(id, text);
+        }
+        self.repaint(false);
+    }
+    fn background_notice(&mut self, message: &str) {
+        self.shell.transcript.notice("Background", message);
+        self.repaint(true);
+    }
+    fn cached_usage(&mut self, read: Option<u64>, write: Option<u64>) {
+        if read.is_some_and(|n| n != 0) || write.is_some_and(|n| n != 0) {
+            self.shell.transcript.notice("Prompt cache", &format!("{} tokens read, {} tokens written", read.map_or("unknown".into(),|n|n.to_string()),write.map_or("unknown".into(),|n|n.to_string())));
+            self.repaint(false);
+        }
+    }
+    fn extension_panel(&mut self, title: &str, markdown: &str) {
+        self.shell.transcript.notice(title, "");
+        self.shell.transcript.assistant_delta(markdown);
+        self.shell.transcript.finish_turn();
+        self.repaint(true);
+    }
+
+    fn role(&mut self, role: &str, model: &str) {
+        let status = &mut self.shell.status;
+        status.role = if role == "main" { String::new() } else { role.to_owned() };
+        if let Some((provider, name)) = model.split_once('/') { status.provider = provider.to_owned(); status.model = name.to_owned(); }
+        self.repaint(true);
+    }
+
+    fn text_delta(&mut self, text: &str) {
+        self.shell.transcript.assistant_delta(text);
+        self.set_activity("writing");
+        self.repaint(false);
+    }
+
+    fn tool_call(&mut self, name: &str, summary: &str) {
+        self.next_id += 1;
+        let id = format!("call-{}", self.next_id);
+        self.shell.transcript.tool_start(&id, name, summary, summary);
+        self.pending.push((id, name.to_owned(), Instant::now()));
+        self.set_activity(name);
+        self.repaint(true);
+    }
+
+    fn tool_result(&mut self, name: &str, output: &ToolOutput) {
+        let at = self.pending.iter().rposition(|(_, n, _)| n == name);
+        let (id, started) = match at {
+            Some(i) => { let (id, _, started) = self.pending.remove(i); (id, started) }
+            None => { self.next_id += 1; (format!("call-{}", self.next_id), Instant::now()) }
+        };
+        self.shell.transcript.tool_end(&id, &output.text, output.is_error, started.elapsed().as_secs_f64());
+        self.set_activity("thinking");
+        self.repaint(true);
+    }
+
+    fn notice(&mut self, message: &str) {
+        self.shell.note("Notice", message);
+        self.repaint(true);
+    }
+
+    fn heartbeat(&mut self) {
+        self.repaint(false);
+    }
+
+    fn model_wait(&mut self, silence: Duration) {
+        if silence.is_zero() { self.set_activity("waiting for model"); }
+        else if silence >= Duration::from_secs(15) {
+            self.set_activity(&format!("waiting · no output for {}s", silence.as_secs()));
+        }
+    }
+
+    fn approve(&mut self, tool: &str, summary: &str) -> Decision {
+        self.shell.status.phase = Phase::Working;
+        let choice = self.shell.ask(&format!("Allow {tool}?"), &agent::truncate(summary, 1500),
+            &[("Allow once", 'y'), ("Always allow this session", 'a'), ("Deny", 'n')]);
+        let decision = match choice { Some(0) => Decision::Allow, Some(1) => Decision::AllowAlways, _ => Decision::Deny };
+        self.repaint(true);
+        decision
+    }
+
+    fn approval_reason(&mut self) -> Option<String> {
+        let mut editor = crate::ui::editor::Editor::default();
+        loop {
+            let (width, _) = self.shell.term.size();
+            let theme = self.shell.themes.current();
+            let rows = vec![
+                Line::from(Span::styled(text::clip("Plan denied: feedback (Enter sends, Esc skips)", width as usize), theme.fg(Tok::Warning))),
+                Line::from(text::clip(&text::one_line(&editor.text), width as usize)),
+            ];
+            if self.shell.paint(Some(rows)).is_err() { return None; }
+            match read().ok()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                    KeyCode::Enter => return (!editor.text.trim().is_empty()).then_some(editor.text),
+                    KeyCode::Esc => return None,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return None,
+                    _ => { editor.key(key); }
+                },
+                Event::Paste(value) => editor.insert(&text::one_line(&value)),
+                Event::Resize(..) => self.shell.term.on_resize(),
+                _ => {}
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Panels, replay
+// ---------------------------------------------------------------------------
+
+/// A rounded panel with a question and choices, exactly `width` cells wide on every row.
+fn panel_rows(theme: &crate::ui::theme::Theme, width: u16, title: &str, body: &str, options: &[(&str, char)], selected: usize) -> Rows {
+    let width = width as usize;
+    if width < 6 { return vec![Line::from(text::clip(title, width))]; }
+    let inner = width - 4;
+    let border = theme.fg(Tok::Warning);
+    let pad_row = |spans: Vec<Span<'static>>| -> Line<'static> {
+        let spans = truncate_spans(spans, inner, "");
+        let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+        let mut row = vec![Span::styled(format!("{} ", theme.sym(Sym::BoxV)), border)];
+        row.extend(spans);
+        row.push(Span::raw(" ".repeat(inner.saturating_sub(used))));
+        row.push(Span::styled(format!(" {}", theme.sym(Sym::BoxV)), border));
+        Line::from(row)
+    };
+    let mut rows = Vec::new();
+    let title_text = text::ellipsize(&text::one_line(title), inner.saturating_sub(2), theme.ascii());
+    let dashes = (width.saturating_sub(text::width(&title_text) + 5)).max(0);
+    rows.push(Line::from(Span::styled(format!("{}{} {} {}{}", theme.sym(Sym::BoxTl), theme.sym(Sym::BoxH), title_text, theme.sym(Sym::BoxH).repeat(dashes), theme.sym(Sym::BoxTr)), border)));
+    for line in text::wrap_words(&text::sanitize(body), inner).into_iter().take(8) {
+        rows.push(pad_row(vec![Span::styled(text::clip(&line, inner), theme.fg(Tok::ToolOutput))]));
+    }
+    for (index, (label, hotkey)) in options.iter().enumerate() {
+        let on = index == selected;
+        let marker = if on { theme.sym(Sym::Pointer) } else { " " };
+        let style = if on { theme.on(Tok::Text, Tok::SelectedBg).patch(theme.fg(Tok::Accent)) } else { theme.fg(Tok::Text) };
+        let label = text::ellipsize(label, inner.saturating_sub(8), theme.ascii());
+        rows.push(pad_row(vec![Span::styled(format!("{marker} {label}"), style), Span::styled(format!("  ({hotkey})"), theme.fg(Tok::Muted))]));
+    }
+    rows.push(pad_row(vec![Span::styled("Up/Down choose · Enter confirm · Esc cancel", theme.fg(Tok::Dim))]));
+    rows.push(Line::from(Span::styled(format!("{}{}{}", theme.sym(Sym::BoxBl), theme.sym(Sym::BoxH).repeat(width - 2), theme.sym(Sym::BoxBr)), border)));
+    rows
+}
+
+/// Show an earlier session's conversation as transcript blocks (for `dial -c`).
+fn replay(transcript: &mut Transcript, messages: &[Value]) {
+    let mut open: HashMap<String, String> = HashMap::new();
+    for message in messages {
+        match message["role"].as_str() {
+            Some("user") => if let Some(text) = message["content"].as_str().filter(|t| !t.trim().is_empty()) { transcript.push_user(text); },
+            Some("assistant") => {
+                if let Some(text) = message["content"].as_str().filter(|t| !t.trim().is_empty()) { transcript.assistant_delta(text); transcript.finish_turn(); }
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    let (id, name) = (call["id"].as_str().unwrap_or("call"), call["function"]["name"].as_str().unwrap_or("tool"));
+                    let args: Value = call["function"]["arguments"].as_str().and_then(|a| serde_json::from_str(a).ok()).unwrap_or(Value::Null);
+                    let summary = args["command"].as_str().or_else(|| args["path"].as_str()).or_else(|| args["prompt"].as_str()).unwrap_or("").to_owned();
+                    transcript.tool_start(id, name, &summary, &summary);
+                    open.insert(id.to_owned(), name.to_owned());
+                }
+            }
+            Some("tool") => {
+                let id = message["tool_call_id"].as_str().unwrap_or("");
+                if open.remove(id).is_some() {
+                    let output = message["content"].as_str().unwrap_or("");
+                    let failed = output.starts_with("invalid tool call") || output.starts_with("denied") || output.starts_with("error");
+                    transcript.tool_end(id, output, failed, 0.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    transcript.finish_turn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switching_models_clears_an_inherited_profile_without_deleting_it() {
+        use crate::llm::{chatgpt,profiles::ModelProfile};
+        let project=tempfile::tempdir().unwrap(); let home=tempfile::tempdir().unwrap();
+        let layout=Layout::with_user_dir(project.path(),home.path().to_owned()).unwrap();
+        let profile=ModelProfile { provider:"chatgpt".into(),model:"old-model".into(),..Default::default() };
+        let config=settings_store::save_config(&layout,Scope::Global,&[
+            Change::Set { path:"provider".into(),value:"chatgpt".into() },Change::Set { path:"model".into(),value:"old-model".into() },
+            Change::Set { path:"model_profiles.old".into(),value:toml::Value::try_from(profile).unwrap() },Change::Set { path:"model_profile".into(),value:"old".into() },
+        ]).unwrap();
+        let before=std::fs::read(layout.config_files()[0].clone()).unwrap();
+        let selection=ModelSelection { provider:"chatgpt".into(),model:"new-model".into(),base_url:Some(chatgpt::BASE_URL.into()),..Default::default() };
+        let saved=settings_store::save_config(&layout,Scope::Project,&selection_changes(&config,&selection,"main").unwrap()).unwrap();
+        assert_eq!(saved.model,"new-model"); assert!(saved.model_profile.is_none()); assert!(saved.model_profiles.contains_key("old"));
+        assert_eq!(std::fs::read(layout.config_files()[0].clone()).unwrap(),before);
+    }
+    #[test]
+    fn chatgpt_reasoning_controls_create_and_persist_an_exact_model_profile() {
+        use crate::llm::{chatgpt,profiles::ReasoningEffort};
+        let project=tempfile::tempdir().unwrap(); let home=tempfile::tempdir().unwrap();
+        let layout=Layout::with_user_dir(project.path(),home.path().to_owned()).unwrap();
+        chatgpt::test_account(&layout.user_dir,false);
+        chatgpt::test_catalog(&layout.user_dir,&serde_json::json!({"models":[{"slug":"account-model","visibility":"list","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"max"},{"effort":"ultra"}]}]}));
+        settings_store::save_config(&layout,Scope::Global,&[Change::Set { path:"provider".into(),value:"chatgpt".into() },Change::Set { path:"model".into(),value:"account-model".into() }]).unwrap();
+        let config=Config::load(&layout,None).unwrap(); assert!(config.model_profile.is_none());
+        let (changes,label)=reasoning_changes(&config,"ultra").unwrap(); assert_eq!(label,"ultra");
+        let saved=settings_store::save_config(&layout,Scope::Project,&changes).unwrap();
+        assert_eq!(saved.active_model_profile().unwrap().reasoning_effort,Some(ReasoningEffort::Ultra));
+        assert_eq!(Config::load(&layout,None).unwrap().active_model_profile().unwrap().reasoning_effort,Some(ReasoningEffort::Ultra));
+        assert!(reasoning_changes(&saved,"off").err().unwrap().to_string().contains("supported reasoning levels"));
+        assert!(reasoning_changes(&saved,"minimal").is_err());
+        let (changes,_) =reasoning_changes(&saved,"high").unwrap();
+        let saved=settings_store::save_config(&layout,Scope::Project,&changes).unwrap();
+        assert_eq!(saved.active_model_profile().unwrap().reasoning_effort,Some(ReasoningEffort::High));
+        let switched=saved.with_selection(&ModelSelection { provider:"chatgpt".into(),model:"other-model".into(),base_url:Some(chatgpt::BASE_URL.into()),..Default::default() });
+        assert!(reasoning_profile(&switched).unwrap().is_none());
+    }
+
+    #[test]
+    fn existing_budgeted_thinking_toggle_keeps_its_budget_without_effort_levels() {
+        use crate::llm::profiles::{ModelProfile,ModelCapabilities,ReasoningApi};
+        let mut config=Config { provider:Some("anthropic".into()),model:"exact-model".into(),model_profile:Some("custom".into()),..Default::default() };
+        config.model_profiles.insert("custom".into(),ModelProfile { provider:"anthropic".into(),model:"exact-model".into(),
+            capabilities:ModelCapabilities { reasoning:ReasoningApi::AnthropicBudget,..Default::default() },thinking:Some(false),thinking_budget:Some(1024),..Default::default() });
+        for arg in ["on","off"] {
+            let (changes,_) =reasoning_changes(&config,arg).unwrap();
+            let Change::Set { value,.. }=&changes[0] else { panic!("profile must be saved") };
+            let updated:ModelProfile=value.clone().try_into().unwrap();
+            assert_eq!(updated.thinking,Some(arg=="on")); assert_eq!(updated.thinking_budget,Some(1024)); updated.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn pending_status_queries_do_not_block_or_spawn_more_workers() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut cache = StatusCache::<String>::default();
+        let start = Instant::now();
+        cache.refresh(Duration::from_secs(5), move || {
+            wait.recv().unwrap();
+            "ready".into()
+        });
+        for _ in 0..100 {
+            cache.refresh(Duration::ZERO, || panic!("a second query must not start while one is pending"));
+        }
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(cache.value.is_empty());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cache.worker.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        cache.refresh(Duration::from_secs(5), || panic!("fresh values must stay cached"));
+        assert_eq!(cache.value, "ready");
+        assert!(cache.worker.is_none());
+    }
+    use crate::ui::theme::Theme;
+
+    fn config() -> (tempfile::TempDir, tempfile::TempDir, Layout, Config) {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
+        let config = Config::load(&layout, None).unwrap();
+        (home, project, layout, config)
+    }
+
+    #[test]
+    fn only_agent_relevant_changes_make_the_controller_rebuild_the_agent() {
+        let (_h, _p, _l, base) = config();
+        let mut ui = base.clone();
+        ui.ui.theme = "light".into();
+        ui.ui.status_separator = crate::llm::model_config::StatusSeparator::Slash;
+        ui.approval = Approval::Auto;
+        assert_eq!(agent_key(&base), agent_key(&ui), "theme, status line and approval apply in place");
+        for mutate in [
+            (|c: &mut Config| c.model = "other".into()) as fn(&mut Config),
+            |c| c.sandbox.allow_network = !c.sandbox.allow_network,
+            |c| c.context_window += 1,
+            |c| c.improve.enabled = !c.improve.enabled,
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(agent_key(&base), agent_key(&changed));
+        }
+    }
+
+    #[test]
+    fn selecting_a_local_model_clears_the_remote_endpoint_and_a_new_remote_adds_its_provider() {
+        let (_h, _p, _l, config) = config();
+        let local = ModelSelection { provider: "mlx".into(), model: "mlx-community/Qwen".into(), ..ModelSelection::default() };
+        let changes = selection_changes(&config, &local, "main").unwrap();
+        assert!(changes.iter().any(|c| matches!(c, Change::Remove { path } if path == "endpoint")), "a local model must not keep an inherited endpoint");
+        assert!(changes.iter().any(|c| matches!(c, Change::Set { path, value } if path == "provider" && value.as_str() == Some("mlx"))));
+        let remote = ModelSelection { provider: "lm-studio".into(), model: "qwen".into(), base_url: Some("http://127.0.0.1:1234/v1".into()),
+            context_window: Some(8192), ..ModelSelection::default() };
+        let changes = selection_changes(&config, &remote, "main").unwrap();
+        let sets: Vec<&str> = changes.iter().filter_map(|c| match c { Change::Set { path, .. } => Some(path.as_str()), _ => None }).collect();
+        for expected in ["model", "endpoint.base_url", "providers.lm-studio.base_url", "context_window"] {
+            assert!(sets.contains(&expected), "{expected} missing from {sets:?}");
+        }
+        let helper = selection_changes(&config, &remote, "subagent").unwrap();
+        assert!(helper.iter().all(|c| match c { Change::Set { path, .. } | Change::Remove { path } => path.starts_with("model_roles.subagent.") }), "a helper role must not touch the main model");
+        assert!(selection_changes(&config, &remote, "bogus").is_err());
+        assert!(selection_changes(&config, &ModelSelection::default(), "main").is_err(), "an empty model id is refused");
+    }
+
+    #[test]
+    fn clearing_a_role_in_the_project_layer_overrides_a_global_assignment() {
+        assert!(matches!(&clear_role_changes("feedback", Scope::Global).unwrap()[..], [Change::Remove { path }] if path == "model_roles.feedback"));
+        let project = clear_role_changes("feedback", Scope::Project).unwrap();
+        assert!(project.iter().any(|c| matches!(c, Change::Set { path, value } if path == "model_roles.feedback.provider" && value.as_str() == Some("inherit"))));
+        assert!(clear_role_changes("main", Scope::Global).is_err());
+    }
+
+    #[test]
+    fn a_global_role_with_a_project_inherit_marker_resolves_to_the_main_model() {
+        let (_h, _p, layout, _) = config();
+        settings_store::save_config(&layout, Scope::Global, &[
+            Change::Set { path: "model".into(), value: "main-model".into() },
+            Change::Set { path: "model_roles.feedback.provider".into(), value: "mlx".into() },
+            Change::Set { path: "model_roles.feedback.model".into(), value: "helper".into() },
+        ]).unwrap();
+        assert_eq!(Config::load(&layout, None).unwrap().model_roles["feedback"].model, "helper");
+        settings_store::save_config(&layout, Scope::Project, &clear_role_changes("feedback", Scope::Project).unwrap()).unwrap();
+        let after = Config::load(&layout, None).unwrap();
+        assert!(!after.model_roles.contains_key("feedback"));
+        assert_eq!(after.for_role("feedback").model, "main-model");
+    }
+
+    #[test]
+    fn command_menu_lists_builtins_then_custom_then_skills_and_builtins_win() {
+        let custom = vec![
+            context::CommandDef { name: "review".into(), description: "review the diff".into(), template: String::new(), source: Default::default() },
+            context::CommandDef { name: "help".into(), description: "shadow".into(), template: String::new(), source: Default::default() },
+            context::CommandDef { name: "models".into(), description: "old alias".into(), template: String::new(), source: Default::default() },
+        ];
+        let skill = skills::Skill { name: "lint".into(), description: "run linters".into(), path: Default::default(), source: skills::Scope::Project };
+        let entries = command_entries(&custom, &[skill]);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names.iter().filter(|n| **n == "help").count(), 1, "a custom command cannot shadow a built-in");
+        assert!(!names.contains(&"models"), "retired aliases are not offered");
+        let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert!(at("exit") < at("review") && at("review") < at("skill:lint"));
+        assert!(matches!(entries[at("review")].kind, CommandKind::Custom) && matches!(entries[at("skill:lint")].kind, CommandKind::Skill));
+        assert_eq!(entries[at("resume")].args_hint.as_deref(), Some("[id]"));
+    }
+
+    #[test]
+    fn git_status_counts_staged_modified_and_untracked() {
+        assert_eq!(parse_status("M  a\n M b\nMM c\n?? d\n?? e\nA  f\n"), (3, 2, 2));
+        assert_eq!(parse_status(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn terminal_background_is_read_from_colorfgbg() {
+        assert_eq!(terminal_dark(Some("15;0")), Some(true));
+        assert_eq!(terminal_dark(Some("0;15")), Some(false));
+        assert_eq!(terminal_dark(Some("0;default;15")), Some(false));
+        assert_eq!(terminal_dark(Some("garbage")), None);
+        assert_eq!(terminal_dark(None), None);
+    }
+
+    #[test]
+    fn local_time_formats_like_strftime() {
+        let clock = local_time("%H:%M");
+        assert_eq!(clock.len(), 5);
+        assert_eq!(clock.as_bytes()[2], b':');
+        assert_eq!(local_time("%Y-%m-%d %H:%M:%S").len(), 19);
+    }
+
+    #[test]
+    fn the_approval_panel_fits_any_width_and_shows_the_choice() {
+        let theme = Theme::dark();
+        let options = [("Allow once", 'y'), ("Always allow this session", 'a'), ("Deny", 'n')];
+        for width in [0u16, 1, 3, 4, 12, 40, 100] {
+            let rows = panel_rows(&theme, width, "Allow bash?", "rm -rf build && cargo build 日本語", &options, 1);
+            assert!(rows.iter().all(|r| text::line_width(r) <= width as usize), "width {width}");
+        }
+        let rows = panel_rows(&theme, 60, "Allow bash?", "cargo test", &options, 1);
+        assert_eq!(rows.len(), 1 + 1 + 3 + 1 + 1, "title, body, options, hint, bottom");
+        assert!(rows.iter().all(|r| text::line_width(r) == 60));
+        let selected: Vec<String> = rows.iter().map(|r| r.to_string()).filter(|s| s.contains(theme.sym(Sym::Pointer))).collect();
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].contains("Always allow this session"), "{selected:?}");
+    }
+
+    #[test]
+    fn effective_config_serializes_for_the_settings_overlay() {
+        let (_h, _p, _l, config) = config();
+        let table = toml::Table::try_from(&config).expect("Config must serialize to TOML");
+        assert_eq!(settings_schema::get(&table, "ui.theme").and_then(toml::Value::as_str), Some("dark"));
+        assert!(settings_schema::get(&table, "improve.interval_secs").is_some());
+        assert!(settings_schema::get(&table, "sandbox.mode").is_some());
+    }
+
+    #[test]
+    fn initial_discovery_publishes_and_a_stale_refresh_cannot_replace_the_newest() {
+        fn result(id: &str) -> catalog::Discovery {
+            catalog::Discovery {
+                models: vec![],
+                providers: vec![catalog::ProviderStatus { id: id.into(), label: id.into(), base_url: None, state: "reachable".into(), detail: String::new(), models: 0 }],
+            }
+        }
+        let mut catalog = Catalog::new();
+        catalog.launch(|| result("first"));
+        catalog.worker.take().unwrap().join().unwrap();
+        assert_eq!(catalog.get().unwrap().providers[0].id, "first");
+        let (release, wait) = std::sync::mpsc::channel();
+        catalog.launch(move || { wait.recv().unwrap(); result("stale") });
+        let stale = catalog.worker.take().unwrap();
+        catalog.launch(|| result("newest"));
+        catalog.worker.take().unwrap().join().unwrap();
+        release.send(()).unwrap();
+        stale.join().unwrap();
+        assert_eq!(catalog.get().unwrap().providers[0].id, "newest");
+    }
+}

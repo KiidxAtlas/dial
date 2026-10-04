@@ -1,0 +1,425 @@
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Harness {
+    /// The improvable part of the system prompt; dial's fixed tool guidance is added around it.
+    pub system_prompt: String,
+    pub memory: Vec<String>,
+    /// Enabled tools: built-ins, dial's extra tools, and operator tools from `[tools.*]`.
+    pub tools: Vec<String>,
+    pub subagents: Vec<String>,
+    pub max_steps: u32,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    /// `None` follows the configured `edit_mode`; the improvement loop may pin one per model.
+    pub edit_mode: Option<EditModeConfig>,
+}
+
+impl Default for Harness {
+    fn default() -> Self {
+        Self {
+            system_prompt: "Work in small verified steps. Read before you edit, run the project's checks after changing code, and say plainly when you are unsure.".into(),
+            memory: vec![],
+            tools: crate::tools::default_tools(),
+            subagents: vec![],
+            max_steps: 40,
+            temperature: 0.2,
+            max_tokens: 8192,
+            edit_mode: None,
+        }
+    }
+}
+
+/// One-way migration of the removed monolithic memory tool selection.
+pub fn migrate_memory_tools(harness: &mut Harness) -> bool {
+    migrate_memory_tool_names(&mut harness.tools)
+}
+
+pub(crate) fn migrate_memory_tool_names(tools: &mut Vec<String>) -> bool {
+    const REPLACEMENTS: [&str; 6] = ["recall", "retain", "memory_update", "forget", "memory_history", "memory_import"];
+    if !tools.iter().any(|tool| tool == "memory") { return false; }
+    let present = REPLACEMENTS.map(|replacement| tools.iter().any(|tool| tool == replacement));
+    let mut added = [false; 6];
+    let original = std::mem::take(tools);
+    tools.reserve(original.len().saturating_add(REPLACEMENTS.len()));
+    for tool in original {
+        if tool == "memory" {
+            for (index, replacement) in REPLACEMENTS.iter().enumerate() {
+                if !present[index] && !added[index] {
+                    tools.push((*replacement).into());
+                    added[index] = true;
+                }
+            }
+        } else {
+            tools.push(tool);
+        }
+    }
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteConfig {
+    pub name: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateConfig {
+    pub suites: Vec<SuiteConfig>,
+    /// Percentage points on a 0..100 scale, per suite.
+    pub max_regression: f64,
+    pub min_improvement: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrainingConfig {
+    pub enabled: bool,
+    /// Defaults to `<state>/grounded/train.jsonl` when empty.
+    pub train_data: PathBuf,
+    pub valid_data: PathBuf,
+    pub iters: u32,
+    pub batch_size: u32,
+    pub num_layers: u32,
+    pub rank: u32,
+    pub max_seq_length: u32,
+    pub interval_secs: u64,
+}
+
+impl Default for TrainingConfig {
+    fn default() -> Self {
+        Self { enabled: true, train_data: PathBuf::new(), valid_data: PathBuf::new(), iters: 32, batch_size: 1,
+            num_layers: 4, rank: 8, max_seq_length: 8192, interval_secs: 6 * 3600 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolConfig {
+    pub program: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+/// Use an OpenAI-compatible server (LM Studio, Ollama, llama.cpp, a hosted API) instead of the
+/// supervised local MLX model. Weight updates are unavailable for endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointConfig {
+    pub base_url: String,
+    /// Name of the environment variable holding the bearer token (the token itself is never stored).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub allow_insecure: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Approval {
+    /// Prompt before writes, edits and shell commands.
+    #[default]
+    Ask,
+    Auto,
+    /// Read-only tools only.
+    Readonly,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxMode {
+    Off,
+    /// Shell can read most of the system but not secrets or dial state, and write only the project.
+    #[default]
+    Dev,
+    /// Workspace-only reads and writes, no network.
+    Strict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SandboxConfig {
+    pub mode: SandboxMode,
+    /// Dev mode only; strict mode never has network.
+    pub allow_network: bool,
+    /// Extra writable directories in dev mode (for example `~/.cargo`, `~/.npm`).
+    pub extra_write: Vec<PathBuf>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self { Self { mode: SandboxMode::Dev, allow_network: true, extra_write: vec![] } }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EditModeConfig {
+    /// Anchored line edits (`[path#TAG]` + `PUT`/`CUT` operations). Strong models handle it; local
+    /// models were observed deleting neighbouring lines with off-by-one ranges.
+    Hashline,
+    /// Exact text replacement (`old` -> `new`); the default because every model handles it.
+    #[default]
+    Replace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    #[serde(skip)]
+    pub state_dir: PathBuf,
+    #[serde(skip)]
+    pub project_root: PathBuf,
+    #[serde(skip)]
+    pub user_dir: PathBuf,
+    /// Python with mlx-lm for local models; defaults to the environment `dial setup` creates.
+    pub python: PathBuf,
+    pub worker: PathBuf,
+    pub model: String,
+    /// Explicit "mlx" clears any inherited endpoint when a project selects a local model.
+    pub provider: Option<String>,
+    pub endpoint: Option<EndpointConfig>,
+    pub providers: BTreeMap<String, crate::llm::model_config::ProviderSpec>,
+    pub model_roles: BTreeMap<String, crate::llm::model_config::ModelSelection>,
+    /// Exact provider/model profiles; capabilities must be declared by the operator.
+    pub model_profiles: BTreeMap<String, crate::llm::profiles::ModelProfile>,
+    pub model_profile: Option<String>,
+    pub ui: crate::llm::model_config::UiConfig,
+    /// Defaults to the project directory name.
+    pub use_case: String,
+    pub worker_timeout_secs: u64,
+    /// Silence limit for remote model responses, independent of long local workers.
+    pub remote_model_idle_timeout_secs: u64,
+    pub context_window: u32,
+    pub harness: Harness,
+    pub gate: Option<GateConfig>,
+    pub training: TrainingConfig,
+    pub improve: ImproveConfig,
+    pub approval: Approval,
+    pub sandbox: SandboxConfig,
+    pub edit_mode: EditModeConfig,
+    pub tools: BTreeMap<String, ToolConfig>,
+    pub subagents: BTreeMap<String, String>,
+    /// Integration tools to offer (`bg`, `web_fetch`, `web_search`, `lsp`, `ast_search`, `ast_edit`).
+    /// Every tool schema costs the model context and attention; trim this list for small models.
+    /// MCP tools follow `[mcp.*]` instead.
+    pub integrations: Vec<String>,
+    /// MCP servers whose tools are offered as `mcp__<server>__<tool>`. Trusted operator programs.
+    pub mcp: BTreeMap<String, McpServerConfig>,
+    /// Language servers overriding or extending the built-in defaults, keyed by language name.
+    pub lsp: BTreeMap<String, LspServerConfig>,
+    /// Debug Adapter Protocol adapters keyed by adapter id.
+    pub dap: BTreeMap<String, crate::tools::dap::DapAdapterConfig>,
+    pub web: WebConfig,
+    pub verification: VerificationConfig,
+    pub browser: crate::tools::browser::BrowserConfig,
+    pub kernel: crate::tools::kernel::KernelConfig,
+    pub memory: MemoryConfig,
+}
+
+/// A stdio MCP server. Like `[tools.*]` it is a trusted program: it runs unsandboxed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    pub program: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Per request timeout.
+    #[serde(default = "default_mcp_timeout")]
+    pub timeout_secs: u64,
+    /// Lifecycle events to forward to this server as `notifications/dial/event`.
+    #[serde(default)]
+    pub lifecycle_hooks: Vec<String>,
+}
+
+fn default_mcp_timeout() -> u64 { 60 }
+
+/// A stdio language server used by the `lsp` tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LspServerConfig {
+    pub program: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// File extensions (without the dot) this server handles.
+    pub extensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebConfig {
+    /// Search endpoint override; empty uses the built-in default provider.
+    pub search_url: String,
+    /// Environment variable holding the search endpoint's API key, when it needs one.
+    pub search_api_key_env: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerificationConfig {
+    /// Run focused static checks after edited source files, then allow a bounded model repair turn.
+    pub enabled: bool,
+    pub repair_attempts: u8,
+    pub commands: Vec<VerificationCommand>,
+}
+
+impl Default for VerificationConfig {
+    fn default() -> Self { Self { enabled: true, repair_attempts: 1, commands: Vec::new() } }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationCommand {
+    pub name: String,
+    pub command: String,
+    /// File extensions without a dot that trigger this command; empty means any source edit.
+    #[serde(default)]
+    pub file_extensions: Vec<String>,
+    #[serde(default = "default_verification_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_verification_timeout() -> u64 { 120 }
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    pub enabled: bool,
+    pub context_limit: usize,
+    pub context_max_bytes: usize,
+}
+impl Default for MemoryConfig {
+    fn default() -> Self { Self { enabled: true, context_limit: 8, context_max_bytes: 6000 } }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            state_dir: PathBuf::new(), project_root: PathBuf::new(), user_dir: PathBuf::new(), python: PathBuf::new(), worker: PathBuf::new(),
+            model: String::new(), provider: None, endpoint: None, use_case: String::new(),
+            providers: BTreeMap::new(), model_roles: BTreeMap::new(), ui: crate::llm::model_config::UiConfig::default(),
+            model_profiles: BTreeMap::new(), model_profile: None,
+            worker_timeout_secs: 3600, context_window: 32768,
+            remote_model_idle_timeout_secs: 180,
+            harness: Harness::default(), gate: None, training: TrainingConfig::default(), improve: ImproveConfig::default(),
+            approval: Approval::default(), sandbox: SandboxConfig::default(), edit_mode: EditModeConfig::default(),
+            tools: BTreeMap::new(), subagents: BTreeMap::new(),
+            integrations: vec!["bg".into(), "web_fetch".into(), "web_search".into(), "lsp".into(), "ast_search".into(), "ast_edit".into(), "dap".into()],
+            mcp: BTreeMap::new(), lsp: BTreeMap::new(), dap: BTreeMap::new(), web: WebConfig::default(),
+            verification: VerificationConfig::default(),
+            browser: Default::default(), kernel: Default::default(), memory: Default::default(),
+        }
+    }
+}
+
+/// Automatic self-improvement. On by default: dial records turns, runs verified self-play on
+/// procedurally generated tasks, and proposes harness and LoRA changes that only a sealed gate can admit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImproveConfig {
+    pub enabled: bool,
+    /// Minimum seconds between background cycles.
+    pub interval_secs: u64,
+    /// A cycle needs at least this many new recorded turns (or tool-call repairs) since the last one.
+    pub min_new_turns: u32,
+    /// Verified self-play tasks per cycle (training data and weakness signal).
+    pub selfplay_tasks: u32,
+    pub gate_primary_cases: u32,
+    pub gate_guard_cases: u32,
+    /// One-sided exact sign-test level for the primary suite; admission also needs `min_net_wins`.
+    pub alpha: f64,
+    pub min_net_wins: u32,
+    /// Candidates evaluated per cycle (harness and weight changes compete).
+    pub max_candidates: u32,
+    /// Percentage points a version may lose against the very first version on the frozen anchor suite.
+    pub drift_tolerance: f64,
+    /// Learn from live turns whose outcome was verified (your /outcome, passing checks, no /undo).
+    pub learn_from_sessions: bool,
+    /// Minimum verified training examples before a LoRA candidate is attempted.
+    pub lora_min_examples: u32,
+    /// Roll back automatically when a new version's live results fall this many points below its parent's.
+    pub monitor_drop: f64,
+    pub monitor_min_turns: u32,
+    /// Run the background cycle at session start/exit. When false, only `dial improve cycle` runs it.
+    pub background: bool,
+}
+
+impl Default for ImproveConfig {
+    fn default() -> Self {
+        Self { enabled: true, interval_secs: 6 * 3600, min_new_turns: 5, selfplay_tasks: 24, gate_primary_cases: 30,
+            gate_guard_cases: 20, alpha: 0.1, min_net_wins: 2, max_candidates: 3, drift_tolerance: 3.0,
+            learn_from_sessions: true, lora_min_examples: 24, monitor_drop: 15.0, monitor_min_turns: 8, background: true }
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Version {
+    pub id: i64,
+    pub parent: Option<i64>,
+    pub kind: String,
+    pub harness: Harness,
+    pub adapter: Option<PathBuf>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    pub trajectory: i64,
+    pub version: i64,
+    pub domain: String,
+    pub task: String,
+    pub step: u32,
+    pub kind: String,
+    pub data: serde_json::Value,
+    pub score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Outcome {
+    pub trajectory: i64,
+    /// Externally assigned score on a 0..100 scale.
+    pub score: f64,
+    pub source: String,
+    pub reference: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuiteScore {
+    pub name: String,
+    pub primary: bool,
+    pub baseline: f64,
+    pub candidate: f64,
+    pub cases: usize,
+    /// Paired outcomes: cases only the candidate passed / only the baseline passed.
+    #[serde(default)]
+    pub candidate_only: usize,
+    #[serde(default)]
+    pub baseline_only: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Admission {
+    pub candidate: i64,
+    pub baseline: i64,
+    pub passed: bool,
+    pub reason: String,
+    pub scores: Vec<SuiteScore>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Proposal {
+    pub diagnosis: String,
+    /// "harness" or "lora". Other operations must be rejected.
+    pub operation: String,
+    pub harness: Option<Harness>,
+}

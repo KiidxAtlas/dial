@@ -1,0 +1,8 @@
+/target/
+/python/.venv/
+**/__pycache__/
+/.dial/
+/dial.toml
+/private/
+/grounded/
+.DS_Store

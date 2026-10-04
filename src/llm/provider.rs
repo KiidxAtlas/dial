@@ -1,0 +1,1360 @@
+//! Where completions come from: a local `mlx_lm.server`, an OpenAI-compatible
+//! endpoint, or Anthropic's Messages API.
+//!
+//! Endpoint rules (see [`endpoint_url`]):
+//! * `base_url` must be `http` or `https`, with no userinfo, query or fragment
+//!   (credentials belong in `api_key`; they would otherwise leak into logs).
+//! * Plain `http` is accepted only for local hosts (loopback, private ranges,
+//!   `localhost`, `.local`) unless the backend was built
+//!   [`with_allow_insecure`](Backend::with_allow_insecure): a bearer token must
+//!   not cross the internet in clear text.
+//! * The request goes to `{base_url}/chat/completions`; a bare
+//!   `scheme://host[:port]` gets `/v1` inserted first, so `https://api.openai.com/v1`
+//!   and `http://localhost:11434` both work.
+//!
+//! Neither prompts nor the API key appear in any error produced here.
+
+use super::server::{self, ModelServer};
+use super::{self as llm, Chat, Reply, SERVER_MODEL};
+use anyhow::{Context, Result, bail, ensure};
+use std::fmt;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+/// `config.json` files larger than this are not read for the context hint.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// Dial's own ChatGPT OAuth registration, refreshed per request.
+    ChatGpt { model: String, user_dir: PathBuf },
+    /// A local model directory served by a supervised `mlx_lm.server`.
+    Local { model_dir: String },
+    /// A remote (or self-hosted) OpenAI-compatible chat endpoint.
+    Endpoint { base_url: String, model: String, api_key: Option<String> },
+    /// Anthropic's native Messages API endpoint.
+    AnthropicEndpoint { base_url: String, model: String, api_key: Option<String> },
+}
+// Not derived: the key must never reach a log through `{:?}`.
+impl fmt::Debug for ProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProviderKind::ChatGpt { model, .. } => f.debug_struct("ChatGpt").field("model", model).finish(),
+            ProviderKind::Local { model_dir } => f.debug_struct("Local").field("model_dir", model_dir).finish(),
+            ProviderKind::Endpoint { base_url, model, api_key } => f
+                .debug_struct("Endpoint")
+                .field("base_url", &llm::display_url(base_url))
+                .field("model", model)
+                .field("api_key", &api_key.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            ProviderKind::AnthropicEndpoint { base_url, model, api_key } => f
+                .debug_struct("AnthropicEndpoint")
+                .field("base_url", &llm::display_url(base_url))
+                .field("model", model)
+                .field("api_key", &api_key.as_ref().map(|_| "<redacted>"))
+                .finish(),
+        }
+    }
+}
+
+/// Validate an endpoint `base_url` and return the chat-completions URL.
+pub fn endpoint_url(base_url: &str, allow_insecure: bool) -> Result<String> {
+    // Messages below never quote `base_url`: it may carry userinfo.
+    let uri: ureq::http::Uri = base_url.parse().map_err(|_| anyhow::anyhow!("endpoint base_url is not a valid URL"))?;
+    let scheme = uri.scheme_str().unwrap_or_default();
+    ensure!(scheme == "http" || scheme == "https", "endpoint base_url must start with http:// or https://");
+    let Some(authority) = uri.authority() else { bail!("endpoint base_url has no host") };
+    ensure!(!authority.as_str().contains('@'), "endpoint base_url must not contain credentials; use the api key setting");
+    ensure!(uri.query().is_none(), "endpoint base_url must not contain a query string");
+    let host = authority.host();
+    ensure!(!host.is_empty(), "endpoint base_url has no host");
+    if scheme == "http" && !allow_insecure && !llm::is_local_host(host) {
+        bail!(
+            "refusing plain http to non-local host {host}: use https, or opt in explicitly to insecure endpoints"
+        );
+    }
+    Ok(llm::completions_url(base_url))
+}
+
+/// Validate an Anthropic base URL and return its Messages API URL.
+pub fn anthropic_url(base_url: &str, allow_insecure: bool) -> Result<String> {
+    let completions = endpoint_url(base_url, allow_insecure)?;
+    let prefix = completions.strip_suffix("/chat/completions")
+        .context("invalid Anthropic endpoint URL")?;
+    Ok(format!("{prefix}/messages"))
+}
+
+/// Validate a provider without contacting it (for config loading).
+pub fn validate(kind: &ProviderKind, allow_insecure: bool) -> Result<()> {
+    match kind {
+        ProviderKind::ChatGpt { model, user_dir } => {
+            ensure!(!model.trim().is_empty() && !user_dir.as_os_str().is_empty(), "ChatGPT requires a model and private user storage"); Ok(())
+        },
+        ProviderKind::Local { model_dir } => {
+            ensure!(!model_dir.is_empty(), "local model directory must not be empty");
+            Ok(())
+        }
+        ProviderKind::Endpoint { base_url, model, api_key }
+        | ProviderKind::AnthropicEndpoint { base_url, model, api_key } => {
+            ensure!(!model.trim().is_empty(), "endpoint model must not be empty");
+            if let Some(key) = api_key {
+                ensure!(
+                    !key.is_empty() && key.bytes().all(|b| b.is_ascii_graphic()),
+                    "api key is empty or contains characters that are not allowed in an HTTP header"
+                );
+            }
+            endpoint_url(base_url, allow_insecure).map(drop)
+        }
+    }
+}
+
+/// A grounded local context window, or `None` for endpoint models.
+/// Remote context limits come from discovery/config, never model-name prefix guesses.
+pub fn context_window_hint(kind: &ProviderKind) -> Option<u32> {
+    match kind {
+        ProviderKind::ChatGpt { .. } => None,
+        ProviderKind::Local { model_dir } => local_context_window(Path::new(model_dir)),
+        ProviderKind::Endpoint { .. } | ProviderKind::AnthropicEndpoint { .. } => None,
+    }
+}
+
+fn local_context_window(model_dir: &Path) -> Option<u32> {
+    let mut text = String::new();
+    std::fs::File::open(model_dir.join("config.json"))
+        .ok()?
+        .take(MAX_CONFIG_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+    [config.pointer("/max_position_embeddings"), config.pointer("/text_config/max_position_embeddings")]
+        .into_iter()
+        .flatten()
+        .find_map(|value| value.as_u64())
+        .and_then(|window| u32::try_from(window).ok())
+        .filter(|&window| window > 0)
+}
+
+pub struct Backend {
+    #[cfg(test)]
+    chatgpt_url: Option<String>,
+    kind: ProviderKind,
+    python: PathBuf,
+    startup_timeout_secs: u64,
+    allow_insecure: bool,
+    retry_backoff: Duration,
+    remote_idle_timeout_secs: u64,
+    server: Option<ModelServer>,
+    metadata: llm::catalog::ModelMetadata,
+    profile: Option<llm::profiles::ModelProfile>,
+}
+
+impl Backend {
+    pub fn new(kind: ProviderKind, python: PathBuf, startup_timeout_secs: u64) -> Self {
+        Backend {
+            #[cfg(test)]
+            chatgpt_url: None,
+            kind,
+            python,
+            startup_timeout_secs,
+            allow_insecure: false,
+            retry_backoff: RETRY_BACKOFF,
+            remote_idle_timeout_secs: 180,
+            server: None,
+            metadata: Default::default(),
+            profile: None,
+        }
+    }
+
+    /// Permit plain `http` to non-local endpoint hosts.
+    pub fn with_allow_insecure(mut self, allow: bool) -> Self {
+        self.allow_insecure = allow;
+        self
+    }
+
+    pub fn with_remote_idle_timeout(mut self, seconds: u64) -> Self {
+        self.remote_idle_timeout_secs = seconds;
+        self
+    }
+
+    fn response_timeout(&self, worker_timeout_secs: u64) -> u64 {
+        let remote = match &self.kind {
+            ProviderKind::ChatGpt { .. } => true,
+            ProviderKind::Local { .. } => false,
+            ProviderKind::Endpoint { base_url, .. } | ProviderKind::AnthropicEndpoint { base_url, .. } =>
+                !llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host)),
+        };
+        if remote { worker_timeout_secs.min(self.remote_idle_timeout_secs) } else { worker_timeout_secs }
+    }
+
+    pub fn with_metadata(mut self, metadata: llm::catalog::ModelMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+    pub fn with_profile(mut self, profile: llm::profiles::ModelProfile) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    pub fn reply_cost(&self, reply: &Reply) -> Option<f64> {
+        let remote = match &self.kind {
+            ProviderKind::ChatGpt { .. } => return None,
+            ProviderKind::Local { .. } => false,
+            ProviderKind::Endpoint { base_url, .. } | ProviderKind::AnthropicEndpoint { base_url, .. } =>
+                !llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host)),
+        };
+        if !remote { return None; }
+        self.metadata.pricing?.reply_cost(reply)
+    }
+
+
+    /// Human-readable summary; never contains the API key.
+    pub fn describe(&self) -> String {
+        match &self.kind {
+            ProviderKind::ChatGpt { model, .. } => format!("{model} via ChatGPT subscription"),
+            ProviderKind::Local { model_dir } => {
+                let name = Path::new(model_dir).file_name().and_then(|n| n.to_str()).unwrap_or(model_dir);
+                format!("local mlx_lm.server ({name})")
+            }
+            ProviderKind::Endpoint { base_url, model, .. }
+            | ProviderKind::AnthropicEndpoint { base_url, model, .. } => {
+                format!("{model} via {}", llm::display_url(base_url))
+            }
+        }
+    }
+
+    /// Only a local server can load a LoRA adapter.
+    pub fn supports_adapters(&self) -> bool {
+        matches!(self.kind, ProviderKind::Local { .. })
+    }
+
+    pub fn model_label(&self) -> &str {
+        match &self.kind {
+            ProviderKind::ChatGpt { model, .. } => model,
+            ProviderKind::Local { .. } => SERVER_MODEL,
+            ProviderKind::Endpoint { model, .. } | ProviderKind::AnthropicEndpoint { model, .. } => model,
+        }
+    }
+
+    /// Stop the local server (if any) to free its memory. A later `chat`
+    /// starts a new one.
+    pub fn release(&mut self) {
+        if let Some(mut server) = self.server.take() {
+            server.stop();
+        }
+    }
+
+    /// One completion with default control hooks. Interactive callers use `chat_with_control`.
+    pub fn chat(
+        &mut self,
+        adapter: Option<&Path>,
+        req: &Chat,
+        timeout_secs: u64,
+        on_text: Option<&mut dyn FnMut(&str) -> bool>,
+    ) -> Result<Reply> {
+        self.chat_with_control(adapter, req, timeout_secs, on_text, &mut |_| {}, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// At most five attempts, with at most 60 seconds spent in backoff.
+    /// Body/stream errors are never replayed, even when no visible text arrived.
+    pub fn chat_with_control(
+        &mut self,
+        adapter: Option<&Path>,
+        req: &Chat,
+        timeout_secs: u64,
+        on_text: Option<&mut dyn FnMut(&str) -> bool>,
+        on_notice: &mut dyn FnMut(&str),
+        interrupt: Arc<AtomicBool>,
+    ) -> Result<Reply> {
+        self.chat_with_control_events(adapter, req, timeout_secs, on_text, on_notice, interrupt, &mut |_| true)
+    }
+
+    pub fn chat_with_control_events(
+        &mut self, adapter: Option<&Path>, req: &Chat, timeout_secs: u64,
+        mut on_text: Option<&mut dyn FnMut(&str) -> bool>, on_notice: &mut dyn FnMut(&str),
+        interrupt: Arc<AtomicBool>, on_event: &mut dyn FnMut(&llm::StreamEvent) -> bool,
+    ) -> Result<Reply> {
+        let interrupted = || interrupt.load(Ordering::SeqCst);
+        let timeout_secs = self.response_timeout(timeout_secs);
+        let vision = self.profile.as_ref().and_then(|p| p.capabilities.vision).or(self.metadata.vision).unwrap_or(false);
+        let prepared = llm::images::prepare(req, vision, on_notice);
+        let req = prepared.as_ref().unwrap_or(req);
+        let chatgpt_token = match &self.kind {
+            ProviderKind::ChatGpt { user_dir, .. } => Some(llm::chatgpt::access_token(user_dir, Arc::clone(&interrupt))?),
+            _ => None,
+        };
+        let (url, auth, model, protocol) = match &self.kind {
+            ProviderKind::ChatGpt { model, .. } => {
+                ensure!(adapter.is_none(), "ChatGPT providers cannot load LoRA adapters");
+                let url = format!("{}/responses", llm::chatgpt::BASE_URL);
+                #[cfg(test)]
+                let url = self.chatgpt_url.clone().unwrap_or(url);
+                (url, chatgpt_token.as_ref().map(|t|t.as_str()), model, 2)
+            },
+            ProviderKind::Local { model_dir } => {
+                if interrupted() { return Err(llm::Interrupted.into()); }
+                let server = server::ensure(&mut self.server, &self.python, model_dir, adapter, self.startup_timeout_secs)?;
+                let result = exchange(&llm::completions_url(server.base_url()), None, SERVER_MODEL, req, timeout_secs, &mut on_text, Arc::clone(&interrupt), self.profile.as_ref(), on_event);
+                return if interrupted() { Err(llm::Interrupted.into()) } else { result };
+            }
+            ProviderKind::Endpoint { base_url, model, api_key } => {
+                ensure!(adapter.is_none(), "endpoint providers cannot load LoRA adapters");
+                (endpoint_url(base_url, self.allow_insecure)?, api_key.as_deref(), model, 0)
+            }
+            ProviderKind::AnthropicEndpoint { base_url, model, api_key } => {
+                ensure!(adapter.is_none(), "endpoint providers cannot load LoRA adapters");
+                (anthropic_url(base_url, self.allow_insecure)?, api_key.as_deref(), model, 1)
+            }
+        };
+        let mut waited = Duration::ZERO;
+        for attempt in 1..=llm::retry::MAX_ATTEMPTS {
+            if interrupted() { return Err(llm::Interrupted.into()); }
+            let result = if protocol == 2 {
+                llm::responses::exchange(&url, auth.unwrap(), model, req, timeout_secs, &mut on_text, Arc::clone(&interrupt), self.profile.as_ref(), on_event)
+            } else if protocol == 1 {
+                anthropic_exchange(&url, auth, model, req, timeout_secs, &mut on_text, Arc::clone(&interrupt), self.profile.as_ref(), on_event)
+            } else {
+                exchange(&url, auth, model, req, timeout_secs, &mut on_text, Arc::clone(&interrupt), self.profile.as_ref(), on_event)
+            };
+            if interrupted() { return Err(llm::Interrupted.into()); }
+            let error = match result { Ok(reply) => return Ok(reply), Err(error) => error };
+            if let Some(status @ (401 | 403)) = error.downcast_ref::<llm::HttpError>().map(|http| http.status) {
+                let host = llm::host_of(&url);
+                let key = match host.as_deref() {
+                    Some("api.openai.com") => "OPENAI_API_KEY",
+                    Some("api.anthropic.com") => "ANTHROPIC_API_KEY",
+                    Some("openrouter.ai") => "OPENROUTER_API_KEY",
+                    Some("api.groq.com") => "GROQ_API_KEY",
+                    Some("api.mistral.ai") => "MISTRAL_API_KEY",
+                    Some("api.deepseek.com") => "DEEPSEEK_API_KEY",
+                    _ => "the endpoint's configured API key",
+                };
+                return Err(error.context(format!("provider authentication failed (HTTP {status}); check {key} or sign in through /providers")));
+            }
+            if !llm::is_transient(&error) || attempt == llm::retry::MAX_ATTEMPTS { return Err(error); }
+            let hinted = error.downcast_ref::<llm::HttpError>().and_then(|http| http.retry_after);
+            let exponential = self.retry_backoff.saturating_mul(1 << (attempt - 1)).min(Duration::from_secs(8));
+            let jitter = exponential.mul_f64(0.75 + rand::random::<f64>() * 0.5);
+            let delay = hinted.map_or(jitter, |minimum| minimum.max(jitter));
+            // Never retry earlier than a server's minimum; a hint beyond the budget ends the call.
+            if delay > llm::retry::MAX_WAIT.saturating_sub(waited) { return Err(error.context("provider retry delay exceeds the 60s backoff budget")); }
+            let reason = if error.downcast_ref::<llm::HttpError>().is_some_and(|http| matches!(http.status, 429 | 529)) { "rate limited" } else { "transient provider failure" };
+            on_notice(&format!("{reason}; retrying in {:.1}s (attempt {}/{})", delay.as_secs_f64(), attempt + 1, llm::retry::MAX_ATTEMPTS));
+            let start = Instant::now();
+            while start.elapsed() < delay {
+                if interrupted() { return Err(llm::Interrupted.into()); }
+                std::thread::sleep(delay.saturating_sub(start.elapsed()).min(Duration::from_millis(50)));
+            }
+            waited += delay;
+        }
+        unreachable!("bounded retries return on the final attempt")
+    }
+}
+
+fn exchange(
+    url: &str,
+    auth: Option<&str>,
+    model: &str,
+    req: &Chat,
+    timeout_secs: u64,
+    on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
+    interrupt: Arc<AtomicBool>,
+    profile: Option<&llm::profiles::ModelProfile>,
+    on_event: &mut dyn FnMut(&llm::StreamEvent) -> bool,
+) -> Result<Reply> {
+    match on_text {
+        Some(callback) => llm::chat_stream_at_controlled(url, auth, model, req, timeout_secs, &mut **callback, Some(interrupt), profile, on_event),
+        None => llm::chat_at_controlled(url, auth, model, req, timeout_secs, Some(interrupt), profile, on_event),
+    }
+}
+
+fn anthropic_exchange(
+    url: &str,
+    api_key: Option<&str>,
+    model: &str,
+    req: &Chat,
+    timeout_secs: u64,
+    on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
+    interrupt: Arc<AtomicBool>,
+    profile: Option<&llm::profiles::ModelProfile>,
+    on_event: &mut dyn FnMut(&llm::StreamEvent) -> bool,
+) -> Result<Reply> {
+    ensure!(timeout_secs > 0, "chat timeout must be positive");
+    if let Some(key) = api_key {
+        ensure!(
+            !key.is_empty() && key.bytes().all(|b| b.is_ascii_graphic()),
+            "api key is empty or contains characters that are not allowed in an HTTP header"
+        );
+    }
+    let mut body = anthropic_request(model, req)?;
+    let streaming = on_text.is_some();
+    body["stream"] = serde_json::json!(streaming);
+    if let Some(profile) = profile {
+        profile.validate_request(req, true)?;
+        if profile.capabilities.temperature && profile.thinking != Some(true) { body["temperature"] = serde_json::json!(profile.temperature.unwrap_or(req.temperature)); }
+        if let Some(p) = profile.top_p { body["top_p"] = serde_json::json!(p); }
+        if let Some(thinking) = profile.thinking {
+            body["thinking"] = if !thinking { serde_json::json!({"type":"disabled"}) }
+                else if profile.capabilities.reasoning == llm::profiles::ReasoningApi::AnthropicAdaptive { serde_json::json!({"type":"adaptive"}) }
+                else { serde_json::json!({"type":"enabled","budget_tokens":profile.thinking_budget}) };
+        }
+        if let Some(effort) = profile.reasoning_effort { body["output_config"] = serde_json::json!({"effort":effort.as_str()}); }
+        if profile.prompt_cache {
+            // Stable system/tool prefixes only; never cache dynamic tool results accidentally.
+            if let Some(text) = body["system"].as_str().map(str::to_owned) { body["system"] = serde_json::json!([{"type":"text","text":text,"cache_control":{"type":"ephemeral"}}]); }
+            else if let Some(tool) = body["tools"].as_array_mut().and_then(|tools| tools.last_mut()) { tool["cache_control"] = serde_json::json!({"type":"ephemeral"}); }
+            else { bail!("Anthropic prompt_cache requires a stable system or tool prefix"); }
+        }
+    }
+    let use_proxy = !llm::host_of(url).is_some_and(|host| llm::is_local_host(&host));
+    let patience = streaming.then(|| llm::Patience::for_stream(timeout_secs, !use_proxy));
+    let mut request = llm::agent_with(timeout_secs, use_proxy, Some(interrupt), patience.clone()).post(url).header("anthropic-version", "2023-06-01");
+    if streaming { request = request.header("Accept", "text/event-stream"); }
+    if let Some(key) = api_key {
+        request = request.header("x-api-key", key);
+    }
+    let mut response = request.send_json(&body).map_err(|error| llm::transport_error(error, url, api_key))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let retry_after = llm::retry::server_delay(response.headers());
+        let mut bytes = llm::read_bounded(response.body_mut().as_reader(), llm::ERROR_EXCERPT_BYTES)
+            .context("reading Anthropic error response")?;
+        // Auth failures need an actionable hint, not an echoed request/credential.
+        if matches!(status, 401 | 403) { bytes = llm::Bounded { data:b"check ANTHROPIC_API_KEY or sign in through /providers".to_vec(), truncated:false }; }
+        return Err(llm::http_error(status, &bytes, api_key, retry_after));
+    }
+    let is_sse = response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
+    if is_sse {
+        let mut accumulator = llm::anthropic::Accumulator::default();
+        let mut forward = |piece: &str| match on_text { Some(callback) => callback(piece), None => true };
+        let patience = patience.unwrap_or_else(|| llm::Patience::for_stream(timeout_secs, !use_proxy));
+        llm::stream::read_events(response.body_mut().as_reader(), llm::MAX_RESPONSE_BYTES, llm::stream::MAX_LINE_BYTES,
+            patience, |data| accumulator.feed(data, &mut forward, on_event))
+            .map_err(|error| llm::response_error(error, api_key))?;
+        return accumulator.finish().map_err(|error| llm::response_error(error, api_key));
+    }
+    let mut bytes = Vec::new();
+    response.body_mut().as_reader().take((llm::MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes).context("reading Anthropic response")?;
+    ensure!(bytes.len() <= llm::MAX_RESPONSE_BYTES, "Anthropic response exceeds {} bytes", llm::MAX_RESPONSE_BYTES);
+    let reply = anthropic_reply(&serde_json::from_slice(&bytes).context("invalid Anthropic response")?)?;
+    if !reply.reasoning.is_empty() && !on_event(&llm::StreamEvent::Reasoning(reply.reasoning.clone())) { return Err(llm::Interrupted.into()); }
+    if !reply.text.is_empty() {
+        if let Some(callback) = on_text {
+            if !callback(&reply.text) {
+                return Err(llm::Interrupted.into());
+            }
+        }
+    }
+    Ok(reply)
+}
+
+fn anthropic_request(model: &str, req: &Chat) -> Result<serde_json::Value> {
+    use serde_json::{Value, json};
+    let mut system = Vec::new();
+    let mut messages = Vec::new();
+    for message in &req.messages {
+        match message["role"].as_str().unwrap_or_default() {
+            "assistant" if message["dial_provider_content"].is_array() => {
+                messages.push(json!({"role":"assistant","content":message["dial_provider_content"]}));
+            }
+            "system" | "developer" => {
+                if let Some(text) = message["content"].as_str() {
+                    system.push(text.to_owned());
+                }
+            }
+            "tool" => messages.push(json!({"role":"user","content":[{
+                "type":"tool_result",
+                "tool_use_id": message["tool_call_id"],
+                "content": message["content"]
+            }]})),
+            "assistant" if message["tool_calls"].is_array() => {
+                let mut content = Vec::new();
+                if let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
+                    content.push(json!({"type":"text","text":text}));
+                }
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    let raw = &call["function"]["arguments"];
+                    let parsed: Value = match raw {
+                        Value::String(text) => serde_json::from_str(text).unwrap_or_else(|_| json!({})),
+                        value => value.clone(),
+                    };
+                    let input = if parsed.is_object() { parsed } else { json!({}) };
+                    content.push(json!({
+                        "type":"tool_use",
+                        "id":call["id"],
+                        "name":call["function"]["name"],
+                        "input":input
+                    }));
+                }
+                messages.push(json!({"role":"assistant","content":content}));
+            }
+            role @ ("user" | "assistant") => {
+                messages.push(json!({"role":role,"content":llm::images::anthropic_content(&message["content"])}));
+            }
+            _ => {}
+        }
+    }
+    let mut body = json!({"model":model,"max_tokens":req.max_tokens,"messages":messages});
+    if !system.is_empty() { body["system"] = json!(system.join("\n\n")); }
+    if !req.tools.is_empty() {
+        body["tools"] = Value::Array(req.tools.iter().filter_map(|tool| {
+            let function = &tool["function"];
+            function["name"].as_str().map(|name| {
+                let mut schema = json!({
+                    "name":name,
+                    "input_schema":function["parameters"]
+                });
+                if let Some(description) = function["description"].as_str() {
+                    schema["description"] = json!(description);
+                }
+                schema
+            })
+        }).collect());
+    }
+    Ok(body)
+}
+
+pub(super) fn anthropic_reply(value: &serde_json::Value) -> Result<Reply> {
+    use serde_json::Value;
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    let content = value["content"].as_array().context("Anthropic response content is not an array")?;
+    ensure!(content.len() <= 128, "Anthropic response carries too many content blocks");
+    for block in content {
+        match block["type"].as_str().unwrap_or_default() {
+            "text" => text.push_str(block["text"].as_str().unwrap_or_default()),
+            "thinking" => reasoning.push_str(block["thinking"].as_str().unwrap_or_default()),
+            "tool_use" => tool_calls.push(crate::llm::ToolCall {
+                id: block["id"].as_str().unwrap_or_default().to_owned(),
+                name: block["name"].as_str().unwrap_or_default().to_owned(),
+                arguments: if block["input"].is_object() { block["input"].clone() } else { Value::Null },
+                malformed_arguments: !block["input"].is_object(),
+            }),
+            _ => {}
+        }
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for call in &tool_calls {
+        ensure!(!call.id.is_empty() && ids.insert(&call.id), "Anthropic tool call has missing or duplicate id");
+    }
+    let reason = value["stop_reason"].as_str().unwrap_or("stop");
+    Ok(Reply {
+        text,
+        tool_calls,
+        finish_reason: match reason { "tool_use" => "tool_calls", "max_tokens" => "length", other => other }.into(),
+        prompt_tokens: value.pointer("/usage/input_tokens").and_then(Value::as_u64).map(|n| n.saturating_add(value.pointer("/usage/cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0)).saturating_add(value.pointer("/usage/cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or(0))),
+        completion_tokens: value.pointer("/usage/output_tokens").and_then(Value::as_u64),
+        reasoning,
+        cached_prompt_tokens: value.pointer("/usage/cache_read_input_tokens").and_then(Value::as_u64),
+        cache_creation_tokens: value.pointer("/usage/cache_creation_input_tokens").and_then(Value::as_u64),
+        provider_content: value["content"].as_array().cloned().unwrap_or_default(),
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::fake::{self, Script, header, request_line};
+    use serde_json::json;
+
+    fn endpoint(base_url: &str) -> ProviderKind {
+        ProviderKind::Endpoint { base_url: base_url.into(), model: "gpt-x".into(), api_key: Some("sk-secret".into()) }
+    }
+
+    fn backend(kind: ProviderKind) -> Backend {
+        let mut backend = Backend::new(kind, PathBuf::from("/nonexistent/python"), 5);
+        backend.retry_backoff = Duration::from_millis(10);
+        backend
+    }
+
+    fn anthropic_endpoint(base_url: &str) -> ProviderKind {
+        ProviderKind::AnthropicEndpoint {
+            base_url: base_url.into(),
+            model: "claude-test".into(),
+            api_key: Some("anth-secret".into()),
+        }
+    }
+
+    fn request() -> Chat {
+        Chat {
+            messages: vec![json!({"role": "user", "content": "SECRET-PROMPT"})],
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: 16,
+            seed: None,
+        }
+    }
+
+    fn ok(text: &str) -> Script {
+        fake::json(200, &json!({"choices": [{"finish_reason": "stop", "message": {"content": text}}]}))
+    }
+
+    #[test]
+    fn url_normalization() {
+        for (base, want) in [
+            ("https://api.openai.com/v1", "https://api.openai.com/v1/chat/completions"),
+            ("https://api.openai.com/v1/", "https://api.openai.com/v1/chat/completions"),
+            ("https://openrouter.ai/api/v1", "https://openrouter.ai/api/v1/chat/completions"),
+            ("http://localhost:11434", "http://localhost:11434/v1/chat/completions"),
+            ("http://127.0.0.1:8000/", "http://127.0.0.1:8000/v1/chat/completions"),
+            ("https://example.com", "https://example.com/v1/chat/completions"),
+            ("https://g.example/v1beta/openai", "https://g.example/v1beta/openai/chat/completions"),
+            ("http://[::1]:9000/v1", "http://[::1]:9000/v1/chat/completions"),
+        ] {
+            assert_eq!(endpoint_url(base, false).unwrap(), want, "{base}");
+        }
+    }
+
+    #[test]
+    fn url_validation() {
+        for bad in [
+            "ftp://example.com/v1",
+            "example.com/v1",
+            "file:///etc/passwd",
+            "https://user:pw@example.com/v1",
+            "https://example.com/v1?key=abc",
+            "",
+            "https://",
+        ] {
+            let error = endpoint_url(bad, false).unwrap_err().to_string();
+            assert!(!error.contains("pw@") && !error.contains("abc"), "{error}");
+            assert!(endpoint_url(bad, true).is_err(), "{bad} must be rejected even when insecure is allowed");
+        }
+    }
+
+    #[test]
+    fn plain_http_only_for_local_hosts_unless_flagged() {
+        for local in [
+            "http://localhost:1/v1",
+            "http://127.0.0.1:1",
+            "http://192.168.1.20:8000/v1",
+            "http://10.0.0.5/v1",
+            "http://172.16.3.4/v1",
+            "http://[::1]:1",
+            "http://studio.local:1234/v1",
+        ] {
+            assert!(endpoint_url(local, false).is_ok(), "{local}");
+        }
+        for remote in ["http://api.example.com/v1", "http://8.8.8.8/v1", "http://172.32.0.1/v1"] {
+            let error = endpoint_url(remote, false).unwrap_err().to_string();
+            assert!(error.contains("plain http"), "{error}");
+            assert!(endpoint_url(remote, true).is_ok(), "{remote}");
+        }
+        assert!(endpoint_url("https://api.example.com/v1", false).is_ok());
+    }
+
+    #[test]
+    fn validate_checks_model_and_key() {
+        assert!(validate(&endpoint("https://e.com/v1"), false).is_ok());
+        let blank = ProviderKind::Endpoint { base_url: "https://e.com".into(), model: " ".into(), api_key: None };
+        assert!(validate(&blank, false).is_err());
+        let bad_key =
+            ProviderKind::Endpoint { base_url: "https://e.com".into(), model: "m".into(), api_key: Some("a b".into()) };
+        let error = validate(&bad_key, false).unwrap_err().to_string();
+        assert!(!error.contains("a b"));
+        assert!(validate(&ProviderKind::Local { model_dir: String::new() }, false).is_err());
+    }
+
+    #[test]
+    fn anthropic_url_uses_messages_path_and_endpoint_safety() {
+        assert_eq!(
+            anthropic_url("https://api.anthropic.com/v1", false).unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_url("https://api.anthropic.com", false).unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert!(anthropic_url("https://user:secret@example.com/v1", false).is_err());
+        assert!(anthropic_url("http://api.example.com/v1", false).is_err());
+    }
+
+    #[test]
+    fn anthropic_request_maps_system_tools_and_tool_results() {
+        let request = Chat {
+            messages: vec![
+                json!({"role":"system","content":"Follow rules"}),
+                json!({"role":"user","content":"Read a file"}),
+                json!({"role":"assistant","content":null,"tool_calls":[{
+                    "id":"call-1","type":"function",
+                    "function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}
+                }]}),
+                json!({"role":"tool","tool_call_id":"call-1","content":"file contents"}),
+            ],
+            tools: vec![json!({"type":"function","function":{
+                "name":"read_file","description":"Read a file",
+                "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+            }})],
+            temperature: 0.0,
+            max_tokens: 128,
+            seed: None,
+        };
+        let body = anthropic_request("claude-test", &request).unwrap();
+        assert_eq!(body["system"], "Follow rules");
+        assert_eq!(body["max_tokens"], 128);
+        assert_eq!(body["tools"][0]["name"], "read_file");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(body["messages"][1]["content"][0]["input"]["path"], "a.txt");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call-1");
+    }
+
+    #[test]
+    fn anthropic_reply_preserves_text_and_tool_calls() {
+        let reply = anthropic_reply(&json!({
+            "content":[
+                {"type":"text","text":"Reading"},
+                {"type":"tool_use","id":"tool-9","name":"read_file","input":{"path":"a.txt"}}
+            ],
+            "stop_reason":"tool_use",
+            "usage":{"input_tokens":12,"output_tokens":4}
+        })).unwrap();
+        assert_eq!(reply.text, "Reading");
+        assert_eq!(reply.finish_reason, "tool_calls");
+        assert_eq!(reply.prompt_tokens, Some(12));
+        assert_eq!(reply.completion_tokens, Some(4));
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].id, "tool-9");
+        assert_eq!(reply.tool_calls[0].arguments, json!({"path":"a.txt"}));
+    }
+
+    #[test]
+    fn anthropic_chat_uses_key_header_and_messages_wire_format() {
+        let server = fake::serve(vec![fake::json(200, &json!({
+            "content":[{"type":"text","text":"hello"}],
+            "stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}
+        }))]);
+        let mut remote = backend(anthropic_endpoint(&format!("{}/v1", server.url)));
+        let reply = remote.chat(None, &request(), 5, None).unwrap();
+        assert_eq!(reply.text, "hello");
+        let seen = server.requests().remove(0);
+        assert_eq!(request_line(&seen), "POST /v1/messages HTTP/1.1");
+        assert_eq!(header(&seen, "x-api-key").as_deref(), Some("anth-secret"));
+        assert_eq!(header(&seen, "anthropic-version").as_deref(), Some("2023-06-01"));
+        let body = fake::body(&seen);
+        assert_eq!(body["model"], "claude-test");
+        assert_eq!(body["max_tokens"], 16);
+        assert_eq!(body["messages"][0]["content"], "SECRET-PROMPT");
+    }
+
+    #[test]
+    fn anthropic_auth_errors_do_not_expose_key_or_prompt() {
+        let server = fake::serve(vec![fake::json(401, &json!({"error":"invalid anth-secret SECRET-PROMPT"}))]);
+        let mut remote = backend(anthropic_endpoint(&format!("{}/v1", server.url)));
+        let error = remote.chat(None, &request(), 5, None).unwrap_err().to_string();
+        assert!(error.contains("HTTP 401"), "{error}");
+        assert!(!error.contains("anth-secret") && !error.contains("SECRET-PROMPT"), "{error}");
+    }
+
+    #[test]
+    fn anthropic_callback_receives_buffered_text_once() {
+        let server = fake::serve(vec![fake::json(200, &json!({
+            "content":[{"type":"text","text":"one"},{"type":"text","text":" answer"}],
+            "stop_reason":"end_turn"
+        }))]);
+        let mut remote = backend(anthropic_endpoint(&format!("{}/v1", server.url)));
+        let mut pieces = Vec::new();
+        let mut callback = |text: &str| { pieces.push(text.to_owned()); true };
+        let reply = remote.chat(None, &request(), 5, Some(&mut callback)).unwrap();
+        assert_eq!(reply.text, "one answer");
+        assert_eq!(pieces, ["one answer"]);
+    }
+
+    #[test]
+    fn describe_and_debug_never_show_the_key_or_userinfo() {
+        let kind = ProviderKind::Endpoint {
+            base_url: "https://user:hunter2@example.com/v1?token=abc".into(),
+            model: "m".into(),
+            api_key: Some("sk-secret".into()),
+        };
+        let shown = format!("{kind:?} {}", backend(kind.clone()).describe());
+        for secret in ["sk-secret", "hunter2", "token=abc"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        assert!(shown.contains("example.com"));
+
+        let anthropic = ProviderKind::AnthropicEndpoint {
+            base_url: "https://api.anthropic.com/v1".into(),
+            model: "claude-test".into(),
+            api_key: Some("anth-secret".into()),
+        };
+        assert!(!format!("{anthropic:?}").contains("anth-secret"));
+    }
+
+    #[test]
+    fn capabilities_and_labels() {
+        let local = backend(ProviderKind::Local { model_dir: "/models/SmolLM2".into() });
+        assert!(local.supports_adapters());
+        assert_eq!(local.model_label(), SERVER_MODEL);
+        assert!(local.describe().contains("SmolLM2"));
+        let remote = backend(endpoint("https://e.com/v1"));
+        assert!(!remote.supports_adapters());
+        assert_eq!(remote.model_label(), "gpt-x");
+    }
+
+    #[test]
+    fn endpoint_rejects_adapters_and_bad_urls_without_network() {
+        let mut remote = backend(endpoint("https://e.com/v1"));
+        let error = remote.chat(Some(Path::new("/adapter")), &request(), 5, None).unwrap_err().to_string();
+        assert!(error.contains("adapter"), "{error}");
+        let mut insecure = backend(endpoint("http://api.example.com/v1"));
+        let error = insecure.chat(None, &request(), 5, None).unwrap_err().to_string();
+        assert!(error.contains("plain http") && !error.contains("sk-secret"), "{error}");
+    }
+
+    #[test]
+    fn endpoint_chat_sends_key_model_and_path() {
+        let server = fake::serve(vec![ok("pong")]);
+        let mut remote = backend(endpoint(&format!("{}/v1", server.url)));
+        let reply = remote.chat(None, &request(), 5, None).unwrap();
+        assert_eq!(reply.text, "pong");
+        let seen = server.requests().remove(0);
+        assert_eq!(request_line(&seen), "POST /v1/chat/completions HTTP/1.1");
+        assert_eq!(header(&seen, "authorization").as_deref(), Some("Bearer sk-secret"));
+        assert_eq!(fake::body(&seen)["model"], "gpt-x");
+    }
+
+    #[test]
+    fn endpoint_streams_when_a_callback_is_given() {
+        let chunk = |c: &str| format!("data: {}\n\n", json!({"choices": [{"delta": {"content": c}}]}));
+        let body = format!(
+            "{}{}data: {}\n\ndata: [DONE]\n\n",
+            chunk("a"),
+            chunk("b"),
+            json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        );
+        let server = fake::serve(vec![Script::Sse(body)]);
+        let mut remote = backend(endpoint(&format!("{}/v1", server.url)));
+        let mut seen = String::new();
+        let mut on_text = |piece: &str| {
+            seen.push_str(piece);
+            true
+        };
+        let reply = remote.chat(None, &request(), 5, Some(&mut on_text)).unwrap();
+        assert_eq!(reply.text, "ab");
+        assert_eq!(seen, "ab");
+        assert_eq!(fake::body(&server.requests()[0])["stream"], true);
+    }
+
+    #[test]
+    fn image_references_reach_both_provider_wire_formats() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let root = tempfile::tempdir().unwrap();
+        let png = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII=").unwrap();
+        std::fs::write(root.path().join("tiny.png"), &png).unwrap();
+        let (message, warnings) = crate::agent::context::expand_message(root.path(), "Describe @tiny.png");
+        assert!(warnings.is_empty());
+        assert!(!message.to_string().contains("base64"));
+        for anthropic in [false, true] {
+            let response = if anthropic { fake::json(200, &json!({"content":[{"type":"text","text":"pixel"}],"stop_reason":"end_turn"})) } else { ok("pixel") };
+            let server = fake::serve(vec![response]);
+            let kind = if anthropic { anthropic_endpoint(&server.url) } else { endpoint(&server.url) };
+            let mut remote = backend(kind).with_metadata(llm::catalog::ModelMetadata { vision:Some(true), pricing:None });
+            let mut req = request();
+            req.messages = vec![message.clone()];
+            assert_eq!(remote.chat(None, &req, 5, None).unwrap().text, "pixel");
+            let body = fake::body(&server.requests()[0]);
+            let image = &body["messages"][0]["content"][1];
+            if anthropic {
+                assert_eq!(image["type"], "image");
+                assert_eq!(image["source"]["media_type"], "image/png");
+                assert_eq!(image["source"]["data"], STANDARD.encode(&png));
+            } else {
+                assert_eq!(image["type"], "image_url");
+                assert_eq!(image["image_url"]["url"], format!("data:image/png;base64,{}", STANDARD.encode(&png)));
+            }
+            assert!(!body.to_string().contains("dial_images"));
+        }
+        let server = fake::serve(vec![ok("text only")]);
+        let mut remote = backend(endpoint(&server.url)).with_metadata(llm::catalog::ModelMetadata { vision:Some(false), pricing:None });
+        let mut req = request();
+        req.messages = vec![message];
+        let mut notices = Vec::new();
+        remote.chat_with_control(None, &req, 5, None, &mut |text| notices.push(text.to_owned()), Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(notices.iter().any(|notice| notice.contains("no vision")));
+        assert_eq!(fake::body(&server.requests()[0])["messages"][0]["content"], "Describe @tiny.png");
+    }
+
+    #[test]
+    fn costs_require_complete_usage_supported_prices_and_remote_provider() {
+        let metadata = llm::catalog::ModelMetadata { vision:None, pricing:Some(llm::catalog::TokenPricing { prompt:0.000001, completion:0.000003, cache_read:None, cache_write:None }) };
+        let remote = backend(endpoint("https://api.example.com")).with_metadata(metadata);
+        let reply = Reply { text:String::new(), tool_calls:vec![], finish_reason:"stop".into(), prompt_tokens:Some(1000), completion_tokens:Some(500), ..Default::default() };
+        assert!((remote.reply_cost(&reply).unwrap() - 0.0025).abs() < 1e-12);
+        let local = backend(endpoint("http://localhost:1234")).with_metadata(metadata);
+        assert_eq!(local.reply_cost(&reply), None);
+        let mut missing = reply.clone();
+        missing.prompt_tokens = None;
+        assert_eq!(remote.reply_cost(&missing), None);
+        assert_eq!(backend(endpoint("https://api.example.com")).reply_cost(&reply), None);
+    }
+
+    #[test]
+    fn connection_failures_retry_but_healthy_silence_keeps_the_same_stream() {
+        let server = fake::serve(vec![Script::Hangup, ok("reconnected")]);
+        let mut remote = backend(endpoint(&server.url));
+        assert_eq!(remote.chat(None, &request(), 5, None).unwrap().text, "reconnected");
+        assert_eq!(server.requests().len(), 2);
+
+        let pieces = vec![": thinking\n\n".into(), format!("data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":"after silence"},"finish_reason":"stop"}]}))];
+        let server = fake::serve(vec![Script::SseSlow { pieces, pause:Duration::from_millis(350) }]);
+        let mut remote = backend(endpoint(&server.url));
+        let mut text = String::new();
+        let mut request = request();
+        request.messages[0]["content"] = json!("long prompt ".repeat(2000));
+        let reply = remote.chat(None, &request, 3600, Some(&mut |piece| { text.push_str(piece); true })).unwrap();
+        assert_eq!(reply.text, "after silence");
+        assert_eq!(text, "after silence");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn transient_failures_retry_with_visible_notices_and_stop_at_the_bound() {
+        for status in [408, 409, 425, 429, 500, 502, 503, 504, 529] {
+            let first = Script::HttpHeaders { status, headers:vec![("Retry-After", "0".into())], body:b"{\"error\":\"busy\"}".to_vec() };
+            let server = fake::serve(vec![first, ok("recovered")]);
+            let mut remote = backend(endpoint(&server.url));
+            let mut notices = Vec::new();
+            let mut notify = |text: &str| notices.push(text.to_owned());
+            assert_eq!(remote.chat_with_control(None, &request(), 5, None, &mut notify, Arc::new(AtomicBool::new(false))).unwrap().text, "recovered");
+            assert_eq!(notices.len(), 1);
+            assert_eq!(server.requests().len(), 2);
+        }
+        let server = fake::serve((0..5).map(|_| fake::json(503, &json!({"error":"busy"}))).collect());
+        let mut remote = backend(endpoint(&server.url));
+        assert_eq!(remote.chat(None, &request(), 5, None).unwrap_err().downcast_ref::<llm::HttpError>().unwrap().status, 503);
+        assert_eq!(server.requests().len(), 5);
+    }
+
+    #[test]
+    fn backoff_is_interruptible_and_obeys_retry_after() {
+        let server = fake::serve(vec![Script::HttpHeaders { status:429, headers:vec![("Retry-After", "4".into())], body:b"{}".to_vec() }]);
+        let mut remote = backend(endpoint(&server.url));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut notice = String::new();
+        let start = Instant::now();
+        let error = remote.chat_with_control(None, &request(), 5, None, &mut |text| { notice = text.into(); cancelled.store(true, Ordering::SeqCst); }, Arc::clone(&cancelled)).unwrap_err();
+        assert!(error.downcast_ref::<llm::Interrupted>().is_some());
+        assert!(notice.contains("4.0s"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn partial_streams_and_permanent_statuses_never_retry() {
+        for status in [400, 401, 403, 404, 501] {
+            let server = fake::serve(vec![fake::json(status, &json!({"error":"permanent"}))]);
+            let mut remote = backend(endpoint(&server.url));
+            assert_eq!(remote.chat(None, &request(), 5, None).unwrap_err().downcast_ref::<llm::HttpError>().unwrap().status, status);
+            assert_eq!(server.requests().len(), 1);
+        }
+        for delta in [json!({"content":"partial"}), json!({"tool_calls":[{"index":0,"id":"call","function":{"name":"read","arguments":"{"}}]})] {
+            let server = fake::serve(vec![Script::Sse(format!("data: {}\n\n", json!({"choices":[{"delta":delta}]})))]);
+            let mut remote = backend(endpoint(&server.url));
+            let mut notices = Vec::new();
+            let error = remote.chat_with_control(None, &request(), 5, Some(&mut |_| true), &mut |text| notices.push(text.to_owned()), Arc::new(AtomicBool::new(false))).unwrap_err();
+            assert!(!llm::is_transient(&error));
+            assert!(notices.is_empty());
+            assert_eq!(server.requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn client_errors_and_interruptions_are_not_retried() {
+        let server = fake::serve(vec![fake::json(401, &json!({"error": "no"}))]);
+        let mut remote = backend(endpoint(&format!("{}/v1", server.url)));
+        let error = remote.chat(None, &request(), 5, None).unwrap_err();
+        assert_eq!(error.downcast_ref::<llm::HttpError>().map(|e| e.status), Some(401));
+
+        let pieces = (0..20)
+            .map(|i| format!("data: {}\n\n", json!({"choices": [{"delta": {"content": format!("w{i}")}}]})))
+            .collect();
+        let server = fake::serve(vec![Script::SseSlow { pieces, pause: Duration::from_millis(50) }]);
+        let mut remote = backend(endpoint(&format!("{}/v1", server.url)));
+        let mut stop = |_: &str| false;
+        let error = remote.chat(None, &request(), 10, Some(&mut stop)).unwrap_err();
+        assert!(error.downcast_ref::<llm::Interrupted>().is_some(), "{error:#}");
+    }
+
+    #[test]
+    fn context_window_from_local_metadata_not_endpoint_name_guesses() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = ProviderKind::Local { model_dir: dir.path().to_str().unwrap().into() };
+        assert_eq!(context_window_hint(&local), None, "missing config.json");
+        std::fs::write(dir.path().join("config.json"), r#"{"max_position_embeddings": 8192}"#).unwrap();
+        assert_eq!(context_window_hint(&local), Some(8192));
+        std::fs::write(dir.path().join("config.json"), r#"{"text_config": {"max_position_embeddings": 32768}}"#).unwrap();
+        assert_eq!(context_window_hint(&local), Some(32768));
+        std::fs::write(dir.path().join("config.json"), "{broken").unwrap();
+        assert_eq!(context_window_hint(&local), None);
+
+        assert_eq!(context_window_hint(&endpoint("https://e.com")), None, "unknown model");
+        let known = ProviderKind::Endpoint {
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "openai/gpt-4o-mini".into(),
+            api_key: None,
+        };
+        assert_eq!(context_window_hint(&known), None, "remote model names do not establish context capabilities");
+    }
+
+    #[test]
+    fn release_without_a_server_is_a_no_op() {
+        let mut local = backend(ProviderKind::Local { model_dir: "/models/x".into() });
+        local.release();
+        local.release();
+    }
+    fn anthropic_sse(events: &[serde_json::Value]) -> String {
+        events.iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap())).collect()
+    }
+
+    fn thinking_tool_events() -> Vec<serde_json::Value> {
+        vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":0,"cache_read_input_tokens":11,"cache_creation_input_tokens":13}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"consider "}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"the file"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed-block"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Reading "}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"now."}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call-a","name":"read","input":{}}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"a.rs\"}"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":19}}),
+            json!({"type":"message_stop"}),
+        ]
+    }
+
+    #[test]
+    fn native_anthropic_streams_text_thinking_tools_usage_and_preserves_signed_replay() {
+        let server = fake::serve(vec![Script::Sse(anthropic_sse(&thinking_tool_events()))]);
+        let mut remote = backend(anthropic_endpoint(&server.url));
+        let mut text = Vec::new();
+        let mut events = Vec::new();
+        let reply = remote.chat_with_control_events(None, &request(), 5,
+            Some(&mut |piece| { text.push(piece.to_owned()); true }), &mut |_| {},
+            Arc::new(AtomicBool::new(false)), &mut |event| { events.push(event.clone()); true }).unwrap();
+        assert_eq!(text, ["Reading ", "now."]);
+        assert_eq!(reply.text, "Reading now.");
+        assert_eq!(reply.reasoning, "consider the file");
+        assert_eq!(reply.tool_calls[0].arguments, json!({"path":"a.rs"}));
+        assert_eq!(reply.finish_reason, "tool_calls");
+        assert_eq!((reply.prompt_tokens,reply.completion_tokens), (Some(31),Some(19)));
+        assert_eq!((reply.cached_prompt_tokens,reply.cache_creation_tokens), (Some(11),Some(13)));
+        assert_eq!(events.iter().filter(|e| matches!(e, llm::StreamEvent::Reasoning(_))).count(), 2);
+        assert_eq!(events.iter().filter(|e| matches!(e, llm::StreamEvent::ToolArguments { .. })).count(), 2);
+        let body = fake::body(&server.requests()[0]);
+        assert_eq!(body["stream"], true);
+        let mut req = request();
+        req.messages = vec![llm::assistant_message(&reply), llm::tool_message("call-a", "contents")];
+        let replay = anthropic_request("claude-test", &req).unwrap();
+        assert_eq!(replay["messages"][0]["content"][0]["signature"], "signed-block");
+        assert_eq!(replay["messages"][1]["content"][0]["tool_use_id"], "call-a");
+    }
+
+    #[test]
+    fn native_anthropic_post_response_failures_never_replay_and_cancel_is_typed() {
+        let events = thinking_tool_events();
+        for script in [
+            Script::Sse(anthropic_sse(&events[..events.len()-1])),
+            Script::Sse("data: not-json\n\n".into()),
+            Script::Sse("data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"anth-secret SECRET-PROMPT\"}}\n\n".into()),
+        ] {
+            let server = fake::serve(vec![script]);
+            let mut remote = backend(anthropic_endpoint(&server.url));
+            let error = remote.chat(None, &request(), 5, Some(&mut |_| true)).unwrap_err();
+            assert!(!llm::is_transient(&error));
+            assert!(!error.to_string().contains("anth-secret") && !error.to_string().contains("SECRET-PROMPT"));
+            assert_eq!(server.requests().len(), 1);
+        }
+        let server = fake::serve(vec![Script::Sse(anthropic_sse(&events))]);
+        let mut remote = backend(anthropic_endpoint(&server.url));
+        let error = remote.chat_with_control_events(None, &request(), 5, Some(&mut |_| true), &mut |_| {},
+            Arc::new(AtomicBool::new(false)), &mut |_| false).unwrap_err();
+        assert!(error.downcast_ref::<llm::Interrupted>().is_some());
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn explicit_openai_reasoning_profile_and_cached_usage_reach_wire_and_reply() {
+        use llm::profiles::*;
+        let profile = ModelProfile { provider:"endpoint".into(), model:"gpt-x".into(),
+            capabilities:ModelCapabilities { reasoning:ReasoningApi::OpenaiEffort,
+                reasoning_efforts:vec![ReasoningEffort::High],output_limit:OutputLimit::MaxCompletionTokens,..Default::default() },
+            reasoning_effort:Some(ReasoningEffort::High),max_tokens:Some(4096),..Default::default() };
+        let body = format!("data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"reasoning_content":"reason"},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":80},"completion_tokens_details":{"reasoning_tokens":17}}}));
+        let server = fake::serve(vec![Script::Sse(body)]);
+        let mut remote = backend(endpoint(&server.url)).with_profile(profile);
+        let mut req = request();
+        req.max_tokens = 4096;
+        let reply = remote.chat(None,&req,5,Some(&mut |_| true)).unwrap();
+        assert_eq!(reply.reasoning, "reason");
+        assert_eq!(reply.reasoning_tokens, Some(17));
+        assert_eq!(reply.cached_prompt_tokens, Some(80));
+        let wire = fake::body(&server.requests()[0]);
+        assert_eq!(wire["reasoning_effort"], "high");
+        assert_eq!(wire["max_completion_tokens"],4096);
+        assert!(wire.get("temperature").is_none() && wire.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn native_anthropic_explicit_thinking_effort_and_cache_prefix_are_consumed() {
+        use llm::profiles::*;
+        let profile = ModelProfile { provider:"anthropic".into(),model:"claude-test".into(),
+            capabilities:ModelCapabilities { reasoning:ReasoningApi::AnthropicBudget,reasoning_efforts:vec![ReasoningEffort::High],prompt_cache:true,..Default::default() },
+            thinking:Some(true),thinking_budget:Some(1024),reasoning_effort:Some(ReasoningEffort::High),
+            max_tokens:Some(2048),prompt_cache:true,..Default::default() };
+        let server = fake::serve(vec![fake::json(200,&json!({"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}))]);
+        let mut remote = backend(anthropic_endpoint(&server.url)).with_profile(profile);
+        let mut req = request();
+        req.messages.insert(0,json!({"role":"system","content":"stable prefix"}));
+        req.max_tokens = 2048;
+        remote.chat(None,&req,5,None).unwrap();
+        let wire = fake::body(&server.requests()[0]);
+        assert_eq!(wire["thinking"],json!({"type":"enabled","budget_tokens":1024}));
+        assert_eq!(wire["output_config"]["effort"],"high");
+        assert_eq!(wire["system"][0]["cache_control"]["type"],"ephemeral");
+        assert_eq!(wire["max_tokens"],2048);
+        assert!(wire.get("temperature").is_none());
+    }
+
+    #[test]
+    fn profiled_provider_honors_increased_output_budget_on_next_request() {
+        use llm::profiles::*;
+        for anthropic in [false,true] {
+            let response = |length: bool| if anthropic {
+                fake::json(200,&json!({"content":[{"type":"text","text":"done"}],"stop_reason":if length { "max_tokens" } else { "end_turn" }}))
+            } else {
+                fake::json(200,&json!({"choices":[{"finish_reason":if length { "length" } else { "stop" },"message":{"content":"done"}}]}))
+            };
+            let server = fake::serve(vec![response(true),response(false)]);
+            let profile = ModelProfile { provider:if anthropic { "anthropic" } else { "endpoint" }.into(),
+                model:if anthropic { "claude-test" } else { "gpt-x" }.into(),max_tokens:Some(16),
+                capabilities:ModelCapabilities { output_limit:if anthropic { OutputLimit::MaxTokens } else { OutputLimit::MaxCompletionTokens },..Default::default() },
+                ..Default::default() };
+            let mut remote = backend(if anthropic { anthropic_endpoint(&server.url) } else { endpoint(&server.url) }).with_profile(profile);
+            let mut req = request();
+            req.max_tokens = 16;
+            assert_eq!(remote.chat(None,&req,5,None).unwrap().finish_reason,"length");
+            req.max_tokens = 64;
+            remote.chat(None,&req,5,None).unwrap();
+            let sent = server.requests();
+            let field = if anthropic { "max_tokens" } else { "max_completion_tokens" };
+            assert_eq!(fake::body(&sent[0])[field],16);
+            assert_eq!(fake::body(&sent[1])[field],64);
+        }
+    }
+
+    #[test]
+    fn cache_cost_never_fabricates_missing_discount_prices() {
+        let pricing = llm::catalog::TokenPricing { prompt:1.0,completion:2.0,cache_read:None,cache_write:None };
+        let reply = Reply { prompt_tokens:Some(100),completion_tokens:Some(5),cached_prompt_tokens:Some(80),..Default::default() };
+        assert_eq!(pricing.reply_cost(&reply),None);
+        assert_eq!(llm::catalog::TokenPricing { cache_read:Some(0.1),..pricing }.reply_cost(&reply),Some(38.0));
+    }
+
+    #[test]
+    fn native_anthropic_interrupt_abandons_one_live_stream() {
+        let server = fake::serve(vec![Script::Drip { pause:Duration::from_millis(20),count:100 }]);
+        let mut remote = backend(anthropic_endpoint(&server.url));
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let flag = interrupt.clone();
+        let trigger = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(150)); flag.store(true,Ordering::SeqCst); });
+        let started = Instant::now();
+        let error = remote.chat_with_control(None,&request(),3600,Some(&mut |_| true),&mut |_| {},interrupt).unwrap_err();
+        trigger.join().unwrap();
+        assert!(error.downcast_ref::<llm::Interrupted>().is_some());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(server.requests().len(),1);
+    }
+
+}
+
+#[cfg(test)]
+mod real_server {
+    //! Run with `cargo test --lib provider::real_server -- --ignored --nocapture`.
+    use super::*;
+    use serde_json::json;
+    use std::time::Instant;
+
+    fn python() -> PathBuf {
+        std::env::var_os("DIAL_TEST_PYTHON")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("python/.venv/bin/python"))
+    }
+
+    fn snapshot(repo_dir: &str) -> Option<String> {
+        let home = std::env::var("HOME").ok()?;
+        let snapshots = Path::new(&home).join(".cache/huggingface/hub").join(repo_dir).join("snapshots");
+        let entry = std::fs::read_dir(snapshots).ok()?.next()?.ok()?;
+        entry.path().to_str().map(str::to_string)
+    }
+
+    fn ask(content: &str, tools: Vec<serde_json::Value>, max_tokens: u32) -> Chat {
+        Chat {
+            messages: vec![json!({"role": "user", "content": content})],
+            tools,
+            temperature: 0.0,
+            max_tokens,
+            seed: Some(1),
+        }
+    }
+
+    #[test]
+    #[ignore = "starts the real mlx_lm.server; needs the SmolLM2 snapshot"]
+    fn streams_text_from_the_real_server() {
+        let dir = snapshot("models--mlx-community--SmolLM2-135M-Instruct-8bit").expect("SmolLM2 snapshot");
+        let mut backend = Backend::new(ProviderKind::Local { model_dir: dir }, python(), 180);
+        let request = ask("Say hello in five words.", vec![], 24);
+
+        let plain = backend.chat(None, &request, 120, None).unwrap();
+        let started = Instant::now();
+        let mut first = None;
+        let mut pieces = Vec::new();
+        let mut on_text = |piece: &str| {
+            first.get_or_insert_with(|| started.elapsed());
+            pieces.push(piece.to_string());
+            true
+        };
+        let streamed = backend.chat(None, &request, 120, Some(&mut on_text)).unwrap();
+        println!(
+            "STREAM: {} deltas, first after {:?}, total {:?}, usage {:?}/{:?}, finish {:?}, text {:?}",
+            pieces.len(), first, started.elapsed(), streamed.prompt_tokens, streamed.completion_tokens,
+            streamed.finish_reason, streamed.text
+        );
+        println!("PLAIN:  usage {:?}/{:?}, text {:?}", plain.prompt_tokens, plain.completion_tokens, plain.text);
+        assert!(!pieces.is_empty());
+        assert_eq!(pieces.concat(), streamed.text);
+        assert_eq!(streamed.text, plain.text, "temperature 0 + seed: stream and plain must agree");
+        assert!(streamed.prompt_tokens.is_some() && streamed.completion_tokens.is_some());
+
+        // Abandoning mid-stream must leave the server usable.
+        let mut stop = |_: &str| false;
+        let error = backend.chat(None, &ask("Count to fifty.", vec![], 200), 120, Some(&mut stop)).unwrap_err();
+        assert!(error.downcast_ref::<llm::Interrupted>().is_some(), "{error:#}");
+        let again = backend.chat(None, &request, 120, None).unwrap();
+        assert_eq!(again.text, plain.text);
+        backend.release();
+    }
+
+    #[test]
+    #[ignore = "starts the real mlx_lm.server; needs the Qwen2.5-0.5B snapshot"]
+    fn streams_tool_calls_from_the_real_server() {
+        let Some(dir) = snapshot("models--mlx-community--Qwen2.5-0.5B-Instruct-4bit") else {
+            println!("Qwen2.5-0.5B snapshot not present; skipping");
+            return;
+        };
+        let mut backend = Backend::new(ProviderKind::Local { model_dir: dir }, python(), 180);
+        let tool = json!({"type": "function", "function": {
+            "name": "read_file",
+            "description": "Read a text file from the workspace",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+        }});
+        let request = ask("Please read the file notes.txt", vec![tool], 128);
+        let mut pieces = Vec::new();
+        let mut on_text = |piece: &str| {
+            pieces.push(piece.to_string());
+            true
+        };
+        let started = Instant::now();
+        let streamed = backend.chat(None, &request, 120, Some(&mut on_text)).unwrap();
+        println!("TOOL STREAM ({:?}): text deltas {pieces:?}\n  reply {streamed:?}", started.elapsed());
+        let plain = backend.chat(None, &request, 120, None).unwrap();
+        println!("TOOL PLAIN: {plain:?}");
+        assert_eq!(streamed.tool_calls.len(), plain.tool_calls.len());
+        assert!(!streamed.tool_calls.is_empty(), "no tool call: {streamed:?}");
+        assert_eq!(streamed.tool_calls[0].name, "read_file");
+        assert!(!streamed.tool_calls[0].malformed_arguments);
+        backend.release();
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn remote_silence_limit_preserves_local_worker_allowances() {
+        let make = |kind| Backend::new(kind, PathBuf::new(), 600).with_remote_idle_timeout(90);
+        for kind in [
+            ProviderKind::ChatGpt { model: "test".into(), user_dir: PathBuf::new() },
+            ProviderKind::Endpoint { base_url: "https://example.com/v1".into(), model: "test".into(), api_key: None },
+            ProviderKind::AnthropicEndpoint { base_url: "https://example.com/v1".into(), model: "test".into(), api_key: None },
+        ] {
+            let backend = make(kind);
+            assert_eq!(backend.response_timeout(3600), 90);
+            assert_eq!(backend.response_timeout(30), 30);
+        }
+        for kind in [
+            ProviderKind::Local { model_dir: "local-model".into() },
+            ProviderKind::Endpoint { base_url: "http://127.0.0.1:1234/v1".into(), model: "test".into(), api_key: None },
+        ] { assert_eq!(make(kind).response_timeout(3600), 3600); }
+    }
+
+    #[test]
+    fn subscription_stall_stops_without_retry_or_executing_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project"); std::fs::create_dir(&project).unwrap();
+        let layout = crate::storage::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
+        llm::chatgpt::test_account(&layout.user_dir, false);
+        let overlay: toml::Table = toml::from_str("model='account-model'\nprovider='chatgpt'\napproval='auto'\nintegrations=[]\nremote_model_idle_timeout_secs=1\n[sandbox]\nmode='off'\n[improve]\nenabled=false").unwrap();
+        let config = crate::config::types::Config::load(&layout, Some(overlay)).unwrap();
+        let item = json!({"type":"function_call","namespace":"dial","name":"write","id":"item1","call_id":"call1","status":"completed","arguments":"{\"path\":\"marker.txt\",\"content\":\"must not run\"}"});
+        let first = format!("data: {}\n\ndata: {}\n\n", json!({"type":"response.output_item.added","output_index":0,"item":item}), json!({"type":"response.output_item.done","output_index":0,"item":item}));
+        let server = llm::fake::serve(vec![llm::fake::Script::StallAfter { first, silence: Duration::from_secs(3) }]);
+        let mut backend = crate::agent::make_backend(&config).unwrap();
+        backend.chatgpt_url = Some(server.url.clone());
+        let session = crate::storage::session::Session::create(&layout, crate::storage::session::SessionMeta { model:config.model.clone() }).unwrap();
+        let mut agent = crate::agent::Agent::interactive(&config, backend, layout, session, None, None, Arc::new(AtomicBool::new(false))).unwrap();
+        struct Ui(usize); impl crate::agent::Ui for Ui { fn heartbeat(&mut self) { self.0 += 1; } }
+        let mut ui = Ui(0);
+        let started = Instant::now();
+        let error = agent.turn("Create marker.txt", &mut ui).err().expect("stalled request must fail");
+        assert!(error.to_string().contains("silent"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(2), "remote request inherited the worker allowance");
+        assert!(ui.0 > 0, "the UI must keep pumping while the provider stalls");
+        assert!(!project.join("marker.txt").exists());
+        assert_eq!(server.requests().len(), 1, "a stream stall must not replay the request");
+    }
+
+    #[test]
+    fn subscription_provider_runs_real_agent_tools_and_replays_results() {
+        let temp=tempfile::tempdir().unwrap(); let project=temp.path().join("project"); std::fs::create_dir(&project).unwrap();
+        let layout=crate::storage::paths::Layout::with_user_dir(&project,temp.path().join("home")).unwrap();
+        llm::chatgpt::test_account(&layout.user_dir,false);
+        let overlay:toml::Table=toml::from_str("model='account-model'\nprovider='chatgpt'\napproval='auto'\nintegrations=[]\n[sandbox]\nmode='off'\n[improve]\nenabled=false").unwrap();
+        let config=crate::config::types::Config::load(&layout,Some(overlay)).unwrap();
+        assert_eq!(config.endpoint.as_ref().unwrap().base_url,llm::chatgpt::BASE_URL);
+        let output=json!({"type":"function_call","namespace":"dial","name":"write","id":"item1","call_id":"call1","status":"completed","arguments":"{\"path\":\"marker.txt\",\"content\":\"real output\"}"});
+        let final_output=json!({"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Marker written.","annotations":[]}]});
+        let sse=|out:serde_json::Value,text:&str| format!("data: {}\n\ndata: {}\n\n",json!({"type":"response.output_text.delta","delta":text}),json!({"type":"response.completed","response":{"status":"completed","output":[out],"usage":{"input_tokens":100,"output_tokens":12}}}));
+        let server=llm::fake::serve(vec![llm::fake::Script::Sse(sse(output.clone(),"")),llm::fake::Script::Sse(sse(final_output,"Marker written."))]);
+        let mut backend=Backend::new(ProviderKind::ChatGpt { model:config.model.clone(),user_dir:layout.user_dir.clone() },config.python.clone(),5);
+        backend.chatgpt_url=Some(server.url.clone());
+        let session=crate::storage::session::Session::create(&layout,crate::storage::session::SessionMeta { model:config.model.clone() }).unwrap();
+        let mut agent=crate::agent::Agent::interactive(&config,backend,layout.clone(),session,None,None,Arc::new(AtomicBool::new(false))).unwrap();
+        struct Ui; impl crate::agent::Ui for Ui {}
+        let report=agent.turn("Create marker.txt",&mut Ui).unwrap();
+        assert_eq!(report.outcome,crate::agent::TurnOutcome::Completed); assert_eq!(report.text,"Marker written.");
+        assert_eq!(std::fs::read_to_string(project.join("marker.txt")).unwrap(),"real output");
+        let requests=server.requests(); assert_eq!(requests.len(),2);
+        assert_eq!(llm::fake::header(&requests[0],"authorization").as_deref(),Some("Bearer test-access"));
+        let second=llm::fake::body(&requests[1]);
+        let input=second["input"].as_array().unwrap(); assert!(input.contains(&output));
+        assert!(input.iter().any(|item| item["type"]=="function_call_output"&&item["call_id"]=="call1"));
+        assert!(second["tools"][0]["tools"].as_array().unwrap().iter().any(|tool| tool["name"]=="finish"));
+    }
+}

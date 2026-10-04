@@ -1,0 +1,87 @@
+{
+  "name": "light",
+  "description": "Default light theme",
+  "dark": false,
+  "vars": {
+    "blue": "#2563eb",
+    "cyan": "#0891b2",
+    "purple": "#7c3aed",
+    "green": "#15803d",
+    "red": "#b91c1c",
+    "amber": "#b45309",
+    "gray": "#6b7280",
+    "silver": "#9ca3af",
+    "ink": "#1f2937",
+    "sea": "#0369a1"
+  },
+  "colors": {
+    "text": "",
+    "muted": "gray",
+    "dim": "silver",
+    "accent": "blue",
+    "border": "silver",
+    "borderAccent": "blue",
+    "borderMuted": "#d1d5db",
+    "success": "green",
+    "error": "red",
+    "warning": "amber",
+    "selectedBg": "#dbeafe",
+    "userBg": "#eef2f7",
+    "userText": "#111827",
+    "toolPendingBg": "#f3f4f6",
+    "toolSuccessBg": "#ecfdf5",
+    "toolErrorBg": "#fef2f2",
+    "toolTitle": {
+      "fg": "ink",
+      "bold": true
+    },
+    "toolOutput": "#4b5563",
+    "thinkingText": {
+      "fg": "gray",
+      "italic": true
+    },
+    "mdHeading": {
+      "fg": "#1d4ed8",
+      "bold": true
+    },
+    "mdLink": {
+      "fg": "sea",
+      "underline": true
+    },
+    "mdLinkUrl": "gray",
+    "mdCode": "amber",
+    "mdCodeBlock": "ink",
+    "mdCodeBorder": "silver",
+    "mdQuote": {
+      "fg": "#4b5563",
+      "italic": true
+    },
+    "mdQuoteBorder": "silver",
+    "mdHr": "silver",
+    "mdBullet": "blue",
+    "diffAdded": "green",
+    "diffRemoved": "red",
+    "diffContext": "gray",
+    "thinkOff": "silver",
+    "thinkMinimal": "gray",
+    "thinkLow": "blue",
+    "thinkMedium": "cyan",
+    "thinkHigh": "purple",
+    "thinkXhigh": "red",
+    "shellMode": "cyan",
+    "statusBg": "#e5e7eb",
+    "statusSep": "silver",
+    "statusModel": "purple",
+    "statusPath": "blue",
+    "statusGitClean": "green",
+    "statusGitDirty": "amber",
+    "statusContext": "cyan",
+    "statusTokens": "ink",
+    "statusRate": "sea",
+    "statusApproval": "amber",
+    "statusSandbox": "green",
+    "statusLearning": "purple",
+    "statusSession": "gray",
+    "statusTime": "gray"
+  }
+}
