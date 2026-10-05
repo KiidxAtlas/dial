@@ -1,0 +1,7 @@
+laya==0.3.20
+fastapi==0.141.1
+uvicorn==0.53.0
+torch==2.14.0
+transformers==5.17.0
+huggingface_hub==1.32.0
+safetensors==0.8.0

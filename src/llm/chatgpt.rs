@@ -344,7 +344,7 @@ fn parse_models(value: &Value) -> Result<Vec<super::catalog::ModelEntry>> {
         let slug=row["slug"].as_str().filter(|s| !s.is_empty())?;
         Some(super::catalog::ModelEntry { selection:super::model_config::ModelSelection {
             provider:PROVIDER.into(),model:slug.into(),base_url:Some(BASE_URL.into()),context_window:row["context_window"].as_u64().and_then(|n|u32::try_from(n).ok()).filter(|n|(2048..=1_048_576).contains(n)),..Default::default()
-        },label:row["display_name"].as_str().unwrap_or(slug).into(),source:"ChatGPT plan (access unverified until inference)".into(),available:true,metadata:super::catalog::ModelMetadata { vision:row["input_modalities"].as_array().map(|items|items.iter().any(|item|item=="image")),pricing:None } })
+        },label:row["display_name"].as_str().unwrap_or(slug).into(),source:"ChatGPT plan (access unverified until inference)".into(),available:true,metadata:super::catalog::ModelMetadata { vision:row["input_modalities"].as_array().map(|items|items.iter().any(|item|item=="image")),..Default::default() } })
     }).collect())
 }
 

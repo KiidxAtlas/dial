@@ -344,6 +344,24 @@ impl Keymap {
         crate::storage::settings_store::write_private(&path, toml::to_string_pretty(&table)?.as_bytes())
     }
 
+    /// Apply an editor change only after validation and persistence succeed. The interactive editor
+    /// never takes over another action's chord silently, or removes its own way to save and leave.
+    pub fn edit_and_save(&mut self, user_dir: &Path, action: Action, chords: &[&str]) -> anyhow::Result<()> {
+        let mut next = self.clone();
+        if chords == action.defaults() { next.reset(action); }
+        else { next.rebind(action, chords).map_err(anyhow::Error::msg)?; }
+        for other in Action::ALL.iter().copied().filter(|other| *other != action) {
+            anyhow::ensure!(next.chords(other) == self.chords(other),
+                "Shortcut is used by {}. Edit that action first.", other.describe());
+        }
+        for required in [Action::SelectConfirm, Action::SelectCancel] {
+            anyhow::ensure!(!next.chords(required).is_empty(), "Keep at least one shortcut for {} so panels remain usable.", required.describe());
+        }
+        next.save(user_dir)?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn chords(&self, action: Action) -> &[Chord] {
         self.bindings.iter().find(|(a, _)| *a == action).map(|(_, c)| c.as_slice()).unwrap_or(&[])
     }
@@ -501,6 +519,39 @@ mod tests {
         let (fallback, warnings) = Keymap::load(dir.path());
         assert_eq!(fallback.label(Action::ModelSelect), "Alt+M");
         assert!(warnings.iter().any(|w| w.contains("using default key bindings")));
+    }
+
+    #[test]
+    fn interactive_edits_persist_before_applying_and_reject_collisions_or_lockout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = Keymap::defaults();
+        map.edit_and_save(dir.path(), Action::ModelSelect, &["Ctrl+K"]).unwrap();
+        assert_eq!(map.label(Action::ModelSelect), "Ctrl+K");
+        assert_eq!(Keymap::load(dir.path()).0.label(Action::ModelSelect), "Ctrl+K");
+        let path = dir.path().join("keybindings.toml");
+        let before = fs::read_to_string(&path).unwrap();
+        for (action, chords) in [
+            (Action::HistorySearch, vec!["Ctrl+K"]),
+            (Action::HistorySearch, vec!["Alt+P"]),
+            (Action::SelectConfirm, vec![]),
+            (Action::SelectCancel, vec![]),
+            (Action::ModelSelect, vec!["Ctrl+Banana"]),
+        ] {
+            let old = map.chords(action).to_vec();
+            assert!(map.edit_and_save(dir.path(), action, &chords).is_err());
+            assert_eq!(map.chords(action), old);
+            assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        }
+        map.edit_and_save(dir.path(), Action::HistorySearch, &[]).unwrap();
+        assert!(map.chords(Action::HistorySearch).is_empty());
+        map.edit_and_save(dir.path(), Action::HistorySearch, Action::HistorySearch.defaults()).unwrap();
+        assert!(!map.is_customized(Action::HistorySearch), "restoring defaults clears the modified marker");
+        assert_eq!(Keymap::load(dir.path()).0.label(Action::HistorySearch), "Ctrl+R");
+        assert!(!toml::from_str::<toml::Table>(&fs::read_to_string(&path).unwrap()).unwrap().contains_key(Action::HistorySearch.id()));
+        fs::write(&path, "not valid = [").unwrap();
+        assert!(map.edit_and_save(dir.path(), Action::ModelSelect, &["Ctrl+Y"]).is_err());
+        assert_eq!(map.label(Action::ModelSelect), "Ctrl+K", "failed writes leave live shortcuts unchanged");
+        assert_eq!(fs::read_to_string(path).unwrap(), "not valid = [");
     }
 
     #[test]

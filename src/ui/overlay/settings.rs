@@ -266,12 +266,13 @@ pub(super) mod testkit {
 // Settings panel
 // ---------------------------------------------------------------------------------------------
 
-const PROVIDERS_TAB: &str = "Providers";
-const LINK_SECTION: &str = "Connections";
-/// Rows of the Providers tab: (label, description, application action).
+const PROVIDERS_TAB: &str = "Setup";
+const LINK_SECTION: &str = "Models, connections & controls";
+/// Launchers for dedicated setup panels: (label, description, application action).
 const LINKS: &[(&str, &str, &str)] = &[
     ("Providers & API keys", "Add or remove providers, see which are reachable and manage API keys.", "open:providers"),
-    ("Models & roles", "Choose the main model and the models used for feedback, subagent and compaction roles.", "open:models"),
+    ("Models & roles", "Choose the main model and models for feedback, subagents, compaction, architecture and escalation.", "open:models"),
+    ("Keyboard shortcuts", "Search, edit or restore keyboard controls. Shortcut changes apply to all projects.", "open:shortcuts"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,6 +302,8 @@ pub struct SettingsOverlay {
     search: String,
     mode: Mode,
     pending: BTreeMap<String, Pending>,
+    /// Save feedback is shown only after the controller acknowledges persistence.
+    feedback: Option<String>,
     /// Inline messages under a row (validation errors, hints), by setting path.
     notes: BTreeMap<String, String>,
 }
@@ -381,7 +384,7 @@ impl SettingsOverlay {
         SettingsOverlay {
             effective: values, project: project_values, global: global_values, scope, themes,
             tabs: settings_schema::tabs(), tab: 0, cursor: 0, scroll: 0, page: 8, search: String::new(),
-            mode: Mode::Browse, pending: BTreeMap::new(), notes: BTreeMap::new(),
+            mode: Mode::Browse, pending: BTreeMap::new(), notes: BTreeMap::new(), feedback: None,
         }
     }
 
@@ -396,11 +399,20 @@ impl SettingsOverlay {
     /// The controller's verdict for the last `Set`/`Unset` of `path`.
     pub fn settled(&mut self, path: &str, result: Result<Value, String>) {
         let pending = self.pending.remove(path);
+        self.feedback = None;
         match result {
             Ok(value) => {
                 match pending {
-                    Some(Pending::Set(v, scope)) => settings_schema::set(self.layer(scope), path, v),
-                    Some(Pending::Unset(scope)) => { settings_schema::unset(self.layer(scope), path); }
+                    Some(Pending::Set(v, scope)) => {
+                        settings_schema::set(self.layer(scope), path, v);
+                        self.feedback = Some(if scope == Scope::Global && settings_schema::get(&self.project, path).is_some() {
+                            "Saved globally; this project's override still applies".to_owned()
+                        } else { format!("Saved to {} settings", scope_name(scope)) });
+                    }
+                    Some(Pending::Unset(scope)) => {
+                        settings_schema::unset(self.layer(scope), path);
+                        self.feedback = Some(format!("Removed {} override", scope_name(scope)));
+                    }
                     None => {}
                 }
                 settings_schema::set(&mut self.effective, path, value);
@@ -502,6 +514,7 @@ impl SettingsOverlay {
     }
 
     fn browse_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
+        self.feedback = None;
         if is_ctrl(key, 's') { self.scope = other_scope(self.scope); return OverlayEvent::None; }
         if keys.matches(Action::SelectCancel, key) {
             if self.search.is_empty() { return OverlayEvent::Close; }
@@ -536,7 +549,6 @@ impl SettingsOverlay {
             if self.search.pop().is_some() { self.cursor = 0; self.scroll = 0; }
         } else if let Some(c) = typed_char(key) {
             if self.search.is_empty() && c == ' ' { return self.activate(); }
-            if self.search.is_empty() && c == 's' { self.scope = other_scope(self.scope); return OverlayEvent::None; }
             self.search.push(c);
             self.cursor = 0;
             self.scroll = 0;
@@ -572,6 +584,7 @@ impl SettingsOverlay {
     }
 
     fn emit_set(&mut self, def: &SettingDef, value: Value) -> OverlayEvent {
+        self.feedback = None;
         self.notes.remove(def.path);
         self.pending.insert(def.path.to_owned(), Pending::Set(value.clone(), self.scope));
         OverlayEvent::Set { path: def.path.to_owned(), value, scope: self.scope }
@@ -587,9 +600,12 @@ impl SettingsOverlay {
         match def.kind {
             Kind::Bool => { let next = !current.as_bool().unwrap_or(false); self.emit_set(def, Value::Boolean(next)) }
             Kind::Enum(options) => {
-                let at = options.iter().position(|(v, _)| Some(*v) == current.as_str());
-                let next = options[at.map_or(0, |i| (i + 1) % options.len())].0;
-                self.emit_set(def, Value::String(next.to_owned()))
+                let choices: Vec<String> = options.iter().map(|(value, _)| (*value).to_owned()).collect();
+                if choices.is_empty() { return OverlayEvent::None; }
+                let cursor = choices.iter().position(|c| Some(c.as_str()) == current.as_str()).unwrap_or(0);
+                self.notes.remove(def.path);
+                self.mode = Mode::Pick { def, choices, cursor };
+                OverlayEvent::None
             }
             Kind::Theme => {
                 let mut choices = self.themes.clone();
@@ -651,43 +667,48 @@ impl SettingsOverlay {
         let last = choices.len().saturating_sub(1);
         if keys.matches(Action::SelectCancel, key) {
             self.mode = Mode::Browse;
-            return OverlayEvent::PreviewTheme(None);
+            return if matches!(def.kind, Kind::Theme) { OverlayEvent::PreviewTheme(None) } else { OverlayEvent::None };
         }
         if keys.matches(Action::SelectConfirm, key) {
             let chosen = choices[*cursor].clone();
             let unchanged = self.current(def).as_str() == Some(chosen.as_str());
             self.mode = Mode::Browse;
-            return if unchanged { OverlayEvent::PreviewTheme(None) } else { self.emit_set(def, Value::String(chosen)) };
+            return if unchanged {
+                if matches!(def.kind, Kind::Theme) { OverlayEvent::PreviewTheme(None) } else { OverlayEvent::None }
+            } else { self.emit_set(def, Value::String(chosen)) };
         }
         let moved = if keys.matches(Action::SelectUp, key) { *cursor = if *cursor == 0 { last } else { *cursor - 1 }; true }
             else if keys.matches(Action::SelectDown, key) { *cursor = if *cursor >= last { 0 } else { *cursor + 1 }; true }
             else if keys.matches(Action::SelectPageUp, key) { *cursor = 0; true }
             else if keys.matches(Action::SelectPageDown, key) { *cursor = last; true }
             else { false };
-        if moved { OverlayEvent::PreviewTheme(Some(choices[*cursor].clone())) } else { OverlayEvent::None }
+        if moved && matches!(def.kind, Kind::Theme) { OverlayEvent::PreviewTheme(Some(choices[*cursor].clone())) } else { OverlayEvent::None }
     }
 
     // ---- drawing --------------------------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        let title = title_line(ctx.theme, Sym::IconSettings, "Settings", &format!("{} scope: {}", ctx.theme.sym(Sym::Dot), scope_name(self.scope)));
+        let scope = match self.scope { Scope::Global => "All projects", Scope::Project => "This project" };
+        let title = title_line(ctx.theme, Sym::IconSettings, "Settings", &format!("{} Save to: {scope}  (Ctrl+S)", ctx.theme.sym(Sym::Dot)));
         panel(frame, ctx.theme, title, |w, h| self.compose(w, h, ctx));
     }
 
     fn compose(&mut self, w: u16, h: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
         let (w, h) = (usize::from(w), usize::from(h));
         let theme = ctx.theme;
+        let rows = self.visible();
+        self.cursor = self.cursor.min(rows.len().saturating_sub(1));
+        let cursor_row = rows.get(self.cursor).copied();
+        let appearance = matches!(cursor_row, Some(Row::Setting(i)) if settings_schema::registry()[i].tab == "Appearance");
         let body_min = h.min(3);
         let mut spare = h - body_min;
         let mut grant = || { if spare > 0 { spare -= 1; true } else { false } };
-        let (show_tabs, show_footer, show_preview, show_desc, show_search, show_desc2) =
-            (grant(), grant(), grant(), grant(), grant(), grant());
+        // Keep navigation and search visible before optional details on short terminals.
+        let (show_footer, show_search, show_tabs, show_desc, show_desc2) =
+            (grant(), grant(), grant(), grant(), grant());
+        let show_preview = appearance && grant();
         let body_rows = h - [show_tabs, show_footer, show_preview, show_desc, show_search, show_desc2].iter().filter(|b| **b).count();
-
-        let rows = self.visible();
-        self.cursor = self.cursor.min(rows.len().saturating_sub(1));
         self.page = body_rows.saturating_sub(1).max(1);
-        let cursor_row = rows.get(self.cursor).copied();
 
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(h);
         if show_tabs { lines.push(self.tab_bar(theme, w)); }
@@ -713,7 +734,8 @@ impl SettingsOverlay {
                     if picking.path == def.path && i == self.cursor {
                         let first = cursor.saturating_sub(3).min(choices.len().saturating_sub(7));
                         for (n, name) in choices.iter().enumerate().skip(first).take(7) {
-                            items.push(Item::Choice { name: name.clone(), on: n == *cursor });
+                            if n == *cursor { cursor_item = items.len(); }
+                            items.push(Item::Choice { name: value_text(def, &Value::String(name.clone())), on: n == *cursor });
                         }
                     }
                 }
@@ -725,7 +747,7 @@ impl SettingsOverlay {
         let mut top = cursor_item;
         if top > 0 && matches!(items.get(top - 1), Some(Item::Header(_))) { top -= 1; }
         let mut bottom = cursor_item;
-        while matches!(items.get(bottom + 1), Some(Item::Note(_) | Item::Choice { .. })) { bottom += 1; }
+        while matches!(items.get(bottom + 1), Some(Item::Note(_))) { bottom += 1; }
         if top < self.scroll { self.scroll = top; }
         if bottom >= self.scroll + body_rows { self.scroll = bottom + 1 - body_rows.max(1); }
         self.scroll = self.scroll.min(items.len().saturating_sub(body_rows));
@@ -786,6 +808,10 @@ impl SettingsOverlay {
                 Some(Row::Setting(i)) => {
                     let def = &settings_schema::registry()[i];
                     if matches!(self.mode, Mode::Edit { .. }) { desc.push((input_hint(def.kind), Tok::Muted)); }
+                    else if show_desc2 || self.feedback.is_some() {
+                        let detail = self.feedback.clone().unwrap_or_else(|| format!("{}  |  Using {} value{}", def.path, self.source(def.path), if def.restart { "  |  Restart required" } else { "" }));
+                        desc.push((detail, if self.feedback.is_some() { Tok::Success } else { Tok::Dim }));
+                    }
                     desc.extend(text::wrap_words(def.description, w.saturating_sub(2).max(1)).into_iter().map(|l| (l, Tok::Muted)));
                 }
                 Some(Row::Link(i)) => desc.extend(text::wrap_words(LINKS[i].1, w.saturating_sub(2).max(1)).into_iter().map(|l| (l, Tok::Muted))),
@@ -838,7 +864,7 @@ impl SettingsOverlay {
     fn search_line(&self, theme: &Theme, w: usize) -> Line<'static> {
         let prompt = Span::styled(format!(" {} ", theme.sym(Sym::Prompt)), theme.fg(Tok::Accent));
         let spans = if self.search.is_empty() {
-            vec![prompt, Span::styled("Type to search settings", theme.fg(Tok::Dim))]
+            vec![prompt, Span::styled("Type to search all settings", theme.fg(Tok::Dim))]
         } else {
             vec![prompt, Span::styled(text::one_line(&self.search), theme.fg(Tok::Text)), Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED))]
         };
@@ -946,36 +972,42 @@ impl SettingsOverlay {
     }
 
     fn footer(&self, keys: &Keymap) -> Vec<String> {
+        let pair = |a, b, what| {
+            let label = pair_label(keys, a, b);
+            if label.is_empty() { String::new() } else { format!("{label} {what}") }
+        };
         match &self.mode {
             Mode::Edit { def, .. } => {
                 let numeric = matches!(def.kind, Kind::Int { .. } | Kind::Float { .. });
                 vec![
                     hint(keys, Action::SelectConfirm, "save"),
-                    if numeric { format!("{} adjust", pair_label(keys, Action::SelectUp, Action::SelectDown)) } else { String::new() },
+                    if numeric { pair(Action::SelectUp, Action::SelectDown, "adjust") } else { String::new() },
                     hint(keys, Action::SelectCancel, "cancel"),
                 ]
             }
-            Mode::Pick { .. } => vec![
-                format!("{} preview", pair_label(keys, Action::SelectUp, Action::SelectDown)),
-                hint(keys, Action::SelectConfirm, "select"),
+            Mode::Pick { def, .. } => vec![
+                hint(keys, Action::SelectConfirm, "save"),
+                pair(Action::SelectUp, Action::SelectDown, if matches!(def.kind, Kind::Theme) { "preview" } else { "choose" }),
                 hint(keys, Action::SelectCancel, "cancel"),
             ],
-            Mode::Browse if !self.search.is_empty() => vec![
-                format!("{} move", pair_label(keys, Action::SelectUp, Action::SelectDown)),
-                hint(keys, Action::SelectConfirm, "change"),
-                "Del reset".to_owned(),
-                "Backspace edit search".to_owned(),
-                hint(keys, Action::SelectCancel, "clear search"),
-            ],
-            Mode::Browse => vec![
-                format!("{} change", pair_label(keys, Action::SelectUp, Action::SelectDown)),
-                hint(keys, Action::SectionNext, "jump sections"),
-                format!("{} switch tabs", pair_label(keys, Action::TabPrev, Action::TabNext)),
-                "Type to search".to_owned(),
-                "Ctrl+S scope".to_owned(),
-                "Del reset".to_owned(),
-                hint(keys, Action::SelectCancel, "close"),
-            ],
+            Mode::Browse => {
+                let verb = match self.current_row() {
+                    Some(Row::Link(_)) => "open",
+                    Some(Row::Setting(i)) => match settings_schema::registry()[i].kind {
+                        Kind::Bool => "toggle", Kind::Enum(_) | Kind::Theme => "choose", _ => "edit",
+                    },
+                    None => "select",
+                };
+                vec![
+                    hint(keys, Action::SelectConfirm, verb),
+                    pair(Action::SelectUp, Action::SelectDown, "move"),
+                    pair(Action::TabPrev, Action::TabNext, "tabs"),
+                    hint(keys, Action::SectionNext, "sections"),
+                    "Ctrl+S scope".to_owned(),
+                    "Del inherit".to_owned(),
+                    hint(keys, Action::SelectCancel, if self.search.is_empty() { "close" } else { "clear search" }),
+                ]
+            }
         }
     }
 }
@@ -1018,12 +1050,18 @@ mod tests {
         match event { OverlayEvent::Set { path, value, scope } => (path, value, scope), other => panic!("expected Set, got {other:?}") }
     }
 
+    fn choose_next(o: &mut SettingsOverlay, keys: &Keymap) -> OverlayEvent {
+        assert!(matches!(send(o, keys, key(KeyCode::Enter)), OverlayEvent::None));
+        assert!(matches!(send(o, keys, key(KeyCode::Down)), OverlayEvent::None));
+        send(o, keys, key(KeyCode::Enter))
+    }
+
     #[test]
     fn renders_title_tabs_sections_rows_and_footer() {
         let rig = Rig::new();
         let mut o = overlay();
         let screen = draw(&mut o, &rig, 130, 30);
-        for needle in ["Settings", "scope: global", "Appearance", "Interaction", "Providers", "Status Line", "Separator", "Powerline thin", "Preview: PREVIEW", "Type to search", "Esc close", "Ctrl+S scope"] {
+        for needle in ["Settings", "Save to: All projects", "Appearance", "Interaction", "Setup", "Status Line", "Separator", "Powerline thin", "Preview: PREVIEW", "Type to search", "Esc close", "Ctrl+S scope"] {
             assert!(screen.contains(needle), "missing {needle:?} in\n{screen}");
         }
         assert!(screen.starts_with('╭'), "rounded frame");
@@ -1046,11 +1084,11 @@ mod tests {
         assert!(tips.contains("off") && tips.contains("(modified)") && tips.contains("global"), "{tips}");
         let welcome = line("Welcome banner");
         assert!(welcome.contains("on") && welcome.contains("default") && !welcome.contains("(modified)"), "{welcome}");
-        assert!(screen.contains("scope: project"));
+        assert!(screen.contains("Save to: This project"));
     }
 
     #[test]
-    fn bool_and_enum_cycle_on_enter_and_space_and_wrap() {
+    fn bool_toggles_and_enum_choices_require_confirmation() {
         let rig = Rig::new();
         let mut o = overlay();
         goto(&mut o, &rig.keys, "ui.tips");
@@ -1063,10 +1101,16 @@ mod tests {
         assert_eq!(value, Value::Boolean(true));
 
         goto(&mut o, &rig.keys, "ui.composer_shape");
-        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Enter)), OverlayEvent::None));
+        assert!(draw(&mut o, &rig, 100, 24).contains("Line"));
+        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Down)), OverlayEvent::None));
+        assert!(o.pending.get("ui.composer_shape").is_none(), "browsing must not save");
+        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Esc)), OverlayEvent::None));
+        assert!(matches!(o.mode, Mode::Browse));
+        let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
         assert_eq!(value, Value::String("line".into()));
-        o.settled("ui.composer_shape", Ok(Value::String("line".into())));
-        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        o.settled("ui.composer_shape", Ok(value));
+        let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
         assert_eq!(value, Value::String("box".into()), "wraps around");
     }
 
@@ -1166,28 +1210,24 @@ mod tests {
         // Enter on a search hit acts on that hit, wherever it lives.
         send_all(&mut o, &rig.keys, typed("approval"));
         assert!(matches!(o.visible().first(), Some(Row::Setting(i)) if settings_schema::registry()[*i].path == "approval"));
-        let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        let (path, value, _) = expect_set(choose_next(&mut o, &rig.keys));
         assert_eq!((path.as_str(), value), ("approval", Value::String("auto".into())));
     }
 
     #[test]
-    fn s_toggles_scope_only_when_not_searching_and_ctrl_s_always() {
+    fn search_never_changes_scope_and_ctrl_s_preserves_the_query() {
         let rig = Rig::new();
         let mut o = overlay();
-        goto(&mut o, &rig.keys, "ui.tips");
-        send(&mut o, &rig.keys, ch('s'));
+        send_all(&mut o, &rig.keys, typed("status"));
+        assert_eq!(o.search, "status", "every letter belongs to search");
+        assert_eq!(o.scope, Scope::Global);
+        send(&mut o, &rig.keys, ctrl('s'));
         assert_eq!(o.scope, Scope::Project);
-        assert!(draw(&mut o, &rig, 100, 24).contains("scope: project"));
+        assert_eq!(o.search, "status");
+        assert!(draw(&mut o, &rig, 100, 24).contains("Save to: This project"));
+        goto(&mut o, &rig.keys, "ui.tips");
         let (_, _, scope) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
         assert_eq!(scope, Scope::Project, "later events carry the new scope");
-        send(&mut o, &rig.keys, ctrl('s'));
-        assert_eq!(o.scope, Scope::Global);
-        send(&mut o, &rig.keys, ch('s'));
-        send(&mut o, &rig.keys, ch('e'));
-        assert_eq!(o.search, "e", "after toggling, 's' typed first is scope; later letters search");
-        send(&mut o, &rig.keys, ch('s'));
-        assert_eq!(o.search, "es", "'s' is search text once searching");
-        assert_eq!(o.scope, Scope::Project);
         send(&mut o, &rig.keys, ctrl('s'));
         assert_eq!(o.scope, Scope::Global);
     }
@@ -1197,7 +1237,7 @@ mod tests {
         let rig = Rig::new();
         let mut o = overlay();
         goto(&mut o, &rig.keys, "ui.status");
-        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
         assert_eq!(value, Value::String("minimal".into()));
         o.settled("ui.status", Err("status preset rejected".into()));
         let shown = draw(&mut o, &rig, 120, 30);
@@ -1207,12 +1247,53 @@ mod tests {
         let error_style = style_of(&render(120, 30, |f| { let p = |u: &UiConfig, w| status_preview(u, w); let c = DrawCtx { theme: &rig.theme, keys: &rig.keys, status: &rig.status, preview_status: &p }; o.draw(f, &c) }), "status preset rejected").unwrap();
         assert_eq!(error_style.fg, rig.theme.fg(Tok::Error).fg, "errors use the Error token");
         // The next attempt clears the message; Ok then moves the value.
-        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
         assert_eq!(value, Value::String("minimal".into()));
         assert!(!draw(&mut o, &rig, 120, 30).contains("status preset rejected"));
         o.settled("ui.status", Ok(Value::String("minimal".into())));
+        assert!(draw(&mut o, &rig, 120, 30).contains("Saved to global settings"));
         let row = draw(&mut o, &rig, 120, 30).lines().find(|l| l.contains("Preset")).unwrap().to_owned();
         assert!(row.contains("Minimal") && row.contains("(modified)"), "{row}");
+    }
+
+    #[test]
+    fn saved_scope_feedback_survives_controller_refresh_but_not_navigation() {
+        let rig = Rig::new();
+        let mut o = SettingsOverlay::new(table("[ui]\ntips = true"), table("[ui]\ntips = true"), Table::new(), Scope::Global, vec![]);
+        goto(&mut o, &rig.keys, "ui.tips");
+        expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        assert!(!draw(&mut o, &rig, 100, 24).contains("Saved globally"));
+        o.settled("ui.tips", Ok(Value::Boolean(true)));
+        o.replace_values(o.effective.clone(), o.project.clone(), o.global.clone());
+        assert!(draw(&mut o, &rig, 100, 24).contains("Saved globally; this project's override still applies"));
+        send(&mut o, &rig.keys, key(KeyCode::Down));
+        assert!(!draw(&mut o, &rig, 100, 24).contains("Saved globally"));
+    }
+
+    #[test]
+    fn short_panels_prioritize_search_and_non_appearance_settings_have_no_preview() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        let shown = draw(&mut o, &rig, 60, 8);
+        assert!(shown.contains("Type to search all settings"), "{shown}");
+        assert!(shown.contains("Enter choose") && shown.contains("Esc close"), "{shown}");
+        goto(&mut o, &rig.keys, "sandbox.mode");
+        assert!(!draw(&mut o, &rig, 100, 24).contains("Preview:"));
+    }
+
+    #[test]
+    fn compact_choice_picker_keeps_the_highlighted_option_visible() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        goto(&mut o, &rig.keys, "ui.theme");
+        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        for height in [6, 8, 10, 12] {
+            assert!(draw(&mut o, &rig, 50, height).contains("● dark"), "highlight hidden at height {height}");
+        }
+        send(&mut o, &rig.keys, key(KeyCode::PageDown));
+        for height in [6, 8, 10, 12] {
+            assert!(draw(&mut o, &rig, 50, height).contains("● auto"), "highlight hidden at height {height}");
+        }
     }
 
     #[test]
@@ -1221,13 +1302,13 @@ mod tests {
         let mut o = overlay();
         let seen: RefCell<Vec<UiConfig>> = RefCell::new(Vec::new());
         let preview = |ui: &UiConfig, _w: u16| { seen.borrow_mut().push(ui.clone()); Line::from(format!("sep={:?}", ui.status_separator)) };
-        let mut paint = |o: &mut SettingsOverlay| {
+        let paint = |o: &mut SettingsOverlay| {
             let ctx = DrawCtx { theme: &rig.theme, keys: &rig.keys, status: &rig.status, preview_status: &preview };
             screen(&render(120, 30, |f| o.draw(f, &ctx)))
         };
         assert!(paint(&mut o).contains("sep=PowerlineThin"));
         goto(&mut o, &rig.keys, "ui.status_separator");
-        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
         assert_eq!(value, Value::String("slash".into()), "next after powerline-thin");
         let shown = paint(&mut o);
         assert!(shown.contains("Preview: sep=Slash"), "pending value is previewed before the controller answers\n{shown}");
@@ -1325,7 +1406,9 @@ mod tests {
         send(&mut o, &remapped, ctrl('n'));
         assert_eq!(section(&o), "Symbols");
         let hints = draw(&mut o, &Rig { keys: remapped.clone(), ..Rig::new() }, 140, 30);
-        assert!(hints.contains("Ctrl+K/Ctrl+J change") && hints.contains("Ctrl+N jump sections"), "footer reflects the remap\n{hints}");
+        assert!(hints.contains("Ctrl+K/Ctrl+J move") && hints.contains("Ctrl+N sections"), "footer reflects the remap\n{hints}");
+        assert!(matches!(send(&mut o, &remapped, ctrl('o')), OverlayEvent::None));
+        assert!(matches!(send(&mut o, &remapped, ctrl('j')), OverlayEvent::None));
         match send(&mut o, &remapped, ctrl('o')) {
             OverlayEvent::Set { path, .. } => assert_eq!(path, "ui.symbols"),
             other => panic!("{other:?}"),
@@ -1338,10 +1421,12 @@ mod tests {
         let mut o = overlay();
         send(&mut o, &rig.keys, key(KeyCode::Left));
         let shown = draw(&mut o, &rig, 110, 24);
-        assert!(shown.contains("Providers & API keys") && shown.contains("Models & roles") && shown.contains("Connections"), "{shown}");
+        assert!(shown.contains("Providers & API keys") && shown.contains("Models & roles") && shown.contains("Keyboard shortcuts"), "{shown}");
         match send(&mut o, &rig.keys, key(KeyCode::Enter)) { OverlayEvent::Action(a) => assert_eq!(a, "open:providers"), other => panic!("{other:?}") }
         send(&mut o, &rig.keys, key(KeyCode::Down));
         match send(&mut o, &rig.keys, key(KeyCode::Enter)) { OverlayEvent::Action(a) => assert_eq!(a, "open:models"), other => panic!("{other:?}") }
+        send(&mut o, &rig.keys, key(KeyCode::Down));
+        match send(&mut o, &rig.keys, key(KeyCode::Enter)) { OverlayEvent::Action(a) => assert_eq!(a, "open:shortcuts"), other => panic!("{other:?}") }
     }
 
     #[test]

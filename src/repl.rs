@@ -181,6 +181,9 @@ impl Ui for PrintUi {
         if self.format == OutputFormat::Text { eprintln!("{title}\n{markdown}"); }
         self.event(|| serde_json::json!({"type":"panel","title":title,"markdown":markdown}));
     }
+    fn todo(&mut self, todo: &crate::agent::todo::TodoList) {
+        self.event(|| serde_json::json!({"type":"todo","tasks":todo.snapshot()}));
+    }
     fn text_delta(&mut self, text: &str) {
         if self.format != OutputFormat::Text { self.text.push_str(text); }
         if self.format == OutputFormat::Text { self.terminal.text_delta(text); }

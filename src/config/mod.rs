@@ -126,6 +126,13 @@ impl Config {
             let candidate = Path::new(&config.model);
             if candidate.exists() { config.model = fs::canonicalize(candidate)?.to_string_lossy().into_owned(); }
         }
+        // A named profile is a selector scoped to one exact provider/model. When settings layers or a
+        // CLI/model-picker change leave that selector pointing at another model, ignore the stale
+        // selector and use the normal harness; keep the profile definition for when its model is chosen again.
+        if config.model_profile.as_ref().is_some_and(|name| !config.model_profiles.get(name)
+            .is_some_and(|profile| profile.provider == config.selection().provider && profile.model == config.selection().model)) {
+            config.model_profile = None;
+        }
         config.state_dir = config.learning_dir(layout);
         let grounded = config.state_dir.join("grounded");
         if config.training.train_data.as_os_str().is_empty() { config.training.train_data = grounded.join("train.jsonl"); }
@@ -217,6 +224,8 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.solve.validate()?;
+        self.escalation.validate()?;
         if self.provider.as_deref() == Some(crate::llm::chatgpt::PROVIDER) {
             ensure!(self.endpoint.as_ref().is_none_or(|e| e.base_url == crate::llm::chatgpt::BASE_URL && e.api_key_env.is_none()), "ChatGPT subscription uses official OAuth credentials only");
         }
@@ -225,6 +234,10 @@ impl Config {
         }
         ensure!((1..=86400).contains(&self.worker_timeout_secs), "worker_timeout_secs must be 1..86400");
         ensure!((1..=86400).contains(&self.remote_model_idle_timeout_secs), "remote_model_idle_timeout_secs must be 1..86400");
+        ensure!((1..=86400).contains(&self.reasoning_guard.max_pre_action_secs), "reasoning_guard.max_pre_action_secs must be 1..86400");
+        ensure!((256..=1_048_576).contains(&self.reasoning_guard.max_reasoning_bytes), "reasoning_guard.max_reasoning_bytes must be 256..1048576");
+        ensure!((1024..=24000).contains(&self.codebase.context_max_bytes), "codebase.context_max_bytes must be 1024..24000");
+        self.laya.validate()?;
         ensure!((2048..=1_048_576).contains(&self.context_window), "context_window must be 2048..1048576 tokens");
         ensure!((1..=10000).contains(&self.ui.history_limit), "ui.history_limit must be 1..10000");
         ensure!((1..=50).contains(&self.memory.context_limit) && (256..=24000).contains(&self.memory.context_max_bytes), "invalid memory context bounds");
@@ -243,11 +256,11 @@ impl Config {
         }
         if let Some(name) = &self.model_profile {
             let profile = self.model_profiles.get(name).with_context(|| format!("unknown model profile {name}"))?;
-            let selection = self.selection();
-            ensure!(profile.provider == selection.provider && profile.model == selection.model, "selected model profile does not match active provider/model");
+            ensure!(profile.provider == self.selection().provider && profile.model == self.selection().model,
+                "model_profile {name:?} is stale for the active model; clear it or choose its provider/model");
         }
         for (role, selection) in &self.model_roles {
-            ensure!(["feedback", "subagent", "compaction"].contains(&role.as_str()), "unknown model role: {role}");
+            ensure!(["feedback", "subagent", "compaction", "architecture", "stronger"].contains(&role.as_str()), "unknown model role: {role}");
             ensure!(!selection.model.trim().is_empty(), "model role {role} has no model");
             if selection.provider == crate::llm::chatgpt::PROVIDER {
                 ensure!(selection.base_url.as_deref().is_none_or(|url| url == crate::llm::chatgpt::BASE_URL) && selection.api_key_env.is_none(), "ChatGPT roles use official OAuth credentials only");
@@ -280,6 +293,10 @@ impl Config {
                     && extension.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')),
                 "verification file extensions must be simple language suffixes");
         }
+        ensure!(self.verification.behavioral_checks.len() <= 16
+            && self.verification.behavioral_checks.iter().all(|name|
+                self.verification.commands.iter().filter(|check| &check.name == name).count() == 1),
+            "behavioral_checks must name unique configured verification commands");
         ensure!(i.lora_min_examples >= 1, "lora_min_examples must be positive");
         if let Some(endpoint) = &self.endpoint {
             ensure!(endpoint.base_url.starts_with("http://") || endpoint.base_url.starts_with("https://"), "endpoint.base_url must be http(s)");
@@ -462,5 +479,25 @@ mod memory_migration_tests {
         fs::write(&path,original).unwrap();
         assert!(Config::load(&layout,None).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(),original);
+    }
+    #[test]
+    fn stale_selected_profile_is_ignored_without_deleting_its_definition() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+        let config_path = layout.config_files()[0].clone();
+        fs::write(&config_path, r#"
+provider = "mlx"
+model = "current-model"
+model_profile = "old"
+[model_profiles.old]
+provider = "mlx"
+model = "previous-model"
+max_tokens = 4096
+"#).unwrap();
+        let config = Config::load(&layout, None).unwrap();
+        assert_eq!(config.model_profile, None, "stale profile selector is ignored");
+        assert!(config.model_profiles.contains_key("old"), "profile remains available when switching back");
+        assert_eq!(Config::load(&layout, None).unwrap().model_profile, None);
     }
 }

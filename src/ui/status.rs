@@ -16,10 +16,72 @@ pub enum Phase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum InputMode { #[default] Normal, Shell }
 
+/// Whether the main model can be, or is being, improved with LoRA weight training.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Lora {
+    /// Not known yet (the status has not been read, or mlx-lm is not installed).
+    #[default] Unknown,
+    /// The model cannot take a LoRA adapter here: an external server serves it, or mlx-lm lacks its architecture.
+    Unsupported,
+    /// Compatible, but weight training is disabled in the configuration.
+    Off,
+    /// Compatible and enabled; no adapter has been admitted yet.
+    Ready,
+    /// MLX implements the architecture, but Dial has not verified adapter training targets.
+    Unverified,
+    VerificationQueued,
+    Verifying,
+    /// Accepted version; runtime loading has not been confirmed.
+    Active(i64),
+    Training,
+    Evaluating,
+    Loading,
+    Loaded,
+    Used,
+    Failed,
+}
+
+impl Lora {
+    /// Short status-line label; empty when unknown.
+    pub fn label(self) -> String {
+        match self {
+            Lora::Unknown => String::new(),
+            Lora::Unsupported => "no LoRA".into(),
+            Lora::Off => "LoRA off".into(),
+            Lora::Ready => "LoRA awaiting training".into(),
+            Lora::Unverified => "LoRA unverified".into(),
+            Lora::VerificationQueued => "LoRA waiting for compute".into(),
+            Lora::Verifying => "LoRA verifying".into(),
+            Lora::Active(id) => format!("LoRA accepted v{id}"),
+            Lora::Training => "LoRA training".into(),
+            Lora::Evaluating => "LoRA evaluating".into(),
+            Lora::Loading => "LoRA loading".into(),
+            Lora::Loaded => "LoRA loaded".into(),
+            Lora::Used => "LoRA used on last response".into(),
+            Lora::Failed => "LoRA request failed".into(),
+        }
+    }
+
+    pub fn with_runtime(self, runtime: &crate::llm::provider::AdapterRuntime) -> Self {
+        use crate::llm::provider::AdapterPhase;
+        if matches!(self, Self::Training | Self::Evaluating) { return self; }
+        if runtime.adapter.is_none() { return self; }
+        match runtime.phase {
+            AdapterPhase::Idle => self,
+            AdapterPhase::Loading => Self::Loading,
+            AdapterPhase::Loaded => Self::Loaded,
+            AdapterPhase::Used => Self::Used,
+            AdapterPhase::Failed => Self::Failed,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StatusData {
     pub provider: String,
     pub model: String,
+    /// Configured reasoning level, toggle or provider default; empty if metadata is unavailable.
+    pub thinking: String,
     /// Which role the running request uses (`main`, `subagent`, …); empty when idle on main.
     pub role: String,
     /// Absolute project path; the segment abbreviates `$HOME` to `~`.
@@ -38,6 +100,7 @@ pub struct StatusData {
     /// Admitted version id of the learning loop, if it is active.
     pub version: Option<i64>,
     pub learning: String,
+    pub lora: Lora,
     pub phase: Phase,
     pub elapsed_secs: f64,
     /// What the running turn is doing right now (`thinking`, a tool name, …); empty when unknown.

@@ -138,6 +138,50 @@ impl Checkpoints {
         paths
     }
 
+    /// Capture exact scoped source states for executable repair evidence. Unlike `changed_files`,
+    /// this fails closed on skipped/oversized files. Content-addressed snapshots live outside
+    /// numbered rollback turns, so both failed and repaired source survive undo.
+    pub fn repair_changes(&self, turn: u64) -> Result<Vec<crate::agent::repair_evidence::FileChange>> {
+        use crate::agent::repair_evidence::FileChange;
+        use sha2::{Digest, Sha256};
+        let inner = self.lock();
+        let manifest = inner.current.as_ref().filter(|m| m.turn == turn).context("no matching checkpoint turn")?;
+        ensure!(manifest.skipped.is_empty(), "repair evidence cannot cover skipped checkpoint files");
+        ensure!(manifest.entries.len() <= 128, "repair evidence exceeds 128 scoped files");
+        let base = turn_dir(&self.dir, turn);
+        let snapshots = self.dir.join("repair-evidence");
+        let mut changes = Vec::with_capacity(manifest.entries.len());
+        for (index, entry) in manifest.entries.iter().enumerate() {
+            let before_path = base.join("files").join(index.to_string());
+            let (before_sha256, before_ref) = if entry.existed {
+                let bytes = fs::read(&before_path)?;
+                let digest = format!("{:x}", Sha256::digest(&bytes));
+                let saved = snapshots.join(&digest);
+                if !saved.exists() { atomic_write(&saved, &bytes, 0o600)?; }
+                (Some(digest), Some(saved.to_string_lossy().into_owned()))
+            } else { (None, None) };
+            let (target, _) = self.resolve(&self.root.join(&entry.rel))?;
+            let (after_sha256, after_ref) = match fs::metadata(&target) {
+                Ok(metadata) => {
+                    ensure!(metadata.is_file() && metadata.len() <= MAX_FILE_BYTES, "repair evidence cannot snapshot {}", entry.rel);
+                    let bytes = fs::read(&target)?;
+                    ensure!(bytes.len() as u64 <= MAX_FILE_BYTES, "repair snapshot grew beyond file limit");
+                    let digest = format!("{:x}", Sha256::digest(&bytes));
+                    let saved = snapshots.join(&digest);
+                    if !saved.exists() { atomic_write(&saved, &bytes, 0o600)?; }
+                    (Some(digest), Some(saved.to_string_lossy().into_owned()))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+                Err(error) => return Err(error.into()),
+            };
+            changes.push(FileChange {
+                path: entry.rel.clone(), before_sha256, after_sha256,
+                before_ref, after_ref,
+            });
+        }
+        Ok(changes)
+    }
+
     /// Record `abs` as it is now, unless this turn already did. Must be called BEFORE the file is
     /// changed or deleted. A path outside the project root is an error (the write must not
     /// proceed); a file over `MAX_FILE_BYTES` is not recorded but only warned about, see `warnings`.
@@ -358,6 +402,42 @@ mod tests {
         checkpoint.before_write(&fixture.path("README.md")).unwrap();
         assert!(checkpoint.changed_files(first).is_empty());
         assert_eq!(checkpoint.changed_files(second), vec!["README.md"]);
+    }
+
+    #[test]
+    fn repair_sources_are_exact_and_survive_further_edits_and_rollback() {
+        let fixture = Fixture::new();
+        let checkpoint = fixture.open();
+        fixture.write("src/lib.rs", "original");
+        let turn = checkpoint.begin_turn("repair").unwrap();
+        modify(&checkpoint, &fixture, "src/lib.rs", "failing");
+        let failure = checkpoint.repair_changes(turn).unwrap();
+        modify(&checkpoint, &fixture, "src/lib.rs", "passing");
+        let pass = checkpoint.repair_changes(turn).unwrap();
+        assert_ne!(failure[0].after_sha256, pass[0].after_sha256);
+        assert_eq!(failure[0].before_sha256, pass[0].before_sha256);
+        checkpoint.rollback(1).unwrap();
+        assert_eq!(fs::read_to_string(failure[0].before_ref.as_ref().unwrap()).unwrap(), "original");
+        assert_eq!(fs::read_to_string(failure[0].after_ref.as_ref().unwrap()).unwrap(), "failing");
+        assert_eq!(fs::read_to_string(pass[0].after_ref.as_ref().unwrap()).unwrap(), "passing");
+        assert!(checkpoint.list().is_empty());
+    }
+
+    #[test]
+    fn repair_sources_represent_creation_and_deletion() {
+        let fixture = Fixture::new();
+        let checkpoint = fixture.open();
+        let turn = checkpoint.begin_turn("create").unwrap();
+        modify(&checkpoint, &fixture, "new.rs", "new");
+        let created = checkpoint.repair_changes(turn).unwrap();
+        assert_eq!(created[0].before_sha256, None);
+        assert_eq!(created[0].before_ref, None);
+        assert!(created[0].after_ref.is_some());
+        fs::remove_file(fixture.path("new.rs")).unwrap();
+        let removed = checkpoint.repair_changes(turn).unwrap();
+        assert_eq!(removed[0].after_sha256, None);
+        assert_eq!(removed[0].after_ref, None);
+        assert!(checkpoint.repair_changes(turn + 1).is_err());
     }
 
     /// Mimic a tool: record, then mutate.

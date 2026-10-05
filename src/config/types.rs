@@ -196,6 +196,9 @@ pub struct Config {
     pub worker_timeout_secs: u64,
     /// Silence limit for remote model responses, independent of long local workers.
     pub remote_model_idle_timeout_secs: u64,
+    pub reasoning_guard: ReasoningGuardConfig,
+    pub codebase: CodebaseConfig,
+    pub laya: crate::agent::laya::Config,
     pub context_window: u32,
     pub harness: Harness,
     pub gate: Option<GateConfig>,
@@ -218,6 +221,10 @@ pub struct Config {
     pub dap: BTreeMap<String, crate::tools::dap::DapAdapterConfig>,
     pub web: WebConfig,
     pub verification: VerificationConfig,
+    /// Bounded isolated patch search. Requires explicit paths and executable checks.
+    pub solve: crate::agent::solve::SolveConfig,
+    /// Narrow stronger-model advice; remote providers require explicit operator opt-in.
+    pub escalation: crate::agent::solve::EscalationConfig,
     pub browser: crate::tools::browser::BrowserConfig,
     pub kernel: crate::tools::kernel::KernelConfig,
     pub memory: MemoryConfig,
@@ -268,10 +275,13 @@ pub struct VerificationConfig {
     pub enabled: bool,
     pub repair_attempts: u8,
     pub commands: Vec<VerificationCommand>,
+    /// Names of configured commands that check behavioral correctness, not only syntax or buildability.
+    /// Explicit operator declaration; only failing-before/passing-after runs qualify as repair evidence.
+    pub behavioral_checks: Vec<String>,
 }
 
 impl Default for VerificationConfig {
-    fn default() -> Self { Self { enabled: true, repair_attempts: 1, commands: Vec::new() } }
+    fn default() -> Self { Self { enabled: true, repair_attempts: 1, commands: Vec::new(), behavioral_checks: Vec::new() } }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +297,34 @@ pub struct VerificationCommand {
 }
 
 fn default_verification_timeout() -> u64 { 120 }
+
+/// Operator-owned limits; harness improvement cannot increase them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReasoningGuardConfig {
+    pub enabled: bool,
+    pub max_pre_action_secs: u64,
+    /// Bytes of streamed reasoning, not an estimate of hidden reasoning tokens.
+    pub max_reasoning_bytes: usize,
+}
+
+impl Default for ReasoningGuardConfig {
+    fn default() -> Self {
+        Self { enabled: true, max_pre_action_secs: 60, max_reasoning_bytes: 16384 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CodebaseConfig {
+    pub enabled: bool,
+    pub context_max_bytes: usize,
+    /// Build a bounded architecture synthesis after successful interactive turns.
+    pub synthesize_architecture: bool,
+}
+impl Default for CodebaseConfig {
+    fn default() -> Self { Self { enabled: true, context_max_bytes: 8000, synthesize_architecture: true } }
+}
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,12 +347,16 @@ impl Default for Config {
             model_profiles: BTreeMap::new(), model_profile: None,
             worker_timeout_secs: 3600, context_window: 32768,
             remote_model_idle_timeout_secs: 180,
+            reasoning_guard: ReasoningGuardConfig::default(),
+            codebase: CodebaseConfig::default(),
+            laya: Default::default(),
             harness: Harness::default(), gate: None, training: TrainingConfig::default(), improve: ImproveConfig::default(),
             approval: Approval::default(), sandbox: SandboxConfig::default(), edit_mode: EditModeConfig::default(),
             tools: BTreeMap::new(), subagents: BTreeMap::new(),
             integrations: vec!["bg".into(), "web_fetch".into(), "web_search".into(), "lsp".into(), "ast_search".into(), "ast_edit".into(), "dap".into()],
             mcp: BTreeMap::new(), lsp: BTreeMap::new(), dap: BTreeMap::new(), web: WebConfig::default(),
             verification: VerificationConfig::default(),
+            solve: Default::default(), escalation: Default::default(),
             browser: Default::default(), kernel: Default::default(), memory: Default::default(),
         }
     }

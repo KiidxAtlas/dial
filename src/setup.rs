@@ -10,6 +10,16 @@ use std::path::Path;
 const WORKER: &str = include_str!("../python/dial_worker.py");
 const PYPROJECT: &str = include_str!("../python/pyproject.toml");
 
+/// Keep the managed worker aligned with the binary without reinstalling Python packages.
+/// Explicit custom worker paths are never replaced.
+pub(crate) fn refresh_worker(config: &Config) -> Result<()> {
+    let managed = config.user_dir.join("python/dial_worker.py");
+    if config.worker == managed && std::fs::read(&managed).ok().as_deref() != Some(WORKER.as_bytes()) {
+        settings_store::write_private(&managed, WORKER.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// Install only the private Python runtime. Capture installer output rather than writing into a TUI.
 pub fn ensure_runtime(layout: &Layout) -> Result<()> {
     let dir = layout.user_dir.join("python");
@@ -43,4 +53,24 @@ pub fn run(layout: &Layout, model: Option<&str>) -> Result<()> {
     ensure!(caps["inference"] == true, "model is not supported: {}", caps["reason"]);
     println!("ready: {}\nlora: {}", config.model, caps["lora"]);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn upgrades_managed_worker_without_touching_custom_workers() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.user_dir = root.path().to_owned();
+        std::fs::create_dir(root.path().join("python")).unwrap();
+        config.worker = root.path().join("python/dial_worker.py");
+        std::fs::write(&config.worker, "old worker").unwrap();
+        refresh_worker(&config).unwrap();
+        assert_eq!(std::fs::read_to_string(&config.worker).unwrap(), WORKER);
+        config.worker = root.path().join("custom.py");
+        std::fs::write(&config.worker, "custom worker").unwrap();
+        refresh_worker(&config).unwrap();
+        assert_eq!(std::fs::read_to_string(&config.worker).unwrap(), "custom worker");
+    }
 }

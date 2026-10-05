@@ -18,6 +18,10 @@ pub enum Cmd {
     /// Explicit external verdict; an unscored answer is not a success or a failure.
     Outcome { trajectory: i64, #[arg(long)] score: f64, #[arg(long)] source: String, #[arg(long)] reference: Option<String> },
     Diagnose,
+    /// Register an immutable repository exercise from an explicit manifest.
+    RegisterTask { manifest: PathBuf, #[arg(long)] trajectory: Option<i64> },
+    /// List registered training/evaluation snapshots.
+    Tasks,
     Propose { file: PathBuf },
     Train,
     Harvest,
@@ -25,6 +29,10 @@ pub enum Cmd {
     Cycle,
     Watch { #[arg(long, default_value_t = 10)] poll_secs: u64 },
     Status,
+    /// Show improvement jobs for every model in this project and the shared compute lock.
+    Jobs,
+    /// Request a safe stop and pause future cycles for a model state ID from jobs.
+    Stop { state_id: String },
     Versions,
     Rollback,
     /// Enable automatic background cycles for this project.
@@ -37,6 +45,8 @@ pub enum Cmd {
 
 pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
     if let Cmd::Background { request } = cmd { return auto::background(&request); }
+    if matches!(cmd, Cmd::Jobs) { return print_json(&auto::jobs(layout)?); }
+    if let Cmd::Stop { state_id } = &cmd { return print_json(&auto::request_stop(layout, state_id)?); }
     auto::prepare_state(layout)?;
     config.require_model()?;
     let store = Store::open(&config.state_dir, &config.model, &config.use_case, &config.harness)?;
@@ -45,12 +55,15 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
         Cmd::Background { .. } => unreachable!(),
         Cmd::Enable | Cmd::Disable => {
             let enabled = matches!(cmd, Cmd::Enable);
+            if enabled { auto::resume(&config.state_dir)?; }
             store.set_meta("auto_enabled", if enabled { "true" } else { "false" })?;
             print_json(&json!({"enabled":enabled,"configured":config.improve.enabled}))?;
             if enabled { auto::maybe_spawn(layout, &config, &store)?; }
         }
         Cmd::Status => print_json(&json!({
             "active":store.active()?, "automatic":auto::enabled(&config, &store)?, "due":auto::due(&config, &store)?,
+            "task_profiles":meta_json(&store,&format!("task_profiles:{}",store.active()?.id))?,
+            "jobs":auto::jobs(layout)?,"progress":meta_json(&store,"cycle_progress")?,
             "scheduler":meta_json(&store,"auto_status")?,"last_cycle":meta_json(&store,"last_cycle_report")?,
             "metrics":store.metrics()?,"capabilities":meta_json(&store,"serving_capabilities")?,
             "layer_sensitivity":meta_json(&store,"layer_sensitivity")?,
@@ -58,6 +71,16 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
             "last_rollback":store.get_meta("last_rollback")?,"state_dir":config.state_dir,
             "unavailable":["expert_growth","routing_calibration","attention_retrofit","hidden_state_neural_probe"]
         }))?,
+        Cmd::RegisterTask { manifest, trajectory } => {
+            let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
+            control.try_lock_exclusive().context("an improvement cycle is using the task registry")?;
+            let task = match trajectory {
+                Some(id) => dial::learn::repository::register_repair(&config,&store,&manifest,id)?,
+                None => dial::learn::repository::register(&config,&manifest)?,
+            };
+            print_json(&json!({"id":task.spec.id,"split":task.spec.split,"digest":task.digest}))?;
+        }
+        Cmd::Tasks => print_json(&dial::learn::repository::load(&config)?.iter().map(|t|json!({"id":t.spec.id,"split":t.spec.split,"digest":t.digest,"files":t.files.len()})).collect::<Vec<_>>())?,
         Cmd::Versions => print_json(&store.versions()?)?,
         Cmd::Outcome { trajectory, score, source, reference } => {
             store.outcome(&Outcome { trajectory, score, source, reference })?;

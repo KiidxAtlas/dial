@@ -49,12 +49,23 @@ pub fn schema() -> Value {
     }})
 }
 
+/// Every task still owed, blocked ones with their reason: what `finish completed` refuses to leave behind.
 pub fn open_work(todo: &TodoList) -> String {
-    todo.tasks().iter().enumerate().filter(|(_, task)| matches!(task.status, Status::Pending | Status::InProgress))
-        .map(|(index, task)| format!("- {}. {}", index + 1, task.content)).collect::<Vec<_>>().join("\n")
+    lines(todo, Status::is_open)
 }
 
-pub enum StopAction { Accept, Continue(String), Incomplete(String) }
+/// Tasks the agent can act on now: pending or in progress.
+fn actionable_work(todo: &TodoList) -> String {
+    lines(todo, |status| matches!(status, Status::Pending | Status::InProgress))
+}
+
+fn lines(todo: &TodoList, keep: impl Fn(Status) -> bool) -> String {
+    todo.tasks().iter().enumerate().filter(|(_, task)| keep(task.status))
+        .map(|(index, task)| format!("- {}", task.label(index + 1))).collect::<Vec<_>>().join("\n")
+}
+
+/// `Blocked` carries the blocker list: every open task is blocked, so stopping is the honest outcome.
+pub enum StopAction { Accept, Continue(String), Blocked(String), Incomplete(String) }
 
 #[derive(Default)]
 pub struct CompletionGuard {
@@ -75,8 +86,11 @@ impl CompletionGuard {
     }
 
     pub fn stopped(&mut self, todo: &TodoList) -> StopAction {
-        let work = open_work(todo);
-        if work.is_empty() { return StopAction::Accept; }
+        let work = actionable_work(todo);
+        if work.is_empty() {
+            let blocked = open_work(todo);
+            return if blocked.is_empty() { StopAction::Accept } else { StopAction::Blocked(format!("Blocked tasks:\n{blocked}")) };
+        }
         if self.reminders >= MAX_REMINDERS || (self.reminders > 0 && !self.progress) {
             return StopAction::Incomplete(format!(
                 "Stopped with unfinished work: the model did not close its todos after bounded continuation.\n{work}\n\nContinue with a concrete next action, or report a blocker or question with finish."
@@ -85,7 +99,7 @@ impl CompletionGuard {
         self.reminders += 1;
         self.progress = false;
         StopAction::Continue(format!(
-            "You stopped with unfinished todo items:\n{work}\n\nContinue the authorized work through tools and keep todos current. Mark tasks completed only after doing and checking them. If genuinely blocked or waiting for user input, use finish (when offered) with outcome=blocked or needs_input and a concrete reason. Do not merely promise to continue. Reminder {}/{MAX_REMINDERS}.", self.reminders
+            "You stopped with unfinished todo items:\n{work}\n\nContinue the authorized work through tools and keep todos current. Mark tasks done only after doing and checking them. If a task is genuinely blocked, mark it with todo op=block and a concrete reason, then carry on with the rest; if waiting for user input, use finish (when offered) with outcome=needs_input and a concrete reason. Do not merely promise to continue. Reminder {}/{MAX_REMINDERS}.", self.reminders
         ))
     }
 
@@ -139,6 +153,17 @@ mod tests {
         guard.observe(&call, true, false);
         assert!(matches!(guard.stopped(&todo), StopAction::Incomplete(_)));
         assert!(matches!(guard.stopped(&TodoList::default()), StopAction::Accept));
+    }
+
+    #[test]
+    fn stopping_with_only_blocked_tasks_reports_the_blockers() {
+        let mut todo = todo();
+        assert!(!todo.call(&json!({"op":"block","reason":"needs the staging password"})).is_error);
+        match CompletionGuard::default().stopped(&todo) {
+            StopAction::Blocked(text) => assert!(text.contains("1. write code (blocked: needs the staging password)"), "{text}"),
+            _ => panic!("only blocked work remains"),
+        }
+        assert!(open_work(&todo).contains("write code"), "finish completed must still refuse blocked work");
     }
 
     #[test]

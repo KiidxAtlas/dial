@@ -262,6 +262,74 @@ pub fn informative(p: &StepProbe) -> bool {
     p.auc >= 0.6 && p.trained_on >= 100
 }
 
+/// Observation-only workflow hypotheses from active-version runs. These aggregate counters are
+/// not verifier labels and never establish that a candidate is better; the sealed gate does that.
+pub fn workflow_evidence(recent: &Value, version: i64) -> super::workflow::Evidence {
+    let mut evidence = super::workflow::Evidence { source_version: version, ..Default::default() };
+    for row in recent.as_array().into_iter().flatten() {
+        if row["version"].as_i64() != Some(version) { continue; }
+        let Some(events) = row["events"].as_array().filter(|events| !events.is_empty()) else { continue };
+        let mut metrics = super::workflow::Metrics::default();
+        for event in events {
+            let kind = event["kind"].as_str().unwrap_or("");
+            let data = &event["data"];
+            metrics.observe(kind, data);
+            if kind == "tool_form_failure" {
+                let kind = data["kind"].as_str().unwrap_or("unknown");
+                // Bound recorded keys; arbitrary payloads cannot expand metadata or instructions.
+                let kind = if FORM_KINDS.contains(&kind) { kind } else { "unknown" };
+                *evidence.failure_kinds.entry(kind.to_owned()).or_default() += 1;
+            }
+        }
+        evidence.observed.add(&metrics);
+        evidence.trajectories += 1;
+        evidence.protocol_trajectories += usize::from(metrics.protocol_errors > 0);
+        let other_calls = metrics.tool_calls.saturating_sub(metrics.investigation_calls);
+        evidence.investigation_trajectories += usize::from(
+            metrics.investigation_calls >= 8 && metrics.investigation_calls >= other_calls.saturating_mul(2));
+    }
+    evidence
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::workflow_evidence;
+    use serde_json::json;
+
+    #[test]
+    fn workflow_hypotheses_require_distinct_active_version_trajectories() {
+        let protocol = json!({"kind":"tool_form_failure","data":{"kind":"schema"}});
+        let read = json!({"kind":"tool_call","data":{"name":"read"}});
+        let mut events = vec![read; 8];
+        events.extend(vec![protocol.clone(); 5]);
+        let observations = json!([
+            {"version":7,"events":events},
+            {"version":6,"events":[protocol.clone()]},
+            {"version":7,"events":[protocol]},
+            {"version":7,"events":[]}
+        ]);
+        let result = workflow_evidence(&observations, 7);
+        assert_eq!(result.trajectories, 2);
+        assert_eq!(result.protocol_trajectories, 2);
+        assert_eq!(result.investigation_trajectories, 1);
+        assert_eq!(result.failure_kinds.get("schema"), Some(&6));
+        assert_eq!(result.observed.protocol_errors, 6);
+        assert_eq!(result.observed.tool_calls, 8);
+    }
+
+    #[test]
+    fn malformed_events_do_not_become_recurring_investigation() {
+        let result = workflow_evidence(&json!([
+            {"version":1,"events":[{},{"kind":"generation","data":{"tool_calls":"bad"}}]},
+            {"version":1,"events":"bad"},
+            {"events":[{"kind":"tool_form_failure"}]}
+        ]), 1);
+        assert_eq!(result.trajectories, 1);
+        assert_eq!(result.investigation_trajectories, 0);
+        assert_eq!(result.protocol_trajectories, 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

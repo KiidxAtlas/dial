@@ -196,7 +196,7 @@ fn valid_name(name: &str) -> bool {
 /// Read up to `max` bytes of a regular file without following a symlink at the final component.
 /// Returns the bytes and whether the file was longer.
 fn read_head(path: &Path, max: usize) -> std::io::Result<(Vec<u8>, bool)> {
-    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
@@ -214,6 +214,9 @@ fn is_real_dir(path: &Path) -> bool {
 fn is_real_file(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
 }
+
+pub mod import;
+pub mod management;
 
 /// A project skills directory must not lead outside the project (e.g. via a symlinked `.dial`).
 fn root_is_safe(layout: &Layout, scope: Scope, root: &Path) -> bool {
@@ -247,7 +250,7 @@ fn load_skill(dir: &Path, scope: Scope) -> Option<Skill> {
 
 /// All valid skills, sorted by name. Project skills shadow user skills of the same name. Entries
 /// that are symlinks, lack a valid `SKILL.md`, or declare a different `name` are skipped.
-pub fn discover(layout: &Layout) -> Vec<Skill> {
+pub fn discover_all(layout: &Layout) -> Vec<Skill> {
     let mut skills: Vec<Skill> = Vec::new();
     for scope in [Scope::Project, Scope::User] {
         let root = scope.root(layout);
@@ -264,6 +267,12 @@ pub fn discover(layout: &Layout) -> Vec<Skill> {
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
+}
+
+/// Only enabled skills are exposed to the model and slash-command completion.
+pub fn discover(layout: &Layout) -> Vec<Skill> {
+    management::installed(layout).unwrap_or_default().into_iter()
+        .filter_map(|(skill, enabled)| enabled.then_some(skill)).collect()
 }
 
 /// The system-prompt catalog: one `- name: description` line per skill, within a size budget.

@@ -94,6 +94,15 @@ static FAMILIES: &[Family] = &[
     guard("unit_convert", unit_convert),
     guard("day_math", day_math),
     guard("direct_facts", direct_facts),
+    // Append only: existing frozen anchor slots must not change.
+    tool("config_precedence", Split::Train, config_precedence),
+    tool("negative_search", Split::Train, negative_search),
+    tool("semantic_validation", Split::Train, semantic_validation),
+    tool("config_layers", Split::Gate, config_layers),
+    tool("search_recovery", Split::Gate, search_recovery),
+    tool("semantic_boundaries", Split::Gate, semantic_boundaries),
+    tool("repository_contract", Split::Train, repository_contract),
+    tool("repository_validation", Split::Gate, repository_validation),
 ];
 
 pub fn families() -> Vec<FamilyInfo> {
@@ -162,6 +171,18 @@ pub fn generate_targeted(role: Role, n: usize, seed: u64, priorities: &[String])
     let rotation = (mix(&[seed, 0xA11CE]) % train.len().max(1) as u64) as usize;
     fill_round_robin(&train, rotation, n.saturating_sub(out.len()), 0, [seed, Role::SelfPlay as u64], &mut seen, &mut out);
     out
+}
+
+/// Sealed transfer tests for the targeted failure families. Selection never depends on observed
+/// gate scores or practice priorities, and these contracts cannot enter self-play.
+pub fn generate_failure_holdout(n: usize, seed: u64) -> Vec<Task> {
+    let families = FAMILIES.iter().filter(|family|
+        matches!(family.name, "config_layers" | "search_recovery" | "semantic_boundaries"))
+        .collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    let mut tasks = Vec::with_capacity(n);
+    fill_round_robin(&families, 0, n, 0, [seed, 0xFA11_401D], &mut seen, &mut tasks);
+    tasks
 }
 
 
@@ -293,8 +314,162 @@ fn lines_text(lines: &[String]) -> String {
     s
 }
 
+// These failure-targeted families use only generated data. Train and held-out variants have
+// distinct contracts and module namespaces; recorded user code and gate prompts are never inputs.
+fn config_precedence(rng: &mut StdRng) -> Task { configuration_task(rng, false) }
+fn config_layers(rng: &mut StdRng) -> Task { configuration_task(rng, true) }
+
+fn configuration_task(rng: &mut StdRng, held_out: bool) -> Task {
+    let family = if held_out { "config_layers" } else { "config_precedence" };
+    let module = format!("{family}_{}", int(rng, 1000, 999999));
+    let key = pick(rng, WORDS);
+    let fallback = int(rng, 10, 99);
+    let low = int(rng, 100, 199);
+    let high = int(rng, 200, 299);
+    let (contract, buggy) = if held_out {
+        ("Layers are ordered highest priority first. Return the first layer containing the key. A present null explicitly clears the value; false, zero and empty strings also override. Only an absent key falls through to the fallback.",
+         "    for layer in reversed(layers):\n        if key in layer:\n            return layer[key]\n    return fallback\n")
+    } else {
+        ("Layers are ordered lowest priority first. Return the last non-null value for the key. Missing keys and null inherit; false, zero and empty strings are explicit overrides. If no layer supplies a value, return the fallback.",
+         "    value = fallback\n    for layer in layers:\n        value = layer.get(key) or value\n    return value\n")
+    };
+    let visible = json!([{key:low}, {key:0}]);
+    let cases = vec![
+        (visible.clone(), json!(if held_out { low } else { 0 })),
+        (json!([{key:low}, {key:high}]), json!(if held_out { low } else { high })),
+        (json!([{key:null}, {key:high}]), if held_out { Value::Null } else { json!(high) }),
+        (json!([{key:low}, {key:null}]), json!(low)),
+        (json!([{key:false}]), json!(false)),
+        (json!([{key:""}]), json!("")),
+        (json!([{}, {"unrelated": high}]), json!(fallback)),
+        (json!([]), json!(fallback)),
+    ];
+    let source = format!("def resolve(layers, key, fallback):\n    \"\"\"{contract}\"\"\"\n{buggy}");
+    let probes = cases.iter().map(|(layers, _)|
+        format!("print(json.dumps(m.resolve(json.loads({:?}), {:?}, {fallback}), sort_keys=True))", layers.to_string(), key))
+        .collect::<Vec<_>>().join("\n");
+    let expected = cases.iter().map(|(_, expected)| expected.to_string()).collect::<Vec<_>>().join("\n");
+    task(family, format!("Fix resolve in {module}.py. {contract} For example, layers {visible}, key {key:?}, fallback {fallback}. Correct precedence must hold on other inputs too."),
+        vec![(format!("{module}.py"), source)],
+        python_check(&module, &format!("import json\n{probes}"), expected))
+}
+
+fn negative_search(rng: &mut StdRng) -> Task { search_task(rng, false) }
+fn search_recovery(rng: &mut StdRng) -> Task { search_task(rng, true) }
+
+fn search_task(rng: &mut StdRng, held_out: bool) -> Task {
+    let family = if held_out { "search_recovery" } else { "negative_search" };
+    let module = format!("{family}_{}", int(rng, 1000, 999999));
+    let token = format!("{}{}", pick(rng, WORDS), int(rng, 100, 999));
+    let missing = format!("absent_{}", int(rng, 1000, 9999));
+    let root = format!("records_{}", int(rng, 1000, 9999));
+    let text = format!("ordinary entry\n{token}\n");
+    let (contract, pattern, buggy) = if held_out {
+        ("Search recursively in .txt files only, with case-insensitive literal substring matching.",
+         "**/*.txt",
+         "    try:\n        return sorted(str(p.relative_to(root)) for p in root.glob('**/*') if p.is_file() and needle in p.read_text())\n    except OSError:\n        return []\n")
+    } else {
+        ("Search only immediate .txt files (not subdirectories), with case-sensitive literal substring matching.",
+         "*.txt",
+         "    try:\n        return sorted(str(p.relative_to(root)) for p in root.glob('*.txt') if needle in p.read_text())\n    except OSError:\n        return []\n")
+    };
+    let source = format!("from pathlib import Path\n\ndef search(directory, needle):\n    root = Path(directory)\n{buggy}");
+    let matching = if held_out { vec!["entry.txt", "nested/entry.txt"] } else { vec!["entry.txt"] };
+    let query = if held_out { token.to_uppercase() } else { token.clone() };
+    let probes = format!(
+        "import json\nprint(json.dumps(m.search({root:?}, {query:?})))\nprint(json.dumps(m.search({root:?}, {missing:?})))\ntry:\n    m.search({missing:?}, {query:?})\nexcept FileNotFoundError:\n    print(\"missing-root\")\nelse:\n    print(\"incorrect-empty-success\")\ntry:\n    m.search({file:?}, {query:?})\nexcept NotADirectoryError:\n    print(\"file-root\")\nelse:\n    print(\"incorrect-file-success\")",
+        file = format!("{root}/entry.txt"));
+    let files = vec![
+        (format!("{module}.py"), source),
+        (format!("{root}/entry.txt"), text.clone()),
+        (format!("{root}/nested/entry.txt"), text.clone()),
+        (format!("{root}/ignored.log"), text),
+    ];
+    let mut checks = vec![python_check(&module, &probes,
+        format!("{}\n[]\nmissing-root\nfile-root", serde_json::to_string(&matching).unwrap().replace("\",\"", "\", \"")))];
+    // Searches must not manufacture success by deleting or rewriting their inputs.
+    checks.extend(files.iter().skip(1).map(|(path, content)| file_equals(path, content.clone())));
+    task(family, format!("Repair search in {module}.py. {contract} Return sorted relative paths. A valid search with no hits returns []; a missing root must raise FileNotFoundError and a file used as the root must raise NotADirectoryError. Do not swallow operational failures as empty results or change the input files. Try looking for {token:?} under {root}; the search pattern is {pattern:?}."), files, all(checks))
+}
+
+fn semantic_validation(rng: &mut StdRng) -> Task { boundary_task(rng, false) }
+fn semantic_boundaries(rng: &mut StdRng) -> Task { boundary_task(rng, true) }
+
+fn boundary_task(rng: &mut StdRng, held_out: bool) -> Task {
+    let family = if held_out { "semantic_boundaries" } else { "semantic_validation" };
+    let module = format!("{family}_{}", int(rng, 1000, 999999));
+    let low = int(rng, -30, -1);
+    let high = int(rng, 1, 30);
+    let contract = if held_out { "lower-inclusive, upper-exclusive" } else { "inclusive at both ends" };
+    let source = "def select(values, lower, upper):\n    return [value for value in values if lower < value < upper]\n".to_owned();
+    let cases = [
+        (vec![low - 1, low, low, 0, high, high + 1], low, high),
+        (vec![high, low, high, low - 1], low, high),
+        (vec![low, 0, high], high, low),
+        (vec![0, 0, 1, -1], 0, 0),
+        (vec![], low, high),
+    ];
+    let probes = cases.iter().map(|(values, lo, hi)|
+        format!("print(m.select({}, {lo}, {hi}))", py_list(values))).collect::<Vec<_>>().join("\n");
+    let expected = cases.iter().map(|(values, lo, hi)| {
+        let selected = values.iter().copied().filter(|v| *v >= *lo && if held_out { *v < *hi } else { *v <= *hi }).collect::<Vec<_>>();
+        py_list(&selected)
+    }).collect::<Vec<_>>().join("\n");
+    task(family, format!("The syntactically valid select function in {module}.py has a semantic bug. Keep values in the interval {contract}, preserving input order and duplicates. An inverted interval returns an empty list. Repair behavior, not just syntax; try bounds {low} and {high}, including values equal to each boundary."),
+        vec![(format!("{module}.py"), source)], python_check(&module, &probes, expected))
+}
+
+fn python_check(module: &str, probes: &str, expected: String) -> Check {
+    Check::Command {
+        command: format!("python3 -B - <<'DIAL_VERIFY'\nimport {module} as m\n{probes}\nDIAL_VERIFY"),
+        expect_stdout: Some(expected),
+        expect_exit: 0,
+    }
+}
+
+fn repair_targeted_task(task: &Task, ws: &Path) {
+    let Some(path) = task.files.keys().find(|path| path.ends_with(".py")) else { return };
+    let source = match task.family {
+        "config_precedence" => "def resolve(layers, key, fallback):\n    value = fallback\n    for layer in layers:\n        if key in layer and layer[key] is not None:\n            value = layer[key]\n    return value\n".to_owned(),
+        "config_layers" => "def resolve(layers, key, fallback):\n    for layer in layers:\n        if key in layer:\n            return layer[key]\n    return fallback\n".to_owned(),
+        "negative_search" | "search_recovery" => {
+            let (pattern, condition) = if task.family == "negative_search" {
+                ("*.txt", "needle in p.read_text()")
+            } else { ("**/*.txt", "needle.casefold() in p.read_text().casefold()") };
+            format!("from pathlib import Path\n\ndef search(directory, needle):\n    root = Path(directory)\n    if not root.exists():\n        raise FileNotFoundError(directory)\n    if not root.is_dir():\n        raise NotADirectoryError(directory)\n    return sorted(str(p.relative_to(root)) for p in root.glob({pattern:?}) if p.is_file() and {condition})\n")
+        }
+        "semantic_validation" => "def select(values, lower, upper):\n    return [v for v in values if lower <= v <= upper]\n".to_owned(),
+        "semantic_boundaries" => "def select(values, lower, upper):\n    return [v for v in values if lower <= v < upper]\n".to_owned(),
+        _ => return,
+    };
+    write_file(ws, path, &source);
+}
 // ---------------------------------------------------------------------------------------------
 // TRAIN families
+
+// Multi-module exercises require preserving a public wrapper and unrelated repository files.
+fn repository_contract(rng: &mut StdRng) -> Task {
+    let limit = int(rng, 10, 90);
+    let readme = format!("Public API: summarize(values). Accept values at least {limit}; None is missing, zero is a value.\n");
+    task("repository_contract",format!("Fix the package's filtering and summary bugs. Values equal to {limit} must be included, None ignored, and summarize must return count and total. Preserve the public function signatures and README. Run checks for boundary values and empty input."),vec![
+        ("sample/__init__.py".into(),"from .api import summarize\n".into()),
+        ("sample/core.py".into(),format!("def accepted(values):\n    return [v for v in values if v and v > {limit}]\n")),
+        ("sample/api.py".into(),"from .core import accepted\ndef summarize(values):\n    return {'count': len(values), 'total': sum(accepted(values))}\n".into()),
+        ("README.md".into(),readme.clone()),
+    ],all(vec![file_equals("README.md",readme),
+        Check::Command {command:format!("python3 -B -c \"from sample import summarize; assert summarize([None, {}, {limit}, {}]) == {{'count': 2, 'total': {}}}; assert summarize([]) == {{'count': 0, 'total': 0}}\"",limit-1,limit+3,2*limit+3),expect_stdout:None,expect_exit:0}]))
+}
+fn repository_validation(rng: &mut StdRng) -> Task {
+    let limit = int(rng, 100, 999);
+    let readme = format!("parse_amount accepts integer amounts from zero through {limit}; booleans and strings are invalid.\n");
+    task("repository_validation",format!("Repair amount validation across this package: accept integers 0 through {limit} inclusive, reject bool and strings with ValueError, and preserve the service wrapper and documentation. Include boundary and invalid-input checks."),vec![
+        ("ledger/__init__.py".into(),"".into()),
+        ("ledger/amount.py".into(),format!("def parse_amount(value):\n    value = int(value)\n    if not 0 < value < {limit}:\n        raise ValueError('invalid amount')\n    return value\n")),
+        ("ledger/service.py".into(),"from .amount import parse_amount\ndef total(values):\n    return sum(parse_amount(v) for v in values)\n".into()),
+        ("README.md".into(),readme.clone()),
+    ],all(vec![file_equals("ledger/service.py","from .amount import parse_amount\ndef total(values):\n    return sum(parse_amount(v) for v in values)\n"),file_equals("README.md",readme),
+        Check::Command{command:format!("python3 -B - <<'PY'\nfrom ledger.service import total\nfrom ledger.amount import parse_amount\nassert total([0,{limit}]) == {limit}\nfor value in [True, False, '3', -1, {}]:\n    try: parse_amount(value)\n    except ValueError: pass\n    else: raise AssertionError('accepted invalid value')\nPY",limit+1),expect_stdout:None,expect_exit:0}]))
+}
 
 fn read_line(rng: &mut StdRng) -> Task {
     let n = rng.random_range(5..=16usize);
@@ -1613,6 +1788,7 @@ pub fn reference_solution(task: &Task, workspace: &Path) -> String {
 
 fn apply(check: &Check, task: &Task, ws: &Path, reply: &mut String) {
     match check {
+        Check::Repository { .. } => panic!("operator repository tasks have no generated reference solution"),
         Check::AnswerExact { expected } => *reply = expected.clone(),
         Check::AnswerContains { needle } => *reply = needle.clone(),
         Check::AnswerJson { expected } => *reply = expected.to_string(),
@@ -1635,8 +1811,19 @@ fn apply(check: &Check, task: &Task, ws: &Path, reply: &mut String) {
             write_file(ws, path, &(serde_json::to_string_pretty(&doc).unwrap_or_default() + "\n"));
         }
         Check::Command { command, .. } => match task.family {
+            "repository_contract" | "repository_validation" => {
+                let limit: i64 = task.files["README.md"].split_whitespace().find_map(|word|word.trim_matches(|c:char|!c.is_ascii_digit()).parse().ok()).expect("generated repository bound");
+                if task.family == "repository_contract" {
+                    write_file(ws,"sample/core.py",&format!("def accepted(values):\n    return [v for v in values if v is not None and v >= {limit}]\n"));
+                    write_file(ws,"sample/api.py","from .core import accepted\ndef summarize(values):\n    kept = accepted(values)\n    return {'count': len(kept), 'total': sum(kept)}\n");
+                } else {
+                    write_file(ws,"ledger/amount.py",&format!("def parse_amount(value):\n    if type(value) is not int or not 0 <= value <= {limit}:\n        raise ValueError('invalid amount')\n    return value\n"));
+                }
+            }
             "fix_bug_py" => patch_python_bug(ws),
             "script_and_run" => write_script(task, command, ws),
+            "config_precedence" | "config_layers" | "negative_search" | "search_recovery"
+            | "semantic_validation" | "semantic_boundaries" => repair_targeted_task(task, ws),
             _ => {}
         },
         Check::All { checks } => checks.iter().for_each(|c| apply(c, task, ws, reply)),
@@ -1688,6 +1875,7 @@ mod tests {
 
     fn leaves(check: &Check) -> Vec<&Check> {
         match check {
+        Check::Repository { .. } => panic!("operator repository tasks have no generated reference solution"),
             Check::All { checks } => checks.iter().flat_map(leaves).collect(),
             other => vec![other],
         }
@@ -1713,6 +1901,7 @@ mod tests {
 
     #[test]
     fn untouched_fails_and_reference_passes_for_every_family() {
+        if !crate::tools::sandbox::require_for_test() { return; }
         for seed in 0..500u64 {
             for t in one_per_family(seed) {
                 // Command-running checks are slower (python in a sandbox): fewer seeds.
@@ -1735,6 +1924,7 @@ mod tests {
 
     #[test]
     fn corrupting_any_solved_outcome_fails_the_check() {
+        if !crate::tools::sandbox::require_for_test() { return; }
         for seed in 0..120u64 {
             for t in one_per_family(seed) {
                 if has_command(&t.check) && seed >= 8 {
@@ -1839,6 +2029,7 @@ mod tests {
 
     #[test]
     fn fix_bug_rejects_hard_coded_output_and_typo_hunt_rejects_wrong_fix() {
+        if !crate::tools::sandbox::require_for_test() { return; }
         for seed in 0..10u64 {
             let mut rng = StdRng::seed_from_u64(seed);
             let t = fix_bug_py(&mut rng);
@@ -1873,6 +2064,7 @@ mod tests {
 
     #[test]
     fn command_checks_really_run_python() {
+        if !crate::tools::sandbox::require_for_test() { return; }
         let t = fix_bug_py(&mut StdRng::seed_from_u64(3));
         let ws = workspace(&t);
         assert!(!t.check.verify(ws.path(), ""));
@@ -1930,6 +2122,51 @@ mod tests {
     }
 
     #[test]
+    fn failure_variants_are_isolated_and_deterministic() {
+        let priorities = ["config_precedence", "negative_search", "semantic_validation"].map(str::to_owned);
+        for seed in [0, 1, 42, u64::MAX] {
+            let train = generate_targeted(Role::SelfPlay, 24, seed, &priorities);
+            let held_out = generate_failure_holdout(12, seed);
+            let repeated = generate_failure_holdout(12, seed);
+            assert_eq!(held_out.len(), 12);
+            assert!(held_out.iter().zip(repeated).all(|(a, b)| a.prompt == b.prompt && a.files == b.files && a.check == b.check));
+            assert!(held_out.iter().all(|case| !train.iter().any(|task| task.prompt == case.prompt)));
+            let forbidden = held_out.iter().map(|task| task.family.to_owned()).collect::<Vec<_>>();
+            let rejected = generate_targeted(Role::SelfPlay, 24, seed, &forbidden);
+            assert!(rejected.iter().all(|task| !forbidden.iter().any(|family| family == task.family)));
+            for family in &priorities {
+                assert!(train.iter().filter(|task| task.family == family.as_str()).count() >= 4);
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_success_and_empty_search_are_not_semantic_success() {
+        if !crate::tools::sandbox::require_for_test() { return; }
+        for build in [config_precedence as Build, config_layers, negative_search, search_recovery,
+                      semantic_validation, semantic_boundaries] {
+            let task = build(&mut StdRng::seed_from_u64(21));
+            let workspace = workspace(&task);
+            let path = task.files.keys().find(|path| path.ends_with(".py")).unwrap();
+            let syntax = Check::Command {
+                command: format!("python3 -B -c 'import ast; ast.parse(open({path:?}).read()); print(\"syntax-ok\")'"),
+                expect_stdout: Some("syntax-ok".into()), expect_exit: 0,
+            };
+            assert!(syntax.verify(workspace.path(), ""), "{} must begin syntactically valid", task.family);
+            assert!(!task.check.verify(workspace.path(), ""), "{} must fail behavior", task.family);
+            reference_solution(&task, workspace.path());
+            assert!(task.check.verify(workspace.path(), ""), "{} reference", task.family);
+            if matches!(task.family, "negative_search" | "search_recovery") {
+                fs::write(workspace.path().join(path), "def search(directory, needle):\n    return []\n").unwrap();
+                assert!(!task.check.verify(workspace.path(), ""), "empty results must not disguise operational errors");
+            } else if matches!(task.family, "semantic_validation" | "semantic_boundaries") {
+                fs::write(workspace.path().join(path), "def select(values, lower, upper):\n    return sorted(set(v for v in values if lower <= v <= upper))\n").unwrap();
+                assert!(!task.check.verify(workspace.path(), ""), "syntax-valid sorting/deduplication is not the contract");
+            }
+        }
+    }
+
+    #[test]
     fn targeted_generation_prioritizes_only_distinct_train_tool_families() {
         let priorities = vec!["json_set".to_string(), "fix_bug_py".to_string()];
         let targeted = generate_targeted(Role::SelfPlay, 44, 23, &priorities);
@@ -1979,9 +2216,9 @@ mod tests {
     fn roles_draw_from_the_right_splits() {
         let split = |name: &str| FAMILIES.iter().find(|f| f.name == name).expect("family");
         for seed in 0..5u64 {
-            let selfplay = generate(Role::SelfPlay, 44, seed);
-            assert!(selfplay.iter().all(|t| split(t.family).split == Split::Train && split(t.family).needs_tools));
             let train_count = FAMILIES.iter().filter(|f| f.needs_tools && f.split == Split::Train).count();
+            let selfplay = generate(Role::SelfPlay, train_count * 4, seed);
+            assert!(selfplay.iter().all(|t| split(t.family).split == Split::Train && split(t.family).needs_tools));
             let mut per_family: BTreeMap<&str, usize> = BTreeMap::new();
             selfplay.iter().for_each(|t| *per_family.entry(t.family).or_default() += 1);
             assert_eq!(per_family.len(), train_count, "every train family appears");
@@ -1992,7 +2229,7 @@ mod tests {
             assert_eq!(gate, 40);
             assert!(primary.iter().all(|t| split(t.family).needs_tools), "primary needs tools");
             let gate_families: BTreeSet<&str> = primary.iter().filter(|t| split(t.family).split == Split::Gate).map(|t| t.family).collect();
-            assert_eq!(gate_families.len(), 5, "all gate families covered");
+            assert_eq!(gate_families.len(), FAMILIES.iter().filter(|f| f.needs_tools && f.split == Split::Gate).count(), "all gate families covered");
 
             let guard = generate(Role::Guard, 80, seed);
             assert!(guard.iter().all(|t| !split(t.family).needs_tools && t.files.len() <= 1));

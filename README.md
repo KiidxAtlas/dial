@@ -18,6 +18,72 @@ For local MLX you can also prepare the runtime and model explicitly:
 Discovery itself does not download weights. Selecting an uncached local model and submitting a
 prompt resolves its weights; a missing default MLX runtime gets an installation confirmation.
 
+## Project architecture and reuse
+
+Dial's project memory indexes source outlines and source-backed findings for reuse across
+sessions and subagents. It also prioritizes Markdown design documents named `ARCHITECTURE.md`,
+`DESIGN.md`, `CONTRIBUTING.md`, or `PRINCIPLES.md` (case-insensitive names), and Markdown files
+under `architecture`, `adr`, or `decisions` directories. This uses the existing bounded,
+ignore-aware index; ignored or unindexed documents are not guaranteed to appear.
+
+Keep project goals, module responsibilities, dependency boundaries, canonical helpers and
+architectural check commands in these documents. Record important decisions and their rationale
+in ADRs. Outlines include section headings so the agent can read the relevant current sections;
+they are not a substitute for reading the source.
+
+Up to three design records receive retrieval priority, using at most a third of the context
+budget for that priority lane. Source hashes are checked before reuse; changed sources and
+their dependent findings must be refreshed. Agents are guided to identify the owner, search
+for reusable implementations, justify new abstractions and review the diff for architectural
+fit. These are evidence and workflow aids, not a guarantee of compliance. Enforce important
+boundaries with executable checks configured through `[verification].commands`.
+
+## Discover, import and toggle skills
+
+Browse compatible skills from Claude, Codex, Agents (`.agents`/`.agent`), omp and pi
+in this project and your home directory with `dial skills sources` or `/skills sources`.
+Browsing does not activate them. Import portable `<name>/SKILL.md` folders explicitly
+from those locations or any locally checked-out repository; no downloading or script execution.
+
+```sh
+dial skills sources
+dial skills import ~/.claude/skills --dry-run
+dial skills import ~/.claude/skills --user
+dial skills import ~/.agents/skills --user
+dial skills import ./vendor/skills/code-review
+dial skills list
+dial skills disable code-review          # this project
+dial skills enable code-review --user    # user default; project overrides still win
+dial skills import ~/.claude/skills --user --update --dry-run
+dial skills import ~/.claude/skills --user --update
+```
+
+Sources can be one skill or a directory of immediate skill folders. Default
+destination is `.dial/skills`; `--user` uses `$DIAL_HOME/skills` (normally
+`~/.dial/skills`). Project skills shadow user skills. `/skills` lists installed skills,
+their on/off state and location. Chat supports `/skills import <path> [--user] [--dry-run]
+[--update]`, `/skills enable <name> [--user]` and `/skills disable <name> [--user]`.
+Quote paths containing spaces. Invoke enabled skills with `/skill:<name>`.
+
+Toggles persist by skill name in `skills.json` outside the workspace: project state by
+default, or Dial's user directory with `--user`. A project setting overrides the user
+default, including for same-name shadowed skills. Disabling never deletes a skill; it
+removes it from completion, the model catalog and skill-tool loading. Imports and toggles
+refresh chat completion immediately and the model catalog on the next turn. Commands
+submitted while a turn runs are queued until it finishes. Previously loaded skill text
+remains in conversation history; disabling is not a sandbox or a way to erase that text.
+
+Folders need lowercase/digit/hyphen names and frontmatter with a nonempty
+`description`; any declared `name` must match. Invalid entries and conflicts
+are reported as skipped. `.dial-import.json` records source paths and hashes.
+`--update` only replaces imports from the same source with no local content
+changes. Updates are explicit; back up local edits before resolving conflicts.
+
+Symlinks and special files are refused. Limits: 64 KiB per file, 200 files,
+8 MiB per skill, five nested directories. Executable permissions are not copied;
+invoke reviewed scripts with their interpreter. Harness-specific tool names and
+dependencies may need adaptation. Importing does not grant extra permissions.
+
 ## Terminal interface
 
 - Inline, scrollback-native transcript with a live composer; finished turns remain in normal terminal
@@ -31,16 +97,25 @@ prompt resolves its weights; a missing default MLX runtime gets an installation 
   rounded or line composer, styled headings/code/diffs, expandable tool results, and `NO_COLOR`.
 - Unicode-aware multiline editing, bracketed paste, persistent per-project prompt history and history
   search. Secret provider inputs are masked and never enter prompt history.
-- **Inline suggestions:** as you type, the most recent matching prompt from your history appears as dim
-  ghost text after the cursor. `Tab` or `Right` accepts it; `Esc` hides it; `Enter` always sends only what
-  you typed. Suggestions appear only at the end of an idle draft, never in secret prompts or mid-line.
+- **Inline suggestions:** command arguments offer valid choices as dim ghost text even before you have
+  used them: `/understanding ` suggests `architecture`, `/skills s` suggests `sources`, and
+  `/skills enable ` suggests an installed skill name (including disabled skills). Built-in choices
+  take priority over matching history; ordinary prompts still suggest the newest matching history entry.
+  `Tab` or `Right` accepts the ghost; `Esc` hides it; `Enter` sends only what you typed. Suggestions
+  appear only at the end of an idle draft, never in secret prompts or mid-line.
 - **Slash commands:** typing `/` opens a list of every command (built-in and your `.dial/commands/*.md`)
   that filters as you type. `Up`/`Down` move (wrapping, with a position counter for long lists), `Tab`/`Right`
   complete, `Esc` dismisses without losing the draft. `Enter` on a partial name completes it so you can add
   arguments; `Enter` on a complete name runs it. Built-ins win over a custom command with the same name.
 - While a turn runs, `Enter` queues steering for its next model step; `Alt-Enter` queues a follow-up
   for the next turn. The queue is visible above the composer. `Up` brings back the last queued
-  message for editing. Interrupting preserves queued messages and the draft.
+  message for editing. Interrupting preserves queued messages and the draft. Slash commands never become
+  model steering: `/help`, `/hotkeys`, `/todo`, `/skills`, `/commands`, `/context` and `/clear` run at once
+  without stopping the turn. `/model`, `/models`, and Alt+M open the picker immediately; a selection
+  applies after the current turn, without canceling it. Closing the picker without selecting changes
+  nothing. Other commands wait for the turn to finish, with a notice, except commands
+  that replace or alter the active session/work: `/exit` (`/quit`, `/q`), `/new`, `/resume`, `/sessions`,
+  `/tree`, `/fork`, `/undo`, `/rollback`, `/compact` and `/plan` stop it first.
 - `/sessions` and `/resume` open searchable session pickers; `/tree` shows forks. `/rename <title>`
   names a session; `/export [path] [--html]` exports Markdown or self-contained HTML without
   overwriting existing files. `/copy` copies the last answer; `Ctrl-G` opens the draft in an external editor.
@@ -49,13 +124,17 @@ prompt resolves its weights; a missing default MLX runtime gets an installation 
   `/permissions allow --persist bash cargo test` persists a project rule outside the workspace.
   Deny rules take precedence, including in automatic approval mode.
 - Idle terminal frames are not rewritten. Fenced code gets theme-aware lexical highlighting,
-  mutation cards show bounded before/after diffs, and completed Markdown prefixes are cached while streaming.
+  and completed Markdown prefixes are cached while streaming. Edit and write cards show the change as a
+  numbered, coloured diff (separate hunks with two lines of context, per file); the anchored preview rows
+  and removed-lines report the model gets are left out. Each todo call renders the list as it now stands,
+  with the steps that call closed struck through and emphasized. Passing automatic checks are one line.
 
 | Action | Shortcut / command |
 |---|---|
 | Model selector / roles | `Alt-M` / `Alt-R`, `/model` |
 | Provider setup | `Alt-P`, `/providers` |
 | Settings | `Ctrl-,` (`Ctrl-4` fallback), `/settings` |
+| Edit keyboard shortcuts | `/hotkeys`, or `/settings` → Setup → Keyboard shortcuts |
 | Previous/next prompt | `Up` / `Down`; preserves the unsent draft |
 | Search prompt history | `Ctrl-R` |
 | Command list / completion | `/`, then `Up` / `Down`, `Tab` or `Right` to complete, `Esc` to dismiss |
@@ -66,27 +145,68 @@ prompt resolves its weights; a missing default MLX runtime gets an installation 
 | Cancel a panel / stop at next callback | `Esc` / `Ctrl-C` |
 | Quit from an empty composer | `Ctrl-D`, `/exit` |
 
-All non-text shortcuts are remappable in `~/.dial/keybindings.toml`; `/hotkeys` shows the active
-bindings. For example:
+`/hotkeys` opens a searchable shortcut editor when idle (during a turn it prints the active reference).
+Type to filter by action, group or key; `Enter` edits, `Delete` restores defaults, and `Esc` goes back.
+Enter chord names separated by spaces, such as `Alt+M Ctrl+K`; an empty field disables the action.
+Changes save globally and apply immediately, only after validation and a successful write. Conflicting
+bindings are rejected, and the editor keeps a way to confirm and close panels. You can also edit
+`~/.dial/keybindings.toml` directly, for example:
 
 ```toml
 "app.model.select" = "Ctrl+M"
 "app.history.search" = []
 ```
 
-Settings are also editable in `/settings`. To create a theme, put a JSON file such as
+`/settings` is the configuration hub. Type to search across every category; `Left`/`Right` change
+categories and `Tab`/`Shift-Tab` jump sections. `Enter` toggles a switch or opens an editor/choice list;
+choices are saved only when confirmed, and `Esc` cancels. `Ctrl-S` switches **All projects** / **This
+project** storage; the title shows the destination and successful saves are acknowledged. `Delete`
+removes the selected override so the inherited value applies. The detail area identifies the effective
+source and restart requirements. The **Setup** category opens models, providers and keyboard controls.
+
+To create a theme, put a JSON file such as
 `~/.dial/themes/custom.json` there; it may extend a built-in (`dark`, `light`, `mono`, `gruvbox`,
 `nord`, or `paper`) and overrides reload live. `NO_COLOR` forces monochrome output.
 
-`Tab` changes global/project storage scope in settings, roles and providers. The model picker
-switches between the main model and helper-role assignments. Supported roles are **main**, **feedback**,
+`Tab` changes global/project storage scope in the model and provider panels (`Ctrl-S` in settings).
+The model picker switches between the main model and helper-role assignments. Supported roles are **main**, **feedback**,
 **subagent**, and **compaction**; each routes real requests. “Use the main model” restores role inheritance.
 
 ### Providers and discovery
 
-The catalog finds cached Hugging Face MLX snapshots and running LM Studio, Ollama and llama.cpp
+The catalog finds cached Hugging Face MLX snapshots, MLX models downloaded by LM Studio (its
+`downloadsFolder`, default `~/.lmstudio/models`; listed under Local MLX and served by dial's own MLX
+server, so LoRA training applies), and running LM Studio, Ollama and llama.cpp
 servers on their usual loopback ports. It also discovers OpenAI-compatible endpoints and Anthropic's
 Messages API. OpenAI, Anthropic, OpenRouter, Groq, Mistral and DeepSeek have setup presets.
+
+**LoRA indicators.** The model picker has a LoRA column: `unverified` for a local MLX model whose architecture
+the installed mlx-lm implements (a static check of `config.json`, not proof of trainable adapter targets), `unsupported` when Dial’s adapter probe rejects it, and `-` for models another server runs. The main model distinguishes awaiting training,
+training, evaluating, accepted vN, loading, loaded, used on last response, and request failed.
+A failed capability probe overrides the static architecture check; only a successful probe can show
+awaiting training. Architecture support alone never claims LoRA compatibility.
+Dial automatically queues unverified downloaded local MLX models as they are discovered, without
+requiring model selection. Idle resident models are unloaded and probes run one at a time under the
+shared compute lock. The picker shows waiting for compute, verifying, verified, or unsupported; a busy
+compute owner is waited out automatically. Foreground prompts cancel this session's automatic probe
+and unfinished checks resume when idle. Results and reasons are saved in each model's private project
+store and reused across restarts. Failed probes are not retried repeatedly within the same session;
+F6 remains an explicit recheck with diagnostics after runtime/model changes. Verification loads the
+model/tokenizer, selects architecture-compatible linear projections, performs a rank-one gradient
+update on a short prompt, and checks that a saved/reloaded adapter preserves output. The temporary
+adapter is discarded. Ordinary attention keeps query-only targets; hybrid, recurrent, and fused blocks
+use compatible output or other linear projections. Training and adapter validation share this selection.
+Old probe results are rechecked automatically after this upgrade, including previous rejections.
+The managed Python worker updates with the binary; explicit custom worker paths are preserved.
+Verification does not establish that a full training run will fit memory or improve quality.
+Accepted means the gate admitted the version; loaded requires the local server's startup generation
+check; used requires a successful, uninterrupted model response with that adapter. Runtime evidence
+is session-local and clears when the server is released. Training/evaluation indicators require a live
+worker lock, so a crashed worker cannot leave a permanent busy label. Disabling future training does
+not hide an already accepted adapter. `/improve` shows the runtime adapter path, latest LoRA gate
+decision and baseline/candidate scores, plus the last training skip reason. Scores measure the gate's
+tasks; successful adapter use alone does not prove improvement. Once the learning loop has probed
+the model, its recorded capability replaces the static architecture check.
 
 `/providers` can add a custom endpoint, set/remove a URL-scoped API key, and choose a model. OpenRouter
 also offers **Sign in with OpenRouter** (PKCE), which creates a user-controlled API key without asking
@@ -137,13 +257,19 @@ LM Studio refuses to load (memory guardrail, unsupported architecture) is report
 message; load it in LM Studio first, with a smaller context, or choose another model. Larger models need
 LM Studio's own resource limits to allow them; Dial cannot override those.
 
+**llama.cpp and Ollama.** The same runtime check covers them: llama.cpp's `/props` reports the per-slot
+context it serves (`-c` divided by `--parallel`; its `/v1/models` lists only the training context), and
+Ollama's `/api/ps` reports the context a running model was loaded with. Ollama's default is small and it
+truncates oversized prompts silently, so raise it with `OLLAMA_CONTEXT_LENGTH` (or `num_ctx` in a
+Modelfile) for agent work; Dial learns the size after the first reply that loads the model.
+
 Use any OpenAI-compatible server instead of the local MLX model (LM Studio, Ollama, llama.cpp, a hosted API): `dial --endpoint http://localhost:1234/v1 --api-key-env KEY -m <model-name>`. Weight updates need the local MLX model.
 
 
 ### Automation
 
 `dial -p --output-format json "prompt"` emits one result object; `--output-format stream-json`
-emits newline-delimited system, text, tool, notice and usage events followed by the result.
+emits newline-delimited system, text, tool, todo, notice and usage events followed by the result.
 JSON modes reserve stdout for JSON. Results include session ID, answer, tool outcomes, usage and duration.
 Use `--allow read,edit` for named tool approval instead of blanket `-y`; read-only mode and deny rules
 still win. With both a prompt argument and piped stdin, stdin is appended as fenced context.
@@ -180,7 +306,40 @@ After edits, dial derives focused Rust and Python syntax checks from checkpointe
 `[verification].commands` can add operator-owned sandboxed commands (name, command, optional file
 extensions and timeout); a failure is sent to the agent for the configured bounded repair attempts,
 then the edited tree and final diagnostics remain visible for `/undo` or manual repair. Approval-denied
-writes are not treated as successful verification.
+writes are not treated as successful verification. `todo done` is a checkpoint too: a step with no
+successful tool call since it started stays open (a claim without evidence), and a step that edited
+files runs the same focused checks, so a broken step is caught while its context is fresh. A failed check
+keeps the step open with the diagnostics (calling `done` again without further edits closes it, for
+failures that predate the step); turn-end verification is skipped when the last step check already
+covered every edit.
+
+Extended investigation must use real todos, not a prose plan. In live runs with the todo tool available,
+after a task-dependent budget of four, six, or ten successful inspection calls without an open plan,
+the next request offers only `todo` until
+the model creates or appends open tasks; a direct final answer remains allowed. Bookkeeping cannot
+reset this checkpoint, and non-planning tool calls are refused while it is active. Ordinary short
+questions and sealed evaluations are unaffected. Guidance directs the model to append necessary
+follow-on work uncovered by results before pursuing it, preserving existing tasks and findings; use
+`start` when a newly discovered prerequisite must come first.
+
+For nontrivial changes, the default guidance starts with 1–3 investigation questions in `todo`
+(`investigation: true`), then implementation and verification. Investigations start from saved project
+understanding and stop once the affected path, proposed change and relevant check are known. Closing
+an active investigation requires `finding` and 1–4 `evidence` references as well as the normal successful
+tool-activity gate. Findings survive session resume and compaction; the latest three are included with
+the current step so the agent can reuse answers. Reopening a question clears its old conclusion.
+These references are agent observations, not independently validated proof. Simple changes skip the
+checklist. A bounded, turn-local observer redirects identical successful read/search calls that return
+unchanged results; it executes the read before comparing, so external changes remain discoverable.
+Different ranges, changed results, artifact recovery and command polling are allowed. Mutations and
+shell commands clear the observation cache. The redirect is advisory, not a hard ban on rereading.
+
+Mid-turn requests end with a never-stored reminder of the current todo step, next step and recent findings.
+Because it sits after the newest tool result, every earlier byte stays identical between requests and a
+prefix (KV) cache only needs to process the appended reminder. Tool results are clipped to about an eighth of the
+context window (4–24 KiB); clipping keeps both ends plus error, panic, failed-test and traceback lines
+from the omitted middle, and `bash` does the same for output it never holds in memory. Full output stays
+in artifacts.
 
 `[dap.<id>]` defines an operator-owned adapter executable. The `dap` integration exposes
 `dap_<id>` actions and requires approval on every call; adapter startup is lazy, and launch program
@@ -264,15 +423,21 @@ regression evidence, not claims about real-model quality.
 **Tools** (file edits confined to the project; shell access follows the chosen sandbox)
 - The lean default is `read`, `write`, `edit`, `glob`, `grep`, `bash`, `todo`, `tool_search`, `tool_load`, `artifact_read` and `working_state`. Specialists are discoverable by name/capability rather than sending every schema on every request. `tool_load` takes `names`; newly enabled schemas are available in the **next** model round, and enabled selections survive session resume. Explicit profile allowlists remain authoritative.
 - **Subagents** (`task`): `scout`, `reviewer`, `planner` and `worker` retain independent contexts, role routing, approval boundaries and structured-output validation. `action="run"` is blocking; `start` returns live IDs, then `status`, `wait`, `message` and `cancel` operate on those jobs. Peers use `task_message` for coordination and artifacts for shared evidence. `/jobs`, `/message <id> <text>` and `/cancel <id>` expose live controls to the user. Inbox/history/concurrency are bounded; children cannot spawn children, and workspace mutations remain serial.
+  Blocking task calls still keep the UI responsive: both serial children (including workers/local models)
+  and parallel batches run off the UI thread. Timed event pumping updates the timer and handles input
+  even while a child produces no output; cancellation prevents pending approvals from authorizing work.
 - `read` takes line selectors in either edit mode: `path:50-200`, `path:50+150`, `path:-60` (last 60 lines), `path:5-16,960-973`, or `offset`/`limit`; the footer states the range returned and the file's total line count, and in hashline mode only the lines shown can be edited. `grep` matches a Rust regex per line (`fixed_string` for literal text) with `ignore_case`, `glob`, `context` lines and `max_results`.
 - **Edit modes.** The default `replace` mode edits by exact text (`old` → `new`). `--edit-mode hashline` (as in omp) has `read` return `[path#TAG]` and `N:text` rows and `edit` take `PUT`/`CUT`/`MV`/`REM` operations anchored to those line numbers, with registers for moving text. Stale tags are recovered only when the file's changes provably do not touch your anchors; unseen lines cannot be edited; multi-file patches are validated before any write; every result lists the existing lines a replacement removed, because `PUT N.=M` replaces N through M inclusive and an off-by-one silently deletes a neighbour. Hashline suits strong models; a local 35B-A3B model was observed repeatedly deleting adjacent lines with it, which is why `replace` is the default. Block anchors (`N*`) use a bracket/indent heuristic, not a parser.
-- **Loop safeguards.** The system prompt is identical on every request of a session (until a tool is loaded or plan mode changes); recalled notes and verified repair patterns are decided once per user turn and stored with that message, so a provider or local server can reuse its prompt cache. A reply that stops at the output-token limit (a reasoning model can spend the whole budget thinking and answer nothing) is never taken as the answer: dial retries with a doubled budget that still fits the context window, then nudges the model, then stops with a clear message. `harness.max_tokens` defaults to 8192. Tool results over 24 KiB keep their beginning and end with an explicit omission marker; `read`, `grep` and `bash` cap themselves at 20 KiB and say how to fetch the rest, so paging footers are never lost. A replace-mode `edit` that misses explains why (line numbers copied from `read`, differing indentation with the file's real text shown, or a drifted block with the line where it starts), edits CRLF files with LF text, and lists the line numbers of ambiguous matches.
-- **Model I/O robustness.** Streamed replies are bounded by silence, not by total time. Remote models use `remote_model_idle_timeout_secs` (180 seconds by default, capped by `worker_timeout_secs`); raise it in `/settings` for models that reason longer without stream events. Local servers retain `worker_timeout_secs` after their first event and can take as long as needed before it. Keep-alive comments and read boundaries never reset the event deadline. While waiting, the UI stays editable and shows elapsed time without output; Ctrl-C or Esc cancels the request. Tool-call arguments that are almost JSON are repaired rather than regenerated: raw newlines/tabs inside strings, invalid escapes such as `\d`, single quotes, unquoted keys, trailing commas and a double-encoded object are accepted as written; cut-off or trailing-garbage arguments are refused and never executed.
+- **Loop safeguards.** The system prompt is identical on every request of a session (until a tool is loaded or plan mode changes); recalled notes and verified repair patterns are decided once per user turn and stored with that message, so a provider or local server can reuse its prompt cache. A reply that stops at the output-token limit is never taken as the answer. Reasoning-only replies use the reasoning gate below; truncated answer text or tool arguments can retry with a doubled budget that fits the context window, then receive bounded nudges. `harness.max_tokens` defaults to 8192. Tool results over 24 KiB keep their beginning and end with an explicit omission marker; `read`, `grep` and `bash` cap themselves at 20 KiB and say how to fetch the rest, so paging footers are never lost. A replace-mode `edit` that misses explains why (line numbers copied from `read`, differing indentation with the file's real text shown, or a drifted block with the line where it starts), edits CRLF files with LF text, and lists the line numbers of ambiguous matches.
+- **Reasoning gate.** Before answer text or tool arguments begin, main and child agent requests have an operator-owned deadline of 60 seconds and a cap of 16 KiB of streamed reasoning. Reasoning events and keep-alives do not reset the deadline; hidden reasoning is covered by time, not guessed token counts. Connection setup, model startup, authentication and provider backoff count toward that wait (startup itself may take longer to cancel). A hit cancels only that request and discards all its partial calls. Dial allows one action-focused recovery per turn, with no token-budget increase or step refund; another hit ends the main turn as `incomplete` or fails the child job. Empty reasoning-only output-limit replies share that same recovery allowance. Successful requests do not replenish it. Notices explain interceptions and main-agent metrics expose `reasoning_interceptions`. Adjust the gate in `/settings` under Models / Roles & Sampling or `[reasoning_guard]`; `enabled = false` restores the previous recovery behavior. These settings are outside the improvable harness. Compaction and semantic reranking retain their own request limits.
+  The streamed-reasoning byte cap remains active after answer text or tool arguments start; a short preamble cannot disable it. Separately, four consecutive successful observations that repeat unchanged evidence end the turn as incomplete after investigation feedback. New evidence, workspace operations, and error recovery reset that repetition count; todo bookkeeping does not. This bounds repeated inspection, not all legitimate research or reasoning.
+- **Model I/O robustness.** After answer text or tool arguments begin, streamed replies are bounded by silence, not by total time. Remote models use `remote_model_idle_timeout_secs` (180 seconds by default, capped by `worker_timeout_secs`); raise it in `/settings` for models that reason longer without stream events. Local servers retain `worker_timeout_secs` after their first event; the reasoning gate separately bounds their pre-action wait. Keep-alive comments and read boundaries never reset the event deadline. While waiting, the UI stays editable and shows elapsed time without output; Ctrl-C or Esc cancels the request. Tool-call arguments that are almost JSON are repaired rather than regenerated: raw newlines/tabs inside strings, invalid escapes such as `\d`, single quotes, unquoted keys, trailing commas and a double-encoded object are accepted as written; cut-off or trailing-garbage arguments are refused and never executed.
 - **Whitespace-tolerant `edit`.** If `old` is not found byte-for-byte but matches exactly one place once leading/trailing whitespace is ignored, and every line differs by the same indentation prefix, the edit is applied with `new` shifted by that prefix and the result says what was matched. Two candidates, uneven indentation or any text difference is refused with the file's real text shown.
+- **Forgiving hashline bodies.** A `PUT` body row written without its `+` prefix, or a raw blank line between body rows, is taken as content and the result warns how many rows lacked the prefix, instead of failing the whole patch. Rows that look like unified-diff deletions (`-…`) are still refused. Lines the model was shown are rebuilt from the session's earlier `read`/`edit`/`write` results when the agent restarts or is rebuilt, for files whose content is unchanged since, so a resumed session does not reject edits with "no read of this file is recorded".
 - **Compaction is checked, not assumed.** The trigger (80% of the window) uses the provider's own count for the last request plus a local estimate of everything added since, so a large tool result is counted before the request it would overflow, not after. After summarising, dial estimates the next prompt the same way (the fixed system prompt and tool schemas included). Above 70% of the window it compacts once more, harder; if it still would not fit it says so and names the fix (a larger context window or fewer `integrations`) instead of summarising again every step.
 - **Stuck-turn detection.** Besides the identical-call guard (warns at the third identical failure, stops at the fourth), dial counts failures whatever the arguments: the same file tool (`read`, `edit`, `write`, `glob`, `grep`, `ast_edit`, `ast_search`, `artifact_read`) failing five calls in a row gets a warning and ten stops the turn, even with successful reads in between (the read-guess-read-guess loop); `bash` and `kernel` failures are task feedback and are never counted. Four rounds in which every call failed add a warning, eight stop the turn. A stopped turn is **reported**, not raised: the reason is recorded in the conversation, shown as a notice, the outcome is `incomplete`, and print mode exits 2 (with `--output-format json` the result has `outcome: "incomplete"` and no `error`). The step limit ends the same way.
-- **Step budget.** `harness.max_steps` counts model calls that did work. A reply that was unusable (cut off by the output limit, an unreadable call, a tool call written as plain text) is retried without spending a step, up to eight times per turn, and compacting after the server rejected the prompt size is never charged. Sealed evaluation runs get no refunds: their budget is what they measure.
-- **Completion and todos.** Open todos survive session resume. If the agent stops with pending or in-progress tasks, dial asks it to continue through tools, up to three reminders; another reminder requires a changed todo list or new successful tool evidence, so repeated reads and text-only promises cannot loop forever. The `finish` control tool reports `completed`, `blocked`, or `needs_input`. Completion refuses open todos and running live tasks; blockers and questions require a concrete `reason` and leave open work intact. Ordinary informational replies still work without todos. JSON print results and RPC `send` responses expose `outcome`; blocked, needs-input, incomplete, and interrupted print runs exit with code 2 instead of reporting success. These controls do not independently prove that a model's task-status claims are true; relevant checks still run after completed edits.
+- **Step budget.** `harness.max_steps` counts model calls that did work. A reply that was unusable (truncated answer text or tool arguments, an unreadable call, a tool call written as plain text) is retried without spending a step, up to eight times per turn, and compacting after the server rejected the prompt size is never charged. Sealed evaluation runs get no refunds: their budget is what they measure.
+- **Completion and todos.** `todo` keeps a numbered plan: `set` (optionally grouped by `phase`), `append`, `start`, `done`, `drop` and `block` (with a reason). Whenever nothing is in progress the earliest pending task starts, so "finished this, on to the next" is one `done` call. The open list is pinned above the composer in the TUI (progress, current step, blockers; long lists window around the active task), streamed as `todo` events over RPC and `stream-json`, carried verbatim through compaction, and survives session resume. If the agent stops with pending or in-progress tasks, dial asks it to continue through tools, up to three reminders; another reminder requires a changed todo list or new successful tool evidence, so repeated reads and text-only promises cannot loop forever. Stopping when every open task is blocked ends the turn as `blocked` without reminders. The `finish` control tool reports `completed`, `blocked`, or `needs_input`. Completion refuses open (including blocked) todos and running live tasks; blockers and questions require a concrete `reason` and leave open work intact. Ordinary informational replies still work without todos. JSON print results and RPC `send` responses expose `outcome`; blocked, needs-input, incomplete, and interrupted print runs exit with code 2 instead of reporting success. These controls do not independently prove that a model's task-status claims are true; relevant checks still run after completed edits.
 - **Specialist integrations** (available per `integrations` in the config, loaded on demand; never in sealed evaluation/self-play). MCP tools follow `[mcp.*]`; enabling a schema never bypasses approval:
   - `bg`: long-running processes (`start`/`list`/`output`/`wait`/`kill`) under the same sandbox as `bash`, in their own process group, at most 8 at once, 256 KiB of output kept each, all killed when dial exits.
   - `web_fetch` / `web_search`: HTTP(S) fetch with HTML→text conversion and an SSRF guard (loopback, private, link-local and metadata addresses are refused on every connection and redirect), and search through DuckDuckGo's HTML endpoint (a scraping path that can break) or your own `[web] search_url` template containing `{query}`. Both need approval and are disabled by `sandbox.mode = "strict"` or `allow_network = false`.
@@ -297,6 +462,7 @@ regression evidence, not claims about real-model quality.
 - `@file`, `@dir/`, `@diff`, `@staged` references in messages.
 - Skills (`.dial/skills/<name>/SKILL.md`, `~/.dial/skills`, agentskills.io format) loaded on demand; the agent can create and refine them (`skill_manage`).
 - Provenance memory lives in private `$DIAL_HOME/memory.sqlite3`. `recall`, `retain`, `memory_update`, `forget`, `memory_history` and approved `memory_import` support project/global scope, source/session provenance, revision-checked corrections and expiration. Relevant bounded entries are retrieved on demand with lexical BM25 ranking. Legacy `MEMORY.md`/`USER.md` import is explicit (`confirm=true`) and preserves originals; old configuration tool selectors are migrated, not kept as executable aliases. Forget is logical redaction, not forensic disk erasure.
+- **Saved codebase understanding.** Dial automatically builds a project-scoped source map in private `$DIAL_HOME/projects/<identity>/codebase.sqlite3`, outside the repository. It records file outlines, actual syntax declarations, imports, module documentation and bounded manifest/README excerpts; unchanged file hashes reuse saved outlines across restarts and new sessions. Each turn refreshes changed sources in a background worker and attaches a relevant slice to that user message, keeping the system prompt stable. Independent child agents reuse the same map. Agents save deeper responsibilities, relationships, entry points and check commands with `codebase_memory` `action="remember"`, a `topic`, factual `summary` and 1–8 supporting `sources` paths. Findings carry source hashes, the originating parent session and a revision; changed, removed or inaccessible sources withhold the old summary and expose the topic/revision/paths for targeted refresh. These are agent observations, not independent verification proof. `action="recall"` retrieves more; `refresh` updates the map; `forget` removes a topic. Updates and forgetting require the observed `expected_revision`; a new topic defaults to 0. Cache operations do not edit project files or require a project mutation approval. The automatic map respects ignore rules and excludes generated directories, links, binary and oversized files; copied text uses the existing secret/instruction screening. Scans are bounded to 2,048 files, 16 MiB and three seconds, with partial coverage reported; files over 256 KiB are omitted and at most 128 findings are saved. Source outlines are structural excerpts, not a complete call graph or generated architectural explanation. Default turn context is 8,000 bytes. Configure `[codebase]` or `/settings` → Models → Project understanding; disable it with `enabled=false`. Sealed evaluations receive no persistent project knowledge.
 - Sessions: JSONL per project, resume/fork, rewind, automatic summarization when the context fills (`/compact`), full-text `session_search`.
 - Historical evidence stays append-only. The request context is a projection of it, built to keep the conversation prefix byte-identical from step to step so a provider or local server can reuse its prompt cache: recalled notes are stored with the user turn they were recalled for, a superseded read becomes a fixed placeholder once (and only while little text follows it, or when the context is filling up), and under context pressure old, large `read`/`grep`/`glob`/`find`/`bash`/`lsp`/web results outside the newest fifth of the window are replaced once by a pointer to their full text (`artifact_read` retrieves it). Mutation results, todo and memory updates, and small results are never replaced. `working_state` preserves explicit goals, constraints, decisions and unfinished work; compaction also carries the original goal and evidence references. Agent notes are not verification proof.
 - Custom slash commands: `.dial/commands/*.md` (`$ARGUMENTS`, `$1`…).
@@ -304,9 +470,23 @@ regression evidence, not claims about real-model quality.
 
 ## Automatic self-improvement
 
-No `improve init`, hand-written evaluation suite, or manual training command is required. Normal sessions record trajectories and tool failures. After **5 new live turns**, a detached worker is queued; cycles run at most once every **6 hours**. On local MLX, the worker waits for the foreground session to release the shared compute lock. A new session may wait if training/evaluation already owns compute. This is automatic idle-time learning, not uninterrupted concurrent training and serving.
+No `improve init`, hand-written evaluation suite, or manual training command is required. Normal sessions record trajectories and tool failures. After **5 new live turns**, a detached worker is queued; cycles run at most once every **6 hours**. On local MLX, a session that queues improvement unloads its resident models and releases the shared compute lock between turns, after its running child agents finish. The chat stays open. Its next turn reloads the model and may wait if training/evaluation owns compute. Other local sessions can still hold up the queued worker. This is automatic idle-time learning, not uninterrupted concurrent training and serving.
 
 ### What a cycle does
+
+`/improve jobs` shows each model's worker status and log alongside the shared compute lock.
+`/improve stop <state_id>` requests a safe stop for the model ID shown there. Updated training
+subprocesses cancel promptly; inference/evaluation finishes its current case before stopping.
+A stop also pauses future cycles until `dial improve enable` is run for that model. Workers
+started with older binaries cannot acknowledge stop requests; the result explicitly reports this.
+A recorded `running` state with `control_busy: false` is stale, not evidence of active training.
+Compute can be held by another model, project, interactive session, or capability verification.
+
+`/improve` shows the remaining cycle and LoRA cooldowns separately, new-turn prerequisites,
+the active stage and elapsed cycle time. The learning status line updates stage progress automatically
+(including self-play task and evaluation-check counts). LoRA training reports its planned iteration
+count while waiting for the worker; it does not yet stream per-iteration progress or predict a finish
+time. Eligibility also depends on verified training data, so an elapsed cooldown is not a training ETA.
 
 1. **Observe and monitor.** Keep tool events, repaired calls and completed conversations. The event-feature logistic probe ranks risky steps when enough externally scored trajectories exist and its held-out AUC is informative; predicted risk remains separate from ground-truth scores. `/outcome` supplies a human verdict and `/undo` records rejection. Shell exit codes alone are telemetry, not task-success labels.
 2. **Practice with external checks.** Run 24 generated file-editing, scripting, search and structured-data tasks in disposable, strictly sandboxed workspaces. Files, JSON values, answers and command results are checked deterministically. Later cycles prioritize train families with low verified pass rates, high risk scores or recent tool-error categories; gate/anchor families never enter self-play.
@@ -322,11 +502,13 @@ may train a separate LoRA adapter for a supported local MLX model from accumulat
 The adapter only becomes active after the external gate admits it; rejected candidates do not alter
 the serving model. Hosted endpoints can improve the harness, not their remote weights.
 
-During live work, Dial may add up to three matching repair hints from the same project to the system context. It shows only tool names, argument field names and failure categories—not old argument values—and never bypasses current validation or approval.
+During live work, Dial may attach up to three matching repair hints from the same project to the user message they match. They are stored with that message, never placed in the system prompt, so the cached prompt prefix does not change from turn to turn. Hints show only tool names, argument field names and failure categories—not old argument values—and never bypass current validation or approval.
 
-The MLX server adapter preserves malformed model tool calls as explicitly invalid, non-executable calls rather than allowing the pinned upstream formatter to crash on missing arguments. These errors remain visible to the agent and the learning pipeline.
+The MLX server adapter preserves malformed model tool calls as explicitly invalid, non-executable calls rather than allowing the pinned upstream formatter to crash on missing arguments. These errors remain visible to the agent and the learning pipeline. Its prompt (KV prefix) cache is bounded to a quarter of physical memory (`--prompt-cache-bytes`); mlx-lm's default holds up to ten caches with no byte limit, which can push weights into swap on unified memory.
 
 ```sh
+dial improve jobs                   # all project models, active locks, stage and recent log
+dial improve stop <state_id>        # cancel training / stop after current case; pause future cycles
 dial improve status                 # scheduler state, last cycle, scores, probe and layer sensitivity
 dial improve versions
 dial improve disable                # pause pending/future automatic cycles; a running cycle finishes
@@ -339,6 +521,129 @@ dial improve propose proposal.json
 dial improve rollback
 dial improve outcome 42 --score 100 --source human-review
 ```
+
+### Verified local-model workflows
+
+These features improve the harness around a model; they do not imply a measured increase in model
+quality merely because training ran.
+
+- **Executable repair evidence.** In recorded live sessions, the same declared check must fail, a
+  checkpointed file must change, and the check must subsequently pass. Dial retains the command,
+  objective, exit results, immutable output, and before/after source bytes with hashes. Sources and
+  outputs are retrievable through `artifact_read`, including after undo. Related records are retrieved
+  within the same project; exact failed-state applicability is checked with a bounded hash scan.
+  An unchanged flaky pass, timeout, missing snapshot, or changed command cannot establish a repair.
+  Changed tests or environment can still explain a pass: this evidence never sets a trajectory success
+  score or bypasses the training admission gate.
+- **Measured workflow candidates.** Recurring tool-form and investigation failures propose protocol
+  discipline, alternate edit-format, or bounded-investigation harness profiles. Profiles enter the
+  existing held-out correctness/drift gate. Paired measurements additionally reject newly lost cases
+  and hidden regressions in tool calls, protocol errors, chatter, or generation rounds. Candidate
+  rationale, source counts, measurements and model identity persist with the version; existing
+  activation/rollback remains authoritative. An efficiency-only gain cannot bypass correctness admission.
+- **Targeted practice.** Recurring failure categories prioritize generated configuration-precedence,
+  empty-search-versus-error, and behavioral-boundary exercises. Separate held-out contracts test
+  transfer to null/clearing rules, search recovery and semantic boundaries. Synthetic variants use
+  aggregate categories, not copied project source, user prompts or sealed gate answers.
+- **Per-todo evidence packets.** An active task gets a bounded context packet containing its question,
+  recorded findings, verification objective and evidence references. At task transitions, eligible old
+  successful observation bodies are replaced by artifact references. All user messages, call/result
+  pairing, mutation/error results and the most recent twelve messages remain intact. The session is
+  append-only; packets stay stable while the task state is unchanged and never modify the system prefix.
+
+Behavioral evidence is opt-in per configured check. Syntax/build checks remain explicitly classified
+as syntax-only unless the operator identifies the command as testing behavior:
+
+```toml
+[verification]
+behavioral_checks = ["regression"]
+
+[[verification.commands]]
+name = "regression"
+command = "python3 -m unittest discover -s tests"
+file_extensions = ["py"]
+timeout_secs = 120
+```
+
+**Isolated patch search and escalation** are optional specialist tools, disabled by default. Enable
+them in user/project configuration, then load `solve` or `escalate` with `tool_load`:
+
+```toml
+[solve]
+enabled = true
+max_candidates = 3
+max_steps = 16
+max_snapshot_bytes = 67108864
+
+[escalation]
+enabled = true
+allow_remote = false
+role = "stronger"
+max_evidence_bytes = 12000
+
+[model_roles.stronger]
+provider = "mlx"
+model = "/absolute/path/to/stronger-mlx-model"
+```
+
+`solve` takes `goal`, exact relative `allowed_paths`, independent `candidates` (approach strings),
+and explicit `checks` (`command`, optional `timeout_secs`). It runs bounded local workers in separate
+copies, then each check in another isolated copy. Workers and checks are network-disabled and follow
+approval policy. A candidate that changes other files or fails a check cannot win. Among passing
+candidates, the smallest changed-byte span wins; application refuses stale source or symlinks and
+preserves unrelated dirty/untracked work. Checks establish only what they actually assert, not broad
+semantic correctness. Source files are never reset or checked out.
+
+`escalate` takes only `goal`, `question`, `evidence` and `rejected_hypotheses`. It sends no automatic
+repository files or conversation history. The stronger role must be configured explicitly. Local MLX
+and exact loopback endpoints are allowed by default; private LAN and public endpoints both require
+`escalation.allow_remote = true`. Approval remains separate. Advice is marked unverified, carries
+usage/cost accounting, and must be checked locally before becoming a correctness claim. Neither a
+solver win nor a stronger-model answer automatically becomes a verified training outcome.
+
+### Machine-configuration comparisons
+
+Use the existing benchmark CLI to compare explicit configurations on identical checked tasks:
+
+```sh
+dial benchmark suite.toml --profiles machine.toml --report machine-report.json
+```
+
+Example `machine.toml`:
+
+```toml
+[machine]
+repetitions = 2
+case_timeout_secs = 300
+minimum_correctness = 1.0
+allow_remote = false
+
+[[configurations]]
+name = "q4-8k"
+provider = "mlx"
+model = "/absolute/path/to/mlx-model"
+context_window = 8192
+quantization_bits = 4
+
+[[configurations]]
+name = "q4-16k-adapter"
+provider = "mlx"
+model = "/absolute/path/to/mlx-model"
+context_window = 16384
+quantization_bits = 4
+adapter = "/absolute/path/to/adapter"
+```
+
+The first configuration is the baseline. `quantization_bits` validates existing MLX model metadata;
+it does not quantize weights. Adapter metadata must identify the selected base model. Endpoint
+variants use explicit provider/model IDs; non-loopback providers require `machine.allow_remote=true`.
+Each case has fresh state against one source snapshot, with automatic improvement, secondary model
+roles, search and escalation disabled. Reports include machine identity, settings, suite hash, checked
+correctness, wall time including failures/checks, observed tokens and repair rounds, and correctly
+completed cases per second. Unavailable measurements stay null. Recommendations must meet the
+correctness floor and per-case regression limits; reports never apply settings, activate adapters or
+start training. Scripted-provider smoke results verify this plumbing, not real-model quality.
+
 
 `improvement.log`, datasets, adapter artifacts and the SQLite audit history live under the project's private state directory, outside the workspace. For custom use cases, an optional `[gate]` can point to your own independent JSONL suites; cases accept `expected`/`matcher` or a declarative `check`, and optional seeded `files`. Automatic generated tasks measure a bounded coding/tool-use curriculum, not arbitrary real-world correctness. Custom gates use their explicit point thresholds rather than the automatic curriculum's significance rule.
 
@@ -356,6 +661,15 @@ incompatible adapter. Sessions, skills, memory and prompt history remain project
 
 ```toml
 remote_model_idle_timeout_secs = 180
+
+[reasoning_guard]          # operator-owned; not mutated by harness improvement
+enabled = true
+max_pre_action_secs = 60
+max_reasoning_bytes = 16384
+
+[codebase]
+enabled = true
+context_max_bytes = 8000
 
 [ui]
 theme = "dark"                    # dark | light | mono | gruvbox | nord | paper | auto
@@ -460,7 +774,8 @@ max_seq_length = 8192
 ## Known limits
 
 - Tool-calling quality depends on the model: 7B-class instruct models handle the tool set; sub-1B models often emit unreadable calls (which become training signal rather than being hidden).
-- Local compute is serialized across projects. Background cycles wait for a resident foreground session to exit; new sessions wait if a cycle already holds compute. There is no claim of zero-downtime training.
+- Local compute is serialized across projects. A session that queues improvement releases compute when idle and its child agents have finished; a subsequent turn waits if the cycle holds compute. There is no claim of zero-downtime training.
+  While waiting for compute, the elapsed timer advances and commands follow the same live/deferred/interrupting policy as during inference. Turn duration includes that wait; acquiring compute returns the status to Working rather than leaving it marked as waiting.
 - The TUI is keyboard-driven; not every terminal supports modified Enter keys. There is no cron or voice integration. Browser and kernel require available OS containment; they fail closed rather than falling back to unrestricted execution.
 - Live memory/skill edits are the user's working state and are not gated; only the admitted harness is.
 - Operator tools are trusted programs and are not sandboxed during live work; they are excluded from automatic evaluation. Non-macOS: `bash` is unavailable unless `sandbox.mode = "off"` for live use, while generated evaluations still require the strict sandbox.
@@ -479,3 +794,162 @@ src/ui/       terminal renderer, composer, themes, overlays
 ```
 
 Adding a tool: implement `tools::ext::Tool` in its own module, return it from a `tools()` constructor, and list it in `Registry::standard`.
+
+### Measured harness improvement and repository exercises
+
+Dial bounds initial reasoning according to task complexity (20–60 seconds, capped by the configured
+reasoning limit), redirects repeated unchanged investigations, and saves completed investigation
+findings with source hashes. Saved findings are untrusted context: changed sources make them stale,
+and replaying an old completed todo cannot make them fresh again. Error recovery hints distinguish
+missing paths, malformed calls and failed edits so retries can change approach.
+
+Improvement records tool errors, repeated investigations, interventions, tool calls, tokens and elapsed
+time alongside correctness. Task profiles may select an accepted version's known-good parent for a
+particular task category only after paired evaluation shows a consistent advantage without lost
+correctness. Unmeasured categories retain the active version. `/improve` and `dial improve status`
+show the measurements; timing is diagnostic and does not by itself establish improved correctness.
+
+Register real repository exercises for the selected model with an explicit JSON manifest:
+
+```json
+{
+  "id": "parser-boundary",
+  "prompt": "Fix the parser's boundary handling while preserving valid inputs.",
+  "split": "train",
+  "files": ["src/parser.py"],
+  "verification_files": ["checks/parser_boundary.py"],
+  "command": "python3 -B checks/parser_boundary.py"
+}
+```
+
+```sh
+dial improve register-task exercise.json
+dial improve tasks
+dial improve register-task repair.json --trajectory 123
+```
+
+Registration captures immutable, explicitly listed UTF-8 source and verification files. Include every
+required dependency; checks run offline in an isolated workspace. Verification files are withheld
+from the initial solver workspace and restored before verification. Use separate `evaluation`
+exercises for held-out checks: duplicate content and prompts cannot cross splits. Repository
+exercises supplement the automatic evaluation suites; they do not replace the primary admission
+gate. Each cycle replays at most four registered training tasks. Training may make one correction
+after an independent failure; evaluation receives no such repair attempt.
+
+`--trajectory` imports a retained behavioral repair, including its original failed source snapshots.
+The supplied independent checks must fail before and pass after the recorded change. The manifest
+must list all changed files, including deletions; changed verification files are rejected. A repair
+record or a successful tool call alone never becomes a successful training label. Syntax-only checks
+remain distinct from behavioral evidence.
+
+The optional `solve` and `escalate` tools use the configuration documented under **Isolated patch
+search and escalation** above. Candidate search verifies independent patches in isolated workspaces;
+escalation supplies compact evidence to an explicitly configured stronger model. Both remain disabled
+until configured, and stronger-model advice still requires local verification.
+
+Use `/improve jobs` to distinguish the selected model's idle state from another model's active
+compute job, and `/improve stop <state_id>` to request cancellation. LoRA support verification,
+training, evaluation, activation and confirmed adapter use are separate states. An available or
+verified adapter capability does not mean training has run or that inference used an adapter.
+
+### Inspect Dial's saved understanding
+
+Use `/understanding` to inspect saved project findings and source outlines, or
+`/understanding routing` to filter by a topic, path or symbol. Entries show their source references
+and freshness: **fresh**, **stale**, or **unchecked** when the freshness read budget is exhausted.
+Findings include their originating session and revision. Stale summaries remain visible for auditing,
+clearly marked as historical; they are not restored to the agent's current context.
+
+The interactive view shows up to 40 matching entries and reports truncation. To see or export every
+saved entry without loading a model:
+
+```sh
+dial understanding
+dial understanding routing
+dial understanding --json > understanding.json
+```
+
+This inspects existing saved knowledge without refreshing the index or generating new claims.
+Coverage is limited to supported, permitted indexed files; it does not imply the model knows every
+file or that agent findings have been independently verified. `/todo` shows current session tasks,
+`/memory` shows other project memory, and `/context` shows context usage.
+
+`/understanding architecture` shows saved architectural findings, design documents and manifests,
+indexed directories, and observed import/module declarations with source locations and freshness.
+The view identifies missing architectural knowledge explicitly. Directory groups do not establish
+responsibilities, and imports are not a resolved dependency graph. No extra model inference is used.
+The same view is available as `dial understanding architecture`, with `--json` for all records.
+
+### Architecture-guided coding
+
+Laya decision advice is available with `/laya on`, or `[laya] enabled = true`. It uses the
+Dial-owned Laya service's native typed prediction API for retrieval scope and post-edit evidence
+review. `/laya status` shows the latest session decision; `/laya check` probes the live checkpoint
+and device. Advice and raw probabilities never certify behavior or replace deterministic checks.
+The Architecture model role writes architecture summaries; it follows the main coding model until you assign a separate model in the model picker (Alt+M). Laya supplies typed decisions rather than summaries.
+
+Install the independent runtime with `dial laya install --checkpoint /path/to/checkpoint`.
+Dial copies the checkpoint assets into `$DIAL_HOME/laya/model` (default `~/.dial/laya/model`),
+creates its own Python environment, and bundles its own server. No other coding-agent installation
+is required. Reinstallation without `--checkpoint` updates the runtime and preserves the saved model.
+
+With `laya.auto_start = true` (default), a refused connection starts Dial's server using its private
+runtime. Default port 8002 is separate from other applications. Health responses must identify the
+service as `dial-laya` with the supported protocol; foreign services are rejected rather than reused.
+Cold startup waits only the configured request interval before coding continues with a **loading**
+notice. `/laya start` explicitly starts/waits for up to 30 seconds, with responsive cancellation.
+`dial laya start` and `dial laya status` also work from a terminal. The managed server logs to
+`~/.dial/laya/server.log` and exits after 15 minutes without prediction requests. Disable advice
+with `/laya off`; existing managed requests finish and the service can shut down when idle.
+
+With `[codebase].synthesize_architecture = true` (the default), a successful turn can maintain a
+persistent architecture synthesis using the Architecture model role. Maintenance response text, reasoning, and tool argument streams stay out of the transcript; progress and completion notices remain visible. The task's first action does
+not wait for this maintenance call. One call per indexed source state is attempted, with a 60-second
+deadline, bounded source excerpts and output, no tools, and visible cancellation. An invalid response
+leaves the previous record intact; `/understanding build` explicitly retries. Sealed evaluations do
+not load or synthesize project memory.
+Queued foreground work takes priority: automatic maintenance skips or cancels without consuming the
+queued message, and an interrupted maintenance attempt may be retried on a later turn.
+
+The record explains project purpose, component responsibilities and state ownership, supported
+execution paths, constraints, and validation evidence. Every section must cite sources actually
+supplied to the model and still unchanged when saved. It records partial coverage and unknowns;
+source citations establish provenance, not semantic correctness. Fresh sections survive incremental
+updates, while changed or excluded supporting sources make affected sections unavailable for reuse.
+Unchanged projects reuse the saved record across sessions without another synthesis call.
+
+Freshness also covers dependency scopes. Component observations watch their cited module, lexical
+consumer candidates, and project documents/configuration; broader architectural observations and
+saved investigation findings watch the supported project sources. File additions/removals/renames,
+branch identity, manifests, lockfiles and toolchain configuration invalidate saved assumptions.
+Checks are bounded (2048 supported files, 16 MiB, three seconds per snapshot); incomplete scopes are
+**unchecked**, never silently current. Old records without dependency provenance require rebuilding.
+Before the first edit to a path, outdated saved assumptions cause an investigation checkpoint: inspect
+current sources and dependencies before retrying. This is a review prompt, not a semantic proof.
+
+`codebase_memory` action `invalidate` records a contradiction using `section_ids` for architecture
+or `topic` for a finding, plus `reason`. Contradicted prose is withheld until explicitly replaced;
+concurrent synthesis cannot erase a newly reported contradiction. The architecture view distinguishes
+source status from behavioral status. The latest configured behavioral check records command digest,
+source/environment fingerprints and time; it becomes stale when its provenance changes. A failure
+requires review, and a pass does not certify an architectural claim. Runtime services, environment
+variables and dynamically resolved dependencies still need task-specific checks; lexical consumers
+do not establish a complete call graph.
+
+`/understanding architecture` leads with this synthesis. Raw imports are labeled unresolved references.
+Each coding turn receives a bounded purpose statement and task-relevant architecture sections.
+After edits, the harness supplies affected-area review guidance and lexical consumer/test candidates;
+the agent uses configured `lsp` definitions/references to resolve symbols where available. Existing
+language-server startup approvals still apply. No architecture-generated shell command runs automatically.
+
+Before editing/debugging tasks, up to eight operator-configured `behavioral_checks` run to record the
+pre-edit baseline, subject to normal tool approval. Relevant configured checks run again after edits.
+This distinguishes pre-existing failures from regressions and supplies failure/change/pass repair
+evidence without labeling the whole task successful. Syntax checks remain separate. Changed-file
+review prompts cover callers, interfaces, configuration/serialization, state ownership, and reuse.
+
+An unchanged investigation observation now consumes the remaining unplanned inspection allowance,
+triggering a concrete investigation todo when needed. The existing repeated-evidence stop still applies.
+Workflow records separately count architecture output tokens, failed verification checks, repair
+rounds, and change-review prompts. Compare actual task correctness and complete-run cost with the
+existing repository benchmarks before attributing performance gains to these features.

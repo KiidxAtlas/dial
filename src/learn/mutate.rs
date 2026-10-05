@@ -87,7 +87,7 @@ fn family_advice(family: &str) -> Option<&'static str> {
 
 /// Append `note`, evicting the oldest notes if needed to stay within the harness memory limits.
 /// Returns false when the note cannot fit at all or is already present.
-fn push_note(h: &mut Harness, note: &str) -> bool {
+pub(super) fn push_note(h: &mut Harness, note: &str) -> bool {
     if note.len() > MAX_NOTE_BYTES || h.memory.iter().any(|m| m == note) { return false; }
     let total = |h: &Harness| h.memory.iter().map(String::len).sum::<usize>();
     let mut evict = 0;

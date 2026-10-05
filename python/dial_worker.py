@@ -276,42 +276,59 @@ def load_base(model):
     return load(model, tokenizer_config={"trust_remote_code": False})
 
 
+LORA_PROBE_VERSION = 2
+
+
 def query_targets(model, count=None):
-    """Only explicit, separately represented q_proj modules are supported."""
+    """Preserve query adapters; fall back to the architecture's linear projections.
+
+    MLX applies a union of relative keys to every selected block. Resolve that union
+    before computing expected tensors, including matches in heterogeneous blocks.
+    """
     import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear
+    supported = (nn.Linear, nn.QuantizedLinear, SwitchLinear, QuantizedSwitchLinear)
     layers = getattr(model, "layers", None)
     require(layers is not None and len(layers) > 0, "model exposes no trainable transformer layers")
     if count is not None:
-        require(count <= len(layers), "num_layers exceeds model layer count")
+        require(0 < count <= len(layers), "num_layers exceeds model layer count")
     selected = layers if count is None else layers[-count:]
-    keys, modules = set(), []
+    keys = set()
     for layer in selected:
-        found = [(name, module) for name, module in layer.named_modules()
-                 if name.rsplit(".", 1)[-1] == "q_proj"
-                 and isinstance(module, (nn.Linear, nn.QuantizedLinear))]
-        require(bool(found), "selected layer lacks a supported separate q_proj; fused QKV is unsupported")
+        eligible = [(name, module) for name, module in layer.named_modules()
+                    if name and isinstance(module, supported)]
+        # Keep existing query-only adapters byte-for-byte compatible on ordinary attention.
+        found = [(name, module) for name, module in eligible if name.rsplit(".", 1)[-1] == "q_proj"]
+        if not found:
+            # Prefer a single output projection for fused attention and recurrent blocks.
+            found = [(name, module) for name, module in eligible
+                     if name.rsplit(".", 1)[-1] in ("o_proj", "out_proj")]
+        if not found:
+            found = eligible
+        require(bool(found), "selected block exposes no MLX LoRA-compatible linear projections")
         keys.update(name for name, _ in found)
-        modules.extend(module for _, module in found)
-    # Guard against accidental matches outside the selected transformer blocks.
+    modules = [module for layer in selected for name, module in layer.named_modules() if name in keys]
+    require(all(isinstance(module, supported) for module in modules), "target path has incompatible types across blocks")
     selected_ids = {id(module) for module in modules}
     require(not any(name in keys and id(module) not in selected_ids
-                    for name, module in model.named_modules()),
-            "ambiguous query projection paths")
+                    for name, module in model.named_modules()), "ambiguous adapter projection paths")
     return sorted(keys), selected_ids
 
 
 def expected_weights(model, selected_ids, rank):
-    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear
+    from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
+    from mlx.utils import tree_flatten
     expected = {}
     for name, module in model.named_modules():
         if id(module) not in selected_ids:
             continue
-        output_dim, input_dim = module.weight.shape
-        if isinstance(module, nn.QuantizedLinear):
-            input_dim = input_dim * 32 // module.bits
-        expected[name + ".lora_a"] = (input_dim, rank)
-        expected[name + ".lora_b"] = (rank, output_dim)
-    require(bool(expected), "no query projection adapter parameters found")
+        wrapper = LoRASwitchLinear if isinstance(module, (SwitchLinear, QuantizedSwitchLinear)) else LoRALinear
+        adapter = wrapper.from_base(module, r=rank, scale=20.0, dropout=0.0)
+        for key, tensor in tree_flatten(adapter.parameters()):
+            if key in ("lora_a", "lora_b"):
+                expected[name + "." + key] = tuple(tensor.shape)
+    require(bool(expected), "no adapter parameters found")
     return expected
 
 
@@ -333,6 +350,53 @@ def validate_adapter(path, model_name, count, parameters, expected):
     return directory
 
 
+def probe_adapter(model, tokens):
+    """One small update and a serialized reload; never saves an admitted adapter."""
+    import tempfile
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten, tree_unflatten
+    from mlx_lm.tuner.utils import linear_to_lora_layers, load_adapters
+    # Exercise all block types, with rank one and a short sequence to bound overhead.
+    keys, ids = query_targets(model)
+    parameters = {"rank": 1, "dropout": 0.0, "scale": 20.0, "keys": keys}
+    expected = expected_weights(model, ids, 1)
+    originals = [(name, module) for name, module in model.named_modules() if id(module) in ids]
+    model.freeze()
+    linear_to_lora_layers(model, len(model.layers), parameters)
+    model.train()
+    batch = mx.array([tokens[:8]])
+    require(batch.shape[1] >= 2, "verification prompt has insufficient tokens")
+    def loss_fn(network):
+        return nn.losses.cross_entropy(network(batch[:, :-1]), batch[:, 1:], reduction="mean")
+    loss, grads = nn.value_and_grad(model, loss_fn)(model)
+    flat = dict(tree_flatten(grads))
+    mx.eval(loss, grads)
+    require(math.isfinite(loss.item()), "adapter verification loss is nonfinite")
+    require(set(flat) == set(expected), "adapter verification trainable tensors differ from targets")
+    require(all(bool(mx.all(mx.isfinite(g)).item()) for g in flat.values()), "adapter verification gradient is nonfinite")
+    require(any(bool(mx.any(g != 0).item()) for g in flat.values()), "adapter verification gradients are all zero")
+    weights = dict(tree_flatten(model.trainable_parameters()))
+    updated = {name: weights[name] - 1e-3 * gradient for name, gradient in flat.items()}
+    model.update(tree_unflatten(list(updated.items())))
+    model.eval()
+    logits = model(batch[:, :-1])
+    mx.eval(logits, updated)
+    require(bool(mx.all(mx.isfinite(logits)).item()), "adapter verification logits are nonfinite")
+    with tempfile.TemporaryDirectory(prefix="dial-lora-probe-") as directory:
+        path = Path(directory)
+        (path / "adapter_config.json").write_text(json.dumps({"fine_tune_type": "lora",
+            "num_layers": len(model.layers), "lora_parameters": parameters}))
+        mx.save_safetensors(str(path / "adapters.safetensors"), updated)
+        model.update_modules(tree_unflatten(originals))
+        load_adapters(model, directory)
+        model.eval()
+        reloaded = model(batch[:, :-1])
+        mx.eval(reloaded)
+        require(bool(mx.allclose(logits, reloaded, rtol=1e-3, atol=1e-3).item()), "adapter reload changed model output")
+    return keys
+
+
 def capabilities(request):
     model_name = string(request, "model")
     resolved = None
@@ -346,12 +410,13 @@ def capabilities(request):
                 "reason": f"MLX model/tokenizer loading or chat template unavailable ({type(error).__name__}); remote code is disabled",
                 "unsupported": UNSUPPORTED, "resolved_model": resolved}
     try:
-        keys, _ = query_targets(model)
+        tokens = tokenizer.apply_chat_template([{"role": "user", "content": "Hello"}], add_generation_prompt=True, tokenize=True)
+        keys = probe_adapter(model, tokens)
     except RequestError as error:
-        return {"inference": True, "lora": False, "reason": str(error),
+        return {"inference": True, "lora": False, "lora_probe_version": LORA_PROBE_VERSION, "reason": "Dial adapter verification failed: " + str(error),
                 "unsupported": UNSUPPORTED, "resolved_model": resolved}
-    return {"inference": True, "lora": True,
-            "reason": "MLX model and chat template loaded; query-only LoRA/QLoRA targets: " + ", ".join(keys),
+    return {"inference": True, "lora": True, "lora_probe_version": LORA_PROBE_VERSION,
+            "reason": "Gradient update and adapter save/reload passed; LoRA/QLoRA targets: " + ", ".join(keys),
             "unsupported": UNSUPPORTED, "resolved_model": resolved}
 
 
@@ -379,7 +444,7 @@ def generate(request):
         rank = integer(parameters, "rank", 1, 128)
         keys, ids = query_targets(model, count)
         require(parameters == {"rank": rank, "dropout": 0.0, "scale": 20.0, "keys": keys},
-                "adapter must use supported query-only LoRA parameters")
+                "adapter must use supported architecture-specific LoRA parameters")
         validate_adapter(directory, model_name, count, parameters, expected_weights(model, ids, rank))
         load_adapters(model, str(directory))
     prompt = tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=True)

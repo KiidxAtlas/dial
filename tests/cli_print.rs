@@ -411,3 +411,33 @@ fn rpc_cancels_live_worker_while_its_write_is_waiting_for_approval() {
     assert!(!env.project.path().join("forbidden.txt").exists());
     rpc.send(5,"shutdown",json!({}));rpc.result(5);
 }
+
+#[test]
+fn understanding_cli_needs_no_model_and_exports_all_saved_entries() {
+    use dial::{storage::{paths::Layout,codebase::Codebase},tools::Workspace};
+    let project=tempfile::tempdir().unwrap();
+    let home=tempfile::tempdir().unwrap();
+    let run=|args:&[&str]|Command::new(env!("CARGO_BIN_EXE_dial"))
+        .env("DIAL_HOME",home.path()).current_dir(project.path()).args(args).output().unwrap();
+    let empty=run(&["understanding","--json"]);
+    assert!(empty.status.success(),"{}",String::from_utf8_lossy(&empty.stderr));
+    let empty:Value=serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(empty["indexed_files"],0);
+    std::fs::write(project.path().join("routing.rs"),"pub fn route_request() {}\n").unwrap();
+    let layout=Layout::with_user_dir(project.path(),home.path().into()).unwrap();
+    Codebase::open(&layout).unwrap().refresh(&Workspace::new(project.path()).unwrap(),&AtomicBool::new(false)).unwrap();
+    let all=run(&["understanding","--json"]);
+    assert!(all.status.success());
+    let report:Value=serde_json::from_slice(&all.stdout).unwrap();
+    assert_eq!(report["files"].as_array().unwrap().len(),1);
+    assert_eq!(report["files"][0]["status"],"fresh");
+    let text=run(&["understanding","route_request"]);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("routing.rs"));
+    let architecture=run(&["understanding","architecture","--json"]);
+    assert!(architecture.status.success());
+    let architecture:Value=serde_json::from_slice(&architecture.stdout).unwrap();
+    assert_eq!(architecture["view"],"architecture");
+    assert!(architecture["architecture"]["areas"]["(root)"].is_array());
+    let filtered=run(&["understanding","missing","--json"]);
+    assert!(serde_json::from_slice::<Value>(&filtered.stdout).unwrap()["files"].as_array().unwrap().is_empty());
+}

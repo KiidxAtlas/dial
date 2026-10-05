@@ -31,13 +31,14 @@ pub mod mcp;
 pub mod lsp;
 pub mod hashline;
 pub mod sandbox;
+pub mod diagnostics;
 mod files;
 mod diff;
 mod tolerant;
 mod search;
 mod select;
 pub(crate) mod shell;
-mod walk;
+pub(crate) mod walk;
 pub mod web;
 #[cfg(test)]
 mod testkit;
@@ -54,7 +55,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub const BUILTIN: &[&str] = &["read", "write", "edit", "glob", "grep", "bash"];
 
 /// dial's own tools beyond the file/shell built-ins.
-pub const EXTRA_TOOLS: &[&str] = &["todo", "finish", "task", "skill", "skill_manage", "session_search", "tool_search", "tool_load", "artifact_read", "working_state", "task_message", "recall", "retain", "memory_update", "forget", "memory_history", "memory_import"];
+pub const EXTRA_TOOLS: &[&str] = &["todo", "finish", "task", "solve", "escalate", "skill", "skill_manage", "session_search", "tool_search", "tool_load", "artifact_read", "working_state", "task_message", "recall", "retain", "memory_update", "forget", "memory_history", "memory_import"];
 
 /// Optional integration tools (see [`ext`]). Offered unless `integrations` in the config omits them.
 pub const INTEGRATION_TOOLS: &[&str] = &["bg", "web_fetch", "web_search", "lsp", "ast_search", "ast_edit", "dap", "find", "browser", "kernel"];
@@ -67,8 +68,17 @@ pub fn default_tools() -> Vec<String> {
 const MAX_LIST: usize = 500;
 
 /// Most bytes of one tool result the agent keeps in the conversation. The built-in tools cap their own
-/// output below this and say how to fetch the rest, so this is only the safety net for tools that do not.
+/// output near this and say how to fetch the rest; the agent applies [`model_output_limit`] on top.
 pub const MODEL_OUTPUT_LIMIT: usize = 24 * 1024;
+/// Floor for [`model_output_limit`]: below this a compiler error with its location no longer fits.
+const MIN_MODEL_OUTPUT: usize = 4 * 1024;
+
+/// The per-result byte limit for a model with `context_window` tokens: about an eighth of the window
+/// (at ~4 bytes per token) between 4 KiB and [`MODEL_OUTPUT_LIMIT`]. A fixed 24 KiB result is about
+/// 6k tokens, most of an 8k local model's context; full text stays retrievable from artifacts.
+pub fn model_output_limit(context_window: u32) -> usize {
+    (context_window as usize / 2).clamp(MIN_MODEL_OUTPUT, MODEL_OUTPUT_LIMIT)
+}
 
 /// Per-workspace scratch directory exported as TMPDIR for bash; walks skip it.
 pub const SCRATCH_DIR: &str = ".tmp";
@@ -288,7 +298,7 @@ impl Workspace {
     }
 }
 
-fn tool_schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+pub(crate) fn tool_schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "function",
         "function": {
@@ -422,6 +432,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
             "bash",
             "Run a shell command with `/bin/bash -c` in the workspace root. It may run inside a sandbox: writes are \
              confined to the project, some paths outside it can be unreadable, and the network may be blocked. \
+             `/tmp` is outside the project: put temporary files in `$TMPDIR`, a scratch directory inside it. \
              `Operation not permitted` or a network failure means the sandbox refused it, not that your command \
              is wrong: do not repeat it unchanged, work inside the project or tell the user. stdout and stderr are \
              merged; large output keeps its beginning and its end (the end holds build and test verdicts). The \

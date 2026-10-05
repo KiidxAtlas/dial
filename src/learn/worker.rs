@@ -98,6 +98,12 @@ pub fn run_command(
     input: &str,
     timeout_secs: u64,
 ) -> Result<String> {
+    run_command_controlled(program, args, input, timeout_secs, None, None)
+}
+
+fn run_command_controlled(program: &Path, args: &[String], input: &str, timeout_secs: u64,
+    cancel: Option<&std::sync::atomic::AtomicBool>, stop: Option<&Path>) -> Result<String> {
+    ensure!(!stop.is_some_and(Path::exists), "improvement stopped by operator");
     ensure!(timeout_secs > 0, "subprocess timeout must be positive");
     ensure!(input.len() <= MAX_OUTPUT, "subprocess input exceeds 8 MiB");
     let started = Instant::now();
@@ -126,6 +132,8 @@ pub fn run_command(
     let mut err_done = false;
     let mut status = None;
     loop {
+        ensure!(!stop.is_some_and(Path::exists), "improvement stopped by operator");
+        ensure!(!cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)), "capability verification cancelled");
         ensure!(started.elapsed() < timeout, "subprocess timed out after {timeout_secs}s");
         if let Some(writer) = stdin.as_mut() {
             match writer.write(&input.as_bytes()[sent..]) {
@@ -163,10 +171,11 @@ pub fn run_command(
 }
 
 pub fn call(config: &Config, request: &Value) -> Result<Value> {
+    crate::setup::refresh_worker(config)?;
     ensure!(config.python.is_absolute() && config.worker.is_absolute(), "python and worker paths must be absolute");
     let input = serde_json::to_string(request).context("serializing worker request")?;
     let worker = config.worker.to_str().context("worker path is not UTF-8")?;
-    let output = run_command(&config.python, &[worker.to_owned()], &input, config.worker_timeout_secs)?;
+    let output = run_command_controlled(&config.python, &[worker.to_owned()], &input, config.worker_timeout_secs, None, Some(&config.state_dir.join("improvement.stop")))?;
     let value: Value = serde_json::from_str(&output).context("worker returned invalid JSON")?;
     ensure!(value.is_object(), "worker response must be an object");
     Ok(value)
@@ -181,8 +190,25 @@ struct Capabilities {
     resolved_model: Option<PathBuf>,
 }
 
+/// Bump when adapter target selection or the verification contract changes.
+pub fn current_lora_probe(caps: &Value) -> bool {
+    caps["lora_probe_version"].as_u64() == Some(2)
+}
+
 pub fn capabilities(config: &Config) -> Result<Value> {
     let result = call(config, &json!({"op": "capabilities", "model": config.model}))?;
+    validate_capabilities(result)
+}
+
+pub fn capabilities_controlled(config: &Config, cancel: &std::sync::atomic::AtomicBool) -> Result<Value> {
+    crate::setup::refresh_worker(config)?;
+    ensure!(config.python.is_absolute() && config.worker.is_absolute(), "python and worker paths must be absolute");
+    let input = json!({"op":"capabilities", "model":config.model}).to_string();
+    let output = run_command_controlled(&config.python, &[config.worker.to_str().context("worker path is not UTF-8")?.to_owned()], &input, config.worker_timeout_secs, Some(cancel), None)?;
+    validate_capabilities(serde_json::from_str(&output).context("worker returned invalid JSON")?)
+}
+
+fn validate_capabilities(result: Value) -> Result<Value> {
     let parsed: Capabilities = serde_json::from_value(result.clone()).context("invalid capability response")?;
     ensure!(!parsed.reason.trim().is_empty(), "worker omitted capability reason");
     ensure!(!parsed.lora || parsed.inference, "LoRA capability requires inference support");
@@ -311,6 +337,49 @@ pub fn choose_layers(scores: &[f64], coverage: f64, min: u32, max: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_request_terminates_running_training_subprocess() {
+        let root = tempfile::tempdir().unwrap();
+        let stop = root.path().join("improvement.stop");
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                std::fs::write(&stop, "").unwrap();
+            });
+            let started = Instant::now();
+            let error = run_command_controlled(Path::new("/bin/sh"), &["-c".into(), "sleep 30".into()], "", 10, None, Some(&stop)).unwrap_err();
+            assert!(error.to_string().contains("stopped by operator"));
+            assert!(started.elapsed() < Duration::from_secs(3));
+        });
+    }
+
+    #[test]
+    fn lora_verification_cancellation_stops_the_worker_promptly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| { std::thread::sleep(Duration::from_millis(40)); cancel.store(true, Ordering::SeqCst); });
+            let error = run_command_controlled(Path::new("/bin/sh"), &["-c".into(), "sleep 30".into()], "", 10, Some(&cancel), None).unwrap_err();
+            assert!(error.to_string().contains("cancelled"));
+        });
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn lora_probe_validates_supported_and_unsupported_results() {
+        let root = tempfile::tempdir().unwrap();
+        let mut caps = json!({"inference":true,"lora":true,"resolved_model":root.path(),"reason":"supported query targets",
+            "unsupported":["expert_growth","routing_calibration","attention_retrofit","learned_step_probe"]});
+        assert!(validate_capabilities(caps.clone()).is_ok());
+        caps["lora"] = json!(false);
+        caps["reason"] = json!("fused QKV unsupported");
+        assert_eq!(validate_capabilities(caps.clone()).unwrap()["reason"], "fused QKV unsupported");
+        caps["inference"] = json!(false);
+        caps["lora"] = json!(true);
+        assert!(validate_capabilities(caps).is_err());
+    }
 
     #[test]
     fn choose_layers_takes_smallest_covering_suffix() {

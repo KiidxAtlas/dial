@@ -62,6 +62,8 @@ struct Tool {
     state: ToolState,
     output: String,
     elapsed: Option<f64>,
+    /// For a `todo` call: the list after it, each task flagged when this call changed it.
+    todo: Option<Vec<(crate::agent::todo::Task, bool)>>,
 }
 
 enum Kind {
@@ -414,6 +416,12 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
 // ---- tools ---------------------------------------------------------------------------------
 
 fn tool_title(t: &Tool) -> String {
+    // A hashline patch is titled by the files it touches, not by its first operation rows.
+    if t.name == "edit" {
+        let paths: Vec<&str> = t.summary.lines()
+            .filter_map(|l| l.trim().strip_prefix('[')?.strip_suffix(']')?.rsplit_once('#').map(|(path, _)| path)).collect();
+        if !paths.is_empty() { return text::one_line(&paths.join(", ")); }
+    }
     let summary = text::one_line(&t.summary);
     if !summary.trim().is_empty() {
         return summary.trim().to_owned();
@@ -450,9 +458,93 @@ fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
         return Vec::new();
     }
     match t.name.as_str() {
+        "todo" if t.todo.is_some() && t.state == ToolState::Ok => todo_card(t, w as usize, ctx),
+        // A passing automatic check is one line; a failing one keeps the full box with its diagnostics.
+        "bash" if t.state == ToolState::Ok && t.summary.starts_with("Verify ") => compact_tool(t, w as usize, ctx),
         "bash" | "edit" | "write" | "ast_edit" if w as usize >= BOX_MIN => tool_box(t, w as usize, ctx),
         _ => compact_tool(t, w as usize, ctx),
     }
+}
+
+/// A todo call: one status line, then the list as it now stands with this call's changes emphasized.
+fn todo_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
+    let theme = ctx.theme;
+    let tasks = t.todo.as_deref().unwrap_or_default();
+    let (glyph, glyph_style) = tool_glyph(t, ctx);
+    let closed = tasks.iter().filter(|(task, _)| !task.status.is_open()).count();
+    let mut spans = vec![Span::styled(glyph, glyph_style), Span::raw(" "), Span::styled("Todo".to_owned(), theme.fg(Tok::ToolTitle))];
+    let title = tool_title(t);
+    if !title.is_empty() { spans.push(Span::styled(format!(" {title}"), theme.fg(Tok::ToolOutput))); }
+    spans.push(Span::styled(format!("  {} {closed}/{} done", theme.sym(Sym::Dot), tasks.len()), theme.fg(Tok::Dim)));
+    let mut rows = vec![fitted(spans, w, theme)];
+    rows.extend(super::tasks::card_rows(tasks, w, theme, ctx.tools_expanded));
+    rows
+}
+
+/// Edit results show at least this many diff rows before collapsing, whatever `tool_output_lines` says.
+const DIFF_MIN_ROWS: usize = 20;
+
+/// The changes an `edit`/`write`/`ast_edit` result reports, as a numbered, coloured diff: per file its
+/// path and summary, then each hunk. The model-facing parts (anchored preview rows, the removed-lines
+/// report) are left out. `None` when the result carries no change preview.
+fn diff_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, usize)> {
+    let output = text::sanitize(&t.output);
+    if !output.contains("change preview (") { return None; }
+    let theme = ctx.theme;
+    enum Row<'a> { File(&'a str), Note(&'a str), Gap, Line(char, Option<usize>, &'a str) }
+    let mut items = Vec::new();
+    let (mut in_diff, mut old, mut new, mut widest) = (false, 0usize, 0usize, 1usize);
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("@@ -") {
+            // `@@ -a,b +c,d @@`: rows count on from a (old) and c (new).
+            let mut nums = rest.split([',', ' ', '+']).filter_map(|n| n.parse::<usize>().ok());
+            let (a, _, c) = (nums.next().unwrap_or(1), nums.next(), nums.next().unwrap_or(1));
+            if in_diff && !matches!(items.last(), Some(Row::File(_) | Row::Note(_))) { items.push(Row::Gap); }
+            (old, new, in_diff) = (a, c, true);
+            continue;
+        }
+        if in_diff {
+            let (sign, rest) = line.split_at(line.chars().next().map_or(0, char::len_utf8));
+            match sign {
+                "+" => { items.push(Row::Line('+', Some(new), rest)); widest = widest.max(new); new += 1; continue; }
+                "-" => { items.push(Row::Line('-', Some(old), rest)); widest = widest.max(old); old += 1; continue; }
+                " " => { items.push(Row::Line(' ', Some(new), rest)); widest = widest.max(new); old += 1; new += 1; continue; }
+                _ => in_diff = false,
+            }
+        }
+        if line.starts_with("change preview (") || line.starts_with("[final newline") || line.starts_with("[diff preview truncated") {
+            if !line.starts_with("change preview (") { items.push(Row::Note(line)); }
+        } else if line.starts_with('[') && line.ends_with(']') && line.contains('#') {
+            items.push(Row::File(line.trim_matches(['[', ']']).rsplit_once('#').map_or(line, |(path, _)| path)));
+        } else if ["updated (", "moved from ", "replaced ", "overwrote ", "created ", "deleted "].iter().any(|p| line.starts_with(p))
+            || line.starts_with("- ") || line == "Warnings:" {
+            items.push(Row::Note(line));
+        }
+    }
+    let gutter = widest.to_string().len();
+    let limit = if ctx.tools_expanded { usize::MAX } else { ctx.ui.tool_output_lines.max(DIFF_MIN_ROWS) };
+    let mut rows: Rows = Vec::new();
+    let mut total = 0;
+    for item in items {
+        let spans = match item {
+            Row::File(path) => vec![Span::styled(path.to_owned(), theme.fg(Tok::Accent))],
+            Row::Note(text) => vec![Span::styled(text.to_owned(), theme.fg(Tok::Dim))],
+            Row::Gap => vec![Span::styled(format!("{:>gutter$}", theme.sym(Sym::Ellipsis)), theme.fg(Tok::Dim))],
+            Row::Line(sign, n, text) => {
+                let style = match sign { '+' => theme.fg(Tok::DiffAdded), '-' => theme.fg(Tok::DiffRemoved), _ => theme.fg(Tok::DiffContext) };
+                vec![
+                    Span::styled(format!("{:>gutter$} ", n.map_or(String::new(), |n| n.to_string())), theme.fg(Tok::Dim)),
+                    Span::styled(format!("{sign}{text}"), style),
+                ]
+            }
+        };
+        for wrapped in text::wrap(vec![Line::from(spans)], inner.max(1)) {
+            total += 1;
+            if rows.len() < limit { rows.push(wrapped); }
+        }
+    }
+    let hidden = total - rows.len();
+    Some((rows, hidden))
 }
 
 const BOX_MIN: usize = 12;
@@ -585,9 +677,12 @@ fn tool_box(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
         rows.push(row(spans));
     }
 
-    let (body, hidden) = output_rows(t, inner, ctx);
+    let (body, hidden, label) = match diff_rows(t, inner, ctx).filter(|_| t.state == ToolState::Ok) {
+        Some((body, hidden)) => (body, hidden, "Changes"),
+        None => { let (body, hidden) = output_rows(t, inner, ctx); (body, hidden, "Output") }
+    };
     if !body.is_empty() {
-        rows.push(rule(theme.sym(Sym::TeeL), &format!("{h}{h} Output "), theme.sym(Sym::TeeR)));
+        rows.push(rule(theme.sym(Sym::TeeL), &format!("{h}{h} {label} "), theme.sym(Sym::TeeR)));
         rows.extend(body.into_iter().map(|l| row(l.spans)));
         if hidden > 0 {
             rows.push(row(vec![hidden_hint(hidden, theme)]));
@@ -617,7 +712,8 @@ fn compact_tool(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     }
     if t.state == ToolState::Ok {
         let clean = text::sanitize(&t.output);
-        if let Some(first) = clean.lines().map(str::trim).find(|l| !l.is_empty()) {
+        let footer = |l: &str| l == "(no output)" || l.starts_with("[exit code: 0]") || l.starts_with("[complete output:");
+        if let Some(first) = clean.lines().map(str::trim).find(|l| !l.is_empty() && !footer(l)) {
             spans.push(Span::styled(format!("  {} {first}", theme.sym(Sym::Dot)), theme.fg(Tok::Dim)));
         }
     }
@@ -710,6 +806,7 @@ impl Transcript {
                 state: ToolState::Pending,
                 output: String::new(),
                 elapsed: None,
+                todo: None,
             }),
             true,
         );
@@ -727,6 +824,16 @@ impl Transcript {
             let mut cut = tool.output.len() - LIMIT;
             while !tool.output.is_char_boundary(cut) { cut += 1; }
             tool.output.drain(..cut);
+        }
+    }
+
+    /// Attach the task list a pending `todo` call produced, so its card shows what changed.
+    pub fn tool_todo(&mut self, id: &str, tasks: Vec<(crate::agent::todo::Task, bool)>) {
+        if let Some(tool) = self.blocks[self.cursor..].iter_mut().rev().find_map(|b| match &mut b.kind {
+            Kind::Tool(t) if t.id == id && t.state == ToolState::Pending => Some(t),
+            _ => None,
+        }) {
+            tool.todo = Some(tasks);
         }
     }
 
@@ -754,6 +861,7 @@ impl Transcript {
                         state,
                         output: output.to_owned(),
                         elapsed: Some(elapsed_secs),
+                        todo: None,
                     }),
                     false,
                 );
@@ -1261,6 +1369,43 @@ mod tests {
         assert_eq!(style("3:"), env.theme.fg(Tok::Dim).fg);
         assert_eq!(style("context"), env.theme.fg(Tok::ToolOutput).fg);
         assert!(text_of(&rows).contains("Wall: 0.50s"));
+    }
+
+    #[test]
+    fn edit_cards_show_the_numbered_diff_not_the_model_facing_preview() {
+        let env = Env::new();
+        let mut t = Transcript::new();
+        let patch = "[src/a.rs#2F12]\nPUT 2.=2:\n+    new();\n";
+        t.tool_start("1", "edit", patch, patch);
+        let output = "[src/a.rs#EF7D]\nupdated (+1 -1 lines)\nremoved lines not present in your new text (old numbering):\n  2:     old();\n1:fn a() {\n2:    new();\n3:}\n\nchange preview (+1 -1 lines)\n@@ -1,3 +1,3 @@\n fn a() {\n-    old();\n+    new();\n }\n";
+        t.tool_end("1", output, false, 0.1);
+        let rows = t.all_rows(60, &env.ctx());
+        let text = plain(&rows);
+        assert!(text[1].contains("src/a.rs") && !text[1].contains("PUT"), "titled by the file it touches: {text:?}");
+        let body: Vec<&str> = text.iter().map(|r| r.trim_matches(|c: char| c == '│' || c == ' ')).collect();
+        for expected in ["src/a.rs", "updated (+1 -1 lines)", "1  fn a() {", "2 -    old();", "2 +    new();", "3  }"] {
+            assert!(body.contains(&expected), "{expected:?} missing from {body:?}");
+        }
+        assert!(!text_of(&rows).contains("removed lines not present") && !text_of(&rows).contains("1:fn a()"), "model-facing parts are hidden");
+        let style = |needle: &str| rows.iter().flat_map(|r| &r.spans).find(|s| s.content.contains(needle)).unwrap().style.fg;
+        assert_eq!(style("+    new();"), env.theme.fg(Tok::DiffAdded).fg);
+        assert_eq!(style("-    old();"), env.theme.fg(Tok::DiffRemoved).fg);
+        assert!(text_of(&rows).contains("Changes"));
+    }
+
+    #[test]
+    fn todo_calls_render_the_list_with_their_changes() {
+        use crate::agent::todo::TodoList;
+        let env = Env::new();
+        let mut before = TodoList::new();
+        before.call(&serde_json::json!({"op": "set", "tasks": [{"content": "read"}, {"content": "fix"}]}));
+        let mut after = before.clone();
+        after.call(&serde_json::json!({"op": "done"}));
+        let mut t = Transcript::new();
+        t.tool_start("1", "todo", "done", "");
+        t.tool_todo("1", crate::ui::tasks::changes(&before, &after));
+        t.tool_end("1", "Completed 1. read. Started 2. fix.\n1/2 done\n[x] 1. read\n[~] 2. fix", false, 0.0);
+        assert_eq!(plain(&t.all_rows(60, &env.ctx()))[..3], ["✓ Todo done  · 1/2 done", "  ✓ read", "  ● fix"]);
     }
 
     #[test]

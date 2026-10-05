@@ -24,14 +24,140 @@ pub fn compute_lock(layout: &Layout) -> Result<File> {
     Ok(file)
 }
 
+/// Persistent operator stop: checked between cases and inside training subprocess polling.
+pub fn check_stop(config: &Config) -> Result<()> {
+    ensure!(!config.state_dir.join("improvement.stop").try_exists()?, "improvement stopped by operator");
+    Ok(())
+}
+
+pub fn resume(state: &Path) -> Result<()> {
+    match fs::remove_file(state.join("improvement.stop")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn request_stop(layout: &Layout, id: &str) -> Result<Value> {
+    ensure!(!id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()), "use a model state ID from improve jobs");
+    let root = fs::canonicalize(layout.state_dir.join("models"))?;
+    let state = fs::canonicalize(root.join(id))?;
+    ensure!(state.parent() == Some(root.as_path()), "model state is outside this project");
+    let store = Store::open_read_only(&state)?;
+    let status: Value = store.get_meta("auto_status")?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or(Value::Null);
+    OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(state.join("improvement.stop"))?.sync_all()?;
+    Ok(json!({"state_id":id,"stop_requested":true,"automatic_paused":true,
+        "running_worker_supports_stop":status["stop_supported"] == true,
+        "message":if status["stop_supported"] == true { "Stop requested. Training subprocesses cancel promptly; inference/evaluation stops after the current case. Run improve jobs to confirm the control lock is released." }
+        else { "Future cycles are paused in updated Dial. This older worker cannot acknowledge stop requests; it must finish or be stopped separately." }}))
+}
+
+/// Project-wide observational status. A busy control lock proves work is still active;
+/// persisted scheduler state alone does not. The compute lock is shared across projects.
+pub fn jobs(layout: &Layout) -> Result<Value> {
+    fn busy(path: &Path) -> Result<bool> {
+        let file = match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn log_tail(path: &Path) -> Option<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(4096))).ok()?;
+        let mut bytes = Vec::new();
+        file.take(4096).read_to_end(&mut bytes).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<_> = text.lines().collect();
+        Some(lines[lines.len().saturating_sub(5)..].join("\n"))
+    }
+    let mut entries = Vec::new();
+    let models = layout.state_dir.join("models");
+    if models.is_dir() {
+        for entry in fs::read_dir(models)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() { continue; }
+            let state = entry.path();
+            let record = (|| -> Result<Value> {
+                let store = Store::open_read_only(&state)?;
+                let meta = |key| -> Result<Value> { Ok(store.get_meta(key)?.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or(Value::Null)) };
+                Ok(json!({"state_id":entry.file_name().to_string_lossy(),"model":store.get_meta("model")?,
+                    "control_busy":busy(&state.join("control.lock"))?,"scheduler":meta("auto_status")?,
+                    "progress":meta("cycle_progress")?,"lora_phase":meta("lora_phase")?,
+                    "stop_requested":state.join("improvement.stop").try_exists()?,"log":state.join("improvement.log"),
+                    "recent_log":log_tail(&state.join("improvement.log"))}))
+            })();
+            entries.push(record.unwrap_or_else(|error| json!({"state_id":entry.file_name().to_string_lossy(),"error":error.to_string()})));
+        }
+    }
+    entries.sort_by_key(|entry| entry["state_id"].as_str().unwrap_or_default().to_owned());
+    Ok(json!({"shared_compute_busy":busy(&layout.user_dir.join("compute.lock"))?,"project_jobs":entries}))
+}
+
+pub fn jobs_summary(layout: &Layout) -> Result<String> {
+    let status = jobs(layout)?;
+    let mut text = format!("Shared local compute: {}", if status["shared_compute_busy"] == true { "busy (all sessions and projects)" } else { "available" });
+    let mut active = 0;
+    for job in status["project_jobs"].as_array().into_iter().flatten() {
+        if let Some(error) = job["error"].as_str() {
+            text.push_str(&format!("\n{}: status unavailable ({error})", job["state_id"].as_str().unwrap_or("unknown")));
+            continue;
+        }
+        if job["control_busy"] != true { continue; }
+        active += 1;
+        let stage = job["progress"]["stage"].as_str()
+            .or_else(|| job["recent_log"].as_str().and_then(|log| log.lines().last()))
+            .unwrap_or("stage unavailable");
+        text.push_str(&format!("\nActive work: {} · PID {}\nStage: {stage}\nStop: /improve stop {}{}",
+            job["model"].as_str().unwrap_or("unknown"), job["scheduler"]["pid"],
+            job["state_id"].as_str().unwrap_or("unknown"),
+            if job["stop_requested"] == true { " (stop already requested)" } else { "" }));
+        if job["scheduler"]["stop_supported"] != true {
+            text.push_str("\nOlder worker: cannot acknowledge the new stop command.");
+        }
+    }
+    if active == 0 { text.push_str("\nNo active improvement job found in this project. Other sessions or verification may hold compute."); }
+    Ok(text)
+}
+
 pub fn enabled(config: &Config, store: &Store) -> Result<bool> {
-    Ok(config.improve.enabled && store.get_meta("auto_enabled")?.as_deref() != Some("false"))
+    Ok(!config.state_dir.join("improvement.stop").try_exists()? && config.improve.enabled && store.get_meta("auto_enabled")?.as_deref() != Some("false"))
 }
 
 pub fn due(config: &Config, store: &Store) -> Result<bool> {
     if !enabled(config, store)? || !improve::due(store, "last_cycle_attempt", config.improve.interval_secs)? { return Ok(false); }
     let watermark = store.get_meta("last_cycle_trajectory")?.map(|v| v.parse::<i64>()).transpose()?.unwrap_or(0);
     Ok(store.live_turns_after(watermark)? >= config.improve.min_new_turns as usize)
+}
+
+pub fn remaining(store: &Store, key: &str, interval: u64, now: u64) -> Result<u64> {
+    let last = store.get_meta(key)?.map(|value| value.parse::<u64>()).transpose()?.unwrap_or(0);
+    Ok(interval.saturating_sub(now.saturating_sub(last)))
+}
+
+pub fn duration(seconds: u64) -> String {
+    format!("{}h {:02}m {:02}s", seconds / 3600, seconds / 60 % 60, seconds % 60)
+}
+
+pub fn readiness(config: &Config, store: &Store) -> Result<String> {
+    if !enabled(config, store)? { return Ok("automatic improvement paused".into()); }
+    let wait = remaining(store, "last_cycle_attempt", config.improve.interval_secs, improve::now())?;
+    let watermark = store.get_meta("last_cycle_trajectory")?.map(|v| v.parse::<i64>()).transpose()?.unwrap_or(0);
+    let turns = store.live_turns_after(watermark)?;
+    let mut gates = Vec::new();
+    if wait > 0 { gates.push(format!("cooldown {} remaining", duration(wait))); }
+    if turns < config.improve.min_new_turns as usize {
+        gates.push(format!("{turns}/{} new turns recorded", config.improve.min_new_turns));
+    }
+    if gates.is_empty() { Ok("eligible at the next scheduling check".into()) }
+    else { Ok(gates.join("; ")) }
 }
 
 pub fn maybe_spawn(layout: &Layout, config: &Config, store: &Store) -> Result<bool> {
@@ -53,7 +179,7 @@ pub fn maybe_spawn(layout: &Layout, config: &Config, store: &Store) -> Result<bo
         .env("DIAL_HOME", &layout.user_dir).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log)
         .process_group(0).spawn().context("starting automatic improvement worker")?;
     store.set_meta("last_background_spawn", &improve::now().to_string())?;
-    store.set_meta("auto_status", &json!({"state":"queued","pid":child.id(),"at":improve::now()}).to_string())?;
+    store.set_meta("auto_status", &json!({"state":"queued","stop_supported":true,"pid":child.id(),"at":improve::now()}).to_string())?;
     std::thread::spawn(move || { let _ = child.wait(); });
     Ok(true)
 }
@@ -72,7 +198,21 @@ pub fn background(path: &Path) -> Result<()> {
     let control = lock_file(&config.state_dir.join("control.lock"))?;
     control.lock_exclusive()?;
     if !due(&config, &store)? { return Ok(()); }
-    let _compute = if config.uses_local_compute() { Some(compute_lock(&layout)?) } else { None };
+    let _compute = if config.uses_local_compute() {
+        let file = lock_file(&layout.user_dir.join("compute.lock"))?;
+        loop {
+            if check_stop(&config).is_err() {
+                store.set_meta("auto_status", &json!({"state":"stopped","at":improve::now()}).to_string())?;
+                return Ok(());
+            }
+            match file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Some(file)
+    } else { None };
     let current = Config::load(&layout, None)?;
     if !current.improve.enabled || !enabled(&config, &store)? {
         store.set_meta("auto_status", &json!({"state":"disabled","at":improve::now()}).to_string())?;
@@ -84,20 +224,26 @@ pub fn background(path: &Path) -> Result<()> {
 
 /// Caller holds control + compute locks. Failures are durable and rate-limited, not swallowed.
 pub fn execute(config: &mut Config, store: &Store, force: bool, progress: &mut dyn FnMut(&str)) -> Result<Value> {
+    check_stop(config)?;
     let now = improve::now();
     store.set_meta("last_cycle_attempt", &now.to_string())?;
-    store.set_meta("auto_status", &json!({"state":"running","pid":std::process::id(),"at":now}).to_string())?;
+    store.set_meta("auto_status", &json!({"state":"running","stop_supported":true,"pid":std::process::id(),"at":now}).to_string())?;
     let watermark = store.max_trajectory()?;
+    store.set_meta("cycle_progress", &json!({"stage":"preparing models","at":now,"started":now}).to_string())?;
+    let mut tracked_progress = |stage: &str| {
+        let _ = store.set_meta("cycle_progress", &json!({"stage":stage,"at":improve::now(),"started":now}).to_string());
+        progress(stage);
+    };
     let result = (|| {
         improve::pin_models(config, store, true)?;
-        improve::run_cycle(&mut Runtime::new(), config, store, force, progress)
+        improve::run_cycle(&mut Runtime::new(), config, store, force, &mut tracked_progress)
     })();
     match &result {
         Ok(report) => {
             store.set_meta("last_cycle_trajectory", &watermark.to_string())?;
             store.set_meta("auto_status", &json!({"state":"idle","at":improve::now(),"admitted":report["admitted"],"active":report["active"]}).to_string())?;
         }
-        Err(error) => store.set_meta("auto_status", &json!({"state":"failed","at":improve::now(),"error":format!("{error:#}")}).to_string())?,
+        Err(error) => store.set_meta("auto_status", &json!({"state":if config.state_dir.join("improvement.stop").exists() { "stopped" } else { "failed" },"at":improve::now(),"error":format!("{error:#}")}).to_string())?,
     }
     result
 }
@@ -112,6 +258,41 @@ pub fn prepare_state(layout: &Layout) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::types::Harness;
+    #[test]
+    fn project_jobs_distinguish_locks_from_stale_status_and_stop_pauses() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let layout = Layout::with_user_dir(&project, root.path().join("user")).unwrap();
+        let state = layout.state_dir.join("models/abcd");
+        let store = Store::open(&state, "model", "project", &Harness::default()).unwrap();
+        let mut config = Config::default();
+        config.state_dir = state.clone();
+        store.set_meta("auto_status", r#"{"state":"running","pid":123,"stop_supported":true}"#).unwrap();
+        let control = lock_file(&state.join("control.lock")).unwrap();
+        control.lock_exclusive().unwrap();
+        let compute = compute_lock(&layout).unwrap();
+        let status = jobs(&layout).unwrap();
+        assert_eq!(status["shared_compute_busy"], true);
+        assert_eq!(status["project_jobs"][0]["control_busy"], true);
+        assert!(request_stop(&layout, "../abcd").is_err());
+        assert_eq!(request_stop(&layout, "abcd").unwrap()["running_worker_supports_stop"], true);
+        assert!(!enabled(&config, &store).unwrap());
+        assert!(check_stop(&config).is_err());
+        assert!(execute(&mut config, &store, true, &mut |_| panic!("stopped cycle started")).is_err());
+        drop(control);
+        drop(compute);
+        let status = jobs(&layout).unwrap();
+        assert_eq!(status["shared_compute_busy"], false);
+        assert_eq!(status["project_jobs"][0]["control_busy"], false);
+        assert_eq!(status["project_jobs"][0]["scheduler"]["state"], "running");
+        resume(&state).unwrap();
+        assert!(enabled(&config, &store).unwrap());
+        check_stop(&config).unwrap();
+        store.set_meta("auto_status", r#"{"state":"running","pid":123}"#).unwrap();
+        assert_eq!(request_stop(&layout, "abcd").unwrap()["running_worker_supports_stop"], false);
+    }
+
     #[test]
     fn only_new_live_turns_trigger_and_disable_and_backoff_win() {
         let root = tempfile::tempdir().unwrap();
@@ -133,5 +314,28 @@ mod tests {
         store.set_meta("last_cycle_attempt", "0").unwrap();
         store.set_meta("last_cycle_trajectory", "3").unwrap();
         assert!(!due(&cfg, &store).unwrap());
+    }
+
+    #[test]
+    fn countdown_and_readiness_report_each_real_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), "model", "project", &Harness::default()).unwrap();
+        let mut cfg = Config::default();
+        cfg.improve.min_new_turns = 1;
+        assert_eq!(readiness(&cfg, &store).unwrap(), "0/1 new turns recorded");
+        store.set_meta("last_cycle_attempt", "1000").unwrap();
+        assert_eq!(remaining(&store, "last_cycle_attempt", 21600, 1001).unwrap(), 21599);
+        assert_eq!(remaining(&store, "last_cycle_attempt", 21600, 22600).unwrap(), 0);
+        assert_eq!(duration(21599), "5h 59m 59s");
+        store.set_meta("last_cycle_attempt", &improve::now().to_string()).unwrap();
+        let status = readiness(&cfg, &store).unwrap();
+        assert!(status.contains("cooldown") && status.contains("0/1 new turns"));
+        let id = store.begin_trajectory(store.active().unwrap().id, "project", "test", "hello").unwrap();
+        store.finish_trajectory(id, Some("done"), None).unwrap();
+        assert!(!readiness(&cfg, &store).unwrap().contains("new turns"));
+        store.set_meta("last_cycle_attempt", "0").unwrap();
+        assert!(readiness(&cfg, &store).unwrap().contains("eligible"));
+        store.set_meta("auto_enabled", "false").unwrap();
+        assert_eq!(readiness(&cfg, &store).unwrap(), "automatic improvement paused");
     }
 }

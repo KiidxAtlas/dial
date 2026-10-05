@@ -14,7 +14,7 @@ pub(super) const MAX_WALK_ENTRIES: usize = 50_000;
 pub(super) const MAX_WALK_DEPTH: usize = 40;
 const SKIPPED_DIRS: &[&str] = &[".git", "node_modules", "target", ".venv", "__pycache__"];
 
-pub(super) struct Walk<'a> {
+pub(crate) struct Walk<'a> {
     ws: &'a Workspace,
     entries: usize,
     /// The walk stopped early (entry budget) or did not descend (depth limit): results may be incomplete.

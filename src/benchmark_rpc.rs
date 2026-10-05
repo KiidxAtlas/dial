@@ -11,15 +11,21 @@ fn request(input:&mut impl Write,rx:&mpsc::Receiver<Result<Value>>,id:u64,method
  loop {let event=receive(rx,deadline)?;observe(metrics,&event);if event["id"]==id {ensure!(event.get("error").is_none(),"benchmark RPC failed: {}",event["error"]);return Ok(event["result"].clone());}}
 }
 fn observe(m:&mut RunMetrics,event:&Value){match event["event"].as_str(){
- Some("usage")=>{m.prompt_tokens+=event["prompt_tokens"].as_u64().unwrap_or(0);m.output_tokens+=event["output_tokens"].as_u64().unwrap_or(0);},
+ Some("usage")=>{if let (Some(prompt),Some(output))=(event["prompt_tokens"].as_u64(),event["output_tokens"].as_u64()){m.token_usage_observed=true;m.prompt_tokens=m.prompt_tokens.saturating_add(prompt);m.output_tokens=m.output_tokens.saturating_add(output);}else{m.token_usage_incomplete=true;}},
  Some("cached_usage")=>{m.cached_tokens+=event["read_tokens"].as_u64().unwrap_or(0);},
  Some("reasoning_usage")=>m.reasoning_tokens+=event["tokens"].as_u64().unwrap_or(0),
  Some("tool_result")=>{m.tool_calls+=1;if event["is_error"]==true{m.tool_errors+=1;}match event["name"].as_str(){Some("artifact_read")|Some("artifact_search")=>m.artifacts_retrieved+=1,Some("tool_load")=>m.dynamic_tools_used+=1,_=>{}}if event["text"].as_str().is_some_and(|t|t.starts_with("invalid tool call")){m.tool_contract_errors+=1;}},
  Some("notice")=>{if event["message"].as_str().is_some_and(|t|t.contains("output limit")&&t.contains("retry")){m.truncated_recoveries+=1;}},_=>{}}}
 
 pub fn run(executable:&Path,user_home:&Path,case:&BenchmarkCase,workspace:&Path)->Result<RunMetrics>{
- let started=Instant::now();let deadline=started+Duration::from_secs(600);
- let mut command=Command::new(executable);command.args(["rpc","--yes","--sandbox","dev"]).arg("--dir").arg(workspace).env("DIAL_HOME",user_home).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+ run_configured(executable,user_home,case,workspace,600,None)
+}
+
+pub fn run_configured(executable:&Path,user_home:&Path,case:&BenchmarkCase,workspace:&Path,timeout_secs:u64,adapter:Option<&Path>)->Result<RunMetrics>{
+ ensure!((1..=600).contains(&timeout_secs),"benchmark timeout must be 1..=600 seconds");
+ let started=Instant::now();let deadline=started+Duration::from_secs(timeout_secs);
+ let mut command=Command::new(executable);command.args(["rpc","--yes","--sandbox","dev"]).arg("--dir").arg(workspace).env("DIAL_HOME",user_home).env("HF_HUB_OFFLINE","1").env("TRANSFORMERS_OFFLINE","1").env_remove("DIAL_BENCHMARK_ADAPTER").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+ if let Some(adapter)=adapter {command.env("DIAL_BENCHMARK_ADAPTER",adapter);}
  let mut child=ChildGuard(command.spawn().context("starting persistent benchmark child")?);
  let mut input=child.0.stdin.take().context("benchmark stdin unavailable")?;let stdout=child.0.stdout.take().context("benchmark stdout unavailable")?;
  let (tx,rx)=mpsc::sync_channel(16);
@@ -36,6 +42,7 @@ pub fn run(executable:&Path,user_home:&Path,case:&BenchmarkCase,workspace:&Path)
    let completed=report.pointer("/metrics/turns_completed").and_then(Value::as_u64).context("benchmark completion counter unavailable")?;
    ensure!(completed==metrics.turns_completed+1,"agent stopped without completing the benchmark turn");metrics.turns_completed=completed;
    if let Some(v)=report.get("metrics"){for (name,target) in [("tool_contract_errors",&mut metrics.tool_contract_errors),("compactions",&mut metrics.compactions),("artifacts_retrieved",&mut metrics.artifacts_retrieved),("dynamic_tools_used",&mut metrics.dynamic_tools_used),("truncated_recoveries",&mut metrics.truncated_recoveries),("reasoning_tokens",&mut metrics.reasoning_tokens),("cached_tokens",&mut metrics.cached_tokens)]{if let Some(n)=v[name].as_u64(){*target=n;}}}
+   if let Some(n)=report.pointer("/metrics/repair_attempts").and_then(Value::as_u64){metrics.repair_attempts=Some(n);}
   }
   request(&mut input,&rx,id,"shutdown",json!({}),deadline,&mut metrics)?;Ok(())
  })();
@@ -43,4 +50,22 @@ pub fn run(executable:&Path,user_home:&Path,case:&BenchmarkCase,workspace:&Path)
  drop(input);drop(child);drop(rx);let _=reader.join();
  if let Err(e)=result{eprintln!("benchmark case {}: {e:#}",case.id);}
  Ok(metrics)
+}
+
+#[cfg(test)]
+mod tests {
+ use super::*;
+
+ #[test]
+ fn only_actual_usage_is_counted_and_partial_usage_stays_incomplete() {
+  let mut metrics=RunMetrics::default();
+  observe(&mut metrics,&json!({"event":"usage","prompt_tokens":null,"output_tokens":12}));
+  observe(&mut metrics,&json!({"event":"usage","prompt_tokens":30,"output_tokens":7}));
+  assert!(metrics.token_usage_observed&&metrics.token_usage_incomplete);
+  assert_eq!((metrics.prompt_tokens,metrics.output_tokens),(30,7));
+  assert_eq!(metrics.repair_attempts,None);
+  observe(&mut metrics,&json!({"event":"tool_result","name":"edit","is_error":true}));
+  assert_eq!(metrics.tool_errors,1);
+  assert_eq!(metrics.repair_attempts,None,"tool errors are not repair attempts");
+ }
 }

@@ -2,6 +2,7 @@
 //! the trajectory store and settings files.
 
 pub mod checkpoint;
+pub mod codebase;
 pub mod memory;
 pub mod paths;
 pub mod provenance;

@@ -173,7 +173,7 @@ const STREAM_CEILING: Duration = Duration::from_secs(6 * 3600);
 /// A non-streaming call is bounded as a whole by `timeout_secs`. A streaming call (`patience`) is not: opening the
 /// connection and sending the request are bounded, then the transport enforces only how long the server may stay
 /// silent (see [`cancel::Patience`]).
-fn agent_with(timeout_secs: u64, env_proxy: bool, interrupt: Option<Arc<AtomicBool>>, patience: Option<Patience>) -> ureq::Agent {
+pub(crate) fn agent_with(timeout_secs: u64, env_proxy: bool, interrupt: Option<Arc<AtomicBool>>, patience: Option<Patience>) -> ureq::Agent {
     let builder = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0);
     let builder = match patience {
         None => builder.timeout_global(Some(Duration::from_secs(timeout_secs))),

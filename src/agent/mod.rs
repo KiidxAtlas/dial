@@ -10,15 +10,21 @@ mod child;
 mod completion;
 pub use completion::TurnOutcome;
 pub mod guard;
+mod reasoning;
+mod investigation;
 pub mod context;
 pub mod output_schema;
 pub mod prompt;
 pub mod subagents;
 pub mod todo;
 mod verification;
+pub mod laya;
 mod evidence;
 mod training;
 mod live_tasks;
+pub mod solve;
+pub(crate) mod repair_evidence;
+mod task_packet;
 pub use live_tasks::LiveTaskControl;
 
 use crate::{
@@ -30,6 +36,7 @@ use crate::{
     },
     storage::{
         checkpoint::Checkpoints,
+        codebase::Codebase,
         provenance::ProvenanceMemory,
         paths::Layout,
         session::{self, Session},
@@ -56,6 +63,8 @@ pub trait Ui {
     fn tool_call(&mut self, _name: &str, _summary: &str) {}
     fn tool_result(&mut self, _name: &str, _output: &ToolOutput) {}
     fn notice(&mut self, _message: &str) {}
+    /// Visible observer activity; never substituted for tool or verification results.
+    fn laya_activity(&mut self, status: &str, message: &str) { self.notice(&format!("Laya · {status}: {message}")); }
     fn usage(&mut self, _prompt: Option<u64>, _output: Option<u64>, _seconds: f64) {}
     fn tool_output(&mut self, _name: &str, _text: &str) {}
     fn background_notice(&mut self, _message: &str) {}
@@ -77,8 +86,12 @@ pub trait Ui {
     /// Messages the user typed while the turn ran. Polled between steps; the agent appends them as user
     /// messages before the next model request so the model can change course without waiting for the turn to end.
     fn take_steering(&mut self) -> Vec<String> { Vec::new() }
+    /// Maintenance must yield to queued foreground work without consuming that work.
+    fn maintenance_ready(&mut self) -> bool { true }
     /// A tool call finished running; `seconds` is its wall time. Structured surfaces (JSON output) use it.
     fn tool_timing(&mut self, _name: &str, _seconds: f64) {}
+    /// The task list changed. Interactive surfaces keep it visible; structured outputs emit it as an event.
+    fn todo(&mut self, _todo: &TodoList) {}
 }
 
 pub struct NullUi;
@@ -104,6 +117,7 @@ fn chat_with_ui(
     interrupt: Arc<AtomicBool>,
     render_text: bool,
     ui: &mut dyn Ui,
+    policy: Option<&crate::config::types::ReasoningGuardConfig>,
     on_idle: &mut dyn FnMut(&mut dyn Ui),
 ) -> Result<llm::Reply> {
     let (tx, rx) = mpsc::channel();
@@ -124,8 +138,12 @@ fn chat_with_ui(
                     }
                     !interrupt.load(Ordering::SeqCst)
                 };
-                let result = backend.chat_with_control_events(adapter, request, timeout, Some(&mut on_text), &mut on_notice,
-                    Arc::clone(&interrupt), &mut on_event);
+                let result = if let Some(policy) = policy {
+                    reasoning::chat(backend, adapter, request, timeout, Arc::clone(&interrupt), policy, &mut on_text, &mut on_notice, &mut on_event)
+                } else {
+                    backend.chat_with_control_events(adapter, request, timeout, Some(&mut on_text), &mut on_notice,
+                        Arc::clone(&interrupt), &mut on_event)
+                };
                 let _ = tx.send(ChatEvent::Finished(result));
             })
             .map_err(|error| anyhow::anyhow!("could not start model worker: {error}"))?;
@@ -135,8 +153,8 @@ fn chat_with_ui(
             match rx.recv_timeout(Duration::from_millis(80)) {
                 Ok(ChatEvent::Text(text)) => { last_progress = Instant::now(); if render_text { ui.text_delta(&text); } }
                 Ok(ChatEvent::Notice(notice)) => { last_progress = Instant::now(); ui.notice(&notice); }
-                Ok(ChatEvent::Reasoning(text)) => { last_progress = Instant::now(); ui.reasoning_delta(&text); }
-                Ok(ChatEvent::ToolArguments { index, id, name, delta }) => { last_progress = Instant::now(); ui.tool_arguments_delta(index, &id, &name, &delta); }
+                Ok(ChatEvent::Reasoning(text)) => { last_progress = Instant::now(); if render_text { ui.reasoning_delta(&text); } }
+                Ok(ChatEvent::ToolArguments { index, id, name, delta }) => { last_progress = Instant::now(); if render_text { ui.tool_arguments_delta(index, &id, &name, &delta); } }
                 Ok(ChatEvent::Finished(result)) => break result,
                 Err(RecvTimeoutError::Timeout) => {},
                 Err(RecvTimeoutError::Disconnected) => break Err(anyhow::anyhow!("model worker ended without a result")),
@@ -289,7 +307,29 @@ pub struct AgentMetrics {
     pub artifacts_retrieved: u64,
     pub dynamic_tools_used: u64,
     pub truncated_recoveries: u64,
+    /// Automatic focused-verification repair rounds actually executed.
+    pub repair_attempts: u64,
+    pub reasoning_interceptions: u64,
     pub turns_completed: u64,
+}
+
+/// Per-turn bookkeeping for what `todo done` checks at step boundaries.
+#[derive(Default)]
+struct StepChecks {
+    /// The checkpoint turn whose changed files the checks cover.
+    turn: Option<u64>,
+    /// Successful file edits this turn, and how many of them the last check run covered.
+    mutations: u64,
+    checked: u64,
+    /// Whether that last run failed.
+    failed: bool,
+    /// A successful non-control tool call since the current step started (or since the turn began).
+    evidence: bool,
+}
+
+impl StepChecks {
+    /// Every edit was covered by a passing check run, so turn-end verification would only repeat it.
+    fn clean(&self) -> bool { self.checked > 0 && self.checked == self.mutations && !self.failed }
 }
 
 pub struct Agent<'a> {
@@ -309,6 +349,7 @@ pub struct Agent<'a> {
     ext: Registry,
     todo: TodoList,
     memory: Option<Arc<ProvenanceMemory>>,
+    codebase: Option<Arc<Codebase>>,
     checkpoints: Option<Arc<Checkpoints>>,
     store: Option<&'a Store>,
     version: Version,
@@ -330,6 +371,7 @@ pub struct Agent<'a> {
     logging: bool,
     /// Outcomes of recognised check commands (tests, builds, linters) run during the turn.
     verifications: Vec<bool>,
+    step_checks: StepChecks,
     cur_step: u32,
     pub last_prompt_tokens: u64,
     /// How many conversation messages the request behind `last_prompt_tokens` carried.
@@ -337,6 +379,13 @@ pub struct Agent<'a> {
     step_probe: Option<crate::learn::probe::StepProbe>,
     enabled_tools: HashSet<String>,
     metrics: AgentMetrics,
+    workflow_metrics: std::cell::RefCell<crate::learn::workflow::Metrics>,
+    workflow_started: Instant,
+    task_policy: crate::learn::task_policy::Policy,
+    repair_tracker: repair_evidence::Tracker,
+    repair_sequence: u64,
+    task_packet: task_packet::PacketCache,
+    reasoning_recovery: reasoning::Recovery,
     live_tasks: live_tasks::LiveTasks,
     superseded: evidence::Supersession,
     legacy_memory_migrated: bool,
@@ -361,6 +410,7 @@ impl<'a> Agent<'a> {
         config.validate_harness(&version.harness)?;
         version.harness = config.effective_harness(&version.harness)?;
         let memory = if config.memory.enabled { Some(Arc::new(ProvenanceMemory::open(&layout)?)) } else { None };
+        let codebase = if config.codebase.enabled { Some(Arc::new(Codebase::open(&layout)?)) } else { None };
         let checkpoints = Arc::new(Checkpoints::new(layout.checkpoints_dir().join(session.id()), layout.project_root.clone())?);
         let mode = version.harness.edit_mode.unwrap_or(config.edit_mode);
         layout.ensure_state_outside_project()?;
@@ -378,19 +428,26 @@ impl<'a> Agent<'a> {
         let always = approval::load(&layout.state_dir.join("permissions.toml"))?;
         let mut agent = Self {
             step_probe: None,
-            config, backend: Some(backend), layout: Some(layout), session, workspace, ext: Registry::standard(config), todo: TodoList::default(), memory,
+            config, backend: Some(backend), layout: Some(layout), session, workspace, ext: Registry::standard(config), todo: TodoList::default(), memory, codebase,
             checkpoints: Some(checkpoints), store, approval: config.approval, always, interrupt,
             plan_mode: false, session_cost: None, pending_plan: None,
             hermetic: false, domain_override: None, trajectory: None, last_trajectory: None, training_capture: training::Capture::default(), logging: true,
-            verifications: Vec::new(), cur_step: 0, last_prompt_tokens: 0, reported_messages: 0, version, system: String::new(), parts,
+            verifications: Vec::new(), step_checks: StepChecks::default(), cur_step: 0, last_prompt_tokens: 0, reported_messages: 0, version, system: String::new(), parts,
             subagent_backend,
             role_backends: BTreeMap::new(),
             context_cap: None,
-            enabled_tools: HashSet::new(), metrics: AgentMetrics::default(), live_tasks: live_tasks::LiveTasks::default(), superseded: evidence::Supersession::default(),
+            enabled_tools: HashSet::new(), metrics: AgentMetrics::default(), reasoning_recovery: reasoning::Recovery::default(), live_tasks: live_tasks::LiveTasks::default(), superseded: evidence::Supersession::default(),
             legacy_memory_migrated,
+            workflow_metrics: Default::default(),
+            workflow_started: Instant::now(),
+            task_policy: crate::learn::task_policy::Policy::for_prompt("", config.reasoning_guard.max_pre_action_secs),
+            repair_tracker: Default::default(), repair_sequence: 0, task_packet: Default::default(),
         };
         if let Some(memory) = &agent.memory {
             for tool in crate::storage::provenance::tools(memory.clone(), agent.session.id().to_owned()) { agent.ext.register(tool); }
+        }
+        if let Some(cache) = &agent.codebase {
+            agent.ext.register(crate::storage::codebase::tool(cache.clone(), agent.session.id().to_owned()));
         }
         agent.restore_control();
         agent.system = agent.build_system();
@@ -412,17 +469,21 @@ impl<'a> Agent<'a> {
         let workspace = configure_strict(Workspace::new(workspace)?, &strict, mode)?;
         let mut agent = Self {
             step_probe: None,
-            config, backend: Some(backend), layout: None, session: Session::ephemeral(), workspace, ext: Registry::new(), todo: TodoList::default(), memory: None,
+            config, backend: Some(backend), layout: None, session: Session::ephemeral(), workspace, ext: Registry::new(), todo: TodoList::default(), memory: None, codebase: None,
             checkpoints: None, store, approval: Approval::Auto, always: Vec::new(),
             plan_mode: false, session_cost: None, pending_plan: None,
             interrupt: Arc::new(AtomicBool::new(false)), hermetic: true, domain_override: domain, trajectory: None, last_trajectory: None,
-            training_capture: training::Capture::default(), logging: true, verifications: Vec::new(), cur_step: 0, last_prompt_tokens: 0, reported_messages: 0, version,
+            training_capture: training::Capture::default(), logging: true, verifications: Vec::new(), step_checks: StepChecks::default(), cur_step: 0, last_prompt_tokens: 0, reported_messages: 0, version,
+            workflow_metrics: Default::default(),
+            workflow_started: Instant::now(),
+            task_policy: crate::learn::task_policy::Policy::for_prompt("", config.reasoning_guard.max_pre_action_secs),
+            repair_tracker: Default::default(), repair_sequence: 0, task_packet: Default::default(),
             system: String::new(),
             parts: PromptParts { soul: None, overrides: (None, None), context: Vec::new(), skills: String::new(), memory: String::new() },
             subagent_backend: None,
             role_backends: BTreeMap::new(),
             context_cap: None,
-            enabled_tools: HashSet::new(), metrics: AgentMetrics::default(), live_tasks: live_tasks::LiveTasks::default(), superseded: evidence::Supersession::default(),
+            enabled_tools: HashSet::new(), metrics: AgentMetrics::default(), reasoning_recovery: reasoning::Recovery::default(), live_tasks: live_tasks::LiveTasks::default(), superseded: evidence::Supersession::default(),
             legacy_memory_migrated,
         };
         agent.system = agent.build_system();
@@ -446,10 +507,10 @@ impl<'a> Agent<'a> {
 
     /// Pick up a version the improvement loop admitted since this session started (between turns only,
     /// so a turn never changes harness mid-flight).
-    fn refresh_version(&mut self, ui: &mut dyn Ui) -> Result<()> {
+    fn refresh_version(&mut self, ui: &mut dyn Ui, prompt: &str) -> Result<()> {
         let Some(store) = self.store else { return Ok(()) };
         if self.hermetic || self.version.id == 0 { return Ok(()); }
-        let mut active = store.active()?;
+        let mut active = crate::learn::profiles::select(store, store.active()?, prompt)?;
         if active.id == self.version.id { return Ok(()); }
         let migrated = crate::config::types::migrate_memory_tools(&mut active.harness);
         if migrated { ui.notice("Migrated legacy memory tool selection to provenance memory tools for this runtime; admitted history is unchanged."); }
@@ -459,13 +520,26 @@ impl<'a> Agent<'a> {
         self.version = active;
         self.workspace = self.workspace.clone().with_edit_mode(tools::EditMode::from(self.edit_mode()));
         self.system = self.build_system();
-        ui.notice(&format!("now running improved version v{} (admitted by the evaluation gate)", self.version.id));
+        ui.notice(&format!("now running accepted version v{} (selected for this task from measured evaluation results)", self.version.id));
         Ok(())
     }
 
     pub fn session(&self) -> &Session { &self.session }
     pub fn session_mut(&mut self) -> &mut Session { &mut self.session }
     pub fn version(&self) -> &Version { &self.version }
+    pub fn adapter_monitor(&self) -> Option<crate::llm::provider::AdapterMonitor> { self.backend.as_ref().map(Backend::adapter_monitor) }
+
+    /// Called between turns: unload resident models only after all child workers have finished.
+    /// Keep backends and session history so the next turn can lazily reload the accepted version.
+    pub fn release_idle_models(&mut self) -> bool {
+        if self.backend.is_none() { return false; }
+        let Ok(jobs) = self.live_tasks.status(None) else { return false; };
+        if jobs.as_array().is_none_or(|jobs| jobs.iter().any(|job| job["status"] == "running")) { return false; }
+        if let Some(backend) = &mut self.backend { backend.release(); }
+        if let Some(backend) = &mut self.subagent_backend { backend.release(); }
+        for backend in self.role_backends.values_mut() { backend.release(); }
+        true
+    }
     pub fn todo(&self) -> &TodoList { &self.todo }
     pub fn restore_todo(&mut self, snapshot: &Value) -> Result<()> {
         self.todo.restore(snapshot).map_err(anyhow::Error::msg)
@@ -482,6 +556,9 @@ impl<'a> Agent<'a> {
         if let Some(memory) = &self.memory {
             for tool in crate::storage::provenance::tools(memory.clone(), self.session.id().to_owned()) { self.ext.register(tool); }
         }
+        if let Some(cache) = &self.codebase {
+            self.ext.register(crate::storage::codebase::tool(cache.clone(), self.session.id().to_owned()));
+        }
         self.system = self.build_system();
     }
     pub fn backend_description(&self) -> String { self.backend.as_ref().map_or("none".into(), Backend::describe) }
@@ -492,6 +569,18 @@ impl<'a> Agent<'a> {
     pub fn session_cost(&self) -> Option<f64> { self.session_cost }
     pub fn set_session_cost(&mut self, cost: Option<f64>) { self.session_cost = cost; }
     pub fn metrics(&self) -> &AgentMetrics { &self.metrics }
+
+    /// An isolated benchmark RPC child may compare an adapter without admitting it into a live store.
+    pub(crate) fn set_benchmark_adapter(&mut self, path: &Path) -> Result<()> {
+        ensure!(self.store.is_none() && !self.hermetic, "benchmark adapters require an isolated RPC session");
+        ensure!(self.config.endpoint.is_none() && self.config.selection().provider == "mlx",
+            "benchmark adapters require the local MLX backend");
+        let path = path.canonicalize().context("resolving benchmark adapter")?;
+        ensure!(path.join("adapter_config.json").is_file() && path.join("adapters.safetensors").is_file(),
+            "benchmark adapter must contain adapter_config.json and adapters.safetensors");
+        self.version.adapter = Some(path);
+        Ok(())
+    }
     pub fn register_tool(&mut self, tool: Arc<dyn tools::ext::Tool>) -> Result<()> {
         self.validate_tool_registration(tool.as_ref())?;
         self.ext.register(tool); self.system = self.build_system(); Ok(())
@@ -520,10 +609,21 @@ impl<'a> Agent<'a> {
         self.enabled_tools = state["enabled_tools"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
         self.todo = TodoList::default();
         if let Some(snapshot) = state.get("todo") { let _ = self.todo.restore(snapshot); }
+        // The workspace's record of shown lines lives in memory; rebuild it from this session's results so
+        // a resumed or rebuilt agent can still edit lines the model was shown before.
+        let messages = self.session.messages();
+        let names: std::collections::HashMap<&str, &str> = messages.iter().flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+            .filter_map(|c| Some((c["id"].as_str()?, c["function"]["name"].as_str()?))).collect();
+        tools::hashline::rehydrate(&self.workspace, messages.iter().filter(|m| m["role"] == "tool")
+            .filter_map(|m| Some((*names.get(m["tool_call_id"].as_str()?)?, m["content"].as_str()?))));
     }
     fn catalog(&self) -> Vec<String> {
         let mut names: Vec<String> = self.version.harness.tools.iter().cloned().chain(tools::EXTRA_TOOLS.iter().map(|s| s.to_string())).chain(self.ext.names().map(str::to_owned)).chain(self.config.tools.keys().cloned()).collect();
         names.retain(|n| tools::BUILTIN.contains(&n.as_str()) || matches!(n.as_str(), "todo" | "finish" | "tool_search" | "tool_load" | "artifact_read" | "working_state") || (self.layout.is_some() && matches!(n.as_str(), "task" | "skill" | "skill_manage" | "session_search")) || self.ext.contains(n) || self.config.tools.contains_key(n));
+        if !self.hermetic && self.layout.is_some() {
+            if self.config.solve.enabled { names.push("solve".into()); }
+            if self.config.escalation.enabled { names.push("escalate".into()); }
+        }
         if let Some(allowed) = self.config.active_model_profile().and_then(|p| p.tools.as_ref()) { names.retain(|name| allowed.contains(name)); }
         if self.config.active_model_profile().is_some_and(|p| p.capabilities.tools == Some(false)) { names.clear(); }
         if self.hermetic { names.retain(|n| tools::BUILTIN.contains(&n.as_str()) || n == "todo"); }
@@ -565,9 +665,10 @@ impl<'a> Agent<'a> {
         self.authorize_call(&call, ui).is_ok()
     }
 
-    /// LM Studio loads models on demand with a context size of its own choosing, often much smaller
-    /// than Dial's default. Its native API reports the loaded size; other servers answer 404 and are
-    /// left alone. An unloaded model keeps the last known cap rather than forgetting it.
+    /// Local servers serve a context of their own choosing, often far below Dial's default: LM Studio
+    /// loads on demand, llama.cpp splits `-c` across slots, Ollama defaults small and truncates silently.
+    /// Their native APIs report the served size (see `catalog::loaded_context`); hosted and unknown
+    /// servers are left alone, and an unloaded model keeps the last known cap rather than forgetting it.
     fn probe_context(&mut self) {
         if self.hermetic { return; }
         let Some(endpoint) = &self.config.endpoint else { return };
@@ -583,6 +684,7 @@ impl<'a> Agent<'a> {
         let mut names: Vec<String> = self.version.harness.tools.iter().chain(self.enabled_tools.iter()).filter(|n| catalog.contains(n)).cloned().collect();
         // Completion is a control tool, including for older admitted harnesses that predate it.
         if !self.hermetic && catalog.iter().any(|name| name == "finish") { names.push("finish".into()); }
+        if catalog.iter().any(|name| name == "codebase_memory") { names.push("codebase_memory".into()); }
         names.retain(|n| !self.plan_mode || matches!(n.as_str(), "task" | "bg" | "lsp" | "ast_edit" | "working_state" | "tool_search" | "tool_load") || approval::is_read_only(&self.ext, n, &json!({})));
         if self.plan_mode { names.push("exit_plan".into()); }
         names.sort(); names.dedup(); names
@@ -598,6 +700,8 @@ impl<'a> Agent<'a> {
                 "todo" => todo::schema(),
                 "finish" => completion::schema(),
                 "task" => subagents::schema(self.config),
+                "solve" => solve::schema(),
+                "escalate" => solve::escalation_schema(),
                 "skill" => skills::skill_tool::schema(),
                 "skill_manage" => skills::manage_tool::schema(),
                 "session_search" => session::session_search_tool::schema(),
@@ -630,6 +734,10 @@ impl<'a> Agent<'a> {
     }
 
     fn record(&self, step: u32, kind: &str, mut data: Value) -> Result<()> {
+        if let Some(object) = data.as_object_mut() {
+            object.insert("wall_ms".into(), json!(self.workflow_started.elapsed().as_millis() as u64));
+        }
+        self.workflow_metrics.borrow_mut().observe(kind, &data);
         if let Some(probe) = &self.step_probe {
             let risk = probe.risk(&crate::learn::probe::features(kind, step, &data));
             if let Some(object) = data.as_object_mut() {
@@ -661,7 +769,18 @@ impl<'a> Agent<'a> {
         ensure!(!user_text.trim().is_empty() && user_text.len() <= 262_144, "message must be 1..262144 bytes");
         if reset_interrupt { self.interrupt.store(false, Ordering::SeqCst); }
         if std::mem::take(&mut self.legacy_memory_migrated) { ui.notice("Migrated legacy memory tool selection to provenance memory tools for this runtime; admitted history is unchanged."); }
-        self.refresh_version(ui)?;
+        self.task_policy = crate::learn::task_policy::Policy::for_prompt(user_text, self.config.reasoning_guard.max_pre_action_secs);
+        self.workflow_started = Instant::now();
+        *self.workflow_metrics.borrow_mut() = Default::default();
+        self.refresh_version(ui, user_text)?;
+        // User-managed skill imports/toggles take effect between turns, including RPC and CLI changes.
+        if let Some(layout) = &self.layout {
+            let catalog = skills::catalog_block(&skills::discover(layout));
+            if catalog != self.parts.skills {
+                self.parts.skills = catalog;
+                self.system = self.build_system();
+            }
+        }
         for notice in self.ext.take_notices() { ui.notice(&notice); }
         self.probe_context();
         self.step_probe = self.store.map(crate::learn::probe::load).transpose()?.flatten().filter(crate::learn::probe::informative);
@@ -674,6 +793,9 @@ impl<'a> Agent<'a> {
         let checkpoint_turn = self.checkpoints.as_ref().map(|checkpoints| {
             checkpoints.begin_turn(&prompt::truncate_chars(user_text, 60))
         }).transpose()?;
+        self.step_checks = StepChecks { turn: checkpoint_turn, ..StepChecks::default() };
+        self.repair_tracker.clear();
+        self.repair_sequence = 0;
         self.ext.fire_lifecycle(&LifecycleEvent {
             event: "turn_started".into(), session_id: Some(self.session.id().to_owned()),
             turn_id: checkpoint_turn.map(|turn| turn.to_string()), tool_name: None, is_error: None,
@@ -689,6 +811,7 @@ impl<'a> Agent<'a> {
         };
         self.training_capture.clear();
         self.verifications.clear();
+        self.reasoning_recovery = reasoning::Recovery::default();
         self.logging = self.store.is_some();
         let mut message = message;
         // Recalled notes and verified repair patterns are decided once, for this message, and stored with it.
@@ -700,9 +823,35 @@ impl<'a> Agent<'a> {
             let query = prompt::truncate_chars(user_text, RECALL_QUERY_CHARS);
             context = memory.context_lookup(&query, self.config.memory.context_limit, self.config.memory.context_max_bytes)?;
         }
+        if let Some(saved) = self.codebase_context(&prompt::truncate_chars(user_text, RECALL_QUERY_CHARS), ui) {
+            if !context.is_empty() { context.push_str("\n\n"); }
+            context.push_str(&saved);
+        }
         if let Some(hints) = self.repair_context(user_text, ui) {
             if !context.is_empty() { context.push_str("\n\n"); }
             context.push_str(&hints);
+        }
+        if !self.hermetic {
+            if let Some(store) = self.store {
+                let repairs = store.recent_executable_repairs(&self.workspace.root().to_string_lossy(), 16)?;
+                let terms: Vec<String> = user_text.split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|term| term.len() >= 4).take(32).map(str::to_lowercase).collect();
+                let related: Vec<_> = repairs.into_iter().filter(|(_, record)| {
+                    let searchable = format!("{} {} {}", record["before"]["objective"], record["before"]["command"],
+                        record["changes"]).to_lowercase();
+                    terms.iter().any(|term| searchable.contains(term))
+                }).take(3).collect();
+                let mut hash_budget = 2 * 1024 * 1024;
+                let matching: Vec<i64> = related.iter().filter_map(|(trajectory, payload)| {
+                    let record: repair_evidence::RepairRecord = serde_json::from_value(payload.clone()).ok()?;
+                    record.matches_current(&self.workspace, &mut hash_budget).then_some(*trajectory)
+                }).collect();
+                if let Some(repairs) = repair_evidence::retrieval_text(&related, 4096) {
+                    if !context.is_empty() { context.push_str("\n\n"); }
+                    context.push_str(&repairs);
+                    context.push_str(&format!("\nExact failed-state file hashes currently match source trajectories {matching:?}. Other records are analogous or unchecked, not directly applicable. Re-run the executable check; file hashes do not verify the environment."));
+                }
+            }
         }
         if !context.is_empty() { message["dial_recall"] = json!(context); }
         self.push(message)?;
@@ -712,35 +861,39 @@ impl<'a> Agent<'a> {
         }
         state["turn_outcome"] = Value::Null;
         self.session.set_control_state(state)?;
+        let review_start=self.session.messages().len().saturating_sub(1);
+        if let Some(advice)=self.laya_advice("investigation",user_text,ui) {
+            self.push(json!({"role":"user","content":format!("Laya retrieval advice (untrusted, advisory; deterministic investigation limits remain in force): {advice}")}))?;
+        }
         let names = self.offered();
         let mut schemas = self.schemas(&names)?;
         self.last_trajectory = self.trajectory.as_ref().map(|(id, _, _)| *id);
         let max_steps = self.version.harness.max_steps;
+        if !self.hermetic && self.config.verification.enabled && matches!(self.task_policy.kind,crate::learn::task_policy::Kind::Editing|crate::learn::task_policy::Kind::Debugging) {
+            let baseline=self.config.verification.commands.iter().filter(|check|self.config.verification.behavioral_checks.contains(&check.name))
+                .take(8).map(|check|verification::FocusedCheck{name:check.name.clone(),command:check.command.clone(),timeout_secs:check.timeout_secs}).collect::<Vec<_>>();
+            if !baseline.is_empty() {
+                ui.notice("Recording the configured behavioral baseline before edits.");
+                let failures=self.run_checks(&baseline,ui);
+                let baseline_context=if failures.is_empty() {"Configured behavioral baseline passed before editing. Preserve these behaviors and rerun relevant checks after the change.".to_owned()}
+                    else {format!("Behavioral baseline before editing (these failures predate this turn's edits):\n{}\nReproduce and fix failures within the requested scope; report unrelated failures without broadening the task.",failures.join("\n"))};
+                self.record(0,"behavioral_baseline",json!({"checks":baseline.len(),"failures":failures.len()}))?;
+                self.push(json!({"role":"user","content":baseline_context}))?;
+            }
+        }
         let mut backend = self.backend.take().context("backend is already in use")?;
         let mut result = self.run_loop(&mut backend, &names, &mut schemas, max_steps, ui);
-        if self.config.verification.enabled {
+        // Checks that already passed at the last `todo done`, with no edit since, need not run again.
+        let already_verified = self.step_checks.clean();
+        if self.config.verification.enabled && !already_verified {
             if let (Ok(report), Some(turn)) = (&result, checkpoint_turn) {
                 if report.outcome == TurnOutcome::Completed {
-                    let paths = self.checkpoints.as_ref().map(|checkpoints| checkpoints.changed_files(turn))
-                        .unwrap_or_default().into_iter().map(PathBuf::from).collect::<Vec<_>>();
-                    let mut checks = verification::plan(self.workspace.root(), &self.config.python, &paths);
-                    for custom in &self.config.verification.commands {
-                        if !paths.is_empty() && (custom.file_extensions.is_empty() || paths.iter().any(|path| path.extension()
-                            .and_then(|ext| ext.to_str()).is_some_and(|ext| custom.file_extensions.iter().any(|suffix| suffix == ext)))) {
-                            checks.push(verification::FocusedCheck {
-                                name: custom.name.clone(), command: custom.command.clone(), timeout_secs: custom.timeout_secs,
-                            });
-                        }
-                    }
-                    let mut failures = Vec::new();
-                    for check in &checks {
-                        if self.interrupt.load(Ordering::SeqCst) { break; }
-                        let output = self.run_focused_check(check, ui);
-                        let exit = verification::exit_code(&output.text);
-                        if output.is_error || exit != Some(0) { failures.push(format!("{} failed:\n{}", check.name, truncate(&output.text, 4096))); }
-                    }
+                    let checks = self.focused_checks(turn);
+                    let mut failures = self.run_checks(&checks, ui);
                     for attempt in 0..self.config.verification.repair_attempts {
                         if failures.is_empty() || self.interrupt.load(Ordering::SeqCst) { break; }
+                        self.metrics.repair_attempts += 1;
+                        self.record(0,"repair_round",json!({"attempt":attempt+1}))?;
                         self.push(json!({"role":"user","content":format!(
                             "Automatic focused verification failed (repair attempt {}). Fix the diagnostics, then rerun the checks:\n{}",
                             attempt + 1, failures.join("\n")
@@ -748,13 +901,7 @@ impl<'a> Agent<'a> {
                         let repaired = self.run_loop(&mut backend, &names, &mut schemas, max_steps.min(8), ui)?;
                         if repaired.interrupted { result = Ok(repaired); break; }
                         result = Ok(repaired);
-                        failures.clear();
-                        for check in &checks {
-                            if self.interrupt.load(Ordering::SeqCst) { break; }
-                            let output = self.run_focused_check(check, ui);
-                            let exit = verification::exit_code(&output.text);
-                            if output.is_error || exit != Some(0) { failures.push(format!("{} failed:\n{}", check.name, truncate(&output.text, 4096))); }
-                        }
+                        failures = self.run_checks(&checks, ui);
                     }
                     if self.interrupt.load(Ordering::SeqCst) {
                         let steps = result.as_ref().map_or(0, |report| report.steps);
@@ -773,6 +920,14 @@ impl<'a> Agent<'a> {
         });
         self.backend = Some(backend);
         self.session.repair_incomplete_tools()?;
+        if !self.hermetic && self.config.laya.enabled && !self.interrupt.load(Ordering::SeqCst) && self.step_checks.mutations>0 && ui.maintenance_ready() {
+            let messages=self.session.messages();
+            let mut recent=messages.iter().skip(review_start).filter(|m|m["role"]=="tool" || m["role"]=="assistant").rev().take(12).map(|m|prompt::truncate_chars(&m.to_string(),700)).collect::<Vec<_>>();
+            recent.reverse();
+            let claim=result.as_ref().map(|r|r.text.as_str()).unwrap_or("Task did not complete successfully.");
+            let packet=format!("Task: {}\nMutation count: {}\nObserved checks passed flags (not proof of coverage): {:?}\nChronological recent tool evidence:\n{}\nProposed completion: {}",prompt::truncate_chars(user_text,700),self.step_checks.mutations,self.verifications,recent.join("\n"),prompt::truncate_chars(claim,1800));
+            let _=self.laya_advice("post-edit",&packet,ui);
+        }
         if let Ok(report) = &result {
             let mut state = self.session.control_state();
             state["turn_outcome"] = json!(report.outcome);
@@ -780,6 +935,12 @@ impl<'a> Agent<'a> {
         }
         if let Some(plan) = self.pending_plan.take() {
             self.push(json!({"role":"user","content":format!("Approved plan:\n{plan}\nProceed with implementation.")}))?;
+        }
+        if result.as_ref().is_ok_and(|report| report.outcome == TurnOutcome::Completed) {
+            self.save_investigation_findings(ui);
+            if !self.hermetic && self.config.codebase.synthesize_architecture && self.config.for_role("architecture").context_window>=4096 && !self.interrupt.load(Ordering::SeqCst) && ui.maintenance_ready() {
+                if let Err(error)=self.synthesize_architecture(false,ui) {ui.notice(&format!("Architecture update deferred: {error:#}"));}
+            }
         }
         if let Some((id, _, _)) = self.trajectory.take() {
             if let Some(store) = self.store {
@@ -800,22 +961,258 @@ impl<'a> Agent<'a> {
         result
     }
 
+    fn save_investigation_findings(&self, ui: &mut dyn Ui) {
+        let Some(cache)=self.codebase.clone() else { return };
+        let findings:Vec<_>=self.todo.tasks().iter().filter(|task| task.investigation && task.status==todo::Status::Completed)
+            .filter_map(|task|Some((task.content.clone(),task.finding.clone()?,task.evidence.clone()))).rev().take(3).collect();
+        if findings.is_empty() { return; }
+        let session=self.session.id().to_owned();
+        thread::scope(|scope| {
+            let (tx,rx)=mpsc::sync_channel(1);
+            scope.spawn(move || {
+                let saved=findings.iter().filter(|(question,finding,refs)|cache.remember_investigation(question,finding,refs,&session).unwrap_or(false)).count();
+                let _=tx.send(saved);
+            });
+            loop {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(count)=>{ if count>0 { ui.notice(&format!("Saved {count} source-linked investigation findings for future sessions.")); } break; }
+                    Err(mpsc::RecvTimeoutError::Timeout)=>ui.heartbeat(),
+                    Err(_)=>break,
+                }
+            }
+        });
+    }
+
     /// Retain observations, not self-assigned rewards. A model-selected shell command can spoof a
     /// successful test invocation; only a separate verifier or user verdict supplies training labels.
     fn persist_turn(&self, store: &Store, trajectory: i64) -> Result<()> {
         store.save_messages(trajectory, &self.training_capture.payload())
     }
 
-    fn note_verification(&mut self, call: &ToolCall, output: &ToolOutput) {
-        let Some(command) = call.arguments["command"].as_str().filter(|c| is_check_command(c)) else { return };
+    fn note_verification(&mut self, call: &ToolCall, output: &ToolOutput, ui: &mut dyn Ui) {
+        let Some(command) = call.arguments["command"].as_str() else { return };
+        let configured = self.config.verification.commands.iter().find(|check| check.command == command);
+        if configured.is_none() && !is_check_command(command) && !call.id.starts_with("focused-check:") { return; }
+        let kind = if configured.is_some_and(|check| self.config.verification.behavioral_checks.contains(&check.name)) {
+            repair_evidence::CheckKind::Behavioral
+        } else { repair_evidence::CheckKind::SyntaxOnly };
         let exit = verification::exit_code(&output.text);
-        let passed = exit == Some(0);
+        let passed = !output.is_error && exit == Some(0);
+        if !self.hermetic && matches!(kind,repair_evidence::CheckKind::Behavioral) {
+            if let Some(cache)=self.codebase.clone() {
+                let command=command.to_owned();
+                let _=thread::scope(|scope| -> Result<_> {
+                    let (tx,rx)=mpsc::sync_channel(1);
+                    scope.spawn(move || {let _=tx.send(cache.record_behavior_check(&command,passed));});
+                    receive_with_heartbeat(&rx,ui)
+                });
+            }
+        }
         self.verifications.push(passed);
-        let _ = self.record(self.cur_step, "verification", json!({"command":truncate(command, 200),"exit":exit,"passed":passed}));
+        let _ = self.record(self.cur_step, "verification", json!({
+            "command":truncate(command, 200),"exit":exit,"passed":passed,"category":kind
+        }));
+        if self.hermetic { return; }
+        let (Some(store), Some(checkpoints), Some(turn), Some(artifacts), Some(trajectory)) =
+            (self.store, self.checkpoints.as_ref(), self.step_checks.turn, self.workspace.artifacts(),
+             self.trajectory.as_ref().map(|(id, _, _)| *id)) else { return; };
+        self.repair_sequence += 1;
+        let captured = (|| -> Result<()> {
+            let mut changes = checkpoints.repair_changes(turn)?;
+            // Private checkpoint files are outside the read tool's workspace. Publish immutable
+            // source bytes through artifact_read rather than hand the model unusable filesystem paths.
+            for change in &mut changes {
+                for reference in [&mut change.before_ref, &mut change.after_ref].into_iter().flatten() {
+                    let mut source = std::fs::File::open(reference.as_str())?;
+                    let mut spool = artifacts.spool()?;
+                    std::io::copy(&mut source, &mut spool)?;
+                    *reference = spool.finish()?;
+                }
+            }
+            let evidence_ref = artifacts.retain(&output.text)?;
+            let run = repair_evidence::CheckRun {
+                command: command.to_owned(), cwd: self.workspace.root().to_string_lossy().into_owned(),
+                objective: configured.map(|c| c.name.clone()).unwrap_or_else(|| "Syntax, build, or undeclared check only".into()),
+                kind, tool_call_id: format!("{}:{}:{}", self.session.id(), call.id, self.repair_sequence),
+                evidence_ref, exit_code: if output.is_error && exit == Some(0) { None } else { exit },
+                sequence: self.repair_sequence,
+            };
+            if let Some(record) = self.repair_tracker.observe(run, changes) {
+                store.executable_repair(trajectory, self.version.id, &serde_json::to_value(record)?)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = captured {
+            self.repair_tracker.clear();
+            let _ = self.record(self.cur_step, "repair_evidence_unavailable", json!({"error":format!("{error:#}")}));
+        }
+    }
+
+    /// Source hashing and indexing never run on the interactive input/render thread.
+    fn laya_advice(&mut self, phase:&str, evidence:&str, ui:&mut dyn Ui)->Option<String> {
+        if self.hermetic || !self.config.laya.enabled || self.interrupt.load(Ordering::SeqCst) {return None;}
+        if phase!="investigation" && matches!(self.session.control_state()["laya"]["status"].as_str(),Some("unavailable"|"loading")) {return None;}
+        ui.laya_activity("checking",if phase=="investigation" {"Choosing a retrieval scope · advisory"} else {"Reviewing post-edit evidence · advisory"});
+        let config=self.config.laya.clone(); let cancel=self.interrupt.clone(); let evidence=evidence.to_owned(); let phase_owned=phase.to_owned();
+        let result=thread::scope(|scope| -> Result<_> {
+            let (tx,rx)=mpsc::sync_channel(1);
+            scope.spawn(move || {let _=tx.send(laya::predict(&config,&phase_owned,&evidence,cancel));});
+            receive_with_heartbeat(&rx,ui)?
+        });
+        let mut state=self.session.control_state();
+        match result {
+            Ok(decision)=>{
+                let summary=laya::summary(phase,&decision.answers);
+                let record=json!({"status":"ready","mode":"advisory","phase":phase,"checkpoint":decision.health.checkpoint,"device":decision.health.device,"answers":decision.answers,"latency_ms":decision.elapsed_ms,"calibration":"raw; not calibrated in Dial","summary":summary});
+                let _=self.record(self.cur_step,"laya_decision",record.clone());
+                state["laya"]=record;
+                let _=self.session.set_control_state(state);
+                ui.laya_activity("advice",&format!("{summary}\nCheckpoint: {} · {} ms",decision.health.checkpoint,decision.elapsed_ms));
+                Some(summary)
+            }
+            Err(error)=>{
+                let reason=if self.interrupt.load(Ordering::SeqCst) {"Cancelled".to_owned()} else {format!("{error:#}")};
+                let status=if reason.contains("loading its checkpoint") {"loading"} else {"unavailable"};
+                state["laya"]=json!({"status":status,"phase":phase,"reason":reason});
+                let _=self.session.set_control_state(state);
+                let _=self.record(self.cur_step,"laya_unavailable",json!({"phase":phase,"reason":reason}));
+                ui.laya_activity(status,&format!("{reason}. Coding remains available; deterministic checks stay active."));
+                None
+            }
+        }
+    }
+
+    pub fn laya_status(&mut self, probe:bool, start:bool, ui:&mut dyn Ui)->Result<String> {
+        let mut text=format!("Laya: {} · advisory decisions\nService: {}\nRequest timeout: {}s\n",if self.config.laya.enabled {"enabled"} else {"disabled (enable Decision advice in /settings → Laya)"},self.config.laya.endpoint,self.config.laya.timeout_secs);
+        if probe || start {
+            ui.laya_activity(if start {"loading"} else {"checking"},if start {"Starting or waiting for Dial's managed service · Esc cancels waiting"} else {"Checking the existing service; no prediction or model loading"});
+            let config=self.config.laya.clone();let cancel=self.interrupt.clone();
+            let health=thread::scope(|scope| -> Result<_> {let (tx,rx)=mpsc::sync_channel(1);scope.spawn(move || {let _=tx.send(if start {laya::ensure_service(&config,cancel,true)} else {laya::health(&config,cancel)});});receive_with_heartbeat(&rx,ui)?});
+            match health {
+                Ok(health)=>text.push_str(&format!("Live service: {}\nCheckpoint: {}\nDevice: {}\n",health.status,health.checkpoint,health.device)),
+                Err(error)=>text.push_str(&format!("Live service unavailable: {error:#}\nUse /laya start, or install the independent runtime with dial laya install --checkpoint PATH.\n")),
+            }
+        }
+        let latest=&self.session.control_state()["laya"];
+        if !latest.is_null() {text.push_str(&format!("Last session observation (not a live probe): {}\n",serde_json::to_string_pretty(latest)?));}
+        text.push_str("Laya does not write architecture summaries or certify behavior. /laya check probes the service; /understanding architecture inspects memory.\n");
+        Ok(text)
+    }
+
+    fn codebase_context(&mut self, query: &str, ui: &mut dyn Ui) -> Option<String> {
+        let cache = self.codebase.as_ref()?.clone();
+        let workspace = self.workspace.clone();
+        let cancel = self.interrupt.clone();
+        let max_bytes = self.config.codebase.context_max_bytes;
+        let result = thread::scope(|scope| -> Result<_> {
+            let (tx, rx) = mpsc::sync_channel(1);
+            let worker = scope.spawn(move || {
+                let result = cache.refresh(&workspace, &cancel).and_then(|stats| {
+                    let architecture=cache.architecture_context(query,max_bytes/2)?;
+                    let context=cache.context(query,max_bytes.saturating_sub(architecture.len()).max(1024))?;
+                    Ok((stats,format!("{architecture}{context}")))
+                });
+                let _ = tx.send(result);
+            });
+            let result = receive_with_heartbeat(&rx, ui);
+            if worker.join().is_err() { bail!("codebase context worker panicked"); }
+            result?
+        });
+        match result {
+            Ok((stats, context)) => {
+                if stats.indexed > 0 || stats.removed > 0 {
+                    ui.notice(&format!("Project understanding: indexed {} changed/new sources, reused {}, removed {}{}.",
+                        stats.indexed, stats.reused, stats.removed, if stats.partial { "; scan coverage is partial" } else { "" }));
+                }
+                Some(context)
+            }
+            Err(_) if self.interrupt.load(Ordering::SeqCst) => None,
+            Err(error) => { ui.notice(&format!("saved codebase context unavailable: {error:#}")); None }
+        }
+    }
+
+    /// Bounded maintenance of project knowledge using the already-selected backend.
+    /// It has no tools, cannot edit files, and never becomes a verified training example.
+    pub fn synthesize_architecture(&mut self, force:bool, ui:&mut dyn Ui) -> Result<()> {
+        let cache=self.codebase.clone().context("codebase memory is disabled")?;
+        let role_config=self.config.for_role("architecture");
+        let separate=self.config.model_roles.get("architecture").filter(|selection| **selection!=self.config.selection()).cloned();
+        let context_window=if separate.is_some() {role_config.context_window} else {self.context_window()};
+        ensure!(context_window>=4096,"architecture synthesis needs a model context window of at least 4096 tokens");
+        let workspace=self.workspace.clone();
+        let cancel=self.interrupt.clone();
+        let budget=(context_window as usize).clamp(4096,24000);
+        let synthesis=thread::scope(|scope| -> Result<_> {
+            let (tx,rx)=mpsc::sync_channel(1);
+            let cache=cache.clone();
+            scope.spawn(move || {let _=tx.send(cache.refresh(&workspace,&cancel).and_then(|_|cache.architecture_synthesis(budget,force)));});
+            receive_with_heartbeat(&rx,ui)?
+        })?;
+        let Some(synthesis)=synthesis else {
+            if force {ui.notice("No eligible indexed source evidence is available for architecture synthesis.");}
+            return Ok(());
+        };
+        if self.interrupt.load(Ordering::SeqCst) {return Ok(());}
+        cache.mark_architecture_attempt(&synthesis)?;
+        ui.notice("Updating saved architecture from bounded source evidence (one model call, up to 60 seconds; Esc cancels).");
+        let request=Chat {messages:vec![
+            json!({"role":"system","content":crate::storage::codebase::architecture::SYSTEM}),
+            json!({"role":"user","content":synthesis.prompt}),
+        ],tools:vec![],temperature:0.0,max_tokens:(context_window/3).clamp(512,2048),seed:None};
+        ensure!(self.backend.is_some(),"backend is already in use");
+        // Construct the role backend before taking the main one so setup failures leave coding usable.
+        let role_backend=if separate.is_some() {Some(match self.role_backends.remove("architecture") {
+            Some(backend)=>backend, None=>make_backend(&role_config)?,
+        })} else {None};
+        let mut main=self.backend.take();
+        let mut backend=if let Some(backend)=role_backend {main.as_mut().expect("checked main backend").release();backend} else {main.take().expect("checked main backend")};
+        if let Some(selection)=&separate {ui.role("architecture",&selection.display_name());}
+        let adapter=if separate.is_some() {None} else {self.version.adapter.clone()};
+        let external=self.interrupt.clone();
+        let local=Arc::new(AtomicBool::new(false));
+        let mut yielded=false;
+        let reply=thread::scope(|scope| {
+            let (done,wait)=mpsc::channel::<()>();
+            let local_watch=local.clone();
+            scope.spawn(move || {
+                let start=Instant::now();
+                loop {
+                    if external.load(Ordering::SeqCst) || start.elapsed()>=Duration::from_secs(60) {local_watch.store(true,Ordering::SeqCst);break;}
+                    if !matches!(wait.recv_timeout(Duration::from_millis(40)),Err(RecvTimeoutError::Timeout)) {break;}
+                }
+            });
+            let yield_cancel=local.clone();
+            let reply=chat_with_ui(&mut backend,adapter.as_deref(),&request,60,local,false,ui,Some(&self.config.reasoning_guard),&mut |ui| {
+                if !force && !ui.maintenance_ready() {yielded=true;yield_cancel.store(true,Ordering::SeqCst);}
+            });
+            drop(done); reply
+        });
+        if let Ok(reply)=&reply {if let Some(cost)=backend.reply_cost(reply) {self.session_cost=Some(self.session_cost.unwrap_or(0.0)+cost);}}
+        if separate.is_some() {
+            backend.release();
+            self.role_backends.insert("architecture".into(),backend);
+            self.backend=main;
+            ui.role("main",&self.config.selection().display_name());
+        } else {self.backend=Some(backend);}
+        if yielded {cache.defer_architecture_attempt(&synthesis)?;ui.notice("Architecture maintenance yielded to queued work.");return Ok(());}
+        let reply=reply?;
+        self.record(0,"architecture_synthesis",json!({"completion_tokens":reply.completion_tokens,"prompt_tokens":reply.prompt_tokens}))?;
+        ensure!(reply.tool_calls.is_empty(),"architecture synthesis unexpectedly requested tools");
+        let model=role_config.model.clone();
+        let saved=thread::scope(|scope| -> Result<_> {
+            let (tx,rx)=mpsc::sync_channel(1);
+            scope.spawn(move || {let _=tx.send(cache.save_architecture(&synthesis,&reply.text,&model));});
+            receive_with_heartbeat(&rx,ui)?
+        })?;
+        ui.notice(&format!("Saved {saved} architecture sections with source references. Inspect /understanding architecture."));
+        Ok(())
     }
 
     fn run_loop(&mut self, backend: &mut Backend, names: &[String], schemas: &mut Vec<Value>, max_steps: u32, ui: &mut dyn Ui) -> Result<TurnReport> {
         let mut names = names.to_vec();
+        let mut reviewed_paths=std::collections::BTreeSet::new();
+        let mut prechecked_paths=std::collections::BTreeSet::new();
+        let mut revalidated_paths=std::collections::BTreeSet::new();
         let h = self.config.effective_harness(&self.version.harness)?;
         let adapter = self.version.adapter.clone();
         let mut pending: Option<Pending> = None;
@@ -825,6 +1222,8 @@ impl<'a> Agent<'a> {
         let mut length_nudges = 0u32;
         let mut recovering_output = false;
         let mut repeats = guard::RepeatGuard::default();
+        let mut investigation = investigation::InvestigationGuard::default();
+        let mut unplanned_inspections = 0usize;
         let mut stall = guard::StallGuard::default();
         let mut completion = completion::CompletionGuard::default();
         let mut budget = guard::StepBudget::new(max_steps, if self.hermetic { 0 } else { guard::StepBudget::FREE_RETRIES });
@@ -855,23 +1254,61 @@ impl<'a> Agent<'a> {
                 pressure,
                 protect_tokens: (self.context_window() as usize / 5).max(PRUNE_PROTECT_MIN_TOKENS),
             };
+            let verification_objective = if self.config.verification.behavioral_checks.is_empty() {
+                "No operator-declared behavioral check. Syntax/build success alone does not establish task correctness.".to_owned()
+            } else { format!("Behavioral checks: {}", self.config.verification.behavioral_checks.join(", ")) };
+            let history = self.session.path().map(|p| p.to_string_lossy().into_owned());
+            let packet = if self.hermetic { None } else {
+                self.task_packet.project(&mut messages, &self.todo, &self.session.control_state(),
+                    self.session.id(), history.as_deref(), &verification_objective,
+                    (self.context_window() as usize / 4).clamp(1024, 4096))
+            };
             evidence::project(&mut messages, &mut self.superseded, &policy);
             let sent_messages = messages.len() - 1;
+            // Keep dynamic task context at the request tail, never in the cached system prefix.
+            let focus = messages.last().filter(|m| m["role"] == "tool").and_then(|_| self.todo.focus());
+            let mut task_context = focus.unwrap_or_default();
+            if let Some(packet) = packet {
+                task_context.push_str(&format!("\n[Current task evidence packet; harness context]\n{packet}"));
+            }
+            if !task_context.is_empty() { messages.push(json!({"role":"user","content":task_context})); }
+            // Short questions need no plan. Extended inspection must enter the real todo workflow,
+            // not produce another prose promise. Keep this instruction at the request tail.
+            let planning_required = !self.hermetic && unplanned_inspections >= self.task_policy.inspection_limit && !self.todo.has_open()
+                && schemas.iter().any(|s| s["function"]["name"] == "todo");
+            if planning_required {
+                messages.push(json!({"role":"user","content":
+                    "Investigation checkpoint: the initial inspection allowance has been used without an active plan. If the request is already answered, answer directly. Otherwise your next tool call must create actual todos: use todo set for an empty list, or append to preserve existing tasks. Add 1-3 concrete unresolved questions with investigation=true, then the known implementation and verification steps. Do not invent a large speculative plan. As a result reveals necessary follow-on work, append that task before pursuing it; start it explicitly if it is a prerequisite. Close investigation questions with finding and evidence. A prose plan is not a todo update."}));
+                schemas.retain(|s| s["function"]["name"] == "todo");
+                names.retain(|name| name == "todo");
+            }
             let request = Chat { messages, tools: std::mem::take(schemas), temperature: h.temperature, max_tokens,
                 seed: if self.hermetic { Some(42 + u64::from(step)) } else { None } };
             let started = Instant::now();
             let timeout = self.config.worker_timeout_secs;
+            let mut reasoning_policy = self.config.reasoning_guard.clone();
+            if step == 0 { reasoning_policy.max_pre_action_secs = self.task_policy.initial_reasoning_secs; }
             let interrupt = self.interrupt.clone();
             let result = if self.hermetic {
-                backend.chat(adapter.as_deref(), &request, timeout, None)
+                reasoning::chat(backend, adapter.as_deref(), &request, timeout, interrupt, &reasoning_policy,
+                    &mut |_| true, &mut |_| {}, &mut |_| true)
             } else {
-                chat_with_ui(backend, adapter.as_deref(), &request, timeout, interrupt, true, ui, &mut |ui| self.pump_subagents(ui))
+                chat_with_ui(backend, adapter.as_deref(), &request, timeout, interrupt, true, ui, Some(&reasoning_policy), &mut |ui| self.pump_subagents(ui))
             };
             let request_tools = request.tools.clone();
             *schemas = request.tools;
             let context_before = request.messages;
             let reply = match result {
                 Ok(reply) => reply,
+                Err(error) if error.downcast_ref::<reasoning::GateHit>().is_some() && !self.interrupt.load(Ordering::SeqCst) => {
+                    self.metrics.reasoning_interceptions += 1;
+                    self.record(step, "reasoning_gate", json!({"reason":error.to_string(),"elapsed_ms":started.elapsed().as_millis()}))?;
+                    match self.reasoning_recovery.intercept(&error.to_string()) {
+                        Ok(message) => { ui.notice(&message); self.push(json!({"role":"user","content":message}))?; }
+                        Err(message) => return self.stop_turn(ui, message, step + 1),
+                    }
+                    continue;
+                }
                 Err(error) if error.downcast_ref::<llm::Interrupted>().is_some() || self.interrupt.load(Ordering::SeqCst) => {
                     return Ok(TurnReport { text: String::new(), outcome: TurnOutcome::Interrupted, steps: step, interrupted: true, trajectory: None });
                 }
@@ -897,6 +1334,16 @@ impl<'a> Agent<'a> {
             self.record(step, "generation", json!({"output":reply.text,"tool_calls":reply.tool_calls.len(),
                 "prompt_tokens":reply.prompt_tokens,"completion_tokens":reply.completion_tokens,"elapsed_ms":started.elapsed().as_millis()}))?;
             if reply.finish_reason == "length" {
+                if self.config.reasoning_guard.enabled && reply.text.trim().is_empty() && reply.tool_calls.is_empty() {
+                    self.metrics.reasoning_interceptions += 1;
+                    let reason = "the output token limit was spent without any answer or tool call";
+                    self.record(step, "reasoning_gate", json!({"reason":reason,"elapsed_ms":started.elapsed().as_millis()}))?;
+                    match self.reasoning_recovery.intercept(reason) {
+                        Ok(message) => { ui.notice(&message); self.push(json!({"role":"user","content":message}))?; }
+                        Err(message) => return self.stop_turn(ui, message, step + 1),
+                    }
+                    continue;
+                }
                 match guard::recover_from_length(max_tokens, self.context_window(), self.last_prompt_tokens, &reply, length_nudges) {
                     guard::LengthAction::Retry { max_tokens: raised } => {
                         recovering_output = true;
@@ -956,6 +1403,10 @@ impl<'a> Agent<'a> {
                         self.push(json!({"role":"user","content":message,"dial_completion_reminder":true}))?;
                         continue;
                     }
+                    completion::StopAction::Blocked(blockers) => {
+                        ui.notice(&blockers);
+                        return Ok(TurnReport { text: reply.text, outcome: TurnOutcome::Blocked, steps: step + 1, interrupted: false, trajectory: None });
+                    }
                     completion::StopAction::Incomplete(text) => return self.stop_turn(ui, text, step + 1),
                 }
                 if self.logging { self.training_capture.record(&context_before, &request_tools, llm::assistant_message(&reply)); }
@@ -979,7 +1430,31 @@ impl<'a> Agent<'a> {
                 });
                 let todo_before = self.todo.snapshot();
                 let mut image = None;
-                let mut output = if let Some((kind, why)) = form {
+                let mut preflight=None;
+                if form.is_none() && !self.hermetic && matches!(call.name.as_str(),"write"|"edit"|"ast_edit") {
+                    if let (Some(cache),Some(path))=(self.codebase.clone(),call.arguments["path"].as_str()) {
+                        if prechecked_paths.insert(path.to_owned()) {
+                            let path=path.to_owned();
+                            let check=thread::scope(|scope| -> Result<_> {
+                                let (tx,rx)=mpsc::sync_channel(1);
+                                scope.spawn(move || {let _=tx.send(cache.pre_edit_context(&path));});
+                                receive_with_heartbeat(&rx,ui)?
+                            });
+                            match check {
+                                Ok(Some(text)) => {preflight=Some(ToolOutput {text,is_error:true});}
+                                Ok(None) => {revalidated_paths.insert(call.arguments["path"].as_str().unwrap().to_owned());}
+                                Err(error) => {preflight=Some(ToolOutput {text:format!("Could not check saved assumptions: {error}. Read the current target before retrying."),is_error:true});}
+                            }
+                        } else if !revalidated_paths.contains(path) {
+                            preflight=Some(ToolOutput {text:format!("Read current {path} before retrying this edit; its saved assumptions required review."),is_error:true});
+                        }
+                    }
+                }
+                let mut output = if let Some(output)=preflight {
+                    ui.tool_call(&call.name,&summarize(call));
+                    ui.tool_result(&call.name,&output);
+                    output
+                } else if let Some((kind, why)) = form {
                     self.metrics.tool_contract_errors += 1;
                     self.record(step, "tool_form_failure", json!({"kind":kind,"name":call.name}))?;
                     form_kinds.push(kind.to_owned());
@@ -1020,9 +1495,53 @@ impl<'a> Agent<'a> {
                     out
                 };
                 if output.is_error && form_kinds.is_empty() { execution_failed = true; }
+                if !output.is_error && call.name=="read" {
+                    if let Some(path)=call.arguments["path"].as_str() {
+                        if prechecked_paths.contains(path) {revalidated_paths.insert(path.to_owned());}
+                    }
+                }
                 if !output.is_error { round_succeeded = true; }
                 completion.observe(call, !output.is_error, todo_before != self.todo.snapshot());
+                if self.todo.has_open() {
+                    unplanned_inspections = 0;
+                } else if matches!(call.name.as_str(), "read" | "grep" | "glob" | "find" | "ast_search") {
+                    if !output.is_error { unplanned_inspections += 1; }
+                } else if !planning_required && !matches!(call.name.as_str(), "todo" | "finish" | "working_state" | "tool_search" | "tool_load") {
+                    unplanned_inspections = 0;
+                }
+                if !output.is_error && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve") { self.step_checks.mutations += 1; }
+                if !self.hermetic && !output.is_error && matches!(call.name.as_str(),"write"|"edit"|"ast_edit") {
+                    if let (Some(cache),Some(path))=(self.codebase.clone(),call.arguments["path"].as_str()) {
+                        if reviewed_paths.len()<4 && reviewed_paths.insert(path.to_owned()) {
+                            let paths=vec![path.to_owned()];
+                            let context=thread::scope(|scope| -> Result<_> {
+                                let (tx,rx)=mpsc::sync_channel(1);
+                                scope.spawn(move || {let _=tx.send(cache.impact_context(&paths,3000));});
+                                receive_with_heartbeat(&rx,ui)?
+                            });
+                            if let Ok(context)=context {
+                                output.text.push_str("\n\n");output.text.push_str(&context);
+                                self.record(step,"change_review",json!({"path":path}))?;
+                            }
+                        }
+                    }
+                }
+                if !output.is_error && !matches!(call.name.as_str(), "todo" | "finish" | "working_state" | "tool_search" | "tool_load") { self.step_checks.evidence = true; }
                 if call.name == "finish" && !output.is_error { finished = Some(completion::Finish::parse(&call.arguments).map_err(anyhow::Error::msg)?); }
+                if let Some(advice) = investigation.observe(call, &output.text, output.is_error) {
+                    // An unchanged observation consumes the remaining unplanned allowance;
+                    // concrete new evidence continues under the ordinary task budget.
+                    if !self.todo.has_open() {unplanned_inspections=self.task_policy.inspection_limit;}
+                    self.record(step, "investigation_gate", json!({"name":call.name}))?;
+                    ui.notice("Investigation repeated an unchanged observation; directing the agent to reuse the evidence.");
+                    output.text.push_str("\n\n");
+                    output.text.push_str(&advice);
+                }
+                if stop.is_none() { stop = investigation.stop_message(); }
+                if output.is_error {
+                    let advice = crate::learn::task_policy::recovery_hint(&call.name, &output.text);
+                    output.text.push_str("\n\n"); output.text.push_str(advice);
+                }
                 if let Some(advice) = repeats.observe(call, output.is_error) {
                     output.text.push_str("\n\n");
                     output.text.push_str(&advice);
@@ -1039,11 +1558,12 @@ impl<'a> Agent<'a> {
                     Some(store) => Some(store.retain(&output.text).context("retaining complete tool evidence")?),
                     None => None,
                 };
-                let mut body = guard::clip_middle(&output.text, tools::MODEL_OUTPUT_LIMIT);
-                if output.text.len() > tools::MODEL_OUTPUT_LIMIT { if let Some(uri) = &artifact { body.push_str(&format!("\n[Complete tool evidence: {uri}; retrieve with artifact_read]")); } }
+                let limit = tools::model_output_limit(self.context_window());
+                let mut body = guard::clip_evidence(&output.text, limit);
+                if output.text.len() > limit { if let Some(uri) = &artifact { body.push_str(&format!("\n[Complete tool evidence: {uri}; retrieve with artifact_read]")); } }
                 let mut message = llm::tool_message(&call.id, &body);
                 message["dial_evidence"] = json!({"artifact":artifact});
-                let clipped = output.text.len() > tools::MODEL_OUTPUT_LIMIT || output.text.contains("output omitted") || output.text.contains("bytes clipped");
+                let clipped = output.text.len() > limit || output.text.contains("output omitted") || output.text.contains("bytes clipped");
                 if clipped {
                     let mut state = self.session.control_state();
                     let mut uris = state["truncated_artifacts"].as_array().cloned().unwrap_or_default();
@@ -1197,13 +1717,69 @@ impl<'a> Agent<'a> {
 
     fn run_focused_check(&mut self, check: &verification::FocusedCheck, ui: &mut dyn Ui) -> ToolOutput {
         let args = json!({"command":check.command,"timeout":check.timeout_secs});
-        ui.tool_call("bash", &format!("Verify {}: {}", check.name, check.command));
+        // Long generated commands (an interpreter path plus inline code) say nothing the check name does not.
+        let title = if check.command.len() <= 80 { format!("Verify {}: {}", check.name, check.command) } else { format!("Verify {}", check.name) };
+        ui.tool_call("bash", &title);
         let started = Instant::now();
         let output = self.run_background_tool("bash", &args, ui)
             .unwrap_or_else(|| tools::execute(&self.workspace, "bash", &args, check.timeout_secs));
         ui.tool_timing("bash", started.elapsed().as_secs_f64());
         ui.tool_result("bash", &output);
+        self.note_verification(&ToolCall {
+            id: format!("focused-check:{}", check.name), name: "bash".into(), arguments: args, malformed_arguments: false,
+        }, &output, ui);
         output
+    }
+
+    /// Focused checks for the files this turn changed: built-in syntax/type checks plus the configured
+    /// commands whose extensions match.
+    fn focused_checks(&self, turn: u64) -> Vec<verification::FocusedCheck> {
+        let paths = self.checkpoints.as_ref().map(|checkpoints| checkpoints.changed_files(turn))
+            .unwrap_or_default().into_iter().map(PathBuf::from).collect::<Vec<_>>();
+        // Endpoint users may never have run `dial setup`; a missing interpreter must not read as broken code.
+        let python = if self.config.python.is_file() { self.config.python.clone() } else { PathBuf::from("python3") };
+        let mut checks = verification::plan(self.workspace.root(), &python, &paths);
+        for custom in &self.config.verification.commands {
+            if !paths.is_empty() && (custom.file_extensions.is_empty() || paths.iter().any(|path| path.extension()
+                .and_then(|ext| ext.to_str()).is_some_and(|ext| custom.file_extensions.iter().any(|suffix| suffix == ext)))) {
+                checks.push(verification::FocusedCheck { name: custom.name.clone(), command: custom.command.clone(), timeout_secs: custom.timeout_secs });
+            }
+        }
+        checks
+    }
+
+    /// Run `checks` until interrupted; one entry per failed check with its (clipped) output.
+    fn run_checks(&mut self, checks: &[verification::FocusedCheck], ui: &mut dyn Ui) -> Vec<String> {
+        let mut failures = Vec::new();
+        for check in checks {
+            if self.interrupt.load(Ordering::SeqCst) { break; }
+            let output = self.run_focused_check(check, ui);
+            if output.is_error || verification::exit_code(&output.text) != Some(0) {
+                failures.push(format!("{} failed:\n{}", check.name, guard::clip_evidence(&output.text, 4096)));
+            }
+        }
+        failures
+    }
+
+    /// Gate `todo done`. A step with no tool call since it started is a claim without evidence and stays
+    /// open. A step that edited files runs the focused checks, so a broken step is caught while its
+    /// context is fresh instead of after the whole plan; a failure keeps it open once, and calling done
+    /// again without further edits closes it (the failure may predate the step).
+    fn check_step(&mut self, ui: &mut dyn Ui) -> Result<Option<String>, String> {
+        if !self.step_checks.evidence {
+            return Err("Step not closed: no tool has run since it started. Do the work (edit, run, or read to check it) before marking it done, or drop it with a reason if it is no longer needed.".into());
+        }
+        let pending = self.step_checks.mutations != self.step_checks.checked;
+        let (Some(turn), true, true) = (self.step_checks.turn, pending, self.config.verification.enabled) else {
+            return Ok(self.step_checks.failed.then(|| "Note: the last focused checks failed and nothing was edited since.".to_owned()));
+        };
+        let checks = self.focused_checks(turn);
+        if checks.is_empty() { return Ok(None); }
+        self.step_checks.checked = self.step_checks.mutations;
+        let failures = self.run_checks(&checks, ui);
+        self.step_checks.failed = !failures.is_empty();
+        if failures.is_empty() { return Ok(Some(format!("Focused checks passed: {}.", checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")))); }
+        Err(format!("Step not closed: focused checks failed after its edits. Fix the diagnostics, then call todo done again (if the failure predates this step, calling done again without edits closes it).\n{}", failures.join("\n")))
     }
 
     fn dispatch(&mut self, backend: &mut Backend, call: &ToolCall, ui: &mut dyn Ui) -> ToolOutput {
@@ -1235,12 +1811,12 @@ impl<'a> Agent<'a> {
             }
         }
         if let Some(out) = self.run_background_tool(name, args, ui) {
-            if name == "bash" { self.note_verification(call, &out); }
+            if name == "bash" { self.note_verification(call, &out, ui); }
             return out;
         }
         if tools::BUILTIN.contains(&name) {
             let out = tools::execute(&self.workspace, name, args, 120);
-            if name == "bash" { self.note_verification(call, &out); }
+            if name == "bash" { self.note_verification(call, &out, ui); }
             return out;
         }
         if let Some(tool) = self.ext.get(name) {
@@ -1255,23 +1831,33 @@ impl<'a> Agent<'a> {
         }
         match name {
             "todo" => {
-                let before = self.todo.snapshot();
-                let output = self.todo.call(args);
-                if !output.is_error && self.todo.snapshot() != before {
-                    let mut state = self.session.control_state();
-                    state["todo"] = self.todo.snapshot();
-                    if let Err(error) = self.session.set_control_state(state) {
-                        let _ = self.todo.restore(&before);
-                        return denied(&format!("could not persist todos: {error:#}"));
+                let mut next = self.todo.clone();
+                let mut output = next.call(args);
+                if output.is_error || next == self.todo { return output; }
+                if args["op"] == "done" {
+                    match self.check_step(ui) {
+                        Ok(Some(note)) => { output.text.push('\n'); output.text.push_str(&note); }
+                        Ok(None) => {}
+                        Err(failure) => return denied(&failure),
                     }
                 }
+                let mut state = self.session.control_state();
+                state["todo"] = next.snapshot();
+                if let Err(error) = self.session.set_control_state(state) {
+                    return denied(&format!("could not persist todos: {error:#}"));
+                }
+                // A new step needs its own evidence; work done before the first plan counts toward its first step.
+                let active = |list: &TodoList| list.tasks().iter().position(|t| t.status == todo::Status::InProgress);
+                if active(&self.todo).is_some() && active(&next) != active(&self.todo) { self.step_checks.evidence = false; }
+                self.todo = next;
+                ui.todo(&self.todo);
                 output
             },
             "finish" => {
                 let finish = match completion::Finish::parse(args) { Ok(finish) => finish, Err(error) => return denied(&error) };
                 if finish.outcome == TurnOutcome::Completed {
                     let work = completion::open_work(&self.todo);
-                    if !work.is_empty() { return denied(&format!("cannot finish completed with unfinished todos:\n{work}")); }
+                    if !work.is_empty() { return denied(&format!("cannot finish completed with open todos:\n{work}\nFinish them, drop them with a reason, or finish blocked if a blocker remains.")); }
                     self.pump_subagents(ui);
                     if self.live_tasks.status(None).ok().and_then(|jobs| jobs.as_array().cloned()).is_some_and(|jobs| jobs.iter().any(|job| job["status"] == "running")) {
                         return denied("cannot finish completed while live tasks are running; wait for and inspect their results");
@@ -1321,6 +1907,15 @@ impl<'a> Agent<'a> {
                 },
             },
             "task" => self.run_task(backend, args, ui),
+            "solve" => self.run_solve(backend, args, ui),
+            "escalate" => {
+                backend.release();
+                let env = subagents::Env {
+                    config: self.config, workspace: &self.workspace, ext: &self.ext, layout: self.layout.as_ref(),
+                    harness: &self.version.harness, interrupt: &self.interrupt,
+                };
+                solve::escalate(env, args, &mut self.session_cost, ui)
+            },
             other => match self.config.tools.get(other) {
                 Some(tool) => {
                     let input = args.get("input").and_then(Value::as_str).unwrap_or("");
@@ -1430,6 +2025,17 @@ impl<'a> Agent<'a> {
         subagents::run(parent, args, ui)
     }
 
+    fn run_solve(&mut self, main: &mut Backend, args: &Value, ui: &mut dyn Ui) -> ToolOutput {
+        let env = subagents::Env {
+            config: self.config, workspace: &self.workspace, ext: &self.ext, layout: self.layout.as_ref(),
+            harness: &self.version.harness, interrupt: &self.interrupt,
+        };
+        solve::run(subagents::Parent {
+            env, approval: self.approval, always: &mut self.always, main, side: &mut self.subagent_backend,
+            cost: &mut self.session_cost, adapter: self.version.adapter.as_deref(),
+        }, args, ui)
+    }
+
     /// Idle compaction temporarily owns the main backend; in-loop compaction borrows the active one.
     pub fn compact(&mut self, ui: &mut dyn Ui) -> Result<()> {
         let mut backend = self.backend.take().context("backend is already in use")?;
@@ -1489,7 +2095,8 @@ impl<'a> Agent<'a> {
         ensure!(!summary.trim().is_empty(), "model produced an empty summary");
         let goal = self.session.control_state()["original_goal"].clone();
         let evidence = messages[..cut].iter().filter_map(|m| m["dial_evidence"]["artifact"].as_str()).collect::<Vec<_>>();
-        let summary = format!("{}\n\nOriginal user goal: {}\nDurable decisions/open work: {}\nRetained evidence (read and mutation results): {}", summary.trim(), goal, self.session.control_state()["working_state"], evidence.join(", "));
+        let tasks = if self.todo.is_empty() { String::new() } else { format!("\nTask list (todo tool, authoritative):\n{}", self.todo.render()) };
+        let summary = format!("{}\n\nOriginal user goal: {}\nDurable decisions/open work: {}{tasks}\nRetained evidence (read and mutation results): {}", summary.trim(), goal, self.session.control_state()["working_state"], evidence.join(", "));
         self.session.compact(summary, messages.len() - cut)?;
         self.metrics.compactions += 1;
         self.last_prompt_tokens = 0;
@@ -1538,7 +2145,7 @@ impl<'a> Agent<'a> {
                 let adapter = self.version.adapter.clone();
                 let timeout = self.config.worker_timeout_secs;
                 let interrupt = self.interrupt.clone();
-                chat_with_ui(main, adapter.as_deref(), request, timeout, interrupt, false, ui, &mut |ui| self.pump_subagents(ui))?
+                chat_with_ui(main, adapter.as_deref(), request, timeout, interrupt, false, ui, None, &mut |ui| self.pump_subagents(ui))?
             };
             if let Some(cost) = main.reply_cost(&reply) { self.session_cost = Some(self.session_cost.unwrap_or(0.0) + cost); }
             return Ok(reply.text);
@@ -1555,7 +2162,7 @@ impl<'a> Agent<'a> {
         } else {
             let timeout = self.config.worker_timeout_secs;
             let interrupt = self.interrupt.clone();
-            chat_with_ui(&mut backend, None, request, timeout, interrupt, false, ui, &mut |ui| self.pump_subagents(ui))
+            chat_with_ui(&mut backend, None, request, timeout, interrupt, false, ui, None, &mut |ui| self.pump_subagents(ui))
         };
         if let Ok(reply) = &result {
             if let Some(cost) = backend.reply_cost(reply) { self.session_cost = Some(self.session_cost.unwrap_or(0.0) + cost); }
@@ -1716,15 +2323,51 @@ fn call_form_error(call: &ToolCall, schemas: &[Value], names: &[String]) -> Opti
 }
 
 fn summarize(call: &ToolCall) -> String {
-    let a = &call.arguments;
-    let text = match call.name.as_str() {
-        "bash" => a["command"].as_str().unwrap_or("").to_owned(),
-        "write" | "read" => a["path"].as_str().unwrap_or("").to_owned(),
-        "edit" => a["input"].as_str().map(|s| s.to_owned()).or_else(|| a["path"].as_str().map(str::to_owned)).unwrap_or_default(),
+    summarize_call(&call.name, &call.arguments)
+}
+
+/// One line a person can read for a tool call: tool lines, approval prompts and replayed sessions. Tools that can
+/// need approval keep their full arguments unless a field below already says everything the approver must see.
+pub fn summarize_call(name: &str, a: &Value) -> String {
+    let s = |key: &str| a[key].as_str().unwrap_or("");
+    let within = |pattern: &str| match (s("path"), s("glob")) {
+        ("", "") => pattern.to_owned(),
+        (path, "") => format!("{pattern} in {path}"),
+        ("", glob) => format!("{pattern} ({glob})"),
+        (path, glob) => format!("{pattern} in {path} ({glob})"),
+    };
+    let text = match name {
+        "bash" => s("command").to_owned(),
+        "write" | "read" => s("path").to_owned(),
+        "edit" => a["input"].as_str().or_else(|| a["path"].as_str()).unwrap_or_default().to_owned(),
         "task" => subagents::summarize(a),
+        "grep" | "glob" => within(s("pattern")),
+        "todo" => summarize_todo(a),
+        "finish" => s("outcome").replace('_', " "),
+        "tool_search" => s("query").to_owned(),
+        "tool_load" => a["names"].as_array().map(|n| n.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
+        "artifact_read" => s("uri").to_owned(),
+        "working_state" => s("action").to_owned(),
+        _ if a.is_null() => String::new(),
         _ => a.to_string(),
     };
     truncate(&text, 1500)
+}
+
+fn summarize_todo(a: &Value) -> String {
+    let op = a["op"].as_str().unwrap_or("?");
+    let count = a["tasks"].as_array().map_or(0, Vec::len);
+    let plural = if count == 1 { "" } else { "s" };
+    let index = a["index"].as_u64().map(|i| format!(" {i}")).unwrap_or_default();
+    match op {
+        "set" if count == 0 => "clear".to_owned(),
+        "set" => format!("plan {count} task{plural}"),
+        "append" => format!("add {count} task{plural}"),
+        _ => match a["reason"].as_str() {
+            Some(reason) => format!("{op}{index}: {reason}"),
+            None => format!("{op}{index}"),
+        },
+    }
 }
 
 fn render_transcript(messages: &[Value]) -> String {
@@ -1767,18 +2410,25 @@ fn seed_workspace(dir: &Path, files: &BTreeMap<String, String>) -> Result<()> {
 /// and answer. A stuck agent (step budget exhausted) fails the case; infrastructure errors propagate
 /// so a broken model server aborts an evaluation instead of silently scoring zero.
 pub fn check_case(runtime: &mut Runtime, config: &Config, version: &Version, prompt: &str, files: &BTreeMap<String, String>, check: &Check) -> Result<bool> {
+    Ok(check_case_measured(runtime, config, version, prompt, files, check)?.passed)
+}
+
+/// The sealed verifier verdict plus observed workflow cost, without writing evaluation traces.
+pub fn check_case_measured(runtime: &mut Runtime, config: &Config, version: &Version, prompt: &str,
+                          files: &BTreeMap<String, String>, check: &Check) -> Result<crate::learn::workflow::CaseMeasurement> {
     ensure!(!prompt.trim().is_empty() && prompt.len() <= 65536, "prompt must be 1..65536 bytes");
     let workspace = tempfile::tempdir()?;
     seed_workspace(workspace.path(), files)?;
     let mut agent = Agent::hermetic(config, runtime.take_backend(config)?, version, workspace.path(), None, None)?;
     let result = agent.turn(prompt, &mut NullUi);
     runtime.backend = agent.backend.take();
-    let answer = match result {
-        Ok(report) => report.text,
-        Err(error) if format!("{error:#}").contains(BUDGET_MSG) => return Ok(false),
+    let metrics = agent.workflow_metrics.into_inner();
+    let passed = match result {
+        Ok(report) => report.outcome == TurnOutcome::Completed && check.verify(workspace.path(), &report.text),
+        Err(error) if format!("{error:#}").contains(BUDGET_MSG) => false,
         Err(error) => return Err(error),
     };
-    Ok(check.verify(workspace.path(), &answer))
+    Ok(crate::learn::workflow::CaseMeasurement { passed, metrics })
 }
 
 /// Self-play: like `check_case`, but the trajectory is recorded (domain `selfplay:<family>`) with the
@@ -1788,19 +2438,30 @@ pub fn selfplay_run(runtime: &mut Runtime, config: &Config, store: &Store, versi
     let workspace = tempfile::tempdir()?;
     seed_workspace(workspace.path(), files)?;
     let mut agent = Agent::hermetic(config, runtime.take_backend(config)?, version, workspace.path(), Some(store), Some(format!("selfplay:{family}")))?;
-    let result = agent.turn(prompt, &mut NullUi);
+    let result = (|| -> Result<bool> {
+        let mut input = prompt.to_owned();
+        for attempt in 0..2 {
+            let result = agent.turn(&input, &mut NullUi);
+            let (trajectory, text, completed) = match result {
+                Ok(report) => (report.trajectory, report.text, report.outcome == TurnOutcome::Completed),
+                Err(error) if format!("{error:#}").contains(BUDGET_MSG) => (agent.last_trajectory, String::new(), false),
+                Err(error) => return Err(error),
+            };
+            let passed = completed && check.verify(workspace.path(), &text);
+            if let Some(id) = trajectory {
+                store.outcome(&crate::config::types::Outcome { trajectory: id, score: if passed { 100.0 } else { 0.0 },
+                    source: format!("verifier:{family}"), reference: Some(format!("training attempt {}",attempt+1)) })?;
+            }
+            if passed { return Ok(true); }
+            if !completed || attempt == 1 { return Ok(false); }
+            crate::learn::auto::check_stop(config)?;
+            // This feedback is confined to training cases. Gate cases are never repaired or logged.
+            input = "The independent training-task verifier rejected the result. Revisit the original requirements, inspect the smallest relevant implementation, and correct the behavior. Preserve tests and requirements. Change your approach instead of repeating the failed attempt, and run relevant checks before finishing.".into();
+        }
+        Ok(false)
+    })();
     runtime.backend = agent.backend.take();
-    let (trajectory, text, completed) = match result {
-        Ok(report) => (report.trajectory, report.text, !report.interrupted),
-        Err(error) if format!("{error:#}").contains(BUDGET_MSG) => (agent.last_trajectory, String::new(), false),
-        Err(error) => return Err(error),
-    };
-    let passed = completed && check.verify(workspace.path(), &text);
-    if let Some(id) = trajectory {
-        store.outcome(&crate::config::types::Outcome { trajectory: id, score: if passed { 100.0 } else { 0.0 },
-            source: format!("verifier:{family}"), reference: None })?;
-    }
-    Ok(passed)
+    result
 }
 
 /// Commands whose exit status is a meaningful external verdict on the work (tests, builds, linters).
@@ -1904,7 +2565,7 @@ mod tests {
             seed: None,
         };
         let mut ui = RecordingUi { heartbeats: 0, text: String::new() };
-        let reply = chat_with_ui(&mut backend, None, &request, 5, Arc::new(AtomicBool::new(false)), true, &mut ui, &mut |_| {}).unwrap();
+        let reply = chat_with_ui(&mut backend, None, &request, 5, Arc::new(AtomicBool::new(false)), true, &mut ui, None, &mut |_| {}).unwrap();
         assert_eq!(reply.text, "hello");
         assert_eq!(ui.text, "hello");
         assert!(ui.heartbeats >= 1, "the UI should repaint during the fake model's initial delay");
@@ -1928,6 +2589,32 @@ mod tests {
     }
 
     #[test]
+    fn internal_model_output_stays_out_of_the_transcript() {
+        #[derive(Default)]
+        struct RecordingUi { text:usize, reasoning:usize, arguments:usize }
+        impl Ui for RecordingUi {
+            fn text_delta(&mut self,_:&str) {self.text+=1;}
+            fn reasoning_delta(&mut self,_:&str) {self.reasoning+=1;}
+            fn tool_arguments_delta(&mut self,_:u64,_:&str,_:&str,_:&str) {self.arguments+=1;}
+        }
+        let events=[
+            json!({"choices":[{"delta":{"reasoning_content":"private maintenance reasoning"}}]}),
+            json!({"choices":[{"delta":{"content":"saved result"}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call","type":"function","function":{"name":"unexpected","arguments":"{}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ];
+        let body=events.iter().map(|event|format!("data: {event}\n\n")).collect::<String>()+"data: [DONE]\n\n";
+        let server=crate::llm::fake::serve(vec![crate::llm::fake::Script::Sse(body)]);
+        let mut backend=Backend::new(ProviderKind::Endpoint {base_url:format!("{}/v1",server.url),model:"test".into(),api_key:None},PathBuf::new(),5);
+        let request=Chat {messages:vec![json!({"role":"user","content":"maintain memory"})],tools:vec![],temperature:0.0,max_tokens:32,seed:None};
+        let mut ui=RecordingUi::default();
+        let reply=chat_with_ui(&mut backend,None,&request,5,Arc::new(AtomicBool::new(false)),false,&mut ui,None,&mut |_| {}).unwrap();
+        assert_eq!(reply.text,"saved result");
+        assert_eq!(reply.tool_calls.len(),1);
+        assert_eq!((ui.text,ui.reasoning,ui.arguments),(0,0,0));
+    }
+
+    #[test]
     fn continuous_model_events_do_not_starve_ui_heartbeats() {
         struct RecordingUi { heartbeats: usize, events: usize }
         impl Ui for RecordingUi {
@@ -1946,7 +2633,7 @@ mod tests {
         }, PathBuf::new(), 5);
         let request = Chat { messages: vec![json!({"role":"user","content":"hello"})], tools: vec![], temperature: 0.2, max_tokens: 16, seed: None };
         let mut ui = RecordingUi { heartbeats: 0, events: 0 };
-        chat_with_ui(&mut backend, None, &request, 5, Arc::new(AtomicBool::new(false)), false, &mut ui, &mut |_| {}).unwrap();
+        chat_with_ui(&mut backend, None, &request, 5, Arc::new(AtomicBool::new(false)), true, &mut ui, None, &mut |_| {}).unwrap();
         assert_eq!(ui.events, 100);
         assert!(ui.heartbeats >= 2, "a continuously occupied event queue must still pump input");
         assert_eq!(server.requests().len(), 1);

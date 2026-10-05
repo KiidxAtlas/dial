@@ -98,6 +98,14 @@ pub struct RunMetrics {
     pub truncated_recoveries: u64,
     #[serde(default)]
     pub turns_completed: u64,
+    /// True only when the runner observed provider usage, not an estimated token count.
+    #[serde(default)]
+    pub token_usage_observed: bool,
+    #[serde(default)]
+    pub token_usage_incomplete: bool,
+    /// Actual repair attempts, when supplied by the agent instrumentation.
+    #[serde(default)]
+    pub repair_attempts: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -199,6 +207,131 @@ pub struct ProfileComparisonReport {
     pub baseline_profile: String,
     /// Sorted by verified success, then successful-case latency; never latency first.
     pub profiles: Vec<ProfileReport>,
+}
+
+/// Explicit configurations are measured, never selected from hardware/model-name guesses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MachineConfiguration {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub context_window: u32,
+    /// Expected local config.json quantization bits; this is checked, not a conversion request.
+    #[serde(default)]
+    pub quantization_bits: Option<u8>,
+    #[serde(default)]
+    pub adapter: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MachineBenchmarkPolicy {
+    pub repetitions: usize,
+    pub case_timeout_secs: u64,
+    pub minimum_correctness: f64,
+    /// Remote inference requires this explicit opt-in; verification tools stay offline.
+    pub allow_remote: bool,
+    pub regression_thresholds: RegressionThresholds,
+}
+
+impl Default for MachineBenchmarkPolicy {
+    fn default() -> Self {
+        Self { repetitions: 1, case_timeout_secs: 300, minimum_correctness: 1.0, allow_remote: false, regression_thresholds: RegressionThresholds::default() }
+    }
+}
+
+impl MachineBenchmarkPolicy {
+    pub fn validate(&self, suite: &BenchmarkSuite, configurations: &[MachineConfiguration]) -> Result<()> {
+        suite.validate()?;
+        ensure!((1..=10).contains(&self.repetitions), "machine benchmark repetitions must be 1..=10");
+        ensure!((1..=600).contains(&self.case_timeout_secs), "machine benchmark case timeout must be 1..=600 seconds");
+        ensure!(self.minimum_correctness.is_finite() && (0.0..=1.0).contains(&self.minimum_correctness), "minimum_correctness must be between zero and one");
+        ensure!(!configurations.is_empty() && configurations.len() <= MAX_PROFILES, "machine benchmark needs 1..={MAX_PROFILES} configurations");
+        ensure!(suite.cases.len().saturating_mul(configurations.len()).saturating_mul(self.repetitions) <= MAX_CASES, "machine benchmark exceeds {MAX_CASES} total case runs");
+        let mut names = std::collections::BTreeSet::new();
+        for configuration in configurations {
+            ensure!(!configuration.name.trim().is_empty() && names.insert(&configuration.name), "configuration names must be nonempty and unique");
+            ensure!(!configuration.provider.trim().is_empty() && !configuration.model.trim().is_empty(), "configuration provider and model must be explicit");
+            ensure!((2048..=1_048_576).contains(&configuration.context_window), "configuration context_window must be 2048..=1048576");
+            ensure!(configuration.quantization_bits.is_none_or(|bits| (1..=16).contains(&bits)), "quantization_bits must be 1..=16");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineIdentity {
+    pub hostname: String,
+    pub operating_system: String,
+    pub architecture: String,
+    pub logical_cpus: Option<usize>,
+    pub dial_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MachineConfigurationReport {
+    pub configuration: MachineConfiguration,
+    /// Effective runtime settings and on-disk metadata, not advertised capabilities.
+    pub settings: serde_json::Value,
+    pub report: BenchmarkReport,
+    /// Includes failed attempts and deterministic verification, not just successful latency.
+    pub wall_time_ms: u64,
+    pub observed_prompt_tokens: Option<u64>,
+    pub observed_output_tokens: Option<u64>,
+    pub repair_attempts: Option<u64>,
+    pub correct_cases_per_second: Option<f64>,
+    pub eligible: bool,
+    pub baseline_comparison: BaselineComparison,
+}
+
+impl MachineConfigurationReport {
+    pub fn measured(configuration: MachineConfiguration, settings: serde_json::Value, report: BenchmarkReport, wall_time_ms: u64) -> Self {
+        let all_usage = !report.cases.is_empty() && report.cases.iter().all(|case| case.metrics.token_usage_observed && !case.metrics.token_usage_incomplete);
+        let repairs = report.cases.iter().try_fold(0u64, |sum, case| case.metrics.repair_attempts.map(|n| sum.saturating_add(n)));
+        let successes = report.cases.iter().filter(|case| case.passed).count();
+        Self {
+            configuration, settings, wall_time_ms,
+            observed_prompt_tokens: all_usage.then(|| total_prompt_tokens(&report)),
+            observed_output_tokens: all_usage.then(|| total_output_tokens(&report)),
+            repair_attempts: repairs,
+            correct_cases_per_second: (wall_time_ms > 0).then(|| successes as f64 * 1000.0 / wall_time_ms as f64),
+            eligible: false,
+            baseline_comparison: BaselineComparison { score_delta: 0.0, pass_rate_delta: 0.0, regressed: false },
+            report,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MachineBenchmarkReport {
+    pub machine: MachineIdentity,
+    pub suite: String,
+    pub suite_sha256: String,
+    pub measured_at_unix_secs: u64,
+    pub policy: MachineBenchmarkPolicy,
+    pub baseline_configuration: String,
+    pub recommended_configuration: Option<String>,
+    pub configurations: Vec<MachineConfigurationReport>,
+}
+
+/// First configuration is the baseline. Only floor-passing, non-regressing
+/// configurations with at least one verified success and measured wall time can win.
+pub fn rank_machine_configurations(reports: &mut [MachineConfigurationReport], policy: &MachineBenchmarkPolicy) -> Result<Option<String>> {
+    let baseline = reports.first().context("machine benchmark has no reports")?.report.clone();
+    for report in reports.iter_mut() {
+        ensure!(report.report.suite == baseline.suite && report.report.cases.len() == baseline.cases.len()
+            && report.report.cases.iter().zip(&baseline.cases).all(|(now, before)| now.id == before.id && now.checks_total == before.checks_total),
+            "machine benchmark configurations must execute identical verified tasks");
+        report.baseline_comparison = compare_baseline_with_thresholds(&report.report, &baseline, policy.regression_thresholds);
+        report.eligible = report.report.pass_rate >= policy.minimum_correctness
+            && !report.baseline_comparison.regressed
+            && report.correct_cases_per_second.is_some_and(|rate| rate > 0.0);
+    }
+    reports.sort_by(|a, b| b.eligible.cmp(&a.eligible)
+        .then_with(|| b.correct_cases_per_second.unwrap_or(0.0).total_cmp(&a.correct_cases_per_second.unwrap_or(0.0)))
+        .then_with(|| a.configuration.name.cmp(&b.configuration.name)));
+    Ok(reports.first().filter(|report| report.eligible).map(|report| report.configuration.name.clone()))
 }
 
 impl BenchmarkSuite {
@@ -628,5 +761,79 @@ prompt = "do work"
         assert!(!copied.path().join("private.pem").exists());
         assert!(copied.path().join(".env.example").is_file());
         assert!(copied.path().join("main.rs").is_file());
+    }
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::*;
+
+    fn measured(name: &str, outcomes: &[bool], wall_time_ms: u64) -> MachineConfigurationReport {
+        let configuration = MachineConfiguration { name: name.into(), provider: "mlx".into(), model: "/explicit/model".into(), context_window: 8192, quantization_bits: Some(4), adapter: None };
+        let cases = outcomes.iter().enumerate().map(|(index, passed)| CaseResult {
+            id: format!("0:{index}"), passed: *passed, checks_passed: usize::from(*passed), checks_total: 1,
+            metrics: RunMetrics { elapsed_ms: 100, agent_succeeded: true, token_usage_observed: true, prompt_tokens: 10, output_tokens: 5, repair_attempts: Some(u64::from(!passed)), ..Default::default() },
+        }).collect();
+        MachineConfigurationReport::measured(configuration, serde_json::json!({}), score_report("identical", cases), wall_time_ms)
+    }
+
+    #[test]
+    fn recommendations_rank_verified_throughput_without_rewarding_fast_failures() {
+        let mut reports = vec![measured("baseline", &[true, true], 2000), measured("fast-failure", &[false, false], 1), measured("fast-correct", &[true, true], 1000)];
+        let winner = rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).unwrap();
+        assert_eq!(winner.as_deref(), Some("fast-correct"));
+        assert_eq!(reports[0].correct_cases_per_second, Some(2.0));
+        assert_eq!(reports[0].observed_prompt_tokens, Some(20));
+        assert_eq!(reports[0].repair_attempts, Some(0));
+        assert!(!reports.iter().find(|report| report.configuration.name == "fast-failure").unwrap().eligible);
+    }
+
+    #[test]
+    fn correctness_floor_and_per_case_regressions_veto_faster_candidates() {
+        let policy = MachineBenchmarkPolicy { minimum_correctness: 0.5, ..Default::default() };
+        let mut reports = vec![measured("baseline", &[true, false], 2000), measured("different-success", &[false, true], 100)];
+        assert_eq!(rank_machine_configurations(&mut reports, &policy).unwrap().as_deref(), Some("baseline"));
+        assert!(reports.iter().find(|report| report.configuration.name == "different-success").unwrap().baseline_comparison.regressed);
+        assert_eq!(rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).unwrap(), None);
+    }
+
+    #[test]
+    fn regression_metric_budget_is_applied_before_throughput_ranking() {
+        let mut reports = vec![measured("baseline", &[true], 2000), measured("faster", &[true], 100)];
+        reports[1].report.cases[0].metrics.prompt_tokens = 100;
+        let policy = MachineBenchmarkPolicy { regression_thresholds: RegressionThresholds { max_prompt_token_increase: Some(0), ..Default::default() }, ..Default::default() };
+        assert_eq!(rank_machine_configurations(&mut reports, &policy).unwrap().as_deref(), Some("baseline"));
+    }
+
+    #[test]
+    fn unavailable_or_partial_metrics_are_not_reported_as_zero() {
+        let mut report = measured("unknown", &[true], 0);
+        report.report.cases[0].metrics.token_usage_incomplete = true;
+        report.report.cases[0].metrics.repair_attempts = None;
+        let report = MachineConfigurationReport::measured(report.configuration, report.settings, report.report, 0);
+        assert_eq!(report.observed_prompt_tokens, None);
+        assert_eq!(report.observed_output_tokens, None);
+        assert_eq!(report.repair_attempts, None);
+        assert_eq!(report.correct_cases_per_second, None);
+        assert_eq!(rank_machine_configurations(&mut [report], &MachineBenchmarkPolicy::default()).unwrap(), None);
+    }
+
+    #[test]
+    fn mismatched_tasks_and_unbounded_work_are_rejected() {
+        let mut reports = vec![measured("baseline", &[true], 100), measured("mismatch", &[true], 100)];
+        reports[1].report.cases[0].id = "other-task".into();
+        assert!(rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).is_err());
+        let suite = BenchmarkSuite { version: 1, name: "bounded".into(), cases: vec![BenchmarkCase { id: "case".into(), prompt: "solve".into(), checks: vec![Assertion::FileExists { path: "answer".into() }], ..Default::default() }] };
+        let configuration = reports[0].configuration.clone();
+        let mut policy = MachineBenchmarkPolicy::default();
+        assert!(policy.validate(&suite, &[configuration.clone()]).is_ok());
+        policy.repetitions = 11;
+        assert!(policy.validate(&suite, &[configuration.clone()]).is_err());
+        policy.repetitions = 1;
+        policy.case_timeout_secs = 601;
+        assert!(policy.validate(&suite, &[configuration.clone()]).is_err());
+        policy.case_timeout_secs = 1;
+        policy.minimum_correctness = f64::NAN;
+        assert!(policy.validate(&suite, &[configuration]).is_err());
     }
 }

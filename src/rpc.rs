@@ -1,5 +1,5 @@
 //! Versioned newline-delimited JSON control protocol. Stdin is control, stdout is JSON only.
-use crate::{agent::{Agent,Decision,Ui,make_backend}, config::types::Config, storage::{paths::Layout,session::{Session,SessionMeta}},tools::ToolOutput};
+use crate::{agent::{Agent,Decision,Ui,make_backend,todo::TodoList}, config::types::Config, storage::{paths::Layout,session::{Session,SessionMeta}},tools::ToolOutput};
 use anyhow::{Context,Result};
 use serde_json::{Value,json};
 use std::{io::{BufRead,Write},sync::{Arc,Mutex,mpsc,atomic::{AtomicBool,Ordering}},thread,time::{Duration,Instant}};
@@ -36,6 +36,7 @@ impl Ui for RpcUi {
  fn tool_arguments_delta(&mut self,index:u64,id:&str,name:&str,delta:&str){self.out.emit(json!({"event":"tool_arguments","index":index,"id":id,"name":name,"delta":delta}));}
  fn cached_usage(&mut self,read:Option<u64>,write:Option<u64>){self.out.emit(json!({"event":"cached_usage","read_tokens":read,"write_tokens":write}));}
  fn extension_panel(&mut self,title:&str,markdown:&str){self.out.emit(json!({"event":"panel","title":title,"markdown":markdown}));}
+ fn todo(&mut self,todo:&TodoList){self.out.emit(json!({"event":"todo","tasks":todo.snapshot()}));}
  fn take_steering(&mut self)->Vec<String>{self.steering.lock().map(|mut q|std::mem::take(&mut *q)).unwrap_or_default()}
  fn approve(&mut self,tool:&str,summary:&str)->Decision {self.request_approval(tool,summary,None)}
  fn approve_with_cancel(&mut self,tool:&str,summary:&str,cancel:&AtomicBool)->Decision {self.request_approval(tool,summary,Some(cancel))}
@@ -76,6 +77,9 @@ pub fn run(layout:Layout,config:Config)->Result<()> {
   let backend=make_backend(&config)?;
   let session=Session::create(&layout,SessionMeta{model:config.model.clone()})?;
   let mut agent=Agent::interactive(&config,backend,layout.clone(),session,None,None,flag.clone())?;
+  if let Some(path)=std::env::var_os("DIAL_BENCHMARK_ADAPTER") {
+   agent.set_benchmark_adapter(std::path::Path::new(&path))?;
+  }
   let _=control_tx.send(agent.live_task_control());
   let mut ui=RpcUi{out:worker_out.clone(),approvals:approval_rx,pending_approval:worker_pending,interrupt:flag.clone(),steering:queue,next:0};
   worker_out.emit(json!({"event":"ready","protocol_version":PROTOCOL_VERSION,"session_id":agent.session().id(),"model":config.model,"tools":agent.tool_names()}));

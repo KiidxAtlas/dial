@@ -48,16 +48,41 @@ fn content(dir: &tempfile::TempDir, name: &str) -> String {
 }
 
 #[test]
-fn missing_put_body_prefix_explains_the_correction_without_writing() {
+fn put_body_rows_without_the_plus_prefix_are_content_with_a_warning() {
     let (dir, ws) = workspace();
-    fs::write(dir.path().join("f.rs"), "original\n").unwrap();
+    fs::write(dir.path().join("f.rs"), "fn a() {\n    old();\n}\nfn b() {}\n").unwrap();
     let tag = read_tag(&ws, "f.rs");
-    let bad = patch(&ws, &format!("[f.rs#{tag}]\nPUT 1.=1:\n+new\n    unchanged\n"));
-    assert!(bad.is_error && bad.text.contains("missing `+` prefix"), "{}", bad.text);
-    assert!(bad.text.contains("+    unchanged"));
-    assert_eq!(content(&dir, "f.rs"), "original\n");
-    assert!(!patch(&ws, &format!("[f.rs#{tag}]\nPUT 1.=1:\n+new\n+    unchanged\n")).is_error);
-    assert_eq!(content(&dir, "f.rs"), "new\n    unchanged\n");
+    // Mixed `+` and bare rows, and a raw blank line between body rows, as models actually write them.
+    let out = patch(&ws, &format!("[f.rs#{tag}]\nPUT 1.=3:\n+fn a() {{\n    new();\n\n    more();\n}}\nPUT 4.=4:\nfn c() {{}}\n"));
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("4 body row(s) had no `+` prefix") && out.text.contains("1 body row(s) had no `+` prefix"), "{}", out.text);
+    assert_eq!(content(&dir, "f.rs"), "fn a() {\n    new();\n\n    more();\n}\nfn c() {}\n");
+    // Diff-looking rows stay refused: a `-` row may be a deletion the model meant, not content.
+    let tag = read_tag(&ws, "f.rs");
+    let bad = patch(&ws, &format!("[f.rs#{tag}]\nPUT 1.=1:\n-fn a() {{\n+fn z() {{\n"));
+    assert!(bad.is_error, "{}", bad.text);
+}
+
+#[test]
+fn a_restarted_workspace_relearns_shown_lines_only_for_unchanged_files() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("f.txt"), numbered(10)).unwrap();
+    fs::write(dir.path().join("g.txt"), numbered(3)).unwrap();
+    let before = Workspace::new(dir.path()).unwrap();
+    let shown = read(&before, "f.txt:2-4").text;
+    let g_shown = read(&before, "g.txt").text;
+    let tag = tag_in(&shown, "f.txt");
+    fs::write(dir.path().join("g.txt"), "changed since\n").unwrap();
+
+    // A new process (or a rebuilt agent) has an empty record of what the model saw.
+    let after = Workspace::new(dir.path()).unwrap();
+    assert!(patch(&after, &format!("[f.txt#{tag}]\nPUT 3.=3:\n+three\n")).text.contains("no read of this file is recorded"));
+    dial::tools::hashline::rehydrate(&after, [("read", shown.as_str()), ("read", g_shown.as_str())]);
+    assert!(!patch(&after, &format!("[f.txt#{tag}]\nPUT 3.=3:\n+three\n")).is_error, "a shown line is editable again");
+    let tag = read_tag(&after, "f.txt:3-3");
+    assert!(patch(&after, &format!("[f.txt#{tag}]\nPUT 8.=8:\n+eight\n")).text.contains("have not been shown"), "unshown lines stay locked");
+    let g_tag = tag_in(&g_shown, "g.txt");
+    assert!(patch(&after, &format!("[g.txt#{g_tag}]\nPUT 1.=1:\n+x\n")).is_error, "a file changed since the read is not unlocked");
 }
 
 #[test]

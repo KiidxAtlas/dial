@@ -9,6 +9,8 @@ use std::{fs, path::{Component, Path, PathBuf}};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Check {
+    /// Operator-owned checks restored after execution, never taken from solver edits.
+    Repository { files: std::collections::BTreeMap<String, String>, command: String },
     /// Final answer equals `expected` after trimming whitespace.
     AnswerExact { expected: String },
     AnswerContains { needle: String },
@@ -30,6 +32,7 @@ pub enum Check {
 impl Check {
     pub fn verify(&self, workspace: &Path, answer: &str) -> bool {
         match self {
+            Check::Repository { files, command } => super::repository::verify(workspace, files, command),
             Check::AnswerExact { expected } => answer.trim() == expected.trim(),
             Check::AnswerContains { needle } => answer.contains(needle.as_str()),
             Check::AnswerJson { expected } => serde_json::from_str::<Value>(answer.trim()).is_ok_and(|v| &v == expected),
@@ -112,6 +115,7 @@ mod tests {
 
     #[test]
     fn command_check_runs_in_the_sandbox() {
+        if !crate::tools::sandbox::require_for_test() { return; }
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("t.py"), "print(6*7)\n").unwrap();
         let ok = Check::Command { command: "python3 t.py".into(), expect_stdout: Some("42".into()), expect_exit: 0 };

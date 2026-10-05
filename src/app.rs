@@ -8,7 +8,7 @@
 //! (theme, status line, approval) is applied in place; one that does (model, provider, sandbox, …) makes
 //! the controller rebuild the agent around the same session.
 use crate::{
-    agent::{self, Agent, Decision, Ui, context, make_backend},
+    agent::{self, Agent, Decision, Ui, context, make_backend, todo::TodoList},
     config::types::{Approval, Config, Outcome},
     learn::auto,
     llm::{
@@ -28,10 +28,11 @@ use crate::{
         composer::{CommandEntry, CommandKind, Composer, ComposerCtx, ComposerEvent},
         markdown::truncate_spans,
         keys::{Action, Keymap},
-        overlay::{DrawCtx, OverlayEvent, models::ModelOverlay, providers::ProviderOverlay, settings::SettingsOverlay},
+        overlay::{DrawCtx, OverlayEvent, models::ModelOverlay, providers::ProviderOverlay, settings::SettingsOverlay, shortcuts::ShortcutOverlay},
         settings_schema,
-        status::{Phase, StatusData},
+        status::{Lora, Phase, StatusData},
         statusline,
+        tasks,
         term::{InlineTerminal, OverlayTerminal, Viewport},
         text,
         theme::{Sym, ThemeManager, Tok},
@@ -176,6 +177,17 @@ impl App {
 
     /// The effective configuration as the files and the command-line flags define it right now.
     fn reload(&self) -> Result<Config> { Config::load(&self.layout, Some(self.overlay.clone())) }
+
+    fn release_idle_compute(&self, agent: &mut Agent<'_>) -> bool {
+        if !agent.release_idle_models() { return false; }
+        // Stop model processes before allowing the training worker to load its weights.
+        if let Some(lock)=self.compute.borrow_mut().take() {
+            // Closing only our descriptor can leave the lock alive in a duplicate inherited
+            // during a concurrent process spawn. Explicitly release the shared lock first.
+            let _=fs2::FileExt::unlock(&lock);
+        }
+        true
+    }
 }
 
 fn short(id: &str) -> String { id.chars().take(8).collect() }
@@ -297,20 +309,126 @@ struct Catalog {
     request: u64,
     worker: Option<JoinHandle<()>>,
     generation: u64,
+    probe: Option<LoraProbe>,
+    attempted: std::collections::HashSet<String>,
+}
+
+struct LoraProbe {
+    model: String,
+    cancel: Arc<AtomicBool>,
+    checking: Arc<AtomicBool>,
+    result: std::sync::mpsc::Receiver<Result<Option<bool>>>,
+    worker: Option<JoinHandle<()>>,
+}
+impl Drop for LoraProbe {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+    }
+}
+
+fn probe_when_available(config: &Config, cancel: &AtomicBool, checking: &AtomicBool,
+    probe: impl FnOnce(&Config, &AtomicBool) -> Result<Value>) -> Result<Option<bool>> {
+    let lock = auto::lock_file(&config.user_dir.join("compute.lock"))?;
+    loop {
+        if cancel.load(Ordering::SeqCst) { return Ok(None); }
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(80)),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if cancel.load(Ordering::SeqCst) { return Ok(None); }
+    let store = Store::open(&config.state_dir, &config.model, &config.use_case, &config.harness)?;
+    // Another session may have completed verification while this job waited for compute.
+    if let Some(raw) = store.get_meta("serving_capabilities")? {
+        if let Ok(caps) = serde_json::from_str::<Value>(&raw) {
+            if crate::learn::worker::current_lora_probe(&caps) && caps["inference"] == true { if let Some(supported) = caps["lora"].as_bool() { return Ok(Some(supported)); } }
+        }
+    }
+    checking.store(true, Ordering::SeqCst);
+    let result = probe(config, cancel);
+    if cancel.load(Ordering::SeqCst) { return Ok(None); }
+    let caps = result?;
+    ensure!(caps["inference"] == true, "could not load model to verify LoRA: {}", caps["reason"]);
+    let supported = caps["lora"].as_bool().ok_or_else(|| anyhow::anyhow!("missing LoRA result"))?;
+    store.set_meta("serving_capabilities", &caps.to_string())?;
+    Ok(Some(supported))
 }
 
 fn shared<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> { mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) }
 
 impl Catalog {
-    fn new() -> Self { Self { slot: Arc::new(Mutex::new((0, None))), request: 0, worker: None, generation: 0 } }
+    fn new() -> Self { Self { slot: Arc::new(Mutex::new((0, None))), request: 0, worker: None, generation: 0, probe: None, attempted: Default::default() } }
 
     fn get(&self) -> Option<catalog::Discovery> { shared(&self.slot).1.clone() }
 
     /// Reap a finished scan so a new request can start; bumps `generation` when one completed.
     fn collect(&mut self) {
+        self.collect_probe();
         if !self.worker.as_ref().is_some_and(JoinHandle::is_finished) { return; }
         self.worker = None;
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn collect_probe(&mut self) {
+        let Some(probe) = &self.probe else { return; };
+        let model = probe.model.clone();
+        let result = match probe.result.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!("verification worker stopped"))),
+            Err(_) => None,
+        };
+        let check = if probe.checking.load(Ordering::SeqCst) { catalog::LoraCheck::Checking } else { catalog::LoraCheck::Waiting };
+        if let Some(discovery) = shared(&self.slot).1.as_mut() {
+            for entry in &mut discovery.models {
+                if entry.selection.model != model || entry.selection.provider != "mlx" { continue; }
+                let previous = (entry.metadata.lora_check, entry.metadata.lora_verified, entry.metadata.lora);
+                match &result {
+                    Some(Ok(Some(supported))) => { entry.metadata.lora = Some(*supported); entry.metadata.lora_verified = true; entry.metadata.lora_check = None; }
+                    Some(Ok(None)) => entry.metadata.lora_check = None,
+                    Some(Err(_)) => entry.metadata.lora_check = Some(catalog::LoraCheck::Failed),
+                    None => entry.metadata.lora_check = Some(check),
+                }
+                if previous != (entry.metadata.lora_check, entry.metadata.lora_verified, entry.metadata.lora) { self.generation = self.generation.wrapping_add(1); }
+            }
+        }
+        if let Some(result) = result {
+            if !matches!(result, Ok(None)) { self.attempted.insert(model); }
+            self.probe.take();
+        }
+    }
+
+    fn auto_verify(&mut self, app: &App) {
+        self.collect();
+        if self.probe.is_some() { return; }
+        let Some(discovery) = self.get() else { return; };
+        let candidate = discovery.models.iter().filter(|entry| entry.selection.provider == "mlx" && entry.selection.base_url.is_none()
+            && entry.available && !entry.metadata.lora_verified && entry.metadata.lora != Some(false)
+            && !self.attempted.contains(&entry.selection.model) && Path::new(&entry.selection.model).is_absolute())
+            .min_by_key(|entry| entry.selection.model != app.config.model);
+        let Some(entry) = candidate else { return; };
+        let mut config = app.config.with_selection(&entry.selection);
+        config.state_dir = config.learning_dir(&app.layout);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let checking = Arc::new(AtomicBool::new(false));
+        let (tx, result) = std::sync::mpsc::channel();
+        let (stop, active) = (cancel.clone(), checking.clone());
+        let worker = std::thread::spawn(move || { let _ = tx.send(probe_when_available(&config, &stop, &active, crate::learn::worker::capabilities_controlled)); });
+        self.probe = Some(LoraProbe { model: entry.selection.model.clone(), cancel, checking, result, worker: Some(worker) });
+        self.collect_probe();
+    }
+
+    fn cancel_probe(&mut self) {
+        if let Some(probe) = &self.probe { probe.cancel.store(true, Ordering::SeqCst); }
+        // Joining a cancelled probe releases its subprocess and compute before foreground inference.
+        if let Some(mut probe) = self.probe.take() {
+            if let Some(worker) = probe.worker.take() { let _ = worker.join(); }
+            if let Some(discovery) = shared(&self.slot).1.as_mut() {
+                for entry in &mut discovery.models { if entry.selection.model == probe.model { entry.metadata.lora_check = None; } }
+            }
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     fn start(&mut self, app: &App) {
@@ -327,9 +445,24 @@ impl Catalog {
     fn scan(&mut self, app: &App) {
         let layout = app.layout.clone();
         let configured = app.config.providers.clone();
+        let config = app.config.clone();
         let mut selections = vec![app.config.selection()];
         selections.extend(app.config.model_roles.values().cloned());
-        self.launch(move || catalog::discover(&layout, &configured, &selections));
+        self.launch(move || {
+            let mut discovery = catalog::discover(&layout, &configured, &selections);
+            for entry in &mut discovery.models {
+                if entry.selection.provider != "mlx" || entry.selection.base_url.is_some() { continue; }
+                let selected = config.with_selection(&entry.selection);
+                let caps = Store::open_read_only(&selected.learning_dir(&layout)).ok()
+                    .and_then(|store| store.get_meta("serving_capabilities").ok().flatten())
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+                if let Some(supported) = caps.filter(crate::learn::worker::current_lora_probe).and_then(|caps| caps["lora"].as_bool()) {
+                    entry.metadata.lora = Some(supported);
+                    entry.metadata.lora_verified = true;
+                }
+            }
+            discovery
+        });
     }
 
     fn launch(&mut self, discover: impl FnOnce() -> catalog::Discovery + Send + 'static) {
@@ -421,19 +554,47 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 #[derive(Default)]
-struct Learning { cache: StatusCache<(Option<i64>, String)> }
+struct Learning { cache: StatusCache<(Option<i64>, String, Lora)>, state_dir: Option<std::path::PathBuf> }
 
 impl Learning {
     fn read(&mut self, app: &App) {
-        let state_dir = app.layout.state_dir.clone();
+        let state_dir = app.config.state_dir.clone();
+        if self.state_dir.as_ref() != Some(&state_dir) {
+            self.cache = StatusCache::default();
+            self.state_dir = Some(state_dir.clone());
+        }
         let config = app.config.clone();
         let available = app.store.is_some();
         self.cache.refresh(STATUS_TTL, move || {
             let store = available.then(|| Store::open_read_only(&state_dir).ok()).flatten();
             let label = improvement_label(&config, store.as_ref());
-            let version = store.as_ref().and_then(|store| store.active().ok()).map(|version| version.id);
-            (version, label)
+            let active = store.as_ref().and_then(|store| store.active().ok());
+            let lora = lora_state(&config, store.as_ref(), active.as_ref());
+            (active.map(|version| version.id), label, lora)
         });
+    }
+}
+
+/// LoRA status of the main model. Endpoint models can never take an adapter. Otherwise the capability the
+/// learning loop recorded wins over the static architecture check. Admission alone never proves runtime use.
+fn lora_state(config: &Config, store: Option<&Store>, active: Option<&crate::config::types::Version>) -> Lora {
+    if config.endpoint.is_some() { return Lora::Unsupported; }
+    if let Some(phase) = store.and_then(|store| crate::learn::improve::lora_phase(config, store)) {
+        match phase.as_str() { "training" => return Lora::Training, "evaluating" => return Lora::Evaluating, _ => {} }
+    }
+    if let Some(version) = active.filter(|version| version.adapter.is_some()) { return Lora::Active(version.id); }
+    let recorded = store.and_then(|store| store.get_meta("serving_capabilities").ok().flatten())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).filter(crate::learn::worker::current_lora_probe).and_then(|caps| caps["lora"].as_bool());
+    let compatible = recorded.or_else(|| catalog::local_lora_support(&config.user_dir, Path::new(&config.model)));
+    match compatible {
+        Some(false) => Lora::Unsupported,
+        None => Lora::Unknown,
+        Some(true) if recorded != Some(true) => Lora::Unverified,
+        Some(true) if !config.training.enabled || !config.improve.enabled => Lora::Off,
+        Some(true) => match active.filter(|version| version.adapter.is_some()) {
+            Some(version) => Lora::Active(version.id),
+            None => Lora::Ready,
+        },
     }
 }
 
@@ -446,10 +607,13 @@ fn improvement_label(config: &Config, store: Option<&Store>) -> String {
         .and_then(|value| value.get("state").and_then(Value::as_str).map(str::to_owned));
     match state.as_deref() {
         Some("queued") => "improvement queued".into(),
-        Some("running") => "improving".into(),
+        Some("running") => store.and_then(|store| store.get_meta("cycle_progress").ok().flatten())
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| value["stage"].as_str().map(|stage| format!("improving: {}", agent::truncate(stage, 80))))
+            .unwrap_or_else(|| "improving".into()),
         Some("failed") => "learning failed".into(),
         Some("disabled") => "learning paused".into(),
-        Some(_) => "learning idle".into(),
+        Some(_) => store.and_then(|store| auto::readiness(config, store).ok()).unwrap_or_else(|| "learning idle".into()),
         None if store.is_none() => "learning unavailable".into(),
         None => "learning idle".into(),
     }
@@ -487,7 +651,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("providers", "set up providers, keys and endpoints"),
     ("settings", "all options: appearance, tools, learning"),
     ("theme", "list or switch the color theme"),
-    ("hotkeys", "show the key bindings in effect"),
+    ("hotkeys", "view and edit keyboard shortcuts"),
     ("new", "start a fresh session"),
     ("sessions", "search and resume sessions"),
     ("resume", "search sessions or resume a unique id prefix"),
@@ -510,8 +674,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("rollback", "restore files changed in the last n turns"),
     ("clear", "clear the screen and repaint the conversation"),
     ("todo", "show the task list"),
-    ("skills", "list available skills"),
+    ("skills", "browse, import and enable/disable skills"),
     ("memory", "show project memory"),
+    ("understanding", "inspect saved knowledge: /understanding [architecture|build|query]"),
+    ("laya", "local decision advice: /laya [status|check|start|on|off]"),
     ("commands", "list custom commands"),
     ("search", "search past sessions"),
     ("context", "show token usage"),
@@ -546,6 +712,41 @@ fn command_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> 
         });
     }
     entries
+}
+
+/// Concrete argument choices, not usage placeholders. Keep these next to the command registry;
+/// the composer only matches/renders continuations and never knows command semantics.
+fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for (name, args) in [
+        ("understanding", &["architecture", "build"][..]),
+        ("laya", &["status", "check", "start", "on", "off"]),
+        ("skills", &["list", "sources", "import", "enable", "disable"]),
+        ("skills import", &["--dry-run", "--user", "--update"]),
+        ("approval", &["ask", "auto", "readonly"]),
+        ("plan", &["on", "off"]),
+        ("permissions", &["allow", "deny", "remove"]),
+        ("permissions allow", &["--persist"]),
+        ("permissions deny", &["--persist"]),
+        ("improve", &["jobs", "stop"]),
+        ("export", &["--html"]),
+        ("profile", &["off"]),
+    ] {
+        candidates.extend(args.iter().map(|arg| format!("/{name} {arg}")));
+    }
+    for skill in skills {
+        for action in ["enable", "disable"] {
+            candidates.push(format!("/skills {action} {}", skill.name));
+            candidates.push(format!("/skills {action} {} --user", skill.name));
+        }
+    }
+    candidates.extend(config.model_profiles.keys().map(|name| format!("/profile {name}")));
+    if let Ok(Some(profile)) = reasoning_profile(config) {
+        for command in ["reasoning", "thinking"] {
+            candidates.extend(profile.capabilities.reasoning_efforts.iter().map(|effort| format!("/{command} {}", effort.as_str())));
+        }
+    }
+    candidates
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +823,15 @@ fn reasoning_profile(config: &Config) -> Result<Option<crate::llm::profiles::Mod
     Ok(None)
 }
 
+fn thinking_label(profile: &crate::llm::profiles::ModelProfile) -> String {
+    use crate::llm::profiles::{ReasoningApi, ReasoningEffort};
+    if profile.capabilities.reasoning == ReasoningApi::None { return "unsupported".into(); }
+    if profile.thinking == Some(false) || profile.reasoning_effort == Some(ReasoningEffort::None) { return "off".into(); }
+    if let Some(effort) = profile.reasoning_effort { return effort.as_str().into(); }
+    if profile.thinking == Some(true) { return "on".into(); }
+    "default".into()
+}
+
 fn reasoning_changes(config: &Config, args: &str) -> Result<(Vec<Change>,String)> {
     use crate::llm::profiles::{ReasoningEffort,ReasoningApi};
     let mut profile=reasoning_profile(config)?.ok_or_else(||anyhow::anyhow!("reasoning metadata is unavailable; open /models and rescan, or select an explicit /profile"))?;
@@ -679,6 +889,8 @@ struct Shell {
     catalog: Catalog,
     git: Git,
     learning: Learning,
+    yield_compute: bool,
+    adapter_monitor: Option<crate::llm::provider::AdapterMonitor>,
     commands: Vec<context::CommandDef>,
     scope: Scope,
     tools_expanded: bool,
@@ -691,12 +903,23 @@ struct Shell {
     session_id: String,
     title: String,
     turn_output_tokens: u64,
+    /// The agent's task list as last reported; drawn above the composer while any task is open.
+    todo: TodoList,
+    /// Skills found at the last command refresh, so `/help` and `/skills` work while a turn runs.
+    skills: Vec<skills::Skill>,
+    skills_listing: String,
+    /// Commands typed during a turn that need the agent but are not meant to stop it; they run, in order,
+    /// as soon as the turn finishes.
+    deferred: std::collections::VecDeque<String>,
+    pending_config: Option<Config>,
+    pending_verification: Option<ModelSelection>,
 }
 
-enum Which { Settings, Models, Providers }
+enum Which { Settings, Models, Providers, Shortcuts }
 
 #[derive(Default)]
 struct OverlayOutcome {
+    verify_lora: Option<ModelSelection>,
     /// The effective config after the last successful change made inside the overlay.
     latest: Option<Config>,
     /// A request from inside the overlay to open another one (`open:models`, `open:providers`, …).
@@ -716,10 +939,12 @@ impl Shell {
             auth_job: None,
             term, themes, keys, composer: Composer::new(history, app.config.ui.history_limit), transcript: Transcript::new(),
             status: StatusData::default(), ui: app.config.ui.clone(), catalog: Catalog::new(), git: Git::default(),
-            learning: Learning::default(), commands, scope: Scope::Global, tools_expanded: false, started: Instant::now(),
+            learning: Learning::default(), yield_compute: false, adapter_monitor: None, commands, scope: Scope::Global, tools_expanded: false, started: Instant::now(),
             last_trajectory: None, startup: (!startup.trim().is_empty()).then_some(startup), cfg_approval: app.config.approval,
             dark, session_id: String::new(), title: format!("dial · {}", app.layout.project_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
-            turn_output_tokens: 0,
+            turn_output_tokens: 0, todo: TodoList::new(), skills: Vec::new(), deferred: Default::default(),
+            skills_listing: String::new(),
+            pending_config: None, pending_verification: None,
         };
         for warning in warnings { shell.note("Key bindings", &warning); }
         if let Some(error) = shell.themes.last_error() { let error = error.to_owned(); shell.note("Theme", &error); }
@@ -731,6 +956,9 @@ impl Shell {
     fn refresh_commands(&mut self, app: &App) {
         let found = skills::discover(&app.layout);
         self.composer.set_commands(command_entries(&self.commands, &found));
+        self.composer.set_argument_completions(command_argument_completions(&app.config, &skills::discover_all(&app.layout)));
+        self.skills = found;
+        self.skills_listing = skills::management::list(&app.layout).unwrap_or_else(|error| format!("{error:#}"));
         let paths = ignore::WalkBuilder::new(&app.layout.project_root).follow_links(false).require_git(false).build()
             .filter_map(|entry| entry.ok()).filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
             .filter_map(|entry| entry.path().strip_prefix(&app.layout.project_root).ok().map(|p| p.to_string_lossy().into_owned()))
@@ -745,12 +973,11 @@ impl Shell {
         if self.ui.welcome {
             let recent: Vec<(String, String)> = Session::list(&app.layout, 3).unwrap_or_default().into_iter()
                 .filter(|s| s.id != session.id()).map(|s| (s.title, s.started.chars().take(10).collect())).collect();
-            let keys = &self.keys;
             let tips = if self.ui.tips { vec![
-                "/ for commands".to_owned(),
-                format!("{} to pick a model · {} for providers", keys.label(Action::ModelSelect), keys.label(Action::ProviderSetup)),
-                format!("{} for settings · {} to search history", keys.label(Action::Settings), keys.label(Action::HistorySearch)),
-                "/theme to change the look".to_owned(),
+                "/ commands and actions".to_owned(),
+                "/model choose a model".to_owned(),
+                "/settings make it yours".to_owned(),
+                "/hotkeys edit keyboard shortcuts".to_owned(),
             ] } else { Vec::new() };
             let selection = app.config.selection();
             let info = WelcomeInfo {
@@ -792,7 +1019,7 @@ impl Shell {
         self.status.clock = local_time("%H:%M");
         self.status.mode = self.composer.mode();
         let (cols, rows) = self.term.size();
-        let Shell { term, themes, keys, composer, transcript, status, ui, tools_expanded, title, .. } = self;
+        let Shell { term, themes, keys, composer, transcript, status, ui, tools_expanded, title, todo, .. } = self;
         let theme = themes.current();
         let tctx = TranscriptCtx { theme, ui, tick: status.tick, tools_expanded: *tools_expanded };
         let settled = transcript.take_settled(cols, &tctx);
@@ -800,7 +1027,15 @@ impl Shell {
         let cctx = ComposerCtx { theme, keys, ui, status };
         let (bottom, cursor) = match panel {
             Some(rows) => (rows, None),
-            None => { let view = composer.view(cols, &cctx); (view.rows, Some(view.cursor)) }
+            None => {
+                let view = composer.view(cols, &cctx);
+                let spinner = (status.phase == Phase::Working).then(|| theme.spinner(status.tick));
+                let cap = (rows as usize / 3).min(10);
+                let mut bottom = tasks::rows(todo, cols as usize, theme, spinner, cap);
+                let above = bottom.len() as u16;
+                bottom.extend(view.rows);
+                (bottom, Some((view.cursor.0 + above, view.cursor.1)))
+            }
         };
         let room = (rows as usize).saturating_sub(bottom.len()).max(1);
         let (spilled, mut live) = transcript.live(cols, &tctx, room);
@@ -811,12 +1046,14 @@ impl Shell {
     }
 
     fn refresh_status(&mut self, app: &App, agent: &Agent<'_>) {
+        self.adapter_monitor = agent.adapter_monitor();
         let selection = app.config.selection();
         let (branch, counts) = self.git.read(&app.layout.project_root);
         self.learning.read(app);
         let status = &mut self.status;
         status.provider = selection.provider.clone();
         status.model = selection.display_name().trim_start_matches(&format!("{}/", selection.provider)).to_owned();
+        status.thinking = reasoning_profile(&app.config).ok().flatten().as_ref().map(thinking_label).unwrap_or_default();
         status.project_path = app.layout.project_root.display().to_string();
         if agent.plan_mode() { status.model.push_str(" [plan]"); }
         status.branch = branch;
@@ -828,7 +1065,15 @@ impl Shell {
         status.sandbox = format!("{:?}", app.config.sandbox.mode).to_lowercase();
         status.version = self.learning.cache.value.0;
         status.learning = self.learning.cache.value.1.clone();
+        status.lora = self.learning.cache.value.2;
+        if let Some(monitor) = &self.adapter_monitor { status.lora = status.lora.with_runtime(&monitor.lock()); }
+        if matches!(status.lora, Lora::Unknown | Lora::Unverified) {
+            if let Some(probe) = self.catalog.probe.as_ref().filter(|probe| probe.model == selection.model) {
+                status.lora = if probe.checking.load(Ordering::SeqCst) { Lora::Verifying } else { Lora::VerificationQueued };
+            }
+        }
         status.role.clear();
+        if self.todo != *agent.todo() { self.todo = agent.todo().clone(); }
     }
 
     // ----- idle loop ----------------------------------------------------------------------
@@ -837,17 +1082,35 @@ impl Shell {
         let mut dirty = true;
         let mut previous_status = None;
         loop {
+            if let Some(config) = self.pending_config.take() {
+                if let step @ Step::Rebuild(_) = self.config_changed(app, agent, config) { return Ok(step); }
+                dirty = true;
+            }
+            if let Some(selection) = self.pending_verification.take() {
+                self.verify_lora(app, agent, &selection)?;
+                dirty = true;
+            }
             if let Some(result)=AuthJob::collect(&mut self.auth_job) {
                 self.note("ChatGPT",match result { Ok(message)=>message,Err(error)=>format!("{error:#}") });
                 self.catalog.refresh(app); dirty=true;
             }
             {
-                let mut bridge = Bridge { shell:self, interrupt:app.interrupt.clone(), started:Instant::now(),
+                let mut bridge = Bridge { app, shell:self, interrupt:app.interrupt.clone(), started:Instant::now(),
                     last_paint:Instant::now()-PAINT_EVERY, failed:false, pending:Vec::new(), next_id:0 };
                 agent.pump_subagents(&mut bridge);
                 if bridge.failed { anyhow::bail!("terminal draw failed"); }
             }
-            if self.startup.is_none() { self.startup = self.composer.take_follow_up(); }
+            if self.startup.is_none() { self.startup = self.deferred.pop_front().or_else(|| self.composer.take_follow_up()); }
+            if self.startup.is_none() {
+                self.catalog.start(app);
+                self.catalog.auto_verify(app);
+                if self.catalog.probe.is_some() && app.compute.borrow().is_some() { app.release_idle_compute(agent); }
+            }
+            if self.yield_compute && app.release_idle_compute(agent) {
+                self.yield_compute = false;
+                self.note("Improvement", "local models unloaded; compute released for queued improvement. This chat stays open; the next turn reloads the model when compute is available.");
+                dirty = true;
+            }
             self.refresh_status(app, agent);
             if self.themes.reload_if_changed() { self.after_theme_reload(); dirty = true; }
             self.status.phase = Phase::Idle;
@@ -861,7 +1124,7 @@ impl Shell {
                 match self.submit(app, agent, text)? { Step::Done => continue, other => return Ok(other) }
             }
             let (left, right) = statusline::segments(&self.ui);
-            let status_pending = self.git.cache.worker.is_some() || self.learning.cache.worker.is_some() || self.auth_job.is_some();
+            let status_pending = self.git.cache.worker.is_some() || self.learning.cache.worker.is_some() || self.auth_job.is_some() || self.catalog.worker.is_some() || self.catalog.probe.is_some();
             let timeout = if status_pending { TICK }
                 else if left.iter().chain(&right).any(|s| s == "time") { Duration::from_secs(1) } else { STATUS_TTL };
             if !poll(timeout)? { continue; }
@@ -968,6 +1231,8 @@ impl Shell {
     fn submit(&mut self, app: &App, agent: &mut Agent<'_>, text: String) -> Result<Step> {
         let trimmed = text.trim().to_owned();
         if trimmed.is_empty() { return Ok(Step::Done); }
+        // Interactive work takes precedence; unverified models resume automatically when idle.
+        if !trimmed.starts_with('/') { self.catalog.cancel_probe(); }
         self.save_history(app);
         if trimmed.starts_with('/') { return self.command(app, agent, &trimmed); }
         let (shell, include) = if let Some(command) = trimmed.strip_prefix("!!") { (Some(command), false) }
@@ -983,7 +1248,7 @@ impl Shell {
     fn run_user_shell(&mut self, app: &App, agent: &mut Agent<'_>, command: &str, include: bool) -> Result<Step> {
         use crate::tools::{self, Workspace};
         let allowed = {
-            let mut bridge = Bridge { shell: self, interrupt: app.interrupt.clone(), started: Instant::now(),
+            let mut bridge = Bridge { app, shell: self, interrupt: app.interrupt.clone(), started: Instant::now(),
                 last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
             agent.approve_user_shell(command, &mut bridge)
         };
@@ -998,7 +1263,7 @@ impl Shell {
             Ok(ws) => {
                 app.interrupt.store(false, Ordering::SeqCst);
                 self.composer.set_busy(true);
-                let mut bridge = Bridge { shell: self, interrupt: app.interrupt.clone(), started,
+                let mut bridge = Bridge { app, shell: self, interrupt: app.interrupt.clone(), started,
                     last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
                 bridge.tool_call("bash", command);
                 let output = std::thread::scope(|scope| {
@@ -1034,6 +1299,8 @@ impl Shell {
 
     fn run_turn(&mut self, app: &App, agent: &mut Agent<'_>, text: &str) -> Result<Step> {
         repl::clear_interrupt();
+        let started = Instant::now();
+        self.status.elapsed_secs = 0.0;
         self.transcript.push_user(text);
         self.composer.set_busy(true);
         self.status.phase = Phase::Working;
@@ -1047,12 +1314,12 @@ impl Shell {
                 return Ok(Step::Done);
             }
         }
-        let started = Instant::now();
+        self.status.phase = Phase::Working;
         self.turn_output_tokens = 0;
         self.status.output_tokens = 0;
         self.status.activity = "thinking".into();
         let (result, failed, streamed_tokens) = {
-            let mut bridge = Bridge { shell: self, interrupt: app.interrupt.clone(), started, last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
+            let mut bridge = Bridge { app, shell: self, interrupt: app.interrupt.clone(), started, last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
             bridge.repaint(true);
             let result = agent.turn(text, &mut bridge);
             (result, bridge.failed, bridge.shell.turn_output_tokens)
@@ -1085,8 +1352,12 @@ impl Shell {
     fn schedule_improvement(&mut self, app: &App) {
         let Some(store) = &app.store else { return };
         match auto::maybe_spawn(&app.layout, &app.config, store) {
-            Ok(true) => self.note("Improvement",
-                if app.config.uses_local_compute() { "queued; local training waits until this session releases compute" } else { "queued in the background; this session keeps the admitted version" }),
+            Ok(true) => {
+                self.yield_compute = app.config.uses_local_compute();
+                self.note("Improvement", if self.yield_compute {
+                    "queued; this session will release compute once its running child agents finish"
+                } else { "queued in the background; this session keeps the admitted version" });
+            },
             Ok(false) => {}
             Err(error) => self.note("Improvement", format!("could not schedule: {error:#}")),
         }
@@ -1125,8 +1396,11 @@ impl Shell {
     }
 
     fn wait_compute(&mut self, app: &App) -> Result<bool> {
+        self.catalog.cancel_probe();
         if !app.config.uses_local_compute() || app.compute.borrow().is_some() { return Ok(true); }
         let lock = auto::lock_file(&app.layout.user_dir.join("compute.lock"))?;
+        let waiting_since = Instant::now();
+        let elapsed_before_wait = self.status.elapsed_secs;
         loop {
             match lock.try_lock_exclusive() {
                 Ok(()) => { *app.compute.borrow_mut() = Some(lock); return Ok(true); }
@@ -1134,6 +1408,8 @@ impl Shell {
                 Err(error) => return Err(error.into()),
             }
             self.status.phase = Phase::WaitingCompute;
+            self.status.elapsed_secs = elapsed_before_wait + waiting_since.elapsed().as_secs_f64();
+            self.status.activity = "waiting for local compute".into();
             self.paint(None)?;
             if poll(TICK)? {
                 match read()? {
@@ -1144,7 +1420,12 @@ impl Shell {
                                 self.note("Cancelled", "Local compute is occupied by another session or an improvement cycle.");
                                 return Ok(false);
                             }
-                            ComposerEvent::Submit(text) => self.startup = Some(text),
+                            ComposerEvent::Submit(text) => {
+                                if self.route_busy_command(app, text) { return Ok(false); }
+                            }
+                            ComposerEvent::Action(Action::ModelSelect | Action::ModelRoles) => {
+                                self.route_busy_command(app, "/model".into());
+                            }
                             ComposerEvent::Action(Action::EditExternal) => self.edit_externally(),
                             _ => {}
                         }
@@ -1186,16 +1467,81 @@ impl Shell {
 
     // ----- overlays -------------------------------------------------------------------------
 
+    fn verify_lora(&mut self, app: &App, agent: &mut Agent<'_>, selection: &ModelSelection) -> Result<()> {
+        self.catalog.cancel_probe();
+        if selection.provider != "mlx" || selection.base_url.is_some() || !Path::new(&selection.model).is_absolute() || !Path::new(&selection.model).is_dir() {
+            self.note("LoRA verification", "Select a downloaded local MLX model. Remote endpoints cannot be probed here.");
+            return Ok(());
+        }
+        if !app.release_idle_compute(agent) {
+            self.note("LoRA verification", "Wait for running child agents to finish, then retry F6.");
+            return Ok(());
+        }
+        let lock = auto::lock_file(&app.layout.user_dir.join("compute.lock"))?;
+        if let Err(error) = lock.try_lock_exclusive() {
+            self.note("LoRA verification", format!("Local compute is busy; retry F6 after the other session or improvement cycle finishes. {error}"));
+            return Ok(());
+        }
+        let mut config = app.config.with_selection(selection);
+        config.state_dir = config.learning_dir(&app.layout);
+        app.interrupt.store(false, Ordering::SeqCst);
+        self.note("LoRA verification", format!("Loading {} to verify adapter gradients and save/reload with a tiny temporary update. Esc cancels.", selection.display_name()));
+        let started = Instant::now();
+        let result = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cancel = app.interrupt.clone();
+            let config = &config;
+            scope.spawn(move || { let _ = tx.send(crate::learn::worker::capabilities_controlled(config, &cancel)); });
+            let mut bridge = Bridge { app, shell: self, interrupt: app.interrupt.clone(), started,
+                last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
+            bridge.set_activity("verifying LoRA support");
+            loop {
+                bridge.heartbeat();
+                match rx.recv_timeout(Duration::from_millis(80)) {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+                    Err(_) => break Err(anyhow::anyhow!("capability worker ended without a result")),
+                }
+            }
+        });
+        let cancelled = app.interrupt.swap(false, Ordering::SeqCst);
+        match result {
+            Ok(caps) if !cancelled && caps["inference"] != true => {
+                self.note("LoRA verification", format!("Could not load the model to verify adapter targets: {}. The previous result was preserved.", caps["reason"].as_str().unwrap_or("model loading failed")));
+            }
+            Ok(caps) if !cancelled => {
+                let store = Store::open(&config.state_dir, &config.model, &config.use_case, &config.harness)?;
+                store.set_meta("serving_capabilities", &caps.to_string())?;
+                self.note("LoRA verification", format!("{}: {}\n{}", selection.display_name(), if caps["lora"] == true { "supported by Dial's trainer" } else { "unsupported by Dial's trainer" }, caps["reason"].as_str().unwrap_or("No reason returned")));
+                self.learning = Learning::default();
+                self.catalog.refresh(app);
+            }
+            _ if cancelled => self.note("LoRA verification", "Cancelled; the previous result was preserved."),
+            Err(error) => self.note("LoRA verification", format!("Could not verify: {error:#}. The previous result was preserved.")),
+            _ => {}
+        }
+        drop(lock);
+        self.status.activity.clear();
+        self.refresh_status(app, agent);
+        Ok(())
+    }
+
     fn open(&mut self, app: &App, agent: &mut Agent<'_>, which: Which) -> Result<Step> {
+        if matches!(which, Which::Models) { app.release_idle_compute(agent); }
         let mut which = which;
         loop {
             let outcome = self.run_overlay(app, which)?;
             let mut step = Step::Done;
             if let Some(config) = outcome.latest { step = self.config_changed(app, agent, config); }
+            if let Some(selection) = outcome.verify_lora {
+                self.verify_lora(app, agent, &selection)?;
+                return Ok(step);
+            }
             match (outcome.next.as_deref(), &step) {
                 (Some("open:models"), Step::Done) => which = Which::Models,
                 (Some("open:providers"), Step::Done) => which = Which::Providers,
                 (Some("open:settings"), Step::Done) => which = Which::Settings,
+                (Some("open:shortcuts"), Step::Done) => which = Which::Shortcuts,
                 _ => return Ok(step),
             }
         }
@@ -1217,12 +1563,13 @@ impl Shell {
         let effective = app.reload().unwrap_or_else(|_| app.config.clone());
         let discovery = self.catalog.get();
         let mut overlay = match which {
+            Which::Shortcuts => ActiveOverlay::Shortcuts(ShortcutOverlay::new()),
             Which::Settings => {
                 let (values, global, project) = settings_tables(app, &effective);
                 let themes = self.themes.names().into_iter().filter(|e| e.error.is_none()).map(|e| e.name).collect();
                 ActiveOverlay::Settings(SettingsOverlay::new(values, project, global, self.scope, themes))
             }
-            Which::Models => ActiveOverlay::Models(ModelOverlay::new(discovery, role_rows(&effective), self.scope)),
+            Which::Models => ActiveOverlay::Models(ModelOverlay::new(discovery, role_rows(&effective), self.scope).with_main_lora(self.status.lora)),
             Which::Providers => {
                 let user_dir = app.layout.user_dir.clone();
                 let has_key = Box::new(move |url: &str| catalog::credential_token(&user_dir, url).ok().flatten().is_some());
@@ -1233,11 +1580,11 @@ impl Shell {
             }
         };
         let Shell { term, themes, keys, status, catalog, scope, dark, auth_job, .. } = self;
-        let mut env = OverlayEnv { app, themes, keys, status, catalog, scope, dark: *dark, latest: None, next: None, seen_generation: 0, auth_job };
+        let mut env = OverlayEnv { app, themes, keys, status, catalog, scope, dark: *dark, latest: None, next: None, verify_lora: None, seen_generation: 0, auth_job };
         env.seen_generation = env.catalog.generation;
         term.with_overlay(|ot| run_overlay(ot, &mut env, &mut overlay))?;
         env.themes.restore();
-        Ok(OverlayOutcome { latest: env.latest, next: env.next })
+        Ok(OverlayOutcome { latest: env.latest, next: env.next, verify_lora: env.verify_lora })
     }
 }
 
@@ -1255,15 +1602,15 @@ impl Shell {
         Ok(self.config_changed(app, agent, fresh))
     }
 
-    fn help_text(&self, app: &App) -> String {
-        let found = skills::discover(&app.layout);
+    fn help_text(&self) -> String {
+        let found = &self.skills;
         let mut lines = vec!["Commands".to_owned()];
-        for entry in command_entries(&self.commands, &found) {
+        for entry in command_entries(&self.commands, found) {
             let name = match &entry.args_hint { Some(hint) => format!("/{} {hint}", entry.name), None => format!("/{}", entry.name) };
             lines.push(format!("  {name:<28} {}", entry.description));
         }
         lines.push(String::new());
-        lines.push("Keys (remap in keybindings.toml; /hotkeys shows all)".into());
+        lines.push("Keys (/hotkeys to view and edit; keybindings.toml for manual configuration)".into());
         for action in [Action::ModelSelect, Action::ProviderSetup, Action::Settings, Action::HistorySearch, Action::Newline,
             Action::ToolsExpand, Action::ApprovalCycle, Action::DisplayReset, Action::EditExternal, Action::Interrupt, Action::Exit] {
             lines.push(format!("  {:<22} {}", self.keys.labels(action), action.describe()));
@@ -1271,7 +1618,84 @@ impl Shell {
         lines.push("  !<command>             run a shell command yourself (output joins the conversation)".into());
         lines.push("  !!<command>            run without adding output to the conversation".into());
         lines.push("  Busy: Enter steers · Alt-Enter queues follow-up · Up edits last queued item · Esc cancels that edit".into());
+        lines.push("  Busy: /help /hotkeys /todo /skills /commands /context /clear run at once; /exit /new /resume /fork /undo /rollback /compact /plan stop the turn; other commands run when it finishes".into());
+        lines.push("  Busy: /model or Alt+M opens the picker now; selections apply after the current turn".into());
         lines.join("\n")
+    }
+
+    /// Commands whose purpose is to end or replace what the running turn is doing, so typing one during a turn
+    /// stops it. Every other command leaves the turn alone: it runs at once or right after the turn.
+    fn stops_turn(line: &str) -> bool {
+        let name = line.trim().trim_start_matches('/').split_whitespace().next().unwrap_or("");
+        matches!(name, "exit" | "quit" | "q" | "new" | "resume" | "sessions" | "tree" | "fork" | "undo" | "rollback" | "compact" | "plan")
+    }
+
+    /// Shared by inference and local-compute waiting. Only explicit session/work changes cancel.
+    fn route_busy_command(&mut self, app: &App, text: String) -> bool {
+        if matches!(text.trim(), "/model" | "/models") {
+            let mut which = Which::Models;
+            loop {
+                match self.run_overlay(app, which) {
+                    Ok(outcome) => {
+                        if let Some(config) = outcome.latest {
+                            self.pending_config = Some(config);
+                            self.note("Model", "Selection saved; it will apply after the current turn.");
+                        }
+                        if let Some(selection) = outcome.verify_lora {
+                            self.pending_verification = Some(selection);
+                            self.note("LoRA verification", "Verification will run after the current turn releases compute.");
+                        }
+                        which = match outcome.next.as_deref() {
+                            Some("open:models") => Which::Models,
+                            Some("open:providers") => Which::Providers,
+                            Some("open:settings") => Which::Settings,
+                            Some("open:shortcuts") => Which::Shortcuts,
+                            _ => break,
+                        };
+                    }
+                    Err(error) => { self.note("Model picker", format!("{error:#}")); break; }
+                }
+            }
+            return false;
+        }
+        if self.live_command(&text) { return false; }
+        let name = text.split_whitespace().next().unwrap_or("");
+        if Self::stops_turn(&text) {
+            self.note("Command", format!("stopping the current turn to run {name}"));
+            self.startup = Some(text);
+            true
+        } else {
+            self.note("Command", format!("{name} will run when this turn finishes"));
+            self.deferred.push_back(text);
+            false
+        }
+    }
+
+    /// Run a command that only reads what the shell already holds, so it works while a turn runs. Returns false
+    /// for commands that need the agent: those stop the turn ([`Shell::stops_turn`]) or run right after it.
+    fn live_command(&mut self, line: &str) -> bool {
+        let Some(rest) = line.trim().strip_prefix('/') else { return false };
+        let (name, args) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(name, args)| (name, args.trim()));
+        match (name, args) {
+            ("help" | "?", "") => { let text = self.help_text(); self.note("Help", text); }
+            ("hotkeys", "") => { let text = self.hotkeys_text(); self.note("Hotkeys", text); }
+            ("todo", "") => { let text = if self.todo.is_empty() { "No tasks.".to_owned() } else { self.todo.render() }; self.note("Todo", text); }
+            ("clear", "") => self.display_reset(),
+            ("skills", "") => {
+                self.note("Skills", self.skills_listing.clone());
+            }
+            ("commands", "") => {
+                let text = if self.commands.is_empty() { "no custom commands (add .dial/commands/<name>.md)".to_owned() }
+                    else { self.commands.iter().map(|def| format!("/{}  {}", def.name, def.description)).collect::<Vec<_>>().join("\n") };
+                self.note("Commands", text);
+            }
+            ("context", "") => {
+                let used = self.status.prompt_tokens.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+                self.note("Context", format!("last prompt: {used} tokens (window {})", self.status.context_window));
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn hotkeys_text(&self) -> String {
@@ -1282,6 +1706,7 @@ impl Shell {
             lines.push(format!("  {:<24} {:<22} {}{}", row.id, row.keys, row.description, if row.customized { "  (customized)" } else { "" }));
         }
         lines.push(String::new());
+        lines.push("Run /hotkeys when idle to open the shortcut editor.".to_owned());
         lines.push(format!("Remap in {}/keybindings.toml, for example:  \"app.model.select\" = \"Ctrl+K\"", app_home_hint()));
         lines.join("\n")
     }
@@ -1389,7 +1814,7 @@ impl Shell {
         let (name, args) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(name, args)| (name, args.trim()));
         match name {
             "exit" | "quit" | "q" => return Ok(Step::Quit),
-            "help" | "?" => { let text = self.help_text(app); self.note("Help", text); }
+            "help" | "?" => { let text = self.help_text(); self.note("Help", text); }
             "model" | "models" | "roles" => return self.open(app, agent, Which::Models),
             "profile" => {
                 if args.is_empty() {
@@ -1407,7 +1832,7 @@ impl Shell {
                 if args.is_empty() {
                     match reasoning_profile(&app.config) {
                         Ok(Some(profile))=>self.note("Reasoning",format!("{}: {}\nAvailable: {}\nSet with /reasoning <level> or /thinking <level>",app.config.model,
-                            profile.reasoning_effort.map(|effort|effort.as_str()).unwrap_or("provider default"),
+                            thinking_label(&profile),
                             profile.capabilities.reasoning_efforts.iter().map(|effort|effort.as_str()).collect::<Vec<_>>().join(" | "))),
                         Ok(None)=>self.note("Reasoning","Open /models and rescan to load this model's reasoning levels, or select an explicit /profile"),
                         Err(error)=>self.note("Reasoning",format!("{error:#}")),
@@ -1421,8 +1846,26 @@ impl Shell {
             }
             "providers" => return self.open(app, agent, Which::Providers),
             "settings" => return self.open(app, agent, Which::Settings),
-            "hotkeys" => { let text = self.hotkeys_text(); self.note("Hotkeys", text); }
-            "improve" => self.note("Improvement", improve_summary(app)),
+            "hotkeys" => return self.open(app, agent, Which::Shortcuts),
+            "improve" if args == "jobs" || args.starts_with("stop ") => {
+                let result = if args == "jobs" { auto::jobs_summary(&app.layout) }
+                    else { auto::request_stop(&app.layout, args.trim_start_matches("stop ").trim()).map(|value| value["message"].as_str().unwrap_or("stop requested").to_owned()) };
+                self.note("Improvement", result.unwrap_or_else(|error| format!("{error:#}")));
+            }
+            "improve" => {
+                let mut summary = improve_summary(app);
+                if let Some(probe) = &self.catalog.probe {
+                    summary.push_str(&format!("\nAutomatic LoRA verification: {} — {}. No model selection or retry needed.",
+                        probe.model, if probe.checking.load(Ordering::SeqCst) { "checking adapter targets" } else { "waiting for shared local compute" }));
+                }
+                if let Some(monitor) = &self.adapter_monitor {
+                    let runtime = monitor.lock();
+                    if let Some(path) = &runtime.adapter {
+                        summary.push_str(&format!("\nThis session: {}\nAdapter: {}", Lora::Unknown.with_runtime(&runtime).label(), path.display()));
+                    } else { summary.push_str("\nThis session: no adapter use confirmed."); }
+                }
+                self.note("Improvement", summary);
+            },
             "clear" => self.display_reset(),
             "theme" => return self.theme_command(app, agent, args),
             "new" => match Session::create(&app.layout, SessionMeta { model: app.config.model.clone() }) {
@@ -1494,7 +1937,7 @@ impl Shell {
             }
             "cost" => self.note("Cost", agent.session_cost().map(|cost| format!("${cost:.6} USD")).unwrap_or_else(|| "pricing unavailable for this session".into())),
             "jobs" => {
-                let mut bridge = Bridge { shell:self, interrupt:app.interrupt.clone(), started:Instant::now(),
+                let mut bridge = Bridge { app, shell:self, interrupt:app.interrupt.clone(), started:Instant::now(),
                     last_paint:Instant::now()-PAINT_EVERY, failed:false, pending:Vec::new(), next_id:0 };
                 let result=agent.subagent_status(if args.is_empty(){None}else{Some(args)},&mut bridge);
                 match result { Ok(value)=>self.note("Jobs",value.to_string()),Err(error)=>self.note("Jobs",format!("{error:#}")) }
@@ -1519,7 +1962,7 @@ impl Shell {
                 self.status.phase = Phase::Compacting;
                 self.status.activity = "compacting".into();
                 let result = {
-                    let mut bridge = Bridge { shell: self, interrupt: app.interrupt.clone(), started: Instant::now(), last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
+                    let mut bridge = Bridge { app, shell: self, interrupt: app.interrupt.clone(), started: Instant::now(), last_paint: Instant::now() - PAINT_EVERY, failed: false, pending: Vec::new(), next_id: 0 };
                     bridge.repaint(true);
                     agent.compact(&mut bridge)
                 };
@@ -1556,9 +1999,61 @@ impl Shell {
             }
             "todo" => self.note("Todo", agent.todo().render()),
             "skills" => {
-                let found = skills::discover(&app.layout);
-                if found.is_empty() { self.note("Skills", "no skills (add .dial/skills/<name>/SKILL.md)"); }
-                else { self.note("Skills", found.iter().map(|skill| format!("{}: {}", skill.name, skill.description)).collect::<Vec<_>>().join("\n")); }
+                match skills::management::command(&app.layout, context::split_words(args)) {
+                    Ok(text) => self.note("Skills", text),
+                    Err(error) => self.note("Skills", format!("{error:#}")),
+                }
+                self.refresh_commands(app);
+            }
+            "laya" => {
+                if matches!(args,"on"|"off") {
+                    let enabled=args=="on";
+                    let step=self.persist(app,agent,&[Change::Set {path:"laya.enabled".into(),value:toml::Value::Boolean(enabled)}],Scope::Project)?;
+                    self.note("Laya",if enabled {"Decision advice enabled for this project. /laya check probes Dial's managed service."} else {"Decision advice disabled for this project. The managed service can shut down when idle."});
+                    return Ok(step);
+                }
+                if !matches!(args,""|"status"|"check"|"start") {self.note("Laya","Usage: /laya status | check | start | on | off");}
+                else {
+                    app.interrupt.store(false,Ordering::SeqCst);
+                    let mut bridge=Bridge {app,shell:self,interrupt:app.interrupt.clone(),started:Instant::now(),last_paint:Instant::now()-PAINT_EVERY,failed:false,pending:Vec::new(),next_id:0};
+                    bridge.shell.composer.set_busy(true);
+                    let result=agent.laya_status(args=="check",args=="start",&mut bridge);
+                    bridge.shell.composer.set_busy(false);
+                    match result {Ok(text)=>bridge.shell.note("Laya",text),Err(error)=>bridge.shell.note("Laya",format!("{error:#}"))}
+                }
+            }
+            "understanding" if args=="build" => {
+                app.interrupt.store(false,Ordering::SeqCst);
+                if !self.wait_compute(app)? || !self.prepare_local(app)? {return Ok(Step::Done);}
+                let mut bridge=Bridge {app,shell:self,interrupt:app.interrupt.clone(),started:Instant::now(),last_paint:Instant::now()-PAINT_EVERY,failed:false,pending:Vec::new(),next_id:0};
+                bridge.shell.composer.set_busy(true);
+                let result=agent.synthesize_architecture(true,&mut bridge);
+                bridge.shell.composer.set_busy(false);
+                if let Err(error)=result {bridge.shell.note("Architecture",format!("{error:#}"));}
+            }
+            "understanding" => {
+                app.interrupt.store(false,Ordering::SeqCst);
+                self.composer.set_busy(true);
+                let result=std::thread::scope(|scope| {
+                    let (tx,rx)=std::sync::mpsc::channel();
+                    let layout=&app.layout;
+                    let cancel=app.interrupt.clone();
+                    scope.spawn(move || {let _=tx.send(crate::storage::codebase::Codebase::open(layout)
+                        .and_then(|cache|cache.understanding(args,&cancel))
+                        .map(|report|crate::storage::codebase::render_understanding(&report,40)));});
+                    let mut bridge=Bridge {app,shell:self,interrupt:app.interrupt.clone(),started:Instant::now(),
+                        last_paint:Instant::now()-PAINT_EVERY,failed:false,pending:Vec::new(),next_id:0};
+                    bridge.set_activity("inspecting saved understanding");
+                    loop {
+                        match rx.recv_timeout(Duration::from_millis(80)) {
+                            Ok(result)=>break result,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>bridge.heartbeat(),
+                            Err(_)=>break Err(anyhow::anyhow!("understanding worker disconnected")),
+                        }
+                    }
+                });
+                self.composer.set_busy(false);
+                self.note("Understanding",result.unwrap_or_else(|error|format!("{error:#}")));
             }
             "memory" => {
                 let result = crate::storage::provenance::ProvenanceMemory::open(&app.layout)
@@ -1657,25 +2152,69 @@ fn improve_summary(app: &App) -> String {
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|value| value.get("state").and_then(Value::as_str).map(str::to_owned))
         .unwrap_or_else(|| "idle".into());
-    let due = auto::due(&app.config, store).unwrap_or(false);
     let enabled = auto::enabled(&app.config, store).unwrap_or(false);
-    format!("{} · version {version} · {state} · cycle {}\nlearning records stay in {}",
+    let readiness = auto::readiness(&app.config, store).unwrap_or_else(|error| format!("schedule unavailable: {error:#}"));
+    let mut summary = format!("Selected model: {} · version {version} · {state} · next cycle: {}\nlearning records stay in {}",
         if enabled { "automatic improvement enabled" } else { "automatic improvement paused" },
-        if due { "due" } else { "waiting for the interval" },
-        app.config.state_dir.display())
+        readiness,
+        app.config.state_dir.display());
+    match auto::remaining(store, "last_training_attempt", app.config.training.interval_secs, crate::learn::improve::now()) {
+        Ok(0) => summary.push_str("\nNext LoRA attempt: cooldown elapsed; training still requires verified data and a passing evaluation."),
+        Ok(wait) => summary.push_str(&format!("\nNext LoRA attempt: cooldown {} remaining.", auto::duration(wait))),
+        Err(error) => summary.push_str(&format!("\nLoRA cooldown unavailable: {error:#}")),
+    }
+    summary.push_str(&format!("\nTraining requires at least {} verified examples and a validation split. Cooldowns are eligibility delays, not training-duration estimates.", app.config.improve.lora_min_examples.max(app.config.training.batch_size)));
+    if state == "running" {
+        if let Ok(Some(raw)) = store.get_meta("cycle_progress") {
+            if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                let elapsed = crate::learn::improve::now().saturating_sub(value["started"].as_u64().unwrap_or(crate::learn::improve::now()));
+                summary.push_str(&format!("\nCurrent stage: {}\nCycle elapsed: {}. Completion ETA is not yet available.", value["stage"].as_str().unwrap_or("unknown"), auto::duration(elapsed)));
+            }
+        }
+    }
+    summary.push_str(&format!("\n{}", lora_state(&app.config, Some(store), store.active().ok().as_ref()).label()));
+    if let Ok(Some(raw)) = store.get_meta("serving_capabilities") {
+        if let Ok(caps) = serde_json::from_str::<Value>(&raw) {
+            if crate::learn::worker::current_lora_probe(&caps) && caps["lora"] == false {
+                summary.push_str(&format!("\nLoRA unavailable in Dial's current trainer: {}. This cycle can still evaluate harness improvements.", caps["reason"].as_str().unwrap_or("the model capability probe rejected adapter training")));
+            }
+        }
+    }
+    if let Ok(Some((report, activated, decision))) = store.latest_lora_admission() {
+        summary.push_str(&format!("\nLatest LoRA evaluation: v{} against v{} — {} ({decision})\n{}", report.candidate, report.baseline, if activated { "accepted" } else { "not activated" }, report.reason));
+        for score in report.scores { summary.push_str(&format!("\n{}: baseline {:.3} → candidate {:.3} ({} cases)", score.name, score.baseline, score.candidate, score.cases)); }
+        summary.push_str("\nGate scores measure the evaluated tasks; adapter use alone does not prove improvement.");
+    } else { summary.push_str("\nNo LoRA evaluation recorded yet."); }
+    if let Ok(Some(raw)) = store.get_meta("last_cycle_report") {
+        if let Ok(report) = serde_json::from_str::<Value>(&raw) {
+            if let Some(steps) = report["steps"].as_array() {
+                for step in steps { if step["step"] == "lora_skipped" { summary.push_str(&format!("\nLast training skip: {}", step["data"].as_str().unwrap_or("unknown"))); } }
+            }
+        }
+    }
+    if let Ok(tasks) = crate::learn::repository::load(&app.config) {
+        if !tasks.is_empty() { summary.push_str(&format!("\nRepository exercises: {} training, {} sealed evaluation.",tasks.iter().filter(|t|t.spec.split=="train").count(),tasks.iter().filter(|t|t.spec.split=="evaluation").count())); }
+    }
+    if let Ok(profiles)=crate::learn::profiles::summary(store) { summary.push_str(&format!("\n{profiles}")); }
+    match auto::jobs_summary(&app.layout) {
+        Ok(jobs) => summary.push_str(&format!("\n{jobs}")),
+        Err(error) => summary.push_str(&format!("\nShared compute status unavailable: {error:#}")),
+    }
+    summary.push_str("\nShared compute includes other models and sessions. Use /improve jobs for project-wide status; /improve stop <state_id> requests a safe stop and pauses that model.");
+    summary
 }
 
-enum ActiveOverlay { Settings(SettingsOverlay), Models(ModelOverlay), Providers(ProviderOverlay) }
+enum ActiveOverlay { Settings(SettingsOverlay), Models(ModelOverlay), Providers(ProviderOverlay), Shortcuts(ShortcutOverlay) }
 
 impl ActiveOverlay {
     fn draw(&mut self, frame: &mut ratatui::Frame, ctx: &DrawCtx) {
-        match self { Self::Settings(o) => o.draw(frame, ctx), Self::Models(o) => o.draw(frame, ctx), Self::Providers(o) => o.draw(frame, ctx) }
+        match self { Self::Settings(o) => o.draw(frame, ctx), Self::Models(o) => o.draw(frame, ctx), Self::Providers(o) => o.draw(frame, ctx), Self::Shortcuts(o) => o.draw(frame, ctx) }
     }
     fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
-        match self { Self::Settings(o) => o.handle(event, keys), Self::Models(o) => o.handle(event, keys), Self::Providers(o) => o.handle(event, keys) }
+        match self { Self::Settings(o) => o.handle(event, keys), Self::Models(o) => o.handle(event, keys), Self::Providers(o) => o.handle(event, keys), Self::Shortcuts(o) => o.handle(event, keys) }
     }
     fn banner(&mut self, message: String, is_error: bool) {
-        match self { Self::Models(o) => o.set_status(message, is_error), Self::Providers(o) => o.set_status(message, is_error), Self::Settings(_) => {} }
+        match self { Self::Models(o) => o.set_status(message, is_error), Self::Providers(o) => o.set_status(message, is_error), Self::Settings(_) | Self::Shortcuts(_) => {} }
     }
 }
 
@@ -1697,10 +2236,11 @@ impl AuthJob {
 }
 
 struct OverlayEnv<'a> {
+    verify_lora: Option<ModelSelection>,
     auth_job: &'a mut Option<AuthJob>,
     app: &'a App,
     themes: &'a mut ThemeManager,
-    keys: &'a Keymap,
+    keys: &'a mut Keymap,
     status: &'a StatusData,
     catalog: &'a mut Catalog,
     scope: &'a mut Scope,
@@ -1847,8 +2387,16 @@ impl OverlayEnv<'_> {
                 self.catalog.refresh(self.app);
             }
             OverlayEvent::Refresh => self.catalog.refresh(self.app),
+            OverlayEvent::VerifyLora(selection) => { self.verify_lora = Some(selection); return true; }
             OverlayEvent::PreviewTheme(Some(name)) => { let _ = self.themes.preview(&name); }
             OverlayEvent::PreviewTheme(None) => self.themes.restore(),
+            OverlayEvent::Rebind { action, chords } => {
+                let chords: Vec<&str> = chords.iter().map(String::as_str).collect();
+                let outcome = self.keys.edit_and_save(&self.app.layout.user_dir, action, &chords);
+                if let ActiveOverlay::Shortcuts(shortcuts) = overlay {
+                    shortcuts.settled(outcome.map(|_| "Saved for all projects; shortcuts are active now".to_owned()).map_err(|error| format!("{error:#}")));
+                }
+            }
             OverlayEvent::Action(action) => {
                 if action.starts_with("open:") { self.next = Some(action); return true; }
             }
@@ -1881,13 +2429,14 @@ fn run_overlay(ot: &mut OverlayTerminal<'_>, env: &mut OverlayEnv<'_>, overlay: 
     loop {
         env.collect_auth(overlay);
         env.catalog.collect();
+        env.catalog.auto_verify(env.app);
         if env.catalog.generation != env.seen_generation {
             env.seen_generation = env.catalog.generation;
             if let Some(discovery) = env.catalog.get() {
                 match overlay {
                     ActiveOverlay::Models(models) => models.set_discovery(discovery),
                     ActiveOverlay::Providers(providers) => providers.set_discovery(discovery),
-                    ActiveOverlay::Settings(_) => {}
+                    ActiveOverlay::Settings(_) | ActiveOverlay::Shortcuts(_) => {}
                 }
             }
         }
@@ -1914,6 +2463,7 @@ fn run_overlay(ot: &mut OverlayTerminal<'_>, env: &mut OverlayEnv<'_>, overlay: 
 // ---------------------------------------------------------------------------
 
 struct Bridge<'a> {
+    app: &'a App,
     shell: &'a mut Shell,
     interrupt: Arc<AtomicBool>,
     started: Instant,
@@ -1930,6 +2480,9 @@ impl Bridge<'_> {
         self.last_paint = Instant::now();
         self.pump();
         self.shell.status.elapsed_secs = self.started.elapsed().as_secs_f64();
+        if let Some(monitor) = &self.shell.adapter_monitor {
+            self.shell.status.lora = self.shell.learning.cache.value.2.with_runtime(&monitor.lock());
+        }
         if self.shell.paint(None).is_err() { self.failed = true; self.interrupt.store(true, Ordering::SeqCst); }
     }
 
@@ -1939,6 +2492,9 @@ impl Bridge<'_> {
 
     /// Drain pending keys so Ctrl-C/Esc reach the agent and the next draft stays editable.
     fn pump(&mut self) {
+        // A submitted command owns the next idle dispatch. Leave subsequent input in the
+        // terminal until the active operation has unwound, rather than overwriting it.
+        if self.shell.startup.is_some() { return; }
         while let Ok(true) = poll(Duration::ZERO) {
             let Ok(event) = read() else { break };
             match event {
@@ -1947,6 +2503,16 @@ impl Bridge<'_> {
                     let ctx = ComposerCtx { theme: shell.themes.current(), keys: &shell.keys, ui: &shell.ui, status: &shell.status };
                     match shell.composer.handle_key(key, &ctx) {
                         ComposerEvent::Interrupt | ComposerEvent::Exit => self.interrupt.store(true, Ordering::SeqCst),
+                        ComposerEvent::Submit(text) => {
+                            if shell.route_busy_command(self.app, text) {
+                                self.interrupt.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                            continue;
+                        }
+                        ComposerEvent::Action(Action::ModelSelect | Action::ModelRoles) => {
+                            shell.route_busy_command(self.app, "/model".into());
+                        }
                         ComposerEvent::Action(Action::ToolsExpand) => shell.tools_expanded = !shell.tools_expanded,
                         ComposerEvent::Action(Action::ToolsToggle) => shell.ui.show_tools = !shell.ui.show_tools,
                         ComposerEvent::Action(Action::ThinkingToggle) => shell.ui.show_thinking = !shell.ui.show_thinking,
@@ -1963,6 +2529,10 @@ impl Bridge<'_> {
 }
 
 impl Ui for Bridge<'_> {
+    fn maintenance_ready(&mut self) -> bool {
+        self.pump();
+        !self.shell.composer.has_queued_work()
+    }
     fn take_steering(&mut self) -> Vec<String> {
         self.pump();
         let messages = self.shell.composer.take_steering();
@@ -2048,6 +2618,20 @@ impl Ui for Bridge<'_> {
 
     fn notice(&mut self, message: &str) {
         self.shell.note("Notice", message);
+        self.repaint(true);
+    }
+
+    fn laya_activity(&mut self, status:&str, message:&str) {
+        self.shell.note("Laya",format!("{status} · {message}"));
+        self.set_activity(if status=="checking" {"Laya checking"} else if status=="loading" {"Laya loading"} else {"thinking"});
+        self.repaint(true);
+    }
+
+    fn todo(&mut self, todo: &TodoList) {
+        if let Some((id, _, _)) = self.pending.iter().rev().find(|(_, name, _)| name == "todo") {
+            self.shell.transcript.tool_todo(id, tasks::changes(&self.shell.todo, todo));
+        }
+        self.shell.todo = todo.clone();
         self.repaint(true);
     }
 
@@ -2145,7 +2729,7 @@ fn replay(transcript: &mut Transcript, messages: &[Value]) {
                 for call in message["tool_calls"].as_array().into_iter().flatten() {
                     let (id, name) = (call["id"].as_str().unwrap_or("call"), call["function"]["name"].as_str().unwrap_or("tool"));
                     let args: Value = call["function"]["arguments"].as_str().and_then(|a| serde_json::from_str(a).ok()).unwrap_or(Value::Null);
-                    let summary = args["command"].as_str().or_else(|| args["path"].as_str()).or_else(|| args["prompt"].as_str()).unwrap_or("").to_owned();
+                    let summary = agent::summarize_call(name, &args);
                     transcript.tool_start(id, name, &summary, &summary);
                     open.insert(id.to_owned(), name.to_owned());
                 }
@@ -2167,6 +2751,16 @@ fn replay(transcript: &mut Transcript, messages: &[Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_commands_meant_to_end_the_turn_stop_it() {
+        for line in ["/exit", "/new", "/resume abc", "/fork", "/undo", "/rollback 2", "/compact", "/plan on"] {
+            assert!(Shell::stops_turn(line), "{line}");
+        }
+        for line in ["/model", "/settings", "/approval auto", "/theme nord", "/cost", "/jobs", "/my-custom", "/skill:review x", "/export"] {
+            assert!(!Shell::stops_turn(line), "{line} must not interrupt a running turn");
+        }
+    }
 
     #[test]
     fn switching_models_clears_an_inherited_profile_without_deleting_it() {
@@ -2197,13 +2791,30 @@ mod tests {
         let saved=settings_store::save_config(&layout,Scope::Project,&changes).unwrap();
         assert_eq!(saved.active_model_profile().unwrap().reasoning_effort,Some(ReasoningEffort::Ultra));
         assert_eq!(Config::load(&layout,None).unwrap().active_model_profile().unwrap().reasoning_effort,Some(ReasoningEffort::Ultra));
+        assert_eq!(thinking_label(&reasoning_profile(&saved).unwrap().unwrap()), "ultra");
         assert!(reasoning_changes(&saved,"off").err().unwrap().to_string().contains("supported reasoning levels"));
         assert!(reasoning_changes(&saved,"minimal").is_err());
         let (changes,_) =reasoning_changes(&saved,"high").unwrap();
         let saved=settings_store::save_config(&layout,Scope::Project,&changes).unwrap();
         assert_eq!(saved.active_model_profile().unwrap().reasoning_effort,Some(ReasoningEffort::High));
+        assert_eq!(thinking_label(&reasoning_profile(&saved).unwrap().unwrap()), "high");
         let switched=saved.with_selection(&ModelSelection { provider:"chatgpt".into(),model:"other-model".into(),base_url:Some(chatgpt::BASE_URL.into()),..Default::default() });
         assert!(reasoning_profile(&switched).unwrap().is_none());
+    }
+
+    #[test]
+    fn thinking_status_distinguishes_toggle_default_and_unsupported() {
+        use crate::llm::profiles::{ModelProfile, ModelCapabilities, ReasoningApi, ReasoningEffort};
+        let mut profile = ModelProfile { capabilities: ModelCapabilities { reasoning: ReasoningApi::AnthropicAdaptive, ..Default::default() }, ..Default::default() };
+        assert_eq!(thinking_label(&profile), "default");
+        profile.thinking = Some(true);
+        assert_eq!(thinking_label(&profile), "on");
+        profile.reasoning_effort = Some(ReasoningEffort::High);
+        assert_eq!(thinking_label(&profile), "high");
+        profile.thinking = Some(false);
+        assert_eq!(thinking_label(&profile), "off");
+        profile.capabilities.reasoning = ReasoningApi::None;
+        assert_eq!(thinking_label(&profile), "unsupported");
     }
 
     #[test]
@@ -2252,6 +2863,145 @@ mod tests {
         let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
         let config = Config::load(&layout, None).unwrap();
         (home, project, layout, config)
+    }
+
+    #[test]
+    fn lora_acceptance_is_not_runtime_use_and_disabling_training_does_not_hide_it() {
+        let (_h, _p, _layout, mut config) = config();
+        config.endpoint = None;
+        config.model = "test-model".into();
+        config.use_case = "test".into();
+        let store = Store::open(&config.state_dir, &config.model, &config.use_case, &config.harness).unwrap();
+        store.set_meta("serving_capabilities", "{\"lora\":true,\"lora_probe_version\":2}").unwrap();
+        let mut active = store.active().unwrap();
+        assert_eq!(lora_state(&config, Some(&store), Some(&active)), Lora::Ready);
+        active.adapter = Some("/adapter".into());
+        config.training.enabled = false;
+        assert_eq!(lora_state(&config, Some(&store), Some(&active)), Lora::Active(active.id));
+        use crate::llm::provider::{AdapterRuntime, AdapterPhase};
+        let accepted = Lora::Active(active.id);
+        assert_eq!(accepted.with_runtime(&AdapterRuntime::default()), accepted);
+        assert_eq!(accepted.with_runtime(&AdapterRuntime { adapter: Some("/adapter".into()), phase: AdapterPhase::Used }), Lora::Used);
+        assert_eq!(Lora::Training.with_runtime(&AdapterRuntime { adapter: Some("/adapter".into()), phase: AdapterPhase::Used }), Lora::Training);
+        assert_eq!(Lora::Ready.with_runtime(&AdapterRuntime { adapter: None, phase: AdapterPhase::Used }), Lora::Ready);
+    }
+
+    #[test]
+    fn idle_handoff_releases_compute_without_closing_the_session() {
+        let (_h, _p, layout, mut config) = config();
+        config.model = "test-model".into();
+        config.use_case = "test".into();
+        let lock_path = layout.user_dir.join("compute.lock");
+        let lock = auto::lock_file(&lock_path).unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let app = App { layout, config, overlay: toml::Table::new(), store: None, store_error: None,
+            interrupt: Arc::new(AtomicBool::new(false)), compute: RefCell::new(Some(lock)) };
+        let session = Session::create(&app.layout, SessionMeta { model: "test-model".into() }).unwrap();
+        let mut agent = app.make_agent(session).unwrap();
+        let id = agent.session().id().to_owned();
+        let worker = auto::lock_file(&lock_path).unwrap();
+        assert_eq!(worker.try_lock_exclusive().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        let inherited=app.compute.borrow().as_ref().unwrap().try_clone().unwrap();
+        assert!(app.release_idle_compute(&mut agent));
+        worker.try_lock_exclusive().unwrap();
+        drop(inherited);
+        assert!(app.compute.borrow().is_none());
+        assert_eq!(agent.session().id(), id);
+        assert!(agent.adapter_monitor().is_some(), "backend remains available for lazy reload");
+    }
+
+    #[test]
+    fn automatic_lora_probe_waits_for_compute_then_persists_and_reuses_result() {
+        let (_h, _p, layout, mut config) = config();
+        config.model = "local-model".into(); config.use_case = "test".into();
+        config.user_dir = layout.user_dir.clone();
+        config.state_dir = layout.state_dir.join("models/probe-test");
+        let store = Store::open(&config.state_dir, &config.model, &config.use_case, &config.harness).unwrap();
+        store.set_meta("serving_capabilities", r#"{"inference":true,"lora":false,"reason":"old query-only restriction"}"#).unwrap();
+        let held = auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
+        held.try_lock_exclusive().unwrap();
+        let cancel = AtomicBool::new(false);
+        let checking = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let config = &config;
+            let cancel = &cancel;
+            let checking = &checking;
+            let job = scope.spawn(move || probe_when_available(config, cancel, checking, |_, _| {
+                tx.send(()).unwrap();
+                Ok(json!({"inference":true,"lora":false,"lora_probe_version":2,"reason":"fused QKV unsupported"}))
+            }));
+            assert!(rx.recv_timeout(Duration::from_millis(120)).is_err(), "probe must not run while compute is held");
+            assert!(!checking.load(Ordering::SeqCst));
+            drop(held);
+            rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(job.join().unwrap().unwrap(), Some(false));
+        });
+        assert_eq!(probe_when_available(&config, &cancel, &checking, |_, _| panic!("cached result must avoid another load")).unwrap(), Some(false));
+        let held = auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
+        held.try_lock_exclusive().unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        assert_eq!(probe_when_available(&config, &cancel, &checking, |_, _| panic!("cancelled probe ran")).unwrap(), None);
+    }
+
+    #[test]
+    fn automatic_lora_queue_checks_models_without_selecting_them() {
+        let (_h, _p, layout, mut config) = config();
+        config.model = "current-model".into(); config.use_case = "test".into();
+        let mut models = Vec::new();
+        for (name, supported) in [("other-a", true), ("other-b", false)] {
+            let path = layout.project_root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            let selection = ModelSelection { model:path.to_string_lossy().into_owned(), ..Default::default() };
+            let selected = config.with_selection(&selection);
+            let store = Store::open(&selected.learning_dir(&layout), &selected.model, &selected.use_case, &selected.harness).unwrap();
+            store.set_meta("serving_capabilities", &json!({"inference":true,"lora":supported,"lora_probe_version":2,"reason":"test result"}).to_string()).unwrap();
+            models.push(catalog::ModelEntry { selection, label:name.into(), source:"local MLX".into(), available:true,
+                metadata:catalog::ModelMetadata { lora:Some(true), ..Default::default() } });
+        }
+        let app = App { layout, config, overlay: toml::Table::new(), store: None, store_error: None,
+            interrupt: Arc::new(AtomicBool::new(false)), compute: RefCell::new(None) };
+        let mut catalog = Catalog::new();
+        shared(&catalog.slot).1 = Some(catalog::Discovery { models, providers:vec![] });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            catalog.auto_verify(&app);
+            if catalog.get().unwrap().models.iter().all(|entry| entry.metadata.lora_verified) { break; }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let models = catalog.get().unwrap().models;
+        assert_eq!(models[0].metadata.lora, Some(true));
+        assert_eq!(models[1].metadata.lora, Some(false));
+        assert_eq!(app.config.model, "current-model");
+    }
+
+    #[test]
+    fn learning_status_reads_the_selected_model_store_not_the_project_store() {
+        let (_h, _p, layout, mut config) = config();
+        config.model = "test-model".into();
+        config.use_case = "test".into();
+        config.endpoint = None;
+        let project_store = Store::open(&layout.state_dir, &config.model, &config.use_case, &config.harness).unwrap();
+        project_store.set_meta("serving_capabilities", "{\"lora\":true,\"lora_probe_version\":2}").unwrap();
+        config.state_dir = layout.state_dir.join("models/selected");
+        let store = Store::open(&config.state_dir, &config.model, &config.use_case, &config.harness).unwrap();
+        store.set_meta("serving_capabilities", "{\"lora\":false,\"lora_probe_version\":2,\"reason\":\"fused QKV unsupported\"}").unwrap();
+        store.set_meta("auto_status", "{\"state\":\"running\"}").unwrap();
+        store.set_meta("cycle_progress", "{\"stage\":\"self-play 5/24\"}").unwrap();
+        let app = App { layout, config, overlay: toml::Table::new(), store: Some(store), store_error: None,
+            interrupt: Arc::new(AtomicBool::new(false)), compute: RefCell::new(None) };
+        let mut learning = Learning::default();
+        learning.read(&app);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !learning.cache.worker.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        learning.read(&app);
+        assert_eq!(learning.cache.value.2, Lora::Unsupported);
+        assert!(learning.cache.value.1.contains("self-play 5/24"));
+        assert!(improve_summary(&app).contains("fused QKV unsupported"));
     }
 
     #[test]
@@ -2333,6 +3083,18 @@ mod tests {
         assert!(at("exit") < at("review") && at("review") < at("skill:lint"));
         assert!(matches!(entries[at("review")].kind, CommandKind::Custom) && matches!(entries[at("skill:lint")].kind, CommandKind::Skill));
         assert_eq!(entries[at("resume")].args_hint.as_deref(), Some("[id]"));
+    }
+
+    #[test]
+    fn command_argument_choices_include_subcommands_flags_and_installed_skill_names() {
+        let skill = skills::Skill { name: "review".into(), description: "Review".into(), path: Default::default(), source: skills::Scope::User };
+        let choices = command_argument_completions(&Config::default(), &[skill]);
+        for expected in ["/understanding architecture", "/understanding build", "/skills sources", "/skills list",
+            "/skills import --dry-run", "/skills enable review", "/skills disable review --user", "/approval readonly", "/plan off"] {
+            assert!(choices.iter().any(|choice| choice == expected), "missing {expected}");
+        }
+        assert!(choices.iter().all(|choice| !choice.contains('<')), "never insert usage placeholders");
+        assert!(choices.iter().all(|choice| BUILTIN_COMMANDS.iter().any(|(name, _)| choice.starts_with(&format!("/{name} ")))));
     }
 
     #[test]

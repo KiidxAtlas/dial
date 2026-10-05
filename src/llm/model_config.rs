@@ -116,6 +116,8 @@ pub const ROLES: &[(&str, &str)] = &[
     ("feedback", "Independent self-improvement feedback agent"),
     ("subagent", "Delegated investigation tasks"),
     ("compaction", "Conversation summarization"),
+    ("architecture", "Saved architecture synthesis"),
+    ("stronger", "Narrow escalation advice (remote requires explicit opt-in)"),
 ];
 
 impl ModelSelection {

@@ -303,6 +303,8 @@ enum OpKind {
 struct Op {
     line_no: usize,
     kind: OpKind,
+    /// Body rows written without the `+` prefix (or as a bare blank line) and taken as content.
+    bare: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -468,23 +470,31 @@ fn parse_patch(input: &str) -> Result<Vec<Section>, String> {
     let mut sections = Vec::new();
     let mut current: Option<Section> = None;
     let mut collecting = false;
-    for (offset, raw) in lines[start..end].iter().enumerate() {
+    let rows = &lines[start..end];
+    // A row that is not an operation, header or diff marker: inside a PUT body it is content even when
+    // the model forgot its `+` (the commonest hashline mistake; rejecting it costs a whole round).
+    let bare_row = |t: &str| !t.is_empty() && !is_op_line(t) && !t.starts_with(['-', '*', '+']);
+    for (offset, raw) in rows.iter().enumerate() {
         let line_no = start + offset + 1;
         if collecting {
-            if let Some(text) = raw.strip_prefix('+') {
-                if let Some(Op { kind: OpKind::Put { src: Src::Body(body), .. }, .. }) =
+            let t = raw.trim();
+            // A blank line continues the body when more body rows follow it; otherwise it ends the body.
+            let continues = t.is_empty() && rows[offset + 1..].iter().map(|l| l.trim()).find(|l| !l.is_empty())
+                .is_some_and(|next| next.starts_with('+') || bare_row(next));
+            let (row, bare) = match raw.strip_prefix('+') {
+                Some(text) => (Some(text), false),
+                None if bare_row(t) => (Some(*raw), true),
+                None if continues => (Some(""), true),
+                None => (None, false),
+            };
+            if let Some(text) = row {
+                if let Some(Op { kind: OpKind::Put { src: Src::Body(body), .. }, bare: count, .. }) =
                     current.as_mut().and_then(|s| s.ops.last_mut())
                 {
                     body.push(text.to_owned());
+                    *count += usize::from(bare);
                 }
                 continue;
-            }
-            let t = raw.trim();
-            if !t.is_empty() && !t.starts_with('[') && !t.starts_with("PUT ") && !t.starts_with("CUT ")
-                && t != "REM" && !t.starts_with("MV ") && !t.starts_with(['-', '*']) {
-                return Err(format!(
-                    "line {line_no}: missing `+` prefix in the PUT body. Every replacement line, including unchanged text, must start with `+` at column 0. Use `+{raw}` for this line; use a lone `+` for a blank line. No files were changed."
-                ));
             }
             collecting = false;
             if body_is_empty(current.as_ref()) {
@@ -508,10 +518,10 @@ fn parse_patch(input: &str) -> Result<Vec<Section>, String> {
         if let Some(rest) = t.strip_prefix("PUT ") {
             let kind = parse_put(rest).map_err(|e| format!("line {line_no}: {e}"))?;
             collecting = matches!(&kind, OpKind::Put { src: Src::Body(_), .. });
-            section.ops.push(Op { line_no, kind });
+            section.ops.push(Op { line_no, kind, bare: 0 });
         } else if let Some(rest) = t.strip_prefix("CUT ") {
             let kind = parse_cut(rest).map_err(|e| format!("line {line_no}: {e}"))?;
-            section.ops.push(Op { line_no, kind });
+            section.ops.push(Op { line_no, kind, bare: 0 });
         } else if t == "REM" {
             if section.rem {
                 return Err(format!("line {line_no}: duplicate REM"));
@@ -554,6 +564,10 @@ fn body_is_empty(section: Option<&Section>) -> bool {
         section.and_then(|s| s.ops.last()),
         Some(Op { kind: OpKind::Put { src: Src::Body(body), .. }, .. }) if body.is_empty()
     )
+}
+
+fn is_op_line(t: &str) -> bool {
+    t.starts_with('[') || t.starts_with("PUT ") || t.starts_with("CUT ") || t == "REM" || t.starts_with("MV ")
 }
 
 // ------------------------------------------------------------------ block heuristic
@@ -1522,6 +1536,9 @@ pub(crate) fn edit(ws: &Workspace, input: &str) -> Result<String, String> {
                         Src::Body(body) => body.clone(),
                         Src::Register(name) => regs.get(name).map_err(located)?,
                     };
+                    if op.bare > 0 {
+                        job.warnings.push(format!("line {}: {} body row(s) had no `+` prefix and were taken as content; check the diff, and start every body row with `+` (a lone `+` for a blank line)", op.line_no, op.bare));
+                    }
                     match resolve_anchor(job, anchor).map_err(located)? {
                         Resolved::Replace(a, b) => job.edits.push(Edit { lo: a, hi: b, insert: false, lines }),
                         Resolved::Insert(g) => job.edits.push(Edit { lo: g, hi: g, insert: true, lines }),
@@ -1750,6 +1767,42 @@ pub(crate) fn note_write(ws: &Workspace, abs: &Path, content: &str) -> String {
     format!("[{}#{tag}]", ws.rel(abs))
 }
 
+/// Rebuild what the model has been shown from earlier `(tool, result)` pairs, after the in-memory store
+/// was lost (a resumed session, or an agent rebuilt for a settings change). A `[path#TAG]` result counts
+/// only while the file still has that exact tag: its `N:` rows become seen again, and a `write` result
+/// marks the whole file. Results for files that changed since are ignored, so nothing unseen is unlocked.
+pub fn rehydrate<'a>(ws: &Workspace, results: impl IntoIterator<Item = (&'a str, &'a str)>) {
+    fn header(line: &str) -> Option<(String, String)> {
+        let (rel, tag) = line.strip_prefix('[')?.strip_suffix(']')?.rsplit_once('#')?;
+        (!rel.is_empty() && tag.len() == 4 && tag.bytes().all(|b| b.is_ascii_hexdigit())).then(|| (rel.to_owned(), tag.to_ascii_uppercase()))
+    }
+    let mut found: BTreeMap<(String, String), (bool, Vec<(usize, usize)>)> = BTreeMap::new();
+    for (tool, text) in results {
+        if !matches!(tool, "read" | "edit" | "write") { continue; }
+        let mut current = None;
+        for line in text.lines() {
+            if let Some(key) = header(line) {
+                found.entry(key.clone()).or_default().0 |= tool == "write";
+                current = Some(key);
+                continue;
+            }
+            let (Some(key), digits) = (&current, line.bytes().take_while(u8::is_ascii_digit).count()) else { continue };
+            if digits > 0 && line.as_bytes().get(digits) == Some(&b':') {
+                if let (Ok(n), Some(entry)) = (line[..digits].parse::<usize>(), found.get_mut(key)) { entry.1.push((n, n)); }
+            }
+        }
+    }
+    let mut store = ws.store();
+    for ((rel, tag), (whole, rows)) in found.into_iter().take(512) {
+        let Ok(abs) = ws.resolve(&rel) else { continue };
+        if fs::metadata(&abs).map_or(true, |meta| !meta.is_file() || meta.len() > MAX_FILE) { continue; }
+        let Ok(raw) = load_text(&abs, &rel) else { continue };
+        let lf = normalize(&raw);
+        if tag_of(&lf) != tag { continue; }
+        if whole { store.record_all(&abs, &lf); } else if !rows.is_empty() { store.record(&abs, &lf, &rows); }
+    }
+}
+
 /// Used by `tools::dispatch` to read the `input` argument.
 pub(crate) fn input_arg(args: &Value) -> Result<&str, String> {
     match args.get("input") {
@@ -1813,7 +1866,7 @@ mod tests {
             ("[a.rs#1234]\nPUT >2 @bad name\n", "invalid register name"),
             ("[a.rs#1234]\n@@ -1 +1 @@\n", "unified diff"),
             ("[a.rs#1234]\n-old\n", "unified diff"),
-            ("[a.rs#1234]\nPUT 1.=1:\n+a\n\n+b\n", "outside"),
+            ("[a.rs#1234]\nCUT 1.=1\n+b\n", "outside"),
             ("[a.rs#1234]\n", "no operations"),
             ("[a.rs#1234]\nFROB 3\n", "unrecognized"),
         ];

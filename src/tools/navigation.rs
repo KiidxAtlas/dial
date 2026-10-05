@@ -76,7 +76,7 @@ pub(crate) fn lsp_args(args: &Value) -> Result<Option<Value>, String> {
 #[derive(Debug)]
 struct Evidence { path: String, start: usize, end: usize, score: usize, kind: String, snippet: String, context: String }
 struct Retrieval { results: Vec<Evidence>, limit: usize, exact: bool, coverage: String }
-fn tokens(text: &str) -> BTreeSet<String> {
+pub(crate) fn tokens(text: &str) -> BTreeSet<String> {
     // Split snake_case and camelCase before lowercasing; no language-model interpretation.
     let mut separated = String::with_capacity(text.len());
     let mut lower = false;
@@ -94,7 +94,7 @@ fn quoted(query: &str) -> Result<Vec<String>, String> {
     if parts.len() % 2 == 0 { return Err("unclosed quoted phrase in behavior query".into()); }
     Ok(parts.iter().skip(1).step_by(2).filter(|p| !p.is_empty()).map(|p| p.to_lowercase()).collect())
 }
-fn declarations(path: &Path, text: &str) -> Vec<(usize, usize, String)> {
+pub(crate) fn declarations(path: &Path, text: &str) -> Vec<(usize, usize, String)> {
     let Some(lang) = SupportLang::from_path(path) else { return vec![] };
     let Ok(tree) = AstGrep::try_new(text, lang) else { return vec![] };
     tree.root().dfs().filter_map(|node| {

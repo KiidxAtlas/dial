@@ -37,6 +37,37 @@ pub fn clip_middle(text: &str, max: usize) -> String {
     )
 }
 
+/// Clip a tool result for the model. Like [`clip_middle`], but diagnostic lines (errors, panics,
+/// failed tests; see [`crate::tools::diagnostics`]) from the omitted middle are kept between the two
+/// ends, within a quarter of `max`, so a long build log still shows the first error and its location.
+pub fn clip_evidence(text: &str, max: usize) -> String {
+    use crate::tools::diagnostics;
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let floor = |mut at: usize| { while !text.is_char_boundary(at) { at -= 1; } at };
+    let head_end = floor(max / 4);
+    let tail_start = floor(text.len() - max / 2);
+    let budget = max - max / 4 - max / 2;
+    let middle = &text[head_end..tail_start];
+    let (mut kept, mut lines, mut overflow) = (String::new(), 0usize, 0usize);
+    for line in middle.lines().filter(|line| diagnostics::is_diagnostic(line)) {
+        let line = diagnostics::shorten(line);
+        if kept.len() + line.len() + 1 > budget { overflow += 1; continue; }
+        kept.push_str(&line);
+        kept.push('\n');
+        lines += 1;
+    }
+    if lines == 0 {
+        return clip_middle(text, max);
+    }
+    let more = if overflow > 0 { format!(" ({overflow} more not shown)") } else { String::new() };
+    format!(
+        "{}\n[... {} of {} bytes omitted from the middle; {lines} diagnostic line(s) from it follow{more}. Fetch other parts with a narrower call ...]\n{kept}[... end of kept diagnostics ...]\n{}",
+        &text[..head_end], tail_start - head_end, text.len(), &text[tail_start..]
+    )
+}
+
 /// Detects the same tool call failing again and again, which a confused model does until its step
 /// budget is gone.
 #[derive(Default)]
@@ -231,6 +262,19 @@ mod tests {
         // Multi-byte text is never split mid-character.
         let wide = "é".repeat(5000);
         assert!(clip_middle(&wide, 1001).is_char_boundary(0));
+    }
+
+    #[test]
+    fn evidence_clipping_keeps_middle_diagnostics_and_stays_bounded() {
+        let noise = |n: usize| (0..n).map(|i| format!("   Compiling crate-{i} v0.1.0\n")).collect::<String>();
+        let log = format!("{}error[E0425]: cannot find value `x`\n  --> src/main.rs:3:5\n{}error: could not compile\n", noise(400), noise(400));
+        let out = clip_evidence(&log, 4000);
+        assert!(out.contains("2 diagnostic line(s)") && out.contains("error[E0425]: cannot find value `x`\n  --> src/main.rs:3:5\n"), "{out}");
+        assert!(out.ends_with("error: could not compile\n") && out.len() < 4300, "{}", out.len());
+        // Without diagnostics it is plain head-and-tail clipping.
+        let plain = noise(800);
+        assert_eq!(clip_evidence(&plain, 4000), clip_middle(&plain, 4000));
+        assert_eq!(clip_evidence("short", 4000), "short");
     }
 
     #[test]

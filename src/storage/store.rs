@@ -130,6 +130,11 @@ impl Store {
                 id INTEGER PRIMARY KEY,trajectory INTEGER NOT NULL REFERENCES trajectories(id),version INTEGER NOT NULL REFERENCES versions(id),
                 digest TEXT NOT NULL UNIQUE,payload TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+            CREATE TABLE IF NOT EXISTS executable_repairs(
+                id INTEGER PRIMARY KEY,trajectory INTEGER NOT NULL REFERENCES trajectories(id),version INTEGER NOT NULL REFERENCES versions(id),
+                project_root TEXT NOT NULL,digest TEXT NOT NULL UNIQUE,payload TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+            CREATE INDEX IF NOT EXISTS executable_repairs_project ON executable_repairs(project_root,id);
             CREATE TABLE IF NOT EXISTS trajectory_messages(
                 trajectory INTEGER PRIMARY KEY REFERENCES trajectories(id),payload TEXT NOT NULL);")?;
         let store = Self { conn };
@@ -180,6 +185,13 @@ impl Store {
     pub fn versions(&self) -> Result<Vec<Version>> {
         let mut statement = self.conn.prepare(&format!("SELECT {VERSION_COLUMNS} FROM versions ORDER BY id"))?;
         Ok(statement.query_map([], version_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Latest LoRA gate decision, including rejected/stale candidates; never infer activation from a score.
+    pub fn latest_lora_admission(&self) -> Result<Option<(Admission, bool, String)>> {
+        let row = self.conn.query_row("SELECT a.report,a.activated,a.decision FROM admissions a JOIN versions v ON v.id=a.candidate WHERE v.kind='lora' ORDER BY a.id DESC LIMIT 1", [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, String>(2)?))).optional()?;
+        row.map(|(report, activated, decision)| Ok((serde_json::from_str(&report)?, activated, decision))).transpose()
     }
 
     pub fn candidate(&self, parent: i64, kind: &str, harness: &Harness, adapter: Option<&Path>) -> Result<Version> {
@@ -382,6 +394,35 @@ impl Store {
         }).collect()
     }
 
+    /// Persist scoped executable proof separately from call-form training targets and outcomes.
+    /// A passing syntax check must never enter the externally verified-success harvest path.
+    pub fn executable_repair(&self, trajectory: i64, version: i64, payload: &Value) -> Result<bool> {
+        let record: crate::agent::repair_evidence::RepairRecord = serde_json::from_value(payload.clone())
+            .context("invalid executable repair record")?;
+        ensure!(record.valid(), "executable repair lacks failure/change/pass provenance");
+        let text = serde_json::to_string(&record)?;
+        ensure!(text.len() <= 256 * 1024, "executable repair exceeds 256 KiB");
+        let digest = format!("{:x}", sha2::Sha256::digest(text.as_bytes()));
+        let trajectory_version: i64 = self.conn.query_row("SELECT version FROM trajectories WHERE id=?1", [trajectory], |row| row.get(0))?;
+        ensure!(trajectory_version == version, "repair version does not match trajectory");
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO executable_repairs(trajectory,version,project_root,digest,payload) VALUES(?1,?2,?3,?4,?5)",
+            params![trajectory, version, record.project_root, digest, text])? == 1)
+    }
+
+    /// Bounded project-scoped retrieval for advisory reuse; does not create training labels.
+    pub fn recent_executable_repairs(&self, project_root: &str, limit: usize) -> Result<Vec<(i64, Value)>> {
+        ensure!(limit <= 1024, "repair lookup limit exceeds 1024");
+        let mut statement = self.conn.prepare(
+            "SELECT trajectory,payload FROM executable_repairs WHERE project_root=?1 ORDER BY id DESC LIMIT ?2")?;
+        let rows = statement.query_map(params![project_root, limit as i64],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        rows.map(|row| {
+            let (trajectory, payload) = row?;
+            Ok((trajectory, serde_json::from_str(&payload).context("corrupt executable repair payload")?))
+        }).collect()
+    }
+
     pub fn trajectory_domain(&self, trajectory: i64) -> Result<String> {
         Ok(self.conn.query_row("SELECT domain FROM trajectories WHERE id=?1", [trajectory], |row| row.get(0))?)
     }
@@ -493,6 +534,28 @@ mod tests {
             replay: vec![format!("{{\"n\":{cursor}}}")], prefix_digest: Some(format!("prefix-{cursor}")),
             validation_path: Some("/valid.jsonl".into()), train_digest: Some("train-window".into()),
             validation_digest: Some("validation-window".into()) }
+    }
+
+    #[test]
+    fn latest_lora_evaluation_keeps_scores_and_actual_activation_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "model", "case", &harness()).unwrap();
+        assert!(store.latest_lora_admission().unwrap().is_none());
+        let base = store.active().unwrap();
+        let candidate = store.candidate(base.id, "lora", &harness(), Some(Path::new("/adapter"))).unwrap();
+        store.admit(&passing(&candidate)).unwrap();
+        let (report, activated, _) = store.latest_lora_admission().unwrap().unwrap();
+        assert!(activated);
+        assert_eq!(report.scores[0].baseline, 50.0);
+        assert_eq!(report.scores[0].candidate, 60.0);
+        let rejected = store.candidate(candidate.id, "lora", &harness(), Some(Path::new("/rejected"))).unwrap();
+        store.admit(&Admission { candidate: rejected.id, baseline: candidate.id, passed: false, reason: "No improvement".into(), scores: vec![] }).unwrap();
+        let harness_candidate = store.candidate(candidate.id, "harness", &harness(), candidate.adapter.as_deref()).unwrap();
+        store.admit(&passing(&harness_candidate)).unwrap();
+        let (report, activated, _) = store.latest_lora_admission().unwrap().unwrap();
+        assert_eq!(report.candidate, rejected.id, "a harness admission must not replace the LoRA result");
+        assert!(!activated);
+        assert_eq!(report.reason, "No improvement");
     }
 
     #[test]
@@ -695,5 +758,37 @@ mod tests {
         assert_eq!(store.recent_tool_recoveries("/workspace/b", 2).unwrap().iter()
             .map(|(_, payload)| payload["n"].as_u64().unwrap()).collect::<Vec<_>>(), vec![3, 1]);
         assert!(store.recent_tool_recoveries("/workspace/a", 1025).is_err());
+    }
+
+    #[test]
+    fn executable_repairs_are_scoped_and_never_training_success_labels() {
+        use crate::agent::repair_evidence::{CheckKind, CheckRun, FileChange, Tracker};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "model", "case", &harness()).unwrap();
+        let version = store.active().unwrap().id;
+        let trajectory = store.begin_trajectory(version, "coding", "repair", "prompt").unwrap();
+        let mut tracker = Tracker::default();
+        let run = |sequence, exit_code| CheckRun {
+            command: "cargo check".into(), cwd: "/workspace/a".into(), objective: "type correctness".into(),
+            kind: CheckKind::SyntaxOnly, tool_call_id: format!("check-{sequence}"), evidence_ref: format!("artifact://{sequence}"),
+            exit_code: Some(exit_code), sequence,
+        };
+        tracker.observe(run(1, 1), vec![]);
+        let record = tracker.observe(run(2, 0), vec![FileChange {
+            path: "src/lib.rs".into(), before_sha256: Some("a".repeat(64)), after_sha256: Some("b".repeat(64)),
+            before_ref: Some("/state/before".into()), after_ref: Some("/state/after".into()),
+        }]).unwrap();
+        let payload = serde_json::to_value(record).unwrap();
+        assert!(store.executable_repair(trajectory, version, &payload).unwrap());
+        assert!(!store.executable_repair(trajectory, version, &payload).unwrap());
+        assert_eq!(store.recent_executable_repairs("/workspace/a", 1).unwrap()[0].1, payload);
+        assert!(store.recent_executable_repairs("/workspace/b", 1).unwrap().is_empty());
+        assert!(store.recent_executable_repairs("/workspace/a", 1025).is_err());
+        assert!(store.tool_recoveries().unwrap().is_empty());
+        store.finish_trajectory(trajectory, Some("done"), None).unwrap();
+        assert!(store.verified_successes(100.0, 100).unwrap().is_empty());
+        let mut invalid = payload;
+        invalid["before"]["exit_code"] = json!(0);
+        assert!(store.executable_repair(trajectory, version, &invalid).is_err());
     }
 }

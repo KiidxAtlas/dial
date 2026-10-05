@@ -137,6 +137,17 @@ fn local_context_window(model_dir: &Path) -> Option<u32> {
         .filter(|&window| window > 0)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AdapterPhase { #[default] Idle, Loading, Loaded, Used, Failed }
+
+#[derive(Clone, Debug, Default)]
+pub struct AdapterRuntime {
+    pub adapter: Option<PathBuf>,
+    pub phase: AdapterPhase,
+}
+
+pub type AdapterMonitor = Arc<parking_lot::Mutex<AdapterRuntime>>;
+
 pub struct Backend {
     #[cfg(test)]
     chatgpt_url: Option<String>,
@@ -147,6 +158,7 @@ pub struct Backend {
     retry_backoff: Duration,
     remote_idle_timeout_secs: u64,
     server: Option<ModelServer>,
+    adapter_monitor: AdapterMonitor,
     metadata: llm::catalog::ModelMetadata,
     profile: Option<llm::profiles::ModelProfile>,
 }
@@ -163,6 +175,7 @@ impl Backend {
             retry_backoff: RETRY_BACKOFF,
             remote_idle_timeout_secs: 180,
             server: None,
+            adapter_monitor: Default::default(),
             metadata: Default::default(),
             profile: None,
         }
@@ -230,6 +243,8 @@ impl Backend {
         matches!(self.kind, ProviderKind::Local { .. })
     }
 
+    pub fn adapter_monitor(&self) -> AdapterMonitor { Arc::clone(&self.adapter_monitor) }
+
     pub fn model_label(&self) -> &str {
         match &self.kind {
             ProviderKind::ChatGpt { model, .. } => model,
@@ -241,6 +256,7 @@ impl Backend {
     /// Stop the local server (if any) to free its memory. A later `chat`
     /// starts a new one.
     pub fn release(&mut self) {
+        *self.adapter_monitor.lock() = AdapterRuntime::default();
         if let Some(mut server) = self.server.take() {
             server.stop();
         }
@@ -295,9 +311,16 @@ impl Backend {
             },
             ProviderKind::Local { model_dir } => {
                 if interrupted() { return Err(llm::Interrupted.into()); }
-                let server = server::ensure(&mut self.server, &self.python, model_dir, adapter, self.startup_timeout_secs)?;
+                *self.adapter_monitor.lock() = AdapterRuntime { adapter: adapter.map(Path::to_path_buf), phase: AdapterPhase::Loading };
+                let server = match server::ensure(&mut self.server, &self.python, model_dir, adapter, self.startup_timeout_secs) {
+                    Ok(server) => server,
+                    Err(error) => { self.adapter_monitor.lock().phase = AdapterPhase::Failed; return Err(error); }
+                };
+                self.adapter_monitor.lock().phase = AdapterPhase::Loaded;
                 let result = exchange(&llm::completions_url(server.base_url()), None, SERVER_MODEL, req, timeout_secs, &mut on_text, Arc::clone(&interrupt), self.profile.as_ref(), on_event);
-                return if interrupted() { Err(llm::Interrupted.into()) } else { result };
+                let result = if interrupted() { Err(llm::Interrupted.into()) } else { result };
+                self.adapter_monitor.lock().phase = if result.is_ok() { AdapterPhase::Used } else { AdapterPhase::Failed };
+                return result;
             }
             ProviderKind::Endpoint { base_url, model, api_key } => {
                 ensure!(adapter.is_none(), "endpoint providers cannot load LoRA adapters");
@@ -558,6 +581,35 @@ pub(super) fn anthropic_reply(value: &serde_json::Value) -> Result<Reply> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lora_runtime_distinguishes_loading_use_failure_and_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let python = super::server::tests::fake_python(dir.path());
+        let marker = dir.path().join("server.json");
+        let adapter = dir.path().join("adapter");
+        let mut local = Backend::new(ProviderKind::Local { model_dir: marker.to_string_lossy().into_owned() }, python.clone(), 10);
+        let monitor = local.adapter_monitor();
+        assert_eq!(monitor.lock().phase, super::AdapterPhase::Idle);
+        let mut observed_loaded = false;
+        let mut text = |_: &str| {
+            observed_loaded = monitor.lock().phase == super::AdapterPhase::Loaded;
+            true
+        };
+        local.chat(Some(&adapter), &request(), 5, Some(&mut text)).unwrap();
+        assert!(observed_loaded, "loading alone must not claim a completed response");
+        assert_eq!(monitor.lock().phase, super::AdapterPhase::Used);
+        assert_eq!(monitor.lock().adapter.as_deref(), Some(adapter.as_path()));
+        let argv: serde_json::Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert!(argv["argv"].as_array().unwrap().iter().any(|arg| arg.as_str().is_some_and(|arg| arg == format!("--adapter-path={}", adapter.display()))));
+        assert!(local.chat(Some(&adapter), &request(), 5, Some(&mut |_| false)).is_err());
+        assert_eq!(monitor.lock().phase, super::AdapterPhase::Failed);
+        local.release();
+        assert_eq!(monitor.lock().phase, super::AdapterPhase::Idle);
+        assert!(monitor.lock().adapter.is_none());
+        let mut broken = Backend::new(ProviderKind::Local { model_dir: "bad-model".into() }, python, 3);
+        assert!(broken.chat(Some(&adapter), &request(), 5, None).is_err());
+        assert_eq!(broken.adapter_monitor().lock().phase, super::AdapterPhase::Failed);
+    }
     use super::*;
     use crate::llm::fake::{self, Script, header, request_line};
     use serde_json::json;
@@ -855,7 +907,7 @@ mod tests {
             let response = if anthropic { fake::json(200, &json!({"content":[{"type":"text","text":"pixel"}],"stop_reason":"end_turn"})) } else { ok("pixel") };
             let server = fake::serve(vec![response]);
             let kind = if anthropic { anthropic_endpoint(&server.url) } else { endpoint(&server.url) };
-            let mut remote = backend(kind).with_metadata(llm::catalog::ModelMetadata { vision:Some(true), pricing:None });
+            let mut remote = backend(kind).with_metadata(llm::catalog::ModelMetadata { vision:Some(true), ..Default::default() });
             let mut req = request();
             req.messages = vec![message.clone()];
             assert_eq!(remote.chat(None, &req, 5, None).unwrap().text, "pixel");
@@ -872,7 +924,7 @@ mod tests {
             assert!(!body.to_string().contains("dial_images"));
         }
         let server = fake::serve(vec![ok("text only")]);
-        let mut remote = backend(endpoint(&server.url)).with_metadata(llm::catalog::ModelMetadata { vision:Some(false), pricing:None });
+        let mut remote = backend(endpoint(&server.url)).with_metadata(llm::catalog::ModelMetadata { vision:Some(false), ..Default::default() });
         let mut req = request();
         req.messages = vec![message];
         let mut notices = Vec::new();
@@ -883,7 +935,7 @@ mod tests {
 
     #[test]
     fn costs_require_complete_usage_supported_prices_and_remote_provider() {
-        let metadata = llm::catalog::ModelMetadata { vision:None, pricing:Some(llm::catalog::TokenPricing { prompt:0.000001, completion:0.000003, cache_read:None, cache_write:None }) };
+        let metadata = llm::catalog::ModelMetadata { vision:None, pricing:Some(llm::catalog::TokenPricing { prompt:0.000001, completion:0.000003, cache_read:None, cache_write:None }), ..Default::default() };
         let remote = backend(endpoint("https://api.example.com")).with_metadata(metadata);
         let reply = Reply { text:String::new(), tool_calls:vec![], finish_reason:"stop".into(), prompt_tokens:Some(1000), completion_tokens:Some(500), ..Default::default() };
         assert!((remote.reply_cost(&reply).unwrap() - 0.0025).abs() < 1e-12);

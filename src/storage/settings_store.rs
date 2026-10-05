@@ -11,7 +11,8 @@ const MAX_HISTORY: usize = 10_000;
 pub enum Scope { Global, Project }
 pub enum Change { Set { path: String, value: toml::Value }, Remove { path: String } }
 
-pub(crate) fn private_dir(dir: &Path) -> Result<()> {
+/// Validate ancestors without creating directories or changing permissions (also used for reads).
+pub(crate) fn validate_private_path(dir: &Path) -> Result<()> {
     ensure!(!dir.components().any(|part| part == std::path::Component::ParentDir), "private storage path must not contain parent traversal");
     // System-owned aliases such as macOS /var are trusted. User-owned symlink
     // ancestors are not: they could redirect private state into the workspace.
@@ -20,6 +21,11 @@ pub(crate) fn private_dir(dir: &Path) -> Result<()> {
             ensure!(!meta.file_type().is_symlink() || meta.uid() == 0, "private storage path contains a user-owned symlink");
         }
     }
+    Ok(())
+}
+
+pub(crate) fn private_dir(dir: &Path) -> Result<()> {
+    validate_private_path(dir)?;
     match fs::symlink_metadata(dir) {
         Ok(meta) => {
             ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "private storage directory is not a regular directory");

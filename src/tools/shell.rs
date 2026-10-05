@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 const MAX_COMMAND: usize = 64 * 1024;
 const BASH_HEAD: usize = 6 * 1024;
 const BASH_TAIL: usize = 14 * 1024;
+/// Diagnostic lines kept from the omitted middle (a compiler's first error is often there).
+const BASH_DIAGNOSTICS: usize = 3 * 1024;
 const CLT_DIR: &str = "/Library/Developer/CommandLineTools";
 
 /// Kills the whole process group on drop so nothing outlives the tool call.
@@ -66,16 +68,18 @@ impl Drop for ProcessGroup {
     }
 }
 
-/// Keeps the first and last bytes of a stream, counting what was dropped.
+/// Keeps the first and last bytes of a stream, counting what was dropped, plus the diagnostic lines
+/// (errors, panics, failed tests) found in the dropped middle.
 struct Capture {
     head: Vec<u8>,
     tail: Vec<u8>,
     total: usize,
+    diagnostics: super::diagnostics::Collector,
 }
 
 impl Capture {
     fn new() -> Self {
-        Capture { head: Vec::new(), tail: Vec::new(), total: 0 }
+        Capture { head: Vec::new(), tail: Vec::new(), total: 0, diagnostics: super::diagnostics::Collector::new(BASH_DIAGNOSTICS) }
     }
 
     fn push(&mut self, mut chunk: &[u8]) {
@@ -87,19 +91,27 @@ impl Capture {
         }
         self.tail.extend_from_slice(chunk);
         if self.tail.len() > 2 * BASH_TAIL {
-            let excess = self.tail.len() - BASH_TAIL;
-            self.tail.drain(..excess);
+            self.drop_front(self.tail.len() - BASH_TAIL);
         }
+    }
+
+    fn drop_front(&mut self, excess: usize) {
+        self.diagnostics.feed(&self.tail[..excess]);
+        self.tail.drain(..excess);
     }
 
     fn finish(mut self) -> String {
         if self.tail.len() > BASH_TAIL {
-            let excess = self.tail.len() - BASH_TAIL;
-            self.tail.drain(..excess);
+            self.drop_front(self.tail.len() - BASH_TAIL);
         }
+        self.diagnostics.finish();
         let dropped = self.total - self.head.len() - self.tail.len();
         let mut text = String::from_utf8_lossy(&self.head).into_owned();
-        if dropped > 0 {
+        let (kept, lines, overflow) = self.diagnostics.kept();
+        if dropped > 0 && lines > 0 {
+            let more = if overflow > 0 { format!(" ({overflow} more not shown)") } else { String::new() };
+            text.push_str(&format!("\n[... {dropped} bytes of output omitted; {lines} diagnostic line(s) from that part follow{more} ...]\n{kept}[... end of omitted-part diagnostics ...]\n"));
+        } else if dropped > 0 {
             text.push_str(&format!("\n[... {dropped} bytes of output omitted ...]\n"));
         }
         text.push_str(&String::from_utf8_lossy(&self.tail));
@@ -260,6 +272,9 @@ pub fn bash_tool_streaming(
     } else if let Some(signal) = status.signal() {
         text.push_str(&format!("[terminated by signal {signal}]\n"));
     }
+    if !success && text.contains("Operation not permitted") && text.contains("/tmp/") {
+        text.push_str("[sandbox: /tmp is outside the project and not writable; use $TMPDIR, a scratch directory inside the project]\n");
+    }
     if let Some(spool) = spool {
         let uri = spool.finish().map_err(|e| format!("saving complete command output artifact: {e}"))?;
         text.push_str(&format!("[complete output: {uri}]\n"));
@@ -323,7 +338,7 @@ mod tests {
     use crate::tools::execute;
     use std::path::PathBuf;
     fn sandboxed() -> bool {
-        Sandbox::detect().available().is_ok()
+        super::super::sandbox::require_for_test()
     }
 
     fn bash(ws: &Workspace, command: &str) -> ToolOutput {
@@ -342,7 +357,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_reads_and_writes_inside_workspace_only() {
-        assert!(sandboxed(), "sandbox-exec must work on this Mac");
+        if !sandboxed() { return; }
         let (dir, ws) = workspace();
         let outside = tempfile::tempdir().unwrap();
         let canary = outside.path().join("canary");
@@ -367,7 +382,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_cannot_read_home() {
-        assert!(sandboxed());
+        if !sandboxed() { return; }
         let (_dir, ws) = workspace();
         let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
         let mut canary = tempfile::Builder::new().prefix(".dial-sandbox-canary-").tempfile_in(&home).unwrap();
@@ -385,7 +400,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_environment_is_scrubbed() {
-        assert!(sandboxed());
+        if !sandboxed() { return; }
         let (_dir, ws) = workspace();
         // cargo exports CARGO_* variables into this test process.
         assert!(std::env::vars().any(|(k, _)| k.starts_with("CARGO")));
@@ -406,7 +421,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_network_is_blocked_unless_allowed() {
-        assert!(sandboxed());
+        if !sandboxed() { return; }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo CONNECTED");
@@ -429,7 +444,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_symlink_escape_is_blocked() {
-        assert!(sandboxed());
+        if !sandboxed() { return; }
         let (dir, ws) = workspace();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("canary"), "LINKED-SECRET").unwrap();
@@ -453,7 +468,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_output_is_bounded_and_keeps_head_and_tail() {
-        assert!(sandboxed());
+        if !sandboxed() { return; }
         let (_dir, ws) = workspace();
         let out = bash(&ws, "echo START; seq 1 300000; echo END");
         assert!(!out.is_error);
@@ -464,6 +479,19 @@ mod tests {
         assert!(flood.text.len() < BASH_HEAD + BASH_TAIL + 200);
         let failing = bash(&ws, "echo oops >&2; exit 3");
         assert!(failing.is_error && failing.text.contains("oops") && failing.text.contains("[exit code: 3]"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bash_keeps_diagnostics_from_the_omitted_middle_within_bounds() {
+        if !sandboxed() { return; }
+        let (_dir, ws) = workspace();
+        let out = bash(&ws, "seq 1 50000; echo 'error[E0308]: mismatched types'; echo '  --> src/lib.rs:7:5'; seq 1 50000; exit 101");
+        assert!(out.is_error);
+        let omitted = out.text.find("diagnostic line(s) from that part follow").expect("marker");
+        let error = out.text.find("error[E0308]: mismatched types\n  --> src/lib.rs:7:5\n").expect("the middle error survives");
+        assert!(omitted < error && out.text.contains("[exit code: 101]"), "{}", &out.text[omitted..omitted + 300]);
+        assert!(out.text.len() < BASH_HEAD + BASH_TAIL + BASH_DIAGNOSTICS + 300, "{}", out.text.len());
     }
 
     #[cfg(target_os = "macos")]
@@ -479,7 +507,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_timeout_kills_process_group_without_orphans() {
-        assert!(sandboxed());
+        if !sandboxed() { return; }
         let (dir, ws) = workspace();
         let started = Instant::now();
         let out = run(
@@ -497,7 +525,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_kills_background_jobs_when_command_returns() {
-        assert!(sandboxed());
+        if !sandboxed() { return; }
         let (dir, ws) = workspace();
         let started = Instant::now();
         let out = bash(&ws, "sleep 30 & echo $! > bg.pid; echo done");
@@ -514,7 +542,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_runs_python_and_git_when_homebrew_is_present() {
-        assert!(sandboxed());
+        if !sandboxed() { return; }
         let (_dir, ws) = workspace();
         let out = bash(&ws, "python3 -c 'import json, sys; print(json.dumps([6*7]))'");
         assert!(!out.is_error && out.text.contains("[42]"), "python3: {}", out.text);

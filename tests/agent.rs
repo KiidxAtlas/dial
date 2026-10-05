@@ -17,7 +17,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-enum Reply { Text(&'static str), Say(String), Call(&'static str, Value), RawCall(&'static str, String), Calls(Vec<(&'static str, Value)>), Cut }
+enum Reply { Text(&'static str), Say(String), Call(&'static str, Value), RawCall(&'static str, String), Calls(Vec<(&'static str, Value)>), Cut,
+    Think { reasoning: String, pause: Duration } }
 
 /// Serves the scripted replies in order (SSE when the client streams) and records every request.
 struct Scripted { url: String, requests: Arc<Mutex<Vec<Value>>> }
@@ -91,6 +92,19 @@ fn answer(mut stream: TcpStream, choose: &Choose, seen: &Mutex<Vec<Value>>, toke
     seen.lock().push(request.clone());
     let say = |text: &str| (json!({"role":"assistant","content":text}), "stop");
     let (delta, finish) = match choose(&request) {
+        Reply::Think { reasoning, pause } => {
+            assert!(streaming);
+            let first = format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"reasoning_content":reasoning},"finish_reason":null}]}));
+            // A fully formed write appears later in the cancelled response; it must never run.
+            let tail = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"late","type":"function","function":{"name":"write","arguments":json!({"path":"gate-leak.txt","content":"must not run"}).to_string()}}]},"finish_reason":null}]}),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}));
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{first}", first.len() + tail.len());
+            let _ = stream.flush();
+            thread::sleep(pause);
+            let _ = write!(stream, "{tail}");
+            return;
+        },
         Reply::Text(t) => say(t),
         Reply::Say(t) => say(&t),
         Reply::Cut => (json!({"role":"assistant","content":""}), "length"),
@@ -127,7 +141,9 @@ fn env(url: &str, approval: &str) -> Env {
     let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
     let overlay: toml::Table = toml::from_str(&format!(
         "model = \"scripted\"\napproval = \"{approval}\"\nedit_mode = \"hashline\"\nintegrations = []\n[endpoint]\nbase_url = \"{url}\"\n[sandbox]\nmode = \"strict\"\n")).unwrap();
-    let config = Config::load(&layout, Some(overlay)).unwrap();
+    let mut config = Config::load(&layout, Some(overlay)).unwrap();
+    // Most scripted providers test one agent task, not the separate architecture maintenance call.
+    config.codebase.synthesize_architecture=false;
     Env { _home: home, project, layout, config }
 }
 
@@ -160,7 +176,150 @@ fn open_todo() -> Reply {
     Reply::Call("todo", json!({"op":"set","tasks":[{"content":"create and verify marker","status":"in_progress"}]}))
 }
 
-fn close_todo() -> Reply { Reply::Call("todo", json!({"op":"update","index":1,"status":"completed"})) }
+#[test]
+fn architecture_uses_its_selected_model_and_restores_coding() {
+    let main=serve(vec![Reply::Text("First answer."),Reply::Text("Second answer.")]);
+    let side=serve(vec![Reply::Say(json!({"sections":[
+        {"id":"purpose","kind":"purpose","title":"Application","summary":"Routes requests.","sources":["main.rs"]},
+        {"id":"router","kind":"component","title":"Router","summary":"run handles routing.","sources":["main.rs"]}
+    ],"unknowns":[]}).to_string())]);
+    let mut e=env(&main.url,"auto");
+    e.config.codebase.synthesize_architecture=true;
+    e.config.model_roles.insert("architecture".into(),dial::llm::model_config::ModelSelection {
+        provider:"summary".into(),model:"architecture-model".into(),base_url:Some(side.url.clone()),context_window:Some(8192),..Default::default()
+    });
+    e.config.validate().unwrap();
+    std::fs::write(e.project.path().join("main.rs"),"fn main() { run(); }\nfn run() {}\n").unwrap();
+    let mut a=agent_with(&e,None,Arc::new(AtomicBool::new(false)));
+    let mut ui=Recorder::default();
+    assert_eq!(a.turn("Explain routing",&mut ui).unwrap().text,"First answer.");
+    assert_eq!(a.turn("Explain again",&mut ui).unwrap().text,"Second answer.");
+    assert_eq!(main.requests.lock().len(),2);
+    let requests=side.requests.lock();
+    assert_eq!(requests.len(),1);
+    assert_eq!(requests[0]["model"],"architecture-model");
+    assert!(requests[0]["messages"][0]["content"].as_str().unwrap().starts_with("Synthesize"));
+    assert!(ui.notices.iter().any(|notice|notice.contains("Saved 2 architecture sections")));
+}
+
+#[test]
+fn architecture_is_built_after_the_task_and_reused_without_extra_generations() {
+    let server=serve_fn(Arc::new(|request| {
+        if request["messages"][0]["content"].as_str().unwrap_or("").starts_with("Synthesize the project's architecture") {
+            Reply::Say(json!({"sections":[
+                {"id":"purpose","kind":"purpose","title":"Application","summary":"Routes requests.","sources":["main.rs"]},
+                {"id":"router","kind":"component","title":"Router","summary":"run handles routing.","sources":["main.rs"]}
+            ],"unknowns":["Persistence is not shown."]}).to_string())
+        } else {Reply::Text("Explained.")}
+    }),None,None);
+    let mut e=env(&server.url,"auto");
+    e.config.codebase.synthesize_architecture=true;
+    std::fs::write(e.project.path().join("main.rs"),"fn main() { run(); }\nfn run() {}\n").unwrap();
+    let mut a=agent_with(&e,None,Arc::new(AtomicBool::new(false)));
+    let mut ui=Recorder::default();
+    a.turn("Explain routing",&mut ui).unwrap();
+    assert_eq!(server.requests.lock().len(),2);
+    assert!(!server.requests.lock()[0]["messages"][0]["content"].as_str().unwrap().starts_with("Synthesize"));
+    drop(a);
+    let mut restarted=agent_with(&e,None,Arc::new(AtomicBool::new(false)));
+    restarted.turn("Explain routing again",&mut ui).unwrap();
+    let requests=server.requests.lock();
+    assert_eq!(requests.len(),3,"unchanged sources must not trigger another synthesis");
+    assert!(requests[2]["messages"].to_string().contains("run handles routing"));
+    assert!(ui.notices.iter().any(|notice|notice.contains("Saved 2 architecture sections")));
+}
+
+#[test]
+fn stale_assumptions_block_blind_edit_retries_until_current_source_is_read() {
+    let server=serve(vec![
+        Reply::Call("write",json!({"path":"main.rs","content":"fn main() { println!(\"changed\"); }\n"})),
+        Reply::Call("write",json!({"path":"main.rs","content":"fn main() { println!(\"changed\"); }\n"})),
+        Reply::Call("read",json!({"path":"main.rs"})),
+        Reply::Call("write",json!({"path":"main.rs","content":"fn main() { println!(\"changed\"); }\n"})),
+        Reply::Text("Updated after checking current evidence."),
+    ]);
+    let mut e=env(&server.url,"auto"); e.config.verification.enabled=false;
+    std::fs::write(e.project.path().join("main.rs"),"fn main() {}\n").unwrap();
+    let cache=Arc::new(dial::storage::codebase::Codebase::open(&e.layout).unwrap());
+    let ws=dial::tools::Workspace::new(e.project.path()).unwrap();
+    cache.refresh(&ws,&AtomicBool::new(false)).unwrap();
+    let tool=dial::storage::codebase::tool(cache.clone(),"old".into());
+    let saved=tool.call(&dial::tools::ext::ToolContext {workspace:&ws,config:&e.config},&json!({"action":"remember","topic":"entry ownership","summary":"Main owns dispatch","sources":["main.rs"]}));
+    assert!(!saved.is_error,"{}",saved.text);
+    cache.invalidate_finding("entry ownership","Ownership has not been established").unwrap();
+    let mut a=agent_with(&e,None,Arc::new(AtomicBool::new(false)));
+    a.turn("Change main output",&mut Recorder::default()).unwrap();
+    let requests=server.requests.lock();
+    assert!(requests[1]["messages"].to_string().contains("Before editing main.rs"));
+    assert!(requests[2]["messages"].to_string().contains("Read current main.rs before retrying"));
+    assert!(requests[3]["messages"].to_string().contains("fn main() {}"),"blocked retries must not have changed the file before read");
+    assert!(std::fs::read_to_string(e.project.path().join("main.rs")).unwrap().contains("changed"));
+}
+
+#[test]
+fn malformed_architecture_does_not_fail_the_task_or_repeat_automatically() {
+    let server=serve(vec![Reply::Text("Done."),Reply::Text("not architecture JSON"),Reply::Text("Done again.")]);
+    let mut e=env(&server.url,"auto");e.config.codebase.synthesize_architecture=true;
+    std::fs::write(e.project.path().join("main.rs"),"fn main() {}\n").unwrap();
+    let mut a=agent_with(&e,None,Arc::new(AtomicBool::new(false)));
+    let mut ui=Recorder::default();
+    assert_eq!(a.turn("Explain",&mut ui).unwrap().outcome,dial::agent::TurnOutcome::Completed);
+    assert!(ui.notices.iter().any(|n|n.contains("Architecture update deferred")));
+    a.turn("Explain again",&mut ui).unwrap();
+    assert_eq!(server.requests.lock().len(),3);
+}
+
+#[test]
+fn queued_work_skips_architecture_maintenance_without_consuming_model_calls() {
+    struct QueuedUi;
+    impl Ui for QueuedUi {fn maintenance_ready(&mut self)->bool {false}}
+    let server=serve(vec![Reply::Text("Done.")]);
+    let mut e=env(&server.url,"auto");e.config.codebase.synthesize_architecture=true;
+    std::fs::write(e.project.path().join("main.rs"),"fn main() {}\n").unwrap();
+    let mut a=agent_with(&e,None,Arc::new(AtomicBool::new(false)));
+    a.turn("Explain",&mut QueuedUi).unwrap();
+    assert_eq!(server.requests.lock().len(),1);
+    let cache=dial::storage::codebase::Codebase::open(&e.layout).unwrap();
+    assert!(cache.architecture_synthesis(8000,false).unwrap().is_some());
+}
+
+fn close_todo() -> Reply { Reply::Call("todo", json!({"op":"done"})) }
+
+#[test]
+fn investigation_gates_findings_redirects_duplicate_reads_and_survives_resume() {
+    let conclusion = json!({"op":"done", "finding":"The current value is five", "evidence":["marker.txt:1"]});
+    let server = serve(vec![
+        Reply::Call("todo", json!({"op":"set","tasks":[
+            {"content":"What is the current value?","investigation":true},
+            {"content":"Change to the requested value"}
+        ]})),
+        Reply::Call("todo", conclusion.clone()),
+        Reply::Call("read", json!({"path":"marker.txt"})),
+        close_todo(),
+        Reply::Call("read", json!({"path":"marker.txt"})),
+        Reply::Call("todo", conclusion),
+        Reply::Call("finish", json!({"outcome":"needs_input","summary":"Found the value","reason":"What value should replace five?"})),
+    ]);
+    let e = env(&server.url, "auto");
+    std::fs::write(e.project.path().join("marker.txt"), "five\n").unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    assert_eq!(a.turn("Investigate and update the value", &mut ui).unwrap().outcome, TurnOutcome::NeedsInput);
+    let requests = server.requests.lock();
+    assert!(requests[2]["messages"].to_string().contains("no tool has run since it started"));
+    assert!(requests[4]["messages"].to_string().contains("Investigation done needs finding"));
+    assert!(requests[5]["messages"].to_string().contains("This observation is unchanged"));
+    assert!(requests[6]["messages"].to_string().contains("Recorded finding (agent observation"));
+    assert!(ui.notices.iter().any(|n| n.contains("unchanged observation")));
+    let path = a.session().path().unwrap().to_owned();
+    drop(a);
+    let resumed = Session::open(&path).unwrap();
+    let a = Agent::interactive(&e.config, make_backend(&e.config).unwrap(), e.layout.clone(), resumed, None, None,
+        Arc::new(AtomicBool::new(false))).unwrap();
+    assert_eq!(a.todo().tasks()[0].finding.as_deref(), Some("The current value is five"));
+    assert_eq!(a.todo().tasks()[0].evidence, ["marker.txt:1"]);
+    assert!(a.todo().has_open());
+}
 
 #[test]
 fn unfinished_todos_continue_into_real_edits_and_completion() {
@@ -220,6 +379,27 @@ fn steering_after_finish_preserves_newly_loaded_tools() {
 }
 
 #[test]
+fn skill_toggles_refresh_the_catalog_between_turns() {
+    use dial::storage::skills::{Scope, management};
+    let server = serve(vec![Reply::Text("First."), Reply::Text("Second."), Reply::Text("Third.")]);
+    let e = env(&server.url, "auto");
+    let dir = e.layout.skills_dirs()[0].join("review");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), "---\nname: review\ndescription: UNIQUE_SKILL_CATALOG_MARKER\n---\nReview.").unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    a.turn("hello", &mut dial::agent::NullUi).unwrap();
+    management::set_enabled(&e.layout, "review", false, Scope::Project).unwrap();
+    a.turn("hello again", &mut dial::agent::NullUi).unwrap();
+    management::set_enabled(&e.layout, "review", true, Scope::Project).unwrap();
+    a.turn("hello once more", &mut dial::agent::NullUi).unwrap();
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 3);
+    for (request, enabled) in requests.iter().zip([true, false, true]) {
+        assert_eq!(request["messages"][0]["content"].as_str().unwrap().contains("UNIQUE_SKILL_CATALOG_MARKER"), enabled);
+    }
+}
+
+#[test]
 fn text_only_acknowledgements_do_not_repeat_completion_reminders() {
     let server = serve(vec![open_todo(), Reply::Text("I'll get started."), Reply::Text("Continuing now.")]);
     let e = env(&server.url, "auto");
@@ -258,7 +438,20 @@ fn finish_completed_rejects_unfinished_todos() {
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("create marker", &mut Recorder::default()).unwrap();
     assert_eq!(report.text, "Actually done");
-    assert!(server.requests.lock()[2]["messages"].to_string().contains("unfinished todos"));
+    assert!(server.requests.lock()[2]["messages"].to_string().contains("cannot finish completed with open todos"));
+}
+
+#[test]
+fn stopping_with_only_blocked_todos_ends_the_turn_blocked_without_reminders() {
+    let server = serve(vec![open_todo(), Reply::Call("todo", json!({"op":"block","reason":"no write access to the target"})),
+        Reply::Text("Blocked on write access.")]);
+    let e = env(&server.url, "auto");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a.turn("create marker", &mut Recorder::default()).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Blocked);
+    assert_eq!(report.text, "Blocked on write access.");
+    assert_eq!(server.requests.lock().len(), 3, "blocked work earns no continuation reminder");
+    assert_eq!(a.metrics().turns_completed, 0);
 }
 
 #[test]
@@ -324,6 +517,7 @@ fn finish_completed_waits_for_live_task_results() {
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     a.start_subagents(&json!({"prompt":"inspect the project"}), &mut ui).unwrap();
+    assert!(!a.release_idle_models(), "a live child must retain the foreground compute reservation");
     let report = a.turn("finish investigation", &mut ui).unwrap();
     assert_eq!(report.outcome, TurnOutcome::NeedsInput);
     assert!(main.requests.lock()[1]["messages"].to_string().contains("live tasks are running"));
@@ -712,7 +906,7 @@ fn each_agent_type_gets_its_own_prompt_and_tool_allowlist() {
         with_subagent_role(&mut e, &side.url);
         run_turn(&e, &mut Recorder::default());
         let request = side.requests.lock()[0].clone();
-        let mut expected: Vec<String> = tools.iter().map(|name| name.to_string()).collect(); expected.push("artifact_read".into());
+        let mut expected: Vec<String> = tools.iter().map(|name| name.to_string()).collect(); expected.push("codebase_memory".into()); expected.push("artifact_read".into());
         assert_eq!(tool_names(&request), expected, "{agent_type}");
         let system = request["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains(&format!("You are a {agent_type} subagent")), "{agent_type}: {system}");
@@ -992,10 +1186,11 @@ fn a_subagent_preset_cannot_reuse_an_agent_type_name() {
 }
 
 #[test]
-fn a_reply_cut_off_by_the_output_limit_is_retried_larger_instead_of_returned_empty() {
+fn disabling_the_reasoning_guard_preserves_larger_output_recovery() {
     // A reasoning model can spend its whole budget thinking and return nothing with finish_reason=length.
     let server = serve(vec![Reply::Cut, Reply::Text("finished")]);
-    let e = env(&server.url, "ask");
+    let mut e = env(&server.url, "ask");
+    e.config.reasoning_guard.enabled = false;
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None);
     let mut ui = Recorder::default();
@@ -1019,6 +1214,165 @@ fn the_same_failing_call_repeated_three_times_is_called_out_to_the_model() {
     let requests = server.requests.lock();
     assert!(!requests[2]["messages"].to_string().contains("failed 3 times"), "not before the third failure");
     assert!(requests[3]["messages"].to_string().contains("failed 3 times with the same arguments"), "{}", requests[3]["messages"]);
+}
+
+#[test]
+fn reasoning_gate_recovers_into_real_work_without_raising_the_token_budget() {
+    let server = serve(vec![Reply::Think { reasoning: "r".repeat(256), pause: Duration::ZERO },
+        Reply::Call("read", json!({"path":"f.txt"})), Reply::Text("Evidence received.")]);
+    let mut e = env(&server.url, "auto");
+    e.config.reasoning_guard.max_reasoning_bytes = 256;
+    std::fs::write(e.project.path().join("f.txt"), "evidence").unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut a = agent_with(&e, None, cancel.clone());
+    let mut ui = Recorder::default();
+    let report = a.turn("inspect f.txt", &mut ui).unwrap();
+    assert_eq!((report.text.as_str(), report.outcome), ("Evidence received.", TurnOutcome::Completed));
+    assert_eq!(ui.calls, ["read"]);
+    assert!(!e.project.path().join("gate-leak.txt").exists());
+    assert!(!cancel.load(Ordering::SeqCst), "request cancellation must not set the user interrupt");
+    assert_eq!(a.metrics().reasoning_interceptions, 1);
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0]["max_tokens"], requests[1]["max_tokens"]);
+    assert!(requests[1]["messages"].to_string().contains("Take the next small, useful tool action now"));
+    assert_eq!(requests[0]["messages"][0], requests[1]["messages"][0], "keep the system prompt cache stable");
+}
+
+#[test]
+fn reasoning_gate_bounds_silent_reasoning_and_stops_incomplete_after_one_retry() {
+    let think = || Reply::Think { reasoning: "thinking".into(), pause: Duration::from_millis(1800) };
+    let server = serve(vec![think(), think(), Reply::Text("must not request")]);
+    let mut e = env(&server.url, "auto");
+    e.config.reasoning_guard.max_pre_action_secs = 1;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut a = agent_with(&e, None, cancel.clone());
+    let mut ui = Recorder::default();
+    let started = Instant::now();
+    let report = a.turn("act", &mut ui).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert!(!report.interrupted && !cancel.load(Ordering::SeqCst));
+    assert_eq!(server.requests.lock().len(), 2);
+    assert!(ui.calls.is_empty() && !e.project.path().join("gate-leak.txt").exists());
+    assert!(ui.notices.iter().any(|n| n.contains("one recovery attempt")));
+    assert!(started.elapsed() < Duration::from_secs(4), "a silent stream must be cancellable");
+}
+
+#[test]
+fn reasoning_only_length_stops_share_the_one_recovery_budget_with_stream_interceptions() {
+    let server = serve(vec![Reply::Cut, Reply::Think { reasoning: "r".repeat(256), pause: Duration::ZERO }, Reply::Text("must not request")]);
+    let mut e = env(&server.url, "auto");
+    e.config.reasoning_guard.max_reasoning_bytes = 256;
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a.turn("act", &mut Recorder::default()).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["max_tokens"], requests[1]["max_tokens"]);
+}
+
+#[test]
+fn user_cancellation_during_reasoning_does_not_trigger_a_gate_retry() {
+    let server = serve(vec![Reply::Think { reasoning: "thinking".into(), pause: Duration::from_millis(1800) }]);
+    let e = env(&server.url, "auto");
+    let cancel = Arc::new(AtomicBool::new(false));
+    struct CancelUi(Arc<AtomicBool>);
+    impl Ui for CancelUi {
+        fn heartbeat(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    }
+    let mut a = agent_with(&e, None, cancel.clone());
+    let report = a.turn("act", &mut CancelUi(cancel)).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Interrupted);
+    assert_eq!(server.requests.lock().len(), 1);
+    assert_eq!(a.metrics().reasoning_interceptions, 0);
+}
+
+#[test]
+fn child_reasoning_uses_the_same_gate_and_bounded_recovery() {
+    let main = serve(vec![Reply::Call("task", json!({"agent":"worker","prompt":"inspect"})), Reply::Text("received")]);
+    let think = || Reply::Think { reasoning: "r".repeat(256), pause: Duration::ZERO };
+    let side = serve(vec![think(), think(), Reply::Text("must not request")]);
+    let mut e = env(&main.url, "auto");
+    e.config.reasoning_guard.max_reasoning_bytes = 256;
+    with_subagent_role(&mut e, &side.url);
+    run_turn(&e, &mut Recorder::default());
+    assert_eq!(side.requests.lock().len(), 2);
+    assert!(task_result(&main).contains("one recovery attempt"));
+    assert!(!e.project.path().join("gate-leak.txt").exists());
+}
+
+#[test]
+fn reasoning_guard_settings_load_defaults_and_validate_limits() {
+    let e = env("http://127.0.0.1:1/v1", "auto");
+    assert!(e.config.reasoning_guard.enabled);
+    assert_eq!(e.config.reasoning_guard.max_pre_action_secs, 60);
+    let overlay = toml::from_str("[reasoning_guard]\nenabled = false\nmax_pre_action_secs = 120\nmax_reasoning_bytes = 4096").unwrap();
+    let mut config = Config::load(&e.layout, Some(overlay)).unwrap();
+    assert!(!config.reasoning_guard.enabled);
+    assert_eq!(config.reasoning_guard.max_reasoning_bytes, 4096);
+    config.reasoning_guard.max_pre_action_secs = 0;
+    assert!(config.validate().unwrap_err().to_string().contains("max_pre_action_secs"));
+    config.reasoning_guard.max_pre_action_secs = 1;
+    config.reasoning_guard.max_reasoning_bytes = 255;
+    assert!(config.validate().unwrap_err().to_string().contains("max_reasoning_bytes"));
+}
+
+#[test]
+fn codebase_understanding_is_saved_across_new_sessions_and_invalidated_by_edits() {
+    let server = serve(vec![
+        Reply::Call("read", json!({"path":"src/router.rs"})),
+        Reply::Call("codebase_memory", json!({"action":"remember","topic":"request routing","summary":"Router forwards requests into storage.","sources":["src/router.rs"]})),
+        Reply::Text("understood"), Reply::Text("reused"), Reply::Text("refreshed"),
+    ]);
+    let e = env(&server.url, "ask");
+    std::fs::create_dir(e.project.path().join("src")).unwrap();
+    std::fs::write(e.project.path().join("src/router.rs"), "//! Routes requests into storage.\npub fn route_request() {}\n").unwrap();
+    let mut first = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let first_id = first.session().id().to_owned();
+    let mut ui = Recorder::default();
+    assert_eq!(first.turn("understand request routing", &mut ui).unwrap().text, "understood");
+    assert!(ui.approvals.is_empty(), "saving harness knowledge must not ask to mutate project files");
+    drop(first);
+    let mut second = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    assert_ne!(first_id, second.session().id());
+    assert_eq!(second.turn("change request routing", &mut Recorder::default()).unwrap().text, "reused");
+    std::fs::write(e.project.path().join("src/router.rs"), "pub fn new_routing_path() {}\n").unwrap();
+    assert_eq!(second.turn("change request routing again", &mut Recorder::default()).unwrap().text, "refreshed");
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 5);
+    assert!(requests[0]["messages"].to_string().contains("route_request"), "automatic index should be available before any model tool call");
+    let reused = requests[3]["messages"].to_string();
+    assert!(reused.contains("Router forwards requests into storage.") && reused.contains(&first_id), "{reused}");
+    let newest = requests[4]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "user").unwrap().to_string();
+    assert!(newest.contains("needs refresh") && newest.contains("new_routing_path"), "{newest}");
+    assert!(!newest.contains("Router forwards requests into storage.") && !newest.contains("route_request"));
+    for pair in requests[..3].windows(2) { assert_eq!(pair[0]["messages"][0], pair[1]["messages"][0], "saved context must not rewrite the system prompt mid-turn"); }
+}
+
+#[test]
+fn independent_child_reuses_saved_codebase_context() {
+    let main = serve(vec![Reply::Call("task", json!({"prompt":"inspect request router"})), Reply::Text("received")]);
+    let side = serve(vec![Reply::Text("located")]);
+    let mut e = env(&main.url, "auto");
+    std::fs::write(e.project.path().join("router.rs"), "pub fn request_router() {}\n").unwrap();
+    with_subagent_role(&mut e, &side.url);
+    run_turn(&e, &mut Recorder::default());
+    let child = side.requests.lock()[0].clone();
+    assert_eq!(child["messages"][1]["content"], "inspect request router");
+    assert!(child["messages"].to_string().contains("request_router") && child["messages"].to_string().contains("Saved codebase understanding"));
+}
+
+#[test]
+fn disabling_codebase_context_preserves_session_only_behavior() {
+    let server = serve(vec![Reply::Text("done")]);
+    let mut e = env(&server.url, "auto");
+    e.config.codebase.enabled = false;
+    std::fs::write(e.project.path().join("router.rs"), "pub fn request_router() {}\n").unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    assert!(!a.available_tool_names().iter().any(|name| name == "codebase_memory"));
+    a.turn("inspect router", &mut Recorder::default()).unwrap();
+    assert!(!server.requests.lock()[0]["messages"].to_string().contains("Saved codebase understanding"));
+    assert!(!e.layout.state_dir.join("codebase.sqlite3").exists());
 }
 
 #[test]
@@ -1252,7 +1606,7 @@ fn image_read_attaches_validated_bytes_without_persisting_base64() {
     let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD,
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=").unwrap();
     std::fs::write(e.project.path().join("tiny.png"), png).unwrap();
-    let backend = make_backend(&e.config).unwrap().with_metadata(dial::llm::catalog::ModelMetadata { vision:Some(true), pricing:None });
+    let backend = make_backend(&e.config).unwrap().with_metadata(dial::llm::catalog::ModelMetadata { vision:Some(true), ..Default::default() });
     let session = Session::create(&e.layout, SessionMeta { model:"scripted".into() }).unwrap();
     let mut a = Agent::interactive(&e.config, backend, e.layout.clone(), session, None, None, Arc::new(AtomicBool::new(false))).unwrap();
     a.turn("read the image", &mut Recorder::default()).unwrap();
@@ -1298,6 +1652,58 @@ fn failed_focused_check_repairs_boundedly_and_never_reports_success() {
     let rollback = a.checkpoints().unwrap().rollback(1).unwrap();
     assert_eq!(rollback.removed, ["marker.txt"]);
     assert!(!e.project.path().join("marker.txt").exists());
+}
+
+#[test]
+fn closing_a_step_needs_evidence_runs_focused_checks_and_a_failure_keeps_it_open() {
+    let plan = json!({"op":"set","tasks":[{"content":"write marker"},{"content":"report"}]});
+    let server = serve(vec![
+        Reply::Call("todo", plan),
+        Reply::Call("write", json!({"path":"marker.txt","content":"bad"})),
+        close_todo(),
+        Reply::Call("write", json!({"path":"marker.txt","content":"fixed"})),
+        close_todo(),
+        close_todo(),
+        Reply::Calls(vec![("read", json!({"path":"marker.txt"})), ("todo", json!({"op":"done"}))]),
+        Reply::Call("finish", json!({"outcome":"completed","summary":"Marker fixed."})),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.verification.commands.push(VerificationCommand {
+        name: "marker-fixed".into(), command: "grep -q fixed marker.txt".into(), file_extensions: vec![], timeout_secs: 10,
+    });
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let report = a.turn("create marker", &mut ui).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    let requests = server.requests.lock();
+    assert!(requests[3]["messages"].to_string().contains("Step not closed: focused checks failed"), "the failed step stays open with diagnostics");
+    assert!(requests[5]["messages"].to_string().contains("Focused checks passed: marker-fixed"));
+    assert!(requests[6]["messages"].to_string().contains("no tool has run since it started"), "a step closed with no work stays open");
+    // One failed and one passing run at step boundaries; the last step made no edits and the turn-end
+    // verification would only repeat a passing check.
+    assert_eq!(ui.calls.iter().filter(|c| *c == "bash").count(), 2, "{:?}", ui.calls);
+    assert!(!a.todo().has_open());
+}
+
+#[test]
+fn the_current_step_rides_at_the_end_of_requests_without_entering_history() {
+    let server = serve(vec![
+        Reply::Call("todo", json!({"op":"set","tasks":[{"content":"inspect notes"},{"content":"summarize notes"}]})),
+        Reply::Call("read", json!({"path":"notes.txt"})),
+        Reply::Call("finish", json!({"outcome":"needs_input","summary":"Paused","reason":"Which format?"})),
+    ]);
+    let e = env(&server.url, "auto");
+    std::fs::write(e.project.path().join("notes.txt"), "hello\n").unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    a.turn("summarize notes", &mut Recorder::default()).unwrap();
+    let requests = server.requests.lock();
+    let (first, second) = (requests[1]["messages"].as_array().unwrap(), requests[2]["messages"].as_array().unwrap());
+    let focus = first.last().unwrap();
+    assert_eq!(focus["role"], "user");
+    assert!(focus["content"].as_str().unwrap().contains("Current step (0/2 done): 1. inspect notes."), "{focus}");
+    assert_eq!(first[..first.len() - 1], second[..first.len() - 1], "everything before the focus stays a stable prefix");
+    assert_eq!(second.last().unwrap()["role"], "user", "the next request carries its own focus after the new tool result");
+    assert!(!a.session().messages().iter().any(|m| m.to_string().contains("Task focus")), "the focus is never stored");
 }
 
 #[test]
@@ -1849,6 +2255,7 @@ fn cut_off_replies_do_not_spend_the_step_budget() {
     let server = serve(vec![Reply::Cut, Reply::Cut, Reply::Call("read", json!({"path":"f.txt"})), Reply::Text("done")]);
     let mut e = env(&server.url, "auto");
     e.config.harness.max_steps = 2;
+    e.config.reasoning_guard.enabled = false;
     std::fs::write(e.project.path().join("f.txt"), "x").unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("read f.txt", &mut Recorder::default()).unwrap();
@@ -1929,4 +2336,199 @@ fn a_session_switch_forgets_the_previous_sessions_token_count() {
     a.record_prompt_usage(4000);
     a.swap_session(Session::ephemeral());
     assert_eq!(a.last_prompt_tokens, 0);
+}
+
+#[test]
+fn extended_inspection_requires_real_todos_and_allows_discovered_work() {
+    let mut script: Vec<_> = (0..6).map(|n| Reply::Call("read", json!({"path":format!("{n}.txt")}))).collect();
+    script.extend([
+        Reply::Call("write", json!({"path":"must-not-exist.txt","content":"bypass plan"})),
+        Reply::Call("todo", json!({"op":"set","tasks":[{"content":"Which check establishes correctness?","investigation":true}]})),
+        Reply::Call("read", json!({"path":"0.txt"})),
+        Reply::Call("todo", json!({"op":"append","tasks":[{"content":"Check the newly discovered boundary"}]})),
+        Reply::Call("finish", json!({"outcome":"needs_input","summary":"Need the expected boundary","reason":"What value should the boundary accept?"})),
+    ]);
+    let server = serve(script);
+    let e = env(&server.url, "auto");
+    for n in 0..6 { std::fs::write(e.project.path().join(format!("{n}.txt")), format!("evidence {n}")).unwrap(); }
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a.turn("Investigate the checks", &mut Recorder::default()).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::NeedsInput);
+    assert!(!e.project.path().join("must-not-exist.txt").exists(), "non-planning calls cannot bypass the checkpoint");
+    let requests = server.requests.lock();
+    let names = |n: usize| requests[n]["tools"].as_array().unwrap().iter().map(|s| s["function"]["name"].as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(names(6), ["todo"]);
+    assert_eq!(names(7), ["todo"], "a rejected bypass does not remove the checkpoint");
+    assert!(names(8).contains(&"read"), "normal tools return after an actual plan is created");
+    assert_eq!(a.todo().tasks()[0].content, "Which check establishes correctness?");
+    assert_eq!(a.todo().tasks()[1].content, "Check the newly discovered boundary");
+}
+
+#[test]
+fn independent_training_failure_gets_one_repair_and_only_success_is_harvestable() {
+    if dial::tools::sandbox::already_sandboxed() { return; }
+    let server=serve(vec![Reply::Text("wrong"),Reply::Text("42")]);
+    let state=tempfile::tempdir().unwrap();
+    let project=tempfile::tempdir().unwrap();
+    let mut config=Config::default();
+    config.endpoint=Some(dial::config::types::EndpointConfig { base_url:server.url.clone(),api_key_env:None,allow_insecure:false }); config.model="test-model".into();
+    config.state_dir=state.path().into(); config.project_root=project.path().into();
+    let store=Store::open(state.path(),&config.model,"test",&config.harness).unwrap();
+    let passed=dial::agent::selfplay_run(&mut dial::agent::Runtime::new(),&config,&store,&store.active().unwrap(),"repair-test","Return 42",&Default::default(),&dial::learn::verify::Check::AnswerExact{expected:"42".into()}).unwrap();
+    assert!(passed);
+    let requests=server.requests.lock();
+    assert_eq!(requests.len(),2);
+    assert!(requests[1]["messages"].as_array().unwrap().iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("independent training-task verifier rejected"))));
+    let successes=store.verified_successes(100.0,10).unwrap();
+    assert_eq!(successes.len(),1);
+}
+
+#[test]
+fn isolated_search_applies_smallest_verified_patch_without_touching_other_files() {
+    let main_step = AtomicUsize::new(0);
+    let server = serve_fn(Arc::new(move |request| {
+        let main = request["tools"].as_array().is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == "solve"));
+        if main {
+            return match main_step.fetch_add(1, Ordering::SeqCst) {
+                0 => Reply::Call("solve", json!({
+                    "goal":"Make value.txt begin with fixed", "allowed_paths":["value.txt"],
+                    "candidates":["minimal fix", "include extra explanatory content"],
+                    "checks":[{"command":"test \"$(head -n 1 value.txt)\" = fixed","timeout_secs":5}]
+                })),
+                _ => Reply::Text("Both candidates were checked; the smaller patch was applied."),
+            };
+        }
+        let messages = request["messages"].as_array().unwrap();
+        if messages.iter().any(|m| m["role"] == "tool") { return Reply::Text("Patch implemented."); }
+        let extra = messages.iter().any(|m| m["content"].as_str().is_some_and(|s| s.contains("include extra explanatory content")));
+        Reply::Call("write", json!({"path":"value.txt","content":if extra {"fixed\nextra\n"} else {"fixed\n"}}))
+    }), None, None);
+    let mut e = env(&server.url, "auto");
+    e.config.solve.enabled = true;
+    e.config.harness.tools.push("solve".into());
+    std::fs::write(e.project.path().join("value.txt"), "broken\n").unwrap();
+    std::fs::write(e.project.path().join("unrelated.txt"), "dirty user work\n").unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a.turn("Fix the value using verified candidates", &mut Recorder::default()).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert_eq!(std::fs::read_to_string(e.project.path().join("value.txt")).unwrap(), "fixed\n");
+    assert_eq!(std::fs::read_to_string(e.project.path().join("unrelated.txt")).unwrap(), "dirty user work\n");
+    let requests = server.requests.lock();
+    assert!(requests.last().unwrap()["messages"].to_string().contains("\\\"winner\\\":1"));
+}
+
+#[test]
+fn escalation_rejects_nonlocal_route_before_disclosing_evidence() {
+    let server = serve(vec![
+        Reply::Call("escalate", json!({"goal":"Fix behavior","question":"Which invariant is missing?",
+            "evidence":["PRIVATE_PROJECT_EVIDENCE"],"rejected_hypotheses":["syntax alone"]})),
+        Reply::Text("Remote escalation requires operator opt-in."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.escalation.enabled = true;
+    e.config.harness.tools.push("escalate".into());
+    e.config.model_roles.insert("stronger".into(), dial::llm::model_config::ModelSelection {
+        provider: "endpoint".into(), model: "stronger".into(),
+        base_url: Some("https://must-not-contact.invalid/v1".into()), ..Default::default()
+    });
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    a.turn("Ask a narrow question", &mut Recorder::default()).unwrap();
+    assert_eq!(server.requests.lock().len(), 2);
+    assert!(a.session().messages().iter().any(|m| m["role"] == "tool"
+        && m["content"].as_str().is_some_and(|s| s.contains("allow_remote"))));
+}
+
+#[test]
+fn behavioral_repairs_retain_failure_and_pass_without_marking_task_success() {
+    let command = "test \"$(cat value.txt)\" = fixed";
+    let server = serve(vec![
+        Reply::Call("bash", json!({"command":command})),
+        Reply::Call("write", json!({"path":"value.txt","content":"fixed\n"})),
+        Reply::Call("bash", json!({"command":command})),
+        Reply::Text("The declared behavioral check passes."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.verification.commands.push(VerificationCommand {
+        name:"value_behavior".into(),command:command.into(),file_extensions:vec!["txt".into()],timeout_secs:5
+    });
+    e.config.verification.behavioral_checks.push("value_behavior".into());
+    std::fs::write(e.project.path().join("value.txt"),"broken\n").unwrap();
+    let store = Store::open(&e.layout.state_dir,"scripted","coding",&e.config.harness).unwrap();
+    let mut a = agent_with(&e,Some(&store),Arc::new(AtomicBool::new(false)));
+    a.turn("Fix the value", &mut Recorder::default()).unwrap();
+    let records = store.recent_executable_repairs(&e.project.path().canonicalize().unwrap().to_string_lossy(), 10).unwrap();
+    assert_eq!(records.len(),1, "{records:?}");
+    let record = &records[0].1;
+    assert_eq!(record["kind"],"behavioral");
+    assert_eq!(record["before"]["exit_code"],1);
+    assert_eq!(record["after"]["exit_code"],0);
+    assert_ne!(record["changes"][0]["before_sha256"],record["changes"][0]["after_sha256"]);
+    let before_ref = record["changes"][0]["before_ref"].as_str().unwrap();
+    let artifacts = dial::tools::artifact::ArtifactStore::new(&e.layout.state_dir.join("artifacts")).unwrap();
+    assert!(artifacts.retrieve(before_ref, 1, 10).unwrap().contains("1:broken\n"));
+}
+
+#[test]
+fn harness_records_behavioral_failure_before_the_model_edits() {
+    if dial::tools::sandbox::already_sandboxed() { return; }
+    let command="test \"$(cat value.txt)\" = fixed";
+    let server=serve(vec![
+        Reply::Call("write",json!({"path":"value.txt","content":"fixed\n"})),
+        Reply::Text("Fixed."),
+    ]);
+    let mut e=env(&server.url,"auto");
+    e.config.verification.commands.push(VerificationCommand {name:"behavior".into(),command:command.into(),file_extensions:vec!["txt".into()],timeout_secs:5});
+    e.config.verification.behavioral_checks.push("behavior".into());
+    std::fs::write(e.project.path().join("value.txt"),"broken\n").unwrap();
+    let store=Store::open(&e.layout.state_dir,"scripted","coding",&e.config.harness).unwrap();
+    let mut a=agent_with(&e,Some(&store),Arc::new(AtomicBool::new(false)));
+    a.turn("Fix the value",&mut Recorder::default()).unwrap();
+    assert!(server.requests.lock()[0]["messages"].to_string().contains("failures predate this turn"));
+    let records=store.recent_executable_repairs(&e.project.path().canonicalize().unwrap().to_string_lossy(),10).unwrap();
+    assert_eq!(records.len(),1);
+    assert_eq!(records[0].1["before"]["exit_code"],1);
+    assert_eq!(records[0].1["after"]["exit_code"],0);
+}
+
+#[test]
+fn silent_serial_and_parallel_subagents_keep_ui_alive_and_cancel_before_late_tools() {
+    struct CancelOnHeartbeat {
+        interrupt: Arc<AtomicBool>,
+        child_started: bool,
+        ticks: usize,
+    }
+    impl Ui for CancelOnHeartbeat {
+        fn notice(&mut self, text: &str) {
+            if text.starts_with("subagent ") && text.contains("(1/") { self.child_started = true; }
+        }
+        fn heartbeat(&mut self) {
+            if self.child_started {
+                self.ticks += 1;
+                if self.ticks >= 3 { self.interrupt.store(true, Ordering::SeqCst); }
+            }
+        }
+        fn approve(&mut self, _: &str, _: &str) -> Decision { Decision::Allow }
+    }
+    for task in [
+        json!({"agent":"worker","prompt":"Implement a fix"}),
+        json!({"agent":"scout","prompt":"Inspect the code"}),
+        json!({"tasks":[{"agent":"scout","prompt":"Inspect A"},{"agent":"scout","prompt":"Inspect B"}]}),
+    ] {
+        let request_number = AtomicUsize::new(0);
+        let server = serve_fn(Arc::new(move |_| {
+            if request_number.fetch_add(1, Ordering::SeqCst) == 0 { Reply::Call("task", task.clone()) }
+            else { Reply::Think { reasoning: "Considering the request".into(), pause: Duration::from_secs(3) } }
+        }), None, None);
+        let mut e = env(&server.url, "auto");
+        e.config.harness.tools.push("task".into());
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let mut ui = CancelOnHeartbeat { interrupt: interrupt.clone(), child_started: false, ticks: 0 };
+        let mut agent = agent_with(&e, None, interrupt);
+        let started = Instant::now();
+        let report = agent.turn("Delegate the work", &mut ui).unwrap();
+        assert!(report.interrupted, "heartbeat-triggered cancellation must reach the child");
+        assert!(ui.ticks >= 3, "silent child must not block the UI owner");
+        assert!(started.elapsed() < Duration::from_secs(2), "cancel must not wait for a child reply");
+        assert!(!e.project.path().join("gate-leak.txt").exists(), "late streamed writes cannot execute");
+    }
 }

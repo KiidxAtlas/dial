@@ -23,11 +23,11 @@ const CONTEXT_CRITICAL: f64 = 0.85;
 pub fn segments(cfg: &UiConfig) -> (Vec<String>, Vec<String>) {
     let names = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     match cfg.status {
-        StatusPreset::Default | StatusPreset::Nerd | StatusPreset::Ascii => (names(&["spinner", "model", "path", "git"]), names(&["context"])),
-        StatusPreset::Minimal => (names(&["model"]), names(&["context"])),
-        StatusPreset::Compact => (names(&["spinner", "model", "git"]), names(&["context", "tokens"])),
+        StatusPreset::Default | StatusPreset::Nerd | StatusPreset::Ascii => (names(&["spinner", "model", "thinking", "path", "git"]), names(&["context"])),
+        StatusPreset::Minimal => (names(&["model", "thinking"]), names(&["context"])),
+        StatusPreset::Compact => (names(&["spinner", "model", "thinking", "git"]), names(&["context", "tokens"])),
         StatusPreset::Full => (
-            names(&["spinner", "model", "role", "path", "git", "approval", "sandbox"]),
+            names(&["spinner", "model", "thinking", "role", "path", "git", "approval", "sandbox"]),
             names(&["tokens", "rate", "learning", "context"]),
         ),
         StatusPreset::Custom => (cfg.status_left.clone(), cfg.status_right.clone()),
@@ -108,6 +108,7 @@ fn canonical(name: &str) -> Option<(&'static str, u8)> {
         "model" => ("model", 100),
         "context" => ("context", 90),
         "spinner" => ("spinner", 80),
+        "thinking" | "reasoning" => ("thinking", 85),
         "path" => ("path", 60),
         "role" => ("role", 55),
         "git" => ("git", 50),
@@ -170,10 +171,18 @@ impl Env<'_> {
                 let provider = provider.trim();
                 let short = short_model(model);
                 let label = if provider.is_empty() { short } else { format!("{provider}/{short}") };
+                let lora = data.lora.label();
+                let lora_tok = match data.lora { super::status::Lora::Loaded | super::status::Lora::Used => Tok::Success, super::status::Lora::Training | super::status::Lora::Evaluating | super::status::Lora::Loading => Tok::StatusLearning, _ => Tok::Muted };
                 self.seg(name, importance, vec![
                     self.icon(Sym::IconModel, Tok::StatusModel, ""),
                     Some(self.shrinkable(label, Tok::StatusModel, Shrink::Tail)),
+                    (!lora.is_empty()).then(|| self.part(format!(" {} {lora}", self.theme.sym(Sym::Dot)), lora_tok)),
                 ])
+            }
+            "thinking" => {
+                let level = text::one_line(&data.thinking);
+                if level.trim().is_empty() { return None; }
+                self.seg(name, importance, vec![Some(self.part(format!("think {}", level.trim()), Tok::Accent))])
             }
             "role" => {
                 let role = text::one_line(&data.role);
@@ -488,6 +497,33 @@ mod tests {
         StatusSeparator::Block, StatusSeparator::None, StatusSeparator::Ascii,
     ];
 
+    #[test]
+    fn thinking_is_visible_in_presets_and_fits_narrow_terminals() {
+        for preset in ALL_PRESETS {
+            let cfg = UiConfig { status_left: vec!["model".into(), "reasoning".into()], ..cfg_with(preset) };
+            for level in ["high", "off", "on", "default", "unsupported"] {
+                let data = StatusData { thinking: level.into(), ..data() };
+                assert!(plain(&render(&cfg, &data, 200)).contains(&format!("think {level}")));
+                for width in 1..100 { assert_eq!(render(&cfg, &data, width).width(), width as usize); }
+            }
+            assert!(!plain(&render(&cfg, &data(), 200)).contains("think "));
+        }
+    }
+
+    #[test]
+    fn the_model_segment_reports_lora_state() {
+        use crate::ui::status::Lora;
+        let row = |lora| plain(&render(&UiConfig::default(), &StatusData { lora, ..data() }, 100));
+        assert!(row(Lora::Active(3)).contains("LoRA accepted v3"), "{}", row(Lora::Active(3)));
+        assert!(row(Lora::Ready).contains("LoRA awaiting training"));
+        for state in [Lora::Training, Lora::Evaluating, Lora::Loading, Lora::Loaded, Lora::Used, Lora::Failed] {
+            assert!(row(state).contains(&state.label()), "{}", row(state));
+        }
+        assert!(row(Lora::Off).contains("LoRA off"));
+        assert!(row(Lora::Unsupported).contains("no LoRA"));
+        assert!(!row(Lora::Unknown).contains("LoRA"), "unknown is not guessed");
+    }
+
     fn busy_full() -> StatusData {
         StatusData {
             role: "subagent".into(), approval: "ask".into(), sandbox: "workspace".into(), version: Some(3), learning: "idle".into(),
@@ -499,11 +535,11 @@ mod tests {
     #[test]
     fn presets_map_to_their_segment_lists_and_custom_uses_the_configured_ones() {
         let names = |s: &[&str]| s.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
-        assert_eq!(segments(&cfg_with(StatusPreset::Default)), (names(&["spinner", "model", "path", "git"]), names(&["context"])));
-        assert_eq!(segments(&cfg_with(StatusPreset::Minimal)), (names(&["model"]), names(&["context"])));
-        assert_eq!(segments(&cfg_with(StatusPreset::Compact)), (names(&["spinner", "model", "git"]), names(&["context", "tokens"])));
+        assert_eq!(segments(&cfg_with(StatusPreset::Default)), (names(&["spinner", "model", "thinking", "path", "git"]), names(&["context"])));
+        assert_eq!(segments(&cfg_with(StatusPreset::Minimal)), (names(&["model", "thinking"]), names(&["context"])));
+        assert_eq!(segments(&cfg_with(StatusPreset::Compact)), (names(&["spinner", "model", "thinking", "git"]), names(&["context", "tokens"])));
         assert_eq!(segments(&cfg_with(StatusPreset::Full)), (
-            names(&["spinner", "model", "role", "path", "git", "approval", "sandbox"]),
+            names(&["spinner", "model", "thinking", "role", "path", "git", "approval", "sandbox"]),
             names(&["tokens", "rate", "learning", "context"])));
         assert_eq!(segments(&cfg_with(StatusPreset::Nerd)), segments(&cfg_with(StatusPreset::Default)));
         assert_eq!(segments(&cfg_with(StatusPreset::Ascii)), segments(&cfg_with(StatusPreset::Default)));

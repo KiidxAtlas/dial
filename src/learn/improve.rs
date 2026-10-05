@@ -8,12 +8,12 @@
 //!   mutations) -> sealed gate (fresh random instances, held-out families, frozen anchor suite) ->
 //!   admit at most one.
 use crate::{
-    agent::{self, Runtime, truncate},
+    agent::{self, Runtime},
     config::types::{Admission, Config, Harness, Proposal, Version},
     learn::{
         curriculum::{self, Role, Task},
         gate::{self, Case, Rules, Suite},
-        harvest, mutate, probe, worker,
+        harvest, mutate, probe, worker, workflow,
     },
     storage::store::{Store, TrainingState},
 };
@@ -48,8 +48,9 @@ pub fn pin_models(config: &mut Config, store: &Store, feedback: bool) -> Result<
         store.set_meta("serving_capabilities", &caps.to_string())?;
         caps
     } else {
-        let caps = if let Some(saved) = store.get_meta("serving_capabilities")? {
-            serde_json::from_str::<Value>(&saved)?
+        let saved = store.get_meta("serving_capabilities")?.map(|raw| serde_json::from_str::<Value>(&raw)).transpose()?;
+        let caps = if let Some(saved) = saved.filter(worker::current_lora_probe) {
+            saved
         } else {
             let caps = worker::capabilities(config)?;
             ensure!(caps["inference"] == true, "selected serving model is unsupported: {}", caps["reason"]);
@@ -110,22 +111,30 @@ pub fn build_evaluation(config: &Config, store: &Store) -> Result<Evaluation> {
         Some(s) => s.parse::<u64>().context("corrupt anchor seed")?,
         None => { let s: u64 = rand::rng().random(); store.set_meta("anchor_seed", &s.to_string())?; s }
     };
-    let suites = vec![
+    let mut suites = vec![
         suite_from("tools", true, curriculum::generate(Role::Primary, i.gate_primary_cases.max(6) as usize, seed)),
         suite_from("general", false, curriculum::generate(Role::Guard, i.gate_guard_cases.max(4) as usize, seed ^ 0x9E37_79B9_7F4A_7C15)),
         suite_from("anchor", false, curriculum::generate(Role::Anchor, 24, anchor_seed)),
+        suite_from("failure-transfer", false, curriculum::generate_failure_holdout(6, seed ^ 0xFA11_401D)),
     ];
+    let repository = super::repository::load(config)?;
+    let cases = repository.iter().filter(|task| task.spec.split == "evaluation").map(|snapshot| {
+        let task = snapshot.task();
+        Case { id:format!("repository-{}",snapshot.spec.id),prompt:task.prompt,files:task.files,check:task.check }
+    }).collect::<Vec<_>>();
+    if !cases.is_empty() { suites.push(Suite { name:"repository".into(),primary:false,cases }); }
     let rules = Rules { max_regression: 1.0, min_improvement: 0.1, alpha: i.alpha / f64::from(i.max_candidates), min_net_wins: i.min_net_wins };
     Ok(Evaluation { held_out: gate::held_out_prompts(&suites), anchor: Some(2), suites, rules, manual: false })
 }
 
-type Cache = HashMap<(i64, String), bool>;
+type Cache = HashMap<(i64, String), workflow::CaseMeasurement>;
 
 fn run_case(runtime: &mut Runtime, config: &Config, cache: &mut Cache, v: &Version, case: &Case, last_error: &mut Option<String>) -> Result<bool> {
+    super::auto::check_stop(config)?;
     let key = (v.id, case.id.clone());
-    if let Some(r) = cache.get(&key) { return Ok(*r); }
-    match agent::check_case(runtime, config, v, &case.prompt, &case.files, &case.check) {
-        Ok(r) => { cache.insert(key, r); Ok(r) }
+    if let Some(r) = cache.get(&key) { return Ok(r.passed); }
+    match agent::check_case_measured(runtime, config, v, &case.prompt, &case.files, &case.check) {
+        Ok(r) => { let passed = r.passed; cache.insert(key, r); Ok(passed) }
         Err(_) => { *last_error = Some("private evaluation execution failed".into()); bail!("private evaluation execution failed") }
     }
 }
@@ -135,6 +144,7 @@ fn run_case(runtime: &mut Runtime, config: &Config, cache: &mut Cache, v: &Versi
 /// the local server swap adapters on every case.
 fn evaluate_candidate(runtime: &mut Runtime, config: &Config, store: &Store, eval: &Evaluation, cache: &mut Cache,
                       baseline: &Version, candidate: &Version, progress: &mut dyn FnMut(&str)) -> Result<Admission> {
+    let _phase = if candidate.kind == "lora" { Some(LoraPhase::start(config, store, "evaluating")?) } else { None };
     verify_adapter(store, baseline)?;
     if let Some(path) = &candidate.adapter {
         let key = format!("adapter_digest:{}", candidate.id);
@@ -149,7 +159,14 @@ fn evaluate_candidate(runtime: &mut Runtime, config: &Config, store: &Store, eva
         }
     }
     progress(&format!("scoring candidate v{} ({})", candidate.id, candidate.kind));
-    let admission = gate::evaluate(&eval.rules, &eval.suites, baseline, candidate, |v, case| run_case(runtime, config, cache, v, case, &mut last_error));
+    let total = eval.suites.iter().map(|suite| suite.cases.len()).sum::<usize>() * 2;
+    let mut checked = 0;
+    let admission = gate::evaluate(&eval.rules, &eval.suites, baseline, candidate, |v, case| {
+        progress(&format!("evaluation check {}/{total} (v{}; cached results may be reused)", checked + 1, v.id));
+        let result = run_case(runtime, config, cache, v, case, &mut last_error);
+        checked += 1;
+        result
+    });
     let mut admission = match admission {
         Ok(a) => a,
         Err(error) => return Err(error.context("evaluation did not complete; private details withheld")),
@@ -164,6 +181,19 @@ fn evaluate_candidate(runtime: &mut Runtime, config: &Config, store: &Store, eva
             }
         }
     }
+    if workflow::is_candidate(candidate) {
+        let pairs = eval.suites.iter().flat_map(|suite| &suite.cases).map(|case| {
+            let baseline = cache.get(&(baseline.id, case.id.clone())).context("missing baseline workflow measurement")?;
+            let candidate = cache.get(&(candidate.id, case.id.clone())).context("missing candidate workflow measurement")?;
+            Ok((baseline.clone(), candidate.clone()))
+        }).collect::<Result<Vec<_>>>()?;
+        workflow::record_comparison(store, baseline, candidate, &mut admission, &pairs)?;
+    }
+    let pairs = eval.suites.iter().flat_map(|suite| &suite.cases).filter_map(|case| {
+        Some((super::task_policy::Kind::classify(&case.prompt), cache.get(&(baseline.id,case.id.clone()))?.clone(),cache.get(&(candidate.id,case.id.clone()))?.clone()))
+    }).collect::<Vec<_>>();
+    // Persist aggregate costs for all candidates; routing only reads a globally accepted version.
+    super::profiles::measure(store,baseline,candidate,&pairs)?;
     Ok(admission)
 }
 
@@ -222,6 +252,8 @@ pub struct Signals {
     pub selfplay_rates: Vec<(String, usize, usize)>,
     pub failure_kinds: BTreeMap<String, usize>,
     pub tool_errors: BTreeMap<String, usize>,
+    /// Closed taxonomy only: per-trajectory counts, never source code, prompts or gate results.
+    pub recurring_failures: BTreeMap<String, usize>,
     pub live_failures: usize,
     pub risky: Vec<(i64, f64)>,
 }
@@ -230,25 +262,60 @@ pub fn collect_signals(store: &Store, active: &Version, probe: Option<&probe::St
     let recent = store.recent(60)?;
     let mut signals = Signals { selfplay_rates: store.selfplay_rates(active.id)?, ..Signals::default() };
     for row in recent.as_array().into_iter().flatten() {
+        if row["version"].as_i64() != Some(active.id) { continue; }
         let mut failed = row.get("error").is_some_and(|v| !v.is_null())
             || row.pointer("/outcome/score").and_then(Value::as_f64).is_some_and(|s| s < 100.0);
+        let mut categories = HashSet::new();
+        let mut tools = HashSet::new();
         for event in row["events"].as_array().into_iter().flatten() {
             if event["kind"] == "tool_form_failure" {
                 failed = true;
-                let kind = event.pointer("/data/kind").and_then(Value::as_str).unwrap_or("unknown").to_owned();
-                *signals.failure_kinds.entry(kind).or_default() += 1;
-            } else if event["kind"] == "tool_error" && row["domain"].as_str().unwrap_or("").starts_with("selfplay:") {
-                // Runtime errors guide practice selection but are not positive/negative training labels.
-                let tool = event.pointer("/data/name").and_then(Value::as_str).unwrap_or("unknown");
-                *signals.tool_errors.entry(truncate(tool, 64)).or_default() += 1;
+                let kind = event.pointer("/data/kind").and_then(Value::as_str).unwrap_or("unknown");
+                if matches!(kind, "text_call" | "dropped_call" | "malformed_arguments" | "unknown_tool" | "schema") {
+                    *signals.failure_kinds.entry(kind.to_owned()).or_default() += 1;
+                }
+            } else if event["kind"] == "tool_error" {
+                let tool = event.pointer("/data/name").and_then(Value::as_str).unwrap_or("");
+                if matches!(tool, "bash" | "read" | "write" | "edit" | "grep" | "glob" | "find") {
+                    tools.insert(tool.to_owned());
+                }
             }
+            if let Some(category) = practice_category(event, failed) { categories.insert(category); }
         }
+        for tool in tools { *signals.tool_errors.entry(tool).or_default() += 1; }
+        for category in categories { *signals.recurring_failures.entry(category.to_owned()).or_default() += 1; }
         if failed && !row["domain"].as_str().unwrap_or("").starts_with("selfplay:") { signals.live_failures += 1; }
     }
     if let Some(p) = probe.filter(|p| probe::informative(p)) {
         signals.risky = probe::rank_risky(store, p, 40)?.into_iter().take(5).collect();
     }
     Ok(signals)
+}
+/// Map observed evidence to a small practice taxonomy, not a training label. A failed behavioral
+/// check can guide semantic practice; a successful syntax check cannot certify behavior.
+fn practice_category(event: &Value, failed: bool) -> Option<&'static str> {
+    let kind = event["kind"].as_str()?;
+    let data = &event["data"];
+    if kind == "verification" && data["passed"] == false && data["category"] == "behavioral" {
+        return Some("semantic_validation");
+    }
+    if kind == "tool_error" {
+        let output = data["output"].as_str().unwrap_or("").to_ascii_lowercase();
+        if ["configuration", "config precedence", "unknown field", "missing field"].iter().any(|term| output.contains(term)) {
+            return Some("config_precedence");
+        }
+        if matches!(data["name"].as_str(), Some("read" | "grep" | "glob" | "find")) {
+            return Some("negative_search");
+        }
+    }
+    // An empty search is legitimate. Practice it only when its enclosing turn actually failed.
+    if failed && kind == "tool_result" && matches!(data["name"].as_str(), Some("grep" | "glob" | "find")) {
+        let output = data["output"].as_str().unwrap_or("").to_ascii_lowercase();
+        if output.contains("no matches") || output.contains("no results") || output.contains("no source candidates") {
+            return Some("negative_search");
+        }
+    }
+    None
 }
 
 /// Map a weak observed tool category to training-family labels only; failures guide practice but
@@ -257,11 +324,11 @@ fn families_for_failure(kind: &str) -> &'static [&'static str] {
     match kind {
         "text_call" | "dropped_call" | "malformed_arguments" | "unknown_tool" | "schema" =>
             &["fix_bug_py", "rename_symbol", "json_set", "run_compute"],
-        "tool_error:bash" => &["run_compute", "fix_bug_py"],
-        "tool_error:read" => &["read_line", "list_by_ext", "count_matches"],
+        "tool_error:bash" => &["run_compute", "fix_bug_py", "semantic_validation"],
+        "tool_error:read" => &["read_line", "list_by_ext", "count_matches", "negative_search"],
         "tool_error:write" => &["create_file", "append_line", "json_set"],
         "tool_error:edit" => &["fix_bug_py", "rename_symbol", "replace_value"],
-        "tool_error:grep" | "tool_error:glob" => &["count_matches", "list_by_ext", "csv_lookup"],
+        "tool_error:grep" | "tool_error:glob" | "tool_error:find" => &["negative_search", "count_matches", "list_by_ext", "csv_lookup"],
         _ => &[],
     }
 }
@@ -287,6 +354,10 @@ fn targeted_selfplay_priorities(store: &Store, signals: &Signals) -> Result<Vec<
     for (tool, count) in &signals.tool_errors {
         let kind = format!("tool_error:{tool}");
         for family in families_for_failure(&kind) { add(family, count.saturating_mul(10)); }
+    }
+    // Recurrence is counted across trajectories, so one noisy failure cannot monopolize practice.
+    for (family, count) in &signals.recurring_failures {
+        if *count >= 2 { add(family, count.saturating_mul(50)); }
     }
     let risky: HashMap<i64, f64> = signals.risky.iter().copied().collect();
     if !risky.is_empty() {
@@ -324,6 +395,7 @@ pub fn diagnose(runtime: &mut Runtime, config: &Config, store: &Store, signals: 
     let mut request = json!({
         "use_case": config.use_case, "active": active, "weak_selfplay_families": weakest,
         "tool_call_failure_kinds": signals.failure_kinds, "tool_runtime_errors": signals.tool_errors,
+        "recurring_failure_categories": signals.recurring_failures,
         "live_failures_recent": signals.live_failures, "highest_risk_trajectories": signals.risky,
         "trajectories": bounded(&recent), "population": population,
         "approved_tools": crate::tools::default_tools().into_iter().chain(config.tools.keys().cloned()).collect::<Vec<_>>(),
@@ -355,6 +427,29 @@ pub fn diagnose(runtime: &mut Runtime, config: &Config, store: &Store, signals: 
 struct LoraCandidate {
     version: Version,
     commit: TrainingState,
+}
+
+// A held file lock makes progress live evidence, rather than a stale marker after a crash.
+struct LoraPhase<'a> { store: &'a Store, _lock: std::fs::File }
+impl<'a> LoraPhase<'a> {
+    fn start(config: &Config, store: &'a Store, phase: &str) -> Result<Self> {
+        use fs2::FileExt;
+        let lock = super::auto::lock_file(&config.state_dir.join("lora-progress.lock"))?;
+        lock.try_lock_exclusive()?;
+        store.set_meta("lora_phase", phase)?;
+        Ok(Self { store, _lock: lock })
+    }
+}
+impl Drop for LoraPhase<'_> {
+    fn drop(&mut self) { let _ = self.store.set_meta("lora_phase", "idle"); }
+}
+
+pub fn lora_phase(config: &Config, store: &Store) -> Option<String> {
+    let lock = std::fs::File::open(config.state_dir.join("lora-progress.lock")).ok()?;
+    match fs2::FileExt::try_lock_shared(&lock) {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => store.get_meta("lora_phase").ok().flatten(),
+        _ => None,
+    }
 }
 
 fn lora_candidate(runtime: &mut Runtime, config: &Config, store: &Store, active: &Version, eval: &Evaluation,
@@ -419,6 +514,8 @@ fn lora_candidate(runtime: &mut Runtime, config: &Config, store: &Store, active:
     store.set_meta("last_training_attempt", &now().to_string())?;
     // Free resident inference weights before the training worker loads the base model.
     runtime.release();
+    let _phase = LoraPhase::start(config, store, "training")?;
+    progress(&format!("training LoRA ({} iterations planned; awaiting worker result)", cfg.training.iters));
     let adapter = match worker::train(&cfg, active, &output) {
         Ok(a) => a,
         Err(error) => { store.set_meta("last_training_error", &format!("{error:#}"))?; return Ok(Err(format!("training failed: {error:#}"))); }
@@ -579,6 +676,64 @@ mod incremental_tests {
         assert!(tasks.iter().all(|task| priorities.contains(&task.family.to_owned())
             || curriculum::families().iter().any(|family| family.name == task.family && family.split == curriculum::Split::Train && family.needs_tools)));
     }
+
+    #[test]
+    fn practice_taxonomy_distinguishes_empty_results_and_behavioral_checks() {
+        let no_hits = json!({"kind":"tool_result","data":{"name":"grep","output":"No matches"}});
+        assert_eq!(practice_category(&no_hits, false), None);
+        assert_eq!(practice_category(&no_hits, true), Some("negative_search"));
+        let syntax = json!({"kind":"verification","data":{"passed":true,"category":"syntax_only"}});
+        assert_eq!(practice_category(&syntax, true), None);
+        let failed_syntax = json!({"kind":"verification","data":{"passed":false,"category":"syntax_only"}});
+        assert_eq!(practice_category(&failed_syntax, true), None);
+        let behavioral = json!({"kind":"verification","data":{"passed":false,"category":"behavioral"}});
+        assert_eq!(practice_category(&behavioral, false), Some("semantic_validation"));
+        let config = json!({"kind":"tool_error","data":{"name":"bash","output":"invalid configuration: unknown field PRIVATE_CODE"}});
+        assert_eq!(practice_category(&config, false), Some("config_precedence"));
+    }
+
+    #[test]
+    fn recurring_failures_count_trajectories_without_copying_private_content() {
+        use crate::config::types::Event;
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let store = Store::open(dir.path(), "test-model", "test", &config.harness).unwrap();
+        let active = store.active().unwrap();
+        for _ in 0..2 {
+            let id = store.begin_trajectory(active.id, "live", "task", "PRIVATE_USER_CODE").unwrap();
+            for step in 0..3 {
+                store.event(&Event {
+                    trajectory: id, version: active.id, domain: "live".into(), task: "task".into(),
+                    step, kind: "tool_error".into(),
+                    data: json!({"name":"bash","output":"invalid configuration PRIVATE_USER_CODE"}), score: None,
+                }).unwrap();
+            }
+            store.finish_trajectory(id, None, Some("failed")).unwrap();
+        }
+        let signals = collect_signals(&store, &active, None).unwrap();
+        assert_eq!(signals.recurring_failures, BTreeMap::from([("config_precedence".into(), 2)]));
+        assert_eq!(signals.tool_errors, BTreeMap::from([("bash".into(), 2)]));
+        let priorities = targeted_selfplay_priorities(&store, &signals).unwrap();
+        assert_eq!(priorities.first().map(String::as_str), Some("config_precedence"));
+        let tasks = curriculum::generate_targeted(Role::SelfPlay, 12, 9, &priorities);
+        assert!(tasks.iter().all(|task| !task.prompt.contains("PRIVATE_USER_CODE")
+            && task.files.values().all(|text| !text.contains("PRIVATE_USER_CODE"))));
+    }
+
+    #[test]
+    fn single_category_occurrence_does_not_override_practice_and_gate_labels_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let store = Store::open(dir.path(), "test-model", "test", &config.harness).unwrap();
+        let mut signals = Signals { recurring_failures: BTreeMap::from([
+            ("config_precedence".into(), 1), ("config_layers".into(), 100),
+            ("semantic_validation".into(), 2),
+        ]), ..Signals::default() };
+        assert_eq!(targeted_selfplay_priorities(&store, &signals).unwrap(), vec!["semantic_validation"]);
+        signals.recurring_failures.insert("config_precedence".into(), 3);
+        assert_eq!(targeted_selfplay_priorities(&store, &signals).unwrap(),
+            vec!["config_precedence", "semantic_validation"]);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -605,6 +760,7 @@ pub fn monitor(store: &Store, config: &Config) -> Result<Option<String>> {
 // The cycle.
 
 pub fn run_cycle(runtime: &mut Runtime, config: &Config, store: &Store, force: bool, progress: &mut dyn FnMut(&str)) -> Result<Value> {
+    super::auto::check_stop(config)?;
     let started = now();
     let mut steps: Vec<Value> = Vec::new();
     let note = |steps: &mut Vec<Value>, kind: &str, data: Value| steps.push(json!({"step": kind, "data": data}));
@@ -630,9 +786,11 @@ pub fn run_cycle(runtime: &mut Runtime, config: &Config, store: &Store, force: b
         let prior_signals = collect_signals(store, &active, probe.as_ref())?;
         let priorities = targeted_selfplay_priorities(store, &prior_signals)?;
         note(&mut steps, "selfplay_targets", json!({"families":priorities}));
-        let tasks = curriculum::generate_targeted(Role::SelfPlay, n, rand::rng().random(), &priorities);
+        let tasks = curriculum::generate_targeted(Role::SelfPlay, n, rand::rng().random(), &priorities)
+            .into_iter().filter(|task| !eval.held_out.contains(task.prompt.trim())).collect::<Vec<_>>();
         let (mut passed, mut total) = (0usize, 0usize);
         for (i, task) in tasks.iter().enumerate() {
+            super::auto::check_stop(config)?;
             progress(&format!("self-play {}/{} ({})", i + 1, tasks.len(), task.family));
             match agent::selfplay_run(runtime, config, store, &active, task.family, &task.prompt, &task.files, &task.check) {
                 Ok(ok) => { total += 1; passed += usize::from(ok); }
@@ -642,14 +800,24 @@ pub fn run_cycle(runtime: &mut Runtime, config: &Config, store: &Store, force: b
         note(&mut steps, "selfplay", json!({"passed":passed,"total":total}));
     }
 
+    // Replay only explicitly registered training snapshots; evaluation snapshots never enter trajectories.
+    for snapshot in super::repository::load(config)?.iter().filter(|s| s.spec.split == "train").take(4) {
+        super::auto::check_stop(config)?;
+        let task = snapshot.task();
+        progress(&format!("repository practice: {}", snapshot.spec.id));
+        let passed = agent::selfplay_run(runtime, config, store, &active, task.family, &task.prompt, &task.files, &task.check)?;
+        note(&mut steps,"repository_practice",json!({"id":snapshot.spec.id,"passed":passed}));
+    }
+    super::auto::check_stop(config)?;
     let report = harvest::harvest(config, store, &eval.held_out)?;
     note(&mut steps, "harvest", serde_json::to_value(&report)?);
 
     let signals = collect_signals(store, &active, probe.as_ref())?;
     let total_sp: usize = signals.selfplay_rates.iter().map(|(_, _, n)| n).sum();
     let passed_sp: usize = signals.selfplay_rates.iter().map(|(_, p, _)| p).sum();
-    note(&mut steps, "diagnosis", json!({"selfplay_rates":signals.selfplay_rates,"failure_kinds":signals.failure_kinds,"tool_errors":signals.tool_errors,"live_failures":signals.live_failures}));
-    if !force && total_sp >= 8 && passed_sp == total_sp && signals.live_failures == 0 && signals.failure_kinds.is_empty() && signals.tool_errors.is_empty() {
+    let workflow_evidence = workflow::collect(store, &active)?;
+    note(&mut steps, "diagnosis", json!({"selfplay_rates":signals.selfplay_rates,"failure_kinds":signals.failure_kinds,"tool_errors":signals.tool_errors,"recurring_failures":signals.recurring_failures,"live_failures":signals.live_failures}));
+    if !force && total_sp >= 8 && passed_sp == total_sp && signals.live_failures == 0 && signals.failure_kinds.is_empty() && signals.tool_errors.is_empty() && signals.recurring_failures.is_empty() && workflow_evidence.investigation_trajectories < 3 {
         note(&mut steps, "no_headroom", json!("every verified task passed and no failures were recorded"));
         return finish(store, started, steps, None);
     }
@@ -665,6 +833,7 @@ pub fn run_cycle(runtime: &mut Runtime, config: &Config, store: &Store, force: b
     } else {
         note(&mut steps, "lora_skipped", json!("training interval has not elapsed"));
     }
+    super::auto::check_stop(config)?;
     if queue.len() < config.improve.max_candidates as usize && (signals.live_failures > 0 || !signals.failure_kinds.is_empty() || total_sp > passed_sp) {
         match diagnose(runtime, config, store, &signals) {
             Ok((proposal, evidence)) => {
@@ -683,6 +852,20 @@ pub fn run_cycle(runtime: &mut Runtime, config: &Config, store: &Store, force: b
         let valid = |h: &Harness| config.validate_harness(h).is_ok();
         let ctx = mutate::Context { failure_kinds: &signals.failure_kinds, selfplay_rates: &signals.selfplay_rates,
             default_edit_mode: config.edit_mode, tried: &tried, valid: &valid };
+        for candidate in workflow::candidates(&active.harness, &ctx, &workflow_evidence, room) {
+            tried.insert(mutate::harness_digest(&candidate.harness));
+            let kind = format!("workflow:{}", candidate.name);
+            let version = store.candidate(active.id, &kind, &candidate.harness, active.adapter.as_deref())?;
+            workflow::register(store, &version, &candidate)?;
+            note(&mut steps, "workflow", json!({"name":candidate.name,"why":candidate.rationale}));
+            queue.push((kind, Ok(version), None));
+        }
+    }
+    let room = (config.improve.max_candidates as usize).saturating_sub(queue.len());
+    if room > 0 {
+        let valid = |h: &Harness| config.validate_harness(h).is_ok();
+        let ctx = mutate::Context { failure_kinds: &signals.failure_kinds, selfplay_rates: &signals.selfplay_rates,
+            default_edit_mode: config.edit_mode, tried: &tried, valid: &valid };
         for m in mutate::candidates(&active.harness, &ctx, &mut rand::rng(), room) {
             tried.insert(mutate::harness_digest(&m.harness));
             note(&mut steps, "mutation", json!({"name":m.name,"why":m.rationale}));
@@ -693,6 +876,7 @@ pub fn run_cycle(runtime: &mut Runtime, config: &Config, store: &Store, force: b
 
     let mut admitted = None;
     for (label, candidate, pending) in queue {
+        super::auto::check_stop(config)?;
         let candidate = candidate?;
         progress(&format!("evaluating {label} as v{}", candidate.id));
         let admission = match evaluate_candidate(runtime, config, store, &eval, &mut cache, &active, &candidate, progress) {
@@ -706,6 +890,7 @@ pub fn run_cycle(runtime: &mut Runtime, config: &Config, store: &Store, force: b
                 continue;
             }
         };
+        super::auto::check_stop(config)?;
         store.admit_with_training(&admission, pending.as_ref())?;
         note(&mut steps, "candidate", json!({"label":label,"version":candidate.id,"passed":admission.passed,"reason":admission.reason,"scores":admission.scores}));
         if label == "lora" && active.adapter.is_none() {
@@ -718,6 +903,7 @@ pub fn run_cycle(runtime: &mut Runtime, config: &Config, store: &Store, force: b
             admitted = Some(candidate.id); tried.clear(); store.set_meta("tried_harnesses", "[]")?; break;
         }
     }
+    super::auto::check_stop(config)?;
     finish(store, started, steps, admitted)
 }
 
@@ -802,4 +988,31 @@ pub fn due(store: &Store, key: &str, interval: u64) -> Result<bool> {
 
 fn meta_count(store: &Store, key: &str) -> Result<usize> {
     Ok(store.get_meta(key)?.map(|s| s.parse()).transpose()?.unwrap_or(0))
+}
+
+#[cfg(test)]
+mod lora_status_tests {
+    use super::*;
+    #[test]
+    fn lora_progress_requires_a_live_lock_and_clears_on_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layout = crate::storage::paths::Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
+        let mut config = Config::load(&layout, None).unwrap();
+        config.model = "test-model".into();
+        config.use_case = "test".into();
+        let store = Store::open(&config.state_dir, &config.model, &config.use_case, &config.harness).unwrap();
+        store.set_meta("lora_phase", "training").unwrap();
+        assert!(lora_phase(&config, &store).is_none());
+        {
+            let _phase = LoraPhase::start(&config, &store, "training").unwrap();
+            assert_eq!(lora_phase(&config, &store).as_deref(), Some("training"));
+        }
+        assert!(lora_phase(&config, &store).is_none());
+        // Simulate a crash marker without a held worker lock.
+        store.set_meta("lora_phase", "evaluating").unwrap();
+        assert!(lora_phase(&config, &store).is_none());
+        let _phase = LoraPhase::start(&config, &store, "evaluating").unwrap();
+        assert_eq!(lora_phase(&config, &store).as_deref(), Some("evaluating"));
+    }
 }

@@ -28,6 +28,18 @@ const ERROR_TAIL_BYTES: usize = 2048;
 /// Port races are retried; model-load failures are not.
 const PORT_ATTEMPTS: usize = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Share of physical memory the server's prompt (KV prefix) cache may hold. mlx_lm keeps up to ten
+/// caches with no byte limit by default; a few long-context caches next to the weights push unified
+/// memory into swap, which costs far more than the occasional re-prefill an evicted cache causes.
+const PROMPT_CACHE_MEMORY_DIVISOR: u64 = 4;
+
+/// The `--prompt-cache-bytes` budget, or `None` when physical memory cannot be read.
+fn prompt_cache_bytes() -> Option<u64> {
+    // SAFETY: sysconf only reads static system configuration.
+    let (pages, page_size) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    let total = u64::try_from(pages).ok()?.checked_mul(u64::try_from(page_size).ok()?)?;
+    (total > 0).then(|| total / PROMPT_CACHE_MEMORY_DIVISOR)
+}
 
 #[derive(Default)]
 struct Tail {
@@ -227,6 +239,9 @@ fn launch(
         .arg("--host=127.0.0.1")
         .arg(format!("--port={port}"))
         .arg("--log-level=WARNING");
+    if let Some(bytes) = prompt_cache_bytes() {
+        command.arg(format!("--prompt-cache-bytes={bytes}"));
+    }
     if let Some(adapter) = adapter {
         let mut flag = std::ffi::OsString::from("--adapter-path=");
         flag.push(adapter);
@@ -321,7 +336,7 @@ fn wait_ready(process: &mut Supervised, base_url: &str, tail: &Mutex<Tail>, dead
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -363,7 +378,7 @@ if mode != "bad-model":
 server.serve_forever()
 "#;
 
-    fn fake_python(dir: &Path) -> PathBuf {
+    pub(crate) fn fake_python(dir: &Path) -> PathBuf {
         let path = dir.join("fake-python");
         fs::write(&path, FAKE_SERVER).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -404,6 +419,9 @@ server.serve_forever()
         let started = info(&marker);
         let (pid, helper) = (started["pid"].as_i64().unwrap(), started["child"].as_i64().unwrap());
         assert!(alive(pid) && alive(helper));
+        let budget = started["argv"].as_array().unwrap().iter().filter_map(|a| a.as_str()?.strip_prefix("--prompt-cache-bytes=")).next()
+            .expect("the KV prefix cache must be bounded").parse::<u64>().unwrap();
+        assert!(budget > 0, "{budget}");
         drop(server);
         assert!(wait_dead(pid), "server survived drop");
         assert!(wait_dead(helper), "server's child survived drop");

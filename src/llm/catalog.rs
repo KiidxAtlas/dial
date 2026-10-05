@@ -32,7 +32,18 @@ pub struct ModelEntry {
 pub struct ModelMetadata {
     pub vision: Option<bool>,
     pub pricing: Option<TokenPricing>,
+    /// Preliminary architecture availability, not verified LoRA compatibility. A true value still
+    /// needs Dial's capability probe to check adapter targets. `None` means unknown.
+    #[serde(default)]
+    pub lora: Option<bool>,
+    #[serde(default)]
+    pub lora_verified: bool,
+    /// Automatic local verification progress; no model weights are loaded during discovery itself.
+    #[serde(default)]
+    pub lora_check: Option<LoraCheck>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoraCheck { Waiting, Checking, Failed }
 /// USD per token, as supplied by provider metadata; no guessed price tables.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct TokenPricing {
@@ -75,13 +86,17 @@ fn metadata(row: &Value) -> ModelMetadata {
         .filter(|n| n.is_finite() && *n >= 0.0);
     let pricing = price("/pricing/prompt").zip(price("/pricing/completion"))
         .map(|(prompt, completion)| TokenPricing { prompt, completion, cache_read:price("/pricing/input_cache_read"), cache_write:price("/pricing/input_cache_write") });
-    ModelMetadata { vision, pricing }
+    ModelMetadata { vision, pricing, ..Default::default() }
 }
 
+/// Preliminary MLX architecture availability; this does not verify adapter training targets.
+pub fn local_lora_support(user_dir: &Path, model: &Path) -> Option<bool> {
+    lora_support(mlx_architectures(user_dir).as_deref(), model)
+}
 /// Cache-only lookup: never make a metadata request in the inference hot path.
 pub fn model_metadata(layout: &Layout, selection: &ModelSelection) -> ModelMetadata {
     if selection.provider == super::chatgpt::PROVIDER {
-        return ModelMetadata { vision:super::chatgpt::model_profile(&layout.user_dir,&selection.model).ok().flatten().and_then(|profile|profile.capabilities.vision),pricing:None };
+        return ModelMetadata { vision:super::chatgpt::model_profile(&layout.user_dir,&selection.model).ok().flatten().and_then(|profile|profile.capabilities.vision), ..Default::default() };
     }
     if selection.provider == "mlx" && selection.base_url.is_none() {
         return read_json(&Path::new(&selection.model).join("config.json")).map(|value| metadata(&value)).unwrap_or_default();
@@ -323,8 +338,9 @@ fn parse_lmstudio(value: &Value) -> Vec<LmStudioModel> {
     }).take(MAX_MODELS).collect()).unwrap_or_default()
 }
 
-/// Only ever asked of loopback/private hosts; a hosted API is never sent LM Studio probes.
-fn lmstudio_get(base_url: &str, path: &str, token: Option<&str>) -> Option<Value> {
+/// GET a native (non-OpenAI) endpoint of a local server. Only ever asked of loopback/private hosts; a
+/// hosted API is never sent these probes.
+fn local_get(base_url: &str, path: &str, token: Option<&str>) -> Option<Value> {
     let uri = validated_url(base_url, true).ok()?;
     if !crate::llm::is_local_host(uri.host()?) { return None; }
     let origin = format!("{}://{}", uri.scheme_str()?, uri.authority()?);
@@ -341,15 +357,28 @@ fn lmstudio_get(base_url: &str, path: &str, token: Option<&str>) -> Option<Value
 }
 
 pub fn lmstudio_models(base_url: &str, token: Option<&str>) -> Option<Vec<LmStudioModel>> {
-    let found = parse_lmstudio(&lmstudio_get(base_url, "/api/v0/models", token)?);
+    let found = parse_lmstudio(&local_get(base_url, "/api/v0/models", token)?);
     (!found.is_empty()).then_some(found)
 }
 
-/// Context window an LM Studio model is loaded with right now (`None` when not loaded or not LM Studio).
+/// Context window the local server is serving `model` with right now: LM Studio's loaded size,
+/// llama.cpp's per-slot `n_ctx` (`-c` divided by `--parallel`), or the `context_length` Ollama loaded
+/// the model with (its default is far below Dial's, and it truncates silently rather than failing).
+/// `None` for hosted APIs, other servers, or a model that is not loaded yet.
 pub fn loaded_context(base_url: &str, model: &str, token: Option<&str>) -> Option<u32> {
     if model.is_empty() || model.len() > 512 || model.chars().any(|c| c.is_control() || c == '?' || c == '#' || c == '%') { return None; }
-    let value = lmstudio_get(base_url, &format!("/api/v0/models/{model}"), token)?;
-    parse_lmstudio(&serde_json::json!({"data":[value]})).into_iter().find(|m| m.id == model)?.loaded_context
+    let positive = |value: Option<&Value>| value?.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
+    if let Some(value) = local_get(base_url, &format!("/api/v0/models/{model}"), token) {
+        return parse_lmstudio(&serde_json::json!({"data":[value]})).into_iter().find(|m| m.id == model)?.loaded_context;
+    }
+    if let Some(props) = local_get(base_url, "/props", token) {
+        return positive(props.pointer("/default_generation_settings/n_ctx"));
+    }
+    let running = local_get(base_url, "/api/ps", token)?;
+    let bare = |name: &str| name.strip_suffix(":latest").unwrap_or(name).to_owned();
+    running["models"].as_array()?.iter()
+        .find(|m| ["name", "model"].iter().any(|key| m[*key].as_str().is_some_and(|name| bare(name) == bare(model))))
+        .and_then(|m| positive(m.get("context_length")))
 }
 
 fn annotate_lmstudio(models: &mut [ModelEntry], info: &[LmStudioModel]) {
@@ -384,7 +413,7 @@ fn snapshot(path: &Path) -> Option<Option<u32>> {
     } else if !fs::read_dir(path).ok()?.filter_map(Result::ok).any(|entry| entry.path().extension().is_some_and(|ext| ext == "safetensors") && fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file() && meta.len() > 0)) { return None; }
     Some(context(&config))
 }
-fn local_models(cache: &Path) -> Vec<ModelEntry> {
+fn local_models(cache: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
     let mut models = Vec::new();
     let Ok(repos) = fs::read_dir(cache) else { return models; };
     let mut repos: Vec<_> = repos.filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().starts_with("models--")).take(4096).collect();
@@ -403,7 +432,7 @@ fn local_models(cache: &Path) -> Vec<ModelEntry> {
         for path in candidates {
             let Some(window) = snapshot(&path) else { continue; };
             let label = repo.file_name().to_string_lossy().trim_start_matches("models--").replace("--", "/");
-            models.push(ModelEntry { selection:ModelSelection { model:path.to_string_lossy().into_owned(), context_window:window, ..ModelSelection::default() }, label, source:"Hugging Face cache (MLX)".into(), available:true, metadata:ModelMetadata::default() });
+            models.push(ModelEntry { selection:ModelSelection { model:path.to_string_lossy().into_owned(), context_window:window, ..ModelSelection::default() }, label, source:"Hugging Face cache (MLX)".into(), available:true, metadata:ModelMetadata { lora: lora_support(trainable, &path), ..ModelMetadata::default() } });
             break;
         }
     }
@@ -413,6 +442,53 @@ fn hf_cache() -> Option<PathBuf> {
     std::env::var_os("HF_HUB_CACHE").filter(|s| !s.is_empty()).map(PathBuf::from)
         .or_else(|| std::env::var_os("HF_HOME").filter(|s| !s.is_empty()).map(|s| PathBuf::from(s).join("hub")))
         .or_else(|| std::env::var_os("HOME").map(|s| PathBuf::from(s).join(".cache/huggingface/hub")))
+}
+/// The `mlx_lm/models` directory of dial's Python environment (`dial setup` creates it under the user dir).
+fn mlx_architectures(user_dir: &Path) -> Option<PathBuf> {
+    let lib = user_dir.join("python/.venv/lib");
+    fs::read_dir(&lib).ok()?.filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("python"))
+        .map(|entry| entry.path().join("site-packages/mlx_lm/models"))
+        .find(|dir| dir.is_dir())
+}
+/// Whether mlx-lm implements the architecture in `model/config.json` (`model_type`, or the text model's
+/// for multimodal configs). A static check: no weights are loaded.
+fn lora_support(architectures: Option<&Path>, model: &Path) -> Option<bool> {
+    let architectures = architectures?;
+    let config = read_json(&model.join("config.json"))?;
+    let kind = config.get("model_type").or_else(|| config.pointer("/text_config/model_type")).and_then(Value::as_str)?;
+    if kind.is_empty() || !kind.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { return Some(false); }
+    // MLX also resolves architecture aliases (for example gemma4_unified).
+    // Absence of a same-named module cannot prove incompatibility.
+    architectures.join(format!("{kind}.py")).is_file().then_some(true)
+}
+/// LM Studio's download folder: its `downloadsFolder` setting, else `~/.lmstudio/models`.
+fn lmstudio_folder() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME").filter(|s| !s.is_empty())?);
+    let configured = read_json(&home.join(".lmstudio/settings.json"))
+        .and_then(|settings| settings["downloadsFolder"].as_str().filter(|s| !s.is_empty()).map(PathBuf::from));
+    Some(configured.unwrap_or_else(|| home.join(".lmstudio/models")))
+}
+/// MLX models LM Studio downloaded, laid out as `<folder>/<publisher>/<model>/`. Only folders that
+/// pass the same check as Hugging Face snapshots (config plus complete safetensors) are listed, so GGUF
+/// downloads and LM Studio-specific bundles are skipped. Entries are labelled `publisher/model`.
+fn lmstudio_mlx_models(folder: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
+    let sorted = |dir: &Path| -> Vec<fs::DirEntry> {
+        let mut entries: Vec<_> = fs::read_dir(dir).map(|it| it.filter_map(Result::ok).take(4096).collect()).unwrap_or_default();
+        entries.sort_by_key(|entry| entry.file_name());
+        entries
+    };
+    let mut models = Vec::new();
+    for publisher in sorted(folder) {
+        for repo in sorted(&publisher.path()) {
+            if models.len() >= MAX_MODELS { return models; }
+            let path = repo.path();
+            let Some(window) = snapshot(&path) else { continue };
+            let label = format!("{}/{}", publisher.file_name().to_string_lossy(), repo.file_name().to_string_lossy());
+            models.push(ModelEntry { selection:ModelSelection { model:path.to_string_lossy().into_owned(), context_window:window, ..ModelSelection::default() }, label, source:"LM Studio download (MLX)".into(), available:true, metadata:ModelMetadata { lora: lora_support(trainable, &path), ..ModelMetadata::default() } });
+        }
+    }
+    models
 }
 fn cached(user_dir: &Path) -> BTreeMap<String, Vec<ModelEntry>> {
     read_private(&user_dir.join("model-catalog.json")).ok().flatten().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
@@ -428,7 +504,14 @@ fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool { a.provider == b.
 
 pub fn discover(layout: &Layout, configured: &BTreeMap<String, ProviderSpec>, selections: &[ModelSelection]) -> Discovery {
     let mut discovery = Discovery::default();
-    if let Some(cache) = hf_cache() { discovery.models = local_models(&cache); }
+    let trainable = mlx_architectures(&layout.user_dir);
+    if let Some(cache) = hf_cache() { discovery.models = local_models(&cache, trainable.as_deref()); }
+    if let Some(folder) = lmstudio_folder() {
+        // The same repository downloaded by both keeps its Hugging Face entry.
+        for entry in lmstudio_mlx_models(&folder, trainable.as_deref()) {
+            if discovery.models.len() < MAX_MODELS && !discovery.models.iter().any(|known| known.label == entry.label) { discovery.models.push(entry); }
+        }
+    }
     discovery.providers.push(ProviderStatus { id:"mlx".into(), label:"Local MLX".into(), base_url:None, state:if discovery.models.is_empty() { "unavailable" } else { "cached" }.into(), detail:"Downloaded config and weights only; no model loading or downloads".into(), models:discovery.models.len() });
     let mut endpoints = BTreeMap::new();
     for (id, label, variable, default) in [("lm-studio", "LM Studio", "LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1"), ("ollama", "Ollama", "OLLAMA_BASE_URL", "http://127.0.0.1:11434"), ("llama-cpp", "llama.cpp", "LLAMA_CPP_BASE_URL", "http://127.0.0.1:8080/v1")] {
@@ -492,7 +575,8 @@ pub fn discover(layout: &Layout, configured: &BTreeMap<String, ProviderSpec>, se
         if selection.base_url.as_deref().is_some_and(|url| validated_url(url, true).is_err()) { selection.base_url = None; }
         let local = selection.provider == "mlx" && selection.base_url.is_none();
         let available = local && snapshot(Path::new(&selection.model)).is_some();
-        discovery.models.push(ModelEntry { label:selection.model.clone(), selection, source:if available { "Configured local model" } else { "Configured (unverified)" }.into(), available, metadata:ModelMetadata::default() });
+        let lora = if local { lora_support(trainable.as_deref(), Path::new(&selection.model)) } else { None };
+        discovery.models.push(ModelEntry { label:selection.model.clone(), selection, source:if available { "Configured local model" } else { "Configured (unverified)" }.into(), available, metadata:ModelMetadata { lora, ..ModelMetadata::default() } });
     }
     discovery
 }
@@ -615,9 +699,35 @@ mod tests {
         let cache = tempfile::tempdir().unwrap(); let repo = cache.path().join("models--mlx-community--example");
         fs::create_dir_all(repo.join("refs")).unwrap(); fs::write(repo.join("refs/main"), "current\n").unwrap();
         for name in ["old", "current"] { let path = repo.join("snapshots").join(name); fs::create_dir_all(&path).unwrap(); fs::write(path.join("config.json"), r#"{"max_position_embeddings":8192}"#).unwrap(); fs::write(path.join("model.safetensors"), "weights").unwrap(); }
-        let entries = local_models(cache.path()); assert_eq!(entries.len(), 1); assert!(entries[0].selection.model.ends_with("/current")); assert_eq!(entries[0].selection.context_window, Some(8192));
+        let entries = local_models(cache.path(), None); assert_eq!(entries.len(), 1); assert!(entries[0].selection.model.ends_with("/current")); assert_eq!(entries[0].selection.context_window, Some(8192));
         fs::write(repo.join("snapshots/current/model.safetensors.index.json"), r#"{"weight_map":{"w":"missing.safetensors"}}"#).unwrap();
-        assert!(local_models(cache.path())[0].selection.model.ends_with("/old"));
+        assert!(local_models(cache.path(), None)[0].selection.model.ends_with("/old"));
+    }
+    #[test]
+    fn lm_studio_mlx_downloads_are_listed_and_other_formats_skipped() {
+        let folder = tempfile::tempdir().unwrap();
+        let mlx = folder.path().join("lmstudio-community/Qwen-MLX-8bit");
+        fs::create_dir_all(&mlx).unwrap();
+        fs::write(mlx.join("config.json"), r#"{"model_type":"qwen3_5","text_config":{"max_position_embeddings":32768}}"#).unwrap();
+        let gemma = folder.path().join("lmstudio-community/gemma-MLX");
+        fs::create_dir_all(&gemma).unwrap();
+        fs::write(gemma.join("config.json"), r#"{"text_config":{"model_type":"gemma4_unified"}}"#).unwrap();
+        fs::write(gemma.join("model.safetensors"), "weights").unwrap();
+        fs::write(mlx.join("model.safetensors"), "weights").unwrap();
+        let gguf = folder.path().join("lmstudio-community/Qwen-GGUF");
+        fs::create_dir_all(&gguf).unwrap();
+        fs::write(gguf.join("model-Q4_K_M.gguf"), "weights").unwrap();
+        fs::create_dir_all(folder.path().join("incoai/Bundle/target")).unwrap();
+        let architectures = folder.path().join("mlx_lm/models");
+        fs::create_dir_all(&architectures).unwrap();
+        fs::write(architectures.join("qwen3_5.py"), "").unwrap();
+        let entries = lmstudio_mlx_models(folder.path(), Some(&architectures));
+        assert_eq!(entries.iter().map(|e| (e.label.as_str(), e.metadata.lora)).collect::<Vec<_>>(),
+            [("lmstudio-community/Qwen-MLX-8bit", Some(true)), ("lmstudio-community/gemma-MLX", None)]);
+        assert_eq!(lmstudio_mlx_models(folder.path(), None)[0].metadata.lora, None, "unknown without an mlx-lm install");
+        assert_eq!(entries[0].selection.model, mlx.to_string_lossy());
+        assert_eq!(entries[0].selection.context_window, Some(32768));
+        assert!(entries[0].selection.base_url.is_none(), "served by dial's MLX server, not LM Studio");
     }
     #[test]
     fn disabled_endpoint_is_never_contacted() {
@@ -732,5 +842,19 @@ mod tests {
         }
         // A hosted API is never sent LM Studio probes, and the answer cannot come from the network.
         assert_eq!(loaded_context("https://api.example.com/v1", "warm", None), None);
+    }
+    #[test]
+    fn llama_cpp_and_ollama_report_the_context_they_actually_serve() {
+        // llama.cpp advertises its training context in /v1/models; the served per-slot size is in /props.
+        let llama = routed(vec![
+            ("/v1/models", r#"{"data":[{"id":"qwen","meta":{"n_ctx_train":131072}}]}"#.into()),
+            ("/props", r#"{"default_generation_settings":{"n_ctx":4096}}"#.into()),
+        ]);
+        assert_eq!(loaded_context(&llama, "qwen", None), Some(4096));
+        let ollama = routed(vec![("/api/ps", r#"{"models":[{"name":"qwen2.5:7b","model":"qwen2.5:7b","context_length":4096},{"name":"llama3:latest","model":"llama3:latest","context_length":8192}]}"#.into())]);
+        assert_eq!(loaded_context(&ollama, "qwen2.5:7b", None), Some(4096));
+        assert_eq!(loaded_context(&ollama, "llama3", None), Some(8192), ":latest is Ollama's implicit tag");
+        assert_eq!(loaded_context(&ollama, "mistral", None), None, "not loaded yet");
+        assert_eq!(loaded_context(&routed(vec![]), "anything", None), None, "a server with none of the native APIs");
     }
 }

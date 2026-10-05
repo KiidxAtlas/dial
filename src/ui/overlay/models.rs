@@ -15,6 +15,7 @@ use crate::{
     storage::settings_store::Scope,
     ui::{
         keys::{Action, Keymap},
+        status::Lora,
         text,
         theme::{Sym, Theme, Tok},
     },
@@ -65,6 +66,8 @@ pub struct ModelOverlay {
     chooser: Option<Chooser>,
     /// Banner near the footer: (text, is_ok). Cleared by the next key press.
     message: Option<(String, bool)>,
+    /// LoRA state of the current main model, which the catalog alone cannot know (admitted adapters).
+    main_lora: Lora,
 }
 
 fn is_embedding(entry: &ModelEntry) -> bool { entry.source.to_lowercase().contains("embedding") }
@@ -96,6 +99,81 @@ fn refusal(entry: &ModelEntry) -> String {
     else { "the provider reports it as unavailable".to_owned() }
 }
 
+fn is_local_mlx(entry: &ModelEntry) -> bool { entry.selection.provider == "mlx" && entry.selection.base_url.is_none() }
+
+/// The LoRA column: whether dial can train this model, and for the main model whether an adapter is on.
+fn lora_cell(entry: &ModelEntry, main: Option<Lora>) -> (String, Tok) {
+    if !entry.metadata.lora_verified {
+        if let Some(check) = entry.metadata.lora_check {
+            return (match check { crate::llm::catalog::LoraCheck::Waiting => "waiting compute", crate::llm::catalog::LoraCheck::Checking => "verifying", crate::llm::catalog::LoraCheck::Failed => "check failed" }.into(), Tok::Muted);
+        }
+    }
+    match main {
+        Some(Lora::Unsupported) if is_local_mlx(entry) => return ("unsupported".into(), Tok::Dim),
+        Some(Lora::Unverified) => return ("unverified".into(), Tok::Muted),
+        Some(Lora::VerificationQueued) => return ("waiting compute".into(), Tok::Muted),
+        Some(Lora::Verifying) => return ("verifying".into(), Tok::Muted),
+        Some(Lora::Active(id)) => return (format!("accepted v{id}"), Tok::Muted),
+        Some(Lora::Ready) => return ("awaiting training".into(), Tok::Muted),
+        Some(Lora::Training) => return ("training".into(), Tok::StatusLearning),
+        Some(Lora::Evaluating) => return ("evaluating".into(), Tok::StatusLearning),
+        Some(Lora::Loading) => return ("loading".into(), Tok::StatusLearning),
+        Some(Lora::Loaded) => return ("loaded".into(), Tok::Success),
+        Some(Lora::Used) => return ("used last response".into(), Tok::Success),
+        Some(Lora::Failed) => return ("request failed".into(), Tok::Muted),
+        Some(Lora::Off) => return ("LoRA off".into(), Tok::Muted),
+        _ => {}
+    }
+    if !is_local_mlx(entry) { return ("-".into(), Tok::Dim); }
+    if entry.metadata.lora_verified { return (if entry.metadata.lora == Some(true) { "verified" } else { "unsupported" }.into(), Tok::Muted); }
+    match entry.metadata.lora {
+        Some(true) => ("unverified".into(), Tok::Muted),
+        Some(false) => ("unsupported".into(), Tok::Dim),
+        None => ("LoRA ?".into(), Tok::Muted),
+    }
+}
+
+/// One sentence for the detail line on LoRA weight training.
+fn lora_detail(entry: &ModelEntry, main: Option<Lora>) -> String {
+    if !entry.metadata.lora_verified {
+        if let Some(check) = entry.metadata.lora_check {
+            return match check {
+                crate::llm::catalog::LoraCheck::Waiting => "Automatic LoRA verification queued; waiting for local compute. No model selection or retry is needed.",
+                crate::llm::catalog::LoraCheck::Checking => "Checking adapter targets, a tiny gradient update, and adapter save/reload. This verification does not create a production adapter.",
+                crate::llm::catalog::LoraCheck::Failed => "Automatic verification could not complete. F6 retries and shows diagnostics; compatibility is still unverified.",
+            }.into();
+        }
+    }
+    match main {
+        Some(Lora::Unsupported) if is_local_mlx(entry) => return "LoRA unavailable in Dial's current trainer. /improve shows the model capability probe's reason.".into(),
+        Some(Lora::Unverified) => return "MLX architecture found; LoRA training targets have not been verified by Dial.".into(),
+        Some(Lora::VerificationQueued) => return "Automatic LoRA verification is waiting for local compute; no retry is needed.".into(),
+        Some(Lora::Verifying) => return "Checking LoRA targets with a tiny gradient update and adapter save/reload.".into(),
+        Some(Lora::Active(id)) => return format!("LoRA v{id} accepted; loading not confirmed in this session. /improve shows evaluation results."),
+        Some(Lora::Ready) => return "LoRA compatible; awaiting training and acceptance. No adapter use confirmed. See /improve.".into(),
+        Some(Lora::Training) => return "LoRA candidate is training; it must pass evaluation before activation.".into(),
+        Some(Lora::Evaluating) => return "LoRA candidate is being evaluated against the baseline; not yet accepted.".into(),
+        Some(Lora::Loading) => return "Loading the adapter into the local server; generation not yet confirmed.".into(),
+        Some(Lora::Loaded) => return "Adapter loaded and startup generation check passed; awaiting a successful response.".into(),
+        Some(Lora::Used) => return "Adapter used on the last successful model response in this session. /improve shows its path and gate scores.".into(),
+        Some(Lora::Failed) => return "Adapter loading or the latest request failed; successful use is not confirmed for that request.".into(),
+        Some(Lora::Off) => return "LoRA compatible, but training or automatic improvement is disabled.".into(),
+        _ => {}
+    }
+    if !is_local_mlx(entry) {
+        return format!("no LoRA: served by {}; pick an mlx/ model to train adapters", entry.selection.provider);
+    }
+    if entry.metadata.lora_verified {
+        return if entry.metadata.lora == Some(true) { "Verified: adapter gradient update and save/reload passed. This does not measure training quality." }
+            else { "Verified unsupported by Dial's trainer. Press F6 to recheck and display the reason." }.into();
+    }
+    match entry.metadata.lora {
+        Some(true) => "MLX architecture found; LoRA training targets have not been verified by Dial.".into(),
+        Some(false) => "no LoRA: the installed mlx-lm does not implement this architecture".into(),
+        None => "LoRA unknown: install the MLX environment with `dial setup` to check".into(),
+    }
+}
+
 fn fmt_context(tokens: u32) -> String {
     if tokens >= 1_000_000 && tokens % 1_000_000 == 0 { format!("{}M", tokens / 1_000_000) }
     else if tokens >= 1024 && tokens % 1024 == 0 { format!("{}k", tokens / 1024) }
@@ -116,8 +194,19 @@ impl ModelOverlay {
     pub fn new(discovery: Option<Discovery>, roles: Vec<(String, Option<ModelSelection>)>, scope: Scope) -> Self {
         ModelOverlay {
             discovery, roles, scope, group: Group::All, focus: Focus::List, kind: KindFilter::All, search: String::new(),
-            cursor: 0, scroll: 0, page: 8, target_role: None, chooser: None, message: None,
+            cursor: 0, scroll: 0, page: 8, target_role: None, chooser: None, message: None, main_lora: Lora::Unknown,
         }
+    }
+
+    /// Report the main model's LoRA state (an admitted adapter, or training switched off).
+    pub fn with_main_lora(mut self, lora: Lora) -> Self {
+        self.main_lora = lora;
+        self
+    }
+
+    /// The main model's LoRA state when `entry` is the main model.
+    fn main_lora_for(&self, entry: &ModelEntry) -> Option<Lora> {
+        self.role_selection("main").filter(|main| same_model(main, &entry.selection)).map(|_| self.main_lora)
     }
 
     /// Open on the Roles view (used by the "assign models to roles" shortcut).
@@ -248,6 +337,17 @@ impl ModelOverlay {
         if self.chooser.is_some() { return self.chooser_key(key, keys); }
         if is_ctrl(key, 's') { self.scope = other_scope(self.scope); return OverlayEvent::None; }
         if key.code == KeyCode::F(5) || is_ctrl(key, 'r') { return OverlayEvent::Refresh; }
+        if key.code == KeyCode::F(6) {
+            if self.focus != Focus::List { self.set_status("Highlight a model or assigned role first.".into(), true); return OverlayEvent::None; }
+            let selected = if self.group == Group::Roles {
+                ROLES.get(self.cursor).and_then(|(role, _)| self.role_selection(role)).cloned()
+            } else { self.rows().get(self.cursor).map(|(entry, _)| entry.selection.clone()) };
+            if let Some(selection) = selected.filter(|s| s.provider == "mlx" && s.base_url.is_none() && std::path::Path::new(&s.model).is_absolute()) {
+                return OverlayEvent::VerifyLora(selection);
+            }
+            self.set_status("Select a downloaded local MLX model to verify LoRA support.".into(), true);
+            return OverlayEvent::None;
+        }
         if is_ctrl(key, 'a') { return self.open_chooser(); }
         if keys.matches(Action::SelectCancel, key) { return self.cancel(); }
         if keys.matches(Action::SelectUp, key) { self.step(-1); }
@@ -548,8 +648,9 @@ impl ModelOverlay {
         let context = entry.selection.context_window.map_or_else(|| "-".to_owned(), fmt_context);
         let state = state_of(entry);
         let state_w = if w >= 60 { 20 } else { 0 };
+        let lora_w = if w >= 90 { 19 } else if w >= 72 { 10 } else { 0 };
         let ctx_w = if w >= 40 { 7 } else { 0 };
-        let name_w = w.saturating_sub(4 + state_w + ctx_w);
+        let name_w = w.saturating_sub(4 + state_w + lora_w + ctx_w);
         let name = text::ellipsize(&display_name(entry), name_w.saturating_sub(1), theme.ascii());
         let mut spans = vec![
             Span::styled(format!("{pointer} "), theme.fg(Tok::Accent).patch(fill)),
@@ -558,6 +659,10 @@ impl ModelOverlay {
         spans.extend(if positions.is_empty() { vec![Span::styled(name.clone(), name_style)] } else { highlighted(&name, positions, name_style, match_style(theme, name_style)) });
         spans.push(Span::styled(" ".repeat(name_w.saturating_sub(text::width(&name))), fill));
         if ctx_w > 0 { spans.push(Span::styled(text::pad(&context, ctx_w), theme.fg(Tok::Muted).patch(fill))); }
+        if lora_w > 0 {
+            let (label, tok) = lora_cell(entry, self.main_lora_for(entry));
+            spans.push(Span::styled(text::pad(&text::ellipsize(&label, lora_w.saturating_sub(1), theme.ascii()), lora_w), theme.fg(tok).patch(fill)));
+        }
         if state_w > 0 {
             let tok = match state { "loaded" => Tok::Success, "unavailable" | "embedding" => Tok::Dim, _ => Tok::Muted };
             spans.push(Span::styled(text::pad(state, state_w), theme.fg(tok).patch(fill)));
@@ -618,6 +723,7 @@ impl ModelOverlay {
         let used_text = if used.is_empty() { "not used by any role".to_owned() } else { format!("used by: {}", used.join(", ")) };
         let second = vec![
             Span::styled(format!(" {used_text}"), theme.fg(Tok::Muted)),
+            Span::styled(format!("  {} {}", theme.sym(Sym::Dot), lora_detail(entry, self.main_lora_for(entry))), theme.fg(Tok::Muted)),
             Span::styled(format!("  {} {}", theme.sym(Sym::Dot), text::one_line(&entry.source)), theme.fg(Tok::Dim)),
         ];
         (first, second)
@@ -632,6 +738,7 @@ impl ModelOverlay {
                 hint(keys, Action::SelectConfirm, "pick model"),
                 format!("{} roles", pair_label(keys, Action::SelectUp, Action::SelectDown)),
                 "x clear".to_owned(),
+                "F6 verify LoRA".to_owned(),
                 hint(keys, Action::TabPrev, "providers"),
                 hint(keys, Action::SelectCancel, "close"),
             ];
@@ -645,6 +752,7 @@ impl ModelOverlay {
             "Ctrl+A role".to_owned(),
             "Ctrl+S scope".to_owned(),
             "F5 rescan".to_owned(),
+            "F6 verify LoRA".to_owned(),
             hint(keys, Action::SelectCancel, if self.target_role.is_some() { "back" } else if self.search.is_empty() { "close" } else { "clear search" }),
         ]
     }
@@ -703,11 +811,61 @@ mod tests {
     fn names(o: &ModelOverlay) -> Vec<String> { o.rows().iter().map(|(e, _)| e.label.clone()).collect() }
 
     #[test]
+    fn rows_and_details_show_lora_compatibility_and_the_main_adapter() {
+        let rig = Rig::new();
+        let local = |label: &str, lora| ModelEntry {
+            selection: ModelSelection { model: format!("/models/{label}"), ..ModelSelection::default() },
+            label: label.into(), source: "LM Studio download (MLX)".into(), available: true,
+            metadata: crate::llm::catalog::ModelMetadata { lora, ..Default::default() },
+        };
+        let models = vec![local("qwen-mlx", Some(true)), local("gemma-mlx", Some(false)), entry("lm-studio", "qwen-served", "LM Studio · loaded", true, None)];
+        let main = models[0].selection.clone();
+        let roles = vec![("main".into(), Some(main))];
+        let mut o = ModelOverlay::new(Some(Discovery { models, providers: vec![] }), roles, Scope::Global).with_main_lora(Lora::Active(4));
+        let shown = draw(&mut o, &rig, 130, 30);
+        let row = |name: &str| shown.lines().find(|l| l.contains(name)).unwrap_or_else(|| panic!("{name} missing:\n{shown}")).to_owned();
+        assert!(row("mlx/qwen-mlx").contains("accepted v4"), "the main model shows its admitted adapter");
+        assert!(row("mlx/gemma-mlx").contains("unsupported"));
+        assert!(row("lm-studio/qwen-served").contains(" - "), "a served model has no LoRA column value");
+        assert!(shown.contains("LoRA v4 accepted; loading not confirmed"), "{shown}");
+        o.main_lora = Lora::Unsupported;
+        let rejected = draw(&mut o, &rig, 130, 30);
+        assert!(rejected.lines().find(|line| line.contains("mlx/qwen-mlx")).unwrap().contains("unsupported"));
+        assert!(rejected.contains("LoRA unavailable in Dial's current trainer"));
+        o.main_lora = Lora::Unknown;
+        let unchecked = draw(&mut o, &rig, 130, 30);
+        assert!(unchecked.lines().find(|line| line.contains("mlx/qwen-mlx")).unwrap().contains("unverified"));
+        assert!(unchecked.contains("training targets have not been verified"));
+        // Loaded models rank above merely available ones, so the served model is the second row.
+        send(&mut o, &rig, key(KeyCode::Down));
+        let shown = draw(&mut o, &rig, 130, 30);
+        assert!(shown.contains("no LoRA: served by lm-studio"), "{shown}");
+    }
+
+    #[test]
+    fn lora_verification_uses_highlighted_local_model_without_assigning_it() {
+        let rig = Rig::new();
+        let selection = ModelSelection { model:"/models/local-test".into(), ..Default::default() };
+        let model = ModelEntry { selection:selection.clone(), label:"local-test".into(), source:"local MLX".into(), available:true,
+            metadata:crate::llm::catalog::ModelMetadata { lora:Some(true), ..Default::default() } };
+        let mut o = ModelOverlay::new(Some(Discovery { models:vec![model.clone()], providers:vec![] }), vec![], Scope::Global);
+        o.group = Group::All; o.focus = Focus::List;
+        assert!(matches!(send(&mut o, &rig, key(KeyCode::F(6))), OverlayEvent::VerifyLora(found) if found.model == selection.model));
+        let mut verified = model;
+        verified.metadata.lora_verified = true;
+        assert_eq!(lora_cell(&verified, None).0, "verified");
+        verified.metadata.lora = Some(false);
+        assert_eq!(lora_cell(&verified, None).0, "unsupported");
+        o.discovery.as_mut().unwrap().models[0] = entry("lm-studio", "remote", "loaded", true, None);
+        assert!(matches!(send(&mut o, &rig, key(KeyCode::F(6))), OverlayEvent::None));
+    }
+
+    #[test]
     fn left_column_shows_roles_all_models_and_providers_with_counts_and_state_glyphs() {
         let rig = Rig::new();
         let mut o = overlay();
         let shown = draw(&mut o, &rig, 110, 30);
-        for needle in ["Models", "scope: global", "Roles", "1/4", "All models", "LM Studio", "Ollama", "OpenAI", "llama.cpp"] {
+        for needle in ["Models", "scope: global", "Roles", "All models", "LM Studio", "Ollama", "OpenAI", "llama.cpp"] {
             assert!(shown.contains(needle), "missing {needle:?}\n{shown}");
         }
         let line = |n: &str| shown.lines().find(|l| l.contains(n)).unwrap().to_owned();
@@ -868,6 +1026,7 @@ mod tests {
         o.show_roles();
         let shown = draw(&mut o, &rig, 120, 30);
         assert!(shown.contains("main") && shown.contains("ollama/llama3") && shown.contains("follows main"), "{shown}");
+        assert!(shown.contains("architecture"), "the maintenance model role must be discoverable: {shown}");
         send(&mut o, &rig, key(KeyCode::Down));
         // Pick a model for `feedback`.
         assert!(matches!(send(&mut o, &rig, key(KeyCode::Enter)), OverlayEvent::None));
@@ -932,7 +1091,7 @@ mod tests {
         let rig = Rig::new();
         let mut o = ModelOverlay::new(Some(Discovery::default()), vec![], Scope::Global);
         let shown = draw(&mut o, &rig, 120, 30);
-        assert!(shown.contains("No models found") && shown.contains("0/4"), "{shown}");
+        assert!(shown.contains("No models found"), "{shown}");
         assert!(matches!(send(&mut o, &rig, key(KeyCode::Enter)), OverlayEvent::None));
         assert!(matches!(send(&mut o, &rig, key(KeyCode::Down)), OverlayEvent::None));
         let mut o = overlay();

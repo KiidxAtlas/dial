@@ -98,6 +98,7 @@ pub struct Composer {
     history_index: Option<usize>,
     saved_draft: Option<Editor>,
     commands: Vec<CommandEntry>,
+    argument_completions: Vec<String>,
     files: Vec<CommandEntry>,
     menu: Option<Menu>,
     /// The exact draft the user dismissed the menu/ghost on; editing the text ends the dismissal.
@@ -120,6 +121,7 @@ impl Composer {
             pastes: Vec::new(), paste_count: 0,
             queued: std::collections::VecDeque::new(), editing_queue: None,
             files: Vec::new(),
+            argument_completions: Vec::new(),
         };
         for entry in history { composer.push_history(entry); }
         composer
@@ -167,6 +169,16 @@ impl Composer {
         self.refresh();
     }
 
+    /// Valid argument continuations supplied by the controller, in preference order. Unlike history,
+    /// these are available before a command has ever been run. Never insert display placeholders.
+    pub fn set_argument_completions(&mut self, candidates: Vec<String>) {
+        let mut seen = std::collections::HashSet::new();
+        self.argument_completions = candidates.into_iter().filter(|candidate| {
+            candidate.starts_with('/') && candidate.contains(' ')
+                && !candidate.chars().any(char::is_control) && seen.insert(candidate.clone())
+        }).collect();
+    }
+
     /// While busy Enter steers, Alt-Enter schedules a follow-up, and Esc interrupts.
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
@@ -197,6 +209,7 @@ impl Composer {
     }
 
     pub fn take_follow_up(&mut self) -> Option<String> { self.queued.pop_front().map(|(text, _)| text) }
+    pub fn has_queued_work(&self) -> bool { !self.queued.is_empty() }
 
     pub fn mode(&self) -> InputMode {
         if self.editor.text.starts_with('!') { InputMode::Shell } else { InputMode::Normal }
@@ -256,7 +269,7 @@ impl Composer {
             }
         }
         if self.busy && key.code == KeyCode::Enter && key.modifiers == KeyModifiers::ALT {
-            return self.submit_queued(true);
+            return if self.editor.text.trim_start().starts_with('/') { self.submit() } else { self.submit_queued(true) };
         }
         if let Some(action) = APP_ACTIONS.into_iter().find(|a| keys.matches(*a, &key)) { return ComposerEvent::Action(action); }
         if keys.matches(Action::HistorySearch, &key) {
@@ -321,7 +334,7 @@ impl Composer {
                 return ComposerEvent::None;
             }
         }
-        if self.busy { return self.submit_queued(false); }
+        if self.busy && !self.editor.text.trim_start().starts_with('/') { return self.submit_queued(false); }
         if self.editor.text.trim().is_empty() { return ComposerEvent::None; }
         let draft = std::mem::take(&mut self.editor.text);
         self.editor.cursor = 0;
@@ -478,17 +491,24 @@ impl Composer {
         }
     }
 
-    /// Dim inline continuation from the newest history entry that extends the draft. Only at the end
-    /// of an idle, non-empty draft, and never over half a grapheme.
+    /// Dim inline continuation from command metadata, then newest history. Only at the end of an
+    /// idle, non-empty draft, and never over half a grapheme. Acceptance never submits the draft.
     fn ghost(&self) -> Option<&str> {
         let draft = self.editor.text.as_str();
         if self.busy || self.search.is_some() || self.history_index.is_some() || self.menu_open()
             || draft.is_empty() || self.editor.cursor != draft.len() || self.dismissed.as_deref() == Some(draft)
         { return None; }
-        self.history.iter().rev().find_map(|entry| {
-            let suffix = entry.strip_prefix(draft).filter(|s| !s.is_empty())?;
-            entry.grapheme_indices(true).any(|(offset, _)| offset == draft.len()).then_some(suffix)
-        })
+        let extends = |entry: &str| {
+            entry.starts_with(draft) && entry.len() > draft.len()
+                && entry.grapheme_indices(true).any(|(offset, _)| offset == draft.len())
+        };
+        // Names still use the command menu; argument ghosts start after its first space.
+        if draft.starts_with('/') && draft.contains(' ') {
+            if let Some(entry) = self.argument_completions.iter().find(|entry| extends(entry)) {
+                return Some(&entry[draft.len()..]);
+            }
+        }
+        self.history.iter().rev().find(|entry| extends(entry)).map(|entry| &entry[draft.len()..])
     }
 
     // -----------------------------------------------------------------------------------------
@@ -533,7 +553,7 @@ impl Composer {
             let (list, col) = self.search_rows(search, w, ctx);
             cursor = (rows.len() as u16, col as u16);
             rows.extend(list);
-        } else if let Some(menu) = self.menu.as_ref().filter(|m| !m.matches.is_empty()) {
+        } else if let Some(menu) = &self.menu {
             rows.extend(self.menu_rows(menu, w, ctx));
         }
         if !self.queued.is_empty() {
@@ -570,41 +590,68 @@ impl Composer {
         theme.fg(token)
     }
 
-    /// The bottom-border key hint for the current state, built from the keymap's own labels.
-    fn hint(&self, ctx: &ComposerCtx) -> String {
-        if !ctx.ui.hints { return String::new(); }
+    /// Priority-ordered, indivisible hints; disabled or shadowed bindings are not advertised.
+    fn hint(&self, ctx: &ComposerCtx) -> Vec<String> {
+        if !ctx.ui.hints { return Vec::new(); }
         let keys = ctx.keys;
+        let label = |action: Action| {
+            keys.chords(action).iter().find(|chord| {
+                let key = KeyEvent::new(chord.code, chord.mods);
+                // These queue controls are literal keys in edit_key, not remappable actions.
+                !(self.search.is_none() && ((self.editing_queue.is_some() && key.code == KeyCode::Esc)
+                    || (self.busy && key.code == KeyCode::Enter && key.modifiers == KeyModifiers::ALT)
+                    || (action == Action::Interrupt && keys.matches(Action::Dismiss, &key)
+                        && (self.menu_open() || self.ghost().is_some()))))
+            }).map(|chord| chord.display()).unwrap_or_default()
+        };
         let hint = |action: Action, what: &str| {
-            let label = keys.label(action);
+            let label = label(action);
             (!label.is_empty()).then(|| format!("{label} {what}"))
         };
-        let pieces: Vec<Option<String>> = if self.search.is_some() {
-            vec![
-                Some(format!("{}/{} select", keys.label(Action::SelectUp), keys.label(Action::SelectDown))),
-                hint(Action::Submit, "accept"), hint(Action::Dismiss, "cancel"),
-            ]
-        } else if self.exit_armed {
-            vec![hint(Action::ClearDraft, "again to exit")]
-        } else if self.menu_open() {
-            vec![
-                Some(format!("{}/{} select", keys.label(Action::SelectUp), keys.label(Action::SelectDown))),
-                hint(Action::Complete, "complete"), hint(Action::Dismiss, "dismiss"),
-            ]
-        } else if self.ghost().is_some() {
-            vec![hint(Action::Complete, "accept suggestion"), hint(Action::Dismiss, "dismiss")]
-        } else if self.busy {
-            vec![hint(Action::Submit, "steer"), Some("Alt-Enter follow-up".into()), hint(Action::Interrupt, "to interrupt")]
-        } else if self.mode() == InputMode::Shell {
-            vec![Some("shell mode".to_owned()), hint(Action::Submit, "run")]
-        } else {
-            vec![hint(Action::ModelSelect, "model"), hint(Action::Settings, "settings"), hint(Action::HistorySearch, "history")]
+        let select = || {
+            let labels: Vec<_> = [Action::SelectUp, Action::SelectDown].into_iter()
+                .map(label).filter(|s| !s.is_empty()).collect();
+            (!labels.is_empty()).then(|| format!("{} select", labels.join("/")))
         };
-        pieces.into_iter().flatten().collect::<Vec<_>>().join(&format!(" {} ", ctx.theme.sym(Sym::Dot)))
+        let mut pieces = Vec::new();
+        if self.search.is_some() {
+            pieces.extend([hint(Action::Submit, "accept"), select(), hint(Action::Dismiss, "cancel")]);
+        } else {
+            if self.busy { pieces.push(hint(Action::Interrupt, "interrupt")); }
+            if let Some(follow_up) = self.editing_queue {
+                pieces.push(Some(format!("editing queued {}", if follow_up { "follow-up" } else { "steering" })));
+                pieces.push(hint(Action::Submit, if self.busy { "save queued item" } else { "send" }));
+                pieces.push(Some("Esc cancel edit".into()));
+            } else if self.exit_armed {
+                pieces.push(hint(Action::ClearDraft, "again to exit"));
+            } else if self.menu_open() {
+                pieces.extend([hint(Action::Complete, "complete"), select(), hint(Action::Dismiss, "dismiss")]);
+            } else if self.busy {
+                let command = self.editor.text.trim_start().starts_with('/');
+                pieces.push(hint(Action::Submit, if command { "run command" } else { "steer" }));
+                if !command { pieces.push(Some("Alt+Enter follow-up".into())); }
+            } else if !self.editor.text.is_empty() {
+                pieces.extend([hint(Action::Submit, if self.mode() == InputMode::Shell { "run" } else { "send" }),
+                    hint(Action::Newline, "newline")]);
+                if self.mode() == InputMode::Shell { pieces.push(Some("shell mode".into())); }
+                if self.ghost().is_some() {
+                    pieces.extend([hint(Action::Complete, "accept suggestion"), hint(Action::Dismiss, "dismiss")]);
+                }
+            } else {
+                pieces.extend([Some("/ commands".into()), Some("/help help".into()),
+                    hint(Action::ModelSelect, "model"), hint(Action::Settings, "settings"), hint(Action::HistorySearch, "history")]);
+            }
+        }
+        pieces.into_iter().flatten().collect()
     }
 
     fn menu_rows(&self, menu: &Menu, w: usize, ctx: &ComposerCtx) -> Rows {
         let theme = ctx.theme;
         let total = menu.matches.len();
+        if total == 0 {
+            let message = if menu.file_start.is_some() { "  No matching files" } else { "  No matching commands" };
+            return vec![finish_row(vec![Span::styled(message, theme.fg(Tok::Dim))], w)];
+        }
         let rows = list_rows(ctx.ui).min(total);
         let start = window(menu.selected, menu.scroll, rows, total);
         let visible = &menu.matches[start..start + rows];
@@ -748,15 +795,18 @@ fn layout(text: &str, ghost: &str, cursor: usize, width: usize, shell: bool) -> 
     Layout { rows, cursor }
 }
 
-/// `╰─ hint ──────╯`, exactly `w` cells; the hint is ellipsized and dropped when it cannot fit.
-fn bottom_border(w: usize, hint: &str, left: &str, right: &str, bar: &str, border: Style, theme: &Theme) -> Line<'static> {
+/// `╰─ hint ──────╯`, exactly `w` cells; lower-priority hint items are dropped whole.
+fn bottom_border(w: usize, hints: &[String], left: &str, right: &str, bar: &str, border: Style, theme: &Theme) -> Line<'static> {
     let frame = text::width(left) + text::width(right) + 2 * text::width(bar);
     let room = w.saturating_sub(frame + 2);
-    if hint.is_empty() || room < 3 {
+    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let mut keep = hints.len();
+    while keep > 0 && text::width(&hints[..keep].join(&sep)) > room { keep -= 1; }
+    let hint = hints[..keep].join(&sep);
+    if hint.is_empty() {
         let corners = text::width(left) + text::width(right);
         return Line::from(Span::styled(format!("{left}{}{right}", bar.repeat(w.saturating_sub(corners))), border));
     }
-    let hint = text::ellipsize(hint, room, theme.ascii());
     let fill = room - text::width(&hint);
     Line::from(vec![
         Span::styled(format!("{left}{bar} "), border),
@@ -1099,6 +1149,119 @@ mod tests {
     // ---- hints and keymap -------------------------------------------------------------------
 
     #[test]
+    fn primary_hints_follow_context_and_effective_bindings() {
+        let mut env = Env::new();
+        let mut c = with_commands();
+        assert_eq!(&c.hint(&env.ctx())[..2], ["/ commands", "/help help"]);
+        env.keys.rebind(Action::Submit, &["F2"]).unwrap();
+        env.keys.rebind(Action::Newline, &["F3"]).unwrap();
+        c.set_draft("a draft");
+        assert_eq!(&c.hint(&env.ctx())[..2], ["F2 send", "F3 newline"]);
+        c.set_busy(true);
+        assert_eq!(c.hint(&env.ctx())[0], "Esc interrupt");
+        env.keys.rebind(Action::Interrupt, &["F4"]).unwrap();
+        assert_eq!(&c.hint(&env.ctx())[..2], ["F4 interrupt", "F2 steer"]);
+        env.keys.rebind(Action::Interrupt, &[]).unwrap();
+        assert!(!c.hint(&env.ctx()).iter().any(|h| h.contains("interrupt")));
+        c.set_busy(false);
+        env.keys.rebind(Action::Submit, &[]).unwrap();
+        env.keys.rebind(Action::Newline, &[]).unwrap();
+        assert!(c.hint(&env.ctx()).is_empty());
+        c.set_draft("/mo");
+        env.keys.rebind(Action::SelectUp, &[]).unwrap();
+        env.keys.rebind(Action::SelectDown, &["F5"]).unwrap();
+        env.keys.rebind(Action::Complete, &[]).unwrap();
+        env.keys.rebind(Action::Dismiss, &[]).unwrap();
+        assert_eq!(c.hint(&env.ctx()), ["F5 select"]);
+        env.keys.rebind(Action::SelectDown, &[]).unwrap();
+        assert!(c.hint(&env.ctx()).is_empty());
+        ctrl(&mut c, &env, 'r');
+        assert!(c.hint(&env.ctx()).is_empty(), "no orphan select slash in search either");
+    }
+
+    #[test]
+    fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
+        let mut env = Env::new();
+        let mut c = with_commands();
+        c.set_busy(true);
+        c.set_draft("/mo");
+        assert_eq!(c.hint(&env.ctx())[0], "Ctrl+C interrupt", "Esc dismisses a menu first");
+        for follow_up in [false, true] {
+            c.set_draft("queued draft");
+            let mods = if follow_up { KeyModifiers::ALT } else { KeyModifiers::NONE };
+            key(&mut c, &env, KeyCode::Enter, mods);
+            press(&mut c, &env, KeyCode::Up);
+            let hints = c.hint(&env.ctx());
+            assert_eq!(hints[0], "Ctrl+C interrupt", "Esc cancels an edited queue item first");
+            assert_eq!(hints[1], format!("editing queued {}", if follow_up { "follow-up" } else { "steering" }));
+            assert!(hints.iter().any(|h| h == "Esc cancel edit"));
+            press(&mut c, &env, KeyCode::Enter);
+            assert_eq!(c.queued.pop_front(), Some(("queued draft".into(), follow_up)), "rendering must not change queue routing");
+        }
+        env.keys.rebind(Action::Submit, &["Alt+Enter", "F2"]).unwrap();
+        c.set_draft("draft");
+        assert!(c.hint(&env.ctx()).iter().any(|h| h == "F2 steer"), "Alt+Enter is reserved for follow-up while busy");
+    }
+
+    #[test]
+    fn footer_drops_whole_items_at_exact_width_boundaries() {
+        for ascii in [false, true] {
+            let mut env = Env::new();
+            if ascii { env.theme = Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii); }
+            env.keys.rebind(Action::Interrupt, &["Ctrl+Shift+F12"]).unwrap();
+            let mut c = composer();
+            c.set_busy(true);
+            let hints = c.hint(&env.ctx());
+            let sep = format!(" {} ", env.theme.sym(Sym::Dot));
+            for shape in [ComposerShape::Box, ComposerShape::Line] {
+                env.ui.composer_shape = shape;
+                for width in 0..=120u16 {
+                    let view = c.view(width, &env.ctx());
+                    assert!(view.rows.iter().all(|r| text::line_width(r) <= width as usize));
+                    if width < MIN_BOX_WIDTH as u16 { continue; }
+                    let footer = view.rows.last().unwrap();
+                    let shown: String = footer.spans.iter().filter(|s| s.style == env.theme.fg(Tok::Muted))
+                        .map(|s| s.content.as_ref()).collect();
+                    let keep = (0..=hints.len()).rev().find(|&n| text::width(&hints[..n].join(&sep)) <= width as usize - 6).unwrap();
+                    assert_eq!(shown, hints[..keep].join(&sep), "width {width}");
+                    assert_eq!(text::line_width(footer), width as usize);
+                    if ascii { assert!(lines(&view.rows).iter().all(|r| r.is_ascii())); }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unmatched_completion_rows_are_informational_and_width_safe() {
+        for ascii in [false, true] {
+            let mut env = Env::new();
+            if ascii { env.theme = Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii); }
+            for (draft, message) in [("/zzzz", "No matching commands"), ("@zzzz", "No matching files")] {
+                let mut c = with_commands();
+                c.set_files(vec!["src/main.rs".into()]);
+                c.set_draft(draft);
+                assert!(!c.menu_open());
+                assert!(screen(&c, &env, 80).last().unwrap().contains(message));
+                let row = c.view(80, &env.ctx()).rows.pop().unwrap();
+                assert!(row.spans.iter().any(|s| s.content.contains(message) && s.style == env.theme.fg(Tok::Dim)));
+                for width in 0..=80u16 {
+                    let view = c.view(width, &env.ctx());
+                    assert!(view.rows.iter().all(|r| text::line_width(r) <= width as usize));
+                    assert!((view.cursor.0 as usize) < view.rows.len());
+                    assert!(view.cursor.1 < width.max(1));
+                    if ascii { assert!(lines(&view.rows).iter().all(|r| r.is_ascii())); }
+                }
+                assert_eq!(press(&mut c, &env, KeyCode::Tab), ComposerEvent::None);
+                assert_eq!(c.draft(), draft, "no completion is selected");
+                assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::Submit(draft.into()));
+                c.set_draft(draft);
+                press(&mut c, &env, KeyCode::Left);
+                assert!(!screen(&c, &env, 80).iter().any(|r| r.contains(message)), "inactive query has no empty row");
+            }
+        }
+    }
+
+    #[test]
     fn hints_come_from_the_keymap_and_change_with_state() {
         let env = Env::new();
         let mut c = Composer::new(vec!["hello world".into()], 10);
@@ -1106,7 +1269,7 @@ mod tests {
         let idle = hint(&c);
         assert!(idle.contains(&format!("{} model", env.keys.label(Action::ModelSelect))) && idle.contains(&format!("{} settings", env.keys.label(Action::Settings))), "{idle:?}");
         c.set_busy(true);
-        assert!(hint(&c).contains(&format!("{} to interrupt", env.keys.label(Action::Interrupt))), "{:?}", hint(&c));
+        assert!(hint(&c).contains(&format!("{} interrupt", env.keys.label(Action::Interrupt))), "{:?}", hint(&c));
         c.set_busy(false);
         typed(&mut c, &env, "hel");
         assert!(hint(&c).contains(&format!("{} accept suggestion", env.keys.label(Action::Complete))), "{:?}", hint(&c));
@@ -1253,6 +1416,25 @@ mod tests {
     }
 
     #[test]
+    fn busy_slash_commands_bypass_both_message_queues() {
+        let env = Env::new();
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::ALT] {
+            for command in ["/help", "/model example", "  /unknown"] {
+                let mut c = composer();
+                c.set_busy(true);
+                c.set_draft("existing follow-up");
+                key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
+                c.set_draft(command);
+                assert_eq!(key(&mut c, &env, KeyCode::Enter, modifiers), ComposerEvent::Submit(command.into()));
+                assert_eq!(c.draft(), "");
+                assert!(c.take_steering().is_empty());
+                assert_eq!(c.take_follow_up().as_deref(), Some("existing follow-up"));
+                assert_eq!(c.take_follow_up(), None);
+            }
+        }
+    }
+
+    #[test]
     fn ctrl_c_preserves_busy_draft_and_arms_exit_only_when_idle() {
         let env = Env::new();
         let mut c = Composer::new(vec![], 10);
@@ -1394,6 +1576,64 @@ mod tests {
     }
 
     // ---- ghost suggestions ------------------------------------------------------------------
+
+    #[test]
+    fn command_arguments_are_dim_ghosts_without_history_and_complete_without_submitting() {
+        let env = Env::new();
+        let mut c = Composer::new(Vec::new(), 100);
+        c.set_commands(vec![cmd("skills", "Manage skills", CommandKind::Builtin), cmd("understanding", "Knowledge", CommandKind::Builtin)]);
+        c.set_argument_completions(vec!["/skills sources", "/skills enable", "/skills enable review", "/skills enable review --user", "/understanding architecture"].into_iter().map(str::to_owned).collect());
+        typed(&mut c, &env, "/understanding ");
+        assert_eq!(c.ghost(), Some("architecture"));
+        let view = c.view(60, &env.ctx());
+        let ghost = view.rows.iter().flat_map(|row| &row.spans).find(|span| span.content == "architecture").unwrap();
+        assert!(ghost.style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(c.draft(), "/understanding ");
+        assert_eq!(press(&mut c, &env, KeyCode::Tab), ComposerEvent::None);
+        assert_eq!(c.draft(), "/understanding architecture");
+        c.set_draft("/skills so");
+        assert_eq!(c.ghost(), Some("urces"));
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::Submit("/skills so".into()));
+        c.set_draft("/skills enable ");
+        assert_eq!(c.ghost(), Some("review"));
+        press(&mut c, &env, KeyCode::Right);
+        assert_eq!(c.draft(), "/skills enable review");
+        typed(&mut c, &env, " --u");
+        assert_eq!(c.ghost(), Some("ser"));
+        press(&mut c, &env, KeyCode::Tab);
+        assert_eq!(c.draft(), "/skills enable review --user");
+        for width in 1..50 {
+            c.set_draft("/understanding ");
+            assert!(screen(&c, &env, width).iter().all(|line| text::width(line) <= width as usize));
+        }
+    }
+
+    #[test]
+    fn command_ghosts_prefer_metadata_and_respect_dismissal_cursor_and_busy_state() {
+        let env = Env::new();
+        let mut c = Composer::new(vec!["/skills stale-history".into(), "/custom remembered".into()], 100);
+        c.set_argument_completions(vec!["/skills sources".into(), "/skills sources".into(), "/skills bad\ncommand".into()]);
+        assert_eq!(c.argument_completions, vec!["/skills sources"]);
+        c.set_draft("/skills ");
+        assert_eq!(c.ghost(), Some("sources"));
+        press(&mut c, &env, KeyCode::Esc);
+        assert_eq!(c.ghost(), None);
+        press(&mut c, &env, KeyCode::Tab);
+        assert_eq!(c.draft(), "/skills ");
+        typed(&mut c, &env, "s");
+        assert_eq!(c.ghost(), Some("ources"));
+        press(&mut c, &env, KeyCode::Left);
+        assert_eq!(c.ghost(), None);
+        press(&mut c, &env, KeyCode::End);
+        c.set_busy(true);
+        assert_eq!(c.ghost(), None);
+        c.set_busy(false);
+        assert_eq!(c.ghost(), Some("ources"));
+        c.set_draft("/custom ");
+        assert_eq!(c.ghost(), Some("remembered"), "unregistered argument choices still use history");
+        c.set_draft("/skills sources");
+        assert_eq!(c.ghost(), None);
+    }
 
     #[test]
     fn ghost_suggestion_is_dim_and_only_changes_the_draft_when_accepted() {
@@ -1552,8 +1792,9 @@ mod tests {
         press(&mut c, &env, KeyCode::Backspace);
         assert!(!c.menu_open(), "deleting the slash closes the menu");
         typed(&mut c, &env, "/zzz");
-        assert!(!c.menu_open(), "no match, no menu");
-        assert_eq!(screen(&c, &env, 80).len(), 3);
+        assert!(!c.menu_open(), "no match, no selectable menu");
+        assert_eq!(screen(&c, &env, 80).len(), 4);
+        assert!(screen(&c, &env, 80)[3].contains("No matching commands"));
     }
 
     #[test]

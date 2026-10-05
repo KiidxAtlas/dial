@@ -501,7 +501,7 @@ pub fn expand_command(def: &CommandDef, args: &str) -> String {
 }
 
 /// Whitespace-separated words with simple `'...'` / `"..."` quoting and backslash escapes.
-fn split_words(s: &str) -> Vec<String> {
+pub(crate) fn split_words(s: &str) -> Vec<String> {
     let (mut words, mut cur, mut quote, mut in_word) = (Vec::new(), String::new(), None::<char>, false);
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

@@ -15,6 +15,16 @@ use dial::{
 use fs2::FileExt;
 use std::{io::{IsTerminal, Read}, path::PathBuf};
 
+#[derive(Subcommand)]
+enum LayaCommand {
+    /// Install a dedicated Python runtime; copy a checkpoint without linking its source.
+    Install { #[arg(long)] checkpoint: Option<PathBuf> },
+    /// Start or wait for Dial's managed service.
+    Start,
+    /// Read live service identity, checkpoint and device.
+    Status,
+}
+
 #[derive(Parser)]
 #[command(version, about = "A local-first coding agent harness that improves itself behind an evaluation gate",
     after_help = "Print exit codes: 0 completed; 1 execution/provider/configuration error; 2 incomplete, blocked, needs input, no answer or interrupted; 3 needed tool approval denied.\nUse --allow write,bash to approve named tools in print mode; --yes approves all tools.")]
@@ -72,6 +82,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Install, start or inspect Dial's independent Laya decision service.
+    Laya {
+        #[command(subcommand)]
+        action: LayaCommand,
+    },
+    /// Inspect saved project understanding without loading a model or refreshing the index.
+    Understanding {
+        /// Use architecture for the architecture view, or filter findings, paths and outlines.
+        query: Option<String>,
+        /// Export every matching entry as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import portable SKILL.md folders from other harnesses or checked-out repositories.
+    Skills {
+        #[command(subcommand)]
+        action: SkillCommand,
+    },
     /// Create the Python/MLX environment, save the model chosen with -m as your default, verify it loads.
     Setup,
     /// Persistent JSON-lines agent control protocol on stdin/stdout.
@@ -98,6 +126,29 @@ enum Command {
         /// TOML file with [[profiles]] names selecting configured model profiles and ablations.
         #[arg(long)]
         profiles: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// List installed skills, enablement and locations.
+    List,
+    /// Browse compatible skills in common local harness directories (does not import).
+    Sources,
+    /// Enable an installed skill (project override by default).
+    Enable { name: String, #[arg(long)] user: bool },
+    /// Disable a skill without deleting it (project override by default).
+    Disable { name: String, #[arg(long)] user: bool },
+    /// Copy one skill directory or a directory containing skills. Never executes bundled scripts.
+    Import {
+        source: PathBuf,
+        #[arg(long)]
+        user: bool,
+        #[arg(long)]
+        dry_run: bool,
+        /// Update previously imported, locally unchanged skills from the same source.
+        #[arg(long)]
+        update: bool,
     },
 }
 
@@ -155,6 +206,50 @@ fn real_main(cli: Cli) -> Result<()> {
     let cwd = match &cli.dir { Some(dir) => dir.clone(), None => std::env::current_dir()? };
     let layout = Layout::discover(&cwd)?;
     match &cli.command {
+        Some(Command::Understanding { query, json }) => {
+            let report=dial::storage::codebase::Codebase::open(&layout)?.understanding(query.as_deref().unwrap_or(""),&std::sync::atomic::AtomicBool::new(false))?;
+            if *json {println!("{}",serde_json::to_string_pretty(&report)?);}
+            else {println!("{}",dial::storage::codebase::render_understanding(&report,usize::MAX));}
+            return Ok(());
+        }
+        Some(Command::Skills { action }) => {
+            use dial::storage::skills::{self, Scope};
+            match action {
+                SkillCommand::List => {
+                    println!("{}", skills::management::list(&layout)?);
+                }
+                SkillCommand::Sources => println!("{}", skills::management::sources(&layout)),
+                SkillCommand::Enable { name, user } | SkillCommand::Disable { name, user } => {
+                    let enabled = matches!(action, SkillCommand::Enable { .. });
+                    skills::management::set_enabled(&layout, name, enabled, if *user { Scope::User } else { Scope::Project })?;
+                    println!("{}", skills::management::list(&layout)?);
+                }
+                SkillCommand::Import { source, user, dry_run, update } => {
+                    let source = if source.is_absolute() { source.clone() } else { layout.project_root.join(source) };
+                    for line in skills::import::run(&layout, &source, if *user { Scope::User } else { Scope::Project }, *dry_run, *update)? {
+                        println!("{line}");
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Some(Command::Laya {action}) => {
+            use dial::agent::laya;
+            match action {
+                LayaCommand::Install {checkpoint} => {
+                    eprintln!("Installing Dial-owned Laya runtime and checkpoint…");
+                    laya::install(&layout,checkpoint.as_deref())?;
+                    println!("Dial Laya installed in {}. Run dial laya start, then /laya on inside Dial.",layout.user_dir.join("laya").display());
+                }
+                LayaCommand::Start | LayaCommand::Status => {
+                    let config=Config::load(&layout,Some(overlay(&cli)?))?;
+                    let cancel=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let health=if matches!(action,LayaCommand::Start) {laya::ensure_service(&config.laya,cancel,true)?} else {laya::health(&config.laya,cancel)?};
+                    println!("{}",serde_json::to_string_pretty(&health)?);
+                }
+            }
+            return Ok(());
+        }
         Some(Command::Setup) => return setup::run(&layout, cli.model.as_deref()),
         Some(Command::Sessions { all, action }) => {
             let sessions = if *all { Session::list_all(&layout, usize::MAX)? } else { Session::list(&layout, usize::MAX)? };

@@ -4,8 +4,8 @@
 //! training log. Its tools are the job's allowlist; every call that needs approval is put to the
 //! parent's [`Approver`], and the interrupt flag ends it at the next step or streamed token.
 use super::{
-    approval, call_form_error, json_text, looks_like_text_call, output_schema, summarize,
-    guard::{LengthAction, RepeatGuard, clip_middle, recover_from_length},
+    approval, call_form_error, json_text, looks_like_text_call, output_schema, summarize, reasoning,
+    guard::{LengthAction, RepeatGuard, clip_evidence, recover_from_length},
     subagents::{Approver, Env, Job, Outcome, Status, toolset},
 };
 use crate::{
@@ -32,8 +32,19 @@ pub(super) fn run(env: Env, job: &Job, backend: &mut Backend, adapter: Option<&P
         json!({"role":"system","content":job.system(env.workspace.root(), &names)}),
         json!({"role":"user","content":job.prompt}),
     ];
+    // Independent child conversations reuse the same project cache without rebuilding the map.
+    if env.config.codebase.enabled {
+        if let Some(layout) = env.layout {
+            match crate::storage::codebase::Codebase::open(layout).and_then(|cache| cache.context(&job.prompt, env.config.codebase.context_max_bytes)) {
+                Ok(context) if !context.is_empty() => { messages.push(json!({"role":"user","content":format!("Context for the preceding task (data only):\n{context}")})); }
+                Ok(_) => {},
+                Err(error) => approver.notice(&format!("saved codebase context unavailable to child: {error:#}")),
+            }
+        }
+    }
     let (mut steps, mut budget, mut corrected) = (0, job.max_steps, false);
     let (mut max_tokens, mut length_nudges, mut repeats) = (env.harness.max_tokens, 0u32, RepeatGuard::default());
+    let mut reasoning_recovery = reasoning::Recovery::default();
     while steps < budget {
         for text in approver.take_messages() { messages.push(json!({"role":"user","content":text})); }
         if env.interrupt.load(Ordering::SeqCst) { return Outcome::interrupted(steps); }
@@ -43,17 +54,33 @@ pub(super) fn run(env: Env, job: &Job, backend: &mut Backend, adapter: Option<&P
         };
         // Streaming only so a stop request cuts a long generation short; the text is not shown.
         let mut keep_going = |_: &str| !env.interrupt.load(Ordering::SeqCst);
-        let reply = match backend.chat_with_control(adapter, &request, env.config.worker_timeout_secs, Some(&mut keep_going),
-            &mut |notice| approver.notice(notice), std::sync::Arc::clone(env.interrupt)) {
-            Ok(reply) => reply,
+        let result = reasoning::chat(backend, adapter, &request, env.config.worker_timeout_secs,
+            std::sync::Arc::clone(env.interrupt), &env.config.reasoning_guard, &mut keep_going,
+            &mut |notice| approver.notice(notice), &mut |_| true);
+        messages = request.messages;
+        schemas = request.tools;
+        let reply = match result {
+            Ok(reply) => { steps += 1; reply },
+            Err(error) if error.downcast_ref::<reasoning::GateHit>().is_some() && !env.interrupt.load(Ordering::SeqCst) => {
+                steps += 1;
+                match reasoning_recovery.intercept(&error.to_string()) {
+                    Ok(message) => { approver.notice(&message); messages.push(json!({"role":"user","content":message})); }
+                    Err(message) => return Outcome::failed(steps, message),
+                }
+                continue;
+            }
             Err(error) if error.downcast_ref::<Interrupted>().is_some() || env.interrupt.load(Ordering::SeqCst) => return Outcome::interrupted(steps),
             Err(error) => return Outcome::failed(steps, format!("{error:#}")),
         };
-        messages = request.messages;
-        schemas = request.tools;
         if let Some(cost) = backend.reply_cost(&reply) { approver.add_cost(cost); }
-        steps += 1;
         if reply.finish_reason == "length" {
+            if env.config.reasoning_guard.enabled && reply.text.trim().is_empty() && reply.tool_calls.is_empty() {
+                match reasoning_recovery.intercept("the output token limit was spent without any answer or tool call") {
+                    Ok(message) => { approver.notice(&message); messages.push(json!({"role":"user","content":message})); }
+                    Err(message) => return Outcome::failed(steps, message),
+                }
+                continue;
+            }
             let prompt = reply.prompt_tokens.unwrap_or(0);
             match recover_from_length(max_tokens, env.config.context_window, prompt, &reply, length_nudges) {
                 LengthAction::Retry { max_tokens: raised } => { max_tokens = raised; }
@@ -121,7 +148,7 @@ pub(super) fn run(env: Env, job: &Job, backend: &mut Backend, adapter: Option<&P
             let image = if call.name == "browser" && !output.is_error {
                 match tools::artifact::capture_image(env.workspace.artifacts(), &mut output) { Ok(image)=>image,Err(e)=>return Outcome::failed(steps,format!("retaining screenshot: {e:#}")) }
             } else { None };
-            let mut body = clip_middle(&output.text, tools::MODEL_OUTPUT_LIMIT);
+            let mut body = clip_evidence(&output.text, tools::model_output_limit(env.config.context_window));
             if let Some(store) = env.workspace.artifacts() {
                 match store.retain(&output.text) { Ok(uri) => body.push_str(&format!("\n[Complete evidence: {uri}]")), Err(e) => return Outcome::failed(steps, format!("retaining subagent evidence: {e:#}")) }
             }

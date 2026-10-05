@@ -8,6 +8,7 @@
 //! - `composer`    the input box with the status line embedded in its border and the `/` menu
 //! - `statusline`  status segments, presets and separators
 //! - `transcript`  conversation blocks rendered to styled rows; `markdown`, `welcome`
+//! - `tasks`       the live todo panel pinned above the composer
 //! - `overlay`     settings, model selector, providers
 pub mod composer;
 pub mod editor;
@@ -18,6 +19,7 @@ pub mod settings_schema;
 pub mod status;
 pub mod statusline;
 pub mod term;
+pub mod tasks;
 pub mod text;
 pub mod theme;
 pub mod transcript;

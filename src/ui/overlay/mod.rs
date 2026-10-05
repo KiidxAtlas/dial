@@ -5,11 +5,12 @@
 pub mod models;
 pub mod providers;
 pub mod settings;
+pub mod shortcuts;
 
 use crate::{
     llm::model_config::{ModelSelection, ProviderSpec, UiConfig},
     storage::settings_store::Scope,
-    ui::{keys::Keymap, status::StatusData, theme::Theme},
+    ui::{keys::{Action, Keymap}, status::StatusData, theme::Theme},
 };
 use ratatui::text::Line;
 
@@ -22,7 +23,7 @@ pub enum OverlayEvent {
     Set { path: String, value: toml::Value, scope: Scope },
     /// Remove the key from `scope` so the lower layer or default applies again.
     Unset { path: String, scope: Scope },
-    /// Make `selection` the model for `role` (`main`, `feedback`, `subagent`, `compaction`).
+    /// Make `selection` the model for a supported role in `model_config::ROLES`.
     AssignModel { role: String, selection: ModelSelection, scope: Scope },
     /// Make `role` follow the main model again.
     ClearRole { role: String, scope: Scope },
@@ -37,8 +38,11 @@ pub enum OverlayEvent {
     RemoveCredential { base_url: String },
     /// Rescan providers and models.
     Refresh,
+    VerifyLora(ModelSelection),
     /// Preview a theme live without saving; `None` restores the configured theme.
     PreviewTheme(Option<String>),
+    /// Validate and persist a global shortcut edit before applying it to the live keymap.
+    Rebind { action: Action, chords: Vec<String> },
     /// Free-form request to the application, e.g. `open:models`, `open:providers`.
     Action(String),
 }
@@ -62,7 +66,9 @@ impl fmt::Debug for OverlayEvent {
             Self::ChatGptSignOut { .. } => f.write_str("ChatGptSignOut"),
             Self::RemoveCredential { base_url } => f.debug_struct("RemoveCredential").field("base_url", base_url).finish(),
             Self::Refresh => f.write_str("Refresh"),
+            Self::VerifyLora(selection) => f.debug_tuple("VerifyLora").field(selection).finish(),
             Self::PreviewTheme(name) => f.debug_tuple("PreviewTheme").field(name).finish(),
+            Self::Rebind { action, chords } => f.debug_struct("Rebind").field("action", action).field("chords", chords).finish(),
             Self::Action(action) => f.debug_tuple("Action").field(action).finish(),
         }
     }

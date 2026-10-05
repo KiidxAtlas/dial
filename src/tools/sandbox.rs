@@ -117,9 +117,10 @@ impl Sandbox {
     pub fn available(&self) -> Result<(), String> {
         match self {
             Sandbox::Available => Ok(()),
-            Sandbox::Unavailable(reason) => Err(format!(
-                "bash is disabled because no sandbox is available: {reason}"
-            )),
+            Sandbox::Unavailable(reason) => {
+                let nested = if already_sandboxed() { " (this process already runs inside a sandbox, which macOS cannot nest)" } else { "" };
+                Err(format!("bash is disabled because no sandbox is available: {reason}{nested}"))
+            }
         }
     }
 
@@ -220,6 +221,30 @@ impl Sandbox {
             Ok(()) => Sandbox::Available,
             Err(reason) => Sandbox::Unavailable(format!("policy cannot be enforced: {reason}")),
         }
+    }
+}
+
+/// Whether this process itself runs under a macOS sandbox (e.g. a dial `bash` command running dial's
+/// own tests). `sandbox-exec` cannot be nested, so sandboxed tools are unavailable there.
+#[cfg(target_os = "macos")]
+pub fn already_sandboxed() -> bool {
+    unsafe extern "C" {
+        fn sandbox_check(pid: libc::pid_t, operation: *const libc::c_char, filter: libc::c_int, ...) -> libc::c_int;
+    }
+    // SAFETY: a null operation with SANDBOX_FILTER_NONE (0) only asks whether the process is sandboxed.
+    unsafe { sandbox_check(libc::getpid(), std::ptr::null(), 0) == 1 }
+}
+#[cfg(not(target_os = "macos"))]
+pub fn already_sandboxed() -> bool { false }
+
+/// For tests that exercise the real sandbox: true when it works; false (skip, with a note) only when
+/// this process is already sandboxed and nesting is impossible; otherwise the missing sandbox fails the test.
+#[cfg(test)]
+pub(crate) fn require_for_test() -> bool {
+    match Sandbox::detect().available() {
+        Ok(()) => true,
+        Err(_) if already_sandboxed() => { eprintln!("skipping: already inside a sandbox, which macOS cannot nest"); false }
+        Err(reason) => panic!("sandbox-exec must work on this Mac: {reason}"),
     }
 }
 
@@ -613,6 +638,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn detect_works_on_macos() {
+        if !require_for_test() { return; }
         assert_eq!(Sandbox::detect(), Sandbox::Available);
     }
 
@@ -745,6 +771,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_reads_widely_but_not_denied_paths() {
+        if !require_for_test() { return; }
         let fx = Fixture::new();
         let policy = fx.policy(false);
         let link_to_denied = fx.ws.join("..").join("denied-link");
@@ -786,6 +813,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_confines_writes() {
+        if !require_for_test() { return; }
         let fx = Fixture::new();
         let policy = fx.policy(false);
         let script = format!(
@@ -821,6 +849,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_denial_beats_extra_write_and_workspace() {
+        if !require_for_test() { return; }
         let fx = Fixture::new();
         // A denied dir nested inside the workspace and one inside an extra_write dir.
         let in_ws = fx.ws.join("private");
@@ -852,6 +881,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_network_follows_flag() {
+        if !require_for_test() { return; }
         let fx = Fixture::new();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -865,6 +895,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_scrubs_secret_environment() {
+        if !require_for_test() { return; }
         let fx = Fixture::new();
         let env: Vec<(OsString, OsString)> = [
             ("PATH", "/usr/bin:/bin"),
@@ -902,6 +933,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_runs_toolchains() {
+        if !require_for_test() { return; }
         let fx = Fixture::new();
         let script = r#"
             set -e
@@ -927,6 +959,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_timeout_kills_the_whole_process_group() {
+        if !require_for_test() { return; }
         use std::os::unix::process::{CommandExt, ExitStatusExt};
         let fx = Fixture::new();
         let marker = fx.ws.join("grandchild-ran");
@@ -948,6 +981,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn probe_policy_reports_enforceable_policies_and_rejects_broken_ones() {
+        if !require_for_test() { return; }
         let fx = Fixture::new();
         for allow_network in [false, true] {
             assert_eq!(

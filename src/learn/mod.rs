@@ -10,3 +10,8 @@ pub mod mutate;
 pub mod probe;
 pub mod verify;
 pub mod worker;
+pub mod workflow;
+
+pub mod repository;
+pub mod task_policy;
+pub mod profiles;

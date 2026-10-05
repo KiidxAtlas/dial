@@ -34,6 +34,8 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
 parking_lot = "0.12"
+similar = { version = "2.7", default-features = false, features = ["text"] }
+shlex = "2"
 
 [dev-dependencies]
 vt100 = "0.15"

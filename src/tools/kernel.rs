@@ -307,6 +307,7 @@ mod tests {
     }
     #[cfg(target_os = "macos")]
     #[test] fn kernel_denies_fork_spawn_and_detached_descendants_even_without_filesystem_sandbox() {
+        if !crate::tools::sandbox::require_for_test() { return; }
         let dir = tempfile::tempdir().unwrap();
         let workspace = super::super::Workspace::new(dir.path()).unwrap().without_sandbox();
         let config = Config::default();

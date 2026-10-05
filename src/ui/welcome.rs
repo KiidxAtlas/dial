@@ -99,13 +99,13 @@ fn right_column(info: &WelcomeInfo, theme: &Theme, width: usize) -> Vec<Entry> {
     let heading = theme.fg(Tok::Accent).add_modifier(Modifier::BOLD);
     let mut out = Vec::new();
     if !info.tips.is_empty() {
-        out.push(entry(vec![label("Tips", width, heading, ascii)]));
+        out.push(entry(vec![label("Get started", width, heading, ascii)]));
         for tip in &info.tips {
             out.push(entry(vec![label(tip, width, theme.fg(Tok::Muted), ascii)]));
         }
         out.push(rule(theme, width));
     }
-    out.push(entry(vec![label("Recent sessions", width, heading, ascii)]));
+    out.push(entry(vec![label("Recent sessions  /resume", width, heading, ascii)]));
     if info.recent.is_empty() {
         out.push(entry(vec![label("No recent sessions", width, theme.fg(Tok::Muted), ascii)]));
     }
@@ -267,11 +267,11 @@ mod tests {
         assert!(text[0].starts_with('╭') && text[0].contains("dial v0.3.1") && text[0].contains('┬'));
         assert!(text.last().unwrap().starts_with('╰') && text.last().unwrap().contains('┴'));
         let joined = text.join("\n");
-        for needle in ["Welcome back!", "qwen3.5-9b", "lmstudio", "Tips", "# prompt actions", "! bash", "Recent sessions", "fix the parser", "2h", "add welcome banner"] {
+        for needle in ["Welcome back!", "qwen3.5-9b", "lmstudio", "Get started", "# prompt actions", "! bash", "Recent sessions", "/resume", "fix the parser", "2h", "add welcome banner"] {
             assert!(joined.contains(needle), "missing {needle:?}\n{joined}");
         }
         // columns: the welcome greeting and the tips share a row
-        let tips_row = text.iter().find(|l| l.contains("Tips")).unwrap();
+        let tips_row = text.iter().find(|l| l.contains("Get started")).unwrap();
         assert_eq!(tips_row.matches('│').count(), 3, "{tips_row}");
         // the age sits at the right edge of its column
         let recent = text.iter().find(|l| l.contains("fix the parser")).unwrap();
@@ -284,7 +284,7 @@ mod tests {
         let text = plain(&rows);
         assert!(text.iter().all(|l| !l.contains('┬') && !l.contains('┴')));
         let joined = text.join("\n");
-        for needle in ["Welcome back!", "qwen3.5-9b", "Tips", "/ commands", "Recent sessions", "fix the parser"] {
+        for needle in ["Welcome back!", "qwen3.5-9b", "Get started", "/ commands", "Recent sessions", "/resume", "fix the parser"] {
             assert!(joined.contains(needle), "missing {needle:?}\n{joined}");
         }
         assert!(text.iter().any(|l| l.contains("▄▀")), "logo is drawn when there is room");
@@ -304,7 +304,7 @@ mod tests {
         bare.tips.clear();
         let joined = plain(&rows(&bare, 90, &Theme::dark())).join("\n");
         assert!(joined.contains("No recent sessions"));
-        assert!(!joined.contains("Tips"));
+        assert!(!joined.contains("Get started"));
     }
 
     #[test]
