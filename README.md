@@ -13,13 +13,12 @@ dial -p -y "summarize this repo"      # one-shot; prints the answer (use -y or -
 dial -c                               # continue the latest session   (-r <id-prefix> to pick one)
 ```
 
-To update the installed CLI after changing this checkout, run `make update` here
-(or `make -C /path/to/dial update` from another directory). This runs
-`cargo install --path . --locked --force`, rebuilding and replacing the Cargo-installed
-binary without pulling Git changes. Restart any running dial session afterward.
-Ensure Cargo's bin directory (normally `~/.cargo/bin`) is on your `PATH`;
-`command -v dial` shows which copy your terminal will run. `make help` lists the
-other build and check targets.
+To rebuild after changing this checkout, run `make update` here (or `make -C /path/to/dial update`).
+This runs `cargo build --release --locked` and copies the binary to `bin/dial` in this checkout
+(git-ignored); run `./bin/dial` or add that directory to your `PATH`. `cargo install --path .`
+installs into Cargo's bin directory instead. `command -v dial` shows which copy your terminal
+will run, and `make help` lists the other build and check targets. Restart any running dial
+session afterward. See `ARCHITECTURE.md` for the module layout.
 
 For local MLX you can also prepare the runtime and model explicitly:
 `dial setup -m mlx-community/Qwen2.5-7B-Instruct-4bit` (requires `uv`).
