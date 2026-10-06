@@ -3,8 +3,8 @@
 //! `grep` matches a Rust `regex` (or, with `fixed_string`, literal text) line
 //! by line, optionally with surrounding context lines.
 
-use super::{MAX_LIST, Workspace, io_message, opt_bool, opt_str, opt_u64, req_str};
 use super::walk::Walk;
+use super::{MAX_LIST, Workspace, io_message, opt_bool, opt_str, opt_u64, req_str};
 use anyhow::Result;
 use regex::bytes::{Regex, RegexBuilder};
 use serde_json::Value;
@@ -56,7 +56,9 @@ fn expand_braces(pattern: &str, out: &mut Vec<String>) -> Result<(), String> {
     for end in commas {
         expand_braces(&format!("{prefix}{}{suffix}", &pattern[start..end]), out)?;
         if out.len() > MAX_ALTERNATIVES {
-            return Err(format!("glob expands to more than {MAX_ALTERNATIVES} alternatives"));
+            return Err(format!(
+                "glob expands to more than {MAX_ALTERNATIVES} alternatives"
+            ));
         }
         start = end + 1;
     }
@@ -151,7 +153,10 @@ impl Glob {
         let mut alternatives = Vec::new();
         for mut alt in expanded {
             if alt.starts_with('/') {
-                return Err("glob patterns are relative to the workspace root; remove the leading '/'".to_string());
+                return Err(
+                    "glob patterns are relative to the workspace root; remove the leading '/'"
+                        .to_string(),
+                );
             }
             while let Some(rest) = alt.strip_prefix("./") {
                 alt = rest.to_string();
@@ -182,16 +187,28 @@ impl Glob {
             .cloned()
             .collect::<Vec<_>>();
         for alternative in &alternatives[1..] {
-            let shared = common.iter().zip(alternative).take_while(|(a, b)| a == b).count();
+            let shared = common
+                .iter()
+                .zip(alternative)
+                .take_while(|(a, b)| a == b)
+                .count();
             common.truncate(shared.min(alternative.len().saturating_sub(1)));
         }
-        let prefix = common.iter().map(|segment| segment.iter().collect::<String>()).collect();
-        Ok(Glob { alternatives, prefix })
+        let prefix = common
+            .iter()
+            .map(|segment| segment.iter().collect::<String>())
+            .collect();
+        Ok(Glob {
+            alternatives,
+            prefix,
+        })
     }
 
     fn matches(&self, relative: &str) -> bool {
         let path: Vec<Vec<char>> = relative.split('/').map(|s| s.chars().collect()).collect();
-        self.alternatives.iter().any(|alt| match_segments(alt, &path))
+        self.alternatives
+            .iter()
+            .any(|alt| match_segments(alt, &path))
     }
 }
 
@@ -204,12 +221,18 @@ pub(super) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
     let mut total = 0;
     let mut walk = Walk::new(ws);
     walk.run_with_prefix(&ws.root, &ws.root.join(&glob.prefix), &mut |path| {
-        let rel = path.strip_prefix(&ws.root).unwrap_or(path).to_string_lossy();
+        let rel = path
+            .strip_prefix(&ws.root)
+            .unwrap_or(path)
+            .to_string_lossy();
         if glob.matches(&rel) {
             total += 1;
             if matches.len() < MAX_LIST {
                 matches.push(rel.into_owned());
-            } else if matches.peek().is_some_and(|last| rel.as_ref() < last.as_str()) {
+            } else if matches
+                .peek()
+                .is_some_and(|last| rel.as_ref() < last.as_str())
+            {
                 *matches.peek_mut().unwrap() = rel.into_owned();
             }
         }
@@ -223,10 +246,18 @@ pub(super) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
             "no matches".to_string()
         });
     }
-    let mut text = matches.iter().take(MAX_LIST).map(String::as_str).collect::<Vec<_>>().join("\n");
+    let mut text = matches
+        .iter()
+        .take(MAX_LIST)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
     text.push('\n');
     if total > MAX_LIST {
-        text.push_str(&format!("[{} more matches not shown; narrow the pattern]\n", total - MAX_LIST));
+        text.push_str(&format!(
+            "[{} more matches not shown; narrow the pattern]\n",
+            total - MAX_LIST
+        ));
     }
     if walk.truncated {
         text.push_str("[workspace walk truncated at its entry limit; results may be incomplete]\n");
@@ -238,7 +269,11 @@ pub(super) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
 /// every character is literal. Size limits bound compile-time memory; matching
 /// itself is linear in the input, so hostile patterns cannot hang the search.
 fn build_matcher(pattern: &str, fixed_string: bool, ignore_case: bool) -> Result<Regex, String> {
-    let source = if fixed_string { regex::escape(pattern) } else { pattern.to_owned() };
+    let source = if fixed_string {
+        regex::escape(pattern)
+    } else {
+        pattern.to_owned()
+    };
     RegexBuilder::new(&source)
         .case_insensitive(ignore_case)
         .size_limit(REGEX_SIZE_LIMIT)
@@ -261,7 +296,10 @@ fn format_row(rel: &str, number: usize, sep: char, lead: &str, line: &[u8]) -> S
         Some((at, _)) => (&text[..at], true),
         None => (&text[..], head.len() < line.len()),
     };
-    format!("{rel}{sep}{number}{sep}{lead}{shown}{}\n", if cut { " …[truncated]" } else { "" })
+    format!(
+        "{rel}{sep}{number}{sep}{lead}{shown}{}\n",
+        if cut { " …[truncated]" } else { "" }
+    )
 }
 
 struct GrepState {
@@ -284,7 +322,13 @@ impl GrepState {
                 while start < line.len() && (line[start] & 0xC0) == 0x80 {
                     start += 1;
                 }
-                format_row(rel, number, ':', &format!("…[{start} bytes skipped] "), &line[start..])
+                format_row(
+                    rel,
+                    number,
+                    ':',
+                    &format!("…[{start} bytes skipped] "),
+                    &line[start..],
+                )
             }
             _ => format_row(rel, number, ':', "", line),
         }
@@ -315,7 +359,9 @@ impl GrepState {
             self.skipped += 1;
             return;
         }
-        let Ok(mut file) = fs::File::open(path) else { return };
+        let Ok(mut file) = fs::File::open(path) else {
+            return;
+        };
         bytes.clear();
         // Inspect the binary prefix before reading the rest; retain this buffer across files.
         if file.by_ref().take(8192).read_to_end(bytes).is_err() {
@@ -326,7 +372,11 @@ impl GrepState {
             return;
         }
         // A file may grow after metadata; bound the read as well as the initial size check.
-        if file.take(MAX_GREP_FILE + 1 - bytes.len() as u64).read_to_end(bytes).is_err() {
+        if file
+            .take(MAX_GREP_FILE + 1 - bytes.len() as u64)
+            .read_to_end(bytes)
+            .is_err()
+        {
             return;
         }
         if bytes.len() as u64 > MAX_GREP_FILE {
@@ -378,8 +428,14 @@ pub(super) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
     if pattern.is_empty() || pattern.len() > MAX_PATTERN {
         return Err(format!("pattern must be 1..={MAX_PATTERN} bytes"));
     }
-    let matcher = build_matcher(pattern, opt_bool(args, "fixed_string")?, opt_bool(args, "ignore_case")?)?;
-    let context = opt_u64(args, "context")?.unwrap_or(0).min(MAX_GREP_CONTEXT as u64) as usize;
+    let matcher = build_matcher(
+        pattern,
+        opt_bool(args, "fixed_string")?,
+        opt_bool(args, "ignore_case")?,
+    )?;
+    let context = opt_u64(args, "context")?
+        .unwrap_or(0)
+        .min(MAX_GREP_CONTEXT as u64) as usize;
     let max_matches = match opt_u64(args, "max_results")? {
         None => DEFAULT_GREP_MATCHES,
         Some(0) => return Err("max_results must be at least 1".to_string()),
@@ -391,17 +447,30 @@ pub(super) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
         None => ws.root.clone(),
     };
     let meta = fs::metadata(&start).map_err(|e| io_message("searching", &ws.rel(&start), &e))?;
-    let mut state = GrepState { matcher, context, max_matches, out: String::new(), matches: 0, skipped: 0, full: false };
+    let mut state = GrepState {
+        matcher,
+        context,
+        max_matches,
+        out: String::new(),
+        matches: 0,
+        skipped: 0,
+        full: false,
+    };
     let mut truncated = false;
     let mut bytes = Vec::new();
     if meta.is_file() {
         state.search_file(ws, &start, &mut bytes);
     } else {
         let mut walk = Walk::new(ws);
-        let prefix = glob.as_ref().map_or_else(|| ws.root.clone(), |g| ws.root.join(&g.prefix));
+        let prefix = glob
+            .as_ref()
+            .map_or_else(|| ws.root.clone(), |g| ws.root.join(&g.prefix));
         walk.run_with_prefix(&start, &prefix, &mut |path| {
             if glob.as_ref().is_none_or(|g| {
-                let rel = path.strip_prefix(&ws.root).unwrap_or(path).to_string_lossy();
+                let rel = path
+                    .strip_prefix(&ws.root)
+                    .unwrap_or(path)
+                    .to_string_lossy();
                 g.matches(&rel)
             }) {
                 state.search_file(ws, path, &mut bytes);
@@ -421,14 +490,16 @@ pub(super) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
         ));
     }
     if state.skipped > 0 {
-        text.push_str(&format!("[{} binary or oversized files skipped]\n", state.skipped));
+        text.push_str(&format!(
+            "[{} binary or oversized files skipped]\n",
+            state.skipped
+        ));
     }
     if truncated {
         text.push_str("[workspace walk truncated at its entry limit; results may be incomplete]\n");
     }
     Ok(text)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -442,7 +513,11 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("leak.txt"), "needle outside\n").unwrap();
         symlink(outside.path(), dir.path().join("linkdir")).unwrap();
-        symlink(outside.path().join("leak.txt"), dir.path().join("linkfile.txt")).unwrap();
+        symlink(
+            outside.path().join("leak.txt"),
+            dir.path().join("linkfile.txt"),
+        )
+        .unwrap();
         fs::write(dir.path().join("real.txt"), "needle inside\n").unwrap();
 
         let glob = run(&ws, "glob", json!({"pattern": "**/*.txt"}));
@@ -457,7 +532,15 @@ mod tests {
     #[test]
     fn glob_patterns_sort_and_cap() {
         let (dir, ws) = workspace();
-        for path in ["src/b.rs", "src/a.rs", "src/deep/c.rs", "README.md", "docs/x.md", ".git/config.rs", ".tmp/t.rs"] {
+        for path in [
+            "src/b.rs",
+            "src/a.rs",
+            "src/deep/c.rs",
+            "README.md",
+            "docs/x.md",
+            ".git/config.rs",
+            ".tmp/t.rs",
+        ] {
             let full = dir.path().join(path);
             fs::create_dir_all(full.parent().unwrap()).unwrap();
             fs::write(full, "").unwrap();
@@ -466,7 +549,10 @@ mod tests {
         assert_eq!(text("src/*.rs"), "src/a.rs\nsrc/b.rs\n");
         assert_eq!(text("src/**/*.rs"), "src/a.rs\nsrc/b.rs\nsrc/deep/c.rs\n");
         assert_eq!(text("*.rs"), "src/a.rs\nsrc/b.rs\nsrc/deep/c.rs\n");
-        assert_eq!(text("*.{md,rs}"), "README.md\ndocs/x.md\nsrc/a.rs\nsrc/b.rs\nsrc/deep/c.rs\n");
+        assert_eq!(
+            text("*.{md,rs}"),
+            "README.md\ndocs/x.md\nsrc/a.rs\nsrc/b.rs\nsrc/deep/c.rs\n"
+        );
         assert_eq!(text("src/[ab].rs"), "src/a.rs\nsrc/b.rs\n");
         assert_eq!(text("src/?.rs"), "src/a.rs\nsrc/b.rs\n");
         assert_eq!(text("docs/"), "docs/x.md\n");
@@ -495,27 +581,51 @@ mod tests {
         let (dir, ws) = workspace();
         fs::write(dir.path().join("a.txt"), "Hello World\nfn a(x) {}\nax\n").unwrap();
         let literal = grep(&ws, json!({"pattern": "a(x)", "fixed_string": true}));
-        assert!(literal.contains("a.txt:2:fn a(x) {}") && !literal.contains("a.txt:3:"), "{literal}");
-        assert!(grep(&ws, json!({"pattern": ".*", "fixed_string": true})).starts_with("no matches\n"));
-        let folded = grep(&ws, json!({"pattern": "HELLO", "fixed_string": true, "ignore_case": true}));
+        assert!(
+            literal.contains("a.txt:2:fn a(x) {}") && !literal.contains("a.txt:3:"),
+            "{literal}"
+        );
+        assert!(
+            grep(&ws, json!({"pattern": ".*", "fixed_string": true})).starts_with("no matches\n")
+        );
+        let folded = grep(
+            &ws,
+            json!({"pattern": "HELLO", "fixed_string": true, "ignore_case": true}),
+        );
         assert!(folded.starts_with("a.txt:1:Hello World"), "{folded}");
     }
 
     #[test]
     fn grep_is_a_case_sensitive_regex_by_default() {
         let (dir, ws) = workspace();
-        fs::write(dir.path().join("a.rs"), "fn alpha(x: u8) {}\nlet fn_ptr = 1;\nHELLO\nhello\n").unwrap();
+        fs::write(
+            dir.path().join("a.rs"),
+            "fn alpha(x: u8) {}\nlet fn_ptr = 1;\nHELLO\nhello\n",
+        )
+        .unwrap();
         let calls = grep(&ws, json!({"pattern": r"^fn \w+\("}));
-        assert!(calls.contains("a.rs:1:fn alpha(x: u8)") && !calls.contains("a.rs:2:"), "{calls}");
+        assert!(
+            calls.contains("a.rs:1:fn alpha(x: u8)") && !calls.contains("a.rs:2:"),
+            "{calls}"
+        );
         let alternation = grep(&ws, json!({"pattern": "alpha|fn_ptr"}));
-        assert!(alternation.contains("a.rs:1:") && alternation.contains("a.rs:2:"), "{alternation}");
+        assert!(
+            alternation.contains("a.rs:1:") && alternation.contains("a.rs:2:"),
+            "{alternation}"
+        );
         // `a(x)` is a group here: it matches `ax`, not the literal text.
         assert!(grep(&ws, json!({"pattern": "a(l)pha"})).contains("a.rs:1:"));
         assert!(grep(&ws, json!({"pattern": "a(x)"})).starts_with("no matches\n"));
         let sensitive = grep(&ws, json!({"pattern": "hello"}));
-        assert!(sensitive.contains("a.rs:4:hello") && !sensitive.contains("a.rs:3:"), "{sensitive}");
+        assert!(
+            sensitive.contains("a.rs:4:hello") && !sensitive.contains("a.rs:3:"),
+            "{sensitive}"
+        );
         let folded = grep(&ws, json!({"pattern": "^hello$", "ignore_case": true}));
-        assert!(folded.contains("a.rs:3:HELLO") && folded.contains("a.rs:4:hello"), "{folded}");
+        assert!(
+            folded.contains("a.rs:3:HELLO") && folded.contains("a.rs:4:hello"),
+            "{folded}"
+        );
     }
 
     #[test]
@@ -523,7 +633,11 @@ mod tests {
         let (dir, ws) = workspace();
         fs::write(dir.path().join("a.txt"), "x(\n").unwrap();
         let bad = run(&ws, "grep", json!({"pattern": "x("}));
-        assert!(bad.is_error && bad.text.contains("invalid regex") && bad.text.contains("fixed_string"), "{}", bad.text);
+        assert!(
+            bad.is_error && bad.text.contains("invalid regex") && bad.text.contains("fixed_string"),
+            "{}",
+            bad.text
+        );
         // The same text is fine as a literal.
         assert!(grep(&ws, json!({"pattern": "x(", "fixed_string": true})).contains("a.txt:1:x("));
         let huge = run(&ws, "grep", json!({"pattern": "((a{100}){100}){100}"}));
@@ -539,9 +653,17 @@ mod tests {
         fs::write(dir.path().join("b.md"), "hello again\n").unwrap();
         fs::write(dir.path().join("bin.dat"), b"hello\0").unwrap();
         let all = grep(&ws, json!({"pattern": "hello"}));
-        assert!(all.contains("b.md:1:hello again") && !all.contains("a.txt") && all.contains("1 binary"), "{all}");
+        assert!(
+            all.contains("b.md:1:hello again")
+                && !all.contains("a.txt")
+                && all.contains("1 binary"),
+            "{all}"
+        );
         let only_txt = grep(&ws, json!({"pattern": "(?i)hello", "glob": "*.txt"}));
-        assert!(only_txt.starts_with("a.txt:1:Hello World") && !only_txt.contains("b.md"), "{only_txt}");
+        assert!(
+            only_txt.starts_with("a.txt:1:Hello World") && !only_txt.contains("b.md"),
+            "{only_txt}"
+        );
         let single = grep(&ws, json!({"pattern": "again", "path": "b.md"}));
         assert!(single.contains("b.md:1:hello again"));
     }
@@ -554,14 +676,29 @@ mod tests {
         assert_eq!(one, "f.txt-4-l4\nf.txt:5:l5\nf.txt-6-l6\n");
         // Distant matches are split by `--`; overlapping windows merge.
         let apart = grep(&ws, json!({"pattern": "l[27]$", "context": 1}));
-        assert_eq!(apart, "f.txt-1-l1\nf.txt:2:l2\nf.txt-3-l3\n--\nf.txt-6-l6\nf.txt:7:l7\nf.txt-8-l8\n");
+        assert_eq!(
+            apart,
+            "f.txt-1-l1\nf.txt:2:l2\nf.txt-3-l3\n--\nf.txt-6-l6\nf.txt:7:l7\nf.txt-8-l8\n"
+        );
         let merged = grep(&ws, json!({"pattern": "l[24]$", "context": 1}));
-        assert_eq!(merged, "f.txt-1-l1\nf.txt:2:l2\nf.txt-3-l3\nf.txt:4:l4\nf.txt-5-l5\n");
+        assert_eq!(
+            merged,
+            "f.txt-1-l1\nf.txt:2:l2\nf.txt-3-l3\nf.txt:4:l4\nf.txt-5-l5\n"
+        );
         // Windows are clipped at both ends of the file.
-        assert_eq!(grep(&ws, json!({"pattern": "l1$", "context": 2})), "f.txt:1:l1\nf.txt-2-l2\nf.txt-3-l3\n");
-        assert_eq!(grep(&ws, json!({"pattern": "l10$", "context": 2})), "f.txt-8-l8\nf.txt-9-l9\nf.txt:10:l10\n");
+        assert_eq!(
+            grep(&ws, json!({"pattern": "l1$", "context": 2})),
+            "f.txt:1:l1\nf.txt-2-l2\nf.txt-3-l3\n"
+        );
+        assert_eq!(
+            grep(&ws, json!({"pattern": "l10$", "context": 2})),
+            "f.txt-8-l8\nf.txt-9-l9\nf.txt:10:l10\n"
+        );
         // No context means plain match rows with no separators.
-        assert_eq!(grep(&ws, json!({"pattern": "l[27]$"})), "f.txt:2:l2\nf.txt:7:l7\n");
+        assert_eq!(
+            grep(&ws, json!({"pattern": "l[27]$"})),
+            "f.txt:2:l2\nf.txt:7:l7\n"
+        );
     }
 
     #[test]
@@ -570,11 +707,23 @@ mod tests {
         numbered_file(&dir, "a.txt", 3);
         numbered_file(&dir, "b.txt", 3);
         let two = grep(&ws, json!({"pattern": "l2$", "context": 1}));
-        assert_eq!(two, "a.txt-1-l1\na.txt:2:l2\na.txt-3-l3\n--\nb.txt-1-l1\nb.txt:2:l2\nb.txt-3-l3\n");
+        assert_eq!(
+            two,
+            "a.txt-1-l1\na.txt:2:l2\na.txt-3-l3\n--\nb.txt-1-l1\nb.txt:2:l2\nb.txt-3-l3\n"
+        );
         // max_results limits matches, not the context rows around them.
-        let one = grep(&ws, json!({"pattern": "l2$", "context": 1, "max_results": 1}));
-        assert!(one.starts_with("a.txt-1-l1\na.txt:2:l2\na.txt-3-l3\n"), "{one}");
-        assert!(!one.contains("b.txt") && one.contains("stopped at 1 matches"), "{one}");
+        let one = grep(
+            &ws,
+            json!({"pattern": "l2$", "context": 1, "max_results": 1}),
+        );
+        assert!(
+            one.starts_with("a.txt-1-l1\na.txt:2:l2\na.txt-3-l3\n"),
+            "{one}"
+        );
+        assert!(
+            !one.contains("b.txt") && one.contains("stopped at 1 matches"),
+            "{one}"
+        );
     }
 
     #[test]
@@ -585,32 +734,75 @@ mod tests {
         let capped = grep(&ws, json!({"pattern": "hit", "path": "many.log"}));
         assert_eq!(capped.matches("many.log:").count(), DEFAULT_GREP_MATCHES);
         assert!(capped.contains("stopped at 200 matches"));
-        let five = grep(&ws, json!({"pattern": "hit", "path": "many.log", "max_results": 5}));
+        let five = grep(
+            &ws,
+            json!({"pattern": "hit", "path": "many.log", "max_results": 5}),
+        );
         assert_eq!(five.matches("many.log:").count(), 5);
-        let raised = grep(&ws, json!({"pattern": "hit", "path": "many.log", "max_results": 5000}));
-        assert_eq!(raised.matches("many.log:").count(), 1000, "an oversized max_results is clamped, not refused");
-        fs::write(dir.path().join("long.txt"), format!("needle{}\n", "z".repeat(5000))).unwrap();
+        let raised = grep(
+            &ws,
+            json!({"pattern": "hit", "path": "many.log", "max_results": 5000}),
+        );
+        assert_eq!(
+            raised.matches("many.log:").count(),
+            1000,
+            "an oversized max_results is clamped, not refused"
+        );
+        fs::write(
+            dir.path().join("long.txt"),
+            format!("needle{}\n", "z".repeat(5000)),
+        )
+        .unwrap();
         let long = grep(&ws, json!({"pattern": "needle", "path": "long.txt"}));
-        assert!(long.len() < 400 && long.contains("…[truncated]"), "{}", long.len());
+        assert!(
+            long.len() < 400 && long.contains("…[truncated]"),
+            "{}",
+            long.len()
+        );
     }
 
     #[test]
     fn walks_honor_gitignore_and_skip_dependency_dirs() {
         let (dir, ws) = workspace();
         fs::write(dir.path().join(".gitignore"), "/vendored/\n*.log\n").unwrap();
-        for path in ["src/a.rs", "vendored/lib.rs", "src/debug.log", "web/node_modules/x.js", ".venv/lib/y.py", "src/.hidden.rs"] {
+        for path in [
+            "src/a.rs",
+            "vendored/lib.rs",
+            "src/debug.log",
+            "web/node_modules/x.js",
+            ".venv/lib/y.py",
+            "src/.hidden.rs",
+        ] {
             let full = dir.path().join(path);
             fs::create_dir_all(full.parent().unwrap()).unwrap();
             fs::write(full, "needle\n").unwrap();
         }
         let listed = glob_tool(&ws, &json!({"pattern": "**/*"})).unwrap();
         let names: Vec<&str> = listed.lines().collect();
-        assert!(names.contains(&"src/a.rs") && names.contains(&"src/.hidden.rs"), "{names:?}");
-        assert!(!names.iter().any(|n| n.contains("vendored") || n.ends_with(".log") || n.contains("node_modules") || n.contains(".venv")), "{names:?}");
+        assert!(
+            names.contains(&"src/a.rs") && names.contains(&"src/.hidden.rs"),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("vendored")
+                || n.ends_with(".log")
+                || n.contains("node_modules")
+                || n.contains(".venv")),
+            "{names:?}"
+        );
         let found = grep_tool(&ws, &json!({"pattern": "needle"})).unwrap();
-        assert!(found.contains("src/a.rs") && !found.contains("vendored") && !found.contains("node_modules") && !found.contains(".venv"), "{found}");
+        assert!(
+            found.contains("src/a.rs")
+                && !found.contains("vendored")
+                && !found.contains("node_modules")
+                && !found.contains(".venv"),
+            "{found}"
+        );
         let explicit = grep_tool(&ws, &json!({"pattern": "needle", "path": "vendored"})).unwrap();
-        assert!(explicit.contains("vendored/lib.rs"), "an explicit path inside an ignored directory is still searched: {explicit}");
+        assert!(
+            explicit.contains("vendored/lib.rs"),
+            "an explicit path inside an ignored directory is still searched: {explicit}"
+        );
     }
 
     #[test]
@@ -619,12 +811,22 @@ mod tests {
         let line = format!("{}NEEDLE_HERE{}\n", "x".repeat(1000), "y".repeat(1000));
         fs::write(dir.path().join("min.js"), line).unwrap();
         let out = grep_tool(&ws, &json!({"pattern": "NEEDLE_HERE"})).unwrap();
-        assert!(out.contains("NEEDLE_HERE") && out.contains("bytes skipped"), "{out}");
+        assert!(
+            out.contains("NEEDLE_HERE") && out.contains("bytes skipped"),
+            "{out}"
+        );
         assert!(out.len() < 600, "{}", out.len());
         // A match near the start keeps the plain prefix.
-        fs::write(dir.path().join("short.js"), format!("NEEDLE_HERE{}\n", "z".repeat(1000))).unwrap();
+        fs::write(
+            dir.path().join("short.js"),
+            format!("NEEDLE_HERE{}\n", "z".repeat(1000)),
+        )
+        .unwrap();
         let near = grep_tool(&ws, &json!({"pattern": "NEEDLE_HERE", "path": "short.js"})).unwrap();
-        assert!(near.contains("short.js:1:NEEDLE_HERE") && !near.contains("skipped"), "{near}");
+        assert!(
+            near.contains("short.js:1:NEEDLE_HERE") && !near.contains("skipped"),
+            "{near}"
+        );
     }
 
     #[test]
@@ -639,9 +841,15 @@ mod tests {
             names.push(name);
         }
         names.sort();
-        let expected = format!("{}\n[4 more matches not shown; narrow the pattern]\n", names[..MAX_LIST].join("\n"));
+        let expected = format!(
+            "{}\n[4 more matches not shown; narrow the pattern]\n",
+            names[..MAX_LIST].join("\n")
+        );
         for _ in 0..3 {
-            assert_eq!(glob_tool(&ws, &json!({"pattern": "**/*.rs"})).unwrap(), expected);
+            assert_eq!(
+                glob_tool(&ws, &json!({"pattern": "**/*.rs"})).unwrap(),
+                expected
+            );
         }
     }
 
@@ -652,17 +860,34 @@ mod tests {
         fs::write(outside.path().join("mod.rs"), "needle\n").unwrap();
         symlink(outside.path(), dir.path().join("link")).unwrap();
         fs::write(dir.path().join(".gitignore"), "/ignored/\n").unwrap();
-        for path in ["src/deep/mod.rs", "docs/mod.rs", "ignored/mod.rs", "target/mod.rs"] {
+        for path in [
+            "src/deep/mod.rs",
+            "docs/mod.rs",
+            "ignored/mod.rs",
+            "target/mod.rs",
+        ] {
             let file = dir.path().join(path);
             fs::create_dir_all(file.parent().unwrap()).unwrap();
             fs::write(file, "needle\n").unwrap();
         }
         for prefix in ["ignored", "target", "link"] {
-            assert_eq!(glob_tool(&ws, &json!({"pattern": format!("{prefix}/**/*.rs")})).unwrap(), "no matches");
+            assert_eq!(
+                glob_tool(&ws, &json!({"pattern": format!("{prefix}/**/*.rs")})).unwrap(),
+                "no matches"
+            );
         }
-        assert_eq!(glob_tool(&ws, &json!({"pattern": "src/**/mod.rs"})).unwrap(), "src/deep/mod.rs\n");
-        assert_eq!(glob_tool(&ws, &json!({"pattern": "{src,docs}/**/mod.rs"})).unwrap(), "docs/mod.rs\nsrc/deep/mod.rs\n");
-        assert_eq!(grep(&ws, json!({"pattern": "needle", "glob": "src/**/mod.rs"})), "src/deep/mod.rs:1:needle\n");
+        assert_eq!(
+            glob_tool(&ws, &json!({"pattern": "src/**/mod.rs"})).unwrap(),
+            "src/deep/mod.rs\n"
+        );
+        assert_eq!(
+            glob_tool(&ws, &json!({"pattern": "{src,docs}/**/mod.rs"})).unwrap(),
+            "docs/mod.rs\nsrc/deep/mod.rs\n"
+        );
+        assert_eq!(
+            grep(&ws, json!({"pattern": "needle", "glob": "src/**/mod.rs"})),
+            "src/deep/mod.rs:1:needle\n"
+        );
     }
 
     #[test]
@@ -687,7 +912,10 @@ mod tests {
         fs::write(dir.path().join("a.rs"), "hit later\n").unwrap();
         let expected = "a/z.rs:1:hit first\n[stopped at 1 matches (max_results 1) or 20 KiB; narrow with path, glob or a more specific pattern]\n";
         for _ in 0..3 {
-            assert_eq!(grep(&ws, json!({"pattern": "hit", "max_results": 1})), expected);
+            assert_eq!(
+                grep(&ws, json!({"pattern": "hit", "max_results": 1})),
+                expected
+            );
         }
     }
 }

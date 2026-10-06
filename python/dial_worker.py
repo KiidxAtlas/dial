@@ -455,6 +455,148 @@ def generate(request):
     return {"text": text}
 
 
+class TrainingPaused(Exception):
+    """A complete training checkpoint was committed; the process can release its GPU memory."""
+
+
+def atomic_json(path, value):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w") as handle:
+        json.dump(value, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def replay_batches(factory, completed, seed):
+    """Give each batch stream its own RNG and replay its cursor without recomputing gradients."""
+    def batches(**kwargs):
+        import numpy as np
+        kwargs.pop("seed", None)
+        loop = kwargs.get("loop", False)
+        iterator = factory(**kwargs)
+        state = np.random.RandomState(seed).get_state()
+        index = 0
+        while True:
+            previous = np.random.get_state()
+            np.random.set_state(state)
+            try:
+                batch = next(iterator)
+                state = np.random.get_state()
+            except StopIteration:
+                return
+            finally:
+                np.random.set_state(previous)
+            index += 1
+            if not loop or index > completed:
+                yield batch
+    return batches
+
+
+def pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args, expected):
+    import mlx.core as mx
+    import mlx.optimizers as optimizers
+    from mlx.utils import tree_flatten, tree_unflatten
+    from mlx_lm.tuner import TrainingArgs, train as tuner_train
+    from mlx_lm.tuner.trainer import iterate_batches
+    from mlx_lm.tuner.callbacks import TrainingCallback
+    from mlx_lm.tuner.utils import linear_to_lora_layers
+    import tempfile
+
+    output = Path(request["output_dir"])
+    pause = Path(string(request, "pause_file"))
+    progress = Path(string(request, "progress_file"))
+    identity = {key: request[key] for key in (
+        "model", "resume_adapter", "iters", "batch_size", "num_layers", "rank", "max_seq_length")}
+    identity["datasets"] = [hashlib.sha256(Path(request[key]).read_bytes()).hexdigest()
+                            for key in ("train_data", "valid_data")]
+    fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    mx.random.seed(args["seed"])
+    model.freeze()
+    linear_to_lora_layers(model, args["num_layers"], args["lora_parameters"])
+    checkpoint = None
+    if request.get("resume_checkpoint"):
+        checkpoint = json.loads((output / "resume.json").read_text())
+        require(checkpoint["fingerprint"] == fingerprint, "training checkpoint inputs changed")
+        directory = (output / checkpoint["directory"]).resolve()
+        require(directory.parent == (output / "checkpoints").resolve(), "invalid checkpoint directory")
+        tensors = mx.load(str(directory / "adapters.safetensors"))
+        require({name: tuple(value.shape) for name, value in tensors.items()} == expected,
+                "checkpoint adapter tensor contract changed")
+        model.load_weights(list(tensors.items()), strict=False)
+    elif args["resume_adapter_file"]:
+        model.load_weights(args["resume_adapter_file"], strict=False)
+    output.mkdir(parents=True, exist_ok=True)
+    atomic_json(output / "adapter_config.json", args)
+    tokenized_pairs = tokenize_preference_pairs(pairs, tokenizer, args["max_seq_length"]) if pairs else []
+    phases = [("sft", args["iters"], train_set, valid_set, args["batch_size"], iterate_batches, None)]
+    if tokenized_pairs:
+        phases.append(("preference", preference_iterations(args["iters"], len(tokenized_pairs)),
+                       tokenized_pairs, None, PREFERENCE_PAIRS_PER_BATCH, iterate_preference_batches, preference_loss))
+    require(checkpoint is None or checkpoint["phase"] in [phase[0] for phase in phases], "invalid checkpoint phase")
+    for phase, total, dataset, validation, batch_size, factory, loss in phases:
+        if checkpoint and checkpoint["phase"] == "preference" and phase == "sft":
+            continue
+        completed = checkpoint["completed"] if checkpoint and checkpoint["phase"] == phase else 0
+        require(type(completed) is int and 0 <= completed <= total, "invalid checkpoint iteration")
+        optimizer = optimizers.Adam(learning_rate=args["learning_rate"])
+        if checkpoint and checkpoint["phase"] == phase:
+            state = tree_unflatten(list(mx.load(str(directory / "state.npz")).items()))
+            optimizer.state = state.get("optimizer", {})
+            require(len(mx.random.state) == len(state["rng"]), "checkpoint RNG contract changed")
+            for current, saved_key in zip(mx.random.state, state["rng"]):
+                current[:] = saved_key
+
+        class Callback(TrainingCallback):
+            def update(self, iteration, info):
+                atomic_json(progress, {"stage": f"training {phase} {iteration}/{total}",
+                                      "phase": phase, "iteration": iteration, "total": total,
+                                      "peak_memory_gb": info.get("peak_memory")})
+                root = output / "checkpoints"
+                root.mkdir(exist_ok=True)
+                saved = Path(tempfile.mkdtemp(prefix="step-", dir=root))
+                weights = dict(tree_flatten(model.trainable_parameters()))
+                state = dict(tree_flatten({"optimizer": optimizer.state, "rng": list(mx.random.state)}))
+                mx.eval(weights, state)
+                mx.save_safetensors(str(saved / "adapters.safetensors"), weights)
+                mx.savez(str(saved / "state.npz"), **state)
+                # Commit the pointer last: an interrupted save cannot become a resumable checkpoint.
+                prior = json.loads((output / "resume.json").read_text()) if (output / "resume.json").exists() else None
+                atomic_json(output / "resume.json", {"fingerprint": fingerprint, "phase": phase,
+                            "completed": iteration, "directory": str(saved.relative_to(output))})
+                if prior:
+                    import shutil
+                    old = (output / prior["directory"]).resolve()
+                    if old.parent == root.resolve() and old != saved.resolve():
+                        shutil.rmtree(old)
+                if pause.exists():
+                    raise TrainingPaused()
+
+            def on_train_loss_report(self, info):
+                self.update(completed + info["iteration"], info)
+
+            def on_val_loss_report(self, info):
+                self.update(completed + info["iteration"], info)
+
+        if completed < total:
+            callback = Callback()
+            callback.update(completed, {})
+            training_args = TrainingArgs(batch_size=batch_size, iters=total-completed,
+                val_batches=-1 if validation else 0, steps_per_report=1,
+                steps_per_eval=min(100, total), steps_per_save=total+1,
+                adapter_file=output / "adapters.safetensors", max_seq_length=args["max_seq_length"])
+            kwargs = {"model": model, "optimizer": optimizer, "train_dataset": dataset,
+                      "val_dataset": validation, "args": training_args,
+                      "iterate_batches": replay_batches(factory, completed, args["seed"] + (1 if phase == "preference" else 0)),
+                      "training_callback": callback}
+            if loss is not None:
+                kwargs["loss"] = loss
+            tuner_train(**kwargs)
+        checkpoint = None
+    mx.save_safetensors(str(output / "adapters.safetensors"), dict(tree_flatten(model.trainable_parameters())))
+
+
 def train(request):
     import numpy as np
     from mlx_lm.lora import CONFIG_DEFAULTS, train_model
@@ -470,7 +612,8 @@ def train(request):
     sft_records = [{key: value for key, value in record.items() if key != "preference_pairs"}
                    for record in train_records]
     output = Path(string(request, "output_dir")).resolve()
-    require(not output.exists(), "output_dir must not already exist")
+    require(not output.exists() or (request.get("pause_file") and request.get("resume_checkpoint")
+            and (output / "resume.json").is_file()), "output_dir must not already exist")
     model_name = resolve_model(model_name)
     model, tokenizer = load_base(model_name)
     keys, ids = query_targets(model, values["num_layers"])
@@ -498,6 +641,13 @@ def train(request):
                 steps_per_eval=min(100, values["iters"]), save_every=values["iters"],
                 mask_prompt=True, trust_remote_code=False)
     np.random.seed(args["seed"])
+    if request.get("pause_file"):
+        try:
+            pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args, expected)
+        except TrainingPaused:
+            return {"paused": True}
+        validate_adapter(output, model_name, values["num_layers"], parameters, expected)
+        return {"adapter": str(output)}
     train_model(SimpleNamespace(**args), model, train_set, valid_set)
     # Without eligible pairs, preserve the established SFT behavior exactly.
     if pairs:
@@ -616,7 +766,8 @@ def main():
         except (ValueError, UnicodeError):
             raise RequestError("request is not valid JSON") from None
         require(isinstance(request, dict), "request must be an object")
-        operations = {"capabilities": capabilities, "generate": generate, "train": train,
+        from dial_steering import operation as steering_operation
+        operations = {"steering_extract":steering_operation,"steering_evaluate":steering_operation,"capabilities": capabilities, "generate": generate, "train": train,
                       "sensitivity": sensitivity}
         operation = request.get("op")
         require(isinstance(operation, str) and operation in operations, "unsupported operation")
@@ -625,7 +776,7 @@ def main():
             result = operations[operation](request)
         sys.stdout.write(json.dumps(result, allow_nan=False) + "\n")
     except Exception as error:
-        detail = str(error) if isinstance(error, RequestError) else type(error).__name__
+        detail = str(error) if isinstance(error, RequestError) or type(error).__name__ == "SteeringError" else type(error).__name__
         print(f"dial-worker: {phase} failed: {detail}", file=sys.stderr)
         return 1
     return 0

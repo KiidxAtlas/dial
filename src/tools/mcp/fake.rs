@@ -15,10 +15,18 @@ pub fn run(flags: &str) -> ! {
     let has = |flag: &str| flags.split(',').any(|f| f == flag);
     let mut ping_answered = false;
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
-        let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
-        let (id, method) = (message.get("id").cloned(), message.get("method").and_then(Value::as_str).unwrap_or(""));
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let (id, method) = (
+            message.get("id").cloned(),
+            message.get("method").and_then(Value::as_str).unwrap_or(""),
+        );
         // A response to our own `ping` (we only send one, with a string id).
-        if method.is_empty() && message.get("id") == Some(&json!("srv-ping")) && message.get("result") == Some(&json!({})) {
+        if method.is_empty()
+            && message.get("id") == Some(&json!("srv-ping"))
+            && message.get("result") == Some(&json!({}))
+        {
             ping_answered = true;
             continue;
         }
@@ -30,24 +38,42 @@ pub fn run(flags: &str) -> ! {
                 }
                 // Noise a real server may produce before answering.
                 println!("starting up... (not JSON)");
-                send(&json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "hi"}}));
+                send(
+                    &json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "hi"}}),
+                );
                 send(&json!({"jsonrpc": "2.0", "id": "srv-ping", "method": "ping"}));
-                let version = if has("bad-protocol") { "1999-01-01" } else { "2025-03-26" };
+                let version = if has("bad-protocol") {
+                    "1999-01-01"
+                } else {
+                    "2025-03-26"
+                };
                 send(&json!({"jsonrpc": "2.0", "id": id, "result": {
                     "protocolVersion": version,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "fake", "version": "0"},
                 }}));
             }
-            "tools/list" => send(&list(&id, message.pointer("/params/cursor").and_then(Value::as_str), flags)),
+            "tools/list" => send(&list(
+                &id,
+                message.pointer("/params/cursor").and_then(Value::as_str),
+                flags,
+            )),
             "tools/call" => {
-                let name = message.pointer("/params/name").and_then(Value::as_str).unwrap_or("");
-                let args = message.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
+                let name = message
+                    .pointer("/params/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let args = message
+                    .pointer("/params/arguments")
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 if let Some(result) = call(name, &args, ping_answered) {
                     send(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
                 }
             }
-            _ => send(&json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "no such method"}})),
+            _ => send(
+                &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "no such method"}}),
+            ),
         }
     }
     std::process::exit(0)
@@ -79,12 +105,36 @@ fn list(id: &Value, cursor: Option<&str>, flags: &str) -> Value {
         return json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}});
     }
     let (tools, next) = match cursor {
-        None => (vec![tool("echo", Some(true)), tool("plain", None), tool("fail", Some(false))], Some("page-2")),
-        Some("page-2") => (vec![tool("mixed", None), tool("slow", None), tool("die", None), tool("pid", Some(true))], Some("page-3")),
+        None => (
+            vec![
+                tool("echo", Some(true)),
+                tool("plain", None),
+                tool("fail", Some(false)),
+            ],
+            Some("page-2"),
+        ),
+        Some("page-2") => (
+            vec![
+                tool("mixed", None),
+                tool("slow", None),
+                tool("die", None),
+                tool("pid", Some(true)),
+            ],
+            Some("page-3"),
+        ),
         _ => {
             // No inputSchema at all, and names that collide once sanitised.
             let bare = json!({"name": "bare"});
-            (vec![tool("a b", None), tool("a.b", None), tool("big", None), tool("pong", None), bare], None)
+            (
+                vec![
+                    tool("a b", None),
+                    tool("a.b", None),
+                    tool("big", None),
+                    tool("pong", None),
+                    bare,
+                ],
+                None,
+            )
         }
     };
     let mut result = json!({"tools": tools});
@@ -101,7 +151,10 @@ fn text(text: impl Into<String>) -> Value {
 /// `None` means "never answer" (a hung server).
 fn call(name: &str, args: &Value, ping_answered: bool) -> Option<Value> {
     Some(match name {
-        "echo" => text(format!("echo: {}", args.get("text").and_then(Value::as_str).unwrap_or(""))),
+        "echo" => text(format!(
+            "echo: {}",
+            args.get("text").and_then(Value::as_str).unwrap_or("")
+        )),
         "plain" => text("plain ok"),
         "fail" => json!({"isError": true, "content": [{"type": "text", "text": "it broke"}]}),
         "mixed" => json!({"content": [
@@ -118,6 +171,8 @@ fn call(name: &str, args: &Value, ping_answered: bool) -> Option<Value> {
             eprintln!("fatal: kaboom");
             std::process::exit(3)
         }
-        _ => json!({"isError": true, "content": [{"type": "text", "text": format!("unknown tool {name}")}]}),
+        _ => {
+            json!({"isError": true, "content": [{"type": "text", "text": format!("unknown tool {name}")}]})
+        }
     })
 }

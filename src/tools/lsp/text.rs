@@ -59,7 +59,10 @@ pub fn read_source(path: &Path) -> io::Result<String> {
     if text.len() as u64 > MAX_SOURCE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("file is larger than {} MiB", MAX_SOURCE_BYTES / (1024 * 1024)),
+            format!(
+                "file is larger than {} MiB",
+                MAX_SOURCE_BYTES / (1024 * 1024)
+            ),
         ));
     }
     Ok(text)
@@ -67,12 +70,17 @@ pub fn read_source(path: &Path) -> io::Result<String> {
 
 /// Lines as LSP sees them: split on `\n`, a trailing `\r` stripped. Always at least one line.
 pub fn split_lines(text: &str) -> Vec<String> {
-    text.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned()).collect()
+    text.split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned())
+        .collect()
 }
 
 /// UTF-16 offset of the character at 0-based char index `char_index` (clamped to the line end).
 pub fn utf16_offset(line: &str, char_index: usize) -> u32 {
-    line.chars().take(char_index).map(|c| c.len_utf16() as u32).sum()
+    line.chars()
+        .take(char_index)
+        .map(|c| c.len_utf16() as u32)
+        .sum()
 }
 
 /// 0-based char index of the UTF-16 offset `utf16` (clamped to the line end; an offset inside a
@@ -103,13 +111,23 @@ fn find_symbol(line: &str, symbol: &str, hint: usize) -> Option<usize> {
     for (byte, _) in line.match_indices(symbol) {
         let index = line[..byte].chars().count();
         let before_ok = !starts_word || !line[..byte].chars().next_back().is_some_and(is_word);
-        let after_ok = !ends_word || !line[byte + symbol.len()..].chars().next().is_some_and(is_word);
+        let after_ok = !ends_word
+            || !line[byte + symbol.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_word);
         all.push(index);
         if before_ok && after_ok {
             whole.push(index);
         }
     }
-    let pick = |found: &[usize]| found.iter().copied().find(|i| *i >= hint).or_else(|| found.first().copied());
+    let pick = |found: &[usize]| {
+        found
+            .iter()
+            .copied()
+            .find(|i| *i >= hint)
+            .or_else(|| found.first().copied())
+    };
     pick(&whole).or_else(|| pick(&all))
 }
 
@@ -125,27 +143,50 @@ pub struct Located {
 }
 
 /// Turn the model's `line` + (`column` | `symbol`) into an LSP position inside `text`.
-pub fn locate(text: &str, line: u64, column: Option<u64>, symbol: Option<&str>) -> Result<Located, String> {
+pub fn locate(
+    text: &str,
+    line: u64,
+    column: Option<u64>,
+    symbol: Option<&str>,
+) -> Result<Located, String> {
     let lines = split_lines(text);
     if line == 0 || line > lines.len() as u64 {
-        return Err(format!("line {line} is out of range (the file has {} lines; lines start at 1)", lines.len()));
+        return Err(format!(
+            "line {line} is out of range (the file has {} lines; lines start at 1)",
+            lines.len()
+        ));
     }
     let content = &lines[line as usize - 1];
     let length = content.chars().count();
     let index = match (symbol.filter(|s| !s.is_empty()), column) {
         (Some(symbol), column) => {
             let hint = column.map_or(0, |c| c.saturating_sub(1) as usize);
-            find_symbol(content, symbol, hint)
-                .ok_or_else(|| format!("symbol {symbol:?} not found on line {line}: {}", content.trim()))?
+            find_symbol(content, symbol, hint).ok_or_else(|| {
+                format!(
+                    "symbol {symbol:?} not found on line {line}: {}",
+                    content.trim()
+                )
+            })?
         }
         (None, Some(0)) => return Err("column starts at 1".into()),
         (None, Some(column)) if column > length as u64 + 1 => {
-            return Err(format!("column {column} is past the end of line {line} ({length} characters)"));
+            return Err(format!(
+                "column {column} is past the end of line {line} ({length} characters)"
+            ));
         }
         (None, Some(column)) => column as usize - 1,
-        (None, None) => return Err("give `column` (1-based) or `symbol` (text on that line) to place the cursor".into()),
+        (None, None) => {
+            return Err(
+                "give `column` (1-based) or `symbol` (text on that line) to place the cursor"
+                    .into(),
+            );
+        }
     };
-    Ok(Located { line: line as u32 - 1, character: utf16_offset(content, index), column: index + 1 })
+    Ok(Located {
+        line: line as u32 - 1,
+        character: utf16_offset(content, index),
+        column: index + 1,
+    })
 }
 
 #[cfg(test)]
@@ -167,7 +208,11 @@ mod tests {
         let line = "a😀b";
         assert_eq!(char_index(line, 0), 0);
         assert_eq!(char_index(line, 1), 1);
-        assert_eq!(char_index(line, 2), 1, "inside the surrogate pair maps to the emoji");
+        assert_eq!(
+            char_index(line, 2),
+            1,
+            "inside the surrogate pair maps to the emoji"
+        );
         assert_eq!(char_index(line, 3), 2);
         assert_eq!(char_index(line, 4), 3);
         assert_eq!(char_index(line, 400), 3);
@@ -179,28 +224,77 @@ mod tests {
         let text = "let s = \"😀\"; foo();\n";
         // `foo` is character index 13 (column 14) but UTF-16 offset 14: the emoji takes two units.
         let got = locate(text, 1, Some(14), None).unwrap();
-        assert_eq!(got, Located { line: 0, character: 14, column: 14 });
+        assert_eq!(
+            got,
+            Located {
+                line: 0,
+                character: 14,
+                column: 14
+            }
+        );
         let got = locate(text, 1, None, Some("foo")).unwrap();
-        assert_eq!(got, Located { line: 0, character: 14, column: 14 });
+        assert_eq!(
+            got,
+            Located {
+                line: 0,
+                character: 14,
+                column: 14
+            }
+        );
     }
 
     #[test]
     fn locate_symbol_prefers_whole_words_and_honours_the_column_hint() {
         let text = "foobar foo foo\n";
-        assert_eq!(locate(text, 1, None, Some("foo")).unwrap().column, 8, "skips foo inside foobar");
-        assert_eq!(locate(text, 1, Some(9), Some("foo")).unwrap().column, 12, "first at or after the hint");
-        assert_eq!(locate(text, 1, None, Some("oba")).unwrap().column, 3, "falls back to a substring match");
+        assert_eq!(
+            locate(text, 1, None, Some("foo")).unwrap().column,
+            8,
+            "skips foo inside foobar"
+        );
+        assert_eq!(
+            locate(text, 1, Some(9), Some("foo")).unwrap().column,
+            12,
+            "first at or after the hint"
+        );
+        assert_eq!(
+            locate(text, 1, None, Some("oba")).unwrap().column,
+            3,
+            "falls back to a substring match"
+        );
     }
 
     #[test]
     fn locate_rejects_bad_positions_with_clear_messages() {
         let text = "ab\ncd";
-        assert!(locate(text, 0, Some(1), None).unwrap_err().contains("out of range"));
-        assert!(locate(text, 3, Some(1), None).unwrap_err().contains("2 lines"));
-        assert!(locate(text, 1, Some(0), None).unwrap_err().contains("starts at 1"));
-        assert!(locate(text, 1, Some(4), None).unwrap_err().contains("past the end"));
-        assert!(locate(text, 1, Some(3), None).is_ok(), "one past the last character is a valid cursor");
-        assert!(locate(text, 1, None, Some("zz")).unwrap_err().contains("not found on line 1"));
+        assert!(
+            locate(text, 0, Some(1), None)
+                .unwrap_err()
+                .contains("out of range")
+        );
+        assert!(
+            locate(text, 3, Some(1), None)
+                .unwrap_err()
+                .contains("2 lines")
+        );
+        assert!(
+            locate(text, 1, Some(0), None)
+                .unwrap_err()
+                .contains("starts at 1")
+        );
+        assert!(
+            locate(text, 1, Some(4), None)
+                .unwrap_err()
+                .contains("past the end")
+        );
+        assert!(
+            locate(text, 1, Some(3), None).is_ok(),
+            "one past the last character is a valid cursor"
+        );
+        assert!(
+            locate(text, 1, None, Some("zz"))
+                .unwrap_err()
+                .contains("not found on line 1")
+        );
         assert!(locate(text, 1, None, None).unwrap_err().contains("column"));
     }
 
@@ -211,7 +305,12 @@ mod tests {
 
     #[test]
     fn uri_round_trips_awkward_paths() {
-        for path in ["/tmp/a b/c#d.rs", "/tmp/ü/😀.rs", "/tmp/100%/x.rs", "/tmp/plain.rs"] {
+        for path in [
+            "/tmp/a b/c#d.rs",
+            "/tmp/ü/😀.rs",
+            "/tmp/100%/x.rs",
+            "/tmp/plain.rs",
+        ] {
             let uri = uri_from_path(Path::new(path));
             assert!(uri.is_ascii() && uri.starts_with("file:///tmp/"), "{uri}");
             assert_eq!(path_from_uri(&uri), Some(PathBuf::from(path)), "{uri}");
@@ -232,7 +331,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bad = dir.path().join("bin");
         fs::write(&bad, [0xff, 0xfe, 0x00]).unwrap();
-        assert_eq!(read_source(&bad).unwrap_err().kind(), io::ErrorKind::InvalidData);
-        assert_eq!(read_source(&dir.path().join("none")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            read_source(&bad).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_source(&dir.path().join("none")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 }

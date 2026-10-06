@@ -18,7 +18,9 @@ fn invalid(message: impl Into<String>) -> io::Error {
 /// One header line without its terminator; `None` on clean EOF before any byte.
 fn read_header_line(reader: &mut impl BufRead) -> io::Result<Option<String>> {
     let mut raw = Vec::new();
-    let read = reader.take(MAX_HEADER_LINE as u64 + 1).read_until(b'\n', &mut raw)?;
+    let read = reader
+        .take(MAX_HEADER_LINE as u64 + 1)
+        .read_until(b'\n', &mut raw)?;
     if read == 0 {
         return Ok(None);
     }
@@ -33,7 +35,9 @@ fn read_header_line(reader: &mut impl BufRead) -> io::Result<Option<String>> {
     if raw.last() == Some(&b'\r') {
         raw.pop();
     }
-    String::from_utf8(raw).map(Some).map_err(|_| invalid("header is not valid UTF-8"))
+    String::from_utf8(raw)
+        .map(Some)
+        .map_err(|_| invalid("header is not valid UTF-8"))
 }
 
 /// Read one message. `Ok(None)` means the peer closed the stream between messages; any
@@ -45,7 +49,10 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
             return if count == 0 {
                 Ok(None)
             } else {
-                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stream ended inside the headers"))
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "stream ended inside the headers",
+                ))
             };
         };
         if line.is_empty() {
@@ -54,22 +61,36 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
         if count >= MAX_HEADERS {
             return Err(invalid("too many headers"));
         }
-        let (name, value) = line.split_once(':').ok_or_else(|| invalid(format!("malformed header {line:?}")))?;
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| invalid(format!("malformed header {line:?}")))?;
         if name.trim().eq_ignore_ascii_case("content-length") {
-            length = Some(value.trim().parse().map_err(|_| invalid(format!("bad Content-Length {:?}", value.trim())))?);
+            length = Some(
+                value
+                    .trim()
+                    .parse()
+                    .map_err(|_| invalid(format!("bad Content-Length {:?}", value.trim())))?,
+            );
         }
     }
     let length = length.ok_or_else(|| invalid("missing Content-Length header"))?;
     if length > MAX_MESSAGE {
-        return Err(invalid(format!("message of {length} bytes exceeds the {MAX_MESSAGE} byte limit")));
+        return Err(invalid(format!(
+            "message of {length} bytes exceeds the {MAX_MESSAGE} byte limit"
+        )));
     }
     // Read through `take` so a lying length cannot force a huge up-front allocation.
     let mut body = Vec::new();
     reader.take(length as u64).read_to_end(&mut body)?;
     if body.len() != length {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stream ended inside a message body"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "stream ended inside a message body",
+        ));
     }
-    serde_json::from_slice(&body).map(Some).map_err(|e| invalid(format!("body is not JSON: {e}")))
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| invalid(format!("body is not JSON: {e}")))
 }
 
 /// Write one framed message as a single `write_all`, then flush.
@@ -136,8 +157,17 @@ mod tests {
     fn survives_one_byte_reads() {
         let mut wire = frame(r#"{"id":1,"v":"héllo"}"#);
         wire.extend(frame(r#"{"id":2}"#));
-        let mut reader = BufReader::with_capacity(1, Trickle { data: &wire, chunk: 1 });
-        assert_eq!(read_message(&mut reader).unwrap(), Some(json!({"id":1,"v":"héllo"})));
+        let mut reader = BufReader::with_capacity(
+            1,
+            Trickle {
+                data: &wire,
+                chunk: 1,
+            },
+        );
+        assert_eq!(
+            read_message(&mut reader).unwrap(),
+            Some(json!({"id":1,"v":"héllo"}))
+        );
         assert_eq!(read_message(&mut reader).unwrap(), Some(json!({"id":2})));
         assert_eq!(read_message(&mut reader).unwrap(), None);
     }
@@ -158,23 +188,46 @@ mod tests {
             b"Content-Length: 99999999999\r\n\r\n",
         ] {
             let error = parse(wire).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{}", String::from_utf8_lossy(wire));
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "{}",
+                String::from_utf8_lossy(wire)
+            );
         }
     }
 
     #[test]
     fn oversized_header_line_and_header_flood_are_rejected() {
         let long = format!("X: {}\r\n\r\n", "a".repeat(MAX_HEADER_LINE * 2));
-        assert_eq!(parse(long.as_bytes()).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            parse(long.as_bytes()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         let flood = format!("{}\r\n", "A: b\r\n".repeat(MAX_HEADERS + 1));
-        assert_eq!(parse(flood.as_bytes()).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            parse(flood.as_bytes()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
     fn truncation_is_unexpected_eof_and_garbage_body_is_invalid() {
-        assert_eq!(parse(b"Content-Length: 10\r\n\r\n{}").unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
-        assert_eq!(parse(b"Content-Length: 10\r\n").unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
-        assert_eq!(parse(b"Content-Len").unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
-        assert_eq!(parse(&frame("not json")).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            parse(b"Content-Length: 10\r\n\r\n{}").unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            parse(b"Content-Length: 10\r\n").unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            parse(b"Content-Len").unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            parse(&frame("not json")).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

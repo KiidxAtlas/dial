@@ -9,7 +9,11 @@ use std::borrow::Cow;
 #[derive(Debug, PartialEq)]
 pub enum Token<'a> {
     Text(Cow<'a, str>),
-    Open { name: String, attrs: Vec<(String, String)>, self_closing: bool },
+    Open {
+        name: String,
+        attrs: Vec<(String, String)>,
+        self_closing: bool,
+    },
     Close(String),
 }
 
@@ -17,7 +21,8 @@ pub enum Token<'a> {
 const RAW_TEXT: &[&str] = &["script", "style", "textarea", "title", "xmp"];
 
 const VOID: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr",
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
 ];
 
 pub fn is_void(name: &str) -> bool {
@@ -47,11 +52,16 @@ pub fn tokenize<'a>(html: &'a str) -> Vec<Token<'a>> {
         } else if rest.starts_with("<!") || rest.starts_with("<?") {
             flush(&mut tokens, text_start, pos);
             pos = rest.find('>').map_or(html.len(), |end| pos + end + 1);
-        } else if rest.starts_with("</") && rest.as_bytes().get(2).is_some_and(u8::is_ascii_alphabetic) {
+        } else if rest.starts_with("</")
+            && rest.as_bytes().get(2).is_some_and(u8::is_ascii_alphabetic)
+        {
             flush(&mut tokens, text_start, pos);
             let end = rest.find('>').map_or(html.len(), |end| pos + end + 1);
             let name = html[pos + 2..end.min(html.len())].trim_end_matches('>');
-            let name = name.split(|c: char| c.is_ascii_whitespace() || c == '/').next().unwrap_or("");
+            let name = name
+                .split(|c: char| c.is_ascii_whitespace() || c == '/')
+                .next()
+                .unwrap_or("");
             tokens.push(Token::Close(name.to_ascii_lowercase()));
             pos = end;
         } else if rest.as_bytes().get(1).is_some_and(u8::is_ascii_alphabetic) {
@@ -61,13 +71,21 @@ pub fn tokenize<'a>(html: &'a str) -> Vec<Token<'a>> {
             if RAW_TEXT.contains(&name.as_str()) && !self_closing {
                 let close = format!("</{name}");
                 let body_end = find_ci(html, &close, pos).unwrap_or(html.len());
-                tokens.push(Token::Open { name: name.clone(), attrs, self_closing });
+                tokens.push(Token::Open {
+                    name: name.clone(),
+                    attrs,
+                    self_closing,
+                });
                 if body_end > pos {
                     tokens.push(Token::Text(Cow::Borrowed(&html[pos..body_end])));
                 }
                 pos = body_end;
             } else {
-                tokens.push(Token::Open { name, attrs, self_closing });
+                tokens.push(Token::Open {
+                    name,
+                    attrs,
+                    self_closing,
+                });
             }
         } else {
             pos += 1;
@@ -84,7 +102,11 @@ fn parse_open_tag(html: &str, start: usize) -> (String, Vec<(String, String)>, b
     let bytes = html.as_bytes();
     let mut pos = start + 1;
     let name_start = pos;
-    while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() && bytes[pos] != b'>' && bytes[pos] != b'/' {
+    while pos < bytes.len()
+        && !bytes[pos].is_ascii_whitespace()
+        && bytes[pos] != b'>'
+        && bytes[pos] != b'/'
+    {
         pos += 1;
     }
     let name = html[name_start..pos].to_ascii_lowercase();
@@ -103,7 +125,10 @@ fn parse_open_tag(html: &str, start: usize) -> (String, Vec<(String, String)>, b
             b if b.is_ascii_whitespace() => pos += 1,
             _ => {
                 let key_start = pos;
-                while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() && !matches!(bytes[pos], b'=' | b'>' | b'/') {
+                while pos < bytes.len()
+                    && !bytes[pos].is_ascii_whitespace()
+                    && !matches!(bytes[pos], b'=' | b'>' | b'/')
+                {
                     pos += 1;
                 }
                 let key = html[key_start..pos].to_ascii_lowercase();
@@ -119,13 +144,19 @@ fn parse_open_tag(html: &str, start: usize) -> (String, Vec<(String, String)>, b
                     let (raw, next) = match bytes.get(pos) {
                         Some(&quote @ (b'"' | b'\'')) => {
                             let from = pos + 1;
-                            let to = bytes[from..].iter().position(|&b| b == quote).map_or(bytes.len(), |i| from + i);
+                            let to = bytes[from..]
+                                .iter()
+                                .position(|&b| b == quote)
+                                .map_or(bytes.len(), |i| from + i);
                             (&html[from..to], (to + 1).min(bytes.len()))
                         }
                         _ => {
                             let from = pos;
                             let mut to = from;
-                            while to < bytes.len() && !bytes[to].is_ascii_whitespace() && bytes[to] != b'>' {
+                            while to < bytes.len()
+                                && !bytes[to].is_ascii_whitespace()
+                                && bytes[to] != b'>'
+                            {
                                 to += 1;
                             }
                             (&html[from..to], to)
@@ -149,11 +180,15 @@ fn find_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
     }
-    (from..=hay.len() - needle.len()).find(|&i| hay[i..i + needle.len()].eq_ignore_ascii_case(needle))
+    (from..=hay.len() - needle.len())
+        .find(|&i| hay[i..i + needle.len()].eq_ignore_ascii_case(needle))
 }
 
 pub fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    attrs.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    attrs
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
 }
 
 /// Decode named (common subset) and numeric character references; unknown ones are kept verbatim.
@@ -191,7 +226,9 @@ fn entity(body: &str) -> Option<String> {
             Some(hex) => u32::from_str_radix(hex, 16).ok()?,
             None => number.parse().ok()?,
         };
-        return char::from_u32(code).filter(|&c| c != '\0').map(String::from);
+        return char::from_u32(code)
+            .filter(|&c| c != '\0')
+            .map(String::from);
     }
     let c = match body {
         "amp" => '&',
@@ -231,19 +268,54 @@ fn entity(body: &str) -> Option<String> {
 
 /// Elements dropped together with everything inside them.
 const DROPPED: &[&str] = &[
-    "script", "style", "noscript", "svg", "canvas", "template", "iframe", "object", "embed", "nav", "footer", "aside",
-    "button", "select", "dialog",
+    "script", "style", "noscript", "svg", "canvas", "template", "iframe", "object", "embed", "nav",
+    "footer", "aside", "button", "select", "dialog",
 ];
 
 /// Elements that start and end a paragraph (blank line around them).
 const PARAGRAPH: &[&str] = &[
-    "p", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote", "table", "ul", "ol", "dl", "figure", "details", "hr",
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "pre",
+    "blockquote",
+    "table",
+    "ul",
+    "ol",
+    "dl",
+    "figure",
+    "details",
+    "hr",
 ];
 
 /// Elements that start and end a line.
 const LINE: &[&str] = &[
-    "div", "section", "article", "main", "header", "li", "tr", "dt", "dd", "form", "fieldset", "figcaption",
-    "address", "center", "summary", "body", "html", "caption", "thead", "tbody", "tfoot", "br",
+    "div",
+    "section",
+    "article",
+    "main",
+    "header",
+    "li",
+    "tr",
+    "dt",
+    "dd",
+    "form",
+    "fieldset",
+    "figcaption",
+    "address",
+    "center",
+    "summary",
+    "body",
+    "html",
+    "caption",
+    "thead",
+    "tbody",
+    "tfoot",
+    "br",
 ];
 
 /// Readable text of an HTML document. `base` (the page's own URL) resolves relative links.
@@ -298,7 +370,11 @@ impl<'a> Writer<'a> {
     fn feed(&mut self, token: Token<'_>) {
         if let Some(skip) = &mut self.skip {
             match &token {
-                Token::Open { name, self_closing: false, .. } if *name == skip.name && !is_void(name) => skip.depth += 1,
+                Token::Open {
+                    name,
+                    self_closing: false,
+                    ..
+                } if *name == skip.name && !is_void(name) => skip.depth += 1,
                 Token::Close(name) if *name == skip.name => {
                     skip.depth -= 1;
                     if skip.depth == 0 {
@@ -315,7 +391,11 @@ impl<'a> Writer<'a> {
                 title.push_str(&decode_entities(&text));
             }
             Token::Text(text) => self.text(&decode_entities(&text)),
-            Token::Open { name, attrs, self_closing } => self.open(name, &attrs, self_closing),
+            Token::Open {
+                name,
+                attrs,
+                self_closing,
+            } => self.open(name, &attrs, self_closing),
             Token::Close(name) => self.close(&name),
         }
     }
@@ -355,7 +435,8 @@ impl<'a> Writer<'a> {
             }
             "li" => {
                 self.line_break();
-                self.out.push_str(&"  ".repeat(self.lists.len().saturating_sub(1)));
+                self.out
+                    .push_str(&"  ".repeat(self.lists.len().saturating_sub(1)));
                 match self.lists.last_mut() {
                     Some(Some(n)) => {
                         self.out.push_str(&format!("{n}. "));
@@ -389,10 +470,16 @@ impl<'a> Writer<'a> {
             "a" => {
                 self.end_link();
                 let href = attr(attrs, "href").and_then(|href| self.link_target(href));
-                self.link = Some(Link { href, text_start: self.out.len() });
+                self.link = Some(Link {
+                    href,
+                    text_start: self.out.len(),
+                });
             }
             "img" => {
-                if let Some(alt) = attr(attrs, "alt").map(str::trim).filter(|alt| !alt.is_empty()) {
+                if let Some(alt) = attr(attrs, "alt")
+                    .map(str::trim)
+                    .filter(|alt| !alt.is_empty())
+                {
                     self.text(&format!("[image: {alt}]"));
                 }
             }
@@ -442,7 +529,11 @@ impl<'a> Writer<'a> {
 
     /// A block starts inside a link that never closed: end the link now if it already has text.
     fn end_link_with_text(&mut self) {
-        if self.link.as_ref().is_some_and(|link| !self.out[link.text_start..].trim().is_empty()) {
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|link| !self.out[link.text_start..].trim().is_empty())
+        {
             self.end_link();
         }
     }
@@ -473,7 +564,13 @@ impl<'a> Writer<'a> {
     }
 
     fn space_if_pending(&mut self) {
-        if std::mem::take(&mut self.pending_space) && self.out.chars().next_back().is_some_and(|c| !c.is_whitespace()) {
+        if std::mem::take(&mut self.pending_space)
+            && self
+                .out
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_whitespace())
+        {
             self.out.push(' ');
         }
     }
@@ -507,7 +604,11 @@ impl<'a> Writer<'a> {
             let line = line.trim_end();
             // List items whose content was dropped (buttons, icons) leave a bare marker behind.
             let marker = line.trim_start();
-            if marker == "-" || marker.strip_suffix('.').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            if marker == "-"
+                || marker
+                    .strip_suffix('.')
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            {
                 continue;
             }
             blank_run = if line.is_empty() { blank_run + 1 } else { 0 };
@@ -517,8 +618,14 @@ impl<'a> Writer<'a> {
             }
         }
         self.out = body.trim().to_owned();
-        match self.title.as_deref().map(|t| t.split_whitespace().collect::<Vec<_>>().join(" ")) {
-            Some(title) if !title.is_empty() => format!("Title: {title}\n\n{}", self.out).trim_end().to_owned(),
+        match self
+            .title
+            .as_deref()
+            .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+        {
+            Some(title) if !title.is_empty() => format!("Title: {title}\n\n{}", self.out)
+                .trim_end()
+                .to_owned(),
             _ => self.out,
         }
     }
@@ -567,30 +674,51 @@ mod tests {
     #[test]
     fn survives_malformed_markup() {
         let out = text("<p>unclosed <b>bold <a href='/x'>link<p>next < 3 & more <div>a</p></span>");
-        assert_eq!(out, "unclosed bold link (https://example.com/x)\n\nnext < 3 & more\na");
+        assert_eq!(
+            out,
+            "unclosed bold link (https://example.com/x)\n\nnext < 3 & more\na"
+        );
         assert_eq!(text("<script>never closed <p>x"), "");
         assert_eq!(text("plain text only"), "plain text only");
     }
 
     #[test]
     fn hidden_elements_are_dropped() {
-        assert_eq!(text(r#"<div hidden><p>secret</p></div><span aria-hidden="true">x</span><p>shown</p>"#), "shown");
+        assert_eq!(
+            text(r#"<div hidden><p>secret</p></div><span aria-hidden="true">x</span><p>shown</p>"#),
+            "shown"
+        );
     }
 
     #[test]
     fn list_items_emptied_by_dropped_content_vanish() {
-        assert_eq!(text("<ul><li><button>menu</button></li><li>real</li></ul><ol><li><svg></svg></li><li>two</li></ol>"), "- real\n\n2. two");
+        assert_eq!(
+            text(
+                "<ul><li><button>menu</button></li><li>real</li></ul><ol><li><svg></svg></li><li>two</li></ol>"
+            ),
+            "- real\n\n2. two"
+        );
     }
 
     #[test]
     fn decodes_entities() {
-        assert_eq!(decode_entities("a &lt;b&gt; &#65;&#x42; &amp;amp; &bogus; & &copy"), "a <b> AB &amp; &bogus; & &copy");
+        assert_eq!(
+            decode_entities("a &lt;b&gt; &#65;&#x42; &amp;amp; &bogus; & &copy"),
+            "a <b> AB &amp; &bogus; & &copy"
+        );
     }
 
     #[test]
     fn tokenizer_handles_attributes() {
         let tokens = tokenize(r#"<A HREF="/a?x=1&amp;y=2" data-x=raw hidden class='c d'/>"#);
-        let Token::Open { name, attrs, self_closing } = &tokens[0] else { panic!("{tokens:?}") };
+        let Token::Open {
+            name,
+            attrs,
+            self_closing,
+        } = &tokens[0]
+        else {
+            panic!("{tokens:?}")
+        };
         assert_eq!(name, "a");
         assert!(self_closing);
         assert_eq!(attr(attrs, "href"), Some("/a?x=1&y=2"));

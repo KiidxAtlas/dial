@@ -77,10 +77,20 @@ fn blocked_v6(ip: Ipv6Addr) -> Option<&'static str> {
         Some("IPv4-compatible")
     } else if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
         // NAT64 well-known prefix: the embedded IPv4 address is what is actually reached.
-        blocked_v4(Ipv4Addr::new((seg[6] >> 8) as u8, seg[6] as u8, (seg[7] >> 8) as u8, seg[7] as u8))
+        blocked_v4(Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        ))
     } else if seg[0] == 0x2002 {
         // 6to4: the IPv4 address sits in bits 16..48.
-        blocked_v4(Ipv4Addr::new((seg[1] >> 8) as u8, seg[1] as u8, (seg[2] >> 8) as u8, seg[2] as u8))
+        blocked_v4(Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            seg[1] as u8,
+            (seg[2] >> 8) as u8,
+            seg[2] as u8,
+        ))
     } else if seg[0] == 0x2001 && seg[1] == 0x0db8 {
         Some("documentation")
     } else {
@@ -106,7 +116,9 @@ impl GuardedResolver {
 
     #[cfg(test)]
     pub fn allowing_loopback() -> Self {
-        Self { allow_loopback: true }
+        Self {
+            allow_loopback: true,
+        }
     }
 
     fn check(&self, ip: IpAddr) -> Option<&'static str> {
@@ -119,13 +131,24 @@ impl GuardedResolver {
 }
 
 impl Resolver for GuardedResolver {
-    fn resolve(&self, uri: &Uri, config: &Config, timeout: NextTimeout) -> Result<ResolvedSocketAddrs, Error> {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, Error> {
         let addrs = DefaultResolver::default().resolve(uri, config, timeout)?;
         for addr in addrs.iter() {
             if let Some(reason) = self.check(addr.ip()) {
                 let host = uri.host().unwrap_or("?");
-                let refusal = format!("refusing to connect to {host}: it resolves to a {reason} address ({})", addr.ip());
-                return Err(Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, refusal)));
+                let refusal = format!(
+                    "refusing to connect to {host}: it resolves to a {reason} address ({})",
+                    addr.ip()
+                );
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    refusal,
+                )));
             }
         }
         Ok(addrs)
@@ -143,10 +166,32 @@ mod tests {
     #[test]
     fn refuses_local_and_private_ranges() {
         for ip in [
-            "127.0.0.1", "127.9.9.9", "0.0.0.0", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1",
-            "169.254.169.254", "100.64.0.1", "100.127.255.255", "198.18.0.1", "224.0.0.1", "255.255.255.255",
-            "240.0.0.1", "::1", "::", "fc00::1", "fd12:3456::1", "fe80::1", "ff02::1", "::ffff:127.0.0.1",
-            "::ffff:10.0.0.1", "::ffff:169.254.169.254", "64:ff9b::a00:1", "2002:7f00:1::1", "::127.0.0.1",
+            "127.0.0.1",
+            "127.9.9.9",
+            "0.0.0.0",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "100.127.255.255",
+            "198.18.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a00:1",
+            "2002:7f00:1::1",
+            "::127.0.0.1",
         ] {
             assert!(blocked(ip), "{ip} should be refused");
         }
@@ -154,14 +199,26 @@ mod tests {
 
     #[test]
     fn allows_public_addresses() {
-        for ip in ["93.184.216.34", "1.1.1.1", "8.8.8.8", "172.32.0.1", "100.63.255.255", "2606:2800:220:1:248:1893:25c8:1946", "::ffff:8.8.8.8", "64:ff9b::808:808"] {
+        for ip in [
+            "93.184.216.34",
+            "1.1.1.1",
+            "8.8.8.8",
+            "172.32.0.1",
+            "100.63.255.255",
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+        ] {
             assert!(!blocked(ip), "{ip} should be allowed");
         }
     }
 
     #[test]
     fn names_the_reason() {
-        assert_eq!(blocked_reason("169.254.169.254".parse().unwrap()), Some("link-local (cloud metadata)"));
+        assert_eq!(
+            blocked_reason("169.254.169.254".parse().unwrap()),
+            Some("link-local (cloud metadata)")
+        );
         assert_eq!(blocked_reason("10.0.0.1".parse().unwrap()), Some("private"));
     }
 }

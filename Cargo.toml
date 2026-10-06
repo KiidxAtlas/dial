@@ -29,6 +29,7 @@ regex = "1.13.1"
 ast-grep-core = "0.45.3"
 ast-grep-language = "0.45.3"
 ignore = "0.4.33"
+globset = "0.4"
 httpdate = "1"
 zip = { version = "4", default-features = false, features = ["deflate"] }
 tar = "0.4"

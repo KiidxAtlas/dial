@@ -55,6 +55,10 @@ def main():
     from mlx_lm import server
     # The pinned server has no formatter factory parameter; replace this single protocol boundary.
     server.ToolCallFormatter = ToolCallFormatter
+    import os
+    from dial_steering import install_server
+    specification=os.environ.get("DIAL_STEERING_SPEC", "")
+    install_server(server, json.loads(specification) if specification else None)
     server.main()
 
 

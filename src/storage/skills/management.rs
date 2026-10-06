@@ -1,69 +1,123 @@
 //! User-facing skill inventory, opt-in imports and enablement. Foreign sources are never activated
 //! by browsing them. Preferences live outside the workspace, separate from agent-authored skills.
 use super::*;
+use crate::storage::settings_store;
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
-use crate::storage::settings_store;
 
 fn preferences_path(layout: &Layout, scope: Scope) -> Result<PathBuf> {
     layout.ensure_state_outside_project()?;
-    ensure!(!layout.user_dir.starts_with(&layout.project_root), "skill preferences must be outside the project");
-    let dir = match scope { Scope::Project => &layout.state_dir, Scope::User => &layout.user_dir };
+    ensure!(
+        !layout.user_dir.starts_with(&layout.project_root),
+        "skill preferences must be outside the project"
+    );
+    let dir = match scope {
+        Scope::Project => &layout.state_dir,
+        Scope::User => &layout.user_dir,
+    };
     settings_store::validate_private_path(dir)?;
     Ok(dir.join("skills.json"))
 }
 
 fn preferences(layout: &Layout, scope: Scope) -> Result<BTreeMap<String, bool>> {
     let path = preferences_path(layout, scope)?;
-    let Some(bytes) = settings_store::read_private(&path)? else { return Ok(BTreeMap::new()); };
-    ensure!(bytes.len() <= MAX_READ_BYTES, "skill preferences exceed 64 KiB");
-    serde_json::from_slice(&bytes).with_context(|| format!("invalid skill preferences in {}", path.display()))
+    let Some(bytes) = settings_store::read_private(&path)? else {
+        return Ok(BTreeMap::new());
+    };
+    ensure!(
+        bytes.len() <= MAX_READ_BYTES,
+        "skill preferences exceed 64 KiB"
+    );
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid skill preferences in {}", path.display()))
 }
 
 pub fn installed(layout: &Layout) -> Result<Vec<(Skill, bool)>> {
     let mut enabled = preferences(layout, Scope::User)?;
     enabled.extend(preferences(layout, Scope::Project)?);
-    Ok(discover_all(layout).into_iter().map(|skill| {
-        let active = enabled.get(&skill.name).copied().unwrap_or(true);
-        (skill, active)
-    }).collect())
+    Ok(discover_all(layout)
+        .into_iter()
+        .map(|skill| {
+            let active = enabled.get(&skill.name).copied().unwrap_or(true);
+            (skill, active)
+        })
+        .collect())
 }
 
 pub fn set_enabled(layout: &Layout, name: &str, enabled: bool, scope: Scope) -> Result<()> {
     ensure!(valid_name(name), "invalid skill name");
-    ensure!(discover_all(layout).iter().any(|skill| skill.name == name), "no installed skill named {name:?}");
+    ensure!(
+        discover_all(layout).iter().any(|skill| skill.name == name),
+        "no installed skill named {name:?}"
+    );
     let path = preferences_path(layout, scope)?;
     let _lock = settings_store::locked(&path)?;
     let mut settings = preferences(layout, scope)?;
     settings.insert(name.to_owned(), enabled);
     let bytes = serde_json::to_vec_pretty(&settings)?;
-    ensure!(bytes.len() <= MAX_READ_BYTES, "skill preferences exceed 64 KiB");
+    ensure!(
+        bytes.len() <= MAX_READ_BYTES,
+        "skill preferences exceed 64 KiB"
+    );
     settings_store::write_private(&path, &bytes)
 }
 
 pub const HELP: &str = "Skills: /skills list | sources | enable <name> [--user] | disable <name> [--user] | import <path> [--user] [--dry-run] [--update]";
 
 pub fn list(layout: &Layout) -> Result<String> {
-    let mut lines: Vec<String> = installed(layout)?.into_iter().map(|(skill, enabled)| {
-        format!("{} [{}; {}] {} — {}", skill.name, if enabled { "on" } else { "off" }, skill.source.as_str(), skill.path.display(), skill.description)
-    }).collect();
-    if lines.is_empty() { lines.push("No installed skills. Browse /skills sources, then import a directory.".into()); }
+    let mut lines: Vec<String> = installed(layout)?
+        .into_iter()
+        .map(|(skill, enabled)| {
+            format!(
+                "{} [{}; {}] {} — {}",
+                skill.name,
+                if enabled { "on" } else { "off" },
+                skill.source.as_str(),
+                skill.path.display(),
+                skill.description
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push("No installed skills. Browse /skills sources, then import a directory.".into());
+    }
     lines.push(HELP.into());
     Ok(lines.join("\n"))
 }
 
 fn source_roots(layout: &Layout, home: Option<&Path>) -> Vec<(String, PathBuf)> {
     let mut roots = Vec::new();
-    for (scope, base) in [("project", Some(layout.project_root.as_path())), ("user", home)] {
+    for (scope, base) in [
+        ("project", Some(layout.project_root.as_path())),
+        ("user", home),
+    ] {
         let Some(base) = base else { continue };
         for (provider, relative) in [
-            ("Claude", ".claude/skills"), ("Codex", ".codex/skills"),
-            ("Agents", ".agents/skills"), ("Agent", ".agent/skills"),
-            ("omp", if scope == "user" { ".omp/agent/skills" } else { ".omp/skills" }),
-            ("pi", if scope == "user" { ".pi/agent/skills" } else { ".pi/skills" }),
+            ("Claude", ".claude/skills"),
+            ("Codex", ".codex/skills"),
+            ("Agents", ".agents/skills"),
+            ("Agent", ".agent/skills"),
+            (
+                "omp",
+                if scope == "user" {
+                    ".omp/agent/skills"
+                } else {
+                    ".omp/skills"
+                },
+            ),
+            (
+                "pi",
+                if scope == "user" {
+                    ".pi/agent/skills"
+                } else {
+                    ".pi/skills"
+                },
+            ),
         ] {
             let root = base.join(relative);
-            if !roots.iter().any(|(_, path)| path == &root) { roots.push((format!("{provider} {scope}"), root)); }
+            if !roots.iter().any(|(_, path)| path == &root) {
+                roots.push((format!("{provider} {scope}"), root));
+            }
         }
     }
     roots
@@ -72,17 +126,37 @@ fn source_roots(layout: &Layout, home: Option<&Path>) -> Vec<(String, PathBuf)> 
 fn browse(layout: &Layout, home: Option<&Path>) -> String {
     let mut lines = vec!["Local sources (not imported or enabled by browsing):".to_owned()];
     for (label, root) in source_roots(layout, home) {
-        if !is_real_dir(&root) { continue; }
-        let mut paths: Vec<_> = fs::read_dir(&root).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        if !is_real_dir(&root) {
+            continue;
+        }
+        let mut paths: Vec<_> = fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
         paths.sort();
         lines.push(format!("{label}: {}", root.display()));
-        let skills: Vec<_> = paths.iter().filter_map(|path| load_skill(path, Scope::User)).take(MAX_SKILLS_PER_DIR).collect();
-        if skills.is_empty() { lines.push("  No compatible skills".into()); }
+        let skills: Vec<_> = paths
+            .iter()
+            .filter_map(|path| load_skill(path, Scope::User))
+            .take(MAX_SKILLS_PER_DIR)
+            .collect();
+        if skills.is_empty() {
+            lines.push("  No compatible skills".into());
+        }
         for skill in skills {
-            lines.push(format!("  {} — {}\n    {}", skill.name, skill.description, skill.dir().display()));
+            lines.push(format!(
+                "  {} — {}\n    {}",
+                skill.name,
+                skill.description,
+                skill.dir().display()
+            ));
         }
     }
-    if lines.len() == 1 { lines.push("No common local source directories found.".into()); }
+    if lines.len() == 1 {
+        lines.push("No common local source directories found.".into());
+    }
     lines.push("Import a listed directory with /skills import <path> (or dial skills import <path>). Other local checkouts work too; no downloads or scripts are run.".into());
     lines.join("\n")
 }
@@ -94,7 +168,9 @@ pub fn sources(layout: &Layout) -> String {
 
 /// Slash-command adapter; the controller supplies words using the shared command tokenizer.
 pub fn command(layout: &Layout, mut words: Vec<String>) -> Result<String> {
-    if words.is_empty() { return list(layout); }
+    if words.is_empty() {
+        return list(layout);
+    }
     let action = words.remove(0);
     let mut scope = Scope::Project;
     let mut dry_run = false;
@@ -119,7 +195,9 @@ pub fn command(layout: &Layout, mut words: Vec<String>) -> Result<String> {
         ("import", [path]) => {
             let path = if let Some(suffix) = path.strip_prefix("~/") {
                 PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(suffix)
-            } else { layout.project_root.join(path) };
+            } else {
+                layout.project_root.join(path)
+            };
             Ok(import::run(layout, &path, scope, dry_run, update)?.join("\n"))
         }
         _ => anyhow::bail!("{HELP}"),
@@ -133,7 +211,11 @@ mod tests {
     fn skill(root: &Path, name: &str) {
         let dir = root.join(name);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(SKILL_FILE), format!("---\nname: {name}\ndescription: Review code\n---\nReview carefully.")).unwrap();
+        fs::write(
+            dir.join(SKILL_FILE),
+            format!("---\nname: {name}\ndescription: Review code\n---\nReview carefully."),
+        )
+        .unwrap();
     }
 
     fn command(layout: &Layout, args: &str) -> Result<String> {
@@ -177,7 +259,11 @@ mod tests {
         assert!(discover(&layout).is_empty());
         let source = project.path().join("my checkout");
         skill(&source, "review");
-        assert!(command(&layout, "import 'my checkout' --dry-run").unwrap().contains("Would import review"));
+        assert!(
+            command(&layout, "import 'my checkout' --dry-run")
+                .unwrap()
+                .contains("Would import review")
+        );
         assert!(discover(&layout).is_empty());
         command(&layout, "import 'my checkout'").unwrap();
         assert_eq!(discover(&layout).len(), 1);
@@ -208,7 +294,12 @@ mod tests {
         std::os::unix::fs::symlink(project.path(), home.path().join("projects")).unwrap();
         assert!(installed(&layout).is_err());
         assert!(set_enabled(&layout, "review", false, Scope::Project).is_err());
-        assert!(!project.path().join(layout.state_dir.file_name().unwrap()).exists());
+        assert!(
+            !project
+                .path()
+                .join(layout.state_dir.file_name().unwrap())
+                .exists()
+        );
     }
 
     #[test]

@@ -63,7 +63,14 @@ fn parse_ranges(seg: &str) -> Result<Option<Parsed>, String> {
                 _ => return Ok(None),
             }
         } else if let Some((a, b)) = part.split_once("..").or_else(|| part.split_once('-')) {
-            match (number(a), if b.is_empty() { Some(None) } else { number(b).map(Some) }) {
+            match (
+                number(a),
+                if b.is_empty() {
+                    Some(None)
+                } else {
+                    number(b).map(Some)
+                },
+            ) {
                 (Some(a), Some(b)) => (a, b),
                 _ => return Ok(None),
             }
@@ -125,7 +132,10 @@ pub fn split_selector(input: &str) -> Result<(&str, Selector), String> {
 
 /// The path and selector of a `read` argument. A literal file name wins over
 /// selector interpretation.
-pub(super) fn split_target<'a>(ws: &Workspace, input: &'a str) -> Result<(&'a str, Selector), String> {
+pub(super) fn split_target<'a>(
+    ws: &Workspace,
+    input: &'a str,
+) -> Result<(&'a str, Selector), String> {
     if ws.resolve(input).is_ok_and(|p| p.exists()) {
         return Ok((input, Selector::default()));
     }
@@ -148,25 +158,57 @@ pub(super) fn plan_spans(sel: &Selector, offset: usize, limit: usize, len: usize
     let bounded_end = |start: usize| start.saturating_add(limit.max(1) - 1).min(len);
     if let Some(n) = sel.tail {
         let n = n.min(MAX_READ_LINES);
-        return if len == 0 { Vec::new() } else { vec![Span { start: len.saturating_sub(n) + 1, end: len, bounded: false }] };
+        return if len == 0 {
+            Vec::new()
+        } else {
+            vec![Span {
+                start: len.saturating_sub(n) + 1,
+                end: len,
+                bounded: false,
+            }]
+        };
     }
     if !sel.selects_lines() {
         let start = offset.max(1);
-        return if start <= len { vec![Span { start, end: bounded_end(start), bounded: true }] } else { Vec::new() };
+        return if start <= len {
+            vec![Span {
+                start,
+                end: bounded_end(start),
+                bounded: true,
+            }]
+        } else {
+            Vec::new()
+        };
     }
     sel.ranges
         .iter()
         .filter(|&&(a, _)| a <= len)
         .map(|&(a, b)| match b {
-            Some(b) => Span { start: a, end: b.min(len), bounded: false },
-            None => Span { start: a, end: bounded_end(a), bounded: true },
+            Some(b) => Span {
+                start: a,
+                end: b.min(len),
+                bounded: false,
+            },
+            None => Span {
+                start: a,
+                end: bounded_end(a),
+                bounded: true,
+            },
         })
         .collect()
 }
 
 fn describe_spans(shown: &[(usize, usize)]) -> String {
-    let parts: Vec<String> =
-        shown.iter().map(|&(a, b)| if a == b { a.to_string() } else { format!("{a}-{b}") }).collect();
+    let parts: Vec<String> = shown
+        .iter()
+        .map(|&(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}-{b}")
+            }
+        })
+        .collect();
     parts.join(", ")
 }
 
@@ -178,23 +220,40 @@ fn describe_spans(shown: &[(usize, usize)]) -> String {
 /// Anchored output states its range and the total whenever it is not the
 /// whole file read without a selector; raw output stays verbatim and only says
 /// how to continue.
-pub(super) fn footer(rel: &str, sel: &Selector, shown: &[(usize, usize)], len: usize, next: Option<usize>, capped: bool) -> String {
+pub(super) fn footer(
+    rel: &str,
+    sel: &Selector,
+    shown: &[(usize, usize)],
+    len: usize,
+    next: Option<usize>,
+    capped: bool,
+) -> String {
     let mut parts = Vec::new();
     let last = shown.last().map_or(0, |s| s.1);
     if capped {
-        parts.push(format!("output truncated at 64 KiB after line {last} of {len}"));
+        parts.push(format!(
+            "output truncated at 64 KiB after line {last} of {len}"
+        ));
     } else if !sel.raw && (sel.selects_lines() || shown != [(1, len)]) {
         parts.push(format!("lines {} of {len}", describe_spans(shown)));
     }
     if let Some(n) = next {
         parts.push(format!("continue with `{rel}:{n}-`"));
     }
-    if parts.is_empty() { String::new() } else { format!("[{}]\n", parts.join("; ")) }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]\n", parts.join("; "))
+    }
 }
 
 /// What to say when a read selects no lines at all.
 pub(super) fn empty_read(len: usize) -> String {
-    if len == 0 { "(empty file)".to_owned() } else { format!("(no lines in that range; file has {len} lines)") }
+    if len == 0 {
+        "(empty file)".to_owned()
+    } else {
+        format!("(no lines in that range; file has {len} lines)")
+    }
 }
 
 #[cfg(test)]
@@ -202,26 +261,46 @@ mod tests {
     use super::*;
 
     fn sel(ranges: &[(usize, Option<usize>)]) -> Selector {
-        Selector { raw: false, ranges: ranges.to_vec(), tail: None }
+        Selector {
+            raw: false,
+            ranges: ranges.to_vec(),
+            tail: None,
+        }
     }
 
     fn span(start: usize, end: usize, bounded: bool) -> Span {
-        Span { start, end, bounded }
+        Span {
+            start,
+            end,
+            bounded,
+        }
     }
 
     #[test]
     fn selectors_parse_ranges_tail_and_raw() {
         let (path, s) = split_selector("src/a.rs:50-100").unwrap();
-        assert_eq!((path, s.ranges.clone(), s.raw), ("src/a.rs", vec![(50, Some(100))], false));
+        assert_eq!(
+            (path, s.ranges.clone(), s.raw),
+            ("src/a.rs", vec![(50, Some(100))], false)
+        );
         let (path, s) = split_selector("a.rs:raw:5-9").unwrap();
         assert_eq!((path, s.ranges, s.raw), ("a.rs", vec![(5, Some(9))], true));
         let (path, s) = split_selector("a.rs:5..9:raw").unwrap();
         assert_eq!((path, s.ranges, s.raw), ("a.rs", vec![(5, Some(9))], true));
         assert_eq!(split_selector("a.rs:-30").unwrap().1.tail, Some(30));
-        assert_eq!(split_selector("a.rs:10+5").unwrap().1.ranges, vec![(10, Some(14))]);
+        assert_eq!(
+            split_selector("a.rs:10+5").unwrap().1.ranges,
+            vec![(10, Some(14))]
+        );
         assert_eq!(split_selector("a.rs:7-").unwrap().1.ranges, vec![(7, None)]);
-        assert_eq!(split_selector("a.rs:12,3-5,4-8").unwrap().1.ranges, vec![(3, Some(8)), (12, None)]);
-        assert_eq!(split_selector("a.rs:5-16,960-973").unwrap().1.ranges, vec![(5, Some(16)), (960, Some(973))]);
+        assert_eq!(
+            split_selector("a.rs:12,3-5,4-8").unwrap().1.ranges,
+            vec![(3, Some(8)), (12, None)]
+        );
+        assert_eq!(
+            split_selector("a.rs:5-16,960-973").unwrap().1.ranges,
+            vec![(5, Some(16)), (960, Some(973))]
+        );
         let (path, s) = split_selector("archive.zip:inner/file").unwrap();
         assert_eq!((path, s), ("archive.zip:inner/file", Selector::default()));
         assert!(split_selector("a.rs:0").is_err());
@@ -233,24 +312,43 @@ mod tests {
     #[test]
     fn spans_clip_to_the_file_and_drop_ranges_past_the_end() {
         let ranges = sel(&[(2, Some(4)), (8, Some(50)), (90, Some(95))]);
-        assert_eq!(plan_spans(&ranges, 1, 100, 10), vec![span(2, 4, false), span(8, 10, false)]);
+        assert_eq!(
+            plan_spans(&ranges, 1, 100, 10),
+            vec![span(2, 4, false), span(8, 10, false)]
+        );
         assert!(plan_spans(&sel(&[(11, None)]), 1, 100, 10).is_empty());
-        assert_eq!(plan_spans(&sel(&[(10, None)]), 1, 100, 10), vec![span(10, 10, true)]);
+        assert_eq!(
+            plan_spans(&sel(&[(10, None)]), 1, 100, 10),
+            vec![span(10, 10, true)]
+        );
     }
 
     #[test]
     fn open_ended_ranges_and_offsets_are_bounded_by_limit() {
-        assert_eq!(plan_spans(&sel(&[(3, None)]), 1, 4, 100), vec![span(3, 6, true)]);
-        assert_eq!(plan_spans(&Selector::default(), 5, 2, 100), vec![span(5, 6, true)]);
+        assert_eq!(
+            plan_spans(&sel(&[(3, None)]), 1, 4, 100),
+            vec![span(3, 6, true)]
+        );
+        assert_eq!(
+            plan_spans(&Selector::default(), 5, 2, 100),
+            vec![span(5, 6, true)]
+        );
         assert!(plan_spans(&Selector::default(), 5, 2, 4).is_empty());
         assert!(plan_spans(&Selector::default(), 1, 2, 0).is_empty());
         // Unknown length (streaming reads) never overflows.
-        assert_eq!(plan_spans(&Selector::default(), 1, 3, usize::MAX), vec![span(1, 3, true)]);
+        assert_eq!(
+            plan_spans(&Selector::default(), 1, 3, usize::MAX),
+            vec![span(1, 3, true)]
+        );
     }
 
     #[test]
     fn tail_selects_the_last_lines_even_when_longer_than_the_file() {
-        let tail = |n| Selector { raw: false, ranges: vec![], tail: Some(n) };
+        let tail = |n| Selector {
+            raw: false,
+            ranges: vec![],
+            tail: Some(n),
+        };
         assert_eq!(plan_spans(&tail(3), 1, 10, 10), vec![span(8, 10, false)]);
         assert_eq!(plan_spans(&tail(50), 1, 10, 10), vec![span(1, 10, false)]);
         assert!(plan_spans(&tail(5), 1, 10, 0).is_empty());
@@ -259,15 +357,33 @@ mod tests {
     #[test]
     fn footer_states_range_total_and_continuation() {
         let none = Selector::default();
-        let raw = Selector { raw: true, ..Selector::default() };
+        let raw = Selector {
+            raw: true,
+            ..Selector::default()
+        };
         let explicit = sel(&[(1, Some(5))]);
         assert_eq!(footer("f", &none, &[(1, 5)], 5, None, false), "");
-        assert_eq!(footer("f", &explicit, &[(1, 5)], 5, None, false), "[lines 1-5 of 5]\n");
-        assert_eq!(footer("f", &none, &[(2, 3)], 5, None, false), "[lines 2-3 of 5]\n");
-        assert_eq!(footer("f", &none, &[(5, 5), (9, 12)], 20, None, false), "[lines 5, 9-12 of 20]\n");
-        assert_eq!(footer("f", &none, &[(1, 2)], 9, Some(3), false), "[lines 1-2 of 9; continue with `f:3-`]\n");
+        assert_eq!(
+            footer("f", &explicit, &[(1, 5)], 5, None, false),
+            "[lines 1-5 of 5]\n"
+        );
+        assert_eq!(
+            footer("f", &none, &[(2, 3)], 5, None, false),
+            "[lines 2-3 of 5]\n"
+        );
+        assert_eq!(
+            footer("f", &none, &[(5, 5), (9, 12)], 20, None, false),
+            "[lines 5, 9-12 of 20]\n"
+        );
+        assert_eq!(
+            footer("f", &none, &[(1, 2)], 9, Some(3), false),
+            "[lines 1-2 of 9; continue with `f:3-`]\n"
+        );
         assert_eq!(footer("f", &raw, &[(2, 3)], 5, None, false), "");
-        assert_eq!(footer("f", &raw, &[(1, 2)], 9, Some(3), false), "[continue with `f:3-`]\n");
+        assert_eq!(
+            footer("f", &raw, &[(1, 2)], 9, Some(3), false),
+            "[continue with `f:3-`]\n"
+        );
         assert_eq!(
             footer("f", &none, &[(1, 2)], 9, Some(3), true),
             "[output truncated at 64 KiB after line 2 of 9; continue with `f:3-`]\n"

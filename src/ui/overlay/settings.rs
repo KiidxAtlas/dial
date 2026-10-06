@@ -32,38 +32,60 @@ use unicode_segmentation::UnicodeSegmentation;
 // ---------------------------------------------------------------------------------------------
 
 pub(super) fn scope_name(scope: Scope) -> &'static str {
-    match scope { Scope::Global => "global", Scope::Project => "project" }
+    match scope {
+        Scope::Global => "global",
+        Scope::Project => "project",
+    }
 }
 
 pub(super) fn other_scope(scope: Scope) -> Scope {
-    match scope { Scope::Global => Scope::Project, Scope::Project => Scope::Global }
+    match scope {
+        Scope::Global => Scope::Project,
+        Scope::Project => Scope::Global,
+    }
 }
 
-pub(super) fn pressed(key: &KeyEvent) -> bool { key.kind != KeyEventKind::Release }
+pub(super) fn pressed(key: &KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release
+}
 
 /// The character a key types into a text field (no Ctrl/Alt/Super chords, no controls).
 pub(super) fn typed_char(key: &KeyEvent) -> Option<char> {
     match key.code {
-        KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) && !c.is_control() => Some(c),
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                && !c.is_control() =>
+        {
+            Some(c)
+        }
         _ => None,
     }
 }
 
 pub(super) fn is_ctrl(key: &KeyEvent, c: char) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(k) if k.eq_ignore_ascii_case(&c))
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(k) if k.eq_ignore_ascii_case(&c))
 }
 
-fn spans_width(spans: &[Span<'_>]) -> usize { spans.iter().map(|s| text::width(&s.content)).sum() }
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| text::width(&s.content)).sum()
+}
 
 /// Truncate spans to `max` cells, never splitting a grapheme.
 pub(super) fn fit(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     let mut left = max;
     let mut out = Vec::with_capacity(spans.len());
     for span in spans {
-        if left == 0 { break; }
+        if left == 0 {
+            break;
+        }
         let clipped = text::clip(&span.content, left);
         let cells = text::width(&clipped);
-        if cells == 0 { continue; }
+        if cells == 0 {
+            continue;
+        }
         left -= cells;
         out.push(Span::styled(clipped, span.style));
     }
@@ -74,40 +96,71 @@ pub(super) fn fit(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
 pub(super) fn filled(spans: Vec<Span<'static>>, width: usize, fill: Style) -> Line<'static> {
     let mut spans = fit(spans, width);
     let used = spans_width(&spans);
-    if used < width { spans.push(Span::styled(" ".repeat(width - used), fill)); }
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), fill));
+    }
     Line::from(spans).style(fill)
 }
 
 /// Spans for `text` with the characters at `positions` (char indexes) emphasized.
-pub(super) fn highlighted(text: &str, positions: &[usize], base: Style, hl: Style) -> Vec<Span<'static>> {
+pub(super) fn highlighted(
+    text: &str,
+    positions: &[usize],
+    base: Style,
+    hl: Style,
+) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut run = String::new();
     let mut run_hl = false;
     for (i, c) in text.chars().enumerate() {
         let h = positions.contains(&i);
         if h != run_hl && !run.is_empty() {
-            out.push(Span::styled(std::mem::take(&mut run), if run_hl { hl } else { base }));
+            out.push(Span::styled(
+                std::mem::take(&mut run),
+                if run_hl { hl } else { base },
+            ));
         }
         run_hl = h;
         run.push(c);
     }
-    if !run.is_empty() { out.push(Span::styled(run, if run_hl { hl } else { base })); }
+    if !run.is_empty() {
+        out.push(Span::styled(run, if run_hl { hl } else { base }));
+    }
     out
 }
 
 pub(super) fn match_style(theme: &Theme, base: Style) -> Style {
-    base.patch(theme.fg(Tok::Accent)).add_modifier(Modifier::BOLD)
+    base.patch(theme.fg(Tok::Accent))
+        .add_modifier(Modifier::BOLD)
 }
 
 /// One scrollbar cell for list row `row` of `rows` visible, `total` items, first visible `offset`.
-pub(super) fn scroll_cell(theme: &Theme, row: usize, rows: usize, total: usize, offset: usize) -> Span<'static> {
-    if total <= rows || rows == 0 { return Span::raw(" "); }
+pub(super) fn scroll_cell(
+    theme: &Theme,
+    row: usize,
+    rows: usize,
+    total: usize,
+    offset: usize,
+) -> Span<'static> {
+    if total <= rows || rows == 0 {
+        return Span::raw(" ");
+    }
     let thumb = (rows * rows / total).max(1).min(rows);
-    let start = if total > rows { offset * (rows - thumb) / (total - rows) } else { 0 };
-    if row >= start && row < start + thumb {
-        Span::styled(theme.sym(Sym::ScrollThumb).to_owned(), theme.fg(Tok::Accent))
+    let start = if total > rows {
+        offset * (rows - thumb) / (total - rows)
     } else {
-        Span::styled(theme.sym(Sym::ScrollTrack).to_owned(), theme.fg(Tok::BorderMuted))
+        0
+    };
+    if row >= start && row < start + thumb {
+        Span::styled(
+            theme.sym(Sym::ScrollThumb).to_owned(),
+            theme.fg(Tok::Accent),
+        )
+    } else {
+        Span::styled(
+            theme.sym(Sym::ScrollTrack).to_owned(),
+            theme.fg(Tok::BorderMuted),
+        )
     }
 }
 
@@ -116,9 +169,21 @@ pub(super) fn scroll_cell(theme: &Theme, row: usize, rows: usize, total: usize, 
 pub(super) fn hint_line(theme: &Theme, segments: &[String], width: usize) -> Line<'static> {
     let sep = format!(" {} ", theme.sym(Sym::Dot));
     let width = width.saturating_sub(1);
-    let mut keep: Vec<&str> = segments.iter().map(String::as_str).filter(|s| !s.is_empty()).collect();
-    while keep.len() > 1 && text::width(&keep.join(&sep)) > width { keep.remove(keep.len() - 2); }
-    Line::from(Span::styled(format!(" {}", text::ellipsize(&keep.join(&sep), width, theme.ascii())), theme.fg(Tok::Muted)))
+    let mut keep: Vec<&str> = segments
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
+    while keep.len() > 1 && text::width(&keep.join(&sep)) > width {
+        keep.remove(keep.len() - 2);
+    }
+    Line::from(Span::styled(
+        format!(
+            " {}",
+            text::ellipsize(&keep.join(&sep), width, theme.ascii())
+        ),
+        theme.fg(Tok::Muted),
+    ))
 }
 
 /// `Key` labels for "a/b" style hints; empty when the action is unbound.
@@ -133,15 +198,26 @@ pub(super) fn pair_label(keys: &Keymap, a: Action, b: Action) -> String {
 /// `"Esc close"`; empty when the action is unbound.
 pub(super) fn hint(keys: &Keymap, action: Action, what: &str) -> String {
     let label = keys.label(action);
-    if label.is_empty() { String::new() } else { format!("{label} {what}") }
+    if label.is_empty() {
+        String::new()
+    } else {
+        format!("{label} {what}")
+    }
 }
 
 /// Draw the rounded full-screen frame (glyphs from the theme) and hand `body` the inner size; it
 /// returns at most that many rows. On a terminal too small for a border the body fills the screen.
-pub(super) fn panel(frame: &mut Frame, theme: &Theme, title: Line<'static>, body: impl FnOnce(u16, u16) -> Vec<Line<'static>>) {
+pub(super) fn panel(
+    frame: &mut Frame,
+    theme: &Theme,
+    title: Line<'static>,
+    body: impl FnOnce(u16, u16) -> Vec<Line<'static>>,
+) {
     let area = frame.area();
     frame.render_widget(Clear, area);
-    if area.width == 0 || area.height == 0 { return; }
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     if area.width < 3 || area.height < 3 {
         let mut lines = body(area.width, area.height);
         lines.truncate(usize::from(area.height));
@@ -151,14 +227,19 @@ pub(super) fn panel(frame: &mut Frame, theme: &Theme, title: Line<'static>, body
     let (inner_w, inner_h) = (area.width - 2, area.height - 2);
     let border = theme.fg(Tok::Border);
     let side = |lines: Vec<Line<'static>>| -> Vec<Line<'static>> {
-        lines.into_iter().map(|line| {
-            let mut spans = vec![Span::styled(theme.sym(Sym::BoxV).to_owned(), border)];
-            spans.extend(fit(line.spans, usize::from(inner_w)));
-            let used = spans_width(&spans) - 1;
-            spans.push(Span::raw(" ".repeat(usize::from(inner_w).saturating_sub(used))));
-            spans.push(Span::styled(theme.sym(Sym::BoxV).to_owned(), border));
-            Line::from(spans)
-        }).collect()
+        lines
+            .into_iter()
+            .map(|line| {
+                let mut spans = vec![Span::styled(theme.sym(Sym::BoxV).to_owned(), border)];
+                spans.extend(fit(line.spans, usize::from(inner_w)));
+                let used = spans_width(&spans) - 1;
+                spans.push(Span::raw(
+                    " ".repeat(usize::from(inner_w).saturating_sub(used)),
+                ));
+                spans.push(Span::styled(theme.sym(Sym::BoxV).to_owned(), border));
+                Line::from(spans)
+            })
+            .collect()
     };
     let rule = |n: usize| theme.sym(Sym::BoxH).repeat(n);
     let mut top = vec![Span::styled(theme.sym(Sym::BoxTl).to_owned(), border)];
@@ -170,24 +251,57 @@ pub(super) fn panel(frame: &mut Frame, theme: &Theme, title: Line<'static>, body
     let mut lines = vec![Line::from(top)];
     let mut inner = body(inner_w, inner_h);
     inner.truncate(usize::from(inner_h));
-    while inner.len() < usize::from(inner_h) { inner.push(Line::default()); }
+    while inner.len() < usize::from(inner_h) {
+        inner.push(Line::default());
+    }
     lines.extend(side(inner));
-    lines.push(Line::from(Span::styled(format!("{}{}{}", theme.sym(Sym::BoxBl), rule(usize::from(inner_w)), theme.sym(Sym::BoxBr)), border)));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{}{}{}",
+            theme.sym(Sym::BoxBl),
+            rule(usize::from(inner_w)),
+            theme.sym(Sym::BoxBr)
+        ),
+        border,
+    )));
     frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Title spans: `<icon> Name  extra`.
 pub(super) fn title_line(theme: &Theme, icon: Sym, name: &str, extra: &str) -> Line<'static> {
     let glyph = theme.sym(icon);
-    let mut spans = vec![Span::styled(if glyph.is_empty() { " ".to_owned() } else { format!(" {glyph} ") }, theme.fg(Tok::Accent))];
-    spans.push(Span::styled(format!("{name} "), theme.fg(Tok::Text).add_modifier(Modifier::BOLD)));
-    if !extra.is_empty() { spans.push(Span::styled(format!("{extra} "), theme.fg(Tok::Muted))); }
+    let mut spans = vec![Span::styled(
+        if glyph.is_empty() {
+            " ".to_owned()
+        } else {
+            format!(" {glyph} ")
+        },
+        theme.fg(Tok::Accent),
+    )];
+    spans.push(Span::styled(
+        format!("{name} "),
+        theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
+    ));
+    if !extra.is_empty() {
+        spans.push(Span::styled(format!("{extra} "), theme.fg(Tok::Muted)));
+    }
     Line::from(spans)
 }
 
 /// Cursor-aware rendering of a single-line editor inside `width` cells (the tail is kept visible).
-pub(super) fn editor_spans(theme: &Theme, editor: &Editor, width: usize, mask: bool) -> Vec<Span<'static>> {
-    let shown = |s: &str| if mask { "•".repeat(s.graphemes(true).count()) } else { s.to_owned() };
+pub(super) fn editor_spans(
+    theme: &Theme,
+    editor: &Editor,
+    width: usize,
+    mask: bool,
+) -> Vec<Span<'static>> {
+    let shown = |s: &str| {
+        if mask {
+            "•".repeat(s.graphemes(true).count())
+        } else {
+            s.to_owned()
+        }
+    };
     let before = shown(&editor.text[..editor.cursor.min(editor.text.len())]);
     let rest = &editor.text[editor.cursor.min(editor.text.len())..];
     let (at, after) = match rest.graphemes(true).next() {
@@ -201,7 +315,9 @@ pub(super) fn editor_spans(theme: &Theme, editor: &Editor, width: usize, mask: b
     let mut used = 0;
     for g in before.graphemes(true).rev() {
         let gw = text::width(g);
-        if used + gw > budget { break; }
+        if used + gw > budget {
+            break;
+        }
         used += gw;
         tail.push(g);
     }
@@ -209,11 +325,14 @@ pub(super) fn editor_spans(theme: &Theme, editor: &Editor, width: usize, mask: b
     let before: String = tail.concat();
     let after = text::clip(&after, budget.saturating_sub(used));
     let base = theme.fg(Tok::Text);
-    fit(vec![
-        Span::styled(before, base),
-        Span::styled(at, base.add_modifier(Modifier::REVERSED)),
-        Span::styled(after, base),
-    ], width)
+    fit(
+        vec![
+            Span::styled(before, base),
+            Span::styled(at, base.add_modifier(Modifier::REVERSED)),
+            Span::styled(after, base),
+        ],
+        width,
+    )
 }
 
 #[cfg(test)]
@@ -223,19 +342,46 @@ pub(super) mod testkit {
         ui::{keys::Keymap, status::StatusData, theme::Theme},
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::{Frame, Terminal, backend::TestBackend, buffer::Buffer, style::Style, text::Line};
+    use ratatui::{
+        Frame, Terminal, backend::TestBackend, buffer::Buffer, style::Style, text::Line,
+    };
 
-    pub fn key(code: KeyCode) -> Event { Event::Key(KeyEvent::new(code, KeyModifiers::NONE)) }
-    pub fn ctrl(c: char) -> Event { Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)) }
-    pub fn ch(c: char) -> Event { key(KeyCode::Char(c)) }
-    pub fn typed(s: &str) -> Vec<Event> { s.chars().map(ch).collect() }
+    pub fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+    pub fn ctrl(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+    pub fn ch(c: char) -> Event {
+        key(KeyCode::Char(c))
+    }
+    pub fn typed(s: &str) -> Vec<Event> {
+        s.chars().map(ch).collect()
+    }
 
-    pub fn status_preview(_: &UiConfig, _: u16) -> Line<'static> { Line::from("PREVIEW") }
+    pub fn status_preview(_: &UiConfig, _: u16) -> Line<'static> {
+        Line::from("PREVIEW")
+    }
 
-    pub struct Rig { pub theme: Theme, pub keys: Keymap, pub status: StatusData }
+    pub struct Rig {
+        pub theme: Theme,
+        pub keys: Keymap,
+        pub status: StatusData,
+    }
     impl Rig {
-        pub fn new() -> Self { Rig { theme: Theme::dark(), keys: Keymap::defaults(), status: StatusData::default() } }
-        pub fn with_theme(theme: Theme) -> Self { Rig { theme, ..Rig::new() } }
+        pub fn new() -> Self {
+            Rig {
+                theme: Theme::dark(),
+                keys: Keymap::defaults(),
+                status: StatusData::default(),
+            }
+        }
+        pub fn with_theme(theme: Theme) -> Self {
+            Rig {
+                theme,
+                ..Rig::new()
+            }
+        }
     }
 
     pub fn render(width: u16, height: u16, draw: impl FnOnce(&mut Frame)) -> Buffer {
@@ -245,10 +391,18 @@ pub(super) mod testkit {
     }
 
     pub fn rows(buffer: &Buffer) -> Vec<String> {
-        (0..buffer.area.height).map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_owned()).collect::<String>()).collect()
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
-    pub fn screen(buffer: &Buffer) -> String { rows(buffer).join("\n") }
+    pub fn screen(buffer: &Buffer) -> String {
+        rows(buffer).join("\n")
+    }
 
     /// Style of the first cell of `needle` found on the screen.
     pub fn style_of(buffer: &Buffer, needle: &str) -> Option<Style> {
@@ -270,23 +424,58 @@ const PROVIDERS_TAB: &str = "Setup";
 const LINK_SECTION: &str = "Models, connections & controls";
 /// Launchers for dedicated setup panels: (label, description, application action).
 const LINKS: &[(&str, &str, &str)] = &[
-    ("Providers & API keys", "Add or remove providers, see which are reachable and manage API keys.", "open:providers"),
-    ("Models & roles", "Choose the main model and models for feedback, subagents, compaction, architecture and escalation.", "open:models"),
-    ("Keyboard shortcuts", "Search, edit or restore keyboard controls. Shortcut changes apply to all projects.", "open:shortcuts"),
+    (
+        "Providers & API keys",
+        "Add or remove providers, see which are reachable and manage API keys.",
+        "open:providers",
+    ),
+    (
+        "Models & roles",
+        "Choose the main model and models for feedback, subagents, compaction, architecture and escalation.",
+        "open:models",
+    ),
+    (
+        "Keyboard shortcuts",
+        "Search, edit or restore keyboard controls. Shortcut changes apply to all projects.",
+        "open:shortcuts",
+    ),
+    (
+        "Compute & background work",
+        "See compute owners across projects; pause, resume, start or stop improvement jobs.",
+        "open:compute",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Row { Setting(usize), Link(usize) }
+enum Row {
+    Setting(usize),
+    Link(usize),
+}
 
-enum Pending { Set(Value, Scope), Unset(Scope) }
+enum Pending {
+    Set(Value, Scope),
+    Unset(Scope),
+}
 
 enum Mode {
     Browse,
-    Edit { def: &'static SettingDef, editor: Editor },
-    Pick { def: &'static SettingDef, choices: Vec<String>, cursor: usize },
+    Edit {
+        def: &'static SettingDef,
+        editor: Editor,
+    },
+    Pick {
+        def: &'static SettingDef,
+        choices: Vec<String>,
+        cursor: usize,
+    },
 }
 
-enum Item { Header(&'static str), Row(usize), Note(String), Choice { name: String, on: bool } }
+enum Item {
+    Header(&'static str),
+    Row(usize),
+    Note(String),
+    Choice { name: String, on: bool },
+}
 
 pub struct SettingsOverlay {
     effective: Table,
@@ -308,21 +497,36 @@ pub struct SettingsOverlay {
     notes: BTreeMap<String, String>,
 }
 
-fn haystack(def: &SettingDef) -> String { format!("{} {} {} {}", def.label, def.section, def.tab, def.path) }
+fn haystack(def: &SettingDef) -> String {
+    format!("{} {} {} {}", def.label, def.section, def.tab, def.path)
+}
 
-fn fmt_float(f: f64) -> String { if f.fract() == 0.0 && f.abs() < 1e15 { format!("{f:.1}") } else { format!("{f}") } }
+fn fmt_float(f: f64) -> String {
+    if f.fract() == 0.0 && f.abs() < 1e15 {
+        format!("{f:.1}")
+    } else {
+        format!("{f}")
+    }
+}
 
 fn value_text(def: &SettingDef, value: &Value) -> String {
     let raw = match (&def.kind, value) {
         (Kind::Bool, Value::Boolean(b)) => if *b { "on" } else { "off" }.to_owned(),
-        (Kind::Enum(options), Value::String(s)) => options.iter().find(|(v, _)| v == s).map_or_else(|| s.clone(), |(_, label)| (*label).to_owned()),
+        (Kind::Enum(options), Value::String(s)) => options
+            .iter()
+            .find(|(v, _)| v == s)
+            .map_or_else(|| s.clone(), |(_, label)| (*label).to_owned()),
         (_, Value::String(s)) if s.is_empty() => "(empty)".to_owned(),
         (_, Value::String(s)) => s.clone(),
         (_, Value::Integer(n)) => n.to_string(),
         (_, Value::Float(f)) => fmt_float(*f),
         (_, Value::Boolean(b)) => b.to_string(),
         (_, Value::Array(items)) if items.is_empty() => "(none)".to_owned(),
-        (_, Value::Array(items)) => items.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned)).collect::<Vec<_>>().join(", "),
+        (_, Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+            .collect::<Vec<_>>()
+            .join(", "),
         (_, other) => other.to_string(),
     };
     text::one_line(&raw)
@@ -333,7 +537,11 @@ fn edit_text(value: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Integer(n) => n.to_string(),
         Value::Float(f) => fmt_float(*f),
-        Value::Array(items) => items.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned)).collect::<Vec<_>>().join(", "),
+        Value::Array(items) => items
+            .iter()
+            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned))
+            .collect::<Vec<_>>()
+            .join(", "),
         other => other.to_string(),
     }
 }
@@ -341,7 +549,9 @@ fn edit_text(value: &Value) -> String {
 fn input_hint(kind: Kind) -> String {
     match kind {
         Kind::Int { min, max, .. } => format!("Whole number from {min} to {max}."),
-        Kind::Float { min, max, .. } => format!("Number from {} to {}.", fmt_float(min), fmt_float(max)),
+        Kind::Float { min, max, .. } => {
+            format!("Number from {} to {}.", fmt_float(min), fmt_float(max))
+        }
         Kind::StringList => "Comma-separated list.".to_owned(),
         _ => "Text.".to_owned(),
     }
@@ -352,14 +562,45 @@ fn parse_input(kind: Kind, input: &str) -> Result<Value, String> {
     let input = input.trim();
     match kind {
         Kind::Int { min, max, .. } => {
-            let n: i64 = input.parse().map_err(|_| format!("Enter a whole number between {min} and {max}"))?;
-            if (min..=max).contains(&n) { Ok(Value::Integer(n)) } else { Err(format!("Must be between {min} and {max}")) }
+            let n: i64 = input
+                .parse()
+                .map_err(|_| format!("Enter a whole number between {min} and {max}"))?;
+            if (min..=max).contains(&n) {
+                Ok(Value::Integer(n))
+            } else {
+                Err(format!("Must be between {min} and {max}"))
+            }
         }
         Kind::Float { min, max, .. } => {
-            let f: f64 = input.parse().ok().filter(|f: &f64| f.is_finite()).ok_or_else(|| format!("Enter a number between {} and {}", fmt_float(min), fmt_float(max)))?;
-            if f >= min && f <= max { Ok(Value::Float(f)) } else { Err(format!("Must be between {} and {}", fmt_float(min), fmt_float(max))) }
+            let f: f64 = input
+                .parse()
+                .ok()
+                .filter(|f: &f64| f.is_finite())
+                .ok_or_else(|| {
+                    format!(
+                        "Enter a number between {} and {}",
+                        fmt_float(min),
+                        fmt_float(max)
+                    )
+                })?;
+            if f >= min && f <= max {
+                Ok(Value::Float(f))
+            } else {
+                Err(format!(
+                    "Must be between {} and {}",
+                    fmt_float(min),
+                    fmt_float(max)
+                ))
+            }
         }
-        Kind::StringList => Ok(Value::Array(input.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| Value::String(s.to_owned())).collect())),
+        Kind::StringList => Ok(Value::Array(
+            input
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| Value::String(s.to_owned()))
+                .collect(),
+        )),
         _ => Ok(Value::String(input.to_owned())),
     }
 }
@@ -369,22 +610,51 @@ fn adjust(kind: Kind, buffer: &str, dir: i64) -> Option<String> {
     match kind {
         Kind::Int { min, max, step } => {
             let n = buffer.trim().parse::<i64>().unwrap_or(min);
-            Some(n.saturating_add(step.saturating_mul(dir)).clamp(min, max).to_string())
+            Some(
+                n.saturating_add(step.saturating_mul(dir))
+                    .clamp(min, max)
+                    .to_string(),
+            )
         }
         Kind::Float { min, max, step } => {
-            let f = buffer.trim().parse::<f64>().ok().filter(|f| f.is_finite()).unwrap_or(min);
-            Some(fmt_float(((f + step * dir as f64).clamp(min, max) * 1e6).round() / 1e6))
+            let f = buffer
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .unwrap_or(min);
+            Some(fmt_float(
+                ((f + step * dir as f64).clamp(min, max) * 1e6).round() / 1e6,
+            ))
         }
         _ => None,
     }
 }
 
 impl SettingsOverlay {
-    pub fn new(values: Table, project_values: Table, global_values: Table, scope: Scope, themes: Vec<String>) -> Self {
+    pub fn new(
+        values: Table,
+        project_values: Table,
+        global_values: Table,
+        scope: Scope,
+        themes: Vec<String>,
+    ) -> Self {
         SettingsOverlay {
-            effective: values, project: project_values, global: global_values, scope, themes,
-            tabs: settings_schema::tabs(), tab: 0, cursor: 0, scroll: 0, page: 8, search: String::new(),
-            mode: Mode::Browse, pending: BTreeMap::new(), notes: BTreeMap::new(), feedback: None,
+            effective: values,
+            project: project_values,
+            global: global_values,
+            scope,
+            themes,
+            tabs: settings_schema::tabs(),
+            tab: 0,
+            cursor: 0,
+            scroll: 0,
+            page: 8,
+            search: String::new(),
+            mode: Mode::Browse,
+            pending: BTreeMap::new(),
+            notes: BTreeMap::new(),
+            feedback: None,
         }
     }
 
@@ -405,9 +675,15 @@ impl SettingsOverlay {
                 match pending {
                     Some(Pending::Set(v, scope)) => {
                         settings_schema::set(self.layer(scope), path, v);
-                        self.feedback = Some(if scope == Scope::Global && settings_schema::get(&self.project, path).is_some() {
-                            "Saved globally; this project's override still applies".to_owned()
-                        } else { format!("Saved to {} settings", scope_name(scope)) });
+                        self.feedback = Some(
+                            if scope == Scope::Global
+                                && settings_schema::get(&self.project, path).is_some()
+                            {
+                                "Saved globally; this project's override still applies".to_owned()
+                            } else {
+                                format!("Saved to {} settings", scope_name(scope))
+                            },
+                        );
                     }
                     Some(Pending::Unset(scope)) => {
                         settings_schema::unset(self.layer(scope), path);
@@ -418,34 +694,56 @@ impl SettingsOverlay {
                 settings_schema::set(&mut self.effective, path, value);
                 self.notes.remove(path);
             }
-            Err(message) => { self.notes.insert(path.to_owned(), text::one_line(&message)); }
+            Err(message) => {
+                self.notes.insert(path.to_owned(), text::one_line(&message));
+            }
         }
     }
 
     fn layer(&mut self, scope: Scope) -> &mut Table {
-        match scope { Scope::Global => &mut self.global, Scope::Project => &mut self.project }
+        match scope {
+            Scope::Global => &mut self.global,
+            Scope::Project => &mut self.project,
+        }
     }
 
     fn layer_ref(&self, scope: Scope) -> &Table {
-        match scope { Scope::Global => &self.global, Scope::Project => &self.project }
+        match scope {
+            Scope::Global => &self.global,
+            Scope::Project => &self.project,
+        }
     }
 
     fn source(&self, path: &str) -> &'static str {
-        if settings_schema::get(&self.project, path).is_some() { "project" }
-        else if settings_schema::get(&self.global, path).is_some() { "global" }
-        else { "default" }
+        if settings_schema::get(&self.project, path).is_some() {
+            "project"
+        } else if settings_schema::get(&self.global, path).is_some() {
+            "global"
+        } else {
+            "default"
+        }
     }
 
     /// What `path` falls back to once it is removed from `scope`.
     fn after_unset(&self, def: &SettingDef, scope: Scope) -> Option<Value> {
-        settings_schema::get(self.layer_ref(super::settings::other_scope(scope)), def.path).cloned().or_else(|| def.default_value())
+        settings_schema::get(
+            self.layer_ref(super::settings::other_scope(scope)),
+            def.path,
+        )
+        .cloned()
+        .or_else(|| def.default_value())
     }
 
     fn current(&self, def: &SettingDef) -> Value {
         match self.pending.get(def.path) {
             Some(Pending::Set(v, _)) => v.clone(),
-            Some(Pending::Unset(scope)) => self.after_unset(def, *scope).unwrap_or_else(|| Value::String(String::new())),
-            None => settings_schema::get(&self.effective, def.path).cloned().or_else(|| def.default_value()).unwrap_or_else(|| Value::String(String::new())),
+            Some(Pending::Unset(scope)) => self
+                .after_unset(def, *scope)
+                .unwrap_or_else(|| Value::String(String::new())),
+            None => settings_schema::get(&self.effective, def.path)
+                .cloned()
+                .or_else(|| def.default_value())
+                .unwrap_or_else(|| Value::String(String::new())),
         }
     }
 
@@ -456,14 +754,23 @@ impl SettingsOverlay {
             match pending {
                 Pending::Set(v, _) => settings_schema::set(&mut table, path, v.clone()),
                 Pending::Unset(scope) => {
-                    match settings_schema::registry().iter().find(|d| d.path == path).and_then(|d| self.after_unset(d, *scope)) {
+                    match settings_schema::registry()
+                        .iter()
+                        .find(|d| d.path == path)
+                        .and_then(|d| self.after_unset(d, *scope))
+                    {
                         Some(v) => settings_schema::set(&mut table, path, v),
-                        None => { settings_schema::unset(&mut table, path); }
+                        None => {
+                            settings_schema::unset(&mut table, path);
+                        }
                     }
                 }
             }
         }
-        table.get("ui").and_then(Value::as_table).cloned()
+        table
+            .get("ui")
+            .and_then(Value::as_table)
+            .cloned()
             .and_then(|ui| Value::Table(ui).try_into().ok())
             .unwrap_or_default()
     }
@@ -473,22 +780,37 @@ impl SettingsOverlay {
         if !self.search.is_empty() {
             let mut hits: Vec<(i32, Row)> = Vec::new();
             for (i, def) in defs.iter().enumerate() {
-                if let Some((score, _)) = text::fuzzy(&self.search, &haystack(def)) { hits.push((score, Row::Setting(i))); }
+                if let Some((score, _)) = text::fuzzy(&self.search, &haystack(def)) {
+                    hits.push((score, Row::Setting(i)));
+                }
             }
             for (i, (label, ..)) in LINKS.iter().enumerate() {
-                if let Some((score, _)) = text::fuzzy(&self.search, &format!("{label} {LINK_SECTION} {PROVIDERS_TAB}")) { hits.push((score, Row::Link(i))); }
+                if let Some((score, _)) = text::fuzzy(
+                    &self.search,
+                    &format!("{label} {LINK_SECTION} {PROVIDERS_TAB}"),
+                ) {
+                    hits.push((score, Row::Link(i)));
+                }
             }
             hits.sort_by(|a, b| b.0.cmp(&a.0));
             return hits.into_iter().map(|(_, row)| row).collect();
         }
         match self.tabs.get(self.tab) {
-            Some((tab, _)) => defs.iter().enumerate().filter(|(_, d)| d.tab == *tab).map(|(i, _)| Row::Setting(i)).collect(),
+            Some((tab, _)) => defs
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.tab == *tab)
+                .map(|(i, _)| Row::Setting(i))
+                .collect(),
             None => (0..LINKS.len()).map(Row::Link).collect(),
         }
     }
 
     fn section_of(row: Row) -> &'static str {
-        match row { Row::Setting(i) => settings_schema::registry()[i].section, Row::Link(_) => LINK_SECTION }
+        match row {
+            Row::Setting(i) => settings_schema::registry()[i].section,
+            Row::Link(_) => LINK_SECTION,
+        }
     }
 
     // ---- input ----------------------------------------------------------------------------
@@ -503,8 +825,15 @@ impl SettingsOverlay {
             Event::Paste(pasted) => {
                 let pasted = text::one_line(pasted);
                 match &mut self.mode {
-                    Mode::Edit { editor, def } => { editor.insert(&pasted); self.notes.remove(def.path); }
-                    Mode::Browse => { self.search.push_str(&pasted); self.cursor = 0; self.scroll = 0; }
+                    Mode::Edit { editor, def } => {
+                        editor.insert(&pasted);
+                        self.notes.remove(def.path);
+                    }
+                    Mode::Browse => {
+                        self.search.push_str(&pasted);
+                        self.cursor = 0;
+                        self.scroll = 0;
+                    }
                     Mode::Pick { .. } => {}
                 }
                 OverlayEvent::None
@@ -515,9 +844,14 @@ impl SettingsOverlay {
 
     fn browse_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
         self.feedback = None;
-        if is_ctrl(key, 's') { self.scope = other_scope(self.scope); return OverlayEvent::None; }
+        if is_ctrl(key, 's') {
+            self.scope = other_scope(self.scope);
+            return OverlayEvent::None;
+        }
         if keys.matches(Action::SelectCancel, key) {
-            if self.search.is_empty() { return OverlayEvent::Close; }
+            if self.search.is_empty() {
+                return OverlayEvent::Close;
+            }
             self.search.clear();
             self.cursor = 0;
             self.scroll = 0;
@@ -526,9 +860,17 @@ impl SettingsOverlay {
         let count = self.visible().len();
         let last = count.saturating_sub(1);
         if keys.matches(Action::SelectUp, key) {
-            self.cursor = if self.cursor == 0 { last } else { self.cursor - 1 };
+            self.cursor = if self.cursor == 0 {
+                last
+            } else {
+                self.cursor - 1
+            };
         } else if keys.matches(Action::SelectDown, key) {
-            self.cursor = if self.cursor >= last { 0 } else { self.cursor + 1 };
+            self.cursor = if self.cursor >= last {
+                0
+            } else {
+                self.cursor + 1
+            };
         } else if keys.matches(Action::SelectPageUp, key) {
             self.cursor = self.cursor.saturating_sub(self.page);
         } else if keys.matches(Action::SelectPageDown, key) {
@@ -546,9 +888,14 @@ impl SettingsOverlay {
         } else if key.code == KeyCode::Delete {
             return self.reset_current();
         } else if key.code == KeyCode::Backspace {
-            if self.search.pop().is_some() { self.cursor = 0; self.scroll = 0; }
+            if self.search.pop().is_some() {
+                self.cursor = 0;
+                self.scroll = 0;
+            }
         } else if let Some(c) = typed_char(key) {
-            if self.search.is_empty() && c == ' ' { return self.activate(); }
+            if self.search.is_empty() && c == ' ' {
+                return self.activate();
+            }
             self.search.push(c);
             self.cursor = 0;
             self.scroll = 0;
@@ -557,7 +904,9 @@ impl SettingsOverlay {
     }
 
     fn change_tab(&mut self, delta: isize) {
-        if !self.search.is_empty() { return; }
+        if !self.search.is_empty() {
+            return;
+        }
         let n = self.tabs.len() + 1;
         self.tab = (self.tab as isize + delta).rem_euclid(n as isize) as usize;
         self.cursor = 0;
@@ -566,28 +915,49 @@ impl SettingsOverlay {
 
     fn jump_section(&mut self, forward: bool) {
         let rows = self.visible();
-        if rows.is_empty() { return; }
+        if rows.is_empty() {
+            return;
+        }
         let at = self.cursor.min(rows.len() - 1);
         let section = |i: usize| Self::section_of(rows[i]);
-        let group_start = |mut i: usize| { while i > 0 && section(i - 1) == section(i) { i -= 1; } i };
+        let group_start = |mut i: usize| {
+            while i > 0 && section(i - 1) == section(i) {
+                i -= 1;
+            }
+            i
+        };
         self.cursor = if forward {
-            (at + 1..rows.len()).find(|&i| section(i) != section(at)).unwrap_or(0)
+            (at + 1..rows.len())
+                .find(|&i| section(i) != section(at))
+                .unwrap_or(0)
         } else {
             let start = group_start(at);
-            if at > start { start } else if start == 0 { group_start(rows.len() - 1) } else { group_start(start - 1) }
+            if at > start {
+                start
+            } else if start == 0 {
+                group_start(rows.len() - 1)
+            } else {
+                group_start(start - 1)
+            }
         };
     }
 
     fn current_row(&self) -> Option<Row> {
         let rows = self.visible();
-        rows.get(self.cursor.min(rows.len().saturating_sub(1))).copied()
+        rows.get(self.cursor.min(rows.len().saturating_sub(1)))
+            .copied()
     }
 
     fn emit_set(&mut self, def: &SettingDef, value: Value) -> OverlayEvent {
         self.feedback = None;
         self.notes.remove(def.path);
-        self.pending.insert(def.path.to_owned(), Pending::Set(value.clone(), self.scope));
-        OverlayEvent::Set { path: def.path.to_owned(), value, scope: self.scope }
+        self.pending
+            .insert(def.path.to_owned(), Pending::Set(value.clone(), self.scope));
+        OverlayEvent::Set {
+            path: def.path.to_owned(),
+            value,
+            scope: self.scope,
+        }
     }
 
     fn activate(&mut self) -> OverlayEvent {
@@ -598,22 +968,48 @@ impl SettingsOverlay {
         };
         let current = self.current(def);
         match def.kind {
-            Kind::Bool => { let next = !current.as_bool().unwrap_or(false); self.emit_set(def, Value::Boolean(next)) }
+            Kind::Bool => {
+                let next = !current.as_bool().unwrap_or(false);
+                self.emit_set(def, Value::Boolean(next))
+            }
             Kind::Enum(options) => {
-                let choices: Vec<String> = options.iter().map(|(value, _)| (*value).to_owned()).collect();
-                if choices.is_empty() { return OverlayEvent::None; }
-                let cursor = choices.iter().position(|c| Some(c.as_str()) == current.as_str()).unwrap_or(0);
+                let choices: Vec<String> = options
+                    .iter()
+                    .map(|(value, _)| (*value).to_owned())
+                    .collect();
+                if choices.is_empty() {
+                    return OverlayEvent::None;
+                }
+                let cursor = choices
+                    .iter()
+                    .position(|c| Some(c.as_str()) == current.as_str())
+                    .unwrap_or(0);
                 self.notes.remove(def.path);
-                self.mode = Mode::Pick { def, choices, cursor };
+                self.mode = Mode::Pick {
+                    def,
+                    choices,
+                    cursor,
+                };
                 OverlayEvent::None
             }
             Kind::Theme => {
                 let mut choices = self.themes.clone();
-                if def.path == "ui.theme" && !choices.iter().any(|t| t == "auto") { choices.push("auto".to_owned()); }
-                if choices.is_empty() { return OverlayEvent::None; }
-                let cursor = choices.iter().position(|c| Some(c.as_str()) == current.as_str()).unwrap_or(0);
+                if def.path == "ui.theme" && !choices.iter().any(|t| t == "auto") {
+                    choices.push("auto".to_owned());
+                }
+                if choices.is_empty() {
+                    return OverlayEvent::None;
+                }
+                let cursor = choices
+                    .iter()
+                    .position(|c| Some(c.as_str()) == current.as_str())
+                    .unwrap_or(0);
                 self.notes.remove(def.path);
-                self.mode = Mode::Pick { def, choices, cursor };
+                self.mode = Mode::Pick {
+                    def,
+                    choices,
+                    cursor,
+                };
                 OverlayEvent::None
             }
             Kind::Int { .. } | Kind::Float { .. } | Kind::Text | Kind::StringList => {
@@ -627,34 +1023,60 @@ impl SettingsOverlay {
     }
 
     fn reset_current(&mut self) -> OverlayEvent {
-        let Some(Row::Setting(i)) = self.current_row() else { return OverlayEvent::None };
+        let Some(Row::Setting(i)) = self.current_row() else {
+            return OverlayEvent::None;
+        };
         let def = &settings_schema::registry()[i];
         if settings_schema::get(self.layer_ref(self.scope), def.path).is_some() {
             self.notes.remove(def.path);
-            self.pending.insert(def.path.to_owned(), Pending::Unset(self.scope));
-            OverlayEvent::Unset { path: def.path.to_owned(), scope: self.scope }
+            self.pending
+                .insert(def.path.to_owned(), Pending::Unset(self.scope));
+            OverlayEvent::Unset {
+                path: def.path.to_owned(),
+                scope: self.scope,
+            }
         } else {
             if settings_schema::get(self.layer_ref(other_scope(self.scope)), def.path).is_some() {
-                self.notes.insert(def.path.to_owned(), format!("Set in the {} scope; press Ctrl+S to switch scope, then Delete", scope_name(other_scope(self.scope))));
+                self.notes.insert(
+                    def.path.to_owned(),
+                    format!(
+                        "Set in the {} scope; press Ctrl+S to switch scope, then Delete",
+                        scope_name(other_scope(self.scope))
+                    ),
+                );
             }
             OverlayEvent::None
         }
     }
 
     fn edit_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
-        let Mode::Edit { def, editor } = &mut self.mode else { return OverlayEvent::None };
+        let Mode::Edit { def, editor } = &mut self.mode else {
+            return OverlayEvent::None;
+        };
         let def: &'static SettingDef = def;
         if keys.matches(Action::SelectCancel, key) {
             self.notes.remove(def.path);
             self.mode = Mode::Browse;
         } else if keys.matches(Action::SelectConfirm, key) {
             match parse_input(def.kind, &editor.text) {
-                Ok(value) => { self.mode = Mode::Browse; return self.emit_set(def, value); }
-                Err(message) => { self.notes.insert(def.path.to_owned(), message); }
+                Ok(value) => {
+                    self.mode = Mode::Browse;
+                    return self.emit_set(def, value);
+                }
+                Err(message) => {
+                    self.notes.insert(def.path.to_owned(), message);
+                }
             }
         } else if keys.matches(Action::SelectUp, key) || keys.matches(Action::SelectDown, key) {
-            let dir = if keys.matches(Action::SelectUp, key) { 1 } else { -1 };
-            if let Some(next) = adjust(def.kind, &editor.text, dir) { editor.set(&next); self.notes.remove(def.path); }
+            let dir = if keys.matches(Action::SelectUp, key) {
+                1
+            } else {
+                -1
+            };
+            if let Some(next) = adjust(def.kind, &editor.text, dir) {
+                editor.set(&next);
+                self.notes.remove(def.path);
+            }
         } else if editor.key(*key) {
             self.notes.remove(def.path);
         }
@@ -662,34 +1084,73 @@ impl SettingsOverlay {
     }
 
     fn pick_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
-        let Mode::Pick { def, choices, cursor } = &mut self.mode else { return OverlayEvent::None };
+        let Mode::Pick {
+            def,
+            choices,
+            cursor,
+        } = &mut self.mode
+        else {
+            return OverlayEvent::None;
+        };
         let def: &'static SettingDef = def;
         let last = choices.len().saturating_sub(1);
         if keys.matches(Action::SelectCancel, key) {
             self.mode = Mode::Browse;
-            return if matches!(def.kind, Kind::Theme) { OverlayEvent::PreviewTheme(None) } else { OverlayEvent::None };
+            return if matches!(def.kind, Kind::Theme) {
+                OverlayEvent::PreviewTheme(None)
+            } else {
+                OverlayEvent::None
+            };
         }
         if keys.matches(Action::SelectConfirm, key) {
             let chosen = choices[*cursor].clone();
             let unchanged = self.current(def).as_str() == Some(chosen.as_str());
             self.mode = Mode::Browse;
             return if unchanged {
-                if matches!(def.kind, Kind::Theme) { OverlayEvent::PreviewTheme(None) } else { OverlayEvent::None }
-            } else { self.emit_set(def, Value::String(chosen)) };
+                if matches!(def.kind, Kind::Theme) {
+                    OverlayEvent::PreviewTheme(None)
+                } else {
+                    OverlayEvent::None
+                }
+            } else {
+                self.emit_set(def, Value::String(chosen))
+            };
         }
-        let moved = if keys.matches(Action::SelectUp, key) { *cursor = if *cursor == 0 { last } else { *cursor - 1 }; true }
-            else if keys.matches(Action::SelectDown, key) { *cursor = if *cursor >= last { 0 } else { *cursor + 1 }; true }
-            else if keys.matches(Action::SelectPageUp, key) { *cursor = 0; true }
-            else if keys.matches(Action::SelectPageDown, key) { *cursor = last; true }
-            else { false };
-        if moved && matches!(def.kind, Kind::Theme) { OverlayEvent::PreviewTheme(Some(choices[*cursor].clone())) } else { OverlayEvent::None }
+        let moved = if keys.matches(Action::SelectUp, key) {
+            *cursor = if *cursor == 0 { last } else { *cursor - 1 };
+            true
+        } else if keys.matches(Action::SelectDown, key) {
+            *cursor = if *cursor >= last { 0 } else { *cursor + 1 };
+            true
+        } else if keys.matches(Action::SelectPageUp, key) {
+            *cursor = 0;
+            true
+        } else if keys.matches(Action::SelectPageDown, key) {
+            *cursor = last;
+            true
+        } else {
+            false
+        };
+        if moved && matches!(def.kind, Kind::Theme) {
+            OverlayEvent::PreviewTheme(Some(choices[*cursor].clone()))
+        } else {
+            OverlayEvent::None
+        }
     }
 
     // ---- drawing --------------------------------------------------------------------------
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        let scope = match self.scope { Scope::Global => "All projects", Scope::Project => "This project" };
-        let title = title_line(ctx.theme, Sym::IconSettings, "Settings", &format!("{} Save to: {scope}  (Ctrl+S)", ctx.theme.sym(Sym::Dot)));
+        let scope = match self.scope {
+            Scope::Global => "All projects",
+            Scope::Project => "This project",
+        };
+        let title = title_line(
+            ctx.theme,
+            Sym::IconSettings,
+            "Settings",
+            &format!("{} Save to: {scope}  (Ctrl+S)", ctx.theme.sym(Sym::Dot)),
+        );
         panel(frame, ctx.theme, title, |w, h| self.compose(w, h, ctx));
     }
 
@@ -702,17 +1163,38 @@ impl SettingsOverlay {
         let appearance = matches!(cursor_row, Some(Row::Setting(i)) if settings_schema::registry()[i].tab == "Appearance");
         let body_min = h.min(3);
         let mut spare = h - body_min;
-        let mut grant = || { if spare > 0 { spare -= 1; true } else { false } };
+        let mut grant = || {
+            if spare > 0 {
+                spare -= 1;
+                true
+            } else {
+                false
+            }
+        };
         // Keep navigation and search visible before optional details on short terminals.
         let (show_footer, show_search, show_tabs, show_desc, show_desc2) =
             (grant(), grant(), grant(), grant(), grant());
         let show_preview = appearance && grant();
-        let body_rows = h - [show_tabs, show_footer, show_preview, show_desc, show_search, show_desc2].iter().filter(|b| **b).count();
+        let body_rows = h - [
+            show_tabs,
+            show_footer,
+            show_preview,
+            show_desc,
+            show_search,
+            show_desc2,
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count();
         self.page = body_rows.saturating_sub(1).max(1);
 
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(h);
-        if show_tabs { lines.push(self.tab_bar(theme, w)); }
-        if show_search { lines.push(self.search_line(theme, w)); }
+        if show_tabs {
+            lines.push(self.tab_bar(theme, w));
+        }
+        if show_search {
+            lines.push(self.search_line(theme, w));
+        }
 
         // Left column of sections.
         let left_w = if w >= 64 { (w / 4).min(22) } else { 0 };
@@ -725,31 +1207,58 @@ impl SettingsOverlay {
         let mut last_section = "";
         for (i, row) in rows.iter().enumerate() {
             let section = Self::section_of(*row);
-            if !searching && section != last_section { items.push(Item::Header(section)); last_section = section; }
-            if i == self.cursor { cursor_item = items.len(); }
+            if !searching && section != last_section {
+                items.push(Item::Header(section));
+                last_section = section;
+            }
+            if i == self.cursor {
+                cursor_item = items.len();
+            }
             items.push(Item::Row(i));
             if let Row::Setting(s) = row {
                 let def = &settings_schema::registry()[*s];
-                if let Mode::Pick { def: picking, choices, cursor } = &self.mode {
+                if let Mode::Pick {
+                    def: picking,
+                    choices,
+                    cursor,
+                } = &self.mode
+                {
                     if picking.path == def.path && i == self.cursor {
-                        let first = cursor.saturating_sub(3).min(choices.len().saturating_sub(7));
+                        let first = cursor
+                            .saturating_sub(3)
+                            .min(choices.len().saturating_sub(7));
                         for (n, name) in choices.iter().enumerate().skip(first).take(7) {
-                            if n == *cursor { cursor_item = items.len(); }
-                            items.push(Item::Choice { name: value_text(def, &Value::String(name.clone())), on: n == *cursor });
+                            if n == *cursor {
+                                cursor_item = items.len();
+                            }
+                            items.push(Item::Choice {
+                                name: value_text(def, &Value::String(name.clone())),
+                                on: n == *cursor,
+                            });
                         }
                     }
                 }
-                if let Some(note) = self.notes.get(def.path) { items.push(Item::Note(note.clone())); }
+                if let Some(note) = self.notes.get(def.path) {
+                    items.push(Item::Note(note.clone()));
+                }
             }
         }
         let overflow = items.len() > body_rows;
         let list_w = list_w_total.saturating_sub(usize::from(overflow));
         let mut top = cursor_item;
-        if top > 0 && matches!(items.get(top - 1), Some(Item::Header(_))) { top -= 1; }
+        if top > 0 && matches!(items.get(top - 1), Some(Item::Header(_))) {
+            top -= 1;
+        }
         let mut bottom = cursor_item;
-        while matches!(items.get(bottom + 1), Some(Item::Note(_))) { bottom += 1; }
-        if top < self.scroll { self.scroll = top; }
-        if bottom >= self.scroll + body_rows { self.scroll = bottom + 1 - body_rows.max(1); }
+        while matches!(items.get(bottom + 1), Some(Item::Note(_))) {
+            bottom += 1;
+        }
+        if top < self.scroll {
+            self.scroll = top;
+        }
+        if bottom >= self.scroll + body_rows {
+            self.scroll = bottom + 1 - body_rows.max(1);
+        }
         self.scroll = self.scroll.min(items.len().saturating_sub(body_rows));
 
         let query_positions = |row: Row| -> Vec<usize> {
@@ -757,11 +1266,22 @@ impl SettingsOverlay {
                 Row::Setting(i) if searching => {
                     let def = &settings_schema::registry()[i];
                     let label_len = def.label.chars().count();
-                    text::fuzzy(&self.search, &haystack(def)).map(|(_, p)| p.into_iter().filter(|p| *p < label_len).collect()).unwrap_or_default()
+                    text::fuzzy(&self.search, &haystack(def))
+                        .map(|(_, p)| p.into_iter().filter(|p| *p < label_len).collect())
+                        .unwrap_or_default()
                 }
                 Row::Link(i) if searching => {
                     let label = LINKS[i].0;
-                    text::fuzzy(&self.search, &format!("{label} {LINK_SECTION} {PROVIDERS_TAB}")).map(|(_, p)| p.into_iter().filter(|p| *p < label.chars().count()).collect()).unwrap_or_default()
+                    text::fuzzy(
+                        &self.search,
+                        &format!("{label} {LINK_SECTION} {PROVIDERS_TAB}"),
+                    )
+                    .map(|(_, p)| {
+                        p.into_iter()
+                            .filter(|p| *p < label.chars().count())
+                            .collect()
+                    })
+                    .unwrap_or_default()
                 }
                 _ => Vec::new(),
             }
@@ -775,29 +1295,83 @@ impl SettingsOverlay {
                 let used = spans_width(&left);
                 spans.extend(left);
                 spans.push(Span::raw(" ".repeat(left_w.saturating_sub(used))));
-                spans.push(Span::styled(theme.sym(Sym::BoxV).to_owned(), theme.fg(Tok::BorderMuted)));
+                spans.push(Span::styled(
+                    theme.sym(Sym::BoxV).to_owned(),
+                    theme.fg(Tok::BorderMuted),
+                ));
             }
             let item = items.get(self.scroll + y);
             let list_line = match item {
                 None if rows.is_empty() && y == 0 => {
-                    let msg = if searching { format!(" No settings match \"{}\"", text::one_line(&self.search)) } else { " Nothing here".to_owned() };
-                    filled(vec![Span::styled(msg, theme.fg(Tok::Muted))], list_w, Style::default())
+                    let msg = if searching {
+                        format!(" No settings match \"{}\"", text::one_line(&self.search))
+                    } else {
+                        " Nothing here".to_owned()
+                    };
+                    filled(
+                        vec![Span::styled(msg, theme.fg(Tok::Muted))],
+                        list_w,
+                        Style::default(),
+                    )
                 }
                 None => filled(vec![], list_w, Style::default()),
-                Some(Item::Header(name)) => filled(vec![Span::styled(format!(" {name}"), theme.fg(Tok::Accent).add_modifier(Modifier::BOLD))], list_w, Style::default()),
-                Some(Item::Note(note)) => filled(vec![Span::styled(format!("    {} {}", theme.sym(Sym::Cross2), text::one_line(note)), theme.fg(Tok::Error))], list_w, Style::default()),
+                Some(Item::Header(name)) => filled(
+                    vec![Span::styled(
+                        format!(" {name}"),
+                        theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+                    )],
+                    list_w,
+                    Style::default(),
+                ),
+                Some(Item::Note(note)) => filled(
+                    vec![Span::styled(
+                        format!("    {} {}", theme.sym(Sym::Cross2), text::one_line(note)),
+                        theme.fg(Tok::Error),
+                    )],
+                    list_w,
+                    Style::default(),
+                ),
                 Some(Item::Choice { name, on }) => {
-                    let pointer = if *on { theme.sym(Sym::RadioOn) } else { theme.sym(Sym::RadioOff) };
-                    let style = if *on { theme.on(Tok::Text, Tok::SelectedBg).add_modifier(Modifier::BOLD) } else { theme.fg(Tok::Muted) };
-                    filled(vec![Span::styled(format!("      {pointer} {}", text::one_line(name)), style)], list_w, if *on { theme.bg(Tok::SelectedBg) } else { Style::default() })
+                    let pointer = if *on {
+                        theme.sym(Sym::RadioOn)
+                    } else {
+                        theme.sym(Sym::RadioOff)
+                    };
+                    let style = if *on {
+                        theme
+                            .on(Tok::Text, Tok::SelectedBg)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        theme.fg(Tok::Muted)
+                    };
+                    filled(
+                        vec![Span::styled(
+                            format!("      {pointer} {}", text::one_line(name)),
+                            style,
+                        )],
+                        list_w,
+                        if *on {
+                            theme.bg(Tok::SelectedBg)
+                        } else {
+                            Style::default()
+                        },
+                    )
                 }
                 Some(Item::Row(i)) => {
                     let selected = *i == self.cursor;
-                    self.row_line(theme, rows[*i], selected, list_w, &query_positions(rows[*i]))
+                    self.row_line(
+                        theme,
+                        rows[*i],
+                        selected,
+                        list_w,
+                        &query_positions(rows[*i]),
+                    )
                 }
             };
             spans.extend(list_line.spans);
-            if overflow { spans.push(scroll_cell(theme, y, body_rows, items.len(), self.scroll)); }
+            if overflow {
+                spans.push(scroll_cell(theme, y, body_rows, items.len(), self.scroll));
+            }
             lines.push(Line::from(spans));
         }
 
@@ -807,20 +1381,53 @@ impl SettingsOverlay {
             match cursor_row {
                 Some(Row::Setting(i)) => {
                     let def = &settings_schema::registry()[i];
-                    if matches!(self.mode, Mode::Edit { .. }) { desc.push((input_hint(def.kind), Tok::Muted)); }
-                    else if show_desc2 || self.feedback.is_some() {
-                        let detail = self.feedback.clone().unwrap_or_else(|| format!("{}  |  Using {} value{}", def.path, self.source(def.path), if def.restart { "  |  Restart required" } else { "" }));
-                        desc.push((detail, if self.feedback.is_some() { Tok::Success } else { Tok::Dim }));
+                    if matches!(self.mode, Mode::Edit { .. }) {
+                        desc.push((input_hint(def.kind), Tok::Muted));
+                    } else if show_desc2 || self.feedback.is_some() {
+                        let detail = self.feedback.clone().unwrap_or_else(|| {
+                            format!(
+                                "{}  |  Using {} value{}",
+                                def.path,
+                                self.source(def.path),
+                                if def.restart {
+                                    "  |  Restart required"
+                                } else {
+                                    ""
+                                }
+                            )
+                        });
+                        desc.push((
+                            detail,
+                            if self.feedback.is_some() {
+                                Tok::Success
+                            } else {
+                                Tok::Dim
+                            },
+                        ));
                     }
-                    desc.extend(text::wrap_words(def.description, w.saturating_sub(2).max(1)).into_iter().map(|l| (l, Tok::Muted)));
+                    desc.extend(
+                        text::wrap_words(def.description, w.saturating_sub(2).max(1))
+                            .into_iter()
+                            .map(|l| (l, Tok::Muted)),
+                    );
                 }
-                Some(Row::Link(i)) => desc.extend(text::wrap_words(LINKS[i].1, w.saturating_sub(2).max(1)).into_iter().map(|l| (l, Tok::Muted))),
+                Some(Row::Link(i)) => desc.extend(
+                    text::wrap_words(LINKS[i].1, w.saturating_sub(2).max(1))
+                        .into_iter()
+                        .map(|l| (l, Tok::Muted)),
+                ),
                 None => {}
             }
             desc.truncate(wanted);
             for n in 0..wanted {
                 lines.push(match desc.get(n) {
-                    Some((line, tok)) => Line::from(fit(vec![Span::styled(format!(" {}", text::one_line(line)), theme.fg(*tok))], w)),
+                    Some((line, tok)) => Line::from(fit(
+                        vec![Span::styled(
+                            format!(" {}", text::one_line(line)),
+                            theme.fg(*tok),
+                        )],
+                        w,
+                    )),
                     None => Line::default(),
                 });
             }
@@ -830,62 +1437,122 @@ impl SettingsOverlay {
             let mut spans = vec![Span::styled(label, theme.fg(Tok::Muted))];
             let room = w.saturating_sub(label.len());
             if room > 0 {
-                let line = (ctx.preview_status)(&self.preview_config(), room.min(usize::from(u16::MAX)) as u16);
+                let line = (ctx.preview_status)(
+                    &self.preview_config(),
+                    room.min(usize::from(u16::MAX)) as u16,
+                );
                 spans.extend(fit(line.spans, room));
             }
             lines.push(Line::from(fit(spans, w)));
         }
-        if show_footer { lines.push(hint_line(theme, &self.footer(ctx.keys), w)); }
+        if show_footer {
+            lines.push(hint_line(theme, &self.footer(ctx.keys), w));
+        }
         lines
     }
 
     fn tab_bar(&self, theme: &Theme, w: usize) -> Line<'static> {
-        let names: Vec<&str> = self.tabs.iter().map(|(t, _)| *t).chain(std::iter::once(PROVIDERS_TAB)).collect();
-        let cells: Vec<String> = names.iter().map(|name| {
-            let icon = theme.sym(match *name {
-                "Appearance" => Sym::IconSettings, "Model" => Sym::IconModel, "Interaction" => Sym::IconKeyboard,
-                "Tools" => Sym::IconSandbox, "Learning" => Sym::IconLearning, _ => Sym::IconProvider,
-            });
-            if icon.is_empty() { format!(" {name} ") } else { format!(" {icon} {name} ") }
-        }).collect();
+        let names: Vec<&str> = self
+            .tabs
+            .iter()
+            .map(|(t, _)| *t)
+            .chain(std::iter::once(PROVIDERS_TAB))
+            .collect();
+        let cells: Vec<String> = names
+            .iter()
+            .map(|name| {
+                let icon = theme.sym(match *name {
+                    "Appearance" => Sym::IconSettings,
+                    "Model" => Sym::IconModel,
+                    "Interaction" => Sym::IconKeyboard,
+                    "Tools" => Sym::IconSandbox,
+                    "Learning" => Sym::IconLearning,
+                    _ => Sym::IconProvider,
+                });
+                if icon.is_empty() {
+                    format!(" {name} ")
+                } else {
+                    format!(" {icon} {name} ")
+                }
+            })
+            .collect();
         let widths: Vec<usize> = cells.iter().map(|c| text::width(c)).collect();
         let mut start = 0;
-        while start < self.tab && widths[start..=self.tab].iter().sum::<usize>() > w { start += 1; }
+        while start < self.tab && widths[start..=self.tab].iter().sum::<usize>() > w {
+            start += 1;
+        }
         let mut spans = Vec::new();
         for (i, cell) in cells.into_iter().enumerate().skip(start) {
             let style = if i == self.tab && self.search.is_empty() {
-                theme.on(Tok::Accent, Tok::SelectedBg).add_modifier(Modifier::BOLD)
-            } else { theme.fg(Tok::Muted) };
+                theme
+                    .on(Tok::Accent, Tok::SelectedBg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme.fg(Tok::Muted)
+            };
             spans.push(Span::styled(cell, style));
         }
         Line::from(fit(spans, w))
     }
 
     fn search_line(&self, theme: &Theme, w: usize) -> Line<'static> {
-        let prompt = Span::styled(format!(" {} ", theme.sym(Sym::Prompt)), theme.fg(Tok::Accent));
+        let prompt = Span::styled(
+            format!(" {} ", theme.sym(Sym::Prompt)),
+            theme.fg(Tok::Accent),
+        );
         let spans = if self.search.is_empty() {
-            vec![prompt, Span::styled("Type to search all settings", theme.fg(Tok::Dim))]
+            vec![
+                prompt,
+                Span::styled("Type to search all settings", theme.fg(Tok::Dim)),
+            ]
         } else {
-            vec![prompt, Span::styled(text::one_line(&self.search), theme.fg(Tok::Text)), Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED))]
+            vec![
+                prompt,
+                Span::styled(text::one_line(&self.search), theme.fg(Tok::Text)),
+                Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED)),
+            ]
         };
         Line::from(fit(spans, w))
     }
 
-    fn section_column(&self, theme: &Theme, width: usize, cursor_row: Option<Row>, hits: usize) -> Vec<Vec<Span<'static>>> {
-        if width == 0 { return Vec::new(); }
+    fn section_column(
+        &self,
+        theme: &Theme,
+        width: usize,
+        cursor_row: Option<Row>,
+        hits: usize,
+    ) -> Vec<Vec<Span<'static>>> {
+        if width == 0 {
+            return Vec::new();
+        }
         let mut out: Vec<Vec<Span<'static>>> = Vec::new();
         if !self.search.is_empty() {
-            out.push(vec![Span::styled(" Results", theme.fg(Tok::Accent).add_modifier(Modifier::BOLD))]);
-            out.push(vec![Span::styled(format!(" {hits} {}", if hits == 1 { "match" } else { "matches" }), theme.fg(Tok::Muted))]);
+            out.push(vec![Span::styled(
+                " Results",
+                theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+            )]);
+            out.push(vec![Span::styled(
+                format!(" {hits} {}", if hits == 1 { "match" } else { "matches" }),
+                theme.fg(Tok::Muted),
+            )]);
             return out;
         }
-        let sections: Vec<&str> = match self.tabs.get(self.tab) { Some((_, s)) => s.clone(), None => vec![LINK_SECTION] };
+        let sections: Vec<&str> = match self.tabs.get(self.tab) {
+            Some((_, s)) => s.clone(),
+            None => vec![LINK_SECTION],
+        };
         let active = cursor_row.map(Self::section_of);
         for section in sections {
             let on = Some(section) == active;
             let label = text::ellipsize(section, width.saturating_sub(3), theme.ascii());
             out.push(if on {
-                vec![Span::styled(format!(" {} ", theme.sym(Sym::Pointer)), theme.fg(Tok::Accent)), Span::styled(label, theme.fg(Tok::Accent).add_modifier(Modifier::BOLD))]
+                vec![
+                    Span::styled(
+                        format!(" {} ", theme.sym(Sym::Pointer)),
+                        theme.fg(Tok::Accent),
+                    ),
+                    Span::styled(label, theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)),
+                ]
             } else {
                 vec![Span::styled(format!("   {label}"), theme.fg(Tok::Muted))]
             });
@@ -893,13 +1560,33 @@ impl SettingsOverlay {
         out
     }
 
-    fn row_line(&self, theme: &Theme, row: Row, selected: bool, w: usize, positions: &[usize]) -> Line<'static> {
-        let fill = if selected { theme.bg(Tok::SelectedBg) } else { Style::default() };
+    fn row_line(
+        &self,
+        theme: &Theme,
+        row: Row,
+        selected: bool,
+        w: usize,
+        positions: &[usize],
+    ) -> Line<'static> {
+        let fill = if selected {
+            theme.bg(Tok::SelectedBg)
+        } else {
+            Style::default()
+        };
         let base = |tok: Tok| theme.fg(tok).patch(fill);
-        let pointer = if selected { theme.sym(Sym::Pointer) } else { " " };
+        let pointer = if selected {
+            theme.sym(Sym::Pointer)
+        } else {
+            " "
+        };
         let mut spans = vec![Span::styled(format!("{pointer} "), base(Tok::Accent))];
         let label_w = (w * 45 / 100).clamp(8, 32).min(w.saturating_sub(2));
-        let (label, value_spans, tags, search_tag): (String, Vec<Span<'static>>, Vec<(String, Tok)>, String) = match row {
+        let (label, value_spans, tags, search_tag): (
+            String,
+            Vec<Span<'static>>,
+            Vec<(String, Tok)>,
+            String,
+        ) = match row {
             Row::Link(i) => (
                 LINKS[i].0.to_owned(),
                 vec![Span::styled("open", base(Tok::Muted))],
@@ -908,7 +1595,10 @@ impl SettingsOverlay {
             ),
             Row::Setting(i) => {
                 let def = &settings_schema::registry()[i];
-                let editing = match &self.mode { Mode::Edit { def: d, editor } if d.path == def.path => Some(editor), _ => None };
+                let editing = match &self.mode {
+                    Mode::Edit { def: d, editor } if d.path == def.path => Some(editor),
+                    _ => None,
+                };
                 let value = self.current(def);
                 let source = self.source(def.path);
                 let value_spans = if let Some(editor) = editing {
@@ -922,27 +1612,53 @@ impl SettingsOverlay {
                     match def.kind {
                         Kind::Bool => {
                             let on = value.as_bool().unwrap_or(false);
-                            vec![Span::styled(format!("{} {text}", theme.sym(if on { Sym::RadioOn } else { Sym::RadioOff })), base(if on { Tok::Success } else { Tok::Muted }))]
+                            vec![Span::styled(
+                                format!(
+                                    "{} {text}",
+                                    theme.sym(if on { Sym::RadioOn } else { Sym::RadioOff })
+                                ),
+                                base(if on { Tok::Success } else { Tok::Muted }),
+                            )]
                         }
                         _ => vec![Span::styled(text, base(Tok::Accent))],
                     }
                 };
                 let mut tags: Vec<(String, Tok)> = Vec::new();
                 if editing.is_none() {
-                    if source != "default" { tags.push(("(modified)".to_owned(), Tok::Warning)); }
+                    if source != "default" {
+                        tags.push(("(modified)".to_owned(), Tok::Warning));
+                    }
                     tags.push((source.to_owned(), Tok::Dim));
-                    if def.restart { tags.push(("restart".to_owned(), Tok::Warning)); }
+                    if def.restart {
+                        tags.push(("restart".to_owned(), Tok::Warning));
+                    }
                 }
-                (def.label.to_owned(), value_spans, tags, format!("{}{}{}", def.tab, theme.sym(Sym::SepSlash), def.section))
+                (
+                    def.label.to_owned(),
+                    value_spans,
+                    tags,
+                    format!("{}{}{}", def.tab, theme.sym(Sym::SepSlash), def.section),
+                )
             }
         };
         let label = text::one_line(&label);
         let shown = text::ellipsize(&label, label_w.saturating_sub(1), theme.ascii());
-        let label_style = if selected { base(Tok::Text).add_modifier(Modifier::BOLD) } else { base(Tok::Text) };
+        let label_style = if selected {
+            base(Tok::Text).add_modifier(Modifier::BOLD)
+        } else {
+            base(Tok::Text)
+        };
         let hl = match_style(theme, label_style);
-        let mut label_spans = if positions.is_empty() { vec![Span::styled(shown.clone(), label_style)] } else { highlighted(&shown, positions, label_style, hl) };
+        let mut label_spans = if positions.is_empty() {
+            vec![Span::styled(shown.clone(), label_style)]
+        } else {
+            highlighted(&shown, positions, label_style, hl)
+        };
         spans.append(&mut label_spans);
-        spans.push(Span::styled(" ".repeat(label_w.saturating_sub(text::width(&shown))), base(Tok::Text)));
+        spans.push(Span::styled(
+            " ".repeat(label_w.saturating_sub(text::width(&shown))),
+            base(Tok::Text),
+        ));
 
         let room = w.saturating_sub(2 + label_w);
         let value_w = spans_width(&value_spans);
@@ -954,18 +1670,40 @@ impl SettingsOverlay {
             let mut tags = tags;
             loop {
                 let width: usize = tags.iter().map(|(t, _)| text::width(t) + 1).sum::<usize>() + 1;
-                if tags.is_empty() || value_w + width <= room { break; }
+                if tags.is_empty() || value_w + width <= room {
+                    break;
+                }
                 // Drop the least important tag first: restart, then (modified), then the source.
-                if let Some(p) = tags.iter().position(|(t, _)| t == "restart") { tags.remove(p); }
-                else if let Some(p) = tags.iter().position(|(t, _)| t == "(modified)") { tags.remove(p); }
-                else { tags.clear(); }
+                if let Some(p) = tags.iter().position(|(t, _)| t == "restart") {
+                    tags.remove(p);
+                } else if let Some(p) = tags.iter().position(|(t, _)| t == "(modified)") {
+                    tags.remove(p);
+                } else {
+                    tags.clear();
+                }
             }
-            let pad_to = (room * 55 / 100).max(value_w).min(room.saturating_sub(room / 4));
+            let pad_to = (room * 55 / 100)
+                .max(value_w)
+                .min(room.saturating_sub(room / 4));
             let pad = pad_to.saturating_sub(value_w);
-            if !tags.is_empty() { tag_spans.push(Span::styled(" ".repeat(pad.max(1)), base(Tok::Text))); }
-            for (t, tok) in tags { tag_spans.push(Span::styled(format!("{t} "), base(tok))); }
+            if !tags.is_empty() {
+                tag_spans.push(Span::styled(" ".repeat(pad.max(1)), base(Tok::Text)));
+            }
+            for (t, tok) in tags {
+                tag_spans.push(Span::styled(format!("{t} "), base(tok)));
+            }
         }
-        let value_spans = if value_w > room { fit(value_spans, room.saturating_sub(1)).into_iter().chain(std::iter::once(Span::styled(theme.sym(Sym::Ellipsis).to_owned(), base(Tok::Muted)))).collect() } else { value_spans };
+        let value_spans = if value_w > room {
+            fit(value_spans, room.saturating_sub(1))
+                .into_iter()
+                .chain(std::iter::once(Span::styled(
+                    theme.sym(Sym::Ellipsis).to_owned(),
+                    base(Tok::Muted),
+                )))
+                .collect()
+        } else {
+            value_spans
+        };
         spans.extend(value_spans);
         spans.extend(tag_spans);
         filled(spans, w, fill)
@@ -974,27 +1712,45 @@ impl SettingsOverlay {
     fn footer(&self, keys: &Keymap) -> Vec<String> {
         let pair = |a, b, what| {
             let label = pair_label(keys, a, b);
-            if label.is_empty() { String::new() } else { format!("{label} {what}") }
+            if label.is_empty() {
+                String::new()
+            } else {
+                format!("{label} {what}")
+            }
         };
         match &self.mode {
             Mode::Edit { def, .. } => {
                 let numeric = matches!(def.kind, Kind::Int { .. } | Kind::Float { .. });
                 vec![
                     hint(keys, Action::SelectConfirm, "save"),
-                    if numeric { pair(Action::SelectUp, Action::SelectDown, "adjust") } else { String::new() },
+                    if numeric {
+                        pair(Action::SelectUp, Action::SelectDown, "adjust")
+                    } else {
+                        String::new()
+                    },
                     hint(keys, Action::SelectCancel, "cancel"),
                 ]
             }
             Mode::Pick { def, .. } => vec![
                 hint(keys, Action::SelectConfirm, "save"),
-                pair(Action::SelectUp, Action::SelectDown, if matches!(def.kind, Kind::Theme) { "preview" } else { "choose" }),
+                pair(
+                    Action::SelectUp,
+                    Action::SelectDown,
+                    if matches!(def.kind, Kind::Theme) {
+                        "preview"
+                    } else {
+                        "choose"
+                    },
+                ),
                 hint(keys, Action::SelectCancel, "cancel"),
             ],
             Mode::Browse => {
                 let verb = match self.current_row() {
                     Some(Row::Link(_)) => "open",
                     Some(Row::Setting(i)) => match settings_schema::registry()[i].kind {
-                        Kind::Bool => "toggle", Kind::Enum(_) | Kind::Theme => "choose", _ => "edit",
+                        Kind::Bool => "toggle",
+                        Kind::Enum(_) | Kind::Theme => "choose",
+                        _ => "edit",
                     },
                     None => "select",
                 };
@@ -1005,7 +1761,15 @@ impl SettingsOverlay {
                     hint(keys, Action::SectionNext, "sections"),
                     "Ctrl+S scope".to_owned(),
                     "Del inherit".to_owned(),
-                    hint(keys, Action::SelectCancel, if self.search.is_empty() { "close" } else { "clear search" }),
+                    hint(
+                        keys,
+                        Action::SelectCancel,
+                        if self.search.is_empty() {
+                            "close"
+                        } else {
+                            "clear search"
+                        },
+                    ),
                 ]
             }
         }
@@ -1018,41 +1782,83 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    fn table(src: &str) -> Table { toml::from_str(src).unwrap() }
-
-    fn overlay() -> SettingsOverlay {
-        SettingsOverlay::new(Table::new(), Table::new(), Table::new(), Scope::Global, vec!["dark".into(), "light".into(), "mono".into()])
+    fn table(src: &str) -> Table {
+        toml::from_str(src).unwrap()
     }
 
-    fn send(o: &mut SettingsOverlay, keys: &Keymap, event: Event) -> OverlayEvent { o.handle(&event, keys) }
+    fn overlay() -> SettingsOverlay {
+        SettingsOverlay::new(
+            Table::new(),
+            Table::new(),
+            Table::new(),
+            Scope::Global,
+            vec!["dark".into(), "light".into(), "mono".into()],
+        )
+    }
+
+    fn send(o: &mut SettingsOverlay, keys: &Keymap, event: Event) -> OverlayEvent {
+        o.handle(&event, keys)
+    }
 
     fn send_all(o: &mut SettingsOverlay, keys: &Keymap, events: Vec<Event>) -> OverlayEvent {
         let mut last = OverlayEvent::None;
-        for e in events { last = o.handle(&e, keys); }
+        for e in events {
+            last = o.handle(&e, keys);
+        }
         last
     }
 
     fn draw(o: &mut SettingsOverlay, rig: &Rig, w: u16, h: u16) -> String {
         let preview = |ui: &UiConfig, width: u16| status_preview(ui, width);
-        let ctx = DrawCtx { theme: &rig.theme, keys: &rig.keys, status: &rig.status, preview_status: &preview };
+        let ctx = DrawCtx {
+            theme: &rig.theme,
+            keys: &rig.keys,
+            status: &rig.status,
+            preview_status: &preview,
+        };
         screen(&render(w, h, |f| o.draw(f, &ctx)))
     }
 
     fn goto(o: &mut SettingsOverlay, keys: &Keymap, path: &str) {
         o.search.clear();
-        o.tab = o.tabs.iter().position(|(t, _)| *t == settings_schema::registry().iter().find(|d| d.path == path).unwrap().tab).unwrap();
-        let at = o.visible().iter().position(|r| matches!(r, Row::Setting(i) if settings_schema::registry()[*i].path == path)).unwrap();
+        o.tab = o
+            .tabs
+            .iter()
+            .position(|(t, _)| {
+                *t == settings_schema::registry()
+                    .iter()
+                    .find(|d| d.path == path)
+                    .unwrap()
+                    .tab
+            })
+            .unwrap();
+        let at = o
+            .visible()
+            .iter()
+            .position(
+                |r| matches!(r, Row::Setting(i) if settings_schema::registry()[*i].path == path),
+            )
+            .unwrap();
         o.cursor = at;
         let _ = keys;
     }
 
     fn expect_set(event: OverlayEvent) -> (String, Value, Scope) {
-        match event { OverlayEvent::Set { path, value, scope } => (path, value, scope), other => panic!("expected Set, got {other:?}") }
+        match event {
+            OverlayEvent::Set { path, value, scope } => (path, value, scope),
+            other => panic!("expected Set, got {other:?}"),
+        }
     }
 
     fn choose_next(o: &mut SettingsOverlay, keys: &Keymap) -> OverlayEvent {
-        assert!(matches!(send(o, keys, key(KeyCode::Enter)), OverlayEvent::None));
-        assert!(matches!(send(o, keys, key(KeyCode::Down)), OverlayEvent::None));
+        assert!(matches!(
+            send(o, keys, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
+        assert!(matches!(
+            send(o, keys, key(KeyCode::Down)),
+            OverlayEvent::None
+        ));
         send(o, keys, key(KeyCode::Enter))
     }
 
@@ -1061,7 +1867,20 @@ mod tests {
         let rig = Rig::new();
         let mut o = overlay();
         let screen = draw(&mut o, &rig, 130, 30);
-        for needle in ["Settings", "Save to: All projects", "Appearance", "Interaction", "Setup", "Status Line", "Separator", "Powerline thin", "Preview: PREVIEW", "Type to search", "Esc close", "Ctrl+S scope"] {
+        for needle in [
+            "Settings",
+            "Save to: All projects",
+            "Appearance",
+            "Interaction",
+            "Setup",
+            "Status Line",
+            "Separator",
+            "Powerline thin",
+            "Preview: PREVIEW",
+            "Type to search",
+            "Esc close",
+            "Ctrl+S scope",
+        ] {
             assert!(screen.contains(needle), "missing {needle:?} in\n{screen}");
         }
         assert!(screen.starts_with('╭'), "rounded frame");
@@ -1074,16 +1893,34 @@ mod tests {
             table("[ui]\nstatus_separator = \"pipe\"\ntips = false\n"),
             table("[ui]\nstatus_separator = \"pipe\"\n"),
             table("[ui]\ntips = false\n"),
-            Scope::Project, vec![],
+            Scope::Project,
+            vec![],
         );
         let screen = draw(&mut o, &rig, 120, 40);
-        let line = |needle: &str| screen.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}\n{screen}")).to_owned();
+        let line = |needle: &str| {
+            screen
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}\n{screen}"))
+                .to_owned()
+        };
         let sep = line("Separator");
-        assert!(sep.contains("Pipe") && sep.contains("(modified)") && sep.contains("project"), "{sep}");
+        assert!(
+            sep.contains("Pipe") && sep.contains("(modified)") && sep.contains("project"),
+            "{sep}"
+        );
         let tips = line(" Tips");
-        assert!(tips.contains("off") && tips.contains("(modified)") && tips.contains("global"), "{tips}");
+        assert!(
+            tips.contains("off") && tips.contains("(modified)") && tips.contains("global"),
+            "{tips}"
+        );
         let welcome = line("Welcome banner");
-        assert!(welcome.contains("on") && welcome.contains("default") && !welcome.contains("(modified)"), "{welcome}");
+        assert!(
+            welcome.contains("on")
+                && welcome.contains("default")
+                && !welcome.contains("(modified)"),
+            "{welcome}"
+        );
         assert!(screen.contains("Save to: This project"));
     }
 
@@ -1093,19 +1930,38 @@ mod tests {
         let mut o = overlay();
         goto(&mut o, &rig.keys, "ui.tips");
         let (path, value, scope) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
-        assert_eq!((path.as_str(), value, scope), ("ui.tips", Value::Boolean(false), Scope::Global));
+        assert_eq!(
+            (path.as_str(), value, scope),
+            ("ui.tips", Value::Boolean(false), Scope::Global)
+        );
         // Before the controller answers the displayed value stays on the pending value, then follows it.
         o.settled("ui.tips", Ok(Value::Boolean(false)));
-        assert_eq!(settings_schema::get(&o.global, "ui.tips"), Some(&Value::Boolean(false)), "source layer updated");
+        assert_eq!(
+            settings_schema::get(&o.global, "ui.tips"),
+            Some(&Value::Boolean(false)),
+            "source layer updated"
+        );
         let (_, value, _) = expect_set(send(&mut o, &rig.keys, ch(' ')));
         assert_eq!(value, Value::Boolean(true));
 
         goto(&mut o, &rig.keys, "ui.composer_shape");
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Enter)), OverlayEvent::None));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
         assert!(draw(&mut o, &rig, 100, 24).contains("Line"));
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Down)), OverlayEvent::None));
-        assert!(o.pending.get("ui.composer_shape").is_none(), "browsing must not save");
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Esc)), OverlayEvent::None));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Down)),
+            OverlayEvent::None
+        ));
+        assert!(
+            o.pending.get("ui.composer_shape").is_none(),
+            "browsing must not save"
+        );
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Esc)),
+            OverlayEvent::None
+        ));
         assert!(matches!(o.mode, Mode::Browse));
         let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
         assert_eq!(value, Value::String("line".into()));
@@ -1119,27 +1975,60 @@ mod tests {
         let rig = Rig::new();
         let mut o = overlay();
         goto(&mut o, &rig.keys, "harness.max_steps");
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Enter)), OverlayEvent::None));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
         assert!(matches!(o.mode, Mode::Edit { .. }));
         // The editor starts with the current value; replace it with out-of-range input.
-        send_all(&mut o, &rig.keys, vec![Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))]);
+        send_all(
+            &mut o,
+            &rig.keys,
+            vec![Event::Key(KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            ))],
+        );
         send_all(&mut o, &rig.keys, typed("99"));
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Enter)), OverlayEvent::None), "out of range is not sent");
+        assert!(
+            matches!(
+                send(&mut o, &rig.keys, key(KeyCode::Enter)),
+                OverlayEvent::None
+            ),
+            "out of range is not sent"
+        );
         let shown = draw(&mut o, &rig, 110, 30);
         assert!(shown.contains("Must be between 1 and 64"), "{shown}");
         assert!(matches!(o.mode, Mode::Edit { .. }), "stays in the editor");
         // Not a number at all.
-        send_all(&mut o, &rig.keys, vec![key(KeyCode::Backspace), key(KeyCode::Backspace), ch('x')]);
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Enter)), OverlayEvent::None));
+        send_all(
+            &mut o,
+            &rig.keys,
+            vec![key(KeyCode::Backspace), key(KeyCode::Backspace), ch('x')],
+        );
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
         assert!(draw(&mut o, &rig, 110, 30).contains("Enter a whole number"));
         // A valid value goes out as an integer.
-        send_all(&mut o, &rig.keys, vec![key(KeyCode::Backspace), ch('6'), ch('4')]);
+        send_all(
+            &mut o,
+            &rig.keys,
+            vec![key(KeyCode::Backspace), ch('6'), ch('4')],
+        );
         let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
-        assert_eq!((path.as_str(), value), ("harness.max_steps", Value::Integer(64)));
+        assert_eq!(
+            (path.as_str(), value),
+            ("harness.max_steps", Value::Integer(64))
+        );
         assert!(matches!(o.mode, Mode::Browse));
         // Esc leaves the editor without sending anything and without closing the panel.
         send(&mut o, &rig.keys, key(KeyCode::Enter));
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Esc)), OverlayEvent::None));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Esc)),
+            OverlayEvent::None
+        ));
         assert!(matches!(o.mode, Mode::Browse));
     }
 
@@ -1150,41 +2039,78 @@ mod tests {
         goto(&mut o, &rig.keys, "harness.temperature");
         send(&mut o, &rig.keys, key(KeyCode::Enter));
         send(&mut o, &rig.keys, key(KeyCode::Up));
-        let Mode::Edit { editor, .. } = &o.mode else { panic!() };
-        assert_eq!(editor.text, "0.3", "Up adds one step to 0.2 without float noise");
+        let Mode::Edit { editor, .. } = &o.mode else {
+            panic!()
+        };
+        assert_eq!(
+            editor.text, "0.3",
+            "Up adds one step to 0.2 without float noise"
+        );
         let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
         assert_eq!(value, Value::Float(0.3));
 
         goto(&mut o, &rig.keys, "ui.status_left");
         send(&mut o, &rig.keys, key(KeyCode::Enter));
-        let Mode::Edit { editor, .. } = &o.mode else { panic!() };
+        let Mode::Edit { editor, .. } = &o.mode else {
+            panic!()
+        };
         assert_eq!(editor.text, "spinner, model, path, git");
-        send_all(&mut o, &rig.keys, vec![Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))]);
+        send_all(
+            &mut o,
+            &rig.keys,
+            vec![Event::Key(KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            ))],
+        );
         send_all(&mut o, &rig.keys, typed("model , ,context"));
         let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
-        assert_eq!(value, Value::Array(vec![Value::String("model".into()), Value::String("context".into())]));
+        assert_eq!(
+            value,
+            Value::Array(vec![
+                Value::String("model".into()),
+                Value::String("context".into())
+            ])
+        );
     }
 
     #[test]
     fn delete_unsets_in_the_active_scope_only() {
         let rig = Rig::new();
-        let mut o = SettingsOverlay::new(table("[ui]\ntips = false\n"), Table::new(), table("[ui]\ntips = false\n"), Scope::Project, vec![]);
+        let mut o = SettingsOverlay::new(
+            table("[ui]\ntips = false\n"),
+            Table::new(),
+            table("[ui]\ntips = false\n"),
+            Scope::Project,
+            vec![],
+        );
         goto(&mut o, &rig.keys, "ui.tips");
         // Set in global, active scope is project: nothing to remove there, say why.
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Delete)), OverlayEvent::None));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Delete)),
+            OverlayEvent::None
+        ));
         assert!(draw(&mut o, &rig, 120, 30).contains("Set in the global scope"));
         send(&mut o, &rig.keys, ctrl('s'));
         match send(&mut o, &rig.keys, key(KeyCode::Delete)) {
-            OverlayEvent::Unset { path, scope } => assert_eq!((path.as_str(), scope), ("ui.tips", Scope::Global)),
+            OverlayEvent::Unset { path, scope } => {
+                assert_eq!((path.as_str(), scope), ("ui.tips", Scope::Global))
+            }
             other => panic!("{other:?}"),
         }
         o.settled("ui.tips", Ok(Value::Boolean(true)));
         assert!(settings_schema::get(&o.global, "ui.tips").is_none());
         let screen = draw(&mut o, &rig, 120, 30);
         let row = screen.lines().find(|l| l.contains(" Tips")).unwrap();
-        assert!(row.contains("on") && row.contains("default") && !row.contains("(modified)"), "{row}");
+        assert!(
+            row.contains("on") && row.contains("default") && !row.contains("(modified)"),
+            "{row}"
+        );
         // An unmodified row has nothing to reset.
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Delete)), OverlayEvent::None));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Delete)),
+            OverlayEvent::None
+        ));
     }
 
     #[test]
@@ -1193,15 +2119,30 @@ mod tests {
         let mut o = overlay();
         send_all(&mut o, &rig.keys, typed("sandbox"));
         let shown = draw(&mut o, &rig, 120, 30);
-        assert!(shown.contains("Sandbox mode") && shown.contains("Allow network"), "{shown}");
-        assert!(shown.contains("Tools/Sandbox"), "each hit names its tab and section\n{shown}");
-        assert!(!shown.contains("Welcome banner"), "non-matching rows are hidden");
+        assert!(
+            shown.contains("Sandbox mode") && shown.contains("Allow network"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("Tools/Sandbox"),
+            "each hit names its tab and section\n{shown}"
+        );
+        assert!(
+            !shown.contains("Welcome banner"),
+            "non-matching rows are hidden"
+        );
         assert!(shown.contains("Esc clear search"));
         // Hits come from other tabs than the current (Appearance) one.
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Esc)), OverlayEvent::None));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Esc)),
+            OverlayEvent::None
+        ));
         assert!(o.search.is_empty());
         assert!(draw(&mut o, &rig, 120, 30).contains("Welcome banner"));
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Esc)), OverlayEvent::Close));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Esc)),
+            OverlayEvent::Close
+        ));
 
         send_all(&mut o, &rig.keys, typed("zzzzqq"));
         assert!(draw(&mut o, &rig, 120, 30).contains("No settings match \"zzzzqq\""));
@@ -1209,9 +2150,14 @@ mod tests {
         assert!(o.search.is_empty());
         // Enter on a search hit acts on that hit, wherever it lives.
         send_all(&mut o, &rig.keys, typed("approval"));
-        assert!(matches!(o.visible().first(), Some(Row::Setting(i)) if settings_schema::registry()[*i].path == "approval"));
+        assert!(
+            matches!(o.visible().first(), Some(Row::Setting(i)) if settings_schema::registry()[*i].path == "approval")
+        );
         let (path, value, _) = expect_set(choose_next(&mut o, &rig.keys));
-        assert_eq!((path.as_str(), value), ("approval", Value::String("auto".into())));
+        assert_eq!(
+            (path.as_str(), value),
+            ("approval", Value::String("auto".into()))
+        );
     }
 
     #[test]
@@ -1244,28 +2190,61 @@ mod tests {
         assert!(shown.contains("status preset rejected"), "{shown}");
         let row = shown.lines().find(|l| l.contains("Preset")).unwrap();
         assert!(row.contains("Default"), "old value kept: {row}");
-        let error_style = style_of(&render(120, 30, |f| { let p = |u: &UiConfig, w| status_preview(u, w); let c = DrawCtx { theme: &rig.theme, keys: &rig.keys, status: &rig.status, preview_status: &p }; o.draw(f, &c) }), "status preset rejected").unwrap();
-        assert_eq!(error_style.fg, rig.theme.fg(Tok::Error).fg, "errors use the Error token");
+        let error_style = style_of(
+            &render(120, 30, |f| {
+                let p = |u: &UiConfig, w| status_preview(u, w);
+                let c = DrawCtx {
+                    theme: &rig.theme,
+                    keys: &rig.keys,
+                    status: &rig.status,
+                    preview_status: &p,
+                };
+                o.draw(f, &c)
+            }),
+            "status preset rejected",
+        )
+        .unwrap();
+        assert_eq!(
+            error_style.fg,
+            rig.theme.fg(Tok::Error).fg,
+            "errors use the Error token"
+        );
         // The next attempt clears the message; Ok then moves the value.
         let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
         assert_eq!(value, Value::String("minimal".into()));
         assert!(!draw(&mut o, &rig, 120, 30).contains("status preset rejected"));
         o.settled("ui.status", Ok(Value::String("minimal".into())));
         assert!(draw(&mut o, &rig, 120, 30).contains("Saved to global settings"));
-        let row = draw(&mut o, &rig, 120, 30).lines().find(|l| l.contains("Preset")).unwrap().to_owned();
-        assert!(row.contains("Minimal") && row.contains("(modified)"), "{row}");
+        let row = draw(&mut o, &rig, 120, 30)
+            .lines()
+            .find(|l| l.contains("Preset"))
+            .unwrap()
+            .to_owned();
+        assert!(
+            row.contains("Minimal") && row.contains("(modified)"),
+            "{row}"
+        );
     }
 
     #[test]
     fn saved_scope_feedback_survives_controller_refresh_but_not_navigation() {
         let rig = Rig::new();
-        let mut o = SettingsOverlay::new(table("[ui]\ntips = true"), table("[ui]\ntips = true"), Table::new(), Scope::Global, vec![]);
+        let mut o = SettingsOverlay::new(
+            table("[ui]\ntips = true"),
+            table("[ui]\ntips = true"),
+            Table::new(),
+            Scope::Global,
+            vec![],
+        );
         goto(&mut o, &rig.keys, "ui.tips");
         expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
         assert!(!draw(&mut o, &rig, 100, 24).contains("Saved globally"));
         o.settled("ui.tips", Ok(Value::Boolean(true)));
         o.replace_values(o.effective.clone(), o.project.clone(), o.global.clone());
-        assert!(draw(&mut o, &rig, 100, 24).contains("Saved globally; this project's override still applies"));
+        assert!(
+            draw(&mut o, &rig, 100, 24)
+                .contains("Saved globally; this project's override still applies")
+        );
         send(&mut o, &rig.keys, key(KeyCode::Down));
         assert!(!draw(&mut o, &rig, 100, 24).contains("Saved globally"));
     }
@@ -1276,7 +2255,10 @@ mod tests {
         let mut o = overlay();
         let shown = draw(&mut o, &rig, 60, 8);
         assert!(shown.contains("Type to search all settings"), "{shown}");
-        assert!(shown.contains("Enter choose") && shown.contains("Esc close"), "{shown}");
+        assert!(
+            shown.contains("Enter choose") && shown.contains("Esc close"),
+            "{shown}"
+        );
         goto(&mut o, &rig.keys, "sandbox.mode");
         assert!(!draw(&mut o, &rig, 100, 24).contains("Preview:"));
     }
@@ -1288,11 +2270,17 @@ mod tests {
         goto(&mut o, &rig.keys, "ui.theme");
         send(&mut o, &rig.keys, key(KeyCode::Enter));
         for height in [6, 8, 10, 12] {
-            assert!(draw(&mut o, &rig, 50, height).contains("● dark"), "highlight hidden at height {height}");
+            assert!(
+                draw(&mut o, &rig, 50, height).contains("● dark"),
+                "highlight hidden at height {height}"
+            );
         }
         send(&mut o, &rig.keys, key(KeyCode::PageDown));
         for height in [6, 8, 10, 12] {
-            assert!(draw(&mut o, &rig, 50, height).contains("● auto"), "highlight hidden at height {height}");
+            assert!(
+                draw(&mut o, &rig, 50, height).contains("● auto"),
+                "highlight hidden at height {height}"
+            );
         }
     }
 
@@ -1301,31 +2289,66 @@ mod tests {
         let rig = Rig::new();
         let mut o = overlay();
         let seen: RefCell<Vec<UiConfig>> = RefCell::new(Vec::new());
-        let preview = |ui: &UiConfig, _w: u16| { seen.borrow_mut().push(ui.clone()); Line::from(format!("sep={:?}", ui.status_separator)) };
+        let preview = |ui: &UiConfig, _w: u16| {
+            seen.borrow_mut().push(ui.clone());
+            Line::from(format!("sep={:?}", ui.status_separator))
+        };
         let paint = |o: &mut SettingsOverlay| {
-            let ctx = DrawCtx { theme: &rig.theme, keys: &rig.keys, status: &rig.status, preview_status: &preview };
+            let ctx = DrawCtx {
+                theme: &rig.theme,
+                keys: &rig.keys,
+                status: &rig.status,
+                preview_status: &preview,
+            };
             screen(&render(120, 30, |f| o.draw(f, &ctx)))
         };
         assert!(paint(&mut o).contains("sep=PowerlineThin"));
         goto(&mut o, &rig.keys, "ui.status_separator");
         let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
-        assert_eq!(value, Value::String("slash".into()), "next after powerline-thin");
+        assert_eq!(
+            value,
+            Value::String("slash".into()),
+            "next after powerline-thin"
+        );
         let shown = paint(&mut o);
-        assert!(shown.contains("Preview: sep=Slash"), "pending value is previewed before the controller answers\n{shown}");
+        assert!(
+            shown.contains("Preview: sep=Slash"),
+            "pending value is previewed before the controller answers\n{shown}"
+        );
         o.settled("ui.status_separator", Err("nope".into()));
-        assert!(paint(&mut o).contains("sep=PowerlineThin"), "a rejected change leaves the preview");
+        assert!(
+            paint(&mut o).contains("sep=PowerlineThin"),
+            "a rejected change leaves the preview"
+        );
         assert!(seen.borrow().len() >= 3);
     }
 
     #[test]
     fn invalid_ui_table_falls_back_to_default_preview() {
         let rig = Rig::new();
-        let mut o = SettingsOverlay::new(table("[ui]\nbogus = 1\n"), Table::new(), Table::new(), Scope::Global, vec![]);
+        let mut o = SettingsOverlay::new(
+            table("[ui]\nbogus = 1\n"),
+            Table::new(),
+            Table::new(),
+            Scope::Global,
+            vec![],
+        );
         let seen: RefCell<Option<UiConfig>> = RefCell::new(None);
-        let preview = |ui: &UiConfig, _w: u16| { *seen.borrow_mut() = Some(ui.clone()); Line::from("x") };
-        let ctx = DrawCtx { theme: &rig.theme, keys: &rig.keys, status: &rig.status, preview_status: &preview };
+        let preview = |ui: &UiConfig, _w: u16| {
+            *seen.borrow_mut() = Some(ui.clone());
+            Line::from("x")
+        };
+        let ctx = DrawCtx {
+            theme: &rig.theme,
+            keys: &rig.keys,
+            status: &rig.status,
+            preview_status: &preview,
+        };
         let _ = render(100, 24, |f| o.draw(f, &ctx));
-        assert_eq!(seen.borrow().as_ref().unwrap().status_separator, UiConfig::default().status_separator);
+        assert_eq!(
+            seen.borrow().as_ref().unwrap().status_separator,
+            UiConfig::default().status_separator
+        );
     }
 
     #[test]
@@ -1333,9 +2356,18 @@ mod tests {
         let rig = Rig::new();
         let mut o = overlay();
         goto(&mut o, &rig.keys, "ui.theme");
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Enter)), OverlayEvent::None), "opening the picker emits nothing");
+        assert!(
+            matches!(
+                send(&mut o, &rig.keys, key(KeyCode::Enter)),
+                OverlayEvent::None
+            ),
+            "opening the picker emits nothing"
+        );
         let shown = draw(&mut o, &rig, 120, 30);
-        assert!(shown.contains("○ light") && shown.contains("○ mono") && shown.contains("○ auto"), "{shown}");
+        assert!(
+            shown.contains("○ light") && shown.contains("○ mono") && shown.contains("○ auto"),
+            "{shown}"
+        );
         match send(&mut o, &rig.keys, key(KeyCode::Down)) {
             OverlayEvent::PreviewTheme(Some(name)) => assert_eq!(name, "light"),
             other => panic!("{other:?}"),
@@ -1344,29 +2376,42 @@ mod tests {
             OverlayEvent::PreviewTheme(Some(name)) => assert_eq!(name, "mono"),
             other => panic!("{other:?}"),
         }
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Esc)), OverlayEvent::PreviewTheme(None)));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Esc)),
+            OverlayEvent::PreviewTheme(None)
+        ));
         assert!(matches!(o.mode, Mode::Browse), "Esc closes only the picker");
 
         send(&mut o, &rig.keys, key(KeyCode::Enter));
         send(&mut o, &rig.keys, key(KeyCode::Down));
         let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
-        assert_eq!((path.as_str(), value), ("ui.theme", Value::String("light".into())));
+        assert_eq!(
+            (path.as_str(), value),
+            ("ui.theme", Value::String("light".into()))
+        );
         // Confirming the theme that is already active just ends the preview.
         o.settled("ui.theme", Ok(Value::String("light".into())));
         send(&mut o, &rig.keys, key(KeyCode::Enter));
-        assert!(matches!(send(&mut o, &rig.keys, key(KeyCode::Enter)), OverlayEvent::PreviewTheme(None)));
+        assert!(matches!(
+            send(&mut o, &rig.keys, key(KeyCode::Enter)),
+            OverlayEvent::PreviewTheme(None)
+        ));
         // `auto` is only offered for the main theme, not for the dark/light slots.
         goto(&mut o, &rig.keys, "ui.theme_dark");
         send(&mut o, &rig.keys, key(KeyCode::Enter));
         let shown = draw(&mut o, &rig, 120, 30);
-        assert!(shown.contains("○ mono") && !shown.contains("○ auto") && !shown.contains("● auto"), "{shown}");
+        assert!(
+            shown.contains("○ mono") && !shown.contains("○ auto") && !shown.contains("● auto"),
+            "{shown}"
+        );
     }
 
     #[test]
     fn tabs_and_sections_follow_the_keymap_including_remapped_keys() {
         let rig = Rig::new();
         let mut o = overlay();
-        let tab_name = |o: &SettingsOverlay| o.tabs.get(o.tab).map(|(t, _)| *t).unwrap_or(PROVIDERS_TAB);
+        let tab_name =
+            |o: &SettingsOverlay| o.tabs.get(o.tab).map(|(t, _)| *t).unwrap_or(PROVIDERS_TAB);
         send(&mut o, &rig.keys, key(KeyCode::Right));
         assert_eq!(tab_name(&o), "Model");
         send(&mut o, &rig.keys, key(KeyCode::Left));
@@ -1382,14 +2427,27 @@ mod tests {
         assert_eq!(section(&o), "Symbols");
         send(&mut o, &rig.keys, key(KeyCode::Tab));
         assert_eq!(section(&o), "Composer");
-        send(&mut o, &rig.keys, Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
+        send(
+            &mut o,
+            &rig.keys,
+            Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+        );
         assert_eq!(section(&o), "Symbols");
-        for _ in 0..5 { send(&mut o, &rig.keys, key(KeyCode::Tab)); }
+        for _ in 0..5 {
+            send(&mut o, &rig.keys, key(KeyCode::Tab));
+        }
         assert_eq!(section(&o), "Symbols", "wraps around the sections");
 
         // Remapped keymap: Ctrl+L / Ctrl+H switch tabs, Ctrl+J / Ctrl+K move, Ctrl+O confirms. Old keys do nothing.
         let mut remapped = Keymap::defaults();
-        for (action, chord) in [(Action::TabNext, "Ctrl+L"), (Action::TabPrev, "Ctrl+H"), (Action::SelectDown, "Ctrl+J"), (Action::SelectUp, "Ctrl+K"), (Action::SelectConfirm, "Ctrl+O"), (Action::SectionNext, "Ctrl+N")] {
+        for (action, chord) in [
+            (Action::TabNext, "Ctrl+L"),
+            (Action::TabPrev, "Ctrl+H"),
+            (Action::SelectDown, "Ctrl+J"),
+            (Action::SelectUp, "Ctrl+K"),
+            (Action::SelectConfirm, "Ctrl+O"),
+            (Action::SectionNext, "Ctrl+N"),
+        ] {
             remapped.rebind(action, &[chord]).unwrap();
         }
         let mut o = overlay();
@@ -1405,10 +2463,27 @@ mod tests {
         assert_eq!(o.cursor, 0);
         send(&mut o, &remapped, ctrl('n'));
         assert_eq!(section(&o), "Symbols");
-        let hints = draw(&mut o, &Rig { keys: remapped.clone(), ..Rig::new() }, 140, 30);
-        assert!(hints.contains("Ctrl+K/Ctrl+J move") && hints.contains("Ctrl+N sections"), "footer reflects the remap\n{hints}");
-        assert!(matches!(send(&mut o, &remapped, ctrl('o')), OverlayEvent::None));
-        assert!(matches!(send(&mut o, &remapped, ctrl('j')), OverlayEvent::None));
+        let hints = draw(
+            &mut o,
+            &Rig {
+                keys: remapped.clone(),
+                ..Rig::new()
+            },
+            140,
+            30,
+        );
+        assert!(
+            hints.contains("Ctrl+K/Ctrl+J move") && hints.contains("Ctrl+N sections"),
+            "footer reflects the remap\n{hints}"
+        );
+        assert!(matches!(
+            send(&mut o, &remapped, ctrl('o')),
+            OverlayEvent::None
+        ));
+        assert!(matches!(
+            send(&mut o, &remapped, ctrl('j')),
+            OverlayEvent::None
+        ));
         match send(&mut o, &remapped, ctrl('o')) {
             OverlayEvent::Set { path, .. } => assert_eq!(path, "ui.symbols"),
             other => panic!("{other:?}"),
@@ -1421,12 +2496,26 @@ mod tests {
         let mut o = overlay();
         send(&mut o, &rig.keys, key(KeyCode::Left));
         let shown = draw(&mut o, &rig, 110, 24);
-        assert!(shown.contains("Providers & API keys") && shown.contains("Models & roles") && shown.contains("Keyboard shortcuts"), "{shown}");
-        match send(&mut o, &rig.keys, key(KeyCode::Enter)) { OverlayEvent::Action(a) => assert_eq!(a, "open:providers"), other => panic!("{other:?}") }
+        assert!(
+            shown.contains("Providers & API keys")
+                && shown.contains("Models & roles")
+                && shown.contains("Keyboard shortcuts"),
+            "{shown}"
+        );
+        match send(&mut o, &rig.keys, key(KeyCode::Enter)) {
+            OverlayEvent::Action(a) => assert_eq!(a, "open:providers"),
+            other => panic!("{other:?}"),
+        }
         send(&mut o, &rig.keys, key(KeyCode::Down));
-        match send(&mut o, &rig.keys, key(KeyCode::Enter)) { OverlayEvent::Action(a) => assert_eq!(a, "open:models"), other => panic!("{other:?}") }
+        match send(&mut o, &rig.keys, key(KeyCode::Enter)) {
+            OverlayEvent::Action(a) => assert_eq!(a, "open:models"),
+            other => panic!("{other:?}"),
+        }
         send(&mut o, &rig.keys, key(KeyCode::Down));
-        match send(&mut o, &rig.keys, key(KeyCode::Enter)) { OverlayEvent::Action(a) => assert_eq!(a, "open:shortcuts"), other => panic!("{other:?}") }
+        match send(&mut o, &rig.keys, key(KeyCode::Enter)) {
+            OverlayEvent::Action(a) => assert_eq!(a, "open:shortcuts"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1435,7 +2524,14 @@ mod tests {
         let mut o = overlay();
         goto(&mut o, &rig.keys, "sandbox.mode");
         let shown = draw(&mut o, &rig, 130, 30);
-        assert!(shown.lines().find(|l| l.contains("Sandbox mode")).unwrap().contains("restart"), "{shown}");
+        assert!(
+            shown
+                .lines()
+                .find(|l| l.contains("Sandbox mode"))
+                .unwrap()
+                .contains("restart"),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -1445,10 +2541,20 @@ mod tests {
         o.tab = o.tabs.iter().position(|(t, _)| *t == "Learning").unwrap();
         let shown = draw(&mut o, &rig, 120, 16);
         assert!(shown.contains(rig.theme.sym(Sym::ScrollThumb)), "{shown}");
-        for _ in 0..20 { send(&mut o, &rig.keys, key(KeyCode::Down)); }
+        for _ in 0..20 {
+            send(&mut o, &rig.keys, key(KeyCode::Down));
+        }
         let shown = draw(&mut o, &rig, 120, 16);
-        let label = settings_schema::registry().iter().filter(|d| d.tab == "Learning").nth(20).unwrap().label;
-        assert!(shown.contains(label), "cursor row {label:?} visible\n{shown}");
+        let label = settings_schema::registry()
+            .iter()
+            .filter(|d| d.tab == "Learning")
+            .nth(20)
+            .unwrap()
+            .label;
+        assert!(
+            shown.contains(label),
+            "cursor row {label:?} visible\n{shown}"
+        );
         send(&mut o, &rig.keys, key(KeyCode::PageDown));
         assert!(o.cursor > 20);
         send(&mut o, &rig.keys, key(KeyCode::Up));
@@ -1463,7 +2569,13 @@ mod tests {
         o.settled("ui.tips", Err("x".into()));
         o.replace_values(table("[ui]\ntips = false\n"), Table::new(), Table::new());
         assert!(o.pending.is_empty() && o.notes.is_empty());
-        assert!(draw(&mut o, &rig, 120, 30).lines().find(|l| l.contains(" Tips")).unwrap().contains("off"));
+        assert!(
+            draw(&mut o, &rig, 120, 30)
+                .lines()
+                .find(|l| l.contains(" Tips"))
+                .unwrap()
+                .contains("off")
+        );
     }
 
     #[test]
@@ -1492,10 +2604,18 @@ mod tests {
     #[test]
     fn wide_and_hostile_text_is_kept_inside_the_frame() {
         let rig = Rig::new();
-        let mut o = SettingsOverlay::new(table("[ui]\nstatus_left = [\"日本語日本語日本語日本語\", \"\\u001b[31mred\"]\n"), Table::new(), Table::new(), Scope::Global, vec![]);
+        let mut o = SettingsOverlay::new(
+            table("[ui]\nstatus_left = [\"日本語日本語日本語日本語\", \"\\u001b[31mred\"]\n"),
+            Table::new(),
+            Table::new(),
+            Scope::Global,
+            vec![],
+        );
         goto(&mut o, &rig.keys, "ui.status_left");
         let shown = draw(&mut o, &rig, 60, 20);
         assert!(!shown.contains('\u{1b}'));
-        for line in shown.lines() { assert!(text::width(line) <= 80); }
+        for line in shown.lines() {
+            assert!(text::width(line) <= 80);
+        }
     }
 }

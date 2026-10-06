@@ -1,7 +1,10 @@
 //! Bounded, turn-local detection of successful observations that add no new evidence.
 //! Execute first: a source may have changed externally, and a reread can be legitimate.
 use crate::llm::ToolCall;
-use std::{collections::VecDeque, hash::{Hash, Hasher}};
+use std::{
+    collections::VecDeque,
+    hash::{Hash, Hasher},
+};
 
 #[derive(Default)]
 pub(super) struct InvestigationGuard {
@@ -12,16 +15,25 @@ pub(super) struct InvestigationGuard {
 impl InvestigationGuard {
     pub fn observe(&mut self, call: &ToolCall, text: &str, is_error: bool) -> Option<String> {
         // Error recovery has its own guards; it is not a run of successful unchanged observations.
-        if is_error { self.unchanged = 0; return None; }
+        if is_error {
+            self.unchanged = 0;
+            return None;
+        }
         match call.name.as_str() {
             // Mutations and arbitrary commands may invalidate earlier observations.
-            "write" | "edit" | "ast_edit" | "bash" => { self.observations.clear(); self.unchanged = 0; return None; }
+            "write" | "edit" | "ast_edit" | "bash" => {
+                self.observations.clear();
+                self.unchanged = 0;
+                return None;
+            }
             "read" | "grep" | "glob" | "find" | "ast_search" => {}
             // Polls, checks, artifact recovery and control calls are not duplicate reads.
             _ => return None,
         }
         let mut args = call.arguments.clone();
-        if let Some(object) = args.as_object_mut() { object.remove("i"); }
+        if let Some(object) = args.as_object_mut() {
+            object.remove("i");
+        }
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         call.name.hash(&mut hash);
         args.to_string().hash(&mut hash);
@@ -29,10 +41,14 @@ impl InvestigationGuard {
         let key = hash.finish();
         if let Some((_, first)) = self.observations.iter().find(|(seen, _)| *seen == key) {
             self.unchanged += 1;
-            return Some(format!("[Investigation check from dial] This observation is unchanged from tool call {first}. Reuse that evidence and record the finding on the current investigation todo. If the question is still unresolved, choose a different, narrower check that can distinguish the remaining possibilities. Reread only for changed sources, missing context or a specific verification need; once the answer supports a change and its check, move on."));
+            return Some(format!(
+                "[Investigation check from dial] This observation is unchanged from tool call {first}. Reuse that evidence and record the finding on the current investigation todo. If the question is still unresolved, choose a different, narrower check that can distinguish the remaining possibilities. Reread only for changed sources, missing context or a specific verification need; once the answer supports a change and its check, move on."
+            ));
         }
         self.unchanged = 0;
-        if self.observations.len() == 128 { self.observations.pop_front(); }
+        if self.observations.len() == 128 {
+            self.observations.pop_front();
+        }
         self.observations.push_back((key, call.id.clone()));
         None
     }
@@ -50,7 +66,12 @@ mod tests {
     use serde_json::json;
 
     fn call(name: &str, args: serde_json::Value) -> ToolCall {
-        ToolCall { id: "first-read".into(), name: name.into(), arguments: args, malformed_arguments: false }
+        ToolCall {
+            id: "first-read".into(),
+            name: name.into(),
+            arguments: args,
+            malformed_arguments: false,
+        }
     }
 
     #[test]
@@ -59,7 +80,12 @@ mod tests {
         let read = call("read", json!({"path":"src/main.rs", "i":"inspect"}));
         assert!(guard.observe(&read, "old", false).is_none());
         let again = call("read", json!({"path":"src/main.rs", "i":"inspect again"}));
-        assert!(guard.observe(&again, "old", false).unwrap().contains("first-read"));
+        assert!(
+            guard
+                .observe(&again, "old", false)
+                .unwrap()
+                .contains("first-read")
+        );
         assert!(guard.observe(&again, "new", false).is_none());
         assert!(guard.observe(&again, "new", true).is_none());
         guard.observe(&call("edit", json!({})), "edited", false);
@@ -70,11 +96,27 @@ mod tests {
     fn independent_ranges_and_recovery_are_allowed_and_storage_is_bounded() {
         let mut guard = InvestigationGuard::default();
         for line in 0..200 {
-            assert!(guard.observe(&call("read", json!({"path":"x", "offset":line})), "same", false).is_none());
+            assert!(
+                guard
+                    .observe(
+                        &call("read", json!({"path":"x", "offset":line})),
+                        "same",
+                        false
+                    )
+                    .is_none()
+            );
         }
         assert_eq!(guard.observations.len(), 128);
         for _ in 0..3 {
-            assert!(guard.observe(&call("artifact_read", json!({"uri":"artifact:x"})), "same", false).is_none());
+            assert!(
+                guard
+                    .observe(
+                        &call("artifact_read", json!({"uri":"artifact:x"})),
+                        "same",
+                        false
+                    )
+                    .is_none()
+            );
         }
     }
 

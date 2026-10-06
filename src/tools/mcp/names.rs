@@ -7,7 +7,15 @@ const MAX_NAME: usize = 64;
 
 /// Replaces every character outside `[A-Za-z0-9_-]` with `_`.
 pub fn sanitize(text: &str) -> String {
-    text.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect()
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Hands out unique names. Two tools that sanitise or truncate to the same name get `_2`, `_3`, … so
@@ -19,7 +27,10 @@ pub struct Namer {
 
 impl Namer {
     pub fn name(&mut self, server: &str, tool: &str) -> String {
-        let base = truncate(&format!("mcp__{}__{}", sanitize(server), sanitize(tool)), MAX_NAME);
+        let base = truncate(
+            &format!("mcp__{}__{}", sanitize(server), sanitize(tool)),
+            MAX_NAME,
+        );
         let mut name = base.clone();
         let mut n = 2;
         while !self.taken.insert(name.clone()) {
@@ -66,7 +77,10 @@ mod tests {
         assert_ne!(first, second);
         assert!(second.ends_with("_2"));
         for name in [first, second] {
-            assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            );
         }
     }
 }

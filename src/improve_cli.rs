@@ -16,23 +16,42 @@ pub enum Cmd {
     /// Resolve model capabilities and pin the local checkpoint.
     Doctor,
     /// Explicit external verdict; an unscored answer is not a success or a failure.
-    Outcome { trajectory: i64, #[arg(long)] score: f64, #[arg(long)] source: String, #[arg(long)] reference: Option<String> },
+    Outcome {
+        trajectory: i64,
+        #[arg(long)]
+        score: f64,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        reference: Option<String>,
+    },
     Diagnose,
     /// Register an immutable repository exercise from an explicit manifest.
-    RegisterTask { manifest: PathBuf, #[arg(long)] trajectory: Option<i64> },
+    RegisterTask {
+        manifest: PathBuf,
+        #[arg(long)]
+        trajectory: Option<i64>,
+    },
     /// List registered training/evaluation snapshots.
     Tasks,
-    Propose { file: PathBuf },
+    Propose {
+        file: PathBuf,
+    },
     Train,
     Harvest,
     /// Run one full cycle now, regardless of the schedule threshold.
     Cycle,
-    Watch { #[arg(long, default_value_t = 10)] poll_secs: u64 },
+    Watch {
+        #[arg(long, default_value_t = 10)]
+        poll_secs: u64,
+    },
     Status,
     /// Show improvement jobs for every model in this project and the shared compute lock.
     Jobs,
     /// Request a safe stop and pause future cycles for a model state ID from jobs.
-    Stop { state_id: String },
+    Stop {
+        state_id: String,
+    },
     Versions,
     Rollback,
     /// Enable automatic background cycles for this project.
@@ -40,16 +59,29 @@ pub enum Cmd {
     /// Disable pending and future automatic cycles (does not interrupt a running cycle).
     Disable,
     #[command(hide = true)]
-    Background { request: PathBuf },
+    Background {
+        request: PathBuf,
+    },
 }
 
 pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
-    if let Cmd::Background { request } = cmd { return auto::background(&request); }
-    if matches!(cmd, Cmd::Jobs) { return print_json(&auto::jobs(layout)?); }
-    if let Cmd::Stop { state_id } = &cmd { return print_json(&auto::request_stop(layout, state_id)?); }
+    if let Cmd::Background { request } = cmd {
+        return auto::background(&request);
+    }
+    if matches!(cmd, Cmd::Jobs) {
+        return print_json(&auto::jobs(layout)?);
+    }
+    if let Cmd::Stop { state_id } = &cmd {
+        return print_json(&auto::request_stop(layout, state_id)?);
+    }
     auto::prepare_state(layout)?;
     config.require_model()?;
-    let store = Store::open(&config.state_dir, &config.model, &config.use_case, &config.harness)?;
+    let store = Store::open(
+        &config.state_dir,
+        &config.model,
+        &config.use_case,
+        &config.harness,
+    )?;
     let mut progress = |s: &str| eprintln!("dial improve: {s}");
     match cmd {
         Cmd::Background { .. } => unreachable!(),
@@ -64,7 +96,7 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
             "active":store.active()?, "automatic":auto::enabled(&config, &store)?, "due":auto::due(&config, &store)?,
             "task_profiles":meta_json(&store,&format!("task_profiles:{}",store.active()?.id))?,
             "jobs":auto::jobs(layout)?,"progress":meta_json(&store,"cycle_progress")?,
-            "scheduler":meta_json(&store,"auto_status")?,"last_cycle":meta_json(&store,"last_cycle_report")?,
+            "scheduler":meta_json(&store,"auto_status")?,"last_cycle_seconds_by_phase":meta_json(&store,"last_cycle_timing")?,"waiting_for":dial::learn::resources::describe(&config.improve,&config.user_dir),"compute_used_today_secs":dial::learn::resources::used_today(&config.user_dir),"last_cycle":meta_json(&store,"last_cycle_report")?,
             "metrics":store.metrics()?,"capabilities":meta_json(&store,"serving_capabilities")?,
             "layer_sensitivity":meta_json(&store,"layer_sensitivity")?,
             "step_probe":probe::load(&store)?.map(|p|json!({"kind":"event-feature logistic regression","auc":p.auc,"trained_on":p.trained_on})),
@@ -106,7 +138,7 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
                 if auto::due(&config, &store)? {
                     let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
                     if control.try_lock_exclusive().is_ok() {
-                        let _compute = if config.uses_local_compute() { Some(auto::compute_lock(layout)?) } else { None };
+                        let _compute = if config.uses_local_compute() { Some(dial::learn::compute::Background::acquire(&config)?) } else { None };
                         match auto::execute(&mut config.clone(), &store, false, &mut progress) {
                             Ok(report) => print_json(&report)?,
                             Err(error) => print_json(&json!({"cycle_error":format!("{error:#}")}))?,
@@ -119,7 +151,7 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
         command => {
             let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
             control.lock_exclusive()?;
-            let _compute = if config.uses_local_compute() { Some(auto::compute_lock(layout)?) } else { None };
+            let _compute = if config.uses_local_compute() { Some(dial::learn::compute::Background::acquire(&config)?) } else { None };
             if matches!(command, Cmd::Cycle) {
                 return print_json(&auto::execute(&mut config, &store, true, &mut progress)?);
             }
@@ -150,7 +182,10 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
 }
 
 fn meta_json(store: &Store, key: &str) -> Result<Option<Value>> {
-    store.get_meta(key)?.map(|s| serde_json::from_str(&s).context("invalid stored report")).transpose()
+    store
+        .get_meta(key)?
+        .map(|s| serde_json::from_str(&s).context("invalid stored report"))
+        .transpose()
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {

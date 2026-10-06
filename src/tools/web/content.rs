@@ -15,11 +15,23 @@ pub enum Kind {
 pub fn classify(media_type: Option<&str>, body: &[u8]) -> Result<Kind, String> {
     match media_type {
         Some("text/html" | "application/xhtml+xml") => Ok(Kind::Html),
-        Some(media) if media == "application/json" || media == "text/json" || media.ends_with("+json") => Ok(Kind::Json),
+        Some(media)
+            if media == "application/json" || media == "text/json" || media.ends_with("+json") =>
+        {
+            Ok(Kind::Json)
+        }
         Some(media) if is_text_media(media) => Ok(Kind::Text),
         None | Some("application/octet-stream") if looks_like_text(body) => {
-            let head = String::from_utf8_lossy(&body[..body.len().min(512)]).trim_start().to_ascii_lowercase();
-            Ok(if head.starts_with("<!doctype html") || head.starts_with("<html") { Kind::Html } else { Kind::Text })
+            let head = String::from_utf8_lossy(&body[..body.len().min(512)])
+                .trim_start()
+                .to_ascii_lowercase();
+            Ok(
+                if head.starts_with("<!doctype html") || head.starts_with("<html") {
+                    Kind::Html
+                } else {
+                    Kind::Text
+                },
+            )
         }
         other => Err(format!(
             "binary content ({}, {} bytes) is not shown; fetch a text representation instead",
@@ -34,8 +46,14 @@ fn is_text_media(media: &str) -> bool {
         || media.ends_with("+xml")
         || matches!(
             media,
-            "application/xml" | "application/javascript" | "application/x-javascript" | "application/yaml"
-                | "application/x-yaml" | "application/toml" | "application/x-sh" | "application/sql"
+            "application/xml"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/yaml"
+                | "application/x-yaml"
+                | "application/toml"
+                | "application/x-sh"
+                | "application/sql"
         )
 }
 
@@ -56,7 +74,9 @@ pub fn decode(body: &[u8], charset: Option<&str>, kind: Kind) -> String {
         None => None,
     };
     match charset {
-        Some("iso-8859-1" | "latin1" | "windows-1252" | "us-ascii") => body.iter().map(|&b| b as char).collect(),
+        Some("iso-8859-1" | "latin1" | "windows-1252" | "us-ascii") => {
+            body.iter().map(|&b| b as char).collect()
+        }
         _ => String::from_utf8_lossy(body).into_owned(),
     }
 }
@@ -64,7 +84,11 @@ pub fn decode(body: &[u8], charset: Option<&str>, kind: Kind) -> String {
 fn meta_charset(head: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(head).to_ascii_lowercase();
     let after = &text[text.find("charset=")? + "charset=".len()..];
-    let name: String = after.trim_start_matches(['"', '\'']).chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+    let name: String = after
+        .trim_start_matches(['"', '\''])
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
     (!name.is_empty()).then_some(name)
 }
 
@@ -107,19 +131,34 @@ mod tests {
     #[test]
     fn classifies_by_media_type_then_by_content() {
         assert_eq!(classify(Some("text/html"), b""), Ok(Kind::Html));
-        assert_eq!(classify(Some("application/vnd.api+json"), b""), Ok(Kind::Json));
+        assert_eq!(
+            classify(Some("application/vnd.api+json"), b""),
+            Ok(Kind::Json)
+        );
         assert_eq!(classify(Some("text/csv"), b""), Ok(Kind::Text));
         assert_eq!(classify(None, b"  <!DOCTYPE html><p>x"), Ok(Kind::Html));
-        assert_eq!(classify(Some("application/octet-stream"), b"plain"), Ok(Kind::Text));
+        assert_eq!(
+            classify(Some("application/octet-stream"), b"plain"),
+            Ok(Kind::Text)
+        );
         let image = classify(Some("image/png"), &[0x89, b'P', b'N', b'G']).unwrap_err();
-        assert!(image.contains("image/png") && image.contains("4 bytes"), "{image}");
+        assert!(
+            image.contains("image/png") && image.contains("4 bytes"),
+            "{image}"
+        );
         assert!(classify(None, &[1, 0, 2, 0]).is_err());
     }
 
     #[test]
     fn decodes_declared_charsets() {
-        assert_eq!(decode(&[b'c', b'a', b'f', 0xE9], Some("iso-8859-1"), Kind::Text), "café");
-        assert_eq!(decode(b"<meta charset=\"ISO-8859-1\"><p>\xE9", None, Kind::Html), "<meta charset=\"ISO-8859-1\"><p>é");
+        assert_eq!(
+            decode(&[b'c', b'a', b'f', 0xE9], Some("iso-8859-1"), Kind::Text),
+            "café"
+        );
+        assert_eq!(
+            decode(b"<meta charset=\"ISO-8859-1\"><p>\xE9", None, Kind::Html),
+            "<meta charset=\"ISO-8859-1\"><p>é"
+        );
         assert_eq!(decode("café".as_bytes(), None, Kind::Text), "café");
     }
 
@@ -127,6 +166,9 @@ mod tests {
     fn truncation_marks_what_was_dropped() {
         assert_eq!(truncate_chars("héllo".into(), 5), "héllo");
         let cut = truncate_chars("héllo wörld".into(), 5);
-        assert!(cut.starts_with("héllo\n[truncated: showing 5 of 11 characters"), "{cut}");
+        assert!(
+            cut.starts_with("héllo\n[truncated: showing 5 of 11 characters"),
+            "{cut}"
+        );
     }
 }

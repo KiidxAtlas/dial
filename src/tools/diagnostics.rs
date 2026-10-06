@@ -8,17 +8,18 @@ const MAX_LINE_CHARS: usize = 300;
 
 static DIAGNOSTIC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
-        r"^\s*(fatal error|error|fatal)(\[[A-Z]*\d+\])?:",      // rustc, gcc/clang, tsc summary
-        r"|:\d+(:\d+)?:\s*(fatal )?error\b",                       // file:line[:col]: error (C, mypy, eslint)
-        r"|^\s*-->\s+\S+:\d+",                                     // rustc location under an error
-        r"|panicked at\b",                                         // Rust panics
-        r"|^Traceback \(most recent call last\)",                  // Python
-        r"|^\s*[A-Za-z_][\w.]*(Error|Exception)(:|$)",             // Python/JS/Java exception lines
-        r"|^E {3}",                                                // pytest assertion detail
-        r"|^(FAIL|FAILED|ERROR)\b|^--- FAIL",                      // pytest, go test
-        r"|\.\.\. FAILED$",                                        // cargo test
-        r"|^\s*● ",                                                // jest failing test header
-    )).expect("diagnostic pattern is valid")
+        r"^\s*(fatal error|error|fatal)(\[[A-Z]*\d+\])?:", // rustc, gcc/clang, tsc summary
+        r"|:\d+(:\d+)?:\s*(fatal )?error\b", // file:line[:col]: error (C, mypy, eslint)
+        r"|^\s*-->\s+\S+:\d+",               // rustc location under an error
+        r"|panicked at\b",                   // Rust panics
+        r"|^Traceback \(most recent call last\)", // Python
+        r"|^\s*[A-Za-z_][\w.]*(Error|Exception)(:|$)", // Python/JS/Java exception lines
+        r"|^E {3}",                          // pytest assertion detail
+        r"|^(FAIL|FAILED|ERROR)\b|^--- FAIL", // pytest, go test
+        r"|\.\.\. FAILED$",                  // cargo test
+        r"|^\s*● ",                          // jest failing test header
+    ))
+    .expect("diagnostic pattern is valid")
 });
 
 /// Whether one output line reports a failure worth keeping when its surroundings are clipped.
@@ -47,7 +48,13 @@ pub struct Collector {
 
 impl Collector {
     pub fn new(budget: usize) -> Self {
-        Collector { pending: Vec::new(), kept: String::new(), budget, lines: 0, overflow: 0 }
+        Collector {
+            pending: Vec::new(),
+            kept: String::new(),
+            budget,
+            lines: 0,
+            overflow: 0,
+        }
     }
 
     pub fn feed(&mut self, mut bytes: &[u8]) {
@@ -76,12 +83,15 @@ impl Collector {
     fn extend_pending(&mut self, bytes: &[u8]) {
         // Enough of an over-long line to recognize it; the rest is never kept anyway.
         let room = (MAX_LINE_CHARS * 4).saturating_sub(self.pending.len());
-        self.pending.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        self.pending
+            .extend_from_slice(&bytes[..bytes.len().min(room)]);
     }
 
     fn line(&mut self, raw: &[u8]) {
         let text = String::from_utf8_lossy(raw);
-        if !is_diagnostic(&text) { return; }
+        if !is_diagnostic(&text) {
+            return;
+        }
         let line = shorten(&text);
         if self.kept.len() + line.len() + 1 > self.budget {
             self.overflow += 1;
@@ -116,7 +126,13 @@ mod tests {
         ] {
             assert!(is_diagnostic(line), "{line}");
         }
-        for line in ["test result: ok. 12 passed; 0 failed", "   Compiling dial v0.1.0", "warning: unused variable: `x`", "test a ... ok", "no errors found"] {
+        for line in [
+            "test result: ok. 12 passed; 0 failed",
+            "   Compiling dial v0.1.0",
+            "warning: unused variable: `x`",
+            "test a ... ok",
+            "no errors found",
+        ] {
             assert!(!is_diagnostic(line), "{line}");
         }
     }

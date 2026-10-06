@@ -42,11 +42,16 @@ pub(super) struct Rewritten {
 }
 
 pub(super) fn parse_lang(name: &str) -> Result<SupportLang, String> {
-    name.trim().parse().map_err(|_| format!("unsupported language {name:?}; supported: {}", lang_names()))
+    name.trim()
+        .parse()
+        .map_err(|_| format!("unsupported language {name:?}; supported: {}", lang_names()))
 }
 
 pub(super) fn lang_names() -> String {
-    let names: Vec<String> = SupportLang::all_langs().iter().map(|l| l.to_string().to_lowercase()).collect();
+    let names: Vec<String> = SupportLang::all_langs()
+        .iter()
+        .map(|l| l.to_string().to_lowercase())
+        .collect();
     names.join(", ")
 }
 
@@ -69,7 +74,10 @@ fn squash(text: &str, limit: usize) -> String {
 }
 
 fn error_count(root: &AstGrep<Doc>) -> usize {
-    root.root().dfs().filter(|n| n.is_error() || n.is_missing()).count()
+    root.root()
+        .dfs()
+        .filter(|n| n.is_error() || n.is_missing())
+        .count()
 }
 
 /// 1-based `line:column` of the first syntax error, for refusal messages.
@@ -85,7 +93,11 @@ fn first_error(root: &AstGrep<Doc>) -> String {
 
 impl Query {
     /// Compile `pattern` (and `rewrite`) for `lang`. A rewrite may only use variables the pattern defines.
-    pub fn compile(lang: SupportLang, pattern: &str, rewrite: Option<&str>) -> Result<Query, String> {
+    pub fn compile(
+        lang: SupportLang,
+        pattern: &str,
+        rewrite: Option<&str>,
+    ) -> Result<Query, String> {
         let compiled = Pattern::try_new(pattern, lang).map_err(|e| e.to_string())?;
         if compiled.has_error() {
             return Err(format!("pattern is not valid {lang} syntax"));
@@ -94,16 +106,27 @@ impl Query {
             Some(text) => {
                 let Ok(template) = TemplateFix::try_new(text, &lang);
                 let defined = compiled.defined_vars();
-                let mut unknown: Vec<&str> = template.used_vars().into_iter().filter(|v| !defined.contains(v)).collect();
+                let mut unknown: Vec<&str> = template
+                    .used_vars()
+                    .into_iter()
+                    .filter(|v| !defined.contains(v))
+                    .collect();
                 unknown.sort_unstable();
                 if !unknown.is_empty() {
-                    return Err(format!("rewrite uses variables the pattern does not capture: ${}", unknown.join(", $")));
+                    return Err(format!(
+                        "rewrite uses variables the pattern does not capture: ${}",
+                        unknown.join(", $")
+                    ));
                 }
                 Some(template)
             }
             None => None,
         };
-        Ok(Query { lang, pattern: compiled, template })
+        Ok(Query {
+            lang,
+            pattern: compiled,
+            template,
+        })
     }
 
     /// Up to `limit` matches in source order.
@@ -128,7 +151,10 @@ impl Query {
     /// Rewrite every match. `Ok(None)` when nothing matches. Refuses a result that has
     /// more syntax errors than the input, so a bad template never produces broken code.
     pub fn rewrite(&self, src: &str) -> Result<Option<Rewritten>, String> {
-        let template = self.template.as_ref().ok_or("internal error: query has no rewrite")?;
+        let template = self
+            .template
+            .as_ref()
+            .ok_or("internal error: query has no rewrite")?;
         let root = parse(src, self.lang)?;
         let edits = root.root().replace_all(&self.pattern, template);
         if edits.is_empty() {
@@ -142,12 +168,17 @@ impl Query {
             if edit.position < cursor || end > src.len() {
                 return Err("internal error: overlapping rewrite ranges".to_owned());
             }
-            let mut text = String::from_utf8(edit.inserted_text).map_err(|_| "rewrite produced invalid UTF-8".to_owned())?;
+            let mut text = String::from_utf8(edit.inserted_text)
+                .map_err(|_| "rewrite produced invalid UTF-8".to_owned())?;
             if crlf {
                 text = text.replace("\r\n", "\n").replace('\n', "\r\n");
             }
             cursor = end;
-            splices.push(Splice { start: edit.position, end, text });
+            splices.push(Splice {
+                start: edit.position,
+                end,
+                text,
+            });
         }
         let text = apply(src, &splices);
         let before = error_count(&root);
@@ -189,8 +220,15 @@ fn captures(found: &NodeMatch<'_, Doc>) -> Vec<(String, String)> {
             }
             MetaVariable::MultiCapture(name) => {
                 let nodes = env.get_multiple_matches(&name);
-                let texts: Vec<String> = nodes.iter().filter(|n| n.is_named()).map(|n| n.text().into_owned()).collect();
-                Some((format!("$$${name}"), squash(&texts.join(", "), MAX_CAPTURE_CHARS)))
+                let texts: Vec<String> = nodes
+                    .iter()
+                    .filter(|n| n.is_named())
+                    .map(|n| n.text().into_owned())
+                    .collect();
+                Some((
+                    format!("$$${name}"),
+                    squash(&texts.join(", "), MAX_CAPTURE_CHARS),
+                ))
             }
             _ => None,
         })

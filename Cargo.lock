@@ -498,6 +498,7 @@ dependencies = [
  "crossterm",
  "flate2",
  "fs2",
+ "globset",
  "httpdate",
  "ignore",
  "libc",

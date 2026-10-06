@@ -39,8 +39,17 @@ pub fn migrate_memory_tools(harness: &mut Harness) -> bool {
 }
 
 pub(crate) fn migrate_memory_tool_names(tools: &mut Vec<String>) -> bool {
-    const REPLACEMENTS: [&str; 6] = ["recall", "retain", "memory_update", "forget", "memory_history", "memory_import"];
-    if !tools.iter().any(|tool| tool == "memory") { return false; }
+    const REPLACEMENTS: [&str; 6] = [
+        "recall",
+        "retain",
+        "memory_update",
+        "forget",
+        "memory_history",
+        "memory_import",
+    ];
+    if !tools.iter().any(|tool| tool == "memory") {
+        return false;
+    }
     let present = REPLACEMENTS.map(|replacement| tools.iter().any(|tool| tool == replacement));
     let mut added = [false; 6];
     let original = std::mem::take(tools);
@@ -95,8 +104,17 @@ pub struct TrainingConfig {
 
 impl Default for TrainingConfig {
     fn default() -> Self {
-        Self { enabled: true, train_data: PathBuf::new(), valid_data: PathBuf::new(), iters: 32, batch_size: 1,
-            num_layers: 4, rank: 8, max_seq_length: 8192, interval_secs: 6 * 3600 }
+        Self {
+            enabled: true,
+            train_data: PathBuf::new(),
+            valid_data: PathBuf::new(),
+            iters: 32,
+            batch_size: 1,
+            num_layers: 4,
+            rank: 8,
+            max_seq_length: 8192,
+            interval_secs: 6 * 3600,
+        }
     }
 }
 
@@ -155,7 +173,13 @@ pub struct SandboxConfig {
 }
 
 impl Default for SandboxConfig {
-    fn default() -> Self { Self { mode: SandboxMode::Dev, allow_network: true, extra_write: vec![] } }
+    fn default() -> Self {
+        Self {
+            mode: SandboxMode::Dev,
+            allow_network: true,
+            extra_write: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -198,6 +222,10 @@ pub struct Config {
     pub remote_model_idle_timeout_secs: u64,
     pub reasoning_guard: ReasoningGuardConfig,
     pub codebase: CodebaseConfig,
+    pub assistance: AssistanceConfig,
+    pub steering: crate::steering::Config,
+    pub adaptive: crate::adaptive::Config,
+    pub reliability: crate::reliability::Config,
     pub laya: crate::agent::laya::Config,
     pub context_window: u32,
     pub harness: Harness,
@@ -228,13 +256,83 @@ pub struct Config {
     pub browser: crate::tools::browser::BrowserConfig,
     pub kernel: crate::tools::kernel::KernelConfig,
     pub memory: MemoryConfig,
+    /// Operator-owned lifecycle hooks (`[[hooks]]`); see `agent::hooks`.
+    pub hooks: Vec<HookConfig>,
+    pub budget: BudgetConfig,
+    /// Named read-only subagents (`[agents.<name>]`) with their own instructions, tool subset and step budget.
+    pub agents: BTreeMap<String, AgentConfig>,
 }
 
-/// A stdio MCP server. Like `[tools.*]` it is a trusted program: it runs unsandboxed.
+/// A user-defined subagent built on a read-only built-in type. Writers stay built in because
+/// launching one needs approval, and that decision is made without the configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    /// `scout`, `reviewer` or `planner`.
+    #[serde(default = "default_agent_base")]
+    pub base: String,
+    /// One line shown to the model in the `task` description.
+    #[serde(default)]
+    pub description: String,
+    /// Instructions appended to the base agent's prompt.
+    pub prompt: String,
+    /// Restrict the base agent's tools to these (never adds any).
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub max_steps: Option<u32>,
+}
+
+fn default_agent_base() -> String {
+    "scout".into()
+}
+
+/// Spend caps in USD, enforced between model requests. They need catalog pricing for the model and
+/// reported token usage: a model with no known price is never stopped by them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BudgetConfig {
+    /// Stop the turn once the session has cost this much.
+    pub max_session_cost_usd: Option<f64>,
+    /// Stop the turn once it alone has cost this much.
+    pub max_turn_cost_usd: Option<f64>,
+}
+
+/// A program run at a lifecycle event. Trusted and unsandboxed, like MCP servers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HookConfig {
+    /// `user_prompt_submit`, `pre_tool_use`, `post_tool_use` or `stop`.
+    pub event: String,
+    /// Anchored regex on the tool name (tool events only); omitted matches every tool.
+    #[serde(default)]
+    pub matcher: Option<String>,
+    /// Program and arguments; the event payload arrives as JSON on stdin.
+    pub command: Vec<String>,
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_hook_timeout() -> u64 {
+    30
+}
+
+/// An MCP server: a stdio program or a streamable-HTTP endpoint. Like `[tools.*]` it is a trusted program: it runs unsandboxed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
+    /// Stdio server executable. Exactly one of `program` and `url` is set.
+    #[serde(default)]
     pub program: PathBuf,
+    /// Streamable-HTTP endpoint (https, or http on localhost).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Name of an environment variable holding a bearer token for `url` servers.
+    #[serde(default)]
+    pub bearer_env: Option<String>,
+    /// Extra non-secret request headers for `url` servers.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -247,7 +345,9 @@ pub struct McpServerConfig {
     pub lifecycle_hooks: Vec<String>,
 }
 
-fn default_mcp_timeout() -> u64 { 60 }
+fn default_mcp_timeout() -> u64 {
+    60
+}
 
 /// A stdio language server used by the `lsp` tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,7 +381,14 @@ pub struct VerificationConfig {
 }
 
 impl Default for VerificationConfig {
-    fn default() -> Self { Self { enabled: true, repair_attempts: 1, commands: Vec::new(), behavioral_checks: Vec::new() } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            repair_attempts: 1,
+            commands: Vec::new(),
+            behavioral_checks: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,7 +403,9 @@ pub struct VerificationCommand {
     pub timeout_secs: u64,
 }
 
-fn default_verification_timeout() -> u64 { 120 }
+fn default_verification_timeout() -> u64 {
+    120
+}
 
 /// Operator-owned limits; harness improvement cannot increase them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,7 +419,40 @@ pub struct ReasoningGuardConfig {
 
 impl Default for ReasoningGuardConfig {
     fn default() -> Self {
-        Self { enabled: true, max_pre_action_secs: 60, max_reasoning_bytes: 16384 }
+        Self {
+            enabled: true,
+            max_pre_action_secs: 60,
+            max_reasoning_bytes: 16384,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AssistanceConfig {
+    pub enabled: bool,
+    pub syntax_guard: bool,
+    pub selective_verification: bool,
+    pub compact_tools: bool,
+    /// Core and explicitly loaded tools are never hidden by this budget.
+    pub initial_tool_limit: usize,
+    pub context_max_bytes: usize,
+    /// Requires an explicitly assigned experience model role; no implicit downloads or calls.
+    pub teacher_enabled: bool,
+    pub teacher_timeout_secs: u64,
+}
+impl Default for AssistanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            syntax_guard: true,
+            selective_verification: true,
+            compact_tools: true,
+            initial_tool_limit: 16,
+            context_max_bytes: 4096,
+            teacher_enabled: false,
+            teacher_timeout_secs: 10,
+        }
     }
 }
 
@@ -321,11 +463,19 @@ pub struct CodebaseConfig {
     pub context_max_bytes: usize,
     /// Build a bounded architecture synthesis after successful interactive turns.
     pub synthesize_architecture: bool,
+    /// Local MLX model for architecture summaries; blank follows main, explicit roles override.
+    pub architecture_model: String,
 }
 impl Default for CodebaseConfig {
-    fn default() -> Self { Self { enabled: true, context_max_bytes: 8000, synthesize_architecture: true } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            context_max_bytes: 8000,
+            synthesize_architecture: true,
+            architecture_model: "mlx-community/Qwen2.5-3B-Instruct-4bit".into(),
+        }
+    }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -335,29 +485,74 @@ pub struct MemoryConfig {
     pub context_max_bytes: usize,
 }
 impl Default for MemoryConfig {
-    fn default() -> Self { Self { enabled: true, context_limit: 8, context_max_bytes: 6000 } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            context_limit: 8,
+            context_max_bytes: 6000,
+        }
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            state_dir: PathBuf::new(), project_root: PathBuf::new(), user_dir: PathBuf::new(), python: PathBuf::new(), worker: PathBuf::new(),
-            model: String::new(), provider: None, endpoint: None, use_case: String::new(),
-            providers: BTreeMap::new(), model_roles: BTreeMap::new(), ui: crate::llm::model_config::UiConfig::default(),
-            model_profiles: BTreeMap::new(), model_profile: None,
-            worker_timeout_secs: 3600, context_window: 32768,
+            state_dir: PathBuf::new(),
+            project_root: PathBuf::new(),
+            user_dir: PathBuf::new(),
+            python: PathBuf::new(),
+            worker: PathBuf::new(),
+            model: String::new(),
+            provider: None,
+            endpoint: None,
+            use_case: String::new(),
+            providers: BTreeMap::new(),
+            model_roles: BTreeMap::new(),
+            ui: crate::llm::model_config::UiConfig::default(),
+            model_profiles: BTreeMap::new(),
+            model_profile: None,
+            worker_timeout_secs: 3600,
+            context_window: 32768,
             remote_model_idle_timeout_secs: 180,
             reasoning_guard: ReasoningGuardConfig::default(),
             codebase: CodebaseConfig::default(),
+            assistance: AssistanceConfig::default(),
+            steering: crate::steering::Config::default(),
+            adaptive: crate::adaptive::Config::default(),
+            reliability: crate::reliability::Config::default(),
             laya: Default::default(),
-            harness: Harness::default(), gate: None, training: TrainingConfig::default(), improve: ImproveConfig::default(),
-            approval: Approval::default(), sandbox: SandboxConfig::default(), edit_mode: EditModeConfig::default(),
-            tools: BTreeMap::new(), subagents: BTreeMap::new(),
-            integrations: vec!["bg".into(), "web_fetch".into(), "web_search".into(), "lsp".into(), "ast_search".into(), "ast_edit".into(), "dap".into()],
-            mcp: BTreeMap::new(), lsp: BTreeMap::new(), dap: BTreeMap::new(), web: WebConfig::default(),
+            harness: Harness::default(),
+            gate: None,
+            training: TrainingConfig::default(),
+            improve: ImproveConfig::default(),
+            approval: Approval::default(),
+            sandbox: SandboxConfig::default(),
+            edit_mode: EditModeConfig::default(),
+            tools: BTreeMap::new(),
+            subagents: BTreeMap::new(),
+            integrations: vec![
+                "bg".into(),
+                "web_fetch".into(),
+                "web_search".into(),
+                "lsp".into(),
+                "ast_search".into(),
+                "ast_edit".into(),
+                "dap".into(),
+                "git".into(),
+            ],
+            mcp: BTreeMap::new(),
+            lsp: BTreeMap::new(),
+            dap: BTreeMap::new(),
+            web: WebConfig::default(),
             verification: VerificationConfig::default(),
-            solve: Default::default(), escalation: Default::default(),
-            browser: Default::default(), kernel: Default::default(), memory: Default::default(),
+            solve: Default::default(),
+            escalation: Default::default(),
+            browser: Default::default(),
+            kernel: Default::default(),
+            memory: Default::default(),
+            hooks: Vec::new(),
+            budget: BudgetConfig::default(),
+            agents: BTreeMap::new(),
         }
     }
 }
@@ -392,16 +587,38 @@ pub struct ImproveConfig {
     pub monitor_min_turns: u32,
     /// Run the background cycle at session start/exit. When false, only `dial improve cycle` runs it.
     pub background: bool,
+    /// Start a background cycle only after this many minutes without a coding turn (0 = any time).
+    pub idle_minutes: u32,
+    /// Do not start background cycles on battery power.
+    pub require_ac_power: bool,
+    /// Background compute allowed per day, in minutes, enforced during a cycle too (0 = unlimited).
+    pub daily_compute_minutes: u32,
 }
 
 impl Default for ImproveConfig {
     fn default() -> Self {
-        Self { enabled: true, interval_secs: 6 * 3600, min_new_turns: 5, selfplay_tasks: 24, gate_primary_cases: 30,
-            gate_guard_cases: 20, alpha: 0.1, min_net_wins: 2, max_candidates: 3, drift_tolerance: 3.0,
-            learn_from_sessions: true, lora_min_examples: 24, monitor_drop: 15.0, monitor_min_turns: 8, background: true }
+        Self {
+            enabled: true,
+            interval_secs: 6 * 3600,
+            min_new_turns: 5,
+            selfplay_tasks: 24,
+            gate_primary_cases: 30,
+            gate_guard_cases: 20,
+            alpha: 0.1,
+            min_net_wins: 2,
+            max_candidates: 3,
+            drift_tolerance: 3.0,
+            learn_from_sessions: true,
+            lora_min_examples: 24,
+            monitor_drop: 15.0,
+            monitor_min_turns: 8,
+            background: true,
+            idle_minutes: 10,
+            require_ac_power: true,
+            daily_compute_minutes: 120,
+        }
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Version {

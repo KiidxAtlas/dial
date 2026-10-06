@@ -17,9 +17,9 @@ mod client;
 mod format;
 mod framing;
 mod servers;
-mod text;
 #[cfg(test)]
 mod tests;
+mod text;
 
 use super::ext::{Tool, ToolContext};
 use super::{ToolOutput, Workspace, io_message, opt_str, opt_u64, req_str, tool_schema};
@@ -74,16 +74,25 @@ const ACTIONS: [(&str, Action); 9] = [
 
 impl Action {
     fn parse(name: &str) -> Result<Self, String> {
-        ACTIONS.iter().find(|(n, _)| *n == name).map(|(_, action)| *action).ok_or_else(|| {
-            let names: Vec<&str> = ACTIONS.iter().map(|(n, _)| *n).collect();
-            format!("unknown action {name:?}; use one of: {}", names.join(", "))
-        })
+        ACTIONS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, action)| *action)
+            .ok_or_else(|| {
+                let names: Vec<&str> = ACTIONS.iter().map(|(n, _)| *n).collect();
+                format!("unknown action {name:?}; use one of: {}", names.join(", "))
+            })
     }
 
     fn needs_position(self) -> bool {
         matches!(
             self,
-            Self::Definition | Self::References | Self::Hover | Self::Implementation | Self::TypeDefinition | Self::RenamePreview
+            Self::Definition
+                | Self::References
+                | Self::Hover
+                | Self::Implementation
+                | Self::TypeDefinition
+                | Self::RenamePreview
         )
     }
 }
@@ -99,7 +108,9 @@ pub struct LspTool {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl LspTool {
@@ -107,17 +118,29 @@ impl LspTool {
         Self::with_launcher(
             config,
             Box::new(|server, root| {
-                Client::spawn(&server.language, &server.program, &server.args, root, Timeouts::default())
+                Client::spawn(
+                    &server.language,
+                    &server.program,
+                    &server.args,
+                    root,
+                    Timeouts::default(),
+                )
             }),
         )
     }
 
     fn with_launcher(config: &BTreeMap<String, LspServerConfig>, launch: Launcher) -> Self {
-        Self { servers: Servers::new(config), launch, running: Mutex::new(HashMap::new()) }
+        Self {
+            servers: Servers::new(config),
+            launch,
+            running: Mutex::new(HashMap::new()),
+        }
     }
 
     fn is_running(&self, language: &str) -> bool {
-        lock(&self.running).get(language).is_some_and(|client| client.is_alive())
+        lock(&self.running)
+            .get(language)
+            .is_some_and(|client| client.is_alive())
     }
 
     /// The live client for `server`'s language, starting (or restarting a dead) one if needed.
@@ -129,8 +152,13 @@ impl LspTool {
             }
             running.remove(&server.language);
         }
-        let client = (self.launch)(server, ws.root())
-            .map_err(|e| format!("could not start the {} language server ({}): {e:#}", server.language, server.program.display()))?;
+        let client = (self.launch)(server, ws.root()).map_err(|e| {
+            format!(
+                "could not start the {} language server ({}): {e:#}",
+                server.language,
+                server.program.display()
+            )
+        })?;
         let client = Arc::new(client);
         running.insert(server.language.clone(), Arc::clone(&client));
         Ok(client)
@@ -145,13 +173,25 @@ impl LspTool {
         }
         let source = read_source(&abs).map_err(|e| io_message("read", file, &e))?;
         // Resolve the position first so a bad request never starts a server.
-        let cursor = if action.needs_position() { Some(cursor(args, &source)?) } else { None };
+        let cursor = if action.needs_position() {
+            Some(cursor(args, &source)?)
+        } else {
+            None
+        };
         let query = match action {
-            Action::WorkspaceSymbols => Some(opt_str(args, "query")?.filter(|q| !q.is_empty()).ok_or("workspace_symbols needs a non-empty `query`")?),
+            Action::WorkspaceSymbols => Some(
+                opt_str(args, "query")?
+                    .filter(|q| !q.is_empty())
+                    .ok_or("workspace_symbols needs a non-empty `query`")?,
+            ),
             _ => None,
         };
         let new_name = match action {
-            Action::RenamePreview => Some(opt_str(args, "new_name")?.filter(|n| !n.is_empty()).ok_or("rename_preview needs `new_name`")?),
+            Action::RenamePreview => Some(
+                opt_str(args, "new_name")?
+                    .filter(|n| !n.is_empty())
+                    .ok_or("rename_preview needs `new_name`")?,
+            ),
             _ => None,
         };
 
@@ -162,7 +202,11 @@ impl LspTool {
         let mark = client.diagnostics_mark(&abs);
         client.refresh_open_documents(&abs);
         let fresh = client
-            .sync_document(&abs, servers::language_id(&extension, &server.language), &source)
+            .sync_document(
+                &abs,
+                servers::language_id(&extension, &server.language),
+                &source,
+            )
             .map_err(io)?;
 
         let document = json!({"uri": uri_from_path(&abs)});
@@ -181,16 +225,29 @@ impl LspTool {
             Action::References => {
                 let mut params = at.unwrap_or_default();
                 params["context"] = json!({"includeDeclaration": true});
-                let result = client.request("textDocument/references", params).map_err(io)?;
+                let result = client
+                    .request("textDocument/references", params)
+                    .map_err(io)?;
                 format::locations(&mut lines, &result, "reference")
             }
-            Action::Hover => format::hover(&client.request("textDocument/hover", at.unwrap_or_default()).map_err(io)?),
+            Action::Hover => format::hover(
+                &client
+                    .request("textDocument/hover", at.unwrap_or_default())
+                    .map_err(io)?,
+            ),
             Action::DocumentSymbols => {
-                let result = client.request("textDocument/documentSymbol", json!({"textDocument": document})).map_err(io)?;
+                let result = client
+                    .request(
+                        "textDocument/documentSymbol",
+                        json!({"textDocument": document}),
+                    )
+                    .map_err(io)?;
                 format::document_symbols(&mut lines, &abs, &result)
             }
             Action::WorkspaceSymbols => {
-                let result = client.request("workspace/symbol", json!({"query": query})).map_err(io)?;
+                let result = client
+                    .request("workspace/symbol", json!({"query": query}))
+                    .map_err(io)?;
                 format::workspace_symbols(&mut lines, &result)
             }
             Action::Diagnostics => match client.diagnostics(&abs, mark, fresh) {
@@ -214,7 +271,12 @@ impl LspTool {
 /// The cursor the model asked for: `line` plus `column` and/or `symbol`.
 fn cursor(args: &Value, source: &str) -> Result<text::Located, String> {
     let line = opt_u64(args, "line")?.ok_or("this action needs `line` (1-based)")?;
-    locate(source, line, opt_u64(args, "column")?, opt_str(args, "symbol")?)
+    locate(
+        source,
+        line,
+        opt_u64(args, "column")?,
+        opt_str(args, "symbol")?,
+    )
 }
 
 impl Tool for LspTool {
@@ -242,7 +304,9 @@ impl Tool for LspTool {
 
     /// True exactly when the call would start a language server that is not running yet.
     fn needs_approval(&self, args: &Value) -> bool {
-        let Some(file) = args.get("path").and_then(Value::as_str) else { return false };
+        let Some(file) = args.get("path").and_then(Value::as_str) else {
+            return false;
+        };
         match self.servers.select(file, &servers::path_dirs()) {
             Ok(server) => !self.is_running(&server.language),
             Err(_) => false,

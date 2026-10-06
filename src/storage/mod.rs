@@ -3,6 +3,7 @@
 
 pub mod checkpoint;
 pub mod codebase;
+pub mod experience;
 pub mod memory;
 pub mod paths;
 pub mod provenance;

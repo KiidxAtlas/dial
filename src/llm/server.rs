@@ -18,6 +18,7 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,8 +37,15 @@ const PROMPT_CACHE_MEMORY_DIVISOR: u64 = 4;
 /// The `--prompt-cache-bytes` budget, or `None` when physical memory cannot be read.
 fn prompt_cache_bytes() -> Option<u64> {
     // SAFETY: sysconf only reads static system configuration.
-    let (pages, page_size) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
-    let total = u64::try_from(pages).ok()?.checked_mul(u64::try_from(page_size).ok()?)?;
+    let (pages, page_size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let total = u64::try_from(pages)
+        .ok()?
+        .checked_mul(u64::try_from(page_size).ok()?)?;
     (total > 0).then(|| total / PROMPT_CACHE_MEMORY_DIVISOR)
 }
 
@@ -63,14 +71,19 @@ fn collect_stderr(mut stderr: impl Read + Send + 'static) -> Arc<Mutex<Tail>> {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             };
-            let mut tail = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut tail = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             tail.bytes.extend_from_slice(&buffer[..count]);
             if tail.bytes.len() > STDERR_KEEP_BYTES {
                 let excess = tail.bytes.len() - STDERR_KEEP_BYTES;
                 tail.bytes.drain(..excess);
             }
         }
-        shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).eof = true;
+        shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .eof = true;
     });
     tail
 }
@@ -78,14 +91,20 @@ fn collect_stderr(mut stderr: impl Read + Send + 'static) -> Arc<Mutex<Tail>> {
 fn tail_text(tail: &Mutex<Tail>, max_bytes: usize) -> String {
     let tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let start = tail.bytes.len().saturating_sub(max_bytes);
-    String::from_utf8_lossy(&tail.bytes[start..]).trim().to_string()
+    String::from_utf8_lossy(&tail.bytes[start..])
+        .trim()
+        .to_string()
 }
 
 /// Wait briefly for the reader thread to see EOF so a dead child's final
 /// words are included in the error.
 fn settle_stderr(tail: &Mutex<Tail>) {
     for _ in 0..50 {
-        if tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).eof {
+        if tail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .eof
+        {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -141,6 +160,7 @@ pub struct ModelServer {
     base_url: String,
     model: String,
     adapter: Option<PathBuf>,
+    steering: Option<crate::steering::Specification>,
 }
 
 enum Failure {
@@ -158,21 +178,61 @@ impl ModelServer {
         adapter: Option<&Path>,
         startup_timeout_secs: u64,
     ) -> Result<ModelServer> {
+        Self::start_controlled(python, model, adapter, startup_timeout_secs, None)
+    }
+
+    fn start_controlled(
+        python: &Path,
+        model: &str,
+        adapter: Option<&Path>,
+        startup_timeout_secs: u64,
+        interrupt: Option<Arc<AtomicBool>>,
+    ) -> Result<ModelServer> {
+        Self::start_profile(
+            python,
+            model,
+            adapter,
+            startup_timeout_secs,
+            interrupt,
+            None,
+        )
+    }
+
+    fn start_profile(
+        python: &Path,
+        model: &str,
+        adapter: Option<&Path>,
+        startup_timeout_secs: u64,
+        interrupt: Option<Arc<AtomicBool>>,
+        steering: Option<&crate::steering::Specification>,
+    ) -> Result<ModelServer> {
         ensure!(python.is_absolute(), "python path must be absolute");
         ensure!(!model.is_empty(), "model must not be empty");
-        ensure!(startup_timeout_secs > 0, "server startup timeout must be positive");
+        ensure!(
+            startup_timeout_secs > 0,
+            "server startup timeout must be positive"
+        );
         let deadline = Instant::now() + Duration::from_secs(startup_timeout_secs);
         let mut last_race = None;
         for _ in 0..PORT_ATTEMPTS {
             let port = free_port()?;
-            match launch(python, model, adapter, port, deadline) {
+            match launch(
+                python,
+                model,
+                adapter,
+                port,
+                deadline,
+                interrupt.clone(),
+                steering,
+            ) {
                 Ok(server) => return Ok(server),
                 Err(Failure::PortTaken(error)) => last_race = Some(error),
                 Err(Failure::Fatal(error)) => return Err(error),
             }
         }
-        Err(last_race.unwrap_or_else(|| anyhow!("no server start attempt was made")))
-            .context(format!("model server could not claim a port after {PORT_ATTEMPTS} attempts"))
+        Err(last_race.unwrap_or_else(|| anyhow!("no server start attempt was made"))).context(
+            format!("model server could not claim a port after {PORT_ATTEMPTS} attempts"),
+        )
     }
 
     pub fn base_url(&self) -> &str {
@@ -206,12 +266,52 @@ pub fn ensure<'a>(
     adapter: Option<&Path>,
     startup_timeout_secs: u64,
 ) -> Result<&'a ModelServer> {
-    let reusable = slot
-        .as_ref()
-        .is_some_and(|server| server.matches(model, adapter) && server.is_running());
+    ensure_controlled(slot, python, model, adapter, startup_timeout_secs, None)
+}
+
+pub fn ensure_controlled<'a>(
+    slot: &'a mut Option<ModelServer>,
+    python: &Path,
+    model: &str,
+    adapter: Option<&Path>,
+    startup_timeout_secs: u64,
+    interrupt: Option<Arc<AtomicBool>>,
+) -> Result<&'a ModelServer> {
+    ensure_profile_controlled(
+        slot,
+        python,
+        model,
+        adapter,
+        startup_timeout_secs,
+        interrupt,
+        None,
+    )
+}
+
+pub fn ensure_profile_controlled<'a>(
+    slot: &'a mut Option<ModelServer>,
+    python: &Path,
+    model: &str,
+    adapter: Option<&Path>,
+    startup_timeout_secs: u64,
+    interrupt: Option<Arc<AtomicBool>>,
+    steering: Option<&crate::steering::Specification>,
+) -> Result<&'a ModelServer> {
+    let reusable = slot.as_ref().is_some_and(|server| {
+        server.matches(model, adapter)
+            && server.steering.as_ref() == steering
+            && server.is_running()
+    });
     if !reusable {
         drop(slot.take());
-        *slot = Some(ModelServer::start(python, model, adapter, startup_timeout_secs)?);
+        *slot = Some(ModelServer::start_profile(
+            python,
+            model,
+            adapter,
+            startup_timeout_secs,
+            interrupt,
+            steering,
+        )?);
     }
     slot.as_ref().context("model server slot is empty")
 }
@@ -219,8 +319,12 @@ pub fn ensure<'a>(
 /// Ask the OS for a free loopback port. The listener is dropped before the
 /// server binds, so a race is possible; `launch` reports it as `PortTaken`.
 fn free_port() -> Result<u16> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("finding a free loopback port")?;
-    Ok(listener.local_addr().context("reading the chosen port")?.port())
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("finding a free loopback port")?;
+    Ok(listener
+        .local_addr()
+        .context("reading the chosen port")?
+        .port())
 }
 
 fn launch(
@@ -229,12 +333,14 @@ fn launch(
     adapter: Option<&Path>,
     port: u16,
     deadline: Instant,
+    interrupt: Option<Arc<AtomicBool>>,
+    steering: Option<&crate::steering::Specification>,
 ) -> std::result::Result<ModelServer, Failure> {
     let mut command = Command::new(python);
     // `--opt=value` keeps a value that starts with `-` from being read as a flag.
     command
         .arg("-c")
-        .arg(include_str!("../../python/dial_server.py"))
+        .arg(format!("import sys, types\n_m = types.ModuleType('dial_steering')\nexec({}, _m.__dict__)\nsys.modules['dial_steering'] = _m\n{}", serde_json::to_string(include_str!("../../python/dial_steering.py")).unwrap(), include_str!("../../python/dial_server.py")))
         .arg(format!("--model={model}"))
         .arg("--host=127.0.0.1")
         .arg(format!("--port={port}"))
@@ -248,6 +354,12 @@ fn launch(
         command.arg(flag);
     }
     let mut child = command
+        .env(
+            "DIAL_STEERING_SPEC",
+            steering
+                .map(|s| serde_json::to_string(s).unwrap())
+                .unwrap_or_default(),
+        )
         .env("HF_HUB_OFFLINE", "1")
         .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())
@@ -258,17 +370,22 @@ fn launch(
         .context("starting mlx_lm.server")
         .map_err(Failure::Fatal)?;
     let stderr = child.stderr.take();
-    let mut process = Supervised { child, stopped: false };
-    let tail = collect_stderr(stderr.ok_or_else(|| Failure::Fatal(anyhow!("missing server stderr")))?);
+    let mut process = Supervised {
+        child,
+        stopped: false,
+    };
+    let tail =
+        collect_stderr(stderr.ok_or_else(|| Failure::Fatal(anyhow!("missing server stderr")))?);
     let base_url = format!("http://127.0.0.1:{port}");
 
-    let outcome = wait_ready(&mut process, &base_url, &tail, deadline);
+    let outcome = wait_ready(&mut process, &base_url, &tail, deadline, interrupt);
     match outcome {
         Ok(()) => Ok(ModelServer {
             process,
             base_url,
             model: model.to_string(),
             adapter: adapter.map(Path::to_path_buf),
+            steering: steering.cloned(),
         }),
         Err(error) => {
             process.stop();
@@ -288,15 +405,30 @@ fn launch(
     }
 }
 
-fn wait_ready(process: &mut Supervised, base_url: &str, tail: &Mutex<Tail>, deadline: Instant) -> Result<()> {
+fn wait_ready(
+    process: &mut Supervised,
+    base_url: &str,
+    tail: &Mutex<Tail>,
+    deadline: Instant,
+    interrupt: Option<Arc<AtomicBool>>,
+) -> Result<()> {
     let models_url = format!("{base_url}/v1/models");
     loop {
+        if interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        {
+            return Err(llm::Interrupted.into());
+        }
         ensure!(
             !process.exited().context("observing server exit")?,
             "model server exited during startup"
         );
         let remaining = deadline.saturating_duration_since(Instant::now());
-        ensure!(!remaining.is_zero(), "model server not ready before the startup timeout");
+        ensure!(
+            !remaining.is_zero(),
+            "model server not ready before the startup timeout"
+        );
         let up = llm::agent(2)
             .get(&models_url)
             .call()
@@ -309,7 +441,10 @@ fn wait_ready(process: &mut Supervised, base_url: &str, tail: &Mutex<Tail>, dead
     // The HTTP port opens before the model finishes loading, and a bad
     // model/adapter only fails on first use. One 1-token request blocks until
     // the weights are loaded and proves generation works.
-    let remaining = deadline.saturating_duration_since(Instant::now()).as_secs().max(1);
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .as_secs()
+        .max(1);
     let warmup = Chat {
         messages: vec![json!({"role": "user", "content": "ping"})],
         tools: Vec::new(),
@@ -317,7 +452,22 @@ fn wait_ready(process: &mut Supervised, base_url: &str, tail: &Mutex<Tail>, dead
         max_tokens: 1,
         seed: None,
     };
-    if let Err(error) = llm::chat(base_url, SERVER_MODEL, &warmup, remaining) {
+    if let Err(error) = llm::chat_at_controlled(
+        &llm::completions_url(base_url),
+        None,
+        SERVER_MODEL,
+        &warmup,
+        remaining,
+        interrupt.clone(),
+        None,
+        &mut |_| true,
+    ) {
+        if interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        {
+            return Err(llm::Interrupted.into());
+        }
         // A crash during load surfaces as a dropped connection; prefer saying so.
         for _ in 0..20 {
             if process.exited().unwrap_or(false) {
@@ -404,6 +554,33 @@ server.serve_forever()
     }
 
     #[test]
+    fn steering_profile_change_restarts_server_and_clears_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let python = fake_python(root.path());
+        let marker = root.path().join("info.json");
+        let model = marker.to_str().unwrap();
+        let mut slot = None;
+        let mut spec = crate::steering::Specification {
+            path: root.path().join("vector.json"),
+            id: "a".repeat(64),
+            strength: 0.5,
+            fingerprint: "first".into(),
+        };
+        ensure_profile_controlled(&mut slot, &python, model, None, 30, None, Some(&spec)).unwrap();
+        let first = info(&marker)["pid"].as_i64().unwrap();
+        ensure_profile_controlled(&mut slot, &python, model, None, 30, None, Some(&spec)).unwrap();
+        assert_eq!(first, info(&marker)["pid"].as_i64().unwrap());
+        spec.strength = 1.;
+        ensure_profile_controlled(&mut slot, &python, model, None, 30, None, Some(&spec)).unwrap();
+        let second = info(&marker)["pid"].as_i64().unwrap();
+        assert_ne!(first, second);
+        assert!(wait_dead(first));
+        ensure_profile_controlled(&mut slot, &python, model, None, 30, None, None).unwrap();
+        assert_ne!(second, info(&marker)["pid"].as_i64().unwrap());
+        assert!(wait_dead(second));
+    }
+
+    #[test]
     fn ready_then_drop_kills_whole_group() {
         let dir = tempfile::tempdir().unwrap();
         let python = fake_python(dir.path());
@@ -417,10 +594,20 @@ server.serve_forever()
         assert!(!server.matches("other", Some(&adapter)));
         assert!(server.is_running());
         let started = info(&marker);
-        let (pid, helper) = (started["pid"].as_i64().unwrap(), started["child"].as_i64().unwrap());
+        let (pid, helper) = (
+            started["pid"].as_i64().unwrap(),
+            started["child"].as_i64().unwrap(),
+        );
         assert!(alive(pid) && alive(helper));
-        let budget = started["argv"].as_array().unwrap().iter().filter_map(|a| a.as_str()?.strip_prefix("--prompt-cache-bytes=")).next()
-            .expect("the KV prefix cache must be bounded").parse::<u64>().unwrap();
+        let budget = started["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str()?.strip_prefix("--prompt-cache-bytes="))
+            .next()
+            .expect("the KV prefix cache must be bounded")
+            .parse::<u64>()
+            .unwrap();
         assert!(budget > 0, "{budget}");
         drop(server);
         assert!(wait_dead(pid), "server survived drop");
@@ -444,9 +631,35 @@ server.serve_forever()
     fn early_exit_reports_stderr() {
         let dir = tempfile::tempdir().unwrap();
         let python = fake_python(dir.path());
-        let error = ModelServer::start(&python, "exit-early", None, 30).err().expect("must fail").to_string();
+        let error = ModelServer::start(&python, "exit-early", None, 30)
+            .err()
+            .expect("must fail")
+            .to_string();
         assert!(error.contains("exited during startup"), "{error}");
         assert!(error.contains("fatal: cannot load model"), "{error}");
+    }
+
+    #[test]
+    fn cancelled_startup_releases_the_server_before_its_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let python = fake_python(dir.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut slot = None;
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let flag = cancel.clone();
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                flag.store(true, Ordering::SeqCst);
+            });
+            let error =
+                ensure_controlled(&mut slot, &python, "never-ready", None, 30, Some(cancel))
+                    .err()
+                    .expect("startup must be cancelled");
+            assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
+        });
+        assert!(slot.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -454,7 +667,10 @@ server.serve_forever()
         let dir = tempfile::tempdir().unwrap();
         let python = fake_python(dir.path());
         let started = Instant::now();
-        let error = ModelServer::start(&python, "never-ready", None, 1).err().expect("must fail").to_string();
+        let error = ModelServer::start(&python, "never-ready", None, 1)
+            .err()
+            .expect("must fail")
+            .to_string();
         assert!(error.contains("startup timeout"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(10));
     }
@@ -463,7 +679,10 @@ server.serve_forever()
     fn failed_warmup_is_a_start_failure() {
         let dir = tempfile::tempdir().unwrap();
         let python = fake_python(dir.path());
-        let error = ModelServer::start(&python, "bad-model", None, 30).err().expect("must fail").to_string();
+        let error = ModelServer::start(&python, "bad-model", None, 30)
+            .err()
+            .expect("must fail")
+            .to_string();
         assert!(error.contains("warm-up"), "{error}");
         assert!(error.contains("HTTP 500"), "{error}");
     }
@@ -475,12 +694,27 @@ server.serve_forever()
         let first = dir.path().join("a.json");
         let second = dir.path().join("b.json");
         let mut slot = None;
-        let url = ensure(&mut slot, &python, first.to_str().unwrap(), None, 30).unwrap().base_url().to_string();
+        let url = ensure(&mut slot, &python, first.to_str().unwrap(), None, 30)
+            .unwrap()
+            .base_url()
+            .to_string();
         let pid = info(&first)["pid"].as_i64().unwrap();
-        assert_eq!(ensure(&mut slot, &python, first.to_str().unwrap(), None, 30).unwrap().base_url(), url);
+        assert_eq!(
+            ensure(&mut slot, &python, first.to_str().unwrap(), None, 30)
+                .unwrap()
+                .base_url(),
+            url
+        );
         // A different adapter forces a restart and tears the old process down.
         let adapter = dir.path().join("adapter");
-        ensure(&mut slot, &python, first.to_str().unwrap(), Some(&adapter), 30).unwrap();
+        ensure(
+            &mut slot,
+            &python,
+            first.to_str().unwrap(),
+            Some(&adapter),
+            30,
+        )
+        .unwrap();
         assert!(wait_dead(pid), "old server not stopped on swap");
         let pid = info(&first)["pid"].as_i64().unwrap();
         // A crashed server is replaced even when the configuration is unchanged.
@@ -491,11 +725,22 @@ server.serve_forever()
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        ensure(&mut slot, &python, first.to_str().unwrap(), Some(&adapter), 30).unwrap();
+        ensure(
+            &mut slot,
+            &python,
+            first.to_str().unwrap(),
+            Some(&adapter),
+            30,
+        )
+        .unwrap();
         assert!(slot.as_ref().unwrap().is_running());
         assert_ne!(info(&first)["pid"].as_i64().unwrap(), pid);
         ensure(&mut slot, &python, second.to_str().unwrap(), None, 30).unwrap();
-        assert!(slot.as_ref().unwrap().matches(second.to_str().unwrap(), None));
+        assert!(
+            slot.as_ref()
+                .unwrap()
+                .matches(second.to_str().unwrap(), None)
+        );
     }
 
     #[test]
@@ -509,7 +754,10 @@ server.serve_forever()
         let noise = vec![b'x'; STDERR_KEEP_BYTES * 3];
         let tail = collect_stderr(io::Cursor::new(noise));
         settle_stderr(&tail);
-        assert_eq!(tail.lock().unwrap_or_else(|p| p.into_inner()).bytes.len(), STDERR_KEEP_BYTES);
+        assert_eq!(
+            tail.lock().unwrap_or_else(|p| p.into_inner()).bytes.len(),
+            STDERR_KEEP_BYTES
+        );
         assert_eq!(tail_text(&tail, ERROR_TAIL_BYTES).len(), ERROR_TAIL_BYTES);
     }
 
@@ -518,12 +766,17 @@ server.serve_forever()
     fn real_python() -> PathBuf {
         std::env::var_os("DIAL_TEST_PYTHON")
             .map(PathBuf::from)
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("python/.venv/bin/python"))
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("python/.venv/bin/python")
+            })
     }
 
     fn snapshot(repo_dir: &str) -> String {
         let home = std::env::var("HOME").unwrap();
-        let snapshots = Path::new(&home).join(".cache/huggingface/hub").join(repo_dir).join("snapshots");
+        let snapshots = Path::new(&home)
+            .join(".cache/huggingface/hub")
+            .join(repo_dir)
+            .join("snapshots");
         let entry = fs::read_dir(&snapshots)
             .unwrap_or_else(|e| panic!("{}: {e}", snapshots.display()))
             .next()
@@ -569,13 +822,19 @@ server.serve_forever()
         };
         let reply = llm::chat(server.base_url(), SERVER_MODEL, &request, 120).unwrap();
         println!("REAL TOOL REPLY: {reply:?}");
-        assert!(!reply.tool_calls.is_empty(), "model produced no parsed tool call");
+        assert!(
+            !reply.tool_calls.is_empty(),
+            "model produced no parsed tool call"
+        );
         assert_eq!(reply.tool_calls[0].name, "read_file");
         assert!(!reply.tool_calls[0].malformed_arguments);
         // Replay the turn with a tool result to prove the history shape is accepted.
         let mut followup = request.clone();
         followup.messages.push(llm::assistant_message(&reply));
-        followup.messages.push(llm::tool_message(&reply.tool_calls[0].id, "hello from notes"));
+        followup.messages.push(llm::tool_message(
+            &reply.tool_calls[0].id,
+            "hello from notes",
+        ));
         let second = llm::chat(server.base_url(), SERVER_MODEL, &followup, 120).unwrap();
         println!("REAL FOLLOWUP: {second:?}");
     }

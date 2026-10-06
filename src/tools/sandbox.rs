@@ -118,8 +118,14 @@ impl Sandbox {
         match self {
             Sandbox::Available => Ok(()),
             Sandbox::Unavailable(reason) => {
-                let nested = if already_sandboxed() { " (this process already runs inside a sandbox, which macOS cannot nest)" } else { "" };
-                Err(format!("bash is disabled because no sandbox is available: {reason}{nested}"))
+                let nested = if already_sandboxed() {
+                    " (this process already runs inside a sandbox, which macOS cannot nest)"
+                } else {
+                    ""
+                };
+                Err(format!(
+                    "bash is disabled because no sandbox is available: {reason}{nested}"
+                ))
             }
         }
     }
@@ -171,14 +177,22 @@ impl Sandbox {
             Policy::Strict { allow_network } => {
                 return self.command(workspace, *allow_network, program, args);
             }
-            Policy::Dev { deny_read, extra_write, allow_network } => (*allow_network, deny_read, extra_write),
+            Policy::Dev {
+                deny_read,
+                extra_write,
+                allow_network,
+            } => (*allow_network, deny_read, extra_write),
         };
         let profile = dev_profile(workspace, deny_read, extra_write, allow_network)?;
         let scratch = workspace.join(crate::tools::SCRATCH_DIR);
-        std::fs::create_dir_all(&scratch).map_err(|e| format!("creating scratch directory: {e}"))?;
+        std::fs::create_dir_all(&scratch)
+            .map_err(|e| format!("creating scratch directory: {e}"))?;
         let mut command = Command::new(SANDBOX_EXEC);
         command.arg("-p").arg(profile).arg(program).args(args);
-        command.env_clear().envs(scrubbed_env(env)).env("TMPDIR", &scratch);
+        command
+            .env_clear()
+            .envs(scrubbed_env(env))
+            .env("TMPDIR", &scratch);
         Ok(command)
     }
 
@@ -200,9 +214,15 @@ impl Sandbox {
                 }
                 (Ok(()), profile(workspace, *allow_network))
             }
-            Policy::Dev { deny_read, extra_write, allow_network } => {
-                static DEV_PROBES: [LazyLock<Result<(), String>>; 2] =
-                    [LazyLock::new(|| dev_self_test(false)), LazyLock::new(|| dev_self_test(true))];
+            Policy::Dev {
+                deny_read,
+                extra_write,
+                allow_network,
+            } => {
+                static DEV_PROBES: [LazyLock<Result<(), String>>; 2] = [
+                    LazyLock::new(|| dev_self_test(false)),
+                    LazyLock::new(|| dev_self_test(true)),
+                ];
                 (
                     DEV_PROBES[usize::from(*allow_network)].clone(),
                     dev_profile(workspace, deny_read, extra_write, *allow_network),
@@ -215,7 +235,11 @@ impl Sandbox {
         // The real profile must at least be valid and let a command start.
         let started = real_profile.and_then(|text| {
             let (code, _) = run_probe(&text, workspace, "exit 0", &[])?;
-            if code == Some(0) { Ok(()) } else { Err(format!("probe exited with {code:?}")) }
+            if code == Some(0) {
+                Ok(())
+            } else {
+                Err(format!("probe exited with {code:?}"))
+            }
         });
         match started {
             Ok(()) => Sandbox::Available,
@@ -229,13 +253,20 @@ impl Sandbox {
 #[cfg(target_os = "macos")]
 pub fn already_sandboxed() -> bool {
     unsafe extern "C" {
-        fn sandbox_check(pid: libc::pid_t, operation: *const libc::c_char, filter: libc::c_int, ...) -> libc::c_int;
+        fn sandbox_check(
+            pid: libc::pid_t,
+            operation: *const libc::c_char,
+            filter: libc::c_int,
+            ...
+        ) -> libc::c_int;
     }
     // SAFETY: a null operation with SANDBOX_FILTER_NONE (0) only asks whether the process is sandboxed.
     unsafe { sandbox_check(libc::getpid(), std::ptr::null(), 0) == 1 }
 }
 #[cfg(not(target_os = "macos"))]
-pub fn already_sandboxed() -> bool { false }
+pub fn already_sandboxed() -> bool {
+    false
+}
 
 /// For tests that exercise the real sandbox: true when it works; false (skip, with a note) only when
 /// this process is already sandboxed and nesting is impossible; otherwise the missing sandbox fails the test.
@@ -243,7 +274,10 @@ pub fn already_sandboxed() -> bool { false }
 pub(crate) fn require_for_test() -> bool {
     match Sandbox::detect().available() {
         Ok(()) => true,
-        Err(_) if already_sandboxed() => { eprintln!("skipping: already inside a sandbox, which macOS cannot nest"); false }
+        Err(_) if already_sandboxed() => {
+            eprintln!("skipping: already inside a sandbox, which macOS cannot nest");
+            false
+        }
         Err(reason) => panic!("sandbox-exec must work on this Mac: {reason}"),
     }
 }
@@ -255,7 +289,10 @@ fn quote(path: &Path) -> Result<String, String> {
     if !path.is_absolute() {
         return Err(format!("sandbox path must be absolute: {text}"));
     }
-    if text.chars().any(|c| c == '"' || c == '\\' || c.is_control()) {
+    if text
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_control())
+    {
         return Err(format!(
             "sandbox path contains a quote, backslash or control character: {text:?}"
         ));
@@ -277,7 +314,9 @@ pub fn profile(workspace: &Path, allow_network: bool) -> Result<String, String> 
     );
     // Metadata: system paths, the workspace, and the literal ancestors of the
     // workspace (needed for path resolution and getcwd, nothing else).
-    out.push_str("(allow file-read-metadata (literal \"/\") (literal \"/opt\") (literal \"/private\")");
+    out.push_str(
+        "(allow file-read-metadata (literal \"/\") (literal \"/opt\") (literal \"/private\")",
+    );
     for ancestor in workspace.ancestors().skip(1) {
         if ancestor.parent().is_some() {
             out.push_str(&format!(" (literal {})", quote(ancestor)?));
@@ -297,7 +336,9 @@ pub fn profile(workspace: &Path, allow_network: bool) -> Result<String, String> 
         out.push_str(&format!(" (literal {})", quote(Path::new(device))?));
     }
     out.push_str(")\n");
-    out.push_str(&format!("(allow file-read* file-write* (subpath {root}))\n"));
+    out.push_str(&format!(
+        "(allow file-read* file-write* (subpath {root}))\n"
+    ));
     if allow_network {
         out.push_str("(allow network*)\n");
     }
@@ -305,13 +346,21 @@ pub fn profile(workspace: &Path, allow_network: bool) -> Result<String, String> 
 }
 
 /// Devices commands may write to under the Dev policy.
-const DEV_WRITABLE_DEVICES: &[&str] =
-    &["/dev/null", "/dev/zero", "/dev/tty", "/dev/dtracehelper", "/dev/ptmx"];
+const DEV_WRITABLE_DEVICES: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/tty",
+    "/dev/dtracehelper",
+    "/dev/ptmx",
+];
 
 /// Mach services denied under the Dev policy: clipboard and keychain access
 /// (the rest of mach-lookup stays open; dyld, DNS and toolchains need it).
-const DEV_DENIED_MACH: &[&str] =
-    &["com.apple.pasteboard.1", "com.apple.SecurityServer", "com.apple.securityd"];
+const DEV_DENIED_MACH: &[&str] = &[
+    "com.apple.pasteboard.1",
+    "com.apple.SecurityServer",
+    "com.apple.securityd",
+];
 
 /// Resolve `path` to the real path the kernel will match against: symlinks and
 /// `..` are resolved through the longest existing prefix; a not-yet-existing
@@ -356,7 +405,10 @@ pub fn dev_profile(
     if workspace.parent().is_none() {
         return Err("refusing to sandbox the filesystem root as a workspace".to_string());
     }
-    let denied = deny_read.iter().map(|p| resolve(p)).collect::<Result<Vec<_>, _>>()?;
+    let denied = deny_read
+        .iter()
+        .map(|p| resolve(p))
+        .collect::<Result<Vec<_>, _>>()?;
     if let Some(hit) = denied.iter().find(|d| workspace.starts_with(d)) {
         return Err(format!(
             "the workspace {} is inside a denied path {}",
@@ -373,7 +425,8 @@ pub fn dev_profile(
         writable.push(real);
     }
 
-    let mut out = String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
+    let mut out =
+        String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
     for path in &writable {
         out.push_str(&format!(" (subpath {})", quote(path)?));
     }
@@ -400,7 +453,10 @@ pub fn dev_profile(
     out.push_str(")\n");
     // Last, so they override the workspace and extra_write allowances.
     for path in &denied {
-        out.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", quote(path)?));
+        out.push_str(&format!(
+            "(deny file-read* file-write* (subpath {}))\n",
+            quote(path)?
+        ));
     }
     Ok(out)
 }
@@ -410,12 +466,38 @@ pub fn dev_profile(
 /// value holding URL userinfo (`scheme://user:password@host`).
 pub fn is_secret_env(name: &str, value: &str) -> bool {
     const PREFIXES: &[&str] = &[
-        "AWS_", "AZURE_", "GCP_", "GCLOUD_", "GOOGLE_", "GITHUB_", "GITLAB_", "GH_", "ANTHROPIC_",
-        "OPENAI_", "OPENROUTER_", "GEMINI_", "MISTRAL_", "GROQ_", "COHERE_", "HF_", "HUGGINGFACE",
-        "DIAL_", "SSH_", "GPG_", "DOCKER_", "KUBE",
+        "AWS_",
+        "AZURE_",
+        "GCP_",
+        "GCLOUD_",
+        "GOOGLE_",
+        "GITHUB_",
+        "GITLAB_",
+        "GH_",
+        "ANTHROPIC_",
+        "OPENAI_",
+        "OPENROUTER_",
+        "GEMINI_",
+        "MISTRAL_",
+        "GROQ_",
+        "COHERE_",
+        "HF_",
+        "HUGGINGFACE",
+        "DIAL_",
+        "SSH_",
+        "GPG_",
+        "DOCKER_",
+        "KUBE",
     ];
     const FRAGMENTS: &[&str] = &[
-        "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE_KEY", "API_KEY", "APIKEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "PRIVATE_KEY",
+        "API_KEY",
+        "APIKEY",
         "ACCESS_KEY",
     ];
     const SUFFIXES: &[&str] = &["_KEY", "_PASS", "_AUTH", "_CREDS", "_COOKIE"];
@@ -428,7 +510,9 @@ pub fn is_secret_env(name: &str, value: &str) -> bool {
     }
     value.split_once("://").is_some_and(|(_, rest)| {
         let authority = rest.split('/').next().unwrap_or("");
-        authority.rsplit_once('@').is_some_and(|(userinfo, _)| userinfo.contains(':'))
+        authority
+            .rsplit_once('@')
+            .is_some_and(|(userinfo, _)| userinfo.contains(':'))
     })
 }
 
@@ -486,7 +570,11 @@ fn dev_self_test(allow_network: bool) -> Result<(), String> {
 
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(io)?;
     let port = listener.local_addr().map_err(io)?.port().to_string();
-    let text = |p: &Path| p.to_str().map(str::to_owned).ok_or("scratch path is not UTF-8");
+    let text = |p: &Path| {
+        p.to_str()
+            .map(str::to_owned)
+            .ok_or("scratch path is not UTF-8")
+    };
     let args = [
         text(&canary_a)?,
         text(&canary_b)?,
@@ -585,7 +673,9 @@ fn run_probe(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = command.spawn().map_err(|e| format!("spawning {SANDBOX_EXEC}: {e}"))?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("spawning {SANDBOX_EXEC}: {e}"))?;
     let started = Instant::now();
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
@@ -623,22 +713,30 @@ mod tests {
         assert!(text.contains("(allow file-read* file-write* (subpath \"/private/tmp/my ws\"))"));
         assert!(!text.contains("network"));
         assert!(!text.contains("/Users"));
-        assert!(profile(Path::new("/private/tmp/ws"), true).unwrap().contains("(allow network*)"));
+        assert!(
+            profile(Path::new("/private/tmp/ws"), true)
+                .unwrap()
+                .contains("(allow network*)")
+        );
     }
 
     #[test]
     fn unavailable_sandbox_refuses_to_build_commands() {
         let sandbox = Sandbox::Unavailable("nope".to_string());
         assert!(sandbox.available().unwrap_err().contains("nope"));
-        assert!(sandbox
-            .command(Path::new("/private/tmp/ws"), false, "/bin/echo", &[])
-            .is_err());
+        assert!(
+            sandbox
+                .command(Path::new("/private/tmp/ws"), false, "/bin/echo", &[])
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn detect_works_on_macos() {
-        if !require_for_test() { return; }
+        if !require_for_test() {
+            return;
+        }
         assert_eq!(Sandbox::detect(), Sandbox::Available);
     }
 
@@ -711,10 +809,26 @@ mod tests {
         let deny = text.find("(deny file-read* file-write* (subpath").unwrap();
         assert!(allow < deny, "denials must come after the write allowances");
         assert!(text.contains("(deny network*)"));
-        assert!(!dev_profile(&fx.ws, &[], &[], true).unwrap().contains("(deny network*)"));
-        for bad in ["/tmp/a\"b", "/tmp/a\nb", "/tmp/a\\b", "/tmp/a\0b", "relative/path"] {
-            assert!(dev_profile(&fx.ws, &[PathBuf::from(bad)], &[], false).is_err(), "deny {bad:?}");
-            assert!(dev_profile(&fx.ws, &[], &[PathBuf::from(bad)], false).is_err(), "write {bad:?}");
+        assert!(
+            !dev_profile(&fx.ws, &[], &[], true)
+                .unwrap()
+                .contains("(deny network*)")
+        );
+        for bad in [
+            "/tmp/a\"b",
+            "/tmp/a\nb",
+            "/tmp/a\\b",
+            "/tmp/a\0b",
+            "relative/path",
+        ] {
+            assert!(
+                dev_profile(&fx.ws, &[PathBuf::from(bad)], &[], false).is_err(),
+                "deny {bad:?}"
+            );
+            assert!(
+                dev_profile(&fx.ws, &[], &[PathBuf::from(bad)], false).is_err(),
+                "write {bad:?}"
+            );
         }
         assert!(dev_profile(&fx.ws, &[], &[PathBuf::from("/")], false).is_err());
         assert!(dev_profile(Path::new("/"), &[], &[], false).is_err());
@@ -730,7 +844,10 @@ mod tests {
         let link = fx.ws.join("link");
         std::os::unix::fs::symlink(&fx.denied, &link).unwrap();
         assert_eq!(resolve(&link).unwrap(), fx.denied);
-        assert_eq!(resolve(&fx.ws.join("..").join("denied")).unwrap(), fx.denied);
+        assert_eq!(
+            resolve(&fx.ws.join("..").join("denied")).unwrap(),
+            fx.denied
+        );
         assert_eq!(
             resolve(&link.join("not").join("yet")).unwrap(),
             fx.denied.join("not").join("yet")
@@ -742,19 +859,47 @@ mod tests {
     #[test]
     fn is_secret_env_flags_credentials_and_keeps_toolchain_vars() {
         for secret in [
-            "GITHUB_TOKEN", "GH_TOKEN", "HF_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_BASE_URL", "AWS_REGION",
-            "AWS_PROFILE", "MY_SECRET", "DB_PASSWORD", "STRIPE_KEY", "npm_config__authToken", "DIAL_HOME",
-            "SSH_AUTH_SOCK", "GOOGLE_APPLICATION_CREDENTIALS", "api_key",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "HF_TOKEN",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "AWS_REGION",
+            "AWS_PROFILE",
+            "MY_SECRET",
+            "DB_PASSWORD",
+            "STRIPE_KEY",
+            "npm_config__authToken",
+            "DIAL_HOME",
+            "SSH_AUTH_SOCK",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "api_key",
         ] {
             assert!(is_secret_env(secret, "v"), "{secret}");
         }
         for plain in [
-            "PATH", "HOME", "USER", "LANG", "TERM", "SHELL", "CARGO_HOME", "RUSTUP_HOME", "EDITOR",
-            "NODE_OPTIONS", "PYENV_ROOT", "XDG_CONFIG_HOME", "DEVELOPER_DIR", "HOMEBREW_PREFIX", "PWD",
+            "PATH",
+            "HOME",
+            "USER",
+            "LANG",
+            "TERM",
+            "SHELL",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "EDITOR",
+            "NODE_OPTIONS",
+            "PYENV_ROOT",
+            "XDG_CONFIG_HOME",
+            "DEVELOPER_DIR",
+            "HOMEBREW_PREFIX",
+            "PWD",
         ] {
             assert!(!is_secret_env(plain, "/some/path"), "{plain}");
         }
-        assert!(is_secret_env("HTTPS_PROXY", "https://user:hunter2@proxy.example:8080/"));
+        assert!(is_secret_env(
+            "HTTPS_PROXY",
+            "https://user:hunter2@proxy.example:8080/"
+        ));
         assert!(!is_secret_env("HTTPS_PROXY", "https://proxy.example:8080/"));
         assert!(!is_secret_env("REMOTE", "git@github.com:a/b"));
     }
@@ -762,16 +907,32 @@ mod tests {
     #[test]
     fn unavailable_sandbox_refuses_dev_commands() {
         let sandbox = Sandbox::Unavailable("nope".to_string());
-        let policy = Policy::Dev { deny_read: vec![], extra_write: vec![], allow_network: false };
-        assert!(sandbox.command_with_policy(Path::new("/private/tmp"), &policy, "/bin/echo", &[]).is_err());
-        let strict = Policy::Strict { allow_network: false };
-        assert!(sandbox.command_with_policy(Path::new("/private/tmp/ws"), &strict, "/bin/echo", &[]).is_err());
+        let policy = Policy::Dev {
+            deny_read: vec![],
+            extra_write: vec![],
+            allow_network: false,
+        };
+        assert!(
+            sandbox
+                .command_with_policy(Path::new("/private/tmp"), &policy, "/bin/echo", &[])
+                .is_err()
+        );
+        let strict = Policy::Strict {
+            allow_network: false,
+        };
+        assert!(
+            sandbox
+                .command_with_policy(Path::new("/private/tmp/ws"), &strict, "/bin/echo", &[])
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_reads_widely_but_not_denied_paths() {
-        if !require_for_test() { return; }
+        if !require_for_test() {
+            return;
+        }
         let fx = Fixture::new();
         let policy = fx.policy(false);
         let link_to_denied = fx.ws.join("..").join("denied-link");
@@ -803,17 +964,26 @@ mod tests {
         let link = fx.ws.join("alias");
         std::os::unix::fs::symlink(&fx.denied, &link).unwrap();
         for spelled in [link, fx.ws.join("..").join("denied")] {
-            let policy = Policy::Dev { deny_read: vec![spelled.clone()], extra_write: vec![], allow_network: false };
+            let policy = Policy::Dev {
+                deny_read: vec![spelled.clone()],
+                extra_write: vec![],
+                allow_network: false,
+            };
             let (code, out) = fx.run(&policy, &format!("/bin/cat {}/canary", fx.denied.display()));
             assert_ne!(code, Some(0), "{spelled:?}: {out}");
-            assert!(out.contains("Operation not permitted"), "{spelled:?}: {out}");
+            assert!(
+                out.contains("Operation not permitted"),
+                "{spelled:?}: {out}"
+            );
         }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_confines_writes() {
-        if !require_for_test() { return; }
+        if !require_for_test() {
+            return;
+        }
         let fx = Fixture::new();
         let policy = fx.policy(false);
         let script = format!(
@@ -840,7 +1010,10 @@ mod tests {
         );
         let (code, out) = fx.run(&policy, &script);
         assert_eq!(code, Some(0), "{out}");
-        assert_eq!(std::fs::read_to_string(fx.ws.join("in-ws.txt")).unwrap(), "a\n");
+        assert_eq!(
+            std::fs::read_to_string(fx.ws.join("in-ws.txt")).unwrap(),
+            "a\n"
+        );
         assert_eq!(std::fs::read_to_string(fx.extra.join("f")).unwrap(), "c\n");
         assert!(!fx.outside.join("f").exists());
         assert!(!fx.denied.join("new").exists());
@@ -849,7 +1022,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_denial_beats_extra_write_and_workspace() {
-        if !require_for_test() { return; }
+        if !require_for_test() {
+            return;
+        }
         let fx = Fixture::new();
         // A denied dir nested inside the workspace and one inside an extra_write dir.
         let in_ws = fx.ws.join("private");
@@ -881,7 +1056,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_network_follows_flag() {
-        if !require_for_test() { return; }
+        if !require_for_test() {
+            return;
+        }
         let fx = Fixture::new();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -895,7 +1072,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_scrubs_secret_environment() {
-        if !require_for_test() { return; }
+        if !require_for_test() {
+            return;
+        }
         let fx = Fixture::new();
         let env: Vec<(OsString, OsString)> = [
             ("PATH", "/usr/bin:/bin"),
@@ -921,7 +1100,16 @@ mod tests {
         assert!(lines.contains(&"PATH=/usr/bin:/bin"), "{out}");
         let tmp = format!("TMPDIR={}", fx.ws.join(crate::tools::SCRATCH_DIR).display());
         assert!(lines.contains(&tmp.as_str()), "{out}");
-        for leaked in ["ghp_x", "hf_x", "sk-x", "sk-ant-x", "aws", "hunter2", "DB_PASSWORD", "should/be/replaced"] {
+        for leaked in [
+            "ghp_x",
+            "hf_x",
+            "sk-x",
+            "sk-ant-x",
+            "aws",
+            "hunter2",
+            "DB_PASSWORD",
+            "should/be/replaced",
+        ] {
             assert!(!out.contains(leaked), "{leaked} leaked: {out}");
         }
         // An environment without PATH still gets a usable one.
@@ -933,7 +1121,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_runs_toolchains() {
-        if !require_for_test() { return; }
+        if !require_for_test() {
+            return;
+        }
         let fx = Fixture::new();
         let script = r#"
             set -e
@@ -959,18 +1149,32 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dev_timeout_kills_the_whole_process_group() {
-        if !require_for_test() { return; }
+        if !require_for_test() {
+            return;
+        }
         use std::os::unix::process::{CommandExt, ExitStatusExt};
         let fx = Fixture::new();
         let marker = fx.ws.join("grandchild-ran");
         let script = format!("(sleep 30; echo late > {}) & wait", marker.display());
         let mut command = Sandbox::Available
-            .dev_command(&fx.ws, &fx.policy(false), "/bin/bash", &["-c", &script], std::env::vars_os())
+            .dev_command(
+                &fx.ws,
+                &fx.policy(false),
+                "/bin/bash",
+                &["-c", &script],
+                std::env::vars_os(),
+            )
             .unwrap();
-        command.current_dir(&fx.ws).stdin(Stdio::null()).process_group(0);
+        command
+            .current_dir(&fx.ws)
+            .stdin(Stdio::null())
+            .process_group(0);
         let mut child = command.spawn().unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        assert!(child.try_wait().unwrap().is_none(), "command should still be running");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "command should still be running"
+        );
         let pgid = i32::try_from(child.id()).unwrap();
         assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
         let status = child.wait().unwrap();
@@ -981,7 +1185,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn probe_policy_reports_enforceable_policies_and_rejects_broken_ones() {
-        if !require_for_test() { return; }
+        if !require_for_test() {
+            return;
+        }
         let fx = Fixture::new();
         for allow_network in [false, true] {
             assert_eq!(
@@ -1002,7 +1208,9 @@ mod tests {
             allow_network: false,
         };
         match Sandbox::probe_policy(&fx.ws, &broken) {
-            Sandbox::Unavailable(reason) => assert!(reason.contains("inside a denied path"), "{reason}"),
+            Sandbox::Unavailable(reason) => {
+                assert!(reason.contains("inside a denied path"), "{reason}")
+            }
             Sandbox::Available => panic!("broken policy reported available"),
         }
     }
@@ -1015,12 +1223,17 @@ mod tests {
         let mut command = Sandbox::Available
             .command_with_policy(
                 &fx.ws,
-                &Policy::Strict { allow_network: false },
+                &Policy::Strict {
+                    allow_network: false,
+                },
                 "/bin/cat",
                 &[target.to_str().unwrap()],
             )
             .unwrap();
         let out = command.current_dir(&fx.ws).output().unwrap();
-        assert!(!out.status.success(), "strict policy must not read outside the workspace");
+        assert!(
+            !out.status.success(),
+            "strict policy must not read outside the workspace"
+        );
     }
 }

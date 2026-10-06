@@ -28,7 +28,10 @@ pub(super) struct ProcessGroup {
 
 impl ProcessGroup {
     pub(super) fn new(child: Child) -> Self {
-        ProcessGroup { child, terminated: false }
+        ProcessGroup {
+            child,
+            terminated: false,
+        }
     }
 
     pub(super) fn terminate(&mut self) {
@@ -79,7 +82,12 @@ struct Capture {
 
 impl Capture {
     fn new() -> Self {
-        Capture { head: Vec::new(), tail: Vec::new(), total: 0, diagnostics: super::diagnostics::Collector::new(BASH_DIAGNOSTICS) }
+        Capture {
+            head: Vec::new(),
+            tail: Vec::new(),
+            total: 0,
+            diagnostics: super::diagnostics::Collector::new(BASH_DIAGNOSTICS),
+        }
     }
 
     fn push(&mut self, mut chunk: &[u8]) {
@@ -109,7 +117,11 @@ impl Capture {
         let mut text = String::from_utf8_lossy(&self.head).into_owned();
         let (kept, lines, overflow) = self.diagnostics.kept();
         if dropped > 0 && lines > 0 {
-            let more = if overflow > 0 { format!(" ({overflow} more not shown)") } else { String::new() };
+            let more = if overflow > 0 {
+                format!(" ({overflow} more not shown)")
+            } else {
+                String::new()
+            };
             text.push_str(&format!("\n[... {dropped} bytes of output omitted; {lines} diagnostic line(s) from that part follow{more} ...]\n{kept}[... end of omitted-part diagnostics ...]\n"));
         } else if dropped > 0 {
             text.push_str(&format!("\n[... {dropped} bytes of output omitted ...]\n"));
@@ -148,7 +160,11 @@ fn drain_pipe(
 }
 
 fn wait_readable(fd: i32, millis: i32) {
-    let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
     unsafe { libc::poll(&mut poll, 1, millis) };
 }
 
@@ -160,7 +176,11 @@ fn bash_path() -> String {
     }
 }
 
-pub(super) fn bash_tool(ws: &Workspace, args: &Value, timeout_secs: u64) -> Result<ToolOutput, String> {
+pub(super) fn bash_tool(
+    ws: &Workspace,
+    args: &Value,
+    timeout_secs: u64,
+) -> Result<ToolOutput, String> {
     bash_tool_streaming(ws, args, timeout_secs, &|_| {}, &AtomicBool::new(false))
 }
 
@@ -193,17 +213,24 @@ pub fn bash_tool_streaming(
     if cancel.load(Ordering::Acquire) {
         return Ok(ToolOutput::err("[cancelled before command started]\n"));
     }
-    let mut spool = ws.artifacts().map(|store| store.spool()).transpose()
+    let mut spool = ws
+        .artifacts()
+        .map(|store| store.spool())
+        .transpose()
         .map_err(|e| format!("creating command output artifact: {e}"))?;
     let mut spawn = shell_command(ws, command, &ws.root)?;
     let (mut reader, writer) = io::pipe().map_err(|e| format!("creating output pipe: {e}"))?;
-    let writer_err = writer.try_clone().map_err(|e| format!("creating output pipe: {e}"))?;
+    let writer_err = writer
+        .try_clone()
+        .map_err(|e| format!("creating output pipe: {e}"))?;
     spawn
         .stdin(Stdio::null())
         .stdout(writer)
         .stderr(writer_err)
         .process_group(0);
-    let child = spawn.spawn().map_err(|e| format!("starting sandboxed bash: {e}"))?;
+    let child = spawn
+        .spawn()
+        .map_err(|e| format!("starting sandboxed bash: {e}"))?;
     // The Command owns the pipe's write ends; release them so EOF is observable.
     drop(spawn);
 
@@ -211,7 +238,10 @@ pub fn bash_tool_streaming(
     let fd = reader.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(format!("configuring output pipe: {}", io::Error::last_os_error()));
+        return Err(format!(
+            "configuring output pipe: {}",
+            io::Error::last_os_error()
+        ));
     }
 
     let timeout = Duration::from_secs(timeout_secs);
@@ -229,7 +259,10 @@ pub fn bash_tool_streaming(
             eof = drain_pipe(&mut reader, &mut capture, &mut spool, on_output)
                 .map_err(|e| format!("capturing command output: {e}"))?;
         }
-        if group.exited().map_err(|e| format!("observing command exit: {e}"))? {
+        if group
+            .exited()
+            .map_err(|e| format!("observing command exit: {e}"))?
+        {
             break;
         }
         if started.elapsed() >= timeout {
@@ -243,7 +276,10 @@ pub fn bash_tool_streaming(
         }
     }
     group.terminate();
-    let status = group.child.wait().map_err(|e| format!("reaping command: {e}"))?;
+    let status = group
+        .child
+        .wait()
+        .map_err(|e| format!("reaping command: {e}"))?;
     // Everything in the group is dead; collect what it wrote. A process that
     // escaped the group may still hold the pipe, so the wait is bounded.
     let grace = Instant::now();
@@ -266,7 +302,9 @@ pub fn bash_tool_streaming(
     if cancelled {
         text.push_str("[cancelled; process group killed]\n");
     } else if timed_out {
-        text.push_str(&format!("[timed out after {timeout_secs}s; process group killed]\n"));
+        text.push_str(&format!(
+            "[timed out after {timeout_secs}s; process group killed]\n"
+        ));
     } else if let Some(code) = status.code() {
         text.push_str(&format!("[exit code: {code}]\n"));
     } else if let Some(signal) = status.signal() {
@@ -276,40 +314,60 @@ pub fn bash_tool_streaming(
         text.push_str("[sandbox: /tmp is outside the project and not writable; use $TMPDIR, a scratch directory inside the project]\n");
     }
     if let Some(spool) = spool {
-        let uri = spool.finish().map_err(|e| format!("saving complete command output artifact: {e}"))?;
+        let uri = spool
+            .finish()
+            .map_err(|e| format!("saving complete command output artifact: {e}"))?;
         text.push_str(&format!("[complete output: {uri}]\n"));
     }
-    Ok(ToolOutput { text, is_error: !success })
+    Ok(ToolOutput {
+        text,
+        is_error: !success,
+    })
 }
 
 /// The command that runs `script` under `/bin/bash -c` in `cwd`, confined exactly as the `bash`
 /// tool is: the workspace sandbox policy, or the explicit unsandboxed opt-out, with a scrubbed
 /// environment. Fails closed when no sandbox is available. Stdio and process group are the
 /// caller's; `cwd` must already be validated to lie inside the workspace.
-pub(super) fn shell_command(ws: &Workspace, script: &str, cwd: &Path) -> Result<std::process::Command, String> {
+pub(super) fn shell_command(
+    ws: &Workspace,
+    script: &str,
+    cwd: &Path,
+) -> Result<std::process::Command, String> {
     let root = ws.root.to_str().ok_or("workspace path is not UTF-8")?;
     let cwd_str = cwd.to_str().ok_or("working directory is not UTF-8")?;
     let scratch = ws.root.join(SCRATCH_DIR);
     fs::create_dir_all(&scratch).map_err(|e| format!("creating scratch directory: {e}"))?;
-    let scratch_str = scratch.to_str().ok_or("scratch path is not UTF-8")?.to_owned();
+    let scratch_str = scratch
+        .to_str()
+        .ok_or("scratch path is not UTF-8")?
+        .to_owned();
     let strict = matches!(ws.policy, None | Some(Policy::Strict { .. }));
     let mut spawn;
     if ws.unsandboxed {
         spawn = std::process::Command::new("/bin/bash");
         spawn.args(["-c", script]).env_clear();
         for (key, value) in std::env::vars() {
-            if !is_secret_env(&key, &value) { spawn.env(key, value); }
+            if !is_secret_env(&key, &value) {
+                spawn.env(key, value);
+            }
         }
-        spawn.env("TMPDIR", &scratch_str).env("PAGER", "cat").env("GIT_PAGER", "cat");
+        spawn
+            .env("TMPDIR", &scratch_str)
+            .env("PAGER", "cat")
+            .env("GIT_PAGER", "cat");
     } else {
         let sandbox = ws.sandbox.clone().unwrap_or_else(Sandbox::detect);
         spawn = match &ws.policy {
-            Some(policy) => sandbox.command_with_policy(&ws.root, policy, "/bin/bash", &["-c", script])?,
+            Some(policy) => {
+                sandbox.command_with_policy(&ws.root, policy, "/bin/bash", &["-c", script])?
+            }
             None => sandbox.command(&ws.root, ws.allow_network, "/bin/bash", &["-c", script])?,
         };
         if strict {
             // The strict sandbox leaves the environment to us: minimal and secret-free.
-            spawn.env_clear()
+            spawn
+                .env_clear()
                 .env("PATH", bash_path())
                 .env("HOME", root)
                 .env("TMPDIR", &scratch_str)
@@ -329,13 +387,12 @@ pub(super) fn shell_command(ws: &Workspace, script: &str, cwd: &Path) -> Result<
     Ok(spawn)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::execute;
     use crate::tools::testkit::*;
     use serde_json::json;
-    use crate::tools::execute;
     use std::path::PathBuf;
     fn sandboxed() -> bool {
         super::super::sandbox::require_for_test()
@@ -350,57 +407,98 @@ mod tests {
         let (dir, ws) = workspace();
         let ws = ws.with_sandbox(Sandbox::Unavailable("test says no".to_string()));
         let out = bash(&ws, "touch ran.txt");
-        assert!(out.is_error && out.text.contains("test says no"), "{}", out.text);
+        assert!(
+            out.is_error && out.text.contains("test says no"),
+            "{}",
+            out.text
+        );
         assert!(!dir.path().join("ran.txt").exists());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_reads_and_writes_inside_workspace_only() {
-        if !sandboxed() { return; }
+        if !sandboxed() {
+            return;
+        }
         let (dir, ws) = workspace();
         let outside = tempfile::tempdir().unwrap();
         let canary = outside.path().join("canary");
         fs::write(&canary, "OUTSIDE-SECRET").unwrap();
-        let out = bash(&ws, "echo inside > made.txt && cat made.txt && mkdir -p d/e && echo x > d/e/f && pwd");
+        let out = bash(
+            &ws,
+            "echo inside > made.txt && cat made.txt && mkdir -p d/e && echo x > d/e/f && pwd",
+        );
         assert!(!out.is_error, "{}", out.text);
         assert!(out.text.contains("inside"));
-        assert!(out.text.contains(dir.path().canonicalize().unwrap().to_str().unwrap()));
-        assert_eq!(fs::read_to_string(dir.path().join("made.txt")).unwrap(), "inside\n");
+        assert!(
+            out.text
+                .contains(dir.path().canonicalize().unwrap().to_str().unwrap())
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("made.txt")).unwrap(),
+            "inside\n"
+        );
 
         let read = bash(&ws, &format!("cat '{}'", canary.display()));
-        assert!(read.is_error && !read.text.contains("OUTSIDE-SECRET"), "{}", read.text);
-        let write = bash(&ws, &format!("echo pwn > '{}/new'", outside.path().display()));
+        assert!(
+            read.is_error && !read.text.contains("OUTSIDE-SECRET"),
+            "{}",
+            read.text
+        );
+        let write = bash(
+            &ws,
+            &format!("echo pwn > '{}/new'", outside.path().display()),
+        );
         assert!(write.is_error && !outside.path().join("new").exists());
         let stat = bash(&ws, &format!("ls '{}'", outside.path().display()));
         assert!(stat.is_error);
         // Redirections to /dev/null and heredocs (temp files) work.
         let misc = bash(&ws, "echo hidden >/dev/null 2>&1; cat <<EOF\nhere\nEOF");
-        assert!(!misc.is_error && misc.text.contains("here"), "{}", misc.text);
+        assert!(
+            !misc.is_error && misc.text.contains("here"),
+            "{}",
+            misc.text
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_cannot_read_home() {
-        if !sandboxed() { return; }
+        if !sandboxed() {
+            return;
+        }
         let (_dir, ws) = workspace();
         let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
-        let mut canary = tempfile::Builder::new().prefix(".dial-sandbox-canary-").tempfile_in(&home).unwrap();
+        let mut canary = tempfile::Builder::new()
+            .prefix(".dial-sandbox-canary-")
+            .tempfile_in(&home)
+            .unwrap();
         io::Write::write_all(&mut canary, b"HOME-SECRET").unwrap();
         assert_eq!(fs::read_to_string(canary.path()).unwrap(), "HOME-SECRET");
         let out = bash(&ws, &format!("cat '{}'", canary.path().display()));
-        assert!(out.is_error && !out.text.contains("HOME-SECRET"), "{}", out.text);
+        assert!(
+            out.is_error && !out.text.contains("HOME-SECRET"),
+            "{}",
+            out.text
+        );
         let listing = bash(&ws, &format!("ls -a '{}'", home.display()));
         assert!(listing.is_error, "{}", listing.text);
         // The scrubbed HOME is the workspace, not the real home.
         let env = bash(&ws, "echo $HOME");
-        assert!(env.text.starts_with(ws.root().to_str().unwrap()), "{}", env.text);
+        assert!(
+            env.text.starts_with(ws.root().to_str().unwrap()),
+            "{}",
+            env.text
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_environment_is_scrubbed() {
-        if !sandboxed() { return; }
+        if !sandboxed() {
+            return;
+        }
         let (_dir, ws) = workspace();
         // cargo exports CARGO_* variables into this test process.
         assert!(std::env::vars().any(|(k, _)| k.starts_with("CARGO")));
@@ -409,8 +507,20 @@ mod tests {
         for line in out.text.lines() {
             let key = line.split('=').next().unwrap_or("");
             assert!(
-                ["PATH", "HOME", "TMPDIR", "PWD", "SHELL", "LANG", "TERM", "DEVELOPER_DIR", "SHLVL", "_", "OLDPWD"]
-                    .contains(&key)
+                [
+                    "PATH",
+                    "HOME",
+                    "TMPDIR",
+                    "PWD",
+                    "SHELL",
+                    "LANG",
+                    "TERM",
+                    "DEVELOPER_DIR",
+                    "SHLVL",
+                    "_",
+                    "OLDPWD"
+                ]
+                .contains(&key)
                     || line.starts_with('['),
                 "unexpected environment entry {line:?}"
             );
@@ -421,19 +531,35 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_network_is_blocked_unless_allowed() {
-        if !sandboxed() { return; }
+        if !sandboxed() {
+            return;
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo CONNECTED");
         // Control: the same command outside the sandbox does connect.
-        let control = std::process::Command::new("/bin/bash").args(["-c", &probe]).output().unwrap();
-        assert!(String::from_utf8_lossy(&control.stdout).contains("CONNECTED"), "control failed");
+        let control = std::process::Command::new("/bin/bash")
+            .args(["-c", &probe])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&control.stdout).contains("CONNECTED"),
+            "control failed"
+        );
 
         let (_dir, ws) = workspace();
         let blocked = bash(&ws, &probe);
-        assert!(blocked.is_error && !blocked.text.contains("CONNECTED"), "{}", blocked.text);
+        assert!(
+            blocked.is_error && !blocked.text.contains("CONNECTED"),
+            "{}",
+            blocked.text
+        );
         let curl = bash(&ws, "/usr/bin/curl --max-time 3 -sS https://example.com");
-        assert!(curl.is_error && !curl.text.contains("Example Domain"), "{}", curl.text);
+        assert!(
+            curl.is_error && !curl.text.contains("Example Domain"),
+            "{}",
+            curl.text
+        );
 
         let (_dir2, open) = workspace();
         let open = open.with_network(true);
@@ -444,7 +570,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_symlink_escape_is_blocked() {
-        if !sandboxed() { return; }
+        if !sandboxed() {
+            return;
+        }
         let (dir, ws) = workspace();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("canary"), "LINKED-SECRET").unwrap();
@@ -455,43 +583,80 @@ mod tests {
                 outside.path().display()
             ),
         );
-        assert!(out.is_error && !out.text.contains("LINKED-SECRET"), "{}", out.text);
+        assert!(
+            out.is_error && !out.text.contains("LINKED-SECRET"),
+            "{}",
+            out.text
+        );
         assert!(!outside.path().join("new").exists());
         // The symlinks now exist in the workspace; the fs tools refuse them too.
         assert!(dir.path().join("flink").symlink_metadata().is_ok());
         assert!(run(&ws, "read", json!({"path": "flink"})).is_error);
         assert!(run(&ws, "read", json!({"path": "dlink/canary"})).is_error);
         assert!(run(&ws, "write", json!({"path": "dlink/new", "content": "x"})).is_error);
-        assert!(!run(&ws, "grep", json!({"pattern": "LINKED"})).text.contains("LINKED-SECRET"));
+        assert!(
+            !run(&ws, "grep", json!({"pattern": "LINKED"}))
+                .text
+                .contains("LINKED-SECRET")
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_output_is_bounded_and_keeps_head_and_tail() {
-        if !sandboxed() { return; }
+        if !sandboxed() {
+            return;
+        }
         let (_dir, ws) = workspace();
         let out = bash(&ws, "echo START; seq 1 300000; echo END");
         assert!(!out.is_error);
-        assert!(out.text.len() < BASH_HEAD + BASH_TAIL + 200, "{}", out.text.len());
+        assert!(
+            out.text.len() < BASH_HEAD + BASH_TAIL + 200,
+            "{}",
+            out.text.len()
+        );
         assert!(out.text.starts_with("START\n") && out.text.contains("bytes of output omitted"));
         assert!(out.text.contains("\nEND\n[exit code: 0]"));
         let flood = bash(&ws, "yes | head -c 20000000");
         assert!(flood.text.len() < BASH_HEAD + BASH_TAIL + 200);
         let failing = bash(&ws, "echo oops >&2; exit 3");
-        assert!(failing.is_error && failing.text.contains("oops") && failing.text.contains("[exit code: 3]"));
+        assert!(
+            failing.is_error
+                && failing.text.contains("oops")
+                && failing.text.contains("[exit code: 3]")
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_keeps_diagnostics_from_the_omitted_middle_within_bounds() {
-        if !sandboxed() { return; }
+        if !sandboxed() {
+            return;
+        }
         let (_dir, ws) = workspace();
-        let out = bash(&ws, "seq 1 50000; echo 'error[E0308]: mismatched types'; echo '  --> src/lib.rs:7:5'; seq 1 50000; exit 101");
+        let out = bash(
+            &ws,
+            "seq 1 50000; echo 'error[E0308]: mismatched types'; echo '  --> src/lib.rs:7:5'; seq 1 50000; exit 101",
+        );
         assert!(out.is_error);
-        let omitted = out.text.find("diagnostic line(s) from that part follow").expect("marker");
-        let error = out.text.find("error[E0308]: mismatched types\n  --> src/lib.rs:7:5\n").expect("the middle error survives");
-        assert!(omitted < error && out.text.contains("[exit code: 101]"), "{}", &out.text[omitted..omitted + 300]);
-        assert!(out.text.len() < BASH_HEAD + BASH_TAIL + BASH_DIAGNOSTICS + 300, "{}", out.text.len());
+        let omitted = out
+            .text
+            .find("diagnostic line(s) from that part follow")
+            .expect("marker");
+        let error = out
+            .text
+            .find("error[E0308]: mismatched types\n  --> src/lib.rs:7:5\n")
+            .expect("the middle error survives");
+        assert!(
+            omitted < error && out.text.contains("[exit code: 101]"),
+            "{}",
+            &out.text[omitted..omitted + 300]
+        );
+        assert!(
+            out.text.len() < BASH_HEAD + BASH_TAIL + BASH_DIAGNOSTICS + 300,
+            "{}",
+            out.text.len()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -501,13 +666,19 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn read_pid(dir: &Path, name: &str) -> i32 {
-        fs::read_to_string(dir.join(name)).unwrap().trim().parse().unwrap()
+        fs::read_to_string(dir.join(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_timeout_kills_process_group_without_orphans() {
-        if !sandboxed() { return; }
+        if !sandboxed() {
+            return;
+        }
         let (dir, ws) = workspace();
         let started = Instant::now();
         let out = run(
@@ -515,43 +686,85 @@ mod tests {
             "bash",
             json!({"command": "sleep 30 & echo $! > bg.pid; echo $$ > sh.pid; echo partial; sleep 30", "timeout": 1}),
         );
-        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
-        assert!(out.is_error && out.text.contains("timed out after 1s") && out.text.contains("partial"), "{}", out.text);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            out.is_error && out.text.contains("timed out after 1s") && out.text.contains("partial"),
+            "{}",
+            out.text
+        );
         std::thread::sleep(Duration::from_millis(200));
-        assert!(!alive(read_pid(dir.path(), "bg.pid")), "backgrounded child survived");
+        assert!(
+            !alive(read_pid(dir.path(), "bg.pid")),
+            "backgrounded child survived"
+        );
         assert!(!alive(read_pid(dir.path(), "sh.pid")), "shell survived");
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_kills_background_jobs_when_command_returns() {
-        if !sandboxed() { return; }
+        if !sandboxed() {
+            return;
+        }
         let (dir, ws) = workspace();
         let started = Instant::now();
         let out = bash(&ws, "sleep 30 & echo $! > bg.pid; echo done");
         assert!(!out.is_error && out.text.contains("done"), "{}", out.text);
-        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
         std::thread::sleep(Duration::from_millis(200));
-        assert!(!alive(read_pid(dir.path(), "bg.pid")), "background job outlived the call");
+        assert!(
+            !alive(read_pid(dir.path(), "bg.pid")),
+            "background job outlived the call"
+        );
         // The harness cap wins over a larger requested timeout.
-        let capped = execute(&ws, "bash", &json!({"command": "sleep 30", "timeout": 600}), 1);
-        assert!(capped.text.contains("timed out after 1s"), "{}", capped.text);
+        let capped = execute(
+            &ws,
+            "bash",
+            &json!({"command": "sleep 30", "timeout": 600}),
+            1,
+        );
+        assert!(
+            capped.text.contains("timed out after 1s"),
+            "{}",
+            capped.text
+        );
         assert!(bash(&ws, "   ").is_error);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_runs_python_and_git_when_homebrew_is_present() {
-        if !sandboxed() { return; }
+        if !sandboxed() {
+            return;
+        }
         let (_dir, ws) = workspace();
-        let out = bash(&ws, "python3 -c 'import json, sys; print(json.dumps([6*7]))'");
-        assert!(!out.is_error && out.text.contains("[42]"), "python3: {}", out.text);
+        let out = bash(
+            &ws,
+            "python3 -c 'import json, sys; print(json.dumps([6*7]))'",
+        );
+        assert!(
+            !out.is_error && out.text.contains("[42]"),
+            "python3: {}",
+            out.text
+        );
         let git = bash(
             &ws,
             "git init -q repo && cd repo && echo a > a && git add a && \
              git -c user.name=t -c user.email=t@example.com commit -q -m first && git log --oneline | wc -l",
         );
-        assert!(!git.is_error && git.text.trim_start().starts_with('1'), "git: {}", git.text);
+        assert!(
+            !git.is_error && git.text.trim_start().starts_with('1'),
+            "git: {}",
+            git.text
+        );
     }
 
     #[test]
@@ -561,12 +774,24 @@ mod tests {
         let events = parking_lot::Mutex::new(Vec::new());
         let on_output = |bytes: &[u8]| {
             assert!(bytes.len() <= 16 * 1024);
-            assert!(!dir.path().join("finished").exists(), "output arrived only after command finished");
-            events.lock().push(String::from_utf8_lossy(bytes).into_owned());
+            assert!(
+                !dir.path().join("finished").exists(),
+                "output arrived only after command finished"
+            );
+            events
+                .lock()
+                .push(String::from_utf8_lossy(bytes).into_owned());
         };
-        let output = bash_tool_streaming(&ws, &json!({
-            "command": "printf 'early\\n'; sleep 0.3; touch finished"
-        }), 5, &on_output, &AtomicBool::new(false)).unwrap();
+        let output = bash_tool_streaming(
+            &ws,
+            &json!({
+                "command": "printf 'early\\n'; sleep 0.3; touch finished"
+            }),
+            5,
+            &on_output,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(!output.is_error, "{}", output.text);
         let mut events = events.into_inner();
         assert!(events.join("").contains("early\n"));
@@ -587,9 +812,18 @@ mod tests {
         }), 10, &|_| {}, &AtomicBool::new(false)).unwrap();
         assert!(!output.is_error, "{}", output.text);
         assert!(!output.text.contains("MIDDLE"));
-        let uri = output.text.lines().find_map(|line| line.strip_prefix("[complete output: "))
-            .unwrap().trim_end_matches(']');
-        let bytes = fs::read(artifacts.path().join(uri.strip_prefix("artifact://").unwrap())).unwrap();
+        let uri = output
+            .text
+            .lines()
+            .find_map(|line| line.strip_prefix("[complete output: "))
+            .unwrap()
+            .trim_end_matches(']');
+        let bytes = fs::read(
+            artifacts
+                .path()
+                .join(uri.strip_prefix("artifact://").unwrap()),
+        )
+        .unwrap();
         assert_eq!(bytes.len(), 2 * 1048576 + b"BEGIN\n\nMIDDLE\n\nEND\n".len());
         assert!(bytes.starts_with(b"BEGIN\n") && bytes.ends_with(b"\nEND\n"));
         assert_eq!(&bytes[1048576 + 6..1048576 + 14], b"\nMIDDLE\n");
@@ -606,7 +840,8 @@ mod tests {
     #[test]
     #[ignore]
     fn sigint_shell_helper() {
-        let root = std::env::var("DIAL_TEST_SHELL_SIGINT_ROOT").expect("launched by SIGINT regression test");
+        let root = std::env::var("DIAL_TEST_SHELL_SIGINT_ROOT")
+            .expect("launched by SIGINT regression test");
         let ws = Workspace::new(Path::new(&root)).unwrap().without_sandbox();
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
@@ -614,24 +849,42 @@ mod tests {
             libc::sigemptyset(&mut action.sa_mask);
             libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
         }
-        let output = bash_tool_streaming(&ws, &json!({
-            "command": "sleep 30 & echo $! > bg.pid; echo $$ > sh.pid; echo READY; wait"
-        }), 30, &|bytes| {
-            if !bytes.is_empty() {
-                fs::write(ws.root().join("ready"), b"ready").unwrap();
-            }
-        }, &SIGNAL_CANCEL).unwrap();
-        assert!(output.is_error && output.text.contains("cancelled"), "{}", output.text);
+        let output = bash_tool_streaming(
+            &ws,
+            &json!({
+                "command": "sleep 30 & echo $! > bg.pid; echo $$ > sh.pid; echo READY; wait"
+            }),
+            30,
+            &|bytes| {
+                if !bytes.is_empty() {
+                    fs::write(ws.root().join("ready"), b"ready").unwrap();
+                }
+            },
+            &SIGNAL_CANCEL,
+        )
+        .unwrap();
+        assert!(
+            output.is_error && output.text.contains("cancelled"),
+            "{}",
+            output.text
+        );
     }
 
     #[test]
     fn sigint_cancellation_kills_shell_and_process_group_promptly() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tools::shell::tests::sigint_shell_helper", "--ignored"])
+            .args([
+                "--exact",
+                "tools::shell::tests::sigint_shell_helper",
+                "--ignored",
+            ])
             .env("DIAL_TEST_SHELL_SIGINT_ROOT", dir.path())
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().unwrap();
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !dir.path().join("ready").exists() {
             if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
@@ -644,7 +897,9 @@ mod tests {
         let started = Instant::now();
         assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
         let status = loop {
-            if let Some(status) = child.try_wait().unwrap() { break status; }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
             if started.elapsed() > Duration::from_secs(3) {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -654,12 +909,20 @@ mod tests {
         };
         assert!(status.success(), "SIGINT helper failed: {status}");
         for name in ["sh.pid", "bg.pid"] {
-            let pid: i32 = fs::read_to_string(dir.path().join(name)).unwrap().trim().parse().unwrap();
+            let pid: i32 = fs::read_to_string(dir.path().join(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "{name} survived cancellation");
+            assert_ne!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "{name} survived cancellation"
+            );
         }
     }
 }

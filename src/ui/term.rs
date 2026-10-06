@@ -24,7 +24,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use crossterm::{
     Command,
-    event::{DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     terminal::{disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement},
 };
 use ratatui::{
@@ -93,7 +96,10 @@ impl InlineTerminal {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             bail!("an interactive terminal is required (stdin and stdout must be TTYs)");
         }
-        if ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        if ACTIVE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             bail!("another terminal session is already active");
         }
         match Self::enter_active() {
@@ -115,7 +121,10 @@ impl InlineTerminal {
         let mut out: Box<dyn Write> = Box::new(io::stdout());
         let mut setup = String::new();
         if keyboard_flags {
-            push_command(&mut setup, &PushKeyboardEnhancementFlags(KEYBOARD_FLAGS_WANTED));
+            push_command(
+                &mut setup,
+                &PushKeyboardEnhancementFlags(KEYBOARD_FLAGS_WANTED),
+            );
         }
         push_command(&mut setup, &EnableBracketedPaste);
         out.write_all(setup.as_bytes())?;
@@ -149,24 +158,38 @@ impl InlineTerminal {
 
     /// `(columns, rows)`, re-queried from the terminal on every call.
     pub fn size(&self) -> (u16, u16) {
-        let (cols, rows) = if self.real { crossterm::terminal::size().unwrap_or(self.last_size) } else { self.fake_size };
+        let (cols, rows) = if self.real {
+            crossterm::terminal::size().unwrap_or(self.last_size)
+        } else {
+            self.fake_size
+        };
         (cols.max(1), rows.max(1))
     }
 
     /// Queue finalized rows; they are written to scrollback exactly once on the next paint.
-    pub fn commit(&mut self, rows: Vec<Line<'static>>) { self.pending.extend(rows); }
+    pub fn commit(&mut self, rows: Vec<Line<'static>>) {
+        self.pending.extend(rows);
+    }
 
     /// Call on `Event::Resize`: the next paint erases conservatively from the recorded viewport top.
-    pub fn on_resize(&mut self) { self.force_erase = true; }
+    pub fn on_resize(&mut self) {
+        self.force_erase = true;
+    }
 
     /// Number of history rows flushed to the terminal so far.
-    pub fn history_rows_written(&self) -> usize { self.history_written }
+    pub fn history_rows_written(&self) -> usize {
+        self.history_written
+    }
 
     /// Number of committed rows still waiting for a paint.
-    pub fn history_rows_pending(&self) -> usize { self.pending.len() }
+    pub fn history_rows_pending(&self) -> usize {
+        self.pending.len()
+    }
 
     /// Test seam: pretend the terminal was resized (only meaningful for `with_writer` terminals).
-    pub fn set_size_for_test(&mut self, size: (u16, u16)) { self.fake_size = size; }
+    pub fn set_size_for_test(&mut self, size: (u16, u16)) {
+        self.fake_size = size;
+    }
 
     pub fn paint(&mut self, vp: &Viewport) -> Result<()> {
         let (cols, rows) = self.size();
@@ -174,14 +197,22 @@ impl InlineTerminal {
         // Taller than the terminal: keep the bottom rows (the composer).
         let dropped = vp.rows.len().saturating_sub(rows as usize);
         let visible = &vp.rows[dropped..];
-        if !self.force_erase && self.pending.is_empty() && (cols, rows) == self.last_size
-            && vp.title.is_none_or(|title| self.title.as_deref() == Some(title))
-            && self.last_frame.as_ref().is_some_and(|(lines, cursor)| lines == visible && *cursor == vp.cursor)
+        if !self.force_erase
+            && self.pending.is_empty()
+            && (cols, rows) == self.last_size
+            && vp
+                .title
+                .is_none_or(|title| self.title.as_deref() == Some(title))
+            && self
+                .last_frame
+                .as_ref()
+                .is_some_and(|(lines, cursor)| lines == visible && *cursor == vp.cursor)
         {
             return Ok(());
         }
         let rendered: Vec<(String, usize)> = visible.iter().map(|l| render_row(l, width)).collect();
-        let history: Vec<(String, usize)> = self.pending.iter().map(|l| render_row(l, width)).collect();
+        let history: Vec<(String, usize)> =
+            self.pending.iter().map(|l| render_row(l, width)).collect();
 
         let width_changed = cols != self.last_size.0;
         let erase_first = self.force_erase || (cols, rows) != self.last_size;
@@ -197,7 +228,8 @@ impl InlineTerminal {
         }
         .min(rows as usize - 1);
 
-        let mut buf = String::with_capacity(256 + rendered.iter().map(|r| r.0.len() + 2).sum::<usize>());
+        let mut buf =
+            String::with_capacity(256 + rendered.iter().map(|r| r.0.len() + 2).sum::<usize>());
         buf.push_str(SYNC_BEGIN);
         buf.push_str(CURSOR_HIDE);
         buf.push_str(WRAP_OFF);
@@ -234,14 +266,23 @@ impl InlineTerminal {
         // Rows of a taller previous viewport that this paint did not overwrite. They are below the
         // cursor, so there is room for a relative step down (no scrolling).
         let covered = history.len() + rendered.len().max(1);
-        let leftover = if erase_first { 0 } else { (self.painted_rows as usize).saturating_sub(covered) };
+        let leftover = if erase_first {
+            0
+        } else {
+            (self.painted_rows as usize).saturating_sub(covered)
+        };
         if leftover > 0 {
             buf.push_str("\x1b[B\r\x1b[J\x1b[A");
         }
 
         let n = rendered.len();
         let bottom = n.saturating_sub(1);
-        let target = vp.cursor.map(|(r, c)| ((r as usize).saturating_sub(dropped).min(bottom), (c as usize).min(width - 1)));
+        let target = vp.cursor.map(|(r, c)| {
+            (
+                (r as usize).saturating_sub(dropped).min(bottom),
+                (c as usize).min(width - 1),
+            )
+        });
         let rest_row = target.map_or(bottom, |(r, _)| r);
         if bottom > rest_row {
             buf.push_str(&format!("\x1b[{}A", bottom - rest_row));
@@ -286,12 +327,18 @@ impl InlineTerminal {
 
     /// Run a full-screen panel on the alternate screen, then bring the inline view back exactly:
     /// the terminal restores the normal buffer and cursor; the next paint redraws the viewport.
-    pub fn with_overlay<R>(&mut self, f: impl FnOnce(&mut OverlayTerminal<'_>) -> Result<R>) -> Result<R> {
+    pub fn with_overlay<R>(
+        &mut self,
+        f: impl FnOnce(&mut OverlayTerminal<'_>) -> Result<R>,
+    ) -> Result<R> {
         let mut enter = String::from(ALT_ENTER);
         if self.real {
             // Kitty keyboard flags are per screen: the alternate screen starts with none.
             if self.keyboard_flags {
-                push_command(&mut enter, &PushKeyboardEnhancementFlags(KEYBOARD_FLAGS_WANTED));
+                push_command(
+                    &mut enter,
+                    &PushKeyboardEnhancementFlags(KEYBOARD_FLAGS_WANTED),
+                );
             }
             IN_ALT_SCREEN.store(true, Ordering::SeqCst);
         }
@@ -307,7 +354,10 @@ impl InlineTerminal {
         }
         leave.push_str(CURSOR_SHOW);
         leave.push_str(ALT_LEAVE);
-        let restored = self.out.write_all(leave.as_bytes()).and_then(|()| self.out.flush());
+        let restored = self
+            .out
+            .write_all(leave.as_bytes())
+            .and_then(|()| self.out.flush());
         if self.real {
             IN_ALT_SCREEN.store(false, Ordering::SeqCst);
         }
@@ -410,14 +460,19 @@ impl InlineTerminal {
 }
 
 impl Drop for InlineTerminal {
-    fn drop(&mut self) { self.leave(); }
+    fn drop(&mut self) {
+        self.leave();
+    }
 }
 
 /// Test constructor: no TTY, no raw mode, no panic hook; everything is written to `out`.
-pub fn with_writer(out: Box<dyn Write>, size: (u16, u16)) -> InlineTerminal { InlineTerminal::build(out, size, false, false) }
+pub fn with_writer(out: Box<dyn Write>, size: (u16, u16)) -> InlineTerminal {
+    InlineTerminal::build(out, size, false, false)
+}
 
 const KEYBOARD_FLAGS_WANTED: KeyboardEnhancementFlags =
-    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
 
 fn push_command(into: &mut String, command: &impl Command) {
     // Writing into a String cannot fail.
@@ -429,8 +484,16 @@ fn run_overlay<R>(
     size_override: Option<(u16, u16)>,
     f: impl FnOnce(&mut OverlayTerminal<'_>) -> Result<R>,
 ) -> Result<R> {
-    let backend = OverlayBackend { inner: CrosstermBackend::new(out), size_override };
-    let terminal = Terminal::with_options(backend, TerminalOptions { viewport: RatatuiViewport::Fullscreen })?;
+    let backend = OverlayBackend {
+        inner: CrosstermBackend::new(out),
+        size_override,
+    };
+    let terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: RatatuiViewport::Fullscreen,
+        },
+    )?;
     let mut overlay = OverlayTerminal { terminal };
     f(&mut overlay)
 }
@@ -492,7 +555,9 @@ impl OverlayTerminal<'_> {
 
     /// `(columns, rows)` of the alternate screen.
     pub fn size(&self) -> (u16, u16) {
-        self.terminal.size().map_or((80, 24), |s| (s.width, s.height))
+        self.terminal
+            .size()
+            .map_or((80, 24), |s| (s.width, s.height))
     }
 }
 
@@ -510,14 +575,28 @@ impl Backend for OverlayBackend<'_> {
     {
         self.inner.draw(content)
     }
-    fn hide_cursor(&mut self) -> io::Result<()> { self.inner.hide_cursor() }
-    fn show_cursor(&mut self) -> io::Result<()> { self.inner.show_cursor() }
-    fn get_cursor_position(&mut self) -> io::Result<Position> {
-        if self.size_override.is_some() { Ok(Position::new(0, 0)) } else { self.inner.get_cursor_position() }
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
     }
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> { self.inner.set_cursor_position(position) }
-    fn clear(&mut self) -> io::Result<()> { self.inner.clear() }
-    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> { self.inner.clear_region(clear_type) }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        if self.size_override.is_some() {
+            Ok(Position::new(0, 0))
+        } else {
+            self.inner.get_cursor_position()
+        }
+    }
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
     fn size(&self) -> io::Result<Size> {
         match self.size_override {
             Some((width, height)) => Ok(Size::new(width, height)),
@@ -526,11 +605,16 @@ impl Backend for OverlayBackend<'_> {
     }
     fn window_size(&mut self) -> io::Result<WindowSize> {
         match self.size_override {
-            Some((columns, rows)) => Ok(WindowSize { columns_rows: Size::new(columns, rows), pixels: Size::new(0, 0) }),
+            Some((columns, rows)) => Ok(WindowSize {
+                columns_rows: Size::new(columns, rows),
+                pixels: Size::new(0, 0),
+            }),
             None => self.inner.window_size(),
         }
     }
-    fn flush(&mut self) -> io::Result<()> { Backend::flush(&mut self.inner) }
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -540,7 +624,9 @@ impl Backend for OverlayBackend<'_> {
 /// SGR-encode each row, clipped to `width` cells (never bisecting a grapheme), control characters
 /// removed, with a style reset at the end of every row.
 pub fn rows_to_ansi(rows: &[Line<'static>], width: u16) -> Vec<String> {
-    rows.iter().map(|line| render_row(line, width as usize).0).collect()
+    rows.iter()
+        .map(|line| render_row(line, width as usize).0)
+        .collect()
 }
 
 /// The encoded row and the number of cells it occupies.
@@ -647,7 +733,9 @@ mod tests {
             self.0.lock().extend_from_slice(data);
             Ok(data.len())
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     /// An `InlineTerminal` wired to a vt100 emulator: assertions look at what a user would see.
@@ -660,7 +748,9 @@ mod tests {
         seen: usize,
     }
 
-    fn lines(rows: &[&str]) -> Vec<Line<'static>> { rows.iter().map(|r| Line::from(r.to_string())).collect() }
+    fn lines(rows: &[&str]) -> Vec<Line<'static>> {
+        rows.iter().map(|r| Line::from(r.to_string())).collect()
+    }
 
     impl Rig {
         fn new(cols: u16, rows: u16) -> Self {
@@ -681,14 +771,22 @@ mod tests {
             self.raw.extend(data);
         }
 
-        fn commit(&mut self, rows: &[&str]) { self.term.commit(lines(rows)); }
+        fn commit(&mut self, rows: &[&str]) {
+            self.term.commit(lines(rows));
+        }
 
         fn paint(&mut self, rows: &[&str], cursor: Option<(u16, u16)>) {
             self.paint_lines(&lines(rows), cursor);
         }
 
         fn paint_lines(&mut self, rows: &[Line<'static>], cursor: Option<(u16, u16)>) {
-            self.term.paint(&Viewport { rows, cursor, title: None }).unwrap();
+            self.term
+                .paint(&Viewport {
+                    rows,
+                    cursor,
+                    title: None,
+                })
+                .unwrap();
             self.sync();
         }
 
@@ -701,7 +799,9 @@ mod tests {
         /// Visible screen rows, right-trimmed.
         fn screen(&self) -> Vec<String> {
             let s = self.parser.screen();
-            s.rows(0, s.size().1).map(|r| r.trim_end().to_string()).collect()
+            s.rows(0, s.size().1)
+                .map(|r| r.trim_end().to_string())
+                .collect()
         }
 
         /// Everything the user can scroll through: scrollback followed by the screen, with trailing
@@ -716,7 +816,9 @@ mod tests {
         }
 
         /// Rows that have scrolled off the top of the screen so far.
-        fn scrollback_len(&self) -> usize { self.history.len() }
+        fn scrollback_len(&self) -> usize {
+            self.history.len()
+        }
 
         /// vt100 0.15 cannot scroll back further than one screen at a time, so feed bytes one by
         /// one and record each row the instant it enters scrollback.
@@ -738,7 +840,9 @@ mod tests {
         }
     }
 
-    fn numbered(n: usize) -> Vec<String> { (1..=n).map(|i| format!("history {i}")).collect() }
+    fn numbered(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("history {i}")).collect()
+    }
 
     fn commit_numbered(rig: &mut Rig, n: usize) {
         let rows = numbered(n);
@@ -774,7 +878,11 @@ mod tests {
         let mut expected = numbered(15);
         expected.extend(["╭─ box ─╮", "│ hi │", "╰───────╯"].map(String::from));
         assert_eq!(rig.transcript(), expected);
-        assert_eq!(rig.scrollback_len(), expected.len() - 8, "everything above the screen is scrollback, nothing duplicated");
+        assert_eq!(
+            rig.scrollback_len(),
+            expected.len() - 8,
+            "everything above the screen is scrollback, nothing duplicated"
+        );
         assert_eq!(&rig.screen()[5..], ["╭─ box ─╮", "│ hi │", "╰───────╯"]);
         assert_eq!(rig.term.history_rows_written(), 15);
     }
@@ -813,8 +921,14 @@ mod tests {
         let mut rig = Rig::new(20, 10);
         commit_numbered(&mut rig, 3);
         rig.paint(&["composer"], Some((0, 8)));
-        rig.paint(&["composer", "menu 1", "menu 2", "menu 3", "menu 4"], Some((0, 8)));
-        assert_eq!(rig.screen()[3..8], ["composer", "menu 1", "menu 2", "menu 3", "menu 4"]);
+        rig.paint(
+            &["composer", "menu 1", "menu 2", "menu 3", "menu 4"],
+            Some((0, 8)),
+        );
+        assert_eq!(
+            rig.screen()[3..8],
+            ["composer", "menu 1", "menu 2", "menu 3", "menu 4"]
+        );
         rig.paint(&["composer", "menu 1"], Some((0, 8)));
         rig.paint(&["composer"], Some((0, 8)));
         let mut expected = numbered(3);
@@ -905,19 +1019,44 @@ mod tests {
     #[test]
     fn wide_graphemes_are_clipped_by_cells() {
         let mut rig = Rig::new(5, 4);
-        rig.paint(&["日本語", "ab日本", "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}"], None);
-        assert_eq!(rig.screen()[..3], ["日本", "ab日", "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}"]);
+        rig.paint(
+            &[
+                "日本語",
+                "ab日本",
+                "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
+            ],
+            None,
+        );
+        assert_eq!(
+            rig.screen()[..3],
+            ["日本", "ab日", "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}"]
+        );
         assert_eq!(rows_to_ansi(&lines(&["日本語"]), 5)[0], "日本\x1b[0m");
-        assert_eq!(rows_to_ansi(&lines(&["日本語"]), 3)[0], "日\x1b[0m", "a wide cell that does not fit is dropped whole");
+        assert_eq!(
+            rows_to_ansi(&lines(&["日本語"]), 3)[0],
+            "日\x1b[0m",
+            "a wide cell that does not fit is dropped whole"
+        );
     }
 
     #[test]
     fn colors_and_modifiers_reach_the_screen() {
         let mut rig = Rig::new(40, 4);
         let row = Line::from(vec![
-            Span::styled("rgb", Style::default().fg(Color::Rgb(10, 20, 30)).bg(Color::Indexed(200))),
-            Span::styled("bold", Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC)),
-            Span::styled("rev", Style::default().add_modifier(Modifier::REVERSED | Modifier::UNDERLINED)),
+            Span::styled(
+                "rgb",
+                Style::default()
+                    .fg(Color::Rgb(10, 20, 30))
+                    .bg(Color::Indexed(200)),
+            ),
+            Span::styled(
+                "bold",
+                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            ),
+            Span::styled(
+                "rev",
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::UNDERLINED),
+            ),
             Span::styled("red", Style::default().fg(Color::Red)),
             Span::raw("plain"),
         ]);
@@ -928,7 +1067,11 @@ mod tests {
         assert_eq!(cell(0).bgcolor(), vt100::Color::Idx(200));
         assert!(!cell(0).bold());
         assert!(cell(3).bold() && cell(3).italic());
-        assert_eq!(cell(3).fgcolor(), vt100::Color::Default, "attributes do not inherit the previous span's colors");
+        assert_eq!(
+            cell(3).fgcolor(),
+            vt100::Color::Default,
+            "attributes do not inherit the previous span's colors"
+        );
         assert!(cell(7).inverse() && cell(7).underline());
         assert_eq!(cell(10).fgcolor(), vt100::Color::Idx(1));
         assert!(!cell(10).inverse());
@@ -991,8 +1134,16 @@ mod tests {
         rig.paint(&["composer", "menu"], Some((0, 3)));
         let t = rig.transcript();
         assert_eq!(&t[t.len() - 2..], ["composer", "menu"]);
-        assert_eq!(t.iter().filter(|r| r.as_str() == "composer").count(), 1, "no stale viewport copy");
-        assert_eq!(t.iter().filter(|r| r.starts_with("history")).count(), 6, "history neither lost nor duplicated");
+        assert_eq!(
+            t.iter().filter(|r| r.as_str() == "composer").count(),
+            1,
+            "no stale viewport copy"
+        );
+        assert_eq!(
+            t.iter().filter(|r| r.starts_with("history")).count(),
+            6,
+            "history neither lost nor duplicated"
+        );
     }
 
     #[test]
@@ -1079,12 +1230,20 @@ mod tests {
         rig.term.clear_screen().unwrap();
         rig.sync();
         // (vt100 does not implement `3J`, so scrollback erasure itself is checked on the bytes.)
-        assert!(String::from_utf8(rig.raw.clone()).unwrap().contains("\x1b[2J\x1b[3J\x1b[H"));
+        assert!(
+            String::from_utf8(rig.raw.clone())
+                .unwrap()
+                .contains("\x1b[2J\x1b[3J\x1b[H")
+        );
         assert!(rig.screen().iter().all(|r| r.is_empty()));
         assert_eq!(rig.parser.screen().cursor_position(), (0, 0));
         rig.commit(&["fresh"]);
         rig.paint(&["input"], Some((0, 0)));
-        assert_eq!(rig.screen(), ["fresh", "input", "", ""], "tracking restarted at the top; the discarded row never appears");
+        assert_eq!(
+            rig.screen(),
+            ["fresh", "input", "", ""],
+            "tracking restarted at the top; the discarded row never appears"
+        );
     }
 
     #[test]
@@ -1099,7 +1258,10 @@ mod tests {
             .with_overlay(|overlay| {
                 assert_eq!(overlay.size(), (30, 8));
                 overlay.draw(|frame| {
-                    frame.render_widget(ratatui::widgets::Paragraph::new("SETTINGS PANEL"), frame.area());
+                    frame.render_widget(
+                        ratatui::widgets::Paragraph::new("SETTINGS PANEL"),
+                        frame.area(),
+                    );
                 })?;
                 Ok(7)
             })
@@ -1107,17 +1269,28 @@ mod tests {
         assert_eq!(seen, 7);
         rig.sync();
         let text = String::from_utf8(rig.raw.clone()).unwrap();
-        let enter = text.find("\x1b[?1049h").expect("enters the alternate screen");
-        let leave = text.find("\x1b[?1049l").expect("leaves the alternate screen");
+        let enter = text
+            .find("\x1b[?1049h")
+            .expect("enters the alternate screen");
+        let leave = text
+            .find("\x1b[?1049l")
+            .expect("leaves the alternate screen");
         assert!(enter < leave);
         assert!(text[enter..leave].contains("SETTINGS"));
         assert!(!rig.parser.screen().alternate_screen());
-        assert_eq!(rig.transcript(), before, "the normal buffer is untouched by the overlay");
+        assert_eq!(
+            rig.transcript(),
+            before,
+            "the normal buffer is untouched by the overlay"
+        );
 
         // Next paint redraws the viewport in full at the saved position, no duplicates.
         let before_len = rig.raw.len();
         rig.paint(&["╭ composer ╮", "╰──────────╯"], Some((0, 3)));
-        assert!(rig.raw[before_len..].windows(3).any(|w| w == b"\x1b[J"), "the redraw erases from the viewport top");
+        assert!(
+            rig.raw[before_len..].windows(3).any(|w| w == b"\x1b[J"),
+            "the redraw erases from the viewport top"
+        );
         assert_eq!(rig.transcript(), before);
     }
 
@@ -1136,12 +1309,21 @@ mod tests {
             .unwrap();
         assert_eq!(value, 42);
         let before_f = String::from_utf8(at_call).unwrap();
-        assert!(before_f.contains("\x1b[?2004l"), "bracketed paste disabled before f");
+        assert!(
+            before_f.contains("\x1b[?2004l"),
+            "bracketed paste disabled before f"
+        );
         assert!(before_f.contains("\x1b[?25h"), "cursor shown before f");
-        assert!(!before_f.contains("\x1b[?2004h"), "nothing re-armed before f ran");
+        assert!(
+            !before_f.contains("\x1b[?2004h"),
+            "nothing re-armed before f ran"
+        );
         rig.sync();
         let all = String::from_utf8(rig.raw.clone()).unwrap();
-        assert!(all.rfind("\x1b[?2004l").unwrap() < all.rfind("\x1b[?2004h").unwrap(), "re-enabled after f");
+        assert!(
+            all.rfind("\x1b[?2004l").unwrap() < all.rfind("\x1b[?2004h").unwrap(),
+            "re-enabled after f"
+        );
     }
 
     #[test]
@@ -1157,20 +1339,37 @@ mod tests {
         rig.term
             .suspend(|| {
                 probe.process(&bytes.0.lock());
-                seen = probe.screen().rows(0, 20).map(|r| r.trim_end().to_string()).collect::<Vec<_>>();
+                seen = probe
+                    .screen()
+                    .rows(0, 20)
+                    .map(|r| r.trim_end().to_string())
+                    .collect::<Vec<_>>();
                 cursor = probe.screen().cursor_position();
             })
             .unwrap();
-        assert!(!seen.iter().any(|r| r.contains("box") || r.contains("typed")), "viewport gone while the editor runs: {seen:?}");
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r.contains("box") || r.contains("typed")),
+            "viewport gone while the editor runs: {seen:?}"
+        );
         assert_eq!(cursor.1, 0, "cursor at column 0");
         rig.sync();
         // The "editor" prints something, then the viewport comes back below it.
         rig.parser.process(b"editor output\r\n");
         rig.paint(&["╭─ box ─╮", "│ typed │", "╰───────╯"], Some((1, 3)));
         let t = rig.transcript();
-        let history: Vec<_> = t.iter().filter(|r| r.starts_with("history")).cloned().collect();
+        let history: Vec<_> = t
+            .iter()
+            .filter(|r| r.starts_with("history"))
+            .cloned()
+            .collect();
         assert_eq!(history, numbered(5), "history exactly once, in order");
-        assert_eq!(t.iter().filter(|r| r.contains("box")).count(), 1, "no stale viewport copy: {t:?}");
+        assert_eq!(
+            t.iter().filter(|r| r.contains("box")).count(),
+            1,
+            "no stale viewport copy: {t:?}"
+        );
         assert_eq!(t.last().unwrap(), "╰───────╯");
     }
 
@@ -1194,7 +1393,10 @@ mod tests {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = rig.term.suspend(|| panic!("editor crashed"));
         }));
-        assert!(caught.is_err(), "the panic propagates after the terminal is re-armed");
+        assert!(
+            caught.is_err(),
+            "the panic propagates after the terminal is re-armed"
+        );
         rig.sync();
         let all = String::from_utf8(rig.raw.clone()).unwrap();
         assert!(all.rfind("\x1b[?2004h").unwrap() > all.rfind("\x1b[?2004l").unwrap());
@@ -1206,7 +1408,10 @@ mod tests {
     fn overlay_error_still_leaves_the_alternate_screen() {
         let mut rig = Rig::new(30, 8);
         rig.paint(&["input"], Some((0, 0)));
-        let err = rig.term.with_overlay::<()>(|_| anyhow::bail!("boom")).unwrap_err();
+        let err = rig
+            .term
+            .with_overlay::<()>(|_| anyhow::bail!("boom"))
+            .unwrap_err();
         assert_eq!(err.to_string(), "boom");
         rig.sync();
         assert!(!rig.parser.screen().alternate_screen());
@@ -1219,7 +1424,13 @@ mod tests {
         let mut rig = Rig::new(20, 4);
         let rows = lines(&["x"]);
         for title in ["dial", "dial", "dial\x1b[2Jevil"] {
-            rig.term.paint(&Viewport { rows: &rows, cursor: None, title: Some(title) }).unwrap();
+            rig.term
+                .paint(&Viewport {
+                    rows: &rows,
+                    cursor: None,
+                    title: Some(title),
+                })
+                .unwrap();
         }
         rig.sync();
         let text = String::from_utf8(rig.raw.clone()).unwrap();
@@ -1232,9 +1443,30 @@ mod tests {
     #[test]
     fn rows_to_ansi_encodes_colors_and_modifiers() {
         let row = Line::from(vec![
-            Span::styled("a", Style::default().fg(Color::Rgb(1, 2, 3)).bg(Color::Indexed(9))),
-            Span::styled("b", Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD | Modifier::DIM)),
-            Span::styled("c", Style::default().fg(Color::Gray).bg(Color::Black).add_modifier(Modifier::ITALIC | Modifier::UNDERLINED | Modifier::REVERSED | Modifier::CROSSED_OUT)),
+            Span::styled(
+                "a",
+                Style::default()
+                    .fg(Color::Rgb(1, 2, 3))
+                    .bg(Color::Indexed(9)),
+            ),
+            Span::styled(
+                "b",
+                Style::default()
+                    .fg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD | Modifier::DIM),
+            ),
+            Span::styled(
+                "c",
+                Style::default()
+                    .fg(Color::Gray)
+                    .bg(Color::Black)
+                    .add_modifier(
+                        Modifier::ITALIC
+                            | Modifier::UNDERLINED
+                            | Modifier::REVERSED
+                            | Modifier::CROSSED_OUT,
+                    ),
+            ),
             Span::raw("d"),
         ]);
         assert_eq!(
@@ -1253,22 +1485,33 @@ mod tests {
 
     #[test]
     fn rows_to_ansi_clips_across_span_boundaries() {
-        let row = Line::from(vec![Span::raw("ab"), Span::styled("cdef", Style::default().add_modifier(Modifier::BOLD))]);
+        let row = Line::from(vec![
+            Span::raw("ab"),
+            Span::styled("cdef", Style::default().add_modifier(Modifier::BOLD)),
+        ]);
         assert_eq!(rows_to_ansi(&[row], 4)[0], "ab\x1b[0;1mcd\x1b[0m");
     }
 
     #[test]
     fn rows_to_ansi_strips_control_characters_and_applies_line_style() {
-        let row = Line::from(vec![Span::raw("a\x1b[31mb\tc\nd")]).style(Style::default().fg(Color::Green));
+        let row = Line::from(vec![Span::raw("a\x1b[31mb\tc\nd")])
+            .style(Style::default().fg(Color::Green));
         let out = rows_to_ansi(&[row], 20)[0].clone();
         assert!(!out.contains('\n') && !out.contains('\t'));
-        assert_eq!(out.matches('\x1b').count(), 2, "only our own SGR + reset; the injected ESC is gone: {out:?}");
+        assert_eq!(
+            out.matches('\x1b').count(),
+            2,
+            "only our own SGR + reset; the injected ESC is gone: {out:?}"
+        );
         assert!(out.starts_with("\x1b[0;32m"));
     }
 
     #[test]
     fn explicit_default_style_after_a_styled_span_resets() {
-        let row = Line::from(vec![Span::styled("x", Style::default().fg(Color::Red)), Span::raw("y")]);
+        let row = Line::from(vec![
+            Span::styled("x", Style::default().fg(Color::Red)),
+            Span::raw("y"),
+        ]);
         assert_eq!(rows_to_ansi(&[row], 5)[0], "\x1b[0;31mx\x1b[0my\x1b[0m");
     }
 }

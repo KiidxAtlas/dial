@@ -17,18 +17,30 @@ pub(super) struct Target {
 }
 
 impl Target {
-    pub fn resolve(ws: &Workspace, path: Option<&str>, lang: Option<&str>) -> Result<Target, String> {
+    pub fn resolve(
+        ws: &Workspace,
+        path: Option<&str>,
+        lang: Option<&str>,
+    ) -> Result<Target, String> {
         let start = match path {
             Some(input) => ws.resolve(input)?,
             None => ws.root().to_owned(),
         };
-        let meta = fs::metadata(&start).map_err(|e| io_message("searching", &ws.rel(&start), &e))?;
+        let meta =
+            fs::metadata(&start).map_err(|e| io_message("searching", &ws.rel(&start), &e))?;
         let lang = lang.map(parse_lang).transpose()?;
         let is_file = meta.is_file();
         if is_file && lang.is_none() && lang_of_path(&start).is_none() {
-            return Err(format!("cannot infer the language of {:?}; pass `lang`", ws.rel(&start)));
+            return Err(format!(
+                "cannot infer the language of {:?}; pass `lang`",
+                ws.rel(&start)
+            ));
         }
-        Ok(Target { start, is_file, lang })
+        Ok(Target {
+            start,
+            is_file,
+            lang,
+        })
     }
 
     /// Language to use for `path`, or `None` to skip the file.
@@ -64,13 +76,18 @@ impl Coverage {
     pub fn footer(&self) -> String {
         let mut out = String::new();
         if self.skipped > 0 {
-            out.push_str(&format!("[{} binary, oversized or non-UTF-8 files skipped]\n", self.skipped));
+            out.push_str(&format!(
+                "[{} binary, oversized or non-UTF-8 files skipped]\n",
+                self.skipped
+            ));
         }
         for (lang, why) in &self.rejected {
             out.push_str(&format!("[{lang} files skipped: {why}]\n"));
         }
         if self.truncated {
-            out.push_str("[workspace walk truncated at its entry limit; results may be incomplete]\n");
+            out.push_str(
+                "[workspace walk truncated at its entry limit; results may be incomplete]\n",
+            );
         }
         out
     }
@@ -85,7 +102,11 @@ pub(super) struct Queries<'a> {
 
 impl<'a> Queries<'a> {
     pub fn new(pattern: &'a str, rewrite: Option<&'a str>) -> Self {
-        Queries { pattern, rewrite, compiled: HashMap::new() }
+        Queries {
+            pattern,
+            rewrite,
+            compiled: HashMap::new(),
+        }
     }
 
     pub fn get(&mut self, lang: SupportLang) -> Result<&Query, &str> {
@@ -108,9 +129,13 @@ fn load(path: &Path, rel: String) -> Result<SourceFile, ()> {
         return Err(());
     }
     let text = String::from_utf8(bytes).map_err(|_| ())?;
-    Ok(SourceFile { abs: path.to_owned(), rel, text, perms: meta.permissions() })
+    Ok(SourceFile {
+        abs: path.to_owned(),
+        rel,
+        text,
+        perms: meta.permissions(),
+    })
 }
-
 
 /// Run `visit` on every loadable file of `target` whose language has a query, in sorted order.
 /// `visit` returns false to stop early. An error means the pattern is unusable for the
@@ -127,7 +152,9 @@ pub(super) fn scan(
     }
     let mut compiled_any = false;
     let mut each = |path: &Path| -> bool {
-        let Some(lang) = target.language(path) else { return true };
+        let Some(lang) = target.language(path) else {
+            return true;
+        };
         let query = match queries.get(lang) {
             Ok(query) => query,
             Err(why) => {

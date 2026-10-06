@@ -3,7 +3,8 @@
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Phase {
-    #[default] Idle,
+    #[default]
+    Idle,
     /// A model turn or a tool is running.
     Working,
     Compacting,
@@ -14,13 +15,18 @@ pub enum Phase {
 
 /// Which special input mode the composer is in (changes its border color).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum InputMode { #[default] Normal, Shell }
+pub enum InputMode {
+    #[default]
+    Normal,
+    Shell,
+}
 
 /// Whether the main model can be, or is being, improved with LoRA weight training.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Lora {
     /// Not known yet (the status has not been read, or mlx-lm is not installed).
-    #[default] Unknown,
+    #[default]
+    Unknown,
     /// The model cannot take a LoRA adapter here: an external server serves it, or mlx-lm lacks its architecture.
     Unsupported,
     /// Compatible, but weight training is disabled in the configuration.
@@ -34,6 +40,7 @@ pub enum Lora {
     /// Accepted version; runtime loading has not been confirmed.
     Active(i64),
     Training,
+    Paused,
     Evaluating,
     Loading,
     Loaded,
@@ -54,6 +61,7 @@ impl Lora {
             Lora::Verifying => "LoRA verifying".into(),
             Lora::Active(id) => format!("LoRA accepted v{id}"),
             Lora::Training => "LoRA training".into(),
+            Lora::Paused => "LoRA paused for coding".into(),
             Lora::Evaluating => "LoRA evaluating".into(),
             Lora::Loading => "LoRA loading".into(),
             Lora::Loaded => "LoRA loaded".into(),
@@ -64,8 +72,12 @@ impl Lora {
 
     pub fn with_runtime(self, runtime: &crate::llm::provider::AdapterRuntime) -> Self {
         use crate::llm::provider::AdapterPhase;
-        if matches!(self, Self::Training | Self::Evaluating) { return self; }
-        if runtime.adapter.is_none() { return self; }
+        if matches!(self, Self::Training | Self::Paused | Self::Evaluating) {
+            return self;
+        }
+        if runtime.adapter.is_none() {
+            return self;
+        }
         match runtime.phase {
             AdapterPhase::Idle => self,
             AdapterPhase::Loading => Self::Loading,
@@ -113,11 +125,17 @@ pub struct StatusData {
 }
 
 impl StatusData {
-    pub fn busy(&self) -> bool { matches!(self.phase, Phase::Working | Phase::Compacting | Phase::WaitingCompute) }
+    pub fn busy(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Working | Phase::Compacting | Phase::WaitingCompute
+        )
+    }
 
     /// Fraction of the context window the last prompt used, when both are known.
     pub fn context_fraction(&self) -> Option<f64> {
         let used = self.prompt_tokens?;
-        (self.context_window > 0).then(|| (used as f64 / f64::from(self.context_window)).clamp(0.0, 1.0))
+        (self.context_window > 0)
+            .then(|| (used as f64 / f64::from(self.context_window)).clamp(0.0, 1.0))
     }
 }

@@ -4,12 +4,12 @@
 //! (total bytes, bytes per line, silence). [`Accumulator`] folds
 //! `chat.completion.chunk` payloads into a [`Reply`].
 
+use super::cancel::Patience;
 use super::{Interrupted, Reply, excerpt, parse_tool_calls};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read};
-use super::cancel::Patience;
 #[cfg(test)]
 use std::time::Instant;
 
@@ -38,11 +38,29 @@ pub(super) fn read_events(
     let mut line: Vec<u8> = Vec::new();
     let mut pending = String::new();
     let mut total = 0usize;
-    let mut on_data = |data: &str| { patience.mark_event(); on_data(data) };
+    let mut on_data = |data: &str| {
+        patience.mark_event();
+        on_data(data)
+    };
     // The longest this stream may currently be silent, or `None` while waiting for the first event on a local server.
-    let limit = || if patience.first_event_seen() { Some(patience.idle) } else { patience.first_event };
-    let stalled = || patience.remaining().is_some_and(|remaining| remaining.is_zero());
-    let stall_message = || format!("chat stream was silent for {:?} (the idle limit); the server may be stuck or overloaded", limit().unwrap_or(patience.idle));
+    let limit = || {
+        if patience.first_event_seen() {
+            Some(patience.idle)
+        } else {
+            patience.first_event
+        }
+    };
+    let stalled = || {
+        patience
+            .remaining()
+            .is_some_and(|remaining| remaining.is_zero())
+    };
+    let stall_message = || {
+        format!(
+            "chat stream was silent for {:?} (the idle limit); the server may be stuck or overloaded",
+            limit().unwrap_or(patience.idle)
+        )
+    };
     loop {
         let count = match reader.read(&mut chunk) {
             Ok(0) => break,
@@ -56,11 +74,17 @@ pub(super) fn read_events(
             }
         };
         total += count;
-        ensure!(total <= total_limit, "chat stream exceeds {total_limit} bytes");
+        ensure!(
+            total <= total_limit,
+            "chat stream exceeds {total_limit} bytes"
+        );
         for &byte in &chunk[..count] {
             if byte != b'\n' {
                 line.push(byte);
-                ensure!(line.len() <= line_limit, "chat stream line exceeds {line_limit} bytes");
+                ensure!(
+                    line.len() <= line_limit,
+                    "chat stream line exceeds {line_limit} bytes"
+                );
             } else {
                 let done = dispatch(&line, &mut pending, &mut on_data)?;
                 line.clear();
@@ -76,22 +100,34 @@ pub(super) fn read_events(
     if !line.is_empty() {
         dispatch(&line, &mut pending, &mut on_data)?;
     }
-    if !pending.is_empty() { on_data(&pending)?; }
+    if !pending.is_empty() {
+        on_data(&pending)?;
+    }
     Ok(())
 }
 
-fn dispatch(line: &[u8], pending: &mut String, on_data: &mut impl FnMut(&str) -> Result<bool>) -> Result<bool> {
+fn dispatch(
+    line: &[u8],
+    pending: &mut String,
+    on_data: &mut impl FnMut(&str) -> Result<bool>,
+) -> Result<bool> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.is_empty() {
-        if pending.is_empty() { return Ok(false); }
+        if pending.is_empty() {
+            return Ok(false);
+        }
         let done = on_data(pending)?;
         pending.clear();
         return Ok(done);
     }
-    let Some(rest) = line.strip_prefix(b"data:") else { return Ok(false) };
+    let Some(rest) = line.strip_prefix(b"data:") else {
+        return Ok(false);
+    };
     let rest = rest.strip_prefix(b" ").unwrap_or(rest);
     let payload = std::str::from_utf8(rest).context("chat stream event is not valid UTF-8")?;
-    if !pending.is_empty() { pending.push('\n'); }
+    if !pending.is_empty() {
+        pending.push('\n');
+    }
     pending.push_str(payload);
     Ok(false)
 }
@@ -120,11 +156,20 @@ impl Accumulator {
     /// Fold one `data:` payload in. Returns true on `[DONE]`. `on_text`
     /// returning false aborts with [`Interrupted`].
     #[cfg(test)]
-    pub(super) fn feed(&mut self, data: &str, on_text: &mut dyn FnMut(&str) -> bool) -> Result<bool> {
+    pub(super) fn feed(
+        &mut self,
+        data: &str,
+        on_text: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<bool> {
         self.feed_with_events(data, on_text, &mut |_| true)
     }
 
-    pub(super) fn feed_with_events(&mut self, data: &str, on_text: &mut dyn FnMut(&str) -> bool, on_event: &mut dyn FnMut(&super::StreamEvent) -> bool) -> Result<bool> {
+    pub(super) fn feed_with_events(
+        &mut self,
+        data: &str,
+        on_text: &mut dyn FnMut(&str) -> bool,
+        on_event: &mut dyn FnMut(&super::StreamEvent) -> bool,
+    ) -> Result<bool> {
         let data = data.trim();
         if data.is_empty() {
             return Ok(false);
@@ -133,30 +178,60 @@ impl Accumulator {
             self.done = true;
             return Ok(true);
         }
-        let event: Value = serde_json::from_str(data).context("chat stream event is not valid JSON")?;
+        let event: Value =
+            serde_json::from_str(data).context("chat stream event is not valid JSON")?;
         if let Some(error) = event.get("error").filter(|e| !e.is_null()) {
-            let message = error.get("message").and_then(Value::as_str).map(str::to_string);
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let message = message.unwrap_or_else(|| error.to_string());
-            bail!("model server reported a stream error: {}", excerpt(message.as_bytes(), message.len() > 512));
+            bail!(
+                "model server reported a stream error: {}",
+                excerpt(message.as_bytes(), message.len() > 512)
+            );
         }
         if let Some(usage) = event.get("usage").filter(|u| u.is_object()) {
-            self.prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64).or(self.prompt_tokens);
-            self.completion_tokens = usage.get("completion_tokens").and_then(Value::as_u64).or(self.completion_tokens);
-            self.reasoning_tokens = usage.pointer("/completion_tokens_details/reasoning_tokens").and_then(Value::as_u64).or(self.reasoning_tokens);
-            self.cached_prompt_tokens = usage.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64).or(self.cached_prompt_tokens);
+            self.prompt_tokens = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .or(self.prompt_tokens);
+            self.completion_tokens = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .or(self.completion_tokens);
+            self.reasoning_tokens = usage
+                .pointer("/completion_tokens_details/reasoning_tokens")
+                .and_then(Value::as_u64)
+                .or(self.reasoning_tokens);
+            self.cached_prompt_tokens = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .or(self.cached_prompt_tokens);
         }
         // `choices` is empty in the trailing usage chunk. Only choice 0 is used.
         let Some(choice) = event
             .get("choices")
             .and_then(Value::as_array)
-            .and_then(|choices| choices.iter().find(|c| c.get("index").and_then(Value::as_u64).unwrap_or(0) == 0))
+            .and_then(|choices| {
+                choices
+                    .iter()
+                    .find(|c| c.get("index").and_then(Value::as_u64).unwrap_or(0) == 0)
+            })
         else {
             return Ok(false);
         };
         if let Some(delta) = choice.get("delta").or_else(|| choice.get("message")) {
-            if let Some(piece) = delta.get("reasoning_content").or_else(|| delta.get("reasoning")).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            if let Some(piece) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
                 self.reasoning.push_str(piece);
-                if !on_event(&super::StreamEvent::Reasoning(piece.to_owned())) { return Err(Interrupted.into()); }
+                if !on_event(&super::StreamEvent::Reasoning(piece.to_owned())) {
+                    return Err(Interrupted.into());
+                }
             }
             match delta.get("content") {
                 Some(Value::String(piece)) if !piece.is_empty() => {
@@ -174,8 +249,17 @@ impl Accumulator {
                         for call in calls {
                             self.add_tool_delta(call)?;
                             let slot = self.slot(call)?;
-                            if let Some(piece) = call.pointer("/function/arguments").and_then(Value::as_str) {
-                                if !on_event(&super::StreamEvent::ToolArguments { index:call["index"].as_u64().unwrap_or(0),id:slot.id.clone(),name:slot.name.clone(),delta:piece.to_owned() }) { return Err(Interrupted.into()); }
+                            if let Some(piece) =
+                                call.pointer("/function/arguments").and_then(Value::as_str)
+                            {
+                                if !on_event(&super::StreamEvent::ToolArguments {
+                                    index: call["index"].as_u64().unwrap_or(0),
+                                    id: slot.id.clone(),
+                                    name: slot.name.clone(),
+                                    delta: piece.to_owned(),
+                                }) {
+                                    return Err(Interrupted.into());
+                                }
                             }
                         }
                     }
@@ -193,12 +277,26 @@ impl Accumulator {
     /// Calls are keyed by `index`. A delta without one continues the call with
     /// the same `id`, else the most recent call, else starts a new one.
     fn slot(&mut self, delta: &Value) -> Result<&mut PartialCall> {
-        let id = delta.get("id").and_then(Value::as_str).filter(|id| !id.is_empty());
+        let id = delta
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
         let key = match delta.get("index").and_then(Value::as_u64) {
             Some(index) => index,
             None => id
-                .and_then(|id| self.calls.iter().find(|(_, call)| call.id == id).map(|(key, _)| *key))
-                .or_else(|| if id.is_none() { self.calls.keys().next_back().copied() } else { None })
+                .and_then(|id| {
+                    self.calls
+                        .iter()
+                        .find(|(_, call)| call.id == id)
+                        .map(|(key, _)| *key)
+                })
+                .or_else(|| {
+                    if id.is_none() {
+                        self.calls.keys().next_back().copied()
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_else(|| self.calls.keys().next_back().map_or(0, |last| last + 1)),
         };
         ensure!(
@@ -209,14 +307,19 @@ impl Accumulator {
     }
 
     fn add_tool_delta(&mut self, delta: &Value) -> Result<()> {
-        ensure!(delta.is_object(), "chat stream tool call delta is not an object");
+        ensure!(
+            delta.is_object(),
+            "chat stream tool call delta is not an object"
+        );
         let slot = self.slot(delta)?;
         if let Some(id) = delta.get("id").and_then(Value::as_str) {
             if slot.id.is_empty() {
                 slot.id = id.to_string();
             }
         }
-        let Some(function) = delta.get("function") else { return Ok(()) };
+        let Some(function) = delta.get("function") else {
+            return Ok(());
+        };
         if let Some(name) = function.get("name").and_then(Value::as_str) {
             // Names normally arrive once; tolerate pieces, ignore exact repeats.
             if slot.name.is_empty() {
@@ -228,7 +331,9 @@ impl Accumulator {
         match function.get("arguments") {
             Some(Value::String(piece)) => slot.arguments.push_str(piece),
             // Some servers send an already-parsed object in one piece.
-            Some(object @ Value::Object(_)) if slot.arguments.is_empty() => slot.arguments = object.to_string(),
+            Some(object @ Value::Object(_)) if slot.arguments.is_empty() => {
+                slot.arguments = object.to_string()
+            }
             _ => {}
         }
         Ok(())
@@ -292,7 +397,13 @@ mod tests {
 
     #[test]
     fn multiline_sse_payload_is_one_event() {
-        assert_eq!(events(b"event: content_block_delta\ndata: {\"type\":\"ping\",\ndata: \"extra\":true}\n\n").unwrap(), ["{\"type\":\"ping\",\n\"extra\":true}"]);
+        assert_eq!(
+            events(
+                b"event: content_block_delta\ndata: {\"type\":\"ping\",\ndata: \"extra\":true}\n\n"
+            )
+            .unwrap(),
+            ["{\"type\":\"ping\",\n\"extra\":true}"]
+        );
     }
 
     #[test]
@@ -303,10 +414,16 @@ mod tests {
     #[test]
     fn line_and_total_caps() {
         let long = format!("data: {}\n", "x".repeat(100));
-        let error = read_events(Cursor::new(long.into_bytes()), 1 << 20, 50, far(), |_| Ok(false)).unwrap_err();
+        let error = read_events(Cursor::new(long.into_bytes()), 1 << 20, 50, far(), |_| {
+            Ok(false)
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("line exceeds"), "{error}");
         let many = "data: 0123456789\n".repeat(100);
-        let error = read_events(Cursor::new(many.into_bytes()), 500, 50, far(), |_| Ok(false)).unwrap_err();
+        let error = read_events(Cursor::new(many.into_bytes()), 500, 50, far(), |_| {
+            Ok(false)
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("stream exceeds"), "{error}");
     }
 
@@ -329,12 +446,23 @@ mod tests {
 
         // A reply that takes far longer than the idle limit overall but never goes quiet for that long is fine,
         // and so is a cold start before the first event when the first-event wait is unbounded (a local server).
-        struct Steady { delay_first: Duration, sent: usize }
+        struct Steady {
+            delay_first: Duration,
+            sent: usize,
+        }
         impl Read for Steady {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                std::thread::sleep(if self.sent == 0 { self.delay_first } else { Duration::from_millis(40) });
+                std::thread::sleep(if self.sent == 0 {
+                    self.delay_first
+                } else {
+                    Duration::from_millis(40)
+                });
                 self.sent += 1;
-                let line: &[u8] = if self.sent > 12 { b"data: [DONE]\n\n" } else { b"data: tick\n\n" };
+                let line: &[u8] = if self.sent > 12 {
+                    b"data: [DONE]\n\n"
+                } else {
+                    b"data: tick\n\n"
+                };
                 buf[..line.len()].copy_from_slice(line);
                 Ok(line.len())
             }
@@ -342,9 +470,25 @@ mod tests {
         let local = Patience::new(None, Duration::from_millis(150));
         let started = Instant::now();
         let mut ticks = 0;
-        read_events(Steady { delay_first: Duration::from_millis(400), sent: 0 }, 1 << 20, 1 << 10, local, |data| { ticks += 1; Ok(data == "[DONE]") }).unwrap();
+        read_events(
+            Steady {
+                delay_first: Duration::from_millis(400),
+                sent: 0,
+            },
+            1 << 20,
+            1 << 10,
+            local,
+            |data| {
+                ticks += 1;
+                Ok(data == "[DONE]")
+            },
+        )
+        .unwrap();
         assert_eq!(ticks, 13);
-        assert!(started.elapsed() > Duration::from_millis(600), "the reply outlived the idle limit several times over");
+        assert!(
+            started.elapsed() > Duration::from_millis(600),
+            "the reply outlived the idle limit several times over"
+        );
     }
 
     fn run(chunks: &[Value]) -> (Result<Reply>, String) {
@@ -379,7 +523,10 @@ mod tests {
         assert_eq!(streamed, "Hello");
         assert_eq!(reply.text, "Hello");
         assert_eq!(reply.finish_reason, "stop");
-        assert_eq!((reply.prompt_tokens, reply.completion_tokens), (Some(9), Some(2)));
+        assert_eq!(
+            (reply.prompt_tokens, reply.completion_tokens),
+            (Some(9), Some(2))
+        );
     }
 
     #[test]
@@ -408,7 +555,13 @@ mod tests {
         assert_eq!(streamed, "");
         assert_eq!(reply.finish_reason, "tool_calls");
         assert_eq!(reply.tool_calls.len(), 2);
-        assert_eq!((reply.tool_calls[0].id.as_str(), reply.tool_calls[0].name.as_str()), ("c0", "read"));
+        assert_eq!(
+            (
+                reply.tool_calls[0].id.as_str(),
+                reply.tool_calls[0].name.as_str()
+            ),
+            ("c0", "read")
+        );
         assert_eq!(reply.tool_calls[0].arguments, json!({"path": "a.txt"}));
         assert_eq!(reply.tool_calls[1].arguments, json!({"cmd": "ls"}));
     }
@@ -437,7 +590,10 @@ mod tests {
         ]);
         let calls = reply.unwrap().tool_calls;
         assert_eq!(calls.len(), 2);
-        assert_eq!((calls[0].name.as_str(), calls[0].arguments.clone()), ("x", json!({"k": 1})));
+        assert_eq!(
+            (calls[0].name.as_str(), calls[0].arguments.clone()),
+            ("x", json!({"k": 1}))
+        );
         assert_eq!(calls[1].id, "b");
     }
 
@@ -475,17 +631,23 @@ mod tests {
     #[test]
     fn callback_false_interrupts_with_typed_error() {
         let mut acc = Accumulator::default();
-        let error = acc.feed(&delta("x").to_string(), &mut |_| false).unwrap_err();
+        let error = acc
+            .feed(&delta("x").to_string(), &mut |_| false)
+            .unwrap_err();
         assert!(error.downcast_ref::<Interrupted>().is_some());
     }
 
     #[test]
     fn in_stream_error_and_garbage_are_errors() {
-        let (reply, _) = run(&[json!({"error": {"message": "overloaded", "type": "server_error"}})]);
+        let (reply, _) =
+            run(&[json!({"error": {"message": "overloaded", "type": "server_error"}})]);
         assert!(reply.unwrap_err().to_string().contains("overloaded"));
         let mut acc = Accumulator::default();
         assert!(acc.feed("{not json", &mut |_| true).is_err());
-        assert!(acc.feed("{\"choices\":[{\"delta\":{\"content\":5}}]}", &mut |_| true).is_err());
+        assert!(
+            acc.feed("{\"choices\":[{\"delta\":{\"content\":5}}]}", &mut |_| true)
+                .is_err()
+        );
     }
 
     #[test]

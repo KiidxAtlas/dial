@@ -112,7 +112,10 @@ impl Tool for AstEdit {
     }
 
     fn needs_approval(&self, args: &Value) -> bool {
-        !matches!(args.get("dry_run"), None | Some(Value::Null) | Some(Value::Bool(true)))
+        !matches!(
+            args.get("dry_run"),
+            None | Some(Value::Null) | Some(Value::Bool(true))
+        )
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
@@ -132,7 +135,9 @@ fn search(ws: &Workspace, args: &Value) -> Result<String, String> {
     let (mut shown, mut files_hit, mut full) = (0usize, 0usize, false);
     let coverage = scan(ws, &target, &mut queries, &mut |file, query| {
         let remaining = limit - shown;
-        let Ok(hits) = query.find(&file.text, remaining) else { return true };
+        let Ok(hits) = query.find(&file.text, remaining) else {
+            return true;
+        };
         if !hits.is_empty() {
             files_hit += 1;
         }
@@ -159,7 +164,9 @@ fn search(ws: &Workspace, args: &Value) -> Result<String, String> {
         let _ = writeln!(out, "[{shown} matches in {files_hit} files]");
     }
     if full {
-        out.push_str("[stopped at the match limit or 64 KiB; narrow the search with path or raise limit]\n");
+        out.push_str(
+            "[stopped at the match limit or 64 KiB; narrow the search with path or raise limit]\n",
+        );
     }
     out.push_str(&coverage.footer());
     Ok(out)
@@ -180,7 +187,12 @@ struct Plan {
     bytes: usize,
 }
 
-fn plan(ws: &Workspace, pattern: &str, rewrite: &str, target: &Target) -> Result<(Plan, Coverage), String> {
+fn plan(
+    ws: &Workspace,
+    pattern: &str,
+    rewrite: &str,
+    target: &Target,
+) -> Result<(Plan, Coverage), String> {
     let mut queries = Queries::new(pattern, Some(rewrite));
     let mut plan = Plan::default();
     let mut over_budget = false;
@@ -197,7 +209,13 @@ fn plan(ws: &Workspace, pattern: &str, rewrite: &str, target: &Target) -> Result
                 plan.files.push(Planned {
                     replacements: done.splices.len(),
                     preview,
-                    change: Change { abs: file.abs, rel: file.rel, original: file.text, updated: done.text, perms: file.perms },
+                    change: Change {
+                        abs: file.abs,
+                        rel: file.rel,
+                        original: file.text,
+                        updated: done.text,
+                        perms: file.perms,
+                    },
                 });
             }
             Err(why) => plan.refused.push(format!("{}: {why}", file.rel)),
@@ -205,7 +223,10 @@ fn plan(ws: &Workspace, pattern: &str, rewrite: &str, target: &Target) -> Result
         true
     })?;
     if over_budget {
-        return Err(format!("the rewrite touches more than {} MiB of source; narrow `path`", MAX_EDIT_BYTES >> 20));
+        return Err(format!(
+            "the rewrite touches more than {} MiB of source; narrow `path`",
+            MAX_EDIT_BYTES >> 20
+        ));
     }
     Ok((plan, coverage))
 }
@@ -226,23 +247,34 @@ fn edit(ws: &Workspace, args: &Value) -> Result<String, String> {
     }
     let refused = refusals(&plan.refused);
     if dry_run {
-        let mut out = format!("dry run: {total} replacements in {} files; nothing written (set dry_run to false to apply)\n", plan.files.len());
+        let mut out = format!(
+            "dry run: {total} replacements in {} files; nothing written (set dry_run to false to apply)\n",
+            plan.files.len()
+        );
         out.push_str(&refused);
         append_previews(&mut out, &plan.files);
         out.push_str(&coverage.footer());
         return Ok(out);
     }
     if !plan.refused.is_empty() {
-        return Err(format!("nothing was written: {} file(s) cannot be rewritten\n{refused}", plan.refused.len()));
+        return Err(format!(
+            "nothing was written: {} file(s) cannot be rewritten\n{refused}",
+            plan.refused.len()
+        ));
     }
-    let mut out = format!("applied {total} replacements in {} files:\n", plan.files.len());
+    let mut out = format!(
+        "applied {total} replacements in {} files:\n",
+        plan.files.len()
+    );
     for planned in &plan.files {
         let _ = writeln!(out, "  {} ({})", planned.change.rel, planned.replacements);
     }
     append_previews(&mut out, &plan.files);
     let changes: Vec<Change> = plan.files.into_iter().map(|p| p.change).collect();
     commit(ws, &changes)?;
-    out.push_str("Earlier [path#TAG] headers for these files are stale; read them again before editing.\n");
+    out.push_str(
+        "Earlier [path#TAG] headers for these files are stale; read them again before editing.\n",
+    );
     out.push_str(&coverage.footer());
     Ok(out)
 }
@@ -255,9 +287,19 @@ fn append_previews(out: &mut String, files: &[Planned]) {
     for (i, planned) in files.iter().enumerate() {
         if out.len() + planned.preview.len() > MAX_OUTPUT {
             let room = MAX_OUTPUT.saturating_sub(out.len());
-            let cut = planned.preview.char_indices().map(|(at, _)| at).take_while(|&at| at <= room).last().unwrap_or(0);
+            let cut = planned
+                .preview
+                .char_indices()
+                .map(|(at, _)| at)
+                .take_while(|&at| at <= room)
+                .last()
+                .unwrap_or(0);
             out.push_str(&planned.preview[..cut]);
-            let _ = writeln!(out, "\n[preview truncated at 64 KiB: {} files not (fully) shown; narrow `path` to see them]", files.len() - i);
+            let _ = writeln!(
+                out,
+                "\n[preview truncated at 64 KiB: {} files not (fully) shown; narrow `path` to see them]",
+                files.len() - i
+            );
             return;
         }
         out.push_str(&planned.preview);

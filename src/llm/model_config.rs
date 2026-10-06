@@ -13,7 +13,14 @@ pub struct ModelSelection {
 }
 impl Default for ModelSelection {
     fn default() -> Self {
-        Self { provider: "mlx".into(), model: String::new(), base_url: None, api_key_env: None, allow_insecure: false, context_window: None }
+        Self {
+            provider: "mlx".into(),
+            model: String::new(),
+            base_url: None,
+            api_key_env: None,
+            allow_insecure: false,
+            context_window: None,
+        }
     }
 }
 
@@ -27,14 +34,23 @@ pub struct ProviderSpec {
     pub allow_insecure: bool,
 }
 impl Default for ProviderSpec {
-    fn default() -> Self { Self { label:String::new(), base_url:String::new(), api_key_env:None, enabled:true, allow_insecure:false } }
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            base_url: String::new(),
+            api_key_env: None,
+            enabled: true,
+            allow_insecure: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SymbolPreset {
     /// Nerd Font glyphs when the terminal advertises a Nerd Font, unicode otherwise.
-    #[default] Auto,
+    #[default]
+    Auto,
     Unicode,
     Nerd,
     Ascii,
@@ -42,17 +58,36 @@ pub enum SymbolPreset {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum StatusPreset { #[default] Default, Minimal, Compact, Full, Nerd, Ascii, Custom }
+pub enum StatusPreset {
+    #[default]
+    Default,
+    Minimal,
+    Compact,
+    Full,
+    Nerd,
+    Ascii,
+    Custom,
+}
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum StatusSeparator { Powerline, #[default] PowerlineThin, Slash, Pipe, Block, None, Ascii }
+pub enum StatusSeparator {
+    Powerline,
+    #[default]
+    PowerlineThin,
+    Slash,
+    Pipe,
+    Block,
+    None,
+    Ascii,
+}
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComposerShape {
     /// Rounded box; the status line is embedded in its top border and key hints in its bottom border.
-    #[default] Box,
+    #[default]
+    Box,
     /// Rules above and below with no side borders (cleaner when copying text).
     Line,
 }
@@ -97,15 +132,34 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            theme: "dark".into(), theme_dark: "dark".into(), theme_light: "light".into(),
-            symbols: SymbolPreset::Auto, color_blind: false,
-            status: StatusPreset::Default, status_separator: StatusSeparator::PowerlineThin,
-            status_left: vec!["spinner".into(), "model".into(), "path".into(), "git".into()],
+            theme: "dark".into(),
+            theme_dark: "dark".into(),
+            theme_light: "light".into(),
+            symbols: SymbolPreset::Auto,
+            color_blind: false,
+            status: StatusPreset::Default,
+            status_separator: StatusSeparator::PowerlineThin,
+            status_left: vec![
+                "spinner".into(),
+                "model".into(),
+                "path".into(),
+                "git".into(),
+            ],
             status_right: vec!["context".into()],
-            status_path_abbreviate: true, status_git_counts: true, status_transparent: false,
-            session_accent: true, composer_shape: ComposerShape::Box, welcome: true, tips: true,
-            show_tools: true, tool_output_lines: 8, show_turn_stats: true, show_thinking: true, hints: true,
-            autocomplete_items: 8, history_limit: 500,
+            status_path_abbreviate: true,
+            status_git_counts: true,
+            status_transparent: false,
+            session_accent: true,
+            composer_shape: ComposerShape::Box,
+            welcome: true,
+            tips: true,
+            show_tools: true,
+            tool_output_lines: 8,
+            show_turn_stats: true,
+            show_thinking: true,
+            hints: true,
+            autocomplete_items: 8,
+            history_limit: 500,
         }
     }
 }
@@ -117,18 +171,33 @@ pub const ROLES: &[(&str, &str)] = &[
     ("subagent", "Delegated investigation tasks"),
     ("compaction", "Conversation summarization"),
     ("architecture", "Saved architecture synthesis"),
-    ("stronger", "Narrow escalation advice (remote requires explicit opt-in)"),
+    ("experience", "Optional verified-workflow teacher"),
+    (
+        "stronger",
+        "Narrow escalation advice (remote requires explicit opt-in)",
+    ),
 ];
 
 impl ModelSelection {
     pub fn display_name(&self) -> String {
         let path = std::path::Path::new(&self.model);
-        let name = path.components().find_map(|part| {
-            part.as_os_str().to_str().and_then(|s| s.strip_prefix("models--")).map(|s| s.replace("--", "/"))
-        }).unwrap_or_else(|| {
-            if path.is_absolute() { path.file_name().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| self.model.clone()) }
-            else { self.model.clone() }
-        });
+        let name = path
+            .components()
+            .find_map(|part| {
+                part.as_os_str()
+                    .to_str()
+                    .and_then(|s| s.strip_prefix("models--"))
+                    .map(|s| s.replace("--", "/"))
+            })
+            .unwrap_or_else(|| {
+                if path.is_absolute() {
+                    path.file_name()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| self.model.clone())
+                } else {
+                    self.model.clone()
+                }
+            });
         format!("{}/{}", self.provider, name)
     }
 }

@@ -5,17 +5,17 @@
 //! dropping the tool all reap everything they started.
 
 use crate::tools::Workspace;
-use crate::tools::shell::{ProcessGroup, shell_command};
 use crate::tools::artifact::ArtifactSpool;
 use crate::tools::ext::ToolEvent;
+use crate::tools::shell::{ProcessGroup, shell_command};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,9 @@ const MAX_NAME: usize = 32;
 const SETTLE: Duration = Duration::from_millis(300);
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The last `cap` bytes a process wrote, plus how much the caller has already been shown.
@@ -49,7 +51,15 @@ pub(super) struct Ring {
 
 impl Ring {
     pub(super) fn new(cap: usize) -> Self {
-        Ring { data: VecDeque::new(), cap, total: 0, cursor: 0, closed: false, artifact: None, error: None }
+        Ring {
+            data: VecDeque::new(),
+            cap,
+            total: 0,
+            cursor: 0,
+            closed: false,
+            artifact: None,
+            error: None,
+        }
     }
 
     pub(super) fn push(&mut self, chunk: &[u8]) {
@@ -97,46 +107,52 @@ fn spawn_reader(
     if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    std::thread::Builder::new().name("dial-bg-reader".into()).spawn(move || {
-        let mut buffer = [0u8; 16 * 1024];
-        let mut error = None;
-        let mut stopping = None;
-        loop {
-            if stop.load(Ordering::Acquire) {
-                let since = stopping.get_or_insert_with(Instant::now);
-                if since.elapsed() >= SETTLE { break; }
-            }
-            match pipe.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    if let Some(spool) = &mut spool {
-                        if let Err(e) = spool.write_all(&buffer[..count]) {
-                            error = Some(format!("capturing complete output: {e}"));
+    std::thread::Builder::new()
+        .name("dial-bg-reader".into())
+        .spawn(move || {
+            let mut buffer = [0u8; 16 * 1024];
+            let mut error = None;
+            let mut stopping = None;
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    let since = stopping.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= SETTLE {
+                        break;
+                    }
+                }
+                match pipe.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if let Some(spool) = &mut spool {
+                            if let Err(e) = spool.write_all(&buffer[..count]) {
+                                error = Some(format!("capturing complete output: {e}"));
+                                break;
+                            }
+                        }
+                        lock(&ring).push(&buffer[..count]);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if stop.load(Ordering::Acquire) {
                             break;
                         }
+                        std::thread::sleep(Duration::from_millis(10));
                     }
-                    lock(&ring).push(&buffer[..count]);
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if stop.load(Ordering::Acquire) { break; }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    error = Some(format!("reading background output: {e}"));
-                    break;
+                    Err(e) => {
+                        error = Some(format!("reading background output: {e}"));
+                        break;
+                    }
                 }
             }
-        }
-        let artifact = spool.map(ArtifactSpool::finish).transpose();
-        let mut ring = lock(&ring);
-        match artifact {
-            Ok(uri) => ring.artifact = uri,
-            Err(e) => error = Some(format!("saving complete output artifact: {e}")),
-        }
-        ring.error = error;
-        ring.closed = true;
-    })
+            let artifact = spool.map(ArtifactSpool::finish).transpose();
+            let mut ring = lock(&ring);
+            match artifact {
+                Ok(uri) => ring.artifact = uri,
+                Err(e) => error = Some(format!("saving complete output artifact: {e}")),
+            }
+            ring.error = error;
+            ring.closed = true;
+        })
 }
 
 #[derive(Clone)]
@@ -178,13 +194,24 @@ pub(super) struct Proc {
 
 impl Proc {
     fn spawn(ws: &Workspace, name: String, command: &str, cwd: &Path) -> Result<Proc, String> {
-        let spool = ws.artifacts().map(|store| store.spool()).transpose()
+        let spool = ws
+            .artifacts()
+            .map(|store| store.spool())
+            .transpose()
             .map_err(|e| format!("creating background output artifact: {e}"))?;
         let mut spawn = shell_command(ws, command, cwd)?;
         let (reader, writer) = io::pipe().map_err(|e| format!("creating output pipe: {e}"))?;
-        let writer_err = writer.try_clone().map_err(|e| format!("creating output pipe: {e}"))?;
-        spawn.stdin(Stdio::null()).stdout(writer).stderr(writer_err).process_group(0);
-        let child = spawn.spawn().map_err(|e| format!("starting sandboxed bash: {e}"))?;
+        let writer_err = writer
+            .try_clone()
+            .map_err(|e| format!("creating output pipe: {e}"))?;
+        spawn
+            .stdin(Stdio::null())
+            .stdout(writer)
+            .stderr(writer_err)
+            .process_group(0);
+        let child = spawn
+            .spawn()
+            .map_err(|e| format!("starting sandboxed bash: {e}"))?;
         // The Command owns the pipe's write ends; release them so EOF is observable.
         drop(spawn);
         let pid = child.id();
@@ -233,7 +260,10 @@ impl Proc {
             (None, Ok(status)) => describe(status),
             (None, Err(e)) => format!("status unavailable: {e}"),
         };
-        self.state = State::Exited { at: Instant::now(), detail };
+        self.state = State::Exited {
+            at: Instant::now(),
+            detail,
+        };
     }
 
     /// Seconds the process has been (or was) up.
@@ -248,24 +278,39 @@ impl Proc {
     fn drain_notifications(&mut self) -> Vec<ToolEvent> {
         let proc = self;
         let mut events = Vec::new();
-            let ring = lock(&proc.ring);
-            if ring.total > proc.notice_cursor {
-                let from = proc.notice_cursor.max(ring.total.saturating_sub(16 * 1024));
-                let (bytes, lost) = ring.since(from);
-                let omitted = from.saturating_sub(proc.notice_cursor) + lost;
-                let mut text = String::from_utf8_lossy(&bytes).into_owned();
-                if omitted > 0 {
-                    text.insert_str(0, &format!("[{omitted} earlier live bytes omitted; complete log in artifact]\n"));
-                }
-                proc.notice_cursor = ring.total;
-                events.push(ToolEvent { kind: "output".into(), name: proc.name.clone(), text, artifact: ring.artifact.clone() });
+        let ring = lock(&proc.ring);
+        if ring.total > proc.notice_cursor {
+            let from = proc.notice_cursor.max(ring.total.saturating_sub(16 * 1024));
+            let (bytes, lost) = ring.since(from);
+            let omitted = from.saturating_sub(proc.notice_cursor) + lost;
+            let mut text = String::from_utf8_lossy(&bytes).into_owned();
+            if omitted > 0 {
+                text.insert_str(
+                    0,
+                    &format!("[{omitted} earlier live bytes omitted; complete log in artifact]\n"),
+                );
             }
-            if !proc.is_running() && ring.closed && !proc.completion_notified {
-                proc.completion_notified = true;
-                let mut text = proc.state.label();
-                if let Some(error) = &ring.error { text.push_str(&format!("; {error}")); }
-                events.push(ToolEvent { kind: "complete".into(), name: proc.name.clone(), text, artifact: ring.artifact.clone() });
+            proc.notice_cursor = ring.total;
+            events.push(ToolEvent {
+                kind: "output".into(),
+                name: proc.name.clone(),
+                text,
+                artifact: ring.artifact.clone(),
+            });
+        }
+        if !proc.is_running() && ring.closed && !proc.completion_notified {
+            proc.completion_notified = true;
+            let mut text = proc.state.label();
+            if let Some(error) = &ring.error {
+                text.push_str(&format!("; {error}"));
             }
+            events.push(ToolEvent {
+                kind: "complete".into(),
+                name: proc.name.clone(),
+                text,
+                artifact: ring.artifact.clone(),
+            });
+        }
         events
     }
 }
@@ -291,7 +336,9 @@ pub(super) struct Snapshot {
 impl Snapshot {
     /// After an exit, give the reader a moment to drain what the process wrote last.
     pub(super) fn settle(&self) {
-        let State::Exited { at, .. } = self.state else { return };
+        let State::Exited { at, .. } = self.state else {
+            return;
+        };
         while !lock(&self.ring).closed && at.elapsed() < SETTLE {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -301,11 +348,15 @@ impl Snapshot {
 fn validate_name(name: &str) -> Result<(), String> {
     let valid = !name.is_empty()
         && name.len() <= MAX_NAME
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if valid {
         Ok(())
     } else {
-        Err(format!("name must be 1-{MAX_NAME} characters of letters, digits, '-', '_' or '.'"))
+        Err(format!(
+            "name must be 1-{MAX_NAME} characters of letters, digits, '-', '_' or '.'"
+        ))
     }
 }
 
@@ -323,7 +374,9 @@ impl Table {
 
     fn notice(&mut self, event: ToolEvent) {
         // Bounded metadata queue; output is generated only when the heartbeat drains.
-        if self.notices.len() >= 64 { self.notices.pop_front(); }
+        if self.notices.len() >= 64 {
+            self.notices.pop_front();
+        }
         self.notices.push_back(event);
     }
 
@@ -380,11 +433,18 @@ impl Table {
             }
             None => self.fresh_name(),
         };
-        if self.position(&name).is_some_and(|i| self.procs[i].is_running()) {
-            return Err(format!("a process named {name:?} is already running; kill it or pick another name"));
+        if self
+            .position(&name)
+            .is_some_and(|i| self.procs[i].is_running())
+        {
+            return Err(format!(
+                "a process named {name:?} is already running; kill it or pick another name"
+            ));
         }
         if self.running() >= MAX_PROCESSES {
-            return Err(format!("{MAX_PROCESSES} background processes are already running; kill one first"));
+            return Err(format!(
+                "{MAX_PROCESSES} background processes are already running; kill one first"
+            ));
         }
         let proc = Proc::spawn(ws, name.clone(), command, cwd)?;
         // Only now that the spawn worked is a finished entry of the same name replaced.
@@ -394,7 +454,12 @@ impl Table {
         self.prune_finished();
         let pid = proc.pid;
         self.procs.push(proc);
-        self.notice(ToolEvent { kind: "start".into(), name: name.clone(), text: format!("started (pid {pid})"), artifact: None });
+        self.notice(ToolEvent {
+            kind: "start".into(),
+            name: name.clone(),
+            text: format!("started (pid {pid})"),
+            artifact: None,
+        });
         Ok((name, pid))
     }
 
@@ -406,26 +471,43 @@ impl Table {
             return Err(if known.is_empty() {
                 format!("no background process named {name:?}; none exist")
             } else {
-                format!("no background process named {name:?}; known: {}", known.join(", "))
+                format!(
+                    "no background process named {name:?}; known: {}",
+                    known.join(", ")
+                )
             });
         };
         let proc = &self.procs[i];
-        Ok(Snapshot { name: proc.name.clone(), pid: proc.pid, ring: proc.ring.clone(), state: proc.state.clone() })
+        Ok(Snapshot {
+            name: proc.name.clone(),
+            pid: proc.pid,
+            ring: proc.ring.clone(),
+            state: proc.state.clone(),
+        })
     }
 
     /// Kill `name` (group and all) and forget it. Returns what state it was in.
     pub(super) fn kill(&mut self, name: &str) -> Result<State, String> {
         self.snapshot(name)?;
-        let i = self.position(name).ok_or_else(|| format!("no background process named {name:?}"))?;
+        let i = self
+            .position(name)
+            .ok_or_else(|| format!("no background process named {name:?}"))?;
         let mut proc = self.procs.remove(i);
         let state = proc.state.clone();
         proc.group.terminate();
         proc.stop.store(true, Ordering::Release);
-        if let Some(reader) = proc.reader.take() { let _ = reader.join(); }
-        if proc.is_running() {
-            proc.state = State::Exited { at: Instant::now(), detail: "killed; process group stopped".into() };
+        if let Some(reader) = proc.reader.take() {
+            let _ = reader.join();
         }
-        for event in proc.drain_notifications() { self.notice(event); }
+        if proc.is_running() {
+            proc.state = State::Exited {
+                at: Instant::now(),
+                detail: "killed; process group stopped".into(),
+            };
+        }
+        for event in proc.drain_notifications() {
+            self.notice(event);
+        }
         Ok(state)
     }
 
@@ -434,7 +516,9 @@ impl Table {
         self.refresh();
         let running = self.running();
         let names: Vec<_> = self.procs.iter().map(|p| p.name.clone()).collect();
-        for name in names { let _ = self.kill(&name); }
+        for name in names {
+            let _ = self.kill(&name);
+        }
         running
     }
 }

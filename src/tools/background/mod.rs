@@ -19,8 +19,8 @@ use super::{ToolOutput, Workspace, opt_bool, opt_str, opt_u64, req_str, tool_sch
 use crate::config::types::Config;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use table::{Ring, Snapshot, State, Table, lock};
 
@@ -51,7 +51,9 @@ pub struct Background {
 
 /// The tools this module contributes, for `Registry::standard`.
 pub fn tools(_config: &Config) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(Background { table: Mutex::new(Table::default()) })]
+    vec![Arc::new(Background {
+        table: Mutex::new(Table::default()),
+    })]
 }
 
 impl Background {
@@ -66,7 +68,9 @@ impl Background {
             "output" => self.output(args),
             "wait" => self.wait(args, None, &AtomicBool::new(false)),
             "kill" => self.kill(args),
-            other => Err(format!("unknown action {other:?}; use start, list, output, wait or kill")),
+            other => Err(format!(
+                "unknown action {other:?}; use start, list, output, wait or kill"
+            )),
         }
     }
 
@@ -85,8 +89,13 @@ impl Background {
         if !cwd.is_dir() {
             return Err(format!("cwd {} is not a directory", ws.rel(&cwd)));
         }
-        let (name, pid) = self.table().start(ws, opt_str(args, "name")?, command, &cwd)?;
-        Ok(ToolOutput::ok(format!("started {name} (pid {pid}) in {}: {command}", ws.rel(&cwd))))
+        let (name, pid) = self
+            .table()
+            .start(ws, opt_str(args, "name")?, command, &cwd)?;
+        Ok(ToolOutput::ok(format!(
+            "started {name} (pid {pid}) in {}: {command}",
+            ws.rel(&cwd)
+        )))
     }
 
     fn list(&self) -> ToolOutput {
@@ -95,11 +104,19 @@ impl Background {
         if table.procs.is_empty() {
             return ToolOutput::ok("no background processes".to_string());
         }
-        let mut text = format!("{} running, {} finished\n", table.running(), table.procs.len() - table.running());
+        let mut text = format!(
+            "{} running, {} finished\n",
+            table.running(),
+            table.procs.len() - table.running()
+        );
         for proc in &table.procs {
             let bytes = lock(&proc.ring).total;
             let command: String = proc.command.chars().take(MAX_LISTED_COMMAND).collect();
-            let ellipsis = if command.len() < proc.command.len() { "…" } else { "" };
+            let ellipsis = if command.len() < proc.command.len() {
+                "…"
+            } else {
+                ""
+            };
             text.push_str(&format!(
                 "{}  pid {}  {}  up {}s  {bytes} bytes of output  $ {command}{ellipsis}\n",
                 proc.name,
@@ -127,7 +144,10 @@ impl Background {
             fresh
         };
         let is_error = lock(&snap.ring).error.is_some();
-        Ok(ToolOutput { text: render_output(&snap, &bytes, lost, tail), is_error })
+        Ok(ToolOutput {
+            text: render_output(&snap, &bytes, lost, tail),
+            is_error,
+        })
     }
 
     fn wait(
@@ -147,10 +167,14 @@ impl Background {
         let mut scanned = None;
         loop {
             if let Some(on_event) = on_event {
-                for event in self.table().drain_notifications() { on_event(event); }
+                for event in self.table().drain_notifications() {
+                    on_event(event);
+                }
             }
             if cancel.load(Ordering::Acquire) {
-                return Ok(ToolOutput::err(format!("cancelled waiting for {name}; background process remains managed by bg")));
+                return Ok(ToolOutput::err(format!(
+                    "cancelled waiting for {name}; background process remains managed by bg"
+                )));
             }
             let snap = self.table().snapshot(name)?;
             let exited = !matches!(snap.state, State::Running);
@@ -169,13 +193,15 @@ impl Background {
                 let state = snap.state.label();
                 return Ok(match until {
                     None => ToolOutput::ok(format!("ready: {name} {state}")),
-                    Some(pattern) => {
-                        ToolOutput::err(format!("not ready: {name} {state} before /{pattern}/ appeared in its output"))
-                    }
+                    Some(pattern) => ToolOutput::err(format!(
+                        "not ready: {name} {state} before /{pattern}/ appeared in its output"
+                    )),
                 });
             }
             if Instant::now() >= deadline {
-                return Ok(ToolOutput::ok(format!("not ready: timed out after {secs}s; {name} is still running")));
+                return Ok(ToolOutput::ok(format!(
+                    "not ready: timed out after {secs}s; {name} is still running"
+                )));
             }
             std::thread::sleep(POLL);
         }
@@ -186,11 +212,16 @@ impl Background {
         match (opt_str(args, "name")?, all) {
             (Some(name), false) => {
                 let state = self.table().kill(name)?;
-                Ok(ToolOutput::ok(format!("killed {name} (was {})", state.label())))
+                Ok(ToolOutput::ok(format!(
+                    "killed {name} (was {})",
+                    state.label()
+                )))
             }
             (None, true) => {
                 let running = self.table().kill_all();
-                Ok(ToolOutput::ok(format!("killed {running} running process(es); table cleared")))
+                Ok(ToolOutput::ok(format!(
+                    "killed {running} running process(es); table cleared"
+                )))
             }
             _ => Err("kill needs either `name` or `all: true`".to_string()),
         }
@@ -221,7 +252,9 @@ fn find_match(ring: &Mutex<Ring>, pattern: &Regex, scanned: &mut Option<u64>) ->
     };
     let found = pattern.find(&text)?;
     let start = text[..found.start()].rfind('\n').map_or(0, |i| i + 1);
-    let end = text[found.end()..].find('\n').map_or(text.len(), |i| found.end() + i);
+    let end = text[found.end()..]
+        .find('\n')
+        .map_or(text.len(), |i| found.end() + i);
     Some(text[start..end].chars().take(MAX_MATCH_LINE).collect())
 }
 
@@ -252,7 +285,12 @@ fn render_output(snap: &Snapshot, bytes: &[u8], lost: u64, tail: Option<usize>) 
         omitted += cut as u64;
         body.drain(..cut);
     }
-    let mut text = format!("[{}: {}, pid {}]\n", snap.name, snap.state.label(), snap.pid);
+    let mut text = format!(
+        "[{}: {}, pid {}]\n",
+        snap.name,
+        snap.state.label(),
+        snap.pid
+    );
     if body.is_empty() {
         text.push_str("(no new output)\n");
     } else {
@@ -262,7 +300,9 @@ fn render_output(snap: &Snapshot, bytes: &[u8], lost: u64, tail: Option<usize>) 
         }
     }
     if omitted > 0 {
-        text.push_str(&format!("[{omitted} bytes of earlier output were discarded]\n"));
+        text.push_str(&format!(
+            "[{omitted} bytes of earlier output were discarded]\n"
+        ));
     }
     let ring = lock(&snap.ring);
     if let Some(uri) = &ring.artifact {
@@ -298,11 +338,15 @@ impl Tool for Background {
     }
 
     fn needs_approval(&self, args: &Value) -> bool {
-        !matches!(args.get("action").and_then(Value::as_str), Some("list" | "output" | "wait"))
+        !matches!(
+            args.get("action").and_then(Value::as_str),
+            Some("list" | "output" | "wait")
+        )
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        self.dispatch(ctx.workspace, args).unwrap_or_else(ToolOutput::err)
+        self.dispatch(ctx.workspace, args)
+            .unwrap_or_else(ToolOutput::err)
     }
 
     fn call_streaming(
@@ -319,8 +363,11 @@ impl Tool for Background {
             self.wait(args, Some(on_event), cancel)
         } else {
             self.dispatch(ctx.workspace, args)
-        }.unwrap_or_else(ToolOutput::err);
-        for event in self.table().drain_notifications() { on_event(event); }
+        }
+        .unwrap_or_else(ToolOutput::err);
+        for event in self.table().drain_notifications() {
+            on_event(event);
+        }
         output
     }
 

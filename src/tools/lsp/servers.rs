@@ -104,16 +104,22 @@ fn normalize_extension(extension: &str) -> String {
 }
 
 pub fn extension_of(file: &str) -> Option<String> {
-    Path::new(file).extension().and_then(OsStr::to_str).map(normalize_extension)
+    Path::new(file)
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(normalize_extension)
 }
 
 /// Directories of the `PATH` environment variable.
 pub fn path_dirs() -> Vec<PathBuf> {
-    std::env::var_os("PATH").map(|paths| std::env::split_paths(&paths).collect()).unwrap_or_default()
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default()
 }
 
 fn is_executable(path: &Path) -> bool {
-    path.metadata().is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    path.metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 /// A program with a path separator is taken as is; a bare name is searched in `dirs`.
@@ -121,7 +127,9 @@ fn find_program(program: &Path, dirs: &[PathBuf]) -> Option<PathBuf> {
     if program.components().count() > 1 {
         return is_executable(program).then(|| program.to_owned());
     }
-    dirs.iter().map(|dir| dir.join(program)).find(|candidate| is_executable(candidate))
+    dirs.iter()
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable(candidate))
 }
 
 impl Servers {
@@ -130,15 +138,27 @@ impl Servers {
             .iter()
             .map(|(language, server)| Entry {
                 language: language.clone(),
-                extensions: server.extensions.iter().map(|e| normalize_extension(e)).collect(),
-                launch: Launch::Configured { program: server.program.clone(), args: server.args.clone() },
+                extensions: server
+                    .extensions
+                    .iter()
+                    .map(|e| normalize_extension(e))
+                    .collect(),
+                launch: Launch::Configured {
+                    program: server.program.clone(),
+                    args: server.args.clone(),
+                },
             })
             .collect();
-        entries.extend(BUILTINS.iter().filter(|b| !config.contains_key(b.language)).map(|builtin| Entry {
-            language: builtin.language.to_owned(),
-            extensions: builtin.extensions.iter().map(|e| e.to_string()).collect(),
-            launch: Launch::Builtin(builtin),
-        }));
+        entries.extend(
+            BUILTINS
+                .iter()
+                .filter(|b| !config.contains_key(b.language))
+                .map(|builtin| Entry {
+                    language: builtin.language.to_owned(),
+                    extensions: builtin.extensions.iter().map(|e| e.to_string()).collect(),
+                    launch: Launch::Builtin(builtin),
+                }),
+        );
         Self { entries }
     }
 
@@ -169,7 +189,11 @@ impl Servers {
                         entry.language
                     )
                 })?;
-                Ok(Resolved { language: entry.language.clone(), program: found, args: args.clone() })
+                Ok(Resolved {
+                    language: entry.language.clone(),
+                    program: found,
+                    args: args.clone(),
+                })
             }
             Launch::Builtin(builtin) => builtin
                 .candidates
@@ -232,10 +256,17 @@ mod tests {
         let servers = Servers::new(&BTreeMap::new());
         let dirs = [bin.path().to_path_buf()];
         let rust = servers.select("src/main.RS", &dirs).unwrap();
-        assert_eq!((rust.language.as_str(), rust.program, rust.args), ("rust", ra, vec![]));
+        assert_eq!(
+            (rust.language.as_str(), rust.program, rust.args),
+            ("rust", ra, vec![])
+        );
         for file in ["a.ts", "a.tsx", "a.js", "a.jsx"] {
             let got = servers.select(file, &dirs).unwrap();
-            assert_eq!((got.program, got.args), (ts.clone(), vec!["--stdio".to_string()]), "{file}");
+            assert_eq!(
+                (got.program, got.args),
+                (ts.clone(), vec!["--stdio".to_string()]),
+                "{file}"
+            );
         }
     }
 
@@ -248,15 +279,25 @@ mod tests {
         assert_eq!(servers.select("a.py", &dirs).unwrap().program, pylsp);
         let pyright = fake_bin(bin.path(), "pyright-langserver");
         let got = servers.select("a.py", &dirs).unwrap();
-        assert_eq!((got.program, got.args), (pyright, vec!["--stdio".to_string()]));
+        assert_eq!(
+            (got.program, got.args),
+            (pyright, vec!["--stdio".to_string()])
+        );
     }
 
     #[test]
     fn missing_builtin_names_what_to_install() {
         let empty = tempfile::tempdir().unwrap();
         let servers = Servers::new(&BTreeMap::new());
-        let error = servers.select("lib.rs", &[empty.path().to_path_buf()]).unwrap_err();
-        assert!(error.contains("rust-analyzer") && error.contains("rustup") && error.contains("[lsp.rust]"), "{error}");
+        let error = servers
+            .select("lib.rs", &[empty.path().to_path_buf()])
+            .unwrap_err();
+        assert!(
+            error.contains("rust-analyzer")
+                && error.contains("rustup")
+                && error.contains("[lsp.rust]"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -270,8 +311,18 @@ mod tests {
     #[test]
     fn unknown_and_missing_extensions_explain_how_to_configure() {
         let servers = Servers::new(&BTreeMap::new());
-        assert!(servers.select("a.zig", &[]).unwrap_err().contains("[lsp.mylang]"));
-        assert!(servers.select("Makefile", &[]).unwrap_err().contains("no file extension"));
+        assert!(
+            servers
+                .select("a.zig", &[])
+                .unwrap_err()
+                .contains("[lsp.mylang]")
+        );
+        assert!(
+            servers
+                .select("Makefile", &[])
+                .unwrap_err()
+                .contains("no file extension")
+        );
     }
 
     #[test]
@@ -281,7 +332,10 @@ mod tests {
         let custom = fake_bin(bin.path(), "my-ra");
         let servers = Servers::new(&config(&[("rust", &custom, &["rs"])]));
         let got = servers.select("a.rs", &[bin.path().to_path_buf()]).unwrap();
-        assert_eq!((got.program, got.args), (custom, vec!["--flag".to_string()]));
+        assert_eq!(
+            (got.program, got.args),
+            (custom, vec!["--flag".to_string()])
+        );
     }
 
     #[test]
@@ -292,15 +346,26 @@ mod tests {
         let servers = Servers::new(&config(&[("zig", &zls, &[".zig", "H"])]));
         let dirs = [bin.path().to_path_buf()];
         assert_eq!(servers.select("a.zig", &dirs).unwrap().language, "zig");
-        assert_eq!(servers.select("a.h", &dirs).unwrap().language, "zig", "config beats the C default for .h");
+        assert_eq!(
+            servers.select("a.h", &dirs).unwrap().language,
+            "zig",
+            "config beats the C default for .h"
+        );
         assert_eq!(servers.select("a.c", &dirs).unwrap().language, "c");
     }
 
     #[test]
     fn configured_program_missing_is_a_clear_error() {
-        let servers = Servers::new(&config(&[("zig", Path::new("/definitely/not/here/zls"), &["zig"])]));
+        let servers = Servers::new(&config(&[(
+            "zig",
+            Path::new("/definitely/not/here/zls"),
+            &["zig"],
+        )]));
         let error = servers.select("a.zig", &[]).unwrap_err();
-        assert!(error.contains("/definitely/not/here/zls") && error.contains("[lsp.zig]"), "{error}");
+        assert!(
+            error.contains("/definitely/not/here/zls") && error.contains("[lsp.zig]"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -308,7 +373,13 @@ mod tests {
         let bin = tempfile::tempdir().unwrap();
         let zls = fake_bin(bin.path(), "zls");
         let servers = Servers::new(&config(&[("zig", Path::new("zls"), &["zig"])]));
-        assert_eq!(servers.select("a.zig", &[bin.path().to_path_buf()]).unwrap().program, zls);
+        assert_eq!(
+            servers
+                .select("a.zig", &[bin.path().to_path_buf()])
+                .unwrap()
+                .program,
+            zls
+        );
     }
 
     #[test]

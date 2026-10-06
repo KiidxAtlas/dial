@@ -102,7 +102,12 @@ struct Block {
 
 impl Block {
     fn new(kind: Kind, active: bool) -> Self {
-        Block { kind, active, spill: Spill::default(), markdown: std::cell::RefCell::new(StreamingRows::default()) }
+        Block {
+            kind,
+            active,
+            spill: Spill::default(),
+            markdown: std::cell::RefCell::new(StreamingRows::default()),
+        }
     }
 
     fn prose(&self) -> Option<(Prose, &str)> {
@@ -140,12 +145,20 @@ impl Block {
     }
 
     fn measure_prefix(&self, w: u16, ctx: &TranscriptCtx) -> usize {
-        self.prose().map_or(0, |(kind, text)| prose_rows(kind, &text[..self.spill.src.min(text.len())], w, ctx).len())
+        self.prose().map_or(0, |(kind, text)| {
+            prose_rows(kind, &text[..self.spill.src.min(text.len())], w, ctx).len()
+        })
     }
 
     /// Latest point at which more of this block's head can be spilled: `(source offset, rows)`,
     /// only if those rows are exactly the head of the block's current rendering `full`.
-    fn spill_point(&self, w: u16, ctx: &TranscriptCtx, full: &Rows, skip: usize) -> Option<(usize, usize)> {
+    fn spill_point(
+        &self,
+        w: u16,
+        ctx: &TranscriptCtx,
+        full: &Rows,
+        skip: usize,
+    ) -> Option<(usize, usize)> {
         let (kind, text) = self.prose()?;
         if kind == Prose::Thinking && !ctx.ui.show_thinking {
             return None;
@@ -172,7 +185,12 @@ struct StreamingRows {
 
 impl StreamingRows {
     fn render(&mut self, source: &str, width: u16, theme: &Theme) -> Rows {
-        if self.key.as_ref().is_none_or(|(w, t)| *w != width || t != theme) || self.cut > source.len() {
+        if self
+            .key
+            .as_ref()
+            .is_none_or(|(w, t)| *w != width || t != theme)
+            || self.cut > source.len()
+        {
             self.key = Some((width, theme.clone()));
             self.cut = 0;
             self.prefix.clear();
@@ -184,19 +202,27 @@ impl StreamingRows {
         }
         let tail = &source[self.cut..];
         let cut = stable_cuts(tail, 0).into_iter().rev().find(|&cut| {
-            tail[cut..].trim_start_matches(['\n', '\r']).chars().next().is_some_and(char::is_alphanumeric)
+            tail[cut..]
+                .trim_start_matches(['\n', '\r'])
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric)
         });
         if let Some(cut) = cut {
             let rows = markdown::render(&tail[..cut], width, theme, false);
             if !rows.is_empty() {
-                if !self.prefix.is_empty() { self.prefix.push(blank_row()); }
+                if !self.prefix.is_empty() {
+                    self.prefix.push(blank_row());
+                }
                 self.prefix.extend(rows);
             }
             self.cut += cut;
         }
         let mut rows = self.prefix.clone();
         let tail = markdown::render(&source[self.cut..], width, theme, false);
-        if !rows.is_empty() && !tail.is_empty() { rows.push(blank_row()); }
+        if !rows.is_empty() && !tail.is_empty() {
+            rows.push(blank_row());
+        }
         rows.extend(tail);
         rows
     }
@@ -250,7 +276,11 @@ fn stable_cuts(text: &str, after: usize) -> Vec<usize> {
 
 fn is_list_marker(line: &str) -> bool {
     let t = line.trim_start();
-    if matches!(t, "-" | "*" | "+") || t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
+    if matches!(t, "-" | "*" | "+")
+        || t.starts_with("- ")
+        || t.starts_with("* ")
+        || t.starts_with("+ ")
+    {
         return true;
     }
     let digits = t.chars().take_while(char::is_ascii_digit).count();
@@ -292,7 +322,11 @@ fn user_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     } else {
         let inner = w - 2;
         for line in text::wrap_words(body, inner) {
-            rows.push(tinted_row(&format!(" {} ", text::pad(&text::clip(&line, inner), inner)), w, style));
+            rows.push(tinted_row(
+                &format!(" {} ", text::pad(&text::clip(&line, inner), inner)),
+                w,
+                style,
+            ));
         }
     }
     rows.push(tinted_row("", w, style));
@@ -316,10 +350,17 @@ fn thinking_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     let style = ctx.theme.fg(Tok::ThinkingText);
     if !ctx.ui.show_thinking {
         let n = body.lines().filter(|l| !l.trim().is_empty()).count();
-        let label = format!("{} reasoning ({n} line{})", ctx.theme.sym(Sym::Pointer), if n == 1 { "" } else { "s" });
+        let label = format!(
+            "{} reasoning ({n} line{})",
+            ctx.theme.sym(Sym::Pointer),
+            if n == 1 { "" } else { "s" }
+        );
         return vec![fitted(vec![Span::styled(label, style)], w, ctx.theme)];
     }
-    text::wrap_words(body, w).into_iter().map(|row| Line::from(Span::styled(text::clip(&row, w), style))).collect()
+    text::wrap_words(body, w)
+        .into_iter()
+        .map(|row| Line::from(Span::styled(text::clip(&row, w), style)))
+        .collect()
 }
 
 fn notice_rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
@@ -335,8 +376,14 @@ fn notice_rows(title: &str, body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     let indent = if title.trim().is_empty() { 0 } else { 2 };
     if indent > 0 {
         let head = vec![
-            Span::styled(format!("{} ", theme.sym(Sym::Bullet)), theme.fg(Tok::Accent)),
-            Span::styled(title.trim().to_owned(), theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} ", theme.sym(Sym::Bullet)),
+                theme.fg(Tok::Accent),
+            ),
+            Span::styled(
+                title.trim().to_owned(),
+                theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+            ),
         ];
         rows.push(fitted(head, w, theme));
     }
@@ -370,8 +417,16 @@ fn error_rows(body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
         .into_iter()
         .enumerate()
         .map(|(i, row)| {
-            let lead = if i == 0 { glyph.clone() } else { " ".repeat(gw) };
-            fitted(vec![Span::styled(lead, style), Span::styled(row, style)], w, theme)
+            let lead = if i == 0 {
+                glyph.clone()
+            } else {
+                " ".repeat(gw)
+            };
+            fitted(
+                vec![Span::styled(lead, style), Span::styled(row, style)],
+                w,
+                theme,
+            )
         })
         .collect()
 }
@@ -405,12 +460,20 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
     }
     if let Some(rate) = s.tokens_per_second {
         let icon = theme.sym(Sym::IconRate);
-        tokens.push(if icon.is_empty() { format!("{rate:.1} tok/s") } else { format!("{icon}{rate:.1}/s") });
+        tokens.push(if icon.is_empty() {
+            format!("{rate:.1} tok/s")
+        } else {
+            format!("{icon}{rate:.1}/s")
+        });
     }
     if !tokens.is_empty() {
         parts.push(tokens.join(" "));
     }
-    vec![fitted(vec![Span::styled(parts.join("  "), theme.fg(Tok::Dim))], w as usize, theme)]
+    vec![fitted(
+        vec![Span::styled(parts.join("  "), theme.fg(Tok::Dim))],
+        w as usize,
+        theme,
+    )]
 }
 
 // ---- tools ---------------------------------------------------------------------------------
@@ -418,9 +481,20 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
 fn tool_title(t: &Tool) -> String {
     // A hashline patch is titled by the files it touches, not by its first operation rows.
     if t.name == "edit" {
-        let paths: Vec<&str> = t.summary.lines()
-            .filter_map(|l| l.trim().strip_prefix('[')?.strip_suffix(']')?.rsplit_once('#').map(|(path, _)| path)).collect();
-        if !paths.is_empty() { return text::one_line(&paths.join(", ")); }
+        let paths: Vec<&str> = t
+            .summary
+            .lines()
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix('[')?
+                    .strip_suffix(']')?
+                    .rsplit_once('#')
+                    .map(|(path, _)| path)
+            })
+            .collect();
+        if !paths.is_empty() {
+            return text::one_line(&paths.join(", "));
+        }
     }
     let summary = text::one_line(&t.summary);
     if !summary.trim().is_empty() {
@@ -441,7 +515,9 @@ fn tool_title(t: &Tool) -> String {
 fn capitalize(name: &str) -> String {
     let name = text::one_line(name);
     let mut chars = name.chars();
-    chars.next().map_or(String::new(), |c| c.to_uppercase().collect::<String>() + chars.as_str())
+    chars.next().map_or(String::new(), |c| {
+        c.to_uppercase().collect::<String>() + chars.as_str()
+    })
 }
 
 fn tool_glyph(t: &Tool, ctx: &TranscriptCtx) -> (String, Style) {
@@ -460,8 +536,12 @@ fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
     match t.name.as_str() {
         "todo" if t.todo.is_some() && t.state == ToolState::Ok => todo_card(t, w as usize, ctx),
         // A passing automatic check is one line; a failing one keeps the full box with its diagnostics.
-        "bash" if t.state == ToolState::Ok && t.summary.starts_with("Verify ") => compact_tool(t, w as usize, ctx),
-        "bash" | "edit" | "write" | "ast_edit" if w as usize >= BOX_MIN => tool_box(t, w as usize, ctx),
+        "bash" if t.state == ToolState::Ok && t.summary.starts_with("Verify ") => {
+            compact_tool(t, w as usize, ctx)
+        }
+        "bash" | "edit" | "write" | "ast_edit" if w as usize >= BOX_MIN => {
+            tool_box(t, w as usize, ctx)
+        }
         _ => compact_tool(t, w as usize, ctx),
     }
 }
@@ -471,11 +551,23 @@ fn todo_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     let theme = ctx.theme;
     let tasks = t.todo.as_deref().unwrap_or_default();
     let (glyph, glyph_style) = tool_glyph(t, ctx);
-    let closed = tasks.iter().filter(|(task, _)| !task.status.is_open()).count();
-    let mut spans = vec![Span::styled(glyph, glyph_style), Span::raw(" "), Span::styled("Todo".to_owned(), theme.fg(Tok::ToolTitle))];
+    let closed = tasks
+        .iter()
+        .filter(|(task, _)| !task.status.is_open())
+        .count();
+    let mut spans = vec![
+        Span::styled(glyph, glyph_style),
+        Span::raw(" "),
+        Span::styled("Todo".to_owned(), theme.fg(Tok::ToolTitle)),
+    ];
     let title = tool_title(t);
-    if !title.is_empty() { spans.push(Span::styled(format!(" {title}"), theme.fg(Tok::ToolOutput))); }
-    spans.push(Span::styled(format!("  {} {closed}/{} done", theme.sym(Sym::Dot), tasks.len()), theme.fg(Tok::Dim)));
+    if !title.is_empty() {
+        spans.push(Span::styled(format!(" {title}"), theme.fg(Tok::ToolOutput)));
+    }
+    spans.push(Span::styled(
+        format!("  {} {closed}/{} done", theme.sym(Sym::Dot), tasks.len()),
+        theme.fg(Tok::Dim),
+    ));
     let mut rows = vec![fitted(spans, w, theme)];
     rows.extend(super::tasks::card_rows(tasks, w, theme, ctx.tools_expanded));
     rows
@@ -489,58 +581,125 @@ const DIFF_MIN_ROWS: usize = 20;
 /// report) are left out. `None` when the result carries no change preview.
 fn diff_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, usize)> {
     let output = text::sanitize(&t.output);
-    if !output.contains("change preview (") { return None; }
+    if !output.contains("change preview (") {
+        return None;
+    }
     let theme = ctx.theme;
-    enum Row<'a> { File(&'a str), Note(&'a str), Gap, Line(char, Option<usize>, &'a str) }
+    enum Row<'a> {
+        File(&'a str),
+        Note(&'a str),
+        Gap,
+        Line(char, Option<usize>, &'a str),
+    }
     let mut items = Vec::new();
     let (mut in_diff, mut old, mut new, mut widest) = (false, 0usize, 0usize, 1usize);
     for line in output.lines() {
         if let Some(rest) = line.strip_prefix("@@ -") {
             // `@@ -a,b +c,d @@`: rows count on from a (old) and c (new).
-            let mut nums = rest.split([',', ' ', '+']).filter_map(|n| n.parse::<usize>().ok());
-            let (a, _, c) = (nums.next().unwrap_or(1), nums.next(), nums.next().unwrap_or(1));
-            if in_diff && !matches!(items.last(), Some(Row::File(_) | Row::Note(_))) { items.push(Row::Gap); }
+            let mut nums = rest
+                .split([',', ' ', '+'])
+                .filter_map(|n| n.parse::<usize>().ok());
+            let (a, _, c) = (
+                nums.next().unwrap_or(1),
+                nums.next(),
+                nums.next().unwrap_or(1),
+            );
+            if in_diff && !matches!(items.last(), Some(Row::File(_) | Row::Note(_))) {
+                items.push(Row::Gap);
+            }
             (old, new, in_diff) = (a, c, true);
             continue;
         }
         if in_diff {
             let (sign, rest) = line.split_at(line.chars().next().map_or(0, char::len_utf8));
             match sign {
-                "+" => { items.push(Row::Line('+', Some(new), rest)); widest = widest.max(new); new += 1; continue; }
-                "-" => { items.push(Row::Line('-', Some(old), rest)); widest = widest.max(old); old += 1; continue; }
-                " " => { items.push(Row::Line(' ', Some(new), rest)); widest = widest.max(new); old += 1; new += 1; continue; }
+                "+" => {
+                    items.push(Row::Line('+', Some(new), rest));
+                    widest = widest.max(new);
+                    new += 1;
+                    continue;
+                }
+                "-" => {
+                    items.push(Row::Line('-', Some(old), rest));
+                    widest = widest.max(old);
+                    old += 1;
+                    continue;
+                }
+                " " => {
+                    items.push(Row::Line(' ', Some(new), rest));
+                    widest = widest.max(new);
+                    old += 1;
+                    new += 1;
+                    continue;
+                }
                 _ => in_diff = false,
             }
         }
-        if line.starts_with("change preview (") || line.starts_with("[final newline") || line.starts_with("[diff preview truncated") {
-            if !line.starts_with("change preview (") { items.push(Row::Note(line)); }
+        if line.starts_with("change preview (")
+            || line.starts_with("[final newline")
+            || line.starts_with("[diff preview truncated")
+        {
+            if !line.starts_with("change preview (") {
+                items.push(Row::Note(line));
+            }
         } else if line.starts_with('[') && line.ends_with(']') && line.contains('#') {
-            items.push(Row::File(line.trim_matches(['[', ']']).rsplit_once('#').map_or(line, |(path, _)| path)));
-        } else if ["updated (", "moved from ", "replaced ", "overwrote ", "created ", "deleted "].iter().any(|p| line.starts_with(p))
-            || line.starts_with("- ") || line == "Warnings:" {
+            items.push(Row::File(
+                line.trim_matches(['[', ']'])
+                    .rsplit_once('#')
+                    .map_or(line, |(path, _)| path),
+            ));
+        } else if [
+            "updated (",
+            "moved from ",
+            "replaced ",
+            "overwrote ",
+            "created ",
+            "deleted ",
+        ]
+        .iter()
+        .any(|p| line.starts_with(p))
+            || line.starts_with("- ")
+            || line == "Warnings:"
+        {
             items.push(Row::Note(line));
         }
     }
     let gutter = widest.to_string().len();
-    let limit = if ctx.tools_expanded { usize::MAX } else { ctx.ui.tool_output_lines.max(DIFF_MIN_ROWS) };
+    let limit = if ctx.tools_expanded {
+        usize::MAX
+    } else {
+        ctx.ui.tool_output_lines.max(DIFF_MIN_ROWS)
+    };
     let mut rows: Rows = Vec::new();
     let mut total = 0;
     for item in items {
         let spans = match item {
             Row::File(path) => vec![Span::styled(path.to_owned(), theme.fg(Tok::Accent))],
             Row::Note(text) => vec![Span::styled(text.to_owned(), theme.fg(Tok::Dim))],
-            Row::Gap => vec![Span::styled(format!("{:>gutter$}", theme.sym(Sym::Ellipsis)), theme.fg(Tok::Dim))],
+            Row::Gap => vec![Span::styled(
+                format!("{:>gutter$}", theme.sym(Sym::Ellipsis)),
+                theme.fg(Tok::Dim),
+            )],
             Row::Line(sign, n, text) => {
-                let style = match sign { '+' => theme.fg(Tok::DiffAdded), '-' => theme.fg(Tok::DiffRemoved), _ => theme.fg(Tok::DiffContext) };
+                let style = match sign {
+                    '+' => theme.fg(Tok::DiffAdded),
+                    '-' => theme.fg(Tok::DiffRemoved),
+                    _ => theme.fg(Tok::DiffContext),
+                };
                 vec![
-                    Span::styled(format!("{:>gutter$} ", n.map_or(String::new(), |n| n.to_string())), theme.fg(Tok::Dim)),
+                    Span::styled(
+                        format!("{:>gutter$} ", n.map_or(String::new(), |n| n.to_string())),
+                        theme.fg(Tok::Dim),
+                    ),
                     Span::styled(format!("{sign}{text}"), style),
                 ]
             }
         };
         for wrapped in text::wrap(vec![Line::from(spans)], inner.max(1)) {
             total += 1;
-            if rows.len() < limit { rows.push(wrapped); }
+            if rows.len() < limit {
+                rows.push(wrapped);
+            }
         }
     }
     let hidden = total - rows.len();
@@ -555,7 +714,10 @@ const MAX_TITLE_ROWS: usize = 4;
 fn edit_spans(theme: &Theme, line: &str) -> Vec<Span<'static>> {
     let plain = theme.fg(Tok::ToolOutput);
     if line.starts_with('+') || line.starts_with('-') || line.starts_with("@@") {
-        return vec![Span::styled(line.to_owned(), markdown::diff_style(theme, line))];
+        return vec![Span::styled(
+            line.to_owned(),
+            markdown::diff_style(theme, line),
+        )];
     }
     if line.starts_with('[') && line.ends_with(']') && line.contains('#') {
         return vec![Span::styled(line.to_owned(), theme.fg(Tok::Accent))];
@@ -580,14 +742,25 @@ fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> (Rows, usize) {
     let theme = ctx.theme;
     let err = t.state == ToolState::Err;
     let diffy = !err && matches!(t.name.as_str(), "edit" | "write" | "ast_edit");
-    let limit = if ctx.tools_expanded { usize::MAX } else { ctx.ui.tool_output_lines };
+    let limit = if ctx.tools_expanded {
+        usize::MAX
+    } else {
+        ctx.ui.tool_output_lines
+    };
     let mut rows: Rows = Vec::new();
     let mut total = 0;
     for line in body.trim_start_matches('\n').split('\n') {
         let spans = if diffy {
             edit_spans(theme, line)
         } else {
-            vec![Span::styled(line.to_owned(), if err { theme.fg(Tok::Error) } else { theme.fg(Tok::ToolOutput) })]
+            vec![Span::styled(
+                line.to_owned(),
+                if err {
+                    theme.fg(Tok::Error)
+                } else {
+                    theme.fg(Tok::ToolOutput)
+                },
+            )]
         };
         for wrapped in text::wrap(vec![Line::from(spans)], inner.max(1)) {
             total += 1;
@@ -602,7 +775,11 @@ fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> (Rows, usize) {
 
 fn hidden_hint(hidden: usize, theme: &Theme) -> Span<'static> {
     Span::styled(
-        format!("{} {hidden} more line{} (Ctrl-O expands)", ellipsis(theme), if hidden == 1 { "" } else { "s" }),
+        format!(
+            "{} {hidden} more line{} (Ctrl-O expands)",
+            ellipsis(theme),
+            if hidden == 1 { "" } else { "s" }
+        ),
         theme.fg(Tok::Dim),
     )
 }
@@ -625,7 +802,12 @@ fn tool_box(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
         ToolState::Err => Tok::ToolErrorBg,
     };
     let bg = theme.bg(bg_tok);
-    let border = if t.state == ToolState::Err { theme.fg(Tok::Error) } else { theme.fg(Tok::Border) }.patch(bg);
+    let border = if t.state == ToolState::Err {
+        theme.fg(Tok::Error)
+    } else {
+        theme.fg(Tok::Border)
+    }
+    .patch(bg);
     let (glyph, glyph_style) = tool_glyph(t, ctx);
     let (v, h) = (theme.sym(Sym::BoxV).to_owned(), theme.sym(Sym::BoxH));
     let inner = w - 4;
@@ -646,7 +828,10 @@ fn tool_box(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     let rule = |left: &str, label: &str, right: &str| -> Line<'static> {
         let label_w = text::width(label);
         let fill = w - 2 - label_w;
-        Line::from(Span::styled(format!("{left}{label}{}{right}", h.repeat(fill)), border))
+        Line::from(Span::styled(
+            format!("{left}{label}{}{right}", h.repeat(fill)),
+            border,
+        ))
     };
 
     let mut rows = vec![rule(theme.sym(Sym::BoxTl), "", theme.sym(Sym::BoxTr))];
@@ -660,11 +845,17 @@ fn tool_box(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     };
     let glyph_w = text::width(&glyph);
     let room = inner.saturating_sub(glyph_w + 1).max(1);
-    let mut title_rows: Vec<String> = text::wrap_words(&title, room).into_iter().map(|r| text::clip(&r, room)).collect();
+    let mut title_rows: Vec<String> = text::wrap_words(&title, room)
+        .into_iter()
+        .map(|r| text::clip(&r, room))
+        .collect();
     if !ctx.tools_expanded && title_rows.len() > MAX_TITLE_ROWS {
         title_rows.truncate(MAX_TITLE_ROWS);
         let last = title_rows.pop().unwrap_or_default();
-        title_rows.push(format!("{}{mark}", text::clip(&last, room.saturating_sub(text::width(&mark)))));
+        title_rows.push(format!(
+            "{}{mark}",
+            text::clip(&last, room.saturating_sub(text::width(&mark)))
+        ));
     }
     let title_style = theme.fg(Tok::ToolTitle);
     for (i, line) in title_rows.into_iter().enumerate() {
@@ -677,12 +868,20 @@ fn tool_box(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
         rows.push(row(spans));
     }
 
-    let (body, hidden, label) = match diff_rows(t, inner, ctx).filter(|_| t.state == ToolState::Ok) {
+    let (body, hidden, label) = match diff_rows(t, inner, ctx).filter(|_| t.state == ToolState::Ok)
+    {
         Some((body, hidden)) => (body, hidden, "Changes"),
-        None => { let (body, hidden) = output_rows(t, inner, ctx); (body, hidden, "Output") }
+        None => {
+            let (body, hidden) = output_rows(t, inner, ctx);
+            (body, hidden, "Output")
+        }
     };
     if !body.is_empty() {
-        rows.push(rule(theme.sym(Sym::TeeL), &format!("{h}{h} {label} "), theme.sym(Sym::TeeR)));
+        rows.push(rule(
+            theme.sym(Sym::TeeL),
+            &format!("{h}{h} {label} "),
+            theme.sym(Sym::TeeR),
+        ));
         rows.extend(body.into_iter().map(|l| row(l.spans)));
         if hidden > 0 {
             rows.push(row(vec![hidden_hint(hidden, theme)]));
@@ -691,8 +890,15 @@ fn tool_box(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
         rows.push(row(vec![hidden_hint(hidden, theme)]));
     }
     if let (Some(secs), true) = (t.elapsed, t.state != ToolState::Pending) {
-        let (open, close) = if theme.ascii() { ("<", ">") } else { ("⟨", "⟩") };
-        rows.push(row(vec![Span::styled(format!("{open}Wall: {}{close}", elapsed_label(secs)), theme.fg(Tok::Dim))]));
+        let (open, close) = if theme.ascii() {
+            ("<", ">")
+        } else {
+            ("⟨", "⟩")
+        };
+        rows.push(row(vec![Span::styled(
+            format!("{open}Wall: {}{close}", elapsed_label(secs)),
+            theme.fg(Tok::Dim),
+        )]));
     }
     rows.push(rule(theme.sym(Sym::BoxBl), "", theme.sym(Sym::BoxBr)));
     rows
@@ -704,7 +910,10 @@ fn compact_tool(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     let mut spans = vec![
         Span::styled(glyph, glyph_style),
         Span::raw(" "),
-        Span::styled(capitalize(if t.name.is_empty() { "tool" } else { &t.name }), theme.fg(Tok::ToolTitle)),
+        Span::styled(
+            capitalize(if t.name.is_empty() { "tool" } else { &t.name }),
+            theme.fg(Tok::ToolTitle),
+        ),
     ];
     let title = tool_title(t);
     if !title.is_empty() {
@@ -712,9 +921,20 @@ fn compact_tool(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     }
     if t.state == ToolState::Ok {
         let clean = text::sanitize(&t.output);
-        let footer = |l: &str| l == "(no output)" || l.starts_with("[exit code: 0]") || l.starts_with("[complete output:");
-        if let Some(first) = clean.lines().map(str::trim).find(|l| !l.is_empty() && !footer(l)) {
-            spans.push(Span::styled(format!("  {} {first}", theme.sym(Sym::Dot)), theme.fg(Tok::Dim)));
+        let footer = |l: &str| {
+            l == "(no output)"
+                || l.starts_with("[exit code: 0]")
+                || l.starts_with("[complete output:")
+        };
+        if let Some(first) = clean
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !footer(l))
+        {
+            spans.push(Span::styled(
+                format!("  {} {first}", theme.sym(Sym::Dot)),
+                theme.fg(Tok::Dim),
+            ));
         }
     }
     let mut rows = vec![fitted(spans, w, theme)];
@@ -727,7 +947,11 @@ fn compact_tool(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
             rows.push(fitted(spans, w, theme));
         }
         if hidden > 0 {
-            rows.push(fitted(vec![Span::raw(" ".repeat(indent)), hidden_hint(hidden, theme)], w, theme));
+            rows.push(fitted(
+                vec![Span::raw(" ".repeat(indent)), hidden_hint(hidden, theme)],
+                w,
+                theme,
+            ));
         }
     }
     rows
@@ -750,7 +974,10 @@ impl Default for Transcript {
 
 impl Transcript {
     pub fn new() -> Self {
-        Transcript { blocks: Vec::new(), cursor: 0 }
+        Transcript {
+            blocks: Vec::new(),
+            cursor: 0,
+        }
     }
 
     /// A streaming reasoning/answer block ends as soon as anything else happens.
@@ -775,7 +1002,12 @@ impl Transcript {
         if text.is_empty() {
             return;
         }
-        if let Some(Block { kind: Kind::Assistant(buf), active: true, .. }) = self.blocks.last_mut() {
+        if let Some(Block {
+            kind: Kind::Assistant(buf),
+            active: true,
+            ..
+        }) = self.blocks.last_mut()
+        {
             buf.push_str(text);
             return;
         }
@@ -787,7 +1019,12 @@ impl Transcript {
         if text.is_empty() {
             return;
         }
-        if let Some(Block { kind: Kind::Thinking(buf), active: true, .. }) = self.blocks.last_mut() {
+        if let Some(Block {
+            kind: Kind::Thinking(buf),
+            active: true,
+            ..
+        }) = self.blocks.last_mut()
+        {
             buf.push_str(text);
             return;
         }
@@ -814,35 +1051,58 @@ impl Transcript {
 
     /// Append a live chunk to a pending card; full output is retained separately in artifacts.
     pub fn tool_delta(&mut self, id: &str, text: &str) {
-        let Some(tool) = self.blocks[self.cursor..].iter_mut().rev().find_map(|b| match &mut b.kind {
-            Kind::Tool(t) if t.id == id && t.state == ToolState::Pending => Some(t),
-            _ => None,
-        }) else { return };
+        let Some(tool) =
+            self.blocks[self.cursor..]
+                .iter_mut()
+                .rev()
+                .find_map(|b| match &mut b.kind {
+                    Kind::Tool(t) if t.id == id && t.state == ToolState::Pending => Some(t),
+                    _ => None,
+                })
+        else {
+            return;
+        };
         tool.output.push_str(text);
         const LIMIT: usize = 16 * 1024;
         if tool.output.len() > LIMIT {
             let mut cut = tool.output.len() - LIMIT;
-            while !tool.output.is_char_boundary(cut) { cut += 1; }
+            while !tool.output.is_char_boundary(cut) {
+                cut += 1;
+            }
             tool.output.drain(..cut);
         }
     }
 
     /// Attach the task list a pending `todo` call produced, so its card shows what changed.
     pub fn tool_todo(&mut self, id: &str, tasks: Vec<(crate::agent::todo::Task, bool)>) {
-        if let Some(tool) = self.blocks[self.cursor..].iter_mut().rev().find_map(|b| match &mut b.kind {
-            Kind::Tool(t) if t.id == id && t.state == ToolState::Pending => Some(t),
-            _ => None,
-        }) {
+        if let Some(tool) =
+            self.blocks[self.cursor..]
+                .iter_mut()
+                .rev()
+                .find_map(|b| match &mut b.kind {
+                    Kind::Tool(t) if t.id == id && t.state == ToolState::Pending => Some(t),
+                    _ => None,
+                })
+        {
             tool.todo = Some(tasks);
         }
     }
 
     pub fn tool_end(&mut self, id: &str, output: &str, is_error: bool, elapsed_secs: f64) {
-        let state = if is_error { ToolState::Err } else { ToolState::Ok };
-        let found = self.blocks[self.cursor..].iter_mut().rev().find_map(|b| match &mut b.kind {
-            Kind::Tool(t) if t.id == id && t.state == ToolState::Pending => Some((&mut b.active, t)),
-            _ => None,
-        });
+        let state = if is_error {
+            ToolState::Err
+        } else {
+            ToolState::Ok
+        };
+        let found = self.blocks[self.cursor..]
+            .iter_mut()
+            .rev()
+            .find_map(|b| match &mut b.kind {
+                Kind::Tool(t) if t.id == id && t.state == ToolState::Pending => {
+                    Some((&mut b.active, t))
+                }
+                _ => None,
+            });
         match found {
             Some((active, tool)) => {
                 tool.state = state;
@@ -871,7 +1131,13 @@ impl Transcript {
 
     pub fn notice(&mut self, title: &str, text: &str) {
         self.close_streaming_text();
-        self.push(Kind::Notice { title: title.to_owned(), text: text.to_owned() }, false);
+        self.push(
+            Kind::Notice {
+                title: title.to_owned(),
+                text: text.to_owned(),
+            },
+            false,
+        );
     }
 
     pub fn error(&mut self, text: &str) {
@@ -957,7 +1223,11 @@ impl Transcript {
         if display.len() > max_rows && first.active {
             if let Some((src, rows)) = first.spill_point(width, ctx, &head, skip) {
                 spilled = head[skip..rows].to_vec();
-                first.spill = Spill { src, rows, key: Some((width, ctx.ui.show_thinking)) };
+                first.spill = Spill {
+                    src,
+                    rows,
+                    key: Some((width, ctx.ui.show_thinking)),
+                };
                 skip = rows;
                 display = assemble(&head, skip);
             }
@@ -1029,7 +1299,11 @@ mod tests {
                 let mut cache = StreamingRows::default();
                 let theme = Theme::dark();
                 for end in (0..=source.len()).filter(|&n| source.is_char_boundary(n)) {
-                    assert_eq!(cache.render(&source[..end], width, &theme), markdown::render(&source[..end], width, &theme, false), "at {end}, width {width}: {source:?}");
+                    assert_eq!(
+                        cache.render(&source[..end], width, &theme),
+                        markdown::render(&source[..end], width, &theme, false),
+                        "at {end}, width {width}: {source:?}"
+                    );
                 }
             }
         }
@@ -1038,7 +1312,10 @@ mod tests {
         cache.render(source, 20, &Theme::dark());
         for theme in [Theme::light(), Theme::mono()] {
             for width in [10, 80] {
-                assert_eq!(cache.render(source, width, &theme), markdown::render(source, width, &theme, false));
+                assert_eq!(
+                    cache.render(source, width, &theme),
+                    markdown::render(source, width, &theme, false)
+                );
             }
         }
     }
@@ -1060,7 +1337,10 @@ mod tests {
         for end in (40..=source.len()).step_by(40) {
             std::hint::black_box(cache.render(&source[..end], 100, &theme));
         }
-        eprintln!("20KB / 40-byte deltas: full={full:?}, cached={:?}", before.elapsed());
+        eprintln!(
+            "20KB / 40-byte deltas: full={full:?}, cached={:?}",
+            before.elapsed()
+        );
     }
 
     struct Env {
@@ -1070,15 +1350,30 @@ mod tests {
 
     impl Env {
         fn new() -> Self {
-            Env { theme: Theme::dark(), ui: UiConfig::default() }
+            Env {
+                theme: Theme::dark(),
+                ui: UiConfig::default(),
+            }
         }
         fn ctx(&self) -> TranscriptCtx<'_> {
-            TranscriptCtx { theme: &self.theme, ui: &self.ui, tick: 0, tools_expanded: false }
+            TranscriptCtx {
+                theme: &self.theme,
+                ui: &self.ui,
+                tick: 0,
+                tools_expanded: false,
+            }
         }
     }
 
     fn plain(rows: &Rows) -> Vec<String> {
-        rows.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+        rows.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     fn text_of(rows: &Rows) -> String {
@@ -1087,7 +1382,11 @@ mod tests {
 
     fn assert_fits(rows: &Rows, w: u16) {
         for row in rows {
-            assert!(text::line_width(row) <= w as usize, "{:?} exceeds {w}", plain(&vec![row.clone()]));
+            assert!(
+                text::line_width(row) <= w as usize,
+                "{:?} exceeds {w}",
+                plain(&vec![row.clone()])
+            );
         }
     }
 
@@ -1109,7 +1408,10 @@ mod tests {
         let text = text_of(&rows);
         assert!(text.find("hello").unwrap() < text.find("first").unwrap());
         assert!(text.find("first").unwrap() < text.find("second").unwrap());
-        assert!(rows.last().unwrap().spans.is_empty(), "block ends with a blank separator");
+        assert!(
+            rows.last().unwrap().spans.is_empty(),
+            "block ends with a blank separator"
+        );
         assert!(t.take_settled(40, &ctx).is_empty());
     }
 
@@ -1131,7 +1433,10 @@ mod tests {
         t.tool_start("a", "bash", "sleep 1", "");
         t.notice("", "after");
         assert!(t.is_streaming());
-        assert!(t.take_settled(40, &ctx).is_empty(), "the pending tool blocks the notice");
+        assert!(
+            t.take_settled(40, &ctx).is_empty(),
+            "the pending tool blocks the notice"
+        );
         t.tool_end("a", "done", false, 1.0);
         let text = text_of(&t.take_settled(40, &ctx));
         assert!(text.find("sleep 1").unwrap() < text.find("after").unwrap());
@@ -1150,7 +1455,13 @@ mod tests {
         t.assistant_delta("ld** again");
         let (_, live) = t.live(40, &ctx, 20);
         assert_eq!(plain(&live), ["Hello world again"]);
-        assert!(live[0].spans.iter().any(|s| s.content.contains("world") && s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(
+            live[0]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("world")
+                    && s.style.add_modifier.contains(Modifier::BOLD))
+        );
         assert!(t.take_settled(40, &ctx).is_empty(), "still streaming");
         t.finish_turn();
         assert_eq!(plain(&t.take_settled(40, &ctx)), ["Hello world again", ""]);
@@ -1167,7 +1478,10 @@ mod tests {
         assert!(settled.contains("pondering") && !settled.contains("answer"));
         t.tool_start("1", "read", "a.txt", "");
         let mid = text_of(&t.take_settled(40, &ctx));
-        assert!(mid.contains("answer") && !mid.contains("Read"), "the pending tool blocks only itself: {mid}");
+        assert!(
+            mid.contains("answer") && !mid.contains("Read"),
+            "the pending tool blocks only itself: {mid}"
+        );
         t.tool_end("1", "x", false, 0.1);
         assert!(text_of(&t.take_settled(40, &ctx)).contains("Read"));
     }
@@ -1240,13 +1554,22 @@ mod tests {
         });
         let rows = t.all_rows(80, &env.ctx());
         let line = &plain(&rows)[0];
-        assert!(line.starts_with("2026-10-01 10:54:32  Δ 26.8s  ↑11K ↓59"), "{line}");
+        assert!(
+            line.starts_with("2026-10-01 10:54:32  Δ 26.8s  ↑11K ↓59"),
+            "{line}"
+        );
         assert!(line.contains("2.2/s"), "{line}");
         assert_eq!(rows[0].spans[0].style, env.theme.fg(Tok::Dim));
         env.ui.show_turn_stats = false;
         assert!(t.all_rows(80, &env.ctx()).is_empty());
         let mut t2 = Transcript::new();
-        t2.turn_stats(TurnStats { clock: String::new(), elapsed_secs: 1.0, prompt_tokens: None, output_tokens: None, tokens_per_second: None });
+        t2.turn_stats(TurnStats {
+            clock: String::new(),
+            elapsed_secs: 1.0,
+            prompt_tokens: None,
+            output_tokens: None,
+            tokens_per_second: None,
+        });
         env.ui.show_turn_stats = true;
         assert_eq!(plain(&t2.all_rows(80, &env.ctx()))[0], "Δ 1.0s");
     }
@@ -1307,7 +1630,11 @@ mod tests {
         assert_eq!(tint(&ok), env.theme.bg(Tok::ToolSuccessBg).bg);
         assert_eq!(tint(&err), env.theme.bg(Tok::ToolErrorBg).bg);
         assert!(plain(&err)[1].contains('✗'));
-        let body = err.iter().flat_map(|r| &r.spans).find(|s| s.content.contains("out")).unwrap();
+        let body = err
+            .iter()
+            .flat_map(|r| &r.spans)
+            .find(|s| s.content.contains("out"))
+            .unwrap();
         assert_eq!(body.style.fg, env.theme.fg(Tok::Error).fg);
     }
 
@@ -1326,20 +1653,38 @@ mod tests {
         assert!(a[1].contains(env.theme.spinner(0)) && b[1].contains(env.theme.spinner(1)));
         let compact = a.iter().find(|l| l.contains("Read")).unwrap();
         assert!(compact.starts_with(env.theme.spinner(0)), "{compact}");
-        assert!(b.iter().any(|l| l.starts_with(env.theme.spinner(1)) && l.contains("Read")));
+        assert!(
+            b.iter()
+                .any(|l| l.starts_with(env.theme.spinner(1)) && l.contains("Read"))
+        );
     }
 
     #[test]
     fn long_output_is_capped_with_a_hint_until_expanded() {
         let env = Env::new();
         let mut t = Transcript::new();
-        let output = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let output = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         t.tool_start("1", "bash", "seq 20", "");
         t.tool_end("1", &output, false, 2.0);
         let capped = text_of(&t.all_rows(50, &env.ctx()));
-        assert!(capped.contains("line 8") && !capped.contains("line 9"), "{capped}");
-        assert!(capped.contains("… 12 more lines (Ctrl-O expands)"), "{capped}");
-        let expanded = text_of(&t.all_rows(50, &TranscriptCtx { tools_expanded: true, ..env.ctx() }));
+        assert!(
+            capped.contains("line 8") && !capped.contains("line 9"),
+            "{capped}"
+        );
+        assert!(
+            capped.contains("… 12 more lines (Ctrl-O expands)"),
+            "{capped}"
+        );
+        let expanded = text_of(&t.all_rows(
+            50,
+            &TranscriptCtx {
+                tools_expanded: true,
+                ..env.ctx()
+            },
+        ));
         assert!(expanded.contains("line 20") && !expanded.contains("more lines"));
     }
 
@@ -1351,7 +1696,10 @@ mod tests {
         t.tool_start("1", "bash", "x", "");
         t.tool_end("1", "a\nb\nc", false, 1.0);
         let text = text_of(&t.all_rows(40, &env.ctx()));
-        assert!(text.contains(" b ") && !text.contains(" c ") && text.contains("1 more line (Ctrl-O"), "{text}");
+        assert!(
+            text.contains(" b ") && !text.contains(" c ") && text.contains("1 more line (Ctrl-O"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1362,7 +1710,14 @@ mod tests {
         t.tool_end("1", "[src/main.rs#AB12]\nupdated (+1 -1 lines)\n@@ -1 +1 @@\n-old line\n+new line\n3:context", false, 0.5);
         let rows = t.all_rows(60, &env.ctx());
         assert!(plain(&rows)[1].contains("src/main.rs") && !plain(&rows)[1].contains('$'));
-        let style = |needle: &str| rows.iter().flat_map(|r| &r.spans).find(|s| s.content.contains(needle)).unwrap().style.fg;
+        let style = |needle: &str| {
+            rows.iter()
+                .flat_map(|r| &r.spans)
+                .find(|s| s.content.contains(needle))
+                .unwrap()
+                .style
+                .fg
+        };
         assert_eq!(style("+new line"), env.theme.fg(Tok::DiffAdded).fg);
         assert_eq!(style("-old line"), env.theme.fg(Tok::DiffRemoved).fg);
         assert_eq!(style("#AB12"), env.theme.fg(Tok::Accent).fg);
@@ -1381,13 +1736,40 @@ mod tests {
         t.tool_end("1", output, false, 0.1);
         let rows = t.all_rows(60, &env.ctx());
         let text = plain(&rows);
-        assert!(text[1].contains("src/a.rs") && !text[1].contains("PUT"), "titled by the file it touches: {text:?}");
-        let body: Vec<&str> = text.iter().map(|r| r.trim_matches(|c: char| c == '│' || c == ' ')).collect();
-        for expected in ["src/a.rs", "updated (+1 -1 lines)", "1  fn a() {", "2 -    old();", "2 +    new();", "3  }"] {
-            assert!(body.contains(&expected), "{expected:?} missing from {body:?}");
+        assert!(
+            text[1].contains("src/a.rs") && !text[1].contains("PUT"),
+            "titled by the file it touches: {text:?}"
+        );
+        let body: Vec<&str> = text
+            .iter()
+            .map(|r| r.trim_matches(|c: char| c == '│' || c == ' '))
+            .collect();
+        for expected in [
+            "src/a.rs",
+            "updated (+1 -1 lines)",
+            "1  fn a() {",
+            "2 -    old();",
+            "2 +    new();",
+            "3  }",
+        ] {
+            assert!(
+                body.contains(&expected),
+                "{expected:?} missing from {body:?}"
+            );
         }
-        assert!(!text_of(&rows).contains("removed lines not present") && !text_of(&rows).contains("1:fn a()"), "model-facing parts are hidden");
-        let style = |needle: &str| rows.iter().flat_map(|r| &r.spans).find(|s| s.content.contains(needle)).unwrap().style.fg;
+        assert!(
+            !text_of(&rows).contains("removed lines not present")
+                && !text_of(&rows).contains("1:fn a()"),
+            "model-facing parts are hidden"
+        );
+        let style = |needle: &str| {
+            rows.iter()
+                .flat_map(|r| &r.spans)
+                .find(|s| s.content.contains(needle))
+                .unwrap()
+                .style
+                .fg
+        };
         assert_eq!(style("+    new();"), env.theme.fg(Tok::DiffAdded).fg);
         assert_eq!(style("-    old();"), env.theme.fg(Tok::DiffRemoved).fg);
         assert!(text_of(&rows).contains("Changes"));
@@ -1398,14 +1780,24 @@ mod tests {
         use crate::agent::todo::TodoList;
         let env = Env::new();
         let mut before = TodoList::new();
-        before.call(&serde_json::json!({"op": "set", "tasks": [{"content": "read"}, {"content": "fix"}]}));
+        before.call(
+            &serde_json::json!({"op": "set", "tasks": [{"content": "read"}, {"content": "fix"}]}),
+        );
         let mut after = before.clone();
         after.call(&serde_json::json!({"op": "done"}));
         let mut t = Transcript::new();
         t.tool_start("1", "todo", "done", "");
         t.tool_todo("1", crate::ui::tasks::changes(&before, &after));
-        t.tool_end("1", "Completed 1. read. Started 2. fix.\n1/2 done\n[x] 1. read\n[~] 2. fix", false, 0.0);
-        assert_eq!(plain(&t.all_rows(60, &env.ctx()))[..3], ["✓ Todo done  · 1/2 done", "  ✓ read", "  ● fix"]);
+        t.tool_end(
+            "1",
+            "Completed 1. read. Started 2. fix.\n1/2 done\n[x] 1. read\n[~] 2. fix",
+            false,
+            0.0,
+        );
+        assert_eq!(
+            plain(&t.all_rows(60, &env.ctx()))[..3],
+            ["✓ Todo done  · 1/2 done", "  ✓ read", "  ● fix"]
+        );
     }
 
     #[test]
@@ -1415,7 +1807,11 @@ mod tests {
         t.tool_start("1", "write", "a.txt", "");
         t.tool_end("1", "-bad: refused", true, 0.1);
         let rows = t.all_rows(40, &env.ctx());
-        let span = rows.iter().flat_map(|r| &r.spans).find(|s| s.content.contains("-bad")).unwrap();
+        let span = rows
+            .iter()
+            .flat_map(|r| &r.spans)
+            .find(|s| s.content.contains("-bad"))
+            .unwrap();
         assert_eq!(span.style.fg, env.theme.fg(Tok::Error).fg);
     }
 
@@ -1426,7 +1822,10 @@ mod tests {
         t.tool_start("1", "bash", "", r#"{"command":"echo hi"}"#);
         t.tool_start("2", "write", "", r#"{"path":"out/a.txt"}"#);
         let text = text_of(&t.all_rows(50, &env.ctx()));
-        assert!(text.contains("$ echo hi") && text.contains("out/a.txt"), "{text}");
+        assert!(
+            text.contains("$ echo hi") && text.contains("out/a.txt"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1536,22 +1935,37 @@ mod tests {
         t.tool_end("2", "x", true, 1.0);
         t.notice("title", "body text");
         t.error("an error");
-        t.turn_stats(TurnStats { clock: "now".into(), elapsed_secs: 1.0, prompt_tokens: Some(1), output_tokens: Some(2), tokens_per_second: Some(3.0) });
+        t.turn_stats(TurnStats {
+            clock: "now".into(),
+            elapsed_secs: 1.0,
+            prompt_tokens: Some(1),
+            output_tokens: Some(2),
+            tokens_per_second: Some(3.0),
+        });
         t.finish_turn();
         for w in 1..=80u16 {
             assert_fits(&t.all_rows(w, &env.ctx()), w);
         }
         let ascii = Theme::dark().with_glyphs(Glyphs::Ascii);
-        let ctx = TranscriptCtx { theme: &ascii, ..env.ctx() };
+        let ctx = TranscriptCtx {
+            theme: &ascii,
+            ..env.ctx()
+        };
         for row in plain(&t.all_rows(60, &ctx)) {
-            assert!(row.chars().all(|c| c.is_ascii() || text::width(&c.to_string()) == 2), "{row:?}");
+            assert!(
+                row.chars()
+                    .all(|c| c.is_ascii() || text::width(&c.to_string()) == 2),
+                "{row:?}"
+            );
         }
     }
 
     // ---- spill ----
 
     fn long_markdown(paragraphs: usize) -> Vec<String> {
-        (1..=paragraphs).map(|i| format!("Paragraph <{i}> has some words in it that wrap around.\n\n")).collect()
+        (1..=paragraphs)
+            .map(|i| format!("Paragraph <{i}> has some words in it that wrap around.\n\n"))
+            .collect()
     }
 
     #[test]
@@ -1584,11 +1998,18 @@ mod tests {
         let committed_text = text_of(&committed);
         for i in 1..=12 {
             let token = format!("<{i}>");
-            assert!(!(text_of(&live).contains(&token) && committed_text.contains(&token)), "{token} shown twice");
+            assert!(
+                !(text_of(&live).contains(&token) && committed_text.contains(&token)),
+                "{token} shown twice"
+            );
         }
         t.finish_turn();
         committed.extend(t.take_settled(30, &ctx));
-        assert_eq!(plain(&committed), plain(&t.all_rows(30, &ctx)), "spilled + settled == everything, once");
+        assert_eq!(
+            plain(&committed),
+            plain(&t.all_rows(30, &ctx)),
+            "spilled + settled == everything, once"
+        );
     }
 
     #[test]
@@ -1601,7 +2022,10 @@ mod tests {
         let (spilled, live) = t.live(30, &ctx, 5);
         committed.extend(spilled);
         let shown = text_of(&committed);
-        assert!(!shown.contains("let a"), "code inside an open fence is not stable: {shown}");
+        assert!(
+            !shown.contains("let a"),
+            "code inside an open fence is not stable: {shown}"
+        );
         assert!(text_of(&live).contains("let b = 2;"));
         t.assistant_delta("```\n\nafter\n");
         t.finish_turn();
@@ -1615,7 +2039,10 @@ mod tests {
         let ctx = env.ctx();
         let mut t = Transcript::new();
         t.assistant_delta("- a\n- b\n\n");
-        assert!(t.live(20, &ctx, 1).0.is_empty(), "the next item could still make the list loose");
+        assert!(
+            t.live(20, &ctx, 1).0.is_empty(),
+            "the next item could still make the list loose"
+        );
         t.assistant_delta("- c\n\nplain text\n");
         let mut committed = t.live(20, &ctx, 1).0;
         t.finish_turn();
@@ -1662,7 +2089,11 @@ mod tests {
         everything.extend(t.take_settled(17, &ctx));
         let all = text_of(&everything);
         for i in 1..=10 {
-            assert_eq!(all.matches(&format!("<{i}>")).count(), 1, "paragraph {i} must appear exactly once:\n{all}");
+            assert_eq!(
+                all.matches(&format!("<{i}>")).count(),
+                1,
+                "paragraph {i} must appear exactly once:\n{all}"
+            );
         }
         assert_eq!(all.matches("<unfinished>").count(), 1);
     }
@@ -1690,7 +2121,10 @@ mod tests {
         t.tool_start("1", "bash", "build", "");
         t.assistant_delta(&long_markdown(10).concat());
         let (spilled, live) = t.live(30, &ctx, 6);
-        assert!(spilled.is_empty(), "the pending tool must be committed first");
+        assert!(
+            spilled.is_empty(),
+            "the pending tool must be committed first"
+        );
         assert!(live.len() <= 6);
     }
 

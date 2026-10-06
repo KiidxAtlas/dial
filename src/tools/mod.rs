@@ -18,34 +18,37 @@
 //! * Timeouts kill the bash process group. A command that calls `setsid` can
 //!   outlive the call (still sandboxed, but orphaned).
 
-pub mod dap;
 pub mod artifact;
+pub mod ast;
+pub mod background;
 pub mod browser;
-pub mod kernel;
-pub mod navigation;
+pub mod dap;
+pub mod diagnostics;
+mod diff;
 pub mod documents;
 pub mod ext;
-pub mod background;
-pub mod ast;
-pub mod mcp;
-pub mod lsp;
-pub mod hashline;
-pub mod sandbox;
-pub mod diagnostics;
 mod files;
-mod diff;
-mod tolerant;
+pub mod git;
+pub mod hashline;
+pub mod kernel;
+pub mod lsp;
+pub mod mcp;
+pub mod navigation;
+pub mod preview;
+pub mod sandbox;
 mod search;
 mod select;
 pub(crate) mod shell;
-pub(crate) mod walk;
-pub mod web;
+pub mod syntax;
 #[cfg(test)]
 mod testkit;
+mod tolerant;
+pub(crate) mod walk;
+pub mod web;
 
 use crate::config::types::{EditModeConfig, SandboxConfig};
-use sandbox::Sandbox;
 use anyhow::{Context, Result, bail, ensure};
+use sandbox::Sandbox;
 use serde_json::{Value, json};
 use std::fs;
 use std::io;
@@ -55,14 +58,59 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub const BUILTIN: &[&str] = &["read", "write", "edit", "glob", "grep", "bash"];
 
 /// dial's own tools beyond the file/shell built-ins.
-pub const EXTRA_TOOLS: &[&str] = &["todo", "finish", "task", "solve", "escalate", "skill", "skill_manage", "session_search", "tool_search", "tool_load", "artifact_read", "working_state", "task_message", "recall", "retain", "memory_update", "forget", "memory_history", "memory_import"];
+pub const EXTRA_TOOLS: &[&str] = &[
+    "todo",
+    "finish",
+    "task",
+    "solve",
+    "escalate",
+    "skill",
+    "skill_manage",
+    "session_search",
+    "tool_search",
+    "tool_load",
+    "artifact_read",
+    "working_state",
+    "task_message",
+    "recall",
+    "retain",
+    "memory_update",
+    "forget",
+    "memory_history",
+    "memory_import",
+];
 
 /// Optional integration tools (see [`ext`]). Offered unless `integrations` in the config omits them.
-pub const INTEGRATION_TOOLS: &[&str] = &["bg", "web_fetch", "web_search", "lsp", "ast_search", "ast_edit", "dap", "find", "browser", "kernel"];
+pub const INTEGRATION_TOOLS: &[&str] = &[
+    "bg",
+    "web_fetch",
+    "web_search",
+    "lsp",
+    "ast_search",
+    "ast_edit",
+    "dap",
+    "git",
+    "find",
+    "browser",
+    "kernel",
+];
 
 /// Every tool dial enables by default: the built-ins plus [`EXTRA_TOOLS`].
 pub fn default_tools() -> Vec<String> {
-    BUILTIN.iter().chain(["todo", "tool_search", "tool_load", "artifact_read", "working_state"].iter()).map(|s| s.to_string()).collect()
+    BUILTIN
+        .iter()
+        .chain(
+            [
+                "todo",
+                "tool_search",
+                "tool_load",
+                "artifact_read",
+                "working_state",
+            ]
+            .iter(),
+        )
+        .map(|s| s.to_string())
+        .collect()
 }
 
 const MAX_LIST: usize = 500;
@@ -91,11 +139,17 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     fn ok(text: String) -> Self {
-        Self { text, is_error: false }
+        Self {
+            text,
+            is_error: false,
+        }
     }
 
     fn err(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: true }
+        Self {
+            text: text.into(),
+            is_error: true,
+        }
     }
 }
 
@@ -122,12 +176,17 @@ struct ObserverSlot(Option<Arc<dyn WriteObserver>>);
 
 impl std::fmt::Debug for ObserverSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() { "Some(WriteObserver)" } else { "None" })
+        f.write_str(if self.0.is_some() {
+            "Some(WriteObserver)"
+        } else {
+            "None"
+        })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
+    syntax_guard: bool,
     root: PathBuf,
     sandbox: Option<Sandbox>,
     allow_network: bool,
@@ -146,9 +205,17 @@ impl Workspace {
         let root = root
             .canonicalize()
             .with_context(|| format!("workspace {} does not exist", root.display()))?;
-        ensure!(root.is_dir(), "workspace {} is not a directory", root.display());
-        ensure!(root.parent().is_some(), "the filesystem root cannot be a workspace");
+        ensure!(
+            root.is_dir(),
+            "workspace {} is not a directory",
+            root.display()
+        );
+        ensure!(
+            root.parent().is_some(),
+            "the filesystem root cannot be a workspace"
+        );
         Ok(Workspace {
+            syntax_guard: false,
             root,
             sandbox: None,
             allow_network: false,
@@ -162,9 +229,16 @@ impl Workspace {
         })
     }
 
-    pub fn with_artifacts(mut self, store: artifact::ArtifactStore) -> Self { self.artifacts = Some(store); self }
-    pub fn artifacts(&self) -> Option<&artifact::ArtifactStore> { self.artifacts.as_ref() }
-    pub(crate) fn serial_operation(&self) -> MutexGuard<'_, ()> { self.operations.lock().unwrap_or_else(|e| e.into_inner()) }
+    pub fn with_artifacts(mut self, store: artifact::ArtifactStore) -> Self {
+        self.artifacts = Some(store);
+        self
+    }
+    pub fn artifacts(&self) -> Option<&artifact::ArtifactStore> {
+        self.artifacts.as_ref()
+    }
+    pub(crate) fn serial_operation(&self) -> MutexGuard<'_, ()> {
+        self.operations.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// Override sandbox detection (tests, or an operator who pre-probed).
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
@@ -206,8 +280,45 @@ impl Workspace {
         self.edit_mode
     }
 
+    pub fn with_syntax_guard(mut self, enabled: bool) -> Self {
+        self.syntax_guard = enabled;
+        self
+    }
+    pub(crate) fn syntax_guard_enabled(&self) -> bool {
+        self.syntax_guard
+    }
+    pub(crate) fn preflight_source(
+        &self,
+        path: &Path,
+        before: &str,
+        proposed: &str,
+    ) -> Result<(), String> {
+        if self.syntax_guard {
+            syntax::preflight(path, before, proposed)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The same sandbox and edit policy over another directory, such as an isolated project copy.
+    /// Edit history and the write observer are not shared: the copy reaches the project only
+    /// through an explicit merge.
+    pub fn rebased(&self, root: &Path) -> Result<Workspace> {
+        let mut copy = Workspace::new(root)?;
+        copy.sandbox = self.sandbox.clone();
+        copy.allow_network = self.allow_network;
+        copy.policy = self.policy.clone();
+        copy.unsandboxed = self.unsandboxed;
+        copy.edit_mode = self.edit_mode;
+        copy.syntax_guard = self.syntax_guard;
+        copy.artifacts = self.artifacts.clone();
+        Ok(copy)
+    }
+
     pub(crate) fn store(&self) -> MutexGuard<'_, hashline::EditStore> {
-        self.edits.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.edits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn observe_write(&self, abs: &Path) -> Result<(), String> {
@@ -221,9 +332,12 @@ impl Workspace {
 
     pub(crate) fn observe_delete(&self, abs: &Path) -> Result<(), String> {
         match &self.observer.0 {
-            Some(observer) => observer
-                .before_delete(abs)
-                .map_err(|e| format!("delete of {:?} blocked by the harness: {e:#}", self.rel(abs))),
+            Some(observer) => observer.before_delete(abs).map_err(|e| {
+                format!(
+                    "delete of {:?} blocked by the harness: {e:#}",
+                    self.rel(abs)
+                )
+            }),
             None => Ok(()),
         }
     }
@@ -298,7 +412,12 @@ impl Workspace {
     }
 }
 
-pub(crate) fn tool_schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+pub(crate) fn tool_schema(
+    name: &str,
+    description: &str,
+    properties: Value,
+    required: &[&str],
+) -> Value {
     json!({
         "type": "function",
         "function": {
@@ -358,7 +477,11 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
     Some(match name {
         "read" => tool_schema(
             "read",
-            if hashline { HASHLINE_READ_DESC } else { REPLACE_READ_DESC },
+            if hashline {
+                HASHLINE_READ_DESC
+            } else {
+                REPLACE_READ_DESC
+            },
             json!({
                 "path": {"type": "string", "description": "File or directory path, relative to the workspace root; may end in a line selector such as `:50-100`, `:50+150`, `:-60` (last 60 lines), `:5-16,960-973` or `:raw`."},
                 "offset": {"type": "integer", "minimum": 1, "description": "1-based line to start at (default 1); not together with a path selector."},
@@ -469,7 +592,12 @@ pub fn execute(ws: &Workspace, name: &str, args: &Value, timeout_secs: u64) -> T
     }
 }
 
-fn dispatch(ws: &Workspace, name: &str, args: &Value, timeout_secs: u64) -> Result<ToolOutput, String> {
+fn dispatch(
+    ws: &Workspace,
+    name: &str,
+    args: &Value,
+    timeout_secs: u64,
+) -> Result<ToolOutput, String> {
     if !args.is_object() {
         return Err("tool arguments must be a JSON object".to_string());
     }
@@ -477,13 +605,18 @@ fn dispatch(ws: &Workspace, name: &str, args: &Value, timeout_secs: u64) -> Resu
         "read" => files::read_tool(ws, args).map(ToolOutput::ok),
         "write" => files::write_tool(ws, args).map(ToolOutput::ok),
         "edit" => match ws.edit_mode {
-            EditMode::Hashline => hashline::input_arg(args).and_then(|input| hashline::edit(ws, input)).map(ToolOutput::ok),
+            EditMode::Hashline => hashline::input_arg(args)
+                .and_then(|input| hashline::edit(ws, input))
+                .map(ToolOutput::ok),
             EditMode::Replace => files::edit_tool(ws, args).map(ToolOutput::ok),
         },
         "glob" => search::glob_tool(ws, args).map(ToolOutput::ok),
         "grep" => search::grep_tool(ws, args).map(ToolOutput::ok),
         "bash" => shell::bash_tool(ws, args, timeout_secs),
-        _ => Err(format!("unknown tool {name:?}; available tools: {}", BUILTIN.join(", "))),
+        _ => Err(format!(
+            "unknown tool {name:?}; available tools: {}",
+            BUILTIN.join(", ")
+        )),
     }
 }
 
@@ -549,7 +682,9 @@ pub fn apply_sandbox_config(
     use sandbox::Policy;
     Ok(match config.mode {
         SandboxMode::Off => ws.without_sandbox(),
-        SandboxMode::Strict => ws.with_policy(Policy::Strict { allow_network: false }),
+        SandboxMode::Strict => ws.with_policy(Policy::Strict {
+            allow_network: false,
+        }),
         SandboxMode::Dev => {
             let home = std::env::var_os("HOME").map(PathBuf::from);
             let mut deny_read: Vec<PathBuf> = Vec::new();
@@ -558,23 +693,40 @@ pub fn apply_sandbox_config(
                 deny_read.push(user.to_owned());
             }
             if let Some(home) = &home {
-                for rel in [".ssh", ".aws", ".gnupg", ".config/gcloud", ".azure", ".kube", ".docker", "Library/Keychains"] {
+                for rel in [
+                    ".ssh",
+                    ".aws",
+                    ".gnupg",
+                    ".config/gcloud",
+                    ".azure",
+                    ".kube",
+                    ".docker",
+                    "Library/Keychains",
+                ] {
                     deny_read.push(home.join(rel));
                 }
             }
-            let extra_write = config.extra_write.iter().map(|p| match (p.strip_prefix("~"), &home) {
-                (Ok(rest), Some(home)) => home.join(rest),
-                _ => p.clone(),
-            }).collect();
-            ws.with_policy(Policy::Dev { deny_read, extra_write, allow_network: config.allow_network })
+            let extra_write = config
+                .extra_write
+                .iter()
+                .map(|p| match (p.strip_prefix("~"), &home) {
+                    (Ok(rest), Some(home)) => home.join(rest),
+                    _ => p.clone(),
+                })
+                .collect();
+            ws.with_policy(Policy::Dev {
+                deny_read,
+                extra_write,
+                allow_network: config.allow_network,
+            })
         }
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::testkit::*;
+    use super::*;
     use std::os::unix::fs::symlink;
 
     #[test]
@@ -585,7 +737,12 @@ mod tests {
             assert_eq!(schema["function"]["name"], *name);
             assert_eq!(schema["type"], "function");
         }
-        assert!(schemas(&["read", "launch_missiles"], EditMode::Replace).unwrap_err().to_string().contains("launch_missiles"));
+        assert!(
+            schemas(&["read", "launch_missiles"], EditMode::Replace)
+                .unwrap_err()
+                .to_string()
+                .contains("launch_missiles")
+        );
         assert!(Workspace::new(Path::new("/definitely/not/here")).is_err());
     }
 
@@ -609,7 +766,11 @@ mod tests {
         symlink(outside.path(), dir.path().join("dir_link")).unwrap();
         symlink(dir.path().join("nowhere"), dir.path().join("dangling")).unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
-        symlink(dir.path().join("inside.txt"), dir.path().join("sub/inner_link")).unwrap();
+        symlink(
+            dir.path().join("inside.txt"),
+            dir.path().join("sub/inner_link"),
+        )
+        .unwrap();
 
         let canary = outside.path().join("canary");
         let escapes = [
@@ -623,10 +784,18 @@ mod tests {
         ];
         for path in &escapes {
             let read = run(&ws, "read", json!({"path": path}));
-            assert!(read.is_error && !read.text.contains("secret"), "read {path}: {}", read.text);
+            assert!(
+                read.is_error && !read.text.contains("secret"),
+                "read {path}: {}",
+                read.text
+            );
             let write = run(&ws, "write", json!({"path": path, "content": "pwned"}));
             assert!(write.is_error, "write {path}");
-            let edit = run(&ws, "edit", json!({"path": path, "old": "secret", "new": "x"}));
+            let edit = run(
+                &ws,
+                "edit",
+                json!({"path": path, "old": "secret", "new": "x"}),
+            );
             assert!(edit.is_error, "edit {path}");
         }
         assert_eq!(fs::read_to_string(&canary).unwrap(), "secret");
@@ -640,5 +809,4 @@ mod tests {
         let abs = dir.path().canonicalize().unwrap().join("inside.txt");
         assert!(!run(&ws, "read", json!({"path": abs})).is_error);
     }
-
 }

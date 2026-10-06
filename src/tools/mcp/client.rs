@@ -60,7 +60,9 @@ struct Shared {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Shared {
@@ -84,8 +86,10 @@ impl Shared {
 
 pub struct Client {
     server: String,
-    child: Mutex<Child>,
-    outgoing: Sender<String>,
+    /// Stdio transport: the child and its writer queue. `None` for HTTP servers.
+    child: Option<Mutex<Child>>,
+    outgoing: Option<Sender<String>>,
+    http: Option<super::http::Http>,
     shared: Arc<Shared>,
     next_id: AtomicU64,
 }
@@ -103,11 +107,14 @@ impl Client {
             .stderr(Stdio::piped())
             // Own process group, so dropping the client also kills what an `npx`/shell wrapper started.
             .process_group(0);
-        let mut child = command.spawn().with_context(|| format!("starting `{}`", config.program.display()))?;
-        let (stdin, stdout, stderr) = match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
-            (Some(stdin), Some(stdout), Some(stderr)) => (stdin, stdout, stderr),
-            _ => bail!("could not open the server's stdio"),
-        };
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("starting `{}`", config.program.display()))?;
+        let (stdin, stdout, stderr) =
+            match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
+                (Some(stdin), Some(stdout), Some(stderr)) => (stdin, stdout, stderr),
+                _ => bail!("could not open the server's stdio"),
+            };
 
         let shared = Arc::new(Shared::default());
         let (outgoing, queue) = mpsc::channel::<String>();
@@ -133,7 +140,32 @@ impl Client {
             })
             .context("starting stderr thread")?;
 
-        Ok(Client { server: server.to_owned(), child: Mutex::new(child), outgoing, shared, next_id: AtomicU64::new(1) })
+        Ok(Client {
+            server: server.to_owned(),
+            child: Some(Mutex::new(child)),
+            outgoing: Some(outgoing),
+            http: None,
+            shared,
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    /// A streamable-HTTP server; nothing is sent until [`Client::initialize`].
+    pub fn connect_http(server: &str, config: &McpServerConfig) -> Result<Client> {
+        let url = config
+            .url
+            .as_deref()
+            .context("HTTP MCP server needs a url")?;
+        let http =
+            super::http::Http::new(server, url, config.bearer_env.as_deref(), &config.headers)?;
+        Ok(Client {
+            server: server.to_owned(),
+            child: None,
+            outgoing: None,
+            http: Some(http),
+            shared: Arc::new(Shared::default()),
+            next_id: AtomicU64::new(1),
+        })
     }
 
     /// The `initialize` handshake: offers the newest protocol version, accepts any version this
@@ -148,9 +180,18 @@ impl Client {
             }),
             timeout,
         )?;
-        let version = result.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
+        let version = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if !PROTOCOL_VERSIONS.contains(&version) {
-            bail!("server speaks unsupported protocol version {version:?} (supported: {})", PROTOCOL_VERSIONS.join(", "));
+            bail!(
+                "server speaks unsupported protocol version {version:?} (supported: {})",
+                PROTOCOL_VERSIONS.join(", ")
+            );
+        }
+        if let Some(http) = &self.http {
+            http.set_protocol(version);
         }
         self.notify("notifications/initialized", json!({}))
     }
@@ -158,6 +199,19 @@ impl Client {
     /// Sends a request and waits for its response, at most `timeout`.
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Some(http) = &self.http {
+            let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+            return match http.request(id, &message, timeout)? {
+                Ok(value) => Ok(value),
+                Err(text) => Err(anyhow!(
+                    "MCP server `{}` returned an error: {text}",
+                    self.server
+                )),
+            };
+        }
+        let Some(outgoing) = &self.outgoing else {
+            return Err(self.closed_error("the connection is closed"));
+        };
         let (reply_tx, reply_rx) = mpsc::channel();
         {
             let mut state = lock(&self.shared.state);
@@ -167,26 +221,45 @@ impl Client {
             state.pending.insert(id, reply_tx);
         }
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        if self.outgoing.send(message.to_string()).is_err() {
+        if outgoing.send(message.to_string()).is_err() {
             self.forget(id);
             return Err(self.closed_error("the connection is closed"));
         }
         match reply_rx.recv_timeout(timeout) {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(Failure::Rpc(message))) => Err(anyhow!("MCP server `{}` returned an error: {message}", self.server)),
+            Ok(Err(Failure::Rpc(message))) => Err(anyhow!(
+                "MCP server `{}` returned an error: {message}",
+                self.server
+            )),
             Ok(Err(Failure::Closed(reason))) => Err(self.closed_error(&reason)),
             Err(RecvTimeoutError::Timeout) => {
                 self.forget(id);
-                let _ = self.notify("notifications/cancelled", json!({"requestId": id, "reason": "timed out"}));
-                Err(anyhow!("MCP server `{}` did not answer `{method}` within {}s", self.server, timeout.as_secs().max(1)))
+                let _ = self.notify(
+                    "notifications/cancelled",
+                    json!({"requestId": id, "reason": "timed out"}),
+                );
+                Err(anyhow!(
+                    "MCP server `{}` did not answer `{method}` within {}s",
+                    self.server,
+                    timeout.as_secs().max(1)
+                ))
             }
-            Err(RecvTimeoutError::Disconnected) => Err(self.closed_error("the connection is closed")),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(self.closed_error("the connection is closed"))
+            }
         }
     }
 
     pub fn notify(&self, method: &str, params: Value) -> Result<()> {
         let message = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        self.outgoing.send(message.to_string()).map_err(|_| self.closed_error("the connection is closed"))
+        if let Some(http) = &self.http {
+            return http.notify(&message);
+        }
+        self.outgoing
+            .as_ref()
+            .ok_or_else(|| self.closed_error("the connection is closed"))?
+            .send(message.to_string())
+            .map_err(|_| self.closed_error("the connection is closed"))
     }
 
     fn forget(&self, id: u64) {
@@ -198,14 +271,20 @@ impl Client {
         if tail.is_empty() {
             anyhow!("MCP server `{}` is not running: {reason}", self.server)
         } else {
-            anyhow!("MCP server `{}` is not running: {reason}; its stderr ended with: {tail}", self.server)
+            anyhow!(
+                "MCP server `{}` is not running: {reason}; its stderr ended with: {tail}",
+                self.server
+            )
         }
     }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
-        let mut child = self.child.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(child) = &self.child else { return };
+        let mut child = child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The leader is not reaped until after killpg, so its PID cannot be reused in between.
         unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
         let _ = child.kill();
@@ -219,15 +298,24 @@ pub(super) fn server_env(
     inherited: impl Iterator<Item = (String, String)>,
     explicit: &BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
-    let mut env: BTreeMap<String, String> = inherited.filter(|(name, value)| !is_secret_env(name, value)).collect();
-    env.extend(explicit.iter().map(|(name, value)| (name.clone(), value.clone())));
+    let mut env: BTreeMap<String, String> = inherited
+        .filter(|(name, value)| !is_secret_env(name, value))
+        .collect();
+    env.extend(
+        explicit
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
     env.into_iter().collect()
 }
 
 fn write_loop(mut stdin: ChildStdin, queue: mpsc::Receiver<String>, shared: &Shared) {
     for mut line in queue {
         line.push('\n');
-        if let Err(error) = stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush()) {
+        if let Err(error) = stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.flush())
+        {
             shared.close(format!("writing to the server failed ({error})"));
             return;
         }
@@ -255,7 +343,9 @@ fn read_loop(stdout: impl Read, shared: &Shared, replies: &Sender<String>) {
     loop {
         let before = line.len();
         // `take` bounds how much of one line is buffered; the rest of an oversized line is skipped.
-        let read = (&mut reader).take((MAX_LINE - before) as u64 + 1).read_until(b'\n', &mut line);
+        let read = (&mut reader)
+            .take((MAX_LINE - before) as u64 + 1)
+            .read_until(b'\n', &mut line);
         match read {
             Ok(0) => break,
             Ok(_) if line.ends_with(b"\n") => {
@@ -282,20 +372,27 @@ fn read_loop(stdout: impl Read, shared: &Shared, replies: &Sender<String>) {
 }
 
 fn handle_line(line: &[u8], shared: &Shared, replies: &Sender<String>) {
-    let Ok(message) = serde_json::from_slice::<Value>(line) else { return };
+    let Ok(message) = serde_json::from_slice::<Value>(line) else {
+        return;
+    };
     let id = message.get("id").filter(|id| !id.is_null());
     match (message.get("method").and_then(Value::as_str), id) {
         (Some(method), Some(id)) => {
             let reply = match method {
                 "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-                _ => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not supported by dial"}}),
+                _ => {
+                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not supported by dial"}})
+                }
             };
             let _ = replies.send(reply.to_string());
         }
         (None, Some(id)) => {
             let Some(id) = id.as_u64() else { return };
             let outcome = if let Some(error) = message.get("error") {
-                let text = error.get("message").and_then(Value::as_str).unwrap_or("unknown error");
+                let text = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error");
                 let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
                 Err(Failure::Rpc(format!("{text} (code {code})")))
             } else if let Some(result) = message.get("result") {

@@ -6,3 +6,9 @@
 /private/
 /grounded/
 .DS_Store
+/.cargo-work/
+/.tmp/
+/.codegraph
+/bin/
+.venv/
+*.pyc

@@ -14,15 +14,24 @@ use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Metrics {
-    #[serde(default)] pub elapsed_ms: u64,
-    #[serde(default)] pub first_useful_ms: Option<u64>,
-    #[serde(default)] pub repeated_calls: u64,
-    #[serde(default)] pub tool_errors: u64,
-    #[serde(default)] pub interventions: u64,
-    #[serde(default)] pub architecture_tokens: u64,
-    #[serde(default)] pub verification_failures: u64,
-    #[serde(default)] pub repair_rounds: u64,
-    #[serde(default)] pub change_reviews: u64,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub first_useful_ms: Option<u64>,
+    #[serde(default)]
+    pub repeated_calls: u64,
+    #[serde(default)]
+    pub tool_errors: u64,
+    #[serde(default)]
+    pub interventions: u64,
+    #[serde(default)]
+    pub architecture_tokens: u64,
+    #[serde(default)]
+    pub verification_failures: u64,
+    #[serde(default)]
+    pub repair_rounds: u64,
+    #[serde(default)]
+    pub change_reviews: u64,
     pub generations: u64,
     pub tool_calls: u64,
     pub investigation_calls: u64,
@@ -37,28 +46,45 @@ impl Metrics {
     pub fn observe(&mut self, kind: &str, data: &Value) {
         self.elapsed_ms = self.elapsed_ms.max(data["wall_ms"].as_u64().unwrap_or(0));
         match kind {
-            "architecture_synthesis" => self.architecture_tokens=self.architecture_tokens.saturating_add(data["completion_tokens"].as_u64().unwrap_or(0)),
-            "repair_round" => self.repair_rounds+=1,
-            "change_review" => self.change_reviews+=1,
-            "verification" if data["passed"]==false => self.verification_failures+=1,
+            "architecture_synthesis" => {
+                self.architecture_tokens = self
+                    .architecture_tokens
+                    .saturating_add(data["completion_tokens"].as_u64().unwrap_or(0))
+            }
+            "repair_round" => self.repair_rounds += 1,
+            "change_review" => self.change_reviews += 1,
+            "verification" if data["passed"] == false => self.verification_failures += 1,
             "generation" => {
                 self.generations += 1;
-                self.completion_tokens = self.completion_tokens.saturating_add(data["completion_tokens"].as_u64().unwrap_or(0));
+                self.completion_tokens = self
+                    .completion_tokens
+                    .saturating_add(data["completion_tokens"].as_u64().unwrap_or(0));
                 if data["tool_calls"].as_u64().unwrap_or(0) > 0 {
-                    self.chatter_bytes = self.chatter_bytes.saturating_add(data["output"].as_str().map_or(0, |text| text.len() as u64));
+                    self.chatter_bytes = self.chatter_bytes.saturating_add(
+                        data["output"].as_str().map_or(0, |text| text.len() as u64),
+                    );
                 }
             }
             "tool_call" => {
                 self.tool_calls += 1;
-                if matches!(data["name"].as_str(), Some("read" | "find" | "grep" | "glob" | "lsp" | "ast_search")) {
+                if matches!(
+                    data["name"].as_str(),
+                    Some("read" | "find" | "grep" | "glob" | "lsp" | "ast_search")
+                ) {
                     self.investigation_calls += 1;
                 }
             }
-            "tool_result" if self.first_useful_ms.is_none() && !matches!(data["name"].as_str(), Some("todo" | "task_list")) => {
+            "tool_result"
+                if self.first_useful_ms.is_none()
+                    && !matches!(data["name"].as_str(), Some("todo" | "task_list")) =>
+            {
                 self.first_useful_ms = data["wall_ms"].as_u64();
             }
             "tool_error" => self.tool_errors += 1,
-            "investigation_gate" => { self.repeated_calls += 1; self.interventions += 1; }
+            "investigation_gate" => {
+                self.repeated_calls += 1;
+                self.interventions += 1;
+            }
             "reasoning_gate" => self.interventions += 1,
             "tool_form_failure" => self.protocol_errors += 1,
             _ => {}
@@ -68,7 +94,9 @@ impl Metrics {
     pub(super) fn add(&mut self, other: &Self) {
         self.elapsed_ms = self.elapsed_ms.saturating_add(other.elapsed_ms);
         self.first_useful_ms = match (self.first_useful_ms, other.first_useful_ms) {
-            (Some(a), Some(b)) => Some(a.saturating_add(b)), (None, b) => b, (a, None) => a,
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            (None, b) => b,
+            (a, None) => a,
         };
         self.repeated_calls += other.repeated_calls;
         self.tool_errors += other.tool_errors;
@@ -79,10 +107,14 @@ impl Metrics {
         self.change_reviews += other.change_reviews;
         self.generations = self.generations.saturating_add(other.generations);
         self.tool_calls = self.tool_calls.saturating_add(other.tool_calls);
-        self.investigation_calls = self.investigation_calls.saturating_add(other.investigation_calls);
+        self.investigation_calls = self
+            .investigation_calls
+            .saturating_add(other.investigation_calls);
         self.protocol_errors = self.protocol_errors.saturating_add(other.protocol_errors);
         self.chatter_bytes = self.chatter_bytes.saturating_add(other.chatter_bytes);
-        self.completion_tokens = self.completion_tokens.saturating_add(other.completion_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
     }
 }
 
@@ -121,7 +153,12 @@ const INVESTIGATION_NOTE: &str = "Bounded investigation workflow: locate the req
 
 /// Recurrence thresholds identify hypotheses, not improvements. Every returned harness still
 /// needs the unchanged correctness admission gate plus paired workflow measurements.
-pub fn candidates(active: &Harness, ctx: &mutate::Context, evidence: &Evidence, limit: usize) -> Vec<Candidate> {
+pub fn candidates(
+    active: &Harness,
+    ctx: &mutate::Context,
+    evidence: &Evidence,
+    limit: usize,
+) -> Vec<Candidate> {
     let mut options = Vec::new();
     if evidence.protocol_trajectories >= 3 {
         let mut harness = active.clone();
@@ -134,7 +171,13 @@ pub fn candidates(active: &Harness, ctx: &mutate::Context, evidence: &Evidence, 
             evidence: evidence.clone(),
         });
         if evidence.failure_kinds.get("schema").copied().unwrap_or(0)
-            + evidence.failure_kinds.get("malformed_arguments").copied().unwrap_or(0) >= 3 {
+            + evidence
+                .failure_kinds
+                .get("malformed_arguments")
+                .copied()
+                .unwrap_or(0)
+            >= 3
+        {
             let mut harness = active.clone();
             mutate::push_note(&mut harness, PROTOCOL_NOTE);
             harness.edit_mode = Some(match active.edit_mode.unwrap_or(ctx.default_edit_mode) {
@@ -162,23 +205,41 @@ pub fn candidates(active: &Harness, ctx: &mutate::Context, evidence: &Evidence, 
     }
     if evidence.observed.tool_errors >= 3 && evidence.trajectories >= 3 {
         let mut harness = active.clone();
-        mutate::push_note(&mut harness, "Failure recovery workflow: after a failed operation, state what the diagnostic rules out, inspect the smallest relevant region, and change one justified part of the approach. Never repeat the same failed action unchanged. Preserve the original tests and acceptance criteria; a passing edited test is not proof of a fix.");
+        mutate::push_note(
+            &mut harness,
+            "Failure recovery workflow: after a failed operation, state what the diagnostic rules out, inspect the smallest relevant region, and change one justified part of the approach. Never repeat the same failed action unchanged. Preserve the original tests and acceptance criteria; a passing edited test is not proof of a fix.",
+        );
         options.push(Candidate { name:"recovery", rationale:"Recurring tool failures: evaluate evidence-driven recovery against the unchanged sealed checks".into(), harness, evidence:evidence.clone() });
     }
     let mut seen = HashSet::from([mutate::harness_digest(active)]);
-    options.into_iter().filter(|candidate| {
-        let digest = mutate::harness_digest(&candidate.harness);
-        !ctx.tried.contains(&digest) && (ctx.valid)(&candidate.harness) && seen.insert(digest)
-    }).take(limit).collect()
+    options
+        .into_iter()
+        .filter(|candidate| {
+            let digest = mutate::harness_digest(&candidate.harness);
+            !ctx.tried.contains(&digest) && (ctx.valid)(&candidate.harness) && seen.insert(digest)
+        })
+        .take(limit)
+        .collect()
 }
 
-pub fn is_candidate(version: &Version) -> bool { version.kind.starts_with("workflow:") }
+pub fn is_candidate(version: &Version) -> bool {
+    version.kind.starts_with("workflow:")
+}
 
 /// The Store is already bound to one model/use-case. Keep the binding explicit in audit metadata.
 pub fn register(store: &Store, version: &Version, candidate: &Candidate) -> Result<()> {
-    ensure!(version.kind == format!("workflow:{}", candidate.name), "workflow candidate kind mismatch");
-    ensure!(version.harness == candidate.harness, "workflow candidate harness mismatch");
-    ensure!(version.parent == Some(candidate.evidence.source_version), "workflow evidence version mismatch");
+    ensure!(
+        version.kind == format!("workflow:{}", candidate.name),
+        "workflow candidate kind mismatch"
+    );
+    ensure!(
+        version.harness == candidate.harness,
+        "workflow candidate harness mismatch"
+    );
+    ensure!(
+        version.parent == Some(candidate.evidence.source_version),
+        "workflow evidence version mismatch"
+    );
     store.set_meta(&format!("workflow_proposal:{}", version.id), &serde_json::to_string(&serde_json::json!({
         "model": store.get_meta("model")?, "use_case": store.get_meta("use_case")?,
         "name": candidate.name, "rationale": candidate.rationale, "evidence": candidate.evidence,
@@ -203,12 +264,23 @@ pub struct Comparison {
 
 /// Additional fail-closed requirement; this function can never turn a gate rejection into a pass.
 /// Pairs must be the exact cached baseline/candidate runs used by the sealed correctness gate.
-pub fn compare(kind: &str, admission: &mut Admission, pairs: &[(CaseMeasurement, CaseMeasurement)]) -> Comparison {
+pub fn compare(
+    kind: &str,
+    admission: &mut Admission,
+    pairs: &[(CaseMeasurement, CaseMeasurement)],
+) -> Comparison {
     let mut report = Comparison {
-        baseline_version: admission.baseline, candidate_version: admission.candidate,
-        cases: pairs.len(), baseline_passed: 0, candidate_passed: 0, newly_failed: 0,
-        baseline: Metrics::default(), candidate: Metrics::default(), measured_reduction: false,
-        admitted: false, reason: String::new(),
+        baseline_version: admission.baseline,
+        candidate_version: admission.candidate,
+        cases: pairs.len(),
+        baseline_passed: 0,
+        candidate_passed: 0,
+        newly_failed: 0,
+        baseline: Metrics::default(),
+        candidate: Metrics::default(),
+        measured_reduction: false,
+        admitted: false,
+        reason: String::new(),
     };
     for (baseline, candidate) in pairs {
         report.baseline_passed += usize::from(baseline.passed);
@@ -220,9 +292,15 @@ pub fn compare(kind: &str, admission: &mut Admission, pairs: &[(CaseMeasurement,
     let b = &report.baseline;
     let c = &report.candidate;
     report.measured_reduction = match kind {
-        "workflow:protocol" | "workflow:protocol_edit_format" => c.protocol_errors < b.protocol_errors,
+        "workflow:protocol" | "workflow:protocol_edit_format" => {
+            c.protocol_errors < b.protocol_errors
+        }
         "workflow:recovery" => c.tool_errors < b.tool_errors || c.repeated_calls < b.repeated_calls,
-        "workflow:bounded_investigation" => c.tool_calls < b.tool_calls || c.investigation_calls < b.investigation_calls || c.chatter_bytes < b.chatter_bytes,
+        "workflow:bounded_investigation" => {
+            c.tool_calls < b.tool_calls
+                || c.investigation_calls < b.investigation_calls
+                || c.chatter_bytes < b.chatter_bytes
+        }
         _ => false,
     };
     let expected: usize = admission.scores.iter().map(|s| s.cases).sum();
@@ -230,11 +308,21 @@ pub fn compare(kind: &str, admission: &mut Admission, pairs: &[(CaseMeasurement,
         Some("workflow comparison missing paired held-out measurements")
     } else if report.newly_failed > 0 {
         Some("workflow comparison lost previously solved held-out cases")
-    } else if c.tool_errors > b.tool_errors || c.repeated_calls > b.repeated_calls || c.protocol_errors > b.protocol_errors || c.tool_calls > b.tool_calls || c.chatter_bytes > b.chatter_bytes || c.generations > b.generations {
-        Some("workflow comparison increased protocol errors, actions, chatter, or generation rounds")
+    } else if c.tool_errors > b.tool_errors
+        || c.repeated_calls > b.repeated_calls
+        || c.protocol_errors > b.protocol_errors
+        || c.tool_calls > b.tool_calls
+        || c.chatter_bytes > b.chatter_bytes
+        || c.generations > b.generations
+    {
+        Some(
+            "workflow comparison increased protocol errors, actions, chatter, or generation rounds",
+        )
     } else if !report.measured_reduction {
         Some("workflow comparison found no measured reduction in the targeted behavior")
-    } else { None };
+    } else {
+        None
+    };
     if admission.passed {
         if let Some(reason) = failure {
             admission.passed = false;
@@ -248,14 +336,29 @@ pub fn compare(kind: &str, admission: &mut Admission, pairs: &[(CaseMeasurement,
 
 /// Persist aggregate comparisons for accepted and rejected profiles. The admitted harness itself
 /// lives in normal version storage; no second active pointer can bypass rollback or model binding.
-pub fn record_comparison(store: &Store, baseline: &Version, candidate: &Version, admission: &mut Admission,
-                         pairs: &[(CaseMeasurement, CaseMeasurement)]) -> Result<()> {
-    if !is_candidate(candidate) { return Ok(()); }
-    ensure!(admission.baseline == baseline.id && admission.candidate == candidate.id, "workflow comparison version mismatch");
-    let proposal = store.get_meta(&format!("workflow_proposal:{}", candidate.id))?.context("workflow proposal evidence missing")?;
+pub fn record_comparison(
+    store: &Store,
+    baseline: &Version,
+    candidate: &Version,
+    admission: &mut Admission,
+    pairs: &[(CaseMeasurement, CaseMeasurement)],
+) -> Result<()> {
+    if !is_candidate(candidate) {
+        return Ok(());
+    }
+    ensure!(
+        admission.baseline == baseline.id && admission.candidate == candidate.id,
+        "workflow comparison version mismatch"
+    );
+    let proposal = store
+        .get_meta(&format!("workflow_proposal:{}", candidate.id))?
+        .context("workflow proposal evidence missing")?;
     let _: Value = serde_json::from_str(&proposal).context("corrupt workflow proposal evidence")?;
     let comparison = compare(&candidate.kind, admission, pairs);
-    store.set_meta(&format!("workflow_comparison:{}", candidate.id), &serde_json::to_string(&comparison)?)
+    store.set_meta(
+        &format!("workflow_comparison:{}", candidate.id),
+        &serde_json::to_string(&comparison)?,
+    )
 }
 
 #[cfg(test)]
@@ -267,46 +370,83 @@ mod tests {
     #[test]
     fn metrics_count_actual_calls_and_chatter_not_answers_or_results() {
         let mut metrics = Metrics::default();
-        metrics.observe("generation", &json!({"tool_calls":1,"output":"look","completion_tokens":7}));
+        metrics.observe(
+            "generation",
+            &json!({"tool_calls":1,"output":"look","completion_tokens":7}),
+        );
         metrics.observe("tool_call", &json!({"name":"read"}));
         metrics.observe("tool_result", &json!({"output":"long tool output"}));
-        metrics.observe("generation", &json!({"tool_calls":0,"output":"the requested final answer","completion_tokens":9}));
+        metrics.observe(
+            "generation",
+            &json!({"tool_calls":0,"output":"the requested final answer","completion_tokens":9}),
+        );
         metrics.observe("tool_form_failure", &json!({"kind":"schema"}));
-        assert_eq!(metrics, Metrics { generations:2, tool_calls:1, investigation_calls:1, protocol_errors:1, chatter_bytes:4, completion_tokens:16, ..Metrics::default() });
+        assert_eq!(
+            metrics,
+            Metrics {
+                generations: 2,
+                tool_calls: 1,
+                investigation_calls: 1,
+                protocol_errors: 1,
+                chatter_bytes: 4,
+                completion_tokens: 16,
+                ..Metrics::default()
+            }
+        );
     }
 
     #[test]
     fn maintenance_and_repair_costs_do_not_count_as_task_success() {
-        let mut metrics=Metrics::default();
-        metrics.observe("architecture_synthesis",&json!({"completion_tokens":120,"wall_ms":2000}));
-        metrics.observe("verification",&json!({"passed":false}));
-        metrics.observe("repair_round",&json!({"attempt":1}));
-        metrics.observe("change_review",&json!({"path":"main.rs"}));
-        let mut combined=Metrics::default();combined.add(&metrics);
-        assert_eq!(combined.architecture_tokens,120);
-        assert_eq!(combined.elapsed_ms,2000);
-        assert_eq!((combined.verification_failures,combined.repair_rounds,combined.change_reviews),(1,1,1));
-        assert_eq!(combined.generations,0);
+        let mut metrics = Metrics::default();
+        metrics.observe(
+            "architecture_synthesis",
+            &json!({"completion_tokens":120,"wall_ms":2000}),
+        );
+        metrics.observe("verification", &json!({"passed":false}));
+        metrics.observe("repair_round", &json!({"attempt":1}));
+        metrics.observe("change_review", &json!({"path":"main.rs"}));
+        let mut combined = Metrics::default();
+        combined.add(&metrics);
+        assert_eq!(combined.architecture_tokens, 120);
+        assert_eq!(combined.elapsed_ms, 2000);
+        assert_eq!(
+            (
+                combined.verification_failures,
+                combined.repair_rounds,
+                combined.change_reviews
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(combined.generations, 0);
     }
 
     #[test]
     fn timing_and_repetition_are_observed_not_inferred_from_token_counts() {
-        let mut metrics=Metrics::default();
-        metrics.observe("generation",&json!({"wall_ms":40,"tool_calls":1}));
-        metrics.observe("tool_error",&json!({"name":"read","wall_ms":50}));
-        assert_eq!(metrics.first_useful_ms,None);
-        metrics.observe("tool_result",&json!({"name":"todo","wall_ms":55}));
-        assert_eq!(metrics.first_useful_ms,None);
-        metrics.observe("tool_result",&json!({"name":"read","wall_ms":70}));
-        metrics.observe("investigation_gate",&json!({"wall_ms":90}));
-        assert_eq!(metrics.first_useful_ms,Some(70));
-        assert_eq!(metrics.elapsed_ms,90);
-        assert_eq!((metrics.tool_errors,metrics.repeated_calls),(1,1));
+        let mut metrics = Metrics::default();
+        metrics.observe("generation", &json!({"wall_ms":40,"tool_calls":1}));
+        metrics.observe("tool_error", &json!({"name":"read","wall_ms":50}));
+        assert_eq!(metrics.first_useful_ms, None);
+        metrics.observe("tool_result", &json!({"name":"todo","wall_ms":55}));
+        assert_eq!(metrics.first_useful_ms, None);
+        metrics.observe("tool_result", &json!({"name":"read","wall_ms":70}));
+        metrics.observe("investigation_gate", &json!({"wall_ms":90}));
+        assert_eq!(metrics.first_useful_ms, Some(70));
+        assert_eq!(metrics.elapsed_ms, 90);
+        assert_eq!((metrics.tool_errors, metrics.repeated_calls), (1, 1));
     }
 
     fn evidence() -> Evidence {
-        Evidence { source_version: 1, trajectories: 6, protocol_trajectories: 3, investigation_trajectories: 3,
-            failure_kinds: BTreeMap::from([("schema".into(),3)]), observed: Metrics { protocol_errors:3, ..Metrics::default() } }
+        Evidence {
+            source_version: 1,
+            trajectories: 6,
+            protocol_trajectories: 3,
+            investigation_trajectories: 3,
+            failure_kinds: BTreeMap::from([("schema".into(), 3)]),
+            observed: Metrics {
+                protocol_errors: 3,
+                ..Metrics::default()
+            },
+        }
     }
 
     #[test]
@@ -315,31 +455,77 @@ mod tests {
         let failures = BTreeMap::new();
         let tried = HashSet::new();
         let valid = |_: &Harness| true;
-        let ctx = mutate::Context { failure_kinds:&failures, selfplay_rates:&[], default_edit_mode:EditModeConfig::Hashline, tried:&tried, valid:&valid };
+        let ctx = mutate::Context {
+            failure_kinds: &failures,
+            selfplay_rates: &[],
+            default_edit_mode: EditModeConfig::Hashline,
+            tried: &tried,
+            valid: &valid,
+        };
         let options = candidates(&harness, &ctx, &evidence(), 8);
         assert_eq!(options.len(), 3);
         assert_eq!(options[0].harness.temperature, 0.0);
         assert_eq!(options[1].harness.edit_mode, Some(EditModeConfig::Replace));
         assert_eq!(options[2].harness.max_steps, 30);
-        assert!(options.iter().all(|c| c.harness != harness && c.harness.tools == harness.tools));
+        assert!(
+            options
+                .iter()
+                .all(|c| c.harness != harness && c.harness.tools == harness.tools)
+        );
         let mut one_run = evidence();
         one_run.protocol_trajectories = 1;
         one_run.investigation_trajectories = 1;
         assert!(candidates(&harness, &ctx, &one_run, 8).is_empty());
-        let tried = options.iter().map(|c| mutate::harness_digest(&c.harness)).collect();
-        let ctx = mutate::Context { tried:&tried, ..ctx };
+        let tried = options
+            .iter()
+            .map(|c| mutate::harness_digest(&c.harness))
+            .collect();
+        let ctx = mutate::Context {
+            tried: &tried,
+            ..ctx
+        };
         assert!(candidates(&harness, &ctx, &evidence(), 8).is_empty());
     }
 
     fn admission(passed: bool, cases: usize) -> Admission {
-        Admission { baseline:1, candidate:2, passed, reason:"sealed gate verdict".into(), scores:vec![SuiteScore {
-            name:"private".into(), primary:true, baseline:50.0, candidate:100.0, cases, candidate_only:1, baseline_only:0,
-        }] }
+        Admission {
+            baseline: 1,
+            candidate: 2,
+            passed,
+            reason: "sealed gate verdict".into(),
+            scores: vec![SuiteScore {
+                name: "private".into(),
+                primary: true,
+                baseline: 50.0,
+                candidate: 100.0,
+                cases,
+                candidate_only: 1,
+                baseline_only: 0,
+            }],
+        }
     }
 
     fn pair(baseline_pass: bool, candidate_pass: bool) -> (CaseMeasurement, CaseMeasurement) {
-        (CaseMeasurement { passed:baseline_pass, metrics:Metrics { tool_calls:5, investigation_calls:4, protocol_errors:2, ..Metrics::default() } },
-         CaseMeasurement { passed:candidate_pass, metrics:Metrics { tool_calls:3, investigation_calls:2, protocol_errors:0, ..Metrics::default() } })
+        (
+            CaseMeasurement {
+                passed: baseline_pass,
+                metrics: Metrics {
+                    tool_calls: 5,
+                    investigation_calls: 4,
+                    protocol_errors: 2,
+                    ..Metrics::default()
+                },
+            },
+            CaseMeasurement {
+                passed: candidate_pass,
+                metrics: Metrics {
+                    tool_calls: 3,
+                    investigation_calls: 2,
+                    protocol_errors: 0,
+                    ..Metrics::default()
+                },
+            },
+        )
     }
 
     #[test]
@@ -348,7 +534,14 @@ mod tests {
         assert!(!compare("workflow:protocol", &mut rejected, &[pair(false, true)]).admitted);
         assert_eq!(rejected.reason, "sealed gate verdict");
         let mut regression = admission(true, 2);
-        assert!(!compare("workflow:bounded_investigation", &mut regression, &[pair(true, false),pair(false, true)]).admitted);
+        assert!(
+            !compare(
+                "workflow:bounded_investigation",
+                &mut regression,
+                &[pair(true, false), pair(false, true)]
+            )
+            .admitted
+        );
         assert!(regression.reason.contains("previously solved"));
     }
 
@@ -374,22 +567,59 @@ mod tests {
         let harness = Harness::default();
         let store = Store::open(dir.path(), "local-model", "coding", &harness).unwrap();
         let base = store.active().unwrap();
-        let candidate = Candidate { name:"protocol", rationale:"recurring failures".into(), harness:base.harness.clone(), evidence:Evidence { source_version:base.id, ..evidence() } };
-        let version = store.candidate(base.id, "workflow:protocol", &candidate.harness, None).unwrap();
+        let candidate = Candidate {
+            name: "protocol",
+            rationale: "recurring failures".into(),
+            harness: base.harness.clone(),
+            evidence: Evidence {
+                source_version: base.id,
+                ..evidence()
+            },
+        };
+        let version = store
+            .candidate(base.id, "workflow:protocol", &candidate.harness, None)
+            .unwrap();
         register(&store, &version, &candidate).unwrap();
         let mut verdict = admission(true, 1);
         verdict.baseline = base.id;
         verdict.candidate = version.id;
         verdict.scores[0].baseline = 0.0;
-        verdict.scores.push(SuiteScore { name:"guard".into(),primary:false,baseline:100.0,candidate:100.0,cases:1,candidate_only:0,baseline_only:0 });
-        record_comparison(&store, &base, &version, &mut verdict, &[pair(false,true),pair(true,true)]).unwrap();
+        verdict.scores.push(SuiteScore {
+            name: "guard".into(),
+            primary: false,
+            baseline: 100.0,
+            candidate: 100.0,
+            cases: 1,
+            candidate_only: 0,
+            baseline_only: 0,
+        });
+        record_comparison(
+            &store,
+            &base,
+            &version,
+            &mut verdict,
+            &[pair(false, true), pair(true, true)],
+        )
+        .unwrap();
         store.admit(&verdict).unwrap();
         drop(store);
         let store = Store::open(dir.path(), "local-model", "coding", &harness).unwrap();
         assert_eq!(store.active().unwrap().id, version.id);
-        let proposal: Value = serde_json::from_str(&store.get_meta(&format!("workflow_proposal:{}",version.id)).unwrap().unwrap()).unwrap();
+        let proposal: Value = serde_json::from_str(
+            &store
+                .get_meta(&format!("workflow_proposal:{}", version.id))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(proposal["model"], "local-model");
-        let comparison: Comparison = serde_json::from_str(&store.get_meta(&format!("workflow_comparison:{}",version.id)).unwrap().unwrap()).unwrap();
+        let comparison: Comparison = serde_json::from_str(
+            &store
+                .get_meta(&format!("workflow_comparison:{}", version.id))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert!(comparison.admitted && comparison.measured_reduction);
         store.rollback().unwrap();
         assert_eq!(store.active().unwrap().id, base.id);

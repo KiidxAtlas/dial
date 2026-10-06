@@ -4,7 +4,9 @@ use serde_json::Value;
 
 pub(crate) fn workspace() -> (tempfile::TempDir, Workspace) {
     let dir = tempfile::tempdir().unwrap();
-    let ws = Workspace::new(dir.path()).unwrap().with_edit_mode(EditMode::Replace);
+    let ws = Workspace::new(dir.path())
+        .unwrap()
+        .with_edit_mode(EditMode::Replace);
     (dir, ws)
 }
 

@@ -10,22 +10,23 @@
 //! that a server returned as Hermes-style text (`<tool_call>…</tool_call>`)
 //! into structured [`ToolCall`]s when the request offered tools.
 
-pub(crate) mod messages;
+pub(crate) mod anthropic;
+pub(crate) mod anthropic_oauth;
 pub mod auth;
-pub mod chatgpt;
-mod responses;
+mod cancel;
 pub mod catalog;
+pub mod chatgpt;
 mod hermes;
+pub mod images;
+mod json_repair;
+pub(crate) mod messages;
 pub mod model_config;
-pub mod provider;
 pub mod profiles;
-mod anthropic;
+pub mod provider;
+mod responses;
+mod retry;
 pub mod server;
 mod stream;
-mod retry;
-pub mod images;
-mod cancel;
-mod json_repair;
 pub(crate) use cancel::Patience;
 #[cfg(test)]
 pub(crate) mod fake;
@@ -71,7 +72,11 @@ pub struct HttpError {
 
 impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "model server returned HTTP {}: {}", self.status, self.excerpt)
+        write!(
+            f,
+            "model server returned HTTP {}: {}",
+            self.status, self.excerpt
+        )
     }
 }
 
@@ -96,9 +101,14 @@ impl std::error::Error for TransportError {}
 /// Whether retrying is reasonable before a response body has been consumed.
 pub fn is_transient(error: &anyhow::Error) -> bool {
     if let Some(http) = error.downcast_ref::<HttpError>() {
-        return matches!(http.status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529);
+        return matches!(
+            http.status,
+            408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529
+        );
     }
-    error.downcast_ref::<TransportError>().is_some_and(|t| t.connection)
+    error
+        .downcast_ref::<TransportError>()
+        .is_some_and(|t| t.connection)
 }
 
 #[derive(Debug, Clone)]
@@ -152,9 +162,13 @@ impl Reply {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     Reasoning(String),
-    ToolArguments { index: u64, id: String, name: String, delta: String },
+    ToolArguments {
+        index: u64,
+        id: String,
+        name: String,
+        delta: String,
+    },
 }
-
 
 /// Agent for loopback calls: no proxy from the environment, no redirects, and
 /// HTTP error statuses are returned as responses so bodies can be inspected.
@@ -173,13 +187,21 @@ const STREAM_CEILING: Duration = Duration::from_secs(6 * 3600);
 /// A non-streaming call is bounded as a whole by `timeout_secs`. A streaming call (`patience`) is not: opening the
 /// connection and sending the request are bounded, then the transport enforces only how long the server may stay
 /// silent (see [`cancel::Patience`]).
-pub(crate) fn agent_with(timeout_secs: u64, env_proxy: bool, interrupt: Option<Arc<AtomicBool>>, patience: Option<Patience>) -> ureq::Agent {
-    let builder = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0);
+pub(crate) fn agent_with(
+    timeout_secs: u64,
+    env_proxy: bool,
+    interrupt: Option<Arc<AtomicBool>>,
+    patience: Option<Patience>,
+) -> ureq::Agent {
+    let builder = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0);
     let builder = match patience {
         None => builder.timeout_global(Some(Duration::from_secs(timeout_secs))),
         // `recv_*` ceilings are set (not left unset) so ureq reports the phase in each timeout; the transport reads
         // that to apply the first-event and idle limits.
-        Some(_) => builder.timeout_global(None)
+        Some(_) => builder
+            .timeout_global(None)
             .timeout_resolve(Some(Duration::from_secs(15)))
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_send_request(Some(Duration::from_secs(60)))
@@ -187,9 +209,15 @@ pub(crate) fn agent_with(timeout_secs: u64, env_proxy: bool, interrupt: Option<A
             .timeout_recv_response(Some(STREAM_CEILING))
             .timeout_recv_body(Some(STREAM_CEILING)),
     };
-    let builder = if env_proxy { builder } else { builder.proxy(None) };
+    let builder = if env_proxy {
+        builder
+    } else {
+        builder.proxy(None)
+    };
     match (patience, interrupt) {
-        (Some(patience), interrupt) => cancel::patient_agent(builder.build(), interrupt.unwrap_or_default(), patience),
+        (Some(patience), interrupt) => {
+            cancel::patient_agent(builder.build(), interrupt.unwrap_or_default(), patience)
+        }
         (None, Some(interrupt)) => cancel::agent(builder.build(), interrupt),
         (None, None) => ureq::Agent::new_with_config(builder.build()),
     }
@@ -198,7 +226,8 @@ pub(crate) fn agent_with(timeout_secs: u64, env_proxy: bool, interrupt: Option<A
 /// Poll cancellation below TLS while retaining a caller's guarded DNS resolver.
 /// The caller still owns bounded DNS, connect and write deadlines.
 pub(crate) fn cancellable_agent_with_resolver(
-    config: ureq::config::Config, interrupt: Arc<AtomicBool>,
+    config: ureq::config::Config,
+    interrupt: Arc<AtomicBool>,
     resolver: impl ureq::unversioned::resolver::Resolver,
 ) -> ureq::Agent {
     cancel::agent_with_resolver(config, interrupt, resolver)
@@ -207,7 +236,10 @@ pub(crate) fn cancellable_agent_with_resolver(
 /// Hosts that are reachable only locally: loopback, RFC 1918 / link-local /
 /// unique-local addresses, `localhost` and mDNS `.local` names.
 pub(crate) fn is_local_host(host: &str) -> bool {
-    let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
             std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
@@ -222,7 +254,10 @@ pub(crate) fn is_local_host(host: &str) -> bool {
 }
 
 fn host_of(url: &str) -> Option<String> {
-    url.parse::<ureq::http::Uri>().ok()?.host().map(str::to_string)
+    url.parse::<ureq::http::Uri>()
+        .ok()?
+        .host()
+        .map(str::to_string)
 }
 
 /// The chat-completions URL for `base_url`: `{base}/chat/completions` when the
@@ -236,7 +271,11 @@ pub fn completions_url(base_url: &str) -> String {
         return base.to_string();
     }
     let after_scheme = base.split_once("://").map_or(base, |(_, rest)| rest);
-    if after_scheme.contains('/') { format!("{base}/chat/completions") } else { format!("{base}/v1/chat/completions") }
+    if after_scheme.contains('/') {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
+    }
 }
 
 /// One non-streaming chat completion. `model_label` should be [`SERVER_MODEL`]
@@ -253,7 +292,13 @@ pub fn chat_with_auth(
     req: &Chat,
     timeout_secs: u64,
 ) -> Result<Reply> {
-    chat_at(&completions_url(base_url), auth, model_label, req, timeout_secs)
+    chat_at(
+        &completions_url(base_url),
+        auth,
+        model_label,
+        req,
+        timeout_secs,
+    )
 }
 
 /// Streaming chat completion over SSE. `on_text` receives each non-empty
@@ -272,7 +317,14 @@ pub fn chat_stream(
     timeout_secs: u64,
     on_text: &mut dyn FnMut(&str) -> bool,
 ) -> Result<Reply> {
-    chat_stream_at(&completions_url(base_url), auth, model_label, req, timeout_secs, on_text)
+    chat_stream_at(
+        &completions_url(base_url),
+        auth,
+        model_label,
+        req,
+        timeout_secs,
+        on_text,
+    )
 }
 
 pub(crate) fn chat_at(
@@ -282,7 +334,16 @@ pub(crate) fn chat_at(
     req: &Chat,
     timeout_secs: u64,
 ) -> Result<Reply> {
-    chat_at_controlled(url, auth, model_label, req, timeout_secs, None, None, &mut |_| true)
+    chat_at_controlled(
+        url,
+        auth,
+        model_label,
+        req,
+        timeout_secs,
+        None,
+        None,
+        &mut |_| true,
+    )
 }
 
 fn chat_at_controlled(
@@ -296,22 +357,34 @@ fn chat_at_controlled(
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
     let mut body = request_body(model_label, req, timeout_secs, false)?;
-    if let Some(profile) = profile { profile.validate_request(req, false)?; profile.apply_openai(&mut body); }
+    if let Some(profile) = profile {
+        profile.validate_request(req, false)?;
+        profile.apply_openai(&mut body);
+    }
     let mut response = send(url, auth, &body, timeout_secs, None, interrupt)?;
     let status = response.status().as_u16();
     let retry_after = retry::server_delay(response.headers());
     let success = (200..300).contains(&status);
     let bytes = read_bounded(
         response.body_mut().as_reader(),
-        if success { MAX_RESPONSE_BYTES } else { ERROR_EXCERPT_BYTES },
+        if success {
+            MAX_RESPONSE_BYTES
+        } else {
+            ERROR_EXCERPT_BYTES
+        },
     )
     .context("reading chat response")?;
     if !success {
         return Err(http_error(status, &bytes, auth, retry_after));
     }
-    ensure!(!bytes.truncated, "chat response exceeds {MAX_RESPONSE_BYTES} bytes");
+    ensure!(
+        !bytes.truncated,
+        "chat response exceeds {MAX_RESPONSE_BYTES} bytes"
+    );
     let mut reply = parse_reply(&bytes.data).map_err(|error| response_error(error, auth))?;
-    if !reply.reasoning.is_empty() && !on_event(&StreamEvent::Reasoning(reply.reasoning.clone())) { return Err(Interrupted.into()); }
+    if !reply.reasoning.is_empty() && !on_event(&StreamEvent::Reasoning(reply.reasoning.clone())) {
+        return Err(Interrupted.into());
+    }
     if !req.tools.is_empty() {
         hermes::apply(&mut reply);
     }
@@ -326,7 +399,17 @@ pub(crate) fn chat_stream_at(
     timeout_secs: u64,
     on_text: &mut dyn FnMut(&str) -> bool,
 ) -> Result<Reply> {
-    chat_stream_at_controlled(url, auth, model_label, req, timeout_secs, on_text, None, None, &mut |_| true)
+    chat_stream_at_controlled(
+        url,
+        auth,
+        model_label,
+        req,
+        timeout_secs,
+        on_text,
+        None,
+        None,
+        &mut |_| true,
+    )
 }
 
 fn chat_stream_at_controlled(
@@ -341,9 +424,22 @@ fn chat_stream_at_controlled(
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
     let mut body = request_body(model_label, req, timeout_secs, true)?;
-    let patience = Patience::for_stream(timeout_secs, host_of(url).is_some_and(|host| is_local_host(&host)));
-    if let Some(profile) = profile { profile.validate_request(req, false)?; profile.apply_openai(&mut body); }
-    let mut response = send(url, auth, &body, timeout_secs, Some(patience.clone()), interrupt)?;
+    let patience = Patience::for_stream(
+        timeout_secs,
+        host_of(url).is_some_and(|host| is_local_host(&host)),
+    );
+    if let Some(profile) = profile {
+        profile.validate_request(req, false)?;
+        profile.apply_openai(&mut body);
+    }
+    let mut response = send(
+        url,
+        auth,
+        &body,
+        timeout_secs,
+        Some(patience.clone()),
+        interrupt,
+    )?;
     let status = response.status().as_u16();
     let retry_after = retry::server_delay(response.headers());
     if !(200..300).contains(&status) {
@@ -366,15 +462,25 @@ fn chat_stream_at_controlled(
             stream::MAX_LINE_BYTES,
             patience,
             |data| accumulator.feed_with_events(data, &mut forward, on_event),
-        ).map_err(|error| response_error(error, auth))?;
-        accumulator.finish().map_err(|error| response_error(error, auth))?
+        )
+        .map_err(|error| response_error(error, auth))?;
+        accumulator
+            .finish()
+            .map_err(|error| response_error(error, auth))?
     } else {
         // A server that ignores `stream: true` answers with one JSON body.
         let bytes = read_bounded(response.body_mut().as_reader(), MAX_RESPONSE_BYTES)
             .context("reading chat response")?;
-        ensure!(!bytes.truncated, "chat response exceeds {MAX_RESPONSE_BYTES} bytes");
+        ensure!(
+            !bytes.truncated,
+            "chat response exceeds {MAX_RESPONSE_BYTES} bytes"
+        );
         let reply = parse_reply(&bytes.data).map_err(|error| response_error(error, auth))?;
-        if !reply.reasoning.is_empty() && !on_event(&StreamEvent::Reasoning(reply.reasoning.clone())) { return Err(Interrupted.into()); }
+        if !reply.reasoning.is_empty()
+            && !on_event(&StreamEvent::Reasoning(reply.reasoning.clone()))
+        {
+            return Err(Interrupted.into());
+        }
         if !reply.text.is_empty() && !hider.push(&reply.text) {
             return Err(Interrupted.into());
         }
@@ -389,7 +495,12 @@ fn chat_stream_at_controlled(
     Ok(reply)
 }
 
-fn request_body(model_label: &str, req: &Chat, timeout_secs: u64, streaming: bool) -> Result<Value> {
+fn request_body(
+    model_label: &str,
+    req: &Chat,
+    timeout_secs: u64,
+    streaming: bool,
+) -> Result<Value> {
     ensure!(timeout_secs > 0, "chat timeout must be positive");
     ensure!(
         req.temperature.is_finite() && req.temperature >= 0.0,
@@ -403,7 +514,9 @@ fn request_body(model_label: &str, req: &Chat, timeout_secs: u64, streaming: boo
         "stream": streaming,
     });
     for message in body["messages"].as_array_mut().into_iter().flatten() {
-        if let Some(object) = message.as_object_mut() { object.remove("dial_provider_content"); }
+        if let Some(object) = message.as_object_mut() {
+            object.remove("dial_provider_content");
+        }
     }
     if streaming {
         body["stream_options"] = json!({ "include_usage": true });
@@ -427,10 +540,29 @@ fn send(
     patience: Option<Patience>,
     interrupt: Option<Arc<AtomicBool>>,
 ) -> Result<ureq::http::Response<ureq::Body>> {
+    send_with_headers(url, auth, body, timeout_secs, patience, interrupt, &[])
+}
+
+pub(super) fn send_with_headers(
+    url: &str,
+    auth: Option<&str>,
+    body: &Value,
+    timeout_secs: u64,
+    patience: Option<Patience>,
+    interrupt: Option<Arc<AtomicBool>>,
+    headers: &[(&str, &str)],
+) -> Result<ureq::http::Response<ureq::Body>> {
     if let Some(token) = auth {
         ensure!(
             !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic()),
             "api key is empty or contains characters that are not allowed in an HTTP header"
+        );
+    }
+    for (name, value) in headers {
+        ensure!(
+            name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && value.bytes().all(|b| b.is_ascii_graphic()),
+            "provider request header contains invalid characters"
         );
     }
     let local = host_of(url).is_some_and(|host| is_local_host(&host));
@@ -441,17 +573,38 @@ fn send(
     if let Some(token) = auth {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    request.send_json(body).map_err(|error| transport_error(error, url, auth))
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    request
+        .send_json(body)
+        .map_err(|error| transport_error(error, url, auth))
 }
 
 fn transport_error(error: ureq::Error, url: &str, auth: Option<&str>) -> anyhow::Error {
     let connection = match &error {
-        ureq::Error::Io(io) => matches!(io.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::NotConnected | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::UnexpectedEof),
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::UnexpectedEof
+        ),
         ureq::Error::ConnectionFailed | ureq::Error::HostNotFound | ureq::Error::Timeout(_) => true,
         _ => false,
     };
-    let message = redact(&format!("chat request to {} failed: {error}", display_url(url)), auth);
-    anyhow::Error::new(TransportError { message, connection })
+    let message = redact(
+        &format!("chat request to {} failed: {error}", display_url(url)),
+        auth,
+    );
+    anyhow::Error::new(TransportError {
+        message,
+        connection,
+    })
 }
 
 /// The URL without userinfo, query or fragment, safe for messages.
@@ -477,36 +630,88 @@ fn redact(text: &str, auth: Option<&str>) -> String {
 
 /// Post-response failures are never transport failures, even if their source was I/O.
 fn response_error(error: anyhow::Error, auth: Option<&str>) -> anyhow::Error {
-    if error.downcast_ref::<Interrupted>().is_some() { error }
-    else { anyhow::anyhow!("{}", redact(&format!("{error:#}"), auth)) }
+    if error.downcast_ref::<Interrupted>().is_some() {
+        error
+    } else {
+        anyhow::anyhow!("{}", redact(&format!("{error:#}"), auth))
+    }
 }
 
-fn http_error(status: u16, body: &Bounded, auth: Option<&str>, retry_after: Option<Duration>) -> anyhow::Error {
+fn http_error(
+    status: u16,
+    body: &Bounded,
+    auth: Option<&str>,
+    retry_after: Option<Duration>,
+) -> anyhow::Error {
     // Servers wrap the useful sentence in JSON; show that instead of a one-line blob.
-    let message = if body.truncated { None } else {
-        serde_json::from_slice::<serde_json::Value>(&body.data).ok().and_then(|value| {
-            value.pointer("/error/message").or_else(|| value.get("error")).or_else(|| value.get("message"))
-                .and_then(serde_json::Value::as_str).map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned)
-        })
+    let message = if body.truncated {
+        None
+    } else {
+        serde_json::from_slice::<serde_json::Value>(&body.data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/error/message")
+                    .or_else(|| value.get("error"))
+                    .or_else(|| value.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_owned)
+            })
+    };
+    let error_type = if body.truncated {
+        None
+    } else {
+        serde_json::from_slice::<serde_json::Value>(&body.data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/error/type")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|kind| {
+                        !kind.is_empty()
+                            && kind.len() <= 64
+                            && kind.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    })
+                    .map(str::to_owned)
+            })
     };
     let mut excerpt = match &message {
         Some(message) => redact(&self::excerpt(message.as_bytes(), false), auth),
         None => redact(&self::excerpt(&body.data, body.truncated), auth),
     };
+    // Some providers (Anthropic 429s) send only "Error"; the error type is then the only signal.
+    let generic = message
+        .as_deref()
+        .is_none_or(|m| m.eq_ignore_ascii_case("error"));
+    if let Some(kind) = error_type.filter(|_| generic) {
+        excerpt = format!("{excerpt} (type: {kind})");
+    }
     // LM Studio loads models on first use and refuses when it cannot (memory guardrail, unsupported
     // architecture); say what to do rather than leaving only its message.
-    if status == 400 && message.as_deref().is_some_and(|m| m.contains("Failed to load model")) {
+    if status == 400
+        && message
+            .as_deref()
+            .is_some_and(|m| m.contains("Failed to load model"))
+    {
         excerpt.push_str(" — the server could not load this model. Load it in LM Studio first (a smaller context length helps), or pick another model.");
     }
     if matches!(status, 401 | 403) {
-        excerpt.push_str(" — check this provider's API key/environment variable or sign in through /providers.");
+        excerpt.push_str(
+            " — check this provider's API key/environment variable or sign in through /providers.",
+        );
     } else if status == 404 {
         excerpt.push_str(" — refresh /models and select an available model; check the provider endpoint in /providers.");
     }
     if status == 400 && excerpt.to_ascii_lowercase().contains("image") {
         excerpt.push_str(" — this model rejected image input; select a vision-capable model or remove the image attachment.");
     }
-    anyhow::Error::new(HttpError { status, excerpt, retry_after })
+    anyhow::Error::new(HttpError {
+        status,
+        excerpt,
+        retry_after,
+    })
 }
 
 struct Bounded {
@@ -525,12 +730,19 @@ fn read_bounded(reader: impl Read, limit: usize) -> Result<Bounded> {
 
 fn excerpt(bytes: &[u8], truncated: bool) -> String {
     let text = String::from_utf8_lossy(bytes);
-    let flattened: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let flattened: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     let flattened = flattened.trim();
     if flattened.is_empty() {
         return "<empty body>".to_string();
     }
-    if truncated { format!("{flattened}…") } else { flattened.to_string() }
+    if truncated {
+        format!("{flattened}…")
+    } else {
+        flattened.to_string()
+    }
 }
 
 /// Parse an OpenAI chat completion body into a [`Reply`].
@@ -539,7 +751,9 @@ pub fn parse_reply(body: &[u8]) -> Result<Reply> {
     let choice = root
         .pointer("/choices/0")
         .context("chat response has no choices")?;
-    let message = choice.get("message").context("chat response choice has no message")?;
+    let message = choice
+        .get("message")
+        .context("chat response choice has no message")?;
     let text = match message.get("content") {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(text)) => text.clone(),
@@ -559,10 +773,21 @@ pub fn parse_reply(body: &[u8]) -> Result<Reply> {
             .unwrap_or_default()
             .to_string(),
         prompt_tokens: root.pointer("/usage/prompt_tokens").and_then(Value::as_u64),
-        completion_tokens: root.pointer("/usage/completion_tokens").and_then(Value::as_u64),
-        reasoning: message.get("reasoning_content").or_else(|| message.get("reasoning")).and_then(Value::as_str).unwrap_or_default().to_owned(),
-        reasoning_tokens: root.pointer("/usage/completion_tokens_details/reasoning_tokens").and_then(Value::as_u64),
-        cached_prompt_tokens: root.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(Value::as_u64),
+        completion_tokens: root
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64),
+        reasoning: message
+            .get("reasoning_content")
+            .or_else(|| message.get("reasoning"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        reasoning_tokens: root
+            .pointer("/usage/completion_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64),
+        cached_prompt_tokens: root
+            .pointer("/usage/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64),
         ..Default::default()
     })
 }
@@ -571,22 +796,34 @@ fn parse_tool_calls(calls: &[Value]) -> Result<Vec<ToolCall>> {
     let mut seen = HashSet::new();
     let mut parsed = Vec::with_capacity(calls.len());
     for (index, call) in calls.iter().enumerate() {
-        ensure!(call.is_object(), "chat response tool call {index} is not an object");
+        ensure!(
+            call.is_object(),
+            "chat response tool call {index} is not an object"
+        );
         // Synthesized ids are positional so they are stable for a given reply;
         // a repeated server id would make tool results ambiguous.
         let id = match call.get("id").and_then(Value::as_str) {
             Some(id) if !id.is_empty() && !seen.contains(id) => id.to_string(),
             _ => format!("call_{index}"),
         };
-        ensure!(seen.insert(id.clone()), "chat response tool call ids collide ({id})");
+        ensure!(
+            seen.insert(id.clone()),
+            "chat response tool call ids collide ({id})"
+        );
         let function = call.get("function");
         let name = function
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let (arguments, malformed_arguments) = normalize_arguments(function.and_then(|f| f.get("arguments")));
-        parsed.push(ToolCall { id, name, arguments, malformed_arguments });
+        let (arguments, malformed_arguments) =
+            normalize_arguments(function.and_then(|f| f.get("arguments")));
+        parsed.push(ToolCall {
+            id,
+            name,
+            arguments,
+            malformed_arguments,
+        });
     }
     Ok(parsed)
 }
@@ -622,17 +859,25 @@ pub fn assistant_message(reply: &Reply) -> Value {
     if !reply.provider_content.is_empty() {
         let mut content = reply.provider_content.clone();
         for block in &mut content {
-            if block["type"] == "tool_use" && !block["input"].is_object() { block["input"] = json!({}); }
+            if block["type"] == "tool_use" && !block["input"].is_object() {
+                block["input"] = json!({});
+            }
         }
         message["dial_provider_content"] = json!(content);
     }
-    if !reply.reasoning.is_empty() && reply.provider_content.is_empty() { message["reasoning_content"] = json!(reply.reasoning); }
+    if !reply.reasoning.is_empty() && reply.provider_content.is_empty() {
+        message["reasoning_content"] = json!(reply.reasoning);
+    }
     if !reply.tool_calls.is_empty() {
         message["tool_calls"] = reply
             .tool_calls
             .iter()
             .map(|call| {
-                let arguments = if call.malformed_arguments { "{}".to_string() } else { call.arguments.to_string() };
+                let arguments = if call.malformed_arguments {
+                    "{}".to_string()
+                } else {
+                    call.arguments.to_string()
+                };
                 json!({
                     "id": call.id,
                     "type": "function",
@@ -722,13 +967,19 @@ mod tests {
         assert_eq!(reply.text, "hello");
         assert!(reply.tool_calls.is_empty());
         assert_eq!(reply.finish_reason, "stop");
-        assert_eq!((reply.prompt_tokens, reply.completion_tokens), (Some(7), Some(2)));
+        assert_eq!(
+            (reply.prompt_tokens, reply.completion_tokens),
+            (Some(7), Some(2))
+        );
         let sent = body_of(&server.join().unwrap());
         assert_eq!(sent["model"], SERVER_MODEL);
         assert_eq!(sent["seed"], 9);
         assert_eq!(sent["stream"], false);
         assert_eq!(sent["max_tokens"], 16);
-        assert!(sent.get("tools").is_none(), "empty tool list must be omitted");
+        assert!(
+            sent.get("tools").is_none(),
+            "empty tool list must be omitted"
+        );
     }
 
     #[test]
@@ -776,8 +1027,14 @@ mod tests {
         let calls = &reply.tool_calls;
         assert_eq!(calls[0].id, "call_0");
         assert!(calls[0].malformed_arguments && calls[0].arguments.is_null());
-        assert!(calls[1].malformed_arguments, "non-object arguments are malformed");
-        assert_eq!((calls[2].id.as_str(), calls[2].arguments.clone()), ("dup", json!({"x": 1})));
+        assert!(
+            calls[1].malformed_arguments,
+            "non-object arguments are malformed"
+        );
+        assert_eq!(
+            (calls[2].id.as_str(), calls[2].arguments.clone()),
+            ("dup", json!({"x": 1}))
+        );
         assert_eq!(calls[3].id, "call_3", "repeated ids are replaced");
         assert!(!calls[3].malformed_arguments && calls[3].arguments == json!({}));
         assert!(!calls[4].malformed_arguments && calls[4].arguments == json!({}));
@@ -802,10 +1059,16 @@ mod tests {
     #[test]
     fn http_error_status_and_bounded_body() {
         let (url, server) = serve_once(500, "x".repeat(100_000).into_bytes());
-        let error = chat(&url, SERVER_MODEL, &request(vec![], None), 5).unwrap_err().to_string();
+        let error = chat(&url, SERVER_MODEL, &request(vec![], None), 5)
+            .unwrap_err()
+            .to_string();
         server.join().unwrap();
         assert!(error.contains("HTTP 500"), "{error}");
-        assert!(error.len() < 700, "error not bounded: {} bytes", error.len());
+        assert!(
+            error.len() < 700,
+            "error not bounded: {} bytes",
+            error.len()
+        );
         assert!(error.ends_with('…'));
         assert!(!error.contains("SECRET-PROMPT"));
     }
@@ -815,16 +1078,27 @@ mod tests {
         let filler = "y".repeat(MAX_RESPONSE_BYTES + 10);
         let body = json!({"choices": [{"message": {"content": filler}}]}).to_string();
         let (url, _server) = serve_once(200, body.into_bytes());
-        let error = chat(&url, SERVER_MODEL, &request(vec![], None), 10).unwrap_err().to_string();
+        let error = chat(&url, SERVER_MODEL, &request(vec![], None), 10)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("exceeds"), "{error}");
     }
 
     #[test]
     fn unreachable_server_error_has_no_prompt() {
-        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let error = chat(&format!("http://127.0.0.1:{port}"), SERVER_MODEL, &request(vec![], None), 2)
-            .unwrap_err()
-            .to_string();
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = chat(
+            &format!("http://127.0.0.1:{port}"),
+            SERVER_MODEL,
+            &request(vec![], None),
+            2,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(!error.contains("SECRET-PROMPT"), "{error}");
     }
 
@@ -834,7 +1108,11 @@ mod tests {
         let reply = parse_reply(body.to_string().as_bytes()).unwrap();
         assert!(reply.dropped_tool_call());
         let text = json!({"choices": [{"finish_reason": "stop", "message": {"content": "done"}}]});
-        assert!(!parse_reply(text.to_string().as_bytes()).unwrap().dropped_tool_call());
+        assert!(
+            !parse_reply(text.to_string().as_bytes())
+                .unwrap()
+                .dropped_tool_call()
+        );
     }
 
     #[test]
@@ -854,13 +1132,20 @@ mod tests {
         };
         let message = assistant_message(&reply);
         assert_eq!(message["content"], "thinking");
-        assert_eq!(message["tool_calls"][0]["function"]["arguments"], "{\"dir\":\".\"}");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            "{\"dir\":\".\"}"
+        );
         assert_eq!(message["tool_calls"][0]["type"], "function");
         assert_eq!(
             tool_message("c1", "out"),
             json!({"role": "tool", "tool_call_id": "c1", "content": "out"})
         );
-        let plain = assistant_message(&Reply { tool_calls: vec![], text: String::new(), ..reply });
+        let plain = assistant_message(&Reply {
+            tool_calls: vec![],
+            text: String::new(),
+            ..reply
+        });
         assert_eq!(plain, json!({"role": "assistant", "content": ""}));
     }
 }
@@ -882,7 +1167,9 @@ mod net_tests {
     }
 
     fn a_tool() -> Vec<Value> {
-        vec![json!({"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}})]
+        vec![
+            json!({"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}),
+        ]
     }
 
     fn sse(events: &[Value]) -> String {
@@ -917,12 +1204,30 @@ mod net_tests {
     #[test]
     fn completions_url_rules() {
         for (base, want) in [
-            ("http://127.0.0.1:8080", "http://127.0.0.1:8080/v1/chat/completions"),
-            ("http://127.0.0.1:8080/", "http://127.0.0.1:8080/v1/chat/completions"),
-            ("https://api.openai.com/v1", "https://api.openai.com/v1/chat/completions"),
-            ("https://api.openai.com/v1/", "https://api.openai.com/v1/chat/completions"),
-            ("https://h/openai/v1beta", "https://h/openai/v1beta/chat/completions"),
-            ("https://h/v1/chat/completions", "https://h/v1/chat/completions"),
+            (
+                "http://127.0.0.1:8080",
+                "http://127.0.0.1:8080/v1/chat/completions",
+            ),
+            (
+                "http://127.0.0.1:8080/",
+                "http://127.0.0.1:8080/v1/chat/completions",
+            ),
+            (
+                "https://api.openai.com/v1",
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            (
+                "https://api.openai.com/v1/",
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            (
+                "https://h/openai/v1beta",
+                "https://h/openai/v1beta/chat/completions",
+            ),
+            (
+                "https://h/v1/chat/completions",
+                "https://h/v1/chat/completions",
+            ),
         ] {
             assert_eq!(completions_url(base), want, "{base}");
         }
@@ -946,10 +1251,16 @@ mod net_tests {
         assert_eq!(pieces, ["Hel", "lo"]);
         assert_eq!(reply.text, "Hello");
         assert_eq!(reply.finish_reason, "stop");
-        assert_eq!((reply.prompt_tokens, reply.completion_tokens), (Some(12), Some(3)));
+        assert_eq!(
+            (reply.prompt_tokens, reply.completion_tokens),
+            (Some(12), Some(3))
+        );
         let request = server.requests().remove(0);
         assert_eq!(request_line(&request), "POST /v1/chat/completions HTTP/1.1");
-        assert_eq!(header(&request, "accept").as_deref(), Some("text/event-stream"));
+        assert_eq!(
+            header(&request, "accept").as_deref(),
+            Some("text/event-stream")
+        );
         let sent = fake::body(&request);
         assert_eq!(sent["stream"], true);
         assert_eq!(sent["stream_options"]["include_usage"], true);
@@ -1004,10 +1315,18 @@ mod net_tests {
 
     #[test]
     fn in_stream_error_event_is_reported() {
-        let body = format!("data: {}\n\n", json!({"error": {"message": "context length exceeded"}}));
+        let body = format!(
+            "data: {}\n\n",
+            json!({"error": {"message": "context length exceeded"}})
+        );
         let server = fake::serve(vec![Script::Sse(body)]);
         let (reply, _) = collect(&server.url, None, &chat_request(vec![]), 10);
-        assert!(reply.unwrap_err().to_string().contains("context length exceeded"));
+        assert!(
+            reply
+                .unwrap_err()
+                .to_string()
+                .contains("context length exceeded")
+        );
     }
 
     #[test]
@@ -1022,7 +1341,10 @@ mod net_tests {
 
     #[test]
     fn oversized_line_is_rejected() {
-        let body = format!("data: {}\n\n", delta(&"z".repeat(stream::MAX_LINE_BYTES + 10)));
+        let body = format!(
+            "data: {}\n\n",
+            delta(&"z".repeat(stream::MAX_LINE_BYTES + 10))
+        );
         let server = fake::serve(vec![Script::Sse(body)]);
         let (reply, _) = collect(&server.url, None, &chat_request(vec![]), 20);
         let error = reply.unwrap_err().to_string();
@@ -1033,23 +1355,38 @@ mod net_tests {
     fn keepalive_comments_do_not_keep_a_started_reply_alive() {
         // Every read succeeds quickly; only the idle limit stops this. Comments are not progress once a reply began.
         let first = format!("data: {}\n\n", delta("Hel"));
-        let server = fake::serve(vec![Script::DripAfter { first, pause: Duration::from_millis(40), count: 500 }]);
+        let server = fake::serve(vec![Script::DripAfter {
+            first,
+            pause: Duration::from_millis(40),
+            count: 500,
+        }]);
         let started = Instant::now();
         let (reply, _) = collect(&server.url, None, &chat_request(vec![]), 1);
         let error = reply.unwrap_err().to_string();
         assert!(error.contains("silent"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(4), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
     fn silence_after_the_first_event_hits_the_idle_limit() {
         let first = format!("data: {}\n\n", delta("Hel"));
-        let server = fake::serve(vec![Script::StallAfter { first, silence: Duration::from_secs(6) }]);
+        let server = fake::serve(vec![Script::StallAfter {
+            first,
+            silence: Duration::from_secs(6),
+        }]);
         let started = Instant::now();
         let (reply, _) = collect(&server.url, None, &chat_request(vec![]), 1);
         let error = reply.unwrap_err().to_string();
         assert!(error.contains("silent"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(4), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -1057,12 +1394,23 @@ mod net_tests {
         // A model server reading a long prompt sends its headers, then nothing, for longer than the idle limit.
         // That is not a stall: the first-event wait is unbounded on a local server, and the reply that follows is
         // judged by silence, not by the total time the call took.
-        let body = format!("data: {}\n\ndata: {}\n\ndata: {}\n\n", delta("ok"), stop(), "[DONE]");
-        let server = fake::serve(vec![Script::ColdStart { delay: Duration::from_millis(2500), body }]);
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            delta("ok"),
+            stop(),
+            "[DONE]"
+        );
+        let server = fake::serve(vec![Script::ColdStart {
+            delay: Duration::from_millis(2500),
+            body,
+        }]);
         let started = Instant::now();
         let (reply, _) = collect(&server.url, None, &chat_request(vec![]), 1);
         assert_eq!(reply.unwrap().text, "ok");
-        assert!(started.elapsed() > Duration::from_millis(2400), "the idle limit was 1s, so this call outlived it");
+        assert!(
+            started.elapsed() > Duration::from_millis(2400),
+            "the idle limit was 1s, so this call outlived it"
+        );
     }
 
     #[test]
@@ -1070,15 +1418,25 @@ mod net_tests {
         let pieces: Vec<String> = (0..50)
             .map(|i| format!("data: {}\n\n", delta(&format!("w{i} "))))
             .collect();
-        let server = fake::serve(vec![Script::SseSlow { pieces, pause: Duration::from_millis(100) }]);
+        let server = fake::serve(vec![Script::SseSlow {
+            pieces,
+            pause: Duration::from_millis(100),
+        }]);
         let mut seen = Vec::new();
         let started = Instant::now();
         let mut on_text = |piece: &str| {
             seen.push(piece.to_string());
             seen.len() < 2
         };
-        let error = chat_stream(&server.url, None, SERVER_MODEL, &chat_request(vec![]), 30, &mut on_text)
-            .unwrap_err();
+        let error = chat_stream(
+            &server.url,
+            None,
+            SERVER_MODEL,
+            &chat_request(vec![]),
+            30,
+            &mut on_text,
+        )
+        .unwrap_err();
         assert!(error.downcast_ref::<Interrupted>().is_some(), "{error:#}");
         assert_eq!(error.to_string(), "interrupted");
         assert_eq!(seen.len(), 2, "no deltas after the refusal");
@@ -1103,66 +1461,155 @@ mod net_tests {
         ]);
         let (limited, _) = collect(&server.url, None, &chat_request(vec![]), 10);
         let limited = limited.unwrap_err();
-        assert_eq!(limited.downcast_ref::<HttpError>().map(|e| e.status), Some(429));
+        assert_eq!(
+            limited.downcast_ref::<HttpError>().map(|e| e.status),
+            Some(429)
+        );
         assert!(is_transient(&limited));
         let url = server.url.clone();
         let busy = chat(&url, SERVER_MODEL, &chat_request(vec![]), 10).unwrap_err();
         assert!(is_transient(&busy), "{busy:#}");
         assert!(busy.to_string().contains("HTTP 503"));
 
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let refused = chat(&format!("http://127.0.0.1:{port}"), SERVER_MODEL, &chat_request(vec![]), 5).unwrap_err();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let refused = chat(
+            &format!("http://127.0.0.1:{port}"),
+            SERVER_MODEL,
+            &chat_request(vec![]),
+            5,
+        )
+        .unwrap_err();
         assert!(is_transient(&refused), "{refused:#}");
     }
 
     #[test]
     fn server_error_messages_replace_raw_json_and_load_failures_get_a_next_step() {
         let server = fake::serve(vec![
-            fake::json(400, &json!({"error": {"message": "Failed to load model \"big-model\". Error: out of memory", "type": "invalid_request_error"}})),
+            fake::json(
+                400,
+                &json!({"error": {"message": "Failed to load model \"big-model\". Error: out of memory", "type": "invalid_request_error"}}),
+            ),
             fake::json(500, &json!({"error": "plain string error"})),
-            fake::json(400, &json!({"error": {"message": "Unrelated validation failure"}})),
+            fake::json(
+                400,
+                &json!({"error": {"message": "Unrelated validation failure"}}),
+            ),
         ]);
-        let load = chat(&server.url, SERVER_MODEL, &chat_request(vec![]), 5).unwrap_err().to_string();
-        assert!(load.contains("Failed to load model \"big-model\""), "{load}");
-        assert!(!load.contains("invalid_request_error") && !load.contains('{'), "no raw JSON in the message: {load}");
+        let load = chat(&server.url, SERVER_MODEL, &chat_request(vec![]), 5)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            load.contains("Failed to load model \"big-model\""),
+            "{load}"
+        );
+        assert!(
+            !load.contains("invalid_request_error") && !load.contains('{'),
+            "no raw JSON in the message: {load}"
+        );
         assert!(load.contains("Load it in LM Studio first"), "{load}");
-        let plain = chat(&server.url, SERVER_MODEL, &chat_request(vec![]), 5).unwrap_err().to_string();
-        assert!(plain.contains("HTTP 500") && plain.contains("plain string error") && !plain.contains("LM Studio"), "{plain}");
-        let other = chat(&server.url, SERVER_MODEL, &chat_request(vec![]), 5).unwrap_err().to_string();
-        assert!(other.contains("Unrelated validation failure") && !other.contains("LM Studio"), "the hint is only for load failures: {other}");
+        let plain = chat(&server.url, SERVER_MODEL, &chat_request(vec![]), 5)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            plain.contains("HTTP 500")
+                && plain.contains("plain string error")
+                && !plain.contains("LM Studio"),
+            "{plain}"
+        );
+        let other = chat(&server.url, SERVER_MODEL, &chat_request(vec![]), 5)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            other.contains("Unrelated validation failure") && !other.contains("LM Studio"),
+            "the hint is only for load failures: {other}"
+        );
+    }
+
+    #[test]
+    fn generic_error_message_reports_provider_error_type() {
+        let server = fake::serve(vec![fake::json(
+            400,
+            &json!({"type":"error","error":{"type":"permission_error","message":"Error"}}),
+        )]);
+        let err = chat(&server.url, SERVER_MODEL, &chat_request(vec![]), 5)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("(type: permission_error)"), "{err}");
     }
 
     #[test]
     fn bearer_token_is_sent_only_when_given_and_never_echoed() {
         let ok = json!({"choices": [{"finish_reason": "stop", "message": {"content": "hi"}}]});
         let server = fake::serve(vec![fake::json(200, &ok), fake::json(200, &ok)]);
-        chat_with_auth(&server.url, Some("sk-secret-123"), SERVER_MODEL, &chat_request(vec![]), 5).unwrap();
+        chat_with_auth(
+            &server.url,
+            Some("sk-secret-123"),
+            SERVER_MODEL,
+            &chat_request(vec![]),
+            5,
+        )
+        .unwrap();
         chat_with_auth(&server.url, None, SERVER_MODEL, &chat_request(vec![]), 5).unwrap();
         let requests = server.requests();
-        assert_eq!(header(&requests[0], "authorization").as_deref(), Some("Bearer sk-secret-123"));
+        assert_eq!(
+            header(&requests[0], "authorization").as_deref(),
+            Some("Bearer sk-secret-123")
+        );
         assert_eq!(header(&requests[1], "authorization"), None);
 
         // A server that echoes the credential back must not make it into the error.
-        let echo = fake::serve(vec![fake::json(401, &json!({"error": "invalid key sk-secret-123"}))]);
-        let error = chat_with_auth(&echo.url, Some("sk-secret-123"), SERVER_MODEL, &chat_request(vec![]), 5)
-            .unwrap_err();
+        let echo = fake::serve(vec![fake::json(
+            401,
+            &json!({"error": "invalid key sk-secret-123"}),
+        )]);
+        let error = chat_with_auth(
+            &echo.url,
+            Some("sk-secret-123"),
+            SERVER_MODEL,
+            &chat_request(vec![]),
+            5,
+        )
+        .unwrap_err();
         let text = format!("{error:#} {error:?}");
         assert!(!text.contains("sk-secret-123"), "{text}");
-        assert!(text.contains("HTTP 401") && text.contains("[redacted]"), "{text}");
+        assert!(
+            text.contains("HTTP 401") && text.contains("[redacted]"),
+            "{text}"
+        );
 
         // Unusable tokens are refused without being quoted.
         for bad in ["bad token", "line\nbreak", ""] {
-            let error = chat_with_auth("http://127.0.0.1:9", Some(bad), SERVER_MODEL, &chat_request(vec![]), 2)
-                .unwrap_err();
+            let error = chat_with_auth(
+                "http://127.0.0.1:9",
+                Some(bad),
+                SERVER_MODEL,
+                &chat_request(vec![]),
+                2,
+            )
+            .unwrap_err();
             let text = format!("{error:#}");
             assert!(text.contains("api key"), "{text}");
             assert!(bad.is_empty() || !text.contains(bad), "{text}");
         }
 
         // Connection failures do not carry the token either.
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let error = chat_with_auth(&format!("http://127.0.0.1:{port}"), Some("sk-secret-123"), SERVER_MODEL,
-            &chat_request(vec![]), 2).unwrap_err();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = chat_with_auth(
+            &format!("http://127.0.0.1:{port}"),
+            Some("sk-secret-123"),
+            SERVER_MODEL,
+            &chat_request(vec![]),
+            2,
+        )
+        .unwrap_err();
         assert!(!format!("{error:#}").contains("sk-secret-123"));
     }
 

@@ -7,14 +7,25 @@ use std::time::Duration;
 
 pub(crate) enum Script {
     /// Complete JSON response with `Content-Length`.
-    Http { status: u16, content_type: &'static str, body: Vec<u8> },
-    HttpHeaders { status: u16, headers: Vec<(&'static str, String)>, body: Vec<u8> },
+    Http {
+        status: u16,
+        content_type: &'static str,
+        body: Vec<u8>,
+    },
+    HttpHeaders {
+        status: u16,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    },
     /// `200 text/event-stream`, close-delimited, written in one go.
     Sse(String),
     /// Valid SSE body with no media type header, as subscription routing can return.
     SseNoContentType(String),
     /// Like [`Script::Sse`] but each piece is flushed with a pause between.
-    SseSlow { pieces: Vec<String>, pause: Duration },
+    SseSlow {
+        pieces: Vec<String>,
+        pause: Duration,
+    },
     /// Read the request, then close without answering.
     Hangup,
     /// SSE head, then a keep-alive comment every `pause` for `count` rounds.
@@ -22,7 +33,11 @@ pub(crate) enum Script {
     /// SSE head, then silence for `silence` before closing.
     Stall { silence: Duration },
     /// SSE head, one real event, then a keep-alive comment every `pause` for `count` rounds.
-    DripAfter { first: String, pause: Duration, count: usize },
+    DripAfter {
+        first: String,
+        pause: Duration,
+        count: usize,
+    },
     /// SSE head, one real event, then silence for `silence` before closing.
     StallAfter { first: String, silence: Duration },
     /// SSE head at once (as a server does before it has finished reading a long prompt), silence for `delay`, then `body`.
@@ -42,7 +57,11 @@ impl Fake {
 }
 
 pub(crate) fn json(status: u16, body: &serde_json::Value) -> Script {
-    Script::Http { status, content_type: "application/json", body: body.to_string().into_bytes() }
+    Script::Http {
+        status,
+        content_type: "application/json",
+        body: body.to_string().into_bytes(),
+    }
 }
 
 pub(crate) fn serve(scripts: Vec<Script>) -> Fake {
@@ -51,7 +70,9 @@ pub(crate) fn serve(scripts: Vec<Script>) -> Fake {
     let handle = std::thread::spawn(move || {
         let mut seen = Vec::new();
         for script in scripts {
-            let Ok((mut stream, _)) = listener.accept() else { break };
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
             seen.push(read_request(&mut stream));
             respond(&mut stream, script);
         }
@@ -65,16 +86,25 @@ pub(crate) fn header<'a>(raw: &'a [u8], name: &str) -> Option<String> {
     let head = String::from_utf8_lossy(&raw[..end]);
     head.lines().skip(1).find_map(|line| {
         let (key, value) = line.split_once(':')?;
-        key.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
     })
 }
 
 pub(crate) fn request_line(raw: &[u8]) -> String {
-    String::from_utf8_lossy(raw).lines().next().unwrap_or_default().to_string()
+    String::from_utf8_lossy(raw)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub(crate) fn body(raw: &[u8]) -> serde_json::Value {
-    let at = raw.windows(4).position(|w| w == b"\r\n\r\n").map_or(0, |p| p + 4);
+    let at = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(0, |p| p + 4);
     serde_json::from_slice(&raw[at..]).unwrap_or(serde_json::Value::Null)
 }
 
@@ -82,7 +112,9 @@ fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {
-        let Ok(count) = stream.read(&mut chunk) else { return request };
+        let Ok(count) = stream.read(&mut chunk) else {
+            return request;
+        };
         if count == 0 {
             return request;
         }
@@ -91,9 +123,13 @@ fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
             break at + 4;
         }
     };
-    let length: usize = header(&request, "content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let length: usize = header(&request, "content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     while request.len() < header_end + length {
-        let Ok(count) = stream.read(&mut chunk) else { break };
+        let Ok(count) = stream.read(&mut chunk) else {
+            break;
+        };
         if count == 0 {
             break;
         }
@@ -107,7 +143,11 @@ const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCa
 fn respond(stream: &mut std::net::TcpStream, script: Script) {
     // Clients may hang up early (oversized or interrupted streams); ignore it.
     match script {
-        Script::Http { status, content_type, body } => {
+        Script::Http {
+            status,
+            content_type,
+            body,
+        } => {
             let head = format!(
                 "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -115,9 +155,18 @@ fn respond(stream: &mut std::net::TcpStream, script: Script) {
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.write_all(&body);
         }
-        Script::HttpHeaders { status, headers, body } => {
-            let mut head = format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
-            for (name, value) in headers { head.push_str(&format!("{name}: {value}\r\n")); }
+        Script::HttpHeaders {
+            status,
+            headers,
+            body,
+        } => {
+            let mut head = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            for (name, value) in headers {
+                head.push_str(&format!("{name}: {value}\r\n"));
+            }
             head.push_str("\r\n");
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.write_all(&body);
@@ -127,12 +176,20 @@ fn respond(stream: &mut std::net::TcpStream, script: Script) {
             let _ = stream.write_all(body.as_bytes());
         }
         Script::SseNoContentType(body) => {
-            let _=write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
         }
         Script::SseSlow { pieces, pause } => {
             let _ = stream.write_all(SSE_HEAD.as_bytes());
             for piece in pieces {
-                if stream.write_all(piece.as_bytes()).and_then(|()| stream.flush()).is_err() {
+                if stream
+                    .write_all(piece.as_bytes())
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
                     return;
                 }
                 std::thread::sleep(pause);
@@ -142,7 +199,11 @@ fn respond(stream: &mut std::net::TcpStream, script: Script) {
         Script::Drip { pause, count } => {
             let _ = stream.write_all(SSE_HEAD.as_bytes());
             for _ in 0..count {
-                if stream.write_all(b": keepalive\n").and_then(|()| stream.flush()).is_err() {
+                if stream
+                    .write_all(b": keepalive\n")
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
                     return;
                 }
                 std::thread::sleep(pause);
@@ -153,11 +214,19 @@ fn respond(stream: &mut std::net::TcpStream, script: Script) {
             let _ = stream.flush();
             std::thread::sleep(silence);
         }
-        Script::DripAfter { first, pause, count } => {
+        Script::DripAfter {
+            first,
+            pause,
+            count,
+        } => {
             let _ = stream.write_all(SSE_HEAD.as_bytes());
             let _ = stream.write_all(first.as_bytes());
             for _ in 0..count {
-                if stream.write_all(b": keepalive\n").and_then(|()| stream.flush()).is_err() {
+                if stream
+                    .write_all(b": keepalive\n")
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
                     return;
                 }
                 std::thread::sleep(pause);

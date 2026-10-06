@@ -61,8 +61,14 @@ pub struct SearchHit {
 #[derive(Debug, Clone)]
 enum Kind {
     Message(Value),
-    Compaction { summary: String, first_kept: Option<String> },
-    Meta { kind: String, removed: usize },
+    Compaction {
+        summary: String,
+        first_kept: Option<String>,
+    },
+    Meta {
+        kind: String,
+        removed: usize,
+    },
     Title(String),
 }
 
@@ -94,7 +100,10 @@ static LAST_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Wall-clock milliseconds, strictly increasing within the process so session files sort by creation.
 fn now_ms() -> u64 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     let mut prev = LAST_MS.load(Ordering::Relaxed);
     loop {
         let next = now.max(prev + 1);
@@ -118,7 +127,13 @@ fn iso(ms: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z", rem / 3600, rem % 3600 / 60, rem % 60, ms % 1000)
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60,
+        ms % 1000
+    )
 }
 
 fn iso_now() -> String {
@@ -126,13 +141,19 @@ fn iso_now() -> String {
 }
 
 fn random_hex(bytes: usize) -> String {
-    (0..bytes).map(|_| format!("{:02x}", rand::random::<u8>())).collect()
+    (0..bytes)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect()
 }
 
 /// Ids are only ever used as labels and map keys, never joined into a path; still, anything read from
 /// disk that is not plain `[A-Za-z0-9_-]` is replaced.
 fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// `<ts>_<id>.jsonl` -> `<id>` (None for any other file name).
@@ -145,7 +166,11 @@ fn file_id(name: &str) -> Option<&str> {
 // ---------------------------------------------------------------- file helpers
 
 fn private_dir(dir: &Path) -> Result<()> {
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("creating {}", dir.display()))?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
     // Tighten a directory that already existed with looser permissions (best effort; we may not own it).
     let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
     Ok(())
@@ -187,7 +212,11 @@ fn read_bounded_line<R: BufRead>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<Opt
             break;
         }
     }
-    Ok((consumed > 0).then_some(RawLine { consumed, terminated, oversized }))
+    Ok((consumed > 0).then_some(RawLine {
+        consumed,
+        terminated,
+        oversized,
+    }))
 }
 
 /// Session files in a directory, newest first. Symlinks and odd names are ignored.
@@ -210,9 +239,11 @@ fn session_files(dir: &Path) -> Result<Vec<PathBuf>> {
 fn content_text(message: &Value) -> String {
     match message.get("content") {
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => {
-            parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")
-        }
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => String::new(),
     }
 }
@@ -232,9 +263,16 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 fn entry_json(e: &Entry, copied: bool) -> Value {
     let mut v = match &e.kind {
-        Kind::Message(m) => json!({"type": "message", "id": e.id, "parent": e.parent, "ts": e.ts, "message": m}),
-        Kind::Title(title) => json!({"type": "meta", "id": e.id, "parent": e.parent, "ts": e.ts, "kind": "title", "title": title}),
-        Kind::Compaction { summary, first_kept } => {
+        Kind::Message(m) => {
+            json!({"type": "message", "id": e.id, "parent": e.parent, "ts": e.ts, "message": m})
+        }
+        Kind::Title(title) => {
+            json!({"type": "meta", "id": e.id, "parent": e.parent, "ts": e.ts, "kind": "title", "title": title})
+        }
+        Kind::Compaction {
+            summary,
+            first_kept,
+        } => {
             json!({"type": "compaction", "id": e.id, "parent": e.parent, "ts": e.ts, "summary": summary, "first_kept": first_kept})
         }
         Kind::Meta { kind, removed } => {
@@ -253,7 +291,11 @@ fn parse_entry(v: &Value) -> Option<Entry> {
         return None;
     }
     let parent = v.get("parent").and_then(Value::as_str).map(str::to_string);
-    let ts = v.get("ts").and_then(Value::as_str).unwrap_or("").to_string();
+    let ts = v
+        .get("ts")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let kind = match v.get("type")?.as_str()? {
         "message" => {
             let m = v.get("message")?;
@@ -263,16 +305,28 @@ fn parse_entry(v: &Value) -> Option<Entry> {
         }
         "compaction" => Kind::Compaction {
             summary: v.get("summary")?.as_str()?.to_string(),
-            first_kept: v.get("first_kept").and_then(Value::as_str).map(str::to_string),
+            first_kept: v
+                .get("first_kept")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         },
         "meta" if v["kind"] == "title" => Kind::Title(v["title"].as_str().unwrap_or("").to_owned()),
         "meta" => Kind::Meta {
-            kind: v.get("kind").and_then(Value::as_str).unwrap_or("").to_string(),
+            kind: v
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             removed: v.get("removed").and_then(Value::as_u64).unwrap_or(0) as usize,
         },
         _ => return None,
     };
-    Some(Entry { id: id.to_string(), parent, ts, kind })
+    Some(Entry {
+        id: id.to_string(),
+        parent,
+        ts,
+        kind,
+    })
 }
 
 // ---------------------------------------------------------------- Session
@@ -298,9 +352,14 @@ impl Session {
         if let Some(parent) = forked_from {
             header["forked_from"] = json!(parent);
         }
-        let mut file = OpenOptions::new().append(true).create_new(true).mode(0o600).open(&path)
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
             .with_context(|| format!("creating session {}", path.display()))?;
-        file.write_all(format!("{header}\n").as_bytes()).context("writing session header")?;
+        file.write_all(format!("{header}\n").as_bytes())
+            .context("writing session header")?;
         Ok(Session {
             id,
             model: model.to_string(),
@@ -335,7 +394,10 @@ impl Session {
     /// crash, garbage, oversized lines) are skipped.
     pub fn open(path: &Path) -> Result<Session> {
         let mut s = Self::load(path)?;
-        let file = OpenOptions::new().append(true).open(path).with_context(|| format!("opening session {}", path.display()))?;
+        let file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .with_context(|| format!("opening session {}", path.display()))?;
         s.file = Some(file);
         s.repair_incomplete_tools()?;
         Ok(s)
@@ -345,8 +407,14 @@ impl Session {
     fn load(path: &Path) -> Result<Session> {
         let meta = fs::metadata(path).with_context(|| format!("session {}", path.display()))?;
         ensure!(meta.is_file(), "{} is not a session file", path.display());
-        let mut reader = BufReader::new(File::open(path).with_context(|| format!("opening session {}", path.display()))?);
-        let name_id = path.file_name().and_then(|n| n.to_str()).and_then(file_id).map(str::to_string);
+        let mut reader = BufReader::new(
+            File::open(path).with_context(|| format!("opening session {}", path.display()))?,
+        );
+        let name_id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(file_id)
+            .map(str::to_string);
         let mut s = Session {
             id: String::new(),
             model: String::new(),
@@ -368,18 +436,37 @@ impl Session {
             if line.oversized {
                 continue;
             }
-            let Ok(v) = serde_json::from_slice::<Value>(&buf) else { continue };
+            let Ok(v) = serde_json::from_slice::<Value>(&buf) else {
+                continue;
+            };
             if v.get("type").and_then(Value::as_str) == Some("session") {
                 if !saw_header && s.entries.is_empty() {
                     saw_header = true;
-                    header_id = v.get("id").and_then(Value::as_str).filter(|i| valid_id(i)).map(str::to_string);
-                    s.model = v.get("model").and_then(Value::as_str).unwrap_or("").to_string();
-                    s.started = v.get("started").and_then(Value::as_str).unwrap_or("").to_string();
-                    s.parent_id = v.get("forked_from").and_then(Value::as_str).map(str::to_owned);
+                    header_id = v
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|i| valid_id(i))
+                        .map(str::to_string);
+                    s.model = v
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    s.started = v
+                        .get("started")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    s.parent_id = v
+                        .get("forked_from")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
                 }
                 continue;
             }
-            let Some(entry) = parse_entry(&v) else { continue };
+            let Some(entry) = parse_entry(&v) else {
+                continue;
+            };
             if s.by_id.contains_key(&entry.id) {
                 continue;
             }
@@ -388,7 +475,9 @@ impl Session {
             s.entries.push(entry);
         }
         s.pending_newline = !ends_with_newline;
-        s.id = header_id.or(name_id).unwrap_or_else(|| "unknown".to_string());
+        s.id = header_id
+            .or(name_id)
+            .unwrap_or_else(|| "unknown".to_string());
         Ok(s)
     }
 
@@ -409,7 +498,9 @@ impl Session {
         if projects.is_dir() {
             for entry in fs::read_dir(projects)? {
                 let entry = entry?;
-                if entry.file_type()?.is_dir() { paths.extend(session_files(&entry.path().join("sessions"))?); }
+                if entry.file_type()?.is_dir() {
+                    paths.extend(session_files(&entry.path().join("sessions"))?);
+                }
             }
         }
         paths.sort_unstable_by(|a, b| b.file_name().cmp(&a.file_name()));
@@ -419,27 +510,60 @@ impl Session {
     fn list_paths(paths: Vec<PathBuf>, limit: usize) -> Result<Vec<SessionInfo>> {
         let mut out = Vec::new();
         for path in paths {
-            if out.len() >= limit { break; }
+            if out.len() >= limit {
+                break;
+            }
             let Ok(s) = Self::load(&path) else { continue };
             let first_message = s.first_message();
-            let project = path.parent().and_then(Path::parent).and_then(Path::file_name).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            out.push(SessionInfo { title: s.title(), messages: s.messages().len(), first_message, project,
-                id: s.id, path, started: s.started, model: s.model, parent_id: s.parent_id });
+            let project = path
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            out.push(SessionInfo {
+                title: s.title(),
+                messages: s.messages().len(),
+                first_message,
+                project,
+                id: s.id,
+                path,
+                started: s.started,
+                model: s.model,
+                parent_id: s.parent_id,
+            });
         }
         Ok(out)
     }
 
     fn first_message(&self) -> String {
-        self.entries.iter().find_map(|e| match &e.kind {
-            Kind::Message(m) if role_of(m) == "user" => Some(content_text(m)),
-            _ => None,
-        }).unwrap_or_default()
+        self.entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                Kind::Message(m) if role_of(m) == "user" => Some(content_text(m)),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     pub fn title(&self) -> String {
-        self.entries.iter().rev().find_map(|e| match &e.kind {
-            Kind::Title(title) => Some(title.clone()), _ => None,
-        }).unwrap_or_else(|| truncate_chars(&self.first_message().split_whitespace().collect::<Vec<_>>().join(" "), TITLE_CHARS))
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                Kind::Title(title) => Some(title.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                truncate_chars(
+                    &self
+                        .first_message()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    TITLE_CHARS,
+                )
+            })
     }
 
     /// Append metadata; never rewrite conversation history.
@@ -451,7 +575,12 @@ impl Session {
 
     /// Export the active conversation with tool payloads collapsed and HTML safely escaped.
     pub fn export(&self, path: &Path, html: bool) -> Result<()> {
-        let escape = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+        let escape = |s: &str| {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+        };
         let mut body = String::new();
         let title = self.title();
         if html {
@@ -460,27 +589,55 @@ impl Session {
             body.push_str(&format!("# {}\n\n", escape(&title)));
         }
         for i in self.branch() {
-            let Kind::Message(message) = &self.entries[i].kind else { continue };
+            let Kind::Message(message) = &self.entries[i].kind else {
+                continue;
+            };
             let role = role_of(message);
             let content = content_text(message);
-            let calls = message.get("tool_calls").filter(|v| v.as_array().is_some_and(|a| !a.is_empty()));
+            let calls = message
+                .get("tool_calls")
+                .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()));
             if role == "tool" || calls.is_some() {
                 if !content.is_empty() && role != "tool" {
-                    body.push_str(&format!("<h2>{}</h2><pre>{}</pre>\n\n", escape(role), escape(&content)));
+                    body.push_str(&format!(
+                        "<h2>{}</h2><pre>{}</pre>\n\n",
+                        escape(role),
+                        escape(&content)
+                    ));
                 }
-                let payload = calls.map(|c| serde_json::to_string_pretty(c).unwrap_or_default()).unwrap_or(content);
-                body.push_str(&format!("<details><summary>{}</summary><pre>{}</pre></details>\n\n",
-                    if role == "tool" { "Tool result" } else { "Tool calls" }, escape(&payload)));
+                let payload = calls
+                    .map(|c| serde_json::to_string_pretty(c).unwrap_or_default())
+                    .unwrap_or(content);
+                body.push_str(&format!(
+                    "<details><summary>{}</summary><pre>{}</pre></details>\n\n",
+                    if role == "tool" {
+                        "Tool result"
+                    } else {
+                        "Tool calls"
+                    },
+                    escape(&payload)
+                ));
             } else if html {
-                body.push_str(&format!("<h2>{}</h2><pre>{}</pre>\n", escape(role), escape(&content)));
+                body.push_str(&format!(
+                    "<h2>{}</h2><pre>{}</pre>\n",
+                    escape(role),
+                    escape(&content)
+                ));
             } else {
                 body.push_str(&format!("## {role}\n\n{content}\n\n"));
             }
         }
-        if html { body.push_str("</body></html>\n"); }
-        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+        if html {
+            body.push_str("</body></html>\n");
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
             .with_context(|| format!("creating export {}", path.display()))?;
-        file.write_all(body.as_bytes()).context("writing session export")
+        file.write_all(body.as_bytes())
+            .context("writing session export")
     }
 
     pub fn id(&self) -> &str {
@@ -507,9 +664,19 @@ impl Session {
 
     /// Appends an entry whose parent is `parent` (a rewind marker's parent is the rewind point, not the leaf).
     fn push_under(&mut self, parent: Option<String>, kind: Kind) -> Result<String> {
-        let entry = Entry { id: self.fresh_id(), parent, ts: iso_now(), kind };
+        let entry = Entry {
+            id: self.fresh_id(),
+            parent,
+            ts: iso_now(),
+            kind,
+        };
         let line = entry_json(&entry, false).to_string();
-        ensure!(line.len() < MAX_LINE, "session entry is {} bytes, over the {} byte line limit", line.len(), MAX_LINE);
+        ensure!(
+            line.len() < MAX_LINE,
+            "session entry is {} bytes, over the {} byte line limit",
+            line.len(),
+            MAX_LINE
+        );
         if let Some(file) = self.file.as_mut() {
             // One write_all on an O_APPEND descriptor: concurrent writers cannot interleave inside it.
             let mut buf = String::with_capacity(line.len() + 2);
@@ -533,36 +700,65 @@ impl Session {
 
     /// Appends a chat message (an object with a string `role`) as a child of the current leaf.
     pub fn append(&mut self, message: Value) -> Result<String> {
-        ensure!(message.is_object() && message.get("role").is_some_and(Value::is_string), "session messages must be objects with a string `role`");
-        if role_of(&message) == "user" && !self.entries.iter().any(|e| matches!(&e.kind, Kind::Title(title) if !title.is_empty())
-            || matches!(&e.kind, Kind::Message(m) if role_of(m) == "user")) {
-            let title = truncate_chars(&content_text(&message).split_whitespace().collect::<Vec<_>>().join(" "), TITLE_CHARS);
-            if !title.is_empty() { self.push(Kind::Title(title))?; }
+        ensure!(
+            message.is_object() && message.get("role").is_some_and(Value::is_string),
+            "session messages must be objects with a string `role`"
+        );
+        if role_of(&message) == "user"
+            && !self.entries.iter().any(|e| {
+                matches!(&e.kind, Kind::Title(title) if !title.is_empty())
+                    || matches!(&e.kind, Kind::Message(m) if role_of(m) == "user")
+            })
+        {
+            let title = truncate_chars(
+                &content_text(&message)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                TITLE_CHARS,
+            );
+            if !title.is_empty() {
+                self.push(Kind::Title(title))?;
+            }
         }
         self.push(Kind::Message(message))
     }
 
     /// Durable harness state is append-only but never sent as a chat role to providers.
     pub fn control_state(&self) -> Value {
-        self.branch().into_iter().rev().find_map(|i| match &self.entries[i].kind {
-            Kind::Message(m) if m["role"] == "dial_state" => Some(m["state"].clone()), _ => None,
-        }).unwrap_or_else(|| json!({}))
+        self.branch()
+            .into_iter()
+            .rev()
+            .find_map(|i| match &self.entries[i].kind {
+                Kind::Message(m) if m["role"] == "dial_state" => Some(m["state"].clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| json!({}))
     }
     pub fn set_control_state(&mut self, state: Value) -> Result<()> {
-        self.append(json!({"role":"dial_state","state":state})).map(|_| ())
+        self.append(json!({"role":"dial_state","state":state}))
+            .map(|_| ())
     }
 
     /// Entry indices from the root to the leaf.
     fn branch(&self) -> Vec<usize> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        let mut cur = self.leaf.as_deref().and_then(|id| self.by_id.get(id)).copied();
+        let mut cur = self
+            .leaf
+            .as_deref()
+            .and_then(|id| self.by_id.get(id))
+            .copied();
         while let Some(i) = cur {
             if !seen.insert(i) {
                 break;
             }
             out.push(i);
-            cur = self.entries[i].parent.as_deref().and_then(|p| self.by_id.get(p)).copied();
+            cur = self.entries[i]
+                .parent
+                .as_deref()
+                .and_then(|p| self.by_id.get(p))
+                .copied();
         }
         out.reverse();
         out
@@ -571,13 +767,29 @@ impl Session {
     /// (summary of the latest compaction on the branch, indices of the message entries still in view).
     fn view(&self, branch: &[usize]) -> (Option<&str>, Vec<usize>) {
         let is_message = |&&i: &&usize| matches!(&self.entries[i].kind, Kind::Message(m) if m["role"] != "dial_state");
-        let Some(p) = branch.iter().rposition(|&i| matches!(self.entries[i].kind, Kind::Compaction { .. })) else {
+        let Some(p) = branch
+            .iter()
+            .rposition(|&i| matches!(self.entries[i].kind, Kind::Compaction { .. }))
+        else {
             return (None, branch.iter().filter(is_message).copied().collect());
         };
-        let Kind::Compaction { summary, first_kept } = &self.entries[branch[p]].kind else { return (None, Vec::new()) };
-        let start = first_kept.as_deref().and_then(|f| branch[..p].iter().position(|&i| self.entries[i].id == f));
+        let Kind::Compaction {
+            summary,
+            first_kept,
+        } = &self.entries[branch[p]].kind
+        else {
+            return (None, Vec::new());
+        };
+        let start = first_kept
+            .as_deref()
+            .and_then(|f| branch[..p].iter().position(|&i| self.entries[i].id == f));
         let before = start.map(|s| &branch[s..p]).unwrap_or(&[]);
-        let kept = before.iter().chain(&branch[p + 1..]).filter(is_message).copied().collect();
+        let kept = before
+            .iter()
+            .chain(&branch[p + 1..])
+            .filter(is_message)
+            .copied()
+            .collect();
         (Some(summary), kept)
     }
 
@@ -602,7 +814,9 @@ impl Session {
         }
         for i in kept {
             if let Kind::Message(m) = &self.entries[i].kind {
-                if m["role"] != "dial_state" { out.push(m.clone()); }
+                if m["role"] != "dial_state" {
+                    out.push(m.clone());
+                }
             }
         }
     }
@@ -619,13 +833,19 @@ impl Session {
         let (summary, kept) = self.view(&branch);
         let (mut index, mut total) = (0usize, 0usize);
         if let Some(summary) = summary {
-            if index >= from { total += weigh(&json!({"role": "user", "content": summary})); }
+            if index >= from {
+                total += weigh(&json!({"role": "user", "content": summary}));
+            }
             index += 1;
         }
         for i in kept {
             if let Kind::Message(m) = &self.entries[i].kind {
-                if m["role"] == "dial_state" { continue; }
-                if index >= from { total += weigh(m); }
+                if m["role"] == "dial_state" {
+                    continue;
+                }
+                if index >= from {
+                    total += weigh(m);
+                }
                 index += 1;
             }
         }
@@ -638,23 +858,34 @@ impl Session {
         let (_, kept) = self.view(&branch);
         let mut calls: Vec<String> = Vec::new();
         for i in kept {
-            let Kind::Message(message) = &self.entries[i].kind else { continue };
+            let Kind::Message(message) = &self.entries[i].kind else {
+                continue;
+            };
             match message["role"].as_str() {
                 Some("assistant") => {
                     calls.clear();
                     if let Some(group) = message["tool_calls"].as_array() {
-                        calls.extend(group.iter().filter_map(|call| call["id"].as_str().map(str::to_owned)));
+                        calls.extend(
+                            group
+                                .iter()
+                                .filter_map(|call| call["id"].as_str().map(str::to_owned)),
+                        );
                     }
                 }
                 Some("tool") => {
-                    if let Some(id) = message["tool_call_id"].as_str() { calls.retain(|pending| pending != id); }
+                    if let Some(id) = message["tool_call_id"].as_str() {
+                        calls.retain(|pending| pending != id);
+                    }
                 }
                 _ => {}
             }
         }
         let count = calls.len();
         for id in calls {
-            self.append(crate::llm::tool_message(&id, "interrupted by the user before this ran"))?;
+            self.append(crate::llm::tool_message(
+                &id,
+                "interrupted by the user before this ran",
+            ))?;
         }
         Ok(count)
     }
@@ -668,12 +899,18 @@ impl Session {
             None
         } else {
             let mut idx = visible.len().saturating_sub(keep_last);
-            while idx > 0 && matches!(&self.entries[visible[idx]].kind, Kind::Message(m) if role_of(m) == "tool") {
+            while idx > 0
+                && matches!(&self.entries[visible[idx]].kind, Kind::Message(m) if role_of(m) == "tool")
+            {
                 idx -= 1;
             }
             Some(self.entries[visible[idx]].id.clone())
         };
-        self.push(Kind::Compaction { summary, first_kept }).map(|_| ())
+        self.push(Kind::Compaction {
+            summary,
+            first_kept,
+        })
+        .map(|_| ())
     }
 
     /// Moves the leaf back to just before the `user_turns`-th most recent user message (clamped to the
@@ -688,12 +925,25 @@ impl Session {
         let users: Vec<usize> = (0..visible.len())
             .filter(|&n| matches!(&self.entries[visible[n]].kind, Kind::Message(m) if role_of(m) == "user"))
             .collect();
-        let Some(&n) = users.iter().rev().nth(user_turns - 1).or(users.first()) else { return Ok(0) };
+        let Some(&n) = users.iter().rev().nth(user_turns - 1).or(users.first()) else {
+            return Ok(0);
+        };
         let removed = visible.len() - n;
         let target = visible[n];
-        let pos = branch.iter().position(|&i| i == target).context("rewind target not on the active branch")?;
-        let new_leaf = pos.checked_sub(1).map(|p| self.entries[branch[p]].id.clone());
-        self.push_under(new_leaf, Kind::Meta { kind: "rewind".into(), removed })?;
+        let pos = branch
+            .iter()
+            .position(|&i| i == target)
+            .context("rewind target not on the active branch")?;
+        let new_leaf = pos
+            .checked_sub(1)
+            .map(|p| self.entries[branch[p]].id.clone());
+        self.push_under(
+            new_leaf,
+            Kind::Meta {
+                kind: "rewind".into(),
+                removed,
+            },
+        )?;
         Ok(removed)
     }
 
@@ -717,7 +967,8 @@ impl Session {
         }
         let mut s = Self::create_file(layout, &self.model, Some(&self.id))?;
         if let Some(file) = s.file.as_mut() {
-            file.write_all(body.as_bytes()).context("writing forked session")?;
+            file.write_all(body.as_bytes())
+                .context("writing forked session")?;
         }
         for e in kept {
             s.by_id.insert(e.id.clone(), s.entries.len());
@@ -740,13 +991,22 @@ impl Session {
         // Every term is a quoted FTS string, so no query syntax from the caller reaches the parser.
         // Prefer sessions containing all terms; fall back to any term.
         for joiner in [" ", " OR "] {
-            let q = terms.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(joiner);
+            let q = terms
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(joiner);
             let mut stmt = conn.prepare(
                 "SELECT session_id, role, snippet(msgs, 0, '', '', '…', 24), ts FROM msgs WHERE msgs MATCH ?1 ORDER BY rank LIMIT ?2",
             )?;
             let hits = stmt
                 .query_map(params![q, limit as i64], |r| {
-                    Ok(SearchHit { session_id: r.get(0)?, role: r.get(1)?, snippet: r.get(2)?, when: r.get(3)? })
+                    Ok(SearchHit {
+                        session_id: r.get(0)?,
+                        role: r.get(1)?,
+                        snippet: r.get(2)?,
+                        when: r.get(3)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             if !hits.is_empty() || terms.len() == 1 {
@@ -790,7 +1050,12 @@ fn index_text(message: &Value) -> Option<(&str, String)> {
     match role {
         "user" => {}
         "assistant" => {
-            for call in message.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+            for call in message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
                 if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
                     text.push_str(&format!("\n[tool: {name}]"));
                 }
@@ -807,13 +1072,25 @@ fn sync_index(conn: &mut Connection, dir: &Path) -> Result<()> {
     let files = session_files(dir)?;
     let known: HashMap<String, u64> = {
         let mut stmt = conn.prepare("SELECT session_id, bytes FROM indexed")?;
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?.collect::<rusqlite::Result<_>>()?
+        stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?
+        .collect::<rusqlite::Result<_>>()?
     };
     let mut present = HashSet::new();
     for path in files {
-        let Some(sid) = path.file_name().and_then(|n| n.to_str()).and_then(file_id).map(str::to_string) else { continue };
+        let Some(sid) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(file_id)
+            .map(str::to_string)
+        else {
+            continue;
+        };
         present.insert(sid.clone());
-        let Ok(len) = fs::metadata(&path).map(|m| m.len()) else { continue };
+        let Ok(len) = fs::metadata(&path).map(|m| m.len()) else {
+            continue;
+        };
         if known.get(&sid) != Some(&len) {
             index_session(conn, &sid, &path, len)?;
         }
@@ -833,7 +1110,11 @@ fn sync_index(conn: &mut Connection, dir: &Path) -> Result<()> {
 fn index_session(conn: &mut Connection, sid: &str, path: &Path, len: u64) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut offset = tx
-        .query_row("SELECT bytes FROM indexed WHERE session_id = ?1", [sid], |r| r.get::<_, i64>(0))
+        .query_row(
+            "SELECT bytes FROM indexed WHERE session_id = ?1",
+            [sid],
+            |r| r.get::<_, i64>(0),
+        )
         .optional()?
         .unwrap_or(0) as u64;
     if len < offset {
@@ -856,16 +1137,28 @@ fn index_session(conn: &mut Connection, sid: &str, path: &Path, len: u64) -> Res
             if line.oversized {
                 continue;
             }
-            let Ok(v) = serde_json::from_slice::<Value>(&buf) else { continue };
-            if v.get("type").and_then(Value::as_str) != Some("message") || v.get("copied").and_then(Value::as_bool) == Some(true) {
+            let Ok(v) = serde_json::from_slice::<Value>(&buf) else {
+                continue;
+            };
+            if v.get("type").and_then(Value::as_str) != Some("message")
+                || v.get("copied").and_then(Value::as_bool) == Some(true)
+            {
                 continue;
             }
-            let Some((role, text)) = v.get("message").and_then(index_text) else { continue };
+            let Some((role, text)) = v.get("message").and_then(index_text) else {
+                continue;
+            };
             let ts = v.get("ts").and_then(Value::as_str).unwrap_or("");
-            tx.execute("INSERT INTO msgs(text, session_id, role, ts) VALUES(?1, ?2, ?3, ?4)", params![text, sid, role, ts])?;
+            tx.execute(
+                "INSERT INTO msgs(text, session_id, role, ts) VALUES(?1, ?2, ?3, ?4)",
+                params![text, sid, role, ts],
+            )?;
         }
     }
-    tx.execute("INSERT OR REPLACE INTO indexed(session_id, bytes) VALUES(?1, ?2)", params![sid, offset as i64])?;
+    tx.execute(
+        "INSERT OR REPLACE INTO indexed(session_id, bytes) VALUES(?1, ?2)",
+        params![sid, offset as i64],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -892,21 +1185,37 @@ pub mod session_search_tool {
     }
 
     pub fn call(layout: &Layout, args: &Value) -> ToolOutput {
-        let err = |text: String| ToolOutput { text, is_error: true };
+        let err = |text: String| ToolOutput {
+            text,
+            is_error: true,
+        };
         let Some(query) = args.get("query").and_then(Value::as_str) else {
             return err("session_search needs a `query` string".into());
         };
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8).clamp(1, 25) as usize;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(8)
+            .clamp(1, 25) as usize;
         match Session::search(layout, query, limit) {
             Err(e) => err(format!("session search failed: {e:#}")),
-            Ok(hits) if hits.is_empty() => ToolOutput { text: "no matching messages in earlier sessions".into(), is_error: false },
+            Ok(hits) if hits.is_empty() => ToolOutput {
+                text: "no matching messages in earlier sessions".into(),
+                is_error: false,
+            },
             Ok(hits) => {
                 let mut text = format!("{} result(s):\n", hits.len());
                 for h in hits {
                     let snippet = h.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-                    text.push_str(&format!("- [{}] session {} ({}): {}\n", h.when, h.session_id, h.role, snippet));
+                    text.push_str(&format!(
+                        "- [{}] session {} ({}): {}\n",
+                        h.when, h.session_id, h.role, snippet
+                    ));
                 }
-                ToolOutput { text, is_error: false }
+                ToolOutput {
+                    text,
+                    is_error: false,
+                }
             }
         }
     }
@@ -926,7 +1235,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
-        Env { _home: home, _project: project, layout }
+        Env {
+            _home: home,
+            _project: project,
+            layout,
+        }
     }
 
     fn user(t: &str) -> Value {
@@ -948,7 +1261,8 @@ mod tests {
         let mut s = new_session(&e);
         s.append(user("first prompt")).unwrap();
         s.append(json!({"role":"assistant","content":"answer","tool_calls":[{"id":"one","function":{"name":"bash","arguments":"{}"}}]})).unwrap();
-        s.append(json!({"role":"tool","tool_call_id":"one","content":"<script>alert(1)</script>"})).unwrap();
+        s.append(json!({"role":"tool","tool_call_id":"one","content":"<script>alert(1)</script>"}))
+            .unwrap();
         let messages = s.messages();
         s.rename("A named session").unwrap();
         let reopened = Session::open(s.path().unwrap()).unwrap();
@@ -960,9 +1274,20 @@ mod tests {
         assert_eq!(info.model, "m");
         let fork = reopened.fork(&e.layout).unwrap();
         let infos = Session::list_all(&e.layout, usize::MAX).unwrap();
-        assert_eq!(infos.iter().find(|i| i.id == fork.id()).unwrap().parent_id.as_deref(), Some(s.id()));
+        assert_eq!(
+            infos
+                .iter()
+                .find(|i| i.id == fork.id())
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some(s.id())
+        );
         for html in [false, true] {
-            let path = e.layout.project_root.join(if html { "out.html" } else { "out.md" });
+            let path = e
+                .layout
+                .project_root
+                .join(if html { "out.html" } else { "out.md" });
             reopened.export(&path, html).unwrap();
             let output = fs::read_to_string(&path).unwrap();
             assert!(output.contains("A named session"));
@@ -970,7 +1295,10 @@ mod tests {
             assert!(output.contains("<details>"));
             assert!(output.contains("&lt;script&gt;"));
             assert!(!output.contains("<script>"));
-            assert!(reopened.export(&path, html).is_err(), "exports must not overwrite existing files");
+            assert!(
+                reopened.export(&path, html).is_err(),
+                "exports must not overwrite existing files"
+            );
         }
     }
 
@@ -995,10 +1323,13 @@ mod tests {
         s.append(user("hello")).unwrap();
         let call = json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]});
         s.append(call.clone()).unwrap();
-        s.append(json!({"role": "tool", "tool_call_id": "c1", "content": "ok"})).unwrap();
+        s.append(json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}))
+            .unwrap();
         let path = s.path().unwrap().to_path_buf();
 
-        let header: Value = serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap()).unwrap();
+        let header: Value =
+            serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap())
+                .unwrap();
         assert_eq!(header["type"], "session");
         assert_eq!(header["id"], s.id());
         assert_eq!(header["model"], "m");
@@ -1009,8 +1340,18 @@ mod tests {
         assert_eq!(reopened.id(), s.id());
         assert_eq!(reopened.messages(), s.messages());
         assert_eq!(reopened.messages()[1], call);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
 
         // Appending after a reopen continues the same branch.
         let mut reopened = reopened;
@@ -1050,13 +1391,19 @@ mod tests {
         let m = s.messages();
         assert_eq!(m[0]["role"], "user");
         let head = m[0]["content"].as_str().unwrap();
-        assert!(head.starts_with("<summary>") && head.contains("SUMMARY-ONE"), "{head}");
+        assert!(
+            head.starts_with("<summary>") && head.contains("SUMMARY-ONE"),
+            "{head}"
+        );
         assert_eq!(contents(&m[1..]), ["a2", "q3", "a3"].map(String::from));
 
         s.append(user("after")).unwrap();
         let reopened = Session::open(s.path().unwrap()).unwrap();
         assert_eq!(reopened.messages(), s.messages());
-        assert_eq!(contents(&reopened.messages()[1..]), ["a2", "q3", "a3", "after"].map(String::from));
+        assert_eq!(
+            contents(&reopened.messages()[1..]),
+            ["a2", "q3", "a3", "after"].map(String::from)
+        );
 
         // A second compaction replaces the first summary and counts only what is still in view.
         let mut s = reopened;
@@ -1074,7 +1421,8 @@ mod tests {
         let mut s = new_session(&e);
         s.append(user("go")).unwrap();
         s.append(json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]})).unwrap();
-        s.append(json!({"role": "tool", "tool_call_id": "c", "content": "out"})).unwrap();
+        s.append(json!({"role": "tool", "tool_call_id": "c", "content": "out"}))
+            .unwrap();
         s.append(assistant("finished")).unwrap();
         s.compact("S".into(), 2).unwrap(); // would cut exactly at the tool result
         let m = s.messages();
@@ -1095,12 +1443,18 @@ mod tests {
         }
         assert_eq!(s.rewind(0).unwrap(), 0);
         assert_eq!(s.rewind(1).unwrap(), 2);
-        assert_eq!(contents(&s.messages()), ["u1", "a1", "u2", "a2"].map(String::from));
+        assert_eq!(
+            contents(&s.messages()),
+            ["u1", "a1", "u2", "a2"].map(String::from)
+        );
         s.append(user("u3b")).unwrap();
         let path = s.path().unwrap().to_path_buf();
 
         let reopened = Session::open(&path).unwrap();
-        assert_eq!(contents(&reopened.messages()), ["u1", "a1", "u2", "a2", "u3b"].map(String::from));
+        assert_eq!(
+            contents(&reopened.messages()),
+            ["u1", "a1", "u2", "a2", "u3b"].map(String::from)
+        );
         // The abandoned branch is still in the file.
         assert!(fs::read_to_string(&path).unwrap().contains("\"u3\""));
 
@@ -1111,7 +1465,10 @@ mod tests {
         assert_eq!(s.rewind(99).unwrap(), 2);
         assert!(s.messages().is_empty());
         s.append(user("fresh")).unwrap();
-        assert_eq!(contents(&Session::open(&path).unwrap().messages()), ["fresh".to_string()]);
+        assert_eq!(
+            contents(&Session::open(&path).unwrap().messages()),
+            ["fresh".to_string()]
+        );
         assert_eq!(Session::open(&path).unwrap().rewind(1).unwrap(), 1);
     }
 
@@ -1146,7 +1503,8 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..3 {
             let mut s = new_session(&e);
-            s.append(user(&format!("topic   number {i}\nwith newline"))).unwrap();
+            s.append(user(&format!("topic   number {i}\nwith newline")))
+                .unwrap();
             s.append(assistant("ok")).unwrap();
             ids.push(s.id().to_string());
         }
@@ -1157,7 +1515,10 @@ mod tests {
         };
         let list = Session::list(&e.layout, 10).unwrap();
         let order: Vec<_> = list.iter().map(|i| i.id.clone()).collect();
-        assert_eq!(order, [long.clone(), ids[2].clone(), ids[1].clone(), ids[0].clone()]);
+        assert_eq!(
+            order,
+            [long.clone(), ids[2].clone(), ids[1].clone(), ids[0].clone()]
+        );
         assert_eq!(list[1].title, "topic number 2 with newline");
         assert_eq!(list[1].messages, 2);
         assert!(list[0].title.chars().count() <= TITLE_CHARS + 1 && list[0].title.ends_with('…'));
@@ -1175,14 +1536,20 @@ mod tests {
         let path = s.path().unwrap().to_path_buf();
         drop(s);
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(b"{\"type\":\"message\",\"id\":\"zz\",\"parent\":null,\"message\":{\"role\":\"us").unwrap();
+        f.write_all(
+            b"{\"type\":\"message\",\"id\":\"zz\",\"parent\":null,\"message\":{\"role\":\"us",
+        )
+        .unwrap();
         drop(f);
 
         let mut s = Session::open(&path).unwrap();
         assert_eq!(contents(&s.messages()), ["one", "two"].map(String::from));
         s.append(user("three")).unwrap();
         let s = Session::open(&path).unwrap();
-        assert_eq!(contents(&s.messages()), ["one", "two", "three"].map(String::from));
+        assert_eq!(
+            contents(&s.messages()),
+            ["one", "two", "three"].map(String::from)
+        );
 
         // Garbage and blank lines in the middle are skipped too.
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
@@ -1241,27 +1608,46 @@ mod tests {
             h.join().unwrap();
         }
         let text = fs::read_to_string(&path).unwrap();
-        let entries: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).expect("every line is intact JSON")).collect();
-        let messages: HashSet<_> = entries.iter().filter(|e| e["type"] == "message")
-            .map(|e| content_text(&e["message"])).collect();
-        let expected: HashSet<_> = (0..2).flat_map(|w| (0..60).map({
-            let big = &big;
-            move |i| format!("w{w}-{i}-{big}")
-        })).collect();
-        assert_eq!(messages, expected, "every concurrent append keeps its full payload");
+        let entries: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every line is intact JSON"))
+            .collect();
+        let messages: HashSet<_> = entries
+            .iter()
+            .filter(|e| e["type"] == "message")
+            .map(|e| content_text(&e["message"]))
+            .collect();
+        let expected: HashSet<_> = (0..2)
+            .flat_map(|w| {
+                (0..60).map({
+                    let big = &big;
+                    move |i| format!("w{w}-{i}-{big}")
+                })
+            })
+            .collect();
+        assert_eq!(
+            messages, expected,
+            "every concurrent append keeps its full payload"
+        );
     }
 
     #[test]
     fn search_ranks_stems_and_follows_new_appends() {
         let e = env();
         let mut a = new_session(&e);
-        a.append(user("how do I configure the database migrations?")).unwrap();
-        a.append(assistant("Run the migration tool against postgres.")).unwrap();
+        a.append(user("how do I configure the database migrations?"))
+            .unwrap();
+        a.append(assistant("Run the migration tool against postgres."))
+            .unwrap();
         let mut b = new_session(&e);
-        b.append(user("unrelated chat about sourdough bread")).unwrap();
+        b.append(user("unrelated chat about sourdough bread"))
+            .unwrap();
         b.append(json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c", "type": "function", "function": {"name": "frobnicate", "arguments": "{\"secret\":\"zebra\"}"}}]})).unwrap();
         b.append(json!({"role": "tool", "tool_call_id": "c", "content": format!("kiwi {}", "filler ".repeat(400))})).unwrap();
-        b.append(json!({"role": "tool", "tool_call_id": "c", "content": "small tool output mango"})).unwrap();
+        b.append(
+            json!({"role": "tool", "tool_call_id": "c", "content": "small tool output mango"}),
+        )
+        .unwrap();
 
         let hits = Session::search(&e.layout, "migrations postgres", 5).unwrap();
         assert!(!hits.is_empty());
@@ -1272,20 +1658,45 @@ mod tests {
         // Stemming: "migrate" finds "migrations"/"migration".
         assert!(!Session::search(&e.layout, "migrate", 5).unwrap().is_empty());
 
-        assert_eq!(Session::search(&e.layout, "frobnicate", 5).unwrap()[0].session_id, b.id());
-        assert!(Session::search(&e.layout, "zebra", 5).unwrap().is_empty(), "tool arguments are not indexed");
-        assert!(Session::search(&e.layout, "kiwi", 5).unwrap().is_empty(), "large tool bodies are not indexed");
+        assert_eq!(
+            Session::search(&e.layout, "frobnicate", 5).unwrap()[0].session_id,
+            b.id()
+        );
+        assert!(
+            Session::search(&e.layout, "zebra", 5).unwrap().is_empty(),
+            "tool arguments are not indexed"
+        );
+        assert!(
+            Session::search(&e.layout, "kiwi", 5).unwrap().is_empty(),
+            "large tool bodies are not indexed"
+        );
         assert_eq!(Session::search(&e.layout, "mango", 5).unwrap().len(), 1);
         // AND fails across messages -> falls back to OR.
-        assert_eq!(Session::search(&e.layout, "sourdough postgres", 5).unwrap().len(), 2);
+        assert_eq!(
+            Session::search(&e.layout, "sourdough postgres", 5)
+                .unwrap()
+                .len(),
+            2
+        );
 
         assert!(Session::search(&e.layout, "quokka", 5).unwrap().is_empty());
         b.append(user("now we discuss quokka habitats")).unwrap();
-        assert_eq!(Session::search(&e.layout, "quokka", 5).unwrap()[0].session_id, b.id());
-        assert_eq!(Session::search(&e.layout, "migrations OR sourdough", 1).unwrap().len(), 1);
+        assert_eq!(
+            Session::search(&e.layout, "quokka", 5).unwrap()[0].session_id,
+            b.id()
+        );
+        assert_eq!(
+            Session::search(&e.layout, "migrations OR sourdough", 1)
+                .unwrap()
+                .len(),
+            1
+        );
 
         let db = e.layout.state_dir.join("sessions.sqlite3");
-        assert_eq!(fs::metadata(db).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(db).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -1294,7 +1705,24 @@ mod tests {
         let mut s = new_session(&e);
         s.append(user("foo and bar")).unwrap();
         s.append(user("OR is a word 1 time")).unwrap();
-        for q in ["foo\" OR 1", "*", "NEAR(", "", "   ", "\"", "text:foo", "foo AND NOT bar", "(((", "foo*", "^foo", "a:b", "\\", "-foo", "{foo}", "foo\0bar"] {
+        for q in [
+            "foo\" OR 1",
+            "*",
+            "NEAR(",
+            "",
+            "   ",
+            "\"",
+            "text:foo",
+            "foo AND NOT bar",
+            "(((",
+            "foo*",
+            "^foo",
+            "a:b",
+            "\\",
+            "-foo",
+            "{foo}",
+            "foo\0bar",
+        ] {
             let r = Session::search(&e.layout, q, 5);
             assert!(r.is_ok(), "query {q:?} errored: {:?}", r.err());
         }
@@ -1303,24 +1731,40 @@ mod tests {
         // Operators are plain words: "foo\" OR 1" is the terms foo, OR, 1.
         let hits = Session::search(&e.layout, "foo\" OR 1", 5).unwrap();
         assert!(!hits.is_empty());
-        assert!(Session::search(&e.layout, "nonexistentword AND foo", 5).unwrap().len() >= 1); // OR fallback, not an FTS AND
+        assert!(
+            Session::search(&e.layout, "nonexistentword AND foo", 5)
+                .unwrap()
+                .len()
+                >= 1
+        ); // OR fallback, not an FTS AND
     }
 
     #[test]
     fn search_without_sessions_is_empty_and_forks_do_not_duplicate_hits() {
         let e = env();
-        assert!(Session::search(&e.layout, "anything", 5).unwrap().is_empty());
+        assert!(
+            Session::search(&e.layout, "anything", 5)
+                .unwrap()
+                .is_empty()
+        );
         assert!(!e.layout.state_dir.join("sessions.sqlite3").exists());
         let mut s = new_session(&e);
         s.append(user("the platypus problem")).unwrap();
         let mut f = s.fork(&e.layout).unwrap();
         assert_eq!(Session::search(&e.layout, "platypus", 10).unwrap().len(), 1);
         f.append(user("fork-only echidna")).unwrap();
-        assert_eq!(Session::search(&e.layout, "echidna", 10).unwrap()[0].session_id, f.id());
+        assert_eq!(
+            Session::search(&e.layout, "echidna", 10).unwrap()[0].session_id,
+            f.id()
+        );
         assert_eq!(Session::search(&e.layout, "platypus", 10).unwrap().len(), 1);
         // Deleting a session file removes its hits.
         fs::remove_file(s.path().unwrap()).unwrap();
-        assert!(Session::search(&e.layout, "platypus", 10).unwrap().is_empty());
+        assert!(
+            Session::search(&e.layout, "platypus", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1329,13 +1773,20 @@ mod tests {
         let mut s = new_session(&e);
         s.append(user("remember the wombat decision")).unwrap();
         let out = session_search_tool::call(&e.layout, &json!({"query": "wombat"}));
-        assert!(!out.is_error && out.text.contains("wombat") && out.text.contains(s.id()), "{}", out.text);
+        assert!(
+            !out.is_error && out.text.contains("wombat") && out.text.contains(s.id()),
+            "{}",
+            out.text
+        );
         assert!(!session_search_tool::call(&e.layout, &json!({"query": "zzzz"})).is_error);
         assert!(session_search_tool::call(&e.layout, &json!({"limit": 3})).is_error);
         assert!(session_search_tool::call(&e.layout, &json!({"query": 7})).is_error);
         let schema = session_search_tool::schema();
         assert_eq!(schema["function"]["name"], "session_search");
-        assert_eq!(schema["function"]["parameters"]["required"], json!(["query"]));
+        assert_eq!(
+            schema["function"]["parameters"]["required"],
+            json!(["query"])
+        );
     }
 
     #[test]

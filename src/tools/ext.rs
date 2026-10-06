@@ -52,8 +52,18 @@ pub trait Tool: Send + Sync {
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput;
 
-    fn call_streaming(&self, ctx: &ToolContext, args: &Value, _on_event: &(dyn Fn(ToolEvent) + Sync), _cancel: &std::sync::atomic::AtomicBool) -> ToolOutput { self.call(ctx, args) }
-    fn drain_notifications(&self) -> Vec<ToolEvent> { Vec::new() }
+    fn call_streaming(
+        &self,
+        ctx: &ToolContext,
+        args: &Value,
+        _on_event: &(dyn Fn(ToolEvent) + Sync),
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> ToolOutput {
+        self.call(ctx, args)
+    }
+    fn drain_notifications(&self) -> Vec<ToolEvent> {
+        Vec::new()
+    }
     /// Interrupt an active blocking operation without acquiring its session mutex.
     fn cancel_operation(&self) {}
 
@@ -91,14 +101,22 @@ impl Registry {
             super::web::tools(config),
             super::lsp::tools(config),
             super::ast::tools(config),
-            super::dap::tools(&config.dap).into_iter().filter(|_tool| config.integrations.iter().any(|name| name == "dap")).collect(),
+            super::git::tools(config),
+            super::dap::tools(&config.dap)
+                .into_iter()
+                .filter(|_tool| config.integrations.iter().any(|name| name == "dap"))
+                .collect(),
         ];
         for tool in groups.into_iter().flatten() {
             if config.integrations.iter().any(|name| name == tool.name()) {
                 registry.register(tool);
             }
         }
-        for tool in super::browser::tools(config).into_iter().chain(super::kernel::tools(config)).chain(super::navigation::tools(config)) {
+        for tool in super::browser::tools(config)
+            .into_iter()
+            .chain(super::kernel::tools(config))
+            .chain(super::navigation::tools(config))
+        {
             registry.register(tool);
         }
         let mcp = super::mcp::load(config);
@@ -133,10 +151,14 @@ impl Registry {
     pub fn fire_lifecycle(&self, event: &LifecycleEvent) {
         for tool in self.tools.values().filter(|tool| {
             tool.extension_api_version() == EXTENSION_API_VERSION
-                && tool.lifecycle_hooks().iter().any(|hook| hook == &event.event)
+                && tool
+                    .lifecycle_hooks()
+                    .iter()
+                    .any(|hook| hook == &event.event)
         }) {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.on_lifecycle_event(event)));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tool.on_lifecycle_event(event)
+            }));
         }
     }
-
 }

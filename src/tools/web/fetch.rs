@@ -17,7 +17,11 @@ pub const MAX_REDIRECTS: usize = 5;
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_URL_LEN: usize = 2048;
-pub const USER_AGENT: &str = concat!("dial-agent/", env!("CARGO_PKG_VERSION"), " (coding agent; web tools)");
+pub const USER_AGENT: &str = concat!(
+    "dial-agent/",
+    env!("CARGO_PKG_VERSION"),
+    " (coding agent; web tools)"
+);
 
 pub struct Response {
     /// The URL that finally answered, after redirects.
@@ -52,7 +56,9 @@ impl Client {
             .max_redirects(0)
             .proxy(None)
             .build();
-        Self { agent: ureq::Agent::with_parts(config, DefaultConnector::new(), resolver) }
+        Self {
+            agent: ureq::Agent::with_parts(config, DefaultConnector::new(), resolver),
+        }
     }
 
     /// GET `url`. `bearer` is attached only to requests to the origin of `url`.
@@ -88,7 +94,11 @@ impl Client {
                 current = parse_url(&next).map_err(|error| format!("redirect refused: {error}"))?;
                 continue;
             }
-            let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).map(str::to_owned);
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
             let (media_type, charset) = split_content_type(content_type.as_deref());
             let mut body = Vec::new();
             response
@@ -99,7 +109,14 @@ impl Client {
                 .map_err(|error| format!("reading response body: {}", io_message(&error)))?;
             let truncated = body.len() > MAX_BODY_BYTES;
             body.truncate(MAX_BODY_BYTES);
-            return Ok(Response { url: current.to_string(), status, media_type, charset, body, truncated });
+            return Ok(Response {
+                url: current.to_string(),
+                status,
+                media_type,
+                charset,
+                body,
+                truncated,
+            });
         }
         Err(format!("too many redirects (more than {MAX_REDIRECTS})"))
     }
@@ -112,9 +129,15 @@ pub fn parse_url(url: &str) -> Result<Uri, String> {
         return Err(format!("URL is longer than {MAX_URL_LEN} characters"));
     }
     if has_scheme(url) {
-        let scheme = url.split(':').next().unwrap_or_default().to_ascii_lowercase();
+        let scheme = url
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         if scheme != "http" && scheme != "https" {
-            return Err(format!("unsupported URL scheme {scheme:?}; only http and https are allowed"));
+            return Err(format!(
+                "unsupported URL scheme {scheme:?}; only http and https are allowed"
+            ));
         }
     }
     let uri: Uri = url.parse().map_err(|_| "not a valid URL".to_string())?;
@@ -129,17 +152,32 @@ pub fn parse_url(url: &str) -> Result<Uri, String> {
 }
 
 fn origin(uri: &Uri) -> (Option<&str>, Option<&str>, Option<u16>) {
-    let default_port = if uri.scheme_str() == Some("https") { 443 } else { 80 };
-    (uri.scheme_str(), uri.host(), Some(uri.port_u16().unwrap_or(default_port)))
+    let default_port = if uri.scheme_str() == Some("https") {
+        443
+    } else {
+        80
+    };
+    (
+        uri.scheme_str(),
+        uri.host(),
+        Some(uri.port_u16().unwrap_or(default_port)),
+    )
 }
 
 fn split_content_type(header: Option<&str>) -> (Option<String>, Option<String>) {
-    let Some(header) = header else { return (None, None) };
+    let Some(header) = header else {
+        return (None, None);
+    };
     let mut parts = header.split(';');
-    let media = parts.next().map(|m| m.trim().to_ascii_lowercase()).filter(|m| !m.is_empty());
+    let media = parts
+        .next()
+        .map(|m| m.trim().to_ascii_lowercase())
+        .filter(|m| !m.is_empty());
     let charset = parts.find_map(|param| {
         let (key, value) = param.split_once('=')?;
-        key.trim().eq_ignore_ascii_case("charset").then(|| value.trim().trim_matches('"').to_ascii_lowercase())
+        key.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches('"').to_ascii_lowercase())
     });
     (media, charset)
 }
@@ -198,9 +236,16 @@ pub fn resolve_url(base: &str, reference: &str) -> Option<String> {
 }
 
 fn has_scheme(reference: &str) -> bool {
-    let Some((scheme, _)) = reference.split_once(':') else { return false };
-    scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    let Some((scheme, _)) = reference.split_once(':') else {
+        return false;
+    };
+    scheme
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Remove `.` and `..` segments (RFC 3986 section 5.2.4), keeping a trailing slash.
@@ -229,7 +274,9 @@ pub fn percent_encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -242,7 +289,11 @@ pub fn percent_decode(text: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let hex = |b: u8| (b as char).to_digit(16);
-        match (bytes[i], bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+        match (
+            bytes[i],
+            bytes.get(i + 1).copied().and_then(hex),
+            bytes.get(i + 2).copied().and_then(hex),
+        ) {
             (b'%', Some(hi), Some(lo)) => {
                 out.push((hi * 16 + lo) as u8);
                 i += 3;
@@ -280,13 +331,25 @@ mod tests {
             ("next#sec", "https://example.com/a/b/next"),
             ("mailto:a@b.c", "mailto:a@b.c"),
         ] {
-            assert_eq!(resolve_url(base, reference).as_deref(), Some(expected), "{reference}");
+            assert_eq!(
+                resolve_url(base, reference).as_deref(),
+                Some(expected),
+                "{reference}"
+            );
         }
     }
 
     #[test]
     fn rejects_unsafe_urls() {
-        for url in ["file:///etc/passwd", "ftp://example.com/x", "gopher://x", "/relative", "http://user:pw@example.com/", "http:///x", "not a url"] {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "gopher://x",
+            "/relative",
+            "http://user:pw@example.com/",
+            "http:///x",
+            "not a url",
+        ] {
             assert!(parse_url(url).is_err(), "{url}");
         }
         assert!(parse_url("https://example.com/path?q=1").is_ok());
@@ -295,7 +358,10 @@ mod tests {
 
     #[test]
     fn percent_round_trip() {
-        assert_eq!(percent_encode("rust async/await & more"), "rust%20async%2Fawait%20%26%20more");
+        assert_eq!(
+            percent_encode("rust async/await & more"),
+            "rust%20async%2Fawait%20%26%20more"
+        );
         assert_eq!(percent_decode("a%20b+c%2Fd%zz%E2%9C%93"), "a b c/d%zz✓");
     }
 

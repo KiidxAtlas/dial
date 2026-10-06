@@ -22,7 +22,9 @@ pub(crate) fn parse_arguments(text: &str) -> Option<Value> {
     match value {
         Value::Object(_) => Some(value),
         // Some models double-encode: "{\"path\": ...}" as a JSON string.
-        Value::String(inner) if inner.trim_start().starts_with('{') => parse(&inner).ok().filter(Value::is_object),
+        Value::String(inner) if inner.trim_start().starts_with('{') => {
+            parse(&inner).ok().filter(Value::is_object)
+        }
         _ => None,
     }
 }
@@ -31,7 +33,10 @@ pub(crate) fn parse(text: &str) -> Result<Value, String> {
     if let Ok(value) = serde_json::from_str::<Value>(text) {
         return Ok(value);
     }
-    let mut parser = Parser { chars: text.chars().collect(), at: 0 };
+    let mut parser = Parser {
+        chars: text.chars().collect(),
+        at: 0,
+    };
     let value = parser.value(0)?;
     parser.space();
     if parser.at < parser.chars.len() {
@@ -46,19 +51,30 @@ struct Parser {
 }
 
 impl Parser {
-    fn peek(&self) -> Option<char> { self.chars.get(self.at).copied() }
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.at).copied()
+    }
 
     fn space(&mut self) {
-        while self.peek().is_some_and(char::is_whitespace) { self.at += 1; }
+        while self.peek().is_some_and(char::is_whitespace) {
+            self.at += 1;
+        }
     }
 
     fn expect(&mut self, wanted: char) -> Result<(), String> {
         self.space();
-        if self.peek() == Some(wanted) { self.at += 1; Ok(()) } else { Err(format!("expected '{wanted}' at {}", self.at)) }
+        if self.peek() == Some(wanted) {
+            self.at += 1;
+            Ok(())
+        } else {
+            Err(format!("expected '{wanted}' at {}", self.at))
+        }
     }
 
     fn value(&mut self, depth: usize) -> Result<Value, String> {
-        if depth > MAX_DEPTH { return Err("nesting too deep".into()); }
+        if depth > MAX_DEPTH {
+            return Err("nesting too deep".into());
+        }
         self.space();
         match self.peek().ok_or("input ends before a value")? {
             '{' => self.object(depth),
@@ -70,11 +86,23 @@ impl Parser {
     }
 
     fn keyword(&mut self) -> Result<Value, String> {
-        for (word, value) in [("true", Value::Bool(true)), ("false", Value::Bool(false)), ("null", Value::Null)] {
+        for (word, value) in [
+            ("true", Value::Bool(true)),
+            ("false", Value::Bool(false)),
+            ("null", Value::Null),
+        ] {
             let end = self.at + word.len();
-            let matches = self.chars.get(self.at..end).is_some_and(|slice| slice.iter().copied().eq(word.chars()));
+            let matches = self
+                .chars
+                .get(self.at..end)
+                .is_some_and(|slice| slice.iter().copied().eq(word.chars()));
             // `trueish` is not `true`.
-            if matches && !self.chars.get(end).is_some_and(|c| c.is_alphanumeric() || *c == '_') {
+            if matches
+                && !self
+                    .chars
+                    .get(end)
+                    .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+            {
                 self.at = end;
                 return Ok(value);
             }
@@ -84,16 +112,25 @@ impl Parser {
 
     fn number(&mut self) -> Result<Value, String> {
         let start = self.at;
-        while self.peek().is_some_and(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | 'e' | 'E')) { self.at += 1; }
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | 'e' | 'E'))
+        {
+            self.at += 1;
+        }
         let token: String = self.chars[start..self.at].iter().collect();
-        serde_json::from_str::<Number>(&token).map(Value::Number).map_err(|_| format!("invalid number {token:?}"))
+        serde_json::from_str::<Number>(&token)
+            .map(Value::Number)
+            .map_err(|_| format!("invalid number {token:?}"))
     }
 
     fn string(&mut self, quote: char) -> Result<String, String> {
         self.at += 1;
         let mut out = String::new();
         loop {
-            let c = self.peek().ok_or("string is not terminated (the arguments were cut off)")?;
+            let c = self
+                .peek()
+                .ok_or("string is not terminated (the arguments were cut off)")?;
             self.at += 1;
             match c {
                 c if c == quote => return Ok(out),
@@ -107,7 +144,9 @@ impl Parser {
     /// The text for the escape after a backslash; unknown escapes keep the backslash, which is what the model
     /// meant for a regex or Windows path.
     fn escape(&mut self, quote: char) -> String {
-        let Some(c) = self.peek() else { return "\\".into() };
+        let Some(c) = self.peek() else {
+            return "\\".into();
+        };
         self.at += 1;
         match c {
             'n' => "\n".into(),
@@ -133,11 +172,17 @@ impl Parser {
         let code = if (0xD800..0xDC00).contains(&high) {
             // A surrogate pair is written as two escapes; a lone half is not text.
             if self.chars.get(end) == Some(&'\\') && self.chars.get(end + 1) == Some(&'u') {
-                let low = self.hex4(end + 2).filter(|low| (0xDC00..0xE000).contains(low))?;
+                let low = self
+                    .hex4(end + 2)
+                    .filter(|low| (0xDC00..0xE000).contains(low))?;
                 end += 6;
                 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
-            } else { return None; }
-        } else { high };
+            } else {
+                return None;
+            }
+        } else {
+            high
+        };
         let ch = char::from_u32(code)?;
         self.at = end;
         Some(ch.to_string())
@@ -149,7 +194,12 @@ impl Parser {
             Some(quote @ ('"' | '\'')) => self.string(quote),
             Some(c) if c.is_alphabetic() || c == '_' || c == '$' => {
                 let start = self.at;
-                while self.peek().is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '-')) { self.at += 1; }
+                while self
+                    .peek()
+                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '-'))
+                {
+                    self.at += 1;
+                }
                 Ok(self.chars[start..self.at].iter().collect())
             }
             _ => Err(format!("expected an object key at {}", self.at)),
@@ -161,7 +211,10 @@ impl Parser {
         let mut map = Map::new();
         loop {
             self.space();
-            if self.peek() == Some('}') { self.at += 1; return Ok(Value::Object(map)); }
+            if self.peek() == Some('}') {
+                self.at += 1;
+                return Ok(Value::Object(map));
+            }
             let key = self.key()?;
             self.expect(':')?;
             let value = self.value(depth + 1)?;
@@ -180,7 +233,10 @@ impl Parser {
         let mut items = Vec::new();
         loop {
             self.space();
-            if self.peek() == Some(']') { self.at += 1; return Ok(Value::Array(items)); }
+            if self.peek() == Some(']') {
+                self.at += 1;
+                return Ok(Value::Array(items));
+            }
             items.push(self.value(depth + 1)?);
             self.space();
             match self.peek() {
@@ -197,34 +253,54 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn args(text: &str) -> Option<Value> { parse_arguments(text) }
+    fn args(text: &str) -> Option<Value> {
+        parse_arguments(text)
+    }
 
     #[test]
     fn valid_json_is_untouched() {
-        assert_eq!(args(r#"{"path":"a.rs","n":3,"ok":true,"x":null,"l":[1,2]}"#), Some(json!({"path":"a.rs","n":3,"ok":true,"x":null,"l":[1,2]})));
+        assert_eq!(
+            args(r#"{"path":"a.rs","n":3,"ok":true,"x":null,"l":[1,2]}"#),
+            Some(json!({"path":"a.rs","n":3,"ok":true,"x":null,"l":[1,2]}))
+        );
     }
 
     #[test]
     fn a_raw_newline_or_tab_inside_a_string_is_kept_as_that_character() {
         // The case that costs the most: a whole file written into "content" with real line breaks.
         let call = "{\"path\":\"a.rs\",\"content\":\"fn main() {\n\tprintln!(\\\"hi\\\");\n}\n\"}";
-        assert!(serde_json::from_str::<Value>(call).is_err(), "strict JSON rejects this");
-        assert_eq!(args(call), Some(json!({"path":"a.rs","content":"fn main() {\n\tprintln!(\"hi\");\n}\n"})));
+        assert!(
+            serde_json::from_str::<Value>(call).is_err(),
+            "strict JSON rejects this"
+        );
+        assert_eq!(
+            args(call),
+            Some(json!({"path":"a.rs","content":"fn main() {\n\tprintln!(\"hi\");\n}\n"}))
+        );
     }
 
     #[test]
     fn an_invalid_escape_keeps_its_backslash() {
-        assert_eq!(args(r#"{"pattern":"\d+\s*\w","dir":"C:\temp\new"}"#), Some(json!({"pattern":"\\d+\\s*\\w","dir":"C:\temp\new"})));
+        assert_eq!(
+            args(r#"{"pattern":"\d+\s*\w","dir":"C:\temp\new"}"#),
+            Some(json!({"pattern":"\\d+\\s*\\w","dir":"C:\temp\new"}))
+        );
     }
 
     #[test]
     fn single_quotes_unquoted_keys_and_trailing_commas_are_accepted() {
-        assert_eq!(args("{path: 'src/a.rs', 'old': 'it\\'s', list: [1, 2,], }"), Some(json!({"path":"src/a.rs","old":"it's","list":[1,2]})));
+        assert_eq!(
+            args("{path: 'src/a.rs', 'old': 'it\\'s', list: [1, 2,], }"),
+            Some(json!({"path":"src/a.rs","old":"it's","list":[1,2]}))
+        );
     }
 
     #[test]
     fn unicode_escapes_including_surrogate_pairs_decode_and_a_broken_one_survives() {
-        assert_eq!(args(r#"{"s":"\u00e9 \ud83d\ude00"}"#), Some(json!({"s":"é 😀"})));
+        assert_eq!(
+            args(r#"{"s":"\u00e9 \ud83d\ude00"}"#),
+            Some(json!({"s":"é 😀"}))
+        );
         assert_eq!(args(r#"{"s":"\u12"}"#), Some(json!({"s":"\\u12"})));
     }
 
@@ -236,14 +312,30 @@ mod tests {
 
     #[test]
     fn truncated_or_trailing_input_is_refused_not_guessed() {
-        for bad in [r#"{"path":"a"#, r#"{"path":"a","b":"#, r#"{"a":[1,2"#, r#"{"a":1} and more"#, r#"{"a":1}}"#, "", "[1,2]", "{\"a\" 1}", r#"{"a":trueish}"#] {
+        for bad in [
+            r#"{"path":"a"#,
+            r#"{"path":"a","b":"#,
+            r#"{"a":[1,2"#,
+            r#"{"a":1} and more"#,
+            r#"{"a":1}}"#,
+            "",
+            "[1,2]",
+            "{\"a\" 1}",
+            r#"{"a":trueish}"#,
+        ] {
             assert_eq!(args(bad), None, "{bad:?}");
         }
     }
 
     #[test]
     fn repair_never_alters_what_a_valid_string_says() {
-        for text in ["plain", "with \"quotes\"", "tab\there", "uni é 日本 😀", "back\\slash"] {
+        for text in [
+            "plain",
+            "with \"quotes\"",
+            "tab\there",
+            "uni é 日本 😀",
+            "back\\slash",
+        ] {
             let strict = json!({ "v": text }).to_string();
             assert_eq!(args(&strict), Some(json!({ "v": text })));
         }

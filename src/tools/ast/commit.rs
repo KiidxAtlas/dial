@@ -24,11 +24,17 @@ static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Write `content` to a fresh temp file beside `target` with `perms`.
 fn stage(target: &Path, content: &str, perms: &fs::Permissions) -> io::Result<PathBuf> {
-    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let n = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = target.with_file_name(format!(".{name}.dial-ast.{}.{n}.tmp", std::process::id()));
     let mut file: File = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-    let written = file.write_all(content.as_bytes()).and_then(|()| file.set_permissions(perms.clone())).and_then(|()| file.sync_all());
+    let written = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.set_permissions(perms.clone()))
+        .and_then(|()| file.sync_all());
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         return Err(e);
@@ -64,6 +70,7 @@ fn restore(done: &[Change]) -> Vec<String> {
 /// dropped so older `[path#TAG]` headers cannot be used to edit them.
 pub(super) fn commit(ws: &Workspace, changes: &[Change]) -> Result<(), String> {
     for change in changes {
+        ws.preflight_source(&change.abs, &change.original, &change.updated)?;
         ws.observe_write(&change.abs)?;
     }
     let mut staged: Vec<PathBuf> = Vec::with_capacity(changes.len());
@@ -72,7 +79,10 @@ pub(super) fn commit(ws: &Workspace, changes: &[Change]) -> Result<(), String> {
             Ok(tmp) => staged.push(tmp),
             Err(e) => {
                 discard(&staged);
-                return Err(format!("staging {:?}: {e}; nothing was written", change.rel));
+                return Err(format!(
+                    "staging {:?}: {e}; nothing was written",
+                    change.rel
+                ));
             }
         }
     }

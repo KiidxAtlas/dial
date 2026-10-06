@@ -10,26 +10,35 @@ const DELIMITER: &str = "§";
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let dir = path.parent().context("path has no parent directory")?;
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir).with_context(|| format!("creating temp file in {}", dir.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating temp file in {}", dir.display()))?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode))?;
-    tmp.persist(path).map_err(|e| e.error).with_context(|| format!("replacing {}", path.display()))?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
 
 pub(crate) fn screen(entry: &str) -> Result<(), String> {
     if entry.contains(DELIMITER) {
-        return Err(format!("entries must not contain the separator character {DELIMITER}"));
+        return Err(format!(
+            "entries must not contain the separator character {DELIMITER}"
+        ));
     }
     if has_hidden_chars(entry) {
         return Err("rejected: contains zero-width or bidirectional control characters".into());
     }
     if let Some(what) = find_injection(entry) {
-        return Err(format!("rejected: looks like a prompt-injection attempt ({what}). Memory stores facts, not instructions to the agent"));
+        return Err(format!(
+            "rejected: looks like a prompt-injection attempt ({what}). Memory stores facts, not instructions to the agent"
+        ));
     }
     if let Some(what) = find_secret(entry) {
-        return Err(format!("rejected: looks like it contains a secret ({what}). Never store credentials in memory"));
+        return Err(format!(
+            "rejected: looks like it contains a secret ({what}). Never store credentials in memory"
+        ));
     }
     Ok(())
 }
@@ -45,7 +54,9 @@ pub(crate) fn has_hidden_chars(text: &str) -> bool {
 
 fn words(text: &str) -> Vec<String> {
     text.to_lowercase()
-        .split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '<' || c == '>' || c == '|' || c == '_'))
+        .split(|c: char| {
+            !(c.is_alphanumeric() || c == '\'' || c == '<' || c == '>' || c == '|' || c == '_')
+        })
         .filter(|w| !w.is_empty())
         .map(str::to_string)
         .collect()
@@ -61,7 +72,10 @@ fn find_injection(text: &str) -> Option<&'static str> {
         ("do not tell the user", "concealment from the user"),
         ("don't tell the user", "concealment from the user"),
         ("without telling the user", "concealment from the user"),
-        ("do not mention this to the user", "concealment from the user"),
+        (
+            "do not mention this to the user",
+            "concealment from the user",
+        ),
         ("reveal your", "prompt extraction"),
         ("system prompt override", "system prompt override"),
         ("developer mode", "jailbreak"),
@@ -76,15 +90,44 @@ fn find_injection(text: &str) -> Option<&'static str> {
         return Some(what);
     }
     const VERBS: &[&str] = &["ignore", "disregard", "forget", "override", "bypass"];
-    const OBJECTS: &[&str] = &["instructions", "instruction", "rules", "prompt", "prompts", "guidelines", "directions", "constraints", "restrictions", "safeguards"];
-    const QUALIFIERS: &[&str] = &["previous", "prior", "above", "earlier", "all", "any", "your", "system", "the", "these", "those", "every", "preceding", "safety"];
+    const OBJECTS: &[&str] = &[
+        "instructions",
+        "instruction",
+        "rules",
+        "prompt",
+        "prompts",
+        "guidelines",
+        "directions",
+        "constraints",
+        "restrictions",
+        "safeguards",
+    ];
+    const QUALIFIERS: &[&str] = &[
+        "previous",
+        "prior",
+        "above",
+        "earlier",
+        "all",
+        "any",
+        "your",
+        "system",
+        "the",
+        "these",
+        "those",
+        "every",
+        "preceding",
+        "safety",
+    ];
     for (i, word) in w.iter().enumerate() {
         if !VERBS.contains(&word.as_str()) {
             continue;
         }
         let window = &w[i + 1..w.len().min(i + 5)];
         if let Some(obj) = window.iter().position(|x| OBJECTS.contains(&x.as_str())) {
-            if window[..obj].iter().any(|x| QUALIFIERS.contains(&x.as_str())) {
+            if window[..obj]
+                .iter()
+                .any(|x| QUALIFIERS.contains(&x.as_str()))
+            {
                 return Some("instruction override");
             }
         }
@@ -102,18 +145,49 @@ pub(crate) fn find_secret(text: &str) -> Option<&'static str> {
     if text.contains("-----BEGIN") && text.to_uppercase().contains("PRIVATE KEY") {
         return Some("private key");
     }
-    for token in text.split(|c: char| !is_token_char(c)).filter(|t| !t.is_empty()) {
-        let after = |prefix: &str, min: usize| token.strip_prefix(prefix).is_some_and(|rest| rest.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').count() >= min);
-        if after("sk-", 16) || after("sk_live_", 12) || after("sk_test_", 12) || after("pk_live_", 12) {
+    for token in text
+        .split(|c: char| !is_token_char(c))
+        .filter(|t| !t.is_empty())
+    {
+        let after = |prefix: &str, min: usize| {
+            token.strip_prefix(prefix).is_some_and(|rest| {
+                rest.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                    .count()
+                    >= min
+            })
+        };
+        if after("sk-", 16)
+            || after("sk_live_", 12)
+            || after("sk_test_", 12)
+            || after("pk_live_", 12)
+        {
             return Some("API key");
         }
-        if ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"].iter().any(|p| after(p, 20)) || after("github_pat_", 20) || after("glpat-", 16) {
+        if ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+            .iter()
+            .any(|p| after(p, 20))
+            || after("github_pat_", 20)
+            || after("glpat-", 16)
+        {
             return Some("GitHub/GitLab token");
         }
-        if ["AKIA", "ASIA", "AGPA", "AIDA", "AROA"].iter().any(|p| token.strip_prefix(p).is_some_and(|r| r.len() >= 16 && r.chars().take(16).all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))) {
+        if ["AKIA", "ASIA", "AGPA", "AIDA", "AROA"].iter().any(|p| {
+            token.strip_prefix(p).is_some_and(|r| {
+                r.len() >= 16
+                    && r.chars()
+                        .take(16)
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            })
+        }) {
             return Some("AWS access key");
         }
-        if after("xoxb-", 10) || after("xoxp-", 10) || after("xoxa-", 10) || after("xoxs-", 10) || after("xoxr-", 10) {
+        if after("xoxb-", 10)
+            || after("xoxp-", 10)
+            || after("xoxa-", 10)
+            || after("xoxs-", 10)
+            || after("xoxr-", 10)
+        {
             return Some("Slack token");
         }
         if after("AIza", 30) {
@@ -123,19 +197,37 @@ pub(crate) fn find_secret(text: &str) -> Option<&'static str> {
         if len >= 32 && token.chars().all(|c| c.is_ascii_hexdigit()) {
             return Some("long hex string");
         }
-        if len >= 40 && token.chars().any(|c| c.is_ascii_uppercase()) && token.chars().any(|c| c.is_ascii_lowercase()) && token.chars().any(|c| c.is_ascii_digit()) {
+        if len >= 40
+            && token.chars().any(|c| c.is_ascii_uppercase())
+            && token.chars().any(|c| c.is_ascii_lowercase())
+            && token.chars().any(|c| c.is_ascii_digit())
+        {
             return Some("long random-looking token");
         }
     }
     let lower = text.to_lowercase();
-    for key in ["password", "passwd", "secret", "api_key", "apikey", "api-key", "access_token", "auth_token", "token"] {
+    for key in [
+        "password",
+        "passwd",
+        "secret",
+        "api_key",
+        "apikey",
+        "api-key",
+        "access_token",
+        "auth_token",
+        "token",
+    ] {
         let mut from = 0;
         while let Some(pos) = lower[from..].find(key) {
             let rest = lower[from + pos + key.len()..].trim_start();
             from += pos + key.len();
             if let Some(value) = rest.strip_prefix('=').or_else(|| rest.strip_prefix(':')) {
                 let value = value.trim_start();
-                if value.split_whitespace().next().is_some_and(|v| v.trim_matches(|c| c == '"' || c == '\'').chars().count() >= 8) {
+                if value
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|v| v.trim_matches(|c| c == '"' || c == '\'').chars().count() >= 8)
+                {
                     return Some("credential assignment");
                 }
             }
@@ -183,7 +275,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn atomic_write_replaces_without_leftovers() {
         let dir = tempfile::tempdir().unwrap();
@@ -191,7 +282,14 @@ mod tests {
         atomic_write(&path, b"one", 0o600).unwrap();
         atomic_write(&path, b"two", 0o644).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "two");
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
-        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1, "temp file must not linger");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "temp file must not linger"
+        );
     }
 }

@@ -39,8 +39,13 @@ pub struct Context<'a> {
 
 /// SHA-256 hex of the canonical (key-sorted) JSON of the harness.
 pub fn harness_digest(h: &Harness) -> String {
-    let canonical = serde_json::to_value(h).map(|v| v.to_string()).unwrap_or_default();
-    Sha256::digest(canonical.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    let canonical = serde_json::to_value(h)
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    Sha256::digest(canonical.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn guidance_variants() -> Vec<(&'static str, String)> {
@@ -56,31 +61,69 @@ fn guidance_variants() -> Vec<(&'static str, String)> {
 
 fn failure_advice(kind: &str) -> Option<&'static str> {
     match kind {
-        "text_call" | "dropped_call" => Some("Always call tools through the tool-calling interface with a valid JSON arguments object; never write a tool call as plain text."),
-        "malformed_arguments" => Some("Tool arguments must be a single valid JSON object; close every brace and quote, and escape newlines inside strings."),
-        "schema" => Some("Re-read each tool's description before calling it and match its parameter names and types exactly; do not invent or omit parameters."),
-        "unknown_tool" => Some("Only use the tools that are actually listed for you; if a tool you want is missing, do the job with the listed ones."),
+        "text_call" | "dropped_call" => Some(
+            "Always call tools through the tool-calling interface with a valid JSON arguments object; never write a tool call as plain text.",
+        ),
+        "malformed_arguments" => Some(
+            "Tool arguments must be a single valid JSON object; close every brace and quote, and escape newlines inside strings.",
+        ),
+        "schema" => Some(
+            "Re-read each tool's description before calling it and match its parameter names and types exactly; do not invent or omit parameters.",
+        ),
+        "unknown_tool" => Some(
+            "Only use the tools that are actually listed for you; if a tool you want is missing, do the job with the listed ones.",
+        ),
         _ => None,
     }
 }
 
 fn family_advice(family: &str) -> Option<&'static str> {
     Some(match family {
-        "read_line" => "When asked for a specific line of a file, read the file and count lines exactly; answer with that line's text only.",
-        "create_file" => "When asked to create a file, write exactly the requested content to exactly the requested path, then read it back to confirm.",
-        "replace_value" => "To change a value in a file, read the file first, change only that value, keep all surrounding text byte-for-byte, and re-read to confirm.",
-        "count_matches" => "To count matches, use grep or a command that counts, do not estimate by eye, and answer with the number alone.",
-        "list_by_ext" => "To list files by extension, search the whole tree with glob, filter on the exact extension, and answer with the sorted list only.",
-        "run_compute" => "When a result must be computed, run a command or script to compute it instead of working it out mentally, and report its exact output.",
-        "fix_bug_py" => "To fix a Python bug, read the code, run it or its tests to see the failure, make a minimal fix, then run it again to confirm it passes.",
-        "json_set" => "When editing JSON, keep the file valid: change only the requested key, preserve all other keys, and re-read the file to confirm it parses.",
-        "append_line" => "To append a line, add it at the end of the file without touching existing lines, including a trailing newline only if the file already uses one.",
-        "rename_symbol" => "When renaming a symbol, search every file for all occurrences, update each one, and search again to confirm none remain.",
-        "sum_two_files" => "When a task combines values from two files, read both files fully, do the arithmetic with a command, and answer with the number alone.",
-        "move_file" => "To move a file, move it (do not copy and leave the original), then list both locations to confirm the source is gone and the target exists.",
-        "multi_file_edit" => "For edits that span several files, list every file that needs changing first, edit them one by one, and verify each before finishing.",
-        "typo_hunt" => "When hunting typos, read the whole file slowly, fix only genuine misspellings, and leave correct text exactly as it was.",
-        "script_and_run" => "When asked to write a script and run it, create the script file, run it, and report its actual output rather than predicting it.",
+        "read_line" => {
+            "When asked for a specific line of a file, read the file and count lines exactly; answer with that line's text only."
+        }
+        "create_file" => {
+            "When asked to create a file, write exactly the requested content to exactly the requested path, then read it back to confirm."
+        }
+        "replace_value" => {
+            "To change a value in a file, read the file first, change only that value, keep all surrounding text byte-for-byte, and re-read to confirm."
+        }
+        "count_matches" => {
+            "To count matches, use grep or a command that counts, do not estimate by eye, and answer with the number alone."
+        }
+        "list_by_ext" => {
+            "To list files by extension, search the whole tree with glob, filter on the exact extension, and answer with the sorted list only."
+        }
+        "run_compute" => {
+            "When a result must be computed, run a command or script to compute it instead of working it out mentally, and report its exact output."
+        }
+        "fix_bug_py" => {
+            "To fix a Python bug, read the code, run it or its tests to see the failure, make a minimal fix, then run it again to confirm it passes."
+        }
+        "json_set" => {
+            "When editing JSON, keep the file valid: change only the requested key, preserve all other keys, and re-read the file to confirm it parses."
+        }
+        "append_line" => {
+            "To append a line, add it at the end of the file without touching existing lines, including a trailing newline only if the file already uses one."
+        }
+        "rename_symbol" => {
+            "When renaming a symbol, search every file for all occurrences, update each one, and search again to confirm none remain."
+        }
+        "sum_two_files" => {
+            "When a task combines values from two files, read both files fully, do the arithmetic with a command, and answer with the number alone."
+        }
+        "move_file" => {
+            "To move a file, move it (do not copy and leave the original), then list both locations to confirm the source is gone and the target exists."
+        }
+        "multi_file_edit" => {
+            "For edits that span several files, list every file that needs changing first, edit them one by one, and verify each before finishing."
+        }
+        "typo_hunt" => {
+            "When hunting typos, read the whole file slowly, fix only genuine misspellings, and leave correct text exactly as it was."
+        }
+        "script_and_run" => {
+            "When asked to write a script and run it, create the script file, run it, and report its actual output rather than predicting it."
+        }
         _ => return None,
     })
 }
@@ -88,7 +131,9 @@ fn family_advice(family: &str) -> Option<&'static str> {
 /// Append `note`, evicting the oldest notes if needed to stay within the harness memory limits.
 /// Returns false when the note cannot fit at all or is already present.
 pub(super) fn push_note(h: &mut Harness, note: &str) -> bool {
-    if note.len() > MAX_NOTE_BYTES || h.memory.iter().any(|m| m == note) { return false; }
+    if note.len() > MAX_NOTE_BYTES || h.memory.iter().any(|m| m == note) {
+        return false;
+    }
     let total = |h: &Harness| h.memory.iter().map(String::len).sum::<usize>();
     let mut evict = 0;
     let mut bytes = total(h);
@@ -102,37 +147,75 @@ pub(super) fn push_note(h: &mut Harness, note: &str) -> bool {
 }
 
 fn mutation(name: &'static str, rationale: String, harness: Harness) -> Mutation {
-    Mutation { name, rationale, harness }
+    Mutation {
+        name,
+        rationale,
+        harness,
+    }
 }
 
 type Operator = fn(&Harness, &Context, &mut dyn RngCore) -> Vec<Mutation>;
 
 fn toggle_edit_mode(active: &Harness, ctx: &Context, _: &mut dyn RngCore) -> Vec<Mutation> {
     let current = active.edit_mode.unwrap_or(ctx.default_edit_mode);
-    let next = match current { EditModeConfig::Hashline => EditModeConfig::Replace, EditModeConfig::Replace => EditModeConfig::Hashline };
+    let next = match current {
+        EditModeConfig::Hashline => EditModeConfig::Replace,
+        EditModeConfig::Replace => EditModeConfig::Hashline,
+    };
     let mut h = active.clone();
     h.edit_mode = Some(next);
-    vec![mutation("toggle_edit_mode", format!("switch edit mode from {current:?} to {next:?}: the other format may suit this model's editing better"), h)]
+    vec![mutation(
+        "toggle_edit_mode",
+        format!(
+            "switch edit mode from {current:?} to {next:?}: the other format may suit this model's editing better"
+        ),
+        h,
+    )]
 }
 
 fn step_temperature(active: &Harness, _: &Context, _: &mut dyn RngCore) -> Vec<Mutation> {
     let t = active.temperature;
     let below = TEMPERATURES.iter().rev().find(|g| **g < t - 1e-9);
     let above = TEMPERATURES.iter().find(|g| **g > t + 1e-9);
-    [below, above].into_iter().flatten().map(|g| {
-        let mut h = active.clone();
-        h.temperature = *g;
-        mutation("temperature", format!("move temperature {t} -> {g} ({})", if *g < t { "more deterministic tool use" } else { "more exploration after failures" }), h)
-    }).collect()
+    [below, above]
+        .into_iter()
+        .flatten()
+        .map(|g| {
+            let mut h = active.clone();
+            h.temperature = *g;
+            mutation(
+                "temperature",
+                format!(
+                    "move temperature {t} -> {g} ({})",
+                    if *g < t {
+                        "more deterministic tool use"
+                    } else {
+                        "more exploration after failures"
+                    }
+                ),
+                h,
+            )
+        })
+        .collect()
 }
 
 fn scale_max_steps(active: &Harness, _: &Context, _: &mut dyn RngCore) -> Vec<Mutation> {
     let from = active.max_steps;
-    [(1.5, "more room to finish multi-step tasks"), (0.67, "a tighter budget stops aimless wandering")].into_iter().map(|(factor, why)| {
+    [
+        (1.5, "more room to finish multi-step tasks"),
+        (0.67, "a tighter budget stops aimless wandering"),
+    ]
+    .into_iter()
+    .map(|(factor, why)| {
         let mut h = active.clone();
         h.max_steps = ((f64::from(from) * factor).round() as u32).clamp(MIN_STEPS, MAX_STEPS);
-        mutation("max_steps", format!("max_steps {from} -> {}: {why}", h.max_steps), h)
-    }).collect()
+        mutation(
+            "max_steps",
+            format!("max_steps {from} -> {}: {why}", h.max_steps),
+            h,
+        )
+    })
+    .collect()
 }
 
 fn ablate_tool(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Mutation> {
@@ -156,11 +239,19 @@ fn restore_tool(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Mut
 }
 
 fn guidance(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Mutation> {
-    let mut options: Vec<Mutation> = guidance_variants().into_iter().filter(|(_, p)| *p != active.system_prompt).map(|(label, prompt)| {
-        let mut h = active.clone();
-        h.system_prompt = prompt;
-        mutation("guidance", format!("replace the system prompt with the '{label}' variant"), h)
-    }).collect();
+    let mut options: Vec<Mutation> = guidance_variants()
+        .into_iter()
+        .filter(|(_, p)| *p != active.system_prompt)
+        .map(|(label, prompt)| {
+            let mut h = active.clone();
+            h.system_prompt = prompt;
+            mutation(
+                "guidance",
+                format!("replace the system prompt with the '{label}' variant"),
+                h,
+            )
+        })
+        .collect();
     options.shuffle(rng);
     options
 }
@@ -177,40 +268,85 @@ fn failure_note(active: &Harness, ctx: &Context, _: &mut dyn RngCore) -> Vec<Mut
     }
     let mut ranked: Vec<_> = by_advice.into_iter().collect();
     ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0));
-    ranked.into_iter().filter_map(|(advice, (count, kinds))| {
-        let mut h = active.clone();
-        push_note(&mut h, advice).then(|| mutation("failure_note", format!("{count} tool-call form failures ({}): add a memory note addressing them", kinds.join(", ")), h))
-    }).collect()
+    ranked
+        .into_iter()
+        .filter_map(|(advice, (count, kinds))| {
+            let mut h = active.clone();
+            push_note(&mut h, advice).then(|| {
+                mutation(
+                    "failure_note",
+                    format!(
+                        "{count} tool-call form failures ({}): add a memory note addressing them",
+                        kinds.join(", ")
+                    ),
+                    h,
+                )
+            })
+        })
+        .collect()
 }
 
 fn family_note(active: &Harness, ctx: &Context, _: &mut dyn RngCore) -> Vec<Mutation> {
-    let mut weak: Vec<(&str, usize, usize)> = ctx.selfplay_rates.iter()
+    let mut weak: Vec<(&str, usize, usize)> = ctx
+        .selfplay_rates
+        .iter()
         .map(|(f, p, t)| (f.strip_prefix("selfplay:").unwrap_or(f), *p, *t))
         .filter(|(_, p, t)| *t > 0 && p * 2 < *t)
         .collect();
     weak.sort_by(|a, b| (a.1 * b.2).cmp(&(b.1 * a.2)).then(a.0.cmp(b.0)));
-    weak.into_iter().filter_map(|(family, passed, total)| {
-        let advice = family_advice(family)?;
-        let mut h = active.clone();
-        push_note(&mut h, advice).then(|| mutation("family_note", format!("self-play family {family} passes {passed}/{total}: add targeted advice"), h))
-    }).collect()
+    weak.into_iter()
+        .filter_map(|(family, passed, total)| {
+            let advice = family_advice(family)?;
+            let mut h = active.clone();
+            push_note(&mut h, advice).then(|| {
+                mutation(
+                    "family_note",
+                    format!(
+                        "self-play family {family} passes {passed}/{total}: add targeted advice"
+                    ),
+                    h,
+                )
+            })
+        })
+        .collect()
 }
 
-const OPERATORS: [Operator; 8] = [toggle_edit_mode, step_temperature, scale_max_steps, ablate_tool, restore_tool, guidance, failure_note, family_note];
+const OPERATORS: [Operator; 8] = [
+    toggle_edit_mode,
+    step_temperature,
+    scale_max_steps,
+    ablate_tool,
+    restore_tool,
+    guidance,
+    failure_note,
+    family_note,
+];
 
 /// Up to `limit` distinct valid mutations of `active`, at most one per operator, in an order
 /// determined by `rng`. Edits equal to the active harness, already tried, or rejected by
 /// `ctx.valid` are skipped; an operator whose first option is rejected falls back to its next one.
-pub fn candidates(active: &Harness, ctx: &Context, rng: &mut impl Rng, limit: usize) -> Vec<Mutation> {
+pub fn candidates(
+    active: &Harness,
+    ctx: &Context,
+    rng: &mut impl Rng,
+    limit: usize,
+) -> Vec<Mutation> {
     let mut seen: HashSet<String> = HashSet::from([harness_digest(active)]);
     let mut operators = OPERATORS;
     operators.shuffle(rng);
     let mut out = Vec::new();
     for operator in operators {
-        if out.len() >= limit { break; }
+        if out.len() >= limit {
+            break;
+        }
         for option in operator(active, ctx, rng) {
             let digest = harness_digest(&option.harness);
-            if ctx.tried.contains(&digest) || seen.contains(&digest) || !(ctx.valid)(&option.harness) { continue; }
+            if ctx.tried.contains(&digest)
+                || seen.contains(&digest)
+                || !(ctx.valid)(&option.harness)
+            {
+                continue;
+            }
             seen.insert(digest);
             out.push(option);
             break;
@@ -224,12 +360,29 @@ mod tests {
     use super::*;
     use rand::{SeedableRng, rngs::StdRng};
 
-    fn ctx<'a>(kinds: &'a BTreeMap<String, usize>, rates: &'a [(String, usize, usize)], tried: &'a HashSet<String>, valid: &'a dyn Fn(&Harness) -> bool) -> Context<'a> {
-        Context { failure_kinds: kinds, selfplay_rates: rates, default_edit_mode: EditModeConfig::Hashline, tried, valid }
+    fn ctx<'a>(
+        kinds: &'a BTreeMap<String, usize>,
+        rates: &'a [(String, usize, usize)],
+        tried: &'a HashSet<String>,
+        valid: &'a dyn Fn(&Harness) -> bool,
+    ) -> Context<'a> {
+        Context {
+            failure_kinds: kinds,
+            selfplay_rates: rates,
+            default_edit_mode: EditModeConfig::Hashline,
+            tried,
+            valid,
+        }
     }
 
     fn signals() -> (BTreeMap<String, usize>, Vec<(String, usize, usize)>) {
-        (BTreeMap::from([("text_call".into(), 4), ("schema".into(), 2)]), vec![("selfplay:read_line".into(), 1, 6), ("selfplay:move_file".into(), 5, 5)])
+        (
+            BTreeMap::from([("text_call".into(), 4), ("schema".into(), 2)]),
+            vec![
+                ("selfplay:read_line".into(), 1, 6),
+                ("selfplay:move_file".into(), 5, 5),
+            ],
+        )
     }
 
     fn all(active: &Harness, c: &Context, seed: u64) -> Vec<Mutation> {
@@ -248,11 +401,26 @@ mod tests {
         let mut active = Harness::default();
         active.tools.retain(|t| t != "grep");
         let out = all(&active, &ctx(&kinds, &rates, &tried, &yes), 1);
-        assert_eq!(names(&out), HashSet::from(["toggle_edit_mode", "temperature", "max_steps", "ablate_tool", "restore_tool", "guidance", "failure_note", "family_note"]));
+        assert_eq!(
+            names(&out),
+            HashSet::from([
+                "toggle_edit_mode",
+                "temperature",
+                "max_steps",
+                "ablate_tool",
+                "restore_tool",
+                "guidance",
+                "failure_note",
+                "family_note"
+            ])
+        );
         assert_eq!(out.len(), 8);
         let digests: HashSet<_> = out.iter().map(|m| harness_digest(&m.harness)).collect();
         assert_eq!(digests.len(), out.len());
-        assert!(out.iter().all(|m| m.harness != active && !m.rationale.is_empty()));
+        assert!(
+            out.iter()
+                .all(|m| m.harness != active && !m.rationale.is_empty())
+        );
         let restored = out.iter().find(|m| m.name == "restore_tool").unwrap();
         assert!(restored.harness.tools.contains(&"grep".to_string()));
         let ablated = out.iter().find(|m| m.name == "ablate_tool").unwrap();
@@ -261,11 +429,21 @@ mod tests {
 
     #[test]
     fn no_signals_means_no_note_operators() {
-        let (kinds, rates) = (BTreeMap::new(), vec![("selfplay:read_line".into(), 3, 4), ("selfplay:nonexistent_family".into(), 0, 9)]);
+        let (kinds, rates) = (
+            BTreeMap::new(),
+            vec![
+                ("selfplay:read_line".into(), 3, 4),
+                ("selfplay:nonexistent_family".into(), 0, 9),
+            ],
+        );
         let tried = HashSet::new();
         let yes = |_: &Harness| true;
         let out = all(&Harness::default(), &ctx(&kinds, &rates, &tried, &yes), 1);
-        assert!(!names(&out).contains("failure_note") && !names(&out).contains("family_note") && !names(&out).contains("restore_tool"));
+        assert!(
+            !names(&out).contains("failure_note")
+                && !names(&out).contains("family_note")
+                && !names(&out).contains("restore_tool")
+        );
     }
 
     #[test]
@@ -274,14 +452,31 @@ mod tests {
         let tried = HashSet::new();
         let yes = |_: &Harness| true;
         let toggled = |active: &Harness, default| {
-            let c = Context { default_edit_mode: default, ..ctx(&kinds, &rates, &tried, &yes) };
-            all(active, &c, 1).into_iter().find(|m| m.name == "toggle_edit_mode").unwrap().harness.edit_mode
+            let c = Context {
+                default_edit_mode: default,
+                ..ctx(&kinds, &rates, &tried, &yes)
+            };
+            all(active, &c, 1)
+                .into_iter()
+                .find(|m| m.name == "toggle_edit_mode")
+                .unwrap()
+                .harness
+                .edit_mode
         };
         let mut h = Harness::default();
-        assert_eq!(toggled(&h, EditModeConfig::Hashline), Some(EditModeConfig::Replace));
-        assert_eq!(toggled(&h, EditModeConfig::Replace), Some(EditModeConfig::Hashline));
+        assert_eq!(
+            toggled(&h, EditModeConfig::Hashline),
+            Some(EditModeConfig::Replace)
+        );
+        assert_eq!(
+            toggled(&h, EditModeConfig::Replace),
+            Some(EditModeConfig::Hashline)
+        );
         h.edit_mode = Some(EditModeConfig::Replace);
-        assert_eq!(toggled(&h, EditModeConfig::Replace), Some(EditModeConfig::Hashline));
+        assert_eq!(
+            toggled(&h, EditModeConfig::Replace),
+            Some(EditModeConfig::Hashline)
+        );
     }
 
     #[test]
@@ -299,7 +494,12 @@ mod tests {
             for _ in 0..4 {
                 let c = ctx(&kinds, &rates, &tried, &yes);
                 match all(&h, &c, 1).into_iter().find(|m| m.name == "temperature") {
-                    Some(m) => { tried.insert(harness_digest(&m.harness)); if seen.insert(m.harness.temperature.to_bits()) { out.push(m.harness.temperature); } }
+                    Some(m) => {
+                        tried.insert(harness_digest(&m.harness));
+                        if seen.insert(m.harness.temperature.to_bits()) {
+                            out.push(m.harness.temperature);
+                        }
+                    }
                     None => break,
                 }
             }
@@ -318,10 +518,16 @@ mod tests {
         let tried = HashSet::new();
         let yes = |_: &Harness| true;
         let steps = |from: u32| -> Vec<u32> {
-            let h = Harness { max_steps: from, ..Harness::default() };
+            let h = Harness {
+                max_steps: from,
+                ..Harness::default()
+            };
             let mut tried = tried.clone();
             let mut out = vec![];
-            while let Some(m) = all(&h, &ctx(&kinds, &rates, &tried, &yes), 1).into_iter().find(|m| m.name == "max_steps") {
+            while let Some(m) = all(&h, &ctx(&kinds, &rates, &tried, &yes), 1)
+                .into_iter()
+                .find(|m| m.name == "max_steps")
+            {
                 tried.insert(harness_digest(&m.harness));
                 out.push(m.harness.max_steps);
             }
@@ -353,9 +559,14 @@ mod tests {
         let mut rounds = 0;
         loop {
             let out = all(&active, &ctx(&kinds, &rates, &tried, &yes), rounds);
-            if out.is_empty() { break; }
+            if out.is_empty() {
+                break;
+            }
             for m in &out {
-                assert!(tried.insert(harness_digest(&m.harness)), "repeated an already-tried harness");
+                assert!(
+                    tried.insert(harness_digest(&m.harness)),
+                    "repeated an already-tried harness"
+                );
             }
             rounds += 1;
             assert!(rounds < 50, "operators never exhaust");
@@ -370,7 +581,12 @@ mod tests {
         let yes = |_: &Harness| true;
         let c = ctx(&kinds, &rates, &tried, &yes);
         let active = Harness::default();
-        let run = |seed| all(&active, &c, seed).iter().map(|m| (m.name, harness_digest(&m.harness))).collect::<Vec<_>>();
+        let run = |seed| {
+            all(&active, &c, seed)
+                .iter()
+                .map(|m| (m.name, harness_digest(&m.harness)))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(run(5), run(5));
         assert!((0..10).any(|s| run(s) != run(5)));
     }
@@ -384,7 +600,10 @@ mod tests {
         let active = Harness::default();
         assert!(candidates(&active, &c, &mut StdRng::seed_from_u64(1), 0).is_empty());
         for limit in [1, 3, 5] {
-            assert_eq!(candidates(&active, &c, &mut StdRng::seed_from_u64(1), limit).len(), limit);
+            assert_eq!(
+                candidates(&active, &c, &mut StdRng::seed_from_u64(1), limit).len(),
+                limit
+            );
         }
     }
 
@@ -395,16 +614,34 @@ mod tests {
         let yes = |_: &Harness| true;
         let c = ctx(&kinds, &rates, &tried, &yes);
         // Full by count: oldest note is evicted.
-        let full = Harness { memory: (0..32).map(|i| format!("old note {i}")).collect(), ..Harness::default() };
+        let full = Harness {
+            memory: (0..32).map(|i| format!("old note {i}")).collect(),
+            ..Harness::default()
+        };
         let out = all(&full, &c, 1);
         let note = out.iter().find(|m| m.name == "failure_note").unwrap();
         assert_eq!(note.harness.memory.len(), 32);
         assert_eq!(note.harness.memory[0], "old note 1");
-        assert!(note.harness.memory.last().unwrap().contains("tool-calling interface"));
+        assert!(
+            note.harness
+                .memory
+                .last()
+                .unwrap()
+                .contains("tool-calling interface")
+        );
         // Full by bytes: enough old notes go to fit the new one.
-        let heavy = Harness { memory: vec!["x".repeat(8192), "y".repeat(8192)], ..Harness::default() };
-        for m in all(&heavy, &c, 1).iter().filter(|m| m.name.ends_with("_note")) {
-            assert!(m.harness.memory.len() <= 32 && m.harness.memory.iter().map(String::len).sum::<usize>() <= 16384);
+        let heavy = Harness {
+            memory: vec!["x".repeat(8192), "y".repeat(8192)],
+            ..Harness::default()
+        };
+        for m in all(&heavy, &c, 1)
+            .iter()
+            .filter(|m| m.name.ends_with("_note"))
+        {
+            assert!(
+                m.harness.memory.len() <= 32
+                    && m.harness.memory.iter().map(String::len).sum::<usize>() <= 16384
+            );
             assert!(!m.harness.memory.contains(&"x".repeat(8192)));
         }
         // A note already present is not added again.
@@ -415,19 +652,29 @@ mod tests {
         assert_eq!(again.memory, vec!["same"]);
     }
 
-
     #[test]
     fn guidance_can_reset_to_the_default_prompt() {
         let (kinds, rates) = signals();
         let tried = HashSet::new();
         let yes = |_: &Harness| true;
         let c = ctx(&kinds, &rates, &tried, &yes);
-        let active = Harness { system_prompt: "something odd".into(), ..Harness::default() };
+        let active = Harness {
+            system_prompt: "something odd".into(),
+            ..Harness::default()
+        };
         let mut tried_prompts = HashSet::new();
         let mut tried = HashSet::new();
         for _ in 0..8 {
-            let c2 = Context { tried: &tried, ..ctx(&kinds, &rates, &tried, &yes) };
-            let Some(m) = all(&active, &c2, 2).into_iter().find(|m| m.name == "guidance") else { break };
+            let c2 = Context {
+                tried: &tried,
+                ..ctx(&kinds, &rates, &tried, &yes)
+            };
+            let Some(m) = all(&active, &c2, 2)
+                .into_iter()
+                .find(|m| m.name == "guidance")
+            else {
+                break;
+            };
             tried.insert(harness_digest(&m.harness));
             tried_prompts.insert(m.harness.system_prompt);
         }

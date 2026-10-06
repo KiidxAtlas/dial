@@ -103,11 +103,20 @@ fn receive_callback(listener: &TcpListener, deadline: Instant) -> Result<String>
                 // ignore the read timeout below and fail instantly if the request has not arrived yet.
                 stream
                     .set_nonblocking(false)
-                    .and_then(|()| stream.set_read_timeout(Some(deadline.saturating_duration_since(Instant::now()))))
-                    .map_err(|_| anyhow::anyhow!("could not configure the sign-in callback connection"))?;
+                    .and_then(|()| {
+                        stream.set_read_timeout(Some(
+                            deadline.saturating_duration_since(Instant::now()),
+                        ))
+                    })
+                    .map_err(|_| {
+                        anyhow::anyhow!("could not configure the sign-in callback connection")
+                    })?;
                 let result = read_callback(&mut stream);
                 let (status, message) = match &result {
-                    Ok(_) => ("200 OK", "OpenRouter sign-in complete. You may close this page."),
+                    Ok(_) => (
+                        "200 OK",
+                        "OpenRouter sign-in complete. You may close this page.",
+                    ),
                     Err(_) => ("400 Bad Request", "Invalid OpenRouter sign-in callback."),
                 };
                 let response = format!(
@@ -163,7 +172,9 @@ fn read_callback(stream: &mut TcpStream) -> Result<String> {
     if parts.next() != Some("GET") {
         bail!("malformed OpenRouter callback request");
     }
-    let target = parts.next().ok_or_else(|| anyhow::anyhow!("malformed OpenRouter callback request"))?;
+    let target = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("malformed OpenRouter callback request"))?;
     if parts.next().is_none() || parts.next().is_some() {
         bail!("malformed OpenRouter callback request");
     }
@@ -183,7 +194,10 @@ fn parse_callback_target(target: &str) -> Result<String> {
                 bail!("malformed OpenRouter callback code");
             }
             let value = decode_component(value)?;
-            if value.is_empty() || value.len() > 4096 || !value.bytes().all(|b| b.is_ascii_graphic()) {
+            if value.is_empty()
+                || value.len() > 4096
+                || !value.bytes().all(|b| b.is_ascii_graphic())
+            {
                 bail!("malformed OpenRouter callback code");
             }
             code = Some(value);
@@ -198,19 +212,30 @@ fn decode_component(value: &str) -> Result<String> {
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
-            b'+' => { decoded.push(b' '); index += 1; }
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
             b'%' => {
-                if index + 2 >= bytes.len() { bail!("malformed OpenRouter callback encoding"); }
-                let high = hex(bytes[index + 1]).ok_or_else(|| anyhow::anyhow!("malformed OpenRouter callback encoding"))?;
-                let low = hex(bytes[index + 2]).ok_or_else(|| anyhow::anyhow!("malformed OpenRouter callback encoding"))?;
+                if index + 2 >= bytes.len() {
+                    bail!("malformed OpenRouter callback encoding");
+                }
+                let high = hex(bytes[index + 1])
+                    .ok_or_else(|| anyhow::anyhow!("malformed OpenRouter callback encoding"))?;
+                let low = hex(bytes[index + 2])
+                    .ok_or_else(|| anyhow::anyhow!("malformed OpenRouter callback encoding"))?;
                 decoded.push(high * 16 + low);
                 index += 3;
             }
-            byte if byte.is_ascii() => { decoded.push(byte); index += 1; }
+            byte if byte.is_ascii() => {
+                decoded.push(byte);
+                index += 1;
+            }
             _ => bail!("malformed OpenRouter callback encoding"),
         }
     }
-    String::from_utf8(decoded).map_err(|_| anyhow::anyhow!("malformed OpenRouter callback encoding"))
+    String::from_utf8(decoded)
+        .map_err(|_| anyhow::anyhow!("malformed OpenRouter callback encoding"))
 }
 
 fn hex(byte: u8) -> Option<u8> {
@@ -266,8 +291,14 @@ fn validate_key_response(value: &serde_json::Value) -> Result<String> {
     let key = value
         .get("key")
         .and_then(serde_json::Value::as_str)
-        .filter(|key| key.starts_with("sk-or-") && key.len() > "sk-or-".len() && key.bytes().all(|b| b.is_ascii_graphic()))
-        .ok_or_else(|| anyhow::anyhow!("OpenRouter token response did not contain a valid API key"))?;
+        .filter(|key| {
+            key.starts_with("sk-or-")
+                && key.len() > "sk-or-".len()
+                && key.bytes().all(|b| b.is_ascii_graphic())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("OpenRouter token response did not contain a valid API key")
+        })?;
     Ok(key.to_owned())
 }
 
@@ -293,10 +324,15 @@ mod tests {
                 reader.read_line(&mut line).unwrap();
                 let lower = line.to_ascii_lowercase();
                 if lower.starts_with("content-length:") {
-                    body_len = lower["content-length:".len()..].trim().parse::<usize>().unwrap();
+                    body_len = lower["content-length:".len()..]
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
                 }
                 request.push_str(&line);
-                if line == "\r\n" || line.is_empty() { break; }
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
             }
             let mut payload = vec![0; body_len];
             reader.read_exact(&mut payload).unwrap();
@@ -312,9 +348,13 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || receive_callback(&listener, Instant::now() + Duration::from_secs(10)));
+        let server = thread::spawn(move || {
+            receive_callback(&listener, Instant::now() + Duration::from_secs(10))
+        });
         let mut browser = TcpStream::connect(address).unwrap();
-        browser.write_all(b"GET /callback?code=callback-code HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        browser
+            .write_all(b"GET /callback?code=callback-code HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         let mut response = String::new();
         browser.read_to_string(&mut response).unwrap();
         assert!(response.contains("OpenRouter sign-in complete"));
@@ -322,7 +362,12 @@ mod tests {
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
-        assert!(receive_callback(&listener, Instant::now()).unwrap_err().to_string().contains("timed out"));
+        assert!(
+            receive_callback(&listener, Instant::now())
+                .unwrap_err()
+                .to_string()
+                .contains("timed out")
+        );
     }
 
     #[test]
@@ -332,13 +377,20 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || receive_callback(&listener, Instant::now() + Duration::from_secs(10)));
+        let server = thread::spawn(move || {
+            receive_callback(&listener, Instant::now() + Duration::from_secs(10))
+        });
         let mut browser = TcpStream::connect(address).unwrap();
         thread::sleep(Duration::from_millis(300));
-        browser.write_all(b"GET /callback?code=late-code HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        browser
+            .write_all(b"GET /callback?code=late-code HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         let mut response = String::new();
         browser.read_to_string(&mut response).unwrap();
-        assert!(response.contains("OpenRouter sign-in complete"), "{response}");
+        assert!(
+            response.contains("OpenRouter sign-in complete"),
+            "{response}"
+        );
         assert_eq!(server.join().unwrap().unwrap(), "late-code");
     }
 
@@ -357,23 +409,35 @@ mod tests {
         assert_eq!(body["code_challenge_method"], "S256");
 
         let (url, job) = token_server(403, r#"{"error":"do not expose this body"}"#);
-        let error = exchange_code_at(&url, "private-code", "private-verifier").unwrap_err().to_string();
+        let error = exchange_code_at(&url, "private-code", "private-verifier")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("rejected"));
-        assert!(!error.contains("private-code") && !error.contains("private-verifier") && !error.contains("do not expose"));
+        assert!(
+            !error.contains("private-code")
+                && !error.contains("private-verifier")
+                && !error.contains("do not expose")
+        );
         job.join().unwrap();
     }
 
     #[test]
     fn authorization_url_contains_documented_pkce_parameters() {
         let url = authorization_url("challenge-value");
-        assert_eq!(url, "https://openrouter.ai/auth?callback_url=http%3A%2F%2Flocalhost%3A54549%2Fcallback&code_challenge=challenge-value&code_challenge_method=S256&key_label=dial");
+        assert_eq!(
+            url,
+            "https://openrouter.ai/auth?callback_url=http%3A%2F%2Flocalhost%3A54549%2Fcallback&code_challenge=challenge-value&code_challenge_method=S256&key_label=dial"
+        );
         assert!(!url.contains("state="));
         assert!(!url.contains("client_id="));
     }
 
     #[test]
     fn callback_accepts_exact_path_and_decodes_code() {
-        assert_eq!(parse_callback_target("/callback?other=x&code=a%2Bb%2Fc").unwrap(), "a+b/c");
+        assert_eq!(
+            parse_callback_target("/callback?other=x&code=a%2Bb%2Fc").unwrap(),
+            "a+b/c"
+        );
         assert!(parse_callback_target("/elsewhere?code=abc").is_err());
         assert!(parse_callback_target("/callback?code=x&code=y").is_err());
         assert!(parse_callback_target("/callback?error=access_denied").is_err());
@@ -381,8 +445,16 @@ mod tests {
 
     #[test]
     fn token_response_requires_nonempty_openrouter_key() {
-        assert_eq!(validate_key_response(&serde_json::json!({"key":"sk-or-test"})).unwrap(), "sk-or-test");
-        for value in [serde_json::json!({}), serde_json::json!({"key": 1}), serde_json::json!({"key":""}), serde_json::json!({"key":"sk-test"})] {
+        assert_eq!(
+            validate_key_response(&serde_json::json!({"key":"sk-or-test"})).unwrap(),
+            "sk-or-test"
+        );
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"key": 1}),
+            serde_json::json!({"key":""}),
+            serde_json::json!({"key":"sk-test"}),
+        ] {
             assert!(validate_key_response(&value).is_err());
         }
     }

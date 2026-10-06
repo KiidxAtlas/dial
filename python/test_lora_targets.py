@@ -38,6 +38,68 @@ class Model(nn.Module):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_training_pause_restores_optimizer_rng_and_batch_cursor(self):
+        self.check_training_pause("sft", 2)
+
+    def test_preference_phase_resumes_without_repeating_sft(self):
+        self.check_training_pause("preference", 1, True)
+
+    def check_training_pause(self, phase, iteration, preference=False):
+        import dial_worker as worker
+        from unittest.mock import patch
+        from mlx_lm.lora import CONFIG_DEFAULTS
+        import copy
+        mx.random.seed(42)
+        original = Model(("q_proj", "out_proj"))
+        weights = dict(tree_flatten(original.parameters()))
+        mx.eval(weights)
+        keys, ids = query_targets(original, 2)
+        expected = expected_weights(original, ids, 2)
+        args = copy.deepcopy(CONFIG_DEFAULTS)
+        args.update(model="test", num_layers=2, iters=4, batch_size=1, max_seq_length=32,
+                    learning_rate=1e-3, lora_parameters={"rank":2,"scale":20.0,"dropout":0.0,"keys":keys})
+        dataset = [([1,2,3,4],1), ([2,3,4,5],1), ([3,4,5,6],1)]
+        def model():
+            result=Model(("q_proj","out_proj"))
+            result.load_weights(list(weights.items()))
+            return result
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            data=root / "data.jsonl"
+            data.write_text("verified immutable examples")
+            request={"model":"test","resume_adapter":None,"iters":4,"batch_size":1,"num_layers":2,
+                     "rank":2,"max_seq_length":32,"train_data":str(data),"valid_data":str(data),
+                     "pause_file":str(root / "pause"),"progress_file":str(root / "progress.json"),
+                     "output_dir":str(root / "baseline"),"resume_checkpoint":False}
+            baseline=model()
+            encoded=[(dataset[i % 3],dataset[(i+1) % 3]) for i in range(12)]
+            def run(target):
+                with patch.object(worker,"tokenize_preference_pairs",return_value=encoded):
+                    worker.pausable_train(request,target,None,dataset,dataset,[True] if preference else [],args,expected)
+            run(baseline)
+            request["output_dir"]=str(root / "resumed")
+            atomic=worker.atomic_json
+            def pause_after_two(path,value):
+                atomic(path,value)
+                if Path(path)==root / "progress.json" and value["phase"]==phase and value["iteration"]==iteration:
+                    (root / "pause").touch()
+            with patch.object(worker,"atomic_json",pause_after_two):
+                with self.assertRaises(worker.TrainingPaused):
+                    run(model())
+            checkpoint=json.loads((root / "resumed/resume.json").read_text())
+            self.assertEqual(checkpoint["completed"],iteration)
+            self.assertEqual(checkpoint["phase"],phase)
+            (root / "pause").unlink()
+            request["resume_checkpoint"]=True
+            resumed=model()
+            run(resumed)
+            for name,tensor in tree_flatten(baseline.trainable_parameters()):
+                actual=dict(tree_flatten(resumed.trainable_parameters()))[name]
+                self.assertLess(float(mx.max(mx.abs(tensor-actual)).item()),1e-6,name)
+            data.write_text("changed examples")
+            with self.assertRaisesRegex(worker.RequestError,"inputs changed"):
+                run(model())
+
     def test_hybrid_and_fused_gradient_save_reload(self):
         for keys in [("q_proj", "out_proj"), ("qkv_proj", "qkv_proj"), ("q_proj", "q_proj")]:
             with self.subTest(keys=keys):

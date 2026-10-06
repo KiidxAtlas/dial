@@ -23,7 +23,11 @@ pub(crate) struct Walk<'a> {
 
 impl<'a> Walk<'a> {
     pub fn new(ws: &'a Workspace) -> Self {
-        Walk { ws, entries: 0, truncated: false }
+        Walk {
+            ws,
+            entries: 0,
+            truncated: false,
+        }
     }
 
     /// Visit every regular file under `start`. `visit` returns false to stop.
@@ -34,7 +38,12 @@ impl<'a> Walk<'a> {
 
     /// Keep only directories on the way to, or below, `prefix`. Start at the original root so
     /// pruning cannot bypass ancestor ignore rules, skipped directories, or symlink checks.
-    pub fn run_with_prefix(&mut self, start: &Path, prefix: &Path, visit: &mut dyn FnMut(&Path) -> bool) {
+    pub fn run_with_prefix(
+        &mut self,
+        start: &Path,
+        prefix: &Path,
+        visit: &mut dyn FnMut(&Path) -> bool,
+    ) {
         let prefix = prefix.to_path_buf();
         let root = self.ws.root.clone();
         let walker = WalkBuilder::new(start)
@@ -61,7 +70,9 @@ impl<'a> Walk<'a> {
                 self.truncated = true;
                 return;
             }
-            let Some(kind) = entry.file_type() else { continue };
+            let Some(kind) = entry.file_type() else {
+                continue;
+            };
             if kind.is_dir() && entry.depth() >= MAX_WALK_DEPTH {
                 self.truncated = true;
             } else if kind.is_file() && !visit(entry.path()) {

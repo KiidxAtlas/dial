@@ -12,9 +12,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Condvar, Mutex, MutexGuard};
@@ -80,7 +80,9 @@ struct Shared {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Shared {
@@ -101,14 +103,22 @@ impl Shared {
                 };
                 let _ = self.send(&reply);
             }
-            (Some("textDocument/publishDiagnostics"), None) => self.store_diagnostics(&message["params"]),
+            (Some("textDocument/publishDiagnostics"), None) => {
+                self.store_diagnostics(&message["params"])
+            }
             (Some(_), None) => {}
             (None, Some(id)) => {
-                let Some(tx) = id.as_i64().and_then(|id| lock(&self.pending).remove(&id)) else { return };
+                let Some(tx) = id.as_i64().and_then(|id| lock(&self.pending).remove(&id)) else {
+                    return;
+                };
                 let reply = match message.get("error") {
                     Some(error) => Err(RpcError {
                         code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
-                        message: error.get("message").and_then(Value::as_str).unwrap_or("unknown error").to_owned(),
+                        message: error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error")
+                            .to_owned(),
                     }),
                     None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
                 };
@@ -119,8 +129,18 @@ impl Shared {
     }
 
     fn store_diagnostics(&self, params: &Value) {
-        let Some(path) = params.get("uri").and_then(Value::as_str).and_then(path_from_uri) else { return };
-        let items = params.get("diagnostics").and_then(Value::as_array).cloned().unwrap_or_default();
+        let Some(path) = params
+            .get("uri")
+            .and_then(Value::as_str)
+            .and_then(path_from_uri)
+        else {
+            return;
+        };
+        let items = params
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let mut diagnostics = lock(&self.diagnostics);
         diagnostics.counter += 1;
         let counter = diagnostics.counter;
@@ -141,10 +161,17 @@ impl Shared {
 
 /// Reply to a request the server sent us. Servers only need to see that we are alive and have
 /// nothing to configure; anything we do not understand gets `MethodNotFound`.
-fn answer_server_request(method: &str, params: &Value, root_uri: &str) -> Result<Value, (i64, &'static str)> {
+fn answer_server_request(
+    method: &str,
+    params: &Value,
+    root_uri: &str,
+) -> Result<Value, (i64, &'static str)> {
     match method {
         "workspace/configuration" => {
-            let count = params.get("items").and_then(Value::as_array).map_or(0, Vec::len);
+            let count = params
+                .get("items")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
             Ok(Value::Array(vec![Value::Null; count]))
         }
         "workspace/workspaceFolders" => Ok(json!([{"uri": root_uri, "name": "workspace"}])),
@@ -194,7 +221,13 @@ pub struct Client {
 
 impl Client {
     /// Start `program` with `args` in `root` and run the handshake.
-    pub fn spawn(name: &str, program: &Path, args: &[String], root: &Path, timeouts: Timeouts) -> Result<Self> {
+    pub fn spawn(
+        name: &str,
+        program: &Path,
+        args: &[String],
+        root: &Path,
+        timeouts: Timeouts,
+    ) -> Result<Self> {
         let mut child = Command::new(program)
             .args(args)
             .current_dir(root)
@@ -209,7 +242,14 @@ impl Client {
             kill_group(&mut child);
             bail!("{name}: could not attach to the server's stdio");
         };
-        Self::connect(name, root, Box::new(stdout), Box::new(stdin), Some(child), timeouts)
+        Self::connect(
+            name,
+            root,
+            Box::new(stdout),
+            Box::new(stdin),
+            Some(child),
+            timeouts,
+        )
     }
 
     /// Run the handshake over an existing stream pair. Dropping the client tears the server down:
@@ -232,7 +272,9 @@ impl Client {
             root_uri: root_uri.clone(),
         });
         let reader = std::sync::Arc::clone(&shared);
-        thread::Builder::new().name(format!("dial-lsp-{name}")).spawn(move || reader_loop(&reader, input))?;
+        thread::Builder::new()
+            .name(format!("dial-lsp-{name}"))
+            .spawn(move || reader_loop(&reader, input))?;
         let mut client = Self {
             name: name.to_owned(),
             shared,
@@ -248,7 +290,10 @@ impl Client {
     }
 
     fn initialize(&self, root: &Path, root_uri: &str) -> Result<()> {
-        let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("workspace");
+        let name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace");
         let params = json!({
             "processId": std::process::id(),
             "clientInfo": {"name": "dial"},
@@ -310,9 +355,15 @@ impl Client {
             Err(RecvTimeoutError::Timeout) => {
                 lock(&self.shared.pending).remove(&id);
                 let _ = self.notify("$/cancelRequest", json!({"id": id}));
-                bail!("{} did not answer {method} within {}s", self.name, limit.as_secs().max(1))
+                bail!(
+                    "{} did not answer {method} within {}s",
+                    self.name,
+                    limit.as_secs().max(1)
+                )
             }
-            Err(RecvTimeoutError::Disconnected) => bail!("{} exited while handling {method}", self.name),
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("{} exited while handling {method}", self.name)
+            }
         }
     }
 
@@ -328,7 +379,14 @@ impl Client {
                     "textDocument/didOpen",
                     json!({"textDocument": {"uri": uri, "languageId": language_id, "version": 1, "text": text}}),
                 )?;
-                docs.insert(path.to_owned(), OpenDoc { version: 1, hash, language_id: language_id.to_owned() });
+                docs.insert(
+                    path.to_owned(),
+                    OpenDoc {
+                        version: 1,
+                        hash,
+                        language_id: language_id.to_owned(),
+                    },
+                );
             }
             Some(doc) if doc.hash == hash => return Ok(false),
             Some(doc) => {
@@ -363,13 +421,19 @@ impl Client {
 
     pub fn close_document(&self, path: &Path) {
         if lock(&self.docs).remove(path).is_some() {
-            let _ = self.notify("textDocument/didClose", json!({"textDocument": {"uri": uri_from_path(path)}}));
+            let _ = self.notify(
+                "textDocument/didClose",
+                json!({"textDocument": {"uri": uri_from_path(path)}}),
+            );
         }
     }
 
     /// Counter value of the last publish for `path` (0 if none yet).
     pub fn diagnostics_mark(&self, path: &Path) -> u64 {
-        lock(&self.shared.diagnostics).by_file.get(path).map_or(0, |(seq, _)| *seq)
+        lock(&self.shared.diagnostics)
+            .by_file
+            .get(path)
+            .map_or(0, |(seq, _)| *seq)
     }
 
     /// Diagnostics for `path`. When `fresh` (the document was just opened or changed) wait for a
@@ -405,8 +469,15 @@ impl Client {
         done: impl Fn(&Diagnostics) -> bool,
     ) -> MutexGuard<'a, Diagnostics> {
         while !done(&guard) && self.is_alive() {
-            let Some(left) = until.checked_duration_since(Instant::now()) else { break };
-            guard = self.shared.published.wait_timeout(guard, left).unwrap_or_else(|p| p.into_inner()).0;
+            let Some(left) = until.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            guard = self
+                .shared
+                .published
+                .wait_timeout(guard, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
         }
         guard
     }
@@ -427,7 +498,9 @@ impl Drop for Client {
             }
             let _ = self.notify("exit", Value::Null);
         }
-        let Some(mut child) = lock(&self.child).take() else { return };
+        let Some(mut child) = lock(&self.child).take() else {
+            return;
+        };
         let deadline = Instant::now() + self.timeouts.shutdown;
         while Instant::now() < deadline {
             if matches!(child.try_wait(), Ok(Some(_))) {
@@ -446,15 +519,33 @@ mod tests {
     #[test]
     fn server_requests_get_empty_but_well_formed_replies() {
         let root = "file:///work";
-        let config = answer_server_request("workspace/configuration", &json!({"items": [{}, {}, {}]}), root);
+        let config = answer_server_request(
+            "workspace/configuration",
+            &json!({"items": [{}, {}, {}]}),
+            root,
+        );
         assert_eq!(config.unwrap(), json!([null, null, null]));
-        let folders = answer_server_request("workspace/workspaceFolders", &Value::Null, root).unwrap();
+        let folders =
+            answer_server_request("workspace/workspaceFolders", &Value::Null, root).unwrap();
         assert_eq!(folders[0]["uri"], root);
-        for method in ["window/workDoneProgress/create", "client/registerCapability", "client/unregisterCapability"] {
-            assert_eq!(answer_server_request(method, &Value::Null, root).unwrap(), Value::Null, "{method}");
+        for method in [
+            "window/workDoneProgress/create",
+            "client/registerCapability",
+            "client/unregisterCapability",
+        ] {
+            assert_eq!(
+                answer_server_request(method, &Value::Null, root).unwrap(),
+                Value::Null,
+                "{method}"
+            );
         }
         let apply = answer_server_request("workspace/applyEdit", &Value::Null, root).unwrap();
         assert_eq!(apply["applied"], false);
-        assert_eq!(answer_server_request("custom/thing", &Value::Null, root).unwrap_err().0, -32601);
+        assert_eq!(
+            answer_server_request("custom/thing", &Value::Null, root)
+                .unwrap_err()
+                .0,
+            -32601
+        );
     }
 }

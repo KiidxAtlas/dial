@@ -25,7 +25,9 @@ pub(super) fn apply(reply: &mut Reply) {
     if !reply.tool_calls.is_empty() {
         return;
     }
-    let Some((text, calls)) = extract(&reply.text) else { return };
+    let Some((text, calls)) = extract(&reply.text) else {
+        return;
+    };
     reply.text = text;
     reply.tool_calls = calls;
     reply.finish_reason = "tool_calls".to_string();
@@ -34,11 +36,19 @@ pub(super) fn apply(reply: &mut Reply) {
 /// The remaining text and the calls found, or `None` when there are none.
 pub(super) fn extract(text: &str) -> Option<(String, Vec<ToolCall>)> {
     let (segments, calls) = extract_tagged(text);
-    let (segments, calls) = if calls.is_empty() { extract_fenced(text) } else { (segments, calls) };
+    let (segments, calls) = if calls.is_empty() {
+        extract_fenced(text)
+    } else {
+        (segments, calls)
+    };
     if calls.is_empty() {
         return None;
     }
-    let kept: Vec<&str> = segments.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let kept: Vec<&str> = segments
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     Some((kept.join("\n"), calls))
 }
 
@@ -62,7 +72,12 @@ fn call_id(index: usize) -> String {
 }
 
 fn malformed(index: usize, name: String) -> ToolCall {
-    ToolCall { id: call_id(index), name, arguments: Value::Null, malformed_arguments: true }
+    ToolCall {
+        id: call_id(index),
+        name,
+        arguments: Value::Null,
+        malformed_arguments: true,
+    }
 }
 
 /// Parse the text following an opening tag. Returns the call and how many bytes
@@ -76,7 +91,11 @@ fn parse_block(after: &str, index: usize) -> (ToolCall, usize) {
         let end = lead + values.byte_offset();
         let tail = &after[end..];
         let padding = tail.len() - tail.trim_start().len();
-        let consumed = if tail[padding..].starts_with(CLOSE) { end + padding + CLOSE.len() } else { end };
+        let consumed = if tail[padding..].starts_with(CLOSE) {
+            end + padding + CLOSE.len()
+        } else {
+            end
+        };
         return (call_from_value(&value, index), consumed);
     }
     let (body, consumed) = match after.find(CLOSE) {
@@ -89,9 +108,13 @@ fn parse_block(after: &str, index: usize) -> (ToolCall, usize) {
 /// Best-effort function name from a block that is not valid JSON, so the
 /// model's error message can say which call was unreadable.
 fn guess_name(body: &str) -> String {
-    let Some(at) = body.find("\"name\"") else { return String::new() };
+    let Some(at) = body.find("\"name\"") else {
+        return String::new();
+    };
     let rest = body[at + "\"name\"".len()..].trim_start();
-    let Some(rest) = rest.strip_prefix(':') else { return String::new() };
+    let Some(rest) = rest.strip_prefix(':') else {
+        return String::new();
+    };
     serde_json::Deserializer::from_str(rest.trim_start())
         .into_iter::<String>()
         .next()
@@ -100,15 +123,26 @@ fn guess_name(body: &str) -> String {
 }
 
 fn call_from_value(value: &Value, index: usize) -> ToolCall {
-    let Some(object) = value.as_object() else { return malformed(index, String::new()) };
-    let name = object.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+    let Some(object) = value.as_object() else {
+        return malformed(index, String::new());
+    };
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     if name.is_empty() {
         return malformed(index, name);
     }
     // Llama-style templates say `parameters`.
     let (arguments, malformed_arguments) =
         normalize_arguments(object.get("arguments").or_else(|| object.get("parameters")));
-    ToolCall { id: call_id(index), name, arguments, malformed_arguments }
+    ToolCall {
+        id: call_id(index),
+        name,
+        arguments,
+        malformed_arguments,
+    }
 }
 
 /// Fenced blocks whose JSON object has exactly `name` and `arguments`.
@@ -121,10 +155,14 @@ fn extract_fenced(text: &str) -> (Vec<&str>, Vec<ToolCall>) {
     while let Some(found) = text[cursor..].find(FENCE) {
         let open = cursor + found;
         let after_open = open + FENCE.len();
-        let Some(line_end) = text[after_open..].find('\n') else { break };
+        let Some(line_end) = text[after_open..].find('\n') else {
+            break;
+        };
         let info = text[after_open..after_open + line_end].trim();
         let body_start = after_open + line_end + 1;
-        let Some(close_rel) = text[body_start..].find(FENCE) else { break };
+        let Some(close_rel) = text[body_start..].find(FENCE) else {
+            break;
+        };
         let body = &text[body_start..body_start + close_rel];
         let block_end = body_start + close_rel + FENCE.len();
         cursor = block_end;
@@ -147,7 +185,10 @@ fn strict_fenced_call(body: &str, index: usize) -> Option<ToolCall> {
     if object.len() != 2 || !object.contains_key("name") || !object.contains_key("arguments") {
         return None;
     }
-    object.get("name")?.as_str().filter(|name| !name.is_empty())?;
+    object
+        .get("name")?
+        .as_str()
+        .filter(|name| !name.is_empty())?;
     Some(call_from_value(&value, index))
 }
 
@@ -163,7 +204,12 @@ pub(super) struct Hider<'a> {
 
 impl<'a> Hider<'a> {
     pub(super) fn new(out: &'a mut dyn FnMut(&str) -> bool, hide_tags: bool) -> Self {
-        Hider { out, held: String::new(), hiding: false, hide_tags }
+        Hider {
+            out,
+            held: String::new(),
+            hiding: false,
+            hide_tags,
+        }
     }
 
     /// False when the consumer asked to stop.
@@ -182,7 +228,10 @@ impl<'a> Hider<'a> {
             return keep_going;
         }
         // Keep back a tail that might be the start of a tag split across deltas.
-        let keep = (1..OPEN.len()).rev().find(|&n| self.held.ends_with(&OPEN[..n])).unwrap_or(0);
+        let keep = (1..OPEN.len())
+            .rev()
+            .find(|&n| self.held.ends_with(&OPEN[..n]))
+            .unwrap_or(0);
         let emit = self.held.len() - keep;
         if emit == 0 {
             return true;
@@ -227,7 +276,9 @@ mod tests {
 
     #[test]
     fn single_tagged_call() {
-        let r = applied("<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.rs\"}}\n</tool_call>");
+        let r = applied(
+            "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.rs\"}}\n</tool_call>",
+        );
         assert_eq!(r.text, "");
         assert_eq!(r.finish_reason, "tool_calls");
         assert_eq!(
@@ -248,7 +299,11 @@ mod tests {
              <tool_call>{\"name\":\"b\",\"arguments\":{\"x\":1}}</tool_call> done",
         );
         assert_eq!(r.text, "Let me look.\nthen\ndone");
-        let names: Vec<_> = r.tool_calls.iter().map(|c| (c.id.as_str(), c.name.as_str())).collect();
+        let names: Vec<_> = r
+            .tool_calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str()))
+            .collect();
         assert_eq!(names, [("call_0", "a"), ("call_1", "b")]);
         assert_eq!(r.tool_calls[1].arguments, json!({"x": 1}));
     }
@@ -281,7 +336,8 @@ mod tests {
 
     #[test]
     fn malformed_blocks_become_malformed_calls_with_best_effort_name() {
-        let r = applied("<tool_call>{\"name\": \"bash\", \"arguments\": {\"cmd\": </tool_call>after");
+        let r =
+            applied("<tool_call>{\"name\": \"bash\", \"arguments\": {\"cmd\": </tool_call>after");
         assert_eq!(r.tool_calls.len(), 1);
         assert!(r.tool_calls[0].malformed_arguments);
         assert_eq!(r.tool_calls[0].name, "bash");
@@ -290,7 +346,9 @@ mod tests {
         assert_eq!(r.finish_reason, "tool_calls");
 
         let nameless = applied("<tool_call>{\"arguments\": {}}</tool_call>");
-        assert!(nameless.tool_calls[0].malformed_arguments && nameless.tool_calls[0].name.is_empty());
+        assert!(
+            nameless.tool_calls[0].malformed_arguments && nameless.tool_calls[0].name.is_empty()
+        );
         let scalar = applied("<tool_call>42</tool_call>");
         assert!(scalar.tool_calls[0].malformed_arguments);
     }
@@ -308,7 +366,13 @@ mod tests {
 
     #[test]
     fn partial_tags_are_plain_text() {
-        for text in ["<tool_cal", "x <tool_call", "</tool_call>", "use the <tool> tag", "tool_call"] {
+        for text in [
+            "<tool_cal",
+            "x <tool_call",
+            "</tool_call>",
+            "use the <tool> tag",
+            "tool_call",
+        ] {
             let r = applied(text);
             assert_eq!(r.text, text);
             assert!(r.tool_calls.is_empty());
@@ -332,7 +396,8 @@ mod tests {
 
     #[test]
     fn fenced_call_requires_exactly_name_and_arguments() {
-        let r = applied("Sure:\n```json\n{\"name\": \"ls\", \"arguments\": {\"dir\": \".\"}}\n```\nok");
+        let r =
+            applied("Sure:\n```json\n{\"name\": \"ls\", \"arguments\": {\"dir\": \".\"}}\n```\nok");
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].arguments, json!({"dir": "."}));
         assert_eq!(r.text, "Sure:\nok");
@@ -364,7 +429,11 @@ mod tests {
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.text, "```rust\nlet a = 1;\n```");
         // An unclosed fence is not a call.
-        assert!(applied("```json\n{\"name\":\"x\",\"arguments\":{}}").tool_calls.is_empty());
+        assert!(
+            applied("```json\n{\"name\":\"x\",\"arguments\":{}}")
+                .tool_calls
+                .is_empty()
+        );
     }
 
     #[test]
@@ -396,7 +465,13 @@ mod tests {
 
     #[test]
     fn hider_withholds_tag_even_when_split_across_deltas() {
-        let (out, _) = feed(&["Let me ", "check <tool", "_ca", "ll>{\"name\":", "\"a\"}</tool_call>"]);
+        let (out, _) = feed(&[
+            "Let me ",
+            "check <tool",
+            "_ca",
+            "ll>{\"name\":",
+            "\"a\"}</tool_call>",
+        ]);
         assert_eq!(out, "Let me check ");
         let (out, _) = feed(&["<", "tool_call>", "{}"]);
         assert_eq!(out, "");

@@ -1,8 +1,8 @@
 //! One remote MCP tool exposed as a dial [`Tool`], and rendering of `tools/call` results.
 
 use super::client::Client;
-use crate::tools::ext::{LifecycleEvent, Tool, ToolContext, EXTENSION_API_VERSION};
 use crate::tools::ToolOutput;
+use crate::tools::ext::{EXTENSION_API_VERSION, LifecycleEvent, Tool, ToolContext};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,8 +21,16 @@ pub struct RemoteTool {
 
 impl RemoteTool {
     pub fn parse(entry: &Value) -> Option<RemoteTool> {
-        let name = entry.get("name")?.as_str().filter(|name| !name.is_empty())?.to_owned();
-        let description = entry.get("description").and_then(Value::as_str).unwrap_or("").to_owned();
+        let name = entry
+            .get("name")?
+            .as_str()
+            .filter(|name| !name.is_empty())?
+            .to_owned();
+        let description = entry
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
         let input_schema = match entry.get("inputSchema") {
             Some(Value::Object(schema)) => {
                 let mut schema = schema.clone();
@@ -31,7 +39,11 @@ impl RemoteTool {
             }
             _ => json!({"type": "object"}),
         };
-        Some(RemoteTool { name, description, input_schema })
+        Some(RemoteTool {
+            name,
+            description,
+            input_schema,
+        })
     }
 }
 
@@ -45,7 +57,6 @@ pub struct McpTool {
 }
 
 impl McpTool {
-
     pub fn with_lifecycle_hooks(
         name: String,
         server: &str,
@@ -54,7 +65,14 @@ impl McpTool {
         timeout: Duration,
         lifecycle_hooks: Vec<String>,
     ) -> Self {
-        McpTool { name, server: server.to_owned(), remote, client, timeout, lifecycle_hooks }
+        McpTool {
+            name,
+            server: server.to_owned(),
+            remote,
+            client,
+            timeout,
+            lifecycle_hooks,
+        }
     }
 
     fn description(&self) -> String {
@@ -90,24 +108,28 @@ impl Tool for McpTool {
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
-        let arguments = if args.is_object() { args.clone() } else { json!({}) };
+        let arguments = if args.is_object() {
+            args.clone()
+        } else {
+            json!({})
+        };
         let params = json!({"name": self.remote.name, "arguments": arguments});
         match self.client.request("tools/call", params, self.timeout) {
             Ok(result) => {
                 let mut output = render_result(&result);
                 if let Some(store) = ctx.workspace.artifacts() {
                     match store.retain(&result.to_string()) {
-                        Ok(uri) => output.text.push_str(&format!("\n[Complete MCP protocol result: {uri}]")),
+                        Ok(uri) => output
+                            .text
+                            .push_str(&format!("\n[Complete MCP protocol result: {uri}]")),
                         Err(e) => return ToolOutput::err(format!("retaining MCP result: {e:#}")),
                     }
                 }
                 output
-            },
+            }
             Err(error) => ToolOutput::err(format!("{error:#}")),
         }
-
     }
-
 
     fn lifecycle_hooks(&self) -> &[String] {
         &self.lifecycle_hooks
@@ -177,10 +199,13 @@ mod lifecycle_tests {
                 "isError": true,
             })
         );
-        assert_eq!(payload.as_object().unwrap().len(), 6, "no arguments, prompts, outputs, or credentials");
+        assert_eq!(
+            payload.as_object().unwrap().len(),
+            6,
+            "no arguments, prompts, outputs, or credentials"
+        );
     }
 }
-
 
 /// Flattens a `tools/call` result: text blocks verbatim, other block kinds noted by type. The text
 /// is the server's, so control characters are stripped and the length bounded.
@@ -195,17 +220,28 @@ pub fn render_result(result: &Value) -> ToolOutput {
             parts.push(structured.to_string());
         }
     }
-    let text = if parts.is_empty() { "(the tool returned no content)".to_owned() } else { parts.join("\n") };
+    let text = if parts.is_empty() {
+        "(the tool returned no content)".to_owned()
+    } else {
+        parts.join("\n")
+    };
     let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
     let text = bound(&strip_controls(&text));
-    if is_error { ToolOutput::err(text) } else { ToolOutput::ok(text) }
+    if is_error {
+        ToolOutput::err(text)
+    } else {
+        ToolOutput::ok(text)
+    }
 }
 
 fn render_block(block: &Value) -> String {
     let field = |name: &str| block.get(name).and_then(Value::as_str);
     match field("type").unwrap_or("unknown") {
         "text" => field("text").unwrap_or("").to_owned(),
-        kind @ ("image" | "audio") => format!("[{kind} content, {}, not shown]", field("mimeType").unwrap_or("unknown type")),
+        kind @ ("image" | "audio") => format!(
+            "[{kind} content, {}, not shown]",
+            field("mimeType").unwrap_or("unknown type")
+        ),
         "resource_link" => format!("[resource link: {}]", field("uri").unwrap_or("?")),
         "resource" => {
             let resource = block.get("resource");
@@ -213,7 +249,10 @@ fn render_block(block: &Value) -> String {
             let uri = inner("uri").unwrap_or("?");
             match inner("text") {
                 Some(text) => format!("[resource: {uri}]\n{text}"),
-                None => format!("[resource: {uri}, {}, binary content not shown]", inner("mimeType").unwrap_or("unknown type")),
+                None => format!(
+                    "[resource: {uri}, {}, binary content not shown]",
+                    inner("mimeType").unwrap_or("unknown type")
+                ),
             }
         }
         other => format!("[{other} content not shown]"),
@@ -222,7 +261,9 @@ fn render_block(block: &Value) -> String {
 
 /// Drops terminal escapes and other control characters (keeping newline and tab).
 fn strip_controls(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect()
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
 }
 
 fn bound(text: &str) -> String {
@@ -233,7 +274,12 @@ fn bound(text: &str) -> String {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n[output truncated: {} of {} bytes shown]", &text[..end], end, text.len())
+    format!(
+        "{}\n[output truncated: {} of {} bytes shown]",
+        &text[..end],
+        end,
+        text.len()
+    )
 }
 
 #[cfg(test)]
@@ -261,11 +307,18 @@ mod tests {
 
     #[test]
     fn is_error_maps_and_empty_results_are_explained() {
-        let failed = render_result(&json!({"isError": true, "content": [{"type": "text", "text": "boom"}]}));
+        let failed =
+            render_result(&json!({"isError": true, "content": [{"type": "text", "text": "boom"}]}));
         assert!(failed.is_error);
         assert_eq!(failed.text, "boom");
-        assert_eq!(render_result(&json!({"content": []})).text, "(the tool returned no content)");
-        assert_eq!(render_result(&json!({"structuredContent": {"n": 1}})).text, r#"{"n":1}"#);
+        assert_eq!(
+            render_result(&json!({"content": []})).text,
+            "(the tool returned no content)"
+        );
+        assert_eq!(
+            render_result(&json!({"structuredContent": {"n": 1}})).text,
+            r#"{"n":1}"#
+        );
     }
 
     #[test]
@@ -274,7 +327,9 @@ mod tests {
         let out = render_result(&json!({"content": [{"type": "text", "text": big}]}));
         assert!(out.text.contains("[output truncated:"));
         assert!(out.text.len() < MAX_RESULT + 100);
-        let escaped = render_result(&json!({"content": [{"type": "text", "text": "a\u{1b}[31mred\u{7}\nb"}]}));
+        let escaped = render_result(
+            &json!({"content": [{"type": "text", "text": "a\u{1b}[31mred\u{7}\nb"}]}),
+        );
         assert_eq!(escaped.text, "a[31mred\nb");
     }
 

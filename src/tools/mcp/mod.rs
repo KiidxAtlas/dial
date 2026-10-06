@@ -12,6 +12,8 @@
 //! returned tools are dropped.
 
 mod client;
+mod http;
+pub use http::validate_url;
 mod names;
 mod tool;
 
@@ -58,7 +60,8 @@ fn load_with(config: &Config, connect_timeout: Duration) -> McpLoad {
         .mcp
         .iter()
         .map(|(name, server)| {
-            let (thread_name, server_name, server) = (format!("mcp-{name}-connect"), name.clone(), server.clone());
+            let (thread_name, server_name, server) =
+                (format!("mcp-{name}-connect"), name.clone(), server.clone());
             let handle = thread::Builder::new()
                 .name(thread_name)
                 .spawn(move || connect(&server_name, &server, connect_timeout));
@@ -69,7 +72,9 @@ fn load_with(config: &Config, connect_timeout: Duration) -> McpLoad {
     let mut namer = Namer::default();
     for (server, handle) in attempts {
         let outcome = match handle {
-            Ok(handle) => handle.join().unwrap_or_else(|_| Err(anyhow::anyhow!("connection thread panicked"))),
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("connection thread panicked"))),
             Err(error) => Err(error.into()),
         };
         match outcome {
@@ -85,7 +90,9 @@ fn load_with(config: &Config, connect_timeout: Duration) -> McpLoad {
 
 fn add_tools(loaded: &mut McpLoad, namer: &mut Namer, server: &str, connected: Connected) {
     if connected.tools.is_empty() {
-        loaded.notices.push(format!("mcp `{server}`: connected but offers no tools"));
+        loaded
+            .notices
+            .push(format!("mcp `{server}`: connected but offers no tools"));
         return; // dropping the only client reference stops the server
     }
     for remote in connected.tools {
@@ -104,27 +111,46 @@ fn add_tools(loaded: &mut McpLoad, namer: &mut Namer, server: &str, connected: C
 
 fn connect(name: &str, server: &McpServerConfig, connect_timeout: Duration) -> Result<Connected> {
     let deadline = Instant::now() + connect_timeout;
-    let remaining = || deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-    let client = Arc::new(Client::spawn(name, server)?);
+    let remaining = || {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1))
+    };
+    let client = Arc::new(if server.url.is_some() {
+        Client::connect_http(name, server)?
+    } else {
+        Client::spawn(name, server)?
+    });
     client.initialize(remaining())?;
 
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_PAGES {
-        let params = cursor.as_ref().map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
+        let params = cursor
+            .as_ref()
+            .map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
         let page = client.request("tools/list", params, remaining())?;
         let Some(entries) = page.get("tools").and_then(Value::as_array) else {
             bail!("`tools/list` returned no `tools` array");
         };
         tools.extend(entries.iter().filter_map(RemoteTool::parse));
-        cursor = page.get("nextCursor").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_owned);
+        cursor = page
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned);
         if cursor.is_none() || tools.len() >= MAX_TOOLS_PER_SERVER {
             break;
         }
     }
     let truncated = cursor.is_some() || tools.len() > MAX_TOOLS_PER_SERVER;
     tools.truncate(MAX_TOOLS_PER_SERVER);
-    let notice = truncated.then(|| format!("mcp `{name}`: tool list cut off after {} tools", tools.len()));
+    let notice = truncated.then(|| {
+        format!(
+            "mcp `{name}`: tool list cut off after {} tools",
+            tools.len()
+        )
+    });
     Ok(Connected {
         client,
         tools,

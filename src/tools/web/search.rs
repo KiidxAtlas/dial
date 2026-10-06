@@ -39,7 +39,12 @@ pub fn parse_html(page: &str) -> Result<Vec<SearchResult>, String> {
     let mut capture: Option<Capture> = None;
     for token in html::tokenize(page) {
         let Some(open) = capture.as_mut() else {
-            if let Token::Open { name, attrs, self_closing: false } = token {
+            if let Token::Open {
+                name,
+                attrs,
+                self_closing: false,
+            } = token
+            {
                 let classes = html::attr(&attrs, "class").unwrap_or("");
                 let part = if name == "a" && has_class(classes, "result__a") {
                     Part::Title
@@ -48,14 +53,26 @@ pub fn parse_html(page: &str) -> Result<Vec<SearchResult>, String> {
                 } else {
                     continue;
                 };
-                let url = html::attr(&attrs, "href").map(target_url).unwrap_or_default();
-                capture = Some(Capture { part, tag: name, depth: 1, text: String::new(), url });
+                let url = html::attr(&attrs, "href")
+                    .map(target_url)
+                    .unwrap_or_default();
+                capture = Some(Capture {
+                    part,
+                    tag: name,
+                    depth: 1,
+                    text: String::new(),
+                    url,
+                });
             }
             continue;
         };
         match token {
             Token::Text(text) => open.text.push_str(&html::decode_entities(&text)),
-            Token::Open { name, self_closing: false, .. } if name == open.tag && !html::is_void(&name) => open.depth += 1,
+            Token::Open {
+                name,
+                self_closing: false,
+                ..
+            } if name == open.tag && !html::is_void(&name) => open.depth += 1,
             Token::Close(name) if name == open.tag => {
                 open.depth -= 1;
                 if open.depth == 0 {
@@ -85,9 +102,17 @@ fn has_class(classes: &str, wanted: &str) -> bool {
 }
 
 fn finish(capture: Capture, results: &mut Vec<SearchResult>) {
-    let text = capture.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = capture
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     match capture.part {
-        Part::Title => results.push(SearchResult { title: text, url: capture.url, snippet: String::new() }),
+        Part::Title => results.push(SearchResult {
+            title: text,
+            url: capture.url,
+            snippet: String::new(),
+        }),
         Part::Snippet => {
             if let Some(last) = results.last_mut().filter(|last| last.snippet.is_empty()) {
                 last.snippet = text;
@@ -107,7 +132,8 @@ fn target_url(href: &str) -> String {
 
 /// A web page, and not one of the sponsored `duckduckgo.com/y.js` ad redirects.
 fn is_organic(url: &str) -> bool {
-    (url.starts_with("http://") || url.starts_with("https://")) && !url.contains("duckduckgo.com/y.js")
+    (url.starts_with("http://") || url.starts_with("https://"))
+        && !url.contains("duckduckgo.com/y.js")
 }
 
 /// Parse a JSON search API response. Understands a top-level array or an array under `results`,
@@ -122,7 +148,12 @@ pub fn parse_json(value: &Value) -> Result<Vec<SearchResult>, String> {
     let field = |entry: &Value, keys: &[&str]| -> String {
         keys.iter()
             .find_map(|key| entry.get(key).and_then(Value::as_str))
-            .map(|text| html::decode_entities(text).split_whitespace().collect::<Vec<_>>().join(" "))
+            .map(|text| {
+                html::decode_entities(text)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
             .unwrap_or_default()
     };
     let results: Vec<SearchResult> = list
@@ -130,12 +161,17 @@ pub fn parse_json(value: &Value) -> Result<Vec<SearchResult>, String> {
         .map(|entry| SearchResult {
             title: field(entry, &["title", "name"]),
             url: field(entry, &["url", "link", "href"]),
-            snippet: field(entry, &["snippet", "content", "description", "body", "text"]),
+            snippet: field(
+                entry,
+                &["snippet", "content", "description", "body", "text"],
+            ),
         })
         .filter(|result| !result.title.is_empty() && is_organic(&result.url))
         .collect();
     if results.is_empty() && !list.is_empty() {
-        return Err("the search response has results but none with both a title and an http(s) URL".into());
+        return Err(
+            "the search response has results but none with both a title and an http(s) URL".into(),
+        );
     }
     Ok(results)
 }
@@ -207,10 +243,17 @@ mod tests {
 
     #[test]
     fn distinguishes_no_results_from_unrecognized_pages() {
-        assert_eq!(parse_html(r#"<div class="no-results">No  results.</div>"#), Ok(vec![]));
-        let blocked = parse_html(r#"<div class="anomaly-modal__modal">Unfortunately, bots use DuckDuckGo too.</div>"#).unwrap_err();
+        assert_eq!(
+            parse_html(r#"<div class="no-results">No  results.</div>"#),
+            Ok(vec![])
+        );
+        let blocked = parse_html(
+            r#"<div class="anomaly-modal__modal">Unfortunately, bots use DuckDuckGo too.</div>"#,
+        )
+        .unwrap_err();
         assert!(blocked.contains("bot check"), "{blocked}");
-        let unknown = parse_html("<html><body><p>Something else entirely</p></body></html>").unwrap_err();
+        let unknown =
+            parse_html("<html><body><p>Something else entirely</p></body></html>").unwrap_err();
         assert!(unknown.contains("layout may have changed"), "{unknown}");
     }
 
@@ -223,7 +266,11 @@ mod tests {
         ]});
         assert_eq!(
             parse_json(&searxng).unwrap(),
-            vec![SearchResult { title: "A".into(), url: "https://a.example/".into(), snippet: "about a".into() }]
+            vec![SearchResult {
+                title: "A".into(),
+                url: "https://a.example/".into(),
+                snippet: "about a".into()
+            }]
         );
         let brave = json!({"web": {"results": [{"title": "C", "url": "https://c.example/", "description": "about c"}]}});
         assert_eq!(parse_json(&brave).unwrap()[0].snippet, "about c");

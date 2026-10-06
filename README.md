@@ -13,10 +13,29 @@ dial -p -y "summarize this repo"      # one-shot; prints the answer (use -y or -
 dial -c                               # continue the latest session   (-r <id-prefix> to pick one)
 ```
 
+To update the installed CLI after changing this checkout, run `make update` here
+(or `make -C /path/to/dial update` from another directory). This runs
+`cargo install --path . --locked --force`, rebuilding and replacing the Cargo-installed
+binary without pulling Git changes. Restart any running dial session afterward.
+Ensure Cargo's bin directory (normally `~/.cargo/bin`) is on your `PATH`;
+`command -v dial` shows which copy your terminal will run. `make help` lists the
+other build and check targets.
+
 For local MLX you can also prepare the runtime and model explicitly:
 `dial setup -m mlx-community/Qwen2.5-7B-Instruct-4bit` (requires `uv`).
 Discovery itself does not download weights. Selecting an uncached local model and submitting a
 prompt resolves its weights; a missing default MLX runtime gets an installation confirmation.
+
+### Anthropic subscription sign-in
+
+Use Dial's browser OAuth flow for a Claude subscription: open `/providers`, select **Anthropic**,
+then choose **Sign in with Claude subscription** and complete authorization in your browser.
+Dial stores access and refresh tokens in its private user directory, refreshes access before
+requests, fingerprints harness requests with Claude Code's billing-header and body attestation,
+and sends subscription requests only to Anthropic's official API endpoint. An Anthropic API key
+remains supported; sign out of the subscription in `/providers` to use the API-key route.
+Providers with zero discovered models are hidden in `/models`, but remain in `/providers`
+so they can be configured.
 
 ## Project architecture and reuse
 
@@ -182,7 +201,30 @@ Messages API. OpenAI, Anthropic, OpenRouter, Groq, Mistral and DeepSeek have set
 
 **LoRA indicators.** The model picker has a LoRA column: `unverified` for a local MLX model whose architecture
 the installed mlx-lm implements (a static check of `config.json`, not proof of trainable adapter targets), `unsupported` when Dial’s adapter probe rejects it, and `-` for models another server runs. The main model distinguishes awaiting training,
-training, evaluating, accepted vN, loading, loaded, used on last response, and request failed.
+training, paused for coding, evaluating, accepted vN, loading, loaded, used on last response, and request failed.
+
+Local training yields to a new coding request at a safe step boundary. Dial saves adapter weights,
+optimizer state, RNG state and the batch cursor, exits the training process to free GPU memory,
+and hands compute to the coding turn. Idle chats unload their local models when the paused trainer
+requests compute back; training resumes the same candidate and remaining iterations automatically.
+The currently admitted adapter stays in use until the candidate passes evaluation. Dial allows
+two seconds for cooperative handoff before terminating the training subprocess. `/improvement`
+and `dial improve jobs` show the current phase and iteration progress. Operator stop also cancels
+the idle wait. Resume occurs within the running improvement cycle; restarting a stopped or crashed
+cycle does not automatically recover its unfinished candidate. Older already-running workers can
+be stopped from the compute menu and restarted with the updated binary.
+
+Open `/compute`, or **Settings → Setup → Compute & background work**, for a live menu of compute
+ownership and jobs across all projects. It shows the model, project, PID and current phase, with
+Pause/Resume background work and Start/Stop controls for each job. While waiting for compute,
+Ctrl+, opens these controls directly. Status refresh and job controls run off the terminal thread.
+Idle chats release models for waiting coding requests; verification and evaluation also yield.
+If training does not acknowledge a pause within two seconds, Dial terminates its subprocess and
+resumes from its last committed step later. A checkpoint is committed at every step, so only an
+unfinished step may need repeating. **Stop job now** targets a verified detached background worker
+and its child processes, preserves the admitted adapter, and abandons that unfinished cycle; it
+never terminates a foreground chat. This also provides recovery for older workers without preemption.
+
 A failed capability probe overrides the static architecture check; only a successful probe can show
 awaiting training. Architecture support alone never claims LoRA compatibility.
 Dial automatically queues unverified downloaded local MLX models as they are discovered, without
@@ -216,13 +258,13 @@ forwarded to a custom gateway.
 
 When entering OpenAI or Anthropic API keys, Dial checks them against each provider's model-list
 endpoint before saving; this is metadata, not an inference call. OpenAI uses bearer authentication;
-Anthropic uses `x-api-key` and `anthropic-version`. Other custom endpoint keys are saved without an
-online check. Environment credentials take precedence over saved keys. Saved keys are **owner-private
-plaintext** in `credentials.json`, not an OS keychain; they are never written into TOML or rendered
-back into the UI. Failed discovery keeps cached models marked unverified. Anthropic uses its Messages
-API with native streaming text, thinking and tool arguments; other remote endpoints use OpenAI-
-compatible chat completions. **ChatGPT subscription** uses its own OAuth registration and the
-Responses API. Claude.ai subscription login is not implemented.
+Anthropic API keys use `x-api-key` and `anthropic-version`. Other custom endpoint keys are saved
+without an online check. Environment credentials take precedence over saved API keys. Saved keys are
+**owner-private plaintext** in `credentials.json`, not an OS keychain; they are never written into
+TOML or rendered back into the UI. Failed discovery keeps cached models marked unverified. Anthropic
+uses its Messages API; other remote endpoints use OpenAI-compatible chat completions. Both
+**ChatGPT subscription** and **Claude subscription** have dedicated OAuth sign-in flows and use their
+respective official inference APIs.
 
 **Use your ChatGPT/Codex subscription.** Restart Dial, open `/providers`, select **ChatGPT
 subscription**, and choose **Continue with ChatGPT (add account)**. In the browser, authorize Dial
@@ -231,14 +273,16 @@ role. Eligible plan access and shared limits are controlled by your account; the
 not an entitlement check, and your first completed inference request verifies access. Manage Dial's
 permission and limits in [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
 
-The provider menu also lets you choose a saved account, sign in again, or sign out. Dial keeps each
-issued client registration and verified identity separate, retains its host ID across restarts,
-and renews rotating tokens under a cross-process lock. Sign-in continues when you close the provider
-panel; use **Cancel pending sign-in** in its menu to stop it, or exit Dial. OAuth credentials live in owner-private, atomic `chatgpt-accounts.json` storage under Dial's
-user directory (plaintext, not an OS keychain), separately from API keys and editable project files.
-Subscription requests always use OpenAI's official Responses endpoint; they never fall back to an
-API key. A partial or failed response never releases its tool calls for execution. This integration
-follows OpenAI's [Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source).
+The provider menu lets you choose a saved workspace, sign in again, or sign out. Dial refreshes
+rotating tokens under a cross-process lock. Sign-in continues if you close the provider panel; use
+**Cancel pending sign-in** in its menu to stop it. OAuth credentials are stored in owner-private,
+atomic `chatgpt-accounts.json` storage under Dial's user directory (plaintext, not an OS keychain),
+separately from API keys and editable project files. Requests use the ChatGPT Codex Responses
+endpoint at `chatgpt.com/backend-api/codex/responses`, include the account ID, and never fall back
+to an API key. A partial or failed response never releases its tool calls. Dial follows OpenAI's
+[Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source). Existing
+accounts created by Dial's older login flow must sign in again. Legacy
+`https://api.openai.com/v1` ChatGPT endpoint settings are migrated to the Codex backend on load.
 
 Dial combines the account model list with visible models in a recent local Codex model metadata
 cache, when present, so newly released models can appear before the account list catches up.
@@ -771,12 +815,83 @@ num_layers = 4
 max_seq_length = 8192
 ```
 
+### Lifecycle hooks, path permissions, isolated workers and schedules
+
+**Hooks.** `[[hooks]]` in your user or project-state config (never the repository) run programs at
+`user_prompt_submit`, `pre_tool_use`, `post_tool_use` and `stop`. The event arrives as JSON on stdin.
+Exit 0 continues (stdout is shown; for `post_tool_use` it is appended to the tool result), exit 2 blocks
+(`pre_tool_use` refuses the call, `user_prompt_submit` rejects the message; stderr is the reason).
+Any other exit, a timeout or a missing program only produces a notice. `matcher` is an anchored regex on
+the tool name. Hooks are trusted and unsandboxed like `[mcp.*]`, apply to subagents too, are off in
+sealed evaluations, and disable parallel read batching so every call passes `pre_tool_use`.
+
+```toml
+[[hooks]]
+event = "pre_tool_use"
+matcher = "write|edit"
+command = ["sh", "-c", "grep -q '\\.env' && { echo 'no .env edits' >&2; exit 2; } || exit 0"]
+timeout_secs = 10
+```
+
+**Path permission rules.** `/permissions deny write --path .env --path 'secrets/**'` (add `--persist` to
+keep it). Globs are project-relative, a pattern without `/` matches at any depth, and matching is
+case-insensitive on macOS. They apply to `read`, `write`, `edit` and `ast_edit`; hashline patch headers
+are inspected, an undeterminable target is denied by deny rules and never granted by allow rules, and an
+allow rule must cover every file a call touches. They do not cover `bash`, `grep` or `glob`.
+
+**Isolated workers.** `task` accepts `isolation: "copy"` for `worker` agents. The worker edits a private
+copy of the project (dirty and untracked files included; `.git`, `.dial`, secrets and build caches
+excluded). Afterwards only changed files are merged back, each only if the project's file is still what the
+copy started from; others are reported as conflicts, never overwritten, and the full copy is kept. Merges
+go through checkpoints (`/undo` works). On remote endpoints isolated workers run concurrently. This is a
+file copy, not `git worktree`, so it works with dirty trees and non-git projects.
+
+**Schedules.** `dial schedule add "prompt" --every 30m --watch 'src/**/*.rs' [--allow read,edit | -y]`,
+`list`, `remove <id>`, `log <id>` and `run [--once]` (a foreground scheduler, one per project; keep it in
+tmux or launchd). Runs are ordinary `dial -p` children, read-only unless `--allow`/`-y` was given at add
+time, one at a time. Watch triggers wait for edits to settle and ignore the run's own changes.
+
+### Git tools, budgets, custom agents and HTTP MCP
+
+**`git` tool** (an integration, on by default). Structured `status`, `diff`, `log`, `show`, `branches`
+(no approval) and `add`, `unstage`, `commit`, `branch_create`, `switch`, `push`, `pr_create` (approval),
+plus `pr_view`, `pr_checks`, `issue_view` through the `gh` CLI. Arguments are validated and never pass
+through a shell; repository hooks, external diff drivers and textconv are disabled; push never forces.
+Path permission rules apply to `git` `paths`. Default slash commands `/review`, `/commit` and `/pr` use
+it; a file in `.dial/commands/` with the same name replaces them.
+
+**Budgets.** `[budget] max_session_cost_usd` and `max_turn_cost_usd` stop a turn between model
+requests. They rely on catalog pricing and reported usage, so a model without a known price is never
+stopped by them (`/cost` shows whether pricing is available).
+
+**Custom agents.** `[agents.<name>]` with `base` (`scout`, `reviewer` or `planner`), `prompt`,
+optional `description`, `tools` (can only narrow the base's tools) and `max_steps`. Writers are not
+configurable because approving a worker launch is decided without the configuration.
+
+**HTTP MCP.** `[mcp.<name>]` takes `url` instead of `program` (https, or http on localhost) with
+`bearer_env` naming an environment variable that holds a token, and optional `headers`. Streamable
+HTTP with JSON or SSE replies and session ids is supported; there is no OAuth flow.
+
+### Keeping improvement off your machine's critical path
+
+Background cycles start only when the machine is free (`[improve]`):
+`idle_minutes` (default 10) since your last coding turn, `require_ac_power` (default true; macOS
+`pmset`), not in Low Power Mode, not thermally throttled, and under `daily_compute_minutes`
+(default 120, `0` = unlimited), which is also enforced while a cycle runs: it pauses with state
+`paused` and resumes when next due. `dial improve cycle` and `/improve start` bypass the start-time
+checks. `dial improve status` shows `waiting_for`, `compute_used_today_secs` and
+`last_cycle_seconds_by_phase` so you can see whether generation, training or evaluation holds the machine.
+Evaluation stops early when a rejection is already certain (a suite over its regression bound, or a
+primary suite that cannot reach the required gain even if every remaining case went the candidate's
+way). This never changes whether a candidate is admitted, only how many cases run. Cloud main
+models never wait for local compute; only local models and explicit local roles take the compute lock.
+
 ## Known limits
 
 - Tool-calling quality depends on the model: 7B-class instruct models handle the tool set; sub-1B models often emit unreadable calls (which become training signal rather than being hidden).
 - Local compute is serialized across projects. A session that queues improvement releases compute when idle and its child agents have finished; a subsequent turn waits if the cycle holds compute. There is no claim of zero-downtime training.
   While waiting for compute, the elapsed timer advances and commands follow the same live/deferred/interrupting policy as during inference. Turn duration includes that wait; acquiring compute returns the status to Working rather than leaving it marked as waiting.
-- The TUI is keyboard-driven; not every terminal supports modified Enter keys. There is no cron or voice integration. Browser and kernel require available OS containment; they fail closed rather than falling back to unrestricted execution.
+- The TUI is keyboard-driven; not every terminal supports modified Enter keys. `dial schedule` provides scheduling but no daemon installer; there is no voice integration. Browser and kernel require available OS containment; they fail closed rather than falling back to unrestricted execution.
 - Live memory/skill edits are the user's working state and are not gated; only the admitted harness is.
 - Operator tools are trusted programs and are not sandboxed during live work; they are excluded from automatic evaluation. Non-macOS: `bash` is unavailable unless `sandbox.mode = "off"` for live use, while generated evaluations still require the strict sandbox.
 
@@ -886,7 +1001,7 @@ Laya decision advice is available with `/laya on`, or `[laya] enabled = true`. I
 Dial-owned Laya service's native typed prediction API for retrieval scope and post-edit evidence
 review. `/laya status` shows the latest session decision; `/laya check` probes the live checkpoint
 and device. Advice and raw probabilities never certify behavior or replace deterministic checks.
-The Architecture model role writes architecture summaries; it follows the main coding model until you assign a separate model in the model picker (Alt+M). Laya supplies typed decisions rather than summaries.
+The Architecture model role writes architecture summaries. Settings → Model → Project understanding → **Architecture model** defaults to local `mlx-community/Qwen2.5-3B-Instruct-4bit`, a compact summarization model. It requires the MLX runtime and model weights; unavailable local inference defers maintenance rather than sending it to the coding provider. Clear this setting to follow the main coding model. An explicit Architecture assignment in the model picker (Alt+M) takes precedence; clearing that role also clears the local fallback. Laya supplies typed decisions rather than summaries.
 
 Install the independent runtime with `dial laya install --checkpoint /path/to/checkpoint`.
 Dial copies the checkpoint assets into `$DIAL_HOME/laya/model` (default `~/.dial/laya/model`),
@@ -953,3 +1068,286 @@ triggering a concrete investigation todo when needed. The existing repeated-evid
 Workflow records separately count architecture output tokens, failed verification checks, repair
 rounds, and change-review prompts. Compare actual task correctness and complete-run cost with the
 existing repository benchmarks before attributing performance gains to these features.
+
+### Coding assistance without local training
+
+Dial reuses completed work through project-scoped experience, separate from model weights and
+self-improvement admission. `/experience` shows saved recipes and source-scoped failures;
+`/experience ledger` shows this session's observations and hypotheses. `dial experience --json`
+exports saved project records without starting a model. `/understanding architecture` remains the
+view of the overall architecture.
+
+The investigation ledger stores questions, source hashes and output digests, and survives session
+resume. Unchanged evidence supplies a reminder before further investigation; changed source stops
+that evidence from being reused. Hypotheses remain agent interpretations linked to an observation,
+not independently verified facts. Actual file contents remain available through the ordinary read tool.
+
+Successful file edits can become executable recipes only after configured behavioral checks pass
+following the last edit. Arbitrary shell changes, missing source preconditions, failed checks and
+oversized or sensitive records prevent capture. Replaying `experience(action="run", id=...)`
+rechecks each step's source hashes, requires the checks still be configured as behavioral, and runs
+through normal tool approvals, hooks, sandbox and checkpoints. A stale recipe remains advisory;
+it cannot overwrite changed source. Failed replay retains edits for diagnosis, rather than undoing
+unrelated work. These observations do not certify a model, provide training rewards or admit adapters.
+
+Local models receive a smaller initial tool set, with core tools and explicitly loaded tools retained.
+Observed tool outcomes rank optional tools per model; `tool_search` and `tool_load` retain access to
+allowed specialist tools. Compact descriptions preserve parameter schemas and the complete edit
+contract. Recalled recipes accumulate display, source-overlap reuse and subsequent configured-check
+counts. These are observed-use proxies, not causal accuracy estimates.
+
+The syntax guard parses proposed complete source before write, replace/hashline edit and AST commits.
+It rejects newly broken syntax, allows repairs that reduce existing errors, and leaves unsupported
+languages to existing checks. `edit_preview` parses proposed source without changing files; its
+optional `check="type"` uses an offline Cargo check in a disposable project copy. That copy is limited
+to 2,048 files, 32 MiB, a three-second preparation budget and a 30-second compiler timeout. Compiler
+previews may execute build scripts and require normal approval. Rust/Cargo is currently the supported
+type-preview backend; syntax parsing supports the installed tree-sitter languages. Preview success
+is not verification of the live workspace. Directly matched Python tests and Rust module tests
+supplement, rather than replace, configured verification. Empty suites do not earn recipe verification
+credit. This does not implement token-level compiler steering during generation.
+
+An optional `experience` model role can annotate a verified workflow with a short lesson. It requires
+both an assigned hosted role and explicit enablement, makes at most one bounded call per eligible
+completed turn, and yields when queued coding arrives. It receives bounded workflow metadata, never
+creates executable steps or checks, and never loads another local model. Local teacher roles are
+skipped to preserve coding compute. No teacher call occurs by default.
+
+All controls are available in `/settings` under Learning / Coding assistance, Tools / Verification,
+and Models / Context. Assign the teacher in `Alt+M → Roles → experience`.
+
+```toml
+[assistance]
+enabled = true
+syntax_guard = true
+selective_verification = true
+compact_tools = true
+initial_tool_limit = 16
+context_max_bytes = 4096
+teacher_enabled = false
+teacher_timeout_secs = 10
+```
+
+### Experimental MLX activation steering
+
+Dial can extract a unit-length behavior vector from matched positive/negative assistant responses,
+then add it to one transformer layer during inference. This runs in Dial's own MLX server;
+hosted providers and external inference servers have no activation hook. Automatic creation is enabled
+by default as part of automatic improvement; no vector is used before it passes evaluation.
+No random vector is activated automatically, and this is independent of OMP and Laya.
+
+Automatic creation reads only train-split preference pairs matching recorded successful tool repairs.
+It waits for at least eight distinct, bounded contrast prompts, extracts at the model's middle layer,
+and tests eight separate exact tool-call contracts covering read, write, grep and glob. Candidates
+must improve over the unsteered model, pass the existing repetition and latency gates, and avoid
+reducing the incumbent vector's held-out score. Failed candidates preserve the active vector.
+These are response-contract checks, not proof of overall coding improvement. Manual vectors are
+preserved. Unchanged completed attempts have a 24-hour cooldown; new evidence can trigger a new attempt.
+
+`/settings` → Model → Activation steering → **Automatic vector creation** controls both automatic
+creation and use. **Enable manual vector** controls explicit vectors independently. `/steering`
+shows collecting `N/8` prompts, candidate extraction/evaluation progress, rejection/admission and
+actual runtime use. Jobs share the improvement cycle's compute lease, budget, stop controls and
+foreground handoff. Auxiliary roles and sealed harness evaluation remain unsteered.
+
+```sh
+dial steering status
+dial steering extract --pairs pairs.json --layer 14
+dial steering evaluate --cases held-out.json
+```
+
+Use `-m MODEL` before `steering` to select the model. Choose a zero-based layer that actually exists;
+Dial probes the model's layer count and hidden dimension. Extraction requires 8–64 distinct matched
+prompts. The pairs file is a JSON array with this shape for each entry:
+
+```json
+{
+  "positive": [{"role":"user","content":"Implement a typed addition function."},
+               {"role":"assistant","content":"def add(a: int, b: int) -> int:\n    return a + b"}],
+  "negative": [{"role":"user","content":"Implement a typed addition function."},
+               {"role":"assistant","content":"def add(a, b):\n    return a + b"}]
+}
+```
+
+Both sides must have identical preceding messages and different final assistant responses. Pick
+examples that isolate the behavior you want. The held-out file is a separate JSON array of 8–32
+cases, with distinct prompts that did not appear in extraction:
+
+```json
+{
+  "messages": [{"role":"user","content":"Write a typed integer multiply function."}],
+  "required": ["def multiply(", "-> int"],
+  "forbidden": ["TODO"],
+  "python_ast": true
+}
+```
+
+Each case needs required text or an `expected_tool`. Tool cases can additionally supply OpenAI
+`tools` declarations and `required_arguments`; checks require complete JSON, the expected tool
+name and presence of those arguments. These are response contracts, not comprehensive tool-schema
+or coding correctness checks. Generation is deterministic and capped at 128 tokens per case.
+
+Evaluation compares baseline and steered responses in alternating order. Admission requires a
+strictly better contract pass count, at least 80% passing, no tool-validity/repetition regression,
+and bounded first-token latency regression. A passing result is **not full coding accuracy
+certification**; inspect real coding behavior before relying on a vector. Admission is tied to
+this artifact and exact strength. Model/adapter metadata changes invalidate the binding; the
+fingerprint uses paths, file sizes/timestamps and selected config content, not a full hash of every
+weight byte. If using LoRA, pass the same `--adapter /absolute/path` to both maintenance commands;
+a base-model vector is bypassed when an adapter is loaded.
+
+For a manually extracted vector, after evaluation open `/settings` → Model → Activation steering
+to enable the manual vector and select
+the vector name and strength. `/steering` reports the evaluation, completed/total job progress,
+and live `loaded`, `used` (with forward-pass count), `bypassed` or `unconfirmed` state. CLI status
+reads saved state without starting inference and cannot confirm another session's runtime use.
+Changing the profile restarts the inference server and clears its prompt cache. A missing,
+unadmitted or incompatible vector is bypassed so coding stays available. Auxiliary model roles
+and sealed harness evaluations do not use steering.
+
+Extraction/evaluation are explicit background jobs. They wait for idle compute, obey the existing
+`/compute` global pause/resume controls, model stop flags and daily compute budget, and yield to foreground coding.
+A checkpoint is saved after each extraction pair or evaluation case; interrupted work repeats only
+the unfinished unit. `Ctrl+C` stops the command and its worker; rerun the same command to resume.
+After an operator stop, select Start in `/compute` before resuming. Changing the dataset or model
+binding starts a fresh checkpoint. Progress and private JSON vectors live under the model's
+learning directory in `steering/`; no weights are changed. No checkpoint compatibility is promised
+across steering format versions.
+
+### Live task and phase policy
+
+Dial now selects request controls between model steps, without a classifier model call, training,
+or a compute lease of its own. `/policy` shows the last effective request settings, the reason for
+selection and bounded recent request metrics; it also works while the agent is busy. Open
+`/settings` → Model → Adaptive policy for controls. CLI inspection and previews load no model:
+
+```sh
+dial policy
+dial policy "Investigate why the build fails" --json
+```
+
+A CLI preview uses the configured baseline; an active session may use a different evaluated harness
+version. The live session report is the record of what that session requested. Capability-unverified
+sampling is labelled unverified, rather than claiming the provider applied a temperature.
+
+Initial phase comes from the task. Observed source reads select investigation, successful edits
+select editing, recognized checks select verification, and errors or reasoning interceptions select
+recovery. Design/alternatives requests start in exploration. Control calls do not clear recovery.
+A recognized check is an observed execution event, not proof that the whole task is correct.
+Later reads after an edit remain focused on implementation. New turns reset phase detection.
+Pin a phase to override this heuristic. Settings saved during a running turn apply after that turn;
+phase selection itself changes at each request boundary.
+
+By default, phase-specific pre-action time and output limits are enabled; **phase sampling is off**.
+Explicit model-profile output/temperature/top-p/thinking/effort overrides win. Reasoning-model output
+budgets are preserved, and supported unpinned reasoning effort can adapt only within the exact
+model's declared capability list. Existing reasoning and retry guards remain authoritative.
+Truncated output retries escape the phase token cap; partial tool calls still cannot execute.
+Editing keeps the baseline output budget. Task evidence packet size can shrink for verification or
+recovery, while cached source messages and tool permissions remain unchanged.
+
+Enable Experimental phase sampling to try configurable temperature presets and top-p choices:
+
+| Phase | Default temperature | Default top-p | Output limit |
+|---|---:|---:|---|
+| Investigation | 0.20 | 0.95 | min(baseline, 2048) |
+| Editing | 0.15 | 0.90 | baseline |
+| Verification | 0.05 | 0.80 | min(baseline, 1536) |
+| Recovery | 0.10 | 0.90 | min(baseline, 2048); expanded during length recovery |
+| Exploration | 0.50 | 1.00 | min(baseline, 4096) |
+
+These are experimental operator-enabled presets, not measured optimal values. Unknown endpoint
+capabilities keep their previous request behavior; MLX uses Dial's supported request controls.
+Pin baseline sampling to preserve the baseline temperature/top-p regardless of phase. Explicit
+model-profile sampler values remain pinned individually even when experimental sampling is enabled.
+A one-request profile is consumed at the request boundary, including failed requests; retries keep
+the same profile, and auxiliary calls cannot inherit it. No server restart or cache flush is needed
+for these request controls. Activation steering remains a separate fixed server profile.
+
+```toml
+[adaptive]
+enabled = true
+sampling = false
+reasoning = true
+output_limits = true
+pin_sampling = false
+phase = "auto"
+editing_temperature = 0.15
+investigation_tokens = 2048
+verification_tokens = 1536
+```
+
+Policy history stores settings and observed execution/token/latency metrics, not new training labels
+or permission grants. It never promotes sampler settings from self-reported success. Existing task
+routes between evaluated harness versions remain scoped to their admission records. Auxiliary roles
+and sealed harness evaluations retain their existing request controls. To measure sampler changes,
+compare pinned model-profile configurations on held-out coding tasks and check correctness, tool
+validity, retries and latency; this release does not automatically tune and admit phase presets.
+
+### Tool reliability and measured interfaces
+
+Dial builds execution validation from the same tool-schema snapshot sent with each model request.
+The system catalog is historical configuration; current schemas are authoritative. Current-call
+names, valid argument examples and single-call restrictions appear in the offered definitions,
+without inserting transient messages into the conversation or rewriting its cached prefix.
+Investigation checkpoints still require real todos; tools withheld by a checkpoint are explained
+as temporarily gated, and invalid todo calls receive a valid argument shape.
+
+```sh
+dial reliability status
+dial reliability check
+dial -m mlx/mlx-community/Qwen2.5-0.5B-Instruct-4bit reliability check --json
+```
+
+The explicit check makes up to eight model requests, each with a 60-second wall-clock limit, through the selected backend: read, grep,
+glob, write, todo, edit, a fixture assertion through bash, and a two-call batch. Model output is
+executed only after matching the exact expected tool and arguments, inside disposable fixtures.
+It never edits project sources. The edit fixture uses the configured hashline or replace contract.
+A profile that explicitly disables parallel calls skips the batch case rather than scoring it as
+a model failure. Transport or fixture infrastructure failures preserve the previous profile rather than counting
+as model failures. Local checks wait for idle compute, yield to foreground coding and obey stop
+controls; Ctrl+C interrupts calls and compute waits. No training is required. Hosted checks use
+the selected service and can incur its normal inference charges.
+
+Results are private, model-scoped `reliability.json` records. Binding includes the selected backend,
+model, model profile, edit format, server helper, available local path metadata and Hugging Face
+main revision pointer. Results expire after seven days. This is metadata invalidation, not a full
+hash of all weights; recheck after changing an external server's model behind an unchanged ID.
+These fixtures measure tool contracts and operations, not overall coding accuracy. Automatic
+interface selection excludes sessions with LoRA or steering because calibration currently tests
+the base model. Failed fixture cases select one-call operation; two consecutive live contract
+failures also select it for recovery. Invalid multi-call batches in this mode execute nothing.
+Three consecutive contract-failure rounds stop by default. Normal runtime errors retain the
+existing path/patch recovery, identical-call guards and stall limits.
+
+Use `/reliability` during a turn to inspect successful calls, schema and runtime failures,
+corrected rounds, check outcomes, time to the first useful action and the selected interface.
+The panel reads a cached session snapshot; it performs no inference, Git or database work on the
+render thread. **Settings → Model → Tool reliability** controls the gate, examples, automatic
+interface selection and failed-round limit. CLI status shows saved base-model results, not another
+session's live observations.
+
+For providers with documented strict tool support, explicitly declare the exact model profile:
+
+```toml
+[model_profiles.my_model.capabilities]
+strict_tools = true
+parallel_tool_calls = false
+```
+
+This extends an existing exact provider/model profile; do not infer support from a model's name.
+Compatible object schemas receive native strict flags in Chat Completions, Responses and Anthropic
+requests. Optional fields become nullable on the wire and their null placeholders are removed
+before validating against the original execution schema. Required nulls, unknown properties and
+invalid values remain errors. Unsupported schema compositions retain ordinary validation.
+Dial's pinned native MLX server has no constrained tool decoder; strict declarations for that
+backend are rejected rather than presented as working constraints. Runtime validation is always
+active. Strict schemas constrain structure, not whether a path, edit or solution is correct.
+See [OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling)
+and [Anthropic strict tool use](https://platform.claude.com/docs/en/agents-and-tools/tool-use/strict-tool-use).
+
+`finish completed` checks pending edits with existing focused verification before accepting the
+claim, and refuses unresolved failed checks. Operator-declared behavioral checks and existing
+bounded repair remain in force. `/reliability` distinguishes missing automatic checks from passing
+checks; build or syntax success is not a certificate of task correctness. Inspect the diff and
+use behavioral checks that cover the requested outcome.

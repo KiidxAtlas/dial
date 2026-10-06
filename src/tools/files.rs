@@ -1,7 +1,8 @@
 //! File tools: `read` (plain mode), `write` and the exact-text `edit` used in replace mode.
 
 use super::select::{
-    self, DEFAULT_READ_LINES, MAX_READ_LINE, MAX_READ_LINES, MAX_READ_OUTPUT, Selector, empty_read, plan_spans,
+    self, DEFAULT_READ_LINES, MAX_READ_LINE, MAX_READ_LINES, MAX_READ_OUTPUT, Selector, empty_read,
+    plan_spans,
 };
 use super::{EditMode, MAX_LIST, Workspace, hashline, io_message, opt_bool, opt_u64, req_str};
 use anyhow::Result;
@@ -64,7 +65,10 @@ pub(super) fn list_dir(ws: &Workspace, dir: &Path) -> Result<String, String> {
     }
     names.sort();
     let total = names.len();
-    let mut text = format!("{} is a directory ({total} entries; '/' dir, '@' symlink):\n", ws.rel(dir));
+    let mut text = format!(
+        "{} is a directory ({total} entries; '/' dir, '@' symlink):\n",
+        ws.rel(dir)
+    );
     for name in names.iter().take(MAX_LIST) {
         text.push_str(name);
         text.push('\n');
@@ -91,7 +95,10 @@ pub(super) fn read_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
     let limit = limit.min(MAX_READ_LINES);
     let (path_text, sel) = select::split_target(ws, input)?;
     if offset.is_some() && sel.selects_lines() {
-        return Err("use either offset or a line selector on the path (`path:50-100`), not both".to_string());
+        return Err(
+            "use either offset or a line selector on the path (`path:50-100`), not both"
+                .to_string(),
+        );
     }
     if crate::llm::images::is_image(Path::new(path_text)) {
         if offset.is_some() || sel.selects_lines() || sel.raw {
@@ -102,7 +109,10 @@ pub(super) fn read_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
         if !meta.is_file() || meta.len() > crate::llm::images::MAX_IMAGE_BYTES {
             return Err("image must be a regular file no larger than 5 MiB".into());
         }
-        return Ok(format!("Image: {path_text} ({} bytes; attached to the next model request when vision is available)", meta.len()));
+        return Ok(format!(
+            "Image: {path_text} ({} bytes; attached to the next model request when vision is available)",
+            meta.len()
+        ));
     }
     let offset = offset.map_or(1, |o| o.min(usize::MAX as u64) as usize);
     match ws.edit_mode {
@@ -133,7 +143,13 @@ fn count_remaining_lines(reader: &mut impl BufRead) -> io::Result<usize> {
 /// Streaming read of the lines a selector picks, in constant memory.
 /// `sel.raw` drops the `     N\t` row prefix. Used by replace mode and as the
 /// raw fallback for files too large for hashline.
-pub(super) fn read_plain(ws: &Workspace, input: &str, sel: &Selector, offset: usize, limit: usize) -> Result<String, String> {
+pub(super) fn read_plain(
+    ws: &Workspace,
+    input: &str,
+    sel: &Selector,
+    offset: usize,
+    limit: usize,
+) -> Result<String, String> {
     let path = ws.resolve(input)?;
     let meta = fs::metadata(&path).map_err(|e| io_message("reading", input, &e))?;
     if meta.is_dir() {
@@ -142,7 +158,11 @@ pub(super) fn read_plain(ws: &Workspace, input: &str, sel: &Selector, offset: us
     let fail = |e: io::Error| io_message("reading", input, &e);
     let open = || fs::File::open(&path).map(BufReader::new).map_err(fail);
     // Only a tail selector needs the length before the first row.
-    let known_len = if sel.tail.is_some() { Some(count_remaining_lines(&mut open()?).map_err(fail)?) } else { None };
+    let known_len = if sel.tail.is_some() {
+        Some(count_remaining_lines(&mut open()?).map_err(fail)?)
+    } else {
+        None
+    };
     let spans = plan_spans(sel, offset, limit, known_len.unwrap_or(usize::MAX));
 
     let mut reader = open()?;
@@ -154,7 +174,10 @@ pub(super) fn read_plain(ws: &Workspace, input: &str, sel: &Selector, offset: us
     let mut at_eof = false;
     'spans: for span in &spans {
         while consumed + 1 < span.start {
-            if read_line_capped(&mut reader, &mut buf, 1).map_err(fail)?.is_none() {
+            if read_line_capped(&mut reader, &mut buf, 1)
+                .map_err(fail)?
+                .is_none()
+            {
                 at_eof = true;
                 break 'spans;
             }
@@ -163,16 +186,23 @@ pub(super) fn read_plain(ws: &Workspace, input: &str, sel: &Selector, offset: us
         let mut emitted = 0usize;
         let mut last = 0usize; // last line of this span actually returned
         while consumed < span.end {
-            let Some(cut) = read_line_capped(&mut reader, &mut buf, MAX_READ_LINE).map_err(fail)? else {
+            let Some(cut) = read_line_capped(&mut reader, &mut buf, MAX_READ_LINE).map_err(fail)?
+            else {
                 at_eof = true;
                 break;
             };
             consumed += 1;
             if buf.contains(&0) {
-                return Err(format!("{input:?} looks like a binary file (NUL byte at line {consumed})"));
+                return Err(format!(
+                    "{input:?} looks like a binary file (NUL byte at line {consumed})"
+                ));
             }
             let text = String::from_utf8_lossy(&buf);
-            let mut row = if sel.raw { text.into_owned() } else { format!("{consumed:>6}\t{text}") };
+            let mut row = if sel.raw {
+                text.into_owned()
+            } else {
+                format!("{consumed:>6}\t{text}")
+            };
             if cut {
                 row.push_str(" …[line truncated]");
             }
@@ -204,8 +234,20 @@ pub(super) fn read_plain(ws: &Workspace, input: &str, sel: &Selector, offset: us
         return Ok(empty_read(len));
     }
     let capped = stopped_at.is_some();
-    let next = stopped_at.or_else(|| spans.last().filter(|s| s.bounded && s.end < len).map(|s| s.end + 1));
-    out.push_str(&select::footer(&ws.rel(&path), sel, &shown, len, next, capped));
+    let next = stopped_at.or_else(|| {
+        spans
+            .last()
+            .filter(|s| s.bounded && s.end < len)
+            .map(|s| s.end + 1)
+    });
+    out.push_str(&select::footer(
+        &ws.rel(&path),
+        sel,
+        &shown,
+        len,
+        next,
+        capped,
+    ));
     Ok(out)
 }
 
@@ -224,12 +266,18 @@ pub(super) fn write_tool(ws: &Workspace, args: &Value) -> Result<String, String>
     }
     let existed = path.exists();
     let before = if existed {
-        fs::metadata(&path).ok().filter(|m| m.len() <= MAX_EDIT_FILE)
+        fs::metadata(&path)
+            .ok()
+            .filter(|m| m.len() <= MAX_EDIT_FILE)
             .and_then(|_| fs::read_to_string(&path).ok())
-    } else { Some(String::new()) };
+    } else {
+        Some(String::new())
+    };
+    ws.preflight_source(&path, before.as_deref().unwrap_or(""), content)?;
     ws.observe_write(&path)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| io_message("creating directories for", input, &e))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| io_message("creating directories for", input, &e))?;
     }
     fs::write(&path, content).map_err(|e| io_message("writing", input, &e))?;
     let mut message = format!(
@@ -242,7 +290,9 @@ pub(super) fn write_tool(ws: &Workspace, args: &Value) -> Result<String, String>
         message.push('\n');
         message.push_str(&hashline::note_write(ws, &path, content));
     }
-    if let Some(before) = before { message.push_str(&super::diff::preview(&before, content)); }
+    if let Some(before) = before {
+        message.push_str(&super::diff::preview(&before, content));
+    }
     Ok(message)
 }
 
@@ -252,7 +302,9 @@ pub(super) fn edit_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
     let new = req_str(args, "new")?;
     let replace_all = opt_bool(args, "replace_all")?;
     if old.is_empty() {
-        return Err("`old` must not be empty; use write to create or replace a whole file".to_string());
+        return Err(
+            "`old` must not be empty; use write to create or replace a whole file".to_string(),
+        );
     }
     if old == new {
         return Err("`old` and `new` are identical; nothing to change".to_string());
@@ -263,14 +315,24 @@ pub(super) fn edit_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
         return Err(format!("{input:?} is not a regular file"));
     }
     if meta.len() > MAX_EDIT_FILE {
-        return Err(format!("{input:?} is {} bytes; edit supports files up to {MAX_EDIT_FILE} bytes", meta.len()));
+        return Err(format!(
+            "{input:?} is {} bytes; edit supports files up to {MAX_EDIT_FILE} bytes",
+            meta.len()
+        ));
     }
     let bytes = fs::read(&path).map_err(|e| io_message("reading", input, &e))?;
     let text = String::from_utf8(bytes).map_err(|_| format!("{input:?} is not valid UTF-8"))?;
     // A model writes `\n`; a CRLF file stores `\r\n`. Match and write in the file's own convention.
     let crlf;
-    let (old, new) = if !text.contains(old) && text.contains("\r\n") && old.contains('\n') && !old.contains('\r') {
-        crlf = (old.replace('\n', "\r\n"), new.replace("\r\n", "\n").replace('\n', "\r\n"));
+    let (old, new) = if !text.contains(old)
+        && text.contains("\r\n")
+        && old.contains('\n')
+        && !old.contains('\r')
+    {
+        crlf = (
+            old.replace('\n', "\r\n"),
+            new.replace("\r\n", "\n").replace('\n', "\r\n"),
+        );
         (crlf.0.as_str(), crlf.1.as_str())
     } else {
         (old, new)
@@ -279,18 +341,34 @@ pub(super) fn edit_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
     match count {
         0 => match super::tolerant::find(&text, old, new) {
             super::tolerant::Outcome::Unique(found) => {
-                let mut note = format!("`old` differed from the file only in whitespace; matched lines {}-{}", found.lines.0, found.lines.1);
-                if let Some(how) = &found.reindent { note.push_str("; "); note.push_str(how); }
-                write_edited(ws, &path, input, &text, &found.updated, 1).map(|message| match message.split_once('\n') {
-                    Some((first, rest)) => format!("{first} ({note})\n{rest}"),
-                    None => format!("{message} ({note})"),
-                })
+                let mut note = format!(
+                    "`old` differed from the file only in whitespace; matched lines {}-{}",
+                    found.lines.0, found.lines.1
+                );
+                if let Some(how) = &found.reindent {
+                    note.push_str("; ");
+                    note.push_str(how);
+                }
+                write_edited(ws, &path, input, &text, &found.updated, 1).map(
+                    |message| match message.split_once('\n') {
+                        Some((first, rest)) => format!("{first} ({note})\n{rest}"),
+                        None => format!("{message} ({note})"),
+                    },
+                )
             }
             super::tolerant::Outcome::Ambiguous(lines) => Err(format!(
                 "`old` was not found byte-for-byte in {input:?}, and once whitespace is ignored it matches {} places (starting at lines {}); add the lines around the one you mean so it is unique, and copy their exact whitespace",
-                lines.len(), lines.iter().map(usize::to_string).collect::<Vec<_>>().join(", ")
+                lines.len(),
+                lines
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
-            super::tolerant::Outcome::None => Err(format!("`old` was not found in {input:?}.{}", diagnose_miss(&text, old))),
+            super::tolerant::Outcome::None => Err(format!(
+                "`old` was not found in {input:?}.{}",
+                diagnose_miss(&text, old)
+            )),
         },
         1 => write_edited(ws, &path, input, &text, &text.replacen(old, new, 1), 1),
         n if replace_all => write_edited(ws, &path, input, &text, &text.replace(old, new), n),
@@ -318,7 +396,13 @@ fn match_lines(text: &str, needle: &str) -> String {
 fn strip_row_number(line: &str) -> Option<&str> {
     let rest = line.trim_start_matches(' ');
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    (digits > 0).then(|| rest[digits..].strip_prefix('\t').or_else(|| rest[digits..].strip_prefix(':'))).flatten()
+    (digits > 0)
+        .then(|| {
+            rest[digits..]
+                .strip_prefix('\t')
+                .or_else(|| rest[digits..].strip_prefix(':'))
+        })
+        .flatten()
 }
 
 /// Why `old` did not match, as concrete advice. The usual causes for a model are copying the line
@@ -327,7 +411,11 @@ fn strip_row_number(line: &str) -> Option<&str> {
 fn diagnose_miss(text: &str, old: &str) -> String {
     const SHOWN: usize = 14;
     let old_lines: Vec<&str> = old.lines().collect();
-    let content: Vec<&str> = old_lines.iter().copied().filter(|l| !l.trim().is_empty()).collect();
+    let content: Vec<&str> = old_lines
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     if !content.is_empty() && content.iter().all(|l| strip_row_number(l).is_some()) {
         return " `old` starts each line with a line number from `read` output (like `    12\\t`); those are not part of the file. Copy only the text after the tab.".into();
     }
@@ -335,10 +423,19 @@ fn diagnose_miss(text: &str, old: &str) -> String {
     let trimmed: Vec<&str> = old_lines.iter().map(|l| l.trim()).collect();
     let n = trimmed.len();
     let similar = (n > 0 && n <= file_lines.len())
-        .then(|| (0..=file_lines.len() - n).find(|&i| file_lines[i..i + n].iter().map(|l| l.trim()).eq(trimmed.iter().copied())))
+        .then(|| {
+            (0..=file_lines.len() - n).find(|&i| {
+                file_lines[i..i + n]
+                    .iter()
+                    .map(|l| l.trim())
+                    .eq(trimmed.iter().copied())
+            })
+        })
         .flatten();
     if let Some(at) = similar {
-        let shown: String = (at..(at + n).min(at + SHOWN)).map(|i| format!("{}:{}\n", i + 1, file_lines[i])).collect();
+        let shown: String = (at..(at + n).min(at + SHOWN))
+            .map(|i| format!("{}:{}\n", i + 1, file_lines[i]))
+            .collect();
         return format!(
             " The same text exists at lines {}-{} but its whitespace (indentation, tabs, trailing spaces) differs. Actual text:\n{shown}Copy `old` exactly from these lines, leading whitespace included.",
             at + 1,
@@ -356,7 +453,10 @@ fn diagnose_miss(text: &str, old: &str) -> String {
         .map(|(i, l)| format!("  {}:{}", i + 1, l))
         .collect();
     if near.is_empty() {
-        return format!(" Not even its first line (`{}`) occurs in the file; the file may have changed. Read it again before editing.", crate::agent::truncate(anchor, 80));
+        return format!(
+            " Not even its first line (`{}`) occurs in the file; the file may have changed. Read it again before editing.",
+            crate::agent::truncate(anchor, 80)
+        );
     }
     format!(
         " Its first line occurs in the file but the lines after it differ:\n{}\nRead that region (for example `path:N-M`) and copy the exact text; matching is byte-exact.",
@@ -364,15 +464,26 @@ fn diagnose_miss(text: &str, old: &str) -> String {
     )
 }
 
-fn write_edited(ws: &Workspace, path: &Path, input: &str, before: &str, updated: &str, count: usize) -> Result<String, String> {
+fn write_edited(
+    ws: &Workspace,
+    path: &Path,
+    input: &str,
+    before: &str,
+    updated: &str,
+    count: usize,
+) -> Result<String, String> {
     if updated.len() > MAX_EDIT_FILE as usize {
         return Err(format!("edited content would exceed {MAX_EDIT_FILE} bytes"));
     }
+    ws.preflight_source(path, before, updated)?;
     ws.observe_write(path)?;
     fs::write(path, updated).map_err(|e| io_message("writing", input, &e))?;
-    Ok(format!("replaced {count} occurrence{} in {input}{}", if count == 1 { "" } else { "s" }, super::diff::preview(before, updated)))
+    Ok(format!(
+        "replaced {count} occurrence{} in {input}{}",
+        if count == 1 { "" } else { "s" },
+        super::diff::preview(before, updated)
+    ))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -384,18 +495,43 @@ mod tests {
         let (dir, ws) = workspace();
         let body: String = (1..=10).map(|i| format!("line {i}\n")).collect();
         fs::write(dir.path().join("f.txt"), &body).unwrap();
-        let out = run(&ws, "read", json!({"path": "f.txt", "offset": 3, "limit": 2}));
+        let out = run(
+            &ws,
+            "read",
+            json!({"path": "f.txt", "offset": 3, "limit": 2}),
+        );
         assert!(!out.is_error);
-        assert!(out.text.contains("     3\tline 3\n     4\tline 4\n"), "{}", out.text);
+        assert!(
+            out.text.contains("     3\tline 3\n     4\tline 4\n"),
+            "{}",
+            out.text
+        );
         assert!(!out.text.contains("line 5\n"));
-        assert!(out.text.ends_with("[lines 3-4 of 10; continue with `f.txt:5-`]\n"), "{}", out.text);
+        assert!(
+            out.text
+                .ends_with("[lines 3-4 of 10; continue with `f.txt:5-`]\n"),
+            "{}",
+            out.text
+        );
         let past = run(&ws, "read", json!({"path": "f.txt", "offset": 99}));
-        assert!(past.text.contains("no lines in that range; file has 10 lines"), "{}", past.text);
+        assert!(
+            past.text
+                .contains("no lines in that range; file has 10 lines"),
+            "{}",
+            past.text
+        );
         assert!(run(&ws, "read", json!({"path": "f.txt", "offset": 0})).is_error);
         fs::write(dir.path().join("empty"), "").unwrap();
-        assert_eq!(run(&ws, "read", json!({"path": "empty"})).text, "(empty file)");
+        assert_eq!(
+            run(&ws, "read", json!({"path": "empty"})).text,
+            "(empty file)"
+        );
         fs::write(dir.path().join("bin"), b"abc\0def").unwrap();
-        assert!(run(&ws, "read", json!({"path": "bin"})).text.contains("binary"));
+        assert!(
+            run(&ws, "read", json!({"path": "bin"}))
+                .text
+                .contains("binary")
+        );
         let missing = run(&ws, "read", json!({"path": "missing"}));
         assert!(missing.is_error && missing.text.contains("no such file"));
         let listing = run(&ws, "read", json!({"path": "."}));
@@ -410,8 +546,16 @@ mod tests {
         fs::write(dir.path().join("big.txt"), &body).unwrap();
         let out = run(&ws, "read", json!({"path": "big.txt", "limit": 10000}));
         assert!(!out.is_error);
-        assert!(out.text.len() <= MAX_READ_OUTPUT + 100, "{}", out.text.len());
-        assert!(out.text.contains("output truncated") && out.text.contains("continue with `big.txt:"), "{}", out.text);
+        assert!(
+            out.text.len() <= MAX_READ_OUTPUT + 100,
+            "{}",
+            out.text.len()
+        );
+        assert!(
+            out.text.contains("output truncated") && out.text.contains("continue with `big.txt:"),
+            "{}",
+            out.text
+        );
         // A single enormous line is truncated, not buffered.
         fs::write(dir.path().join("long.txt"), "y".repeat(5_000_000)).unwrap();
         let long = run(&ws, "read", json!({"path": "long.txt"}));
@@ -434,13 +578,23 @@ mod tests {
         );
         assert_eq!(read("f.txt:3+2").text, read("f.txt:3-4").text);
         let tail = read("f.txt:-2").text;
-        assert_eq!(tail, "    19\tline 19\n    20\tline 20\n[lines 19-20 of 20]\n");
+        assert_eq!(
+            tail,
+            "    19\tline 19\n    20\tline 20\n[lines 19-20 of 20]\n"
+        );
         let multi = read("f.txt:2-3,18-").text;
-        assert_eq!(multi, "     2\tline 2\n     3\tline 3\n…\n    18\tline 18\n    19\tline 19\n    20\tline 20\n[lines 2-3, 18-20 of 20]\n");
+        assert_eq!(
+            multi,
+            "     2\tline 2\n     3\tline 3\n…\n    18\tline 18\n    19\tline 19\n    20\tline 20\n[lines 2-3, 18-20 of 20]\n"
+        );
         assert_eq!(read("f.txt:raw:19-20").text, "line 19\nline 20\n");
         assert!(read("f.txt:0").is_error);
         assert!(read("f.txt:9-3").is_error);
-        assert!(read("f.txt:1-20").text.ends_with("    20\tline 20\n[lines 1-20 of 20]\n"));
+        assert!(
+            read("f.txt:1-20")
+                .text
+                .ends_with("    20\tline 20\n[lines 1-20 of 20]\n")
+        );
     }
 
     #[test]
@@ -448,14 +602,20 @@ mod tests {
         let (dir, ws) = workspace();
         numbered_file(&dir, "f.txt", 5);
         let read = |path: &str| run(&ws, "read", json!({ "path": path })).text;
-        assert_eq!(read("f.txt:4-99"), "     4\tline 4\n     5\tline 5\n[lines 4-5 of 5]\n");
+        assert_eq!(
+            read("f.txt:4-99"),
+            "     4\tline 4\n     5\tline 5\n[lines 4-5 of 5]\n"
+        );
         assert!(read("f.txt:6-9").contains("no lines in that range; file has 5 lines"));
         // A range past the end is skipped; the valid one is still returned.
         assert_eq!(read("f.txt:2-2,50-60"), "     2\tline 2\n[lines 2 of 5]\n");
         assert!(read("f.txt:-100").contains("[lines 1-5 of 5]"));
         // Open-ended ranges are bounded by `limit` and say how to continue.
         let paged = run(&ws, "read", json!({"path": "f.txt:2-", "limit": 2})).text;
-        assert!(paged.ends_with("[lines 2-3 of 5; continue with `f.txt:4-`]\n"), "{paged}");
+        assert!(
+            paged.ends_with("[lines 2-3 of 5; continue with `f.txt:4-`]\n"),
+            "{paged}"
+        );
         // An empty file has no lines for any selector.
         fs::write(dir.path().join("empty"), "").unwrap();
         assert_eq!(read("empty:3-5"), "(empty file)");
@@ -469,7 +629,10 @@ mod tests {
         let out = run(&ws, "read", json!({"path": "f.txt:-1"})).text;
         assert_eq!(out, "     3\tc\n[lines 3 of 3]\n");
         let head = run(&ws, "read", json!({"path": "f.txt", "limit": 1})).text;
-        assert!(head.ends_with("[lines 1 of 3; continue with `f.txt:2-`]\n"), "{head}");
+        assert!(
+            head.ends_with("[lines 1 of 3; continue with `f.txt:2-`]\n"),
+            "{head}"
+        );
     }
 
     #[test]
@@ -477,9 +640,16 @@ mod tests {
         let (dir, ws) = workspace();
         numbered_file(&dir, "f.txt", 5);
         let both = run(&ws, "read", json!({"path": "f.txt:2-3", "offset": 2}));
-        assert!(both.is_error && both.text.contains("not both"), "{}", both.text);
+        assert!(
+            both.is_error && both.text.contains("not both"),
+            "{}",
+            both.text
+        );
         fs::write(dir.path().join("weird:5"), "x\n").unwrap();
-        assert_eq!(run(&ws, "read", json!({"path": "weird:5"})).text, "     1\tx\n");
+        assert_eq!(
+            run(&ws, "read", json!({"path": "weird:5"})).text,
+            "     1\tx\n"
+        );
     }
 
     #[test]
@@ -487,8 +657,19 @@ mod tests {
         let (dir, ws) = workspace();
         let out = run(&ws, "write", json!({"path": "a/b/c.txt", "content": "hi"}));
         assert!(!out.is_error, "{}", out.text);
-        assert_eq!(fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(), "hi");
-        assert!(run(&ws, "write", json!({"path": "a/b/c.txt", "content": "again"})).text.contains("overwrote"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
+            "hi"
+        );
+        assert!(
+            run(
+                &ws,
+                "write",
+                json!({"path": "a/b/c.txt", "content": "again"})
+            )
+            .text
+            .contains("overwrote")
+        );
         let big = "z".repeat(MAX_WRITE + 1);
         let refused = run(&ws, "write", json!({"path": "big", "content": big}));
         assert!(refused.is_error && !dir.path().join("big").exists());
@@ -502,23 +683,54 @@ mod tests {
         let (dir, ws) = workspace();
         let file = dir.path().join("e.txt");
         fs::write(&file, "foo bar foo\n").unwrap();
-        let ambiguous = run(&ws, "edit", json!({"path": "e.txt", "old": "foo", "new": "baz"}));
-        assert!(ambiguous.is_error && ambiguous.text.contains("matches 2 places"), "{}", ambiguous.text);
+        let ambiguous = run(
+            &ws,
+            "edit",
+            json!({"path": "e.txt", "old": "foo", "new": "baz"}),
+        );
+        assert!(
+            ambiguous.is_error && ambiguous.text.contains("matches 2 places"),
+            "{}",
+            ambiguous.text
+        );
         assert_eq!(fs::read_to_string(&file).unwrap(), "foo bar foo\n");
-        let missing = run(&ws, "edit", json!({"path": "e.txt", "old": "nope", "new": "x"}));
+        let missing = run(
+            &ws,
+            "edit",
+            json!({"path": "e.txt", "old": "nope", "new": "x"}),
+        );
         assert!(missing.is_error && missing.text.contains("not found"));
-        let unique = run(&ws, "edit", json!({"path": "e.txt", "old": "bar", "new": "BAR"}));
+        let unique = run(
+            &ws,
+            "edit",
+            json!({"path": "e.txt", "old": "bar", "new": "BAR"}),
+        );
         assert!(!unique.is_error);
         assert_eq!(fs::read_to_string(&file).unwrap(), "foo BAR foo\n");
-        let all = run(&ws, "edit", json!({"path": "e.txt", "old": "foo", "new": "baz", "replace_all": true}));
+        let all = run(
+            &ws,
+            "edit",
+            json!({"path": "e.txt", "old": "foo", "new": "baz", "replace_all": true}),
+        );
         assert!(all.text.contains("2 occurrences"));
         assert_eq!(fs::read_to_string(&file).unwrap(), "baz BAR baz\n");
         assert!(run(&ws, "edit", json!({"path": "e.txt", "old": "", "new": "x"})).is_error);
-        assert!(run(&ws, "edit", json!({"path": "e.txt", "old": "baz", "new": "baz"})).is_error);
+        assert!(
+            run(
+                &ws,
+                "edit",
+                json!({"path": "e.txt", "old": "baz", "new": "baz"})
+            )
+            .is_error
+        );
     }
 
     fn edit_err(ws: &Workspace, path: &str, old: &str) -> String {
-        let out = run(ws, "edit", json!({"path": path, "old": old, "new": "REPLACED"}));
+        let out = run(
+            ws,
+            "edit",
+            json!({"path": path, "old": old, "new": "REPLACED"}),
+        );
         assert!(out.is_error, "{}", out.text);
         out.text
     }
@@ -529,10 +741,23 @@ mod tests {
         let file = dir.path().join("a.py");
         fs::write(&file, "def f():\n    x = 1\n    return x\n").unwrap();
         // The model dropped two spaces of indentation from every line of the block.
-        let out = run(&ws, "edit", json!({"path": "a.py", "old": "  x = 1\n  return x", "new": "  x = 2\n  return x"}));
+        let out = run(
+            &ws,
+            "edit",
+            json!({"path": "a.py", "old": "  x = 1\n  return x", "new": "  x = 2\n  return x"}),
+        );
         assert!(!out.is_error, "{}", out.text);
-        assert!(out.text.contains("only in whitespace") && out.text.contains("lines 2-3") && out.text.contains("2 spaces more"), "{}", out.text);
-        assert_eq!(fs::read_to_string(&file).unwrap(), "def f():\n    x = 2\n    return x\n");
+        assert!(
+            out.text.contains("only in whitespace")
+                && out.text.contains("lines 2-3")
+                && out.text.contains("2 spaces more"),
+            "{}",
+            out.text
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "def f():\n    x = 2\n    return x\n"
+        );
     }
 
     #[test]
@@ -542,12 +767,21 @@ mod tests {
         let original = "def f():\n    x = 1\n    return x\n\ndef g():\n    x = 1\n    return x\n";
         fs::write(&file, original).unwrap();
         let err = edit_err(&ws, "a.py", "x = 1\nreturn x");
-        assert!(err.contains("matches 2 places") && err.contains("lines 2, 6"), "{err}");
+        assert!(
+            err.contains("matches 2 places") && err.contains("lines 2, 6"),
+            "{err}"
+        );
         fs::write(&file, "def f():\n    x = 1\n    return x\n").unwrap();
         // Two spaces short on one line, four on the next: no single shift, so nothing is guessed.
         let err = edit_err(&ws, "a.py", "def f():\n  x = 1\n return x");
-        assert!(err.contains("lines 1-3") && err.contains("whitespace") && err.contains("2:    x = 1"), "{err}");
-        assert_eq!(fs::read_to_string(&file).unwrap(), "def f():\n    x = 1\n    return x\n");
+        assert!(
+            err.contains("lines 1-3") && err.contains("whitespace") && err.contains("2:    x = 1"),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "def f():\n    x = 1\n    return x\n"
+        );
     }
 
     #[test]
@@ -555,15 +789,25 @@ mod tests {
         let (dir, ws) = workspace();
         fs::write(dir.path().join("a.txt"), "alpha\nbeta\n").unwrap();
         let err = edit_err(&ws, "a.txt", "     1\talpha\n     2\tbeta");
-        assert!(err.contains("line number") && err.contains("after the tab"), "{err}");
+        assert!(
+            err.contains("line number") && err.contains("after the tab"),
+            "{err}"
+        );
     }
 
     #[test]
     fn a_drifted_block_points_at_where_its_first_line_is() {
         let (dir, ws) = workspace();
-        fs::write(dir.path().join("a.rs"), "fn a() {}\nfn target() {\n    new_body();\n}\n").unwrap();
+        fs::write(
+            dir.path().join("a.rs"),
+            "fn a() {}\nfn target() {\n    new_body();\n}\n",
+        )
+        .unwrap();
         let err = edit_err(&ws, "a.rs", "fn target() {\n    old_body();\n}");
-        assert!(err.contains("first line occurs") && err.contains("2:fn target() {"), "{err}");
+        assert!(
+            err.contains("first line occurs") && err.contains("2:fn target() {"),
+            "{err}"
+        );
         let gone = edit_err(&ws, "a.rs", "fn missing_entirely() {}");
         assert!(gone.contains("Not even its first line"), "{gone}");
     }
@@ -573,7 +817,10 @@ mod tests {
         let (dir, ws) = workspace();
         fs::write(dir.path().join("a.txt"), "x = 1\nfoo\nbar\nfoo\n").unwrap();
         let err = edit_err(&ws, "a.txt", "foo");
-        assert!(err.contains("matches 2 places") && err.contains("lines 2, 4"), "{err}");
+        assert!(
+            err.contains("matches 2 places") && err.contains("lines 2, 4"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -581,8 +828,15 @@ mod tests {
         let (dir, ws) = workspace();
         let file = dir.path().join("w.txt");
         fs::write(&file, "one\r\ntwo\r\nthree\r\n").unwrap();
-        let out = run(&ws, "edit", json!({"path": "w.txt", "old": "one\ntwo", "new": "1\n2\n2b"}));
+        let out = run(
+            &ws,
+            "edit",
+            json!({"path": "w.txt", "old": "one\ntwo", "new": "1\n2\n2b"}),
+        );
         assert!(!out.is_error, "{}", out.text);
-        assert_eq!(fs::read_to_string(&file).unwrap(), "1\r\n2\r\n2b\r\nthree\r\n");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "1\r\n2\r\n2b\r\nthree\r\n"
+        );
     }
 }

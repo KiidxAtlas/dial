@@ -1,15 +1,54 @@
 //! Reproducible, local benchmark suite parsing, workspace isolation, and scoring.
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::{Component, Path, PathBuf}, time::Instant};
+use std::{
+    fs,
+    path::{Component, Path, PathBuf},
+    time::Instant,
+};
 
 pub const MAX_CASES: usize = 1_000;
 pub const MAX_CHECKS_PER_CASE: usize = 100;
 pub const MAX_TURNS_PER_CASE: usize = 100;
 pub const MAX_CONTEXT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PROFILES: usize = 64;
-const EXCLUDED_DIRS: &[&str] = &[".git", ".dial", ".codegraph", ".ssh", ".aws", ".gnupg", ".kube", "secrets", ".secrets", "credentials", "target", "build", "dist", ".cache", ".venv", "venv", ".tox", "__pycache__", "node_modules", "vendor"];
-const EXCLUDED_FILES: &[&str] = &[".env", ".env.local", ".env.production", ".netrc", ".npmrc", ".pypirc", ".git-credentials", "credentials.json", "secrets.json", "secrets.yaml", "secrets.yml", "id_rsa", "id_ed25519"];
+const EXCLUDED_DIRS: &[&str] = &[
+    ".git",
+    ".dial",
+    ".codegraph",
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    "secrets",
+    ".secrets",
+    "credentials",
+    "target",
+    "build",
+    "dist",
+    ".cache",
+    ".venv",
+    "venv",
+    ".tox",
+    "__pycache__",
+    "node_modules",
+    "vendor",
+];
+const EXCLUDED_FILES: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    "credentials.json",
+    "secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    "id_rsa",
+    "id_ed25519",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -64,11 +103,31 @@ pub enum ObservedMetric {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Assertion {
-    FileExists { path: PathBuf },
-    FileContains { path: PathBuf, needle: String },
-    FileEquals { path: PathBuf, content: String },
-    Command { command: String, #[serde(default)] expect_stdout: Option<String>, #[serde(default)] expect_exit: i32 },
-    Metric { metric: ObservedMetric, #[serde(default)] min: Option<u64>, #[serde(default)] max: Option<u64> },
+    FileExists {
+        path: PathBuf,
+    },
+    FileContains {
+        path: PathBuf,
+        needle: String,
+    },
+    FileEquals {
+        path: PathBuf,
+        content: String,
+    },
+    Command {
+        command: String,
+        #[serde(default)]
+        expect_stdout: Option<String>,
+        #[serde(default)]
+        expect_exit: i32,
+    },
+    Metric {
+        metric: ObservedMetric,
+        #[serde(default)]
+        min: Option<u64>,
+        #[serde(default)]
+        max: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,7 +198,6 @@ pub struct BaselineComparison {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RegressionThresholds {
-
     pub max_latency_increase_ms: Option<u64>,
     pub max_prompt_token_increase: Option<u64>,
     pub max_output_token_increase: Option<u64>,
@@ -237,24 +295,68 @@ pub struct MachineBenchmarkPolicy {
 
 impl Default for MachineBenchmarkPolicy {
     fn default() -> Self {
-        Self { repetitions: 1, case_timeout_secs: 300, minimum_correctness: 1.0, allow_remote: false, regression_thresholds: RegressionThresholds::default() }
+        Self {
+            repetitions: 1,
+            case_timeout_secs: 300,
+            minimum_correctness: 1.0,
+            allow_remote: false,
+            regression_thresholds: RegressionThresholds::default(),
+        }
     }
 }
 
 impl MachineBenchmarkPolicy {
-    pub fn validate(&self, suite: &BenchmarkSuite, configurations: &[MachineConfiguration]) -> Result<()> {
+    pub fn validate(
+        &self,
+        suite: &BenchmarkSuite,
+        configurations: &[MachineConfiguration],
+    ) -> Result<()> {
         suite.validate()?;
-        ensure!((1..=10).contains(&self.repetitions), "machine benchmark repetitions must be 1..=10");
-        ensure!((1..=600).contains(&self.case_timeout_secs), "machine benchmark case timeout must be 1..=600 seconds");
-        ensure!(self.minimum_correctness.is_finite() && (0.0..=1.0).contains(&self.minimum_correctness), "minimum_correctness must be between zero and one");
-        ensure!(!configurations.is_empty() && configurations.len() <= MAX_PROFILES, "machine benchmark needs 1..={MAX_PROFILES} configurations");
-        ensure!(suite.cases.len().saturating_mul(configurations.len()).saturating_mul(self.repetitions) <= MAX_CASES, "machine benchmark exceeds {MAX_CASES} total case runs");
+        ensure!(
+            (1..=10).contains(&self.repetitions),
+            "machine benchmark repetitions must be 1..=10"
+        );
+        ensure!(
+            (1..=600).contains(&self.case_timeout_secs),
+            "machine benchmark case timeout must be 1..=600 seconds"
+        );
+        ensure!(
+            self.minimum_correctness.is_finite() && (0.0..=1.0).contains(&self.minimum_correctness),
+            "minimum_correctness must be between zero and one"
+        );
+        ensure!(
+            !configurations.is_empty() && configurations.len() <= MAX_PROFILES,
+            "machine benchmark needs 1..={MAX_PROFILES} configurations"
+        );
+        ensure!(
+            suite
+                .cases
+                .len()
+                .saturating_mul(configurations.len())
+                .saturating_mul(self.repetitions)
+                <= MAX_CASES,
+            "machine benchmark exceeds {MAX_CASES} total case runs"
+        );
         let mut names = std::collections::BTreeSet::new();
         for configuration in configurations {
-            ensure!(!configuration.name.trim().is_empty() && names.insert(&configuration.name), "configuration names must be nonempty and unique");
-            ensure!(!configuration.provider.trim().is_empty() && !configuration.model.trim().is_empty(), "configuration provider and model must be explicit");
-            ensure!((2048..=1_048_576).contains(&configuration.context_window), "configuration context_window must be 2048..=1048576");
-            ensure!(configuration.quantization_bits.is_none_or(|bits| (1..=16).contains(&bits)), "quantization_bits must be 1..=16");
+            ensure!(
+                !configuration.name.trim().is_empty() && names.insert(&configuration.name),
+                "configuration names must be nonempty and unique"
+            );
+            ensure!(
+                !configuration.provider.trim().is_empty() && !configuration.model.trim().is_empty(),
+                "configuration provider and model must be explicit"
+            );
+            ensure!(
+                (2048..=1_048_576).contains(&configuration.context_window),
+                "configuration context_window must be 2048..=1048576"
+            );
+            ensure!(
+                configuration
+                    .quantization_bits
+                    .is_none_or(|bits| (1..=16).contains(&bits)),
+                "quantization_bits must be 1..=16"
+            );
         }
         Ok(())
     }
@@ -286,18 +388,35 @@ pub struct MachineConfigurationReport {
 }
 
 impl MachineConfigurationReport {
-    pub fn measured(configuration: MachineConfiguration, settings: serde_json::Value, report: BenchmarkReport, wall_time_ms: u64) -> Self {
-        let all_usage = !report.cases.is_empty() && report.cases.iter().all(|case| case.metrics.token_usage_observed && !case.metrics.token_usage_incomplete);
-        let repairs = report.cases.iter().try_fold(0u64, |sum, case| case.metrics.repair_attempts.map(|n| sum.saturating_add(n)));
+    pub fn measured(
+        configuration: MachineConfiguration,
+        settings: serde_json::Value,
+        report: BenchmarkReport,
+        wall_time_ms: u64,
+    ) -> Self {
+        let all_usage = !report.cases.is_empty()
+            && report.cases.iter().all(|case| {
+                case.metrics.token_usage_observed && !case.metrics.token_usage_incomplete
+            });
+        let repairs = report.cases.iter().try_fold(0u64, |sum, case| {
+            case.metrics.repair_attempts.map(|n| sum.saturating_add(n))
+        });
         let successes = report.cases.iter().filter(|case| case.passed).count();
         Self {
-            configuration, settings, wall_time_ms,
+            configuration,
+            settings,
+            wall_time_ms,
             observed_prompt_tokens: all_usage.then(|| total_prompt_tokens(&report)),
             observed_output_tokens: all_usage.then(|| total_output_tokens(&report)),
             repair_attempts: repairs,
-            correct_cases_per_second: (wall_time_ms > 0).then(|| successes as f64 * 1000.0 / wall_time_ms as f64),
+            correct_cases_per_second: (wall_time_ms > 0)
+                .then(|| successes as f64 * 1000.0 / wall_time_ms as f64),
             eligible: false,
-            baseline_comparison: BaselineComparison { score_delta: 0.0, pass_rate_delta: 0.0, regressed: false },
+            baseline_comparison: BaselineComparison {
+                score_delta: 0.0,
+                pass_rate_delta: 0.0,
+                regressed: false,
+            },
             report,
         }
     }
@@ -317,21 +436,53 @@ pub struct MachineBenchmarkReport {
 
 /// First configuration is the baseline. Only floor-passing, non-regressing
 /// configurations with at least one verified success and measured wall time can win.
-pub fn rank_machine_configurations(reports: &mut [MachineConfigurationReport], policy: &MachineBenchmarkPolicy) -> Result<Option<String>> {
-    let baseline = reports.first().context("machine benchmark has no reports")?.report.clone();
+pub fn rank_machine_configurations(
+    reports: &mut [MachineConfigurationReport],
+    policy: &MachineBenchmarkPolicy,
+) -> Result<Option<String>> {
+    let baseline = reports
+        .first()
+        .context("machine benchmark has no reports")?
+        .report
+        .clone();
     for report in reports.iter_mut() {
-        ensure!(report.report.suite == baseline.suite && report.report.cases.len() == baseline.cases.len()
-            && report.report.cases.iter().zip(&baseline.cases).all(|(now, before)| now.id == before.id && now.checks_total == before.checks_total),
-            "machine benchmark configurations must execute identical verified tasks");
-        report.baseline_comparison = compare_baseline_with_thresholds(&report.report, &baseline, policy.regression_thresholds);
+        ensure!(
+            report.report.suite == baseline.suite
+                && report.report.cases.len() == baseline.cases.len()
+                && report
+                    .report
+                    .cases
+                    .iter()
+                    .zip(&baseline.cases)
+                    .all(|(now, before)| now.id == before.id
+                        && now.checks_total == before.checks_total),
+            "machine benchmark configurations must execute identical verified tasks"
+        );
+        report.baseline_comparison = compare_baseline_with_thresholds(
+            &report.report,
+            &baseline,
+            policy.regression_thresholds,
+        );
         report.eligible = report.report.pass_rate >= policy.minimum_correctness
             && !report.baseline_comparison.regressed
-            && report.correct_cases_per_second.is_some_and(|rate| rate > 0.0);
+            && report
+                .correct_cases_per_second
+                .is_some_and(|rate| rate > 0.0);
     }
-    reports.sort_by(|a, b| b.eligible.cmp(&a.eligible)
-        .then_with(|| b.correct_cases_per_second.unwrap_or(0.0).total_cmp(&a.correct_cases_per_second.unwrap_or(0.0)))
-        .then_with(|| a.configuration.name.cmp(&b.configuration.name)));
-    Ok(reports.first().filter(|report| report.eligible).map(|report| report.configuration.name.clone()))
+    reports.sort_by(|a, b| {
+        b.eligible
+            .cmp(&a.eligible)
+            .then_with(|| {
+                b.correct_cases_per_second
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.correct_cases_per_second.unwrap_or(0.0))
+            })
+            .then_with(|| a.configuration.name.cmp(&b.configuration.name))
+    });
+    Ok(reports
+        .first()
+        .filter(|report| report.eligible)
+        .map(|report| report.configuration.name.clone()))
 }
 
 impl BenchmarkSuite {
@@ -342,32 +493,93 @@ impl BenchmarkSuite {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(!self.name.trim().is_empty(), "benchmark suite name cannot be empty");
-        ensure!(self.version == 1, "unsupported benchmark suite version {}", self.version);
-        ensure!(!self.cases.is_empty() && self.cases.len() <= MAX_CASES, "benchmark suite must contain 1..={MAX_CASES} cases");
+        ensure!(
+            !self.name.trim().is_empty(),
+            "benchmark suite name cannot be empty"
+        );
+        ensure!(
+            self.version == 1,
+            "unsupported benchmark suite version {}",
+            self.version
+        );
+        ensure!(
+            !self.cases.is_empty() && self.cases.len() <= MAX_CASES,
+            "benchmark suite must contain 1..={MAX_CASES} cases"
+        );
         let mut ids = std::collections::BTreeSet::new();
         for case in &self.cases {
-            ensure!(!case.id.trim().is_empty() && ids.insert(&case.id), "benchmark case IDs must be non-empty and unique");
-            ensure!(case.checks.len() <= MAX_CHECKS_PER_CASE, "case {} exceeds {MAX_CHECKS_PER_CASE} checks", case.id);
-            ensure!(!case.checks.is_empty(), "case {} must contain at least one deterministic check", case.id);
-            ensure!(!case.prompt.trim().is_empty(), "case {} prompt cannot be empty", case.id);
-            ensure!(case.turns.len() <= MAX_TURNS_PER_CASE, "case {} exceeds {MAX_TURNS_PER_CASE} follow-up turns", case.id);
-            ensure!(case.turns.iter().all(|turn| !turn.prompt.trim().is_empty()), "case {} has an empty follow-up prompt", case.id);
-            let bytes = case.context_messages.iter().map(String::len)
+            ensure!(
+                !case.id.trim().is_empty() && ids.insert(&case.id),
+                "benchmark case IDs must be non-empty and unique"
+            );
+            ensure!(
+                case.checks.len() <= MAX_CHECKS_PER_CASE,
+                "case {} exceeds {MAX_CHECKS_PER_CASE} checks",
+                case.id
+            );
+            ensure!(
+                !case.checks.is_empty(),
+                "case {} must contain at least one deterministic check",
+                case.id
+            );
+            ensure!(
+                !case.prompt.trim().is_empty(),
+                "case {} prompt cannot be empty",
+                case.id
+            );
+            ensure!(
+                case.turns.len() <= MAX_TURNS_PER_CASE,
+                "case {} exceeds {MAX_TURNS_PER_CASE} follow-up turns",
+                case.id
+            );
+            ensure!(
+                case.turns.iter().all(|turn| !turn.prompt.trim().is_empty()),
+                "case {} has an empty follow-up prompt",
+                case.id
+            );
+            let bytes = case
+                .context_messages
+                .iter()
+                .map(String::len)
                 .chain(std::iter::once(case.prompt.len()))
                 .chain(case.turns.iter().map(|turn| turn.prompt.len()))
                 .fold(0usize, usize::saturating_add);
-            ensure!(bytes <= MAX_CONTEXT_BYTES, "case {} exceeds {MAX_CONTEXT_BYTES} input bytes", case.id);
+            ensure!(
+                bytes <= MAX_CONTEXT_BYTES,
+                "case {} exceeds {MAX_CONTEXT_BYTES} input bytes",
+                case.id
+            );
             let mut categories = std::collections::BTreeSet::new();
-            ensure!(case.categories.iter().all(|category| !category.trim().is_empty() && categories.insert(category)), "case {} categories must be non-empty and unique", case.id);
-            if let Some(project) = &case.project { validate_relative(project).context("invalid case project path")?; }
+            ensure!(
+                case.categories
+                    .iter()
+                    .all(|category| !category.trim().is_empty() && categories.insert(category)),
+                "case {} categories must be non-empty and unique",
+                case.id
+            );
+            if let Some(project) = &case.project {
+                validate_relative(project).context("invalid case project path")?;
+            }
             for assertion in &case.checks {
                 match assertion {
-                    Assertion::FileExists { path } | Assertion::FileContains { path, .. } | Assertion::FileEquals { path, .. } => validate_relative(path).context("invalid assertion path")?,
-                    Assertion::Command { command, .. } => ensure!(!command.trim().is_empty(), "command assertion cannot be empty"),
+                    Assertion::FileExists { path }
+                    | Assertion::FileContains { path, .. }
+                    | Assertion::FileEquals { path, .. } => {
+                        validate_relative(path).context("invalid assertion path")?
+                    }
+                    Assertion::Command { command, .. } => ensure!(
+                        !command.trim().is_empty(),
+                        "command assertion cannot be empty"
+                    ),
                     Assertion::Metric { min, max, .. } => {
-                        ensure!(min.is_some() || max.is_some(), "metric assertion needs a bound");
-                        ensure!((*min).zip(*max).is_none_or(|(min, max)| min <= max), "metric minimum exceeds maximum");
+                        ensure!(
+                            min.is_some() || max.is_some(),
+                            "metric assertion needs a bound"
+                        );
+                        ensure!(
+                            (*min).zip(*max).is_none_or(|(min, max)| min <= max),
+                            "metric minimum exceeds maximum"
+                        );
                     }
                 }
             }
@@ -377,7 +589,12 @@ impl BenchmarkSuite {
 
     /// Run cases with parent-supplied execution and verifier callbacks. Agent and verifier
     /// failures are recorded per case rather than treated as a passing result.
-    pub fn run<A, C>(&self, source_root: &Path, mut agent: A, mut command_check: C) -> Result<BenchmarkReport>
+    pub fn run<A, C>(
+        &self,
+        source_root: &Path,
+        mut agent: A,
+        mut command_check: C,
+    ) -> Result<BenchmarkReport>
     where
         A: FnMut(&BenchmarkCase, &Path) -> Result<RunMetrics>,
         C: FnMut(&CommandCheck, &Path) -> Result<bool>,
@@ -393,16 +610,45 @@ impl BenchmarkSuite {
             let started = Instant::now();
             let mut metrics = match agent(case, workspace.path()) {
                 Ok(metrics) => metrics,
-                Err(_) => RunMetrics { agent_error: true, ..RunMetrics::default() },
+                Err(_) => RunMetrics {
+                    agent_error: true,
+                    ..RunMetrics::default()
+                },
             };
-            if metrics.elapsed_ms == 0 { metrics.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64; }
+            if metrics.elapsed_ms == 0 {
+                metrics.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            }
             let mut checks_passed = 0;
             for assertion in &case.checks {
                 let passed = match assertion {
-                    Assertion::FileExists { path } => confined_existing(workspace.path(), path).is_ok_and(|path| path.is_file()),
-                    Assertion::FileContains { path, needle } => confined_existing(workspace.path(), path).ok().and_then(|p| fs::read_to_string(p).ok()).is_some_and(|s| s.contains(needle)),
-                    Assertion::FileEquals { path, content } => confined_existing(workspace.path(), path).ok().and_then(|p| fs::read_to_string(p).ok()).is_some_and(|s| s.trim_end() == content.trim_end()),
-                    Assertion::Command { command, expect_stdout, expect_exit } => command_check(&CommandCheck { command, expect_stdout: expect_stdout.as_deref(), expect_exit: *expect_exit }, workspace.path()).unwrap_or(false),
+                    Assertion::FileExists { path } => {
+                        confined_existing(workspace.path(), path).is_ok_and(|path| path.is_file())
+                    }
+                    Assertion::FileContains { path, needle } => {
+                        confined_existing(workspace.path(), path)
+                            .ok()
+                            .and_then(|p| fs::read_to_string(p).ok())
+                            .is_some_and(|s| s.contains(needle))
+                    }
+                    Assertion::FileEquals { path, content } => {
+                        confined_existing(workspace.path(), path)
+                            .ok()
+                            .and_then(|p| fs::read_to_string(p).ok())
+                            .is_some_and(|s| s.trim_end() == content.trim_end())
+                    }
+                    Assertion::Command {
+                        command,
+                        expect_stdout,
+                        expect_exit,
+                    } => command_check(
+                        &CommandCheck {
+                            command,
+                            expect_stdout: expect_stdout.as_deref(),
+                            expect_exit: *expect_exit,
+                        },
+                        workspace.path(),
+                    )
+                    .unwrap_or(false),
                     Assertion::Metric { metric, min, max } => {
                         let value = metrics.observed(*metric);
                         min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
@@ -410,48 +656,105 @@ impl BenchmarkSuite {
                 };
                 checks_passed += usize::from(passed);
             }
-            let completed_turns = case.turns.is_empty() || metrics.turns_completed == (case.turns.len() + 1) as u64;
-            let forced_compactions = case.turns.iter().filter(|turn| turn.compact_before).count() as u64;
-            let passed = metrics.agent_succeeded && !metrics.agent_error && completed_turns
-                && metrics.compactions >= forced_compactions && checks_passed == case.checks.len();
-            results.push(CaseResult { id: case.id.clone(), passed, checks_passed, checks_total: case.checks.len(), metrics });
+            let completed_turns =
+                case.turns.is_empty() || metrics.turns_completed == (case.turns.len() + 1) as u64;
+            let forced_compactions =
+                case.turns.iter().filter(|turn| turn.compact_before).count() as u64;
+            let passed = metrics.agent_succeeded
+                && !metrics.agent_error
+                && completed_turns
+                && metrics.compactions >= forced_compactions
+                && checks_passed == case.checks.len();
+            results.push(CaseResult {
+                id: case.id.clone(),
+                passed,
+                checks_passed,
+                checks_total: case.checks.len(),
+                metrics,
+            });
         }
         Ok(score_report(&self.name, results))
     }
 
     /// Each profile gets a fresh workspace for every case. The runner must select
     /// the named real configuration and apply each requested ablation or fail.
-    pub fn run_profiles<A, C>(&self, source_root: &Path, profiles: &[BenchmarkProfile], mut agent: A, mut command_check: C) -> Result<ProfileComparisonReport>
+    pub fn run_profiles<A, C>(
+        &self,
+        source_root: &Path,
+        profiles: &[BenchmarkProfile],
+        mut agent: A,
+        mut command_check: C,
+    ) -> Result<ProfileComparisonReport>
     where
         A: FnMut(&BenchmarkProfile, &BenchmarkCase, &Path) -> Result<RunMetrics>,
         C: FnMut(&CommandCheck, &Path) -> Result<bool>,
     {
-        ensure!(!profiles.is_empty() && profiles.len() <= MAX_PROFILES, "benchmark needs 1..={MAX_PROFILES} profiles");
+        ensure!(
+            !profiles.is_empty() && profiles.len() <= MAX_PROFILES,
+            "benchmark needs 1..={MAX_PROFILES} profiles"
+        );
         let mut names = std::collections::BTreeSet::new();
         for profile in profiles {
-            ensure!(!profile.name.trim().is_empty() && names.insert(&profile.name), "profile names must be non-empty and unique");
+            ensure!(
+                !profile.name.trim().is_empty() && names.insert(&profile.name),
+                "profile names must be non-empty and unique"
+            );
             let mut ablations = std::collections::BTreeSet::new();
-            ensure!(profile.ablations.iter().all(|item| !item.trim().is_empty() && ablations.insert(item)), "ablations must be non-empty and unique");
+            ensure!(
+                profile
+                    .ablations
+                    .iter()
+                    .all(|item| !item.trim().is_empty() && ablations.insert(item)),
+                "ablations must be non-empty and unique"
+            );
         }
         let mut reports = Vec::with_capacity(profiles.len());
         for profile in profiles {
-            let report = self.run(source_root, |case, workspace| agent(profile, case, workspace), &mut command_check)?;
+            let report = self.run(
+                source_root,
+                |case, workspace| agent(profile, case, workspace),
+                &mut command_check,
+            )?;
             let normalized = normalize(&report, None);
             let categories = category_metrics(self, &report);
-            reports.push(ProfileReport { profile: profile.clone(), report, normalized, categories, baseline_comparison: BaselineComparison { score_delta: 0.0, pass_rate_delta: 0.0, regressed: false } });
+            reports.push(ProfileReport {
+                profile: profile.clone(),
+                report,
+                normalized,
+                categories,
+                baseline_comparison: BaselineComparison {
+                    score_delta: 0.0,
+                    pass_rate_delta: 0.0,
+                    regressed: false,
+                },
+            });
         }
-        let (baseline, others) = reports.split_first_mut().expect("validated non-empty profiles");
+        let (baseline, others) = reports
+            .split_first_mut()
+            .expect("validated non-empty profiles");
         baseline.normalized = normalize(&baseline.report, Some(&baseline.report));
         for report in others {
-            report.normalized = normalize_cases(report.report.cases.iter(), Some(&baseline.normalized));
+            report.normalized =
+                normalize_cases(report.report.cases.iter(), Some(&baseline.normalized));
             report.baseline_comparison = compare_baseline(&report.report, &baseline.report);
         }
         reports.sort_by(|a, b| {
-            b.normalized.verified_success_rate.total_cmp(&a.normalized.verified_success_rate)
-                .then_with(|| a.normalized.successful_latency_ms.unwrap_or(f64::INFINITY).total_cmp(&b.normalized.successful_latency_ms.unwrap_or(f64::INFINITY)))
+            b.normalized
+                .verified_success_rate
+                .total_cmp(&a.normalized.verified_success_rate)
+                .then_with(|| {
+                    a.normalized
+                        .successful_latency_ms
+                        .unwrap_or(f64::INFINITY)
+                        .total_cmp(&b.normalized.successful_latency_ms.unwrap_or(f64::INFINITY))
+                })
                 .then_with(|| a.profile.name.cmp(&b.profile.name))
         });
-        Ok(ProfileComparisonReport { suite: self.name.clone(), baseline_profile: profiles[0].name.clone(), profiles: reports })
+        Ok(ProfileComparisonReport {
+            suite: self.name.clone(),
+            baseline_profile: profiles[0].name.clone(),
+            profiles: reports,
+        })
     }
 }
 
@@ -465,7 +768,8 @@ pub struct CommandCheck<'a> {
 /// Copy a source tree into a unique temporary directory, omitting generated/state directories.
 /// Symlinks are materialized only when their canonical targets remain inside the source root.
 pub fn clone_project(source: &Path) -> Result<tempfile::TempDir> {
-    let source = fs::canonicalize(source).with_context(|| format!("resolving benchmark source {}", source.display()))?;
+    let source = fs::canonicalize(source)
+        .with_context(|| format!("resolving benchmark source {}", source.display()))?;
     ensure!(source.is_dir(), "benchmark source must be a directory");
     let destination = tempfile::tempdir().context("creating benchmark workspace")?;
     let mut visited = std::collections::BTreeSet::new();
@@ -473,23 +777,46 @@ pub fn clone_project(source: &Path) -> Result<tempfile::TempDir> {
     Ok(destination)
 }
 
-fn copy_directory(source: &Path, dest: &Path, root: &Path, visited: &mut std::collections::BTreeSet<PathBuf>) -> Result<()> {
+fn copy_directory(
+    source: &Path,
+    dest: &Path,
+    root: &Path,
+    visited: &mut std::collections::BTreeSet<PathBuf>,
+) -> Result<()> {
     let canonical = fs::canonicalize(source)?;
-    ensure!(canonical.starts_with(root), "source symlink escapes project root");
-    if !visited.insert(canonical.clone()) { return Ok(()); }
+    ensure!(
+        canonical.starts_with(root),
+        "source symlink escapes project root"
+    );
+    if !visited.insert(canonical.clone()) {
+        return Ok(());
+    }
     for entry in fs::read_dir(source).with_context(|| format!("reading {}", source.display()))? {
         let entry = entry?;
         let from = entry.path();
-        if is_excluded_source_path(root, &from) { continue; }
+        if is_excluded_source_path(root, &from) {
+            continue;
+        }
         let name = entry.file_name();
         let to = dest.join(&name);
         let metadata = fs::symlink_metadata(&from)?;
         if metadata.file_type().is_symlink() {
-            let target = fs::canonicalize(&from).with_context(|| format!("resolving symlink {}", from.display()))?;
-            ensure!(target.starts_with(root), "source symlink escapes project root: {}", from.display());
-            if is_excluded_source_path(root, &target) { continue; }
-            if target.is_dir() { fs::create_dir_all(&to)?; copy_directory(&target, &to, root, visited)?; }
-            else { fs::copy(&target, &to).with_context(|| format!("copying {}", from.display()))?; }
+            let target = fs::canonicalize(&from)
+                .with_context(|| format!("resolving symlink {}", from.display()))?;
+            ensure!(
+                target.starts_with(root),
+                "source symlink escapes project root: {}",
+                from.display()
+            );
+            if is_excluded_source_path(root, &target) {
+                continue;
+            }
+            if target.is_dir() {
+                fs::create_dir_all(&to)?;
+                copy_directory(&target, &to, root, visited)?;
+            } else {
+                fs::copy(&target, &to).with_context(|| format!("copying {}", from.display()))?;
+            }
         } else if metadata.is_dir() {
             fs::create_dir(&to)?;
             copy_directory(&from, &to, root, visited)?;
@@ -502,22 +829,43 @@ fn copy_directory(source: &Path, dest: &Path, root: &Path, visited: &mut std::co
 
 fn is_secret_file(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    if EXCLUDED_FILES.contains(&lower.as_str()) { return true; }
-    if lower.starts_with(".env.") && !matches!(lower.as_str(), ".env.example" | ".env.sample" | ".env.template") { return true; }
-    [".pem", ".p12", ".pfx"].iter().any(|extension| lower.ends_with(extension))
+    if EXCLUDED_FILES.contains(&lower.as_str()) {
+        return true;
+    }
+    if lower.starts_with(".env.")
+        && !matches!(
+            lower.as_str(),
+            ".env.example" | ".env.sample" | ".env.template"
+        )
+    {
+        return true;
+    }
+    [".pem", ".p12", ".pfx"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
 }
 
-fn is_excluded_source_path(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else { return true };
+pub(crate) fn is_excluded_source_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
     relative.components().any(|component| {
-        let Component::Normal(name) = component else { return true };
+        let Component::Normal(name) = component else {
+            return true;
+        };
         let name = name.to_string_lossy();
         EXCLUDED_DIRS.contains(&name.as_ref()) || is_secret_file(&name)
     })
 }
 
 fn validate_relative(path: &Path) -> Result<()> {
-    ensure!(!path.as_os_str().is_empty() && path.components().all(|part| matches!(part, Component::Normal(_))), "path must be a non-empty relative path without traversal");
+    ensure!(
+        !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_))),
+        "path must be a non-empty relative path without traversal"
+    );
     Ok(())
 }
 
@@ -526,13 +874,21 @@ fn confined_existing(root: &Path, relative: &Path) -> Result<PathBuf> {
     let root = fs::canonicalize(root).context("resolving workspace root")?;
     let mut path = root.clone();
     for component in relative.components() {
-        let Component::Normal(name) = component else { bail!("invalid workspace path") };
+        let Component::Normal(name) = component else {
+            bail!("invalid workspace path")
+        };
         path.push(name);
         let metadata = fs::symlink_metadata(&path).context("workspace path does not exist")?;
-        ensure!(!metadata.file_type().is_symlink(), "workspace assertion path traverses symlink");
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "workspace assertion path traverses symlink"
+        );
     }
     let resolved = fs::canonicalize(&path)?;
-    ensure!(resolved.starts_with(root), "workspace assertion path escapes root");
+    ensure!(
+        resolved.starts_with(root),
+        "workspace assertion path escapes root"
+    );
     Ok(resolved)
 }
 
@@ -540,41 +896,120 @@ pub fn score_report(suite: &str, cases: Vec<CaseResult>) -> BenchmarkReport {
     let n = cases.len() as f64;
     let passed = cases.iter().filter(|case| case.passed).count() as f64;
     let pass_rate = if cases.is_empty() { 0.0 } else { passed / n };
-    let average_latency_ms = if cases.is_empty() { 0.0 } else { cases.iter().map(|case| case.metrics.elapsed_ms as f64).sum::<f64>() / n };
-    let total_tokens = cases.iter().fold(0u64, |sum, case| sum.saturating_add(case.metrics.prompt_tokens).saturating_add(case.metrics.output_tokens));
-    let total_tool_calls = cases.iter().fold(0u64, |sum, case| sum.saturating_add(case.metrics.tool_calls));
-    let total_tool_errors = cases.iter().fold(0u64, |sum, case| sum.saturating_add(case.metrics.tool_errors));
-    BenchmarkReport { suite: suite.to_owned(), cases, pass_rate, average_latency_ms, total_tokens, total_tool_calls, total_tool_errors, score: pass_rate }
+    let average_latency_ms = if cases.is_empty() {
+        0.0
+    } else {
+        cases
+            .iter()
+            .map(|case| case.metrics.elapsed_ms as f64)
+            .sum::<f64>()
+            / n
+    };
+    let total_tokens = cases.iter().fold(0u64, |sum, case| {
+        sum.saturating_add(case.metrics.prompt_tokens)
+            .saturating_add(case.metrics.output_tokens)
+    });
+    let total_tool_calls = cases.iter().fold(0u64, |sum, case| {
+        sum.saturating_add(case.metrics.tool_calls)
+    });
+    let total_tool_errors = cases.iter().fold(0u64, |sum, case| {
+        sum.saturating_add(case.metrics.tool_errors)
+    });
+    BenchmarkReport {
+        suite: suite.to_owned(),
+        cases,
+        pass_rate,
+        average_latency_ms,
+        total_tokens,
+        total_tool_calls,
+        total_tool_errors,
+        score: pass_rate,
+    }
 }
 
-pub fn compare_baseline(current: &BenchmarkReport, baseline: &BenchmarkReport) -> BaselineComparison {
+pub fn compare_baseline(
+    current: &BenchmarkReport,
+    baseline: &BenchmarkReport,
+) -> BaselineComparison {
     compare_baseline_with_thresholds(current, baseline, RegressionThresholds::default())
 }
 
 /// Compare aggregate/case outcomes and configured upper bounds on metric growth.
-pub fn compare_baseline_with_thresholds(current: &BenchmarkReport, baseline: &BenchmarkReport, thresholds: RegressionThresholds) -> BaselineComparison {
+pub fn compare_baseline_with_thresholds(
+    current: &BenchmarkReport,
+    baseline: &BenchmarkReport,
+    thresholds: RegressionThresholds,
+) -> BaselineComparison {
     let score_delta = current.score - baseline.score;
     let pass_rate_delta = current.pass_rate - baseline.pass_rate;
-    let current_by_id: std::collections::BTreeMap<_, _> = current.cases.iter().map(|case| (&case.id, case)).collect();
-    let failed_previous_case = baseline.cases.iter().filter(|case| case.passed).any(|case| current_by_id.get(&case.id).is_none_or(|now| !now.passed || (case.checks_passed > now.checks_passed)));
-    let exceeds = |current: u64, baseline: u64, threshold: Option<u64>| threshold.is_some_and(|max| current.saturating_sub(baseline) > max);
-    let metric_regression = exceeds(current.total_tool_calls, baseline.total_tool_calls, thresholds.max_tool_call_increase)
-        || exceeds(current.total_tool_errors, baseline.total_tool_errors, thresholds.max_tool_error_increase)
-        || exceeds(total_prompt_tokens(current), total_prompt_tokens(baseline), thresholds.max_prompt_token_increase)
-        || exceeds(total_output_tokens(current), total_output_tokens(baseline), thresholds.max_output_token_increase)
-        || exceeds(current.average_latency_ms.max(0.0) as u64, baseline.average_latency_ms.max(0.0) as u64, thresholds.max_latency_increase_ms);
-    BaselineComparison { score_delta, pass_rate_delta, regressed: score_delta < 0.0 || pass_rate_delta < 0.0 || failed_previous_case || metric_regression }
+    let current_by_id: std::collections::BTreeMap<_, _> =
+        current.cases.iter().map(|case| (&case.id, case)).collect();
+    let failed_previous_case = baseline
+        .cases
+        .iter()
+        .filter(|case| case.passed)
+        .any(|case| {
+            current_by_id
+                .get(&case.id)
+                .is_none_or(|now| !now.passed || (case.checks_passed > now.checks_passed))
+        });
+    let exceeds = |current: u64, baseline: u64, threshold: Option<u64>| {
+        threshold.is_some_and(|max| current.saturating_sub(baseline) > max)
+    };
+    let metric_regression = exceeds(
+        current.total_tool_calls,
+        baseline.total_tool_calls,
+        thresholds.max_tool_call_increase,
+    ) || exceeds(
+        current.total_tool_errors,
+        baseline.total_tool_errors,
+        thresholds.max_tool_error_increase,
+    ) || exceeds(
+        total_prompt_tokens(current),
+        total_prompt_tokens(baseline),
+        thresholds.max_prompt_token_increase,
+    ) || exceeds(
+        total_output_tokens(current),
+        total_output_tokens(baseline),
+        thresholds.max_output_token_increase,
+    ) || exceeds(
+        current.average_latency_ms.max(0.0) as u64,
+        baseline.average_latency_ms.max(0.0) as u64,
+        thresholds.max_latency_increase_ms,
+    );
+    BaselineComparison {
+        score_delta,
+        pass_rate_delta,
+        regressed: score_delta < 0.0
+            || pass_rate_delta < 0.0
+            || failed_previous_case
+            || metric_regression,
+    }
 }
 
-fn total_prompt_tokens(report: &BenchmarkReport) -> u64 { report.cases.iter().fold(0u64, |sum, case| sum.saturating_add(case.metrics.prompt_tokens)) }
-fn total_output_tokens(report: &BenchmarkReport) -> u64 { report.cases.iter().fold(0u64, |sum, case| sum.saturating_add(case.metrics.output_tokens)) }
+fn total_prompt_tokens(report: &BenchmarkReport) -> u64 {
+    report.cases.iter().fold(0u64, |sum, case| {
+        sum.saturating_add(case.metrics.prompt_tokens)
+    })
+}
+fn total_output_tokens(report: &BenchmarkReport) -> u64 {
+    report.cases.iter().fold(0u64, |sum, case| {
+        sum.saturating_add(case.metrics.output_tokens)
+    })
+}
 
-pub fn normalize(report: &BenchmarkReport, baseline: Option<&BenchmarkReport>) -> NormalizedMetrics {
+pub fn normalize(
+    report: &BenchmarkReport,
+    baseline: Option<&BenchmarkReport>,
+) -> NormalizedMetrics {
     let baseline = baseline.map(|baseline| normalize_cases(baseline.cases.iter(), None));
     normalize_cases(report.cases.iter(), baseline.as_ref())
 }
 
-fn normalize_cases<'a>(cases: impl Iterator<Item = &'a CaseResult>, baseline: Option<&NormalizedMetrics>) -> NormalizedMetrics {
+fn normalize_cases<'a>(
+    cases: impl Iterator<Item = &'a CaseResult>,
+    baseline: Option<&NormalizedMetrics>,
+) -> NormalizedMetrics {
     let mut count = 0usize;
     let mut passed = 0usize;
     let mut successful_latency = 0.0;
@@ -590,10 +1025,17 @@ fn normalize_cases<'a>(cases: impl Iterator<Item = &'a CaseResult>, baseline: Op
         checks_total += case.checks_total as f64;
         checks_passed += case.checks_passed as f64;
         for (total, value) in totals.iter_mut().zip([
-            case.metrics.prompt_tokens, case.metrics.output_tokens, case.metrics.cached_tokens,
-            case.metrics.reasoning_tokens, case.metrics.tool_calls, case.metrics.tool_errors,
-            case.metrics.tool_contract_errors, case.metrics.compactions, case.metrics.artifacts_retrieved,
-            case.metrics.dynamic_tools_used, case.metrics.truncated_recoveries,
+            case.metrics.prompt_tokens,
+            case.metrics.output_tokens,
+            case.metrics.cached_tokens,
+            case.metrics.reasoning_tokens,
+            case.metrics.tool_calls,
+            case.metrics.tool_errors,
+            case.metrics.tool_contract_errors,
+            case.metrics.compactions,
+            case.metrics.artifacts_retrieved,
+            case.metrics.dynamic_tools_used,
+            case.metrics.truncated_recoveries,
         ]) {
             *total += value as f64;
         }
@@ -606,7 +1048,11 @@ fn normalize_cases<'a>(cases: impl Iterator<Item = &'a CaseResult>, baseline: Op
     NormalizedMetrics {
         case_count: count,
         verified_success_rate: passed as f64 / divisor,
-        check_pass_rate: if checks_total > 0.0 { checks_passed / checks_total } else { 0.0 },
+        check_pass_rate: if checks_total > 0.0 {
+            checks_passed / checks_total
+        } else {
+            0.0
+        },
         successful_latency_ms,
         prompt_tokens_per_case,
         output_tokens_per_case,
@@ -619,18 +1065,39 @@ fn normalize_cases<'a>(cases: impl Iterator<Item = &'a CaseResult>, baseline: Op
         artifacts_retrieved_per_case: totals[8] / divisor,
         dynamic_tools_used_per_case: totals[9] / divisor,
         truncated_recoveries_per_case: totals[10] / divisor,
-        latency_relative_to_baseline: baseline.and_then(|baseline| successful_latency_ms.zip(baseline.successful_latency_ms)).and_then(|(now, before)| ratio(now, before)),
-        tokens_relative_to_baseline: baseline.and_then(|baseline| ratio(prompt_tokens_per_case + output_tokens_per_case, baseline.prompt_tokens_per_case + baseline.output_tokens_per_case)),
+        latency_relative_to_baseline: baseline
+            .and_then(|baseline| successful_latency_ms.zip(baseline.successful_latency_ms))
+            .and_then(|(now, before)| ratio(now, before)),
+        tokens_relative_to_baseline: baseline.and_then(|baseline| {
+            ratio(
+                prompt_tokens_per_case + output_tokens_per_case,
+                baseline.prompt_tokens_per_case + baseline.output_tokens_per_case,
+            )
+        }),
     }
 }
 
-fn category_metrics(suite: &BenchmarkSuite, report: &BenchmarkReport) -> std::collections::BTreeMap<String, NormalizedMetrics> {
-    let categories: std::collections::BTreeSet<_> = suite.cases.iter().flat_map(|case| case.categories.iter()).collect();
-    categories.into_iter().map(|category| {
-        let cases = suite.cases.iter().zip(&report.cases)
-            .filter(|(case, _)| case.categories.contains(category)).map(|(_, result)| result);
-        (category.clone(), normalize_cases(cases, None))
-    }).collect()
+fn category_metrics(
+    suite: &BenchmarkSuite,
+    report: &BenchmarkReport,
+) -> std::collections::BTreeMap<String, NormalizedMetrics> {
+    let categories: std::collections::BTreeSet<_> = suite
+        .cases
+        .iter()
+        .flat_map(|case| case.categories.iter())
+        .collect();
+    categories
+        .into_iter()
+        .map(|category| {
+            let cases = suite
+                .cases
+                .iter()
+                .zip(&report.cases)
+                .filter(|(case, _)| case.categories.contains(category))
+                .map(|(_, result)| result);
+            (category.clone(), normalize_cases(cases, None))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -641,23 +1108,68 @@ mod tests {
 
     #[test]
     fn parsing_limits_and_scoring_are_deterministic_and_serializable() {
-        let suite = BenchmarkSuite::parse_toml(r#"version = 1
+        let suite = BenchmarkSuite::parse_toml(
+            r#"version = 1
 name = "basic"
 [[cases]]
 id = "one"
 prompt = "private"
 checks = [{ kind = "file_exists", path = "answer.txt" }]
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         assert_eq!(suite.cases[0].id, "one");
-        let results = vec![CaseResult { id: "one".into(), passed: true, checks_passed: 1, checks_total: 1, metrics: RunMetrics { prompt_tokens: 4, output_tokens: 8, elapsed_ms: 10, tool_calls: 2, tool_errors: 1, agent_succeeded: true, ..Default::default() } }, CaseResult { id: "two".into(), passed: false, checks_passed: 0, checks_total: 1, metrics: RunMetrics { prompt_tokens: 2, output_tokens: 1, elapsed_ms: 20, tool_calls: 1, tool_errors: 0, ..Default::default() } }];
+        let results = vec![
+            CaseResult {
+                id: "one".into(),
+                passed: true,
+                checks_passed: 1,
+                checks_total: 1,
+                metrics: RunMetrics {
+                    prompt_tokens: 4,
+                    output_tokens: 8,
+                    elapsed_ms: 10,
+                    tool_calls: 2,
+                    tool_errors: 1,
+                    agent_succeeded: true,
+                    ..Default::default()
+                },
+            },
+            CaseResult {
+                id: "two".into(),
+                passed: false,
+                checks_passed: 0,
+                checks_total: 1,
+                metrics: RunMetrics {
+                    prompt_tokens: 2,
+                    output_tokens: 1,
+                    elapsed_ms: 20,
+                    tool_calls: 1,
+                    tool_errors: 0,
+                    ..Default::default()
+                },
+            },
+        ];
         let report = score_report("s", results.clone());
         assert_eq!(report, score_report("s", results));
         assert_eq!(report.pass_rate, 0.5);
         assert_eq!(report.average_latency_ms, 15.0);
-        assert_eq!((report.total_tokens, report.total_tool_calls, report.total_tool_errors), (15, 3, 1));
+        assert_eq!(
+            (
+                report.total_tokens,
+                report.total_tool_calls,
+                report.total_tool_errors
+            ),
+            (15, 3, 1)
+        );
         let value = serde_json::to_value(report).unwrap();
         assert!(value.pointer("/cases/0/prompt").is_none());
-        assert_eq!(serde_json::from_value::<BenchmarkReport>(value).unwrap().pass_rate, 0.5);
+        assert_eq!(
+            serde_json::from_value::<BenchmarkReport>(value)
+                .unwrap()
+                .pass_rate,
+            0.5
+        );
         assert!(BenchmarkSuite::parse_toml("name='x'\n").is_err());
     }
 
@@ -684,8 +1196,36 @@ prompt = "do work"
     fn failed_checks_never_pass_and_command_checks_are_delegated() {
         let source = tempfile::tempdir().unwrap();
         fs::write(source.path().join("present"), "ok").unwrap();
-        let suite = BenchmarkSuite { version: 1, name: "x".into(), cases: vec![BenchmarkCase { id: "c".into(), project: None, prompt: "do not report".into(), checks: vec![Assertion::FileExists { path: "missing".into() }, Assertion::Command { command: "opaque command".into(), expect_stdout: None, expect_exit: 0 }], ..Default::default() }] };
-        let report = suite.run(source.path(), |_, _| Ok(RunMetrics::default()), |check, _| { assert_eq!(check.command, "opaque command"); Ok(false) }).unwrap();
+        let suite = BenchmarkSuite {
+            version: 1,
+            name: "x".into(),
+            cases: vec![BenchmarkCase {
+                id: "c".into(),
+                project: None,
+                prompt: "do not report".into(),
+                checks: vec![
+                    Assertion::FileExists {
+                        path: "missing".into(),
+                    },
+                    Assertion::Command {
+                        command: "opaque command".into(),
+                        expect_stdout: None,
+                        expect_exit: 0,
+                    },
+                ],
+                ..Default::default()
+            }],
+        };
+        let report = suite
+            .run(
+                source.path(),
+                |_, _| Ok(RunMetrics::default()),
+                |check, _| {
+                    assert_eq!(check.command, "opaque command");
+                    Ok(false)
+                },
+            )
+            .unwrap();
         assert!(!report.cases[0].passed);
         assert_eq!(report.cases[0].checks_passed, 0);
     }
@@ -707,7 +1247,13 @@ prompt = "do work"
                 ..Default::default()
             }],
         };
-        let report = suite.run(source.path(), |_, _| anyhow::bail!("agent failed"), |_, _| Ok(true)).unwrap();
+        let report = suite
+            .run(
+                source.path(),
+                |_, _| anyhow::bail!("agent failed"),
+                |_, _| Ok(true),
+            )
+            .unwrap();
         assert!(!report.cases[0].passed);
         assert_eq!(report.cases[0].checks_passed, 1);
         assert!(report.cases[0].metrics.agent_error);
@@ -721,37 +1267,99 @@ prompt = "do work"
     fn clones_are_isolated_and_skip_generated_directories() {
         let source = tempfile::tempdir().unwrap();
         fs::write(source.path().join("file"), "original").unwrap();
-        for excluded in EXCLUDED_DIRS { fs::create_dir(source.path().join(excluded)).unwrap(); fs::write(source.path().join(excluded).join("x"), "x").unwrap(); }
+        for excluded in EXCLUDED_DIRS {
+            fs::create_dir(source.path().join(excluded)).unwrap();
+            fs::write(source.path().join(excluded).join("x"), "x").unwrap();
+        }
         let first = clone_project(source.path()).unwrap();
         let second = clone_project(source.path()).unwrap();
         assert_ne!(first.path(), second.path());
         fs::write(first.path().join("file"), "changed").unwrap();
-        assert_eq!(fs::read_to_string(second.path().join("file")).unwrap(), "original");
+        assert_eq!(
+            fs::read_to_string(second.path().join("file")).unwrap(),
+            "original"
+        );
         assert!(EXCLUDED_DIRS.iter().all(|d| !first.path().join(d).exists()));
-        assert_eq!(json!({"pass": score_report("", vec![]).pass_rate}), json!({"pass": 0.0}));
+        assert_eq!(
+            json!({"pass": score_report("", vec![]).pass_rate}),
+            json!({"pass": 0.0})
+        );
     }
 
     #[test]
     fn rejects_escape_paths_and_symlinks_and_detects_baseline_regressions() {
         let outer = tempfile::tempdir().unwrap();
-        let source = outer.path().join("source"); fs::create_dir(&source).unwrap();
+        let source = outer.path().join("source");
+        fs::create_dir(&source).unwrap();
         fs::write(outer.path().join("secret"), "private").unwrap();
         symlink(outer.path().join("secret"), source.join("escape")).unwrap();
         assert!(clone_project(&source).is_err());
         assert!(validate_relative(Path::new("../secret")).is_err());
-        let metrics = RunMetrics { prompt_tokens: 5, output_tokens: 8, elapsed_ms: 10, tool_calls: 2, tool_errors: 0, agent_succeeded: true, ..Default::default() };
-        let good = score_report("s", vec![CaseResult { id: "a".into(), passed: true, checks_passed: 1, checks_total: 1, metrics }]);
-        let bad = score_report("s", vec![CaseResult { id: "a".into(), passed: false, checks_passed: 0, checks_total: 1, metrics }]);
+        let metrics = RunMetrics {
+            prompt_tokens: 5,
+            output_tokens: 8,
+            elapsed_ms: 10,
+            tool_calls: 2,
+            tool_errors: 0,
+            agent_succeeded: true,
+            ..Default::default()
+        };
+        let good = score_report(
+            "s",
+            vec![CaseResult {
+                id: "a".into(),
+                passed: true,
+                checks_passed: 1,
+                checks_total: 1,
+                metrics,
+            }],
+        );
+        let bad = score_report(
+            "s",
+            vec![CaseResult {
+                id: "a".into(),
+                passed: false,
+                checks_passed: 0,
+                checks_total: 1,
+                metrics,
+            }],
+        );
         assert!(compare_baseline(&bad, &good).regressed);
         assert!(!compare_baseline(&good, &good).regressed);
-        let slower = score_report("s", vec![CaseResult { id: "a".into(), passed: true, checks_passed: 1, checks_total: 1, metrics: RunMetrics { elapsed_ms: 20, ..metrics } }]);
-        assert!(compare_baseline_with_thresholds(&slower, &good, RegressionThresholds { max_latency_increase_ms: Some(5), ..Default::default() }).regressed);
+        let slower = score_report(
+            "s",
+            vec![CaseResult {
+                id: "a".into(),
+                passed: true,
+                checks_passed: 1,
+                checks_total: 1,
+                metrics: RunMetrics {
+                    elapsed_ms: 20,
+                    ..metrics
+                },
+            }],
+        );
+        assert!(
+            compare_baseline_with_thresholds(
+                &slower,
+                &good,
+                RegressionThresholds {
+                    max_latency_increase_ms: Some(5),
+                    ..Default::default()
+                }
+            )
+            .regressed
+        );
     }
     #[test]
     fn benchmark_copy_omits_common_credentials_but_keeps_templates() {
         let source = tempfile::tempdir().unwrap();
         fs::write(source.path().join(".env"), "OPENAI_API_KEY=secret").unwrap();
-        fs::write(source.path().join(".env.example"), "OPENAI_API_KEY=replace-me").unwrap();
+        fs::write(
+            source.path().join(".env.example"),
+            "OPENAI_API_KEY=replace-me",
+        )
+        .unwrap();
         fs::write(source.path().join("private.pem"), "private key").unwrap();
         symlink(source.path().join(".env"), source.path().join("env_alias")).unwrap();
         fs::write(source.path().join("main.rs"), "fn main() {}").unwrap();
@@ -769,40 +1377,113 @@ mod machine_tests {
     use super::*;
 
     fn measured(name: &str, outcomes: &[bool], wall_time_ms: u64) -> MachineConfigurationReport {
-        let configuration = MachineConfiguration { name: name.into(), provider: "mlx".into(), model: "/explicit/model".into(), context_window: 8192, quantization_bits: Some(4), adapter: None };
-        let cases = outcomes.iter().enumerate().map(|(index, passed)| CaseResult {
-            id: format!("0:{index}"), passed: *passed, checks_passed: usize::from(*passed), checks_total: 1,
-            metrics: RunMetrics { elapsed_ms: 100, agent_succeeded: true, token_usage_observed: true, prompt_tokens: 10, output_tokens: 5, repair_attempts: Some(u64::from(!passed)), ..Default::default() },
-        }).collect();
-        MachineConfigurationReport::measured(configuration, serde_json::json!({}), score_report("identical", cases), wall_time_ms)
+        let configuration = MachineConfiguration {
+            name: name.into(),
+            provider: "mlx".into(),
+            model: "/explicit/model".into(),
+            context_window: 8192,
+            quantization_bits: Some(4),
+            adapter: None,
+        };
+        let cases = outcomes
+            .iter()
+            .enumerate()
+            .map(|(index, passed)| CaseResult {
+                id: format!("0:{index}"),
+                passed: *passed,
+                checks_passed: usize::from(*passed),
+                checks_total: 1,
+                metrics: RunMetrics {
+                    elapsed_ms: 100,
+                    agent_succeeded: true,
+                    token_usage_observed: true,
+                    prompt_tokens: 10,
+                    output_tokens: 5,
+                    repair_attempts: Some(u64::from(!passed)),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        MachineConfigurationReport::measured(
+            configuration,
+            serde_json::json!({}),
+            score_report("identical", cases),
+            wall_time_ms,
+        )
     }
 
     #[test]
     fn recommendations_rank_verified_throughput_without_rewarding_fast_failures() {
-        let mut reports = vec![measured("baseline", &[true, true], 2000), measured("fast-failure", &[false, false], 1), measured("fast-correct", &[true, true], 1000)];
-        let winner = rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).unwrap();
+        let mut reports = vec![
+            measured("baseline", &[true, true], 2000),
+            measured("fast-failure", &[false, false], 1),
+            measured("fast-correct", &[true, true], 1000),
+        ];
+        let winner =
+            rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).unwrap();
         assert_eq!(winner.as_deref(), Some("fast-correct"));
         assert_eq!(reports[0].correct_cases_per_second, Some(2.0));
         assert_eq!(reports[0].observed_prompt_tokens, Some(20));
         assert_eq!(reports[0].repair_attempts, Some(0));
-        assert!(!reports.iter().find(|report| report.configuration.name == "fast-failure").unwrap().eligible);
+        assert!(
+            !reports
+                .iter()
+                .find(|report| report.configuration.name == "fast-failure")
+                .unwrap()
+                .eligible
+        );
     }
 
     #[test]
     fn correctness_floor_and_per_case_regressions_veto_faster_candidates() {
-        let policy = MachineBenchmarkPolicy { minimum_correctness: 0.5, ..Default::default() };
-        let mut reports = vec![measured("baseline", &[true, false], 2000), measured("different-success", &[false, true], 100)];
-        assert_eq!(rank_machine_configurations(&mut reports, &policy).unwrap().as_deref(), Some("baseline"));
-        assert!(reports.iter().find(|report| report.configuration.name == "different-success").unwrap().baseline_comparison.regressed);
-        assert_eq!(rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).unwrap(), None);
+        let policy = MachineBenchmarkPolicy {
+            minimum_correctness: 0.5,
+            ..Default::default()
+        };
+        let mut reports = vec![
+            measured("baseline", &[true, false], 2000),
+            measured("different-success", &[false, true], 100),
+        ];
+        assert_eq!(
+            rank_machine_configurations(&mut reports, &policy)
+                .unwrap()
+                .as_deref(),
+            Some("baseline")
+        );
+        assert!(
+            reports
+                .iter()
+                .find(|report| report.configuration.name == "different-success")
+                .unwrap()
+                .baseline_comparison
+                .regressed
+        );
+        assert_eq!(
+            rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn regression_metric_budget_is_applied_before_throughput_ranking() {
-        let mut reports = vec![measured("baseline", &[true], 2000), measured("faster", &[true], 100)];
+        let mut reports = vec![
+            measured("baseline", &[true], 2000),
+            measured("faster", &[true], 100),
+        ];
         reports[1].report.cases[0].metrics.prompt_tokens = 100;
-        let policy = MachineBenchmarkPolicy { regression_thresholds: RegressionThresholds { max_prompt_token_increase: Some(0), ..Default::default() }, ..Default::default() };
-        assert_eq!(rank_machine_configurations(&mut reports, &policy).unwrap().as_deref(), Some("baseline"));
+        let policy = MachineBenchmarkPolicy {
+            regression_thresholds: RegressionThresholds {
+                max_prompt_token_increase: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            rank_machine_configurations(&mut reports, &policy)
+                .unwrap()
+                .as_deref(),
+            Some("baseline")
+        );
     }
 
     #[test]
@@ -810,20 +1491,44 @@ mod machine_tests {
         let mut report = measured("unknown", &[true], 0);
         report.report.cases[0].metrics.token_usage_incomplete = true;
         report.report.cases[0].metrics.repair_attempts = None;
-        let report = MachineConfigurationReport::measured(report.configuration, report.settings, report.report, 0);
+        let report = MachineConfigurationReport::measured(
+            report.configuration,
+            report.settings,
+            report.report,
+            0,
+        );
         assert_eq!(report.observed_prompt_tokens, None);
         assert_eq!(report.observed_output_tokens, None);
         assert_eq!(report.repair_attempts, None);
         assert_eq!(report.correct_cases_per_second, None);
-        assert_eq!(rank_machine_configurations(&mut [report], &MachineBenchmarkPolicy::default()).unwrap(), None);
+        assert_eq!(
+            rank_machine_configurations(&mut [report], &MachineBenchmarkPolicy::default()).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn mismatched_tasks_and_unbounded_work_are_rejected() {
-        let mut reports = vec![measured("baseline", &[true], 100), measured("mismatch", &[true], 100)];
+        let mut reports = vec![
+            measured("baseline", &[true], 100),
+            measured("mismatch", &[true], 100),
+        ];
         reports[1].report.cases[0].id = "other-task".into();
-        assert!(rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).is_err());
-        let suite = BenchmarkSuite { version: 1, name: "bounded".into(), cases: vec![BenchmarkCase { id: "case".into(), prompt: "solve".into(), checks: vec![Assertion::FileExists { path: "answer".into() }], ..Default::default() }] };
+        assert!(
+            rank_machine_configurations(&mut reports, &MachineBenchmarkPolicy::default()).is_err()
+        );
+        let suite = BenchmarkSuite {
+            version: 1,
+            name: "bounded".into(),
+            cases: vec![BenchmarkCase {
+                id: "case".into(),
+                prompt: "solve".into(),
+                checks: vec![Assertion::FileExists {
+                    path: "answer".into(),
+                }],
+                ..Default::default()
+            }],
+        };
         let configuration = reports[0].configuration.clone();
         let mut policy = MachineBenchmarkPolicy::default();
         assert!(policy.validate(&suite, &[configuration.clone()]).is_ok());

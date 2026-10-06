@@ -5,7 +5,10 @@ use serde_json::Value;
 /// validation must still reject malformed messages and unsupported image-bearing examples.
 pub(crate) fn canonical(message: &Value) -> Value {
     let mut message = message.clone();
-    if let Some(object) = message.as_object_mut() { object.remove("dial_evidence"); object.remove("dial_recall"); }
+    if let Some(object) = message.as_object_mut() {
+        object.remove("dial_evidence");
+        object.remove("dial_recall");
+    }
     message
 }
 

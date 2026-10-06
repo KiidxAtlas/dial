@@ -28,7 +28,8 @@ pub fn render(text: &str, width: u16, theme: &Theme, ascii: bool) -> Rows {
     };
     let clean = text::sanitize(text);
     let mut renderer = Renderer::new(theme, width as usize);
-    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     for event in Parser::new_ext(&clean, options) {
         renderer.event(event);
     }
@@ -37,7 +38,11 @@ pub fn render(text: &str, width: u16, theme: &Theme, ascii: bool) -> Rows {
 
 /// Style of one line of a unified diff / patch (`+` added, `-` removed, `@@` hunk, headers, context).
 pub fn diff_style(theme: &Theme, line: &str) -> Style {
-    if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff ") || line.starts_with("index ") {
+    if line.starts_with("+++")
+        || line.starts_with("---")
+        || line.starts_with("diff ")
+        || line.starts_with("index ")
+    {
         theme.fg(Tok::DiffContext).add_modifier(Modifier::BOLD)
     } else if line.starts_with('+') {
         theme.fg(Tok::DiffAdded)
@@ -51,9 +56,33 @@ pub fn diff_style(theme: &Theme, line: &str) -> Style {
 }
 
 /// Compact, allocation-light lexer. Unknown fence languages deliberately stay plain.
-fn highlight(theme: &Theme, lang: &str, line: &str, block_comment: &mut bool) -> Vec<Span<'static>> {
-    let hash = matches!(lang, "python" | "py" | "toml" | "yaml" | "yml" | "sh" | "bash" | "shell");
-    let c_like = matches!(lang, "rust" | "rs" | "javascript" | "js" | "typescript" | "ts" | "tsx" | "jsx" | "go" | "c" | "cpp" | "c++" | "h" | "java");
+fn highlight(
+    theme: &Theme,
+    lang: &str,
+    line: &str,
+    block_comment: &mut bool,
+) -> Vec<Span<'static>> {
+    let hash = matches!(
+        lang,
+        "python" | "py" | "toml" | "yaml" | "yml" | "sh" | "bash" | "shell"
+    );
+    let c_like = matches!(
+        lang,
+        "rust"
+            | "rs"
+            | "javascript"
+            | "js"
+            | "typescript"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "go"
+            | "c"
+            | "cpp"
+            | "c++"
+            | "h"
+            | "java"
+    );
     if !hash && !c_like && lang != "json" {
         return vec![Span::styled(line.to_owned(), theme.fg(Tok::MdCodeBlock))];
     }
@@ -81,20 +110,107 @@ fn highlight(theme: &Theme, lang: &str, line: &str, block_comment: &mut bool) ->
             let mut escape = false;
             for c in line[i..].chars() {
                 i += c.len_utf8();
-                if escape { escape = false; }
-                else if c == '\\' { escape = true; }
-                else if c == ch { break; }
+                if escape {
+                    escape = false;
+                } else if c == '\\' {
+                    escape = true;
+                } else if c == ch {
+                    break;
+                }
             }
             Tok::SyntaxString
         } else if ch.is_ascii_digit() {
-            i += rest.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_')).map(char::len_utf8).sum::<usize>();
+            i += rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_'))
+                .map(char::len_utf8)
+                .sum::<usize>();
             Tok::SyntaxNumber
         } else if ch.is_alphabetic() || ch == '_' {
-            i += rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').map(char::len_utf8).sum::<usize>();
+            i += rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .map(char::len_utf8)
+                .sum::<usize>();
             let word = &line[start..i];
-            if matches!(word, "fn" | "let" | "mut" | "pub" | "impl" | "struct" | "enum" | "trait" | "use" | "mod" | "match" | "if" | "else" | "for" | "while" | "loop" | "in" | "return" | "break" | "continue" | "async" | "await" | "const" | "static" | "true" | "false" | "null" | "None" | "True" | "False" | "def" | "class" | "import" | "from" | "as" | "with" | "try" | "except" | "raise" | "pass" | "yield" | "function" | "var" | "new" | "export" | "default" | "interface" | "type" | "package" | "func" | "defer" | "range" | "switch" | "case" | "select" | "go" | "chan" | "void" | "int" | "char" | "double" | "float" | "bool" | "auto" | "namespace" | "include" | "done" | "then" | "fi" | "do") {
+            if matches!(
+                word,
+                "fn" | "let"
+                    | "mut"
+                    | "pub"
+                    | "impl"
+                    | "struct"
+                    | "enum"
+                    | "trait"
+                    | "use"
+                    | "mod"
+                    | "match"
+                    | "if"
+                    | "else"
+                    | "for"
+                    | "while"
+                    | "loop"
+                    | "in"
+                    | "return"
+                    | "break"
+                    | "continue"
+                    | "async"
+                    | "await"
+                    | "const"
+                    | "static"
+                    | "true"
+                    | "false"
+                    | "null"
+                    | "None"
+                    | "True"
+                    | "False"
+                    | "def"
+                    | "class"
+                    | "import"
+                    | "from"
+                    | "as"
+                    | "with"
+                    | "try"
+                    | "except"
+                    | "raise"
+                    | "pass"
+                    | "yield"
+                    | "function"
+                    | "var"
+                    | "new"
+                    | "export"
+                    | "default"
+                    | "interface"
+                    | "type"
+                    | "package"
+                    | "func"
+                    | "defer"
+                    | "range"
+                    | "switch"
+                    | "case"
+                    | "select"
+                    | "go"
+                    | "chan"
+                    | "void"
+                    | "int"
+                    | "char"
+                    | "double"
+                    | "float"
+                    | "bool"
+                    | "auto"
+                    | "namespace"
+                    | "include"
+                    | "done"
+                    | "then"
+                    | "fi"
+                    | "do"
+            ) {
                 Tok::SyntaxKeyword
-            } else if ch.is_uppercase() { Tok::SyntaxType } else { Tok::MdCodeBlock }
+            } else if ch.is_uppercase() {
+                Tok::SyntaxType
+            } else {
+                Tok::MdCodeBlock
+            }
         } else {
             i += ch.len_utf8();
             Tok::MdCodeBlock
@@ -112,7 +228,11 @@ pub fn truncate_spans(spans: Vec<Span<'static>>, max: usize, ellipsis: &str) -> 
         return spans;
     }
     let mark_w = text::width(ellipsis);
-    let (room, mark) = if mark_w <= max { (max - mark_w, ellipsis) } else { (max, "") };
+    let (room, mark) = if mark_w <= max {
+        (max - mark_w, ellipsis)
+    } else {
+        (max, "")
+    };
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut used = 0;
     let mut last_style = Style::default();
@@ -145,7 +265,11 @@ fn clip_line(line: Line<'static>, max: usize) -> Line<'static> {
     if text::line_width(&line) <= max {
         return line;
     }
-    Line { style: line.style, alignment: line.alignment, spans: truncate_spans(line.spans, max, "") }
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: truncate_spans(line.spans, max, ""),
+    }
 }
 
 fn is_blank(line: &Line<'_>) -> bool {
@@ -196,7 +320,11 @@ impl Wrapper {
             }
             for span in word {
                 for g in span.content.graphemes(true) {
-                    let (g, gw) = if text::width(g) > self.max { ("?", 1) } else { (g, text::width(g)) };
+                    let (g, gw) = if text::width(g) > self.max {
+                        ("?", 1)
+                    } else {
+                        (g, text::width(g))
+                    };
                     if self.used + gw > self.max {
                         self.break_line();
                     }
@@ -270,7 +398,11 @@ fn wrap_spans(spans: &[Span<'static>], max: usize) -> Rows {
 enum FrameKind {
     Root,
     Quote,
-    List { next: Option<u64>, items: usize, prev_loose: bool },
+    List {
+        next: Option<u64>,
+        items: usize,
+        prev_loose: bool,
+    },
     Item,
 }
 
@@ -287,7 +419,14 @@ struct Frame {
 
 impl Frame {
     fn new(kind: FrameKind, loose: bool) -> Self {
-        Frame { kind, rows: Vec::new(), loose, blocks: 0, marker: Vec::new(), indent: 0 }
+        Frame {
+            kind,
+            rows: Vec::new(),
+            loose,
+            blocks: 0,
+            marker: Vec::new(),
+            indent: 0,
+        }
     }
 }
 
@@ -336,7 +475,9 @@ impl<'a> Renderer<'a> {
     }
 
     fn style(&self) -> Style {
-        self.styles.iter().fold(Style::default(), |acc, s| acc.patch(*s))
+        self.styles
+            .iter()
+            .fold(Style::default(), |acc, s| acc.patch(*s))
     }
 
     fn top(&mut self) -> &mut Frame {
@@ -377,7 +518,10 @@ impl<'a> Renderer<'a> {
     }
 
     fn rule_row(&self, cells: usize, tok: Tok) -> Line<'static> {
-        Line::from(Span::styled(self.theme.sym(Sym::Hr).repeat(cells), self.theme.fg(tok)))
+        Line::from(Span::styled(
+            self.theme.sym(Sym::Hr).repeat(cells),
+            self.theme.fg(tok),
+        ))
     }
 
     fn event(&mut self, event: Event<'_>) {
@@ -418,7 +562,12 @@ impl<'a> Renderer<'a> {
                 } else {
                     ("[ ] ", self.theme.fg(Tok::Muted))
                 };
-                if let Some(frame) = self.frames.iter_mut().rev().find(|f| matches!(f.kind, FrameKind::Item)) {
+                if let Some(frame) = self
+                    .frames
+                    .iter_mut()
+                    .rev()
+                    .find(|f| matches!(f.kind, FrameKind::Item))
+                {
                     frame.marker = vec![Span::styled(mark, style)];
                     frame.indent = text::width(mark);
                 }
@@ -466,13 +615,25 @@ impl<'a> Renderer<'a> {
             Tag::List(start) => {
                 self.flush_inline();
                 self.begin_block();
-                self.frames.push(Frame::new(FrameKind::List { next: start, items: 0, prev_loose: false }, false));
+                self.frames.push(Frame::new(
+                    FrameKind::List {
+                        next: start,
+                        items: 0,
+                        prev_loose: false,
+                    },
+                    false,
+                ));
             }
             Tag::Item => {
                 self.flush_inline();
                 let mut blank = false;
                 let mut marker = String::new();
-                if let FrameKind::List { next, items, prev_loose } = &mut self.top().kind {
+                if let FrameKind::List {
+                    next,
+                    items,
+                    prev_loose,
+                } = &mut self.top().kind
+                {
                     blank = *items > 0 && *prev_loose;
                     marker = match next {
                         Some(n) => {
@@ -502,18 +663,31 @@ impl<'a> Renderer<'a> {
             }
             Tag::Table(aligns) => {
                 self.flush_inline();
-                self.table = Some(TableBuf { aligns, head: Vec::new(), rows: Vec::new(), cur: Vec::new() });
+                self.table = Some(TableBuf {
+                    aligns,
+                    head: Vec::new(),
+                    rows: Vec::new(),
+                    cur: Vec::new(),
+                });
             }
-            Tag::TableHead => self.styles.push(Style::default().add_modifier(Modifier::BOLD)),
+            Tag::TableHead => self
+                .styles
+                .push(Style::default().add_modifier(Modifier::BOLD)),
             Tag::TableRow => {
                 if let Some(t) = &mut self.table {
                     t.cur.clear();
                 }
             }
             Tag::TableCell => self.inline.clear(),
-            Tag::Emphasis => self.styles.push(Style::default().add_modifier(Modifier::ITALIC)),
-            Tag::Strong => self.styles.push(Style::default().add_modifier(Modifier::BOLD)),
-            Tag::Strikethrough => self.styles.push(Style::default().add_modifier(Modifier::CROSSED_OUT)),
+            Tag::Emphasis => self
+                .styles
+                .push(Style::default().add_modifier(Modifier::ITALIC)),
+            Tag::Strong => self
+                .styles
+                .push(Style::default().add_modifier(Modifier::BOLD)),
+            Tag::Strikethrough => self
+                .styles
+                .push(Style::default().add_modifier(Modifier::CROSSED_OUT)),
             Tag::Link { dest_url, .. } => {
                 self.styles.push(self.theme.fg(Tok::MdLink));
                 self.links.push((dest_url.into_string(), self.inline.len()));
@@ -523,13 +697,18 @@ impl<'a> Renderer<'a> {
                 self.add_text("[image: ");
                 self.links.push((dest_url.into_string(), self.inline.len()));
             }
-            Tag::DefinitionList | Tag::DefinitionListTitle | Tag::DefinitionListDefinition | Tag::MetadataBlock(_) => {}
+            Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition
+            | Tag::MetadataBlock(_) => {}
         }
     }
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::HtmlBlock | TagEnd::FootnoteDefinition => self.flush_inline(),
+            TagEnd::Paragraph | TagEnd::HtmlBlock | TagEnd::FootnoteDefinition => {
+                self.flush_inline()
+            }
             TagEnd::Heading(level) => {
                 self.flush_inline();
                 self.styles.pop();
@@ -606,24 +785,40 @@ impl<'a> Renderer<'a> {
                     self.add_text("]");
                 }
                 if let Some((url, start)) = self.links.pop() {
-                    let label: String = self.inline[start.min(self.inline.len())..].iter().map(|s| s.content.as_ref()).collect();
+                    let label: String = self.inline[start.min(self.inline.len())..]
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect();
                     let label = label.trim_end_matches(']');
-                    if !url.is_empty() && label != url && label.trim_start_matches("mailto:") != url.trim_start_matches("mailto:") {
+                    if !url.is_empty()
+                        && label != url
+                        && label.trim_start_matches("mailto:") != url.trim_start_matches("mailto:")
+                    {
                         let style = self.style().patch(self.theme.fg(Tok::MdLinkUrl));
                         self.add_span(&format!(" ({url})"), style);
                     }
                 }
             }
-            TagEnd::DefinitionList | TagEnd::DefinitionListTitle | TagEnd::DefinitionListDefinition | TagEnd::MetadataBlock(_) => {}
+            TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::MetadataBlock(_) => {}
         }
     }
 
     fn pop_frame(&mut self) -> Option<Frame> {
-        if self.frames.len() > 1 { self.frames.pop() } else { None }
+        if self.frames.len() > 1 {
+            self.frames.pop()
+        } else {
+            None
+        }
     }
 
     fn quote_rows(&self, rows: Rows) -> Rows {
-        let bar = Span::styled(format!("{} ", self.theme.sym(Sym::Quote)), self.theme.fg(Tok::MdQuoteBorder));
+        let bar = Span::styled(
+            format!("{} ", self.theme.sym(Sym::Quote)),
+            self.theme.fg(Tok::MdQuoteBorder),
+        );
         if rows.is_empty() {
             return vec![Line::from(bar)];
         }
@@ -651,7 +846,10 @@ impl<'a> Renderer<'a> {
         }
         let width = self.width;
         let root = self.frames.pop().expect("root frame");
-        root.rows.into_iter().map(|line| clip_line(line, width)).collect()
+        root.rows
+            .into_iter()
+            .map(|line| clip_line(line, width))
+            .collect()
     }
 
     // ---- code ----------------------------------------------------------------------------
@@ -662,15 +860,23 @@ impl<'a> Renderer<'a> {
         let diff = is_diff(lang, body);
         let body = body.strip_suffix('\n').unwrap_or(body);
         let mut block_comment = false;
-        let language = lang.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        let language = lang
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let lines: Rows = if body.is_empty() {
             Vec::new()
         } else {
-            body.split('\n').map(|l| Line::from(if diff {
-                vec![Span::styled(l.to_owned(), diff_style(theme, l))]
-            } else {
-                highlight(theme, &language, l, &mut block_comment)
-            })).collect()
+            body.split('\n')
+                .map(|l| {
+                    Line::from(if diff {
+                        vec![Span::styled(l.to_owned(), diff_style(theme, l))]
+                    } else {
+                        highlight(theme, &language, l, &mut block_comment)
+                    })
+                })
+                .collect()
         };
         let mut rows: Rows = Vec::new();
         if avail < MIN_CODE_BOX {
@@ -681,15 +887,24 @@ impl<'a> Renderer<'a> {
             let border = theme.fg(Tok::MdCodeBorder);
             let inner = avail - 4;
             let h = theme.sym(Sym::BoxH);
-            let mut top = vec![Span::styled(format!("{}{h}", theme.sym(Sym::BoxTl)), border)];
+            let mut top = vec![Span::styled(
+                format!("{}{h}", theme.sym(Sym::BoxTl)),
+                border,
+            )];
             let label = text::ellipsize(lang, avail.saturating_sub(6), theme.ascii());
             if label.is_empty() {
-                top.push(Span::styled(format!("{}{}", h.repeat(avail - 3), theme.sym(Sym::BoxTr)), border));
+                top.push(Span::styled(
+                    format!("{}{}", h.repeat(avail - 3), theme.sym(Sym::BoxTr)),
+                    border,
+                ));
             } else {
                 let fill = avail.saturating_sub(5 + text::width(&label));
                 top.push(Span::styled(" ", border));
                 top.push(Span::styled(label, theme.fg(Tok::Muted)));
-                top.push(Span::styled(format!(" {}{}", h.repeat(fill), theme.sym(Sym::BoxTr)), border));
+                top.push(Span::styled(
+                    format!(" {}{}", h.repeat(fill), theme.sym(Sym::BoxTr)),
+                    border,
+                ));
             }
             rows.push(Line::from(top));
             let v = theme.sym(Sym::BoxV);
@@ -698,12 +913,20 @@ impl<'a> Renderer<'a> {
                     let used = text::line_width(&wrapped);
                     let mut spans = vec![Span::styled(format!("{v} "), border)];
                     spans.extend(wrapped.spans);
-                    spans.push(Span::styled(format!("{} {v}", " ".repeat(inner.saturating_sub(used))), border));
+                    spans.push(Span::styled(
+                        format!("{} {v}", " ".repeat(inner.saturating_sub(used))),
+                        border,
+                    ));
                     rows.push(Line::from(spans));
                 }
             }
             rows.push(Line::from(Span::styled(
-                format!("{}{}{}", theme.sym(Sym::BoxBl), h.repeat(avail - 2), theme.sym(Sym::BoxBr)),
+                format!(
+                    "{}{}{}",
+                    theme.sym(Sym::BoxBl),
+                    h.repeat(avail - 2),
+                    theme.sym(Sym::BoxBr)
+                ),
                 border,
             )));
         }
@@ -714,19 +937,34 @@ impl<'a> Renderer<'a> {
     // ---- tables --------------------------------------------------------------------------
 
     fn table_rows(&self, table: &TableBuf) -> Rows {
-        let columns = table.aligns.len().max(table.head.len()).max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
+        let columns = table
+            .aligns
+            .len()
+            .max(table.head.len())
+            .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
         if columns == 0 {
             return Vec::new();
         }
         let avail = self.avail();
         let empty: Cell = Vec::new();
-        let cell = |row: &Vec<Cell>, i: usize| -> Cell { row.get(i).cloned().unwrap_or_else(|| empty.clone()) };
+        let cell = |row: &Vec<Cell>, i: usize| -> Cell {
+            row.get(i).cloned().unwrap_or_else(|| empty.clone())
+        };
         let head: Vec<Cell> = (0..columns).map(|i| cell(&table.head, i)).collect();
-        let body: Vec<Vec<Cell>> = table.rows.iter().map(|r| (0..columns).map(|i| cell(r, i)).collect()).collect();
+        let body: Vec<Vec<Cell>> = table
+            .rows
+            .iter()
+            .map(|r| (0..columns).map(|i| cell(r, i)).collect())
+            .collect();
 
         let natural: Vec<usize> = (0..columns)
             .map(|i| {
-                std::iter::once(&head[i]).chain(body.iter().map(|r| &r[i])).map(|c| cell_width(c)).max().unwrap_or(1).max(1)
+                std::iter::once(&head[i])
+                    .chain(body.iter().map(|r| &r[i]))
+                    .map(|c| cell_width(c))
+                    .max()
+                    .unwrap_or(1)
+                    .max(1)
             })
             .collect();
         let overhead = 3 * columns + 1;
@@ -785,7 +1023,11 @@ impl<'a> Renderer<'a> {
                 .iter()
                 .enumerate()
                 .flat_map(|(i, c)| {
-                    let mut v = if i > 0 { vec![Span::raw(", ")] } else { Vec::new() };
+                    let mut v = if i > 0 {
+                        vec![Span::raw(", ")]
+                    } else {
+                        Vec::new()
+                    };
                     v.extend(c.iter().cloned());
                     v
                 })
@@ -831,10 +1073,16 @@ fn item_rows(rows: Rows, marker: Vec<Span<'static>>, indent: usize) -> Rows {
 }
 
 fn is_diff(lang: &str, body: &str) -> bool {
-    if ["diff", "patch", "udiff"].iter().any(|l| lang.eq_ignore_ascii_case(l)) {
+    if ["diff", "patch", "udiff"]
+        .iter()
+        .any(|l| lang.eq_ignore_ascii_case(l))
+    {
         return true;
     }
-    lang.is_empty() && body.lines().any(|l| l.starts_with("@@ ") || l.starts_with("diff --git"))
+    lang.is_empty()
+        && body
+            .lines()
+            .any(|l| l.starts_with("@@ ") || l.starts_with("diff --git"))
 }
 
 fn cell_width(cell: &[Span<'static>]) -> usize {
@@ -848,7 +1096,10 @@ fn fit_columns(natural: &[usize], room: usize) -> Vec<usize> {
     if natural.iter().sum::<usize>() <= room {
         return natural.to_vec();
     }
-    let (mut lo, mut hi) = (MIN_COLUMN, natural.iter().copied().max().unwrap_or(MIN_COLUMN));
+    let (mut lo, mut hi) = (
+        MIN_COLUMN,
+        natural.iter().copied().max().unwrap_or(MIN_COLUMN),
+    );
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
         if natural.iter().map(|&w| w.min(mid)).sum::<usize>() <= room {
@@ -875,7 +1126,11 @@ fn fit_columns(natural: &[usize], room: usize) -> Vec<usize> {
 fn grid_row(theme: &Theme, cells: &[Cell], widths: &[usize], aligns: &[Alignment]) -> Rows {
     let border = theme.fg(Tok::MdCodeBorder);
     let v = theme.sym(Sym::BoxV);
-    let wrapped: Vec<Rows> = cells.iter().zip(widths).map(|(c, &w)| wrap_spans(c, w)).collect();
+    let wrapped: Vec<Rows> = cells
+        .iter()
+        .zip(widths)
+        .map(|(c, &w)| wrap_spans(c, w))
+        .collect();
     let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
     (0..height)
         .map(|y| {
@@ -909,15 +1164,39 @@ mod tests {
     fn syntax_tokens_preserve_text_and_degrade() {
         let source = "let value = \"hello\"; // comment";
         let colored = highlight(&theme(), "rust", source, &mut false);
-        assert_eq!(colored.iter().map(|s| s.content.as_ref()).collect::<String>(), source);
+        assert_eq!(
+            colored
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            source
+        );
         assert_eq!(colored[0].style, theme().fg(Tok::SyntaxKeyword));
-        assert!(colored.iter().any(|s| s.content == "\"hello\"" && s.style == theme().fg(Tok::SyntaxString)));
-        assert!(colored.iter().any(|s| s.content == "// comment" && s.style == theme().fg(Tok::SyntaxComment)));
-        for mode in [super::super::theme::ColorMode::None, super::super::theme::ColorMode::Ansi16, super::super::theme::ColorMode::Ansi256] {
+        assert!(
+            colored
+                .iter()
+                .any(|s| s.content == "\"hello\"" && s.style == theme().fg(Tok::SyntaxString))
+        );
+        assert!(
+            colored
+                .iter()
+                .any(|s| s.content == "// comment" && s.style == theme().fg(Tok::SyntaxComment))
+        );
+        for mode in [
+            super::super::theme::ColorMode::None,
+            super::super::theme::ColorMode::Ansi16,
+            super::super::theme::ColorMode::Ansi256,
+        ] {
             let palette = theme().downgraded(mode);
             let spans = highlight(&palette, "rust", source, &mut false);
-            assert!(spans.iter().all(|s| !matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..)))));
-            if mode == super::super::theme::ColorMode::None { assert!(spans.iter().all(|s| s.style.fg.is_none())); }
+            assert!(
+                spans
+                    .iter()
+                    .all(|s| !matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
+            );
+            if mode == super::super::theme::ColorMode::None {
+                assert!(spans.iter().all(|s| s.style.fg.is_none()));
+            }
         }
         let unknown = highlight(&theme(), "unknown", source, &mut false);
         assert_eq!(unknown.len(), 1);
@@ -926,7 +1205,11 @@ mod tests {
         assert!(comment);
         let closed = highlight(&theme(), "c", "end */ int n = 42;", &mut comment);
         assert!(!comment);
-        assert!(closed.iter().any(|s| s.content == "42" && s.style == theme().fg(Tok::SyntaxNumber)));
+        assert!(
+            closed
+                .iter()
+                .any(|s| s.content == "42" && s.style == theme().fg(Tok::SyntaxNumber))
+        );
     }
 
     fn theme() -> Theme {
@@ -934,7 +1217,14 @@ mod tests {
     }
 
     fn plain(rows: &Rows) -> Vec<String> {
-        rows.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect()
+        rows.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     fn md(src: &str, width: u16) -> Rows {
@@ -944,7 +1234,11 @@ mod tests {
     fn assert_fits(rows: &Rows, width: u16) {
         for (i, row) in rows.iter().enumerate() {
             let w = text::line_width(row);
-            assert!(w <= width as usize, "row {i} is {w} cells wide, limit {width}: {:?}", plain(&vec![row.clone()]));
+            assert!(
+                w <= width as usize,
+                "row {i} is {w} cells wide, limit {width}: {:?}",
+                plain(&vec![row.clone()])
+            );
         }
     }
 
@@ -977,12 +1271,18 @@ mod tests {
     fn prose_wraps_on_words_without_losing_text() {
         let rows = md("alpha beta gamma delta epsilon zeta eta theta", 14);
         assert_fits(&rows, 14);
-        assert_eq!(plain(&rows), ["alpha beta", "gamma delta", "epsilon zeta", "eta theta"]);
+        assert_eq!(
+            plain(&rows),
+            ["alpha beta", "gamma delta", "epsilon zeta", "eta theta"]
+        );
     }
 
     #[test]
     fn paragraphs_are_separated_by_one_blank_row() {
-        assert_eq!(plain(&md("one\n\ntwo\n\n\n\nthree", 20)), ["one", "", "two", "", "three"]);
+        assert_eq!(
+            plain(&md("one\n\ntwo\n\n\n\nthree", 20)),
+            ["one", "", "two", "", "three"]
+        );
     }
 
     #[test]
@@ -996,9 +1296,21 @@ mod tests {
     fn emphasis_strong_strike_and_code_carry_their_styles() {
         let rows = md("plain *slanted* **heavy** ~~gone~~ `mono`", 80);
         let t = theme();
-        assert!(style_of(&rows, "slanted").add_modifier.contains(Modifier::ITALIC));
-        assert!(style_of(&rows, "heavy").add_modifier.contains(Modifier::BOLD));
-        assert!(style_of(&rows, "gone").add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(
+            style_of(&rows, "slanted")
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert!(
+            style_of(&rows, "heavy")
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            style_of(&rows, "gone")
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
         assert_eq!(style_of(&rows, "mono").fg, t.fg(Tok::MdCode).fg);
         let p = style_of(&rows, "plain");
         assert!(p.add_modifier.is_empty());
@@ -1008,12 +1320,27 @@ mod tests {
     fn nested_emphasis_combines_and_survives_wrapping() {
         let rows = md("**bold and _both_ here** tail", 9);
         assert_fits(&rows, 9);
-        let both: Vec<_> = rows.iter().flat_map(|l| &l.spans).filter(|s| s.content.contains("both")).collect();
-        assert!(both.iter().all(|s| s.style.add_modifier.contains(Modifier::BOLD | Modifier::ITALIC)));
+        let both: Vec<_> = rows
+            .iter()
+            .flat_map(|l| &l.spans)
+            .filter(|s| s.content.contains("both"))
+            .collect();
+        assert!(both.iter().all(|s| {
+            s.style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::ITALIC)
+        }));
         for word in ["bold", "and", "here"] {
-            assert!(style_of(&rows, word).add_modifier.contains(Modifier::BOLD), "{word}");
+            assert!(
+                style_of(&rows, word).add_modifier.contains(Modifier::BOLD),
+                "{word}"
+            );
         }
-        assert!(!style_of(&rows, "tail").add_modifier.contains(Modifier::BOLD));
+        assert!(
+            !style_of(&rows, "tail")
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -1022,11 +1349,17 @@ mod tests {
         let rows = md("# Big\n\n## Medium\n\n### Small", 20);
         let text = plain(&rows);
         assert_eq!(text[0], "Big");
-        assert!(text[1].chars().all(|c| t.sym(Sym::Hr).contains(c)) && text[1].chars().count() == 20);
+        assert!(
+            text[1].chars().all(|c| t.sym(Sym::Hr).contains(c)) && text[1].chars().count() == 20
+        );
         assert!(text.contains(&"Medium".to_owned()));
         assert!(text.contains(&"### Small".to_owned()));
         assert_eq!(style_of(&rows, "Big").fg, t.fg(Tok::MdHeading).fg);
-        assert!(style_of(&rows, "Medium").add_modifier.contains(Modifier::BOLD));
+        assert!(
+            style_of(&rows, "Medium")
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -1035,7 +1368,10 @@ mod tests {
         let rows = md("see [docs](https://x.dev/a) now", 80);
         assert_eq!(plain(&rows), ["see docs (https://x.dev/a) now"]);
         assert_eq!(style_of(&rows, "docs").fg, t.fg(Tok::MdLink).fg);
-        assert_eq!(style_of(&rows, "https://x.dev/a").fg, t.fg(Tok::MdLinkUrl).fg);
+        assert_eq!(
+            style_of(&rows, "https://x.dev/a").fg,
+            t.fg(Tok::MdLinkUrl).fg
+        );
         let auto = md("<https://x.dev/a>", 80);
         assert_eq!(plain(&auto), ["https://x.dev/a"]);
     }
@@ -1091,14 +1427,23 @@ mod tests {
 
     #[test]
     fn lists_nest_with_hanging_indents() {
-        let rows = md("- alpha beta gamma delta\n  - inner item that is long\n- two", 16);
+        let rows = md(
+            "- alpha beta gamma delta\n  - inner item that is long\n- two",
+            16,
+        );
         assert_fits(&rows, 16);
         let text = plain(&rows);
         let bullet = theme().sym(Sym::Bullet).to_owned();
         assert!(text[0].starts_with(&format!("{bullet} alpha")), "{text:?}");
-        assert!(text[1].starts_with("  gamma"), "continuation hangs under the text: {text:?}");
+        assert!(
+            text[1].starts_with("  gamma"),
+            "continuation hangs under the text: {text:?}"
+        );
         let nested = text.iter().position(|l| l.contains("inner")).unwrap();
-        assert!(text[nested].starts_with(&format!("  {bullet} inner")), "{text:?}");
+        assert!(
+            text[nested].starts_with(&format!("  {bullet} inner")),
+            "{text:?}"
+        );
         assert!(text.last().unwrap().starts_with(&format!("{bullet} two")));
     }
 
@@ -1127,9 +1472,17 @@ mod tests {
         let rows = md("> first line\n>\n> second line that wraps around", 16);
         assert_fits(&rows, 16);
         let bar = t.sym(Sym::Quote);
-        assert!(plain(&rows).iter().all(|l| l.starts_with(bar)), "{:?}", plain(&rows));
+        assert!(
+            plain(&rows).iter().all(|l| l.starts_with(bar)),
+            "{:?}",
+            plain(&rows)
+        );
         assert_eq!(rows[0].spans[0].style.fg, t.fg(Tok::MdQuoteBorder).fg);
-        assert!(style_of(&rows, "first").add_modifier.contains(Modifier::ITALIC));
+        assert!(
+            style_of(&rows, "first")
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
     }
 
     #[test]
@@ -1149,13 +1502,20 @@ mod tests {
         assert!(text[2].starts_with('├') && text[2].contains('┼'));
         assert!(text[5].starts_with('╰') && text[5].contains('┴'));
         assert!(text.iter().all(|l| text::width(l) == text::width(&text[0])));
-        assert!(text[3].contains("│ apple │   3 │"), "numbers are right aligned: {text:?}");
+        assert!(
+            text[3].contains("│ apple │   3 │"),
+            "numbers are right aligned: {text:?}"
+        );
         assert!(text[4].contains("│  12 │"), "{text:?}");
     }
 
     #[test]
     fn table_header_is_bold() {
-        assert!(style_of(&md(TABLE, 60), "name").add_modifier.contains(Modifier::BOLD));
+        assert!(
+            style_of(&md(TABLE, 60), "name")
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -1181,7 +1541,10 @@ mod tests {
         assert!(text.iter().all(|l| !l.contains('┬')), "{text:?}");
         assert!(text.contains(&"name: apple".to_owned()), "{text:?}");
         assert!(text.contains(&"qty: 12".to_owned()), "{text:?}");
-        assert!(text.iter().any(|l| l.contains('─')), "records are separated by a rule: {text:?}");
+        assert!(
+            text.iter().any(|l| l.contains('─')),
+            "records are separated by a rule: {text:?}"
+        );
     }
 
     #[test]
@@ -1235,8 +1598,19 @@ mod tests {
         let src = "safe \x1b[31mred\x1b[0m \x1b]0;pwned\x07title \x1b]8;;http://evil\x1b\\link\x1b]8;;\x1b\\ \u{202e}rtl\r\n\n```\n\x1b[2Jcode\x1b[H\n```\n| \x1b[1mh | b |\n|--|--|\n| \u{9b}31mx | y |";
         for row in md(src, 40) {
             for span in row.spans {
-                assert!(!span.content.chars().any(|c| c.is_control() || c == '\u{202e}'), "{:?}", span.content);
-                assert!(!span.content.contains("pwned") && !span.content.contains("[31m") && !span.content.contains("[2J"));
+                assert!(
+                    !span
+                        .content
+                        .chars()
+                        .any(|c| c.is_control() || c == '\u{202e}'),
+                    "{:?}",
+                    span.content
+                );
+                assert!(
+                    !span.content.contains("pwned")
+                        && !span.content.contains("[31m")
+                        && !span.content.contains("[2J")
+                );
             }
         }
     }
@@ -1245,12 +1619,20 @@ mod tests {
     fn html_is_shown_as_dim_text_not_dropped() {
         let rows = md("before <b>x</b> after", 40);
         let joined = plain(&rows).join("");
-        assert!(joined.contains("<b>") && joined.contains("after"), "{joined}");
+        assert!(
+            joined.contains("<b>") && joined.contains("after"),
+            "{joined}"
+        );
     }
 
     #[test]
     fn ascii_mode_uses_ascii_glyphs_for_structure() {
-        let rows = render("- a\n\n```rs\nx\n```\n\n> q\n\n| a |\n|--|\n| b |", 30, &theme(), true);
+        let rows = render(
+            "- a\n\n```rs\nx\n```\n\n> q\n\n| a |\n|--|\n| b |",
+            30,
+            &theme(),
+            true,
+        );
         for row in plain(&rows) {
             assert!(row.is_ascii(), "{row:?}");
         }
