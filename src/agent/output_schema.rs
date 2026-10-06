@@ -66,10 +66,10 @@ fn check_at(schema: &Value, path: &str) -> Result<(), String> {
     if let Some(items) = object.get("items") {
         check_at(items, &format!("{path}[]"))?;
     }
-    if let Some(values) = object.get("enum") {
-        if !values.as_array().is_some_and(|v| !v.is_empty()) {
-            return Err(format!("{path}: `enum` must be a non-empty array"));
-        }
+    if let Some(values) = object.get("enum")
+        && !values.as_array().is_some_and(|v| !v.is_empty())
+    {
+        return Err(format!("{path}: `enum` must be a non-empty array"));
     }
     Ok(())
 }
@@ -103,29 +103,29 @@ fn validate_at(schema: &Value, value: &Value, path: &str) -> Result<(), String> 
             type_of(value)
         ));
     }
-    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
-        if !allowed.contains(value) {
-            return Err(format!(
-                "{path}: {value} is not one of {}",
-                Value::Array(allowed.clone())
-            ));
-        }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        return Err(format!(
+            "{path}: {value} is not one of {}",
+            Value::Array(allowed.clone())
+        ));
     }
-    if let Some(expected) = schema.get("const") {
-        if expected != value {
-            return Err(format!("{path}: must equal {expected}"));
-        }
+    if let Some(expected) = schema.get("const")
+        && expected != value
+    {
+        return Err(format!("{path}: must equal {expected}"));
     }
     if let Some(n) = value.as_f64() {
-        if let Some(min) = schema.get("minimum").and_then(Value::as_f64) {
-            if n < min {
-                return Err(format!("{path}: {n} is below the minimum {min}"));
-            }
+        if let Some(min) = schema.get("minimum").and_then(Value::as_f64)
+            && n < min
+        {
+            return Err(format!("{path}: {n} is below the minimum {min}"));
         }
-        if let Some(max) = schema.get("maximum").and_then(Value::as_f64) {
-            if n > max {
-                return Err(format!("{path}: {n} is above the maximum {max}"));
-            }
+        if let Some(max) = schema.get("maximum").and_then(Value::as_f64)
+            && n > max
+        {
+            return Err(format!("{path}: {n} is above the maximum {max}"));
         }
     }
     match value {
@@ -174,21 +174,21 @@ fn validate_array(
     items: &[Value],
     path: &str,
 ) -> Result<(), String> {
-    if let Some(min) = schema.get("minItems").and_then(Value::as_u64) {
-        if (items.len() as u64) < min {
-            return Err(format!(
-                "{path}: needs at least {min} items, has {}",
-                items.len()
-            ));
-        }
+    if let Some(min) = schema.get("minItems").and_then(Value::as_u64)
+        && (items.len() as u64) < min
+    {
+        return Err(format!(
+            "{path}: needs at least {min} items, has {}",
+            items.len()
+        ));
     }
-    if let Some(max) = schema.get("maxItems").and_then(Value::as_u64) {
-        if items.len() as u64 > max {
-            return Err(format!(
-                "{path}: allows at most {max} items, has {}",
-                items.len()
-            ));
-        }
+    if let Some(max) = schema.get("maxItems").and_then(Value::as_u64)
+        && items.len() as u64 > max
+    {
+        return Err(format!(
+            "{path}: allows at most {max} items, has {}",
+            items.len()
+        ));
     }
     if let Some(sub) = schema.get("items") {
         for (i, item) in items.iter().enumerate() {

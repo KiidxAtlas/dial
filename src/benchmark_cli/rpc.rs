@@ -84,13 +84,12 @@ fn observe(m: &mut RunMetrics, event: &Value) {
                 m.tool_contract_errors += 1;
             }
         }
-        Some("notice") => {
+        Some("notice")
             if event["message"]
                 .as_str()
-                .is_some_and(|t| t.contains("output limit") && t.contains("retry"))
-            {
-                m.truncated_recoveries += 1;
-            }
+                .is_some_and(|t| t.contains("output limit") && t.contains("retry")) =>
+        {
+            m.truncated_recoveries += 1;
         }
         _ => {}
     }

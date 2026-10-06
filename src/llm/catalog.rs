@@ -317,10 +317,10 @@ pub fn resolve_credential(
             })
             .map(|(_, _, _, key)| *key)
     });
-    if let Some(variable) = variable {
-        if let Some(token) = env_token(variable, &uri)? {
-            return Ok(Some(token));
-        }
+    if let Some(variable) = variable
+        && let Some(token) = env_token(variable, &uri)?
+    {
+        return Ok(Some(token));
     }
     let token = if user_dir.as_os_str().is_empty() {
         None
@@ -602,10 +602,11 @@ fn probe_models(probe: &Probe) -> (ProviderStatus, Vec<ModelEntry>) {
         .and_then(|value| parse_models(&value, probe).ok())
     {
         Some(mut models) => {
-            if local && probe.id != "ollama" {
-                if let Some(info) = lmstudio_models(&probe.spec.base_url, probe.token.as_deref()) {
-                    annotate_lmstudio(&mut models, &info);
-                }
+            if local
+                && probe.id != "ollama"
+                && let Some(info) = lmstudio_models(&probe.spec.base_url, probe.token.as_deref())
+            {
+                annotate_lmstudio(&mut models, &info);
             }
             (
                 status(probe, "reachable", "Live model metadata", models.len()),
@@ -1378,13 +1379,14 @@ pub fn discover(
                     }
                 } else {
                     let mut probe = prepare(id.clone(), spec, &layout.user_dir);
-                    if id == "anthropic" && super::anthropic_oauth::signed_in(&layout.user_dir) {
-                        if let Ok(token) = super::anthropic_oauth::access_token(
+                    if id == "anthropic"
+                        && super::anthropic_oauth::signed_in(&layout.user_dir)
+                        && let Ok(token) = super::anthropic_oauth::access_token(
                             &layout.user_dir,
                             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                        ) {
-                            apply_anthropic_oauth_token(&mut probe, &token);
-                        }
+                        )
+                    {
+                        apply_anthropic_oauth_token(&mut probe, &token);
                     }
                     probe
                 }
@@ -1419,32 +1421,9 @@ pub fn discover(
                         anthropic_subscription_catalog(probe, &mut status, saved)
                     {
                         models = subscription_models;
-                    } else if status.state != "disabled" {
-                        if let Some(stale) = cache.get(&probe.spec.base_url) {
-                            models = stale
-                                .iter()
-                                .take(MAX_MODELS)
-                                .cloned()
-                                .map(|mut entry| {
-                                    entry.available = false;
-                                    entry.source =
-                                        format!("{} (cached, unverified)", probe.spec.label);
-                                    entry.selection.provider = probe.id.clone();
-                                    entry.selection.api_key_env = probe.spec.api_key_env.clone();
-                                    entry.selection.allow_insecure = probe.spec.allow_insecure;
-                                    entry
-                                })
-                                .collect();
-                            if !models.is_empty() {
-                                status
-                                    .detail
-                                    .push_str("; showing cached metadata as unverified");
-                                status.models = models.len();
-                            }
-                        }
-                    }
-                } else if status.state != "disabled" {
-                    if let Some(stale) = cache.get(&probe.spec.base_url) {
+                    } else if status.state != "disabled"
+                        && let Some(stale) = cache.get(&probe.spec.base_url)
+                    {
                         models = stale
                             .iter()
                             .take(MAX_MODELS)
@@ -1464,6 +1443,28 @@ pub fn discover(
                                 .push_str("; showing cached metadata as unverified");
                             status.models = models.len();
                         }
+                    }
+                } else if status.state != "disabled"
+                    && let Some(stale) = cache.get(&probe.spec.base_url)
+                {
+                    models = stale
+                        .iter()
+                        .take(MAX_MODELS)
+                        .cloned()
+                        .map(|mut entry| {
+                            entry.available = false;
+                            entry.source = format!("{} (cached, unverified)", probe.spec.label);
+                            entry.selection.provider = probe.id.clone();
+                            entry.selection.api_key_env = probe.spec.api_key_env.clone();
+                            entry.selection.allow_insecure = probe.spec.allow_insecure;
+                            entry
+                        })
+                        .collect();
+                    if !models.is_empty() {
+                        status
+                            .detail
+                            .push_str("; showing cached metadata as unverified");
+                        status.models = models.len();
                     }
                 }
                 discovery.providers.push(status);

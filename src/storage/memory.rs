@@ -123,13 +123,12 @@ fn find_injection(text: &str) -> Option<&'static str> {
             continue;
         }
         let window = &w[i + 1..w.len().min(i + 5)];
-        if let Some(obj) = window.iter().position(|x| OBJECTS.contains(&x.as_str())) {
-            if window[..obj]
+        if let Some(obj) = window.iter().position(|x| OBJECTS.contains(&x.as_str()))
+            && window[..obj]
                 .iter()
                 .any(|x| QUALIFIERS.contains(&x.as_str()))
-            {
-                return Some("instruction override");
-            }
+        {
+            return Some("instruction override");
         }
     }
     None

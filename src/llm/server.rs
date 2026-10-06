@@ -46,7 +46,7 @@ fn prompt_cache_bytes() -> Option<u64> {
     let total = u64::try_from(pages)
         .ok()?
         .checked_mul(u64::try_from(page_size).ok()?)?;
-    (total > 0).then(|| total / PROMPT_CACHE_MEMORY_DIVISOR)
+    (total > 0).then_some(total / PROMPT_CACHE_MEMORY_DIVISOR)
 }
 
 #[derive(Default)]

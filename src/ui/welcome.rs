@@ -461,11 +461,10 @@ mod tests {
         let text = plain(&rows(&info(), 6, &Theme::dark()));
         assert!(text.iter().all(|l| !l.contains('╭')));
         assert!(text.iter().any(|l| l.contains("Welc")));
-        assert_eq!(
+        assert!(
             plain(&rows(&info(), 1, &Theme::dark()))
                 .iter()
-                .all(|l| text::width(l) <= 1),
-            true
+                .all(|l| text::width(l) <= 1)
         );
     }
 

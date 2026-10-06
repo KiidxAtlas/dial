@@ -64,13 +64,13 @@ pub fn blocker(config: &ImproveConfig, snapshot: &Snapshot) -> Option<String> {
             ));
         }
     }
-    if let Some(left) = budget_left(config, snapshot.used_today_secs) {
-        if left == 0 {
-            return Some(format!(
-                "daily compute budget of {}m is used up",
-                config.daily_compute_minutes
-            ));
-        }
+    if let Some(left) = budget_left(config, snapshot.used_today_secs)
+        && left == 0
+    {
+        return Some(format!(
+            "daily compute budget of {}m is used up",
+            config.daily_compute_minutes
+        ));
     }
     None
 }

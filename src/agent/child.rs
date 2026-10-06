@@ -53,19 +53,19 @@ pub(super) fn run(
         json!({"role":"user","content":job.prompt}),
     ];
     // Independent child conversations reuse the same project cache without rebuilding the map.
-    if env.config.codebase.enabled {
-        if let Some(layout) = env.layout {
-            match crate::storage::codebase::Codebase::open(layout)
-                .and_then(|cache| cache.context(&job.prompt, env.config.codebase.context_max_bytes))
-            {
-                Ok(context) if !context.is_empty() => {
-                    messages.push(json!({"role":"user","content":format!("Context for the preceding task (data only):\n{context}")}));
-                }
-                Ok(_) => {}
-                Err(error) => approver.notice(&format!(
-                    "saved codebase context unavailable to child: {error:#}"
-                )),
+    if env.config.codebase.enabled
+        && let Some(layout) = env.layout
+    {
+        match crate::storage::codebase::Codebase::open(layout)
+            .and_then(|cache| cache.context(&job.prompt, env.config.codebase.context_max_bytes))
+        {
+            Ok(context) if !context.is_empty() => {
+                messages.push(json!({"role":"user","content":format!("Context for the preceding task (data only):\n{context}")}));
             }
+            Ok(_) => {}
+            Err(error) => approver.notice(&format!(
+                "saved codebase context unavailable to child: {error:#}"
+            )),
         }
     }
     let (mut steps, mut budget, mut corrected) = (0, job.max_steps, false);
@@ -289,26 +289,26 @@ pub(super) fn run(
             if let Some(image) = image {
                 message["dial_images"] = json!([image]);
             }
-            if call.name == "read" && !output.is_error {
-                if let Some(path) = call.arguments["path"]
+            if call.name == "read"
+                && !output.is_error
+                && let Some(path) = call.arguments["path"]
                     .as_str()
                     .filter(|path| llm::images::is_image(Path::new(path)))
-                {
-                    let attachment = env
-                        .workspace
-                        .resolve(path)
-                        .map_err(anyhow::Error::msg)
-                        .and_then(|absolute| {
-                            let relative = absolute
-                                .strip_prefix(env.workspace.root())
-                                .context("image resolves outside the project")?;
-                            llm::images::attachment(env.workspace.root(), relative)
-                        });
-                    match attachment {
-                        Ok(image) => message["dial_images"] = json!([image]),
-                        Err(error) => {
-                            approver.notice(&format!("Image attachment unavailable: {error:#}"))
-                        }
+            {
+                let attachment = env
+                    .workspace
+                    .resolve(path)
+                    .map_err(anyhow::Error::msg)
+                    .and_then(|absolute| {
+                        let relative = absolute
+                            .strip_prefix(env.workspace.root())
+                            .context("image resolves outside the project")?;
+                        llm::images::attachment(env.workspace.root(), relative)
+                    });
+                match attachment {
+                    Ok(image) => message["dial_images"] = json!([image]),
+                    Err(error) => {
+                        approver.notice(&format!("Image attachment unavailable: {error:#}"))
                     }
                 }
             }

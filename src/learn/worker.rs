@@ -482,13 +482,14 @@ pub fn train(config: &Config, active: &Version, output_dir: &Path) -> Result<Pat
                             return Err(super::compute::Preempted.into());
                         }
                     }
-                    if let Ok(raw) = std::fs::read_to_string(&progress) {
-                        if raw.len() <= 8192 && raw != last_progress {
-                            let value: Value = serde_json::from_str(&raw)?;
-                            store.set_meta("training_progress", &raw)?;
-                            store.set_meta("cycle_progress",&json!({"stage":value["stage"],"at":super::improve::now(),"started":started,"training":value}).to_string())?;
-                            last_progress = raw;
-                        }
+                    if let Ok(raw) = std::fs::read_to_string(&progress)
+                        && raw.len() <= 8192
+                        && raw != last_progress
+                    {
+                        let value: Value = serde_json::from_str(&raw)?;
+                        store.set_meta("training_progress", &raw)?;
+                        store.set_meta("cycle_progress",&json!({"stage":value["stage"],"at":super::improve::now(),"started":started,"training":value}).to_string())?;
+                        last_progress = raw;
                     }
                     Ok(())
                 },

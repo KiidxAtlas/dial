@@ -215,10 +215,10 @@ pub fn render_result(result: &Value) -> ToolOutput {
         .and_then(Value::as_array)
         .map(|blocks| blocks.iter().map(render_block).collect())
         .unwrap_or_default();
-    if parts.is_empty() {
-        if let Some(structured) = result.get("structuredContent") {
-            parts.push(structured.to_string());
-        }
+    if parts.is_empty()
+        && let Some(structured) = result.get("structuredContent")
+    {
+        parts.push(structured.to_string());
     }
     let text = if parts.is_empty() {
         "(the tool returned no content)".to_owned()

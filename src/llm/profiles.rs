@@ -112,12 +112,11 @@ impl ModelProfile {
             self.capabilities.tools != Some(false) || self.tools.as_ref().is_none_or(Vec::is_empty),
             "tool profile conflicts with unsupported tools"
         );
-        if let Some(budget) = self.thinking_budget {
-            if self.thinking == Some(true) {
-                if let Some(limit) = self.max_tokens {
-                    ensure!(budget < limit, "thinking_budget must be below max_tokens");
-                }
-            }
+        if let Some(budget) = self.thinking_budget
+            && self.thinking == Some(true)
+            && let Some(limit) = self.max_tokens
+        {
+            ensure!(budget < limit, "thinking_budget must be below max_tokens");
         }
         if let Some(effort) = self.reasoning_effort {
             ensure!(
@@ -223,13 +222,13 @@ impl ModelProfile {
             anthropic || !self.prompt_cache,
             "OpenAI caching is automatic; prompt_cache controls native Anthropic breakpoints only"
         );
-        if let Some(budget) = self.thinking_budget {
-            if self.thinking == Some(true) {
-                ensure!(
-                    budget < req.max_tokens,
-                    "thinking_budget must be below request max_tokens"
-                );
-            }
+        if let Some(budget) = self.thinking_budget
+            && self.thinking == Some(true)
+        {
+            ensure!(
+                budget < req.max_tokens,
+                "thinking_budget must be below request max_tokens"
+            );
         }
         Ok(())
     }
@@ -249,10 +248,10 @@ impl ModelProfile {
         if let Some(p) = self.top_p {
             object.insert("top_p".into(), json!(p));
         }
-        if self.capabilities.output_limit == OutputLimit::MaxCompletionTokens {
-            if let Some(n) = object.remove("max_tokens") {
-                object.insert("max_completion_tokens".into(), n);
-            }
+        if self.capabilities.output_limit == OutputLimit::MaxCompletionTokens
+            && let Some(n) = object.remove("max_tokens")
+        {
+            object.insert("max_completion_tokens".into(), n);
         }
         if let Some(e) = self
             .reasoning_effort

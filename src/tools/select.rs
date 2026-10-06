@@ -117,13 +117,13 @@ pub fn split_selector(input: &str) -> Result<(&str, Selector), String> {
             rest = &rest[..i];
             continue;
         }
-        if !sel.selects_lines() {
-            if let Some((ranges, tail)) = parse_ranges(seg)? {
-                sel.ranges = ranges;
-                sel.tail = tail;
-                rest = &rest[..i];
-                continue;
-            }
+        if !sel.selects_lines()
+            && let Some((ranges, tail)) = parse_ranges(seg)?
+        {
+            sel.ranges = ranges;
+            sel.tail = tail;
+            rest = &rest[..i];
+            continue;
         }
         break;
     }

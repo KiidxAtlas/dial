@@ -123,11 +123,11 @@ fn spawn_reader(
                 match pipe.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
-                        if let Some(spool) = &mut spool {
-                            if let Err(e) = spool.write_all(&buffer[..count]) {
-                                error = Some(format!("capturing complete output: {e}"));
-                                break;
-                            }
+                        if let Some(spool) = &mut spool
+                            && let Err(e) = spool.write_all(&buffer[..count])
+                        {
+                            error = Some(format!("capturing complete output: {e}"));
+                            break;
                         }
                         lock(&ring).push(&buffer[..count]);
                     }

@@ -808,10 +808,10 @@ pub fn block_end<S: AsRef<str>>(lines: &[S], n: usize, ext: &str) -> Result<usiz
             "line {n} is blank; anchor the first line of the construct (or use an explicit range)"
         ));
     }
-    if matches!(ext, "md" | "markdown" | "mdx") {
-        if let Some(level) = heading_level(at(n)) {
-            return markdown_end(lines, n, level);
-        }
+    if matches!(ext, "md" | "markdown" | "mdx")
+        && let Some(level) = heading_level(at(n))
+    {
+        return markdown_end(lines, n, level);
     }
     let mut open = n;
     while open < len && is_prefix_line(at(open)) {
@@ -2077,11 +2077,11 @@ pub fn rehydrate<'a>(ws: &Workspace, results: impl IntoIterator<Item = (&'a str,
             ) else {
                 continue;
             };
-            if digits > 0 && line.as_bytes().get(digits) == Some(&b':') {
-                if let (Ok(n), Some(entry)) = (line[..digits].parse::<usize>(), found.get_mut(key))
-                {
-                    entry.1.push((n, n));
-                }
+            if digits > 0
+                && line.as_bytes().get(digits) == Some(&b':')
+                && let (Ok(n), Some(entry)) = (line[..digits].parse::<usize>(), found.get_mut(key))
+            {
+                entry.1.push((n, n));
             }
         }
     }

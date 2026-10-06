@@ -813,10 +813,10 @@ impl Session {
             }));
         }
         for i in kept {
-            if let Kind::Message(m) = &self.entries[i].kind {
-                if m["role"] != "dial_state" {
-                    out.push(m.clone());
-                }
+            if let Kind::Message(m) = &self.entries[i].kind
+                && m["role"] != "dial_state"
+            {
+                out.push(m.clone());
             }
         }
     }
@@ -1732,10 +1732,9 @@ mod tests {
         let hits = Session::search(&e.layout, "foo\" OR 1", 5).unwrap();
         assert!(!hits.is_empty());
         assert!(
-            Session::search(&e.layout, "nonexistentword AND foo", 5)
+            !Session::search(&e.layout, "nonexistentword AND foo", 5)
                 .unwrap()
-                .len()
-                >= 1
+                .is_empty()
         ); // OR fallback, not an FTS AND
     }
 

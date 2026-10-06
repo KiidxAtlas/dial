@@ -323,11 +323,11 @@ pub fn compare(
     } else {
         None
     };
-    if admission.passed {
-        if let Some(reason) = failure {
-            admission.passed = false;
-            admission.reason = reason.into();
-        }
+    if admission.passed
+        && let Some(reason) = failure
+    {
+        admission.passed = false;
+        admission.reason = reason.into();
     }
     report.admitted = admission.passed;
     report.reason = admission.reason.clone();

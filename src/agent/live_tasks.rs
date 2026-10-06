@@ -338,7 +338,7 @@ impl LiveTasks {
                     let mut value =
                         json!({"id":done_id,"status":status,"steps":outcome.steps,"result":text});
                     if let Some(store) = workspace.artifacts() {
-                        match store.retain(&value["result"].as_str().unwrap_or("")) {
+                        match store.retain(value["result"].as_str().unwrap_or("")) {
                             Ok(uri) => value["artifact"] = json!(uri),
                             Err(e) => {
                                 value["status"] = json!("failed");

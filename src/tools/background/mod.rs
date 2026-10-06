@@ -181,13 +181,13 @@ impl Background {
             if exited {
                 snap.settle();
             }
-            if let Some(pattern) = &until {
-                if let Some(line) = find_match(&snap.ring, pattern, &mut scanned) {
-                    return Ok(ToolOutput::ok(format!(
-                        "ready: {name} output matched /{pattern}/\n> {line}\n[{}]",
-                        snap.state.label()
-                    )));
-                }
+            if let Some(pattern) = &until
+                && let Some(line) = find_match(&snap.ring, pattern, &mut scanned)
+            {
+                return Ok(ToolOutput::ok(format!(
+                    "ready: {name} output matched /{pattern}/\n> {line}\n[{}]",
+                    snap.state.label()
+                )));
             }
             if exited {
                 let state = snap.state.label();

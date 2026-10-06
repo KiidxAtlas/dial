@@ -291,11 +291,11 @@ struct Wrapper {
 }
 
 fn push_merged(spans: &mut Vec<Span<'static>>, content: &str, style: Style) {
-    if let Some(last) = spans.last_mut() {
-        if last.style == style {
-            last.content.to_mut().push_str(content);
-            return;
-        }
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push_str(content);
+        return;
     }
     spans.push(Span::styled(content.to_owned(), style));
 }

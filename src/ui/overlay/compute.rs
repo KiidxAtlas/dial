@@ -264,6 +264,12 @@ impl ComputeOverlay {
     }
 }
 
+impl Default for ComputeOverlay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::settings::testkit::*;

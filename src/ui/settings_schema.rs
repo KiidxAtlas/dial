@@ -1309,13 +1309,13 @@ mod tests {
     use std::collections::HashSet;
 
     fn default_table() -> Table {
-        Table::try_from(&Config::default()).expect("default config serializes")
+        Table::try_from(Config::default()).expect("default config serializes")
     }
 
     #[test]
     fn every_path_is_a_real_key_with_the_real_default() {
         let table = default_table();
-        let ui = Table::try_from(&UiConfig::default()).unwrap();
+        let ui = Table::try_from(UiConfig::default()).unwrap();
         for def in registry() {
             let default = def.default_value().unwrap_or_else(|| {
                 panic!(

@@ -260,10 +260,10 @@ fn load_skill(dir: &Path, scope: Scope) -> Option<Skill> {
     let text = String::from_utf8_lossy(&head);
     let (frontmatter, _) = split_frontmatter(&text)?;
     let fields = parse_fields(frontmatter);
-    if let Some(declared) = field(&fields, "name") {
-        if declared.value != name {
-            return None;
-        }
+    if let Some(declared) = field(&fields, "name")
+        && declared.value != name
+    {
+        return None;
     }
     let description: String = one_line(&field(&fields, "description")?.value)
         .chars()

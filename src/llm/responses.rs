@@ -66,23 +66,22 @@ pub(super) fn request(
             let mut function = tool["function"].clone();
             function["type"] = json!("function");
             function["strict"] = json!(false);
-            if profile.is_some_and(|p| p.capabilities.strict_tools) {
-                if let Some(parameters) =
+            if profile.is_some_and(|p| p.capabilities.strict_tools)
+                && let Some(parameters) =
                     crate::reliability::strict_parameters(&function["parameters"])
-                {
-                    function["parameters"] = parameters;
-                    function["strict"] = json!(true);
-                }
+            {
+                function["parameters"] = parameters;
+                function["strict"] = json!(true);
             }
             functions.push(function);
         }
         body["tools"] = json!([{"type":"namespace","name":"dial","description":"Tools executed locally by Dial.","tools":functions}]);
     }
     if let Some(profile) = profile {
-        if !chat.tools.is_empty() {
-            if let Some(parallel) = profile.capabilities.parallel_tool_calls {
-                body["parallel_tool_calls"] = json!(parallel);
-            }
+        if !chat.tools.is_empty()
+            && let Some(parallel) = profile.capabilities.parallel_tool_calls
+        {
+            body["parallel_tool_calls"] = json!(parallel);
         }
         profile.validate_request(chat, false)?;
         ensure!(
@@ -239,10 +238,10 @@ impl Accumulator {
                 }
             }
             Some("response.reasoning_summary_text.delta") => {
-                if let Some(delta) = event["delta"].as_str() {
-                    if !on_event(&StreamEvent::Reasoning(delta.into())) {
-                        return Err(Interrupted.into());
-                    }
+                if let Some(delta) = event["delta"].as_str()
+                    && !on_event(&StreamEvent::Reasoning(delta.into()))
+                {
+                    return Err(Interrupted.into());
                 }
             }
             Some("response.output_item.added") => {

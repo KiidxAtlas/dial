@@ -344,12 +344,13 @@ impl Composer {
             self.clear();
             return ComposerEvent::None;
         }
-        if self.editor.text.is_empty() && key.code == KeyCode::Up {
-            if let Some((text, follow_up)) = self.queued.pop_back() {
-                self.set_draft(&text);
-                self.editing_queue = Some(follow_up);
-                return ComposerEvent::None;
-            }
+        if self.editor.text.is_empty()
+            && key.code == KeyCode::Up
+            && let Some((text, follow_up)) = self.queued.pop_back()
+        {
+            self.set_draft(&text);
+            self.editing_queue = Some(follow_up);
+            return ComposerEvent::None;
         }
         if self.busy && key.code == KeyCode::Enter && key.modifiers == KeyModifiers::ALT {
             return if self.editor.text.trim_start().starts_with('/') {
@@ -721,14 +722,14 @@ impl Composer {
                     .any(|(offset, _)| offset == draft.len())
         };
         // Names still use the command menu; argument ghosts start after its first space.
-        if draft.starts_with('/') && draft.contains(' ') {
-            if let Some(entry) = self
+        if draft.starts_with('/')
+            && draft.contains(' ')
+            && let Some(entry) = self
                 .argument_completions
                 .iter()
                 .find(|entry| extends(entry))
-            {
-                return Some(&entry[draft.len()..]);
-            }
+        {
+            return Some(&entry[draft.len()..]);
         }
         self.history
             .iter()
@@ -1697,7 +1698,7 @@ mod tests {
         );
         let empty = Composer::new(vec![], 10);
         for width in [1u16, 8, 60] {
-            assert!(empty.view(width, &env.ctx()).rows.len() >= 1);
+            assert!(!empty.view(width, &env.ctx()).rows.is_empty());
         }
     }
 

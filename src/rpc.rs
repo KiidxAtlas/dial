@@ -78,10 +78,10 @@ impl RpcUi {
                 Err(_) => break Decision::Deny,
             }
         };
-        if let Ok(mut pending) = self.pending_approval.lock() {
-            if pending.as_deref() == Some(&approval_id) {
-                *pending = None;
-            }
+        if let Ok(mut pending) = self.pending_approval.lock()
+            && pending.as_deref() == Some(&approval_id)
+        {
+            *pending = None;
         }
         decision
     }
@@ -247,11 +247,10 @@ pub fn run(layout: Layout, config: Config) -> Result<()> {
                             && (crate::learn::compute::background_pending(&layout.user_dir)?
                                 || crate::learn::compute::foreground_pending(&layout.user_dir)?)
                             && agent.release_idle_models()
+                            && let Some(lock) = compute.take()
                         {
-                            if let Some(lock) = compute.take() {
-                                crate::learn::compute::clear_owner(&layout.user_dir);
-                                fs2::FileExt::unlock(&lock)?;
-                            }
+                            crate::learn::compute::clear_owner(&layout.user_dir);
+                            fs2::FileExt::unlock(&lock)?;
                         }
                         continue;
                     }

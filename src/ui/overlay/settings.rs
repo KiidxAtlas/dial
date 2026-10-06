@@ -1222,20 +1222,20 @@ impl SettingsOverlay {
                     choices,
                     cursor,
                 } = &self.mode
+                    && picking.path == def.path
+                    && i == self.cursor
                 {
-                    if picking.path == def.path && i == self.cursor {
-                        let first = cursor
-                            .saturating_sub(3)
-                            .min(choices.len().saturating_sub(7));
-                        for (n, name) in choices.iter().enumerate().skip(first).take(7) {
-                            if n == *cursor {
-                                cursor_item = items.len();
-                            }
-                            items.push(Item::Choice {
-                                name: value_text(def, &Value::String(name.clone())),
-                                on: n == *cursor,
-                            });
+                    let first = cursor
+                        .saturating_sub(3)
+                        .min(choices.len().saturating_sub(7));
+                    for (n, name) in choices.iter().enumerate().skip(first).take(7) {
+                        if n == *cursor {
+                            cursor_item = items.len();
                         }
+                        items.push(Item::Choice {
+                            name: value_text(def, &Value::String(name.clone())),
+                            on: n == *cursor,
+                        });
                     }
                 }
                 if let Some(note) = self.notes.get(def.path) {

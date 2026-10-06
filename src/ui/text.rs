@@ -210,7 +210,7 @@ pub fn justify(
         left.iter().map(|s| width(&s.content)).sum(),
         right.iter().map(|s| width(&s.content)).sum(),
     );
-    if lw + rw + 1 <= total {
+    if lw + rw < total {
         let mut out = left;
         out.push(Span::styled(" ".repeat(total - lw - rw), fill));
         out.extend(right);

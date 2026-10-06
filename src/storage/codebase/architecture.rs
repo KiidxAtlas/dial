@@ -399,7 +399,7 @@ impl Codebase {
                 )
                 .optional()?
                 .is_some();
-            let scope = Self::scope_status(section.freshness.as_ref(), &snapshot);
+            let scope = Self::scope_status(section.freshness.as_ref(), snapshot);
             statuses.insert(
                 section.id.clone(),
                 if contradicted {

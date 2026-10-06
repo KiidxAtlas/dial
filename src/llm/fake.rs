@@ -81,7 +81,7 @@ pub(crate) fn serve(scripts: Vec<Script>) -> Fake {
     Fake { url, handle }
 }
 
-pub(crate) fn header<'a>(raw: &'a [u8], name: &str) -> Option<String> {
+pub(crate) fn header(raw: &[u8], name: &str) -> Option<String> {
     let end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = String::from_utf8_lossy(&raw[..end]);
     head.lines().skip(1).find_map(|line| {

@@ -494,14 +494,13 @@ fn probe_when_available(
         &config.harness,
     )?;
     // Another session may have completed verification while this job waited for compute.
-    if let Some(raw) = store.get_meta("serving_capabilities")? {
-        if let Ok(caps) = serde_json::from_str::<Value>(&raw) {
-            if crate::learn::worker::current_lora_probe(&caps) && caps["inference"] == true {
-                if let Some(supported) = caps["lora"].as_bool() {
-                    return Ok(Some(supported));
-                }
-            }
-        }
+    if let Some(raw) = store.get_meta("serving_capabilities")?
+        && let Ok(caps) = serde_json::from_str::<Value>(&raw)
+        && crate::learn::worker::current_lora_probe(&caps)
+        && caps["inference"] == true
+        && let Some(supported) = caps["lora"].as_bool()
+    {
+        return Ok(Some(supported));
     }
     let _owner = crate::learn::compute::owner_record(
         &config.user_dir,
@@ -1770,19 +1769,18 @@ impl Shell {
         if let Some(monitor) = &self.adapter_monitor {
             status.lora = status.lora.with_runtime(&monitor.lock());
         }
-        if matches!(status.lora, Lora::Unknown | Lora::Unverified) {
-            if let Some(probe) = self
+        if matches!(status.lora, Lora::Unknown | Lora::Unverified)
+            && let Some(probe) = self
                 .catalog
                 .probe
                 .as_ref()
                 .filter(|probe| probe.model == selection.model)
-            {
-                status.lora = if probe.checking.load(Ordering::SeqCst) {
-                    Lora::Verifying
-                } else {
-                    Lora::VerificationQueued
-                };
-            }
+        {
+            status.lora = if probe.checking.load(Ordering::SeqCst) {
+                Lora::Verifying
+            } else {
+                Lora::VerificationQueued
+            };
         }
         status.role.clear();
         if self.todo != *agent.todo() {
@@ -4068,37 +4066,36 @@ fn improve_summary(app: &App) -> String {
         Err(error) => summary.push_str(&format!("\nLoRA cooldown unavailable: {error:#}")),
     }
     summary.push_str(&format!("\nTraining requires at least {} verified examples and a validation split. Cooldowns are eligibility delays, not training-duration estimates.", app.config.improve.lora_min_examples.max(app.config.training.batch_size)));
-    if state == "running" {
-        if let Ok(Some(raw)) = store.get_meta("cycle_progress") {
-            if let Ok(value) = serde_json::from_str::<Value>(&raw) {
-                let elapsed = crate::learn::improve::now().saturating_sub(
-                    value["started"]
-                        .as_u64()
-                        .unwrap_or(crate::learn::improve::now()),
-                );
-                summary.push_str(&format!(
-                    "\nCurrent stage: {}\nCycle elapsed: {}. Completion ETA is not yet available.",
-                    value["stage"].as_str().unwrap_or("unknown"),
-                    auto::duration(elapsed)
-                ));
-                if let Some(peak) = value["training"]["peak_memory_gb"].as_f64() {
-                    summary.push_str(&format!(
-                        "\nLast training report: MLX peak allocated memory {peak:.2} GB."
-                    ));
-                }
-            }
+    if state == "running"
+        && let Ok(Some(raw)) = store.get_meta("cycle_progress")
+        && let Ok(value) = serde_json::from_str::<Value>(&raw)
+    {
+        let elapsed = crate::learn::improve::now().saturating_sub(
+            value["started"]
+                .as_u64()
+                .unwrap_or(crate::learn::improve::now()),
+        );
+        summary.push_str(&format!(
+            "\nCurrent stage: {}\nCycle elapsed: {}. Completion ETA is not yet available.",
+            value["stage"].as_str().unwrap_or("unknown"),
+            auto::duration(elapsed)
+        ));
+        if let Some(peak) = value["training"]["peak_memory_gb"].as_f64() {
+            summary.push_str(&format!(
+                "\nLast training report: MLX peak allocated memory {peak:.2} GB."
+            ));
         }
     }
     summary.push_str(&format!(
         "\n{}",
         lora_state(&app.config, Some(store), store.active().ok().as_ref()).label()
     ));
-    if let Ok(Some(raw)) = store.get_meta("serving_capabilities") {
-        if let Ok(caps) = serde_json::from_str::<Value>(&raw) {
-            if crate::learn::worker::current_lora_probe(&caps) && caps["lora"] == false {
-                summary.push_str(&format!("\nLoRA unavailable in Dial's current trainer: {}. This cycle can still evaluate harness improvements.", caps["reason"].as_str().unwrap_or("the model capability probe rejected adapter training")));
-            }
-        }
+    if let Ok(Some(raw)) = store.get_meta("serving_capabilities")
+        && let Ok(caps) = serde_json::from_str::<Value>(&raw)
+        && crate::learn::worker::current_lora_probe(&caps)
+        && caps["lora"] == false
+    {
+        summary.push_str(&format!("\nLoRA unavailable in Dial's current trainer: {}. This cycle can still evaluate harness improvements.", caps["reason"].as_str().unwrap_or("the model capability probe rejected adapter training")));
     }
     if let Ok(Some((report, activated, decision))) = store.latest_lora_admission() {
         summary.push_str(&format!(
@@ -4122,31 +4119,30 @@ fn improve_summary(app: &App) -> String {
     } else {
         summary.push_str("\nNo LoRA evaluation recorded yet.");
     }
-    if let Ok(Some(raw)) = store.get_meta("last_cycle_report") {
-        if let Ok(report) = serde_json::from_str::<Value>(&raw) {
-            if let Some(steps) = report["steps"].as_array() {
-                for step in steps {
-                    if step["step"] == "lora_skipped" {
-                        summary.push_str(&format!(
-                            "\nLast training skip: {}",
-                            step["data"].as_str().unwrap_or("unknown")
-                        ));
-                    }
-                }
+    if let Ok(Some(raw)) = store.get_meta("last_cycle_report")
+        && let Ok(report) = serde_json::from_str::<Value>(&raw)
+        && let Some(steps) = report["steps"].as_array()
+    {
+        for step in steps {
+            if step["step"] == "lora_skipped" {
+                summary.push_str(&format!(
+                    "\nLast training skip: {}",
+                    step["data"].as_str().unwrap_or("unknown")
+                ));
             }
         }
     }
-    if let Ok(tasks) = crate::learn::repository::load(&app.config) {
-        if !tasks.is_empty() {
-            summary.push_str(&format!(
-                "\nRepository exercises: {} training, {} sealed evaluation.",
-                tasks.iter().filter(|t| t.spec.split == "train").count(),
-                tasks
-                    .iter()
-                    .filter(|t| t.spec.split == "evaluation")
-                    .count()
-            ));
-        }
+    if let Ok(tasks) = crate::learn::repository::load(&app.config)
+        && !tasks.is_empty()
+    {
+        summary.push_str(&format!(
+            "\nRepository exercises: {} training, {} sealed evaluation.",
+            tasks.iter().filter(|t| t.spec.split == "train").count(),
+            tasks
+                .iter()
+                .filter(|t| t.spec.split == "evaluation")
+                .count()
+        ));
     }
     if let Ok(profiles) = crate::learn::profiles::summary(store) {
         summary.push_str(&format!("\n{profiles}"));
@@ -5083,7 +5079,7 @@ fn panel_rows(
         inner.saturating_sub(2),
         theme.ascii(),
     );
-    let dashes = (width.saturating_sub(text::width(&title_text) + 5)).max(0);
+    let dashes = width.saturating_sub(text::width(&title_text) + 5);
     rows.push(Line::from(Span::styled(
         format!(
             "{}{} {} {}{}",

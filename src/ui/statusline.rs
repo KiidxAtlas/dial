@@ -512,7 +512,7 @@ fn elapsed(secs: f64) -> String {
 fn human(n: u64) -> String {
     let scaled = |unit: u64, suffix: &str| {
         let tenths = n * 10 / unit;
-        if tenths % 10 == 0 {
+        if tenths.is_multiple_of(10) {
             format!("{}{suffix}", tenths / 10)
         } else {
             format!("{}.{}{suffix}", tenths / 10, tenths % 10)
@@ -537,10 +537,10 @@ fn short_model(model: &str) -> String {
     }) {
         return name.replace("--", "/");
     }
-    if path.is_absolute() {
-        if let Some(name) = path.file_name() {
-            return name.to_string_lossy().into_owned();
-        }
+    if path.is_absolute()
+        && let Some(name) = path.file_name()
+    {
+        return name.to_string_lossy().into_owned();
     }
     model.to_owned()
 }

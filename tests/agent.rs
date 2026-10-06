@@ -2210,8 +2210,7 @@ fn a_subagent_preset_cannot_reuse_an_agent_type_name() {
         "model = \"m\"\n[endpoint]\nbase_url = \"http://127.0.0.1:1/v1\"\n[subagents]\n{name} = \"Extra guidance.\"\n")).unwrap()
     };
     let error = Config::load(&layout, Some(overlay("worker")))
-        .err()
-        .expect("a preset named like an agent type must be refused");
+        .expect_err("a preset named like an agent type must be refused");
     assert!(
         format!("{error:#}").contains("collides with a built-in agent type"),
         "{error:#}"

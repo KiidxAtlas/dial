@@ -92,17 +92,13 @@ impl Tool for DapTool {
             Ok(value) => {
                 let full = value.to_string();
                 let mut text = bounded(&full);
-                if full.len() > text.len() {
-                    if let Some(store) = ctx.workspace.artifacts() {
-                        match store.retain(&full) {
-                            Ok(uri) => {
-                                text.push_str(&format!("\n[Complete debugger evidence: {uri}]"))
-                            }
-                            Err(e) => {
-                                return ToolOutput::err(format!(
-                                    "retaining debugger result: {e:#}"
-                                ));
-                            }
+                if full.len() > text.len()
+                    && let Some(store) = ctx.workspace.artifacts()
+                {
+                    match store.retain(&full) {
+                        Ok(uri) => text.push_str(&format!("\n[Complete debugger evidence: {uri}]")),
+                        Err(e) => {
+                            return ToolOutput::err(format!("retaining debugger result: {e:#}"));
                         }
                     }
                 }
@@ -110,15 +106,13 @@ impl Tool for DapTool {
             }
             Err(error) => {
                 let mut text = bounded(&error);
-                if error.len() > text.len() {
-                    if let Some(store) = ctx.workspace.artifacts() {
-                        match store.retain(&error) {
-                            Ok(uri) => {
-                                text.push_str(&format!("\n[Complete debugger error: {uri}]"))
-                            }
-                            Err(e) => {
-                                return ToolOutput::err(format!("retaining debugger error: {e:#}"));
-                            }
+                if error.len() > text.len()
+                    && let Some(store) = ctx.workspace.artifacts()
+                {
+                    match store.retain(&error) {
+                        Ok(uri) => text.push_str(&format!("\n[Complete debugger error: {uri}]")),
+                        Err(e) => {
+                            return ToolOutput::err(format!("retaining debugger error: {e:#}"));
                         }
                     }
                 }
@@ -441,18 +435,18 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
             let text = std::str::from_utf8(&line)
                 .map_err(|_| "DAP header is not UTF-8")?
                 .trim();
-            if let Some((key, value)) = text.split_once(':') {
-                if key.eq_ignore_ascii_case("content-length") {
-                    if length.is_some() {
-                        return Err("duplicate DAP Content-Length".into());
-                    }
-                    length = Some(
-                        value
-                            .trim()
-                            .parse::<usize>()
-                            .map_err(|_| "invalid DAP Content-Length")?,
-                    );
+            if let Some((key, value)) = text.split_once(':')
+                && key.eq_ignore_ascii_case("content-length")
+            {
+                if length.is_some() {
+                    return Err("duplicate DAP Content-Length".into());
                 }
+                length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|_| "invalid DAP Content-Length")?,
+                );
             }
             line.clear();
         } else {

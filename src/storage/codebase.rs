@@ -772,14 +772,12 @@ impl Codebase {
         if synthesis["sections"]
             .as_array()
             .is_some_and(|sections| sections.iter().any(|s| s["status"] == "fresh"))
+            && let Some(gaps) = architecture["gaps"].as_array_mut()
         {
-            if let Some(gaps) = architecture["gaps"].as_array_mut() {
-                gaps.retain(|gap| {
-                    !gap.as_str().is_some_and(|text| {
-                        text.starts_with("No fresh saved architectural findings")
-                    })
-                });
-            }
+            gaps.retain(|gap| {
+                !gap.as_str()
+                    .is_some_and(|text| text.starts_with("No fresh saved architectural findings"))
+            });
         }
         Ok(
             json!({"project":self.root,"query":query,"view":if architecture_mode {"architecture"} else {"all"},"architecture":architecture,"synthesis":synthesis,"coverage_partial":partial!="false",

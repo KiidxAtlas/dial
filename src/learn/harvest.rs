@@ -1400,7 +1400,9 @@ mod tests {
             .map(|i| format!("pair prompt {i}"))
             .find(|p| {
                 let group = prompt_group(&json!([user(p)])).unwrap();
-                u8::from_str_radix(&group[..2], 16).unwrap() % 5 != 0
+                !u8::from_str_radix(&group[..2], 16)
+                    .unwrap()
+                    .is_multiple_of(5)
             })
             .unwrap();
         let id = f.record(
@@ -1617,7 +1619,9 @@ mod tests {
             .map(|i| format!("read file {i}"))
             .find(|p| {
                 let group = prompt_group(&json!([user(p)])).unwrap();
-                u8::from_str_radix(&group[..2], 16).unwrap() % 5 != 0
+                !u8::from_str_radix(&group[..2], 16)
+                    .unwrap()
+                    .is_multiple_of(5)
             })
             .unwrap();
         f.record(
@@ -1699,7 +1703,9 @@ mod tests {
             .map(|i| format!("question {i}"))
             .filter(|p| {
                 let group = prompt_group(&json!([user(p)])).unwrap();
-                u8::from_str_radix(&group[..2], 16).unwrap() % 5 == 0
+                u8::from_str_radix(&group[..2], 16)
+                    .unwrap()
+                    .is_multiple_of(5)
             })
             .take(2)
             .collect();

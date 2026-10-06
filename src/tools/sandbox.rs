@@ -804,7 +804,13 @@ mod tests {
     #[test]
     fn dev_profile_orders_denials_last_and_rejects_unsafe_paths() {
         let fx = Fixture::new();
-        let text = dev_profile(&fx.ws, &[fx.denied.clone()], &[fx.extra.clone()], false).unwrap();
+        let text = dev_profile(
+            &fx.ws,
+            std::slice::from_ref(&fx.denied),
+            std::slice::from_ref(&fx.extra),
+            false,
+        )
+        .unwrap();
         let allow = text.find("(allow file-write*").unwrap();
         let deny = text.find("(deny file-read* file-write* (subpath").unwrap();
         assert!(allow < deny, "denials must come after the write allowances");
@@ -835,7 +841,7 @@ mod tests {
         // A workspace inside a denied path (or equal to it) could never work.
         let parent = fx.ws.parent().unwrap().to_path_buf();
         assert!(dev_profile(&fx.ws, &[parent], &[], false).is_err());
-        assert!(dev_profile(&fx.ws, &[fx.ws.clone()], &[], false).is_err());
+        assert!(dev_profile(&fx.ws, std::slice::from_ref(&fx.ws), &[], false).is_err());
     }
 
     #[test]

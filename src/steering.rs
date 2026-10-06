@@ -359,23 +359,22 @@ fn automatic_with(
             bundle["model_name"] == config.model,
             "candidate model changed"
         );
-        if let Ok(incumbent) = read(&path) {
-            if incumbent["automatic_adapter"] == json!(adapter)
-                && incumbent["evaluation"]["strength"] == config.steering.strength
-            {
-                let incumbent_path = path.with_extension("incumbent.json");
-                settings_store::write_private(&incumbent_path, &serde_json::to_vec(&incumbent)?)?;
-                let evaluation = call(
-                    &json!({"op":"steering_evaluate","model":config.model,"adapter":adapter,"output":incumbent_path,"progress":path.with_extension("incumbent.progress.json"),"strength":config.steering.strength,"cases":automatic_cases(),"max_tokens":128}),
-                )?;
-                ensure!(
-                    bundle["evaluation"]["steered_passes"].as_u64().unwrap_or(0)
-                        >= evaluation["steered_passes"]
-                            .as_u64()
-                            .context("incumbent evaluation missing score")?,
-                    "candidate regressed from the active vector"
-                );
-            }
+        if let Ok(incumbent) = read(&path)
+            && incumbent["automatic_adapter"] == json!(adapter)
+            && incumbent["evaluation"]["strength"] == config.steering.strength
+        {
+            let incumbent_path = path.with_extension("incumbent.json");
+            settings_store::write_private(&incumbent_path, &serde_json::to_vec(&incumbent)?)?;
+            let evaluation = call(
+                &json!({"op":"steering_evaluate","model":config.model,"adapter":adapter,"output":incumbent_path,"progress":path.with_extension("incumbent.progress.json"),"strength":config.steering.strength,"cases":automatic_cases(),"max_tokens":128}),
+            )?;
+            ensure!(
+                bundle["evaluation"]["steered_passes"].as_u64().unwrap_or(0)
+                    >= evaluation["steered_passes"]
+                        .as_u64()
+                        .context("incumbent evaluation missing score")?,
+                "candidate regressed from the active vector"
+            );
         }
         bundle["automatic_adapter"] = json!(adapter);
         bundle["origin"] = json!("automatic verified repairs");

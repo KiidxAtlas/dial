@@ -248,52 +248,52 @@ pub fn select(
             }
             sampling_source = "experimental operator-enabled phase preset".into();
         }
-        if let Some(p) = profile.as_mut() {
-            if p.capabilities.top_p && p.top_p.is_none() {
-                p.top_p = Some(match phase {
-                    Phase::Editing | Phase::Recovery => 0.9,
-                    Phase::Verification => 0.8,
-                    Phase::Exploration => 1.0,
-                    _ => 0.95,
-                });
-                top_p = p.top_p;
-            }
+        if let Some(p) = profile.as_mut()
+            && p.capabilities.top_p
+            && p.top_p.is_none()
+        {
+            p.top_p = Some(match phase {
+                Phase::Editing | Phase::Recovery => 0.9,
+                Phase::Verification => 0.8,
+                Phase::Exploration => 1.0,
+                _ => 0.95,
+            });
+            top_p = p.top_p;
         }
     }
     let mut reasoning_source = "provider default or explicit profile".to_owned();
-    if enabled && settings.reasoning {
-        if let Some(p) = profile.as_mut() {
-            if p.reasoning_effort.is_none()
-                && p.thinking.is_none()
-                && matches!(
-                    p.capabilities.reasoning,
-                    ReasoningApi::OpenaiEffort | ReasoningApi::OpenaiResponses
-                )
-            {
-                let preferences = match phase {
-                    Phase::Editing | Phase::Verification | Phase::Recovery | Phase::General => [
-                        ReasoningEffort::Low,
-                        ReasoningEffort::Minimal,
-                        ReasoningEffort::Medium,
-                    ],
-                    Phase::Exploration => [
-                        ReasoningEffort::High,
-                        ReasoningEffort::Medium,
-                        ReasoningEffort::Low,
-                    ],
-                    _ => [
-                        ReasoningEffort::Medium,
-                        ReasoningEffort::Low,
-                        ReasoningEffort::High,
-                    ],
-                };
-                p.reasoning_effort = preferences
-                    .into_iter()
-                    .find(|e| p.capabilities.reasoning_efforts.contains(e));
-                if p.reasoning_effort.is_some() {
-                    reasoning_source = "phase preference within declared model capabilities".into();
-                }
-            }
+    if enabled
+        && settings.reasoning
+        && let Some(p) = profile.as_mut()
+        && p.reasoning_effort.is_none()
+        && p.thinking.is_none()
+        && matches!(
+            p.capabilities.reasoning,
+            ReasoningApi::OpenaiEffort | ReasoningApi::OpenaiResponses
+        )
+    {
+        let preferences = match phase {
+            Phase::Editing | Phase::Verification | Phase::Recovery | Phase::General => [
+                ReasoningEffort::Low,
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Medium,
+            ],
+            Phase::Exploration => [
+                ReasoningEffort::High,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Low,
+            ],
+            _ => [
+                ReasoningEffort::Medium,
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+            ],
+        };
+        p.reasoning_effort = preferences
+            .into_iter()
+            .find(|e| p.capabilities.reasoning_efforts.contains(e));
+        if p.reasoning_effort.is_some() {
+            reasoning_source = "phase preference within declared model capabilities".into();
         }
     }
     let explicit_output = base_profile.is_some_and(|p| p.max_tokens.is_some());

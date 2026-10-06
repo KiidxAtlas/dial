@@ -244,17 +244,16 @@ impl Agent<'_> {
             self.assistance.mutated = true;
             self.assistance.checks.clear();
             for (path, hash) in &sources {
-                if let Ok(target) = self.workspace.resolve(path) {
-                    if let Ok(content) = std::fs::read_to_string(target) {
-                        if content.len() <= 1024 * 1024 {
-                            self.assistance.steps.push(Step {
-                                tool: "write".into(),
-                                args: json!({"path":path,"content":content}),
-                                sources: BTreeMap::from([(path.clone(), hash.clone())]),
-                            });
-                            captured += 1;
-                        }
-                    }
+                if let Ok(target) = self.workspace.resolve(path)
+                    && let Ok(content) = std::fs::read_to_string(target)
+                    && content.len() <= 1024 * 1024
+                {
+                    self.assistance.steps.push(Step {
+                        tool: "write".into(),
+                        args: json!({"path":path,"content":content}),
+                        sources: BTreeMap::from([(path.clone(), hash.clone())]),
+                    });
+                    captured += 1;
                 }
             }
             if captured == 0 || captured != sources.len() {
@@ -334,77 +333,73 @@ impl Agent<'_> {
         if self.config.assistance.teacher_enabled
             && ui.maintenance_ready()
             && !self.interrupt.load(Ordering::SeqCst)
+            && let Some(selection) = self.config.model_roles.get("experience")
         {
-            if let Some(selection) = self.config.model_roles.get("experience") {
-                let mut cfg = self.config.with_selection(selection);
-                // Remote teacher calls never load a second local model or compete for its GPU.
-                if !matches!(
-                    selection.provider.as_str(),
-                    "mlx" | "ollama" | "lm-studio" | "llama.cpp"
-                ) {
-                    cfg.worker_timeout_secs = self.config.assistance.teacher_timeout_secs;
-                    let safe = json!({"objective":recipe.objective,"tools":recipe.steps.iter().map(|s|&s.tool).collect::<Vec<_>>(),"passing_configured_checks":recipe.checks});
-                    if crate::storage::memory::screen(&safe.to_string()).is_ok() {
-                        let request = Chat {
-                            messages: vec![
-                                json!({"role":"system","content":"Return only JSON {\"lesson\":\"brief reusable guidance\"}. Describe limitations. Do not invent observed outcomes or executable instructions."}),
-                                json!({"role":"user","content":safe.to_string()}),
-                            ],
-                            tools: vec![],
-                            temperature: 0.0,
-                            max_tokens: 256,
-                            seed: None,
-                        };
-                        if let Ok(mut backend) = make_backend(&cfg) {
-                            let cancel = Arc::new(AtomicBool::new(false));
-                            let yield_cancel = cancel.clone();
-                            let external = self.interrupt.clone();
-                            ui.notice(
-                                "Experience teacher: bounded optional review; coding has priority.",
-                            );
-                            let result = thread::scope(|scope| {
-                                let (done, wait) = mpsc::channel::<()>();
-                                let watchdog = cancel.clone();
-                                let timeout = cfg.worker_timeout_secs;
-                                scope.spawn(move || {
-                                    if matches!(
-                                        wait.recv_timeout(Duration::from_secs(timeout)),
-                                        Err(RecvTimeoutError::Timeout)
-                                    ) {
-                                        watchdog.store(true, Ordering::SeqCst);
-                                    }
-                                });
-                                let result = chat_with_ui(
-                                    &mut backend,
-                                    None,
-                                    &request,
-                                    timeout,
-                                    cancel,
-                                    false,
-                                    ui,
-                                    None,
-                                    &mut |ui| {
-                                        if !ui.maintenance_ready()
-                                            || external.load(Ordering::SeqCst)
-                                        {
-                                            yield_cancel.store(true, Ordering::SeqCst);
-                                        }
-                                    },
-                                );
-                                drop(done);
-                                result
-                            });
-                            if let Ok(reply) = result {
-                                if let Ok(value) = serde_json::from_str::<Value>(&reply.text) {
-                                    if let Some(lesson) = value["lesson"].as_str().filter(|s| {
-                                        s.len() <= 1024 && crate::storage::memory::screen(s).is_ok()
-                                    }) {
-                                        recipe.lesson = Some(lesson.into());
-                                    }
+            let mut cfg = self.config.with_selection(selection);
+            // Remote teacher calls never load a second local model or compete for its GPU.
+            if !matches!(
+                selection.provider.as_str(),
+                "mlx" | "ollama" | "lm-studio" | "llama.cpp"
+            ) {
+                cfg.worker_timeout_secs = self.config.assistance.teacher_timeout_secs;
+                let safe = json!({"objective":recipe.objective,"tools":recipe.steps.iter().map(|s|&s.tool).collect::<Vec<_>>(),"passing_configured_checks":recipe.checks});
+                if crate::storage::memory::screen(&safe.to_string()).is_ok() {
+                    let request = Chat {
+                        messages: vec![
+                            json!({"role":"system","content":"Return only JSON {\"lesson\":\"brief reusable guidance\"}. Describe limitations. Do not invent observed outcomes or executable instructions."}),
+                            json!({"role":"user","content":safe.to_string()}),
+                        ],
+                        tools: vec![],
+                        temperature: 0.0,
+                        max_tokens: 256,
+                        seed: None,
+                    };
+                    if let Ok(mut backend) = make_backend(&cfg) {
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        let yield_cancel = cancel.clone();
+                        let external = self.interrupt.clone();
+                        ui.notice(
+                            "Experience teacher: bounded optional review; coding has priority.",
+                        );
+                        let result = thread::scope(|scope| {
+                            let (done, wait) = mpsc::channel::<()>();
+                            let watchdog = cancel.clone();
+                            let timeout = cfg.worker_timeout_secs;
+                            scope.spawn(move || {
+                                if matches!(
+                                    wait.recv_timeout(Duration::from_secs(timeout)),
+                                    Err(RecvTimeoutError::Timeout)
+                                ) {
+                                    watchdog.store(true, Ordering::SeqCst);
                                 }
-                            }
-                            backend.release();
+                            });
+                            let result = chat_with_ui(
+                                &mut backend,
+                                None,
+                                &request,
+                                timeout,
+                                cancel,
+                                false,
+                                ui,
+                                None,
+                                &mut |ui| {
+                                    if !ui.maintenance_ready() || external.load(Ordering::SeqCst) {
+                                        yield_cancel.store(true, Ordering::SeqCst);
+                                    }
+                                },
+                            );
+                            drop(done);
+                            result
+                        });
+                        if let Ok(reply) = result
+                            && let Ok(value) = serde_json::from_str::<Value>(&reply.text)
+                            && let Some(lesson) = value["lesson"].as_str().filter(|s| {
+                                s.len() <= 1024 && crate::storage::memory::screen(s).is_ok()
+                            })
+                        {
+                            recipe.lesson = Some(lesson.into());
                         }
+                        backend.release();
                     }
                 }
             }

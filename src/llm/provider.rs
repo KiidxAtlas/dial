@@ -834,11 +834,11 @@ fn anthropic_exchange(
         if let Some(effort) = profile.reasoning_effort {
             body["output_config"] = serde_json::json!({"effort":effort.as_str()});
         }
-        if !req.tools.is_empty() {
-            if let Some(parallel) = profile.capabilities.parallel_tool_calls {
-                body["tool_choice"] =
-                    serde_json::json!({"type":"auto","disable_parallel_tool_use":!parallel});
-            }
+        if !req.tools.is_empty()
+            && let Some(parallel) = profile.capabilities.parallel_tool_calls
+        {
+            body["tool_choice"] =
+                serde_json::json!({"type":"auto","disable_parallel_tool_use":!parallel});
         }
         if profile.capabilities.strict_tools {
             for tool in body
@@ -974,12 +974,11 @@ fn anthropic_exchange(
     {
         return Err(llm::Interrupted.into());
     }
-    if !reply.text.is_empty() {
-        if let Some(callback) = on_text {
-            if !callback(&reply.text) {
-                return Err(llm::Interrupted.into());
-            }
-        }
+    if !reply.text.is_empty()
+        && let Some(callback) = on_text
+        && !callback(&reply.text)
+    {
+        return Err(llm::Interrupted.into());
     }
     Ok(reply)
 }
@@ -1004,11 +1003,10 @@ fn anthropic_request_variant(
                 let mut content=message["dial_provider_content"].clone();
                 if claude_code_oauth {
                     for block in content.as_array_mut().into_iter().flatten() {
-                        if block["type"]=="tool_use" {
-                            if let Some(name)=block["name"].as_str().filter(|name| !name.starts_with('_')) {
+                        if block["type"]=="tool_use"
+                            && let Some(name)=block["name"].as_str().filter(|name| !name.starts_with('_')) {
                                 block["name"]=json!(format!("_{name}"));
                             }
-                        }
                     }
                 }
                 messages.push(json!({"role":"assistant","content":content}));

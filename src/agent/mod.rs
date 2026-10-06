@@ -453,10 +453,10 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
     .with_steering(config);
     if let Some(profile) = config.active_model_profile() {
         backend = backend.with_profile(profile.clone());
-    } else if config.provider.as_deref() == Some(llm::chatgpt::PROVIDER) {
-        if let Some(profile) = llm::chatgpt::model_profile(&config.user_dir, &config.model)? {
-            backend = backend.with_profile(profile);
-        }
+    } else if config.provider.as_deref() == Some(llm::chatgpt::PROVIDER)
+        && let Some(profile) = llm::chatgpt::model_profile(&config.user_dir, &config.model)?
+    {
+        backend = backend.with_profile(profile);
     }
     Ok(backend)
 }
@@ -1585,48 +1585,48 @@ impl<'a> Agent<'a> {
             }
             context.push_str(&hints);
         }
-        if !self.hermetic {
-            if let Some(store) = self.store {
-                let repairs = store
-                    .recent_executable_repairs(&self.workspace.root().to_string_lossy(), 16)?;
-                let terms: Vec<String> = user_text
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .filter(|term| term.len() >= 4)
-                    .take(32)
-                    .map(str::to_lowercase)
-                    .collect();
-                let related: Vec<_> = repairs
-                    .into_iter()
-                    .filter(|(_, record)| {
-                        let searchable = format!(
-                            "{} {} {}",
-                            record["before"]["objective"],
-                            record["before"]["command"],
-                            record["changes"]
-                        )
-                        .to_lowercase();
-                        terms.iter().any(|term| searchable.contains(term))
-                    })
-                    .take(3)
-                    .collect();
-                let mut hash_budget = 2 * 1024 * 1024;
-                let matching: Vec<i64> = related
-                    .iter()
-                    .filter_map(|(trajectory, payload)| {
-                        let record: repair_evidence::RepairRecord =
-                            serde_json::from_value(payload.clone()).ok()?;
-                        record
-                            .matches_current(&self.workspace, &mut hash_budget)
-                            .then_some(*trajectory)
-                    })
-                    .collect();
-                if let Some(repairs) = repair_evidence::retrieval_text(&related, 4096) {
-                    if !context.is_empty() {
-                        context.push_str("\n\n");
-                    }
-                    context.push_str(&repairs);
-                    context.push_str(&format!("\nExact failed-state file hashes currently match source trajectories {matching:?}. Other records are analogous or unchecked, not directly applicable. Re-run the executable check; file hashes do not verify the environment."));
+        if !self.hermetic
+            && let Some(store) = self.store
+        {
+            let repairs =
+                store.recent_executable_repairs(&self.workspace.root().to_string_lossy(), 16)?;
+            let terms: Vec<String> = user_text
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|term| term.len() >= 4)
+                .take(32)
+                .map(str::to_lowercase)
+                .collect();
+            let related: Vec<_> = repairs
+                .into_iter()
+                .filter(|(_, record)| {
+                    let searchable = format!(
+                        "{} {} {}",
+                        record["before"]["objective"],
+                        record["before"]["command"],
+                        record["changes"]
+                    )
+                    .to_lowercase();
+                    terms.iter().any(|term| searchable.contains(term))
+                })
+                .take(3)
+                .collect();
+            let mut hash_budget = 2 * 1024 * 1024;
+            let matching: Vec<i64> = related
+                .iter()
+                .filter_map(|(trajectory, payload)| {
+                    let record: repair_evidence::RepairRecord =
+                        serde_json::from_value(payload.clone()).ok()?;
+                    record
+                        .matches_current(&self.workspace, &mut hash_budget)
+                        .then_some(*trajectory)
+                })
+                .collect();
+            if let Some(repairs) = repair_evidence::retrieval_text(&related, 4096) {
+                if !context.is_empty() {
+                    context.push_str("\n\n");
                 }
+                context.push_str(&repairs);
+                context.push_str(&format!("\nExact failed-state file hashes currently match source trajectories {matching:?}. Other records are analogous or unchecked, not directly applicable. Re-run the executable check; file hashes do not verify the environment."));
             }
         }
         if !context.is_empty() {
@@ -1696,53 +1696,48 @@ impl<'a> Agent<'a> {
         let mut result = self.run_loop(&mut backend, &names, &mut schemas, max_steps, ui);
         // Checks that already passed at the last `todo done`, with no edit since, need not run again.
         let already_verified = self.step_checks.clean();
-        if self.config.verification.enabled && !already_verified {
-            if let (Ok(report), Some(turn)) = (&result, checkpoint_turn) {
-                if report.outcome == TurnOutcome::Completed {
-                    let checks = self.focused_checks(turn);
-                    let mut failures = self.run_checks(&checks, ui);
-                    for attempt in 0..self.config.verification.repair_attempts {
-                        if failures.is_empty() || self.interrupt.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        self.metrics.repair_attempts += 1;
-                        self.record(0, "repair_round", json!({"attempt":attempt+1}))?;
-                        self.push(json!({"role":"user","content":format!(
+        if self.config.verification.enabled
+            && !already_verified
+            && let (Ok(report), Some(turn)) = (&result, checkpoint_turn)
+            && report.outcome == TurnOutcome::Completed
+        {
+            let checks = self.focused_checks(turn);
+            let mut failures = self.run_checks(&checks, ui);
+            for attempt in 0..self.config.verification.repair_attempts {
+                if failures.is_empty() || self.interrupt.load(Ordering::SeqCst) {
+                    break;
+                }
+                self.metrics.repair_attempts += 1;
+                self.record(0, "repair_round", json!({"attempt":attempt+1}))?;
+                self.push(json!({"role":"user","content":format!(
                             "Automatic focused verification failed (repair attempt {}). Fix the diagnostics, then rerun the checks:\n{}",
                             attempt + 1, failures.join("\n")
                         )}))?;
-                        let repaired = self.run_loop(
-                            &mut backend,
-                            &names,
-                            &mut schemas,
-                            max_steps.min(8),
-                            ui,
-                        )?;
-                        if repaired.interrupted {
-                            result = Ok(repaired);
-                            break;
-                        }
-                        result = Ok(repaired);
-                        failures = self.run_checks(&checks, ui);
-                    }
-                    if self.interrupt.load(Ordering::SeqCst) {
-                        let steps = result.as_ref().map_or(0, |report| report.steps);
-                        result = Ok(TurnReport {
-                            text: String::new(),
-                            outcome: TurnOutcome::Interrupted,
-                            steps,
-                            interrupted: true,
-                            trajectory: None,
-                        });
-                    } else if !failures.is_empty() {
-                        let diagnostic = format!(
-                            "Focused verification still fails after bounded repair: {}",
-                            failures.join("; ")
-                        );
-                        ui.notice(&diagnostic);
-                        result = Err(anyhow::anyhow!(diagnostic));
-                    }
+                let repaired =
+                    self.run_loop(&mut backend, &names, &mut schemas, max_steps.min(8), ui)?;
+                if repaired.interrupted {
+                    result = Ok(repaired);
+                    break;
                 }
+                result = Ok(repaired);
+                failures = self.run_checks(&checks, ui);
+            }
+            if self.interrupt.load(Ordering::SeqCst) {
+                let steps = result.as_ref().map_or(0, |report| report.steps);
+                result = Ok(TurnReport {
+                    text: String::new(),
+                    outcome: TurnOutcome::Interrupted,
+                    steps,
+                    interrupted: true,
+                    trajectory: None,
+                });
+            } else if !failures.is_empty() {
+                let diagnostic = format!(
+                    "Focused verification still fails after bounded repair: {}",
+                    failures.join("; ")
+                );
+                ui.notice(&diagnostic);
+                result = Err(anyhow::anyhow!(diagnostic));
             }
         }
         self.ext.fire_lifecycle(&LifecycleEvent {
@@ -1818,10 +1813,9 @@ impl<'a> Agent<'a> {
                 && self.config.for_role("architecture").context_window >= 4096
                 && !self.interrupt.load(Ordering::SeqCst)
                 && ui.maintenance_ready()
+                && let Err(error) = self.synthesize_architecture(false, ui)
             {
-                if let Err(error) = self.synthesize_architecture(false, ui) {
-                    ui.notice(&format!("Architecture update deferred: {error:#}"));
-                }
+                ui.notice(&format!("Architecture update deferred: {error:#}"));
             }
         }
         if let Some((id, _, _)) = self.trajectory.take() {
@@ -1829,12 +1823,10 @@ impl<'a> Agent<'a> {
                 match &result {
                     Ok(report) => {
                         store.finish_trajectory(id, Some(&report.text), None)?;
-                        if report.outcome == TurnOutcome::Completed {
-                            if let Err(error) = self.persist_turn(store, id) {
-                                ui.notice(&format!(
-                                    "training observation was not saved: {error:#}"
-                                ));
-                            }
+                        if report.outcome == TurnOutcome::Completed
+                            && let Err(error) = self.persist_turn(store, id)
+                        {
+                            ui.notice(&format!("training observation was not saved: {error:#}"));
                         }
                     }
                     Err(error) => store.finish_trajectory(id, None, Some(&format!("{error:#}")))?,
@@ -1935,17 +1927,18 @@ impl<'a> Agent<'a> {
         };
         let exit = verification::exit_code(&output.text);
         let passed = !output.is_error && exit == Some(0);
-        if !self.hermetic && matches!(kind, repair_evidence::CheckKind::Behavioral) {
-            if let Some(cache) = self.codebase.clone() {
-                let command = command.to_owned();
-                let _ = thread::scope(|scope| -> Result<_> {
-                    let (tx, rx) = mpsc::sync_channel(1);
-                    scope.spawn(move || {
-                        let _ = tx.send(cache.record_behavior_check(&command, passed));
-                    });
-                    receive_with_heartbeat(&rx, ui)
+        if !self.hermetic
+            && matches!(kind, repair_evidence::CheckKind::Behavioral)
+            && let Some(cache) = self.codebase.clone()
+        {
+            let command = command.to_owned();
+            let _ = thread::scope(|scope| -> Result<_> {
+                let (tx, rx) = mpsc::sync_channel(1);
+                scope.spawn(move || {
+                    let _ = tx.send(cache.record_behavior_check(&command, passed));
                 });
-            }
+                receive_with_heartbeat(&rx, ui)
+            });
         }
         self.assistance.check(
             command,
@@ -2316,10 +2309,10 @@ impl<'a> Agent<'a> {
             drop(done);
             reply
         });
-        if let Ok(reply) = &reply {
-            if let Some(cost) = backend.reply_cost(reply) {
-                self.session_cost = Some(self.session_cost.unwrap_or(0.0) + cost);
-            }
+        if let Ok(reply) = &reply
+            && let Some(cost) = backend.reply_cost(reply)
+        {
+            self.session_cost = Some(self.session_cost.unwrap_or(0.0) + cost);
         }
         if separate.is_some() {
             backend.release();
@@ -2578,12 +2571,11 @@ impl<'a> Agent<'a> {
             let requested_tokens = request.max_tokens;
             if !self.hermetic {
                 let mut profile = selection.profile.clone();
-                if single_call {
-                    if let Some(profile) = profile.as_mut() {
-                        if profile.capabilities.parallel_tool_calls.is_some() {
-                            profile.capabilities.parallel_tool_calls = Some(false);
-                        }
-                    }
+                if single_call
+                    && let Some(profile) = profile.as_mut()
+                    && profile.capabilities.parallel_tool_calls.is_some()
+                {
+                    profile.capabilities.parallel_tool_calls = Some(false);
                 }
                 backend.next_request_profile(profile);
                 let signature = json!([
@@ -2925,48 +2917,45 @@ impl<'a> Agent<'a> {
                 if form.is_none()
                     && !self.hermetic
                     && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
-                {
-                    if let (Some(cache), Some(path)) =
+                    && let (Some(cache), Some(path)) =
                         (self.codebase.clone(), call.arguments["path"].as_str())
-                    {
-                        if prechecked_paths.insert(path.to_owned()) {
-                            let path = path.to_owned();
-                            let check = thread::scope(|scope| -> Result<_> {
-                                let (tx, rx) = mpsc::sync_channel(1);
-                                scope.spawn(move || {
-                                    let _ = tx.send(cache.pre_edit_context(&path));
+                {
+                    if prechecked_paths.insert(path.to_owned()) {
+                        let path = path.to_owned();
+                        let check = thread::scope(|scope| -> Result<_> {
+                            let (tx, rx) = mpsc::sync_channel(1);
+                            scope.spawn(move || {
+                                let _ = tx.send(cache.pre_edit_context(&path));
+                            });
+                            receive_with_heartbeat(&rx, ui)?
+                        });
+                        match check {
+                            Ok(Some(text)) => {
+                                preflight = Some(ToolOutput {
+                                    text,
+                                    is_error: true,
                                 });
-                                receive_with_heartbeat(&rx, ui)?
-                            });
-                            match check {
-                                Ok(Some(text)) => {
-                                    preflight = Some(ToolOutput {
-                                        text,
-                                        is_error: true,
-                                    });
-                                }
-                                Ok(None) => {
-                                    revalidated_paths.insert(
-                                        call.arguments["path"].as_str().unwrap().to_owned(),
-                                    );
-                                }
-                                Err(error) => {
-                                    preflight = Some(ToolOutput {
-                                        text: format!(
-                                            "Could not check saved assumptions: {error}. Read the current target before retrying."
-                                        ),
-                                        is_error: true,
-                                    });
-                                }
                             }
-                        } else if !revalidated_paths.contains(path) {
-                            preflight = Some(ToolOutput {
-                                text: format!(
-                                    "Read current {path} before retrying this edit; its saved assumptions required review."
-                                ),
-                                is_error: true,
-                            });
+                            Ok(None) => {
+                                revalidated_paths
+                                    .insert(call.arguments["path"].as_str().unwrap().to_owned());
+                            }
+                            Err(error) => {
+                                preflight = Some(ToolOutput {
+                                    text: format!(
+                                        "Could not check saved assumptions: {error}. Read the current target before retrying."
+                                    ),
+                                    is_error: true,
+                                });
+                            }
                         }
+                    } else if !revalidated_paths.contains(path) {
+                        preflight = Some(ToolOutput {
+                            text: format!(
+                                "Read current {path} before retrying this edit; its saved assumptions required review."
+                            ),
+                            is_error: true,
+                        });
                     }
                 }
                 let mut output = if let Some(output) = preflight {
@@ -3082,12 +3071,12 @@ impl<'a> Agent<'a> {
                 if output.is_error && form_kinds.is_empty() {
                     execution_failed = true;
                 }
-                if !output.is_error && call.name == "read" {
-                    if let Some(path) = call.arguments["path"].as_str() {
-                        if prechecked_paths.contains(path) {
-                            revalidated_paths.insert(path.to_owned());
-                        }
-                    }
+                if !output.is_error
+                    && call.name == "read"
+                    && let Some(path) = call.arguments["path"].as_str()
+                    && prechecked_paths.contains(path)
+                {
+                    revalidated_paths.insert(path.to_owned());
                 }
                 if !output.is_error {
                     round_succeeded = true;
@@ -3118,25 +3107,23 @@ impl<'a> Agent<'a> {
                 if !self.hermetic
                     && !output.is_error
                     && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
-                {
-                    if let (Some(cache), Some(path)) =
+                    && let (Some(cache), Some(path)) =
                         (self.codebase.clone(), call.arguments["path"].as_str())
-                    {
-                        if reviewed_paths.len() < 4 && reviewed_paths.insert(path.to_owned()) {
-                            let paths = vec![path.to_owned()];
-                            let context = thread::scope(|scope| -> Result<_> {
-                                let (tx, rx) = mpsc::sync_channel(1);
-                                scope.spawn(move || {
-                                    let _ = tx.send(cache.impact_context(&paths, 3000));
-                                });
-                                receive_with_heartbeat(&rx, ui)?
-                            });
-                            if let Ok(context) = context {
-                                output.text.push_str("\n\n");
-                                output.text.push_str(&context);
-                                self.record(step, "change_review", json!({"path":path}))?;
-                            }
-                        }
+                    && reviewed_paths.len() < 4
+                    && reviewed_paths.insert(path.to_owned())
+                {
+                    let paths = vec![path.to_owned()];
+                    let context = thread::scope(|scope| -> Result<_> {
+                        let (tx, rx) = mpsc::sync_channel(1);
+                        scope.spawn(move || {
+                            let _ = tx.send(cache.impact_context(&paths, 3000));
+                        });
+                        receive_with_heartbeat(&rx, ui)?
+                    });
+                    if let Ok(context) = context {
+                        output.text.push_str("\n\n");
+                        output.text.push_str(&context);
+                        self.record(step, "change_review", json!({"path":path}))?;
                     }
                 }
                 if !output.is_error
@@ -3207,12 +3194,12 @@ impl<'a> Agent<'a> {
                 };
                 let limit = tools::model_output_limit(self.context_window());
                 let mut body = guard::clip_evidence(&output.text, limit);
-                if output.text.len() > limit {
-                    if let Some(uri) = &artifact {
-                        body.push_str(&format!(
-                            "\n[Complete tool evidence: {uri}; retrieve with artifact_read]"
-                        ));
-                    }
+                if output.text.len() > limit
+                    && let Some(uri) = &artifact
+                {
+                    body.push_str(&format!(
+                        "\n[Complete tool evidence: {uri}; retrieve with artifact_read]"
+                    ));
                 }
                 let mut message = llm::tool_message(&call.id, &body);
                 message["dial_evidence"] = json!({"artifact":artifact});
@@ -3225,10 +3212,10 @@ impl<'a> Agent<'a> {
                         .as_array()
                         .cloned()
                         .unwrap_or_default();
-                    if let Some(uri) = &artifact {
-                        if !uris.contains(&json!(uri)) {
-                            uris.push(json!(uri));
-                        }
+                    if let Some(uri) = &artifact
+                        && !uris.contains(&json!(uri))
+                    {
+                        uris.push(json!(uri));
                     }
                     for uri in tools::artifact::uris(&output.text) {
                         if !uris.contains(&json!(uri)) {
@@ -3248,25 +3235,27 @@ impl<'a> Agent<'a> {
                 if let Some(image) = image {
                     message["dial_images"] = json!([image]);
                 }
-                if call.name == "read" && !output.is_error && !self.hermetic {
-                    if let Some(path) = call.arguments["path"].as_str() {
-                        let path = Path::new(path);
-                        if llm::images::is_image(path) {
-                            let attachment = self
-                                .workspace
-                                .resolve(path.to_string_lossy().as_ref())
-                                .map_err(anyhow::Error::msg)
-                                .and_then(|absolute| {
-                                    let relative = absolute
-                                        .strip_prefix(self.workspace.root())
-                                        .context("image resolves outside the project")?;
-                                    llm::images::attachment(self.workspace.root(), relative)
-                                });
-                            match attachment {
-                                Ok(image) => message["dial_images"] = json!([image]),
-                                Err(error) => {
-                                    ui.notice(&format!("Image attachment unavailable: {error:#}"))
-                                }
+                if call.name == "read"
+                    && !output.is_error
+                    && !self.hermetic
+                    && let Some(path) = call.arguments["path"].as_str()
+                {
+                    let path = Path::new(path);
+                    if llm::images::is_image(path) {
+                        let attachment = self
+                            .workspace
+                            .resolve(path.to_string_lossy().as_ref())
+                            .map_err(anyhow::Error::msg)
+                            .and_then(|absolute| {
+                                let relative = absolute
+                                    .strip_prefix(self.workspace.root())
+                                    .context("image resolves outside the project")?;
+                                llm::images::attachment(self.workspace.root(), relative)
+                            });
+                        match attachment {
+                            Ok(image) => message["dial_images"] = json!([image]),
+                            Err(error) => {
+                                ui.notice(&format!("Image attachment unavailable: {error:#}"))
                             }
                         }
                     }
@@ -3381,18 +3370,17 @@ impl<'a> Agent<'a> {
                 for rejected in rejected_calls {
                     failed.reject(rejected);
                 }
-            } else if !execution_failed {
-                if let (Some(failed), Some(store), Some((id, _, _))) =
+            } else if !execution_failed
+                && let (Some(failed), Some(store), Some((id, _, _))) =
                     (pending.take(), self.store, &self.trajectory)
-                {
-                    // Corrected turn: every call validated and ran without error.
-                    store.tool_recovery(*id, self.version.id, &json!({
+            {
+                // Corrected turn: every call validated and ran without error.
+                store.tool_recovery(*id, self.version.id, &json!({
                         "context": failed.context, "tools": request_tools, "corrected": llm::assistant_message(&reply),
                         "failure_kinds": failed.kinds, "rejected": failed.rejected,
                         "project_root": self.workspace.root().to_string_lossy(),
                     }))?;
-                    self.record(step, "tool_recovery", json!({"failure_kinds":failed.kinds}))?;
-                }
+                self.record(step, "tool_recovery", json!({"failure_kinds":failed.kinds}))?;
             }
         }
         if self.hermetic {
@@ -3891,19 +3879,18 @@ impl<'a> Agent<'a> {
                     && !self.hermetic
                     && self.config.verification.enabled
                     && self.step_checks.mutations > self.step_checks.checked
+                    && let Some(turn) = self.step_checks.turn
                 {
-                    if let Some(turn) = self.step_checks.turn {
-                        let checks = self.focused_checks(turn);
-                        if !checks.is_empty() {
-                            self.step_checks.checked = self.step_checks.mutations;
-                            let failures = self.run_checks(&checks, ui);
-                            self.step_checks.failed = !failures.is_empty();
-                            if !failures.is_empty() {
-                                return denied(&format!(
-                                    "Cannot finish completed: focused verification failed. Fix the observed diagnostics or report a blocker.\n{}",
-                                    failures.join("\n")
-                                ));
-                            }
+                    let checks = self.focused_checks(turn);
+                    if !checks.is_empty() {
+                        self.step_checks.checked = self.step_checks.mutations;
+                        let failures = self.run_checks(&checks, ui);
+                        self.step_checks.failed = !failures.is_empty();
+                        if !failures.is_empty() {
+                            return denied(&format!(
+                                "Cannot finish completed: focused verification failed. Fix the observed diagnostics or report a blocker.\n{}",
+                                failures.join("\n")
+                            ));
                         }
                     }
                 }
@@ -4158,10 +4145,11 @@ impl<'a> Agent<'a> {
                 Ok(Event::Done(output)) => break output,
                 Err(RecvTimeoutError::Timeout) => {
                     ui.heartbeat();
-                    if self.interrupt.load(Ordering::SeqCst) && active.load(Ordering::SeqCst) {
-                        if let Some(tool) = &cancellation {
-                            tool.cancel_operation();
-                        }
+                    if self.interrupt.load(Ordering::SeqCst)
+                        && active.load(Ordering::SeqCst)
+                        && let Some(tool) = &cancellation
+                    {
+                        tool.cancel_operation();
                     }
                     self.pump_subagents(ui);
                 }
@@ -4587,10 +4575,10 @@ impl<'a> Agent<'a> {
                 &mut |ui| self.pump_subagents(ui),
             )
         };
-        if let Ok(reply) = &result {
-            if let Some(cost) = backend.reply_cost(reply) {
-                self.session_cost = Some(self.session_cost.unwrap_or(0.0) + cost);
-            }
+        if let Ok(reply) = &result
+            && let Some(cost) = backend.reply_cost(reply)
+        {
+            self.session_cost = Some(self.session_cost.unwrap_or(0.0) + cost);
         }
         backend.release();
         self.role_backends.insert(role.to_owned(), backend);
@@ -4859,7 +4847,7 @@ fn call_form_error(
             "tool arguments were not a valid JSON object".into(),
         ));
     }
-    if !names.iter().any(|n| *n == call.name) {
+    if !names.contains(&call.name) {
         return Some((
             "unknown_tool",
             format!("unknown or unavailable tool: {}", call.name),
@@ -5136,6 +5124,53 @@ fn is_check_command(command: &str) -> bool {
     ];
     let c = command.to_lowercase();
     MARKERS.iter().any(|m| c.contains(m))
+}
+
+pub fn json_text(text: &str) -> &str {
+    let text = text.trim();
+    if let Some(body) = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+    {
+        body.trim().strip_suffix("```").unwrap_or(body).trim()
+    } else {
+        text
+    }
+}
+
+pub fn truncate(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} [truncated]", &text[..end])
+}
+
+fn looks_like_overflow(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_lowercase();
+    text.contains("context")
+        && ["length", "window", "too long", "exceed", "too large"]
+            .iter()
+            .any(|k| text.contains(k))
+}
+
+/// A reply that is just a JSON-looking object naming an offered tool. Small models often emit
+/// slightly broken ones (`{{"name": ...}` with unbalanced braces), so this matches the shape
+/// rather than requiring valid JSON.
+fn looks_like_text_call(text: &str, names: &[String]) -> bool {
+    let t = text.trim();
+    if !t.starts_with('{')
+        || t.len() > 8000
+        || !t.contains("\"arguments\"") && !t.contains("\"parameters\"")
+    {
+        return false;
+    }
+    names.iter().any(|n| {
+        t.contains(&format!("\"name\": \"{n}\"")) || t.contains(&format!("\"name\":\"{n}\""))
+    })
 }
 
 #[cfg(test)]
@@ -5514,51 +5549,4 @@ mod tests {
             assert!(!is_check_command(no), "{no}");
         }
     }
-}
-
-pub fn json_text(text: &str) -> &str {
-    let text = text.trim();
-    if let Some(body) = text
-        .strip_prefix("```json")
-        .or_else(|| text.strip_prefix("```"))
-    {
-        body.trim().strip_suffix("```").unwrap_or(body).trim()
-    } else {
-        text
-    }
-}
-
-pub fn truncate(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_owned();
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{} [truncated]", &text[..end])
-}
-
-fn looks_like_overflow(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}").to_lowercase();
-    text.contains("context")
-        && ["length", "window", "too long", "exceed", "too large"]
-            .iter()
-            .any(|k| text.contains(k))
-}
-
-/// A reply that is just a JSON-looking object naming an offered tool. Small models often emit
-/// slightly broken ones (`{{"name": ...}` with unbalanced braces), so this matches the shape
-/// rather than requiring valid JSON.
-fn looks_like_text_call(text: &str, names: &[String]) -> bool {
-    let t = text.trim();
-    if !t.starts_with('{')
-        || t.len() > 8000
-        || !t.contains("\"arguments\"") && !t.contains("\"parameters\"")
-    {
-        return false;
-    }
-    names.iter().any(|n| {
-        t.contains(&format!("\"name\": \"{n}\"")) || t.contains(&format!("\"name\":\"{n}\""))
-    })
 }

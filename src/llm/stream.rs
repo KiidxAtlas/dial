@@ -251,15 +251,14 @@ impl Accumulator {
                             let slot = self.slot(call)?;
                             if let Some(piece) =
                                 call.pointer("/function/arguments").and_then(Value::as_str)
-                            {
-                                if !on_event(&super::StreamEvent::ToolArguments {
+                                && !on_event(&super::StreamEvent::ToolArguments {
                                     index: call["index"].as_u64().unwrap_or(0),
                                     id: slot.id.clone(),
                                     name: slot.name.clone(),
                                     delta: piece.to_owned(),
-                                }) {
-                                    return Err(Interrupted.into());
-                                }
+                                })
+                            {
+                                return Err(Interrupted.into());
                             }
                         }
                     }
@@ -312,10 +311,10 @@ impl Accumulator {
             "chat stream tool call delta is not an object"
         );
         let slot = self.slot(delta)?;
-        if let Some(id) = delta.get("id").and_then(Value::as_str) {
-            if slot.id.is_empty() {
-                slot.id = id.to_string();
-            }
+        if let Some(id) = delta.get("id").and_then(Value::as_str)
+            && slot.id.is_empty()
+        {
+            slot.id = id.to_string();
         }
         let Some(function) = delta.get("function") else {
             return Ok(());

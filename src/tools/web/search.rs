@@ -75,10 +75,10 @@ pub fn parse_html(page: &str) -> Result<Vec<SearchResult>, String> {
             } if name == open.tag && !html::is_void(&name) => open.depth += 1,
             Token::Close(name) if name == open.tag => {
                 open.depth -= 1;
-                if open.depth == 0 {
-                    if let Some(done) = capture.take() {
-                        finish(done, &mut results);
-                    }
+                if open.depth == 0
+                    && let Some(done) = capture.take()
+                {
+                    finish(done, &mut results);
                 }
             }
             _ => {}

@@ -101,6 +101,28 @@ pub fn select(store: &Store, active: Version, prompt: &str) -> Result<Version> {
     super::improve::verify_adapter(store, &parent)?;
     Ok(parent)
 }
+
+/// Compact operator-facing audit of the currently active routing report.
+pub fn summary(store: &Store) -> Result<String> {
+    let active = store.active()?;
+    let Some(raw) = store.get_meta(&format!("task_profiles:{}", active.id))? else {
+        return Ok(
+            "Task profiles: collecting paired evaluation evidence; using the accepted default."
+                .into(),
+        );
+    };
+    let report: Report = serde_json::from_str(&raw)?;
+    let mut lines = vec![
+        "Task profiles (correctness-gated; speed alone cannot activate an adapter):".to_owned(),
+    ];
+    for (kind, p) in report.categories {
+        lines.push(format!("{}: v{} · {} paired cases · actions {} → {} · errors {} → {} · inference tokens {} → {} · elapsed {} → {} ms",
+            kind.label(),if p.prefer_parent {report.parent}else{active.id},p.samples,
+            p.baseline.tool_calls,p.candidate.tool_calls,p.baseline.tool_errors,p.candidate.tool_errors,
+            p.baseline.completion_tokens,p.candidate.completion_tokens,p.baseline.elapsed_ms,p.candidate.elapsed_ms));
+    }
+    Ok(lines.join("\n"))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,26 +206,4 @@ mod tests {
             base.id
         );
     }
-}
-
-/// Compact operator-facing audit of the currently active routing report.
-pub fn summary(store: &Store) -> Result<String> {
-    let active = store.active()?;
-    let Some(raw) = store.get_meta(&format!("task_profiles:{}", active.id))? else {
-        return Ok(
-            "Task profiles: collecting paired evaluation evidence; using the accepted default."
-                .into(),
-        );
-    };
-    let report: Report = serde_json::from_str(&raw)?;
-    let mut lines = vec![
-        "Task profiles (correctness-gated; speed alone cannot activate an adapter):".to_owned(),
-    ];
-    for (kind, p) in report.categories {
-        lines.push(format!("{}: v{} · {} paired cases · actions {} → {} · errors {} → {} · inference tokens {} → {} · elapsed {} → {} ms",
-            kind.label(),if p.prefer_parent {report.parent}else{active.id},p.samples,
-            p.baseline.tool_calls,p.candidate.tool_calls,p.baseline.tool_errors,p.candidate.tool_errors,
-            p.baseline.completion_tokens,p.candidate.completion_tokens,p.baseline.elapsed_ms,p.candidate.elapsed_ms));
-    }
-    Ok(lines.join("\n"))
 }

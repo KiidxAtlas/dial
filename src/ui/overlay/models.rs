@@ -139,18 +139,18 @@ fn is_local_mlx(entry: &ModelEntry) -> bool {
 
 /// The LoRA column: whether dial can train this model, and for the main model whether an adapter is on.
 fn lora_cell(entry: &ModelEntry, main: Option<Lora>) -> (String, Tok) {
-    if !entry.metadata.lora_verified {
-        if let Some(check) = entry.metadata.lora_check {
-            return (
-                match check {
-                    crate::llm::catalog::LoraCheck::Waiting => "waiting compute",
-                    crate::llm::catalog::LoraCheck::Checking => "verifying",
-                    crate::llm::catalog::LoraCheck::Failed => "check failed",
-                }
-                .into(),
-                Tok::Muted,
-            );
-        }
+    if !entry.metadata.lora_verified
+        && let Some(check) = entry.metadata.lora_check
+    {
+        return (
+            match check {
+                crate::llm::catalog::LoraCheck::Waiting => "waiting compute",
+                crate::llm::catalog::LoraCheck::Checking => "verifying",
+                crate::llm::catalog::LoraCheck::Failed => "check failed",
+            }
+            .into(),
+            Tok::Muted,
+        );
     }
     match main {
         Some(Lora::Unsupported) if is_local_mlx(entry) => return ("unsupported".into(), Tok::Dim),
@@ -192,14 +192,14 @@ fn lora_cell(entry: &ModelEntry, main: Option<Lora>) -> (String, Tok) {
 
 /// One sentence for the detail line on LoRA weight training.
 fn lora_detail(entry: &ModelEntry, main: Option<Lora>) -> String {
-    if !entry.metadata.lora_verified {
-        if let Some(check) = entry.metadata.lora_check {
-            return match check {
+    if !entry.metadata.lora_verified
+        && let Some(check) = entry.metadata.lora_check
+    {
+        return match check {
                 crate::llm::catalog::LoraCheck::Waiting => "Automatic LoRA verification queued; waiting for local compute. No model selection or retry is needed.",
                 crate::llm::catalog::LoraCheck::Checking => "Checking adapter targets, a tiny gradient update, and adapter save/reload. This verification does not create a production adapter.",
                 crate::llm::catalog::LoraCheck::Failed => "Automatic verification could not complete. F6 retries and shows diagnostics; compatibility is still unverified.",
             }.into();
-        }
     }
     match main {
         Some(Lora::Unsupported) if is_local_mlx(entry) => return "LoRA unavailable in Dial's current trainer. /improve shows the model capability probe's reason.".into(),
@@ -238,9 +238,9 @@ fn lora_detail(entry: &ModelEntry, main: Option<Lora>) -> String {
 }
 
 fn fmt_context(tokens: u32) -> String {
-    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
         format!("{}M", tokens / 1_000_000)
-    } else if tokens >= 1024 && tokens % 1024 == 0 {
+    } else if tokens >= 1024 && tokens.is_multiple_of(1024) {
         format!("{}k", tokens / 1024)
     } else if tokens >= 1000 {
         format!("{}k", (tokens + 500) / 1000)
@@ -306,10 +306,10 @@ impl ModelOverlay {
     pub fn set_discovery(&mut self, d: Discovery) {
         let anchor = self.highlighted().map(|e| e.selection.clone());
         self.discovery = Some(d);
-        if let Group::Provider(id) = &self.group {
-            if !self.providers().any(|p| &p.id == id) {
-                self.group = Group::All;
-            }
+        if let Group::Provider(id) = &self.group
+            && !self.providers().any(|p| &p.id == id)
+        {
+            self.group = Group::All;
         }
         let rows = self.rows();
         self.cursor = anchor
@@ -384,10 +384,10 @@ impl ModelOverlay {
         let main = self.role_selection("main");
         let mut rows: Vec<(u8, i32, usize, &ModelEntry, Vec<usize>)> = Vec::new();
         for (index, entry) in d.models.iter().enumerate() {
-            if let Group::Provider(id) = &self.group {
-                if &entry.selection.provider != id {
-                    continue;
-                }
+            if let Group::Provider(id) = &self.group
+                && &entry.selection.provider != id
+            {
+                continue;
             }
             if !self.kind.accepts(entry) {
                 continue;
@@ -1788,7 +1788,7 @@ mod tests {
         assert!(
             shown.contains("context 32k")
                 && shown.contains("not used by any role")
-                && shown.contains("Source") == false,
+                && !shown.contains("Source"),
             "{shown}"
         );
     }

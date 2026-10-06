@@ -118,14 +118,13 @@ pub fn features(kind: &str, step: u32, data: &Value) -> Vec<f64> {
     f[F_PROMPT_TOKENS] = number(data, "prompt_tokens").ln_1p();
     f[F_COMPLETION_TOKENS] = number(data, "completion_tokens").ln_1p();
     f[F_ELAPSED] = number(data, "elapsed_ms").ln_1p();
-    if kind == "tool_form_failure" {
-        if let Some(i) = data
+    if kind == "tool_form_failure"
+        && let Some(i) = data
             .get("kind")
             .and_then(Value::as_str)
             .and_then(|k| FORM_KINDS.iter().position(|x| *x == k))
-        {
-            f[F_FORM + i] = 1.0;
-        }
+    {
+        f[F_FORM + i] = 1.0;
     }
     f[F_TOOL_CALLS] = number(data, "tool_calls").ln_1p();
     f

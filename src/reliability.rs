@@ -586,11 +586,11 @@ pub fn strict_parameters(schema: &Value) -> Option<Value> {
 pub fn constrain_openai(body: &mut Value, profile: &llm::profiles::ModelProfile) {
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools {
-            if profile.capabilities.strict_tools {
-                if let Some(parameters) = strict_parameters(&tool["function"]["parameters"]) {
-                    tool["function"]["parameters"] = parameters;
-                    tool["function"]["strict"] = json!(true);
-                }
+            if profile.capabilities.strict_tools
+                && let Some(parameters) = strict_parameters(&tool["function"]["parameters"])
+            {
+                tool["function"]["parameters"] = parameters;
+                tool["function"]["strict"] = json!(true);
             }
         }
         if let Some(parallel) = profile.capabilities.parallel_tool_calls {
@@ -630,10 +630,10 @@ pub fn omit_optional_nulls(args: &mut Value, schema: &Value) {
 }
 pub fn normalize_reply(reply: &mut llm::Reply, schemas: &[Value]) {
     for call in &mut reply.tool_calls {
-        if let Some(schema) = schemas.iter().find(|s| s["function"]["name"] == call.name) {
-            if strict_parameters(&schema["function"]["parameters"]).is_some() {
-                omit_optional_nulls(&mut call.arguments, &schema["function"]["parameters"]);
-            }
+        if let Some(schema) = schemas.iter().find(|s| s["function"]["name"] == call.name)
+            && strict_parameters(&schema["function"]["parameters"]).is_some()
+        {
+            omit_optional_nulls(&mut call.arguments, &schema["function"]["parameters"]);
         }
     }
 }

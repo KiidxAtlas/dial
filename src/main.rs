@@ -666,10 +666,11 @@ fn chat(cli: Cli, layout: Layout, config: Config) -> Result<()> {
         ) {
             Ok(store) => {
                 let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
-                if control.try_lock_exclusive().is_ok() && auto::enabled(&config, &store)? {
-                    if let Some(note) = improve::monitor(&store, &config)? {
-                        notices.push(note);
-                    }
+                if control.try_lock_exclusive().is_ok()
+                    && auto::enabled(&config, &store)?
+                    && let Some(note) = improve::monitor(&store, &config)?
+                {
+                    notices.push(note);
                 }
                 if !auto::enabled(&config, &store)? {
                     notices.push("automatic improvement is paused; observations are still recorded (`dial improve enable` resumes)".into());

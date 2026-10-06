@@ -79,14 +79,14 @@ pub fn paths(tool: &str, args: &Value) -> Vec<String> {
             paths.push(path.into());
         }
     }
-    if tool == "edit" {
-        if let Some(input) = args["input"].as_str() {
-            for line in input.lines().filter(|line| line.starts_with('[')) {
-                if let Some((path, _)) = line.trim_start_matches('[').rsplit_once('#') {
-                    if safe_path(path) {
-                        paths.push(path.into());
-                    }
-                }
+    if tool == "edit"
+        && let Some(input) = args["input"].as_str()
+    {
+        for line in input.lines().filter(|line| line.starts_with('[')) {
+            if let Some((path, _)) = line.trim_start_matches('[').rsplit_once('#')
+                && safe_path(path)
+            {
+                paths.push(path.into());
             }
         }
     }

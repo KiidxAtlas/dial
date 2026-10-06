@@ -477,7 +477,7 @@ fn configuration_task(rng: &mut StdRng, held_out: bool) -> Task {
         )
     };
     let visible = json!([{key:low}, {key:0}]);
-    let cases = vec![
+    let cases = [
         (visible.clone(), json!(if held_out { low } else { 0 })),
         (
             json!([{key:low}, {key:high}]),
@@ -941,12 +941,12 @@ fn replace_value(rng: &mut StdRng) -> Task {
         }
     };
     // A decoy sharing the old value defeats a blind global search-and-replace.
-    if matches!(old, Val::Int(_)) && rng.random_bool(0.5) {
-        if let Some(i) =
+    if matches!(old, Val::Int(_))
+        && rng.random_bool(0.5)
+        && let Some(i) =
             (0..entries.len()).find(|&i| i != target && matches!(entries[i].1, Val::Int(_)))
-        {
-            entries[i].1 = old.clone();
-        }
+    {
+        entries[i].1 = old.clone();
     }
     let path = join(&rand_dir(rng), &config_name(rng, style));
     let shown = entry_key(style, key);
@@ -1149,7 +1149,10 @@ fn list_by_ext(rng: &mut StdRng) -> Task {
 }
 
 fn is_prime(n: u64) -> bool {
-    n >= 2 && (2..).take_while(|d| d * d <= n).all(|d| n % d != 0)
+    n >= 2
+        && (2..)
+            .take_while(|d| d * d <= n)
+            .all(|d| !n.is_multiple_of(d))
 }
 
 /// Sum of decimal digits of the product of `factors` (little-endian big integer).
@@ -2160,7 +2163,7 @@ fn script_and_run(rng: &mut StdRng) -> Task {
         ),
     );
     let data_path = join(
-        &pick(rng, &["data", "inputs", "samples"]).to_string(),
+        pick(rng, &["data", "inputs", "samples"]),
         &format!("{}.txt", pick(rng, WORDS)),
     );
     let value = (kind.f)(&data);
@@ -3170,8 +3173,8 @@ mod tests {
                     _ => None,
                 })
                 .expect("unchanged module");
-            let good = fs::read_to_string(ws.path().join(&victim)).expect("read");
-            fs::write(ws.path().join(&victim), good.replace("def ", "def  ")).expect("write");
+            let good = fs::read_to_string(ws.path().join(victim)).expect("read");
+            fs::write(ws.path().join(victim), good.replace("def ", "def  ")).expect("write");
             assert!(!t.check.verify(ws.path(), ""), "unrelated edit must fail");
         }
     }

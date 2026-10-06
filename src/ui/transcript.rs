@@ -257,10 +257,12 @@ fn stable_cuts(text: &str, after: usize) -> Vec<usize> {
             prev_blank = true;
             continue;
         }
-        if let Some(at) = pending.take() {
-            if !body.starts_with([' ', '\t']) && !is_list_marker(body) && at > after {
-                cuts.push(at);
-            }
+        if let Some(at) = pending.take()
+            && !body.starts_with([' ', '\t'])
+            && !is_list_marker(body)
+            && at > after
+        {
+            cuts.push(at);
         }
         if let Some(ch) = t.chars().next().filter(|c| matches!(c, '`' | '~')) {
             let run = t.chars().take_while(|c| *c == ch).count();
@@ -1153,12 +1155,12 @@ impl Transcript {
     /// Finalize every streaming block; a tool that never reported back is shown as interrupted.
     pub fn finish_turn(&mut self) {
         for block in self.blocks[self.cursor..].iter_mut() {
-            if let Kind::Tool(t) = &mut block.kind {
-                if t.state == ToolState::Pending {
-                    t.state = ToolState::Err;
-                    if t.output.is_empty() {
-                        t.output = "interrupted".into();
-                    }
+            if let Kind::Tool(t) = &mut block.kind
+                && t.state == ToolState::Pending
+            {
+                t.state = ToolState::Err;
+                if t.output.is_empty() {
+                    t.output = "interrupted".into();
                 }
             }
             block.active = false;
@@ -1220,17 +1222,18 @@ impl Transcript {
 
         let mut display = assemble(&head, skip);
         let mut spilled = Vec::new();
-        if display.len() > max_rows && first.active {
-            if let Some((src, rows)) = first.spill_point(width, ctx, &head, skip) {
-                spilled = head[skip..rows].to_vec();
-                first.spill = Spill {
-                    src,
-                    rows,
-                    key: Some((width, ctx.ui.show_thinking)),
-                };
-                skip = rows;
-                display = assemble(&head, skip);
-            }
+        if display.len() > max_rows
+            && first.active
+            && let Some((src, rows)) = first.spill_point(width, ctx, &head, skip)
+        {
+            spilled = head[skip..rows].to_vec();
+            first.spill = Spill {
+                src,
+                rows,
+                key: Some((width, ctx.ui.show_thinking)),
+            };
+            skip = rows;
+            display = assemble(&head, skip);
         }
         if display.len() > max_rows {
             display.drain(..display.len() - max_rows);

@@ -315,22 +315,21 @@ fn evaluate_candidate(
     };
     verify_adapter(store, baseline)?;
     verify_adapter(store, candidate)?;
-    if admission.passed {
-        if let Some(index) = eval.anchor {
-            if let Some(reason) = drift_failure(
-                runtime,
-                config,
-                store,
-                eval,
-                index,
-                &admission,
-                cache,
-                &mut last_error,
-            )? {
-                admission.passed = false;
-                admission.reason = reason;
-            }
-        }
+    if admission.passed
+        && let Some(index) = eval.anchor
+        && let Some(reason) = drift_failure(
+            runtime,
+            config,
+            store,
+            eval,
+            index,
+            &admission,
+            cache,
+            &mut last_error,
+        )?
+    {
+        admission.passed = false;
+        admission.reason = reason;
     }
     if workflow::is_candidate(candidate) {
         let pairs = eval
@@ -847,14 +846,11 @@ fn lora_candidate(
     let same_path = prior
         .as_ref()
         .is_some_and(|p| p.train_path == train_path.to_string_lossy());
-    if same_path {
-        if let Some(expected) = prior.as_ref().and_then(|p| p.prefix_digest.as_ref()) {
-            ensure!(
-                training_prefix_digest(&train_path, prior.as_ref().unwrap().watermark)?
-                    == *expected,
-                "training dataset changed before its committed watermark; use a new dataset path"
-            );
-        }
+    if same_path && let Some(expected) = prior.as_ref().and_then(|p| p.prefix_digest.as_ref()) {
+        ensure!(
+            training_prefix_digest(&train_path, prior.as_ref().unwrap().watermark)? == *expected,
+            "training dataset changed before its committed watermark; use a new dataset path"
+        );
     }
     let (train_lines, watermark) = bounded_training_records(
         &train_path,
@@ -1510,14 +1506,14 @@ pub fn run_cycle(
         match diagnose(runtime, config, store, &signals) {
             Ok((proposal, evidence)) => {
                 note(&mut steps, "feedback_agent", evidence);
-                if let Some(h) = proposal.harness {
-                    if tried.insert(mutate::harness_digest(&h)) {
-                        queue.push((
-                            "feedback".into(),
-                            store.candidate(active.id, "harness", &h, active.adapter.as_deref()),
-                            None,
-                        ));
-                    }
+                if let Some(h) = proposal.harness
+                    && tried.insert(mutate::harness_digest(&h))
+                {
+                    queue.push((
+                        "feedback".into(),
+                        store.candidate(active.id, "harness", &h, active.adapter.as_deref()),
+                        None,
+                    ));
                 }
             }
             Err(error) => note(

@@ -1531,12 +1531,24 @@ mod machine_tests {
         };
         let configuration = reports[0].configuration.clone();
         let mut policy = MachineBenchmarkPolicy::default();
-        assert!(policy.validate(&suite, &[configuration.clone()]).is_ok());
+        assert!(
+            policy
+                .validate(&suite, std::slice::from_ref(&configuration))
+                .is_ok()
+        );
         policy.repetitions = 11;
-        assert!(policy.validate(&suite, &[configuration.clone()]).is_err());
+        assert!(
+            policy
+                .validate(&suite, std::slice::from_ref(&configuration))
+                .is_err()
+        );
         policy.repetitions = 1;
         policy.case_timeout_secs = 601;
-        assert!(policy.validate(&suite, &[configuration.clone()]).is_err());
+        assert!(
+            policy
+                .validate(&suite, std::slice::from_ref(&configuration))
+                .is_err()
+        );
         policy.case_timeout_secs = 1;
         policy.minimum_correctness = f64::NAN;
         assert!(policy.validate(&suite, &[configuration]).is_err());

@@ -370,13 +370,14 @@ impl ShortcutOverlay {
         // Keep the footer visible; show save errors ahead of less important detail on short screens.
         if out.len() >= h {
             out.truncate(h.saturating_sub(1));
-            if h > 1 && (!editing || h > 2) {
-                if let Some((message, ok)) = &self.message {
-                    out[h - 2] = line(
-                        format!(" {message}"),
-                        if *ok { Tok::Success } else { Tok::Error },
-                    );
-                }
+            if h > 1
+                && (!editing || h > 2)
+                && let Some((message, ok)) = &self.message
+            {
+                out[h - 2] = line(
+                    format!(" {message}"),
+                    if *ok { Tok::Success } else { Tok::Error },
+                );
             }
         }
         while out.len() < h.saturating_sub(1) {
@@ -388,6 +389,12 @@ impl ShortcutOverlay {
             Style::default(),
         ));
         out
+    }
+}
+
+impl Default for ShortcutOverlay {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -462,7 +469,7 @@ mod tests {
         assert!(overlay.edit.is_some());
         overlay.settled(Err("Cannot save: read-only".into()));
         assert_eq!(overlay.edit.as_ref().unwrap().1.text, "Ctrl+, Alt+界");
-        assert_eq!(overlay.message.as_ref().unwrap().1, false);
+        assert!(!overlay.message.as_ref().unwrap().1);
         let rig = Rig::new();
         assert!(screen(&draw(&mut overlay, &rig, 90, 16)).contains("Cannot save: read-only"));
         overlay.settled(Ok("Saved global shortcuts".into()));

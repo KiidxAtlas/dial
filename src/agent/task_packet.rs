@@ -106,15 +106,15 @@ impl PacketCache {
                     .into_iter()
                     .flatten()
                 {
-                    if let Some(text) = constraint.as_str() {
-                        if !add_bounded(
+                    if let Some(text) = constraint.as_str()
+                        && !add_bounded(
                             &mut packet,
                             "constraints",
                             json!(clipped(text, 512)),
                             max_bytes,
-                        ) {
-                            break;
-                        }
+                        )
+                    {
+                        break;
                     }
                 }
                 // User constraints are not inferred from a summary. Every user message is retained

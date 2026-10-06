@@ -282,12 +282,11 @@ mod tests {
         ];
         project(&mut later, &mut memo, &Policy::calm());
         assert_eq!(first[0]["content"], later[0]["content"]);
-        assert_eq!(
+        assert!(
             later[1]["content"]
                 .as_str()
                 .unwrap()
-                .starts_with("[Superseded"),
-            true
+                .starts_with("[Superseded")
         );
     }
     #[test]

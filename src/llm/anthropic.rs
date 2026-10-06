@@ -194,19 +194,17 @@ impl Accumulator {
                     .get("text")
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
+                    && !on_text(text)
                 {
-                    if !on_text(text) {
-                        return Err(Interrupted.into());
-                    }
+                    return Err(Interrupted.into());
                 }
                 if let Some(text) = block
                     .get("thinking")
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
+                    && !on_event(&StreamEvent::Reasoning(text.to_owned()))
                 {
-                    if !on_event(&StreamEvent::Reasoning(text.to_owned())) {
-                        return Err(Interrupted.into());
-                    }
+                    return Err(Interrupted.into());
                 }
                 self.blocks.insert(index, block);
                 self.open.insert(index);
@@ -265,10 +263,10 @@ impl Accumulator {
                             .context("invalid Anthropic tool JSON delta")?;
                         self.arguments.entry(index).or_default().push_str(piece);
                         let mut name = block["name"].as_str().unwrap_or_default().to_owned();
-                        if self.claude_code_oauth {
-                            if let Some(stripped) = name.strip_prefix('_') {
-                                name = stripped.to_owned();
-                            }
+                        if self.claude_code_oauth
+                            && let Some(stripped) = name.strip_prefix('_')
+                        {
+                            name = stripped.to_owned();
                         }
                         if !on_event(&StreamEvent::ToolArguments {
                             index,

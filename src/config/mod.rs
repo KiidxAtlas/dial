@@ -140,18 +140,17 @@ impl Config {
                 api_key_env: None,
                 allow_insecure: false,
             });
-        } else if config.endpoint.is_none() {
-            if let Some(spec) = config
+        } else if config.endpoint.is_none()
+            && let Some(spec) = config
                 .provider
                 .as_ref()
                 .and_then(|id| config.providers.get(id))
-            {
-                config.endpoint = Some(types::EndpointConfig {
-                    base_url: spec.base_url.clone(),
-                    api_key_env: spec.api_key_env.clone(),
-                    allow_insecure: spec.allow_insecure,
-                });
-            }
+        {
+            config.endpoint = Some(types::EndpointConfig {
+                base_url: spec.base_url.clone(),
+                api_key_env: spec.api_key_env.clone(),
+                allow_insecure: spec.allow_insecure,
+            });
         }
         if let Some(endpoint) = &mut config.endpoint {
             endpoint.api_key_env = endpoint
@@ -159,12 +158,12 @@ impl Config {
                 .take()
                 .filter(|name| !name.trim().is_empty());
         }
-        if config.provider.as_deref() == Some(crate::llm::chatgpt::PROVIDER) {
-            if let Some(endpoint) = config.endpoint.as_mut() {
-                if legacy_chatgpt_api_url(&endpoint.base_url) && endpoint.api_key_env.is_none() {
-                    endpoint.base_url = crate::llm::chatgpt::BASE_URL.into();
-                }
-            }
+        if config.provider.as_deref() == Some(crate::llm::chatgpt::PROVIDER)
+            && let Some(endpoint) = config.endpoint.as_mut()
+            && legacy_chatgpt_api_url(&endpoint.base_url)
+            && endpoint.api_key_env.is_none()
+        {
+            endpoint.base_url = crate::llm::chatgpt::BASE_URL.into();
         }
         config
             .model_roles
