@@ -1868,6 +1868,8 @@ impl<'a> Agent<'a> {
             state["original_goal"] = json!(prompt::truncate_chars(user_text, 4096));
         }
         state["turn_outcome"] = Value::Null;
+        state["current_instruction"] = json!(prompt::truncate_chars(user_text, 4096));
+        state["steering_active"] = json!(false);
         self.session.set_control_state(state)?;
         let review_start = self.session.messages().len().saturating_sub(1);
         if let Some(advice) = self.laya_advice("investigation", user_text, ui) {
@@ -2633,6 +2635,7 @@ impl<'a> Agent<'a> {
         let mut max_tokens = h.max_tokens;
         let mut length_nudges = 0u32;
         let mut recovering_output = false;
+        let mut unusable_replies = 0u32;
         let mut reasoning_budget = None;
         let mut repeats = guard::RepeatGuard::default();
         let mut recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
@@ -2664,6 +2667,8 @@ impl<'a> Agent<'a> {
         let mut policy_signature = String::new();
         let mut stall = guard::StallGuard::default();
         let mut completion = completion::CompletionGuard::default();
+        let mut narration = guard::NarrationGuard::default();
+        let mut steering_pending = false;
         let mut budget = guard::StepBudget::new(
             max_steps,
             if self.hermetic {
@@ -2699,8 +2704,26 @@ impl<'a> Agent<'a> {
                 }
             }
             if self.take_steering(ui)? {
+                steering_pending = true;
+            }
+            if std::mem::take(&mut steering_pending) {
                 completion.reset_for_steering();
                 recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
+                investigation = Default::default();
+                repeats = Default::default();
+                stall = Default::default();
+                narration = Default::default();
+                pending = None;
+                unusable_replies = 0;
+                recovering_output = false;
+                length_nudges = 0;
+                max_tokens = h.max_tokens;
+                reasoning_budget = None;
+                unplanned_inspections = 0;
+                planning_notice = false;
+                reliability.consecutive_contract_failures = 0;
+                names = self.offered();
+                *schemas = self.schemas(&names)?;
             }
             self.pump_subagents(ui);
             self.cur_step = step;
@@ -2793,6 +2816,9 @@ impl<'a> Agent<'a> {
                 task_context.push_str(&format!(
                     "\n[Current task evidence packet; harness context]\n{packet}"
                 ));
+            }
+            if self.session.control_state()["steering_active"] == true {
+                task_context.push_str("\n[User steering from Dial] Follow the latest user instruction before taking another action. New user corrections take precedence over conflicting older plans, todos, original goals and summaries. Keep compatible unfinished work, but revise or drop conflicting todos instead of continuing the old task. The user's full messages are authoritative; task packets are context, not permission to ignore them.");
             }
             if !task_context.is_empty() {
                 messages.push(json!({"role":"user","content":task_context}));
@@ -2895,6 +2921,11 @@ impl<'a> Agent<'a> {
             let mut reasoning_policy = self.config.reasoning_guard.clone();
             reasoning_policy.max_pre_action_secs = selection.pre_action_secs;
             let interrupt = self.interrupt.clone();
+            // Steering cancels only this generation, never the whole user turn or
+            // independent workers that share the ordinary interrupt flag.
+            let generation_cancel = Arc::new(AtomicBool::new(false));
+            let mut steered_during_generation = false;
+            let mut steering_error = None;
             let result = if self.hermetic {
                 crate::learn::compute::background_call(self.config, backend, |backend, cancel| {
                     reasoning::chat(
@@ -2919,12 +2950,28 @@ impl<'a> Agent<'a> {
                     adapter.as_deref(),
                     &request,
                     timeout,
-                    interrupt,
+                    generation_cancel.clone(),
                     true,
                     Some(request_context),
                     ui,
                     Some(&reasoning_policy),
-                    &mut |ui| self.pump_subagents(ui),
+                    &mut |ui| {
+                        self.pump_subagents(ui);
+                        if self.interrupt.load(Ordering::SeqCst) {
+                            generation_cancel.store(true, Ordering::SeqCst);
+                        }
+                        match self.take_steering(ui) {
+                            Ok(true) => {
+                                steered_during_generation = true;
+                                generation_cancel.store(true, Ordering::SeqCst);
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                steering_error = Some(error);
+                                generation_cancel.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    },
                 )
             };
             // Also clear a profile if the model worker failed before entering the provider.
@@ -2932,6 +2979,20 @@ impl<'a> Agent<'a> {
             let request_tools = request.tools.clone();
             *schemas = request.tools;
             let context_before = request.messages;
+            if let Some(error) = steering_error {
+                return Err(error);
+            }
+            if steered_during_generation && !self.interrupt.load(Ordering::SeqCst) {
+                steering_pending = true;
+                self.record(
+                    step,
+                    "steering_superseded_generation",
+                    json!({"elapsed_ms":started.elapsed().as_millis()}),
+                )?;
+                ui.notice("Stopped the old generation; replanning with your new instruction.");
+                budget.give_back();
+                continue;
+            }
             let reply = match result {
                 Ok(reply) => reply,
                 Err(error)
@@ -3021,6 +3082,12 @@ impl<'a> Agent<'a> {
             self.probe_context();
             self.record(step, "generation", json!({"output":reply.text,"tool_calls":reply.tool_calls.len(),
                 "prompt_tokens":reply.prompt_tokens,"completion_tokens":reply.completion_tokens,"elapsed_ms":started.elapsed().as_millis()}))?;
+            if self.take_steering(ui)? {
+                steering_pending = true;
+                ui.notice("Discarded the old response before executing its tools; replanning with your new instruction.");
+                budget.give_back();
+                continue;
+            }
             if reply.finish_reason == "length" {
                 if self.config.reasoning_guard.enabled
                     && reply.text.trim().is_empty()
@@ -3082,6 +3149,22 @@ impl<'a> Agent<'a> {
                 self.metrics.truncated_recoveries += 1;
                 recovering_output = false;
             }
+            // Form failures bypass tool-result guards. Bound their recovery independently of
+            // the optional step limit, including when providers alternate failure formats.
+            let unusable = reply.dropped_tool_call()
+                || (reply.tool_calls.is_empty() && looks_like_text_call(&reply.text, &names));
+            if unusable {
+                unusable_replies += 1;
+                if unusable_replies >= 8 {
+                    return self.stop_turn(
+                        ui,
+                        "Stopped: the model returned 8 consecutive unusable tool calls; no tools ran during these attempts. Choose a tool-capable model or adjust its tool-call configuration, then retry. Completed work and the chat are kept.".into(),
+                        step + 1,
+                    );
+                }
+            } else {
+                unusable_replies = 0;
+            }
             if reply.dropped_tool_call() {
                 self.request_phase
                     .recover("the previous tool call was malformed");
@@ -3112,8 +3195,7 @@ impl<'a> Agent<'a> {
                 }
                 self.push(json!({"role":"assistant","content":reply.text}))?;
                 if self.take_steering(ui)? {
-                    completion.reset_for_steering();
-                    recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
+                    steering_pending = true;
                     continue;
                 }
                 if self.interrupt.load(Ordering::SeqCst) {
@@ -3194,6 +3276,7 @@ impl<'a> Agent<'a> {
                     trajectory: None,
                 });
             }
+            let narration_warning = narration.observe(&reply);
             self.push(llm::assistant_message(&reply))?;
             let (mut form_kinds, mut rejected_calls, mut execution_failed) =
                 (Vec::new(), Vec::new(), false);
@@ -3203,6 +3286,7 @@ impl<'a> Agent<'a> {
             let mut round_succeeded = false;
             let mut last_tool_failure = None;
             let mut finished = None;
+            let mut round_steering = Vec::new();
             for (index, call) in reply.tool_calls.iter().enumerate() {
                 if self.interrupt.load(Ordering::SeqCst) {
                     self.session.repair_incomplete_tools()?;
@@ -3213,6 +3297,17 @@ impl<'a> Agent<'a> {
                         interrupted: true,
                         trajectory: None,
                     });
+                }
+                round_steering.extend(
+                    ui.take_steering()
+                        .into_iter()
+                        .filter(|text| !text.trim().is_empty()),
+                );
+                if !round_steering.is_empty() && parallel.is_empty() {
+                    // Close the old call/result pair before appending the new user
+                    // message. Already-prefetched reads keep their actual results.
+                    self.push(llm::tool_message(&call.id, "This call was not executed: a newer user instruction superseded this pending action. Replan from the latest user message."))?;
+                    continue;
                 }
                 let observed_sources = self.experience_sources(call, ui);
                 // Read-only batch results may already have finished before a prior
@@ -3676,6 +3771,15 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 let (tokens, estimated) = self.context_usage();
                 ui.context_usage(tokens, estimated);
             }
+            if self.accept_steering(round_steering, ui)? || self.take_steering(ui)? {
+                steering_pending = true;
+                ui.notice("Kept completed tool results and skipped unstarted old actions; replanning with your new instruction.");
+                continue;
+            }
+            if let Some(advice) = narration_warning {
+                ui.notice(&advice);
+                self.push(json!({"role":"user","content":advice}))?;
+            }
             let warning = match stall.round(!round_succeeded) {
                 guard::Stall::Stop(message) => {
                     stop.get_or_insert(message);
@@ -3744,8 +3848,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             *schemas = self.schemas(&names)?;
             if let Some(mut finish) = finished {
                 if self.take_steering(ui)? {
-                    completion.reset_for_steering();
-                    recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
+                    steering_pending = true;
                     continue;
                 }
                 if self.interrupt.load(Ordering::SeqCst) {
@@ -3794,8 +3897,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 });
             }
             if self.take_steering(ui)? {
-                completion.reset_for_steering();
-                recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
+                steering_pending = true;
             }
             if form_kinds.is_empty() && !execution_failed && self.logging {
                 self.training_capture.record(
@@ -3901,8 +4003,13 @@ text: "finish completed cannot follow a failed call in the same batch; address i
         Some(text)
     }
     fn take_steering(&mut self, ui: &mut dyn Ui) -> Result<bool> {
+        let messages = ui.take_steering();
+        self.accept_steering(messages, ui)
+    }
+
+    fn accept_steering(&mut self, messages: Vec<String>, ui: &mut dyn Ui) -> Result<bool> {
         let mut received = false;
-        for text in ui.take_steering() {
+        for text in messages {
             if text.trim().is_empty() {
                 continue;
             }
@@ -3919,9 +4026,21 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 ui.image(reference);
             }
             self.push(message)?;
+            self.task_policy = crate::learn::task_policy::Policy::for_prompt(
+                &text,
+                self.config.reasoning_guard.max_pre_action_secs,
+            );
+            self.request_phase = crate::adaptive::State::begin(self.task_policy.kind, &text);
+            let mut control = self.session.control_state();
+            control["current_instruction"] = json!(prompt::truncate_chars(&text, 4096));
+            control["steering_active"] = json!(true);
+            self.session.set_control_state(control)?;
             received = true;
         }
         if received {
+            self.task_packet.clear();
+            self.reasoning_recovery = Default::default();
+            self.pending_plan = None;
             ui.notice("Steering received; continuing with the new instruction.");
         }
         Ok(received)

@@ -25,7 +25,9 @@ enum Reply {
     Say(String),
     Call(&'static str, Value),
     IdentifiedCall(&'static str, Value, String),
+    NarratedCall(&'static str, &'static str, Value),
     RawCall(&'static str, String),
+    DroppedCall,
     Calls(Vec<(&'static str, Value)>),
     Cut,
     Think { reasoning: String, pause: Duration },
@@ -201,6 +203,12 @@ fn answer(
             "function":{"name":name,"arguments":args.to_string()}}]}),
             "tool_calls",
         ),
+        Reply::NarratedCall(text, name, args) => (
+            json!({"role":"assistant","content":text,"tool_calls":[{"index":0,"id":"call_1","type":"function",
+            "function":{"name":name,"arguments":args.to_string()}}]}),
+            "tool_calls",
+        ),
+        Reply::DroppedCall => (json!({"role":"assistant","content":null}), "tool_calls"),
         Reply::RawCall(name, raw) => (
             json!({"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function",
             "function":{"name":name,"arguments":raw}}]}),
@@ -898,6 +906,83 @@ fn repeated_reads_across_failed_checks_stop_and_keep_compact_evidence() {
             .to_string()
             .contains("ORIGINAL_EVIDENCE"),
         "duplicate must not supersede the original observation"
+    );
+}
+
+#[test]
+fn repeated_successful_shell_inspections_withhold_bash_and_stop_without_step_limit() {
+    if skip_without_sandbox() {
+        return;
+    }
+    let command = "cd . && grep '^version' pyproject.toml && grep '__version__' version.py";
+    let mut script = vec![open_todo()];
+    script.extend((0..8).map(|n| {
+        Reply::IdentifiedCall(
+            "bash",
+            json!({"command":command, "timeout":30+n}),
+            format!("version-{n}"),
+        )
+    }));
+    script.push(Reply::Text("Must never reach this request"));
+    let server = serve(script);
+    let mut e = env(&server.url, "auto");
+    e.config.harness.max_steps = 0;
+    std::fs::write(
+        e.project.path().join("pyproject.toml"),
+        "version = \"0.3.31\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        e.project.path().join("version.py"),
+        "__version__ = \"0.3.31\"\n",
+    )
+    .unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let report = a.turn("Verify the package version", &mut ui).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert_eq!(
+        ui.results
+            .iter()
+            .filter(|(name, _, failed)| name == "bash" && !failed)
+            .count(),
+        2,
+        "report: {}; results: {:?}",
+        report.text,
+        ui.results
+    );
+    let requests = server.requests.lock();
+    assert!(
+        requests.len() < 9,
+        "ignored recovery feedback must stop the turn"
+    );
+    assert!(!tool_names(&requests[3]).iter().any(|name| name == "bash"));
+    let messages = a.session().messages();
+    let original = messages
+        .iter()
+        .find(|m| m["tool_call_id"] == "version-0")
+        .unwrap();
+    assert!(original["content"].as_str().unwrap().contains("0.3.31"));
+    let duplicate = messages
+        .iter()
+        .find(|m| m["tool_call_id"] == "version-1")
+        .unwrap();
+    assert!(
+        duplicate["content"]
+            .as_str()
+            .unwrap()
+            .contains("unchanged from tool call version-0")
+    );
+    assert!(!duplicate["content"].as_str().unwrap().contains("0.3.31"));
+    let ignored = messages
+        .iter()
+        .find(|m| m["tool_call_id"] == "version-2")
+        .unwrap();
+    assert!(
+        ignored["content"]
+            .as_str()
+            .unwrap()
+            .contains("This call was not executed")
     );
 }
 
@@ -1836,6 +1921,62 @@ fn repaired_tool_call_becomes_a_verified_training_recovery() {
 }
 
 #[test]
+fn repeated_unusable_tool_calls_stop_even_without_a_step_limit() {
+    for max_steps in [0, 2] {
+        for mode in 0..3 {
+            let replies = (0..10)
+                .map(|n| {
+                    if mode == 0 || (mode == 2 && n % 2 == 0) {
+                        Reply::DroppedCall
+                    } else {
+                        Reply::Text("{\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}")
+                    }
+                })
+                .collect();
+            let server = serve(replies);
+            let mut e = env(&server.url, "auto");
+            e.config.harness.max_steps = max_steps;
+            let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+            let mut ui = Recorder::default();
+            let report = a.turn("Read a.txt", &mut ui).unwrap();
+            assert_eq!(report.outcome, TurnOutcome::Incomplete);
+            assert!(
+                report.text.contains("unusable tool calls"),
+                "{}",
+                report.text
+            );
+            assert_eq!(server.requests.lock().len(), 8);
+            assert!(ui.calls.is_empty(), "invalid calls must never execute");
+        }
+    }
+}
+
+#[test]
+fn valid_calls_reset_unusable_tool_recovery() {
+    let mut replies = Vec::new();
+    for n in 0..2 {
+        for _ in 0..7 {
+            replies.push(Reply::DroppedCall);
+        }
+        replies.push(Reply::Call("read", json!({"path":format!("f{n}.txt")})));
+    }
+    replies.push(Reply::Text("done"));
+    let server = serve(replies);
+    let mut e = env(&server.url, "auto");
+    e.config.harness.max_steps = 0;
+    for n in 0..2 {
+        std::fs::write(e.project.path().join(format!("f{n}.txt")), "hello").unwrap();
+    }
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let report = a.turn("Read the numbered files", &mut ui).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert_eq!(report.text, "done");
+    assert_eq!(ui.calls, ["read", "read"]);
+    assert_eq!(server.requests.lock().len(), 17);
+}
+
+#[test]
 fn matching_verified_repairs_become_advisory_context_in_the_user_turn() {
     let server = serve(vec![Reply::Text("I'll inspect the current file first.")]);
     let e = env(&server.url, "ask");
@@ -2400,6 +2541,158 @@ fn has_tool_result(request: &Value) -> bool {
         .unwrap()
         .iter()
         .any(|m| m["role"] == "tool")
+}
+
+#[test]
+fn child_repeated_successful_shell_inspections_stop_before_exhausting_steps() {
+    if skip_without_sandbox() {
+        return;
+    }
+    let main = serve(vec![
+        Reply::Call(
+            "task",
+            json!({"prompt":"Verify the package version", "agent":"worker", "max_steps":12}),
+        ),
+        Reply::Text("child stopped"),
+    ]);
+    let side = serve(
+        (0..8)
+            .map(|n| Reply::IdentifiedCall(
+                "bash",
+                json!({"command":"cd . && grep '^version' pyproject.toml && grep '__version__' version.py", "timeout":30+n}),
+                format!("version-{n}"),
+            ))
+            .collect(),
+    );
+    let mut e = env(&main.url, "auto");
+    with_subagent_role(&mut e, &side.url);
+    std::fs::write(
+        e.project.path().join("pyproject.toml"),
+        "version = \"0.3.31\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        e.project.path().join("version.py"),
+        "__version__ = \"0.3.31\"\n",
+    )
+    .unwrap();
+    let mut ui = Recorder::default();
+    run_turn(&e, &mut ui);
+    let result = task_result(&main);
+    assert!(
+        result.contains("same observation was repeated four times"),
+        "{result}; results: {:?}",
+        ui.results
+    );
+    let requests = side.requests.lock();
+    assert_eq!(requests.len(), 5);
+    let results: Vec<_> = requests[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .collect();
+    assert!(results[0]["content"].as_str().unwrap().contains("0.3.31"));
+    assert!(
+        results[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("unchanged from tool call version-0")
+    );
+    assert!(!results[1]["content"].as_str().unwrap().contains("0.3.31"));
+}
+
+#[test]
+fn child_repeated_reads_reuse_evidence_and_stop_before_exhausting_steps() {
+    let main = serve(vec![
+        Reply::Call(
+            "task",
+            json!({"prompt":"Inspect marker.txt and report", "agent":"scout", "max_steps":12}),
+        ),
+        Reply::Text("child stopped"),
+    ]);
+    let side = serve(
+        (0..8)
+            .map(|n| {
+                let args = if n % 2 == 0 {
+                    json!({"path":"marker.txt:1-2"})
+                } else {
+                    json!({"path":"marker.txt", "offset":1, "limit":2})
+                };
+                Reply::IdentifiedCall("read", args, format!("read-{n}"))
+            })
+            .collect(),
+    );
+    let mut e = env(&main.url, "auto");
+    with_subagent_role(&mut e, &side.url);
+    std::fs::write(
+        e.project.path().join("marker.txt"),
+        "ORIGINAL_EVIDENCE\ntwo\n",
+    )
+    .unwrap();
+    run_turn(&e, &mut Recorder::default());
+    let result = task_result(&main);
+    assert!(
+        result.contains("same observation was repeated four times"),
+        "{result}"
+    );
+    let requests = side.requests.lock();
+    assert_eq!(
+        requests.len(),
+        5,
+        "the child must stop rather than use all steps"
+    );
+    assert!(
+        requests[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Each tool call must resolve")
+    );
+    let messages = requests[2]["messages"].as_array().unwrap();
+    let results: Vec<_> = messages.iter().filter(|m| m["role"] == "tool").collect();
+    assert!(
+        results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("ORIGINAL_EVIDENCE")
+    );
+    let duplicate = results[1]["content"].as_str().unwrap();
+    assert!(duplicate.contains("unchanged from tool call read-0"));
+    assert!(!duplicate.contains("ORIGINAL_EVIDENCE"));
+}
+
+#[test]
+fn child_rereads_after_an_edit_are_fresh_evidence() {
+    let main = serve(vec![
+        Reply::Call(
+            "task",
+            json!({"prompt":"Update marker.txt", "agent":"worker"}),
+        ),
+        Reply::Text("done"),
+    ]);
+    let side = serve(vec![
+        Reply::Call("read", json!({"path":"marker.txt"})),
+        Reply::Call("read", json!({"path":"marker.txt"})),
+        Reply::Call(
+            "write",
+            json!({"path":"marker.txt", "content":"new evidence"}),
+        ),
+        Reply::Call("read", json!({"path":"marker.txt"})),
+        Reply::Text("changed and checked"),
+    ]);
+    let mut e = env(&main.url, "auto");
+    with_subagent_role(&mut e, &side.url);
+    std::fs::write(e.project.path().join("marker.txt"), "old evidence").unwrap();
+    run_turn(&e, &mut Recorder::default());
+    let result = task_result(&main);
+    assert!(result.contains("changed and checked"), "{result}");
+    let requests = side.requests.lock();
+    let messages = requests[4]["messages"].as_array().unwrap();
+    let result = messages.iter().rev().find(|m| m["role"] == "tool").unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(result.contains("new evidence"));
+    assert!(!result.contains("This observation is unchanged"));
 }
 
 /// What the parent's second request carried back from its `task` call.
@@ -3645,6 +3938,227 @@ fn crashed_session_is_repaired_on_open() {
 }
 
 #[test]
+fn steering_during_reasoning_cancels_generation_without_interrupting_the_turn() {
+    #[derive(Default)]
+    struct SteeringUi {
+        ready: bool,
+        sent: bool,
+        cancelled_old: bool,
+    }
+    impl Ui for SteeringUi {
+        fn reasoning_delta(&mut self, _: &str) {
+            self.ready = true;
+        }
+        fn notice(&mut self, text: &str) {
+            self.cancelled_old |= text.contains("Stopped the old generation");
+        }
+        fn take_steering(&mut self) -> Vec<String> {
+            if self.ready && !self.sent {
+                self.sent = true;
+                vec!["Stop the old task. Answer what is two plus two.".into()]
+            } else {
+                vec![]
+            }
+        }
+    }
+    let server = serve(vec![
+        Reply::Think {
+            reasoning: "I will keep working on the old task.".into(),
+            pause: Duration::from_millis(500),
+        },
+        Reply::Text("Four."),
+    ]);
+    let e = env(&server.url, "auto");
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let mut a = agent_with(&e, None, interrupt.clone());
+    let mut ui = SteeringUi::default();
+    let report = a.turn("Create a file", &mut ui).unwrap();
+    assert!(ui.cancelled_old);
+    assert!(!interrupt.load(Ordering::SeqCst));
+    assert!(!report.interrupted);
+    assert_eq!(report.text, "Four.");
+    assert!(!e.project.path().join("gate-leak.txt").exists());
+    assert_eq!(server.requests.lock().len(), 2);
+}
+
+#[test]
+fn steering_arriving_with_a_response_prevents_stale_tool_execution() {
+    #[derive(Default)]
+    struct SteeringUi {
+        ready: bool,
+        sent: bool,
+    }
+    impl Ui for SteeringUi {
+        fn usage(&mut self, _: Option<u64>, _: Option<u64>, _: f64) {
+            self.ready = true;
+        }
+        fn take_steering(&mut self) -> Vec<String> {
+            if self.ready && !self.sent {
+                self.sent = true;
+                vec!["Stop editing. Answer my new question: what is two plus two?".into()]
+            } else {
+                vec![]
+            }
+        }
+    }
+    let server = serve(vec![
+        Reply::Call(
+            "write",
+            json!({"path":"stale.txt","content":"must not run"}),
+        ),
+        Reply::Text("Four."),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a
+        .turn("Create stale.txt", &mut SteeringUi::default())
+        .unwrap();
+    assert!(
+        !e.project.path().join("stale.txt").exists(),
+        "the old response must be discarded before approval or execution"
+    );
+    assert_eq!(report.text, "Four.");
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]["messages"]
+            .to_string()
+            .contains("what is two plus two?")
+    );
+    assert!(!requests[1]["messages"].to_string().contains("must not run"));
+}
+
+#[test]
+fn steering_between_tools_skips_unstarted_calls_and_keeps_completed_results() {
+    #[derive(Default)]
+    struct SteeringUi {
+        ready: bool,
+        sent: bool,
+    }
+    impl Ui for SteeringUi {
+        fn tool_result(&mut self, name: &str, out: &ToolOutput) {
+            if name == "write" && !out.is_error {
+                self.ready = true;
+            }
+        }
+        fn take_steering(&mut self) -> Vec<String> {
+            if self.ready && !self.sent {
+                self.sent = true;
+                vec!["Stop writing files and ask me what to do next.".into()]
+            } else {
+                vec![]
+            }
+        }
+    }
+    let server = serve(vec![
+        Reply::Calls(vec![
+            ("write", json!({"path":"first.txt","content":"completed"})),
+            (
+                "write",
+                json!({"path":"stale.txt","content":"must not run"}),
+            ),
+        ]),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"needs_input","summary":"Stopped after the first file","reason":"What should I do next?"}),
+        ),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a
+        .turn("Create first.txt and stale.txt", &mut SteeringUi::default())
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(e.project.path().join("first.txt")).unwrap(),
+        "completed"
+    );
+    assert!(!e.project.path().join("stale.txt").exists());
+    assert_eq!(report.outcome, TurnOutcome::NeedsInput);
+    let requests = server.requests.lock();
+    let results: Vec<_> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .collect();
+    assert_eq!(
+        results.len(),
+        2,
+        "every old call must have an honest completed or skipped result"
+    );
+    assert!(
+        results[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("not executed")
+    );
+    assert!(
+        requests[1]["messages"]
+            .to_string()
+            .contains("latest user instruction")
+    );
+}
+
+#[test]
+fn child_repeated_narration_gets_loop_feedback_with_different_calls() {
+    const NARRATION: &str = "I can see the current version. Let me verify the current state and check the UI header integration.";
+    let main = serve(vec![
+        Reply::Call(
+            "task",
+            json!({"agent":"scout", "prompt":"Inspect three sources"}),
+        ),
+        Reply::Text("done"),
+    ]);
+    let mut script = (0..3)
+        .map(|n| Reply::NarratedCall(NARRATION, "read", json!({"path":format!("source-{n}.txt")})))
+        .collect::<Vec<_>>();
+    script.push(Reply::Text("The sources are inspected."));
+    let side = serve(script);
+    let mut e = env(&main.url, "auto");
+    with_subagent_role(&mut e, &side.url);
+    for n in 0..3 {
+        std::fs::write(
+            e.project.path().join(format!("source-{n}.txt")),
+            format!("evidence {n}"),
+        )
+        .unwrap();
+    }
+    run_turn(&e, &mut Recorder::default());
+    assert!(task_result(&main).contains("The sources are inspected."));
+    assert!(
+        side.requests.lock()[3]["messages"]
+            .to_string()
+            .contains("[Loop check from Dial]")
+    );
+}
+
+#[test]
+fn repeated_narration_gets_loop_feedback_even_with_different_tool_calls() {
+    const NARRATION: &str = "I can see the current version. Let me verify the current state and check the UI header integration.";
+    let mut script = (0..3)
+        .map(|n| Reply::NarratedCall(NARRATION, "read", json!({"path":format!("source-{n}.txt")})))
+        .collect::<Vec<_>>();
+    script.push(Reply::Text("The sources are inspected."));
+    let server = serve(script);
+    let e = env(&server.url, "auto");
+    for n in 0..3 {
+        std::fs::write(
+            e.project.path().join(format!("source-{n}.txt")),
+            format!("evidence {n}"),
+        )
+        .unwrap();
+    }
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    a.turn("Inspect three sources", &mut Recorder::default())
+        .unwrap();
+    assert!(
+        server.requests.lock()[3]["messages"]
+            .to_string()
+            .contains("[Loop check from Dial]")
+    );
+}
+
+#[test]
 fn steering_after_final_text_extends_the_turn() {
     struct Steer {
         ready: bool,
@@ -3679,9 +4193,12 @@ fn steering_after_final_text_extends_the_turn() {
         "the risks"
     );
     let requests = server.requests.lock();
-    assert_eq!(
-        requests[1]["messages"].as_array().unwrap().last().unwrap()["content"],
-        "Also explain the risks."
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "user" && m["content"] == "Also explain the risks.")
     );
 }
 
@@ -4682,6 +5199,62 @@ fn working_state_and_read_evidence_survive_compaction_without_mutation_loss() {
     let last = server.requests.lock().last().unwrap()["messages"].to_string();
     assert!(last.contains("preserve exact goal") && last.contains("finish regression tests"));
     assert_eq!(a.metrics().compactions, 1);
+}
+
+#[test]
+fn live_worker_coordination_during_generation_discards_stale_writes() {
+    let main = serve(vec![Reply::Text("unused")]);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let side = serve_fn(
+        Arc::new(move |request| {
+            if request["messages"]
+                .to_string()
+                .contains("Stop writing; answer four")
+            {
+                return Reply::Text("Four.");
+            }
+            started_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            Reply::Call(
+                "write",
+                json!({"path":"stale.txt","content":"must not run"}),
+            )
+        }),
+        None,
+        None,
+    );
+    let mut e = env(&main.url, "auto");
+    with_subagent_role(&mut e, &side.url);
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let started = a
+        .start_subagents(
+            &json!({"agent":"worker","prompt":"Write stale.txt"}),
+            &mut ui,
+        )
+        .unwrap();
+    let id = started[0]["id"].as_str().unwrap();
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    a.subagent_message(id, "Stop writing; answer four").unwrap();
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = a.subagent_status(Some(id), &mut ui).unwrap();
+        if state["status"] != "running" {
+            assert_eq!(state["status"], "done", "{state}");
+            assert_eq!(state["result"], "Four.");
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!e.project.path().join("stale.txt").exists());
+    assert_eq!(side.requests.lock().len(), 2);
 }
 
 #[test]

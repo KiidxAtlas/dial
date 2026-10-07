@@ -83,7 +83,7 @@ impl PacketCache {
             return None;
         }
         let key = format!("{:x}", Sha256::digest(json!({
-            "tasks":todo.tasks(), "working":control["working_state"], "goal":control["original_goal"],
+            "tasks":todo.tasks(), "working":control["working_state"], "goal":control["original_goal"], "instruction":control["current_instruction"],
             "session":session_id, "history":history_ref, "objective":verification_objective, "budget":max_bytes
         }).to_string().as_bytes()));
         if self.key != key {
@@ -97,10 +97,13 @@ impl PacketCache {
                 "verification_objective":clipped(verification_objective, 512),
                 "constraints":[], "findings":[], "evidence":[],
                 "history":{"session_id":session_id,"session_file":history_ref,"retrieve":"session_search (session files are outside the read tool workspace)"},
-                "authority":"User messages and full history remain authoritative. Findings below are task-recorded claims with references, not new verification. Retrieve omitted evidence with artifact_read; summaries do not weaken constraints."
+                "authority":"The latest user instruction takes precedence over conflicting older plans and original goals. User messages and full history remain authoritative. Findings below are task-recorded claims with references, not new verification. Retrieve omitted evidence with artifact_read; summaries do not weaken constraints."
             });
             if let Some(goal) = control["original_goal"].as_str() {
                 packet["original_goal"] = json!(clipped(goal, 512));
+            }
+            if let Some(instruction) = control["current_instruction"].as_str() {
+                packet["current_instruction_excerpt"] = json!(clipped(instruction, 512));
             }
             if packet.to_string().len() <= max_bytes {
                 for constraint in control["working_state"]["constraints"]
@@ -258,6 +261,33 @@ mod tests {
         todo.restore(&json!([{"content":"repair duplicate handling","status":"in_progress"}]))
             .unwrap();
         todo
+    }
+
+    #[test]
+    fn a_new_instruction_rebuilds_the_packet_without_erasing_compatible_history() {
+        let mut cache = PacketCache::default();
+        let mut control =
+            json!({"original_goal":"write the feature", "current_instruction":"inspect first"});
+        let before = cache
+            .project(&mut [], &tasks(), &control, "s", None, "check", 4096)
+            .unwrap();
+        control["current_instruction"] = json!("Stop editing and explain the current results");
+        let after = cache
+            .project(&mut [], &tasks(), &control, "s", None, "check", 4096)
+            .unwrap();
+        assert_ne!(before, after);
+        let packet: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            packet["current_instruction_excerpt"],
+            control["current_instruction"]
+        );
+        assert_eq!(packet["original_goal"], control["original_goal"]);
+        assert!(
+            packet["authority"]
+                .as_str()
+                .unwrap()
+                .contains("latest user instruction takes precedence")
+        );
     }
     fn history() -> Vec<Value> {
         let mut messages = vec![

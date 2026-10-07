@@ -4,6 +4,36 @@
 
 use crate::llm::{Reply, ToolCall};
 
+/// Repeated narration can disguise a loop even when the model varies its calls.
+/// This is feedback, not a stop condition: repeated wording alone does not prove
+/// the tools failed to make progress. Result/failure guards enforce those stops.
+#[derive(Default)]
+pub(super) struct NarrationGuard {
+    seen: std::collections::VecDeque<(u64, u32)>,
+}
+
+impl NarrationGuard {
+    pub fn observe(&mut self, reply: &Reply) -> Option<String> {
+        use std::hash::{Hash, Hasher};
+        let text = reply.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if reply.tool_calls.is_empty() || text.len() < 64 {
+            return None;
+        }
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hash);
+        let key = hash.finish();
+        if let Some((_, count)) = self.seen.iter_mut().find(|(seen, _)| *seen == key) {
+            *count = count.saturating_add(1);
+            return (*count == 3).then(|| "[Loop check from Dial] You have repeated the same explanation three times this turn, even if the tool arguments differ. Check whether you are looping: review the latest user instruction and the evidence already returned. If nothing relevant changed, reuse that evidence and choose a different concrete action or report the blocker. If the repeated action is necessary, identify the specific changed state or uncertainty it checks. Do not repeat the same promise to verify again.".into());
+        }
+        if self.seen.len() == 32 {
+            self.seen.pop_front();
+        }
+        self.seen.push_back((key, 1));
+        None
+    }
+}
+
 /// A tool call that failed this many times with identical arguments earns a warning.
 const REPEAT_LIMIT: u32 = 3;
 const FAILURE_LIMIT: u32 = 4;
@@ -415,6 +445,38 @@ mod tests {
         assert!(guard.stop_message(&same).is_some());
         assert!(guard.observe(&same, false).is_none());
         assert!(guard.observe(&same, true).is_none() && guard.observe(&same, true).is_none());
+    }
+
+    #[test]
+    fn repeated_narration_warns_once_despite_different_calls_and_whitespace() {
+        let mut guard = NarrationGuard::default();
+        let text = "I can see the current version. Let me verify the current state and check the UI header integration.";
+        for n in 0..6 {
+            let text = if n % 2 == 0 {
+                text.to_owned()
+            } else {
+                text.replace(' ', "\n")
+            };
+            let r = reply(
+                &text,
+                vec![call("read", json!({"path":format!("source-{n}")}))],
+            );
+            assert_eq!(guard.observe(&r).is_some(), n == 2);
+        }
+        assert!(guard.observe(&reply(text, vec![])).is_none());
+        assert!(
+            guard
+                .observe(&reply("Checking.", vec![call("read", json!({}))]))
+                .is_none()
+        );
+        for n in 0..100 {
+            let r = reply(
+                &format!("{text} Unique explanation {n}."),
+                vec![call("read", json!({}))],
+            );
+            assert!(guard.observe(&r).is_none());
+        }
+        assert_eq!(guard.seen.len(), 32);
     }
 
     #[test]

@@ -1101,7 +1101,12 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
         ("permissions", &["allow", "deny", "remove"]),
         ("permissions allow", &["--persist"]),
         ("permissions deny", &["--persist"]),
-        ("improve", &["status", "jobs", "stop", "cycle", "enable", "disable", "versions", "tasks"]),
+        (
+            "improve",
+            &[
+                "status", "jobs", "stop", "cycle", "enable", "disable", "versions", "tasks",
+            ],
+        ),
         ("theme", &["auto"]),
         ("export", &["--html"]),
         ("profile", &["off"]),

@@ -1155,7 +1155,7 @@ static REGISTRY: &[SettingDef] = &[
         "Adapt output budget",
         "Bound investigation and verification output; preserve editing, reasoning and recovery budgets.",
         Kind::Bool,
-        "true"
+        "false"
     ),
     def!(
         "adaptive.phase",
