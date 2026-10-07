@@ -9,15 +9,31 @@ permissions:
 
 jobs:
   test:
-    name: fmt, build, test
-    runs-on: macos-latest
+    name: fmt, build, test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux sandbox
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install Rust
         run: rustup update stable --no-self-update
+      - name: Test terminal installer
+        run: bash scripts/test-install.sh
+      - name: Verify Linux sandbox enforcement
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: cargo test --locked linux_sandbox_enforces_filesystem_and_both_network_modes
       - name: Format
         run: cargo fmt --check
       - name: Build
         run: cargo build --locked --all-targets
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=4

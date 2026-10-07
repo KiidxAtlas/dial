@@ -1,4 +1,7 @@
-//! macOS `sandbox-exec` confinement for the model-facing `bash` tool.
+//! OS confinement for model-facing commands: macOS `sandbox-exec`, Linux/WSL2 `bubblewrap`.
+//!
+//! Linux/WSL2 uses a bounded filesystem view even in Dev mode; see `sandbox/linux.rs`.
+//! The profiles and residual limits below describe the unchanged macOS backend.
 //!
 //! The profile is deny-by-default. Reads are limited to the system locations
 //! needed to run bash, coreutils, Homebrew python and git; reads and writes are
@@ -56,6 +59,9 @@
 //!   target; `readlink` on the link itself still works.
 //! * Hard links: creating one to a denied file is refused (needs read access),
 //!   but a hard link made before the sandbox started is a distinct path.
+
+#[cfg(any(target_os = "linux", test))]
+mod linux;
 
 use std::ffi::OsString;
 use std::io::ErrorKind;
@@ -140,10 +146,15 @@ impl Sandbox {
         args: &[&str],
     ) -> Result<Command, String> {
         self.available()?;
-        let profile = profile(workspace, allow_network)?;
-        let mut command = Command::new(SANDBOX_EXEC);
-        command.arg("-p").arg(profile).arg(program).args(args);
-        Ok(command)
+        #[cfg(target_os = "linux")]
+        return linux::command(workspace, &Policy::Strict { allow_network }, program, args);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let profile = profile(workspace, allow_network)?;
+            let mut command = Command::new(SANDBOX_EXEC);
+            command.arg("-p").arg(profile).arg(program).args(args);
+            Ok(command)
+        }
     }
 
     /// Like [`Sandbox::command`] but for an arbitrary [`Policy`].
@@ -183,12 +194,21 @@ impl Sandbox {
                 allow_network,
             } => (*allow_network, deny_read, extra_write),
         };
+        #[cfg(not(target_os = "linux"))]
         let profile = dev_profile(workspace, deny_read, extra_write, allow_network)?;
+        #[cfg(target_os = "linux")]
+        let _ = (allow_network, deny_read, extra_write);
         let scratch = workspace.join(crate::tools::SCRATCH_DIR);
         std::fs::create_dir_all(&scratch)
             .map_err(|e| format!("creating scratch directory: {e}"))?;
-        let mut command = Command::new(SANDBOX_EXEC);
-        command.arg("-p").arg(profile).arg(program).args(args);
+        #[cfg(target_os = "linux")]
+        let mut command = linux::command(workspace, policy, program, args)?;
+        #[cfg(not(target_os = "linux"))]
+        let mut command = {
+            let mut command = Command::new(SANDBOX_EXEC);
+            command.arg("-p").arg(profile).arg(program).args(args);
+            command
+        };
         command
             .env_clear()
             .envs(scrubbed_env(env))
@@ -204,46 +224,51 @@ impl Sandbox {
     /// loopback network gated by the flag); the probe result is cached per
     /// network setting. `Strict` reuses [`Sandbox::detect`].
     pub fn probe_policy(workspace: &Path, policy: &Policy) -> Sandbox {
-        if let Err(reason) = platform_check() {
-            return Sandbox::Unavailable(reason);
-        }
-        let (mechanism, real_profile) = match policy {
-            Policy::Strict { allow_network } => {
-                if let Sandbox::Unavailable(reason) = Sandbox::detect() {
-                    return Sandbox::Unavailable(reason);
+        #[cfg(target_os = "linux")]
+        return linux::probe_policy(workspace, policy);
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Err(reason) = platform_check() {
+                return Sandbox::Unavailable(reason);
+            }
+            let (mechanism, real_profile) = match policy {
+                Policy::Strict { allow_network } => {
+                    if let Sandbox::Unavailable(reason) = Sandbox::detect() {
+                        return Sandbox::Unavailable(reason);
+                    }
+                    (Ok(()), profile(workspace, *allow_network))
                 }
-                (Ok(()), profile(workspace, *allow_network))
+                Policy::Dev {
+                    deny_read,
+                    extra_write,
+                    allow_network,
+                } => {
+                    static DEV_PROBES: [LazyLock<Result<(), String>>; 2] = [
+                        LazyLock::new(|| dev_self_test(false)),
+                        LazyLock::new(|| dev_self_test(true)),
+                    ];
+                    (
+                        DEV_PROBES[usize::from(*allow_network)].clone(),
+                        dev_profile(workspace, deny_read, extra_write, *allow_network),
+                    )
+                }
+            };
+            if let Err(reason) = mechanism {
+                return Sandbox::Unavailable(format!("sandbox-exec self-test failed: {reason}"));
             }
-            Policy::Dev {
-                deny_read,
-                extra_write,
-                allow_network,
-            } => {
-                static DEV_PROBES: [LazyLock<Result<(), String>>; 2] = [
-                    LazyLock::new(|| dev_self_test(false)),
-                    LazyLock::new(|| dev_self_test(true)),
-                ];
-                (
-                    DEV_PROBES[usize::from(*allow_network)].clone(),
-                    dev_profile(workspace, deny_read, extra_write, *allow_network),
-                )
+            // The real profile must at least be valid and let a command start.
+            let started = real_profile.and_then(|text| {
+                let (code, _) = run_probe(&text, workspace, "exit 0", &[])?;
+                if code == Some(0) {
+                    Ok(())
+                } else {
+                    Err(format!("probe exited with {code:?}"))
+                }
+            });
+            match started {
+                Ok(()) => Sandbox::Available,
+                Err(reason) => Sandbox::Unavailable(format!("policy cannot be enforced: {reason}")),
             }
-        };
-        if let Err(reason) = mechanism {
-            return Sandbox::Unavailable(format!("sandbox-exec self-test failed: {reason}"));
-        }
-        // The real profile must at least be valid and let a command start.
-        let started = real_profile.and_then(|text| {
-            let (code, _) = run_probe(&text, workspace, "exit 0", &[])?;
-            if code == Some(0) {
-                Ok(())
-            } else {
-                Err(format!("probe exited with {code:?}"))
-            }
-        });
-        match started {
-            Ok(()) => Sandbox::Available,
-            Err(reason) => Sandbox::Unavailable(format!("policy cannot be enforced: {reason}")),
         }
     }
 }
@@ -610,6 +635,12 @@ fn dev_self_test(allow_network: bool) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn probe() -> Sandbox {
+    linux::probe()
+}
+
+#[cfg(not(target_os = "linux"))]
 fn probe() -> Sandbox {
     if !cfg!(target_os = "macos") {
         return Sandbox::Unavailable("sandbox-exec exists only on macOS".to_string());
@@ -673,9 +704,14 @@ fn run_probe(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    run_probe_command(command)
+}
+
+/// Run a fixed enforcement probe, never a model-supplied script.
+fn run_probe_command(mut command: Command) -> Result<(Option<i32>, String), String> {
     let mut child = command
         .spawn()
-        .map_err(|e| format!("spawning {SANDBOX_EXEC}: {e}"))?;
+        .map_err(|e| format!("spawning sandbox enforcement probe: {e}"))?;
     let started = Instant::now();
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {

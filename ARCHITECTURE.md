@@ -50,6 +50,12 @@ Changing a rule means editing that test and stating why here.
 
 - Tool execution always passes through schemas, approvals, workspace confinement and the
   checkpoint observer (`tools/mod.rs`, `agent/approval.rs`, `tools/sandbox.rs`).
+- Shell confinement is platform-owned: macOS retains `sandbox-exec`; Linux/WSL2 uses
+  bubblewrap namespaces (`tools/sandbox/linux.rs`). Linux exposes only the system
+  runtime, workspace and explicit extra-write directories, and refuses denied/allowed
+  overlaps and enabled WSL Windows interop. Both backends fail closed after real
+  enforcement probes; approvals never grant an unsandboxed fallback. MLX remains
+  macOS/Apple Silicon only; Linux/WSL2 uses hosted or OpenAI-compatible providers.
 - Every completed live edit turn, including text-only completion, surfaces a bounded checkpoint diff; shell and approval-requiring extension calls are tracked as uncheckpointed and require staged/unstaged Git review (`agent/mod.rs`, `storage/checkpoint.rs`).
 - Failed focused checks remain named repair obligations and are re-run alongside checks selected from new changed files; project-aware mappings use Python, Rust, Go and JavaScript test metadata (`agent/verification.rs`, `agent/mod.rs`).
 - A learned adapter is used only after it passes the evaluation gate; admission and rollback

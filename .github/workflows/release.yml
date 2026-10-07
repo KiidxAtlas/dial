@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and package ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux sandbox
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup target add "${{ matrix.target }}"
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cargo metadata --no-deps --format-version 1 --locked > release-metadata.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          metadata = json.loads(Path('release-metadata.json').read_text())
+          version = next(p['version'] for p in metadata['packages'] if p['name'] == 'dial')
+          tag = os.environ['RELEASE_TAG']
+          if tag != f'v{version}':
+              raise SystemExit(f'Tag {tag} must match Cargo.toml version v{version}')
+          PY
+      - name: Test terminal installer
+        run: bash scripts/test-install.sh
+      - name: Verify Linux sandbox enforcement
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: cargo test --locked linux_sandbox_enforces_filesystem_and_both_network_modes
+      - name: Format
+        run: cargo fmt --check
+      - name: Test
+        run: cargo test --locked -- --test-threads=4
+      - name: Build release binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package and smoke-test outside the checkout
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          package="dial-${GITHUB_REF_NAME}-${RELEASE_TARGET}"
+          mkdir -p "dist/$package"
+          install -m 755 "target/$RELEASE_TARGET/release/dial" "dist/$package/dial"
+          cp LICENSE README.md "dist/$package/"
+          tar -czf "dist/$package.tar.gz" -C dist "$package"
+          (cd dist && shasum -a 256 "$package.tar.gz" > "$package.tar.gz.sha256")
+          smoke="$(mktemp -d "${RUNNER_TEMP:-$PWD/dist}/dial-smoke.XXXXXX")"
+          trap 'rm -rf "$smoke"' EXIT
+          tar -xzf "dist/$package.tar.gz" -C "$smoke"
+          cd "$smoke/$package"
+          ./dial --version | grep -Fx "dial ${GITHUB_REF_NAME#v}"
+          ./dial --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          merge-multiple: true
+          path: dist
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cp scripts/install.sh dist/install.sh
+          (cd dist && sha256sum install.sh > install.sh.sha256)
+          cat dist/*.sha256 > dist/SHA256SUMS
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS dist/install.sh \
+            --verify-tag --generate-notes --title "Dial $RELEASE_TAG"

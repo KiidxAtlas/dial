@@ -3,8 +3,8 @@
 //! Every file path a model supplies is resolved against the workspace root:
 //! `..` escapes, absolute paths outside the root and symlinks that lead out of
 //! it are rejected, and directory walks (glob, grep) never follow symlinks.
-//! `bash` runs inside the macOS sandbox (see [`sandbox`]) and refuses to
-//! run at all when no sandbox is available.
+//! `bash` runs inside the platform sandbox (macOS sandbox-exec or Linux/WSL2 bubblewrap;
+//! see [`sandbox`]) and refuses to run at all when no sandbox is available.
 //!
 //! Residual limits, stated plainly:
 //! * Path checks and later file operations are not atomic. Tools run one at a

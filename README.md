@@ -1,11 +1,125 @@
 # dial
 
-A local-first coding agent harness for macOS/Apple Silicon. Run it in a project directory like any agent CLI. Self-improvement is automatic: observations feed verified practice, harness proposals and local LoRA training; only an external evaluation gate can activate a candidate.
+A local-first coding agent harness for macOS and Linux, including Windows through WSL2. Run it in a project directory like any agent CLI. Self-improvement is automatic: observations feed verified practice, harness proposals and local LoRA training; only an external evaluation gate can activate a candidate. Local MLX inference and training require Apple Silicon; Intel Macs and Linux/WSL2 use hosted or OpenAI-compatible providers.
 
 Standalone: no dependency on omp, Hermes, or any hosted service. Rust control plane and tools; Python for local MLX inference/training (`mlx-lm`, plus `mlx-vlm` for vision).
 
+## Install
+
+Release targets are **macOS 13+ on Apple Silicon (arm64) or Intel (x86-64)** and **Linux x86-64 (Ubuntu
+22.04 or newer), including Windows through WSL2**. There is no native Windows
+`.exe`; run Dial in the WSL terminal, not PowerShell. No Rust compiler or source
+checkout is needed for prebuilt releases. Download the archive for your platform
+and its matching `.tar.gz.sha256` file from
+[GitHub Releases](https://github.com/KiidxAtlas/dial/releases).
+
+For a terminal install, after the platform prerequisites below are satisfied,
+download and review the installer from the latest published release, then run it:
+
 ```sh
-cargo install --path .
+curl -fL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh -o dial-install.sh
+bash dial-install.sh
+export PATH="$HOME/.local/bin:$PATH"
+dial
+```
+
+The installer selects the correct archive and verifies its SHA-256 before installing.
+Run `bash dial-install.sh v0.1.0` to select a specific release. On Windows these commands
+run in your WSL2 Ubuntu terminal; the PowerShell command below installs WSL2 first.
+
+### macOS (Apple Silicon or Intel)
+
+In the download directory (replace `v0.1.0` with the release you downloaded):
+
+```sh
+version=v0.1.0
+# Apple Silicon: aarch64-apple-darwin; Intel: x86_64-apple-darwin
+target=aarch64-apple-darwin
+shasum -a 256 -c "dial-$version-$target.tar.gz.sha256"
+tar -xzf "dial-$version-$target.tar.gz"
+mkdir -p "$HOME/.local/bin"
+install -m 755 "dial-$version-$target/dial" "$HOME/.local/bin/dial"
+export PATH="$HOME/.local/bin:$PATH"
+dial --version
+```
+
+Stop if checksum verification fails. Add `export PATH="$HOME/.local/bin:$PATH"`
+to your shell configuration (usually `~/.zshrc`) to keep Dial on your PATH.
+To update, repeat with a newer release and restart any running Dial sessions.
+The archives are not signed or notarized; if macOS blocks execution, review your
+system's security prompt rather than disabling Gatekeeper globally.
+
+Hosted providers need an account/API key configured through first-run setup, but
+do not need Python. Local MLX inference is **macOS/Apple Silicon only** and
+additionally requires `uv`, network access for runtime/model downloads, and sufficient memory for the selected model. The
+Python worker is embedded in the binary; no repository checkout is needed.
+
+### Windows through WSL2 / Linux x86-64
+
+On Windows, install **WSL2 with Ubuntu 22.04 or newer**, using PowerShell as
+administrator if it is not already installed:
+
+```powershell
+wsl --install -d Ubuntu-22.04
+```
+
+Restart if prompted and create your normal Ubuntu user. For confinement, disable
+Windows executable interop in this Ubuntu distribution: edit `/etc/wsl.conf` with
+`sudoedit`, preserving existing settings, and add or update:
+
+```ini
+[interop]
+enabled=false
+appendWindowsPath=false
+```
+
+Then run `wsl --shutdown` from PowerShell and reopen Ubuntu. This affects that
+distribution's ability to launch Windows executables, not Windows itself. Dial
+refuses sandboxed commands while Windows interop remains enabled, rather than
+letting a Windows process escape Linux confinement.
+
+In Ubuntu (or native Linux), install the sandbox and certificates:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y bubblewrap ca-certificates
+```
+
+Download the Linux archive and checksum into a Linux directory, then:
+
+```sh
+version=v0.1.0
+sha256sum -c "dial-$version-x86_64-unknown-linux-gnu.tar.gz.sha256"
+tar -xzf "dial-$version-x86_64-unknown-linux-gnu.tar.gz"
+mkdir -p "$HOME/.local/bin"
+install -m 755 "dial-$version-x86_64-unknown-linux-gnu/dial" "$HOME/.local/bin/dial"
+export PATH="$HOME/.local/bin:$PATH"
+dial --version
+```
+
+Stop if checksum verification fails. Add the PATH export to `~/.bashrc`. Keep your
+checkout and Dial's home/state on the Linux filesystem (for example `~/code`),
+not the Windows-mounted drive, and run Dial as your normal user, never with sudo.
+Choose a hosted provider in first-run setup or `/providers`; local MLX is unavailable on Intel Macs and Linux/WSL2.
+An OpenAI-compatible server running elsewhere can also be configured as an endpoint.
+
+Linux/WSL2 commands require working unprivileged user namespaces. Dial runs a real
+filesystem and network enforcement probe; missing or blocked bubblewrap disables
+command execution with an error, never an unsandboxed fallback. Linux Dev mode is
+deliberately stricter than macOS Dev mode: only the system runtime, workspace and
+explicit `sandbox.extra_write` directories are visible. Host home directories,
+IPC sockets and Windows drives are not exposed wholesale. Secret/denied paths
+overlapping any exposed tree are refused; keep secrets outside allowed trees.
+Toolchains must be installed in system paths or inside the project/explicit allowed
+directories. Do not allow your entire home directory just to expose a toolchain.
+
+### Build from source
+
+With Rust and a C toolchain installed (Xcode Command Line Tools on macOS;
+`build-essential` on Ubuntu), clone this repository and run:
+
+```sh
+cargo install --path . --locked
 cd ~/code/my-project
 dial                                  # native terminal UI; first run opens model/provider setup
 dial "fix the failing test in src/lib.rs"   # interactive, opening with a message
@@ -24,6 +138,28 @@ For local MLX you can also prepare the runtime and model explicitly:
 `dial setup -m mlx-community/Qwen2.5-7B-Instruct-4bit` (requires `uv`).
 Discovery itself does not download weights. Selecting an uncached local model and submitting a
 prompt resolves its weights; a missing default MLX runtime gets an installation confirmation.
+
+### Publishing a release (maintainers)
+
+The release workflow runs on pushed `v*` tags and requires the tag to match
+`Cargo.toml`'s version. After updating the version and lockfile as needed, commit
+the release changes and push that commit and its tag, for example:
+
+```sh
+git tag v0.1.0
+git push origin main
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` checks formatting, runs the Rust tests (including
+required Linux sandbox probes), builds Apple Silicon/Intel Mac and Linux x86-64 binaries,
+and smoke-tests each extracted archive outside the checkout. Only after **all three**
+platform builds pass does it create a GitHub release with the archives, bundled MIT
+license and README, per-archive SHA-256 checksums, a combined `SHA256SUMS`, and
+generated notes. CI runs on both macOS and Ubuntu without weakening host security.
+The repository must be public for everyone to download releases; this workflow
+does not change repository visibility. Dial is MIT licensed; see `LICENSE` for
+permission to use, modify, and redistribute it.
 
 ### Anthropic subscription sign-in
 

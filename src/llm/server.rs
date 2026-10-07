@@ -524,6 +524,7 @@ fn wait_ready(
     model: &str,
 ) -> Result<()> {
     let models_url = format!("{base_url}/v1/models");
+    let mut last_probe = "no health response yet".to_string();
     loop {
         if interrupt
             .as_ref()
@@ -538,14 +539,12 @@ fn wait_ready(
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(
             !remaining.is_zero(),
-            "model server not ready before the startup timeout"
+            "model server not ready before the startup timeout; last health probe: {last_probe}"
         );
-        let up = llm::agent(2)
-            .get(&models_url)
-            .call()
-            .is_ok_and(|response| response.status().as_u16() == 200);
-        if up {
-            break;
+        match llm::agent(2).get(&models_url).call() {
+            Ok(response) if response.status().as_u16() == 200 => break,
+            Ok(response) => last_probe = format!("HTTP {}", response.status().as_u16()),
+            Err(error) => last_probe = error.to_string(),
         }
         std::thread::sleep(POLL_INTERVAL.min(remaining));
     }
