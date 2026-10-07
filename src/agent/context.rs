@@ -136,7 +136,41 @@ fn discover_with_home(layout: &Layout, home: Option<&Path>) -> Vec<ContextFile> 
 
     let mut out: Vec<ContextFile> = user.into_iter().collect();
     out.extend(groups.into_iter().rev().flatten());
-    out
+    dedupe_contained_context(out)
+}
+
+/// Keep precedence order and original text; only remove an earlier file when its
+/// complete paragraph sequence occurs in a later, more specific file (OMP's
+/// conservative context-containment approach). Never fuzzy-match instructions.
+fn dedupe_contained_context(files: Vec<ContextFile>) -> Vec<ContextFile> {
+    let blocks: Vec<Vec<&str>> = files
+        .iter()
+        .map(|file| {
+            file.content
+                .split("\n\n")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .collect();
+    let keep: Vec<bool> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, rule)| {
+            rule.is_empty()
+                || !blocks[i + 1..].iter().any(|candidate| {
+                    candidate.len() >= rule.len()
+                        && candidate
+                            .windows(rule.len())
+                            .any(|window| window == rule.as_slice())
+                })
+        })
+        .collect();
+    files
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(file, keep)| keep.then_some(file))
+        .collect()
 }
 
 fn load_context_file(
@@ -780,6 +814,66 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn containment_removes_only_complete_earlier_paragraph_sequences() {
+        let file = |content: &str| ContextFile {
+            path: PathBuf::from("AGENTS.md"),
+            display: "AGENTS.md".into(),
+            content: content.into(),
+        };
+        let base = "Shared rule A.\n\nShared rule B.";
+        let fuller = format!("{base}\n\nProject-specific rule.");
+        let files = dedupe_contained_context(vec![file(base), file(&fuller)]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].content, fuller);
+        assert_eq!(
+            files.iter().map(|f| f.content.len()).sum::<usize>(),
+            fuller.len()
+        );
+        // A less authoritative superset must not erase a nearer instruction.
+        assert_eq!(
+            dedupe_contained_context(vec![file(&fuller), file(base)]).len(),
+            2
+        );
+        for distinct in [
+            "Shared rule A.\n\nOther rule.\n\nShared rule B.",
+            "Shared rule A changed.\n\nShared rule B.",
+        ] {
+            assert_eq!(
+                dedupe_contained_context(vec![file(base), file(distinct)]).len(),
+                2
+            );
+        }
+        assert_eq!(
+            dedupe_contained_context(vec![file(""), file(base)]).len(),
+            2
+        );
+        assert_eq!(
+            dedupe_contained_context(vec![
+                file("  Shared rule A.  \n\n Shared rule B. "),
+                file(&fuller)
+            ])
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn discovery_omits_parent_rules_contained_in_project_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = canon(&tmp);
+        let repo = home.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let shared = "Run tests.\n\nPreserve user changes.";
+        write(repo.join("AGENTS.md"), shared);
+        let local = format!("{shared}\n\nUse cargo.");
+        write(repo.join("pkg/AGENTS.md"), &local);
+        let layout = layout_at(&repo.join("pkg"), &home.join("userdial"));
+        let files = discover_with_home(&layout, Some(&home));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].content, local);
     }
 
     #[test]

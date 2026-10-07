@@ -625,6 +625,35 @@ fn repeated_todo_rejections_stop_despite_reworded_claims() {
 }
 
 #[test]
+fn repeated_invalid_plans_stop_despite_reworded_tasks_and_interleaved_reads() {
+    let mut replies = Vec::new();
+    for i in 0..4 {
+        if i > 0 {
+            replies.push(Reply::Call("read", json!({"path":"src/lib.rs"})));
+        }
+        replies.push(Reply::Call(
+            "todo",
+            json!({
+                "op":"set", "tasks":[{
+                    "content":format!("Already inspected the source, attempt {i}"),
+                    "investigation":true, "status":"completed"
+                }]
+            }),
+        ));
+    }
+    let server = serve(replies);
+    let e = env(&server.url, "auto");
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = agent
+        .turn("Inspect the source", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert_eq!(server.requests.lock().len(), 7);
+    assert!(report.text.contains("failed 4 times"), "{}", report.text);
+    assert!(!agent.todo().has_open());
+}
+
+#[test]
 fn report_for_one_step_does_not_close_the_next_step() {
     let server = serve(vec![
         Reply::Call(
@@ -739,7 +768,7 @@ fn investigation_gates_findings_redirects_duplicate_reads_and_survives_resume() 
     assert!(
         requests[6]["messages"]
             .to_string()
-            .contains("Recorded finding (agent observation")
+            .contains("task-recorded claims with references")
     );
     assert!(
         ui.notices
@@ -1746,7 +1775,11 @@ fn oversized_tool_recovery_does_not_abort_the_session() {
         "a malformed call must not execute, or replay the repaired call"
     );
     assert!(store.tool_recoveries().unwrap().is_empty());
-    assert!(server.requests.lock()[1]["messages"].to_string().len() > 256 * 1024);
+    assert!(
+        server.requests.lock()[1]["messages"]
+            .to_string()
+            .contains(&prompt)
+    );
     let next = a.turn("Are you still available?", &mut ui).unwrap();
     assert_eq!(next.outcome, TurnOutcome::Completed);
     assert_eq!(next.text, "Still available.");
@@ -2977,6 +3010,21 @@ fn disabling_the_reasoning_guard_preserves_larger_output_recovery() {
         "{:?}",
         ui.notices
     );
+}
+
+#[test]
+fn default_investigation_uses_configured_output_budget_without_retry() {
+    let server = serve(vec![Reply::Text("Located the relevant code.")]);
+    let e = env(&server.url, "ask");
+    let mut backend = make_backend(&e.config).unwrap();
+    let mut a = agent(&e, &mut backend, None);
+    let mut ui = Recorder::default();
+    let report = a.turn("Locate the relevant code", &mut ui).unwrap();
+    assert_eq!(report.text, "Located the relevant code.");
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["max_tokens"], e.config.harness.max_tokens);
+    assert!(!ui.notices.iter().any(|n| n.contains("output limit")));
 }
 
 #[test]
@@ -4351,9 +4399,11 @@ fn the_current_step_rides_at_the_end_of_requests_without_entering_history() {
         focus["content"]
             .as_str()
             .unwrap()
-            .contains("Current step (0/2 done): 1. inspect notes."),
+            .contains("Current task evidence packet"),
         "{focus}"
     );
+    assert!(focus["content"].as_str().unwrap().contains("inspect notes"));
+    assert!(!focus["content"].as_str().unwrap().contains("[Task focus"));
     assert_eq!(
         first[..first.len() - 1],
         second[..first.len() - 1],
@@ -4567,6 +4617,30 @@ fn discovery_enables_only_next_round_and_rejects_invalid_names_atomically() {
     assert_eq!(a.metrics().tool_contract_errors, 1);
     assert!(a.tool_names().iter().any(|n| n == "skill"));
     assert!(!a.tool_names().iter().any(|n| n == "task"));
+}
+
+#[test]
+fn specialist_schema_can_be_released_and_loaded_again() {
+    let server = serve(vec![
+        Reply::Call("tool_load", json!({"names":["skill"]})),
+        Reply::Call("tool_load", json!({"unload":["skill"]})),
+        Reply::Call("tool_load", json!({"names":["skill"]})),
+        Reply::Text("finished"),
+    ]);
+    let e = env(&server.url, "ask");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    a.turn("Manage specialist tools", &mut Recorder::default())
+        .unwrap();
+    let requests = server.requests.lock();
+    let has = |i: usize| {
+        requests[i]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["function"]["name"] == "skill")
+    };
+    assert!(!has(0) && has(1) && !has(2) && has(3));
+    assert!(a.tool_names().iter().any(|n| n == "skill"));
 }
 
 #[test]
@@ -5779,14 +5853,38 @@ fn a_big_tool_result_triggers_compaction_before_the_request_it_would_overflow() 
 }
 
 #[test]
-fn a_session_switch_forgets_the_previous_sessions_token_count() {
-    let server = serve_with(vec![Reply::Text("hi")], None, Some(4096));
+fn a_session_switch_forgets_previous_context_and_token_count() {
+    let server = serve_with(
+        vec![Reply::Text("old-answer"), Reply::Text("fresh-answer")],
+        None,
+        Some(4096),
+    );
     let e = env(&server.url, "auto");
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None);
+    a.turn("old-conversation-marker", &mut Recorder::default())
+        .unwrap();
+    assert!(!a.session().messages().is_empty());
     a.record_prompt_usage(4000);
-    a.swap_session(Session::ephemeral());
+    a.swap_session(
+        Session::create(
+            &e.layout,
+            SessionMeta {
+                model: e.config.model.clone(),
+            },
+        )
+        .unwrap(),
+    );
     assert_eq!(a.last_prompt_tokens, 0);
+    assert!(a.session().messages().is_empty());
+    assert!(!a.todo().has_open());
+    a.turn("fresh-conversation-marker", &mut Recorder::default())
+        .unwrap();
+    let requests = server.requests.lock();
+    let messages = requests.last().unwrap()["messages"].to_string();
+    assert!(messages.contains("fresh-conversation-marker"));
+    assert!(!messages.contains("old-conversation-marker"));
+    assert!(!messages.contains("old-answer"));
 }
 
 #[test]
@@ -6495,6 +6593,7 @@ fn adaptive_settings_follow_real_reads_edits_checks_and_review_handoff() {
     let mut e = env(&server.url, "auto");
     e.config.verification.enabled = false;
     e.config.adaptive.sampling = true;
+    e.config.adaptive.output_limits = true;
     let profile = dial::llm::profiles::ModelProfile {
         provider: e.config.selection().provider,
         model: e.config.model.clone(),

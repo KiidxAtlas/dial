@@ -14,14 +14,14 @@ from dial_server import ToolCallFormatter
 class EngineTests(unittest.TestCase):
     def test_vision_runner_uses_its_own_engine_and_compatible_steering_boundary(self):
         server = SimpleNamespace(main=mock.Mock())
-        steering = SimpleNamespace(install_server=mock.Mock())
+        steering = SimpleNamespace(install_vision_server=mock.Mock())
         with mock.patch.dict(os.environ, {"DIAL_MODEL_ENGINE": "mlx-vlm"}), \
              mock.patch.dict(sys.modules, {"mlx_vlm": SimpleNamespace(server=server),
                                            "mlx_lm": None, "dial_steering": steering}), \
              mock.patch.object(dial_server, "watch_parent"):
             dial_server.main()
         server.main.assert_called_once_with()
-        steering.install_server.assert_called_once_with(server, None)
+        steering.install_vision_server.assert_called_once_with(server, None)
 
 
 class ParentLifetimeTests(unittest.TestCase):

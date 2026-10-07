@@ -58,7 +58,7 @@ impl Default for Config {
             enabled: true,
             sampling: false,
             reasoning: true,
-            output_limits: true,
+            output_limits: false,
             pin_sampling: false,
             phase: Phase::Auto,
             investigation_temperature: 0.2,
@@ -453,8 +453,25 @@ mod tests {
         assert_eq!(s.phase, Phase::Editing);
     }
     #[test]
-    fn budgets_respect_operator_limits_and_length_recovery_escapes_phase_cap() {
+    fn default_output_budget_is_not_reduced_by_phase() {
         let c = config();
+        assert!(!c.adaptive.output_limits);
+        for phase in [
+            Phase::Investigation,
+            Phase::Editing,
+            Phase::Verification,
+            Phase::Recovery,
+            Phase::Exploration,
+        ] {
+            let mut s = State::begin(Kind::Editing, "Implement change");
+            s.phase = phase;
+            assert_eq!(choose(&c, &s, None, false, false).max_tokens, 8192);
+        }
+    }
+    #[test]
+    fn budgets_respect_operator_limits_and_length_recovery_escapes_phase_cap() {
+        let mut c = config();
+        c.adaptive.output_limits = true;
         let mut s = State::begin(Kind::Investigation, "Locate symbol");
         let first = choose(&c, &s, None, false, false);
         assert_eq!(first.max_tokens, 2048);

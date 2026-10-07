@@ -168,7 +168,9 @@ fn parse_items(args: &Value, op: &str, mut inherited: Option<String>) -> Result<
             Some(value) => value.as_bool().ok_or("investigation must be a boolean")?,
         };
         if investigation && status == Status::Completed {
-            return Err("Investigation tasks must start open; close them with done, finding and evidence after inspecting.".into());
+            return Err(format!(
+                "Task {n}: investigation tasks must start open. Omit status when creating the plan; after inspecting, close the active task with {{\"op\":\"done\",\"finding\":\"what you found\",\"evidence\":[\"src/file.rs:line\"]}}. Task numbers start at 1, not 0. Do not resend a plan with completed investigations."
+            ));
         }
         tasks.push(Task {
             content,
@@ -310,11 +312,11 @@ impl TodoList {
                 |(i, t)| format!("Next: {}.", t.label(i + 1)),
             );
         let mut focus = format!(
-            "[Task focus from dial, not the user] Current step ({closed}/{total} done): {}. {next} Work only on this step; call todo done once it is finished and checked.",
+            "[Task focus from dial, not the user] Current step ({closed}/{total} done): {}. {next} Finish and check this step, then todo done.",
             self.tasks[slot].label(slot + 1)
         );
         if self.tasks[slot].investigation {
-            focus.push_str(" Resolve this question with the smallest useful check. Close it with finding and evidence, or block with the missing prerequisite. If the result uncovers necessary work not already represented, call todo append before pursuing it; use start on that item if it must precede the current step. Preserve existing tasks and findings rather than replacing the plan. Stop exploring once the answer supports the next action.");
+            focus.push_str(" Resolve with the smallest useful check; close with finding/evidence or block with the prerequisite. Append newly necessary work, preserve findings, and stop exploring once the next action is supported.");
         }
         // A bounded tail of findings survives context projection without shifting the cached prefix.
         for task in self
@@ -385,7 +387,14 @@ impl TodoList {
         let mut next = self.tasks.clone();
         let event = match Self::apply(&mut next, op, args) {
             Ok(event) => event,
-            Err(error) => return fail(error),
+            Err(error) => {
+                let mut output = fail(format!(
+                    "{error}\nNo tasks were changed. Current plan:\n{}\nUse op=done to close the active task; do not replace an existing plan to record findings.",
+                    self.summary()
+                ));
+                output.data = Some(serde_json::json!({"tasks": self.snapshot()}));
+                return output;
+            }
         };
         // Prune before the cap check so accumulated closed work cannot crowd out new tasks; the
         // summary below renders the pruned list, keeping the numbering the model will cite next.
@@ -682,6 +691,37 @@ mod tests {
             .restore(&json!([{"content":"old task","status":"completed"}]))
             .unwrap();
         assert!(!legacy.tasks()[0].investigation);
+    }
+
+    #[test]
+    fn rejected_plan_returns_preserved_state_and_actionable_recovery() {
+        let mut list = TodoList::new();
+        set(
+            &mut list,
+            json!([{"content":"Inspect clear", "investigation":true}]),
+        );
+        let before = list.snapshot();
+        let output = set(
+            &mut list,
+            json!([
+                {"content":"Inspect clear", "investigation":true, "status":"completed"}
+            ]),
+        );
+        assert!(output.is_error);
+        assert!(output.text.contains("Omit status"));
+        assert!(output.text.contains("\"op\":\"done\""));
+        assert!(output.text.contains("Task numbers start at 1"));
+        assert!(output.text.contains("Current plan:"));
+        assert!(output.text.contains("Inspect clear"));
+        assert_eq!(output.data.unwrap()["tasks"], before);
+        assert_eq!(list.snapshot(), before);
+        assert!(
+            !list
+                .call(&json!({
+                    "op":"done", "finding":"Clear only repaints", "evidence":["src/app.rs:2994"]
+                }))
+                .is_error
+        );
     }
 
     fn set(list: &mut TodoList, tasks: Value) -> ToolOutput {

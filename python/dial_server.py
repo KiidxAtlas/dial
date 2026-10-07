@@ -267,9 +267,9 @@ def main():
                 raise RuntimeError("Local vision requires MLX-VLM in Dial's Python runtime; run dial setup") from error
             raise
         install_vision_progress(server)
-        from dial_steering import install_server
+        from dial_steering import install_vision_server
         specification = os.environ.get("DIAL_STEERING_SPEC", "")
-        install_server(server, json.loads(specification) if specification else None)
+        install_vision_server(server, json.loads(specification) if specification else None)
         server.main()
         return
     from mlx_lm import server

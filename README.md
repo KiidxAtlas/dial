@@ -1244,11 +1244,12 @@ teacher_timeout_secs = 10
 ### Experimental MLX activation steering
 
 Dial can extract a unit-length behavior vector from matched positive/negative assistant responses,
-then add it to one transformer layer during inference. This runs in Dial's own MLX-LM text server;
-the MLX-VLM vision runner, hosted providers and external inference servers have no Dial activation
-hook. Vision models continue to handle images and tools without activation steering. Unsupported
-runners skip automatic steering extraction and evaluation before starting a worker; `/steering`
-reports the limitation. Automatic creation is enabled
+then add it to one language-decoder transformer layer during inference. This runs in Dial's own
+MLX-LM text server and MLX-VLM vision server, including image requests and cached decoding.
+The vision encoder stays unchanged. Vision-model extraction and evaluation use the same decoder
+weights and model tokenizer for text/tool contracts; these checks do not certify image accuracy.
+Hosted providers and external inference servers have no Dial activation hook. Incompatible decoder
+architectures bypass the vector and report the reason through `/steering`. Automatic creation is enabled
 by default as part of automatic improvement; no vector is used before it passes evaluation.
 No random vector is activated automatically, and this is independent of OMP and Laya.
 

@@ -99,6 +99,17 @@ impl RepeatGuard {
         if call.name == "todo" && call.arguments["op"] == "done" {
             return format!("todo\u{0}done\u{0}{}", call.arguments["index"]);
         }
+        // Rewording task descriptions cannot fix a plan containing precompleted investigations.
+        if call.name == "todo"
+            && matches!(call.arguments["op"].as_str(), Some("set" | "append"))
+            && call.arguments["tasks"].as_array().is_some_and(|tasks| {
+                tasks
+                    .iter()
+                    .any(|task| task["investigation"] == true && task["status"] == "completed")
+            })
+        {
+            return "todo\u{0}precompleted-investigation".into();
+        }
         format!("{}\u{0}{}", call.name, call.arguments)
     }
     /// Keep failures across intervening reads. Only success for this exact call resets its count.

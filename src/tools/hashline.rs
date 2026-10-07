@@ -2173,6 +2173,7 @@ mod tests {
         let path = dir.path().join("a.txt");
         fs::write(&path, "a\nb\nc\n").unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
+        let path = ws.resolve("a.txt").unwrap();
         let tag = ws.store().record(&path, "a\nb\nc\n", &[(1, 1)]);
         for target in ["2", "2,3"] {
             let patch = format!("[a.txt#{tag}]\nPUT {target}:\n+x\n");

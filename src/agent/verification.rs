@@ -41,6 +41,55 @@ pub(super) fn zero_tests(output: &str) -> bool {
     counts.peek().is_some() && counts.all(|n| n == 0)
 }
 
+/// Only compact retained successful checks; preserve test counts and diagnostics
+/// in the visible tail, and leave empty suites/failures untouched.
+pub(super) fn compact_success(output: &str, artifact: &str) -> Option<String> {
+    if output.len() < 4096 || exit_code(output) != Some(0) || zero_tests(output) {
+        return None;
+    }
+    let mut tail = output.len().saturating_sub(2048);
+    while !output.is_char_boundary(tail) {
+        tail += 1;
+    }
+    Some(format!(
+        "[Successful check; {} bytes retained at {artifact}; retrieve with artifact_read]\n{}",
+        output.len(),
+        &output[tail..]
+    ))
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    #[test]
+    fn compaction_is_bounded_retrievable_and_preserves_verdicts() {
+        let text = format!(
+            "{}\nrunning 12 tests\ntest result: ok. 12 passed\n[exit code: 0]",
+            "build progress\n".repeat(1000)
+        );
+        let compact = compact_success(&text, "artifact://check").unwrap();
+        assert!(
+            compact.len() < 2300
+                && compact.contains("12 passed")
+                && compact.contains("artifact://check")
+        );
+        assert!(
+            compact_success(
+                &text.replace("[exit code: 0]", "[exit code: 1]"),
+                "artifact://check"
+            )
+            .is_none()
+        );
+        assert!(
+            compact_success(
+                &text.replace("running 12 tests", "running 0 tests"),
+                "artifact://check"
+            )
+            .is_none()
+        );
+    }
+}
+
 /// Plans safe syntax/type checks for supported changed files without running them.
 pub fn plan(root: &Path, python: &Path, changed_paths: &[PathBuf]) -> Vec<FocusedCheck> {
     let has_rust_changes = changed_paths.iter().any(|path| {

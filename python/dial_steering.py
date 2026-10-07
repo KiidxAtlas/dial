@@ -92,9 +92,35 @@ def bind(bundle, model_path, adapter_path):
 
 
 def layer_list(model):
-    layers=getattr(model,'layers',None)
+    # Some multimodal models expose vision layers on the outer object. Always target the
+    # language decoder so image encoding remains unchanged and worker/server layer indices agree.
+    decoder=getattr(model,'language_model',model)
+    layers=getattr(decoder,'layers',None)
+    if layers is None:
+        layers=getattr(getattr(decoder,'model',None),'layers',None)
     require(isinstance(layers,list) and 1<=len(layers)<=256, 'architecture does not expose mutable transformer layers')
     return layers
+
+
+def text_model(model):
+    """Expose a VLM decoder's logits/cache through MLX-LM's text evaluation interface."""
+    if not hasattr(model,'language_model'):
+        return model
+    import mlx.nn as nn
+    class Decoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self['inner']=model.language_model
+        def __getattr__(self,name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                if 'inner' not in self:raise
+                return getattr(self['inner'],name)
+        def __call__(self,*args,**kwargs):
+            output=self.inner(*args,**kwargs)
+            return getattr(output,'logits',output)
+    return Decoder()
 
 
 def wrap(layer, callback):
@@ -146,6 +172,52 @@ def steering_callback(vector, strength, counted=False):
     return add
 
 
+def apply_server_vector(model, model_path, adapter_path, specification, engine):
+    """Admission and shape probing happen before the first cache or decoding request is built."""
+    STATUS.clear();STATUS.update(state='bypassed',uses=0,engine=engine)
+    try:
+        bundle=validate(read_json(specification['path']),specification['strength'],admitted=True)
+        require(bundle['id']==specification['id'], 'steering file changed since admission')
+        bind(bundle,model_path,adapter_path)
+        layers=layer_list(model)
+        require(len(layers)==bundle['layer_count'], 'layer count changed')
+        import mlx.core as mx
+        captured=[]
+        with hook(model,bundle['layer'],lambda output:(captured.append(hidden(output).shape[-1]) or output)):
+            mx.eval(text_model(model)(mx.array([[0]],dtype=mx.int32)))
+        require(captured==[bundle['dimension']], 'architecture hidden dimension does not match vector')
+        layers[bundle['layer']]=wrap(layers[bundle['layer']],steering_callback(bundle['vector'],specification['strength'],True))
+        STATUS.update(state='loaded',id=bundle['id'],layer=bundle['layer'],strength=specification['strength'],uses=0,scope='fixed server profile; cache isolated by server lifetime')
+    except Exception as error:
+        STATUS.update(state='bypassed',reason=str(error),uses=0)
+
+
+def install_vision_server(server, specification):
+    """Attach to MLX-VLM's GPU-thread resource loader, before batching or fallback generation."""
+    import importlib
+    require(callable(getattr(getattr(server,'app',None),'add_api_route',None)),
+            'steering requires a compatible MLX-VLM FastAPI server')
+    generation=importlib.import_module('mlx_vlm.server.generation')
+    original=getattr(generation,'load_model_resources',None)
+    require(callable(original),'steering requires MLX-VLM load_model_resources')
+    STATUS.clear();STATUS.update(state='disabled',uses=0,engine='mlx-vlm')
+    if specification is not None:
+        def load(model_path,adapter_path):
+            model,processor,config=original(model_path,adapter_path)
+            # Dial launches a fixed profile with APC disabled. Reject a manually injected draft
+            # profile rather than sharing a steered target's caches with an unsteered draft.
+            runtime=getattr(server,'runtime',None)
+            draft=getattr(getattr(runtime,'config',None),'spec_draft_model',None)
+            if draft or os.environ.get('MLX_VLM_DRAFT_MODEL'):
+                STATUS.clear();STATUS.update(state='bypassed',uses=0,engine='mlx-vlm',reason='steering does not support speculative inference')
+            else:
+                apply_server_vector(model,model_path,adapter_path,specification,'mlx-vlm')
+            return model,processor,config
+        generation.load_model_resources=load
+    # Return a snapshot; the GPU thread updates confirmed use while FastAPI serves this endpoint.
+    server.app.add_api_route('/dial/steering',lambda:dict(STATUS),methods=['GET'])
+
+
 def install_server(server, specification):
     """Patch compatible MLX-LM APIs; other backends may run without steering."""
     provider_class=getattr(server,'ModelProvider',None)
@@ -157,23 +229,10 @@ def install_server(server, specification):
         return
     def load(provider, model_path, adapter_path=None, draft_model_path=None):
         original(provider,model_path,adapter_path,draft_model_path)
-        STATUS.clear();STATUS.update(state='bypassed',uses=0)
-        try:
-            require(not provider.is_distributed and provider.draft_model is None, 'steering does not support distributed or speculative inference')
-            bundle=validate(read_json(specification['path']),specification['strength'],admitted=True)
-            require(bundle['id']==specification['id'], 'steering file changed since admission')
-            bind(bundle,model_path,adapter_path)
-            layers=layer_list(provider.model)
-            require(len(layers)==bundle['layer_count'], 'layer count changed')
-            import mlx.core as mx
-            captured=[]
-            with hook(provider.model,bundle['layer'],lambda output:(captured.append(hidden(output).shape[-1]) or output)):
-                mx.eval(provider.model(mx.array([[0]],dtype=mx.int32)))
-            require(captured==[bundle['dimension']], 'architecture hidden dimension does not match vector')
-            layers[bundle['layer']]=wrap(layers[bundle['layer']],steering_callback(bundle['vector'],specification['strength'],True))
-            STATUS.update(state='loaded',id=bundle['id'],layer=bundle['layer'],strength=specification['strength'],uses=0,scope='fixed server profile; cache isolated by server lifetime')
-        except Exception as error:
-            STATUS.update(state='bypassed',reason=str(error),uses=0)
+        if provider.is_distributed or provider.draft_model is not None:
+            STATUS.clear();STATUS.update(state='bypassed',uses=0,reason='steering does not support distributed or speculative inference')
+        else:
+            apply_server_vector(provider.model,model_path,adapter_path,specification,'mlx-lm')
     if specification is not None:
         provider_class._load=load
     def do_get(handler):
@@ -213,9 +272,21 @@ def prompt(tokenizer, value, complete=False, tools=None):
 
 
 def load(request):
-    from mlx_lm import load as mlx_load
     model_path=request['model'];adapter=request.get('adapter')
     require(Path(model_path).is_dir(),'steering requires a resolved local model directory')
+    config=read_json(Path(model_path)/'config.json')
+    if isinstance(config.get('vision_config'),dict):
+        from mlx_vlm import load as vlm_load
+        from mlx_lm.tokenizer_utils import load as load_tokenizer
+        model,processor=vlm_load(model_path,adapter_path=adapter,trust_remote_code=False)
+        # Evaluation contracts are text/tool tasks, using the same decoder weights as image
+        # inference. Load the model's tokenizer with its EOS and tool markers for exact checks.
+        eos=getattr(getattr(processor,'stopping_criteria',None),'eos_token_ids',None)
+        if eos is None:
+            eos=getattr(getattr(getattr(processor,'tokenizer',None),'stopping_criteria',None),'eos_token_ids',None)
+        tokenizer=load_tokenizer(Path(model_path),{'trust_remote_code':False},eos_token_ids=eos)
+        return text_model(model),tokenizer
+    from mlx_lm import load as mlx_load
     return mlx_load(model_path,adapter_path=adapter,tokenizer_config={'trust_remote_code':False})
 
 

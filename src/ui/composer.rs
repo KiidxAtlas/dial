@@ -96,6 +96,7 @@ struct Match {
 struct Menu {
     query: String,
     file_start: Option<usize>,
+    arguments: Option<Vec<CommandEntry>>,
     matches: Vec<Match>,
     selected: usize,
     scroll: usize,
@@ -231,6 +232,8 @@ impl Composer {
                     && seen.insert(candidate.clone())
             })
             .collect();
+        self.menu = None;
+        self.refresh();
     }
 
     /// While busy Enter steers, Alt-Enter schedules a follow-up, and Esc interrupts.
@@ -254,8 +257,10 @@ impl Composer {
         self.refresh();
     }
 
-    fn menu_entries(&self, menu: &Menu) -> &[CommandEntry] {
-        if menu.file_start.is_some() {
+    fn menu_entries<'a>(&'a self, menu: &'a Menu) -> &'a [CommandEntry] {
+        if let Some(arguments) = &menu.arguments {
+            arguments
+        } else if menu.file_start.is_some() {
             &self.files
         } else {
             &self.commands
@@ -486,13 +491,16 @@ impl Composer {
             return false;
         };
         let entry = &self.menu_entries(menu)[menu.matches[menu.selected].index];
+        let arguments = menu.arguments.is_some();
         let completed = if let Some(start) = menu.file_start {
             format!("{}@{} ", &self.editor.text[..start], entry.name)
+        } else if menu.arguments.is_some() {
+            format!("/{}", entry.name)
         } else {
             format!("/{} ", entry.name)
         };
         self.editor.set(&completed);
-        self.dismissed = None;
+        self.dismissed = arguments.then_some(completed);
         true
     }
 
@@ -663,7 +671,38 @@ impl Composer {
             return None;
         }
         let rest = text.strip_prefix('/')?;
-        (!rest.chars().any(char::is_whitespace)).then_some((rest, None))
+        if rest.chars().any(char::is_control) {
+            return None;
+        }
+        (!rest.chars().any(char::is_whitespace) || self.argument_entries(rest).is_some())
+            .then_some((rest, None))
+    }
+
+    /// Offer only the next word at the current command depth. This prevents nested flags or skill
+    /// names from overwhelming the initial subcommand list.
+    fn argument_entries(&self, query: &str) -> Option<Vec<CommandEntry>> {
+        let (prefix, _) = query.rsplit_once(' ')?;
+        let root = query.split(' ').next()?;
+        let command = self.commands.iter().find(|entry| entry.name == root)?;
+        let stem = format!("/{prefix} ");
+        let mut seen = std::collections::HashSet::new();
+        let entries: Vec<_> = self
+            .argument_completions
+            .iter()
+            .filter_map(|candidate| {
+                let next = candidate.strip_prefix(&stem)?.split(' ').next()?;
+                if next.is_empty() || !seen.insert(next.to_owned()) {
+                    return None;
+                }
+                Some(CommandEntry {
+                    name: format!("{prefix} {next}"),
+                    description: String::new(),
+                    kind: command.kind,
+                    args_hint: None,
+                })
+            })
+            .collect();
+        (!entries.is_empty()).then_some(entries)
     }
 
     fn refresh(&mut self) {
@@ -683,9 +722,16 @@ impl Composer {
                     .is_some_and(|m| m.query == query && m.file_start == start) => {}
             Some((query, file_start)) => {
                 let query = query.to_owned();
+                let arguments = if file_start.is_none() {
+                    self.argument_entries(&query)
+                } else {
+                    None
+                };
                 self.menu = Some(Menu {
                     matches: rank(
-                        if file_start.is_some() {
+                        if let Some(entries) = &arguments {
+                            entries
+                        } else if file_start.is_some() {
                             &self.files
                         } else {
                             &self.commands
@@ -694,6 +740,7 @@ impl Composer {
                     ),
                     query,
                     file_start,
+                    arguments,
                     selected: 0,
                     scroll: 0,
                 });
@@ -708,12 +755,23 @@ impl Composer {
         if self.busy
             || self.search.is_some()
             || self.history_index.is_some()
-            || self.menu_open()
+            || (self.menu_open()
+                && self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.arguments.is_none()))
             || draft.is_empty()
             || self.editor.cursor != draft.len()
             || self.dismissed.as_deref() == Some(draft)
         {
             return None;
+        }
+        if let Some(menu) = self.menu.as_ref().filter(|_| self.menu_open()) {
+            let entry = &self.menu_entries(menu)[menu.matches.get(menu.selected)?.index];
+            return entry
+                .name
+                .strip_prefix(&draft[1..])
+                .filter(|suffix| !suffix.is_empty());
         }
         let extends = |entry: &str| {
             entry.starts_with(draft)
@@ -1012,6 +1070,8 @@ impl Composer {
         if total == 0 {
             let message = if menu.file_start.is_some() {
                 "  No matching files"
+            } else if menu.arguments.is_some() {
+                "  No matching subcommands or options"
             } else {
                 "  No matching commands"
             };
@@ -1029,7 +1089,7 @@ impl Composer {
             .map(|m| text::width(&entries[m.index].name))
             .max()
             .unwrap_or(0)
-            .min(if menu.file_start.is_some() {
+            .min(if menu.file_start.is_some() || menu.arguments.is_some() {
                 w.saturating_sub(6)
             } else {
                 MAX_NAME_COLUMN
@@ -2729,6 +2789,96 @@ mod tests {
     // ---- ghost suggestions ------------------------------------------------------------------
 
     #[test]
+    fn subcommand_menu_lists_filters_and_completes_without_submitting() {
+        let env = Env::new();
+        let mut c = Composer::new(vec![], 10);
+        c.set_commands(vec![cmd(
+            "improve",
+            "Self-improvement",
+            CommandKind::Builtin,
+        )]);
+        c.set_argument_completions(vec!["/improve jobs".into(), "/improve stop".into()]);
+        typed(&mut c, &env, "/improve ");
+        assert!(c.menu_open(), "a space should reveal subcommands");
+        let rows = screen(&c, &env, 80);
+        assert!(rows.iter().any(|row| row.contains("improve jobs")));
+        assert!(rows.iter().any(|row| row.contains("improve stop")));
+        press(&mut c, &env, KeyCode::Down);
+        assert_eq!(press(&mut c, &env, KeyCode::Tab), ComposerEvent::None);
+        assert_eq!(c.draft(), "/improve stop");
+        assert!(!c.menu_open());
+        c.set_draft("/improve jo");
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+        assert_eq!(c.draft(), "/improve jobs");
+        assert_eq!(
+            press(&mut c, &env, KeyCode::Enter),
+            ComposerEvent::Submit("/improve jobs".into())
+        );
+    }
+
+    #[test]
+    fn nested_argument_menus_show_only_the_next_word_and_respect_input_controls() {
+        let env = Env::new();
+        let mut c = Composer::new(vec![], 10);
+        c.set_commands(vec![cmd("skills", "Skills", CommandKind::Builtin)]);
+        c.set_argument_completions(vec![
+            "/skills list".into(),
+            "/skills enable review".into(),
+            "/skills enable review --user".into(),
+            "/skills enable lint".into(),
+        ]);
+        c.set_draft("/skills ");
+        assert_eq!(
+            c.menu.as_ref().unwrap().matches.len(),
+            2,
+            "nested choices collapse to one enable row"
+        );
+        c.set_draft("/skills enable ");
+        let rows = screen(&c, &env, 80);
+        assert!(rows.iter().any(|row| row.contains("skills enable review")));
+        assert!(rows.iter().any(|row| row.contains("skills enable lint")));
+        assert!(!rows.iter().any(|row| row.contains("--user")));
+        press(&mut c, &env, KeyCode::Tab);
+        typed(&mut c, &env, " ");
+        assert_eq!(c.ghost(), Some("--user"));
+        assert!(c.menu_open());
+        press(&mut c, &env, KeyCode::Esc);
+        assert!(!c.menu_open());
+        assert_eq!(c.draft(), "/skills enable review ");
+        typed(&mut c, &env, "--u");
+        assert!(c.menu_open());
+        press(&mut c, &env, KeyCode::Left);
+        assert!(!c.menu_open());
+        press(&mut c, &env, KeyCode::End);
+        assert!(c.menu_open());
+        for width in 1..100 {
+            assert!(
+                screen(&c, &env, width)
+                    .iter()
+                    .all(|row| text::width(row) <= width as usize)
+            );
+        }
+        c.set_busy(true);
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+        assert_eq!(c.draft(), "/skills enable review --user");
+        assert!(c.take_steering().is_empty());
+        c.set_draft("");
+        c.handle_paste("/skills enable ");
+        assert!(c.menu_open());
+        assert_eq!(c.draft(), "/skills enable ");
+        c.set_draft("/skills nope");
+        assert!(
+            screen(&c, &env, 80)
+                .iter()
+                .any(|row| row.contains("No matching subcommands"))
+        );
+        c.set_draft("/skills enable\nreview");
+        assert!(!c.menu_open());
+        c.set_draft("/unknown ");
+        assert!(!c.menu_open());
+    }
+
+    #[test]
     fn command_arguments_are_dim_ghosts_without_history_and_complete_without_submitting() {
         let env = Env::new();
         let mut c = Composer::new(Vec::new(), 100);
@@ -2763,9 +2913,11 @@ mod tests {
         assert_eq!(c.draft(), "/understanding architecture");
         c.set_draft("/skills so");
         assert_eq!(c.ghost(), Some("urces"));
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
         assert_eq!(
-            press(&mut c, &env, KeyCode::Enter),
-            ComposerEvent::Submit("/skills so".into())
+            c.draft(),
+            "/skills sources",
+            "Enter completes before running"
         );
         c.set_draft("/skills enable ");
         assert_eq!(c.ghost(), Some("review"));

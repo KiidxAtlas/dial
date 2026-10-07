@@ -185,7 +185,8 @@ fn owned_mlx(config: &AppConfig) -> bool {
 }
 /// Match the supervisor's runner choice without starting Python or loading weights.
 pub(crate) fn local_unsupported_reason(_model: &str) -> Option<&'static str> {
-    // Vision models now support steering via the same ModelProvider._load hook.
+    // Both managed engines have activation hooks. Python probes decoder layers and dimensions
+    // before applying an evaluated vector; hosted/external endpoints remain unsupported.
     None
 }
 fn unsupported_reason(config: &AppConfig) -> Option<&'static str> {
@@ -688,33 +689,24 @@ mod tests {
             "disabled or unsupported"
         );
     }
-    fn vision_runner_supports_steering_with_the_same_hook() {
-        let (dir, mut config, store) = auto_fixture();
-        seed_pairs(&mut config, &store);
+    #[test]
+    fn vision_models_keep_the_evaluation_gate_and_normal_dataset_validation() {
+        let (dir, mut config, _store) = auto_fixture();
         let model = dir.path().join("vision-model");
         fs::create_dir(&model).unwrap();
         fs::write(model.join("config.json"), r#"{"vision_config":{}}"#).unwrap();
         config.model = model.to_string_lossy().into_owned();
         config.steering.enabled = true;
+        config.steering.automatic = false;
         let path = vector_path(&config);
         settings_store::private_dir(path.parent().unwrap()).unwrap();
         let mut vector = candidate();
         vector["model_name"] = json!(config.model);
         vector["origin"] = json!("automatic verified repairs");
         settings_store::write_private(&path, &serde_json::to_vec(&vector).unwrap()).unwrap();
-        let before = fs::read(&path).unwrap();
-        // Vision models now support steering via the same ModelProvider._load hook.
         assert_eq!(status(&config)["state"], "configured");
-        let result = automatic_with(&config, &store, None, &mut |_| {
-            panic!("automatic steering must not start a worker for this fixture")
-        })
-        .unwrap();
-        assert_eq!(result["phase"], "admitted");
-        assert!(result["reason"].is_null());
-        assert!(!path.with_extension("automatic.json").exists());
-        // Specification is available for vision models now.
         assert!(specification(&config, &config.model).unwrap().is_some());
-        // Runner eligibility is checked before reading the dataset or acquiring a compute lease.
+        // Eligible vision models still reject missing datasets before starting any worker.
         assert!(
             run(
                 &config,
@@ -723,9 +715,11 @@ mod tests {
                 None,
                 None
             )
-            .is_ok()
+            .is_err()
         );
-        assert_eq!(fs::read(&path).unwrap(), before);
+        vector["evaluation"]["passed"] = json!(false);
+        settings_store::write_private(&path, &serde_json::to_vec(&vector).unwrap()).unwrap();
+        assert!(specification(&config, &config.model).is_err());
     }
     #[test]
     fn automatic_admits_only_passing_candidates_and_preserves_last_good_on_failure() {

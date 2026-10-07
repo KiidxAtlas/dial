@@ -266,6 +266,10 @@ fn chat_with_ui(
             match rx.recv_timeout(Duration::from_millis(80)) {
                 Ok(ChatEvent::Progress(value)) => {
                     last_progress = Instant::now();
+                    if let Some(context) = &mut context {
+                        let (tokens, estimated) = context.telemetry(&value);
+                        ui.context_usage(tokens, estimated);
+                    }
                     if let Some(progress) = &mut progress {
                         progress.observe(value, last_progress);
                         ui.model_progress(&progress.value);
@@ -279,7 +283,7 @@ fn chat_with_ui(
                     }
                     if render_text {
                         if let Some(context) = &mut context {
-                            ui.context_usage(context.observe(&text), true);
+                            ui.context_usage(context.observe(&text), context.estimated());
                         }
                         ui.text_delta(&text);
                     }
@@ -296,7 +300,7 @@ fn chat_with_ui(
                     }
                     if render_text {
                         if let Some(context) = &mut context {
-                            ui.context_usage(context.observe(&text), true);
+                            ui.context_usage(context.observe(&text), context.estimated());
                         }
                         ui.reasoning_delta(&text);
                     }
@@ -314,7 +318,7 @@ fn chat_with_ui(
                     }
                     if render_text {
                         if let Some(context) = &mut context {
-                            ui.context_usage(context.observe(&delta), true);
+                            ui.context_usage(context.observe(&delta), context.estimated());
                         }
                         ui.tool_arguments_delta(index, &id, &name, &delta);
                     }
@@ -836,7 +840,7 @@ impl<'a> Agent<'a> {
             context_cap: None,
             enabled_tools: HashSet::new(),
             metrics: AgentMetrics::default(),
-            usage_scope: Default::default(),
+            usage_scope: llm::usage::Scope::default().next_turn(subagents::MAX_STEPS),
             reasoning_recovery: reasoning::Recovery::default(),
             live_tasks: live_tasks::LiveTasks::default(),
             superseded: evidence::Supersession::default(),
@@ -953,7 +957,7 @@ impl<'a> Agent<'a> {
             context_cap: None,
             enabled_tools: HashSet::new(),
             metrics: AgentMetrics::default(),
-            usage_scope: Default::default(),
+            usage_scope: llm::usage::Scope::default().next_turn(subagents::MAX_STEPS),
             reasoning_recovery: reasoning::Recovery::default(),
             live_tasks: live_tasks::LiveTasks::default(),
             superseded: evidence::Supersession::default(),
@@ -1483,7 +1487,7 @@ impl<'a> Agent<'a> {
                 "artifact_read" => tools::artifact::schema(),
                 "working_state" => evidence::working_schema(),
                 "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Discover specialist tools by capability or name. Discovery does not enable calls: load exact names and await the next model round.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
-                "tool_load" => json!({"type":"function","function":{"name":"tool_load","description":"Enable available specialist tools for subsequent model rounds. Selection persists in this session. Tools loaded in this call cannot be called in the same batch.","parameters":{"type":"object","properties":{"names":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"string"}}},"required":["names"],"additionalProperties":false}}}),
+                "tool_load" => json!({"type":"function","function":{"name":"tool_load","description":"Enable specialist tools for subsequent rounds; optionally unload names after a workflow to reduce schema overhead. Changes take effect next round, never in this batch.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":32,"items":{"type":"string"}},"unload":{"type":"array","maxItems":32,"items":{"type":"string"}}},"additionalProperties":false}}}),
                 "exit_plan" => json!({"type":"function","function":{"name":"exit_plan","description":"Ask the user to approve this plan and leave plan mode.","parameters":{"type":"object","properties":{"plan":{"type":"string","minLength":1}},"required":["plan"],"additionalProperties":false}}}),
                 other => json!({"type":"function","function":{"name":other,
                     "description":"Operator-approved tool. Pass the request as `input`.",
@@ -2403,7 +2407,8 @@ impl<'a> Agent<'a> {
         let cache = self.codebase.as_ref()?.clone();
         let workspace = self.workspace.clone();
         let cancel = self.interrupt.clone();
-        let max_bytes = self.config.codebase.context_max_bytes;
+        // Initial context is an index; explicit retrieval retains its own budget.
+        let max_bytes = self.config.codebase.context_max_bytes.min(8192);
         let result = thread::scope(|scope| -> Result<_> {
             let (tx, rx) = mpsc::sync_channel(1);
             let worker = scope.spawn(move || {
@@ -2484,7 +2489,6 @@ impl<'a> Agent<'a> {
         if self.interrupt.load(Ordering::SeqCst) {
             return Ok(());
         }
-        cache.mark_architecture_attempt(&synthesis)?;
         ui.notice("Updating saved architecture from bounded source evidence (one model call, up to 60 seconds; Esc cancels).");
         let request = Chat {
             messages: vec![
@@ -2506,6 +2510,9 @@ impl<'a> Agent<'a> {
         } else {
             None
         };
+        // Setup failures must not suppress maintenance for unchanged sources after the user fixes
+        // model availability. Mark an attempt only once a backend has been constructed.
+        cache.mark_architecture_attempt(&synthesis)?;
         let mut main = self.backend.take();
         let mut backend = if let Some(backend) = role_backend {
             main.as_mut().expect("checked main backend").release();
@@ -2582,7 +2589,13 @@ impl<'a> Agent<'a> {
             ui.notice("Architecture maintenance yielded to queued work.");
             return Ok(());
         }
-        let reply = reply?;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                cache.defer_architecture_attempt(&synthesis)?;
+                return Err(error);
+            }
+        };
         self.record(0,"architecture_synthesis",json!({"completion_tokens":reply.completion_tokens,"prompt_tokens":reply.prompt_tokens}))?;
         ensure!(
             reply.tool_calls.is_empty(),
@@ -2773,6 +2786,7 @@ impl<'a> Agent<'a> {
             let focus = messages
                 .last()
                 .filter(|m| m["role"] == "tool")
+                .filter(|_| packet.is_none())
                 .and_then(|_| self.todo.focus());
             let mut task_context = focus.unwrap_or_default();
             if let Some(packet) = packet {
@@ -2870,6 +2884,11 @@ impl<'a> Agent<'a> {
                 )?;
             }
             let request_estimate = context_meter::estimate_request(&request);
+            self.record(
+                step,
+                "request_overhead",
+                serde_json::to_value(context_meter::overhead(&request))?,
+            )?;
             let request_context = self.context_meter.predict(request_estimate);
             let started = Instant::now();
             let timeout = self.config.worker_timeout_secs;
@@ -3020,7 +3039,7 @@ impl<'a> Agent<'a> {
                     match self.reasoning_recovery.intercept(reason) {
                         Ok(message) => {
                             ui.notice(&message);
-                            self.push(json!({"role":"user","content":message}))?;
+                            self.push(json!({"role":"user","content":message,"dial_reminder":"reasoning"}))?;
                         }
                         Err(message) => return self.stop_turn(ui, message, step + 1),
                     }
@@ -3515,8 +3534,12 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 }
                 match stall.call(call, output.is_error) {
                     guard::Stall::Warn(advice) => {
-                        recovery_checkpoint.arm(&call.name, &advice);
-                        ui.notice(&format!("Recovery checkpoint: `{}` keeps failing; choose a different action to restore it.", call.name));
+                        if self.config.reliability.enabled {
+                            recovery_checkpoint.arm(&call.name, &advice);
+                            ui.notice(&format!("Recovery checkpoint: `{}` keeps failing; choose a different action to restore it.", call.name));
+                        } else {
+                            ui.notice(&advice);
+                        }
                         output.text.push_str("\n\n");
                         output.text.push_str(&advice);
                     }
@@ -3553,6 +3576,16 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 );
                 let mut body =
                     duplicate.unwrap_or_else(|| guard::clip_evidence(&output.text, limit));
+                if call.name == "bash"
+                    && !output.is_error
+                    && call.arguments["command"]
+                        .as_str()
+                        .is_some_and(is_check_command)
+                    && let Some(uri) = &artifact
+                    && let Some(compact) = verification::compact_success(&output.text, uri)
+                {
+                    body = compact;
+                }
                 if (output.text.len() > limit || body.starts_with("[Investigation check"))
                     && let Some(uri) = &artifact
                 {
@@ -3561,7 +3594,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     ));
                 }
                 let mut message = llm::tool_message(&call.id, &body);
-                message["dial_evidence"] = json!({"artifact":artifact});
+                message["dial_evidence"] = json!({"artifact":artifact,"is_error":output.is_error});
                 let clipped = output.text.len() > limit
                     || output.text.contains("output omitted")
                     || output.text.contains("bytes clipped");
@@ -4540,12 +4573,27 @@ text: "Plan approved; implementation is now permitted subject to normal tool app
                     .filter_map(Value::as_str)
                     .map(str::to_owned)
                     .collect();
+                let unload: Vec<String> = args["unload"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
                 let catalog = self.catalog();
-                if requested.is_empty() || requested.iter().any(|n| !catalog.contains(n)) {
+                if (requested.is_empty() && unload.is_empty())
+                    || requested
+                        .iter()
+                        .chain(&unload)
+                        .any(|n| !catalog.contains(n))
+                {
                     return denied("tool_load contains an unavailable tool; use tool_search first");
                 }
                 let mut enabled = self.enabled_tools.clone();
                 enabled.extend(requested.iter().cloned());
+                for name in &unload {
+                    enabled.remove(name);
+                }
                 let mut state = self.session.control_state();
                 let mut sorted: Vec<_> = enabled.iter().cloned().collect();
                 sorted.sort();
@@ -4557,7 +4605,11 @@ text: "Plan approved; implementation is now permitted subject to normal tool app
                 self.system = self.build_system();
                 ToolOutput {
                     data: None,
-                    text: format!("Enabled for the next model round: {}", requested.join(", ")),
+                    text: format!(
+                        "Next round: enabled [{}]; unloaded [{}]",
+                        requested.join(", "),
+                        unload.join(", ")
+                    ),
                     is_error: false,
                 }
             }

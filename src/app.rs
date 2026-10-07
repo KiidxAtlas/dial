@@ -934,7 +934,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("compact", "summarize older messages to free context"),
     ("undo", "drop the last turn and restore its file changes"),
     ("rollback", "restore files changed in the last n turns"),
-    ("clear", "clear the screen and repaint the conversation"),
+    (
+        "clear",
+        "clear conversation context and start a fresh session",
+    ),
     ("todo", "show the task list"),
     ("skills", "browse, import and enable/disable skills"),
     ("memory", "show project memory"),
@@ -967,7 +970,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("context", "show token usage"),
     ("approval", "ask, auto or readonly"),
     ("outcome", "record your verdict on the last answer (0-100)"),
-    ("improve", "automatic self-improvement status"),
+    ("improve", "self-improvement status and job controls"),
     ("exit", "quit"),
 ];
 
@@ -1086,6 +1089,7 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
     let mut candidates = Vec::new();
     for (name, args) in [
         ("understanding", &["architecture", "build"][..]),
+        ("experience", &["ledger"]),
         ("laya", &["status", "check", "start", "on", "off"]),
         (
             "skills",
@@ -1097,7 +1101,8 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
         ("permissions", &["allow", "deny", "remove"]),
         ("permissions allow", &["--persist"]),
         ("permissions deny", &["--persist"]),
-        ("improve", &["jobs", "stop"]),
+        ("improve", &["status", "jobs", "stop", "cycle", "enable", "disable", "versions", "tasks"]),
+        ("theme", &["auto"]),
         ("export", &["--html"]),
         ("profile", &["off"]),
     ] {
@@ -1529,11 +1534,16 @@ impl Shell {
         let found = skills::discover(&app.layout);
         self.composer
             .set_commands(command_entries(&self.commands, &found));
-        self.composer
-            .set_argument_completions(command_argument_completions(
-                &app.config,
-                &skills::discover_all(&app.layout),
-            ));
+        let mut arguments =
+            command_argument_completions(&app.config, &skills::discover_all(&app.layout));
+        arguments.extend(
+            self.themes
+                .names()
+                .into_iter()
+                .filter(|entry| entry.error.is_none())
+                .map(|entry| format!("/theme {}", entry.name)),
+        );
+        self.composer.set_argument_completions(arguments);
         self.skills = found;
         self.skills_listing =
             skills::management::list(&app.layout).unwrap_or_else(|error| format!("{error:#}"));
@@ -2856,6 +2866,7 @@ impl Shell {
                 | "quit"
                 | "q"
                 | "new"
+                | "clear"
                 | "resume"
                 | "sessions"
                 | "tree"
@@ -2984,7 +2995,6 @@ impl Shell {
                 };
                 self.note("Todo", text);
             }
-            ("clear", "") => self.display_reset(),
             ("search", query) if !query.is_empty() => {
                 match Session::search(&app.layout, query, 8) {
                     Ok(hits) if hits.is_empty() => self.note("Search", "no matches"),
@@ -3408,6 +3418,48 @@ impl Shell {
                     result.unwrap_or_else(|error| format!("{error:#}")),
                 );
             }
+            "improve" if matches!(args, "cycle" | "enable" | "disable" | "versions" | "tasks") => {
+                let result = (|| -> Result<String> {
+                    let store = app.store.as_ref().context(
+                        "self-improvement is unavailable (disabled, or no model selected)",
+                    )?;
+                    match args {
+                        "cycle" => {
+                            ensure!(
+                                !crate::learn::compute::paused(&app.layout.user_dir),
+                                "Resume background work first"
+                            );
+                            ensure!(
+                                auto::start_cycle(&app.layout, &app.config, store)?,
+                                "A cycle is already running or queued"
+                            );
+                            Ok("Improvement cycle started in the background; coding keeps priority. Follow it with /improve jobs.".into())
+                        }
+                        "enable" => {
+                            auto::resume(&app.config.state_dir)?;
+                            store.set_meta("auto_enabled", "true")?;
+                            auto::maybe_spawn(&app.layout, &app.config, store)?;
+                            Ok("Automatic improvement enabled for this project.".into())
+                        }
+                        "disable" => {
+                            store.set_meta("auto_enabled", "false")?;
+                            Ok("Automatic improvement disabled; a running cycle is not interrupted.".into())
+                        }
+                        "versions" => Ok(serde_json::to_string_pretty(&store.versions()?)?),
+                        _ => {
+                            let tasks = crate::learn::repository::load(&app.config)?
+                                .iter()
+                                .map(|t| serde_json::json!({"id":t.spec.id,"split":t.spec.split,"digest":t.digest,"files":t.files.len()}))
+                                .collect::<Vec<_>>();
+                            Ok(serde_json::to_string_pretty(&tasks)?)
+                        }
+                    }
+                })();
+                self.note(
+                    "Improvement",
+                    result.unwrap_or_else(|error| format!("{error:#}")),
+                );
+            }
             "improve" => {
                 let mut summary = improve_summary(app);
                 if let Some(monitor) = &self.adapter_monitor {
@@ -3424,7 +3476,6 @@ impl Shell {
                 }
                 self.note("Improvement", summary);
             }
-            "clear" => self.display_reset(),
             "changes" => {
                 let files = self.git.files(&app.layout.project_root);
                 let text = if files.is_empty() {
@@ -3449,7 +3500,7 @@ impl Shell {
                 self.note("Changes", text);
             }
             "theme" => return self.theme_command(app, agent, args),
-            "new" => match Session::create(
+            "new" | "clear" => match Session::create(
                 &app.layout,
                 SessionMeta {
                     model: app.config.model.clone(),
@@ -3458,6 +3509,9 @@ impl Shell {
                 Ok(session) => {
                     let id = session.id().to_owned();
                     agent.swap_session(session);
+                    if name == "clear" {
+                        self.show_session(agent.session());
+                    }
                     self.session_id = id.clone();
                     self.note("Session", format!("new session {}", short(&id)));
                 }
@@ -4985,9 +5039,6 @@ impl Ui for Bridge<'_> {
     fn model_progress(&mut self, progress: &crate::llm::ModelProgress) {
         self.shell.status.model_progress = Some(progress.clone());
         self.shell.status.model_silence_secs = 0;
-        if let Some(prompt) = progress.prompt_tokens {
-            self.shell.status.prompt_tokens = Some(prompt);
-        }
         self.repaint(false);
     }
     fn reasoning_delta(&mut self, text: &str) {
@@ -5468,6 +5519,7 @@ mod tests {
         for line in [
             "/exit",
             "/new",
+            "/clear",
             "/resume abc",
             "/fork",
             "/undo",
@@ -6354,6 +6406,16 @@ mod tests {
             "/skills disable review --user",
             "/approval readonly",
             "/plan off",
+            "/improve status",
+            "/improve jobs",
+            "/improve stop",
+            "/improve cycle",
+            "/improve enable",
+            "/improve disable",
+            "/improve versions",
+            "/improve tasks",
+            "/experience ledger",
+            "/theme auto",
         ] {
             assert!(
                 choices.iter().any(|choice| choice == expected),

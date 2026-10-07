@@ -399,6 +399,35 @@ fn render_architecture(report: &Value, limit: usize) -> String {
         .collect()
 }
 
+/// Extra relevance for a path the query refers to: path-component tokens count triple, and a
+/// literal mention of the file name or full path wins outright.
+fn path_relevance(query: &str, path: &str, terms: &BTreeSet<String>) -> usize {
+    if terms.is_empty() {
+        return 0;
+    }
+    // Generic path tokens ("src", "rs", "mod") occur in nearly every path and say nothing.
+    const GENERIC: [&str; 10] = [
+        "src", "rs", "py", "js", "ts", "mod", "lib", "main", "index", "md",
+    ];
+    let mut rank = navigation::tokens(path)
+        .iter()
+        .filter(|t| terms.contains(*t) && !GENERIC.contains(&t.as_str()))
+        .count()
+        * 3;
+    let lower = query.to_lowercase();
+    let path_lower = path.to_lowercase();
+    let name = Path::new(&path_lower)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if lower.contains(&path_lower) {
+        rank += 20;
+    } else if name.len() > 3 && lower.contains(name) {
+        rank += 12;
+    }
+    rank
+}
+
 fn document(path: &Path) -> bool {
     path.extension().is_some_and(|e| {
         matches!(
@@ -838,10 +867,7 @@ impl Codebase {
             }
             let sources: Vec<Source> = serde_json::from_str(&raw_sources)?;
             let rank = score(&format!("{topic} {content} {raw_sources}"));
-            if !terms.is_empty()
-                && rank == 0
-                && !matches!(topic.as_str(), "architecture" | "overview")
-            {
+            if !terms.is_empty() && rank == 0 {
                 continue;
             }
             if !fresh(&sources) || Self::finding_scope_status(&conn, &topic, &snapshot)? != "fresh"
@@ -877,7 +903,9 @@ impl Codebase {
             *groups
                 .entry(path.split('/').next().unwrap_or(&path).to_owned())
                 .or_default() += 1;
-            let rank = score(&format!("{path} {outline}"));
+            // Paths and file names are the strongest locator: weight their tokens above outline
+            // text, and prefer files the query names outright ("approval.rs", "src/agent").
+            let rank = score(&format!("{path} {outline}")) + path_relevance(query, &path, &terms);
             if architecture_document(Path::new(&path)) {
                 architecture_files.push((rank, path.clone(), digest.clone(), outline.clone()));
             }
@@ -1068,7 +1096,7 @@ impl Codebase {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let scope = self.scope_for(&snapshot, &supporting, true)?;
+        let scope = self.scope_for(&snapshot, &supporting)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let mut sources = Vec::new();
@@ -1281,6 +1309,30 @@ mod tests {
         let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
         let ws = Workspace::new(project.path()).unwrap();
         (home, project, layout, ws)
+    }
+
+    #[test]
+    fn query_naming_a_file_or_directory_outranks_incidental_word_matches() {
+        let terms = navigation::tokens("fix the approval flow in src/agent/approval.rs");
+        let named = path_relevance(
+            "fix the approval flow in src/agent/approval.rs",
+            "src/agent/approval.rs",
+            &terms,
+        );
+        let other = path_relevance(
+            "fix the approval flow in src/agent/approval.rs",
+            "src/ui/theme.rs",
+            &terms,
+        );
+        assert!(named >= 20 && other == 0);
+        assert_eq!(path_relevance("", "src/a.rs", &BTreeSet::new()), 0);
+        // A bare file name mention still ranks above a path that only shares one word.
+        let by_name = path_relevance(
+            "what does router.rs do",
+            "src/router.rs",
+            &navigation::tokens("what does router.rs do"),
+        );
+        assert!(by_name >= 12);
     }
 
     #[test]
@@ -1556,6 +1608,34 @@ mod tests {
                     0
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn task_recall_does_not_force_unrelated_overview_findings() {
+        let (_home, _project, layout, ws) = fixture();
+        let cache = Codebase::open(&layout).unwrap();
+        cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+        cache
+            .remember(
+                "overview",
+                "unrelated unique overview prose",
+                &["src/router.rs".into()],
+                "s",
+                0,
+            )
+            .unwrap();
+        assert!(
+            !cache
+                .context("zzunmatchedqueryzz", 24000)
+                .unwrap()
+                .contains("unrelated unique overview prose")
+        );
+        assert!(
+            cache
+                .context("", 24000)
+                .unwrap()
+                .contains("unrelated unique overview prose")
         );
     }
 

@@ -242,10 +242,6 @@ impl ModelServer {
         )
     }
 
-    pub fn matches_profile(&self, steering: Option<&crate::steering::Specification>) -> bool {
-        self.steering.as_ref() == steering
-    }
-
     pub fn base_url(&self) -> &str {
         &self.base_url
     }

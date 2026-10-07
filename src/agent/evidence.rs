@@ -95,6 +95,17 @@ pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy)
             other => *other = json!(recall),
         }
     }
+    // Only exact duplicates of explicitly tagged harness notices are projected.
+    let mut reminders = HashSet::new();
+    for message in messages.iter_mut().rev() {
+        if let Some(kind) = message["dial_reminder"].as_str() {
+            let key = (kind.to_owned(), message["content"].to_string());
+            if !reminders.insert(key) {
+                message["content"] =
+                    json!("[Repeated harness notice; identical guidance retained later]");
+            }
+        }
+    }
     let mut suffix = vec![0usize; messages.len()];
     let mut running = 0;
     for i in (0..messages.len()).rev() {
@@ -148,7 +159,6 @@ const OBSERVATIONS: &[&str] = &[
     "grep",
     "glob",
     "find",
-    "bash",
     "lsp",
     "ast_search",
     "web_fetch",
@@ -190,6 +200,10 @@ fn prune(
         }
         let id = result_id(&messages[i]);
         let already = memo.pruned.contains(&id);
+        // Preserve failures even for read-only tools.
+        if messages[i]["dial_evidence"]["is_error"] == true {
+            continue;
+        }
         let Some(artifact) = messages[i]["dial_evidence"]["artifact"]
             .as_str()
             .map(str::to_owned)
@@ -375,7 +389,11 @@ mod tests {
                 && content(&m, "old-grep").contains("artifact://old-grep")
                 && content(&m, "old-grep").contains("20000 bytes")
         );
-        assert!(content(&m, "old-bash").starts_with("[Older bash result omitted"));
+        assert_eq!(
+            content(&m, "old-bash").len(),
+            20_000,
+            "shell output may be mutation or verification evidence"
+        );
         assert_eq!(
             content(&m, "old-edit").len(),
             20_000,
@@ -392,6 +410,26 @@ mod tests {
             "the newest results are inside the protected tail"
         );
     }
+    #[test]
+    fn pressure_preserves_error_diagnostics_and_artifactless_results() {
+        let mut m = exchange("failed", "grep", 20_000);
+        m[1]["dial_evidence"]["is_error"] = json!(true);
+        m.extend(exchange("unretained", "read", 20_000));
+        m[3].as_object_mut().unwrap().remove("dial_evidence");
+        m.push(json!({"role":"user","content":"tail"}));
+        project(
+            &mut m,
+            &mut Supersession::default(),
+            &Policy {
+                warm_tokens: 0,
+                pressure: true,
+                protect_tokens: 0,
+            },
+        );
+        assert_eq!(content(&m, "failed").len(), 20_000);
+        assert_eq!(content(&m, "unretained").len(), 20_000);
+    }
+
     #[test]
     fn nothing_is_dropped_without_pressure() {
         let mut m = history();
@@ -487,5 +525,29 @@ mod tests {
             first_placeholder,
             "the repeat must not turn the placeholder into a different one"
         );
+    }
+}
+
+#[cfg(test)]
+mod reminder_tests {
+    use super::*;
+    #[test]
+    fn identical_tagged_notices_shrink_but_user_text_is_untouched() {
+        let text = "diagnostic ".repeat(100);
+        let user = json!({"role":"user","content":text});
+        let notice = json!({"role":"user","content":text,"dial_reminder":"reasoning"});
+        let mut messages = vec![user.clone(), notice.clone(), notice.clone()];
+        project(
+            &mut messages,
+            &mut Supersession::default(),
+            &Policy {
+                warm_tokens: 0,
+                pressure: false,
+                protect_tokens: 0,
+            },
+        );
+        assert_eq!(messages[0], user);
+        assert!(messages[1]["content"].as_str().unwrap().len() < 100);
+        assert_eq!(messages[2], notice);
     }
 }
