@@ -2,7 +2,7 @@
 //!
 //! Layout of responsibilities:
 //! - `term`        inline terminal driver: history rows go to the terminal's own scrollback; only the
-//!                 live bottom region is repainted; overlays use the alternate screen
+//!   live bottom region is repainted; overlays use the alternate screen
 //! - `theme`       color/style tokens, symbol presets, theme files
 //! - `keys`        remappable key bindings
 //! - `composer`    the input box with the status line embedded in its border and the `/` menu
@@ -12,9 +12,12 @@
 //! - `overlay`     settings, model selector, providers
 pub mod composer;
 pub mod editor;
+pub mod images;
+pub mod input;
 pub mod keys;
 pub mod markdown;
 pub mod overlay;
+pub mod rail;
 pub mod settings_schema;
 pub mod status;
 pub mod statusline;

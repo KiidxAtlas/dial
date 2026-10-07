@@ -30,6 +30,7 @@ pub enum Action {
     HistorySearch,
     EditExternal,
     DisplayReset,
+    CommandPalette,
     ModelSelect,
     ModelRoles,
     ProviderSetup,
@@ -63,6 +64,7 @@ impl Action {
         Action::HistorySearch,
         Action::EditExternal,
         Action::DisplayReset,
+        Action::CommandPalette,
         Action::ModelSelect,
         Action::ModelRoles,
         Action::ProviderSetup,
@@ -95,6 +97,7 @@ impl Action {
             Action::HistorySearch => "app.history.search",
             Action::EditExternal => "app.editor.external",
             Action::DisplayReset => "app.display.reset",
+            Action::CommandPalette => "app.command.palette",
             Action::ModelSelect => "app.model.select",
             Action::ModelRoles => "app.model.roles",
             Action::ProviderSetup => "app.provider.setup",
@@ -132,6 +135,7 @@ impl Action {
             Action::HistorySearch => "Search prompt history",
             Action::EditExternal => "Edit the draft in $VISUAL/$EDITOR",
             Action::DisplayReset => "Clear the screen and repaint",
+            Action::CommandPalette => "Search application actions",
             Action::ModelSelect => "Open the model selector",
             Action::ModelRoles => "Assign models to roles",
             Action::ProviderSetup => "Set up providers and API keys",
@@ -164,7 +168,8 @@ impl Action {
             | Action::Exit
             | Action::HistorySearch
             | Action::EditExternal => "Input",
-            Action::ModelSelect
+            Action::CommandPalette
+            | Action::ModelSelect
             | Action::ModelRoles
             | Action::ProviderSetup
             | Action::Settings
@@ -189,6 +194,7 @@ impl Action {
             Action::HistorySearch => &["Ctrl+R"],
             Action::EditExternal => &["Ctrl+G"],
             Action::DisplayReset => &["Alt+L"],
+            Action::CommandPalette => &["Ctrl+P", "Alt+K"],
             Action::ModelSelect => &["Alt+M"],
             Action::ModelRoles => &["Alt+R"],
             Action::ProviderSetup => &["Alt+P"],

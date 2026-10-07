@@ -6,6 +6,31 @@ use std::collections::BTreeMap;
 
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com/v1";
 
+/// Documented fallback when older Models API responses omit max_input_tokens.
+/// Live catalog values and explicit operator limits take precedence.
+pub(crate) fn documented_context_window(model: &str) -> Option<u32> {
+    // https://platform.claude.com/docs/en/models/overview (verified 2026-10-06).
+    for (id, window) in [
+        ("claude-opus-5-5", 1_000_000),
+        ("claude-opus-5", 1_000_000),
+        ("claude-sonnet-5-5", 1_000_000),
+        ("claude-sonnet-5", 1_000_000),
+        ("claude-fable-5-1", 1_000_000),
+        ("claude-haiku-4-5", 200_000),
+    ] {
+        if model == id
+            || model.strip_prefix(id).is_some_and(|suffix| {
+                suffix.len() == 9
+                    && suffix.starts_with('-')
+                    && suffix[1..].bytes().all(|byte| byte.is_ascii_digit())
+            })
+        {
+            return Some(window);
+        }
+    }
+    None
+}
+
 pub(crate) fn subscription_token(token: &str) -> bool {
     token.starts_with("sk-ant-oat01-")
 }

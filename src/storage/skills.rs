@@ -358,6 +358,7 @@ pub fn catalog_block(skills: &[Skill]) -> String {
 
 fn fail(text: impl Into<String>) -> ToolOutput {
     ToolOutput {
+        data: None,
         text: text.into(),
         is_error: true,
     }
@@ -365,6 +366,7 @@ fn fail(text: impl Into<String>) -> ToolOutput {
 
 fn ok(text: impl Into<String>) -> ToolOutput {
     ToolOutput {
+        data: None,
         text: text.into(),
         is_error: false,
     }

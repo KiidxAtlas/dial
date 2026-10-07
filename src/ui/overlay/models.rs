@@ -23,7 +23,7 @@ use crate::{
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     Frame,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 
@@ -101,6 +101,71 @@ fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
 
 fn display_name(entry: &ModelEntry) -> String {
     text::one_line(&format!("{}/{}", entry.selection.provider, entry.label))
+}
+
+fn capabilities(entry: &ModelEntry) -> Vec<(Sym, &'static str, Option<bool>)> {
+    if is_embedding(entry) {
+        return vec![(Sym::IconEmbedding, "embedding", Some(true))];
+    }
+    vec![
+        (Sym::IconVision, "vision", entry.metadata.vision),
+        (Sym::IconTools, "tools", entry.metadata.tools),
+        (Sym::IconReasoning, "reasoning", entry.metadata.reasoning),
+    ]
+}
+
+fn capability_badges(theme: &Theme, entry: &ModelEntry) -> String {
+    let capabilities = capabilities(entry);
+    let mut badges = capabilities
+        .iter()
+        .filter(|(_, _, supported)| *supported == Some(true))
+        .map(|(icon, _, _)| theme.sym(*icon).to_owned())
+        .collect::<Vec<_>>();
+    if capabilities
+        .iter()
+        .any(|(_, _, supported)| supported.is_none())
+    {
+        badges.push("?".into());
+    }
+    if badges.is_empty() {
+        "-".into()
+    } else {
+        badges.join(" ")
+    }
+}
+
+fn capability_detail(theme: &Theme, entry: &ModelEntry) -> String {
+    capabilities(entry)
+        .iter()
+        .map(|(icon, name, supported)| {
+            format!(
+                "{} {name}{}",
+                theme.sym(*icon),
+                match supported {
+                    Some(true) => "",
+                    Some(false) => " no",
+                    None => " unknown",
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn capability_cell(theme: &Theme, entry: &ModelEntry, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let badges = text::ellipsize(
+        &capability_badges(theme, entry),
+        width.saturating_sub(1),
+        theme.ascii(),
+    );
+    format!(
+        "{}{} ",
+        " ".repeat(width.saturating_sub(text::width(&badges) + 1)),
+        badges
+    )
 }
 
 /// `loaded`, `loads on first use`, `embedding`, `unavailable` or `available`, from what the catalog reported.
@@ -196,15 +261,15 @@ fn lora_detail(entry: &ModelEntry, main: Option<Lora>) -> String {
         && let Some(check) = entry.metadata.lora_check
     {
         return match check {
-                crate::llm::catalog::LoraCheck::Waiting => "Automatic LoRA verification queued; waiting for local compute. No model selection or retry is needed.",
+                crate::llm::catalog::LoraCheck::Waiting => "LoRA verification queued; waiting for local compute.",
                 crate::llm::catalog::LoraCheck::Checking => "Checking adapter targets, a tiny gradient update, and adapter save/reload. This verification does not create a production adapter.",
-                crate::llm::catalog::LoraCheck::Failed => "Automatic verification could not complete. F6 retries and shows diagnostics; compatibility is still unverified.",
+                crate::llm::catalog::LoraCheck::Failed => "Verification could not complete. F6 retries and shows diagnostics; compatibility is still unverified.",
             }.into();
     }
     match main {
         Some(Lora::Unsupported) if is_local_mlx(entry) => return "LoRA unavailable in Dial's current trainer. /improve shows the model capability probe's reason.".into(),
         Some(Lora::Unverified) => return "MLX architecture found; LoRA training targets have not been verified by Dial.".into(),
-        Some(Lora::VerificationQueued) => return "Automatic LoRA verification is waiting for local compute; no retry is needed.".into(),
+        Some(Lora::VerificationQueued) => return "LoRA verification is waiting for local compute.".into(),
         Some(Lora::Verifying) => return "Checking LoRA targets with a tiny gradient update and adapter save/reload.".into(),
         Some(Lora::Active(id)) => return format!("LoRA v{id} accepted; loading not confirmed in this session. /improve shows evaluation results."),
         Some(Lora::Ready) => return "LoRA compatible; awaiting training and acceptance. No adapter use confirmed. See /improve.".into(),
@@ -399,7 +464,16 @@ impl ModelOverlay {
                 match text::fuzzy(&self.search, &name).or_else(|| {
                     text::fuzzy(
                         &self.search,
-                        &format!("{name} {}", text::one_line(&entry.source)),
+                        &format!(
+                            "{name} {} {}",
+                            text::one_line(&entry.source),
+                            capabilities(entry)
+                                .iter()
+                                .filter(|(_, _, supported)| *supported == Some(true))
+                                .map(|(_, label, _)| *label)
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        ),
                     )
                     .map(|(s, _)| (s - 50, Vec::new()))
                 }) {
@@ -864,8 +938,8 @@ impl ModelOverlay {
                     theme.fg(Tok::BorderMuted),
                 ));
             }
-            if y < top_rows {
-                spans.extend(right_top[y].spans.clone());
+            if let Some(top) = right_top.get(y) {
+                spans.extend(top.spans.clone());
             } else {
                 let i = y - top_rows;
                 let index = self.scroll + i;
@@ -879,9 +953,16 @@ impl ModelOverlay {
                     }
                 } else if let Some((entry, positions)) = rows.get(index) {
                     self.model_line(theme, entry, positions, index == self.cursor, list_w)
-                } else if i == 0 && rows.is_empty() {
+                } else if rows.is_empty() {
+                    let empty_rows =
+                        text::wrap_words(self.empty_text().trim(), list_w.saturating_sub(2).max(1));
                     filled(
-                        vec![Span::styled(self.empty_text(), theme.fg(Tok::Muted))],
+                        empty_rows
+                            .get(i)
+                            .map(|line| {
+                                vec![Span::styled(format!(" {line}"), theme.fg(Tok::Muted))]
+                            })
+                            .unwrap_or_default(),
                         list_w,
                         Style::default(),
                     )
@@ -964,6 +1045,27 @@ impl ModelOverlay {
                 theme.fg(Tok::Muted)
             };
             spans.push(Span::styled(format!(" {} ", kind.label()), style));
+        }
+        // Legend entries are added whole while they fit, so a narrow pane never shows a clipped word.
+        let legend = [
+            format!("{} vision", theme.sym(Sym::IconVision)),
+            format!("{} tools", theme.sym(Sym::IconTools)),
+            format!("{} reasoning", theme.sym(Sym::IconReasoning)),
+            format!("{} embedding", theme.sym(Sym::IconEmbedding)),
+            "? unknown".to_owned(),
+        ];
+        let dim = Style::default()
+            .fg(Color::Reset)
+            .add_modifier(Modifier::DIM);
+        let mut used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+        for item in legend {
+            let piece = format!("  {item}");
+            let cells = text::width(&piece);
+            if used + cells > w {
+                break;
+            }
+            used += cells;
+            spans.push(Span::styled(piece, dim));
         }
         Line::from(fit(spans, w))
     }
@@ -1156,7 +1258,9 @@ impl ModelOverlay {
             0
         };
         let ctx_w = if w >= 40 { 7 } else { 0 };
-        let name_w = w.saturating_sub(4 + state_w + lora_w + ctx_w);
+        let caps_w = if w >= 28 { 8 } else { 0 };
+        let prefix_w = text::width(&pointer) + text::width(&marker) + 2;
+        let name_w = w.saturating_sub(prefix_w + caps_w + state_w + lora_w + ctx_w);
         let name = text::ellipsize(
             &display_name(entry),
             name_w.saturating_sub(1),
@@ -1202,6 +1306,12 @@ impl ModelOverlay {
                 theme.fg(tok).patch(fill),
             ));
         }
+        if caps_w > 0 {
+            spans.push(Span::styled(
+                capability_cell(theme, entry, caps_w),
+                Style::default().fg(Color::Reset).patch(fill),
+            ));
+        }
         filled(spans, w, fill)
     }
 
@@ -1223,6 +1333,16 @@ impl ModelOverlay {
             None if role == "main" => ("not configured".to_owned(), Tok::Warning),
             None => ("follows main".to_owned(), Tok::Dim),
         };
+        let entry = self.role_selection(role).and_then(|selection| {
+            self.discovery
+                .as_ref()?
+                .models
+                .iter()
+                .find(|entry| same_model(selection, &entry.selection))
+        });
+        let caps_w = if entry.is_some() && w >= 28 { 8 } else { 0 };
+        let value_w = w.saturating_sub(text::width(pointer) + 1 + 12 + caps_w);
+        let value = text::ellipsize(&value, value_w, theme.ascii());
         filled(
             vec![
                 Span::styled(format!("{pointer} "), theme.fg(Tok::Accent).patch(fill)),
@@ -1237,7 +1357,17 @@ impl ModelOverlay {
                         })
                         .patch(fill),
                 ),
-                Span::styled(value, theme.fg(tok).patch(fill)),
+                Span::styled(value.clone(), theme.fg(tok).patch(fill)),
+                Span::styled(
+                    " ".repeat(value_w.saturating_sub(text::width(&value))),
+                    fill,
+                ),
+                Span::styled(
+                    entry
+                        .map(|entry| capability_cell(theme, entry, caps_w))
+                        .unwrap_or_default(),
+                    Style::default().fg(Color::Reset).patch(fill),
+                ),
             ],
             w,
             fill,
@@ -1332,6 +1462,10 @@ impl ModelOverlay {
             format!(" {}", display_name(entry)),
             theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
         )];
+        first.push(Span::styled(
+            format!("  {}", capability_detail(theme, entry)),
+            Style::default().fg(Color::Reset),
+        ));
         let context = entry.selection.context_window.map_or_else(
             || "context unknown".to_owned(),
             |c| format!("context {}", fmt_context(c)),
@@ -1553,6 +1687,74 @@ mod tests {
 
     fn names(o: &ModelOverlay) -> Vec<String> {
         o.rows().iter().map(|(e, _)| e.label.clone()).collect()
+    }
+
+    #[test]
+    fn capability_icons_labels_and_search_use_metadata_in_every_glyph_preset() {
+        use crate::ui::theme::Glyphs;
+        for glyphs in [Glyphs::Unicode, Glyphs::Nerd, Glyphs::Ascii] {
+            let mut rig = Rig::new();
+            rig.theme = rig.theme.with_glyphs(glyphs);
+            let mut model = entry("mlx", "qwen-local", "Downloaded", true, Some(32768));
+            model.metadata.vision = Some(true);
+            model.metadata.tools = Some(true);
+            model.metadata.reasoning = Some(true);
+            let mut o = ModelOverlay::new(
+                Some(Discovery {
+                    models: vec![model.clone()],
+                    providers: vec![],
+                }),
+                vec![],
+                Scope::Global,
+            );
+            let shown = draw(&mut o, &rig, 150, 24);
+            let row = shown
+                .lines()
+                .find(|line| line.contains("mlx/qwen-local"))
+                .unwrap();
+            for icon in [Sym::IconVision, Sym::IconTools, Sym::IconReasoning] {
+                assert!(row.contains(rig.theme.sym(icon)), "{shown}");
+            }
+            o.roles = vec![("main".into(), Some(model.selection.clone()))];
+            for selected in [false, true] {
+                let line = o.model_line(&rig.theme, &model, &[], selected, 100);
+                let icons = line.spans.last().unwrap();
+                assert_eq!(icons.content, capability_cell(&rig.theme, &model, 8));
+                assert_eq!(icons.style.fg, Some(Color::Reset));
+                assert_eq!(line.width(), 100);
+                assert_eq!(
+                    line.spans[..line.spans.len() - 1]
+                        .iter()
+                        .map(|span| span.width())
+                        .sum::<usize>(),
+                    92
+                );
+            }
+            let role = o.role_line(&rig.theme, 0, 100);
+            assert_eq!(
+                role.spans.last().unwrap().content,
+                capability_cell(&rig.theme, &model, 8)
+            );
+            assert_eq!(role.spans.last().unwrap().style.fg, Some(Color::Reset));
+            assert!(
+                shown.contains("vision") && shown.contains("tools") && shown.contains("reasoning")
+            );
+            o.type_text("vision");
+            assert_eq!(names(&o), ["qwen-local"]);
+            model.metadata.tools = Some(false);
+            model.metadata.reasoning = None;
+            let detail = capability_detail(&rig.theme, &model);
+            assert!(detail.contains("tools no") && detail.contains("reasoning unknown"));
+            assert!(!capability_badges(&rig.theme, &model).contains(rig.theme.sym(Sym::IconTools)));
+            let embed = entry("ollama", "embed-model", "embedding", false, None);
+            assert_eq!(
+                capability_badges(&rig.theme, &embed),
+                rig.theme.sym(Sym::IconEmbedding)
+            );
+            for w in [28, 40, 60, 80, 100] {
+                assert!(o.model_line(&rig.theme, &model, &[], true, w).width() <= w);
+            }
+        }
     }
 
     #[test]
@@ -2108,6 +2310,21 @@ mod tests {
         smaller.providers.retain(|p| p.id != "openai");
         o.set_discovery(smaller);
         assert_eq!(o.group, Group::All);
+    }
+
+    #[test]
+    fn kind_legend_omits_whole_items_when_space_is_limited() {
+        let o = ModelOverlay::new(Some(Discovery::default()), vec![], Scope::Global);
+        let theme = Theme::dark();
+        let full = o.kind_line(&theme, 200);
+        let full: String = full.spans.iter().map(|s| s.content.as_ref()).collect();
+        let unknown = full.find("  ? unknown").unwrap();
+        let width = text::width(&full[..unknown]) + 5;
+        let narrow = o.kind_line(&theme, width);
+        let narrow: String = narrow.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!narrow.contains('?'), "{narrow}");
+        assert!(text::width(&narrow) <= width);
+        assert!(full.contains("? unknown"));
     }
 
     #[test]

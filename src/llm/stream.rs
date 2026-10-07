@@ -191,6 +191,14 @@ impl Accumulator {
                 excerpt(message.as_bytes(), message.len() > 512)
             );
         }
+        if let Some(raw) = event.get("dial_progress") {
+            if let Ok(mut progress) = serde_json::from_value::<super::ModelProgress>(raw.clone()) {
+                progress.normalize();
+                if !on_event(&super::StreamEvent::Progress(progress)) {
+                    return Err(Interrupted.into());
+                }
+            }
+        }
         if let Some(usage) = event.get("usage").filter(|u| u.is_object()) {
             self.prompt_tokens = usage
                 .get("prompt_tokens")
@@ -208,6 +216,18 @@ impl Accumulator {
                 .pointer("/prompt_tokens_details/cached_tokens")
                 .and_then(Value::as_u64)
                 .or(self.cached_prompt_tokens);
+            if self.completion_tokens.is_some() {
+                let mut progress = super::ModelProgress::new(super::InferencePhase::Generating);
+                progress.prompt_tokens = self.prompt_tokens;
+                progress.output_tokens = self.completion_tokens;
+                progress.tokens_per_second = event
+                    .pointer("/timings/predicted_per_second")
+                    .and_then(Value::as_f64);
+                progress.normalize();
+                if !on_event(&super::StreamEvent::Progress(progress)) {
+                    return Err(Interrupted.into());
+                }
+            }
         }
         // `choices` is empty in the trailing usage chunk. Only choice 0 is used.
         let Some(choice) = event
@@ -408,6 +428,42 @@ mod tests {
     #[test]
     fn final_line_without_newline_is_delivered() {
         assert_eq!(events(b"data: {\"a\":1}").unwrap(), ["{\"a\":1}"]);
+    }
+
+    #[test]
+    fn live_progress_is_cancellable_and_never_becomes_answer_or_billed_usage() {
+        use crate::llm::{InferencePhase, StreamEvent};
+        let mut acc = Accumulator::default();
+        let mut seen = Vec::new();
+        for event in [
+            json!({"dial_progress":{"phase":"processing","processed_tokens":100,"prompt_tokens":80}}),
+            json!({"dial_progress":{"phase":"generating","output_tokens":12,"tokens_per_second":24}}),
+            json!({"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}),
+        ] {
+            acc.feed_with_events(&event.to_string(), &mut |_| true, &mut |e| {
+                seen.push(e.clone());
+                true
+            })
+            .unwrap();
+        }
+        let StreamEvent::Progress(p) = &seen[0] else {
+            panic!("missing processing progress")
+        };
+        assert_eq!(p.phase, InferencePhase::Processing);
+        assert_eq!(p.processed_tokens, Some(80));
+        let reply = acc.finish().unwrap();
+        assert_eq!(reply.text, "hello");
+        assert_eq!(reply.completion_tokens, None);
+        assert!(reply.tool_calls.is_empty());
+        let mut acc = Accumulator::default();
+        let err = acc
+            .feed_with_events(
+                &json!({"dial_progress":{"phase":"generating","output_tokens":1}}).to_string(),
+                &mut |_| true,
+                &mut |_| false,
+            )
+            .unwrap_err();
+        assert!(err.downcast_ref::<Interrupted>().is_some());
     }
 
     #[test]

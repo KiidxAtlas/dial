@@ -323,11 +323,8 @@ mod tests {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 let lower = line.to_ascii_lowercase();
-                if lower.starts_with("content-length:") {
-                    body_len = lower["content-length:".len()..]
-                        .trim()
-                        .parse::<usize>()
-                        .unwrap();
+                if let Some(value) = lower.strip_prefix("content-length:") {
+                    body_len = value.trim().parse::<usize>().unwrap();
                 }
                 request.push_str(&line);
                 if line == "\r\n" || line.is_empty() {

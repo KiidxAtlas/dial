@@ -108,6 +108,27 @@ pub fn ellipsize(text: &str, max: usize, ascii: bool) -> String {
     format!("{}{mark}", clip(text, room))
 }
 
+/// Keep the end of `text` within `max` cells, starting with `…` (or `...` when `ascii`) if anything
+/// was cut. For paths, where the tail is what identifies the thing.
+pub fn ellipsize_start(text: &str, max: usize, ascii: bool) -> String {
+    if width(text) <= max {
+        return text.to_owned();
+    }
+    let mark = if ascii { "..." } else { "…" };
+    let room = max.saturating_sub(width(mark));
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true).rev() {
+        used += width(grapheme);
+        if used > room {
+            break;
+        }
+        kept.push(grapheme);
+    }
+    kept.reverse();
+    format!("{mark}{}", kept.concat())
+}
+
 /// Pad (never truncate) with spaces to exactly `cells` when shorter.
 pub fn pad(text: &str, cells: usize) -> String {
     let used = width(text);
@@ -336,7 +357,7 @@ mod tests {
                 .iter()
                 .filter_map(|t| fuzzy(q, t).map(|(s, _)| (s, *t)))
                 .collect();
-            found.sort_by(|a, b| b.0.cmp(&a.0));
+            found.sort_by_key(|a| std::cmp::Reverse(a.0));
             found.into_iter().map(|(_, t)| t).collect()
         }
         assert_eq!(

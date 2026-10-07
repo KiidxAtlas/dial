@@ -6,6 +6,7 @@ pub mod codebase;
 pub mod experience;
 pub mod memory;
 pub mod paths;
+pub mod process_record;
 pub mod provenance;
 pub mod session;
 pub mod settings_store;

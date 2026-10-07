@@ -263,13 +263,14 @@ pub fn expand_message(root: &Path, text: &str) -> (serde_json::Value, Vec<String
     let mut seen = HashSet::new();
     for token in reference_tokens(text)
         .into_iter()
+        .chain(pasted_image_tokens(text))
         .filter(|token| seen.insert(*token))
         .take(MAX_REFS)
     {
         if !crate::llm::images::is_image(Path::new(token)) {
             continue;
         }
-        match crate::llm::images::attachment(root, Path::new(token)) {
+        match crate::llm::images::user_attachment(root, Path::new(token)) {
             Ok(image) => images.push(image),
             Err(error) => warnings.push(format!("@{token} skipped: {error}")),
         }
@@ -281,10 +282,44 @@ pub fn expand_message(root: &Path, text: &str) -> (serde_json::Value, Vec<String
     (message, warnings)
 }
 
+/// Terminal drag/drop and clipboard paths need no @ prefix. Only standalone local image paths
+/// in the human's message are eligible; ordinary prose, URLs and non-image files stay untouched.
+fn pasted_image_tokens(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || "([{,;".contains(c));
+        if rest.is_empty() {
+            break;
+        }
+        let (token, consumed) = if let Some(quote @ ('\'' | '"' | '`')) = rest.chars().next() {
+            match rest[1..].find(quote) {
+                Some(end) => (&rest[1..end + 1], end + 2),
+                None => break,
+            }
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            (&rest[..end], end)
+        };
+        let token = token.trim_end_matches([',', ';', '.', ')', ']', '}']);
+        if (token.starts_with('/') || token.starts_with("~/") || token.starts_with("./"))
+            && crate::llm::images::is_image(Path::new(token))
+        {
+            out.push(token);
+        }
+        rest = &rest[consumed..];
+    }
+    out
+}
+
 /// Tokens following an `@` that starts a word (so `user@host` is skipped), minus trailing punctuation.
 fn reference_tokens(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
+    let mut consumed_until = 0;
     for (i, _) in text.match_indices('@') {
+        if i < consumed_until {
+            continue;
+        }
         let starts_word = text[..i]
             .chars()
             .next_back()
@@ -293,6 +328,16 @@ fn reference_tokens(text: &str) -> Vec<&str> {
             continue;
         }
         let rest = &text[i + 1..];
+        if let Some(quote @ ('"' | '\'')) = rest.chars().next() {
+            if let Some(end) = rest[1..].find(quote) {
+                consumed_until = i + 3 + end;
+                let token = &rest[1..1 + end];
+                if !token.is_empty() {
+                    out.push(token);
+                }
+            }
+            continue;
+        }
         let end = rest
             .find(|c: char| c.is_whitespace() || c == '\0')
             .unwrap_or(rest.len());
@@ -812,6 +857,14 @@ mod tests {
     fn project_outside_home_without_git_only_reads_its_own_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let base = canon(&tmp);
+        if base
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir.join(".git").exists())
+        {
+            eprintln!("skipping: the temp dir sits inside a git repository");
+            return;
+        }
         write(base.join("AGENTS.md"), "shared dir: untrusted");
         write(base.join("proj/AGENTS.md"), "mine");
         let fake_home = base.join("elsewhere");
@@ -990,6 +1043,63 @@ mod tests {
     }
 
     #[test]
+    fn pasted_image_paths_attach_without_at_and_deduplicate() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let image = outside.path().join("Screenshot 1.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let text = format!(
+            "\"{}\" this is the reference, and @\"{}\"",
+            image.display(),
+            image.display()
+        );
+        let (message, warnings) = expand_message(root.path(), &text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(message["dial_images"].as_array().unwrap().len(), 1);
+        let image = outside.path().join("pasted.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        assert_eq!(expand_message(root.path(), &format!("{} inspect this", image.display())).0["dial_images"].as_array().unwrap().len(), 1);
+        assert!(
+            pasted_image_tokens("https://example.com/image.png /tmp/secret.txt \"unterminated.png")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_quoted_images_can_be_supplied_outside_the_project() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("Screenshot @1.png");
+        fs::write(&path, b"\x89PNG\r\n\x1a\nimage").unwrap();
+        let text = format!(
+            "Compare @\"{}\" and @\"{}\"",
+            path.display(),
+            path.display()
+        );
+        let (message, warnings) = expand_message(root.path(), &text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(message["dial_images"].as_array().unwrap().len(), 1);
+        assert_eq!(message["dial_images"][0]["path"], "Screenshot @1.png");
+        assert!(!message.to_string().contains("base64"));
+        assert!(
+            crate::llm::images::attachment(root.path(), &path).is_err(),
+            "tool reads remain confined"
+        );
+        assert_eq!(expand_message(root.path(), "@../escape.png").1.len(), 1);
+        fs::write(outside.path().join("secret.txt"), "private").unwrap();
+        let (message, warnings) = expand_message(
+            root.path(),
+            &format!("@\"{}\"", outside.path().join("secret.txt").display()),
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            !message.to_string().contains("private"),
+            "external text files stay confined"
+        );
+        assert!(reference_tokens("@\"unterminated.png").is_empty());
+    }
+
+    #[test]
     fn binary_huge_and_hostile_files() {
         let (_t, base) = project();
         let root = base.join("proj");
@@ -1061,6 +1171,14 @@ mod tests {
     #[test]
     fn git_diff_and_staged_references() {
         let (_t, base) = project();
+        if base
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir.join(".git").exists())
+        {
+            eprintln!("skipping: the temp dir sits inside a git repository");
+            return;
+        }
         let root = base.join("proj");
         let (out, w) = expand_references(&root, "@diff");
         assert_eq!(out, "@diff");

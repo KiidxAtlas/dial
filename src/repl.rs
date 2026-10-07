@@ -332,6 +332,7 @@ impl Ui for PrintUi {
             serde_json::json!({
                 "type":"tool_result", "name":name, "is_error":output.is_error, "seconds":seconds,
                 "text":crate::agent::guard::clip_middle(&output.text, 16_384),
+                "data":output.data,
             })
         });
     }

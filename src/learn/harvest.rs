@@ -7,9 +7,9 @@
 //!    verifier or a user verdict, never the agent's own command exit code). Request snapshots
 //!    preserve the actual inference context and label only the new assistant target. Legacy
 //!    conversations use cleaned prefixes, removing form failures and their correction messages.
-//! All prefixes and repairs sharing a trajectory or first user prompt stay in one dataset split,
-//! including snapshots before/after compaction. Existing split assignments are preserved; contaminated
-//! datasets are rejected rather than reused for evaluation.
+//!    All prefixes and repairs sharing a trajectory or first user prompt stay in one dataset split,
+//!    including snapshots before/after compaction. Existing split assignments are preserved; contaminated
+//!    datasets are rejected rather than reused for evaluation.
 use crate::{config::types::Config, storage::store::Store};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;

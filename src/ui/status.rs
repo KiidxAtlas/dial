@@ -118,6 +118,8 @@ pub struct StatusData {
     pub elapsed_secs: f64,
     /// What the running turn is doing right now (`thinking`, a tool name, …); empty when unknown.
     pub activity: String,
+    pub model_progress: Option<crate::llm::ModelProgress>,
+    pub model_silence_secs: u64,
     /// Monotonic animation counter (about 12 per second) for spinners.
     pub tick: u64,
     pub mode: InputMode,
@@ -126,6 +128,58 @@ pub struct StatusData {
 }
 
 impl StatusData {
+    pub fn model_activity(&self) -> Option<String> {
+        use crate::llm::InferencePhase;
+        let p = self.model_progress.as_ref()?;
+        let mut label = match p.phase {
+            InferencePhase::Loading => "loading model".to_owned(),
+            InferencePhase::Processing => match (p.processed_tokens, p.prompt_tokens) {
+                (Some(done), Some(total)) if total > 0 => format!(
+                    "processing prompt {}/{total} tokens ({:.0}%)",
+                    done.min(total),
+                    done.min(total) as f64 * 100.0 / total as f64
+                ),
+                (_, Some(total)) => format!("processing prompt {total} tokens"),
+                _ => "processing prompt".into(),
+            },
+            InferencePhase::Generating => {
+                let prefix = if p.estimated { "~" } else { "" };
+                let mut label = p.output_tokens.map_or_else(
+                    || "generating tokens".into(),
+                    |n| format!("generating {prefix}{n} tokens"),
+                );
+                if let Some(rate) = p.tokens_per_second.filter(|r| r.is_finite() && *r > 0.0) {
+                    label.push_str(&format!(" · {prefix}{rate:.1} tok/s"));
+                }
+                if self.model_silence_secs >= 15 {
+                    label.push_str(&format!(" · no output for {}s", self.model_silence_secs));
+                }
+                label
+            }
+        };
+        // Invalid telemetry cannot introduce terminal control sequences.
+        label = crate::ui::text::one_line(&label);
+        Some(label)
+    }
+
+    pub fn live_output_tokens(&self) -> (u64, bool) {
+        match &self.model_progress {
+            Some(p) => (
+                self.output_tokens
+                    .saturating_add(p.output_tokens.unwrap_or(0)),
+                p.estimated,
+            ),
+            None => (self.output_tokens, false),
+        }
+    }
+
+    pub fn live_tokens_per_second(&self) -> Option<f64> {
+        match &self.model_progress {
+            Some(p) => p.tokens_per_second,
+            None => self.tokens_per_second,
+        }
+    }
+
     pub fn busy(&self) -> bool {
         matches!(
             self.phase,

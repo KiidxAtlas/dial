@@ -2,26 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-fn deserialize_context_window<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum ContextWindow {
-        Tokens(u32),
-        Auto(String),
-    }
-
-    match ContextWindow::deserialize(deserializer)? {
-        ContextWindow::Tokens(tokens) => Ok(tokens),
-        ContextWindow::Auto(value) if value.eq_ignore_ascii_case("auto") => Ok(32768),
-        ContextWindow::Auto(value) => Err(serde::de::Error::custom(format!(
-            "expected an integer or \"auto\", found {value:?}"
-        ))),
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Harness {
@@ -31,11 +11,23 @@ pub struct Harness {
     /// Enabled tools: built-ins, dial's extra tools, and operator tools from `[tools.*]`.
     pub tools: Vec<String>,
     pub subagents: Vec<String>,
+    /// Model steps per turn; zero means unlimited for interactive turns.
     pub max_steps: u32,
     pub temperature: f64,
     pub max_tokens: u32,
     /// `None` follows the configured `edit_mode`; the improvement loop may pin one per model.
     pub edit_mode: Option<EditModeConfig>,
+}
+
+impl Harness {
+    /// Apply a finite cap for evaluation and bounded automatic repair, including unlimited harnesses.
+    pub fn capped_steps(&self, cap: u32) -> u32 {
+        if self.max_steps == 0 {
+            cap
+        } else {
+            self.max_steps.min(cap)
+        }
+    }
 }
 
 impl Default for Harness {
@@ -213,6 +205,52 @@ pub enum EditModeConfig {
     Replace,
 }
 
+pub use crate::llm::model_config::MAX_CONTEXT_WINDOW;
+
+/// Operator context budget. Auto follows model metadata; a number caps retained history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextWindow {
+    #[default]
+    Auto,
+    Tokens(u32),
+}
+
+impl ContextWindow {
+    pub fn tokens(self) -> Option<u32> {
+        match self {
+            Self::Auto => None,
+            Self::Tokens(n) => Some(n),
+        }
+    }
+}
+
+impl Serialize for ContextWindow {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Tokens(n) => serializer.serialize_u32(*n),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextWindow {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Number(u32),
+            Text(String),
+        }
+        match Input::deserialize(deserializer)? {
+            Input::Text(s) if s.eq_ignore_ascii_case("auto") => Ok(Self::Auto),
+            Input::Number(n) if (2048..=MAX_CONTEXT_WINDOW).contains(&n) => Ok(Self::Tokens(n)),
+            _ => Err(serde::de::Error::custom(
+                "context window must be 'auto' or 2048..2097152 tokens",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -247,9 +285,13 @@ pub struct Config {
     pub adaptive: crate::adaptive::Config,
     pub reliability: crate::reliability::Config,
     pub laya: crate::agent::laya::Config,
-    /// Configured context budget; `auto` uses the standard budget, then honors reported server caps.
-    #[serde(deserialize_with = "deserialize_context_window")]
+    /// Effective model budget, resolved after loading. Never persisted as an operator override.
+    #[serde(skip)]
     pub context_window: u32,
+    #[serde(rename = "context_window")]
+    pub context_limit: ContextWindow,
+    pub cloud_context_window: ContextWindow,
+    pub local_context_window: ContextWindow,
     pub harness: Harness,
     pub gate: Option<GateConfig>,
     pub training: TrainingConfig,
@@ -535,6 +577,9 @@ impl Default for Config {
             model_profile: None,
             worker_timeout_secs: 3600,
             context_window: 32768,
+            context_limit: ContextWindow::Auto,
+            cloud_context_window: ContextWindow::Auto,
+            local_context_window: ContextWindow::Auto,
             remote_model_idle_timeout_secs: 180,
             reasoning_guard: ReasoningGuardConfig::default(),
             codebase: CodebaseConfig::default(),

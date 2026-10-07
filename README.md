@@ -2,7 +2,7 @@
 
 A local-first coding agent harness for macOS/Apple Silicon. Run it in a project directory like any agent CLI. Self-improvement is automatic: observations feed verified practice, harness proposals and local LoRA training; only an external evaluation gate can activate a candidate.
 
-Standalone: no dependency on omp, Hermes, or any hosted service. Rust control plane and tools; Python only for MLX inference/training (`mlx-lm`).
+Standalone: no dependency on omp, Hermes, or any hosted service. Rust control plane and tools; Python for local MLX inference/training (`mlx-lm`, plus `mlx-vlm` for vision).
 
 ```sh
 cargo install --path .
@@ -109,12 +109,23 @@ dependencies may need adaptation. Importing does not grant extra permissions.
   when closed. Approval prompts and settings adapt to narrow terminal widths.
 - A configurable status line shows model, role, path, Git state, context, token usage/rate, approval,
   sandbox and learning state. Settings let you choose presets or define left/right segments.
+- Local inference shows **loading model**, **processing prompt**, then a live **generating tokens**
+  counter and tokens/second in the composer. Dial's MLX runners report engine counts, including
+  reasoning and tool tokens; the text runner also reports prompt processing progress. Other local
+  servers use estimates marked `~` until reported usage arrives. Counters reset for each request.
 - Searchable model/role, provider and settings panels. Settings save globally or per project outside
   the editable workspace, validate before writing, and apply display changes immediately.
+- **Action palette:** `Ctrl-P`, `Alt-K` or `/palette` searches built-ins, custom commands and enabled
+  skills without replacing your chat draft. `Tab` / `Shift-Tab` switch categories; `Enter` runs the
+  selected action, asking for required arguments first. `Alt-Enter` edits optional arguments.
+  During a turn, the panel explains whether the selected action runs immediately, waits or stops
+  the turn. Pasting never runs an action. Provider discovery waits until Models or Providers opens.
 - Dark, light, monochrome, Gruvbox, Nord and Paper themes; custom JSON themes, symbol presets,
   rounded or line composer, styled headings/code/diffs, expandable tool results, and `NO_COLOR`.
 - Unicode-aware multiline editing, bracketed paste, persistent per-project prompt history and history
   search. Secret provider inputs are masked and never enter prompt history.
+- Pasted text stays in the draft. Buffered unbracketed paste preserves line breaks, and an immediate
+  trailing Enter after bracketed paste is ignored. Press Enter after the paste settles to send it.
 - **Inline suggestions:** command arguments offer valid choices as dim ghost text even before you have
   used them: `/understanding ` suggests `architecture`, `/skills s` suggests `sources`, and
   `/skills enable ` suggests an installed skill name (including disabled skills). Built-in choices
@@ -149,6 +160,7 @@ dependencies may need adaptation. Importing does not grant extra permissions.
 
 | Action | Shortcut / command |
 |---|---|
+| Search application actions | `Ctrl-P` / `Alt-K`, `/palette` |
 | Model selector / roles | `Alt-M` / `Alt-R`, `/model` |
 | Provider setup | `Alt-P`, `/providers` |
 | Settings | `Ctrl-,` (`Ctrl-4` fallback), `/settings` |
@@ -189,6 +201,18 @@ To create a theme, put a JSON file such as
 `Tab` changes global/project storage scope in the model and provider panels (`Ctrl-S` in settings).
 The model picker switches between the main model and helper-role assignments. Supported roles are **main**, **feedback**,
 **subagent**, and **compaction**; each routes real requests. “Use the main model” restores role inheritance.
+Model rows include monochrome icons at the right for vision, tool use, reasoning and embeddings, with a legend and capability
+labels in the highlighted model's details. ASCII themes use `V`, `T`, `R` and `E`. `?` means metadata is
+unknown. Typing `vision`, `tools` or `reasoning` searches supported capabilities as well as names.
+Local capability declarations come from downloaded configuration and chat templates; discovery does
+not start inference or load weights to produce these badges.
+
+Viewed images and user image attachments also appear as compact inline terminal thumbnails, up to
+80 columns by 16 rows, with their filename and original dimensions. Previews preserve proportions,
+shrink for narrow terminals and remain in scrollback. iTerm2, Kitty and Ghostty receive a sharper
+native image preview; other terminals and multiplexers use portable colored cells. Image decoding
+runs on a worker while input and interruption remain responsive. The model receives the original
+image bytes independently of preview size; supported cloud image requests use high detail.
 
 ### Providers and discovery
 
@@ -197,6 +221,24 @@ The catalog finds cached Hugging Face MLX snapshots, MLX models downloaded by LM
 server, so LoRA training applies), and running LM Studio, Ollama and llama.cpp
 servers on their usual loopback ports. It also discovers OpenAI-compatible endpoints and Anthropic's
 Messages API. OpenAI, Anthropic, OpenRouter, Groq, Mistral and DeepSeek have setup presets.
+
+`/settings` → Model → Context offers **Current model context**, **Cloud context default** and
+**Local context default**. Each accepts `auto` (the default) or a token cap from 2,048 to 2,097,152.
+Auto follows the selected model's catalog/downloaded metadata; unknown capacities fall back to 32,768.
+ChatGPT discovery uses `max_context_window` when valid and larger than the standard `context_window`
+default, so the picker and Auto budget expose the account's extended capacity instead of stopping at 272k.
+Subscription capacities come from the account catalog and may differ from API model-card capacities.
+A numeric current-model override takes precedence over the cloud/local default, and known model or
+loaded-server capacities cap the result downward. Local defaults also cover loopback/LAN endpoints.
+Picking a different model resets its current override to Auto while preserving both family defaults.
+The window controls retained history and compaction; it does not send that many tokens on every
+request or reserve that much model memory. Actual usage appears before the slash in the context meter.
+Configure the same values in TOML, for example `context_window = "auto"`,
+`cloud_context_window = 64000`, and `local_context_window = 16384`.
+
+Anthropic discovery reads `max_input_tokens`; older catalogs with missing windows use
+documented limits for known models, including 1M tokens for Claude Opus 5.5. The status meter and
+compaction share this resolved window. Custom endpoints use their own reported limits.
 
 **LoRA indicators.** The model picker has a LoRA column: `unverified` for a local MLX model whose architecture
 the installed mlx-lm implements (a static check of `config.json`, not proof of trainable adapter targets), `unsupported` when Dial’s adapter probe rejects it, and `-` for models another server runs. The main model distinguishes awaiting training,
@@ -214,10 +256,23 @@ cycle does not automatically recover its unfinished candidate. Older already-run
 be stopped from the compute menu and restarted with the updated binary.
 
 Open `/compute`, or **Settings → Setup → Compute & background work**, for a live menu of compute
-ownership and jobs across all projects. It shows the model, project, PID and current phase, with
-Pause/Resume background work and Start/Stop controls for each job. While waiting for compute,
+ownership and processes across all projects. **All**, **Models**, **Background**, **Services** and
+**Tools** tabs separate model servers, capability checks, improvement jobs, Laya and tool subprocesses.
+Live processes and the compute owner appear green, including models still loading. Process rows show
+PID, CPU use and memory in decimal GB. On macOS this uses physical footprint, including compressed
+and GPU-backed allocations, with RSS as a fallback. The header totals Dial processes and sessions,
+shared services, and their combined memory; shared services are counted once. Process details show
+RSS separately. These observational totals are not a measurement of the whole machine's memory use.
+Use Left/Right or Tab to switch sections, Enter for details, and **x** to stop/unload a process or
+remove and disable a background job. Saved model weights, adapters and session history are preserved;
+models reload on their next use. Orphaned model servers from older Dial versions are included too.
+The shared OMP Laya service appears in All and Services as `Laya (OMP/shared)`; stopping it also
+affects OMP.
+Pause/Resume background work and Start/Stop controls remain available. While waiting for compute,
 Ctrl+, opens these controls directly. Status refresh and job controls run off the terminal thread.
-Idle chats release models for waiting coding requests; verification and evaluation also yield.
+Idle chats unload resident main and role models as soon as the turn and its child agents finish,
+including when no other job is waiting. Queued follow-ups keep their models; the next turn reloads
+an unloaded model. Verification and evaluation also yield for coding requests.
 If training does not acknowledge a pause within two seconds, Dial terminates its subprocess and
 resumes from its last committed step later. A checkpoint is committed at every step, so only an
 unfinished step may need repeating. **Stop job now** targets a verified detached background worker
@@ -226,18 +281,16 @@ never terminates a foreground chat. This also provides recovery for older worker
 
 A failed capability probe overrides the static architecture check; only a successful probe can show
 awaiting training. Architecture support alone never claims LoRA compatibility.
-Dial automatically queues unverified downloaded local MLX models as they are discovered, without
-requiring model selection. Idle resident models are unloaded and probes run one at a time under the
-shared compute lock. The picker shows waiting for compute, verifying, verified, or unsupported; a busy
-compute owner is waited out automatically. Foreground prompts cancel this session's automatic probe
-and unfinished checks resume when idle. Results and reasons are saved in each model's private project
-store and reused across restarts. Failed probes are not retried repeatedly within the same session;
-F6 remains an explicit recheck with diagnostics after runtime/model changes. Verification loads the
-model/tokenizer, selects architecture-compatible linear projections, performs a rank-one gradient
+Opening Dial or browsing the model catalog reads saved LoRA results without loading weights, including
+models assigned to roles. Unverified models stay unverified until an explicit F6 check or improvement
+work needs the capability probe. Results and reasons are saved in each model's private project store
+and reused across restarts. F6 runs a check with diagnostics after runtime/model changes under the shared
+compute lock. Verification loads the model/tokenizer, selects architecture-compatible linear
+projections, performs a rank-one gradient
 update on a short prompt, and checks that a saved/reloaded adapter preserves output. The temporary
 adapter is discarded. Ordinary attention keeps query-only targets; hybrid, recurrent, and fused blocks
 use compatible output or other linear projections. Training and adapter validation share this selection.
-Old probe results are rechecked automatically after this upgrade, including previous rejections.
+Old probe results are rechecked on the next explicit verification or improvement run.
 The managed Python worker updates with the binary; explicit custom worker paths are preserved.
 Verification does not establish that a full training run will fit memory or improve quality.
 Accepted means the gate admitted the version; loaded requires the local server's startup generation
@@ -320,6 +373,24 @@ Exit status: `0` completed, `1` error, `2` interrupted/no answer, `3` required a
 
 `dial sessions --all` lists sessions across projects. `dial sessions rename <id> <title>` and
 `dial sessions export <id> [path] [--html]` expose session management without the TUI.
+
+The **Session rail** above the composer shows the current session and per-file additions/deletions;
+new files are labelled `new` and binary diffs `binary`. `/changes` lists the cached workspace snapshot.
+**Live worker cards** show synchronous and background child phases, step counts and streamed previews.
+They stay bounded on small terminals and running workers remain visible between turns. Toggle either
+panel in `/settings` → Appearance → Display. Ctrl-P opens the searchable command palette; viewed
+images use compact inline previews when supported by the terminal.
+
+Execution uses shared, revisioned result bodies backed by the session's branch-aware JSONL journal.
+RPC `state` exposes a `tree` containing session, conversation and execution nodes. Each execution
+node has an `id`, `parent`, `kind`, `label` and `result` (`text`, optional structured `data`, `phase`,
+`revision`). `state_reset` clears the current observer view; `state_node` replaces one node and
+`state_delta` appends text to an existing node at the supplied revision. Worker updates use bounded
+replacement snapshots. Legacy events remain available; clients should choose one projection to
+avoid displaying a token twice. Tool-result events include original structured `data` when supplied.
+Snapshots are written at boundaries, not for every token. Resuming never restarts unfinished workers.
+Unassigned child roles inherit the parent model, profile and request controls; the model picker can
+still assign an explicit child model.
 Ctrl-C interrupts silent HTTP response reads without replacing the configured inference deadline with
 a short timeout. Connection establishment and partial writes still use their configured deadlines.
 
@@ -349,12 +420,15 @@ After edits, dial derives focused Rust and Python syntax checks from checkpointe
 `[verification].commands` can add operator-owned sandboxed commands (name, command, optional file
 extensions and timeout); a failure is sent to the agent for the configured bounded repair attempts,
 then the edited tree and final diagnostics remain visible for `/undo` or manual repair. Approval-denied
-writes are not treated as successful verification. `todo done` is a checkpoint too: a step with no
-successful tool call since it started stays open (a claim without evidence), and a step that edited
-files runs the same focused checks, so a broken step is caught while its context is fresh. A failed check
-keeps the step open with the diagnostics (calling `done` again without further edits closes it, for
-failures that predate the step); turn-end verification is skipped when the last step check already
-covered every edit.
+writes are not treated as successful verification. `todo done` is a checkpoint too: an investigation
+requires a successful tool call since it started. An active non-investigation step may instead close
+after a nonempty text-only answer was delivered for that step, provided no edits await verification.
+This records delivery, not an independent judgment of the report's quality. Delivery does not carry
+over to the next step. Reworded `todo done` failures for the same target share a four-failure retry
+limit and end the turn as incomplete rather than looping. Steps that edited files still run focused
+checks, so a broken step is caught while its context is fresh. A failed check keeps the step open
+with diagnostics; repeating `done` alone does not convert a failure into verification. Turn-end
+verification is skipped when the last step check already covered every edit.
 
 Extended investigation must use real todos, not a prose plan. In live runs with the todo tool available,
 after a task-dependent budget of four, six, or ten successful inspection calls without an open plan,
@@ -380,9 +454,10 @@ shell commands clear the observation cache. The redirect is advisory, not a hard
 Mid-turn requests end with a never-stored reminder of the current todo step, next step and recent findings.
 Because it sits after the newest tool result, every earlier byte stays identical between requests and a
 prefix (KV) cache only needs to process the appended reminder. Tool results are clipped to about an eighth of the
-context window (4–24 KiB); clipping keeps both ends plus error, panic, failed-test and traceback lines
-from the omitted middle, and `bash` does the same for output it never holds in memory. Full output stays
-in artifacts.
+context window (4–24 KiB); successful retrievable read/search/shell/web previews are additionally capped
+at 8 KiB. Failed diagnostics and mutation results retain the larger context-dependent budget.
+Clipping keeps both ends plus error, panic, failed-test and traceback lines from the omitted middle;
+full output stays in artifacts. `bash` also bounds the output it holds in memory.
 
 `[dap.<id>]` defines an operator-owned adapter executable. The `dap` integration exposes
 `dap_<id>` actions and requires approval on every call; adapter startup is lazy, and launch program
@@ -391,14 +466,42 @@ and cwd paths must resolve inside the workspace. `[mcp.<id>].lifecycle_hooks` op
 `notifications/dial/event`; payloads contain identifiers/status only, never prompts, arguments,
 outputs, or source content. Hook delivery is observational and cannot bypass tool approvals.
 
-Transient provider errors use bounded backoff with server retry hints and visible notices; authentication
-errors and failed response streams are not replayed. `@image.png` and image `read` calls attach supported
-PNG/JPEG/GIF/WebP files up to 5 MiB. Sessions store confined paths and content hashes, not base64;
+Transient provider errors use bounded backoff with server retry hints and visible notices (at most five
+attempts and 60 seconds of backoff). This includes macOS socket `Invalid argument (os error 22)` and
+TLS `BadRecordMac` alerts before a response arrives. Each retry opens a fresh connection; TLS certificate
+verification remains enabled. Exhausted retries pause the turn with a reason and instructions to continue; authentication
+errors and failed response streams are not replayed. `@image.png` and image `read` calls attach actual
+PNG/JPEG/GIF/WebP pixels up to 5 MiB. To supply an image outside the project, explicitly reference its
+absolute path or home path, such as `@"/Users/me/Desktop/Screenshot 1.png"` or `@~/Pictures/example.jpg`.
+Pasted standalone or quoted image paths also attach automatically without `@`. The model can reread
+exactly those supplied images; other external tool reads stay confined. Sessions store file references and content hashes, not base64;
 changed or missing attachments are skipped with a notice rather than silently replaced on replay.
-Known non-vision models skip images; unknown capabilities are attempted and may be rejected by the provider.
+Browser screenshots attach rendered pixels automatically, and Dial's visual-work guidance calls for
+proactive inspection when looking would help. Visual tasks receive an initial inspection reminder;
+edits to styles/templates/components trigger a bounded completion checkpoint when no fresh rendered
+pixels have reached the model. Earlier screenshots become stale after subsequent edits. If visual
+inspection remains unavailable, the final result explicitly reports that it was not completed.
+Known non-vision models skip images with a notice to both the user and model. Downloaded local models
+with a vision encoder in `config.json` use MLX-VLM and receive the image pixels; text-only models use
+MLX-LM. `dial setup` installs both runners in Dial's private runtime. The vision runner retains at most
+one image-feature cache and disables persistent prefix caching. External endpoints with unknown
+capabilities are attempted and may be rejected by the provider; use a vision-capable model for visual work.
 `/cost` shows accumulated cost only when catalog pricing and token usage are available; no local-model
-price is invented.
+price is invented. It also shows observed main-agent input, output, cached-read, cache-write and reasoning
+counts for the current runtime, with response-count coverage. These counters do not yet include worker
+usage or transport retries and are not restored across process restarts. Reasoning may overlap output;
+do not add them twice. Missing provider usage is unknown, not free.
 
+
+### Measuring efficiency
+
+From this checkout run `dial benchmark examples/benchmarks/efficiency.toml --profiles machine.toml --report efficiency-report.json`
+using the machine/profile configuration described below. The five disposable cases cover a simple
+question, a one-file edit, a failing-test repair, a multi-file rename, and continued-session compaction.
+Compare correctness first, then observed prompt/output/cache/reasoning usage, calls, errors and elapsed
+time. The simple-question case checks tool avoidance only; manually review its answer for correctness.
+The continued-session case tests multi-turn compaction, not process restart/resume. No live-model savings
+are claimed by these fixtures, and prompt cache hits need not be free under a subscription limit.
 ## Model controls, embedding SDK and persistent RPC
 
 Profiles declare capabilities for an **exact** provider/model; no model-name heuristics select reasoning,
@@ -435,9 +538,17 @@ For browser setup, install outside the editable workspace:
 npm install --prefix "$HOME/.dial/browser" playwright
 "$HOME/.dial/browser/node_modules/.bin/playwright" install chromium
 ```
-Set `[browser] playwright_module` to that absolute module path. `allowed_hosts=["127.0.0.1:3000"]`
-permits only that local dev endpoint; redirects/subresources are checked again. Metadata/link-local
-addresses remain forbidden. Networking is paused between approved browser operations. Python and
+Set `[browser] playwright_module` to that absolute module path. Approved browser `open`/`navigate`
+requests to `localhost` or `127.0.0.1` automatically permit only that exact host and port for the browser
+session, so local development sites work without configuring each port. Redirects and subresources
+cannot grant access to another local endpoint. `/settings` → Tools → Browser controls this behavior;
+`auto_localhost=false` restores explicit allowlisting with `allowed_hosts=["127.0.0.1:3000"]`.
+Other private hosts still require operator allowlisting. Metadata/link-local addresses remain forbidden.
+Use managed `bg` processes for previews: list/reuse a running server, start one if needed, wait for
+readiness, then open its HTTP URL. Foreground `bash` kills servers at its deadline. The browser accepts
+`about:blank`, and tab IDs may be omitted when exactly one tab is open; multiple tabs require an ID.
+Browser failures show the underlying network refusal before Chromium's generic error. Networking is
+paused between approved browser operations. Python and
 Poppler must also be installed when using kernel/PDF capabilities.
 
 `dial rpc` is a persistent version-1 JSON-lines control endpoint. Requests have `id`, `method` and `params`;
@@ -479,10 +590,10 @@ regression evidence, not claims about real-model quality.
 - **Forgiving hashline bodies.** A `PUT` body row written without its `+` prefix, or a raw blank line between body rows, is taken as content and the result warns how many rows lacked the prefix, instead of failing the whole patch. Rows that look like unified-diff deletions (`-…`) are still refused. Lines the model was shown are rebuilt from the session's earlier `read`/`edit`/`write` results when the agent restarts or is rebuilt, for files whose content is unchanged since, so a resumed session does not reject edits with "no read of this file is recorded".
 - **Compaction is checked, not assumed.** The trigger (80% of the window) uses the provider's own count for the last request plus a local estimate of everything added since, so a large tool result is counted before the request it would overflow, not after. After summarising, dial estimates the next prompt the same way (the fixed system prompt and tool schemas included). Above 70% of the window it compacts once more, harder; if it still would not fit it says so and names the fix (a larger context window or fewer `integrations`) instead of summarising again every step.
 - **Stuck-turn detection.** Besides the identical-call guard (warns at the third identical failure, stops at the fourth), dial counts failures whatever the arguments: the same file tool (`read`, `edit`, `write`, `glob`, `grep`, `ast_edit`, `ast_search`, `artifact_read`) failing five calls in a row gets a warning and ten stops the turn, even with successful reads in between (the read-guess-read-guess loop); `bash` and `kernel` failures are task feedback and are never counted. Four rounds in which every call failed add a warning, eight stop the turn. A stopped turn is **reported**, not raised: the reason is recorded in the conversation, shown as a notice, the outcome is `incomplete`, and print mode exits 2 (with `--output-format json` the result has `outcome: "incomplete"` and no `error`). The step limit ends the same way.
-- **Step budget.** `harness.max_steps` counts model calls that did work; `0` means unlimited, and `1..64` sets a per-turn cap. A reply that was unusable (truncated answer text or tool arguments, an unreadable call, a tool call written as plain text) is retried without spending a step, up to eight times per turn, and compacting after the server rejected the prompt size is never charged. Sealed evaluation runs get no refunds: their budget is what they measure.
+- **Step budget.** `harness.max_steps` counts model calls that did work; `0` means unlimited interactive turns, including when an admitted harness has a finite budget. Positive values keep their step limit. Automatic repair and sealed evaluation still have finite caps. A reply that was unusable (truncated answer text or tool arguments, an unreadable call, a tool call written as plain text) is retried without spending a step, up to eight times per turn, and compacting after the server rejected the prompt size is never charged. Sealed evaluation runs get no refunds: their budget is what they measure.
 - **Completion and todos.** `todo` keeps a numbered plan: `set` (optionally grouped by `phase`), `append`, `start`, `done`, `drop` and `block` (with a reason). Whenever nothing is in progress the earliest pending task starts, so "finished this, on to the next" is one `done` call. The open list is pinned above the composer in the TUI (progress, current step, blockers; long lists window around the active task), streamed as `todo` events over RPC and `stream-json`, carried verbatim through compaction, and survives session resume. If the agent stops with pending or in-progress tasks, dial asks it to continue through tools, up to three reminders; another reminder requires a changed todo list or new successful tool evidence, so repeated reads and text-only promises cannot loop forever. Stopping when every open task is blocked ends the turn as `blocked` without reminders. The `finish` control tool reports `completed`, `blocked`, or `needs_input`. Completion refuses open (including blocked) todos and running live tasks; blockers and questions require a concrete `reason` and leave open work intact. Ordinary informational replies still work without todos. JSON print results and RPC `send` responses expose `outcome`; blocked, needs-input, incomplete, and interrupted print runs exit with code 2 instead of reporting success. These controls do not independently prove that a model's task-status claims are true; relevant checks still run after completed edits.
 - **Specialist integrations** (available per `integrations` in the config, loaded on demand; never in sealed evaluation/self-play). MCP tools follow `[mcp.*]`; enabling a schema never bypasses approval:
-  - `bg`: long-running processes (`start`/`list`/`output`/`wait`/`kill`) under the same sandbox as `bash`, in their own process group, at most 8 at once, 256 KiB of output kept each, all killed when dial exits.
+  - `bg`: long-running processes (`start`/`list`/`output`/`wait`/`kill`) under the same sandbox as `bash`, in their own process group, at most 8 at once, 256 KiB of output kept each, all killed when dial exits. Browser tool loading also exposes `bg` when enabled. Start or reuse local preview servers here, wait for readiness, then open the actual HTTP URL; foreground `bash` kills its process group on return/timeout and refuses common dev-server commands before launching them. Stop temporary preview processes you created after inspection, preserving existing user services.
   - `web_fetch` / `web_search`: HTTP(S) fetch with HTML→text conversion and an SSRF guard (loopback, private, link-local and metadata addresses are refused on every connection and redirect), and search through DuckDuckGo's HTML endpoint (a scraping path that can break) or your own `[web] search_url` template containing `{query}`. Both need approval and are disabled by `sandbox.mode = "strict"` or `allow_network = false`.
   - `lsp`: definition, references, hover, implementation, type_definition, document_symbols, workspace_symbols, diagnostics and `rename_preview` (never applies) through language servers found on `PATH` (rust-analyzer, typescript-language-server, pyright/pylsp, gopls, clangd) or `[lsp.<language>]`. Servers run unsandboxed, so the call that would start one asks for approval.
   - `ast_search` / `ast_edit`: structural search and rewrite with ast-grep patterns (`$VAR`, `$$$ARGS`) over 28 languages. `ast_edit` previews by default; applying is all-or-nothing, atomic, checkpointed (`/undo` works) and refuses results that no longer parse.
@@ -547,7 +658,7 @@ the serving model. Hosted endpoints can improve the harness, not their remote we
 
 During live work, Dial may attach up to three matching repair hints from the same project to the user message they match. They are stored with that message, never placed in the system prompt, so the cached prompt prefix does not change from turn to turn. Hints show only tool names, argument field names and failure categories—not old argument values—and never bypass current validation or approval.
 
-The MLX server adapter preserves malformed model tool calls as explicitly invalid, non-executable calls rather than allowing the pinned upstream formatter to crash on missing arguments. These errors remain visible to the agent and the learning pipeline. Its prompt (KV prefix) cache is bounded to a quarter of physical memory (`--prompt-cache-bytes`); mlx-lm's default holds up to ten caches with no byte limit, which can push weights into swap on unified memory.
+The MLX-LM server adapter preserves malformed model tool calls as explicitly invalid, non-executable calls rather than allowing the pinned upstream formatter to crash on missing arguments. These errors remain visible to the agent and the learning pipeline. Its prompt (KV prefix) cache is bounded to a quarter of physical memory (`--prompt-cache-bytes`); mlx-lm's default holds up to ten caches with no byte limit, which can push weights into swap on unified memory.
 
 ```sh
 dial improve jobs                   # all project models, active locks, stage and recent log
@@ -913,7 +1024,10 @@ Adding a tool: implement `tools::ext::Tool` in its own module, return it from a 
 
 Dial bounds initial reasoning according to task complexity (20–60 seconds, capped by the configured
 reasoning limit), redirects repeated unchanged investigations, and saves completed investigation
-findings with source hashes. Saved findings are untrusted context: changed sources make them stale,
+findings with source hashes. Investigation todo findings and drop/block reasons allow up to 4,000
+characters, including relevant detail and remaining uncertainty; saved codebase notes allow up to
+20,000 UTF-8 bytes.
+Saved findings are untrusted context: changed sources make them stale,
 and replaying an old completed todo cannot make them fresh again. Error recovery hints distinguish
 missing paths, malformed calls and failed edits so retries can change approach.
 
@@ -1130,8 +1244,11 @@ teacher_timeout_secs = 10
 ### Experimental MLX activation steering
 
 Dial can extract a unit-length behavior vector from matched positive/negative assistant responses,
-then add it to one transformer layer during inference. This runs in Dial's own MLX server;
-hosted providers and external inference servers have no activation hook. Automatic creation is enabled
+then add it to one transformer layer during inference. This runs in Dial's own MLX-LM text server;
+the MLX-VLM vision runner, hosted providers and external inference servers have no Dial activation
+hook. Vision models continue to handle images and tools without activation steering. Unsupported
+runners skip automatic steering extraction and evaluation before starting a worker; `/steering`
+reports the limitation. Automatic creation is enabled
 by default as part of automatic improvement; no vector is used before it passes evaluation.
 No random vector is activated automatically, and this is independent of OMP and Laya.
 
@@ -1346,7 +1463,10 @@ See [OpenAI function calling](https://developers.openai.com/api/docs/guides/func
 and [Anthropic strict tool use](https://platform.claude.com/docs/en/agents-and-tools/tool-use/strict-tool-use).
 
 `finish completed` checks pending edits with existing focused verification before accepting the
-claim, and refuses unresolved failed checks. Operator-declared behavioral checks and existing
+claim, and refuses unresolved failed checks. A pending diff or visual review continues the agent
+normally; it is not a tool failure or an accepted completion. Visual edits require fresh rendered
+pixels in a subsequent model round. If inspection is unavailable, the agent reports that limit;
+the visual reminder is bounded for each revision. Operator-declared behavioral checks and existing
 bounded repair remain in force. `/reliability` distinguishes missing automatic checks from passing
 checks; build or syntax success is not a certificate of task correctness. Inspect the diff and
 use behavioral checks that cover the requested outcome.

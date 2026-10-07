@@ -128,6 +128,44 @@ pub fn model_output_limit(context_window: u32) -> usize {
     (context_window as usize / 2).clamp(MIN_MODEL_OUTPUT, MODEL_OUTPUT_LIMIT)
 }
 
+/// Smaller successful inspection previews only when the full body is retrievable.
+pub fn preview_limit(window: u32, tool: &str, failed: bool, retained: bool) -> usize {
+    let limit = model_output_limit(window);
+    if retained
+        && !failed
+        && matches!(
+            tool,
+            "read" | "grep" | "glob" | "find" | "bash" | "web_fetch" | "web_search"
+        )
+    {
+        limit.min(8 * 1024)
+    } else {
+        limit
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn compact_previews_require_retrievable_successful_observations() {
+        assert_eq!(preview_limit(128000, "read", false, true), 8192);
+        assert_eq!(
+            preview_limit(128000, "read", false, false),
+            MODEL_OUTPUT_LIMIT
+        );
+        assert_eq!(
+            preview_limit(128000, "bash", true, true),
+            MODEL_OUTPUT_LIMIT
+        );
+        assert_eq!(
+            preview_limit(128000, "edit", false, true),
+            MODEL_OUTPUT_LIMIT
+        );
+        assert_eq!(preview_limit(8000, "read", false, true), 4096);
+    }
+}
+
 /// Per-workspace scratch directory exported as TMPDIR for bash; walks skip it.
 pub const SCRATCH_DIR: &str = ".tmp";
 
@@ -135,11 +173,21 @@ pub const SCRATCH_DIR: &str = ".tmp";
 pub struct ToolOutput {
     pub text: String,
     pub is_error: bool,
+    /// Original structured result for clients; never recover richer objects by parsing `text`.
+    pub data: Option<Value>,
 }
 
 impl ToolOutput {
+    pub fn structured(data: Value) -> Self {
+        Self {
+            text: data.to_string(),
+            is_error: false,
+            data: Some(data),
+        }
+    }
     fn ok(text: String) -> Self {
         Self {
+            data: None,
             text,
             is_error: false,
         }
@@ -147,6 +195,7 @@ impl ToolOutput {
 
     fn err(text: impl Into<String>) -> Self {
         Self {
+            data: None,
             text: text.into(),
             is_error: true,
         }
@@ -483,7 +532,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 REPLACE_READ_DESC
             },
             json!({
-                "path": {"type": "string", "description": "File or directory path, relative to the workspace root; may end in a line selector such as `:50-100`, `:50+150`, `:-60` (last 60 lines), `:5-16,960-973` or `:raw`."},
+                "path": {"type": "string", "description": "File or directory path relative to the workspace root, or the exact absolute path of an image already attached by the user. Images attach original pixels for vision input and do not support line selectors. Text paths may end in `:50-100`, `:50+150`, `:-60`, `:5-16,960-973` or `:raw`."},
                 "offset": {"type": "integer", "minimum": 1, "description": "1-based line to start at (default 1); not together with a path selector."},
                 "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of lines (default 2000)."},
             }),
@@ -559,7 +608,9 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
              `Operation not permitted` or a network failure means the sandbox refused it, not that your command \
              is wrong: do not repeat it unchanged, work inside the project or tell the user. stdout and stderr are \
              merged; large output keeps its beginning and its end (the end holds build and test verdicts). The \
-             process group is killed on timeout and when the command returns, so background jobs do not survive.",
+             process group is killed on timeout and when the command returns, so background jobs do not survive. \
+             Do not launch dev servers/watchers here: discover/load bg, start or reuse a managed process, and wait \
+             for readiness before browser navigation. Common preview commands are refused before starting.",
             json!({
                 "command": {"type": "string", "description": "Shell command to run."},
                 "timeout": {"type": "integer", "minimum": 1, "description": "Timeout in seconds (capped by the harness limit)."},

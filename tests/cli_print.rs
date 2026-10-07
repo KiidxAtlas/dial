@@ -646,11 +646,64 @@ impl RpcChild {
 }
 
 #[test]
+fn rpc_projects_shared_results_and_exposes_a_resolvable_execution_tree() {
+    let env = Env::new();
+    let server = Server::new(vec![
+        call("todo", json!({"op":"view"})),
+        text("shared answer"),
+    ]);
+    let mut rpc = RpcChild::start(&env, &server);
+    rpc.send(1, "send", json!({"text":"inspect the todo list"}));
+    let mut events = Vec::new();
+    loop {
+        let event = rpc.next();
+        if event["id"] == 1 {
+            assert_eq!(event["result"]["text"], "shared answer");
+            break;
+        }
+        events.push(event);
+    }
+    let settled = events
+        .iter()
+        .find(|e| {
+            e["event"] == "state_node"
+                && e["node"]["label"] == "todo"
+                && e["node"]["result"]["phase"] == "done"
+        })
+        .unwrap();
+    assert_eq!(settled["node"]["result"]["data"]["tasks"], json!([]));
+    assert_eq!(settled["node"]["result"]["text"], "No tasks.");
+    let legacy = events
+        .iter()
+        .find(|e| e["event"] == "tool_result" && e["name"] == "todo")
+        .unwrap();
+    assert_eq!(legacy["data"], settled["node"]["result"]["data"]);
+    rpc.send(2, "state", json!({}));
+    let state = rpc.result(2);
+    let nodes = state["tree"].as_array().unwrap();
+    for node in nodes {
+        if let Some(parent) = node["parent"].as_str() {
+            assert!(nodes.iter().any(|n| n["id"] == parent), "orphan: {node}");
+        }
+    }
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n["kind"] == "message" && n["label"] == "user")
+    );
+    rpc.send(3, "shutdown", json!({}));
+    rpc.result(3);
+}
+
+#[test]
 fn rpc_keeps_conversation_state_and_approval_does_not_bypass_policy() {
     let env = Env::new();
     let server = Server::new(vec![
         text("first answer"),
         call("write", json!({"path":"result.txt","content":"saved"})),
+        // The edit review requests another model round before accepting completion.
+        text("second answer"),
+        text("second answer"),
         text("second answer"),
     ]);
     let mut rpc = RpcChild::start(&env, &server);
@@ -702,6 +755,11 @@ fn rpc_keeps_conversation_state_and_approval_does_not_bypass_policy() {
     );
     let requests = server.requests.lock();
     assert!(requests[1]["messages"].to_string().contains("first answer"));
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("review required before completion")
+    );
     drop(requests);
     rpc.send(4, "shutdown", json!({}));
     rpc.result(4);
@@ -781,6 +839,17 @@ fn rpc_cancels_live_worker_while_its_write_is_waiting_for_approval() {
         thread::sleep(Duration::from_millis(5));
     }
     assert!(!env.project.path().join("forbidden.txt").exists());
+    rpc.send(6, "state", json!({}));
+    let tree = rpc.result(6);
+    let worker = tree["tree"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "worker")
+        .unwrap();
+    assert_eq!(worker["result"]["phase"], "interrupted");
+    assert_eq!(worker["result"]["data"]["id"], id);
+    assert_eq!(worker["result"]["data"]["status"], "cancelled");
     rpc.send(5, "shutdown", json!({}));
     rpc.result(5);
 }

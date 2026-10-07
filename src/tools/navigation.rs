@@ -97,6 +97,7 @@ impl Tool for Find {
             }
         }
         ToolOutput {
+            data: None,
             text,
             is_error: error,
         }

@@ -227,10 +227,10 @@ pub fn render_result(result: &Value) -> ToolOutput {
     };
     let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
     let text = bound(&strip_controls(&text));
-    if is_error {
-        ToolOutput::err(text)
-    } else {
-        ToolOutput::ok(text)
+    ToolOutput {
+        text,
+        is_error,
+        data: Some(result.clone()),
     }
 }
 

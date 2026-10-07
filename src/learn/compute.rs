@@ -302,9 +302,11 @@ mod tests {
     fn background_generation_is_retried_after_foreground_handoff_without_scoring_a_partial_reply() {
         use std::sync::atomic::Ordering;
         let root = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.user_dir = root.path().join("user");
-        config.state_dir = root.path().join("state");
+        let config = Config {
+            user_dir: root.path().join("user"),
+            state_dir: root.path().join("state"),
+            ..Config::default()
+        };
         let _lease = Background::acquire(&config).unwrap();
         let mut backend = crate::llm::provider::Backend::new(
             crate::llm::provider::ProviderKind::Endpoint {
@@ -359,9 +361,11 @@ mod tests {
     #[test]
     fn stop_interrupts_a_paused_training_wait_and_releases_its_lease() {
         let root = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.user_dir = root.path().join("user");
-        config.state_dir = root.path().join("state");
+        let config = Config {
+            user_dir: root.path().join("user"),
+            state_dir: root.path().join("state"),
+            ..Config::default()
+        };
         std::fs::create_dir_all(&config.state_dir).unwrap();
         let lease = Background::acquire(&config).unwrap();
         let _foreground = Request::foreground(&config.user_dir).unwrap();

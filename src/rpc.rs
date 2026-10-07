@@ -47,6 +47,9 @@ struct RpcUi {
     interrupt: Arc<AtomicBool>,
     steering: Arc<Mutex<Vec<String>>>,
     next: u64,
+    node_cursors: std::collections::BTreeMap<String, usize>,
+    node_revisions: std::collections::BTreeMap<String, u64>,
+    tree: Option<crate::runtime::Tree>,
 }
 impl RpcUi {
     fn request_approval(
@@ -87,6 +90,31 @@ impl RpcUi {
     }
 }
 impl Ui for RpcUi {
+    fn runtime(&mut self, tree: &crate::runtime::Tree) {
+        if self.tree.as_ref().is_none_or(|old| !old.same(tree)) {
+            self.node_cursors.clear();
+            self.node_revisions.clear();
+            self.tree = Some(tree.clone());
+            self.out.emit(json!({"event":"state_reset"}));
+        }
+    }
+    fn heartbeat(&mut self) {
+        if let Some(tree) = self.tree.clone() {
+            for body in tree.bodies("worker") {
+                self.result_node(&body);
+            }
+        }
+    }
+    fn result_node(&mut self, body: &crate::runtime::Body) {
+        body.read(|node| {
+            if self.node_revisions.insert(node.id.clone(), node.result.revision) == Some(node.result.revision) { return; }
+            let bytes=self.node_cursors.insert(node.id.clone(),node.result.text.len());
+            if node.kind != "worker" && node.result.phase==crate::runtime::Phase::Running && let Some(bytes)=bytes
+                && bytes<=node.result.text.len() && node.result.text.is_char_boundary(bytes) {
+                self.out.emit(json!({"event":"state_delta","id":node.id,"revision":node.result.revision,"append":&node.result.text[bytes..]}));
+            } else {self.out.emit(json!({"event":"state_node","node":node}));}
+        });
+    }
     fn text_delta(&mut self, text: &str) {
         self.out.emit(json!({"event":"text","delta":text}));
     }
@@ -95,10 +123,14 @@ impl Ui for RpcUi {
             .emit(json!({"event":"tool_call","name":name,"summary":summary}));
     }
     fn tool_result(&mut self, name: &str, output: &ToolOutput) {
-        self.out.emit(json!({"event":"tool_result","name":name,"text":crate::agent::guard::clip_middle(&output.text,24*1024),"is_error":output.is_error}));
+        self.out.emit(json!({"event":"tool_result","name":name,"text":crate::agent::guard::clip_middle(&output.text,24*1024),"is_error":output.is_error,"data":output.data}));
     }
     fn notice(&mut self, message: &str) {
         self.out.emit(json!({"event":"notice","message":message}));
+    }
+    fn model_progress(&mut self, progress: &crate::llm::ModelProgress) {
+        self.out
+            .emit(json!({"event":"model_progress","progress":progress}));
     }
     fn context_usage(&mut self, tokens: u64, estimated: bool) {
         self.out
@@ -240,6 +272,9 @@ pub fn run(layout: Layout, config: Config) -> Result<()> {
                 interrupt: flag.clone(),
                 steering: queue,
                 next: 0,
+                node_cursors: Default::default(),
+                node_revisions: Default::default(),
+                tree: None,
             };
             worker_out.emit(json!({"event":"ready","protocol_version":PROTOCOL_VERSION,"session_id":agent.session().id(),"model":config.model,"tools":agent.tool_names()}));
             loop {
@@ -291,7 +326,7 @@ pub fn run(layout: Layout, config: Config) -> Result<()> {
                             )
                         }
                         "state" => Ok(
-                            json!({"session_id":agent.session().id(),"title":agent.session().title(),"tools":agent.tool_names(),"plan_mode":agent.plan_mode(),"cost":agent.session_cost(),"metrics":agent.metrics()}),
+                            json!({"session_id":agent.session().id(),"title":agent.session().title(),"tools":agent.tool_names(),"plan_mode":agent.plan_mode(),"cost":agent.session_cost(),"metrics":agent.metrics(),"tree":agent.session().execution_tree()}),
                         ),
                         "plan" => {
                             agent.set_plan_mode(

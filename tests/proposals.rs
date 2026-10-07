@@ -75,6 +75,8 @@ fn invalid_generation_budgets_do_not_reach_model_execution() {
     assert!(f.config.validate_harness(&harness).is_err());
     harness.temperature = 0.0;
     harness.max_steps = 0;
+    assert!(f.config.validate_harness(&harness).is_ok());
+    harness.max_steps = 65;
     assert!(f.config.validate_harness(&harness).is_err());
     harness.max_steps = 4;
     harness.max_tokens = 9000;

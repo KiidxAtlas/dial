@@ -1,6 +1,9 @@
 //! Persisted UI preferences and provider-independent model selections.
 use serde::{Deserialize, Serialize};
 
+/// Shared budget ceiling, large enough for decimal 1.05M and 2M model windows.
+pub const MAX_CONTEXT_WINDOW: u32 = 2_097_152;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelSelection {
@@ -9,8 +12,26 @@ pub struct ModelSelection {
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub allow_insecure: bool,
+    #[serde(deserialize_with = "context_override")]
     pub context_window: Option<u32>,
 }
+fn context_override<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Input {
+        Number(u32),
+        Text(String),
+    }
+    match Option::<Input>::deserialize(d)? {
+        None => Ok(None),
+        Some(Input::Number(n)) => Ok(Some(n)),
+        Some(Input::Text(s)) if s.eq_ignore_ascii_case("auto") => Ok(None),
+        _ => Err(serde::de::Error::custom(
+            "context window must be auto or a token count",
+        )),
+    }
+}
+
 impl Default for ModelSelection {
     fn default() -> Self {
         Self {
@@ -121,6 +142,8 @@ pub struct UiConfig {
     pub welcome: bool,
     pub tips: bool,
     pub show_tools: bool,
+    pub session_rail: bool,
+    pub worker_shards: bool,
     /// Lines of tool output shown before collapsing (Ctrl-O expands).
     pub tool_output_lines: usize,
     pub show_turn_stats: bool,
@@ -154,6 +177,8 @@ impl Default for UiConfig {
             welcome: true,
             tips: true,
             show_tools: true,
+            session_rail: true,
+            worker_shards: true,
             tool_output_lines: 8,
             show_turn_stats: true,
             show_thinking: true,
@@ -199,5 +224,32 @@ impl ModelSelection {
                 }
             });
         format!("{}/{}", self.provider, name)
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn context_overrides_accept_auto_without_restricting_catalog_capacities() {
+        for value in [serde_json::Value::Null, serde_json::json!("auto")] {
+            let row: ModelSelection =
+                serde_json::from_value(serde_json::json!({"context_window":value})).unwrap();
+            assert_eq!(row.context_window, None);
+        }
+        let row: ModelSelection =
+            serde_json::from_value(serde_json::json!({"context_window":2_000_000})).unwrap();
+        assert_eq!(row.context_window, Some(2_000_000));
+        assert_eq!(
+            serde_json::from_value::<ModelSelection>(serde_json::to_value(&row).unwrap()).unwrap(),
+            row
+        );
+        assert!(
+            serde_json::from_value::<ModelSelection>(
+                serde_json::json!({"context_window":"invalid"})
+            )
+            .is_err()
+        );
     }
 }

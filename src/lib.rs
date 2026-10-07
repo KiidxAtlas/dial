@@ -7,6 +7,7 @@ pub mod learn;
 pub mod llm;
 pub mod repl;
 pub mod rpc;
+pub mod runtime;
 pub mod schedule;
 pub mod setup;
 pub mod storage;

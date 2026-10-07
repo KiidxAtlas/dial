@@ -46,6 +46,8 @@ impl Config {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Health {
     pub status: String,
+    #[serde(default)]
+    pub busy: bool,
     pub checkpoint: String,
     pub device: String,
     pub service: String,
@@ -314,6 +316,7 @@ fn ensure_service_with(
             }
             child_exited = Some(launch()?);
             Health {
+                busy: false,
                 status: "starting".into(),
                 checkpoint: "Dial configured checkpoint".into(),
                 device: "loading".into(),
@@ -379,6 +382,10 @@ pub fn predict(
         health.status == "ok",
         "Laya is loading its checkpoint; coding continues without advice"
     );
+    ensure!(
+        !health.busy,
+        "Laya is busy with another prediction; coding continues without advice"
+    );
     let filtered = state
         .lines()
         .filter(|line| crate::storage::memory::screen(line).is_ok())
@@ -386,10 +393,24 @@ pub fn predict(
         .join("\n");
     let state = crate::agent::prompt::truncate_chars(&filtered, 10000);
     let requested = questions(phase);
+    let prediction_error = |error| {
+        if matches!(error, ureq::Error::Timeout(_)) {
+            anyhow::anyhow!(
+                "Laya advice exceeded its {}s budget; pausing advice for 60s while coding continues",
+                config.timeout_secs
+            )
+        } else {
+            anyhow::Error::new(error).context("Laya prediction failed")
+        }
+    };
     let mut response = client(config, cancel)
         .post(format!("{}/v1/predict", config.endpoint))
         .send_json(json!({"state":{"input":state},"questions":requested}))
-        .context("Laya prediction failed")?;
+        .map_err(&prediction_error)?;
+    ensure!(
+        response.status().as_u16() != 503,
+        "Laya is busy or loading; coding continues without advice"
+    );
     ensure!(
         response.status().is_success(),
         "Laya prediction request failed: HTTP {}",
@@ -399,7 +420,8 @@ pub fn predict(
         .body_mut()
         .with_config()
         .limit(32768)
-        .read_to_string()?;
+        .read_to_string()
+        .map_err(prediction_error)?;
     let value: Value = serde_json::from_str(&raw).context("invalid Laya prediction JSON")?;
     let answers = value["answers"]
         .as_object()
@@ -500,6 +522,7 @@ mod tests {
     }
     fn ready() -> Health {
         Health {
+            busy: false,
             status: "ok".into(),
             checkpoint: "test-checkpoint".into(),
             device: "cpu".into(),
@@ -510,6 +533,63 @@ mod tests {
     fn refused() -> anyhow::Error {
         std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into()
     }
+
+    #[test]
+    fn busy_service_does_not_submit_another_prediction() {
+        let mut health = ready();
+        health.busy = true;
+        let server = crate::llm::fake::serve(vec![crate::llm::fake::json(
+            200,
+            &serde_json::to_value(health).unwrap(),
+        )]);
+        let config = Config {
+            endpoint: server.url.clone(),
+            ..Default::default()
+        };
+        let error = predict(
+            &config,
+            "investigation",
+            "hello",
+            Arc::new(AtomicBool::new(false)),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("Laya is busy"));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(crate::llm::fake::request_line(&requests[0]).starts_with("GET /health"));
+    }
+
+    #[test]
+    fn prediction_body_timeout_is_an_advisory_delay() {
+        let server = crate::llm::fake::serve(vec![
+            crate::llm::fake::json(200, &serde_json::to_value(ready()).unwrap()),
+            crate::llm::fake::Script::ColdStart {
+                delay: std::time::Duration::from_millis(1200),
+                body: String::new(),
+            },
+        ]);
+        let config = Config {
+            endpoint: server.url.clone(),
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let error = predict(
+            &config,
+            "investigation",
+            "hello",
+            Arc::new(AtomicBool::new(false)),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.to_string().contains("exceeded its 1s budget"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("coding continues"));
+        assert_eq!(server.requests().len(), 2);
+    }
+
     #[test]
     fn refused_service_is_started_once_and_existing_service_is_reused() {
         let config = Config::default();

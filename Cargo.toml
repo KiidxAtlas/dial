@@ -14,6 +14,7 @@ libc = "0.2"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 ureq = { version = "3", features = ["json"] }
+rustls = { version = "0.23", default-features = false }
 base64 = "0.23"
 tempfile = "3"
 serde_json = "1"
@@ -37,6 +38,7 @@ flate2 = "1"
 parking_lot = "0.12"
 similar = { version = "2.7", default-features = false, features = ["text"] }
 shlex = "2"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dev-dependencies]
 vt100 = "0.15"

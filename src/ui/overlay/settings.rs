@@ -510,7 +510,11 @@ fn fmt_float(f: f64) -> String {
 }
 
 fn value_text(def: &SettingDef, value: &Value) -> String {
+    if def.path == "harness.max_steps" && value.as_integer() == Some(0) {
+        return "0 (unlimited)".into();
+    }
     let raw = match (&def.kind, value) {
+        (Kind::AutoInt { .. }, Value::String(s)) if s == "auto" => "Auto".into(),
         (Kind::Bool, Value::Boolean(b)) => if *b { "on" } else { "off" }.to_owned(),
         (Kind::Enum(options), Value::String(s)) => options
             .iter()
@@ -548,6 +552,7 @@ fn edit_text(value: &Value) -> String {
 
 fn input_hint(kind: Kind) -> String {
     match kind {
+        Kind::AutoInt { min, max, .. } => format!("Auto or a whole number from {min} to {max}."),
         Kind::Int { min, max, .. } => format!("Whole number from {min} to {max}."),
         Kind::Float { min, max, .. } => {
             format!("Number from {} to {}.", fmt_float(min), fmt_float(max))
@@ -561,7 +566,10 @@ fn input_hint(kind: Kind) -> String {
 fn parse_input(kind: Kind, input: &str) -> Result<Value, String> {
     let input = input.trim();
     match kind {
-        Kind::Int { min, max, .. } => {
+        Kind::AutoInt { .. } if input.eq_ignore_ascii_case("auto") => {
+            Ok(Value::String("auto".into()))
+        }
+        Kind::Int { min, max, .. } | Kind::AutoInt { min, max, .. } => {
             let n: i64 = input
                 .parse()
                 .map_err(|_| format!("Enter a whole number between {min} and {max}"))?;
@@ -608,7 +616,17 @@ fn parse_input(kind: Kind, input: &str) -> Result<Value, String> {
 /// Step a numeric buffer up (`dir = 1`) or down.
 fn adjust(kind: Kind, buffer: &str, dir: i64) -> Option<String> {
     match kind {
-        Kind::Int { min, max, step } => {
+        Kind::AutoInt { min, .. } if buffer.trim().eq_ignore_ascii_case("auto") => {
+            Some(if dir > 0 {
+                min.to_string()
+            } else {
+                "auto".into()
+            })
+        }
+        Kind::AutoInt { min, .. } if dir < 0 && buffer.trim().parse::<i64>().ok() == Some(min) => {
+            Some("auto".into())
+        }
+        Kind::Int { min, max, step } | Kind::AutoInt { min, max, step } => {
             let n = buffer.trim().parse::<i64>().unwrap_or(min);
             Some(
                 n.saturating_add(step.saturating_mul(dir))
@@ -792,7 +810,7 @@ impl SettingsOverlay {
                     hits.push((score, Row::Link(i)));
                 }
             }
-            hits.sort_by(|a, b| b.0.cmp(&a.0));
+            hits.sort_by_key(|a| std::cmp::Reverse(a.0));
             return hits.into_iter().map(|(_, row)| row).collect();
         }
         match self.tabs.get(self.tab) {
@@ -1012,7 +1030,11 @@ impl SettingsOverlay {
                 };
                 OverlayEvent::None
             }
-            Kind::Int { .. } | Kind::Float { .. } | Kind::Text | Kind::StringList => {
+            Kind::Int { .. }
+            | Kind::AutoInt { .. }
+            | Kind::Float { .. }
+            | Kind::Text
+            | Kind::StringList => {
                 let mut editor = Editor::default();
                 editor.set(&edit_text(&current));
                 self.notes.remove(def.path);
@@ -1720,7 +1742,10 @@ impl SettingsOverlay {
         };
         match &self.mode {
             Mode::Edit { def, .. } => {
-                let numeric = matches!(def.kind, Kind::Int { .. } | Kind::Float { .. });
+                let numeric = matches!(
+                    def.kind,
+                    Kind::Int { .. } | Kind::AutoInt { .. } | Kind::Float { .. }
+                );
                 vec![
                     hint(keys, Action::SelectConfirm, "save"),
                     if numeric {
@@ -1955,7 +1980,7 @@ mod tests {
             OverlayEvent::None
         ));
         assert!(
-            o.pending.get("ui.composer_shape").is_none(),
+            !o.pending.contains_key("ui.composer_shape"),
             "browsing must not save"
         );
         assert!(matches!(
@@ -1998,7 +2023,7 @@ mod tests {
             "out of range is not sent"
         );
         let shown = draw(&mut o, &rig, 110, 30);
-        assert!(shown.contains("Must be between 1 and 64"), "{shown}");
+        assert!(shown.contains("Must be between 0 and 64"), "{shown}");
         assert!(matches!(o.mode, Mode::Edit { .. }), "stays in the editor");
         // Not a number at all.
         send_all(
@@ -2023,6 +2048,22 @@ mod tests {
             ("harness.max_steps", Value::Integer(64))
         );
         assert!(matches!(o.mode, Mode::Browse));
+        o.settled("harness.max_steps", Ok(Value::Integer(64)));
+        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        send(
+            &mut o,
+            &rig.keys,
+            Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        );
+        send(&mut o, &rig.keys, ch('0'));
+        let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        assert_eq!(
+            (path.as_str(), value),
+            ("harness.max_steps", Value::Integer(0))
+        );
+        o.settled("harness.max_steps", Ok(Value::Integer(0)));
+        assert!(draw(&mut o, &rig, 110, 30).contains("0 (unlimited)"));
+        assert_eq!(edit_text(&Value::Integer(0)), "0");
         // Esc leaves the editor without sending anything and without closing the panel.
         send(&mut o, &rig.keys, key(KeyCode::Enter));
         assert!(matches!(
@@ -2072,6 +2113,45 @@ mod tests {
                 Value::String("context".into())
             ])
         );
+    }
+
+    #[test]
+    fn context_editor_displays_auto_and_accepts_cloud_local_caps() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        for path in [
+            "context_window",
+            "cloud_context_window",
+            "local_context_window",
+        ] {
+            goto(&mut o, &rig.keys, path);
+            let screen = draw(&mut o, &rig, 130, 30);
+            assert!(screen.contains("Auto"), "{screen}");
+            send(&mut o, &rig.keys, key(KeyCode::Enter));
+            send(&mut o, &rig.keys, ctrl('u'));
+            send_all(&mut o, &rig.keys, typed("64000"));
+            let (saved_path, value, scope) =
+                expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+            assert_eq!(saved_path, path);
+            assert_eq!(value, Value::Integer(64000));
+            assert_eq!(scope, Scope::Global);
+            o.settled(path, Ok(value));
+            send(&mut o, &rig.keys, key(KeyCode::Enter));
+            send(&mut o, &rig.keys, ctrl('u'));
+            send_all(&mut o, &rig.keys, typed("AUTO"));
+            let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+            assert_eq!(value.as_str(), Some("auto"));
+            o.settled(path, Ok(value));
+        }
+        let kind = settings_schema::registry()
+            .iter()
+            .find(|d| d.path == "context_window")
+            .unwrap()
+            .kind;
+        assert!(parse_input(kind, "2097153").is_err());
+        assert!(parse_input(kind, "2047").is_err());
+        assert_eq!(adjust(kind, "2048", -1).as_deref(), Some("auto"));
+        assert_eq!(adjust(kind, "auto", 1).as_deref(), Some("2048"));
     }
 
     #[test]

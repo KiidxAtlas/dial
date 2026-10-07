@@ -35,10 +35,16 @@ enum Event {
     Done(String, Value),
 }
 struct JobState {
-    status: Value,
+    body: crate::runtime::Body,
     interrupt: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     active_tool: ActiveTool,
+}
+impl JobState {
+    fn status(&self) -> Value {
+        self.body
+            .read(|n| n.result.data.clone().unwrap_or(Value::Null))
+    }
 }
 type Mailboxes = Arc<Mutex<BTreeMap<String, Arc<ControlJob>>>>;
 type ActiveTool = Arc<Mutex<Option<Arc<dyn crate::tools::ext::Tool>>>>;
@@ -114,6 +120,7 @@ impl Ui for CancelUi<'_> {
     }
 }
 pub(super) struct LiveTasks {
+    tree: crate::runtime::Tree,
     jobs: BTreeMap<String, JobState>,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
@@ -124,6 +131,7 @@ impl Default for LiveTasks {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
+            tree: Default::default(),
             jobs: BTreeMap::new(),
             tx,
             rx,
@@ -133,6 +141,7 @@ impl Default for LiveTasks {
     }
 }
 struct Bridge {
+    body: crate::runtime::Body,
     tx: mpsc::Sender<Event>,
     interrupt: Arc<AtomicBool>,
     inbox: Arc<Mutex<Vec<String>>>,
@@ -140,6 +149,12 @@ struct Bridge {
     active_tool: ActiveTool,
 }
 impl Approver for Bridge {
+    fn progress(&mut self, steps: u32, phase: &str, text: &str) {
+        self.body.progress(phase, steps);
+        if !text.is_empty() {
+            self.body.append(text);
+        }
+    }
     fn authorize(&mut self, call: &ToolCall, summary: &str, needs: bool) -> Result<(), Denial> {
         let (answer, rx) = mpsc::channel();
         if self
@@ -179,6 +194,14 @@ impl Approver for Bridge {
         true
     }
     fn tool_started(&mut self, name: &str, registry: &Registry) {
+        let steps = self.body.read(|n| {
+            n.result
+                .data
+                .as_ref()
+                .and_then(|d| d["steps"].as_u64())
+                .unwrap_or(0) as u32
+        });
+        self.body.progress(&format!("tool: {name}"), steps);
         *self.active_tool.lock().unwrap_or_else(|e| e.into_inner()) = registry.get(name).cloned();
     }
     fn tool_finished(&mut self) {
@@ -210,6 +233,13 @@ impl Approver for Bridge {
     }
 }
 impl LiveTasks {
+    pub fn bind(&mut self, tree: crate::runtime::Tree) {
+        if !self.tree.same(&tree) {
+            self.cancel_all();
+            self.tree.interrupt_open();
+        }
+        self.tree = tree;
+    }
     pub fn control(&self) -> LiveTaskControl {
         LiveTaskControl {
             jobs: self.mailboxes.clone(),
@@ -223,12 +253,13 @@ impl LiveTasks {
         layout: Option<&Layout>,
         harness: &Harness,
         args: &Value,
+        usage: Option<&crate::llm::usage::Scope>,
     ) -> Result<Value, String> {
         let request = subagents::parse(args, config)?;
         if self
             .jobs
             .values()
-            .filter(|j| j.status["status"] == "running")
+            .filter(|j| j.status()["status"] == "running")
             .count()
             + request.jobs.len()
             > 32
@@ -239,7 +270,7 @@ impl LiveTasks {
             let oldest = self
                 .jobs
                 .iter()
-                .filter(|(_, j)| j.status["status"] != "running")
+                .filter(|(_, j)| j.status()["status"] != "running")
                 .min_by_key(|(id, _)| id.trim_start_matches("task-").parse::<u64>().unwrap_or(0))
                 .map(|(id, _)| id.clone())
                 .ok_or("live job history is full")?;
@@ -250,6 +281,14 @@ impl LiveTasks {
         for job in &request.jobs {
             self.next += 1;
             let id = format!("task-{}", self.next);
+            let body = self.tree.start("worker", &job.label, None);
+            let status = json!({"id":id,"status":"running","name":job.label,"agent":job.kind,"model":config.for_role("subagent").model,"phase":"starting","steps":0});
+            body.settle(
+                String::new(),
+                Some(status.clone()),
+                crate::runtime::Phase::Running,
+            );
+            let shared_body = body.clone();
             let mut task = json!({"prompt":job.prompt,"agent":job.kind,"max_steps":job.max_steps,"name":job.label});
             if job.isolated {
                 task["isolation"] = json!("copy");
@@ -258,6 +297,7 @@ impl LiveTasks {
                 task["output_schema"] = schema.clone();
             }
             let config = config.clone();
+            let usage = usage.cloned();
             let role = config.for_role("subagent");
             let workspace = workspace.clone();
             let ext = ext.clone();
@@ -288,6 +328,7 @@ impl LiveTasks {
                 .name(format!("dial-{id}"))
                 .spawn(move || {
                     let mut bridge = Bridge {
+                        body: shared_body,
                         tx: tx.clone(),
                         interrupt: cancel.clone(),
                         inbox: messages,
@@ -306,6 +347,7 @@ impl LiveTasks {
                             layout: layout.as_ref(),
                             harness: &harness,
                             interrupt: &cancel,
+                            usage: usage.as_ref(),
                         };
                         match make_backend(&role) {
                             Ok(mut backend) => {
@@ -337,6 +379,9 @@ impl LiveTasks {
                     };
                     let mut value =
                         json!({"id":done_id,"status":status,"steps":outcome.steps,"result":text});
+                    if let Some(data) = outcome.data {
+                        value["data"] = data;
+                    }
                     if let Some(store) = workspace.artifacts() {
                         match store.retain(value["result"].as_str().unwrap_or("")) {
                             Ok(uri) => value["artifact"] = json!(uri),
@@ -349,12 +394,23 @@ impl LiveTasks {
                     control.finished.store(true, Ordering::SeqCst);
                     let _ = tx.send(Event::Done(done_id, value));
                 })
-                .map_err(|e| format!("starting live subagent: {e}"))?;
-            let status = json!({"id":id,"status":"running","name":job.label,"agent":job.kind});
+                .map_err(|e| {
+                    self.mailboxes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id);
+                    let why = format!("starting live subagent: {e}");
+                    body.settle(
+                        why.clone(),
+                        Some(json!({"id":id,"status":"failed"})),
+                        crate::runtime::Phase::Failed,
+                    );
+                    why
+                })?;
             self.jobs.insert(
                 id.clone(),
                 JobState {
-                    status: status.clone(),
+                    body,
                     interrupt,
                     worker: Some(worker),
                     active_tool,
@@ -413,8 +469,27 @@ impl LiveTasks {
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&id);
                     if let Some(job) = self.jobs.get_mut(&id) {
-                        job.status = value;
-                        ui.background_notice(&format!("{id} finished: {}", job.status["status"]));
+                        let phase = match value["status"].as_str() {
+                            Some("done") => crate::runtime::Phase::Done,
+                            Some("cancelled") => crate::runtime::Phase::Interrupted,
+                            _ => crate::runtime::Phase::Failed,
+                        };
+                        let mut data = job.status();
+                        if let (Some(target), Some(fields)) =
+                            (data.as_object_mut(), value.as_object())
+                        {
+                            target.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        }
+                        data["phase"] = value["status"].clone();
+                        job.body.settle(
+                            value["result"].as_str().unwrap_or("").into(),
+                            Some(data),
+                            phase,
+                        );
+                        if self.tree.owns(&job.body) {
+                            ui.result_node(&job.body);
+                        }
+                        ui.background_notice(&format!("{id} finished: {}", job.status()["status"]));
                         if let Some(worker) = job.worker.take() {
                             let _ = worker.join();
                         }
@@ -428,7 +503,7 @@ impl LiveTasks {
             Some(id) => self
                 .jobs
                 .get(id)
-                .map(|j| j.status.clone())
+                .map(|j| j.status())
                 .ok_or_else(|| format!("unknown job {id}")),
             None => {
                 let mut jobs: Vec<_> = self.jobs.iter().collect();
@@ -437,7 +512,7 @@ impl LiveTasks {
                 });
                 Ok(json!(
                     jobs.into_iter()
-                        .map(|(_, j)| j.status.clone())
+                        .map(|(_, j)| j.status())
                         .collect::<Vec<_>>()
                 ))
             }
@@ -482,10 +557,9 @@ impl LiveTasks {
         let until = Instant::now() + Duration::from_secs(seconds.min(120));
         loop {
             self.pump(approval, read_only, rules, root, cost, ui);
-            let pending = self
-                .jobs
-                .iter()
-                .any(|(name, j)| id.is_none_or(|id| id == name) && j.status["status"] == "running");
+            let pending = self.jobs.iter().any(|(name, j)| {
+                id.is_none_or(|id| id == name) && j.status()["status"] == "running"
+            });
             if !pending || Instant::now() >= until {
                 return self.status(id);
             }
@@ -507,10 +581,12 @@ impl Drop for LiveTasks {
 pub(super) fn output(result: Result<Value, String>) -> ToolOutput {
     match result {
         Ok(value) => ToolOutput {
+            data: Some(value.clone()),
             text: value.to_string(),
             is_error: false,
         },
         Err(text) => ToolOutput {
+            data: None,
             text,
             is_error: true,
         },
@@ -518,4 +594,69 @@ pub(super) fn output(result: Result<Value, String>) -> ToolOutput {
 }
 pub(super) fn message_schema() -> Value {
     json!({"type":"function","function":{"name":"task_message","description":"Coordinate with active peer subagents: list job IDs or deliver a bounded steering message. This never starts a child, changes permissions or changes workspace files.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","message"]},"id":{"type":"string"},"message":{"type":"string"}},"required":["action"],"additionalProperties":false}}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rebinding_cancels_old_workers_without_projecting_them_into_the_new_session() {
+        #[derive(Default)]
+        struct View {
+            results: usize,
+        }
+        impl Ui for View {
+            fn result_node(&mut self, _: &crate::runtime::Body) {
+                self.results += 1;
+            }
+        }
+        let mut tasks = LiveTasks::default();
+        let old = tasks.tree.start("worker", "old session", None);
+        old.settle(
+            String::new(),
+            Some(json!({"id":"task-1","status":"running"})),
+            crate::runtime::Phase::Running,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        tasks.jobs.insert(
+            "task-1".into(),
+            JobState {
+                body: old.clone(),
+                interrupt: cancel.clone(),
+                worker: None,
+                active_tool: Arc::new(Mutex::new(None)),
+            },
+        );
+        let new = crate::runtime::Tree::default();
+        let current = new.start("worker", "new session", None);
+        assert_eq!(old.read(|n| n.id.clone()), current.read(|n| n.id.clone()));
+        tasks.bind(new.clone());
+        assert!(cancel.load(Ordering::SeqCst));
+        assert_eq!(
+            old.read(|n| n.result.phase),
+            crate::runtime::Phase::Interrupted
+        );
+        assert!(!new.owns(&old));
+        tasks
+            .tx
+            .send(Event::Done(
+                "task-1".into(),
+                json!({"id":"task-1","status":"cancelled","result":"interrupted"}),
+            ))
+            .unwrap();
+        let mut view = View::default();
+        tasks.pump(
+            Approval::Ask,
+            false,
+            &mut Vec::new(),
+            std::path::Path::new("."),
+            &mut None,
+            &mut view,
+        );
+        assert_eq!(view.results, 0);
+        assert_eq!(
+            current.read(|n| n.result.phase),
+            crate::runtime::Phase::Running
+        );
+    }
 }

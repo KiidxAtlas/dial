@@ -49,6 +49,12 @@ pub trait Tool: Send + Sync {
 
     /// Whether this call changes anything or reaches outside the workspace and so needs approval.
     fn needs_approval(&self, args: &Value) -> bool;
+    /// Whether this operation may change workspace files outside `Workspace`'s write observer.
+    /// The default is conservative for approval-requiring tools; integrations backed only by
+    /// external state should return false.
+    fn may_modify_workspace(&self, args: &Value) -> bool {
+        self.needs_approval(args)
+    }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput;
 

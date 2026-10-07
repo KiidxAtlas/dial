@@ -111,10 +111,12 @@ mod tests {
     #[test]
     fn upgrades_managed_worker_without_touching_custom_workers() {
         let root = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.user_dir = root.path().to_owned();
+        let mut config = Config {
+            user_dir: root.path().to_owned(),
+            worker: root.path().join("python/dial_worker.py"),
+            ..Config::default()
+        };
         std::fs::create_dir(root.path().join("python")).unwrap();
-        config.worker = root.path().join("python/dial_worker.py");
         std::fs::write(&config.worker, "old worker").unwrap();
         refresh_worker(&config).unwrap();
         assert_eq!(std::fs::read_to_string(&config.worker).unwrap(), WORKER);

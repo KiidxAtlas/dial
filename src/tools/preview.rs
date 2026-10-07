@@ -124,10 +124,12 @@ pub fn run(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> ToolOutput {
     })();
     match result {
         Ok(value) => ToolOutput {
+            data: None,
             text: value.to_string(),
             is_error: false,
         },
         Err(text) => ToolOutput {
+            data: None,
             text,
             is_error: true,
         },
@@ -178,6 +180,9 @@ mod compiler_tests {
     use super::*;
     #[test]
     fn compiler_preview_reports_type_failure_and_preserves_project() {
+        if !crate::tools::sandbox::require_for_test() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("src")).unwrap();
         fs::write(

@@ -113,22 +113,37 @@ fn run_command_controlled(
         program,
         args,
         input,
-        timeout_secs,
-        cancel,
-        stop,
+        ProcessControl {
+            timeout_secs,
+            cancel,
+            stop,
+            tracking: None,
+        },
         &mut || Ok(()),
     )
+}
+
+/// Limits, cancellation and tracking for a worker process; shared by each handoff path.
+struct ProcessControl<'a> {
+    timeout_secs: u64,
+    cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    stop: Option<&'a Path>,
+    tracking: Option<&'a Config>,
 }
 
 fn run_command_handoff(
     program: &Path,
     args: &[String],
     input: &str,
-    timeout_secs: u64,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-    stop: Option<&Path>,
+    control: ProcessControl<'_>,
     on_tick: &mut dyn FnMut() -> Result<()>,
 ) -> Result<String> {
+    let ProcessControl {
+        timeout_secs,
+        cancel,
+        stop,
+        tracking,
+    } = control;
     ensure!(
         !stop.is_some_and(Path::exists),
         "improvement stopped by operator"
@@ -139,6 +154,7 @@ fn run_command_handoff(
     let timeout = Duration::from_secs(timeout_secs);
     let child = Command::new(program)
         .args(args)
+        .env("DIAL_PARENT_PID", std::process::id().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -149,6 +165,23 @@ fn run_command_handoff(
         child,
         terminated: false,
     };
+    let operation = serde_json::from_str::<Value>(input)
+        .ok()
+        .and_then(|value| value["op"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "working".into());
+    let _record = tracking
+        .map(|config| {
+            super::processes::Record::new(
+                &config.user_dir,
+                group.child.id(),
+                "models",
+                &config.model,
+                &config.project_root,
+                &config.state_dir,
+                &operation,
+            )
+        })
+        .transpose()?;
     let stdin = group
         .child
         .stdin
@@ -267,9 +300,12 @@ pub fn call_controlled(
             &config.python,
             &[worker.to_owned()],
             &input,
-            config.worker_timeout_secs,
-            cancel,
-            Some(&config.state_dir.join("improvement.stop")),
+            ProcessControl {
+                timeout_secs: config.worker_timeout_secs,
+                cancel,
+                stop: Some(&config.state_dir.join("improvement.stop")),
+                tracking: Some(config),
+            },
             &mut || {
                 if super::compute::can_yield() && super::compute::should_yield(&config.user_dir)? {
                     return Err(super::compute::Preempted.into());
@@ -329,9 +365,12 @@ pub fn capabilities_controlled(
             .context("worker path is not UTF-8")?
             .to_owned()],
         &input,
-        config.worker_timeout_secs,
-        Some(cancel),
-        None,
+        ProcessControl {
+            timeout_secs: config.worker_timeout_secs,
+            cancel: Some(cancel),
+            stop: None,
+            tracking: Some(config),
+        },
         &mut || {
             if super::compute::should_yield(&config.user_dir)? {
                 return Err(super::compute::Preempted.into());
@@ -469,9 +508,12 @@ pub fn train(config: &Config, active: &Version, output_dir: &Path) -> Result<Pat
                     .context("worker path is not UTF-8")?
                     .to_owned()],
                 &input,
-                config.worker_timeout_secs,
-                None,
-                Some(&config.state_dir.join("improvement.stop")),
+                ProcessControl {
+                    timeout_secs: config.worker_timeout_secs,
+                    cancel: None,
+                    stop: Some(&config.state_dir.join("improvement.stop")),
+                    tracking: Some(config),
+                },
                 &mut || {
                     if super::compute::should_yield(&config.user_dir)? {
                         if !pause.exists() {
@@ -672,15 +714,17 @@ mod tests {
     fn handoff_fixture(unresponsive: bool) {
         use fs2::FileExt;
         let root = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.user_dir = root.path().join("user");
-        config.state_dir = root.path().join("state");
-        config.python = PathBuf::from("/usr/bin/python3");
-        config.worker = root.path().join("worker.py");
-        config.model = "fixture".into();
-        config.use_case = "project".into();
+        let mut config = Config {
+            user_dir: root.path().join("user"),
+            state_dir: root.path().join("state"),
+            python: PathBuf::from("/usr/bin/python3"),
+            worker: root.path().join("worker.py"),
+            model: "fixture".into(),
+            use_case: "project".into(),
+            worker_timeout_secs: 10,
+            ..Config::default()
+        };
         config.training.enabled = true;
-        config.worker_timeout_secs = 10;
         let started = root.path().join("started");
         let coded = root.path().join("coded");
         std::fs::write(
@@ -903,10 +947,12 @@ else:
             lines.push_str(&format!("{record}\n"));
         }
         std::fs::write(&data, lines).unwrap();
-        let mut config = Config::default();
-        config.python = python;
-        config.worker = worker;
-        config.worker_timeout_secs = 600;
+        let config = Config {
+            python,
+            worker,
+            worker_timeout_secs: 600,
+            ..Config::default()
+        };
         let result = sensitivity(
             &config,
             "mlx-community/Qwen2.5-0.5B-Instruct-4bit",

@@ -240,6 +240,7 @@ pub struct Backend {
     next_profile: Option<llm::profiles::ModelProfile>,
     steering_config: Option<crate::config::types::Config>,
     steering_runtime: serde_json::Value,
+    usage_scope: Option<llm::usage::Scope>,
 }
 
 impl Backend {
@@ -260,7 +261,15 @@ impl Backend {
             next_profile: None,
             steering_config: None,
             steering_runtime: serde_json::json!({"state":"disabled","uses":0}),
+            usage_scope: None,
         }
+    }
+
+    pub fn set_usage_scope(
+        &mut self,
+        scope: Option<llm::usage::Scope>,
+    ) -> Option<llm::usage::Scope> {
+        std::mem::replace(&mut self.usage_scope, scope)
     }
 
     /// Permit plain `http` to non-local endpoint hosts.
@@ -378,6 +387,17 @@ impl Backend {
         matches!(self.kind, ProviderKind::Local { .. })
     }
 
+    pub fn local_inference(&self) -> bool {
+        match &self.kind {
+            ProviderKind::Local { .. } => true,
+            ProviderKind::Endpoint { base_url, .. }
+            | ProviderKind::AnthropicEndpoint { base_url, .. } => {
+                llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host))
+            }
+            _ => false,
+        }
+    }
+
     pub fn adapter_monitor(&self) -> AdapterMonitor {
         Arc::clone(&self.adapter_monitor)
     }
@@ -441,7 +461,55 @@ impl Backend {
         )
     }
 
+    /// Local vision requires a vision encoder; unknown external endpoints may attempt images.
+    pub fn accepts_image_input(&self) -> bool {
+        self.image_input_for(self.profile.as_ref())
+    }
+
+    fn image_input_for(&self, profile: Option<&llm::profiles::ModelProfile>) -> bool {
+        let supported = profile
+            .and_then(|p| p.capabilities.vision)
+            .or(self.metadata.vision)
+            .unwrap_or(true);
+        supported
+            && match &self.kind {
+                ProviderKind::Local { model_dir } => {
+                    llm::catalog::local_model_metadata(Path::new(model_dir)).vision == Some(true)
+                }
+                _ => true,
+            }
+    }
+
     pub fn chat_with_control_events(
+        &mut self,
+        adapter: Option<&Path>,
+        req: &Chat,
+        timeout_secs: u64,
+        on_text: Option<&mut dyn FnMut(&str) -> bool>,
+        on_notice: &mut dyn FnMut(&str),
+        interrupt: Arc<AtomicBool>,
+        on_event: &mut dyn FnMut(&llm::StreamEvent) -> bool,
+    ) -> Result<Reply> {
+        let scope = self.usage_scope.clone();
+        if let Some(scope) = &scope {
+            scope.begin()?;
+        }
+        let result = self.chat_with_control_events_inner(
+            adapter,
+            req,
+            timeout_secs,
+            on_text,
+            on_notice,
+            interrupt,
+            on_event,
+        );
+        if let Some(scope) = scope {
+            scope.finish(result.as_ref().ok());
+        }
+        result
+    }
+
+    fn chat_with_control_events_inner(
         &mut self,
         adapter: Option<&Path>,
         req: &Chat,
@@ -454,11 +522,7 @@ impl Backend {
         let profile = self.next_profile.take().or_else(|| self.profile.clone());
         let interrupted = || interrupt.load(Ordering::SeqCst);
         let timeout_secs = self.response_timeout(timeout_secs);
-        let vision = profile
-            .as_ref()
-            .and_then(|p| p.capabilities.vision)
-            .or(self.metadata.vision)
-            .unwrap_or(false);
+        let vision = self.image_input_for(profile.as_ref());
         let prepared = llm::images::prepare(req, vision, on_notice);
         let req = prepared.as_ref().unwrap_or(req);
         let chatgpt_access = match &self.kind {
@@ -514,6 +578,23 @@ impl Backend {
                     phase: AdapterPhase::Loading,
                 };
                 let steering = self.steering_config.as_ref().and_then(|config| {
+                    if let Some(reason) = crate::steering::local_unsupported_reason(model_dir) {
+                        if (config.steering.enabled || config.steering.automatic)
+                            && config.steering.strength > 0.0
+                        {
+                            let state =
+                                serde_json::json!({"state":"unsupported","reason":reason,"uses":0});
+                            let changed = self.steering_runtime != state;
+                            self.steering_runtime = state;
+                            if config.steering.enabled && changed {
+                                on_notice(&format!("Activation steering unavailable: {reason}"));
+                            }
+                        } else {
+                            self.steering_runtime =
+                                serde_json::json!({"state":"disabled","uses":0});
+                        }
+                        return None;
+                    }
                     match crate::steering::specification(config, model_dir) {
                         Ok(spec) => spec,
                         Err(error) => {
@@ -527,14 +608,28 @@ impl Backend {
                         }
                     }
                 });
-                let server = match server::ensure_profile_controlled(
+                let phase =
+                    if self.server.as_ref().is_some_and(|server| {
+                        server.ready_for(model_dir, adapter, steering.as_ref())
+                    }) {
+                        llm::InferencePhase::Processing
+                    } else {
+                        llm::InferencePhase::Loading
+                    };
+                if !on_event(&llm::StreamEvent::Progress(llm::ModelProgress::new(phase))) {
+                    return Err(llm::Interrupted.into());
+                }
+                let server = match server::ensure_profile_tracked(
                     &mut self.server,
-                    &self.python,
-                    model_dir,
-                    adapter,
+                    server::ServerProfile {
+                        python: &self.python,
+                        model: model_dir,
+                        adapter,
+                        steering: steering.as_ref(),
+                        context: self.steering_config.as_ref(),
+                    },
                     self.startup_timeout_secs,
                     Some(Arc::clone(&interrupt)),
-                    steering.as_ref(),
                 ) {
                     Ok(server) => server,
                     Err(error) => {
@@ -543,10 +638,13 @@ impl Backend {
                     }
                 };
                 self.adapter_monitor.lock().phase = AdapterPhase::Loaded;
+                server.phase("generating")?;
                 let result = exchange(
-                    &llm::completions_url(server.base_url()),
-                    None,
-                    SERVER_MODEL,
+                    llm::Endpoint {
+                        url: &llm::completions_url(server.base_url()),
+                        auth: None,
+                        model: server.request_model(),
+                    },
                     req,
                     timeout_secs,
                     &mut on_text,
@@ -554,6 +652,7 @@ impl Backend {
                     profile.as_ref(),
                     on_event,
                 );
+                server.phase("loaded")?;
                 if steering.is_some() {
                     let previous = self.steering_runtime["state"].clone();
                     self.steering_runtime = crate::steering::runtime(server.base_url())
@@ -635,12 +734,19 @@ impl Backend {
             if interrupted() {
                 return Err(llm::Interrupted.into());
             }
+            if attempt > 1 {
+                if let Some(scope) = &self.usage_scope {
+                    scope.retry();
+                }
+            }
             let result = if protocol == 2 {
                 llm::responses::exchange_codex(
-                    &url,
-                    auth.unwrap(),
-                    codex_account_id.unwrap(),
-                    model,
+                    llm::responses::Endpoint {
+                        url: &url,
+                        token: auth.unwrap(),
+                        account_id: Some(codex_account_id.unwrap()),
+                        model,
+                    },
                     req,
                     timeout_secs,
                     &mut on_text,
@@ -650,9 +756,11 @@ impl Backend {
                 )
             } else if protocol == 1 {
                 anthropic_exchange(
-                    &url,
-                    auth,
-                    model,
+                    llm::Endpoint {
+                        url: &url,
+                        auth,
+                        model,
+                    },
                     req,
                     timeout_secs,
                     &mut on_text,
@@ -662,9 +770,11 @@ impl Backend {
                 )
             } else {
                 exchange(
-                    &url,
-                    auth,
-                    model,
+                    llm::Endpoint {
+                        url: &url,
+                        auth,
+                        model,
+                    },
                     req,
                     timeout_secs,
                     &mut on_text,
@@ -704,8 +814,13 @@ impl Backend {
                 };
                 return Err(error.context(format!("provider authentication failed (HTTP {status}); check {key} or sign in through /providers")));
             }
-            if !llm::is_transient(&error) || attempt == llm::retry::MAX_ATTEMPTS {
+            if !llm::is_transient(&error) {
                 return Err(error);
+            }
+            if attempt == llm::retry::MAX_ATTEMPTS {
+                return Err(error.context(format!(
+                    "provider request failed after {attempt} attempts; the turn is paused. Say \"continue\" to retry"
+                )));
             }
             let hinted = error
                 .downcast_ref::<llm::HttpError>()
@@ -728,8 +843,19 @@ impl Backend {
             } else {
                 "transient provider failure"
             };
+            let cause = format!("{error:#}");
+            let cause = cause.lines().next().unwrap_or("").trim();
+            let cause: String = if cause.chars().count() > 160 {
+                cause
+                    .chars()
+                    .take(159)
+                    .chain(std::iter::once('…'))
+                    .collect()
+            } else {
+                cause.to_owned()
+            };
             on_notice(&format!(
-                "{reason}; retrying in {:.1}s (attempt {}/{})",
+                "{reason}: {cause}; retrying in {:.1}s (attempt {}/{})",
                 delay.as_secs_f64(),
                 attempt + 1,
                 llm::retry::MAX_ATTEMPTS
@@ -752,9 +878,7 @@ impl Backend {
 }
 
 fn exchange(
-    url: &str,
-    auth: Option<&str>,
-    model: &str,
+    endpoint: llm::Endpoint<'_>,
     req: &Chat,
     timeout_secs: u64,
     on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
@@ -764,9 +888,7 @@ fn exchange(
 ) -> Result<Reply> {
     match on_text {
         Some(callback) => llm::chat_stream_at_controlled(
-            url,
-            auth,
-            model,
+            endpoint,
             req,
             timeout_secs,
             &mut **callback,
@@ -775,9 +897,7 @@ fn exchange(
             on_event,
         ),
         None => llm::chat_at_controlled(
-            url,
-            auth,
-            model,
+            endpoint,
             req,
             timeout_secs,
             Some(interrupt),
@@ -788,9 +908,7 @@ fn exchange(
 }
 
 fn anthropic_exchange(
-    url: &str,
-    api_key: Option<&str>,
-    model: &str,
+    endpoint: llm::Endpoint<'_>,
     req: &Chat,
     timeout_secs: u64,
     on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
@@ -798,6 +916,11 @@ fn anthropic_exchange(
     profile: Option<&llm::profiles::ModelProfile>,
     on_event: &mut dyn FnMut(&llm::StreamEvent) -> bool,
 ) -> Result<Reply> {
+    let llm::Endpoint {
+        url,
+        auth: api_key,
+        model,
+    } = endpoint;
     ensure!(timeout_secs > 0, "chat timeout must be positive");
     if let Some(key) = api_key {
         ensure!(
@@ -807,9 +930,6 @@ fn anthropic_exchange(
     }
     let claude_code_oauth = api_key.is_some_and(llm::anthropic::subscription_token);
     let mut body = anthropic_request_variant(model, req, claude_code_oauth)?;
-    if claude_code_oauth {
-        attest_claude_code_body(&mut body)?;
-    }
     let streaming = on_text.is_some();
     body["stream"] = serde_json::json!(streaming);
     if let Some(profile) = profile {
@@ -891,6 +1011,7 @@ fn anthropic_exchange(
         }
     }
     if claude_code_oauth {
+        // Attest once, after all body mutations, so the fingerprint covers the wire payload.
         attest_claude_code_body(&mut body)?;
     }
     let mut response = request
@@ -999,7 +1120,11 @@ fn anthropic_request_variant(
     let mut messages = Vec::new();
     for message in &req.messages {
         match message["role"].as_str().unwrap_or_default() {
-            "assistant" if message["dial_provider_content"].is_array() => {
+            // Responses native replay uses Dial wrappers, not Anthropic content blocks. Old
+            // sessions may contain both protocols; fall through to shared text/tool calls for
+            // foreign replay data, while keeping Claude's opaque signed blocks unchanged.
+            "assistant" if message["dial_provider_content"].as_array().is_some_and(|blocks|
+                !blocks.is_empty() && blocks.iter().all(|block| block["type"] != "dial_response_item")) => {
                 let mut content=message["dial_provider_content"].clone();
                 if claude_code_oauth {
                     for block in content.as_array_mut().into_iter().flatten() {
@@ -1605,6 +1730,76 @@ mod tests {
         assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call-1");
     }
+
+    #[test]
+    fn provider_switch_replays_responses_history_as_claude_text_and_tools() {
+        let items = json!([
+            {"type":"reasoning","id":"r1","encrypted_content":"responses-only","summary":[]},
+            {"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"Reading now."}]},
+            {"type":"function_call","id":"f1","call_id":"call-1","namespace":"dial","name":"read","arguments":"{\"path\":\"a.rs\"}"}
+        ]);
+        let server = fake::serve(vec![Script::Sse(format!(
+            "data: {}\n\n",
+            json!({"type":"response.completed","response":{"status":"completed","output":items}})
+        ))]);
+        let reply = llm::responses::exchange(
+            llm::responses::Endpoint {
+                url: &server.url,
+                token: "fixture-token",
+                account_id: None,
+                model: "fixture-model",
+            },
+            &request(),
+            5,
+            &mut None,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            &mut |_| true,
+        )
+        .unwrap();
+        server.requests();
+        // Old session files have the untagged native wrapper too; test a saved-history roundtrip.
+        let saved = serde_json::to_string(&llm::assistant_message(&reply)).unwrap();
+        let restored: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        let claude_blocks = json!([
+            {"type":"thinking","thinking":"checked","signature":"claude-signed"},
+            {"type":"redacted_thinking","data":"claude-redacted"},
+            {"type":"text","text":"File inspected."}
+        ]);
+        let claude_reply =
+            anthropic_reply(&json!({"content":claude_blocks,"stop_reason":"end_turn"})).unwrap();
+        let mut req = request();
+        req.messages.extend([
+            restored,
+            llm::tool_message("call-1", "contents"),
+            llm::assistant_message(&claude_reply),
+        ]);
+        for oauth in [false, true] {
+            let body = anthropic_request_variant("claude-test", &req, oauth).unwrap();
+            assert_eq!(
+                body["messages"][1]["content"][0],
+                json!({"type":"text","text":"Reading now."})
+            );
+            assert_eq!(
+                body["messages"][1]["content"][1],
+                json!({"type":"tool_use","id":"call-1","name":if oauth {"_read"} else {"read"},"input":{"path":"a.rs"}})
+            );
+            assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call-1");
+            assert_eq!(body["messages"][3]["content"], claude_blocks);
+            assert!(!body.to_string().contains("dial_response_item"));
+            assert!(!body.to_string().contains("responses-only"));
+        }
+        // Switching back still preserves Responses IDs/encrypted reasoning, without leaking
+        // Claude's signed thinking into the Responses protocol or changing saved history.
+        let body = llm::responses::request("fixture-model", &req, None).unwrap();
+        assert_eq!(
+            &body["input"].as_array().unwrap()[1..4],
+            items.as_array().unwrap()
+        );
+        assert_eq!(body["input"][4]["call_id"], "call-1");
+        assert_eq!(body["input"][5]["content"], "File inspected.");
+        assert!(!body.to_string().contains("claude-signed"));
+    }
     #[test]
     fn claude_subscription_request_matches_claude_code_message_conventions() {
         let request = Chat {
@@ -1661,6 +1856,49 @@ mod tests {
             cch,
             format!("{:05x}", xxhash64(&unattested, CCH_SEED) & 0xfffff)
         );
+    }
+
+    #[test]
+    fn claude_subscription_exchange_reaches_transport_after_finalizing_body() {
+        use llm::profiles::*;
+        let profile = ModelProfile {
+            provider: "anthropic".into(),
+            model: "claude-test".into(),
+            capabilities: ModelCapabilities {
+                temperature: true,
+                prompt_cache: true,
+                ..Default::default()
+            },
+            temperature: Some(0.3),
+            prompt_cache: true,
+            ..Default::default()
+        };
+        for streaming in [false, true] {
+            let mut accept_text = |_: &str| true;
+            let mut on_text: Option<&mut dyn FnMut(&str) -> bool> =
+                streaming.then_some(&mut accept_text);
+            // Exercise subscription preparation in the real exchange path, then cancel
+            // at the transport boundary before DNS or any credential is sent.
+            let error = anthropic_exchange(
+                llm::Endpoint {
+                    url: "https://api.anthropic.com/v1/messages",
+                    auth: Some("sk-ant-oat01-test"),
+                    model: "claude-test",
+                },
+                &request(),
+                5,
+                &mut on_text,
+                Arc::new(AtomicBool::new(true)),
+                Some(&profile),
+                &mut |_| true,
+            )
+            .unwrap_err();
+            assert!(
+                error.downcast_ref::<llm::TransportError>().is_some()
+                    && error.to_string().contains("interrupted"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]
@@ -1868,7 +2106,12 @@ mod tests {
             crate::agent::context::expand_message(root.path(), "Describe @tiny.png");
         assert!(warnings.is_empty());
         assert!(!message.to_string().contains("base64"));
-        for anthropic in [false, true] {
+        for (anthropic, vision) in [
+            (false, Some(true)),
+            (true, Some(true)),
+            (false, None),
+            (true, None),
+        ] {
             let response = if anthropic {
                 fake::json(
                     200,
@@ -1884,7 +2127,7 @@ mod tests {
                 endpoint(&server.url)
             };
             let mut remote = backend(kind).with_metadata(llm::catalog::ModelMetadata {
-                vision: Some(true),
+                vision,
                 ..Default::default()
             });
             let mut req = request();
@@ -1924,11 +2167,156 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
             )
             .unwrap();
-        assert!(notices.iter().any(|notice| notice.contains("no vision")));
-        assert_eq!(
-            fake::body(&server.requests()[0])["messages"][0]["content"],
-            "Describe @tiny.png"
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("cannot view images"))
         );
+        let content = fake::body(&server.requests()[0])["messages"][0]["content"].clone();
+        assert!(content.as_str().unwrap().starts_with("Describe @tiny.png"));
+        assert!(content.as_str().unwrap().contains("Image unavailable"));
+        assert!(!content.to_string().contains("image_url"));
+    }
+
+    #[test]
+    fn local_vision_model_receives_pixels_and_uses_one_supervised_vlm_server() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("vision-model");
+        std::fs::create_dir(&model).unwrap();
+        std::fs::write(
+            model.join("config.json"),
+            r#"{"vision_config":{},"text_config":{}}"#,
+        )
+        .unwrap();
+        let png = b"\x89PNG\r\n\x1a\npixels";
+        std::fs::write(root.path().join("image.png"), png).unwrap();
+        let mut local = Backend::new(
+            ProviderKind::Local {
+                model_dir: model.to_string_lossy().into_owned(),
+            },
+            server::tests::fake_python(root.path()),
+            30,
+        );
+        assert!(local.accepts_image_input());
+        let mut req = request();
+        req.messages[0]["dial_images"] =
+            json!([llm::images::attachment(root.path(), Path::new("image.png")).unwrap()]);
+        let mut notices = Vec::new();
+        for _ in 0..2 {
+            assert_eq!(
+                local
+                    .chat_with_control(
+                        None,
+                        &req,
+                        5,
+                        None,
+                        &mut |notice| notices.push(notice.to_owned()),
+                        Arc::new(AtomicBool::new(false))
+                    )
+                    .unwrap()
+                    .text,
+                "pong"
+            );
+        }
+        assert!(notices.is_empty(), "{notices:?}");
+        let info: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(model.join("info.json")).unwrap()).unwrap();
+        assert_eq!(info["engine"], "mlx-vlm");
+        assert_eq!(info["apc"], "0");
+        assert!(
+            info["argv"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("--vision-cache-size=1"))
+        );
+        assert!(!info["argv"].as_array().unwrap().iter().any(|a| {
+            a.as_str()
+                .is_some_and(|s| s.starts_with("--prompt-cache-bytes="))
+        }));
+        let requests = info["requests"].as_array().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "one warmup and two requests reuse the same server"
+        );
+        for wire in &requests[1..] {
+            assert_eq!(wire["model"], model.to_string_lossy().as_ref());
+            assert_eq!(
+                wire["messages"][0]["content"][1]["image_url"]["url"],
+                format!("data:image/png;base64,{}", STANDARD.encode(png))
+            );
+            assert!(!wire.to_string().contains("dial_images"));
+        }
+        let disabled = llm::profiles::ModelProfile {
+            capabilities: llm::profiles::ModelCapabilities {
+                vision: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!local.image_input_for(Some(&disabled)));
+        drop(local);
+        let text = backend(ProviderKind::Local {
+            model_dir: root.path().to_string_lossy().into_owned(),
+        });
+        assert!(!text.accepts_image_input());
+    }
+
+    #[test]
+    fn vision_steering_status_and_notice_respect_manual_automatic_and_disabled_settings() {
+        for (enabled, automatic, strength, state, notice_count) in [
+            (true, false, 0.5, "bypassed", 1),
+            (false, true, 0.5, "disabled", 0),
+            (true, true, 0.0, "disabled", 0),
+            (false, false, 0.5, "disabled", 0),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let model = root.path().join("vision-model");
+            std::fs::create_dir(&model).unwrap();
+            std::fs::write(model.join("config.json"), r#"{"vision_config":{}}"#).unwrap();
+            let config = crate::config::types::Config {
+                model: model.to_string_lossy().into_owned(),
+                user_dir: root.path().join("user"),
+                state_dir: root.path().join("state"),
+                steering: crate::steering::Config {
+                    enabled,
+                    automatic,
+                    strength,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut local = Backend::new(
+                ProviderKind::Local {
+                    model_dir: config.model.clone(),
+                },
+                server::tests::fake_python(root.path()),
+                30,
+            )
+            .with_steering(&config);
+            let mut notices = Vec::new();
+            for _ in 0..2 {
+                assert_eq!(
+                    local
+                        .chat_with_control(
+                            None,
+                            &request(),
+                            5,
+                            None,
+                            &mut |notice| notices.push(notice.to_owned()),
+                            Arc::new(AtomicBool::new(false)),
+                        )
+                        .unwrap()
+                        .text,
+                    "pong"
+                );
+            }
+            assert_eq!(local.steering_runtime()["state"], state);
+            assert_eq!(local.steering_runtime()["uses"], 0);
+            assert_eq!(notices.len(), notice_count, "{notices:?}");
+            assert!(!crate::steering::vector_path(&config).exists());
+        }
     }
 
     #[test]
@@ -1962,6 +2350,63 @@ mod tests {
             backend(endpoint("https://api.example.com")).reply_cost(&reply),
             None
         );
+    }
+
+    #[test]
+    fn bad_record_mac_alerts_retry_on_fresh_tls_connections_and_stop_at_the_bound() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let peer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut connections = 0;
+            while connections < llm::retry::MAX_ATTEMPTS && Instant::now() < deadline {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("TLS fixture accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                // Consume the ClientHello, then send a real TLS fatal BadRecordMac alert.
+                // No certificate is accepted and no HTTP prompt or credentials reach the peer.
+                let mut header = [0u8; 5];
+                stream.read_exact(&mut header).unwrap();
+                assert_eq!(header[0], 0x16);
+                let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+                stream.read_exact(&mut vec![0; length]).unwrap();
+                stream
+                    .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x14])
+                    .unwrap();
+                connections += 1;
+            }
+            connections
+        });
+        let mut remote = backend(endpoint(&url));
+        let mut notices = Vec::new();
+        let error = remote
+            .chat_with_control(
+                None,
+                &request(),
+                5,
+                None,
+                &mut |notice| notices.push(notice.to_owned()),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap_err();
+        assert_eq!(peer.join().unwrap(), llm::retry::MAX_ATTEMPTS, "{error:#}");
+        assert_eq!(notices.len(), llm::retry::MAX_ATTEMPTS - 1);
+        assert!(format!("{error:#}").contains("received fatal alert: BadRecordMac"));
+        assert!(error.to_string().contains("failed after 5 attempts"));
     }
 
     #[test]
@@ -2040,15 +2485,13 @@ mod tests {
                 .collect(),
         );
         let mut remote = backend(endpoint(&server.url));
-        assert_eq!(
-            remote
-                .chat(None, &request(), 5, None)
-                .unwrap_err()
-                .downcast_ref::<llm::HttpError>()
-                .unwrap()
-                .status,
-            503
+        let error = remote.chat(None, &request(), 5, None).unwrap_err();
+        assert!(
+            error.to_string().contains("failed after 5 attempts")
+                && error.to_string().contains("Say \"continue\" to retry"),
+            "{error:#}"
         );
+        assert_eq!(error.downcast_ref::<llm::HttpError>().unwrap().status, 503);
         assert_eq!(server.requests().len(), 5);
     }
 
@@ -2592,6 +3035,55 @@ mod real_server {
     }
 
     #[test]
+    #[ignore = "loads a downloaded vision model; set DIAL_TEST_VISION_MODEL and DIAL_TEST_VISION_IMAGE (a red square)"]
+    fn sees_images_and_streams_tools_from_the_real_vlm_server() {
+        let model = std::env::var("DIAL_TEST_VISION_MODEL").expect("downloaded vision model path");
+        let image =
+            PathBuf::from(std::env::var("DIAL_TEST_VISION_IMAGE").expect("red-square PNG path"));
+        let root = tempfile::tempdir().unwrap();
+        let config = crate::config::types::Config {
+            user_dir: root.path().join("user"),
+            state_dir: root.path().join("state"),
+            project_root: root.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut backend = Backend::new(ProviderKind::Local { model_dir: model }, python(), 180)
+            .with_steering(&config);
+        assert!(backend.accepts_image_input());
+        let mut req = ask(
+            "Describe the shape and color in this image in one short sentence.",
+            vec![],
+            64,
+        );
+        req.messages[0]["dial_images"] =
+            json!([llm::images::user_attachment(root.path(), &image).unwrap()]);
+        let reply = backend.chat(None, &req, 90, None).unwrap();
+        println!("VISION: {}", reply.text);
+        assert!(
+            reply.text.to_lowercase().contains("red")
+                && reply.text.to_lowercase().contains("square")
+        );
+        req.messages[0]["content"] = json!(
+            "Inspect the attached image and call describe_image with its color and shape. Use the tool instead of writing an answer."
+        );
+        req.tools = vec![json!({"type":"function","function":{
+            "name":"describe_image", "description":"Record the color and shape seen in the image.",
+            "parameters":{"type":"object","properties":{"color":{"type":"string"},"shape":{"type":"string"}},"required":["color","shape"]}
+        }})];
+        req.max_tokens = 256;
+        let reply = backend.chat(None, &req, 90, Some(&mut |_| true)).unwrap();
+        println!("VISION TOOL CALLS: {:?}", reply.tool_calls);
+        let call = reply
+            .tool_calls
+            .iter()
+            .find(|call| call.name == "describe_image")
+            .expect("visual tool call");
+        assert_eq!(call.arguments["color"], "red");
+        assert_eq!(call.arguments["shape"], "square");
+        backend.release();
+    }
+
+    #[test]
     #[ignore = "starts the real mlx_lm.server; needs the SmolLM2 snapshot"]
     fn streams_text_from_the_real_server() {
         let dir = snapshot("models--mlx-community--SmolLM2-135M-Instruct-8bit")
@@ -2828,6 +3320,8 @@ mod chatgpt_tests {
         };
         let server = llm::fake::serve(vec![
             llm::fake::Script::Sse(sse(output.clone(), "")),
+            // Editing requires the final diff review before completion is accepted.
+            llm::fake::Script::Sse(sse(final_output.clone(), "Marker written.")),
             llm::fake::Script::Sse(sse(final_output, "Marker written.")),
         ]);
         let mut backend = Backend::new(
@@ -2866,7 +3360,12 @@ mod chatgpt_tests {
             "real output"
         );
         let requests = server.requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
+        assert!(
+            llm::fake::body(&requests[2])["input"]
+                .to_string()
+                .contains("review required before completion")
+        );
         let expected_auth = format!("Bearer {}", llm::chatgpt::test_access("oaiapp_test"));
         assert_eq!(
             llm::fake::header(&requests[0], "authorization").as_deref(),

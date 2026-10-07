@@ -21,12 +21,14 @@ pub trait Extension: Send + Sync {
         Vec::new()
     }
 }
+/// A command handler: takes the argument text and the UI, returns the prompt text to expand.
+pub type CommandHandler = Arc<dyn Fn(&str, &mut dyn Ui) -> Result<String> + Send + Sync>;
 /// Commands may render a panel and expand into a user-visible prompt, not bypass tool execution.
 #[derive(Clone)]
 pub struct Command {
     pub name: String,
     pub description: String,
-    pub execute: Arc<dyn Fn(&str, &mut dyn Ui) -> Result<String> + Send + Sync>,
+    pub execute: CommandHandler,
 }
 #[derive(Default)]
 pub struct ExtensionHost {

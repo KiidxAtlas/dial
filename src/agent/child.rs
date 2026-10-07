@@ -30,6 +30,19 @@ pub(super) fn run(
     adapter: Option<&Path>,
     approver: &mut dyn Approver,
 ) -> Outcome {
+    let prior = backend.set_usage_scope(env.usage.map(|scope| scope.worker()));
+    let result = run_inner(env, job, backend, adapter, approver);
+    backend.set_usage_scope(prior);
+    result
+}
+
+fn run_inner(
+    env: Env,
+    job: &Job,
+    backend: &mut Backend,
+    adapter: Option<&Path>,
+    approver: &mut dyn Approver,
+) -> Outcome {
     let mut names = toolset(job.spec, &env.harness.tools, env.ext);
     if let Some(allowed) = job.allowed_tools {
         names.retain(|name| allowed.contains(name) || name == "artifact_read");
@@ -87,7 +100,14 @@ pub(super) fn run(
             seed: None,
         };
         // Streaming only so a stop request cuts a long generation short; the text is not shown.
-        let mut keep_going = |_: &str| !env.interrupt.load(Ordering::SeqCst);
+        approver.progress(steps.saturating_add(1), "processing", "");
+        let observer = std::cell::RefCell::new(&mut *approver);
+        let mut keep_going = |text: &str| {
+            observer
+                .borrow_mut()
+                .progress(steps.saturating_add(1), "generating", text);
+            !env.interrupt.load(Ordering::SeqCst)
+        };
         let result = reasoning::chat(
             backend,
             adapter,
@@ -96,8 +116,21 @@ pub(super) fn run(
             std::sync::Arc::clone(env.interrupt),
             &env.config.reasoning_guard,
             &mut keep_going,
-            &mut |notice| approver.notice(notice),
-            &mut |_| true,
+            &mut |notice| observer.borrow_mut().notice(notice),
+            &mut |event| {
+                match event {
+                    llm::StreamEvent::Reasoning(text) => {
+                        observer
+                            .borrow_mut()
+                            .progress(steps.saturating_add(1), "reasoning", text)
+                    }
+                    llm::StreamEvent::ToolArguments { delta, .. } => observer
+                        .borrow_mut()
+                        .progress(steps, "tool arguments", delta),
+                    _ => {}
+                }
+                true
+            },
         );
         messages = request.messages;
         schemas = request.tools;
@@ -190,9 +223,10 @@ pub(super) fn run(
                 continue;
             }
             match finish(job, &reply.text) {
-                Ok(answer) => {
+                Ok((answer, data)) => {
                     return Outcome {
                         status: Status::Done(answer),
+                        data,
                         steps,
                     };
                 }
@@ -325,9 +359,9 @@ pub(super) fn run(
 }
 
 /// The final answer: the text itself, or (with an `output_schema`) compact JSON that satisfies it.
-fn finish(job: &Job, text: &str) -> Result<String, String> {
+fn finish(job: &Job, text: &str) -> Result<(String, Option<Value>), String> {
     let Some(schema) = &job.schema else {
-        return Ok(text.to_owned());
+        return Ok((text.to_owned(), None));
     };
     let value: Value = serde_json::from_str(json_text(text))
         .map_err(|error| format!("it is not valid JSON ({error})"))?;
@@ -340,7 +374,7 @@ fn finish(job: &Job, text: &str) -> Result<String, String> {
             job.limit
         ));
     }
-    Ok(answer)
+    Ok((answer, Some(value)))
 }
 
 struct RerankContext<'a> {
@@ -360,6 +394,7 @@ fn call_tool(
     rerank: Option<RerankContext<'_>>,
 ) -> ToolOutput {
     let refuse = |text: String| ToolOutput {
+        data: None,
         text,
         is_error: true,
     };
@@ -464,6 +499,7 @@ fn semantic_find(
             "{\"indices\":[]}".to_owned()
         };
         let mut output = ToolOutput {
+            data: None,
             text: request
                 .render_response(&response)
                 .map_err(anyhow::Error::msg)?,
@@ -497,6 +533,7 @@ fn semantic_find(
         Ok(output)
     })();
     result.unwrap_or_else(|e| ToolOutput {
+        data: None,
         text: format!("{e:#}"),
         is_error: true,
     })
@@ -516,6 +553,7 @@ fn execute(env: Env, call: &llm::ToolCall) -> ToolOutput {
             env.interrupt,
         )
         .unwrap_or_else(|text| ToolOutput {
+            data: None,
             text,
             is_error: true,
         });
@@ -526,6 +564,7 @@ fn execute(env: Env, call: &llm::ToolCall) -> ToolOutput {
             .artifacts()
             .map(|store| store.call(args))
             .unwrap_or_else(|| ToolOutput {
+                data: None,
                 text: "artifacts unavailable".into(),
                 is_error: true,
             });
@@ -545,6 +584,7 @@ fn execute(env: Env, call: &llm::ToolCall) -> ToolOutput {
     match (name, env.layout) {
         ("skill", Some(layout)) => skills::skill_tool::call(layout, args),
         _ => ToolOutput {
+            data: None,
             text: format!("{name} is unavailable to subagents"),
             is_error: true,
         },
@@ -601,6 +641,7 @@ mod tests {
         }
         fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
             ToolOutput {
+                data: None,
                 text: format!("{} ran", self.name),
                 is_error: false,
             }
@@ -658,6 +699,7 @@ mod tests {
             layout: None,
             harness: &harness,
             interrupt: &interrupt,
+            usage: None,
         };
         let request = subagents::parse(&json!({"agent": agent, "prompt": "p"}), &config)
             .ok()

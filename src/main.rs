@@ -367,13 +367,15 @@ fn real_main(cli: Cli) -> Result<()> {
                 let selection = dial::adaptive::select(
                     &config,
                     &phase,
-                    task.kind,
-                    h.temperature,
-                    h.max_tokens,
-                    task.initial_reasoning_secs,
-                    config.active_model_profile(),
-                    false,
-                    false,
+                    dial::adaptive::Request {
+                        kind: task.kind,
+                        temperature: h.temperature,
+                        tokens: h.max_tokens,
+                        pre_action_secs: task.initial_reasoning_secs,
+                        base_profile: config.active_model_profile(),
+                        recovering_output: false,
+                        hermetic: false,
+                    },
                 );
                 let mut control = serde_json::json!({"adaptive_policy":{"selection":selection,"result":{"state":"preview only; configured baseline, no model request"}}});
                 control["adaptive_history"] = serde_json::json!([]);

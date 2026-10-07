@@ -68,7 +68,30 @@ fn serve_with(
 /// subagents) get the right answer in any order. Every connection is served on its own thread.
 type Choose = Arc<dyn Fn(&Value) -> Reply + Send + Sync>;
 
+/// Parallel tests each hold sockets, databases and child pipes; macOS defaults to 256 descriptors,
+/// which the suite exceeds. Raise this process's soft limit (never above the hard limit), once.
+fn raise_fd_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: plain getrlimit/setrlimit calls on a local, fully initialised struct.
+        unsafe {
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+                let target = lim.rlim_max.min(10_240);
+                if lim.rlim_cur < target {
+                    lim.rlim_cur = target;
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+                }
+            }
+        }
+    });
+}
+
 fn serve_fn(choose: Choose, token: Option<&'static str>, lm_context: Option<u32>) -> Scripted {
+    raise_fd_limit();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -222,7 +245,18 @@ struct Env {
     config: Config,
 }
 
+/// Tests that run real `bash` need `sandbox-exec`, which macOS cannot nest. Skip (with a note) only
+/// when this process is itself sandboxed; everywhere else the test must really run.
+fn skip_without_sandbox() -> bool {
+    let nested = dial::tools::sandbox::already_sandboxed();
+    if nested {
+        eprintln!("skipping: already inside a sandbox, which macOS cannot nest");
+    }
+    nested
+}
+
 fn env(url: &str, approval: &str) -> Env {
+    raise_fd_limit();
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
@@ -242,21 +276,33 @@ fn env(url: &str, approval: &str) -> Env {
 
 #[derive(Default)]
 struct Recorder {
+    text: String,
     calls: Vec<String>,
     approvals: Vec<String>,
     summaries: Vec<String>,
     notices: Vec<String>,
     roles: Vec<String>,
+    images: Vec<Value>,
+    results: Vec<(String, String, bool)>,
     deny: bool,
 }
 
 impl Ui for Recorder {
+    fn text_delta(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
     fn tool_call(&mut self, name: &str, _: &str) {
         self.calls.push(name.into());
     }
-    fn tool_result(&mut self, _: &str, _: &ToolOutput) {}
+    fn tool_result(&mut self, name: &str, output: &ToolOutput) {
+        self.results
+            .push((name.into(), output.text.clone(), output.is_error));
+    }
     fn notice(&mut self, message: &str) {
         self.notices.push(message.into());
+    }
+    fn image(&mut self, reference: &Value) {
+        self.images.push(reference.clone());
     }
     fn role(&mut self, role: &str, _: &str) {
         self.roles.push(role.into());
@@ -522,6 +568,124 @@ fn queued_work_skips_architecture_maintenance_without_consuming_model_calls() {
 
 fn close_todo() -> Reply {
     Reply::Call("todo", json!({"op":"done"}))
+}
+
+#[test]
+fn synthesis_step_closes_after_text_without_a_dummy_tool_call() {
+    let synthesis = "Architecture: preserve the control-plane boundary. Performance: bound recurring context. Tests: cover rejection recovery. Documentation: explain verification limits.";
+    let server = serve(vec![
+        Reply::Call(
+            "todo",
+            json!({"op":"set","tasks":[{"content":"Provide complete synthesis"}]}),
+        ),
+        Reply::Text(synthesis),
+        close_todo(),
+        Reply::Text("Synthesis delivered."),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = agent
+        .turn("Provide complete synthesis", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert!(!agent.todo().has_open());
+    assert_eq!(agent.metrics().responses, 4);
+    assert_eq!(agent.metrics().usage_reported_responses, 4);
+    assert_eq!(agent.metrics().prompt_tokens, 400);
+    assert_eq!(agent.metrics().output_tokens, 20);
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2]["messages"].to_string().contains(synthesis));
+    assert!(
+        !requests[3]["messages"]
+            .to_string()
+            .contains("Step not closed")
+    );
+}
+
+#[test]
+fn repeated_todo_rejections_stop_despite_reworded_claims() {
+    let mut replies = vec![Reply::Call(
+        "todo",
+        json!({"op":"set","tasks":[{"content":"Inspect the source","investigation":true}]}),
+    )];
+    for i in 0..4 {
+        replies.push(Reply::Call("todo", json!({"op":"done", "finding":format!("It is complete, explanation {i}"),"evidence":["src/lib.rs:1"]})));
+    }
+    let server = serve(replies);
+    let e = env(&server.url, "auto");
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = agent
+        .turn("Inspect the source", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert!(agent.todo().has_open());
+    assert_eq!(server.requests.lock().len(), 5);
+    assert!(report.text.contains("failed 4 times"), "{}", report.text);
+}
+
+#[test]
+fn report_for_one_step_does_not_close_the_next_step() {
+    let server = serve(vec![
+        Reply::Call(
+            "todo",
+            json!({"op":"set","tasks":[{"content":"First report"},{"content":"Second report"}]}),
+        ),
+        Reply::Text(
+            "First report: the architecture keeps the UI and inference boundaries separate.",
+        ),
+        close_todo(),
+        close_todo(),
+        Reply::Text("Second report: the tests cover failure recovery and completion review."),
+        close_todo(),
+        Reply::Text("Both reports delivered."),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = agent
+        .turn("Write both reports", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert!(!agent.todo().has_open());
+    assert!(
+        server.requests.lock()[4]["messages"]
+            .to_string()
+            .contains("no text-only answer was delivered")
+    );
+}
+
+#[test]
+fn prose_does_not_replace_investigation_tool_evidence() {
+    let server = serve(vec![
+        Reply::Call(
+            "todo",
+            json!({"op":"set","tasks":[{"content":"Inspect source","investigation":true}]}),
+        ),
+        Reply::Text(
+            "The architecture looks correct based on what I recall; I have not read the source.",
+        ),
+        Reply::Call(
+            "todo",
+            json!({"op":"done","finding":"Looks correct","evidence":["src/lib.rs:1"]}),
+        ),
+        Reply::Call(
+            "todo",
+            json!({"op":"block","reason":"Current source has not been inspected"}),
+        ),
+        Reply::Text("Blocked: source not inspected."),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = agent
+        .turn("Inspect source", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Blocked);
+    assert!(agent.todo().has_open());
+    assert!(
+        server.requests.lock()[3]["messages"]
+            .to_string()
+            .contains("Step not closed")
+    );
 }
 
 #[test]
@@ -1002,6 +1166,10 @@ fn unfinished_todos_continue_into_real_edits_and_completion() {
             "finish",
             json!({"outcome":"completed","summary":"Created marker."}),
         ),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"completed","summary":"Created marker."}),
+        ),
     ]);
     let e = env(&server.url, "auto");
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
@@ -1017,9 +1185,124 @@ fn unfinished_todos_continue_into_real_edits_and_completion() {
             .to_string()
             .contains("You stopped with unfinished todo items")
     );
+    let requests = server.requests.lock();
+    assert!(
+        requests[5]["messages"]
+            .to_string()
+            .contains("review required before completion")
+            && requests[5]["messages"].to_string().contains("+done"),
+        "final diff review was not delivered before completion"
+    );
+    drop(requests);
+    let status = a.session().control_state();
+    assert_eq!(
+        status["reliability"]["edit_loop"]["diff_surfaced_mutations"],
+        1
+    );
+    assert_eq!(
+        status["reliability"]["verification"],
+        "no automatic focused check available; behavior unverified"
+    );
     assert_eq!(a.metrics().turns_completed, 1);
 }
 
+#[test]
+fn editing_after_a_diff_review_requires_a_fresh_review() {
+    let server = serve(vec![
+        Reply::Call("write", json!({"path":"marker.txt","content":"first"})),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"completed","summary":"Created marker."}),
+        ),
+        Reply::Call("write", json!({"path":"marker.txt","content":"second"})),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"completed","summary":"Updated marker."}),
+        ),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"completed","summary":"Updated marker."}),
+        ),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a
+        .turn("create and revise marker", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert_eq!(
+        std::fs::read_to_string(e.project.path().join("marker.txt")).unwrap(),
+        "second"
+    );
+    let requests = server.requests.lock();
+    let second_review = requests[4]["messages"].to_string();
+    assert!(
+        second_review.contains("review required before completion")
+            && second_review.contains("+second"),
+        "changed files need a new final review after edits"
+    );
+    let status = a.session().control_state();
+    assert_eq!(status["reliability"]["edit_loop"]["mutations"], 2);
+    assert_eq!(
+        status["reliability"]["edit_loop"]["diff_surfaced_mutations"],
+        2
+    );
+}
+
+#[test]
+fn text_only_completion_surfaces_uncheckpointed_shell_mutations() {
+    if skip_without_sandbox() {
+        return;
+    }
+    let server = serve(vec![
+        Reply::Call("bash", json!({"command":"printf shell > untracked.txt"})),
+        Reply::Text("done"),
+        Reply::Text("The shell edit remains unverified."),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a
+        .turn("create a file through shell", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert_eq!(
+        std::fs::read_to_string(e.project.path().join("untracked.txt")).unwrap(),
+        "shell"
+    );
+    let requests = server.requests.lock();
+    assert!(
+        requests[2]["messages"]
+            .to_string()
+            .contains("Uncheckpointed shell command attempts: 1.")
+    );
+    let status = a.session().control_state();
+    assert_eq!(
+        status["reliability"]["edit_loop"]["uncheckpointed_shell_commands"],
+        1
+    );
+    assert_eq!(
+        status["reliability"]["edit_loop"]["phase"],
+        "uncheckpointed_operations_disclosed_not_verified"
+    );
+}
+
+#[test]
+fn text_only_completion_surfaces_checkpointed_file_diffs() {
+    let server = serve(vec![
+        Reply::Call("write", json!({"path":"marker.txt","content":"text-only"})),
+        Reply::Text("Done."),
+        Reply::Text("Diff reviewed; completion summary."),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a.turn("create marker", &mut Recorder::default()).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    let messages = server.requests.lock()[2]["messages"].to_string();
+    assert!(
+        messages.contains("--- marker.txt ---") && messages.contains("+text-only"),
+        "plain-text completion must be gated by the checkpoint diff"
+    );
+}
 #[test]
 fn explicit_completion_records_its_actual_request_for_training() {
     let server = serve(vec![Reply::Call(
@@ -1215,6 +1498,10 @@ fn finish_completed_rejects_unfinished_todos() {
         Reply::Call("finish", json!({"outcome":"completed","summary":"Done"})),
         Reply::Call("write", json!({"path":"marker.txt","content":"done"})),
         close_todo(),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"completed","summary":"Actually done"}),
+        ),
         Reply::Call(
             "finish",
             json!({"outcome":"completed","summary":"Actually done"}),
@@ -1909,6 +2196,25 @@ fn lm_studio_loaded_context_overrides_the_configured_window_and_drives_compactio
             .contains("SUMMARY"),
         "history must have been compacted"
     );
+}
+
+#[test]
+fn local_context_auto_follows_loaded_capacity_and_manual_caps_still_apply() {
+    use dial::config::types::ContextWindow;
+    for (mode, expected) in [
+        (ContextWindow::Auto, 65536),
+        (ContextWindow::Tokens(8192), 8192),
+    ] {
+        let server = serve_with(vec![Reply::Text("first")], None, Some(65536));
+        let mut e = env(&server.url, "auto");
+        e.config.local_context_window = mode;
+        // A stale catalog or unknown-model fallback must not pin Auto to 32768 after probing.
+        e.config.context_window = 32768;
+        let mut backend = make_backend(&e.config).unwrap();
+        let mut a = agent(&e, &mut backend, None);
+        a.turn("one?", &mut Recorder::default()).unwrap();
+        assert_eq!(a.context_window(), expected);
+    }
 }
 
 fn summary_requests(server: &Scripted) -> usize {
@@ -2806,7 +3112,7 @@ fn user_cancellation_during_reasoning_does_not_trigger_a_gate_retry() {
     let cancel = Arc::new(AtomicBool::new(false));
     struct CancelUi(Arc<AtomicBool>);
     impl Ui for CancelUi {
-        fn heartbeat(&mut self) {
+        fn reasoning_delta(&mut self, _text: &str) {
             self.0.store(true, Ordering::SeqCst);
         }
     }
@@ -3071,6 +3377,9 @@ fn rereads_do_not_allow_identical_failed_edits_to_loop_forever() {
 
 #[test]
 fn automatic_focused_checks_keep_pumping_the_ui() {
+    if skip_without_sandbox() {
+        return;
+    }
     struct ResponsiveUi {
         heartbeats: usize,
     }
@@ -3082,6 +3391,7 @@ fn automatic_focused_checks_keep_pumping_the_ui() {
     let server = serve(vec![
         Reply::Call("write", json!({"path":"marker.txt","content":"ok"})),
         Reply::Text("done"),
+        Reply::Text("Checkpoint diff surfaced."),
     ]);
     let mut e = env(&server.url, "auto");
     e.config.verification.commands.push(VerificationCommand {
@@ -3100,13 +3410,16 @@ fn automatic_focused_checks_keep_pumping_the_ui() {
     );
     assert_eq!(
         server.requests.lock().len(),
-        2,
-        "successful checks with artifact footers must not start repair turns"
+        3,
+        "the final diff review adds a request; successful checks must not start a repair request"
     );
 }
 
 #[test]
 fn cancellation_during_automatic_checks_stops_without_a_repair_turn() {
+    if skip_without_sandbox() {
+        return;
+    }
     struct CancellingUi {
         cancel: Arc<AtomicBool>,
         checking: bool,
@@ -3124,6 +3437,7 @@ fn cancellation_during_automatic_checks_stops_without_a_repair_turn() {
     let server = serve(vec![
         Reply::Call("write", json!({"path":"marker.txt","content":"ok"})),
         Reply::Text("done"),
+        Reply::Text("Checkpoint diff surfaced."),
     ]);
     let mut e = env(&server.url, "auto");
     e.config.verification.commands.push(VerificationCommand {
@@ -3147,8 +3461,8 @@ fn cancellation_during_automatic_checks_stops_without_a_repair_turn() {
     );
     assert_eq!(
         server.requests.lock().len(),
-        2,
-        "cancellation must not start a repair request"
+        3,
+        "the final diff review adds a request; cancellation must not start a repair request"
     );
 }
 
@@ -3410,6 +3724,9 @@ fn shell_inspection_skips_prompt_but_destructive_command_asks() {
 
 #[test]
 fn always_allow_shell_permission_is_not_a_blanket_bash_grant() {
+    if skip_without_sandbox() {
+        return;
+    }
     struct AlwaysOnce {
         prompts: Vec<String>,
     }
@@ -3449,13 +3766,7 @@ fn image_read_attaches_validated_bytes_without_persisting_base64() {
     let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD,
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=").unwrap();
     std::fs::write(e.project.path().join("tiny.png"), png).unwrap();
-    let backend =
-        make_backend(&e.config)
-            .unwrap()
-            .with_metadata(dial::llm::catalog::ModelMetadata {
-                vision: Some(true),
-                ..Default::default()
-            });
+    let backend = make_backend(&e.config).unwrap();
     let session = Session::create(
         &e.layout,
         SessionMeta {
@@ -3473,7 +3784,10 @@ fn image_read_attaches_validated_bytes_without_persisting_base64() {
         Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
-    a.turn("read the image", &mut Recorder::default()).unwrap();
+    let mut ui = Recorder::default();
+    a.turn("read the image", &mut ui).unwrap();
+    assert_eq!(ui.images.len(), 1);
+    assert_eq!(ui.images[0]["path"], "tiny.png");
     let requests = server.requests.lock();
     assert!(
         requests[1]["messages"]
@@ -3483,6 +3797,291 @@ fn image_read_attaches_validated_bytes_without_persisting_base64() {
     let saved = std::fs::read_to_string(a.session().path().unwrap()).unwrap();
     assert!(saved.contains("sha256"));
     assert!(!saved.contains("data:image/png;base64,"));
+}
+
+#[test]
+fn user_supplied_external_image_reaches_the_model_with_unknown_capabilities() {
+    let server = serve(vec![Reply::Text("image received")]);
+    let e = env(&server.url, "auto");
+    let outside = tempfile::tempdir().unwrap();
+    let image = outside.path().join("Screenshot 1.png");
+    let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII=";
+    std::fs::write(
+        &image,
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap(),
+    )
+    .unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let ui = &mut Recorder::default();
+    a.turn(&format!("Inspect @\"{}\"", image.display()), ui)
+        .unwrap();
+    assert_eq!(ui.images.len(), 1);
+    assert_eq!(ui.images[0]["path"], "Screenshot 1.png");
+    let requests = server.requests.lock();
+    let user = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "user")
+        .unwrap();
+    assert_eq!(
+        user["content"][1]["image_url"]["url"],
+        format!("data:image/png;base64,{encoded}")
+    );
+    let saved = std::fs::read_to_string(a.session().path().unwrap()).unwrap();
+    assert!(saved.contains("Screenshot 1.png"));
+    assert!(!saved.contains(encoded));
+}
+
+#[test]
+fn loading_browser_exposes_managed_preview_tools_without_starting_a_service() {
+    if skip_without_sandbox() {
+        return;
+    }
+    let server = serve(vec![
+        Reply::Call("tool_load", json!({"names":["browser"]})),
+        Reply::Call("bg", json!({"action":"list"})),
+        Reply::Call(
+            "bg",
+            json!({"action":"start","name":"preview","command":"echo READY; sleep 30"}),
+        ),
+        Reply::Call(
+            "bg",
+            json!({"action":"wait","name":"preview","until":"^READY$","timeout":2}),
+        ),
+        Reply::Call("bg", json!({"action":"kill","name":"preview"})),
+        Reply::Text("Temporary preview process stopped."),
+        Reply::Text("Temporary preview process stopped; opaque command effects reviewed."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.integrations = vec!["bg".into()];
+    // Exercise the local-compute schema budget without starting or contacting a local model.
+    e.config.model_roles.insert(
+        "architecture".into(),
+        dial::llm::model_config::ModelSelection {
+            model: "unused-local-model".into(),
+            ..Default::default()
+        },
+    );
+    e.config.assistance.enabled = true;
+    e.config.assistance.compact_tools = true;
+    e.config.assistance.initial_tool_limit = 1;
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let report = a
+        .turn("Check a temporary preview process and stop it.", &mut ui)
+        .unwrap();
+    assert_eq!(
+        report.outcome,
+        TurnOutcome::Completed,
+        "results={:?}; notices={:?}; text={}",
+        ui.results,
+        ui.notices,
+        ui.text
+    );
+    let requests = server.requests.lock();
+    assert!(!tool_names(&requests[0]).contains(&"bg".into()));
+    assert!(
+        requests[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["function"]["name"] == "bg")
+    );
+    let results: Vec<_> = ui
+        .results
+        .iter()
+        .filter(|(name, _, _)| name == "bg")
+        .collect();
+    assert_eq!(results.len(), 4);
+    assert!(results.iter().all(|(_, _, error)| !error));
+    assert!(
+        results[0].1.contains("no background processes"),
+        "loading browser starts no server"
+    );
+    assert!(results[2].1.starts_with("ready:"));
+    assert!(results[3].1.contains("killed preview"));
+}
+
+#[test]
+fn pasted_external_image_attaches_and_rereads_without_a_workspace_copy() {
+    let outside = tempfile::tempdir().unwrap();
+    let image = outside.path().join("pasted image.png");
+    let other = outside.path().join("not supplied.png");
+    let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII=";
+    let pixels =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap();
+    std::fs::write(&image, &pixels).unwrap();
+    std::fs::write(&other, &pixels).unwrap();
+    let server = serve(vec![
+        Reply::Call("read", json!({"path":image})),
+        Reply::Call("read", json!({"path":other})),
+        Reply::Text("Supplied image inspected; unrelated external file unavailable."),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let report = a
+        .turn(
+            &format!("\"{}\" this is what it looks like", image.display()),
+            &mut ui,
+        )
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert_eq!(
+        ui.images.len(),
+        2,
+        "initial attachment and explicit reread both preview"
+    );
+    let reads: Vec<_> = ui
+        .results
+        .iter()
+        .filter(|(name, _, _)| name == "read")
+        .collect();
+    assert!(!reads[0].2, "supplied image may be reread directly");
+    assert!(
+        reads[1].2,
+        "no access to another file with identical pixels"
+    );
+    let requests = server.requests.lock();
+    for request in &requests[..2] {
+        assert!(
+            request["messages"]
+                .to_string()
+                .contains(&format!("data:image/png;base64,{encoded}")),
+            "the original pixels reach inference"
+        );
+        assert!(
+            request["messages"]
+                .to_string()
+                .contains("\"detail\":\"high\"")
+        );
+    }
+    assert!(
+        !e.project.path().join(".cache").exists(),
+        "no shell copy needed"
+    );
+}
+
+#[test]
+fn visual_source_edits_proactively_require_looking_and_disclose_missing_inspection() {
+    for explicit_finish in [false, true] {
+        let stop = || {
+            if explicit_finish {
+                Reply::Call(
+                    "finish",
+                    json!({"outcome":"completed","summary":"style updated"}),
+                )
+            } else {
+                Reply::Text("style updated")
+            }
+        };
+        let server = serve(vec![
+            Reply::Call(
+                "write",
+                json!({"path":"style.css","content":"body { color: green; }\n"}),
+            ),
+            stop(),
+            stop(),
+        ]);
+        let mut e = env(&server.url, "auto");
+        e.config.verification.enabled = false;
+        let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+        let mut ui = Recorder::default();
+        let report = a.turn("Add the requested rule.", &mut ui).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(e.project.path().join("style.css")).unwrap(),
+            "body { color: green; }\n"
+        );
+        let requests = server.requests.lock();
+        assert_eq!(requests.len(), 3, "the visual reminder is bounded");
+        assert!(
+            requests[2]["messages"]
+                .to_string()
+                .contains("Visual inspection checkpoint")
+        );
+        assert!(report.text.contains("Visual inspection was not completed"));
+        assert!(
+            ui.text.contains("Visual inspection was not completed"),
+            "the limitation reaches the actual streamed UI"
+        );
+        assert_eq!(report.outcome, dial::agent::TurnOutcome::Completed);
+        if explicit_finish {
+            let finishes: Vec<_> = ui
+                .results
+                .iter()
+                .filter(|(name, _, _)| name == "finish")
+                .collect();
+            assert_eq!(
+                finishes.len(),
+                2,
+                "review must continue before accepting completion"
+            );
+            assert!(finishes[0].1.contains("Final edit review required"));
+            assert!(!finishes[0].2, "a completion review is not a tool failure");
+            assert_eq!(finishes[1].1, "Turn outcome accepted.");
+            assert_eq!(
+                a.session().control_state()["reliability"]["stats"]["runtime_errors"],
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn new_edits_rearm_completion_review_without_error_recovery() {
+    let stop = || {
+        Reply::Call(
+            "finish",
+            json!({"outcome":"completed","summary":"Updated; local preview unavailable, appearance unverified."}),
+        )
+    };
+    let server = serve(vec![
+        Reply::Call(
+            "write",
+            json!({"path":"style.css","content":"body { color: green; }\n"}),
+        ),
+        stop(),
+        Reply::Call(
+            "write",
+            json!({"path":"style.css","content":"body { color: blue; }\n"}),
+        ),
+        stop(),
+        Reply::Call("bash", json!({"command":"cat style.css"})),
+        stop(),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.verification.enabled = false;
+    // This fixture tests completion review, not OS sandbox availability.
+    e.config.sandbox.mode = dial::config::types::SandboxMode::Off;
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let report = a.turn("Fix the page color.", &mut ui).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert_eq!(
+        server.requests.lock().len(),
+        6,
+        "reading for review must not rearm it"
+    );
+    let finishes: Vec<_> = ui
+        .results
+        .iter()
+        .filter(|(name, _, _)| name == "finish")
+        .collect();
+    assert_eq!(finishes.len(), 3);
+    for (_, text, is_error) in &finishes[..2] {
+        assert!(!is_error, "review is a normal continuation");
+        assert!(
+            text.contains("Visual inspection checkpoint"),
+            "new visual edits need fresh evidence"
+        );
+    }
+    assert_eq!(finishes[2].1, "Turn outcome accepted.");
+    assert_eq!(
+        a.session().control_state()["reliability"]["stats"]["runtime_errors"],
+        0
+    );
+    assert!(report.text.contains("Visual inspection was not completed"));
 }
 
 #[test]
@@ -3551,6 +4150,9 @@ fn failed_focused_check_repairs_boundedly_and_never_reports_success() {
 
 #[test]
 fn closing_a_step_needs_evidence_runs_focused_checks_and_a_failure_keeps_it_open() {
+    if skip_without_sandbox() {
+        return;
+    }
     let plan = json!({"op":"set","tasks":[{"content":"write marker"},{"content":"report"}]});
     let server = serve(vec![
         Reply::Call("todo", plan),
@@ -3606,6 +4208,12 @@ fn closing_a_step_needs_evidence_runs_focused_checks_and_a_failure_keeps_it_open
         ui.calls
     );
     assert!(!a.todo().has_open());
+    assert!(
+        a.session().control_state()["reliability"]["edit_loop"]["failed_checks"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "a passing repair rerun clears the failed-check set"
+    );
 }
 #[test]
 fn repeated_done_cannot_bypass_failed_or_unavailable_verification() {
@@ -3633,6 +4241,11 @@ fn repeated_done_cannot_bypass_failed_or_unavailable_verification() {
     let mut ui = Recorder::default();
     let report = a.turn("create marker", &mut ui).unwrap();
     assert_eq!(report.outcome, TurnOutcome::Blocked);
+    assert_eq!(
+        a.session().control_state()["reliability"]["edit_loop"]["failed_checks"],
+        json!(["always-fails"]),
+        "the exact failed check remains visible until a later run passes"
+    );
     assert!(
         a.todo().has_open(),
         "failed verification must leave the step open"
@@ -3652,6 +4265,61 @@ fn repeated_done_cannot_bypass_failed_or_unavailable_verification() {
         ui.calls.iter().filter(|c| *c == "bash").count(),
         1,
         "a repeat done must not rerun an unchanged failed check"
+    );
+}
+
+#[test]
+fn finish_reruns_failed_checks_after_a_repair_edit() {
+    let server = serve(vec![
+        Reply::Call("write", json!({"path":"marker.txt","content":"bad"})),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"completed","summary":"Created marker."}),
+        ),
+        Reply::Call("write", json!({"path":"marker.txt","content":"fixed"})),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"completed","summary":"Repaired marker."}),
+        ),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"completed","summary":"Repaired marker."}),
+        ),
+    ]);
+    let mut e = env(&server.url, "auto");
+    // The disposable fixture's verification command must run even inside a host sandbox.
+    e.config.sandbox.mode = dial::config::types::SandboxMode::Off;
+    e.config.verification.commands.push(VerificationCommand {
+        name: "marker-fixed".into(),
+        command: "grep -q fixed marker.txt".into(),
+        file_extensions: vec![],
+        timeout_secs: 10,
+    });
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let report = a.turn("create marker", &mut ui).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert_eq!(
+        std::fs::read_to_string(e.project.path().join("marker.txt")).unwrap(),
+        "fixed"
+    );
+    let requests = server.requests.lock();
+    assert!(
+        requests[2]["messages"]
+            .to_string()
+            .contains("focused verification failed")
+    );
+    assert!(
+        requests[4]["messages"]
+            .to_string()
+            .contains("Final edit review required")
+            && requests[4]["messages"].to_string().contains("+fixed")
+    );
+    assert_eq!(ui.calls.iter().filter(|call| *call == "bash").count(), 2);
+    assert!(
+        a.session().control_state()["reliability"]["edit_loop"]["failed_checks"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
     );
 }
 
@@ -3755,10 +4423,12 @@ fn dynamic_extension_sdk_executes_with_approval_and_evidence() {
                 .and_then(|path| std::fs::read_to_string(path).map_err(|e| e.to_string()));
             match result {
                 Ok(text) => ToolOutput {
+                    data: None,
                     text,
                     is_error: false,
                 },
                 Err(text) => ToolOutput {
+                    data: None,
                     text,
                     is_error: true,
                 },
@@ -4741,11 +5411,15 @@ fn every_request_extends_the_previous_one_so_prompt_caches_stay_valid() {
 }
 #[test]
 fn a_tool_call_with_raw_newlines_in_its_arguments_runs_instead_of_being_regenerated() {
-    // Local models routinely write a file's real line breaks into the JSON string. Strict parsing rejected the call and
-    // made the model generate the whole payload again; the repair keeps what it meant.
+    // Local models routinely write real line breaks into JSON strings. This verifies the raw write executes once;
+    // the additional reply below covers the mandatory final diff review.
     let raw = "{\"path\":\"out.txt\",\"content\":\"line one\nline two\n\"}".to_owned();
     assert!(serde_json::from_str::<Value>(&raw).is_err());
-    let server = serve(vec![Reply::RawCall("write", raw), Reply::Text("done")]);
+    let server = serve(vec![
+        Reply::RawCall("write", raw),
+        Reply::Text("done"),
+        Reply::Text("done"),
+    ]);
     let e = env(&server.url, "auto");
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("write out.txt", &mut Recorder::default()).unwrap();
@@ -4756,11 +5430,10 @@ fn a_tool_call_with_raw_newlines_in_its_arguments_runs_instead_of_being_regenera
     );
     assert_eq!(
         server.requests.lock().len(),
-        2,
-        "one call, one answer: nothing was regenerated"
+        3,
+        "the review handoff may add a reply, but must not regenerate the raw write call"
     );
 }
-
 #[test]
 fn a_cut_off_tool_call_is_still_refused_and_nothing_is_written() {
     let server = serve(vec![
@@ -4851,6 +5524,88 @@ fn repair_hints_ride_with_the_user_turn_so_the_system_prompt_never_changes() {
             n + 1
         );
     }
+}
+
+#[test]
+fn zero_step_limit_runs_past_64_and_overrides_a_finite_admitted_harness() {
+    for unlimited in [false, true] {
+        let mut replies: Vec<_> = (0..65)
+            .map(|n| Reply::Call("read", json!({"path":format!("f{n}.txt")})))
+            .collect();
+        replies.push(Reply::Text("done"));
+        let server = serve(replies);
+        let mut e = env(&server.url, "auto");
+        e.config.harness.tools = vec!["read".into()];
+        e.config.harness.max_steps = 2;
+        let store = Store::open(&e.layout.state_dir, "scripted", "t", &e.config.harness).unwrap();
+        if unlimited {
+            e.config.harness.max_steps = 0;
+        }
+        e.config.reasoning_guard.enabled = false;
+        for n in 0..65 {
+            std::fs::write(
+                e.project.path().join(format!("f{n}.txt")),
+                format!("value {n}"),
+            )
+            .unwrap();
+        }
+        let mut a = agent_with(&e, Some(&store), Arc::new(AtomicBool::new(false)));
+        assert_eq!(a.version().harness.max_steps, 2);
+        let report = a
+            .turn(
+                "Read the numbered files and report the result.",
+                &mut Recorder::default(),
+            )
+            .unwrap();
+        if unlimited {
+            assert_eq!(
+                (report.text.as_str(), report.outcome),
+                ("done", TurnOutcome::Completed)
+            );
+            assert_eq!(server.requests.lock().len(), 66);
+        } else {
+            assert_eq!(report.outcome, TurnOutcome::Incomplete);
+            assert!(report.text.contains("2-step limit"), "{}", report.text);
+            assert_eq!(server.requests.lock().len(), 2);
+        }
+    }
+}
+
+#[test]
+fn zero_step_limit_keeps_sealed_evaluation_finite() {
+    let mut replies: Vec<_> = (0..25)
+        .map(|n| Reply::Call("read", json!({"path":format!("f{n}.txt")})))
+        .collect();
+    replies.push(Reply::Text("done"));
+    let server = serve(replies);
+    let mut e = env(&server.url, "auto");
+    e.config.harness.tools = vec!["read".into()];
+    e.config.harness.max_steps = 0;
+    let version = dial::config::types::Version {
+        id: 1,
+        parent: None,
+        kind: "initial".into(),
+        harness: e.config.harness.clone(),
+        adapter: None,
+        status: "active".into(),
+    };
+    let files = (0..25)
+        .map(|n| (format!("f{n}.txt"), format!("value {n}")))
+        .collect();
+    let passed = dial::agent::check_case(
+        &mut dial::agent::Runtime::new(),
+        &e.config,
+        &version,
+        "Read the numbered files and report the result.",
+        &files,
+        &dial::learn::verify::Check::FileEquals {
+            path: "f0.txt".into(),
+            content: "value 0".into(),
+        },
+    )
+    .unwrap();
+    assert!(!passed);
+    assert_eq!(server.requests.lock().len(), 24);
 }
 
 #[test]
@@ -4955,6 +5710,13 @@ fn rounds_in_which_nothing_worked_end_the_turn_even_when_no_single_tool_streak_d
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("read the notes", &mut Recorder::default()).unwrap();
     assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert!(
+        report.text.contains("Most recent tool error (`read`)")
+            && report.text.contains("missing-8.txt")
+            && report.text.contains("say \"continue\" to resume"),
+        "{}",
+        report.text
+    );
     assert!(
         report
             .text
@@ -5109,7 +5871,7 @@ fn extended_inspection_requires_real_todos_and_allows_discovered_work() {
 
 #[test]
 fn independent_training_failure_gets_one_repair_and_only_success_is_harvestable() {
-    if dial::tools::sandbox::already_sandboxed() {
+    if skip_without_sandbox() {
         return;
     }
     let server = serve(vec![Reply::Text("wrong"), Reply::Text("42")]);
@@ -5152,6 +5914,9 @@ fn independent_training_failure_gets_one_repair_and_only_success_is_harvestable(
 
 #[test]
 fn isolated_search_applies_smallest_verified_patch_without_touching_other_files() {
+    if skip_without_sandbox() {
+        return;
+    }
     let main_step = AtomicUsize::new(0);
     let server = serve_fn(
         Arc::new(move |request| {
@@ -5255,6 +6020,9 @@ fn escalation_rejects_nonlocal_route_before_disclosing_evidence() {
 
 #[test]
 fn behavioral_repairs_retain_failure_and_pass_without_marking_task_success() {
+    if skip_without_sandbox() {
+        return;
+    }
     let command = "test \"$(cat value.txt)\" = fixed";
     let server = serve(vec![
         Reply::Call("bash", json!({"command":command})),
@@ -5305,7 +6073,7 @@ fn behavioral_repairs_retain_failure_and_pass_without_marking_task_success() {
 
 #[test]
 fn harness_records_behavioral_failure_before_the_model_edits() {
-    if dial::tools::sandbox::already_sandboxed() {
+    if skip_without_sandbox() {
         return;
     }
     let command = "test \"$(cat value.txt)\" = fixed";
@@ -5428,6 +6196,9 @@ fn experience_checks(e: &mut Env) {
 }
 #[test]
 fn experience_capture_replay_and_stale_refusal_use_real_tools() {
+    if skip_without_sandbox() {
+        return;
+    }
     let server = serve(vec![
         Reply::Call("write", json!({"path":"value.txt","content":"fixed"})),
         Reply::Call(
@@ -5561,6 +6332,9 @@ fn experience_ledger_survives_session_resume_and_unrelated_source_changes() {
 }
 #[test]
 fn experience_teacher_is_opt_in_and_cannot_replace_recipe_evidence() {
+    if skip_without_sandbox() {
+        return;
+    }
     let main = serve(vec![
         Reply::Call("write", json!({"path":"value.txt","content":"fixed"})),
         Reply::Call(
@@ -5671,6 +6445,9 @@ fn experience_replay_still_requires_each_write_approval() {
 
 #[test]
 fn experience_does_not_capture_untracked_shell_mutations() {
+    if skip_without_sandbox() {
+        return;
+    }
     let server = serve(vec![
         Reply::Call("write", json!({"path":"value.txt","content":"fixed"})),
         Reply::Call("bash", json!({"command":"printf other > untracked.txt"})),
@@ -5700,7 +6477,10 @@ fn experience_does_not_capture_untracked_shell_mutations() {
 }
 
 #[test]
-fn adaptive_settings_follow_real_reads_edits_checks_and_failures_without_extra_generations() {
+fn adaptive_settings_follow_real_reads_edits_checks_and_review_handoff() {
+    if skip_without_sandbox() {
+        return;
+    }
     let server = serve(vec![
         Reply::Call("read", json!({"path":"marker.txt"})),
         Reply::Call("write", json!({"path":"marker.txt","content":"after\n"})),
@@ -5710,6 +6490,7 @@ fn adaptive_settings_follow_real_reads_edits_checks_and_failures_without_extra_g
         ),
         Reply::Call("read", json!({"path":"missing.txt"})),
         Reply::Text("Updated and checked the marker."),
+        Reply::Text("Final workspace review complete."),
     ]);
     let mut e = env(&server.url, "auto");
     e.config.verification.enabled = false;
@@ -5734,7 +6515,7 @@ fn adaptive_settings_follow_real_reads_edits_checks_and_failures_without_extra_g
     a.turn("Implement the marker change", &mut Recorder::default())
         .unwrap();
     let requests = server.requests.lock();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 6);
     assert_eq!(requests[0]["temperature"], 0.2);
     assert_eq!(requests[2]["temperature"], 0.15);
     assert_eq!(requests[3]["temperature"], 0.05);
@@ -5744,11 +6525,14 @@ fn adaptive_settings_follow_real_reads_edits_checks_and_failures_without_extra_g
     assert_eq!(requests[3]["max_tokens"], 1536);
     let control = a.session().control_state();
     assert_eq!(control["adaptive_policy"]["selection"]["phase"], "recovery");
-    assert_eq!(control["adaptive_history"].as_array().unwrap().len(), 4);
+    assert_eq!(control["adaptive_history"].as_array().unwrap().len(), 5);
 }
 
 #[test]
 fn reliability_capability_check_executes_only_disposable_expected_calls() {
+    if skip_without_sandbox() {
+        return;
+    }
     let server = serve_fn(
         Arc::new(|request| {
             if request["tools"].as_array().unwrap().len() == 2 {
@@ -5830,6 +6614,13 @@ fn reliability_stops_different_contract_failures_without_executing_them() {
     let report = a.turn("Fix a fixture", &mut Recorder::default()).unwrap();
     assert_eq!(report.outcome, TurnOutcome::Incomplete);
     assert!(report.text.contains("consecutive tool-contract failures"));
+    assert!(
+        report.text.contains("Most recent tool error (`read`)")
+            && report.text.contains("entire batch is rejected")
+            && report.text.contains("say \"continue\" to resume"),
+        "{}",
+        report.text
+    );
     assert!(!e.project.path().join("must-not-exist.txt").exists());
     assert_eq!(server.requests.lock().len(), 3);
     let control = a.session().control_state();
@@ -5914,7 +6705,7 @@ fn finish_cannot_accept_or_reuse_failed_behavioral_verification() {
     assert!(
         server.requests.lock()[3]["messages"]
             .to_string()
-            .contains("last focused checks failed")
+            .contains("focused checks failed and no new edits are awaiting a fresh check")
     );
     assert!(
         a.session().control_state()["reliability"]["automatic_failing_checks"]

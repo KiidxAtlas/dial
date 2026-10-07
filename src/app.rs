@@ -30,8 +30,13 @@ use crate::{
         keys::{Action, Keymap},
         markdown::truncate_spans,
         overlay::{
-            DrawCtx, OverlayEvent, compute::ComputeOverlay, models::ModelOverlay,
-            providers::ProviderOverlay, settings::SettingsOverlay, shortcuts::ShortcutOverlay,
+            DrawCtx, OverlayEvent,
+            compute::ComputeOverlay,
+            models::ModelOverlay,
+            palette::{PaletteEntry, PaletteOverlay},
+            providers::ProviderOverlay,
+            settings::SettingsOverlay,
+            shortcuts::ShortcutOverlay,
         },
         settings_schema,
         status::{Lora, Phase, StatusData},
@@ -323,6 +328,10 @@ fn agent_key(config: &Config) -> String {
     let mut table = toml::Table::try_from(config).unwrap_or_default();
     table.remove("ui");
     table.remove("approval");
+    table.insert(
+        "effective_context_window".into(),
+        i64::from(config.context_window).into(),
+    );
     table.to_string()
 }
 
@@ -441,99 +450,14 @@ struct Catalog {
     request: u64,
     worker: Option<JoinHandle<()>>,
     generation: u64,
-    probe: Option<LoraProbe>,
-    attempted: std::collections::HashSet<String>,
 }
 
-struct LoraProbe {
-    model: String,
-    cancel: Arc<AtomicBool>,
-    checking: Arc<AtomicBool>,
-    result: std::sync::mpsc::Receiver<Result<Option<bool>>>,
-    worker: Option<JoinHandle<()>>,
-}
-impl Drop for LoraProbe {
+struct ProbeLease(std::fs::File);
+impl Drop for ProbeLease {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // Closing our handle alone leaves flock held by any duplicate inherited during spawn.
+        let _ = fs2::FileExt::unlock(&self.0);
     }
-}
-
-fn probe_when_available(
-    config: &Config,
-    cancel: &AtomicBool,
-    checking: &AtomicBool,
-    probe: impl FnOnce(&Config, &AtomicBool) -> Result<Value>,
-) -> Result<Option<bool>> {
-    let lock = auto::lock_file(&config.user_dir.join("compute.lock"))?;
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-        if crate::learn::compute::should_yield(&config.user_dir)? {
-            std::thread::sleep(Duration::from_millis(80));
-            continue;
-        }
-        match lock.try_lock_exclusive() {
-            Ok(()) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(80))
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if cancel.load(Ordering::SeqCst) {
-        return Ok(None);
-    }
-    let store = Store::open(
-        &config.state_dir,
-        &config.model,
-        &config.use_case,
-        &config.harness,
-    )?;
-    // Another session may have completed verification while this job waited for compute.
-    if let Some(raw) = store.get_meta("serving_capabilities")?
-        && let Ok(caps) = serde_json::from_str::<Value>(&raw)
-        && crate::learn::worker::current_lora_probe(&caps)
-        && caps["inference"] == true
-        && let Some(supported) = caps["lora"].as_bool()
-    {
-        return Ok(Some(supported));
-    }
-    let _owner = crate::learn::compute::owner_record(
-        &config.user_dir,
-        "verification",
-        &config.project_root,
-        &config.state_dir,
-        &config.model,
-    )?;
-    checking.store(true, Ordering::SeqCst);
-    let result = probe(config, cancel);
-    if cancel.load(Ordering::SeqCst) {
-        return Ok(None);
-    }
-    let caps = match result {
-        Err(error)
-            if error
-                .downcast_ref::<crate::learn::compute::Preempted>()
-                .is_some() =>
-        {
-            return Ok(None);
-        }
-        result => result?,
-    };
-    ensure!(
-        caps["inference"] == true,
-        "could not load model to verify LoRA: {}",
-        caps["reason"]
-    );
-    let supported = caps["lora"]
-        .as_bool()
-        .ok_or_else(|| anyhow::anyhow!("missing LoRA result"))?;
-    store.set_meta("serving_capabilities", &caps.to_string())?;
-    Ok(Some(supported))
 }
 
 fn shared<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -549,8 +473,6 @@ impl Catalog {
             request: 0,
             worker: None,
             generation: 0,
-            probe: None,
-            attempted: Default::default(),
         }
     }
 
@@ -560,136 +482,11 @@ impl Catalog {
 
     /// Reap a finished scan so a new request can start; bumps `generation` when one completed.
     fn collect(&mut self) {
-        self.collect_probe();
         if !self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
             return;
         }
         self.worker = None;
         self.generation = self.generation.wrapping_add(1);
-    }
-
-    fn collect_probe(&mut self) {
-        let Some(probe) = &self.probe else {
-            return;
-        };
-        let model = probe.model.clone();
-        let result = match probe.result.try_recv() {
-            Ok(result) => Some(result),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Some(Err(anyhow::anyhow!("verification worker stopped")))
-            }
-            Err(_) => None,
-        };
-        let check = if probe.checking.load(Ordering::SeqCst) {
-            catalog::LoraCheck::Checking
-        } else {
-            catalog::LoraCheck::Waiting
-        };
-        if let Some(discovery) = shared(&self.slot).1.as_mut() {
-            for entry in &mut discovery.models {
-                if entry.selection.model != model || entry.selection.provider != "mlx" {
-                    continue;
-                }
-                let previous = (
-                    entry.metadata.lora_check,
-                    entry.metadata.lora_verified,
-                    entry.metadata.lora,
-                );
-                match &result {
-                    Some(Ok(Some(supported))) => {
-                        entry.metadata.lora = Some(*supported);
-                        entry.metadata.lora_verified = true;
-                        entry.metadata.lora_check = None;
-                    }
-                    Some(Ok(None)) => entry.metadata.lora_check = None,
-                    Some(Err(_)) => entry.metadata.lora_check = Some(catalog::LoraCheck::Failed),
-                    None => entry.metadata.lora_check = Some(check),
-                }
-                if previous
-                    != (
-                        entry.metadata.lora_check,
-                        entry.metadata.lora_verified,
-                        entry.metadata.lora,
-                    )
-                {
-                    self.generation = self.generation.wrapping_add(1);
-                }
-            }
-        }
-        if let Some(result) = result {
-            if !matches!(result, Ok(None)) {
-                self.attempted.insert(model);
-            }
-            self.probe.take();
-        }
-    }
-
-    fn auto_verify(&mut self, app: &App) {
-        self.collect();
-        if self.probe.is_some() {
-            return;
-        }
-        let Some(discovery) = self.get() else {
-            return;
-        };
-        let candidate = discovery
-            .models
-            .iter()
-            .filter(|entry| {
-                entry.selection.provider == "mlx"
-                    && entry.selection.base_url.is_none()
-                    && entry.available
-                    && !entry.metadata.lora_verified
-                    && entry.metadata.lora != Some(false)
-                    && !self.attempted.contains(&entry.selection.model)
-                    && Path::new(&entry.selection.model).is_absolute()
-            })
-            .min_by_key(|entry| entry.selection.model != app.config.model);
-        let Some(entry) = candidate else {
-            return;
-        };
-        let mut config = app.config.with_selection(&entry.selection);
-        config.state_dir = config.learning_dir(&app.layout);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let checking = Arc::new(AtomicBool::new(false));
-        let (tx, result) = std::sync::mpsc::channel();
-        let (stop, active) = (cancel.clone(), checking.clone());
-        let worker = std::thread::spawn(move || {
-            let _ = tx.send(probe_when_available(
-                &config,
-                &stop,
-                &active,
-                crate::learn::worker::capabilities_controlled,
-            ));
-        });
-        self.probe = Some(LoraProbe {
-            model: entry.selection.model.clone(),
-            cancel,
-            checking,
-            result,
-            worker: Some(worker),
-        });
-        self.collect_probe();
-    }
-
-    fn cancel_probe(&mut self) {
-        if let Some(probe) = &self.probe {
-            probe.cancel.store(true, Ordering::SeqCst);
-        }
-        // Joining a cancelled probe releases its subprocess and compute before foreground inference.
-        if let Some(mut probe) = self.probe.take() {
-            if let Some(worker) = probe.worker.take() {
-                let _ = worker.join();
-            }
-            if let Some(discovery) = shared(&self.slot).1.as_mut() {
-                for entry in &mut discovery.models {
-                    if entry.selection.model == probe.model {
-                        entry.metadata.lora_check = None;
-                    }
-                }
-            }
-            self.generation = self.generation.wrapping_add(1);
-        }
     }
 
     fn start(&mut self, app: &App) {
@@ -702,7 +499,11 @@ impl Catalog {
 
     fn refresh(&mut self, app: &App) {
         self.collect();
-        self.scan(app);
+        // Config changes must not opt an idle chat into provider discovery. Once the
+        // user has opened a model/provider panel, keep that requested catalog fresh.
+        if self.request != 0 {
+            self.scan(app);
+        }
     }
 
     fn scan(&mut self, app: &App) {
@@ -753,6 +554,9 @@ impl Catalog {
 // Git and learning status, cached so a repaint never spawns a process.
 // ---------------------------------------------------------------------------
 
+/// Git status shown in the status line: (branch, optional `(ahead, behind, dirty)` counts).
+type GitStatus = (String, Option<(u32, u32, u32)>);
+
 /// Refresh optional status on a worker, keeping the last value while a query is pending.
 struct StatusCache<T> {
     at: Option<Instant>,
@@ -795,11 +599,57 @@ impl<T: Send + 'static> StatusCache<T> {
 
 #[derive(Default)]
 struct Git {
-    cache: StatusCache<(String, Option<(u32, u32, u32)>)>,
+    cache: StatusCache<GitStatus>,
+    files: StatusCache<Vec<crate::ui::rail::FileDiff>>,
 }
 
 impl Git {
-    fn read(&mut self, root: &Path) -> (String, Option<(u32, u32, u32)>) {
+    fn files(&mut self, root: &Path) -> Vec<crate::ui::rail::FileDiff> {
+        let root = root.to_owned();
+        self.files.refresh(GIT_TTL, move || {
+            let mut files = git_output(
+                &root,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    "-z",
+                    "HEAD",
+                ],
+            )
+            .map(|s| parse_file_diffs(&s))
+            .unwrap_or_else(|| {
+                // A newly initialized repository has no HEAD; show staged files without invented counts.
+                git_output(&root, &["ls-files", "-z"])
+                    .unwrap_or_default()
+                    .split('\0')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| crate::ui::rail::FileDiff {
+                        path: p.into(),
+                        untracked: true,
+                        ..Default::default()
+                    })
+                    .collect()
+            });
+            for path in git_output(&root, &["ls-files", "--others", "--exclude-standard", "-z"])
+                .unwrap_or_default()
+                .split('\0')
+                .filter(|p| !p.is_empty())
+            {
+                files.push(crate::ui::rail::FileDiff {
+                    path: path.into(),
+                    untracked: true,
+                    ..Default::default()
+                });
+            }
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            files.dedup_by(|a, b| a.path == b.path);
+            files
+        });
+        self.files.value.clone()
+    }
+    fn read(&mut self, root: &Path) -> GitStatus {
         let root = root.to_owned();
         self.cache.refresh(GIT_TTL, move || {
             let branch = git_output(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -840,8 +690,42 @@ fn parse_status(output: &str) -> (u32, u32, u32) {
     (staged, modified, untracked)
 }
 
+fn parse_file_diffs(output: &str) -> Vec<crate::ui::rail::FileDiff> {
+    let mut fields = output.split('\0');
+    let mut out = Vec::new();
+    while let Some(field) = fields.next() {
+        let mut parts = field.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            let _old = fields.next();
+            fields.next().unwrap_or("")
+        } else {
+            path
+        };
+        if !path.is_empty() {
+            out.push(crate::ui::rail::FileDiff {
+                path: path.into(),
+                added: added.parse().ok(),
+                removed: removed.parse().ok(),
+                untracked: false,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     let mut child = Command::new("git")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+        ])
         .arg("-C")
         .arg(root)
         .args(args)
@@ -1006,7 +890,15 @@ fn terminal_dark(value: Option<&str>) -> Option<bool> {
 
 /// Name and one-line description of every built-in slash command, in the order the list shows them.
 const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    (
+        "palette",
+        "search actions, sessions, models, tools and settings",
+    ),
     ("compute", "open compute owners and background job controls"),
+    (
+        "changes",
+        "list changed files and line counts for this workspace",
+    ),
     ("help", "list commands and shortcuts"),
     ("model", "choose the main model and assign roles"),
     ("providers", "set up providers, keys and endpoints"),
@@ -1089,12 +981,23 @@ fn command_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> 
             kind: CommandKind::Builtin,
             args_hint: matches!(
                 *name,
-                "resume" | "search" | "rollback" | "approval" | "outcome" | "theme"
+                "resume"
+                    | "search"
+                    | "rollback"
+                    | "approval"
+                    | "outcome"
+                    | "theme"
+                    | "rename"
+                    | "message"
+                    | "cancel"
             )
             .then(|| {
                 match *name {
                     "resume" => "[id]",
                     "search" => "<query>",
+                    "rename" => "<title>",
+                    "message" => "<id> <text>",
+                    "cancel" => "<id>",
                     "rollback" => "[n]",
                     "approval" => "[ask|auto|readonly]",
                     "outcome" => "<0-100> [note]",
@@ -1136,6 +1039,45 @@ fn command_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> 
         });
     }
     entries
+}
+
+fn palette_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> Vec<PaletteEntry> {
+    command_entries(custom, skills)
+        .into_iter()
+        .map(|command| {
+            let during_turn = if Shell::stops_turn(&command.name) {
+                "Stops the current turn before running."
+            } else if matches!(
+                command.name.as_str(),
+                "model" | "providers" | "settings" | "compute"
+            ) {
+                "Opens now; changes to model/config apply after this turn."
+            } else if matches!(
+                command.name.as_str(),
+                "help"
+                    | "hotkeys"
+                    | "todo"
+                    | "skills"
+                    | "commands"
+                    | "context"
+                    | "clear"
+                    | "policy"
+                    | "reliability"
+                    | "jobs"
+                    | "message"
+                    | "cancel"
+                    | "search"
+            ) {
+                "Runs now without stopping the current turn."
+            } else {
+                "Runs after the current turn finishes."
+            };
+            PaletteEntry {
+                command,
+                during_turn,
+            }
+        })
+        .collect()
 }
 
 /// Concrete argument choices, not usage placeholders. Keep these next to the command registry;
@@ -1247,9 +1189,9 @@ fn selection_changes(
                 path: "endpoint".into(),
             }),
         }
-        if let Some(window) = selection.context_window {
-            changes.push(set("context_window".into(), i64::from(window).into()));
-        }
+        // Capacity is metadata, not a user override. An explicit Auto marker also clears
+        // a numeric cap inherited from the other settings layer when switching models.
+        changes.push(set("context_window".into(), "auto".into()));
     } else {
         ensure!(
             ROLES.iter().any(|(name, _)| *name == role) && role != "main",
@@ -1280,12 +1222,7 @@ fn selection_changes(
                 path: format!("{prefix}.base_url"),
             }),
         }
-        changes.push(match selection.context_window {
-            Some(window) => set(format!("{prefix}.context_window"), i64::from(window).into()),
-            None => Change::Remove {
-                path: format!("{prefix}.context_window"),
-            },
-        });
+        changes.push(set(format!("{prefix}.context_window"), "auto".into()));
     }
     Ok(changes)
 }
@@ -1457,11 +1394,15 @@ fn provider_changes(id: &str, spec: &ProviderSpec) -> Vec<Change> {
 // ---------------------------------------------------------------------------
 
 struct Shell {
+    runtime: crate::runtime::Tree,
+    pending_result: Option<crate::runtime::Body>,
+    shared_prose: bool,
     auth_job: Option<AuthJob>,
     term: InlineTerminal,
     themes: ThemeManager,
     keys: Keymap,
     composer: Composer,
+    paste_guard: crate::ui::input::PasteGuard,
     transcript: Transcript,
     status: StatusData,
     ui: UiConfig,
@@ -1498,6 +1439,7 @@ struct Shell {
 }
 
 enum Which {
+    Palette,
     Compute,
     Settings,
     Models,
@@ -1525,11 +1467,15 @@ impl Shell {
             .unwrap_or_default();
         let commands = context::discover_commands(&app.layout);
         let mut shell = Shell {
+            runtime: Default::default(),
+            pending_result: None,
+            shared_prose: false,
             auth_job: None,
             term,
             themes,
             keys,
             composer: Composer::new(history, app.config.ui.history_limit),
+            paste_guard: Default::default(),
             transcript: Transcript::new(),
             status: StatusData::default(),
             ui: app.config.ui.clone(),
@@ -1622,7 +1568,10 @@ impl Shell {
                 .collect();
             let tips = if self.ui.tips {
                 vec![
-                    "/ commands and actions".to_owned(),
+                    format!(
+                        "{} search actions",
+                        self.keys.labels(Action::CommandPalette)
+                    ),
                     "/model choose a model".to_owned(),
                     "/settings make it yours".to_owned(),
                     "/hotkeys edit keyboard shortcuts".to_owned(),
@@ -1674,6 +1623,59 @@ impl Shell {
     // ----- painting -------------------------------------------------------------------------
 
     fn paint(&mut self, panel: Option<Rows>) -> Result<()> {
+        let files = if self.ui.session_rail {
+            self.git.files(Path::new(&self.status.project_path))
+        } else {
+            Vec::new()
+        };
+        let workers = if self.ui.worker_shards {
+            let mut bodies = self.runtime.bodies("worker");
+            bodies.retain(|b| {
+                self.status.phase == Phase::Working
+                    || b.read(|n| n.result.phase == crate::runtime::Phase::Running)
+            });
+            bodies.sort_by_key(|b| {
+                b.read(|n| {
+                    (
+                        n.result.phase != crate::runtime::Phase::Running,
+                        std::cmp::Reverse(
+                            n.id.strip_prefix("runtime-")
+                                .and_then(|n| n.parse::<u64>().ok())
+                                .unwrap_or(0),
+                        ),
+                    )
+                })
+            });
+            bodies
+                .iter()
+                .take(5)
+                .map(|b| {
+                    b.read(|n| crate::runtime::Node {
+                        id: n.id.clone(),
+                        parent: n.parent.clone(),
+                        kind: n.kind.clone(),
+                        label: n.label.clone(),
+                        result: crate::runtime::ResultBody {
+                            text: n
+                                .result
+                                .text
+                                .lines()
+                                .rev()
+                                .find(|l| !l.trim().is_empty())
+                                .map(|l| l.chars().take(200).collect())
+                                .unwrap_or_default(),
+                            data: n.result.data.as_ref().map(
+                                |d| serde_json::json!({"phase":d["phase"],"steps":d["steps"]}),
+                            ),
+                            phase: n.result.phase,
+                            revision: n.result.revision,
+                        },
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         self.status.tick = (self.started.elapsed().as_millis() / 83) as u64;
         self.status.clock = local_time("%H:%M");
         self.status.mode = self.composer.mode();
@@ -1698,9 +1700,13 @@ impl Shell {
             tick: status.tick,
             tools_expanded: *tools_expanded,
         };
-        let settled = transcript.take_settled(cols, &tctx);
+        let (settled, images) = transcript.take_settled_with_images(cols, &tctx);
         if !settled.is_empty() {
-            term.commit(settled);
+            if let Some(protocol) = term.image_protocol() {
+                term.commit_with_images(settled, images, protocol);
+            } else {
+                term.commit(settled);
+            }
         }
         let cctx = ComposerCtx {
             theme,
@@ -1714,7 +1720,38 @@ impl Shell {
                 let view = composer.view(cols, &cctx);
                 let spinner = (status.phase == Phase::Working).then(|| theme.spinner(status.tick));
                 let cap = (rows as usize / 3).min(10);
-                let mut bottom = tasks::rows(todo, cols as usize, theme, spinner, cap);
+                let available = (rows as usize).saturating_sub(view.rows.len() + 3);
+                let mut bottom = if ui.session_rail && available > 0 {
+                    crate::ui::rail::session(
+                        &self.session_id,
+                        title,
+                        &files,
+                        cols as usize,
+                        (rows as usize / 8).clamp(1, 4).min(available),
+                        theme,
+                    )
+                } else {
+                    Vec::new()
+                };
+                let worker_cap = (rows as usize / 5)
+                    .clamp(2, 6)
+                    .min(available.saturating_sub(bottom.len()));
+                if ui.worker_shards {
+                    bottom.extend(crate::ui::rail::workers(
+                        &workers,
+                        cols as usize,
+                        worker_cap,
+                        status.tick,
+                        theme,
+                    ));
+                }
+                bottom.extend(tasks::rows(
+                    todo,
+                    cols as usize,
+                    theme,
+                    spinner,
+                    cap.min(available.saturating_sub(bottom.len())),
+                ));
                 let above = bottom.len() as u16;
                 bottom.extend(view.rows);
                 (bottom, Some((view.cursor.0 + above, view.cursor.1)))
@@ -1771,19 +1808,6 @@ impl Shell {
         if let Some(monitor) = &self.adapter_monitor {
             status.lora = status.lora.with_runtime(&monitor.lock());
         }
-        if matches!(status.lora, Lora::Unknown | Lora::Unverified)
-            && let Some(probe) = self
-                .catalog
-                .probe
-                .as_ref()
-                .filter(|probe| probe.model == selection.model)
-        {
-            status.lora = if probe.checking.load(Ordering::SeqCst) {
-                Lora::Verifying
-            } else {
-                Lora::VerificationQueued
-            };
-        }
         status.role.clear();
         if self.todo != *agent.todo() {
             self.todo = agent.todo().clone();
@@ -1839,21 +1863,18 @@ impl Shell {
                     .pop_front()
                     .or_else(|| self.composer.take_follow_up());
             }
-            if self.startup.is_none() {
-                self.catalog.start(app);
-                self.catalog.auto_verify(app);
-                if self.catalog.probe.is_some() && app.compute.borrow().is_some() {
-                    app.release_idle_compute(agent);
-                }
-            }
             let handoff = self.yield_compute
                 || ((crate::learn::compute::background_pending(&app.layout.user_dir)?
                     || crate::learn::compute::foreground_pending(&app.layout.user_dir)?)
                     && app.compute.borrow().is_some());
-            if handoff && app.release_idle_compute(agent) {
-                self.yield_compute = false;
-                self.note("Compute", "Local models unloaded for queued work. This chat stays open; the next turn reloads the model.");
-                dirty = true;
+            // Free resident models while waiting for input, including remote chats with local
+            // role models. Running child agents keep their models and compute lease.
+            if self.startup.is_none() && app.release_idle_compute(agent) {
+                if handoff {
+                    self.yield_compute = false;
+                    self.note("Compute", "Local models unloaded for queued work. This chat stays open; the next turn reloads the model.");
+                    dirty = true;
+                }
             }
             self.refresh_status(app, agent);
             if self.themes.reload_if_changed() {
@@ -1861,6 +1882,8 @@ impl Shell {
                 dirty = true;
             }
             self.status.phase = Phase::Idle;
+            self.status.model_progress = None;
+            self.status.model_silence_secs = 0;
             self.status.clock = local_time("%H:%M");
             let status = statusline::preview_row(
                 &self.ui,
@@ -1884,8 +1907,7 @@ impl Shell {
             let status_pending = self.git.cache.worker.is_some()
                 || self.learning.cache.worker.is_some()
                 || self.auth_job.is_some()
-                || self.catalog.worker.is_some()
-                || self.catalog.probe.is_some();
+                || self.catalog.worker.is_some();
             let timeout = if status_pending {
                 TICK
             } else if left.iter().chain(&right).any(|s| s == "time") {
@@ -1899,15 +1921,7 @@ impl Shell {
             dirty = true;
             match read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    let event = {
-                        let ctx = ComposerCtx {
-                            theme: self.themes.current(),
-                            keys: &self.keys,
-                            ui: &self.ui,
-                            status: &self.status,
-                        };
-                        self.composer.handle_key(key, &ctx)
-                    };
+                    let event = self.composer_key(key);
                     let step = match event {
                         ComposerEvent::None | ComposerEvent::Interrupt => Step::Done,
                         ComposerEvent::Exit => Step::Quit,
@@ -1918,11 +1932,31 @@ impl Shell {
                         return Ok(step);
                     }
                 }
-                Event::Paste(text) => self.composer.handle_paste(&text),
+                Event::Paste(text) => self.composer_paste(&text),
                 Event::Resize(..) => self.term.on_resize(),
                 _ => {}
             }
         }
+    }
+
+    fn composer_key(&mut self, key: crossterm::event::KeyEvent) -> ComposerEvent {
+        let buffered = poll(Duration::ZERO).unwrap_or(false);
+        if let Some(text) = self.paste_guard.text_for_key(key, buffered, Instant::now()) {
+            self.composer.handle_paste(text);
+            return ComposerEvent::None;
+        }
+        let ctx = ComposerCtx {
+            theme: self.themes.current(),
+            keys: &self.keys,
+            ui: &self.ui,
+            status: &self.status,
+        };
+        self.composer.handle_key(key, &ctx)
+    }
+
+    fn composer_paste(&mut self, text: &str) {
+        self.paste_guard.pasted(Instant::now());
+        self.composer.handle_paste(text);
     }
 
     fn after_theme_reload(&mut self) {
@@ -1942,6 +1976,7 @@ impl Shell {
 
     fn on_action(&mut self, action: Action, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
         match action {
+            Action::CommandPalette => self.open(app, agent, Which::Palette),
             Action::ModelSelect | Action::ModelRoles => self.open(app, agent, Which::Models),
             Action::ProviderSetup => self.open(app, agent, Which::Providers),
             Action::Settings => self.open(app, agent, Which::Settings),
@@ -2086,10 +2121,6 @@ impl Shell {
         if trimmed.is_empty() {
             return Ok(Step::Done);
         }
-        // Interactive work takes precedence; unverified models resume automatically when idle.
-        if !trimmed.starts_with('/') {
-            self.catalog.cancel_probe();
-        }
         self.save_history(app);
         if trimmed.starts_with('/') {
             return self.command(app, agent, &trimmed);
@@ -2184,6 +2215,7 @@ impl Shell {
                         let output = match result {
                             Ok(output) => output,
                             Err(text) => ToolOutput {
+                                data: None,
                                 text,
                                 is_error: true,
                             },
@@ -2199,6 +2231,7 @@ impl Shell {
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bridge.heartbeat(),
                             Err(_) => {
                                 break ToolOutput {
+                                    data: None,
                                     text: "shell worker disconnected".into(),
                                     is_error: true,
                                 };
@@ -2211,6 +2244,7 @@ impl Shell {
                 output
             }
             Err(error) => ToolOutput {
+                data: None,
                 text: format!("{error:#}"),
                 is_error: true,
             },
@@ -2252,6 +2286,7 @@ impl Shell {
         self.status.phase = Phase::Working;
         self.turn_output_tokens = 0;
         self.status.output_tokens = 0;
+        self.status.tokens_per_second = None;
         self.status.activity = "thinking".into();
         let (result, failed, streamed_tokens) = {
             let mut bridge = Bridge {
@@ -2272,6 +2307,8 @@ impl Shell {
         self.composer.set_busy(false);
         self.save_history(app);
         self.status.activity.clear();
+        self.status.model_progress = None;
+        self.status.model_silence_secs = 0;
         let elapsed = started.elapsed().as_secs_f64();
         self.refresh_status(app, agent);
         match &result {
@@ -2358,7 +2395,6 @@ impl Shell {
     }
 
     fn wait_compute(&mut self, app: &App) -> Result<bool> {
-        self.catalog.cancel_probe();
         if !app.config.uses_local_compute() || app.compute.borrow().is_some() {
             return Ok(true);
         }
@@ -2389,19 +2425,18 @@ impl Shell {
             if poll(TICK)? {
                 match read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        let ctx = ComposerCtx {
-                            theme: self.themes.current(),
-                            keys: &self.keys,
-                            ui: &self.ui,
-                            status: &self.status,
-                        };
-                        match self.composer.handle_key(key, &ctx) {
+                        match self.composer_key(key) {
                             ComposerEvent::Interrupt | ComposerEvent::Exit => {
                                 self.note("Cancelled", "Local compute is occupied by another session or an improvement cycle.");
                                 return Ok(false);
                             }
                             ComposerEvent::Submit(text) => {
                                 if self.route_busy_command(app, text) {
+                                    return Ok(false);
+                                }
+                            }
+                            ComposerEvent::Action(Action::CommandPalette) => {
+                                if self.route_busy_command(app, "/palette".into()) {
                                     return Ok(false);
                                 }
                             }
@@ -2415,7 +2450,7 @@ impl Shell {
                             _ => {}
                         }
                     }
-                    Event::Paste(text) => self.composer.handle_paste(&text),
+                    Event::Paste(text) => self.composer_paste(&text),
                     Event::Resize(..) => self.term.on_resize(),
                     _ => {}
                 }
@@ -2479,7 +2514,6 @@ impl Shell {
         agent: &mut Agent<'_>,
         selection: &ModelSelection,
     ) -> Result<()> {
-        self.catalog.cancel_probe();
         if selection.provider != "mlx"
             || selection.base_url.is_some()
             || !Path::new(&selection.model).is_absolute()
@@ -2503,6 +2537,7 @@ impl Shell {
             self.note("LoRA verification", format!("Local compute is busy; retry F6 after the other session or improvement cycle finishes. {error}"));
             return Ok(());
         }
+        let _lease = ProbeLease(lock);
         let mut config = app.config.with_selection(selection);
         config.state_dir = config.learning_dir(&app.layout);
         app.interrupt.store(false, Ordering::SeqCst);
@@ -2578,7 +2613,7 @@ impl Shell {
             ),
             _ => {}
         }
-        drop(lock);
+        drop(_lease);
         self.status.activity.clear();
         self.refresh_status(app, agent);
         Ok(())
@@ -2591,7 +2626,6 @@ impl Shell {
         let mut which = which;
         loop {
             if matches!(which, Which::Compute) {
-                self.catalog.cancel_probe();
                 app.release_idle_compute(agent);
             }
             let outcome = self.run_overlay(app, which)?;
@@ -2602,6 +2636,13 @@ impl Shell {
             if let Some(selection) = outcome.verify_lora {
                 self.verify_lora(app, agent, &selection)?;
                 return Ok(step);
+            }
+            if let Some(command) = outcome
+                .next
+                .as_deref()
+                .and_then(|next| next.strip_prefix("command:"))
+            {
+                return self.command(app, agent, command);
             }
             match (outcome.next.as_deref(), &step) {
                 (Some("open:models"), Step::Done) => which = Which::Models,
@@ -2632,10 +2673,16 @@ impl Shell {
     }
 
     fn run_overlay(&mut self, app: &App, which: Which) -> Result<OverlayOutcome> {
-        self.catalog.start(app);
+        if matches!(which, Which::Models | Which::Providers) {
+            self.catalog.start(app);
+        }
         let effective = app.reload().unwrap_or_else(|_| app.config.clone());
         let discovery = self.catalog.get();
         let mut overlay = match which {
+            Which::Palette => ActiveOverlay::Palette(PaletteOverlay::new(
+                palette_entries(&self.commands, &self.skills),
+                self.status.phase != Phase::Idle,
+            )),
             Which::Compute => ActiveOverlay::Compute(ComputeOverlay::new()),
             Which::Shortcuts => ActiveOverlay::Shortcuts(ShortcutOverlay::new()),
             Which::Settings => {
@@ -2761,6 +2808,7 @@ impl Shell {
             "Keys (/hotkeys to view and edit; keybindings.toml for manual configuration)".into(),
         );
         for action in [
+            Action::CommandPalette,
             Action::ModelSelect,
             Action::ProviderSetup,
             Action::Settings,
@@ -2822,6 +2870,7 @@ impl Shell {
     /// Shared by inference and local-compute waiting. Only explicit session/work changes cancel.
     fn route_busy_command(&mut self, app: &App, text: String) -> bool {
         let overlay = match text.trim() {
+            "/palette" => Some(Which::Palette),
             "/model" | "/models" => Some(Which::Models),
             "/providers" | "/provider" => Some(Which::Providers),
             "/settings" => Some(Which::Settings),
@@ -2845,6 +2894,13 @@ impl Shell {
                                 "LoRA verification",
                                 "Verification will run after the current turn releases compute.",
                             );
+                        }
+                        if let Some(command) = outcome
+                            .next
+                            .as_deref()
+                            .and_then(|next| next.strip_prefix("command:"))
+                        {
+                            return self.route_busy_command(app, command.to_owned());
                         }
                         which = match outcome.next.as_deref() {
                             Some("open:models") => Which::Models,
@@ -3331,6 +3387,7 @@ impl Shell {
                 }
             }
             "providers" | "provider" => return self.open(app, agent, Which::Providers),
+            "palette" => return self.open(app, agent, Which::Palette),
             "settings" => return self.open(app, agent, Which::Settings),
             "hotkeys" => return self.open(app, agent, Which::Shortcuts),
             "improve" if args == "jobs" || args.starts_with("stop ") => {
@@ -3353,10 +3410,6 @@ impl Shell {
             }
             "improve" => {
                 let mut summary = improve_summary(app);
-                if let Some(probe) = &self.catalog.probe {
-                    summary.push_str(&format!("\nAutomatic LoRA verification: {} — {}. No model selection or retry needed.",
-                        probe.model, if probe.checking.load(Ordering::SeqCst) { "checking adapter targets" } else { "waiting for shared local compute" }));
-                }
                 if let Some(monitor) = &self.adapter_monitor {
                     let runtime = monitor.lock();
                     if let Some(path) = &runtime.adapter {
@@ -3372,6 +3425,29 @@ impl Shell {
                 self.note("Improvement", summary);
             }
             "clear" => self.display_reset(),
+            "changes" => {
+                let files = self.git.files(&app.layout.project_root);
+                let text = if files.is_empty() {
+                    "No changes in the current Git snapshot.".into()
+                } else {
+                    files
+                        .iter()
+                        .map(|file| {
+                            let stats = if file.untracked {
+                                "new".into()
+                            } else {
+                                match (file.added, file.removed) {
+                                    (Some(a), Some(r)) => format!("+{a} −{r}"),
+                                    _ => "binary".into(),
+                                }
+                            };
+                            format!("{}  {stats}", crate::ui::text::one_line(&file.path))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.note("Changes", text);
+            }
             "theme" => return self.theme_command(app, agent, args),
             "new" => match Session::create(
                 &app.layout,
@@ -3537,13 +3613,14 @@ impl Shell {
                     self.note("Permissions", "usage: /permissions; /permissions allow|deny [--persist] <tool> [prefix words | --path <glob>…]; /permissions remove <number> [--persist]");
                 }
             }
-            "cost" => self.note(
-                "Cost",
-                agent
+            "cost" => {
+                let cost = agent
                     .session_cost()
                     .map(|cost| format!("${cost:.6} USD"))
-                    .unwrap_or_else(|| "pricing unavailable for this session".into()),
-            ),
+                    .unwrap_or_else(|| "pricing unavailable for this session".into());
+                let m = agent.metrics();
+                self.note("Cost and usage", format!("{cost}\nMain agent, current runtime: {} responses (usage reported for {}).\nInput: {} · cached reads: {} · cache writes: {}\nOutput: {} · reasoning: {} (provider-reported; may overlap output).\nWorker usage and transport retries are not included. Missing usage is unknown, not free.", m.responses, m.usage_reported_responses, m.prompt_tokens, m.cached_tokens, m.cache_write_tokens, m.output_tokens, m.reasoning_tokens));
+            }
             "jobs" => {
                 let mut bridge = Bridge {
                     app,
@@ -4158,6 +4235,7 @@ fn improve_summary(app: &App) -> String {
 }
 
 enum ActiveOverlay {
+    Palette(PaletteOverlay),
     Compute(ComputeOverlay),
     Settings(SettingsOverlay),
     Models(ModelOverlay),
@@ -4168,6 +4246,7 @@ enum ActiveOverlay {
 impl ActiveOverlay {
     fn draw(&mut self, frame: &mut ratatui::Frame, ctx: &DrawCtx) {
         match self {
+            Self::Palette(o) => o.draw(frame, ctx),
             Self::Settings(o) => o.draw(frame, ctx),
             Self::Compute(o) => o.draw(frame, ctx),
             Self::Models(o) => o.draw(frame, ctx),
@@ -4177,6 +4256,7 @@ impl ActiveOverlay {
     }
     fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
         match self {
+            Self::Palette(o) => o.handle(event, keys),
             Self::Settings(o) => o.handle(event, keys),
             Self::Compute(o) => o.handle(event, keys),
             Self::Models(o) => o.handle(event, keys),
@@ -4189,7 +4269,7 @@ impl ActiveOverlay {
             Self::Models(o) => o.set_status(message, is_error),
             Self::Compute(o) => o.banner(message),
             Self::Providers(o) => o.set_status(message, is_error),
-            Self::Settings(_) | Self::Shortcuts(_) => {}
+            Self::Palette(_) | Self::Settings(_) | Self::Shortcuts(_) => {}
         }
     }
 }
@@ -4271,6 +4351,16 @@ impl ComputeMonitor {
                             "stop_now" => crate::learn::compute_controls::stop_legacy(
                                 &layout.user_dir,
                                 action["state"].as_str().context("select a job")?,
+                            ),
+                            "stop_process" => crate::learn::processes::stop(
+                                &layout.user_dir,
+                                action["pid"]
+                                    .as_i64()
+                                    .and_then(|pid| i32::try_from(pid).ok())
+                                    .context("select a process")?,
+                                action["identity"]
+                                    .as_str()
+                                    .context("missing process identity")?,
                             ),
                             _ => crate::learn::compute_controls::action(
                                 &layout.user_dir,
@@ -4612,7 +4702,7 @@ impl OverlayEnv<'_> {
                     }
                     return false;
                 }
-                if action.starts_with("open:") {
+                if action.starts_with("open:") || action.starts_with("command:") {
                     self.next = Some(action);
                     return true;
                 }
@@ -4660,6 +4750,7 @@ fn run_overlay(
     env: &mut OverlayEnv<'_>,
     overlay: &mut ActiveOverlay,
 ) -> Result<()> {
+    let mut paste_guard = crate::ui::input::PasteGuard::default();
     loop {
         if let (Some(monitor), ActiveOverlay::Compute(panel)) =
             (&env.compute_monitor, &mut *overlay)
@@ -4673,16 +4764,14 @@ fn run_overlay(
         }
         env.collect_auth(overlay);
         env.catalog.collect();
-        if !matches!(overlay, ActiveOverlay::Compute(_)) {
-            env.catalog.auto_verify(env.app);
-        }
         if env.catalog.generation != env.seen_generation {
             env.seen_generation = env.catalog.generation;
             if let Some(discovery) = env.catalog.get() {
                 match overlay {
                     ActiveOverlay::Models(models) => models.set_discovery(discovery),
                     ActiveOverlay::Providers(providers) => providers.set_discovery(discovery),
-                    ActiveOverlay::Settings(_)
+                    ActiveOverlay::Palette(_)
+                    | ActiveOverlay::Settings(_)
                     | ActiveOverlay::Shortcuts(_)
                     | ActiveOverlay::Compute(_) => {}
                 }
@@ -4708,7 +4797,26 @@ fn run_overlay(
         if !poll(TICK)? {
             continue;
         }
-        let event = read()?;
+        let mut event = read()?;
+        // The palette can dispatch actions. A pasted newline must never run the selected action.
+        if matches!(overlay, ActiveOverlay::Palette(_)) {
+            match &event {
+                Event::Paste(_) => paste_guard.pasted(Instant::now()),
+                Event::Key(key) => {
+                    if let Some(value) = paste_guard.text_for_key(
+                        *key,
+                        poll(Duration::ZERO).unwrap_or(false),
+                        Instant::now(),
+                    ) {
+                        if value.is_empty() {
+                            continue;
+                        }
+                        event = Event::Paste(value.into());
+                    }
+                }
+                _ => {}
+            }
+        }
         if matches!(event, Event::Resize(..)) {
             continue;
         }
@@ -4776,13 +4884,13 @@ impl Bridge<'_> {
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let shell = &mut *self.shell;
-                    let ctx = ComposerCtx {
-                        theme: shell.themes.current(),
-                        keys: &shell.keys,
-                        ui: &shell.ui,
-                        status: &shell.status,
-                    };
-                    match shell.composer.handle_key(key, &ctx) {
+                    match shell.composer_key(key) {
+                        ComposerEvent::Action(Action::CommandPalette) => {
+                            if shell.route_busy_command(self.app, "/palette".into()) {
+                                self.interrupt.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                        }
                         ComposerEvent::Interrupt | ComposerEvent::Exit => {
                             self.interrupt.store(true, Ordering::SeqCst)
                         }
@@ -4809,7 +4917,7 @@ impl Bridge<'_> {
                         _ => {}
                     }
                 }
-                Event::Paste(text) => self.shell.composer.handle_paste(&text),
+                Event::Paste(text) => self.shell.composer_paste(&text),
                 Event::Resize(..) => self.shell.term.on_resize(),
                 _ => {}
             }
@@ -4818,6 +4926,25 @@ impl Bridge<'_> {
 }
 
 impl Ui for Bridge<'_> {
+    fn runtime(&mut self, tree: &crate::runtime::Tree) {
+        self.shell.runtime = tree.clone();
+    }
+    fn result_node(&mut self, body: &crate::runtime::Body) {
+        let (kind, running) = body.read(|n| {
+            (
+                n.kind.clone(),
+                n.result.phase == crate::runtime::Phase::Running,
+            )
+        });
+        match kind.as_str() {
+            "tool" => self.shell.pending_result = running.then(|| body.clone()),
+            "assistant" | "reasoning" => {
+                self.shell.transcript.bind_prose(body);
+                self.shell.shared_prose = running;
+            }
+            _ => {}
+        }
+    }
     fn maintenance_ready(&mut self) -> bool {
         self.pump();
         !self.shell.composer.has_queued_work()
@@ -4841,16 +4968,32 @@ impl Ui for Bridge<'_> {
     }
     fn usage(&mut self, _prompt: Option<u64>, output: Option<u64>, seconds: f64) {
         let status = &mut self.shell.status;
+        let generation_rate = status
+            .model_progress
+            .take()
+            .filter(|p| !p.estimated)
+            .and_then(|p| p.tokens_per_second);
+        status.model_silence_secs = 0;
         if let Some(tokens) = output {
             self.shell.turn_output_tokens = self.shell.turn_output_tokens.saturating_add(tokens);
             status.output_tokens = self.shell.turn_output_tokens;
-            status.tokens_per_second =
-                (seconds > 0.0 && tokens > 0).then_some(tokens as f64 / seconds);
+            status.tokens_per_second = generation_rate
+                .or_else(|| (seconds > 0.0 && tokens > 0).then_some(tokens as f64 / seconds));
         }
         self.repaint(true);
     }
+    fn model_progress(&mut self, progress: &crate::llm::ModelProgress) {
+        self.shell.status.model_progress = Some(progress.clone());
+        self.shell.status.model_silence_secs = 0;
+        if let Some(prompt) = progress.prompt_tokens {
+            self.shell.status.prompt_tokens = Some(prompt);
+        }
+        self.repaint(false);
+    }
     fn reasoning_delta(&mut self, text: &str) {
-        self.shell.transcript.thinking_delta(text);
+        if !std::mem::take(&mut self.shell.shared_prose) {
+            self.shell.transcript.thinking_delta(text);
+        }
         self.set_activity("reasoning");
         self.repaint(false);
     }
@@ -4894,6 +5037,8 @@ impl Ui for Bridge<'_> {
 
     fn role(&mut self, role: &str, model: &str) {
         let status = &mut self.shell.status;
+        status.model_progress = None;
+        status.model_silence_secs = 0;
         status.role = if role == "main" {
             String::new()
         } else {
@@ -4907,17 +5052,23 @@ impl Ui for Bridge<'_> {
     }
 
     fn text_delta(&mut self, text: &str) {
-        self.shell.transcript.assistant_delta(text);
+        if !std::mem::take(&mut self.shell.shared_prose) {
+            self.shell.transcript.assistant_delta(text);
+        }
         self.set_activity("writing");
         self.repaint(false);
     }
 
     fn tool_call(&mut self, name: &str, summary: &str) {
+        self.shell.status.model_progress = None;
         self.next_id += 1;
         let id = format!("call-{}", self.next_id);
         self.shell
             .transcript
             .tool_start(&id, name, summary, summary);
+        if let Some(body) = self.shell.pending_result.take() {
+            self.shell.transcript.bind_tool(&id, body);
+        }
         self.pending.push((id, name.to_owned(), Instant::now()));
         self.set_activity(name);
         self.repaint(true);
@@ -4952,6 +5103,47 @@ impl Ui for Bridge<'_> {
         self.shell.note("Notice", message);
         self.repaint(true);
     }
+    /// Policy and index bookkeeping stays out of the transcript; `/policy` shows the same data on demand.
+    fn diagnostic(&mut self, _message: &str) {}
+
+    fn image(&mut self, reference: &Value) {
+        if self.interrupt.load(Ordering::SeqCst) {
+            return;
+        }
+        let reference = reference.clone();
+        let native = self.shell.term.image_protocol().is_some();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("dial-image-preview".into())
+            .spawn(move || {
+                let _ = tx.send(crate::ui::images::Thumbnail::load_with_native(
+                    &reference, native,
+                ));
+            });
+        if worker.is_err() {
+            return;
+        }
+        loop {
+            match rx.recv_timeout(TICK) {
+                Ok(Ok(thumbnail)) => {
+                    self.shell.transcript.image(thumbnail);
+                    self.repaint(true);
+                    break;
+                }
+                Ok(Err(error)) => {
+                    self.notice(&format!("Terminal image preview unavailable: {error:#}"));
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.heartbeat();
+                    if self.interrupt.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
 
     fn laya_activity(&mut self, status: &str, message: &str) {
         self.shell.note("Laya", format!("{status} · {message}"));
@@ -4985,6 +5177,10 @@ impl Ui for Bridge<'_> {
     }
 
     fn model_wait(&mut self, silence: Duration) {
+        if self.shell.status.model_progress.is_some() {
+            self.shell.status.model_silence_secs = silence.as_secs();
+            return;
+        }
         if silence.is_zero() {
             self.set_activity("waiting for model");
         } else if silence >= Duration::from_secs(15) {
@@ -5188,6 +5384,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn action_palette_uses_registered_commands_and_real_turn_policies() {
+        use crate::ui::theme::Theme;
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+        let custom = context::CommandDef {
+            name: "review-project".into(),
+            description: "Review project conventions".into(),
+            template: "Review $ARGUMENTS".into(),
+            source: "/fixture/review-project.md".into(),
+        };
+        let skill = skills::Skill {
+            name: "web-review".into(),
+            description: "Inspect a rendered page".into(),
+            path: "/fixture/web-review/SKILL.md".into(),
+            source: skills::Scope::Project,
+        };
+        let entries = palette_entries(&[custom], &[skill]);
+        let find = |name: &str| entries.iter().find(|e| e.command.name == name).unwrap();
+        assert!(find("undo").during_turn.starts_with("Stops"));
+        assert!(find("model").during_turn.starts_with("Opens now"));
+        for name in ["jobs", "message", "cancel", "search", "help", "context"] {
+            assert!(find(name).during_turn.starts_with("Runs now"), "{name}");
+        }
+        for name in ["rename", "review-project", "skill:web-review"] {
+            assert!(find(name).during_turn.starts_with("Runs after"), "{name}");
+        }
+        assert_eq!(find("rename").command.args_hint.as_deref(), Some("<title>"));
+        let theme = Theme::dark();
+        let keys = Keymap::defaults();
+        let status = StatusData::default();
+        let preview = |_: &UiConfig, _: u16| Line::default();
+        let ctx = DrawCtx {
+            theme: &theme,
+            keys: &keys,
+            status: &status,
+            preview_status: &preview,
+        };
+        let mut palette = PaletteOverlay::new(entries, true);
+        palette.handle(&Event::Paste("model".into()), &keys);
+        let mut terminal = Terminal::new(TestBackend::new(110, 26)).unwrap();
+        terminal.draw(|frame| palette.draw(frame, &ctx)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(screen.contains("turn running"));
+        assert!(screen.contains("Opens now"));
+        assert!(screen.contains("Alt+M"));
+        // Optional visual artifact from the real renderer and command registry, for offscreen QA.
+        if let Ok(path) = std::env::var("DIAL_TEST_PALETTE_CAPTURE") {
+            let cells: Vec<_> = buffer
+                .content
+                .iter()
+                .map(|cell| {
+                    json!({
+                        "symbol":cell.symbol(), "fg":format!("{:?}", cell.fg),
+                        "bg":format!("{:?}", cell.bg), "modifiers":format!("{:?}",cell.modifier),
+                    })
+                })
+                .collect();
+            std::fs::write(
+                path,
+                json!({"width":110,"height":26,"cells":cells}).to_string(),
+            )
+            .unwrap();
+        }
+        assert!(
+            matches!(palette.handle(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), &keys),
+            OverlayEvent::Action(action) if action == "command:/model")
+        );
+        palette.handle(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &keys,
+        );
+        palette.handle(&Event::Paste("review-project".into()), &keys);
+        assert!(
+            matches!(palette.handle(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), &keys),
+            OverlayEvent::Action(action) if action == "command:/review-project")
+        );
+    }
+
+    #[test]
     fn only_commands_meant_to_end_the_turn_stop_it() {
         for line in [
             "/exit",
@@ -5217,6 +5493,60 @@ mod tests {
                 "{line} must not interrupt a running turn"
             );
         }
+    }
+
+    #[test]
+    fn context_model_picker_auto_masks_inherited_caps_and_preserves_family_defaults() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+        let set = |path: &str, value: toml::Value| Change::Set {
+            path: path.into(),
+            value,
+        };
+        let base = settings_store::save_config(
+            &layout,
+            Scope::Global,
+            &[
+                set("context_window", 272000.into()),
+                set("cloud_context_window", 64000.into()),
+                set("local_context_window", 8192.into()),
+                set("model_roles.subagent.provider", "anthropic".into()),
+                set("model_roles.subagent.model", "claude-opus-5-5".into()),
+                set("model_roles.subagent.context_window", 200000.into()),
+            ],
+        )
+        .unwrap();
+        let global = std::fs::read(&layout.config_files()[0]).unwrap();
+        let model = ModelSelection {
+            provider: "anthropic".into(),
+            model: "claude-opus-5-5".into(),
+            base_url: Some(crate::llm::anthropic::BASE_URL.into()),
+            context_window: Some(1000000),
+            ..Default::default()
+        };
+        let selected = settings_store::save_config(
+            &layout,
+            Scope::Project,
+            &selection_changes(&base, &model, "main").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(selected.context_window, 64000);
+        assert_eq!(
+            selected.context_limit,
+            crate::config::types::ContextWindow::Auto
+        );
+        let selected = settings_store::save_config(
+            &layout,
+            Scope::Project,
+            &selection_changes(&selected, &model, "subagent").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(selected.for_role("subagent").context_window, 64000);
+        assert_eq!(std::fs::read(&layout.config_files()[0]).unwrap(), global);
+        let reloaded = Config::load(&layout, None).unwrap();
+        assert_eq!(reloaded.context_window, 64000);
+        assert_eq!(reloaded.for_role("subagent").context_window, 64000);
     }
 
     #[test]
@@ -5445,6 +5775,104 @@ mod tests {
     }
 
     #[test]
+    fn browsing_model_catalog_reads_cached_lora_without_starting_python() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_home, project, layout, mut config) = config();
+        config.endpoint = None;
+        config.provider = Some("mlx".into());
+        let python = project.path().join("unexpected-python");
+        std::fs::write(&python, "#!/bin/sh\nprintf ran > \"$0.called\"\nexit 1\n").unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        config.python = python;
+        let mut paths = Vec::new();
+        for (name, supported) in [("main-model", true), ("role-model", false)] {
+            let path = project.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            let selection = ModelSelection {
+                model: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            };
+            let selected = config.with_selection(&selection);
+            let store = Store::open(
+                &selected.learning_dir(&layout),
+                &selected.model,
+                &selected.use_case,
+                &selected.harness,
+            )
+            .unwrap();
+            store
+                .set_meta(
+                    "serving_capabilities",
+                    &json!({"inference":true, "lora":supported, "lora_probe_version":2})
+                        .to_string(),
+                )
+                .unwrap();
+            paths.push(selection);
+        }
+        config.model = paths[0].model.clone();
+        config
+            .model_roles
+            .insert("reviewer".into(), paths[1].clone());
+        let unverified = project.path().join("unverified-role-model");
+        std::fs::create_dir_all(&unverified).unwrap();
+        config.model_roles.insert(
+            "writer".into(),
+            ModelSelection {
+                model: unverified.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        );
+        let app = App {
+            layout,
+            config,
+            overlay: toml::Table::new(),
+            store: None,
+            store_error: None,
+            interrupt: Arc::new(AtomicBool::new(false)),
+            compute: RefCell::new(None),
+        };
+        let mut catalog = Catalog::new();
+        catalog.refresh(&app);
+        assert_eq!(
+            catalog.request, 0,
+            "config refresh must preserve lazy discovery"
+        );
+        assert!(catalog.worker.is_none());
+        assert!(catalog.get().is_none());
+        catalog.start(&app);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while catalog.worker.is_some() {
+            catalog.collect();
+            assert!(Instant::now() < deadline, "catalog scan did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for (selection, supported) in paths.iter().zip([true, false]) {
+            let discovery = catalog.get().unwrap();
+            let entry = discovery
+                .models
+                .iter()
+                .find(|entry| entry.selection.model == selection.model)
+                .unwrap();
+            assert!(entry.metadata.lora_verified);
+            assert_eq!(entry.metadata.lora, Some(supported));
+        }
+        let discovery = catalog.get().unwrap();
+        let entry = discovery
+            .models
+            .iter()
+            .find(|entry| entry.selection.model == unverified.to_string_lossy())
+            .unwrap();
+        assert!(!entry.metadata.lora_verified);
+        // Repeated idle/catalog visits reuse the scan and never create model workers.
+        for _ in 0..10 {
+            catalog.start(&app);
+            catalog.collect();
+        }
+        assert!(!project.path().join("unexpected-python.called").exists());
+        assert!(!app.layout.user_dir.join("compute-processes").exists());
+    }
+
+    #[test]
     fn lora_acceptance_is_not_runtime_use_and_disabling_training_does_not_hide_it() {
         let (_h, _p, _layout, mut config) = config();
         config.endpoint = None;
@@ -5548,99 +5976,49 @@ mod tests {
     }
 
     #[test]
-    fn automatic_lora_probe_waits_for_compute_then_persists_and_reuses_result() {
-        let (_h, _p, layout, mut config) = config();
-        config.model = "local-model".into();
-        config.use_case = "test".into();
-        config.user_dir = layout.user_dir.clone();
-        config.state_dir = layout.state_dir.join("models/probe-test");
-        let store = Store::open(
-            &config.state_dir,
-            &config.model,
-            &config.use_case,
-            &config.harness,
-        )
-        .unwrap();
-        store
-            .set_meta(
-                "serving_capabilities",
-                r#"{"inference":true,"lora":false,"reason":"old query-only restriction"}"#,
-            )
-            .unwrap();
-        let held = auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
-        held.try_lock_exclusive().unwrap();
-        let cancel = AtomicBool::new(false);
-        let checking = AtomicBool::new(false);
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            let config = &config;
-            let cancel = &cancel;
-            let checking = &checking;
-            let job = scope.spawn(move || probe_when_available(config, cancel, checking, |_, _| {
-                tx.send(()).unwrap();
-                Ok(json!({"inference":true,"lora":false,"lora_probe_version":2,"reason":"fused QKV unsupported"}))
-            }));
-            assert!(
-                rx.recv_timeout(Duration::from_millis(120)).is_err(),
-                "probe must not run while compute is held"
-            );
-            assert!(!checking.load(Ordering::SeqCst));
-            drop(held);
-            rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert_eq!(job.join().unwrap().unwrap(), Some(false));
-        });
-        assert_eq!(
-            probe_when_available(&config, &cancel, &checking, |_, _| panic!(
-                "cached result must avoid another load"
-            ))
-            .unwrap(),
-            Some(false)
-        );
-        let held = auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
-        held.try_lock_exclusive().unwrap();
-        cancel.store(true, Ordering::SeqCst);
-        assert_eq!(
-            probe_when_available(&config, &cancel, &checking, |_, _| panic!(
-                "cancelled probe ran"
-            ))
-            .unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn automatic_lora_queue_checks_models_without_selecting_them() {
-        let (_h, _p, layout, mut config) = config();
-        config.model = "current-model".into();
-        config.use_case = "test".into();
-        let mut models = Vec::new();
-        for (name, supported) in [("other-a", true), ("other-b", false)] {
-            let path = layout.project_root.join(name);
-            std::fs::create_dir_all(&path).unwrap();
-            let selection = ModelSelection {
-                model: path.to_string_lossy().into_owned(),
-                ..Default::default()
-            };
-            let selected = config.with_selection(&selection);
-            let store = Store::open(
-                &selected.learning_dir(&layout),
-                &selected.model,
-                &selected.use_case,
-                &selected.harness,
-            )
-            .unwrap();
-            store.set_meta("serving_capabilities", &json!({"inference":true,"lora":supported,"lora_probe_version":2,"reason":"test result"}).to_string()).unwrap();
-            models.push(catalog::ModelEntry {
-                selection,
-                label: name.into(),
-                source: "local MLX".into(),
-                available: true,
-                metadata: catalog::ModelMetadata {
-                    lora: Some(true),
-                    ..Default::default()
-                },
-            });
+    fn idle_unload_stops_a_resident_server_without_a_background_request() {
+        if crate::learn::processes::live_inspection_unavailable() {
+            return;
         }
+        let (_h, _p, layout, mut config) = config();
+        std::fs::create_dir_all(&layout.user_dir).unwrap();
+        let python = crate::llm::server::tests::fake_python(&layout.user_dir);
+        config.python = python.clone();
+        config.endpoint = None;
+        config.provider = Some("mlx".into());
+        config.model = layout
+            .user_dir
+            .join("fake-model-pid")
+            .to_string_lossy()
+            .into_owned();
+        config.improve.enabled = false;
+        let mut backend = crate::llm::provider::Backend::new(
+            crate::llm::provider::ProviderKind::Local {
+                model_dir: config.model.clone(),
+            },
+            python,
+            5,
+        )
+        .with_steering(&config);
+        let reply = backend
+            .chat(
+                None,
+                &crate::llm::Chat {
+                    messages: vec![json!({"role":"user","content":"hello"})],
+                    tools: vec![],
+                    temperature: 0.0,
+                    max_tokens: 16,
+                    seed: None,
+                },
+                5,
+                None,
+            )
+            .unwrap();
+        assert_eq!(reply.text, "pong");
+        let marker: Value = serde_json::from_slice(&std::fs::read(&config.model).unwrap()).unwrap();
+        let pid = marker["pid"].as_i64().unwrap() as i32;
+        let lock = auto::lock_file(&layout.user_dir.join("compute.lock")).unwrap();
+        lock.try_lock_exclusive().unwrap();
         let app = App {
             layout,
             config,
@@ -5648,32 +6026,54 @@ mod tests {
             store: None,
             store_error: None,
             interrupt: Arc::new(AtomicBool::new(false)),
-            compute: RefCell::new(None),
+            compute: RefCell::new(Some(lock)),
         };
-        let mut catalog = Catalog::new();
-        shared(&catalog.slot).1 = Some(catalog::Discovery {
-            models,
-            providers: vec![],
-        });
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            catalog.auto_verify(&app);
-            if catalog
-                .get()
+        let session = Session::create(
+            &app.layout,
+            SessionMeta {
+                model: app.config.model.clone(),
+            },
+        )
+        .unwrap();
+        let id = session.id().to_owned();
+        let mut agent = Agent::interactive(
+            &app.config,
+            backend,
+            app.layout.clone(),
+            session,
+            None,
+            None,
+            app.interrupt.clone(),
+        )
+        .unwrap();
+        assert!(!crate::learn::compute::background_pending(&app.layout.user_dir).unwrap());
+        assert!(
+            crate::learn::processes::snapshot(&app.layout.user_dir)
                 .unwrap()
-                .models
                 .iter()
-                .all(|entry| entry.metadata.lora_verified)
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let models = catalog.get().unwrap().models;
-        assert_eq!(models[0].metadata.lora, Some(true));
-        assert_eq!(models[1].metadata.lora, Some(false));
-        assert_eq!(app.config.model, "current-model");
+                .any(|row| row["pid"] == pid)
+        );
+        assert!(app.release_idle_compute(&mut agent));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert!(app.compute.borrow().is_none());
+        assert_eq!(agent.session().id(), id);
+        assert!(
+            agent.adapter_monitor().is_some(),
+            "backend remains available for the next turn"
+        );
+    }
+    #[test]
+    fn completed_probe_releases_compute_even_when_a_handle_was_inherited() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("compute.lock");
+        let lock = auto::lock_file(&path).unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let lease = ProbeLease(lock);
+        let inherited = lease.0.try_clone().unwrap();
+        drop(lease);
+        let next = auto::lock_file(&path).unwrap();
+        next.try_lock_exclusive().unwrap();
+        drop(inherited);
     }
 
     #[test]
@@ -5777,6 +6177,12 @@ mod tests {
             "a local model must not keep an inherited endpoint"
         );
         assert!(changes.iter().any(|c| matches!(c, Change::Set { path, value } if path == "provider" && value.as_str() == Some("mlx"))));
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, Change::Set { path, value } if path == "context_window" && value.as_str() == Some("auto"))),
+            "a model without a known window must not keep the previous model's"
+        );
         let remote = ModelSelection {
             provider: "lm-studio".into(),
             model: "qwen".into(),
@@ -5963,6 +6369,19 @@ mod tests {
                 .iter()
                 .any(|(name, _)| choice.starts_with(&format!("/{name} ")))
         }));
+    }
+
+    #[test]
+    fn numstat_parsing_keeps_binary_counts_and_renames_and_unusual_paths() {
+        let files = parse_file_diffs(
+            "12\t3\tsrc/with\ttab.rs\0-\t-\timage.png\02\t1\t\0old name.rs\0new name.rs\0",
+        );
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].path, "image.png");
+        assert_eq!(files[0].added, None);
+        assert_eq!(files[1].path, "new name.rs");
+        assert_eq!((files[1].added, files[1].removed), (Some(2), Some(1)));
+        assert_eq!(files[2].path, "src/with\ttab.rs");
     }
 
     #[test]

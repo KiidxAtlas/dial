@@ -27,6 +27,7 @@ mod responses;
 mod retry;
 pub mod server;
 mod stream;
+pub mod usage;
 pub(crate) use cancel::Patience;
 #[cfg(test)]
 pub(crate) mod fake;
@@ -158,9 +159,55 @@ impl Reply {
         self.finish_reason == "tool_calls" && self.tool_calls.is_empty()
     }
 }
+/// Stages reported by a local inference engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferencePhase {
+    Loading,
+    Processing,
+    Generating,
+}
+
+/// Request-local telemetry. It never becomes conversation content or billable usage.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ModelProgress {
+    pub phase: InferencePhase,
+    #[serde(default)]
+    pub processed_tokens: Option<u64>,
+    #[serde(default)]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub tokens_per_second: Option<f64>,
+    #[serde(default)]
+    pub estimated: bool,
+}
+
+impl ModelProgress {
+    pub fn new(phase: InferencePhase) -> Self {
+        Self {
+            phase,
+            processed_tokens: None,
+            prompt_tokens: None,
+            output_tokens: None,
+            tokens_per_second: None,
+            estimated: false,
+        }
+    }
+
+    pub fn normalize(&mut self) {
+        self.tokens_per_second = self.tokens_per_second.filter(|n| n.is_finite() && *n > 0.0);
+        if let (Some(done), Some(total)) = (self.processed_tokens, self.prompt_tokens) {
+            self.processed_tokens = Some(done.min(total));
+        }
+    }
+}
+
 /// Incremental provider events, separate from visible answer text and retry notices.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
+    Progress(ModelProgress),
     Reasoning(String),
     ToolArguments {
         index: u64,
@@ -253,7 +300,7 @@ pub(crate) fn is_local_host(host: &str) -> bool {
     host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local")
 }
 
-fn host_of(url: &str) -> Option<String> {
+pub(crate) fn host_of(url: &str) -> Option<String> {
     url.parse::<ureq::http::Uri>()
         .ok()?
         .host()
@@ -327,6 +374,13 @@ pub fn chat_stream(
     )
 }
 
+/// The provider route is kept together when forwarding a request through transports.
+pub(super) struct Endpoint<'a> {
+    pub url: &'a str,
+    pub auth: Option<&'a str>,
+    pub model: &'a str,
+}
+
 pub(crate) fn chat_at(
     url: &str,
     auth: Option<&str>,
@@ -335,9 +389,11 @@ pub(crate) fn chat_at(
     timeout_secs: u64,
 ) -> Result<Reply> {
     chat_at_controlled(
-        url,
-        auth,
-        model_label,
+        Endpoint {
+            url,
+            auth,
+            model: model_label,
+        },
         req,
         timeout_secs,
         None,
@@ -347,15 +403,18 @@ pub(crate) fn chat_at(
 }
 
 fn chat_at_controlled(
-    url: &str,
-    auth: Option<&str>,
-    model_label: &str,
+    endpoint: Endpoint<'_>,
     req: &Chat,
     timeout_secs: u64,
     interrupt: Option<Arc<AtomicBool>>,
     profile: Option<&profiles::ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
+    let Endpoint {
+        url,
+        auth,
+        model: model_label,
+    } = endpoint;
     let mut body = request_body(model_label, req, timeout_secs, false)?;
     if let Some(profile) = profile {
         profile.validate_request(req, false)?;
@@ -400,9 +459,11 @@ pub(crate) fn chat_stream_at(
     on_text: &mut dyn FnMut(&str) -> bool,
 ) -> Result<Reply> {
     chat_stream_at_controlled(
-        url,
-        auth,
-        model_label,
+        Endpoint {
+            url,
+            auth,
+            model: model_label,
+        },
         req,
         timeout_secs,
         on_text,
@@ -413,9 +474,7 @@ pub(crate) fn chat_stream_at(
 }
 
 fn chat_stream_at_controlled(
-    url: &str,
-    auth: Option<&str>,
-    model_label: &str,
+    endpoint: Endpoint<'_>,
     req: &Chat,
     timeout_secs: u64,
     on_text: &mut dyn FnMut(&str) -> bool,
@@ -423,6 +482,11 @@ fn chat_stream_at_controlled(
     profile: Option<&profiles::ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
+    let Endpoint {
+        url,
+        auth,
+        model: model_label,
+    } = endpoint;
     let mut body = request_body(model_label, req, timeout_secs, true)?;
     let patience = Patience::for_stream(
         timeout_secs,
@@ -583,17 +647,33 @@ pub(super) fn send_with_headers(
 
 fn transport_error(error: ureq::Error, url: &str, auth: Option<&str>) -> anyhow::Error {
     let connection = match &error {
-        ureq::Error::Io(io) => matches!(
-            io.kind(),
-            std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::NotConnected
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::UnexpectedEof
-        ),
+        // No response has arrived at this boundary. A fresh connection may recover
+        // macOS EINVAL or a record-integrity alert, but certificate failures and
+        // generic InvalidInput/InvalidData remain permanent. Body errors bypass this policy.
+        ureq::Error::Io(io) => {
+            let bad_record_mac = io
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+                .is_some_and(|tls| {
+                    matches!(
+                        tls,
+                        rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac)
+                    )
+                });
+            (cfg!(target_os = "macos") && io.raw_os_error() == Some(libc::EINVAL))
+                || bad_record_mac
+                || matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+        }
         ureq::Error::ConnectionFailed | ureq::Error::HostNotFound | ureq::Error::Timeout(_) => true,
         _ => false,
     };
@@ -704,7 +784,33 @@ fn http_error(
     } else if status == 404 {
         excerpt.push_str(" — refresh /models and select an available model; check the provider endpoint in /providers.");
     }
-    if status == 400 && excerpt.to_ascii_lowercase().contains("image") {
+    // Validation errors often list every allowed content type, including "image". Only an
+    // explicit capability rejection justifies suggesting another model, not malformed history,
+    // oversized images, or unsupported image encodings.
+    if status == 400
+        && message.as_deref().is_some_and(|message| {
+            let lower = message.to_ascii_lowercase();
+            [
+                "does not support image input",
+                "does not support images",
+                "model does not support image",
+                "model doesn't support image",
+                "image input is not supported",
+                "image inputs are not supported",
+                "image input not supported",
+                "image inputs not supported",
+                "unsupported image input",
+                "images are not supported by this model",
+                "image_url is only supported by certain models",
+                "image_url is not supported by this model",
+                "does not support vision",
+                "vision is not supported",
+                "not a vision model",
+            ]
+            .iter()
+            .any(|reason| lower.contains(reason))
+        })
+    {
         excerpt.push_str(" — this model rejected image input; select a vision-capable model or remove the image attachment.");
     }
     anyhow::Error::new(HttpError {
@@ -1454,6 +1560,70 @@ mod net_tests {
     }
 
     #[test]
+    fn tls_bad_record_mac_reconnects_only_before_a_response() {
+        let error = transport_error(
+            ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac),
+            )),
+            "https://chatgpt.com/backend-api/codex/responses?secret=hidden",
+            None,
+        );
+        assert!(is_transient(&error), "{error:#}");
+        assert!(!error.to_string().contains("secret"));
+        assert!(!is_transient(&response_error(error, None)));
+
+        for tls in [
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+            rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),
+            rustls::Error::General("received fatal alert: BadRecordMac".into()),
+        ] {
+            let error = transport_error(
+                ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, tls)),
+                "https://chatgpt.com/backend-api/codex/responses",
+                None,
+            );
+            assert!(!is_transient(&error), "{error:#}");
+        }
+        let error = transport_error(
+            ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "received fatal alert: BadRecordMac",
+            )),
+            "https://chatgpt.com/backend-api/codex/responses",
+            None,
+        );
+        assert!(
+            !is_transient(&error),
+            "text alone must not classify a TLS error"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn socket_invalid_argument_retries_only_before_a_response() {
+        let error = transport_error(
+            ureq::Error::Io(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            "https://api.anthropic.com/v1/messages?secret=hidden",
+            None,
+        );
+        assert!(is_transient(&error), "{error:#}");
+        assert!(!error.to_string().contains("secret"));
+        // Invalid headers/settings are client errors, even when their I/O kind is InvalidInput.
+        let invalid = transport_error(
+            ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid setting",
+            )),
+            "https://api.anthropic.com/v1/messages",
+            None,
+        );
+        assert!(!is_transient(&invalid));
+        // Once a response is being consumed, reconnecting could duplicate partial output.
+        assert!(!is_transient(&response_error(error, None)));
+    }
+
+    #[test]
     fn http_errors_are_typed_and_classified() {
         let server = fake::serve(vec![
             fake::json(429, &json!({"error": "slow down"})),
@@ -1539,6 +1709,47 @@ mod net_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("(type: permission_error)"), "{err}");
+    }
+
+    #[test]
+    fn image_support_hint_requires_an_explicit_model_capability_error() {
+        for (message, hint) in [
+            (
+                "messages.1.content.0: Input tag 'dial_response_item' found using 'type' does not match any expected tags: 'document', 'image', 'text', 'tool_use'",
+                false,
+            ),
+            ("Image exceeds maximum dimensions", false),
+            ("Invalid image format", false),
+            ("This model does not support image input", true),
+            (
+                "Invalid content type. image_url is only supported by certain models.",
+                true,
+            ),
+            ("Image inputs are not supported by this model", true),
+        ] {
+            let error = http_error(
+                400,
+                &Bounded {
+                    data: serde_json::to_vec(
+                        &json!({"error":{"type":"invalid_request_error","message":message}}),
+                    )
+                    .unwrap(),
+                    truncated: false,
+                },
+                None,
+                None,
+            )
+            .to_string();
+            assert_eq!(
+                error.contains("select a vision-capable model"),
+                hint,
+                "{error}"
+            );
+            assert!(
+                error.contains(message),
+                "keep the actual provider error: {error}"
+            );
+        }
     }
 
     #[test]

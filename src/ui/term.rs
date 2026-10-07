@@ -68,6 +68,9 @@ pub struct Viewport<'a> {
     pub title: Option<&'a str>,
 }
 
+/// A painted frame: its rows and the cursor position, if any.
+type Frame = (Vec<Line<'static>>, Option<(u16, u16)>);
+
 pub struct InlineTerminal {
     out: Box<dyn Write>,
     /// Talks to the real TTY (raw mode, size query, panic hook). `false` for `with_writer`.
@@ -78,6 +81,11 @@ pub struct InlineTerminal {
     left: bool,
     /// Finalized rows waiting for the next paint.
     pending: Vec<Line<'static>>,
+    pending_images: Vec<(
+        usize,
+        super::images::NativeImage,
+        super::images::ImageProtocol,
+    )>,
     history_written: usize,
     /// Rows the previous paint left on screen, their cell widths, and the row (relative to the
     /// viewport top) the hardware cursor rests on.
@@ -88,7 +96,8 @@ pub struct InlineTerminal {
     /// Erase from the viewport top down before painting (resize, overlay return).
     force_erase: bool,
     title: Option<String>,
-    last_frame: Option<(Vec<Line<'static>>, Option<(u16, u16)>)>,
+    last_frame: Option<Frame>,
+    last_rendered: Vec<(String, usize)>,
 }
 
 impl InlineTerminal {
@@ -145,6 +154,7 @@ impl InlineTerminal {
             keyboard_flags,
             left: false,
             pending: Vec::new(),
+            pending_images: Vec::new(),
             history_written: 0,
             painted_rows: 0,
             painted_widths: Vec::new(),
@@ -153,6 +163,7 @@ impl InlineTerminal {
             force_erase: false,
             title: None,
             last_frame: None,
+            last_rendered: Vec::new(),
         }
     }
 
@@ -169,6 +180,28 @@ impl InlineTerminal {
     /// Queue finalized rows; they are written to scrollback exactly once on the next paint.
     pub fn commit(&mut self, rows: Vec<Line<'static>>) {
         self.pending.extend(rows);
+    }
+
+    pub fn image_protocol(&self) -> Option<super::images::ImageProtocol> {
+        self.real
+            .then(super::images::ImageProtocol::detect)
+            .flatten()
+    }
+
+    pub fn commit_with_images(
+        &mut self,
+        rows: Vec<Line<'static>>,
+        images: Vec<(usize, super::images::NativeImage)>,
+        protocol: super::images::ImageProtocol,
+    ) {
+        let offset = self.pending.len();
+        self.pending_images.extend(
+            images
+                .into_iter()
+                .filter(|(row, image)| *row < rows.len() && image.rows() <= row + 1)
+                .map(|(row, image)| (offset + row, image, protocol)),
+        );
+        self.commit(rows);
     }
 
     /// Call on `Event::Resize`: the next paint erases conservatively from the recorded viewport top.
@@ -210,7 +243,31 @@ impl InlineTerminal {
         {
             return Ok(());
         }
-        let rendered: Vec<(String, usize)> = visible.iter().map(|l| render_row(l, width)).collect();
+        let diff = !self.force_erase
+            && self.pending.is_empty()
+            && (cols, rows) == self.last_size
+            && self
+                .last_frame
+                .as_ref()
+                .is_some_and(|(lines, _)| lines.len() == visible.len());
+        // Each changed rich row passes through the ANSI primitive once. Stable rows reuse their
+        // frame cells and never allocate a new encoded buffer just because a spinner changed.
+        let rendered: Vec<Option<(String, usize)>> = visible
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                if diff
+                    && self
+                        .last_frame
+                        .as_ref()
+                        .is_some_and(|(lines, _)| lines[i] == *line)
+                {
+                    None
+                } else {
+                    Some(render_row(line, width))
+                }
+            })
+            .collect();
         let history: Vec<(String, usize)> =
             self.pending.iter().map(|l| render_row(l, width)).collect();
 
@@ -228,8 +285,13 @@ impl InlineTerminal {
         }
         .min(rows as usize - 1);
 
-        let mut buf =
-            String::with_capacity(256 + rendered.iter().map(|r| r.0.len() + 2).sum::<usize>());
+        let mut buf = String::with_capacity(
+            256 + rendered
+                .iter()
+                .flatten()
+                .map(|r| r.0.len() + 2)
+                .sum::<usize>(),
+        );
         buf.push_str(SYNC_BEGIN);
         buf.push_str(CURSOR_HIDE);
         buf.push_str(WRAP_OFF);
@@ -247,17 +309,26 @@ impl InlineTerminal {
         if erase_first {
             buf.push_str("\x1b[J");
         }
-        for (row, _) in &history {
+        for (index, (row, _)) in history.iter().enumerate() {
             buf.push_str("\x1b[2K");
             buf.push_str(row);
+            for (_, image, protocol) in self
+                .pending_images
+                .iter()
+                .filter(|(at, image, _)| *at == index && image.fits(cols, rows))
+            {
+                image.write_ansi(&mut buf, *protocol);
+            }
             buf.push_str("\r\n");
         }
-        for (i, (row, _)) in rendered.iter().enumerate() {
+        for (i, row) in rendered.iter().enumerate() {
             if i > 0 {
                 buf.push_str("\r\n");
             }
-            buf.push_str("\x1b[2K");
-            buf.push_str(row);
+            if let Some((row, _)) = row {
+                buf.push_str("\x1b[2K");
+                buf.push_str(row);
+            }
         }
         if rendered.is_empty() {
             // The (empty) viewport still owns the line the cursor sits on.
@@ -299,8 +370,16 @@ impl InlineTerminal {
 
         self.history_written += history.len();
         self.pending.clear();
+        self.pending_images.clear();
         self.painted_rows = n as u16;
-        self.painted_widths = rendered.iter().map(|r| r.1).collect();
+        self.last_rendered
+            .resize_with(rendered.len(), || (String::new(), 0));
+        for (i, row) in rendered.into_iter().enumerate() {
+            if let Some(row) = row {
+                self.last_rendered[i] = row;
+            }
+        }
+        self.painted_widths = self.last_rendered.iter().map(|r| r.1).collect();
         self.cursor_row = rest_row as u16;
         self.last_size = (cols, rows);
         self.force_erase = false;
@@ -316,6 +395,7 @@ impl InlineTerminal {
         self.out.flush()?;
         self.pending.clear();
         self.painted_rows = 0;
+        self.pending_images.clear();
         self.painted_widths.clear();
         self.last_frame = None;
         self.cursor_row = 0;
@@ -342,6 +422,7 @@ impl InlineTerminal {
             }
             IN_ALT_SCREEN.store(true, Ordering::SeqCst);
         }
+        push_command(&mut enter, &EnableBracketedPaste);
         self.out.write_all(enter.as_bytes())?;
         self.out.flush()?;
 
@@ -354,6 +435,7 @@ impl InlineTerminal {
         }
         leave.push_str(CURSOR_SHOW);
         leave.push_str(ALT_LEAVE);
+        push_command(&mut leave, &EnableBracketedPaste);
         let restored = self
             .out
             .write_all(leave.as_bytes())
@@ -377,18 +459,26 @@ impl InlineTerminal {
         if self.real && !ACTIVE.swap(false, Ordering::SeqCst) {
             return; // the panic hook already restored the terminal
         }
-        let (cols, _) = self.size();
+        let (cols, terminal_rows) = self.size();
         let mut s = String::new();
         if self.cursor_row > 0 {
             s.push_str(&format!("\x1b[{}A", self.cursor_row));
         }
         s.push_str("\r\x1b[J");
-        for line in &self.pending {
+        for (index, line) in self.pending.iter().enumerate() {
             s.push_str(&render_row(line, cols as usize).0);
+            for (_, image, protocol) in self
+                .pending_images
+                .iter()
+                .filter(|(at, image, _)| *at == index && image.fits(cols, terminal_rows))
+            {
+                image.write_ansi(&mut s, *protocol);
+            }
             s.push_str("\r\n");
         }
         self.history_written += self.pending.len();
         self.pending.clear();
+        self.pending_images.clear();
         s.push_str(WRAP_ON);
         s.push_str(CURSOR_SHOW);
         if self.real {
@@ -1117,6 +1207,29 @@ mod tests {
     }
 
     #[test]
+    fn frame_diff_writes_only_changed_rows_and_repaints_style_changes() {
+        let mut rig = Rig::new(30, 8);
+        rig.paint(&["stable row", "old row"], Some((1, 2)));
+        let before = rig.raw.len();
+        rig.paint(&["stable row", "new row"], Some((1, 2)));
+        let update = String::from_utf8_lossy(&rig.raw[before..]);
+        assert!(!update.contains("stable row"));
+        assert!(update.contains("new row"));
+        assert!(rig.screen().iter().any(|row| row == "stable row"));
+        assert!(rig.screen().iter().any(|row| row == "new row"));
+        let before = rig.raw.len();
+        rig.paint_lines(
+            &[
+                Line::from("stable row"),
+                Line::styled("new row", Style::default().fg(Color::Red)),
+            ],
+            Some((1, 2)),
+        );
+        assert!(String::from_utf8_lossy(&rig.raw[before..]).contains("new row"));
+        assert!(!String::from_utf8_lossy(&rig.raw[before..]).contains("stable row"));
+    }
+
+    #[test]
     fn each_paint_is_one_synchronized_write() {
         let mut rig = Rig::new(20, 4);
         rig.paint(&["x"], Some((0, 0)));
@@ -1276,6 +1389,14 @@ mod tests {
             .find("\x1b[?1049l")
             .expect("leaves the alternate screen");
         assert!(enter < leave);
+        assert!(
+            text[enter..leave].contains("\x1b[?2004h"),
+            "paste mode enabled in the panel"
+        );
+        assert!(
+            text[leave..].contains("\x1b[?2004h"),
+            "paste mode re-armed after the panel"
+        );
         assert!(text[enter..leave].contains("SETTINGS"));
         assert!(!rig.parser.screen().alternate_screen());
         assert_eq!(

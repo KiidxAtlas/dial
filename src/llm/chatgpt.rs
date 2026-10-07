@@ -69,6 +69,17 @@ pub fn model_profile(dir: &Path, model: &str) -> Result<Option<super::profiles::
     Ok(cached_catalog(dir)?.profiles.remove(model))
 }
 
+/// Capacity from the active account's last discovery, without network or inference.
+pub(crate) fn model_context_window(dir: &Path, model: &str) -> Option<u32> {
+    cached_catalog(dir)
+        .ok()?
+        .models
+        .into_iter()
+        .find(|entry| entry.selection.model == model)?
+        .selection
+        .context_window
+}
+
 fn save_catalog(dir: &Path, id: &str, catalog: &ModelCatalog) -> Result<()> {
     let path = dir.join(CATALOG_FILE);
     let _lock = locked(&path)?;
@@ -953,11 +964,13 @@ fn parse_models(value: &Value) -> Result<Vec<super::catalog::ModelEntry>> {
                     provider: PROVIDER.into(),
                     model: slug.into(),
                     base_url: Some(BASE_URL.into()),
-                    context_window: row["context_window"]
-                        .as_u64()
-                        .or_else(|| row["max_context_window"].as_u64())
-                        .and_then(|n| u32::try_from(n).ok())
-                        .filter(|n| (2048..=1_048_576).contains(n)),
+                    // context_window is Codex's standard default, not the extended capacity.
+                    // Validate independently so a malformed maximum still permits a valid default.
+                    context_window: ["max_context_window", "context_window"]
+                        .into_iter()
+                        .filter_map(|key| row[key].as_u64().and_then(|n| u32::try_from(n).ok()))
+                        .filter(|n| (2048..=super::model_config::MAX_CONTEXT_WINDOW).contains(n))
+                        .max(),
                     ..Default::default()
                 },
                 label: row["display_name"].as_str().unwrap_or(slug).into(),
@@ -967,6 +980,12 @@ fn parse_models(value: &Value) -> Result<Vec<super::catalog::ModelEntry>> {
                     vision: row["input_modalities"]
                         .as_array()
                         .map(|items| items.iter().any(|item| item == "image")),
+                    tools: row["supports_parallel_tool_calls"]
+                        .as_bool()
+                        .filter(|supported| *supported),
+                    reasoning: row["supported_reasoning_levels"]
+                        .as_array()
+                        .map(|items| !items.is_empty()),
                     ..Default::default()
                 },
             })
@@ -1596,6 +1615,64 @@ mod tests {
         let err = accounts(dir.path()).unwrap_err();
         assert!(!err.to_string().contains("sensitive"));
     }
+    #[test]
+    fn catalog_prefers_valid_extended_maximum_over_default_context() {
+        let models = parse_models(&json!({"models":[
+            {"slug":"gpt-6.1-sol", "context_window":272000, "max_context_window":872000},
+            {"slug":"api-size", "context_window":272000, "max_context_window":1050000},
+            {"slug":"no-maximum", "context_window":272000},
+            {"slug":"invalid-maximum", "context_window":64000, "max_context_window":-1},
+            {"slug":"oversized-maximum", "context_window":64000, "max_context_window":4294967296u64},
+            {"slug":"bad-default", "context_window":-1, "max_context_window":1000000},
+            {"slug":"stale-low-maximum", "context_window":128000, "max_context_window":64000},
+            {"slug":"no-valid-window", "context_window":0, "max_context_window":-1}
+        ]})).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|entry| entry.selection.context_window)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(872000),
+                Some(1050000),
+                Some(272000),
+                Some(64000),
+                Some(64000),
+                Some(1000000),
+                Some(128000),
+                None
+            ]
+        );
+        let home = tempfile::tempdir().unwrap();
+        test_account(home.path(), false);
+        test_catalog(
+            home.path(),
+            &json!({"models":[{"slug":"gpt-6.1-sol", "context_window":272000, "max_context_window":872000}]}),
+        );
+        assert_eq!(
+            model_context_window(home.path(), "gpt-6.1-sol"),
+            Some(872000)
+        );
+        let project = tempfile::tempdir().unwrap();
+        let layout =
+            crate::storage::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
+                .unwrap();
+        let auto = crate::config::types::Config::from_table(
+            &layout,
+            toml::from_str("provider='chatgpt'\nmodel='gpt-6.1-sol'\ncontext_window='auto'\n")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(auto.context_window, 872000);
+        let capped = crate::config::types::Config::from_table(
+            &layout,
+            toml::from_str("provider='chatgpt'\nmodel='gpt-6.1-sol'\ncloud_context_window=64000\n")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(capped.context_window, 64000);
+    }
+
     #[test]
     fn account_model_catalog_uses_visibility_slug_and_display_name() {
         let rows=parse_models(&json!({"models":[{"slug":"available-model","display_name":"Friendly","visibility":"list","context_window":131072},{"slug":"hidden","visibility":"hidden"}]})).unwrap();

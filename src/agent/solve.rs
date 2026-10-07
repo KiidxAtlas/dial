@@ -275,15 +275,20 @@ fn patch_size(before: &Tree, after: &Tree, paths: &[PathBuf]) -> (usize, usize) 
 fn output(result: Result<Value>) -> ToolOutput {
     match result {
         Ok(value) => ToolOutput {
+            data: None,
             text: value.to_string(),
             is_error: false,
         },
         Err(error) => ToolOutput {
+            data: None,
             text: format!("{error:#}"),
             is_error: true,
         },
     }
 }
+
+/// Best candidate so far: (index, tree, changed files, (score, size)).
+type BestCandidate = (usize, Tree, Vec<PathBuf>, (usize, usize));
 
 pub(super) fn run(mut parent: subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> ToolOutput {
     output(search(&mut parent, args, ui))
@@ -344,7 +349,7 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
             .model_roles
             .insert("subagent".into(), child_config.selection());
     }
-    let mut best: Option<(usize, Tree, Vec<PathBuf>, (usize, usize))> = None;
+    let mut best: Option<BestCandidate> = None;
     let mut attempts = Vec::new();
     for (index, approach) in request.candidates.iter().enumerate() {
         ensure!(
@@ -360,6 +365,7 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
             layout: None,
             harness: &harness,
             interrupt: env.interrupt,
+            usage: env.usage,
         };
         let prompt = format!(
             "Goal: {}\nCandidate approach: {}\nOnly change these exact relative files: {:?}. Preserve unrelated work. Do not run verification; the caller runs identical checks in a separate copy. Implement the patch, then summarize. Never use network.\n",
@@ -1015,19 +1021,25 @@ mod tests {
             let accepted = local_route(config, false).unwrap();
             assert!(!accepted.endpoint.unwrap().base_url.contains("localhost"));
         }
-        let mut remote = Config::default();
-        remote.endpoint = Some(crate::config::types::EndpointConfig {
-            base_url: "https://models.example.test/v1".into(),
-            api_key_env: None,
-            allow_insecure: false,
-        });
+        let remote = Config {
+            endpoint: Some(crate::config::types::EndpointConfig {
+                base_url: "https://models.example.test/v1".into(),
+                api_key_env: None,
+                allow_insecure: false,
+            }),
+            ..Config::default()
+        };
         assert!(local_route(remote.clone(), false).is_err());
         assert!(local_route(remote, true).is_ok());
-        let mut subscription = Config::default();
-        subscription.provider = Some(crate::llm::chatgpt::PROVIDER.into());
+        let subscription = Config {
+            provider: Some(crate::llm::chatgpt::PROVIDER.into()),
+            ..Config::default()
+        };
         assert!(local_route(subscription, false).is_err());
-        let mut local = Config::default();
-        local.provider = Some("mlx".into());
+        let local = Config {
+            provider: Some("mlx".into()),
+            ..Config::default()
+        };
         assert!(local_route(local, false).is_ok());
     }
 }

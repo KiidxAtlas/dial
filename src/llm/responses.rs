@@ -361,59 +361,59 @@ impl Accumulator {
         })
     }
 }
+/// Optional visible-text callback; returning `false` interrupts the stream.
+type OnText<'a> = Option<&'a mut dyn FnMut(&str) -> bool>;
+
+/// Responses authentication and routing travel together; account IDs are only sent for Codex.
+pub(super) struct Endpoint<'a> {
+    pub url: &'a str,
+    pub token: &'a str,
+    pub account_id: Option<&'a str>,
+    pub model: &'a str,
+}
+
 #[cfg(test)]
 pub(super) fn exchange(
-    url: &str,
-    token: &str,
-    model: &str,
+    endpoint: Endpoint<'_>,
     chat: &Chat,
     timeout: u64,
-    on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
+    on_text: &mut OnText<'_>,
     interrupt: Arc<AtomicBool>,
     profile: Option<&super::profiles::ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
     exchange_inner(
-        url, token, None, model, chat, timeout, on_text, interrupt, profile, on_event,
+        endpoint, chat, timeout, on_text, interrupt, profile, on_event,
     )
 }
 pub(super) fn exchange_codex(
-    url: &str,
-    token: &str,
-    account_id: &str,
-    model: &str,
+    endpoint: Endpoint<'_>,
     chat: &Chat,
     timeout: u64,
-    on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
+    on_text: &mut OnText<'_>,
     interrupt: Arc<AtomicBool>,
     profile: Option<&super::profiles::ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
     exchange_inner(
-        url,
-        token,
-        Some(account_id),
-        model,
-        chat,
-        timeout,
-        on_text,
-        interrupt,
-        profile,
-        on_event,
+        endpoint, chat, timeout, on_text, interrupt, profile, on_event,
     )
 }
 fn exchange_inner(
-    url: &str,
-    token: &str,
-    codex_account_id: Option<&str>,
-    model: &str,
+    endpoint: Endpoint<'_>,
     chat: &Chat,
     timeout: u64,
-    on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
+    on_text: &mut OnText<'_>,
     interrupt: Arc<AtomicBool>,
     profile: Option<&super::profiles::ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
+    let Endpoint {
+        url,
+        token,
+        account_id: codex_account_id,
+        model,
+    } = endpoint;
     ensure!(timeout > 0, "Responses timeout must be positive");
     let body = if codex_account_id.is_some() {
         request_codex(model, chat, profile)?
@@ -663,9 +663,12 @@ mod tests {
         full.push(json!({"type":"response.completed","response":response(vec![])}));
         let server = fake::serve(vec![Script::SseNoContentType(sse(full))]);
         let reply = exchange(
-            &server.url,
-            "fixture-token",
-            "account-model",
+            Endpoint {
+                url: &server.url,
+                token: "fixture-token",
+                account_id: None,
+                model: "account-model",
+            },
             &chat(),
             5,
             &mut None,
@@ -683,9 +686,12 @@ mod tests {
         let server = fake::serve(vec![Script::SseNoContentType(sse(failed))]);
         assert!(
             exchange(
-                &server.url,
-                "fixture-token",
-                "account-model",
+                Endpoint {
+                    url: &server.url,
+                    token: "fixture-token",
+                    account_id: None,
+                    model: "account-model"
+                },
                 &chat(),
                 5,
                 &mut None,
@@ -702,9 +708,12 @@ mod tests {
         ]))]);
         assert!(
             exchange(
-                &server.url,
-                "fixture-token",
-                "account-model",
+                Endpoint {
+                    url: &server.url,
+                    token: "fixture-token",
+                    account_id: None,
+                    model: "account-model"
+                },
                 &chat(),
                 5,
                 &mut None,
@@ -723,9 +732,12 @@ mod tests {
         ]);
         let server = fake::serve(vec![Script::SseNoContentType(payload)]);
         let reply = exchange(
-            &server.url,
-            "fixture-token",
-            "account-model",
+            Endpoint {
+                url: &server.url,
+                token: "fixture-token",
+                account_id: None,
+                model: "account-model",
+            },
             &chat(),
             5,
             &mut None,
@@ -741,9 +753,12 @@ mod tests {
         )]);
         assert!(
             exchange(
-                &server.url,
-                "fixture-token",
-                "account-model",
+                Endpoint {
+                    url: &server.url,
+                    token: "fixture-token",
+                    account_id: None,
+                    model: "account-model"
+                },
                 &chat(),
                 5,
                 &mut None,
@@ -777,9 +792,12 @@ mod tests {
         events.push(json!({"type":"response.completed","response":response(vec![call()])}));
         let server = fake::serve(vec![Script::Sse(sse(events))]);
         let reply = exchange(
-            &server.url,
-            "test-access",
-            "account-model",
+            Endpoint {
+                url: &server.url,
+                token: "test-access",
+                account_id: None,
+                model: "account-model",
+            },
             &chat(),
             5,
             &mut None,
@@ -809,9 +827,12 @@ mod tests {
                 terminal,
             ]))]);
             let err = exchange(
-                &server.url,
-                "test-access",
-                "account-model",
+                Endpoint {
+                    url: &server.url,
+                    token: "test-access",
+                    account_id: None,
+                    model: "account-model",
+                },
                 &chat(),
                 5,
                 &mut None,
@@ -855,9 +876,12 @@ mod tests {
         let mut callback = |_: &str| false;
         assert!(
             exchange(
-                &server.url,
-                "test-access",
-                "account-model",
+                Endpoint {
+                    url: &server.url,
+                    token: "test-access",
+                    account_id: None,
+                    model: "account-model"
+                },
                 &chat(),
                 5,
                 &mut Some(&mut callback),
@@ -878,9 +902,12 @@ mod tests {
         let start = std::time::Instant::now();
         let job = std::thread::spawn(move || {
             exchange(
-                &server.url,
-                "test-access",
-                "account-model",
+                Endpoint {
+                    url: &server.url,
+                    token: "test-access",
+                    account_id: None,
+                    model: "account-model",
+                },
                 &chat(),
                 5,
                 &mut None,
@@ -923,9 +950,12 @@ mod tests {
         ]);
         for _ in 0..2 {
             let err = exchange(
-                &server.url,
-                "test-access",
-                "account-model",
+                Endpoint {
+                    url: &server.url,
+                    token: "test-access",
+                    account_id: None,
+                    model: "account-model",
+                },
                 &chat(),
                 5,
                 &mut None,

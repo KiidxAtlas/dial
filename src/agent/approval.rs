@@ -115,6 +115,42 @@ pub fn safe_bash(command: &str) -> bool {
                     .all(|c| c.is_ascii_digit() || c == ',' || c == '$')
                 && !args[2..].iter().any(|a| a.starts_with('-'))
         }
+        "git" => {
+            args == [
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.pager=cat",
+                "--no-pager",
+                "status",
+                "--short",
+                "--untracked-files=all",
+            ] || args
+                == [
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.pager=cat",
+                    "--no-pager",
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                ]
+                || args
+                    == [
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-c",
+                        "core.pager=cat",
+                        "--no-pager",
+                        "diff",
+                        "--no-color",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--staged",
+                    ]
+        }
         "rustc" | "cargo" | "go" | "python" | "python3" | "node" => args == ["--version"],
         _ => false,
     }
@@ -140,6 +176,15 @@ pub fn needs_approval(ext: &Registry, call: &ToolCall) -> bool {
 
 /// Stateful reads (background output cursors, memory, todo) remain serial barriers.
 pub fn parallel_read(ext: &Registry, name: &str, args: &Value) -> bool {
+    // Explicit user attachments are resolved against the conversation by the serial controller.
+    if name == "read"
+        && args["path"].as_str().is_some_and(|p| {
+            (Path::new(p).is_absolute() || p.starts_with("~/"))
+                && crate::llm::images::is_image(Path::new(p))
+        })
+    {
+        return false;
+    }
     matches!(
         name,
         "read" | "glob" | "grep" | "ast_search" | "web_fetch" | "web_search"
@@ -462,6 +507,9 @@ mod tests {
             "cat \"a b\"",
             "find . -name '*.rs'",
             "sed -n '1,10p' file",
+            "git -c core.fsmonitor=false -c core.pager=cat --no-pager status --short --untracked-files=all",
+            "git -c core.fsmonitor=false -c core.pager=cat --no-pager diff --no-color --no-ext-diff --no-textconv",
+            "git -c core.fsmonitor=false -c core.pager=cat --no-pager diff --no-color --no-ext-diff --no-textconv --staged",
         ] {
             assert!(safe_bash(text), "{text}");
         }

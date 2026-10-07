@@ -734,9 +734,13 @@ impl Tool for MemoryTool {
     fn needs_approval(&self, _: &Value) -> bool {
         !matches!(self.name, "recall" | "memory_history")
     }
+    fn may_modify_workspace(&self, _: &Value) -> bool {
+        false
+    }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         if ctx.workspace.root() != self.memory.root.as_path() {
             return ToolOutput {
+                data: None,
                 text: "memory handle belongs to a different workspace".into(),
                 is_error: true,
             };
@@ -744,15 +748,18 @@ impl Tool for MemoryTool {
         match self.invoke(args) {
             Ok(value) => match serde_json::to_string(&value) {
                 Ok(text) => ToolOutput {
+                    data: None,
                     text,
                     is_error: false,
                 },
                 Err(error) => ToolOutput {
+                    data: None,
                     text: error.to_string(),
                     is_error: true,
                 },
             },
             Err(error) => ToolOutput {
+                data: None,
                 text: format!("{error:#}"),
                 is_error: true,
             },

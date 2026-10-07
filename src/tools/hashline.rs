@@ -757,10 +757,12 @@ fn skip_string(cs: &[char], start: usize, quote: char) -> usize {
 fn skip_char_literal(cs: &[char], start: usize) -> usize {
     // 'x' or '\n' / '\u{..}' ; anything else (a lifetime like 'a) is one char.
     if cs.get(start + 1) == Some(&'\\') {
-        for i in start + 2..(start + 12).min(cs.len()) {
-            if cs[i] == '\'' {
-                return i + 1;
-            }
+        let end = (start + 12).min(cs.len());
+        if let Some(offset) = cs
+            .get(start + 2..end)
+            .and_then(|window| window.iter().position(|&c| c == '\''))
+        {
+            return start + 2 + offset + 1;
         }
     } else if cs.get(start + 2) == Some(&'\'') {
         return start + 3;
@@ -2054,6 +2056,9 @@ pub(crate) fn note_write(ws: &Workspace, abs: &Path, content: &str) -> String {
 /// was lost (a resumed session, or an agent rebuilt for a settings change). A `[path#TAG]` result counts
 /// only while the file still has that exact tag: its `N:` rows become seen again, and a `write` result
 /// marks the whole file. Results for files that changed since are ignored, so nothing unseen is unlocked.
+/// What a result showed of one file: (whole file seen, seen line ranges).
+type SeenFile = (bool, Vec<(usize, usize)>);
+
 pub fn rehydrate<'a>(ws: &Workspace, results: impl IntoIterator<Item = (&'a str, &'a str)>) {
     fn header(line: &str) -> Option<(String, String)> {
         let (rel, tag) = line
@@ -2063,7 +2068,7 @@ pub fn rehydrate<'a>(ws: &Workspace, results: impl IntoIterator<Item = (&'a str,
         (!rel.is_empty() && tag.len() == 4 && tag.bytes().all(|b| b.is_ascii_hexdigit()))
             .then(|| (rel.to_owned(), tag.to_ascii_uppercase()))
     }
-    let mut found: BTreeMap<(String, String), (bool, Vec<(usize, usize)>)> = BTreeMap::new();
+    let mut found: BTreeMap<(String, String), SeenFile> = BTreeMap::new();
     for (tool, text) in results {
         if !matches!(tool, "read" | "edit" | "write") {
             continue;

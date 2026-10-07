@@ -312,6 +312,9 @@ impl Tool for LspTool {
             Err(_) => false,
         }
     }
+    fn may_modify_workspace(&self, _args: &Value) -> bool {
+        false
+    }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         match self.run(ctx.workspace, args) {

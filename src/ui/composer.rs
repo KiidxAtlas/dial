@@ -33,7 +33,8 @@ const MIN_BOX_WIDTH: usize = 8;
 const MAX_NAME_COLUMN: usize = 24;
 const MAX_ARGS_COLUMN: usize = 20;
 /// App-level shortcuts the composer reports instead of handling.
-const APP_ACTIONS: [Action; 10] = [
+const APP_ACTIONS: [Action; 11] = [
+    Action::CommandPalette,
     Action::ModelSelect,
     Action::ModelRoles,
     Action::ProviderSetup,
@@ -1349,11 +1350,9 @@ fn render_list(
         0
     };
     let max_start = total.saturating_sub(rows);
-    let thumb_start = if max_start == 0 {
-        0
-    } else {
-        (start * (rows - thumb_len) + max_start / 2) / max_start
-    };
+    let thumb_start = (start * (rows - thumb_len) + max_start / 2)
+        .checked_div(max_start)
+        .unwrap_or(0);
     (0..rows)
         .map(|r| {
             let index = start + r;
@@ -1498,7 +1497,7 @@ fn rank(commands: &[CommandEntry], query: &str) -> Vec<Match> {
             ))
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
     scored.into_iter().map(|(_, m)| m).collect()
 }
 
@@ -1587,6 +1586,145 @@ mod tests {
     fn event(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
     }
+
+    #[test]
+    fn shared_workers_and_session_rail_render_with_an_editable_composer() {
+        use crate::runtime::{Phase as ResultPhase, Tree};
+        use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
+        let mut env = Env::new();
+        env.status.phase = Phase::Working;
+        let mut composer = Composer::new(Vec::new(), 100);
+        composer.set_draft("Make the header spacing tighter");
+        let tree = Tree::default();
+        let active = tree.start("worker", "Inspect visuals", None);
+        active.progress("generating", 2);
+        active.append("Checking the rendered header and navigation");
+        let done = tree.start("worker", "Review styles", None);
+        done.settle(
+            "Found the spacing rule in app.css".into(),
+            Some(serde_json::json!({"steps":3})),
+            ResultPhase::Done,
+        );
+        let files = vec![
+            super::super::rail::FileDiff {
+                path: "app/components/Header.vue".into(),
+                added: Some(12),
+                removed: Some(4),
+                ..Default::default()
+            },
+            super::super::rail::FileDiff {
+                path: "app/assets/app.css".into(),
+                added: Some(6),
+                removed: Some(2),
+                ..Default::default()
+            },
+            super::super::rail::FileDiff {
+                path: "screenshots/header.png".into(),
+                untracked: true,
+                ..Default::default()
+            },
+        ];
+        let mut rows = super::super::rail::session(
+            "abcdef123",
+            "Polish the site header",
+            &files,
+            110,
+            4,
+            &env.theme,
+        );
+        rows.extend(super::super::rail::workers(
+            &tree.snapshots(),
+            110,
+            4,
+            0,
+            &env.theme,
+        ));
+        rows.extend(composer.view(110, &env.ctx()).rows);
+        let height = rows.len() as u16;
+        let mut terminal = Terminal::new(TestBackend::new(110, height)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(rows.clone()), frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        for expected in [
+            "+12",
+            "3 changed files",
+            "step 2",
+            "generating",
+            "Make the header spacing tighter",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        if let Ok(path) = std::env::var("DIAL_TEST_EXECUTION_CAPTURE") {
+            let cells = buffer.content.iter().map(|cell|serde_json::json!({"symbol":cell.symbol(),"fg":format!("{:?}",cell.fg),"bg":format!("{:?}",cell.bg)})).collect::<Vec<_>>();
+            std::fs::write(
+                path,
+                serde_json::json!({"width":110,"height":height,"cells":cells}).to_string(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn local_model_progress_preserves_the_draft_and_renders_all_stages() {
+        use crate::llm::{InferencePhase, ModelProgress};
+        use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
+        let mut env = Env::new();
+        env.status.phase = Phase::Working;
+        let mut composer = Composer::new(Vec::new(), 100);
+        composer.set_draft("Keep this draft while the model runs");
+        let mut terminal = Terminal::new(TestBackend::new(110, 15)).unwrap();
+        let mut stages = Vec::new();
+        for phase in [
+            InferencePhase::Loading,
+            InferencePhase::Processing,
+            InferencePhase::Generating,
+        ] {
+            let mut progress = ModelProgress::new(phase);
+            if phase == InferencePhase::Processing {
+                progress.processed_tokens = Some(2048);
+                progress.prompt_tokens = Some(6000);
+            }
+            if phase == InferencePhase::Generating {
+                progress.output_tokens = Some(128);
+                progress.tokens_per_second = Some(31.2);
+            }
+            env.status.model_progress = Some(progress);
+            let view = composer.view(110, &env.ctx());
+            let text = view
+                .rows
+                .iter()
+                .flat_map(|r| r.spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect::<String>();
+            assert!(text.contains("Keep this draft"));
+            stages.push(view.rows);
+        }
+        terminal
+            .draw(|frame| {
+                for (index, rows) in stages.iter().enumerate() {
+                    frame.render_widget(
+                        Paragraph::new(rows.clone()),
+                        ratatui::layout::Rect::new(0, index as u16 * 5, 110, 5),
+                    );
+                }
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        if let Ok(path) = std::env::var("DIAL_TEST_PROGRESS_CAPTURE") {
+            let cells=buffer.content.iter().map(|cell|serde_json::json!({"symbol":cell.symbol(),"fg":format!("{:?}",cell.fg),"bg":format!("{:?}",cell.bg),"modifiers":format!("{:?}",cell.modifier)})).collect::<Vec<_>>();
+            std::fs::write(
+                path,
+                serde_json::json!({"width":110,"height":15,"cells":cells}).to_string(),
+            )
+            .unwrap();
+        }
+    }
     fn key(c: &mut Composer, env: &Env, code: KeyCode, mods: KeyModifiers) -> ComposerEvent {
         c.handle_key(event(code, mods), &env.ctx())
     }
@@ -1611,6 +1749,34 @@ mod tests {
     }
     fn composer() -> Composer {
         Composer::new(vec!["older prompt".into(), "recent prompt".into()], 100)
+    }
+
+    #[test]
+    fn action_palette_shortcuts_preserve_pasted_drafts_and_the_running_queue() {
+        for busy in [false, true] {
+            let env = Env::new();
+            let mut composer = composer();
+            composer.busy = busy;
+            composer.set_draft("日本語 draft\n");
+            composer.handle_paste(&"long pasted reference\n".repeat(20));
+            composer.queued.push_back(("next request".into(), true));
+            let draft = composer.draft();
+            let pastes = composer.pastes.clone();
+            let cursor = composer.editor.cursor;
+            for (code, modifiers) in [
+                (KeyCode::Char('p'), KeyModifiers::CONTROL),
+                (KeyCode::Char('k'), KeyModifiers::ALT),
+            ] {
+                assert!(matches!(
+                    key(&mut composer, &env, code, modifiers),
+                    ComposerEvent::Action(Action::CommandPalette)
+                ));
+                assert_eq!(composer.draft(), draft);
+                assert_eq!(composer.editor.cursor, cursor);
+                assert_eq!(composer.pastes, pastes);
+                assert_eq!(composer.queued.back(), Some(&("next request".into(), true)));
+            }
+        }
     }
 
     fn cmd(name: &str, desc: &str, kind: CommandKind) -> CommandEntry {
@@ -2880,6 +3046,51 @@ mod tests {
         assert_eq!(c.draft(), "one\ntwo\nthree");
         key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
         assert_eq!(c.history().len(), 0);
+    }
+
+    #[test]
+    fn guarded_raw_paste_never_submits_or_steers_an_active_turn() {
+        let env = Env::new();
+        for busy in [false, true] {
+            let mut c = Composer::new(vec![], 10);
+            c.set_busy(busy);
+            let mut guard = crate::ui::input::PasteGuard::default();
+            let now = std::time::Instant::now();
+            for ch in "first line\nsecond line\n".chars() {
+                let code = if ch == '\n' {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Char(ch)
+                };
+                let key = KeyEvent::new(code, KeyModifiers::NONE);
+                let event = if let Some(text) = guard.text_for_key(key, true, now) {
+                    c.handle_paste(text);
+                    ComposerEvent::None
+                } else {
+                    c.handle_key(key, &env.ctx())
+                };
+                assert_eq!(event, ComposerEvent::None);
+            }
+            assert_eq!(c.draft(), "first line\nsecond line\n");
+            assert!(c.history().is_empty());
+            assert!(c.take_steering().is_empty());
+            assert!(c.take_follow_up().is_none());
+            let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                guard.text_for_key(enter, false, now + std::time::Duration::from_secs(1)),
+                None
+            );
+            let event = c.handle_key(enter, &env.ctx());
+            if busy {
+                assert_eq!(event, ComposerEvent::None);
+                assert_eq!(c.take_steering(), vec!["first line\nsecond line\n"]);
+            } else {
+                assert_eq!(
+                    event,
+                    ComposerEvent::Submit("first line\nsecond line\n".into())
+                );
+            }
+        }
     }
 
     // ---- slash menu -------------------------------------------------------------------------

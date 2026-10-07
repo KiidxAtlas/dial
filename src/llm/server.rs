@@ -1,4 +1,4 @@
-//! Supervision of a persistent `python -m mlx_lm.server` (mlx-lm 0.32.0).
+//! Supervision of a persistent local MLX server: MLX-LM for text, MLX-VLM for vision.
 //!
 //! The server listens on loopback only, runs in its own process group, and is
 //! killed (group and all) on `stop()` or drop. Model and adapter are fixed at
@@ -159,8 +159,10 @@ pub struct ModelServer {
     process: Supervised,
     base_url: String,
     model: String,
+    vision: bool,
     adapter: Option<PathBuf>,
     steering: Option<crate::steering::Specification>,
+    tracking: Option<crate::storage::process_record::Record>,
 }
 
 enum Failure {
@@ -195,6 +197,7 @@ impl ModelServer {
             startup_timeout_secs,
             interrupt,
             None,
+            None,
         )
     }
 
@@ -205,6 +208,7 @@ impl ModelServer {
         startup_timeout_secs: u64,
         interrupt: Option<Arc<AtomicBool>>,
         steering: Option<&crate::steering::Specification>,
+        context: Option<&crate::config::types::Config>,
     ) -> Result<ModelServer> {
         ensure!(python.is_absolute(), "python path must be absolute");
         ensure!(!model.is_empty(), "model must not be empty");
@@ -217,13 +221,16 @@ impl ModelServer {
         for _ in 0..PORT_ATTEMPTS {
             let port = free_port()?;
             match launch(
-                python,
-                model,
-                adapter,
+                ServerProfile {
+                    python,
+                    model,
+                    adapter,
+                    steering,
+                    context,
+                },
                 port,
                 deadline,
                 interrupt.clone(),
-                steering,
             ) {
                 Ok(server) => return Ok(server),
                 Err(Failure::PortTaken(error)) => last_race = Some(error),
@@ -235,8 +242,20 @@ impl ModelServer {
         )
     }
 
+    pub fn matches_profile(&self, steering: Option<&crate::steering::Specification>) -> bool {
+        self.steering.as_ref() == steering
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub fn request_model(&self) -> &str {
+        if self.vision {
+            &self.model
+        } else {
+            SERVER_MODEL
+        }
     }
 
     /// Whether this server serves exactly `model` with exactly `adapter`.
@@ -249,9 +268,26 @@ impl ModelServer {
         !self.process.stopped && matches!(self.process.exited(), Ok(false))
     }
 
+    pub fn ready_for(
+        &self,
+        model: &str,
+        adapter: Option<&Path>,
+        steering: Option<&crate::steering::Specification>,
+    ) -> bool {
+        self.matches(model, adapter) && self.steering.as_ref() == steering && self.is_running()
+    }
+
     /// Kill the whole process group and reap the server. Idempotent.
     pub fn stop(&mut self) {
         self.process.stop();
+        self.tracking.take();
+    }
+
+    pub fn phase(&mut self, phase: &str) -> Result<()> {
+        if let Some(record) = &mut self.tracking {
+            record.phase(phase)?;
+        }
+        Ok(())
     }
 }
 
@@ -297,11 +333,47 @@ pub fn ensure_profile_controlled<'a>(
     interrupt: Option<Arc<AtomicBool>>,
     steering: Option<&crate::steering::Specification>,
 ) -> Result<&'a ModelServer> {
-    let reusable = slot.as_ref().is_some_and(|server| {
-        server.matches(model, adapter)
-            && server.steering.as_ref() == steering
-            && server.is_running()
-    });
+    ensure_profile_tracked(
+        slot,
+        ServerProfile {
+            python,
+            model,
+            adapter,
+            steering,
+            context: None,
+        },
+        startup_timeout_secs,
+        interrupt,
+    )?;
+    slot.as_ref().context("model server slot is empty")
+}
+
+/// Immutable model identity and optional steering/process-tracking configuration.
+#[derive(Clone, Copy)]
+pub struct ServerProfile<'a> {
+    pub python: &'a Path,
+    pub model: &'a str,
+    pub adapter: Option<&'a Path>,
+    pub steering: Option<&'a crate::steering::Specification>,
+    pub context: Option<&'a crate::config::types::Config>,
+}
+
+pub fn ensure_profile_tracked<'a>(
+    slot: &'a mut Option<ModelServer>,
+    profile: ServerProfile<'_>,
+    startup_timeout_secs: u64,
+    interrupt: Option<Arc<AtomicBool>>,
+) -> Result<&'a mut ModelServer> {
+    let ServerProfile {
+        python,
+        model,
+        adapter,
+        steering,
+        context,
+    } = profile;
+    let reusable = slot
+        .as_ref()
+        .is_some_and(|server| server.ready_for(model, adapter, steering));
     if !reusable {
         drop(slot.take());
         *slot = Some(ModelServer::start_profile(
@@ -311,9 +383,10 @@ pub fn ensure_profile_controlled<'a>(
             startup_timeout_secs,
             interrupt,
             steering,
+            context,
         )?);
     }
-    slot.as_ref().context("model server slot is empty")
+    slot.as_mut().context("model server slot is empty")
 }
 
 /// Ask the OS for a free loopback port. The listener is dropped before the
@@ -328,14 +401,19 @@ fn free_port() -> Result<u16> {
 }
 
 fn launch(
-    python: &Path,
-    model: &str,
-    adapter: Option<&Path>,
+    profile: ServerProfile<'_>,
     port: u16,
     deadline: Instant,
     interrupt: Option<Arc<AtomicBool>>,
-    steering: Option<&crate::steering::Specification>,
 ) -> std::result::Result<ModelServer, Failure> {
+    let ServerProfile {
+        python,
+        model,
+        adapter,
+        steering,
+        context,
+    } = profile;
+    let vision = llm::catalog::local_model_metadata(Path::new(model)).vision == Some(true);
     let mut command = Command::new(python);
     // `--opt=value` keeps a value that starts with `-` from being read as a flag.
     command
@@ -345,7 +423,10 @@ fn launch(
         .arg("--host=127.0.0.1")
         .arg(format!("--port={port}"))
         .arg("--log-level=WARNING");
-    if let Some(bytes) = prompt_cache_bytes() {
+    if vision {
+        command.arg("--vision-cache-size=1").arg("--max-num-seqs=1");
+        command.env("APC_ENABLED", "0");
+    } else if let Some(bytes) = prompt_cache_bytes() {
         command.arg(format!("--prompt-cache-bytes={bytes}"));
     }
     if let Some(adapter) = adapter {
@@ -354,6 +435,11 @@ fn launch(
         command.arg(flag);
     }
     let mut child = command
+        .env(
+            "DIAL_MODEL_ENGINE",
+            if vision { "mlx-vlm" } else { "mlx-lm" },
+        )
+        .env("DIAL_PARENT_PID", std::process::id().to_string())
         .env(
             "DIAL_STEERING_SPEC",
             steering
@@ -367,26 +453,54 @@ fn launch(
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
-        .context("starting mlx_lm.server")
+        .context("starting local MLX server")
         .map_err(Failure::Fatal)?;
     let stderr = child.stderr.take();
     let mut process = Supervised {
         child,
         stopped: false,
     };
+    let mut tracking = context
+        .map(|config| {
+            crate::storage::process_record::Record::new(
+                &config.user_dir,
+                process.child.id(),
+                "models",
+                model,
+                &config.project_root,
+                &config.state_dir,
+                "loading",
+            )
+        })
+        .transpose()
+        .map_err(Failure::Fatal)?;
     let tail =
         collect_stderr(stderr.ok_or_else(|| Failure::Fatal(anyhow!("missing server stderr")))?);
     let base_url = format!("http://127.0.0.1:{port}");
 
-    let outcome = wait_ready(&mut process, &base_url, &tail, deadline, interrupt);
+    let outcome = wait_ready(
+        &mut process,
+        &base_url,
+        &tail,
+        deadline,
+        interrupt,
+        if vision { model } else { SERVER_MODEL },
+    );
     match outcome {
-        Ok(()) => Ok(ModelServer {
-            process,
-            base_url,
-            model: model.to_string(),
-            adapter: adapter.map(Path::to_path_buf),
-            steering: steering.cloned(),
-        }),
+        Ok(()) => {
+            if let Some(record) = &mut tracking {
+                record.phase("loaded").map_err(Failure::Fatal)?;
+            }
+            Ok(ModelServer {
+                process,
+                base_url,
+                model: model.to_string(),
+                vision,
+                adapter: adapter.map(Path::to_path_buf),
+                steering: steering.cloned(),
+                tracking,
+            })
+        }
         Err(error) => {
             process.stop();
             settle_stderr(&tail);
@@ -411,6 +525,7 @@ fn wait_ready(
     tail: &Mutex<Tail>,
     deadline: Instant,
     interrupt: Option<Arc<AtomicBool>>,
+    model: &str,
 ) -> Result<()> {
     let models_url = format!("{base_url}/v1/models");
     loop {
@@ -453,9 +568,11 @@ fn wait_ready(
         seed: None,
     };
     if let Err(error) = llm::chat_at_controlled(
-        &llm::completions_url(base_url),
-        None,
-        SERVER_MODEL,
+        llm::Endpoint {
+            url: &llm::completions_url(base_url),
+            auth: None,
+            model,
+        },
         &warmup,
         remaining,
         interrupt.clone(),
@@ -505,6 +622,7 @@ if mode == "never-ready":
     import time
     time.sleep(300)
 helper = subprocess.Popen(["sleep", "300"])
+marker = os.path.join(mode, "info.json") if os.path.isdir(mode) else mode
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def reply(self, code, payload):
@@ -516,15 +634,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.reply(200, {"object": "list", "data": []})
     def do_POST(self):
-        self.rfile.read(int(self.headers["Content-Length"]))
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if mode == "bad-model":
             self.reply(500, {"error": "adapter config is broken"})
         else:
+            with open(marker) as f: info = json.load(f)
+            info.setdefault("requests", []).append(body)
+            with open(marker, "w") as f: json.dump(info, f)
             self.reply(200, {"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "pong"}}],
                              "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
 server = http.server.ThreadingHTTPServer((opts["--host"], int(opts["--port"])), Handler)
 if mode != "bad-model":
-    open(mode, "w").write(json.dumps({"pid": os.getpid(), "child": helper.pid, "argv": sys.argv[1:]}))
+    open(marker, "w").write(json.dumps({"pid": os.getpid(), "child": helper.pid, "argv": sys.argv[1:], "engine": os.environ.get("DIAL_MODEL_ENGINE"), "apc": os.environ.get("APC_ENABLED")}))
 server.serve_forever()
 "#;
 
@@ -533,6 +654,50 @@ server.serve_forever()
         fs::write(&path, FAKE_SERVER).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn tracked_server_exposes_model_phase_and_cleans_up_on_stop() {
+        if crate::learn::processes::live_inspection_unavailable() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let python = fake_python(root.path());
+        let model_path = root.path().join("model-one");
+        let model = model_path.to_str().unwrap();
+        let config = crate::config::types::Config {
+            user_dir: root.path().join("user"),
+            state_dir: root.path().join("state"),
+            project_root: root.path().join("project"),
+            ..Default::default()
+        };
+        let mut slot = None;
+        let server = ensure_profile_tracked(
+            &mut slot,
+            ServerProfile {
+                python: &python,
+                model,
+                adapter: None,
+                steering: None,
+                context: Some(&config),
+            },
+            30,
+            None,
+        )
+        .unwrap();
+        server.phase("generating").unwrap();
+        let rows = crate::learn::processes::snapshot(&config.user_dir).unwrap();
+        let row = rows.iter().find(|row| row["model"] == model).unwrap();
+        assert_eq!(row["phase"], "generating");
+        assert_eq!(row["project"], json!(config.project_root));
+        let pid = row["pid"].clone();
+        server.stop();
+        assert!(
+            !crate::learn::processes::snapshot(&config.user_dir)
+                .unwrap()
+                .iter()
+                .any(|row| row["pid"] == pid)
+        );
     }
 
     fn alive(pid: i64) -> bool {

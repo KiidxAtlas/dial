@@ -55,7 +55,7 @@ impl Finish {
 pub fn schema() -> Value {
     json!({"type":"function","function":{
         "name":"finish",
-        "description":"End the current turn. completed requires all todos to be completed or abandoned and no live tasks still running. blocked means a concrete missing prerequisite prevents further work; needs_input asks the user a specific question. Both require reason and leave todos open. Use as the last call in a batch. Never claim completed for promised or unverified work.",
+        "description":"Request the end of the current turn. completed requires all todos to be completed or abandoned and no live tasks still running. A review-pending response continues the turn: inspect the supplied diff and requested evidence, then call finish again. blocked means a concrete missing prerequisite prevents further work; needs_input asks the user a specific question. Both require reason and leave todos open. Use as the last call in a batch. Never claim completed for promised or unverified work.",
         "parameters":{"type":"object","properties":{
             "outcome":{"type":"string","enum":["completed","blocked","needs_input"]},
             "summary":{"type":"string","minLength":1,"maxLength":8192},

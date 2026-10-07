@@ -126,30 +126,10 @@ impl Seg {
             return;
         }
         part.text = match part.shrink {
-            Some(Shrink::Head) => ellipsize_start(&part.text, target, ascii),
+            Some(Shrink::Head) => text::ellipsize_start(&part.text, target, ascii),
             _ => text::ellipsize(&part.text, target, ascii),
         };
     }
-}
-
-fn ellipsize_start(value: &str, max: usize, ascii: bool) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
-    if text::width(value) <= max {
-        return value.to_owned();
-    }
-    let mark = if ascii { "..." } else { "…" };
-    let room = max.saturating_sub(text::width(mark));
-    let mut kept: Vec<&str> = Vec::new();
-    let mut used = 0;
-    for grapheme in value.graphemes(true).rev() {
-        used += text::width(grapheme);
-        if used > room {
-            break;
-        }
-        kept.push(grapheme);
-    }
-    kept.reverse();
-    format!("{mark}{}", kept.concat())
 }
 
 fn canonical(name: &str) -> Option<(&'static str, u8)> {
@@ -221,7 +201,9 @@ impl Env<'_> {
                     return None;
                 }
                 let frame = self.theme.spinner(data.tick);
-                let activity = text::one_line(&data.activity);
+                let activity = data
+                    .model_activity()
+                    .unwrap_or_else(|| text::one_line(&data.activity));
                 let mut label = frame.to_owned();
                 if !activity.trim().is_empty() {
                     label.push_str(&format!(" {}", activity.trim()));
@@ -229,7 +211,17 @@ impl Env<'_> {
                 if data.elapsed_secs.is_finite() && data.elapsed_secs >= 0.0 {
                     label.push_str(&format!(" {}", elapsed(data.elapsed_secs)));
                 }
-                self.seg(name, importance, vec![Some(self.part(label, Tok::Success))])
+                let part = if data.model_progress.is_some() {
+                    self.shrinkable(label, Tok::Success, Shrink::Tail)
+                } else {
+                    self.part(label, Tok::Success)
+                };
+                let importance = if data.model_progress.is_some() {
+                    95
+                } else {
+                    importance
+                };
+                self.seg(name, importance, vec![Some(part)])
             }
             "model" => {
                 let model = text::one_line(&data.model);
@@ -342,13 +334,15 @@ impl Env<'_> {
             }
             "context" => Some(self.context(importance)),
             "tokens" => {
-                if data.output_tokens == 0 {
+                let (tokens, estimated) = data.live_output_tokens();
+                if tokens == 0 {
                     return None;
                 }
                 let label = format!(
-                    "{}{}",
+                    "{}{}{}",
                     self.theme.sym(Sym::ArrowDown),
-                    human(data.output_tokens)
+                    if estimated { "~" } else { "" },
+                    human(tokens)
                 );
                 self.seg(
                     name,
@@ -361,14 +355,24 @@ impl Env<'_> {
             }
             "rate" => {
                 let rate = data
-                    .tokens_per_second
+                    .live_tokens_per_second()
                     .filter(|r| r.is_finite() && *r > 0.0)?;
                 self.seg(
                     name,
                     importance,
                     vec![
                         self.icon(Sym::IconRate, Tok::StatusRate, ""),
-                        Some(self.part(format!("{rate:.1} tok/s"), Tok::StatusRate)),
+                        Some(self.part(
+                            format!(
+                                "{}{rate:.1} tok/s",
+                                if data.model_progress.as_ref().is_some_and(|p| p.estimated) {
+                                    "~"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            Tok::StatusRate,
+                        )),
                     ],
                 )
             }
@@ -667,7 +671,11 @@ fn fit(left: &mut Vec<Seg>, right: &mut Vec<Seg>, avail: usize, sep: usize, asci
         avail,
         sep,
         ascii,
-        &[("path", PATH_FLOOR), ("model", MODEL_FLOOR)],
+        &[
+            ("path", PATH_FLOOR),
+            ("model", MODEL_FLOOR),
+            ("spinner", 24),
+        ],
     );
     while needed(left, right, sep) > avail && drop_least_important(left, right, true, u8::MAX) {}
     shrink_texts(
@@ -882,6 +890,53 @@ mod tests {
         StatusSeparator::None,
         StatusSeparator::Ascii,
     ];
+
+    #[test]
+    fn local_progress_shows_stages_live_tokens_and_rates_in_the_default_composer() {
+        use crate::llm::{InferencePhase, ModelProgress};
+        let mut progress = ModelProgress::new(InferencePhase::Loading);
+        let mut data = StatusData {
+            phase: Phase::Working,
+            model_progress: Some(progress.clone()),
+            ..data()
+        };
+        assert!(plain(&render(&UiConfig::default(), &data, 110)).contains("loading model"));
+        progress.phase = InferencePhase::Processing;
+        progress.prompt_tokens = Some(6000);
+        progress.processed_tokens = Some(2048);
+        data.model_progress = Some(progress.clone());
+        assert!(
+            plain(&render(&UiConfig::default(), &data, 110)).contains("2048/6000 tokens (34%)")
+        );
+        progress.phase = InferencePhase::Generating;
+        progress.output_tokens = Some(128);
+        progress.tokens_per_second = Some(31.2);
+        data.model_progress = Some(progress.clone());
+        assert!(
+            plain(&render(&UiConfig::default(), &data, 110))
+                .contains("generating 128 tokens · 31.2 tok/s")
+        );
+        for width in [60, 80] {
+            let row = plain(&render(&UiConfig::default(), &data, width));
+            assert!(row.contains("generating 128"), "width {width}: {row}");
+        }
+        for width in 1..140 {
+            assert_eq!(
+                render(&UiConfig::default(), &data, width).width(),
+                width as usize
+            );
+        }
+        data.output_tokens = 100;
+        assert_eq!(data.live_output_tokens(), (228, false));
+        progress.estimated = true;
+        data.model_progress = Some(progress);
+        assert!(
+            plain(&render(&UiConfig::default(), &data, 110))
+                .contains("generating ~128 tokens · ~31.2 tok/s")
+        );
+        data.model_progress = None;
+        assert_eq!(data.live_output_tokens(), (100, false));
+    }
 
     #[test]
     fn thinking_is_visible_in_presets_and_fits_narrow_terminals() {

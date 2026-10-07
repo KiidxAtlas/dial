@@ -195,7 +195,9 @@ pub fn candidates(
     if evidence.investigation_trajectories >= 3 {
         let mut harness = active.clone();
         mutate::push_note(&mut harness, INVESTIGATION_NOTE);
-        harness.max_steps = (active.max_steps.saturating_mul(3) / 4).clamp(8, 64);
+        if active.max_steps != 0 {
+            harness.max_steps = (active.max_steps.saturating_mul(3) / 4).clamp(8, 64);
+        }
         options.push(Candidate {
             name: "bounded_investigation",
             rationale: format!("{}/{} active-version trajectories made at least eight investigation calls and twice as many investigation as other calls: test focused evidence reuse with max_steps {} -> {}; correctness must not regress", evidence.investigation_trajectories, evidence.trajectories, active.max_steps, harness.max_steps),
@@ -467,6 +469,15 @@ mod tests {
         assert_eq!(options[0].harness.temperature, 0.0);
         assert_eq!(options[1].harness.edit_mode, Some(EditModeConfig::Replace));
         assert_eq!(options[2].harness.max_steps, 30);
+        let unlimited = Harness {
+            max_steps: 0,
+            ..harness.clone()
+        };
+        assert!(
+            candidates(&unlimited, &ctx, &evidence(), 8)
+                .iter()
+                .all(|c| c.harness.max_steps == 0)
+        );
         assert!(
             options
                 .iter()

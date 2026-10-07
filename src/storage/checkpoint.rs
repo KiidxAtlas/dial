@@ -11,6 +11,7 @@
 use super::memory::atomic_write;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use similar::{Algorithm, ChangeTag, TextDiff};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -161,6 +162,118 @@ impl Checkpoints {
         paths.sort();
         paths.dedup();
         paths
+    }
+    /// Render the source delta captured by this turn's first-write checkpoints.
+    /// The output is bounded and reports paths that need manual inspection.
+    pub fn review_diff(&self, turn: u64) -> Result<String> {
+        use std::fmt::Write as _;
+        const MAX_REVIEW_BYTES: usize = 24 * 1024;
+        const MAX_PATH_LIST_BYTES: usize = 4 * 1024;
+        const TRUNCATED: &str =
+            "\n[Diff review truncated; inspect remaining changed files manually.]\n";
+        let inner = self.lock();
+        let manifest = inner
+            .current
+            .as_ref()
+            .filter(|manifest| manifest.turn == turn)
+            .context("no matching checkpoint turn")?;
+        let base = turn_dir(&self.dir, turn);
+        let mut output = String::new();
+        let mut entries = manifest.entries.iter().enumerate().collect::<Vec<_>>();
+        entries.sort_by(|(_, left), (_, right)| left.rel.cmp(&right.rel));
+        output.push_str("Changed files in this turn:\n");
+        let mut omitted_paths = 0;
+        for (_, entry) in &entries {
+            if output.len() + entry.rel.len() + 3 <= MAX_PATH_LIST_BYTES - 64 {
+                let _ = writeln!(output, "- {}", entry.rel);
+            } else {
+                omitted_paths += 1;
+            }
+        }
+        let skipped_suffix = " (checkpoint unavailable; inspect manually)";
+        for path in &manifest.skipped {
+            if output.len() + path.len() + skipped_suffix.len() + 3 <= MAX_PATH_LIST_BYTES - 64 {
+                let _ = writeln!(output, "- {path}{skipped_suffix}");
+            } else {
+                omitted_paths += 1;
+            }
+        }
+        if omitted_paths > 0 {
+            let _ = writeln!(
+                output,
+                "[{omitted_paths} additional paths omitted from list]"
+            );
+        }
+        for (index, entry) in entries {
+            if output.len() + TRUNCATED.len() + entry.rel.len() + 12 > MAX_REVIEW_BYTES {
+                output.push_str(TRUNCATED);
+                break;
+            }
+            const PRIVATE_NOTICE: &str = "[sensitive or private path; content omitted]\n";
+            if !crate::storage::experience::safe_path(&entry.rel) {
+                if output.len() + PRIVATE_NOTICE.len() + TRUNCATED.len() > MAX_REVIEW_BYTES {
+                    output.push_str(TRUNCATED);
+                    break;
+                }
+                output.push_str(PRIVATE_NOTICE);
+                continue;
+            }
+            let before = if entry.existed {
+                Some(fs::read(base.join("files").join(index.to_string()))?)
+            } else {
+                None
+            };
+            let (target, _) = self.resolve(&self.root.join(&entry.rel))?;
+            let after = match fs::read(&target) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if before == after {
+                continue;
+            }
+            let _ = writeln!(output, "\n--- {} ---", entry.rel);
+            let text_before = before.as_deref().unwrap_or_default();
+            let text_after = after.as_deref().unwrap_or_default();
+            let (Ok(text_before), Ok(text_after)) = (
+                std::str::from_utf8(text_before),
+                std::str::from_utf8(text_after),
+            ) else {
+                const BINARY_NOTICE: &str = "[binary file change; inspect with read]\n";
+                if output.len() + BINARY_NOTICE.len() + TRUNCATED.len() > MAX_REVIEW_BYTES {
+                    output.push_str(TRUNCATED);
+                    return Ok(output);
+                }
+                output.push_str(BINARY_NOTICE);
+                continue;
+            };
+            let diff = TextDiff::configure()
+                .algorithm(Algorithm::Myers)
+                .timeout(std::time::Duration::from_millis(200))
+                .diff_lines(text_before, text_after);
+            for change in diff.iter_all_changes() {
+                if change.tag() == ChangeTag::Equal {
+                    continue;
+                }
+                let prefix = if change.tag() == ChangeTag::Delete {
+                    '-'
+                } else {
+                    '+'
+                };
+                let line = change.value();
+                let added_bytes = 1 + line.len() + usize::from(!line.ends_with('\n'));
+                if output.len() + added_bytes + TRUNCATED.len() > MAX_REVIEW_BYTES {
+                    output.push_str(TRUNCATED);
+                    return Ok(output);
+                }
+                output.push(prefix);
+                output.push_str(line);
+                if !line.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+        }
+        Ok(output)
     }
 
     /// Capture exact scoped source states for executable repair evidence. Unlike `changed_files`,
@@ -569,6 +682,64 @@ mod tests {
         assert_eq!(removed[0].after_sha256, None);
         assert_eq!(removed[0].after_ref, None);
         assert!(checkpoint.repair_changes(turn + 1).is_err());
+    }
+
+    #[test]
+    fn review_diff_covers_modified_created_and_deleted_files() {
+        let fixture = Fixture::new();
+        fixture.write("change.rs", "old line\n");
+        fixture.write("remove.rs", "remove me\n");
+        let checkpoint = fixture.open();
+        let turn = checkpoint.begin_turn("review").unwrap();
+        modify(&checkpoint, &fixture, "change.rs", "new line\n");
+        modify(&checkpoint, &fixture, "create.rs", "created\n");
+        checkpoint.before_write(&fixture.path("remove.rs")).unwrap();
+        fs::remove_file(fixture.path("remove.rs")).unwrap();
+
+        let review = checkpoint.review_diff(turn).unwrap();
+        assert!(review.contains("- change.rs\n- create.rs\n- remove.rs\n"));
+        assert!(review.contains("-old line\n+new line\n"));
+        assert!(
+            review.contains("--- create.rs ---\n+created\n"),
+            "{review:?}"
+        );
+        assert!(review.contains("--- remove.rs ---\n-remove me\n"));
+    }
+
+    #[test]
+    fn review_diff_never_includes_private_file_contents() {
+        let fixture = Fixture::new();
+        fixture.write(".env.local", "old-secret");
+        let checkpoint = fixture.open();
+        let turn = checkpoint.begin_turn("private edit").unwrap();
+        modify(&checkpoint, &fixture, ".env.local", "new-secret");
+
+        let review = checkpoint.review_diff(turn).unwrap();
+        assert!(review.contains(".env.local"));
+        assert!(review.contains("content omitted"));
+        assert!(!review.contains("old-secret") && !review.contains("new-secret"));
+    }
+
+    #[test]
+    fn review_diff_output_stays_within_its_byte_budget() {
+        let fixture = Fixture::new();
+        fixture.write("large.txt", "old\n");
+        let checkpoint = fixture.open();
+        let turn = checkpoint.begin_turn("large diff").unwrap();
+        modify(
+            &checkpoint,
+            &fixture,
+            "large.txt",
+            &"new line\n".repeat(4000),
+        );
+
+        let review = checkpoint.review_diff(turn).unwrap();
+        assert!(
+            review.len() <= 24 * 1024,
+            "review grew to {} bytes",
+            review.len()
+        );
+        assert!(review.contains("[Diff review truncated;"));
     }
 
     /// Mimic a tool: record, then mutate.

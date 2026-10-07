@@ -20,16 +20,19 @@ mod isolation;
 pub mod laya;
 mod live_tasks;
 pub mod output_schema;
+mod progress;
 pub mod prompt;
 mod reasoning;
 mod recovery_checkpoint;
 pub(crate) mod repair_evidence;
 pub mod solve;
+mod state_ui;
 pub mod subagents;
 mod task_packet;
 pub mod todo;
 mod training;
 mod verification;
+mod visual;
 pub use live_tasks::LiveTaskControl;
 
 use crate::{
@@ -75,10 +78,22 @@ pub enum Decision {
 }
 
 pub trait Ui {
+    fn runtime_tree(&self) -> Option<crate::runtime::Tree> {
+        None
+    }
+    fn runtime(&mut self, _tree: &crate::runtime::Tree) {}
+    /// Shared result body, delivered before its legacy display callback.
+    fn result_node(&mut self, _body: &crate::runtime::Body) {}
     fn text_delta(&mut self, _text: &str) {}
     fn tool_call(&mut self, _name: &str, _summary: &str) {}
     fn tool_result(&mut self, _name: &str, _output: &ToolOutput) {}
     fn notice(&mut self, _message: &str) {}
+    /// Internal bookkeeping (policy selection, index refresh). Defaults to a notice; the TUI keeps it out of the transcript.
+    fn diagnostic(&mut self, message: &str) {
+        self.notice(message);
+    }
+    /// Display an already-authorized image reference; plain/structured surfaces may omit previews.
+    fn image(&mut self, _reference: &Value) {}
     /// Effective request controls, for live status views; never a correctness claim.
     fn request_policy(&mut self, _control: &Value) {}
     /// Visible observer activity; never substituted for tool or verification results.
@@ -88,6 +103,7 @@ pub trait Ui {
     /// Context occupancy for display; estimates do not affect billing or compaction.
     fn context_usage(&mut self, _tokens: u64, _estimated: bool) {}
     fn usage(&mut self, _prompt: Option<u64>, _output: Option<u64>, _seconds: f64) {}
+    fn model_progress(&mut self, _progress: &llm::ModelProgress) {}
     fn tool_output(&mut self, _name: &str, _text: &str) {}
     fn background_notice(&mut self, _message: &str) {}
     fn reasoning_delta(&mut self, _text: &str) {}
@@ -134,6 +150,7 @@ pub struct NullUi;
 impl Ui for NullUi {}
 
 enum ChatEvent {
+    Progress(llm::ModelProgress),
     Text(String),
     Reasoning(String),
     ToolArguments {
@@ -175,6 +192,12 @@ fn chat_with_ui(
         ui.context_usage(tokens, true);
     }
     let (tx, rx) = mpsc::channel();
+    let mut progress = backend
+        .local_inference()
+        .then(progress::RequestProgress::new);
+    if let Some(progress) = &progress {
+        ui.model_progress(&progress.value);
+    }
     ui.model_wait(Duration::ZERO);
     thread::scope(|scope| {
         let worker = thread::Builder::new()
@@ -189,6 +212,9 @@ fn chat_with_ui(
                 };
                 let mut on_event = |event: &llm::StreamEvent| {
                     match event {
+                        llm::StreamEvent::Progress(value) => {
+                            let _ = tx.send(ChatEvent::Progress(value.clone()));
+                        }
                         llm::StreamEvent::Reasoning(text) => {
                             let _ = tx.send(ChatEvent::Reasoning(text.clone()));
                         }
@@ -238,8 +264,19 @@ fn chat_with_ui(
         let mut last_tick = Instant::now();
         let result = loop {
             match rx.recv_timeout(Duration::from_millis(80)) {
+                Ok(ChatEvent::Progress(value)) => {
+                    last_progress = Instant::now();
+                    if let Some(progress) = &mut progress {
+                        progress.observe(value, last_progress);
+                        ui.model_progress(&progress.value);
+                    }
+                }
                 Ok(ChatEvent::Text(text)) => {
                     last_progress = Instant::now();
+                    if let Some(progress) = &mut progress {
+                        progress.text(&text, last_progress);
+                        ui.model_progress(&progress.value);
+                    }
                     if render_text {
                         if let Some(context) = &mut context {
                             ui.context_usage(context.observe(&text), true);
@@ -253,6 +290,10 @@ fn chat_with_ui(
                 }
                 Ok(ChatEvent::Reasoning(text)) => {
                     last_progress = Instant::now();
+                    if let Some(progress) = &mut progress {
+                        progress.text(&text, last_progress);
+                        ui.model_progress(&progress.value);
+                    }
                     if render_text {
                         if let Some(context) = &mut context {
                             ui.context_usage(context.observe(&text), true);
@@ -267,6 +308,10 @@ fn chat_with_ui(
                     delta,
                 }) => {
                     last_progress = Instant::now();
+                    if let Some(progress) = &mut progress {
+                        progress.text(&delta, last_progress);
+                        ui.model_progress(&progress.value);
+                    }
                     if render_text {
                         if let Some(context) = &mut context {
                             ui.context_usage(context.observe(&delta), true);
@@ -275,6 +320,16 @@ fn chat_with_ui(
                     }
                 }
                 Ok(ChatEvent::Finished(result)) => {
+                    if let (Some(progress), Ok(reply)) = (&mut progress, &result) {
+                        if reply.completion_tokens.is_some() {
+                            let mut reported =
+                                llm::ModelProgress::new(llm::InferencePhase::Generating);
+                            reported.output_tokens = reply.completion_tokens;
+                            reported.prompt_tokens = reply.prompt_tokens;
+                            progress.observe(reported, Instant::now());
+                            ui.model_progress(&progress.value);
+                        }
+                    }
                     if let (Some(context), Ok(reply)) = (&context, &result) {
                         let (tokens, estimated) =
                             context.finish(reply.prompt_tokens, reply.completion_tokens);
@@ -304,6 +359,7 @@ fn chat_with_ui(
 
 fn interrupted_tool() -> ToolOutput {
     ToolOutput {
+        data: None,
         text: "interrupted by the user before this ran".into(),
         is_error: true,
     }
@@ -335,12 +391,14 @@ fn parallel_tools(
                         tool.call(&ToolContext { workspace, config }, &call.arguments)
                     } else {
                         ToolOutput {
+                            data: None,
                             text: "parallel tool unavailable".into(),
                             is_error: true,
                         }
                     }
                 }))
                 .unwrap_or_else(|_| ToolOutput {
+                    data: None,
                     text: "tool worker panicked".into(),
                     is_error: true,
                 });
@@ -353,6 +411,7 @@ fn parallel_tools(
                 receive_with_heartbeat(&rx, ui).unwrap_or_else(|error| {
                     (
                         ToolOutput {
+                            data: None,
                             text: format!("{error:#}"),
                             is_error: true,
                         },
@@ -505,6 +564,12 @@ struct PromptParts {
 #[derive(Default, Debug, serde::Serialize)]
 pub struct AgentMetrics {
     pub cached_tokens: u64,
+    /// Main-agent responses in this runtime; transport retries and workers are not included.
+    pub responses: u64,
+    pub usage_reported_responses: u64,
+    pub prompt_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
     pub compactions: u64,
     pub tool_contract_errors: u64,
@@ -520,21 +585,81 @@ pub struct AgentMetrics {
 /// Per-turn bookkeeping for what `todo done` checks at step boundaries.
 #[derive(Default)]
 struct StepChecks {
+    visual: visual::Review,
+    /// A successful finish call can request review without accepting the turn's outcome.
+    finish_accepted: bool,
     /// The checkpoint turn whose changed files the checks cover.
     turn: Option<u64>,
     /// Successful file edits this turn, and how many of them the last check run covered.
     mutations: u64,
     checked: u64,
-    /// Whether that last run failed.
+    /// Number of checkpointed edits whose bounded diff has been surfaced for review.
+    diff_surfaced: u64,
+    /// Non-read-only shell attempts outside checkpoint observation.
+    uncheckpointed_shell_commands: u64,
+    disclosed_shell_commands: u64,
+    /// Approval-requiring extension attempts that may have effects outside checkpoint observation.
+    uncheckpointed_extension_calls: u64,
+    disclosed_extension_calls: u64,
+    uncheckpointed_extension_tools: std::collections::BTreeSet<String>,
+    /// Exact configured checks whose most recent run failed; retain them across new edits.
+    failed_checks: Vec<verification::FocusedCheck>,
     failed: bool,
     /// A successful non-control tool call since the current step started (or since the turn began).
     evidence: bool,
+    /// A text-only answer emitted since this step began; not verification of edits or findings.
+    answer_delivered: bool,
 }
-
 impl StepChecks {
-    /// Every edit was covered by a passing check run, so turn-end verification would only repeat it.
     fn clean(&self) -> bool {
-        self.checked > 0 && self.checked == self.mutations && !self.failed
+        self.checked > 0
+            && self.checked == self.mutations
+            && !self.failed
+            && self.uncheckpointed_shell_commands == 0
+            && self.uncheckpointed_extension_calls == 0
+    }
+    fn uncheckpointed_pending(&self) -> bool {
+        self.uncheckpointed_shell_commands > self.disclosed_shell_commands
+            || self.uncheckpointed_extension_calls > self.disclosed_extension_calls
+    }
+    fn has_uncheckpointed_operations(&self) -> bool {
+        self.uncheckpointed_shell_commands > 0 || self.uncheckpointed_extension_calls > 0
+    }
+    fn include_failed_checks(&self, checks: &mut Vec<verification::FocusedCheck>) {
+        for failed in &self.failed_checks {
+            if !checks.iter().any(|check| check.command == failed.command) {
+                checks.push(failed.clone());
+            }
+        }
+    }
+    fn status(&self) -> Value {
+        let phase = if self.failed {
+            "checks_failed"
+        } else if self.uncheckpointed_pending() {
+            "uncheckpointed_operations_pending_review"
+        } else if self.has_uncheckpointed_operations() {
+            "uncheckpointed_operations_disclosed_not_verified"
+        } else if self.mutations == 0 {
+            "no_edits"
+        } else if self.checked < self.mutations {
+            "edited_unchecked"
+        } else if self.diff_surfaced < self.mutations {
+            "checks_passed_diff_surfaced_review_pending"
+        } else {
+            "checks_passed_diff_surfaced"
+        };
+        json!({
+            "phase":phase,
+            "mutations":self.mutations,
+            "checked_mutations":self.checked,
+            "diff_surfaced_mutations":self.diff_surfaced,
+            "uncheckpointed_shell_commands":self.uncheckpointed_shell_commands,
+            "disclosed_shell_commands":self.disclosed_shell_commands,
+            "uncheckpointed_extension_calls":self.uncheckpointed_extension_calls,
+            "disclosed_extension_calls":self.disclosed_extension_calls,
+            "uncheckpointed_extension_tools":self.uncheckpointed_extension_tools,
+            "failed_checks":self.failed_checks.iter().map(|check| &check.name).collect::<Vec<_>>()
+        })
     }
 }
 
@@ -588,6 +713,7 @@ pub struct Agent<'a> {
     step_probe: Option<crate::learn::probe::StepProbe>,
     enabled_tools: HashSet<String>,
     metrics: AgentMetrics,
+    usage_scope: llm::usage::Scope,
     workflow_metrics: std::cell::RefCell<crate::learn::workflow::Metrics>,
     workflow_started: Instant,
     task_policy: crate::learn::task_policy::Policy,
@@ -710,6 +836,7 @@ impl<'a> Agent<'a> {
             context_cap: None,
             enabled_tools: HashSet::new(),
             metrics: AgentMetrics::default(),
+            usage_scope: Default::default(),
             reasoning_recovery: reasoning::Recovery::default(),
             live_tasks: live_tasks::LiveTasks::default(),
             superseded: evidence::Supersession::default(),
@@ -758,7 +885,7 @@ impl<'a> Agent<'a> {
     ) -> Result<Self> {
         let mut version = version.clone();
         // Bound evaluation cost: a stuck candidate must fail, not run for an hour.
-        version.harness.max_steps = version.harness.max_steps.min(24);
+        version.harness.max_steps = version.harness.capped_steps(24);
         let legacy_memory_migrated =
             crate::config::types::migrate_memory_tools(&mut version.harness);
         config.validate_harness(&version.harness)?;
@@ -826,6 +953,7 @@ impl<'a> Agent<'a> {
             context_cap: None,
             enabled_tools: HashSet::new(),
             metrics: AgentMetrics::default(),
+            usage_scope: Default::default(),
             reasoning_recovery: reasoning::Recovery::default(),
             live_tasks: live_tasks::LiveTasks::default(),
             superseded: evidence::Supersession::default(),
@@ -986,9 +1114,13 @@ impl<'a> Agent<'a> {
     }
     /// The window to plan against: what is configured, limited by what the server really loaded.
     pub fn context_window(&self) -> u32 {
-        self.config
-            .context_window
-            .min(self.context_cap.unwrap_or(u32::MAX))
+        match self.context_cap {
+            Some(loaded) => self
+                .config
+                .requested_context_window()
+                .map_or(loaded, |limit| limit.min(loaded)),
+            None => self.config.context_window,
+        }
     }
     pub fn tool_names(&self) -> Vec<String> {
         self.offered()
@@ -1004,6 +1136,9 @@ impl<'a> Agent<'a> {
     }
     pub fn metrics(&self) -> &AgentMetrics {
         &self.metrics
+    }
+    pub fn usage(&self) -> (llm::usage::Groups, llm::usage::Groups) {
+        self.usage_scope.snapshot()
     }
 
     /// An isolated benchmark RPC child may compare an adapter without admitting it into a live store.
@@ -1316,6 +1451,15 @@ impl<'a> Agent<'a> {
                 &self.assistance.scores,
             );
         }
+        // Browser previews need a server that survives a tool call. Add bg after compacting so
+        // local models retain it too; exposing a tool starts no process and preserves opt-outs.
+        if names.iter().any(|name| name == "browser")
+            && catalog.iter().any(|name| name == "bg")
+            && !names.iter().any(|name| name == "bg")
+        {
+            names.push("bg".into());
+            names.sort();
+        }
         names
     }
 
@@ -1459,7 +1603,7 @@ impl<'a> Agent<'a> {
 
     /// One user message through to a final answer (or interruption / step limit).
     pub fn turn(&mut self, user_text: &str, ui: &mut dyn Ui) -> Result<TurnReport> {
-        self.turn_inner(user_text, ui, true)
+        self.turn_with_state(user_text, ui, true)
     }
     /// RPC admission already cleared its interrupt before enqueueing; preserve a subsequent abort.
     pub fn turn_preserving_interrupt(
@@ -1467,7 +1611,32 @@ impl<'a> Agent<'a> {
         user_text: &str,
         ui: &mut dyn Ui,
     ) -> Result<TurnReport> {
-        self.turn_inner(user_text, ui, false)
+        self.turn_with_state(user_text, ui, false)
+    }
+    fn turn_with_state(
+        &mut self,
+        user_text: &str,
+        ui: &mut dyn Ui,
+        reset_interrupt: bool,
+    ) -> Result<TurnReport> {
+        self.usage_scope = self.usage_scope.next_turn(subagents::MAX_STEPS);
+        if let Some(backend) = &mut self.backend {
+            backend.set_usage_scope(Some(self.usage_scope.clone()));
+        }
+        for backend in self.role_backends.values_mut() {
+            backend.set_usage_scope(Some(self.usage_scope.clone()));
+        }
+        let mut observed = state_ui::StateUi::new(ui, self.session.runtime(), None);
+        self.live_tasks.bind(self.session.runtime());
+        let result = self.turn_inner(user_text, &mut observed, reset_interrupt);
+        observed.finish(!result.as_ref().is_ok_and(|turn| !turn.interrupted));
+        match (result, self.session.flush_runtime()) {
+            (Err(error), Err(journal)) => {
+                Err(error.context(format!("execution journal also failed: {journal:#}")))
+            }
+            (result, Ok(())) => result,
+            (Ok(_), Err(journal)) => Err(journal),
+        }
     }
     fn turn_inner(
         &mut self,
@@ -1548,14 +1717,38 @@ impl<'a> Agent<'a> {
             .transpose()?;
         if !self.hermetic {
             let mut control = self.session.control_state();
-            control["reliability"] = json!({"stats":crate::reliability::Stats::default(),"verification":"no checks recorded this turn","interface":"standard","automatic_passing_checks":0,"automatic_failing_checks":0});
+            control["reliability"] = json!({
+                "stats":crate::reliability::Stats::default(),
+                "verification":"no checks recorded this turn",
+                "interface":"standard",
+                "automatic_passing_checks":0,
+                "automatic_failing_checks":0,
+                "edit_loop":{"phase":"no_edits","mutations":0,"checked_mutations":0,"diff_surfaced_mutations":0,"uncheckpointed_shell_commands":0,"disclosed_shell_commands":0,"uncheckpointed_extension_calls":0,"disclosed_extension_calls":0}
+            });
             self.session.set_control_state(control.clone())?;
             ui.request_policy(&control);
         }
         self.step_checks = StepChecks {
             turn: checkpoint_turn,
+            visual: if self.hermetic {
+                visual::Review::default()
+            } else {
+                visual::Review::new(user_text)
+            },
             ..StepChecks::default()
         };
+        if !self.hermetic
+            && message.get("dial_images").is_some()
+            && self
+                .backend
+                .as_ref()
+                .is_some_and(Backend::accepts_image_input)
+        {
+            self.step_checks.visual.captured((0, 0), false);
+        }
+        for reference in message["dial_images"].as_array().into_iter().flatten() {
+            ui.image(reference);
+        }
         self.repair_tracker.clear();
         self.repair_sequence = 0;
         self.ext.fire_lifecycle(&LifecycleEvent {
@@ -1590,6 +1783,10 @@ impl<'a> Agent<'a> {
         // Recomputing them on every request (or putting them in the system prompt, as hints once were) would
         // change the text in front of the whole conversation and discard the provider's prompt cache.
         let mut context = self.experience_context(user_text, ui);
+        if !self.hermetic && visual::useful(user_text) {
+            context.push_str("\n\n");
+            context.push_str(visual::INITIAL_GUIDANCE);
+        }
         if let Some(memory) = &self.memory {
             // The lookup is a search query, not the prompt: a pasted file or log must not fail the turn.
             let query = prompt::truncate_chars(user_text, RECALL_QUERY_CHARS);
@@ -1675,7 +1872,11 @@ impl<'a> Agent<'a> {
         let names = self.offered();
         let mut schemas = self.schemas(&names)?;
         self.last_trajectory = self.trajectory.as_ref().map(|(id, _, _)| *id);
-        let max_steps = self.version.harness.max_steps;
+        let max_steps = if !self.hermetic && self.config.harness.max_steps == 0 {
+            0
+        } else {
+            self.version.harness.max_steps
+        };
         if !self.hermetic
             && self.config.verification.enabled
             && matches!(
@@ -1730,7 +1931,8 @@ impl<'a> Agent<'a> {
             && let (Ok(report), Some(turn)) = (&result, checkpoint_turn)
             && report.outcome == TurnOutcome::Completed
         {
-            let checks = self.focused_checks(turn);
+            let mut checks = self.focused_checks(turn);
+            self.step_checks.include_failed_checks(&mut checks);
             let mut failures = self.run_checks(&checks, ui);
             for attempt in 0..self.config.verification.repair_attempts {
                 if failures.is_empty() || self.interrupt.load(Ordering::SeqCst) {
@@ -1742,13 +1944,16 @@ impl<'a> Agent<'a> {
                             "Automatic focused verification failed (repair attempt {}). Fix the diagnostics, then rerun the checks:\n{}",
                             attempt + 1, failures.join("\n")
                         )}))?;
+                let repair_steps = if max_steps == 0 { 8 } else { max_steps.min(8) };
                 let repaired =
-                    self.run_loop(&mut backend, &names, &mut schemas, max_steps.min(8), ui)?;
+                    self.run_loop(&mut backend, &names, &mut schemas, repair_steps, ui)?;
                 if repaired.interrupted {
                     result = Ok(repaired);
                     break;
                 }
                 result = Ok(repaired);
+                checks = self.focused_checks(turn);
+                self.step_checks.include_failed_checks(&mut checks);
                 failures = self.run_checks(&checks, ui);
             }
             if self.interrupt.load(Ordering::SeqCst) {
@@ -2052,6 +2257,16 @@ impl<'a> Agent<'a> {
         if self.hermetic || !self.config.laya.enabled || self.interrupt.load(Ordering::SeqCst) {
             return None;
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if self.session.control_state()["laya"]["retry_after"]
+            .as_u64()
+            .is_some_and(|retry| now < retry)
+        {
+            return None;
+        }
         if phase != "investigation"
             && matches!(
                 self.session.control_state()["laya"]["status"].as_str(),
@@ -2102,12 +2317,22 @@ impl<'a> Agent<'a> {
                 } else {
                     format!("{error:#}")
                 };
-                let status = if reason.contains("loading its checkpoint") {
+                let retry_after =
+                    if reason.contains("exceeded its") || reason.contains("Laya is busy") {
+                        Some(now.saturating_add(60))
+                    } else {
+                        None
+                    };
+                let status = if reason.contains("exceeded its") {
+                    "delayed"
+                } else if reason.contains("Laya is busy") {
+                    "busy"
+                } else if reason.contains("loading its checkpoint") {
                     "loading"
                 } else {
                     "unavailable"
                 };
-                state["laya"] = json!({"status":status,"phase":phase,"reason":reason});
+                state["laya"] = json!({"status":status,"phase":phase,"reason":reason,"retry_after":retry_after});
                 let _ = self.session.set_control_state(state);
                 let _ = self.record(
                     self.cur_step,
@@ -2201,7 +2426,7 @@ impl<'a> Agent<'a> {
         match result {
             Ok((stats, context)) => {
                 if stats.indexed > 0 || stats.removed > 0 {
-                    ui.notice(&format!("Project understanding: indexed {} changed/new sources, reused {}, removed {}{}.",
+                    ui.diagnostic(&format!("Project understanding: indexed {} changed/new sources, reused {}, removed {}{}.",
                         stats.indexed, stats.reused, stats.removed, if stats.partial { "; scan coverage is partial" } else { "" }));
                 }
                 Some(context)
@@ -2438,7 +2663,7 @@ impl<'a> Agent<'a> {
         let turn_cost_start = self.session_cost.unwrap_or(0.0);
         while budget.begin() {
             let step = iteration;
-            iteration += 1;
+            iteration = iteration.saturating_add(1);
             if !self.hermetic {
                 let spent = self.session_cost.unwrap_or(0.0);
                 let caps = &self.config.budget;
@@ -2517,13 +2742,15 @@ impl<'a> Agent<'a> {
             let selection = crate::adaptive::select(
                 self.config,
                 &self.request_phase,
-                self.task_policy.kind,
-                h.temperature,
-                reasoning_budget.unwrap_or(max_tokens),
-                pre_action_secs,
-                backend.model_profile(),
-                recovering_output || reasoning_budget.is_some(),
-                self.hermetic,
+                crate::adaptive::Request {
+                    kind: self.task_policy.kind,
+                    temperature: h.temperature,
+                    tokens: reasoning_budget.unwrap_or(max_tokens),
+                    pre_action_secs,
+                    base_profile: backend.model_profile(),
+                    recovering_output: recovering_output || reasoning_budget.is_some(),
+                    hermetic: self.hermetic,
+                },
             );
             let packet = if self.hermetic {
                 None
@@ -2624,7 +2851,7 @@ impl<'a> Agent<'a> {
                 if signature != policy_signature {
                     policy_signature = signature;
                     if selection.enabled {
-                        ui.notice(&format!("Policy: {} → {} · temp {} · output {} · pre-action {}s · /policy shows why",selection.task,selection.phase.label(),selection.temperature.map(|t|t.to_string()).unwrap_or("provider-controlled".into()),selection.max_tokens,selection.pre_action_secs));
+                        ui.diagnostic(&format!("Policy: {} → {} · temp {} · output {} · pre-action {}s · /policy shows why",selection.task,selection.phase.label(),selection.temperature.map(|t|t.to_string()).unwrap_or("provider-controlled".into()),selection.max_tokens,selection.pre_action_secs));
                     }
                 }
                 let mut control = self.session.control_state();
@@ -2748,12 +2975,20 @@ impl<'a> Agent<'a> {
                 sent_messages,
             );
             reasoning_budget = None;
+            self.step_checks.visual.delivered();
             self.save_request_policy(None,json!({"state":"response received","prompt_tokens":reply.prompt_tokens,"completion_tokens":reply.completion_tokens,"elapsed_ms":started.elapsed().as_millis(),"tool_calls":reply.tool_calls.len(),"finish_reason":reply.finish_reason}),ui)?;
             ui.usage(
                 reply.prompt_tokens,
                 reply.completion_tokens,
                 started.elapsed().as_secs_f64(),
             );
+            self.metrics.responses += 1;
+            if reply.prompt_tokens.is_some() && reply.completion_tokens.is_some() {
+                self.metrics.usage_reported_responses += 1;
+            }
+            self.metrics.prompt_tokens += reply.prompt_tokens.unwrap_or(0);
+            self.metrics.output_tokens += reply.completion_tokens.unwrap_or(0);
+            self.metrics.cache_write_tokens += reply.cache_creation_tokens.unwrap_or(0);
             self.metrics.cached_tokens += reply.cached_prompt_tokens.unwrap_or(0);
             self.metrics.reasoning_tokens += reply.reasoning_tokens.unwrap_or(0);
             ui.cached_usage(reply.cached_prompt_tokens, reply.cache_creation_tokens);
@@ -2853,6 +3088,9 @@ impl<'a> Agent<'a> {
                 continue;
             }
             if reply.tool_calls.is_empty() {
+                if !reply.text.trim().is_empty() {
+                    self.step_checks.answer_delivered = true;
+                }
                 self.push(json!({"role":"assistant","content":reply.text}))?;
                 if self.take_steering(ui)? {
                     completion.reset_for_steering();
@@ -2898,6 +3136,18 @@ impl<'a> Agent<'a> {
                         return self.stop_turn(ui, text, step + 1);
                     }
                 }
+                if !self.hermetic
+                    && let Some(prompt) = self.final_review_prompt(ui)?
+                {
+                    ui.notice("Review the changed files before reporting completion.");
+                    self.push(llm::assistant_message(&reply))?;
+                    self.push(json!({
+                        "role":"user",
+                        "content":prompt,
+                        "dial_completion_reminder":true
+                    }))?;
+                    continue;
+                }
                 if self.logging {
                     self.training_capture.record(
                         &context_before,
@@ -2906,8 +3156,19 @@ impl<'a> Agent<'a> {
                     );
                 }
                 self.metrics.turns_completed += 1;
+                let streamed_len = reply.text.len();
+                let text = self.step_checks.visual.summary(
+                    reply.text,
+                    (
+                        self.step_checks.mutations,
+                        self.step_checks.uncheckpointed_shell_commands,
+                    ),
+                );
+                if text.len() > streamed_len {
+                    ui.text_delta(&text[streamed_len..]);
+                }
                 return Ok(TurnReport {
-                    text: reply.text,
+                    text,
                     outcome: TurnOutcome::Completed,
                     steps: step + 1,
                     interrupted: false,
@@ -2921,6 +3182,7 @@ impl<'a> Agent<'a> {
             let mut parallel = std::collections::VecDeque::new();
             let mut stop: Option<String> = None;
             let mut round_succeeded = false;
+            let mut last_tool_failure = None;
             let mut finished = None;
             for (index, call) in reply.tool_calls.iter().enumerate() {
                 if self.interrupt.load(Ordering::SeqCst) {
@@ -2980,6 +3242,7 @@ impl<'a> Agent<'a> {
                         match check {
                             Ok(Some(text)) => {
                                 preflight = Some(ToolOutput {
+                                    data: None,
                                     text,
                                     is_error: true,
                                 });
@@ -2990,6 +3253,7 @@ impl<'a> Agent<'a> {
                             }
                             Err(error) => {
                                 preflight = Some(ToolOutput {
+                                    data: None,
                                     text: format!(
                                         "Could not check saved assumptions: {error}. Read the current target before retrying."
                                     ),
@@ -2999,6 +3263,7 @@ impl<'a> Agent<'a> {
                         }
                     } else if !revalidated_paths.contains(path) {
                         preflight = Some(ToolOutput {
+                            data: None,
                             text: format!(
                                 "Read current {path} before retrying this edit; its saved assumptions required review."
                             ),
@@ -3022,6 +3287,7 @@ impl<'a> Agent<'a> {
                         rejected_calls.push(rejected_tool_call_message(call));
                     }
                     let output = ToolOutput {
+                        data: None,
                         text: format!("invalid tool call: {why}"),
                         is_error: true,
                     };
@@ -3070,7 +3336,8 @@ impl<'a> Agent<'a> {
                     let (mut out, seconds) = match parallel.pop_front() {
                         Some(result) => result,
                         None if call.name == "finish" && call.arguments["outcome"] == "completed" && (execution_failed || !form_kinds.is_empty()) => {
-                            (ToolOutput { text: "finish completed cannot follow a failed call in the same batch; address its error first".into(), is_error: true }, 0.0)
+                            (ToolOutput { data: None,
+text: "finish completed cannot follow a failed call in the same batch; address its error first".into(), is_error: true }, 0.0)
                         }
                         None => { let started = Instant::now(); let out = self.dispatch(backend, call, ui); (out, started.elapsed().as_secs_f64()) }
                     };
@@ -3079,6 +3346,7 @@ impl<'a> Agent<'a> {
                             Ok(attachment) => image = attachment,
                             Err(e) => {
                                 out = ToolOutput {
+                                    data: None,
                                     text: format!("retaining browser screenshot: {e:#}"),
                                     is_error: true,
                                 }
@@ -3099,6 +3367,13 @@ impl<'a> Agent<'a> {
                     turn_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 );
                 self.observe_experience(call, &output, observed_sources, ui);
+                if output.is_error {
+                    last_tool_failure = Some(format!(
+                        "Most recent tool error (`{}`):\n{}",
+                        call.name,
+                        guard::clip_middle(&output.text, 1200)
+                    ));
+                }
                 let is_check = call.name == "bash"
                     && call.arguments["command"]
                         .as_str()
@@ -3151,6 +3426,26 @@ impl<'a> Agent<'a> {
                     && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve")
                 {
                     self.step_checks.mutations += 1;
+                    if !self.hermetic
+                        && let Some(path) = call.arguments["path"].as_str()
+                    {
+                        self.step_checks.visual.changed(Path::new(path));
+                    }
+                }
+                if call.name == "bash" {
+                    if call.arguments["command"]
+                        .as_str()
+                        .is_some_and(|command| !approval::safe_bash(command))
+                    {
+                        self.step_checks.uncheckpointed_shell_commands += 1;
+                    }
+                } else if let Some(tool) = self.ext.get(&call.name)
+                    && tool.may_modify_workspace(&call.arguments)
+                {
+                    self.step_checks.uncheckpointed_extension_calls += 1;
+                    self.step_checks
+                        .uncheckpointed_extension_tools
+                        .insert(call.name.clone());
                 }
                 if !self.hermetic
                     && !output.is_error
@@ -3182,7 +3477,7 @@ impl<'a> Agent<'a> {
                 {
                     self.step_checks.evidence = true;
                 }
-                if call.name == "finish" && !output.is_error {
+                if call.name == "finish" && !output.is_error && self.step_checks.finish_accepted {
                     finished = Some(
                         completion::Finish::parse(&call.arguments).map_err(anyhow::Error::msg)?,
                     );
@@ -3250,10 +3545,12 @@ impl<'a> Agent<'a> {
                     ),
                     None => None,
                 };
-                let limit = tools::model_output_limit(self.context_window());
-                // Retain the complete observation, but send only its reference on a
-                // duplicate. Replaying identical file contents wastes context and
-                // rewards the same read loop after its corrective feedback.
+                let limit = tools::preview_limit(
+                    self.context_window(),
+                    &call.name,
+                    output.is_error,
+                    artifact.is_some(),
+                );
                 let mut body =
                     duplicate.unwrap_or_else(|| guard::clip_evidence(&output.text, limit));
                 if (output.text.len() > limit || body.starts_with("[Investigation check"))
@@ -3304,16 +3601,21 @@ impl<'a> Agent<'a> {
                 {
                     let path = Path::new(path);
                     if llm::images::is_image(path) {
-                        let attachment = self
-                            .workspace
-                            .resolve(path.to_string_lossy().as_ref())
-                            .map_err(anyhow::Error::msg)
-                            .and_then(|absolute| {
-                                let relative = absolute
-                                    .strip_prefix(self.workspace.root())
-                                    .context("image resolves outside the project")?;
-                                llm::images::attachment(self.workspace.root(), relative)
-                            });
+                        let authorized =
+                            llm::images::authorized_user_reference(&self.session.messages(), path);
+                        let attachment = if let Some(image) = authorized {
+                            Ok(image)
+                        } else {
+                            self.workspace
+                                .resolve(path.to_string_lossy().as_ref())
+                                .map_err(anyhow::Error::msg)
+                                .and_then(|absolute| {
+                                    let relative = absolute
+                                        .strip_prefix(self.workspace.root())
+                                        .context("image resolves outside the project")?;
+                                    llm::images::attachment(self.workspace.root(), relative)
+                                })
+                        };
                         match attachment {
                             Ok(image) => message["dial_images"] = json!([image]),
                             Err(error) => {
@@ -3321,6 +3623,21 @@ impl<'a> Agent<'a> {
                             }
                         }
                     }
+                }
+                if !self.hermetic
+                    && message.get("dial_images").is_some()
+                    && backend.accepts_image_input()
+                {
+                    self.step_checks.visual.captured(
+                        (
+                            self.step_checks.mutations,
+                            self.step_checks.uncheckpointed_shell_commands,
+                        ),
+                        call.name == "browser",
+                    );
+                }
+                for reference in message["dial_images"].as_array().into_iter().flatten() {
+                    ui.image(reference);
                 }
                 self.push(message)?;
                 let (tokens, estimated) = self.context_usage();
@@ -3344,14 +3661,26 @@ impl<'a> Agent<'a> {
             if !self.hermetic {
                 let mut control = self.session.control_state();
                 let previous = control["reliability"].clone();
-                control["reliability"] = json!({"automatic_passing_checks":previous["automatic_passing_checks"],"automatic_failing_checks":previous["automatic_failing_checks"],"checked_commands":previous["checked_commands"],"stats":reliability,"measured":measured,"interface":if single_call {"compact single call"}else{"standard"},"verification":if self.step_checks.failed {"failed"}else if self.step_checks.clean() {"focused checks passed; review task behavior"}else if self.step_checks.mutations > 0 {"edits need verification"}else {"no edits this turn"}});
+                control["reliability"] = json!({
+                    "automatic_passing_checks":previous["automatic_passing_checks"],
+                    "automatic_failing_checks":previous["automatic_failing_checks"],
+                    "checked_commands":previous["checked_commands"],
+                    "stats":reliability,
+                    "measured":measured,
+                    "interface":if single_call {"compact single call"}else{"standard"},
+                    "verification":if self.step_checks.failed {"failed"}else if self.step_checks.clean() {"focused checks passed; review task behavior"}else if self.step_checks.mutations > 0 {"edits need verification"}else {"no edits this turn"},
+                    "edit_loop":self.step_checks.status()
+                });
                 self.session.set_control_state(control.clone())?;
                 ui.request_policy(&control);
                 if self.config.reliability.enabled
                     && reliability.consecutive_contract_failures
                         >= self.config.reliability.max_contract_failures
                 {
-                    return self.stop_turn(ui, format!("Stopped after {} consecutive tool-contract failures without useful recovery. No rejected calls were executed. Inspect /reliability; run dial reliability check or select another model before retrying.", reliability.consecutive_contract_failures), step+1);
+                    stop = Some(format!(
+                        "Stopped after {} consecutive tool-contract failures without useful recovery. No rejected calls were executed. Inspect /reliability; run dial reliability check or select another model before retrying.",
+                        reliability.consecutive_contract_failures
+                    ));
                 }
                 let mut result = control["adaptive_policy"]["result"].clone();
                 result["tool_round_failed"] = json!(
@@ -3363,10 +3692,15 @@ impl<'a> Agent<'a> {
                 result["next_observed_phase"] = json!(self.request_phase.phase);
                 self.save_request_policy(None, result, ui)?;
             }
-            if let Some(message) = stop {
+            if let Some(mut message) = stop {
                 if self.hermetic {
                     bail!("{message}");
                 }
+                if let Some(failure) = last_tool_failure {
+                    message.push_str("\n\n");
+                    message.push_str(&failure);
+                }
+                message.push_str("\n\nThe chat and completed work are kept. Send a corrected instruction or say \"continue\" to resume.");
                 return self.stop_turn(ui, message, step + 1);
             }
             if !form_kinds.is_empty() || execution_failed || observed_check_failure {
@@ -3375,7 +3709,7 @@ impl<'a> Agent<'a> {
             }
             names = self.offered();
             *schemas = self.schemas(&names)?;
-            if let Some(finish) = finished {
+            if let Some(mut finish) = finished {
                 if self.take_steering(ui)? {
                     completion.reset_for_steering();
                     recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
@@ -3391,6 +3725,13 @@ impl<'a> Agent<'a> {
                     });
                 }
                 if finish.outcome == TurnOutcome::Completed {
+                    finish.text = self.step_checks.visual.summary(
+                        finish.text,
+                        (
+                            self.step_checks.mutations,
+                            self.step_checks.uncheckpointed_shell_commands,
+                        ),
+                    );
                     if self.logging {
                         self.training_capture.record(
                             &context_before,
@@ -3461,7 +3802,7 @@ impl<'a> Agent<'a> {
         }
         self.stop_turn(
             ui,
-            "Stopped: step limit reached. Say \"continue\" to keep going.".to_owned(),
+            format!("Stopped: this turn used its {max_steps}-step limit. The chat and completed work are kept. Say \"continue\" to keep going, or raise harness.max_steps in /settings."),
             iteration,
         )
     }
@@ -3541,6 +3882,9 @@ impl<'a> Agent<'a> {
             } else {
                 json!({"role":"user","content":text})
             };
+            for reference in message["dial_images"].as_array().into_iter().flatten() {
+                ui.image(reference);
+            }
             self.push(message)?;
             received = true;
         }
@@ -3656,12 +4000,114 @@ impl<'a> Agent<'a> {
         checks
     }
 
+    fn publish_no_automatic_check(&mut self, ui: &mut dyn Ui) {
+        if self.hermetic {
+            return;
+        }
+        let mut control = self.session.control_state();
+        if control["reliability"].is_object() {
+            control["reliability"]["verification"] =
+                json!("no automatic focused check available; behavior unverified");
+            control["reliability"]["checked_commands"] = json!([]);
+            control["reliability"]["edit_loop"] = self.step_checks.status();
+            if let Err(error) = self.session.set_control_state(control.clone()) {
+                ui.notice(&format!("could not save verification status: {error:#}"));
+            }
+            ui.request_policy(&control);
+        }
+    }
+    fn publish_edit_loop_status(&mut self, ui: &mut dyn Ui) {
+        if self.hermetic {
+            return;
+        }
+        let mut control = self.session.control_state();
+        control["reliability"]["edit_loop"] = self.step_checks.status();
+        if let Err(error) = self.session.set_control_state(control.clone()) {
+            ui.notice(&format!("could not save edit-loop status: {error:#}"));
+        }
+        ui.request_policy(&control);
+    }
+    fn final_review_prompt(&mut self, ui: &mut dyn Ui) -> Result<Option<String>> {
+        let mutations_pending = self.step_checks.mutations > self.step_checks.diff_surfaced;
+        let shell_pending = self.step_checks.uncheckpointed_shell_commands
+            > self.step_checks.disclosed_shell_commands;
+        let extension_pending = self.step_checks.uncheckpointed_extension_calls
+            > self.step_checks.disclosed_extension_calls;
+        let mut review = String::new();
+        let mut paths = Vec::new();
+        if let (Some(turn), Some(checkpoints)) = (self.step_checks.turn, self.checkpoints.as_ref())
+        {
+            paths = checkpoints.changed_files(turn);
+            for path in &paths {
+                self.step_checks.visual.changed(Path::new(path));
+            }
+            if mutations_pending && !paths.is_empty() {
+                review = checkpoints.review_diff(turn)?;
+            }
+        }
+        let visual = self.step_checks.visual.reminder((
+            self.step_checks.mutations,
+            self.step_checks.uncheckpointed_shell_commands,
+        ));
+        if !mutations_pending && !shell_pending && !extension_pending && visual.is_none() {
+            return Ok(None);
+        }
+        if let Some(visual) = visual {
+            ui.notice("Visual inspection checkpoint: inspect fresh pixels or report the concrete limitation.");
+            review.push_str("\n\n");
+            review.push_str(visual);
+        }
+        if mutations_pending && paths.is_empty() {
+            review.push_str(
+                "No checkpointed file diff is available; inspect the workspace diff/status manually.",
+            );
+        }
+        if shell_pending || extension_pending {
+            if shell_pending {
+                review.push_str(&format!(
+                    "\nUncheckpointed shell command attempts: {}.",
+                    self.step_checks.uncheckpointed_shell_commands
+                ));
+            }
+            if extension_pending {
+                let tools = self
+                    .step_checks
+                    .uncheckpointed_extension_tools
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                review.push_str(&format!(
+                    "\nUncheckpointed approval-requiring extension calls: {} (tools: {tools}).",
+                    self.step_checks.uncheckpointed_extension_calls
+                ));
+            }
+            review.push_str(
+                "\nThese operations may have effects outside checkpoint tracking. Inspect workspace changes with:\n  git -c core.fsmonitor=false -c core.pager=cat --no-pager status --short --untracked-files=all\n  git -c core.fsmonitor=false -c core.pager=cat --no-pager diff --no-color --no-ext-diff --no-textconv\n  git -c core.fsmonitor=false -c core.pager=cat --no-pager diff --no-color --no-ext-diff --no-textconv --staged\nGit output may include pre-existing work; distinguish it from this turn and leave unrelated changes untouched. Inspect untracked public files individually. If this is not a Git worktree, report that review limit.",
+            );
+        }
+        if mutations_pending && !self.config.verification.enabled {
+            self.publish_no_automatic_check(ui);
+        }
+        self.step_checks.diff_surfaced = self.step_checks.mutations;
+        self.step_checks.disclosed_shell_commands = self.step_checks.uncheckpointed_shell_commands;
+        self.step_checks.disclosed_extension_calls =
+            self.step_checks.uncheckpointed_extension_calls;
+        self.publish_edit_loop_status(ui);
+        Ok(Some(format!(
+            "Final edit review required before completion. Inspect the changes below, then call finish again. Report verification limits.\n\n{review}"
+        )))
+    }
+
     /// Run `checks` until interrupted; one entry per failed check with its (clipped) output.
     fn run_checks(
         &mut self,
         checks: &[verification::FocusedCheck],
         ui: &mut dyn Ui,
     ) -> Vec<String> {
+        if !checks.is_empty() {
+            self.step_checks.failed_checks.clear();
+        }
         let mut failures = Vec::new();
         for check in checks {
             if self.interrupt.load(Ordering::SeqCst) {
@@ -3669,7 +4115,11 @@ impl<'a> Agent<'a> {
                 break;
             }
             let output = self.run_focused_check(check, ui);
-            if output.is_error || verification::exit_code(&output.text) != Some(0) {
+            if output.is_error
+                || verification::exit_code(&output.text) != Some(0)
+                || verification::zero_tests(&output.text)
+            {
+                self.step_checks.failed_checks.push(check.clone());
                 failures.push(format!(
                     "{} failed:\n{}",
                     check.name,
@@ -3677,12 +4127,28 @@ impl<'a> Agent<'a> {
                 ));
             }
         }
+        let failed_check_count = self.step_checks.failed_checks.len() as u64;
+        if !failures.is_empty()
+            && let Some(paths) = self
+                .step_checks
+                .turn
+                .as_ref()
+                .zip(self.checkpoints.as_ref())
+                .map(|(turn, checkpoints)| checkpoints.changed_files(*turn))
+                .filter(|paths| !paths.is_empty())
+        {
+            failures.insert(
+                0,
+                format!("Files changed in this turn: {}", paths.join(", ")),
+            );
+        }
+
         if !self.hermetic {
             let mut control = self.session.control_state();
             if control["reliability"].is_object() {
                 let state = &mut control["reliability"];
                 state["verification"] = json!(if checks.is_empty() {
-                    "no automatic check available; behavior unverified"
+                    "no automatic focused check available; behavior unverified"
                 } else if failures.is_empty() {
                     "focused checks passed; assess coverage against requirements"
                 } else {
@@ -3692,11 +4158,12 @@ impl<'a> Agent<'a> {
                     json!(checks.iter().map(|c| &c.name).collect::<Vec<_>>());
                 state["automatic_passing_checks"] = json!(
                     state["automatic_passing_checks"].as_u64().unwrap_or(0)
-                        + checks.len().saturating_sub(failures.len()) as u64
+                        + (checks.len() as u64).saturating_sub(failed_check_count)
                 );
                 state["automatic_failing_checks"] = json!(
-                    state["automatic_failing_checks"].as_u64().unwrap_or(0) + failures.len() as u64
+                    state["automatic_failing_checks"].as_u64().unwrap_or(0) + failed_check_count
                 );
+                state["edit_loop"] = self.step_checks.status();
                 ui.request_policy(&control);
                 if let Err(error) = self.session.set_control_state(control) {
                     ui.notice(&format!("could not save verification status: {error:#}"));
@@ -3710,9 +4177,19 @@ impl<'a> Agent<'a> {
     /// open. A step that edited files runs the focused checks, so a broken step is caught while its
     /// context is fresh instead of after the whole plan. Failed checks keep the step open;
     /// repeating done without further edits cannot turn a failure into evidence of success.
-    fn check_step(&mut self, ui: &mut dyn Ui) -> Result<Option<String>, String> {
-        if !self.step_checks.evidence {
-            return Err("Step not closed: no tool has run since it started. Do the work (edit, run, or read to check it) before marking it done, or drop it with a reason if it is no longer needed.".into());
+    fn check_step(&mut self, ui: &mut dyn Ui, args: &Value) -> Result<Option<String>, String> {
+        let text_only = self.step_checks.answer_delivered
+            && self.step_checks.mutations == self.step_checks.checked
+            && !self.step_checks.uncheckpointed_pending()
+            && self.todo.tasks().iter().enumerate().any(|(index, task)| {
+                task.status == todo::Status::InProgress
+                    && !task.investigation
+                    && args["index"]
+                        .as_u64()
+                        .is_none_or(|target| target == (index + 1) as u64)
+            });
+        if !self.step_checks.evidence && !text_only {
+            return Err("Step not closed: no tool has run since it started and no text-only answer was delivered. Deliver the report for a non-investigation step, do the required work, or block it with a concrete reason. Do not repeat done unchanged.".into());
         }
         let pending = self.step_checks.mutations != self.step_checks.checked;
         let (Some(turn), true, true) = (
@@ -3726,13 +4203,19 @@ impl<'a> Agent<'a> {
                 Ok(None)
             };
         };
-        let checks = self.focused_checks(turn);
+        let mut checks = self.focused_checks(turn);
+        self.step_checks.include_failed_checks(&mut checks);
         if checks.is_empty() {
-            return Ok(None);
+            self.publish_no_automatic_check(ui);
+            return Ok(Some(
+                "No automatic focused check is available for this step; behavior remains unverified."
+                    .into(),
+            ));
         }
         self.step_checks.checked = self.step_checks.mutations;
         let failures = self.run_checks(&checks, ui);
         self.step_checks.failed = !failures.is_empty();
+        self.publish_edit_loop_status(ui);
         if failures.is_empty() {
             return Ok(Some(format!(
                 "Focused checks passed: {}.",
@@ -3759,6 +4242,9 @@ impl<'a> Agent<'a> {
     }
 
     fn dispatch(&mut self, backend: &mut Backend, call: &ToolCall, ui: &mut dyn Ui) -> ToolOutput {
+        if call.name == "finish" {
+            self.step_checks.finish_accepted = false;
+        }
         if call.name != "exit_plan" {
             let root = self.workspace.root().to_path_buf();
             if let Err(reason) = hooks::pre_tool(
@@ -3774,6 +4260,7 @@ impl<'a> Agent<'a> {
                     json!({"name":call.name,"hook":true}),
                 );
                 return ToolOutput {
+                    data: None,
                     text: reason,
                     is_error: true,
                 };
@@ -3801,6 +4288,7 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
     ) -> ToolOutput {
         let denied = |why: &str| ToolOutput {
+            data: None,
             text: why.to_owned(),
             is_error: true,
         };
@@ -3816,7 +4304,8 @@ impl<'a> Agent<'a> {
                     self.set_plan_mode(false);
                     self.pending_plan = Some(plan.to_owned());
                     ui.notice(&format!("Plan approved:\n{plan}"));
-                    return ToolOutput { text: "Plan approved; implementation is now permitted subject to normal tool approvals.".into(), is_error: false };
+                    return ToolOutput { data: None,
+text: "Plan approved; implementation is now permitted subject to normal tool approvals.".into(), is_error: false };
                 }
                 Decision::Deny => {
                     return denied(&format!(
@@ -3836,6 +4325,27 @@ impl<'a> Agent<'a> {
         }
         let args = &call.arguments;
         let name = call.name.as_str();
+        if name == "read"
+            && !self.hermetic
+            && let Some(path) = args["path"].as_str()
+            && let Some(reference) =
+                llm::images::authorized_user_reference(&self.session.messages(), Path::new(path))
+        {
+            if args["offset"].as_u64().is_some() {
+                return denied("images do not support line offsets");
+            }
+            return match llm::images::verified_bytes(&reference) {
+                Ok((bytes, _)) => ToolOutput {
+                    data: None,
+                    text: format!(
+                        "Image: {path} ({} original bytes; explicitly supplied by the user; attached to the next model request when vision is available)",
+                        bytes.len()
+                    ),
+                    is_error: false,
+                },
+                Err(error) => denied(&format!("Cannot read supplied image: {error:#}")),
+            };
+        }
         if name == "experience" {
             return self.experience_tool(backend, call, ui);
         }
@@ -3848,6 +4358,7 @@ impl<'a> Agent<'a> {
                 Ok(None) => {}
                 Err(text) => {
                     return ToolOutput {
+                        data: None,
                         text,
                         is_error: true,
                     };
@@ -3895,7 +4406,7 @@ impl<'a> Agent<'a> {
                     return output;
                 }
                 if args["op"] == "done" {
-                    match self.check_step(ui) {
+                    match self.check_step(ui, args) {
                         Ok(Some(note)) => {
                             output.text.push('\n');
                             output.text.push_str(&note);
@@ -3917,6 +4428,7 @@ impl<'a> Agent<'a> {
                 };
                 if active(&self.todo).is_some() && active(&next) != active(&self.todo) {
                     self.step_checks.evidence = false;
+                    self.step_checks.answer_delivered = false;
                 }
                 self.todo = next;
                 ui.todo(&self.todo);
@@ -3950,9 +4462,11 @@ impl<'a> Agent<'a> {
                 if finish.outcome == TurnOutcome::Completed
                     && !self.hermetic
                     && self.step_checks.failed
+                    && (!self.config.verification.enabled
+                        || self.step_checks.mutations <= self.step_checks.checked)
                 {
                     return denied(
-                        "Cannot finish completed: the last focused checks failed. Repair and verify the affected behavior, or report a blocker.",
+                        "Cannot finish completed: focused checks failed and no new edits are awaiting a fresh check. Repair, rerun the failed check, or report a blocker.",
                     );
                 }
                 if finish.outcome == TurnOutcome::Completed
@@ -3961,20 +4475,45 @@ impl<'a> Agent<'a> {
                     && self.step_checks.mutations > self.step_checks.checked
                     && let Some(turn) = self.step_checks.turn
                 {
-                    let checks = self.focused_checks(turn);
+                    let mut checks = self.focused_checks(turn);
+                    self.step_checks.include_failed_checks(&mut checks);
                     if !checks.is_empty() {
                         self.step_checks.checked = self.step_checks.mutations;
                         let failures = self.run_checks(&checks, ui);
                         self.step_checks.failed = !failures.is_empty();
+                        self.publish_edit_loop_status(ui);
                         if !failures.is_empty() {
                             return denied(&format!(
                                 "Cannot finish completed: focused verification failed. Fix the observed diagnostics or report a blocker.\n{}",
                                 failures.join("\n")
                             ));
                         }
+                    } else {
+                        self.publish_no_automatic_check(ui);
                     }
                 }
+                if finish.outcome == TurnOutcome::Completed && !self.hermetic {
+                    match self.final_review_prompt(ui) {
+                        Ok(Some(prompt)) => {
+                            ui.notice("Completion review pending; continuing the agent.");
+                            return ToolOutput {
+                                data: None,
+                                text: prompt,
+                                is_error: false,
+                            };
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            return denied(&format!(
+                                "Cannot complete final diff review: {error:#}. Inspect the changed files before finishing."
+                            ));
+                        }
+                    }
+                }
+
+                self.step_checks.finish_accepted = true;
                 ToolOutput {
+                    data: None,
                     text: "Turn outcome accepted.".into(),
                     is_error: false,
                 }
@@ -3988,6 +4527,7 @@ impl<'a> Agent<'a> {
                     query.split_whitespace().all(|word| text.contains(word)).then(|| json!({"name":name,"description":description,"enabled":self.offered().contains(&name)}))
                 }).take(32).collect();
                 ToolOutput {
+                    data: None,
                     text: json!(matches).to_string(),
                     is_error: false,
                 }
@@ -4016,6 +4556,7 @@ impl<'a> Agent<'a> {
                 self.enabled_tools = enabled;
                 self.system = self.build_system();
                 ToolOutput {
+                    data: None,
                     text: format!("Enabled for the next model round: {}", requested.join(", ")),
                     is_error: false,
                 }
@@ -4047,6 +4588,7 @@ impl<'a> Agent<'a> {
                     }
                 }
                 ToolOutput {
+                    data: None,
                     text: state["working_state"].to_string(),
                     is_error: false,
                 }
@@ -4070,6 +4612,7 @@ impl<'a> Agent<'a> {
                     layout: self.layout.as_ref(),
                     harness: &self.version.harness,
                     interrupt: &self.interrupt,
+                    usage: Some(&self.usage_scope),
                 };
                 solve::escalate(env, args, &mut self.session_cost, ui)
             }
@@ -4083,10 +4626,12 @@ impl<'a> Agent<'a> {
                         tool.timeout_secs,
                     ) {
                         Ok(text) => ToolOutput {
+                            data: None,
                             text,
                             is_error: false,
                         },
                         Err(error) => ToolOutput {
+                            data: None,
                             text: format!("{error:#}"),
                             is_error: true,
                         },
@@ -4155,6 +4700,7 @@ impl<'a> Agent<'a> {
                             &workspace, &arguments, 120, &stream, &cancel,
                         )
                         .unwrap_or_else(|text| ToolOutput {
+                            data: None,
                             text,
                             is_error: true,
                         });
@@ -4181,16 +4727,19 @@ impl<'a> Agent<'a> {
                         tool.timeout_secs,
                     ) {
                         Ok(text) => ToolOutput {
+                            data: None,
                             text,
                             is_error: false,
                         },
                         Err(e) => ToolOutput {
+                            data: None,
                             text: format!("{e:#}"),
                             is_error: true,
                         },
                     }
                 }))
                 .unwrap_or_else(|_| ToolOutput {
+                    data: None,
                     text: "tool worker panicked".into(),
                     is_error: true,
                 });
@@ -4200,6 +4749,7 @@ impl<'a> Agent<'a> {
             Ok(worker) => worker,
             Err(e) => {
                 return Some(ToolOutput {
+                    data: None,
                     text: format!("starting tool: {e}"),
                     is_error: true,
                 });
@@ -4235,6 +4785,7 @@ impl<'a> Agent<'a> {
                 }
                 Err(_) => {
                     break ToolOutput {
+                        data: None,
                         text: "tool worker ended without output".into(),
                         is_error: true,
                     };
@@ -4246,6 +4797,8 @@ impl<'a> Agent<'a> {
     }
 
     pub fn pump_subagents(&mut self, ui: &mut dyn Ui) {
+        self.live_tasks.bind(self.session.runtime());
+        ui.runtime(&self.session.runtime());
         if self.interrupt.load(Ordering::SeqCst) {
             self.live_tasks.cancel_all();
         }
@@ -4257,6 +4810,12 @@ impl<'a> Agent<'a> {
             &mut self.session_cost,
             ui,
         );
+        ui.heartbeat();
+        if let Err(error) = self.session.flush_settled_runtime() {
+            ui.diagnostic(&format!(
+                "could not journal settled execution state: {error:#}"
+            ));
+        }
         for name in self.ext.names() {
             if let Some(tool) = self.ext.get(name) {
                 for event in tool.drain_notifications() {
@@ -4293,6 +4852,8 @@ impl<'a> Agent<'a> {
         self.live_tasks.control()
     }
     pub fn start_subagents(&mut self, args: &Value, ui: &mut dyn Ui) -> Result<Value> {
+        self.live_tasks.bind(self.session.runtime());
+        ui.runtime(&self.session.runtime());
         let call = ToolCall {
             id: String::new(),
             name: "task".into(),
@@ -4303,7 +4864,8 @@ impl<'a> Agent<'a> {
             .map_err(|e| anyhow::anyhow!(e.message()))?;
         let mut harness = self.version.harness.clone();
         harness.tools = self.offered();
-        self.live_tasks
+        let result = self
+            .live_tasks
             .start(
                 self.config,
                 &self.workspace,
@@ -4311,8 +4873,11 @@ impl<'a> Agent<'a> {
                 self.layout.as_ref(),
                 &harness,
                 args,
+                Some(&self.usage_scope),
             )
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::msg);
+        self.session.flush_runtime()?;
+        result
     }
 
     /// Delegate to the subagent runner, lending it only the pieces a child may use: the workspace,
@@ -4330,6 +4895,7 @@ impl<'a> Agent<'a> {
                     self.layout.as_ref(),
                     &harness,
                     args,
+                    Some(&self.usage_scope),
                 ));
             }
             "status" => return live_tasks::output(self.live_tasks.status(args["id"].as_str())),
@@ -4359,6 +4925,7 @@ impl<'a> Agent<'a> {
             "run" => {}
             _ => {
                 return ToolOutput {
+                    data: None,
                     text: "unknown task action".into(),
                     is_error: true,
                 };
@@ -4371,6 +4938,7 @@ impl<'a> Agent<'a> {
             layout: self.layout.as_ref(),
             harness: &harness,
             interrupt: &self.interrupt,
+            usage: Some(&self.usage_scope),
         };
         let parent = subagents::Parent {
             env,
@@ -4392,6 +4960,7 @@ impl<'a> Agent<'a> {
             layout: self.layout.as_ref(),
             harness: &self.version.harness,
             interrupt: &self.interrupt,
+            usage: Some(&self.usage_scope),
         };
         solve::run(
             subagents::Parent {
@@ -4553,6 +5122,7 @@ impl<'a> Agent<'a> {
                 "{\"indices\":[]}".to_owned()
             };
             let mut output = ToolOutput {
+                data: None,
                 text: request
                     .render_response(&response)
                     .map_err(anyhow::Error::msg)?,
@@ -4573,6 +5143,7 @@ impl<'a> Agent<'a> {
             Ok(output)
         })();
         result.unwrap_or_else(|e| ToolOutput {
+            data: None,
             text: format!("{e:#}"),
             is_error: true,
         })
@@ -4972,6 +5543,7 @@ pub fn summarize_call(name: &str, a: &Value) -> String {
         "task" => subagents::summarize(a),
         "grep" | "glob" => within(s("pattern")),
         "todo" => summarize_todo(a),
+        "finish" if s("outcome") == "completed" => "request completion".into(),
         "finish" => s("outcome").replace('_', " "),
         "tool_search" => s("query").to_owned(),
         "tool_load" => a["names"]
@@ -5288,6 +5860,7 @@ mod tests {
                     thread::sleep(Duration::from_millis(30));
                 }
                 ToolOutput {
+                    data: None,
                     text: args["index"].to_string(),
                     is_error: !overlap,
                 }
@@ -5463,6 +6036,78 @@ mod tests {
     }
 
     #[test]
+    fn local_startup_is_visible_and_does_not_trigger_the_reasoning_gate() {
+        use std::os::unix::fs::PermissionsExt;
+        #[derive(Default)]
+        struct StartupUi {
+            phases: Vec<llm::InferencePhase>,
+            heartbeats: usize,
+        }
+        impl Ui for StartupUi {
+            fn model_progress(&mut self, progress: &llm::ModelProgress) {
+                self.phases.push(progress.phase);
+            }
+            fn heartbeat(&mut self) {
+                self.heartbeats += 1;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let python = llm::server::tests::fake_python(dir.path());
+        let script = std::fs::read_to_string(&python).unwrap();
+        let (shebang, rest) = script.split_once('\n').unwrap();
+        std::fs::write(
+            &python,
+            format!("{shebang}\nimport time; time.sleep(1.3)\n{rest}"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut backend = Backend::new(
+            ProviderKind::Local {
+                model_dir: dir
+                    .path()
+                    .join("model-info.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+            python,
+            10,
+        );
+        let request = Chat {
+            messages: vec![json!({"role":"user","content":"hi"})],
+            tools: vec![],
+            temperature: 0.2,
+            max_tokens: 16,
+            seed: None,
+        };
+        let mut ui = StartupUi::default();
+        let policy = crate::config::types::ReasoningGuardConfig {
+            max_pre_action_secs: 1,
+            ..Default::default()
+        };
+        let reply = chat_with_ui(
+            &mut backend,
+            None,
+            &request,
+            5,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            None,
+            &mut ui,
+            Some(&policy),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(reply.text, "pong");
+        assert!(ui.phases.contains(&llm::InferencePhase::Loading));
+        assert!(ui.phases.contains(&llm::InferencePhase::Processing));
+        assert!(ui.phases.contains(&llm::InferencePhase::Generating));
+        assert!(
+            ui.heartbeats >= 5,
+            "input must remain responsive during startup"
+        );
+    }
+
+    #[test]
     fn context_updates_before_stream_callbacks_and_reconciles_reported_usage() {
         #[derive(Default)]
         struct RecordingUi {
@@ -5556,6 +6201,100 @@ mod tests {
             ui.0 >= 1,
             "the UI must repaint while the operation is pending"
         );
+    }
+
+    #[test]
+    fn local_progress_reaches_ui_before_text_and_resets_between_requests() {
+        #[derive(Default)]
+        struct RecordingUi {
+            progress: Vec<llm::ModelProgress>,
+            text: String,
+            before_text: bool,
+            heartbeats: usize,
+        }
+        impl Ui for RecordingUi {
+            fn model_progress(&mut self, p: &llm::ModelProgress) {
+                if p.output_tokens == Some(12) && self.text.is_empty() {
+                    self.before_text = true;
+                }
+                self.progress.push(p.clone());
+            }
+            fn text_delta(&mut self, text: &str) {
+                self.text.push_str(text);
+            }
+            fn heartbeat(&mut self) {
+                self.heartbeats += 1;
+            }
+        }
+        let events = [
+            json!({"dial_progress":{"phase":"processing","processed_tokens":32,"prompt_tokens":64}}),
+            json!({"dial_progress":{"phase":"generating","output_tokens":12,"tokens_per_second":30}}),
+            json!({"choices":[{"delta":{"content":"ok"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":64,"completion_tokens":14}}),
+        ];
+        let pieces = events
+            .iter()
+            .map(|e| format!("data: {e}\n\n"))
+            .chain(["data: [DONE]\n\n".into()])
+            .collect::<Vec<_>>();
+        let server = crate::llm::fake::serve(vec![
+            crate::llm::fake::Script::SseSlow { pieces, pause: Duration::from_millis(110) },
+            crate::llm::fake::Script::Sse("data: {\"choices\":[{\"delta\":{\"content\":\"next\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()),
+        ]);
+        let mut backend = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: format!("{}/v1", server.url),
+                model: "test".into(),
+                api_key: None,
+            },
+            PathBuf::new(),
+            5,
+        );
+        let request = Chat {
+            messages: vec![json!({"role":"user","content":"hello"})],
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: 32,
+            seed: None,
+        };
+        let mut ui = RecordingUi::default();
+        let reply = chat_with_ui(
+            &mut backend,
+            None,
+            &request,
+            5,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            None,
+            &mut ui,
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(ui.before_text);
+        assert!(ui.heartbeats > 0);
+        assert_eq!(ui.text, "ok");
+        assert_eq!(reply.completion_tokens, Some(14));
+        assert!(ui.progress.iter().any(|p| p.processed_tokens == Some(32)));
+        assert_eq!(ui.progress.last().unwrap().output_tokens, Some(14));
+        let mut ui = RecordingUi::default();
+        chat_with_ui(
+            &mut backend,
+            None,
+            &request,
+            5,
+            Arc::new(AtomicBool::new(false)),
+            false,
+            None,
+            &mut ui,
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(ui.text.is_empty());
+        assert_eq!(ui.progress[0].output_tokens, None);
+        assert_eq!(ui.progress.last().unwrap().output_tokens, Some(1));
+        assert!(ui.progress.last().unwrap().estimated);
     }
 
     #[test]

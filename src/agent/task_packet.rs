@@ -6,9 +6,10 @@
 use super::todo::{Status, TodoList};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const RECENT_MESSAGES: usize = 12;
+const RECENT_EVIDENCE: usize = 4;
 const MIN_BODY_BYTES: usize = 1024;
 const OBSERVATIONS: &[&str] = &[
     "read",
@@ -154,17 +155,32 @@ impl PacketCache {
                         break;
                     }
                 }
-                // Prefer newest retrievable observations as the active task's evidence index.
-                for message in messages.iter().rev() {
+                // The packet is resent at every request tail. Keep a small reference index rather
+                // than repeating excerpts already present in history (or retrievable artifacts).
+                let mut seen: BTreeSet<String> = packet["evidence"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item["reference"].as_str().map(str::to_owned))
+                    .collect();
+                let mut added = 0;
+                for message in messages.iter().rev().filter(|m| m["role"] == "tool") {
                     let Some(reference) = message["dial_evidence"]["artifact"]
                         .as_str()
                         .filter(|r| !r.is_empty())
                     else {
                         continue;
                     };
-                    let item = json!({"tool_call_id":message["tool_call_id"],"reference":reference,
-                        "excerpt":clipped(message["content"].as_str().unwrap_or(""), 160)});
+                    if !seen.insert(reference.to_owned()) {
+                        continue;
+                    }
+                    let item =
+                        json!({"tool_call_id":message["tool_call_id"],"reference":reference});
                     if !add_bounded(&mut packet, "evidence", item, max_bytes) {
+                        break;
+                    }
+                    added += 1;
+                    if added == RECENT_EVIDENCE {
                         break;
                     }
                 }
@@ -336,6 +352,68 @@ mod tests {
             );
             assert_eq!(messages[2], original);
         }
+    }
+
+    #[test]
+    fn automatic_index_is_small_unique_and_preserves_explicit_evidence() {
+        let mut messages = history();
+        for i in 0..20 {
+            messages.push(json!({"role":"tool","tool_call_id":format!("call_{i}"),
+                "content":"source excerpt ".repeat(100),
+                "dial_evidence":{"artifact":format!("artifact://{i:064}"),"observation":"src/lib.rs"}}));
+        }
+        // Duplicate the newest artifact: it must occupy only one slot.
+        messages.push(messages.last().unwrap().clone());
+        let original = messages.clone();
+        let control = json!({"working_state":{"constraints":["preserve APIs"],
+            "evidence":["artifact://explicit"]},"original_goal":"fix the regression"});
+        let packet = PacketCache::default()
+            .project(
+                &mut messages,
+                &tasks(),
+                &control,
+                "session",
+                None,
+                "check",
+                4096,
+            )
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&packet).unwrap();
+        let evidence = parsed["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), RECENT_EVIDENCE + 1);
+        assert_eq!(evidence[0]["reference"], "artifact://explicit");
+        assert_eq!(evidence[1]["reference"], format!("artifact://{:064}", 19));
+        assert!(evidence.iter().all(|item| item.get("excerpt").is_none()));
+        assert!(
+            parsed["constraints"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("preserve APIs"))
+        );
+        assert_eq!(parsed["original_goal"], "fix the regression");
+        // The newest results and original user message are untouched.
+        assert_eq!(messages[0], original[0]);
+        assert_eq!(
+            &messages[messages.len() - RECENT_MESSAGES..],
+            &original[original.len() - RECENT_MESSAGES..]
+        );
+        assert!(packet.len() < 1600, "packet bytes: {}", packet.len());
+        // Reconstruct the previous fill-to-budget index using this exact fixture for comparison.
+        let mut previous = parsed.clone();
+        previous["evidence"] = json!([{"reference":"artifact://explicit"}]);
+        for message in original.iter().rev() {
+            let Some(reference) = message["dial_evidence"]["artifact"].as_str() else {
+                continue;
+            };
+            let item = json!({"tool_call_id":message["tool_call_id"],"reference":reference,
+                "excerpt":clipped(message["content"].as_str().unwrap_or(""), 160)});
+            if !add_bounded(&mut previous, "evidence", item, 4096) {
+                break;
+            }
+        }
+        let old_bytes = previous.to_string().len();
+        eprintln!("task packet fixture: {old_bytes} -> {} bytes", packet.len());
+        assert!(packet.len() * 2 < old_bytes);
     }
 
     #[test]

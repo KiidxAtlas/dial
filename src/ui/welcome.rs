@@ -94,10 +94,12 @@ fn fit(entry: Entry, width: usize, ellipsis: &str) -> Vec<Span<'static>> {
 fn left_column(info: &WelcomeInfo, theme: &Theme, width: usize) -> Vec<Entry> {
     let ascii = theme.ascii();
     let bold = theme.fg(Tok::Text).add_modifier(Modifier::BOLD);
-    let mut out = vec![
-        centered(vec![label("Welcome back!", width, bold, ascii)]),
-        blank(),
-    ];
+    let greeting = if info.recent.is_empty() {
+        "Welcome to dial"
+    } else {
+        "Welcome back!"
+    };
+    let mut out = vec![centered(vec![label(greeting, width, bold, ascii)]), blank()];
     if width >= LOGO_WIDTH {
         let rows = if ascii { LOGO_ASCII } else { LOGO };
         for row in rows {
@@ -119,14 +121,29 @@ fn left_column(info: &WelcomeInfo, theme: &Theme, width: usize) -> Vec<Entry> {
         theme.fg(Tok::Accent),
         ascii,
     )]));
-    let place: Vec<&str> = [info.provider.as_str(), info.project.as_str()]
-        .into_iter()
-        .filter(|s| !s.trim().is_empty())
-        .collect();
+    let provider = text::one_line(&info.provider);
+    let project = text::one_line(&info.project);
+    let sep = format!(" {} ", theme.sym(Sym::Dot));
+    let mut place = String::new();
+    if !provider.trim().is_empty() {
+        place.push_str(provider.trim());
+    }
+    if !project.trim().is_empty() {
+        // The tail of a path identifies the project; cut the head when the line is too long.
+        let used = if place.is_empty() {
+            0
+        } else {
+            text::width(&place) + text::width(&sep)
+        };
+        let room = width.saturating_sub(used).max(1);
+        if !place.is_empty() {
+            place.push_str(&sep);
+        }
+        place.push_str(&text::ellipsize_start(project.trim(), room, ascii));
+    }
     if !place.is_empty() {
-        let sep = format!(" {} ", theme.sym(Sym::Dot));
         out.push(centered(vec![label(
-            &place.join(&sep),
+            &place,
             width,
             theme.fg(Tok::Muted),
             ascii,
@@ -453,7 +470,18 @@ mod tests {
         bare.tips.clear();
         let joined = plain(&rows(&bare, 90, &Theme::dark())).join("\n");
         assert!(joined.contains("No recent sessions"));
+        assert!(joined.contains("Welcome to dial"));
+        assert!(!joined.contains("Welcome back!"));
         assert!(!joined.contains("Get started"));
+    }
+
+    #[test]
+    fn long_project_path_preserves_project_name() {
+        let mut welcome = info();
+        welcome.project = "/a/very/long/parent/path/to/my-project".into();
+        let rendered = plain(&rows(&welcome, 100, &Theme::dark())).join("\n");
+        assert!(rendered.contains("…"));
+        assert!(rendered.contains("my-project"), "{rendered}");
     }
 
     #[test]

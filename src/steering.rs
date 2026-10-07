@@ -143,6 +143,9 @@ pub fn specification(config: &AppConfig, model: &str) -> Result<Option<Specifica
     if (!config.steering.enabled && !config.steering.automatic) || config.steering.strength == 0.0 {
         return Ok(None);
     }
+    if let Some(reason) = local_unsupported_reason(model) {
+        anyhow::bail!(reason);
+    }
     config.steering.validate()?;
     let path = vector_path(config);
     if config.steering.automatic && !path.exists() {
@@ -180,16 +183,26 @@ pub fn specification(config: &AppConfig, model: &str) -> Result<Option<Specifica
 fn owned_mlx(config: &AppConfig) -> bool {
     config.endpoint.is_none() && config.provider.as_deref().is_none_or(|p| p == "mlx")
 }
+/// Match the supervisor's runner choice without starting Python or loading weights.
+pub(crate) fn local_unsupported_reason(_model: &str) -> Option<&'static str> {
+    // Vision models now support steering via the same ModelProvider._load hook.
+    None
+}
+fn unsupported_reason(config: &AppConfig) -> Option<&'static str> {
+    if !owned_mlx(config) {
+        return Some("hosted/external endpoints expose no Dial-owned activation hook");
+    }
+    let model = crate::llm::catalog::resolve_local_model(&config.model)
+        .unwrap_or_else(|_| config.model.clone());
+    local_unsupported_reason(&model)
+}
 pub fn status(config: &AppConfig) -> Value {
     let path = vector_path(config);
     let progress = read(&path.with_extension("progress.json")).ok();
     let automatic = read(&path.with_extension("automatic.json")).ok();
     let candidate = read(&path);
-    let (state, reason) = if !owned_mlx(config) {
-        (
-            "unsupported",
-            "hosted/external endpoints expose no Dial-owned activation hook".to_owned(),
-        )
+    let (state, reason) = if let Some(reason) = unsupported_reason(config) {
+        ("unsupported", reason.to_owned())
     } else {
         match &candidate {
             Err(error) => {
@@ -255,6 +268,9 @@ fn automatic_with(
 ) -> Result<Value> {
     if !config.steering.automatic || !owned_mlx(config) || config.steering.strength == 0.0 {
         return Ok(json!({"phase":"disabled or unsupported"}));
+    }
+    if let Some(reason) = unsupported_reason(config) {
+        return Ok(json!({"phase":"unsupported","reason":reason}));
     }
     let path = vector_path(config);
     settings_store::private_dir(path.parent().unwrap())?;
@@ -446,6 +462,9 @@ pub fn run(
         owned_mlx(config),
         "activation steering currently supports Dial-owned MLX only"
     );
+    if let Some(reason) = unsupported_reason(config) {
+        anyhow::bail!(reason);
+    }
     config.steering.validate()?;
     let data = read(input)?;
     let rows = data
@@ -668,6 +687,45 @@ mod tests {
             automatic_with(&config, &store, None, &mut |_| panic!("disabled")).unwrap()["phase"],
             "disabled or unsupported"
         );
+    }
+    fn vision_runner_supports_steering_with_the_same_hook() {
+        let (dir, mut config, store) = auto_fixture();
+        seed_pairs(&mut config, &store);
+        let model = dir.path().join("vision-model");
+        fs::create_dir(&model).unwrap();
+        fs::write(model.join("config.json"), r#"{"vision_config":{}}"#).unwrap();
+        config.model = model.to_string_lossy().into_owned();
+        config.steering.enabled = true;
+        let path = vector_path(&config);
+        settings_store::private_dir(path.parent().unwrap()).unwrap();
+        let mut vector = candidate();
+        vector["model_name"] = json!(config.model);
+        vector["origin"] = json!("automatic verified repairs");
+        settings_store::write_private(&path, &serde_json::to_vec(&vector).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+        // Vision models now support steering via the same ModelProvider._load hook.
+        assert_eq!(status(&config)["state"], "configured");
+        let result = automatic_with(&config, &store, None, &mut |_| {
+            panic!("automatic steering must not start a worker for this fixture")
+        })
+        .unwrap();
+        assert_eq!(result["phase"], "admitted");
+        assert!(result["reason"].is_null());
+        assert!(!path.with_extension("automatic.json").exists());
+        // Specification is available for vision models now.
+        assert!(specification(&config, &config.model).unwrap().is_some());
+        // Runner eligibility is checked before reading the dataset or acquiring a compute lease.
+        assert!(
+            run(
+                &config,
+                "extract",
+                &dir.path().join("missing.json"),
+                None,
+                None
+            )
+            .is_ok()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
     #[test]
     fn automatic_admits_only_passing_candidates_and_preserves_last_good_on_failure() {

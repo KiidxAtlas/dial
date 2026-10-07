@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 pub const MAX_TASKS: usize = 50;
 pub const MAX_CONTENT_CHARS: usize = 200;
 pub const MAX_PHASE_CHARS: usize = 60;
+pub const MAX_FINDING_CHARS: usize = 4_000;
+pub const MAX_REASON_CHARS: usize = 4_000;
 
 /// How many completed or abandoned tasks stay listed as context; older closed tasks are pruned.
 pub const KEEP_CLOSED: usize = 3;
@@ -94,6 +96,7 @@ pub struct TodoList {
 
 fn fail(text: impl Into<String>) -> ToolOutput {
     ToolOutput {
+        data: None,
         text: text.into(),
         is_error: true,
     }
@@ -206,7 +209,7 @@ fn target(args: &Value, tasks: &[Task], op: &str, active: bool) -> Result<usize,
 fn reason(args: &Value) -> Result<Option<String>, String> {
     match args.get("reason").and_then(Value::as_str) {
         None => Ok(None),
-        Some(raw) => clean_text(raw, MAX_CONTENT_CHARS, "reason").map(Some),
+        Some(raw) => clean_text(raw, MAX_REASON_CHARS, "reason").map(Some),
     }
 }
 
@@ -214,7 +217,7 @@ fn finding(args: &Value) -> Result<(String, Vec<String>), String> {
     let raw = args["finding"]
         .as_str()
         .ok_or("Investigation done needs finding: the answer or ruled-out hypothesis")?;
-    let finding = clean_text(raw, 600, "finding")?;
+    let finding = clean_text(raw, MAX_FINDING_CHARS, "finding")?;
     let refs = args["evidence"].as_array().filter(|refs| !refs.is_empty() && refs.len() <= 4)
         .ok_or("Investigation done needs evidence: 1-4 source locations, check results or artifact references")?;
     let evidence = refs
@@ -345,7 +348,7 @@ impl TodoList {
             task.note = task
                 .note
                 .as_deref()
-                .map(|n| clean_text(n, MAX_CONTENT_CHARS, "note"))
+                .map(|n| clean_text(n, MAX_REASON_CHARS, "note"))
                 .transpose()?;
             if task.finding.is_some()
                 || !task.evidence.is_empty()
@@ -374,6 +377,7 @@ impl TodoList {
                 self.summary()
             };
             return ToolOutput {
+                data: Some(serde_json::json!({"tasks": self.snapshot()})),
                 text,
                 is_error: false,
             };
@@ -393,6 +397,7 @@ impl TodoList {
         self.tasks = next;
         if self.tasks.is_empty() {
             return ToolOutput {
+                data: Some(serde_json::json!({"tasks": self.snapshot()})),
                 text: "Todo list cleared.".into(),
                 is_error: false,
             };
@@ -404,6 +409,7 @@ impl TodoList {
         text.push('\n');
         text.push_str(&self.summary());
         ToolOutput {
+            data: Some(serde_json::json!({"tasks": self.snapshot()})),
             text,
             is_error: false,
         }
@@ -570,8 +576,8 @@ pub fn schema() -> Value {
                         }
                     },
                     "index": {"type": "integer", "minimum": 1, "description": "1-based task number. Required for start; done/drop/block default to the in-progress task."},
-                    "reason": {"type": "string", "description": "For block (required) and drop: why."},
-                    "finding": {"type": "string", "description": "Required for investigation done: concise answer, including ruled-out hypotheses or remaining uncertainty; max 600 chars."},
+                    "reason": {"type": "string", "maxLength": MAX_REASON_CHARS, "description": format!("For block (required) and drop: why, including relevant evidence and detail; up to {MAX_REASON_CHARS} chars.")},
+                    "finding": {"type": "string", "maxLength": MAX_FINDING_CHARS, "description": format!("Required for investigation done: answer, including relevant detail, ruled-out hypotheses or remaining uncertainty; up to {MAX_FINDING_CHARS} chars.")},
                     "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4, "description": "Required for investigation done: 1-4 supporting file:line locations, check results or artifact references; max 240 chars each. References are agent observations, not proof."}
                 },
                 "required": ["op"],
@@ -584,6 +590,36 @@ pub fn schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detailed_findings_close_tasks_and_survive_resume_without_truncation() {
+        for answer in ["x".repeat(633), "界".repeat(4_000)] {
+            let mut list = TodoList::new();
+            assert!(
+                !set(
+                    &mut list,
+                    json!([
+                        {"content":"Trace the failure", "investigation":true},
+                        {"content":"Implement the correction"}
+                    ])
+                )
+                .is_error
+            );
+            let output =
+                list.call(&json!({"op":"done","finding":answer,"evidence":["src/parser.rs:24"]}));
+            assert!(!output.is_error, "{}", output.text);
+            assert_eq!(list.tasks()[0].finding.as_deref(), Some(answer.as_str()));
+            assert_eq!(list.tasks()[1].status, Status::InProgress);
+            let mut resumed = TodoList::new();
+            resumed.restore(&list.snapshot()).unwrap();
+            assert_eq!(resumed, list);
+            assert!(resumed.focus().unwrap().contains(&answer));
+            assert!(!resumed.call(&json!({"op":"start","index":1})).is_error);
+            let before = resumed.snapshot();
+            assert!(resumed.call(&json!({"op":"done","finding":"x".repeat(4_001),"evidence":["src/parser.rs:24"]})).is_error);
+            assert_eq!(resumed.snapshot(), before);
+        }
+    }
 
     #[test]
     fn investigation_requires_findings_and_preserves_them_through_resume() {
@@ -856,6 +892,53 @@ mod tests {
         list.call(&json!({"op": "start", "index": 1}));
         assert_eq!(list.tasks()[0].status, Status::InProgress);
         assert_eq!(list.tasks()[0].note, None);
+    }
+
+    #[test]
+    fn detailed_drop_and_block_reasons_survive_resume_and_keep_state_on_overflow() {
+        for op in ["drop", "block"] {
+            for why in ["x".repeat(350), "𐍈".repeat(MAX_REASON_CHARS)] {
+                let mut list = TodoList::new();
+                set(
+                    &mut list,
+                    json!([{"content":"inspect baseline"},{"content":"next step"}]),
+                );
+                let output = list.call(&json!({"op":op,"reason":why}));
+                assert!(!output.is_error, "{}", output.text);
+                assert_eq!(list.tasks()[0].note.as_deref(), Some(why.as_str()));
+                assert_eq!(
+                    list.tasks()[0].status,
+                    if op == "drop" {
+                        Status::Abandoned
+                    } else {
+                        Status::Blocked
+                    }
+                );
+                assert_eq!(list.tasks()[1].status, Status::InProgress);
+                assert!(list.render().contains(&why));
+                let mut resumed = TodoList::new();
+                resumed.restore(&list.snapshot()).unwrap();
+                assert_eq!(resumed, list);
+
+                let before = resumed.snapshot();
+                let oversized = "𐍈".repeat(MAX_REASON_CHARS + 1);
+                let failed = resumed.call(&json!({"op":op,"index":2,"reason":oversized}));
+                assert!(
+                    failed.is_error && failed.text.contains("limit is 4000"),
+                    "{}",
+                    failed.text
+                );
+                assert_eq!(resumed.snapshot(), before);
+                let mut bad_snapshot = before.clone();
+                bad_snapshot[0]["note"] = json!(oversized);
+                assert!(resumed.restore(&bad_snapshot).is_err());
+                assert_eq!(resumed.snapshot(), before);
+            }
+        }
+        assert_eq!(
+            schema()["function"]["parameters"]["properties"]["reason"]["maxLength"],
+            MAX_REASON_CHARS
+        );
     }
 
     #[test]

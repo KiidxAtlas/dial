@@ -359,7 +359,7 @@ fn select_configuration(
     selected.model = requested.model.clone();
     selected.context_window = requested.context_window;
     selected.worker_timeout_secs = policy.case_timeout_secs;
-    selected.harness.max_steps = selected.harness.max_steps.min(24);
+    selected.harness.max_steps = selected.harness.capped_steps(24);
     let mut quantization = serde_json::Value::Null;
     let mut adapter_metadata = serde_json::Value::Null;
     if requested.provider == "mlx" {

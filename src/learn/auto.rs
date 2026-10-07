@@ -89,11 +89,14 @@ impl std::fmt::Display for BudgetReached {
 impl std::error::Error for BudgetReached {}
 
 pub fn resume(state: &Path) -> Result<()> {
-    match fs::remove_file(state.join("improvement.stop")) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+    for name in ["improvement.stop", "compute.hidden"] {
+        match fs::remove_file(state.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
+    Ok(())
 }
 
 pub fn request_stop(layout: &Layout, id: &str) -> Result<Value> {
@@ -517,8 +520,10 @@ mod tests {
         let layout = Layout::with_user_dir(&project, root.path().join("user")).unwrap();
         let state = layout.state_dir.join("models/abcd");
         let store = Store::open(&state, "model", "project", &Harness::default()).unwrap();
-        let mut config = Config::default();
-        config.state_dir = state.clone();
+        let mut config = Config {
+            state_dir: state.clone(),
+            ..Config::default()
+        };
         store
             .set_meta(
                 "auto_status",

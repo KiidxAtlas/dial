@@ -22,6 +22,16 @@ test('idle pages cannot queue network callbacks',async () => {
   assert.equal(h.run('callbacks.size'),0);
   assert.equal(h.frames.length,0);
 });
+test('missing tab selects one existing tab but never guesses among several', () => {
+  const h=harness();
+  assert.throws(()=>h.run('tabFor({})'),/No browser tab is open/);
+  h.run('tabs.set(4,{page:{title:"preview"}}); request={}; tabFor(request)');
+  assert.equal(h.run('request.tab'),4);
+  h.run('tabs.set(5,{page:{title:"other"}})');
+  assert.throws(()=>h.run('tabFor({})'),/Multiple browser tabs/);
+  assert.throws(()=>h.run('tabFor({tab:999})'),/999 is not open/);
+  assert.equal(h.run('tabFor({tab:4}).page.title'),'preview');
+});
 test('pending callbacks and bytes remain bounded and expire',async () => {
   const h=harness();
   h.run('operationId = 42');
@@ -53,4 +63,17 @@ test('callback byte budget prevents large concurrent uploads',async () => {
   h.run('cancelPending("test cleanup")');
   await Promise.all(promises);
   assert.equal(h.run('pendingBytes'),0);
+});
+
+test('network failures lead with the current operation cause, not stale tab failures', () => {
+  const h=harness();
+  h.run(`tabs.set(1,{console:[],network:[
+    {kind:'blocked',operation_id:1,error:'stale failure'},
+    {kind:'blocked',operation_id:2,error:'refusing browser request to 127.0.0.1: loopback address'}
+  ]})`);
+  const message=h.run(`failureMessage(new Error('page.goto: net::ERR_BLOCKED_BY_CLIENT'),2)`);
+  assert(message.startsWith('Browser network failure: refusing browser request'));
+  assert(message.includes('page.goto: net::ERR_BLOCKED_BY_CLIENT'));
+  assert(message.includes('Browser failure evidence:'));
+  assert(!h.run(`failureMessage(new Error('page crashed'),3)`).startsWith('Browser network failure:'));
 });

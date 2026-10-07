@@ -37,12 +37,13 @@ fn fake_config(flags: &str, timeout_secs: u64) -> McpServerConfig {
 }
 
 fn config_with(servers: Vec<(&str, McpServerConfig)>) -> Config {
-    let mut config = Config::default();
-    config.mcp = servers
-        .into_iter()
-        .map(|(name, server)| (name.to_owned(), server))
-        .collect();
-    config
+    Config {
+        mcp: servers
+            .into_iter()
+            .map(|(name, server)| (name.to_owned(), server))
+            .collect(),
+        ..Config::default()
+    }
 }
 
 fn load_fake() -> McpLoad {

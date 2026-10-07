@@ -61,7 +61,9 @@ fn serve(handler: impl Fn(&str, &[(String, String)]) -> Reply + Send + Sync + 's
     Server { base, hits }
 }
 
-fn respond(mut stream: std::net::TcpStream, handler: &dyn Fn(&str, &[(String, String)]) -> Reply) {
+type RequestHandler = dyn Fn(&str, &[(String, String)]) -> Reply;
+
+fn respond(mut stream: std::net::TcpStream, handler: &RequestHandler) {
     let mut request = Vec::new();
     let mut buf = [0u8; 1024];
     while !request.windows(4).any(|w| w == b"\r\n\r\n") {

@@ -94,9 +94,16 @@ pub struct RepeatGuard {
 }
 
 impl RepeatGuard {
+    fn key(call: &ToolCall) -> String {
+        // Rephrasing a completion claim is not recovery from a rejected step closure.
+        if call.name == "todo" && call.arguments["op"] == "done" {
+            return format!("todo\u{0}done\u{0}{}", call.arguments["index"]);
+        }
+        format!("{}\u{0}{}", call.name, call.arguments)
+    }
     /// Keep failures across intervening reads. Only success for this exact call resets its count.
     pub fn observe(&mut self, call: &ToolCall, failed: bool) -> Option<String> {
-        let key = format!("{}\u{0}{}", call.name, call.arguments);
+        let key = Self::key(call);
         if !failed {
             self.failures.remove(&key);
             return None;
@@ -111,9 +118,12 @@ impl RepeatGuard {
     }
 
     pub fn stop_message(&self, call: &ToolCall) -> Option<String> {
-        let count = *self
-            .failures
-            .get(&format!("{}\u{0}{}", call.name, call.arguments))?;
+        let count = *self.failures.get(&Self::key(call))?;
+        if call.name == "todo" && call.arguments["op"] == "done" && count >= FAILURE_LIMIT {
+            return Some(format!(
+                "Stopped: `todo done` for the same target failed {count} times this turn. Rewording the completion claim is not recovery. Deliver the report, satisfy the reported check, or block the step with a concrete reason before retrying."
+            ));
+        }
         (count >= FAILURE_LIMIT).then(|| format!(
             "Stopped: `{}` with the same arguments failed {count} times this turn. The model did not correct the call after feedback. Change the call or editing mode, or use a different model before retrying.", call.name
         ))
@@ -140,7 +150,7 @@ impl StepBudget {
         }
     }
 
-    /// Start a step; false once a nonzero budget is used up. Zero means unlimited.
+    /// Start a step; false once a finite budget is used up. Zero means unlimited.
     pub fn begin(&mut self) -> bool {
         if self.max != 0 && self.spent >= self.max {
             return false;
@@ -475,6 +485,29 @@ mod tests {
         // Evaluation runs grant no refunds: their step budget is the thing being measured.
         let mut measured = StepBudget::new(2, 0);
         assert!(measured.begin() && !measured.refund() && measured.begin() && !measured.begin());
+    }
+
+    #[test]
+    fn zero_step_budget_is_unlimited_but_refunds_remain_bounded() {
+        let mut budget = StepBudget::new(0, 2);
+        for _ in 0..100 {
+            assert!(budget.begin());
+        }
+        assert!(budget.refund() && budget.refund() && !budget.refund());
+        budget.spent = u32::MAX;
+        assert!(budget.begin());
+        assert_eq!(budget.spent, u32::MAX);
+        assert!(budget.begin());
+        let h = crate::config::types::Harness {
+            max_steps: 0,
+            ..Default::default()
+        };
+        assert_eq!(h.capped_steps(24), 24);
+        assert_eq!(h.capped_steps(8), 8);
+        assert_eq!(
+            crate::config::types::Harness { max_steps: 2, ..h }.capped_steps(24),
+            2
+        );
     }
 
     #[test]

@@ -18,6 +18,20 @@ MAX_REQUEST = 8 * 1024 * 1024
 MAX_DATA = 128 * 1024 * 1024
 
 
+def watch_parent():
+    """Release model memory if the Rust worker is killed without running Drop."""
+    import threading
+    import time
+    parent = int(os.environ.get("DIAL_PARENT_PID", "0"))
+    if parent > 1:
+        def watch():
+            while True:
+                if os.getppid() != parent:
+                    os._exit(0)
+                time.sleep(1)
+        threading.Thread(target=watch, daemon=True).start()
+
+
 class RequestError(ValueError):
     """Messages contain field names/positions only, never supplied content."""
 
@@ -757,6 +771,7 @@ def diagnostics_to_stderr():
 
 
 def main():
+    watch_parent()
     phase = "request validation"
     try:
         payload = sys.stdin.buffer.read(MAX_REQUEST + 1)

@@ -174,17 +174,27 @@ pub struct Selection {
     #[serde(skip)]
     pub profile: Option<ModelProfile>,
 }
-pub fn select(
-    config: &AppConfig,
-    state: &State,
-    kind: Kind,
-    temperature: f64,
-    tokens: u32,
-    pre_action_secs: u64,
-    base_profile: Option<&ModelProfile>,
-    recovering_output: bool,
-    hermetic: bool,
-) -> Selection {
+/// Baseline request controls and execution context before adaptive policy is applied.
+pub struct Request<'a> {
+    pub kind: Kind,
+    pub temperature: f64,
+    pub tokens: u32,
+    pub pre_action_secs: u64,
+    pub base_profile: Option<&'a ModelProfile>,
+    pub recovering_output: bool,
+    pub hermetic: bool,
+}
+
+pub fn select(config: &AppConfig, state: &State, request: Request<'_>) -> Selection {
+    let Request {
+        kind,
+        temperature,
+        tokens,
+        pre_action_secs,
+        base_profile,
+        recovering_output,
+        hermetic,
+    } = request;
     let settings = &config.adaptive;
     let enabled = settings.enabled && !hermetic;
     let phase = if enabled && settings.phase != Phase::Auto {
@@ -413,7 +423,19 @@ mod tests {
         recover: bool,
         hermetic: bool,
     ) -> Selection {
-        select(c, s, Kind::Editing, 0.4, 8192, 60, p, recover, hermetic)
+        select(
+            c,
+            s,
+            Request {
+                kind: Kind::Editing,
+                temperature: 0.4,
+                tokens: 8192,
+                pre_action_secs: 60,
+                base_profile: p,
+                recovering_output: recover,
+                hermetic,
+            },
+        )
     }
     #[test]
     fn task_phase_follows_observed_work_and_recovery_is_not_a_quality_label() {
@@ -437,7 +459,19 @@ mod tests {
         let first = choose(&c, &s, None, false, false);
         assert_eq!(first.max_tokens, 2048);
         assert_eq!(first.temperature, Some(0.4));
-        let smaller = select(&c, &s, Kind::Editing, 0.4, 512, 3, None, false, false);
+        let smaller = select(
+            &c,
+            &s,
+            Request {
+                kind: Kind::Editing,
+                temperature: 0.4,
+                tokens: 512,
+                pre_action_secs: 3,
+                base_profile: None,
+                recovering_output: false,
+                hermetic: false,
+            },
+        );
         assert_eq!(smaller.max_tokens, 512);
         assert_eq!(smaller.pre_action_secs, 3);
         s.recover("truncated");

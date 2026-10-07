@@ -73,6 +73,10 @@ pub struct ModelEntry {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct ModelMetadata {
     pub vision: Option<bool>,
+    #[serde(default)]
+    pub tools: Option<bool>,
+    #[serde(default)]
+    pub reasoning: Option<bool>,
     pub pricing: Option<TokenPricing>,
     /// Preliminary architecture availability, not verified LoRA compatibility. A true value still
     /// needs Dial's capability probe to check adapter targets. `None` means unknown.
@@ -138,10 +142,48 @@ fn metadata(row: &Value) -> ModelMetadata {
         .or_else(|| row.pointer("/capabilities/vision").and_then(Value::as_bool))
         .or_else(|| row.get("vision").and_then(Value::as_bool))
         .or_else(|| {
+            row.get("capabilities")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().any(|item| item == "vision"))
+        })
+        .or_else(|| {
             row.get("vision_config")
                 .filter(|config| config.is_object())
                 .map(|_| true)
         });
+    let capability = |name: &str, parameters: &[&str]| {
+        row.pointer(&format!("/capabilities/{name}"))
+            .and_then(Value::as_bool)
+            .or_else(|| row.get(name).and_then(Value::as_bool))
+            .or_else(|| {
+                row.get("capabilities")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .any(|item| item == name || (name == "reasoning" && item == "thinking"))
+                    })
+            })
+            .or_else(|| {
+                row.get("supported_parameters")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .any(|item| parameters.iter().any(|parameter| item == parameter))
+                    })
+            })
+    };
+    let tools = capability("tools", &["tools", "tool_choice"]).or_else(|| {
+        row["supports_parallel_tool_calls"]
+            .as_bool()
+            .filter(|supported| *supported)
+    });
+    let reasoning = capability("reasoning", &["reasoning", "reasoning_effort"]).or_else(|| {
+        row.get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .map(|items| !items.is_empty())
+    });
     let price = |key| {
         row.pointer(key)
             .and_then(|v| {
@@ -160,6 +202,8 @@ fn metadata(row: &Value) -> ModelMetadata {
         });
     ModelMetadata {
         vision,
+        tools,
+        reasoning,
         pricing,
         ..Default::default()
     }
@@ -168,6 +212,57 @@ fn metadata(row: &Value) -> ModelMetadata {
 /// Preliminary MLX architecture availability; this does not verify adapter training targets.
 pub fn local_lora_support(user_dir: &Path, model: &Path) -> Option<bool> {
     lora_support(mlx_architectures(user_dir).as_deref(), model)
+}
+
+/// Read local capabilities without importing Python or loading model weights.
+pub fn local_model_metadata(model: &Path) -> ModelMetadata {
+    read_json(&model.join("config.json"))
+        .map(|value| {
+            let mut info = metadata(&value);
+            // A downloaded text-only configuration has no vision encoder.
+            info.vision = Some(info.vision.unwrap_or(false));
+            // These are template declarations, not inference or quality checks. Missing
+            // template markers remain unknown rather than being classified by model name.
+            let tokenizer = read_json(&model.join("tokenizer_config.json"));
+            let template = tokenizer
+                .as_ref()
+                .and_then(|value| {
+                    let templates = match &value["chat_template"] {
+                        Value::String(template) => vec![template.as_str()],
+                        Value::Array(items) => items
+                            .iter()
+                            .filter_map(|item| item["template"].as_str())
+                            .collect(),
+                        Value::Object(items) => items.values().filter_map(Value::as_str).collect(),
+                        _ => Vec::new(),
+                    };
+                    (!templates.is_empty()).then(|| templates.join("\n"))
+                })
+                .or_else(|| {
+                    let file = fs::File::open(model.join("chat_template.jinja")).ok()?;
+                    let mut template = String::new();
+                    file.take(MAX_RESPONSE + 1)
+                        .read_to_string(&mut template)
+                        .ok()?;
+                    (template.len() as u64 <= MAX_RESPONSE).then_some(template)
+                });
+            if let Some(template) = template {
+                info.tools = info.tools.or_else(|| {
+                    (template.contains("tools")
+                        && ["tool_call", "function_call", "[TOOL_CALLS]"]
+                            .iter()
+                            .any(|marker| template.contains(marker)))
+                    .then_some(true)
+                });
+                info.reasoning = info.reasoning.or_else(|| {
+                    (template.contains("enable_thinking")
+                        || (template.contains("<think>") && template.contains("</think>")))
+                    .then_some(true)
+                });
+            }
+            info
+        })
+        .unwrap_or_default()
 }
 /// Cache-only lookup: never make a metadata request in the inference hot path.
 pub fn model_metadata(layout: &Layout, selection: &ModelSelection) -> ModelMetadata {
@@ -181,9 +276,9 @@ pub fn model_metadata(layout: &Layout, selection: &ModelSelection) -> ModelMetad
         };
     }
     if selection.provider == "mlx" && selection.base_url.is_none() {
-        return read_json(&Path::new(&selection.model).join("config.json"))
-            .map(|value| metadata(&value))
-            .unwrap_or_default();
+        let model =
+            resolve_local_model(&selection.model).unwrap_or_else(|_| selection.model.clone());
+        return local_model_metadata(Path::new(&model));
     }
     selection
         .base_url
@@ -411,6 +506,7 @@ fn status(probe: &Probe, state: &str, detail: &str, models: usize) -> ProviderSt
 fn context(value: &Value) -> Option<u32> {
     [
         "/context_window",
+        "/max_input_tokens",
         "/context_length",
         "/max_context_length",
         "/max_position_embeddings",
@@ -453,15 +549,19 @@ fn parse_models(value: &Value, probe: &Probe) -> Result<Vec<ModelEntry>> {
             {
                 return None;
             }
+            let mut selection = ModelSelection {
+                provider: probe.id.clone(),
+                model: model.into(),
+                base_url: Some(probe.spec.base_url.clone()),
+                api_key_env: probe.spec.api_key_env.clone(),
+                allow_insecure: probe.spec.allow_insecure,
+                context_window: context(row),
+            };
+            selection.context_window = selection
+                .context_window
+                .or_else(|| documented_context_window(&selection));
             Some(ModelEntry {
-                selection: ModelSelection {
-                    provider: probe.id.clone(),
-                    model: model.into(),
-                    base_url: Some(probe.spec.base_url.clone()),
-                    api_key_env: probe.spec.api_key_env.clone(),
-                    allow_insecure: probe.spec.allow_insecure,
-                    context_window: context(row),
-                },
+                selection,
                 label: model.into(),
                 source: probe.spec.label.clone(),
                 available: true,
@@ -979,7 +1079,7 @@ fn local_models(cache: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
                 available: true,
                 metadata: ModelMetadata {
                     lora: lora_support(trainable, &path),
-                    ..ModelMetadata::default()
+                    ..local_model_metadata(&path)
                 },
             });
             break;
@@ -1107,7 +1207,7 @@ fn lmstudio_mlx_models(folder: &Path, trainable: Option<&Path>) -> Vec<ModelEntr
                 available: true,
                 metadata: ModelMetadata {
                     lora: lora_support(trainable, &path),
-                    ..ModelMetadata::default()
+                    ..local_model_metadata(&path)
                 },
             });
         }
@@ -1115,11 +1215,63 @@ fn lmstudio_mlx_models(folder: &Path, trainable: Option<&Path>) -> Vec<ModelEntr
     models
 }
 fn cached(user_dir: &Path) -> BTreeMap<String, Vec<ModelEntry>> {
-    read_private(&user_dir.join("model-catalog.json"))
-        .ok()
-        .flatten()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    let mut cache: BTreeMap<String, Vec<ModelEntry>> =
+        read_private(&user_dir.join("model-catalog.json"))
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+    // Repair missing windows in older cached Claude rows without a network request or a rewrite.
+    for entries in cache.values_mut() {
+        for entry in entries {
+            if entry.selection.context_window.is_none() {
+                entry.selection.context_window = documented_context_window(&entry.selection);
+            }
+        }
+    }
+    cache
+}
+
+fn documented_context_window(selection: &ModelSelection) -> Option<u32> {
+    if selection.provider == "anthropic"
+        && selection
+            .base_url
+            .as_deref()
+            .is_none_or(|url| url.trim_end_matches('/') == super::anthropic::BASE_URL)
+    {
+        super::anthropic::documented_context_window(&selection.model)
+    } else {
+        None
+    }
+}
+
+/// Metadata-only resolution for configuration load and model changes. No provider requests.
+pub(crate) fn model_context_window(user_dir: &Path, selection: &ModelSelection) -> Option<u32> {
+    selection
+        .context_window
+        .or_else(|| {
+            let url = selection.base_url.as_deref()?;
+            cached(user_dir)
+                .into_iter()
+                .filter(|(base, _)| base.trim_end_matches('/') == url.trim_end_matches('/'))
+                .flat_map(|(_, entries)| entries)
+                .find(|entry| {
+                    entry.selection.provider == selection.provider
+                        && entry.selection.model == selection.model
+                })
+                .and_then(|entry| entry.selection.context_window)
+        })
+        .or_else(|| {
+            if selection.provider == super::chatgpt::PROVIDER {
+                super::chatgpt::model_context_window(user_dir, &selection.model)
+            } else if selection.provider == "mlx" && selection.base_url.is_none() {
+                let model = resolve_local_model(&selection.model).ok()?;
+                context(&read_json(&Path::new(&model).join("config.json"))?)
+            } else {
+                None
+            }
+        })
+        .or_else(|| documented_context_window(selection))
 }
 const ANTHROPIC_SUBSCRIPTION_SEEDS: &[(&str, &str)] = &[
     ("claude-opus-5-5", "Claude Opus 5.5"),
@@ -1508,6 +1660,11 @@ pub fn discover(
         } else {
             None
         };
+        let capabilities = if local {
+            local_model_metadata(Path::new(&selection.model))
+        } else {
+            ModelMetadata::default()
+        };
         discovery.models.push(ModelEntry {
             label: selection.model.clone(),
             selection,
@@ -1520,7 +1677,7 @@ pub fn discover(
             available,
             metadata: ModelMetadata {
                 lora,
-                ..ModelMetadata::default()
+                ..capabilities
             },
         });
     }
@@ -1534,6 +1691,61 @@ mod tests {
         io::{BufRead, BufReader, Write},
         net::TcpListener,
     };
+    #[test]
+    fn picker_capabilities_preserve_declarations_and_unknown_cached_fields() {
+        let info = metadata(&serde_json::json!({"capabilities":["vision","tools","thinking"]}));
+        assert_eq!(
+            (info.vision, info.tools, info.reasoning),
+            (Some(true), Some(true), Some(true))
+        );
+        let info = metadata(
+            &serde_json::json!({"supported_parameters":["temperature","tools","reasoning_effort"]}),
+        );
+        assert_eq!((info.tools, info.reasoning), (Some(true), Some(true)));
+        let info = metadata(&serde_json::json!({"tools":false,"supported_parameters":["tools"]}));
+        assert_eq!(info.tools, Some(false));
+        let info: ModelMetadata =
+            serde_json::from_value(serde_json::json!({"vision":true})).unwrap();
+        assert_eq!((info.tools, info.reasoning), (None, None));
+        assert_eq!(
+            metadata(&serde_json::json!({"id":"vision-reasoning-tools-model"})).tools,
+            None
+        );
+    }
+
+    #[test]
+    fn local_picker_capabilities_read_templates_without_loading_weights() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("config.json"), r#"{"vision_config":{}}"#).unwrap();
+        fs::write(root.path().join("tokenizer_config.json"), serde_json::json!({
+            "chat_template":[{"name":"tool_use","template":"{% if tools %}<tool_call>{% endif %}"},
+                {"name":"default","template":"{% if enable_thinking %}<think></think>{% endif %}"}]
+        }).to_string()).unwrap();
+        let info = local_model_metadata(root.path());
+        assert_eq!(
+            (info.vision, info.tools, info.reasoning),
+            (Some(true), Some(true), Some(true))
+        );
+        fs::write(
+            root.path().join("config.json"),
+            r#"{"tools":false,"reasoning":false}"#,
+        )
+        .unwrap();
+        let info = local_model_metadata(root.path());
+        assert_eq!(
+            (info.vision, info.tools, info.reasoning),
+            (Some(false), Some(false), Some(false))
+        );
+        fs::remove_file(root.path().join("tokenizer_config.json")).unwrap();
+        fs::write(root.path().join("config.json"), "{}").unwrap();
+        fs::write(
+            root.path().join("chat_template.jinja"),
+            "{% if tools %}<tool_call>{% endif %}",
+        )
+        .unwrap();
+        assert_eq!(local_model_metadata(root.path()).tools, Some(true));
+    }
+
     #[test]
     fn provider_metadata_preserves_supported_prices_and_vision() {
         let info = metadata(
@@ -1902,7 +2114,7 @@ mod tests {
         fs::create_dir_all(&mlx).unwrap();
         fs::write(
             mlx.join("config.json"),
-            r#"{"model_type":"qwen3_5","text_config":{"max_position_embeddings":32768}}"#,
+            r#"{"model_type":"qwen3_5","vision_config":{},"text_config":{"max_position_embeddings":32768}}"#,
         )
         .unwrap();
         let gemma = folder.path().join("lmstudio-community/gemma-MLX");
@@ -1922,6 +2134,8 @@ mod tests {
         fs::create_dir_all(&architectures).unwrap();
         fs::write(architectures.join("qwen3_5.py"), "").unwrap();
         let entries = lmstudio_mlx_models(folder.path(), Some(&architectures));
+        assert_eq!(entries[0].metadata.vision, Some(true));
+        assert_eq!(entries[1].metadata.vision, Some(false));
         assert_eq!(
             entries
                 .iter()
@@ -2070,6 +2284,79 @@ mod tests {
                 .iter()
                 .all(|entry| entry.selection.model != format!("model-{MAX_MODELS}"))
         );
+    }
+
+    #[test]
+    fn anthropic_catalog_reads_input_context_without_confusing_output_limits() {
+        let probe = test_probe(super::super::anthropic::BASE_URL.into(), "anthropic");
+        let entries = parse_models(
+            &serde_json::json!({"data":[
+                {"id":"claude-opus-5-5","max_input_tokens":1_000_000,"max_tokens":128_000},
+                {"id":"claude-custom","max_input_tokens":750_000,"max_tokens":32_000},
+                {"id":"claude-unknown","max_input_tokens":null,"max_tokens":128_000}
+            ]}),
+            &probe,
+        )
+        .unwrap();
+        assert_eq!(entries[0].selection.context_window, Some(1_000_000));
+        assert_eq!(entries[1].selection.context_window, Some(750_000));
+        assert_eq!(entries[2].selection.context_window, None);
+    }
+
+    #[test]
+    fn old_claude_cache_recovers_context_without_network_or_rewriting_saved_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let selection = ModelSelection {
+            provider: "anthropic".into(),
+            model: "claude-opus-5-5".into(),
+            base_url: Some(super::super::anthropic::BASE_URL.into()),
+            ..Default::default()
+        };
+        let mut row = ModelEntry {
+            selection: selection.clone(),
+            label: "Opus".into(),
+            source: "cached".into(),
+            available: false,
+            metadata: Default::default(),
+        };
+        let path = home.path().join("model-catalog.json");
+        let bytes = serde_json::to_vec(&BTreeMap::from([(
+            super::super::anthropic::BASE_URL,
+            vec![row.clone()],
+        )]))
+        .unwrap();
+        write_private(&path, &bytes).unwrap();
+        assert_eq!(
+            model_context_window(home.path(), &selection),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            cached(home.path())[super::super::anthropic::BASE_URL][0]
+                .selection
+                .context_window,
+            Some(1_000_000)
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        row.selection.context_window = Some(400_000);
+        write_private(
+            &path,
+            &serde_json::to_vec(&BTreeMap::from([(
+                super::super::anthropic::BASE_URL,
+                vec![row],
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(model_context_window(home.path(), &selection), Some(400_000));
+        let mut selected = selection.clone();
+        selected.context_window = Some(64_000);
+        assert_eq!(model_context_window(home.path(), &selected), Some(64_000));
+        selected.context_window = None;
+        selected.base_url = Some("https://proxy.example/v1".into());
+        assert_eq!(model_context_window(home.path(), &selected), None);
+        selected.base_url = selection.base_url;
+        selected.model = "claude-future-99".into();
+        assert_eq!(model_context_window(home.path(), &selected), None);
     }
     #[test]
     fn malformed_credentials_fail_closed_without_echoing_content() {

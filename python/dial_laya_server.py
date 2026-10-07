@@ -71,6 +71,7 @@ async def activity(request: Request, call_next):
 def health():
     return {"service": "dial-laya", "protocol": 1,
             "status": "ok" if agent is not None else "starting",
+            "busy": prediction_lock.locked(),
             "checkpoint": CHECKPOINT, "device": device}
 
 
@@ -88,9 +89,15 @@ def predict(request: Prediction):
     for question in request.questions.values():
         if question.get("type") not in ("choice", "noul", "score"):
             raise HTTPException(422, "Unsupported typed question")
+    # Timed-out clients must not leave a queue of costly predictions behind them.
+    if not prediction_lock.acquire(blocking=False):
+        raise HTTPException(503, "Dial Laya is busy; coding continues without advice")
+    started = time.monotonic()
     try:
-        with prediction_lock:
-            return agent.predict(request.state, request.questions)
+        return agent.predict(request.state, request.questions)
     except Exception:
         log.exception("Dial Laya prediction failed")
         raise HTTPException(500, "Dial Laya prediction failed")
+    finally:
+        prediction_lock.release()
+        log.info("Dial Laya prediction completed in %.2fs", time.monotonic() - started)

@@ -326,6 +326,7 @@ mod tests {
     fn post_hook_output_reaches_the_model_and_block_marks_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut out = crate::tools::ToolOutput {
+            data: None,
             text: "ok".into(),
             is_error: false,
         };

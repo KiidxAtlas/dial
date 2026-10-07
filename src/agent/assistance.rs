@@ -589,10 +589,12 @@ impl Agent<'_> {
         })();
         match result {
             Ok(value) => ToolOutput {
+                data: None,
                 text: value.to_string(),
                 is_error: false,
             },
             Err(error) => ToolOutput {
+                data: None,
                 text: format!("{error:#}"),
                 is_error: true,
             },
@@ -608,6 +610,7 @@ impl Agent<'_> {
                 let _ = tx.send(crate::tools::preview::run(&ws, &args, &cancel));
             });
             receive_with_heartbeat(&rx, ui).unwrap_or_else(|e| ToolOutput {
+                data: None,
                 text: e.to_string(),
                 is_error: true,
             })

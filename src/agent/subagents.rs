@@ -37,7 +37,7 @@ use std::{
 /// Most tasks one `task` call may launch.
 pub const MAX_BATCH: usize = 8;
 /// Hard ceiling on a subagent's step budget, whatever the caller asks for.
-const MAX_STEPS: u32 = 40;
+pub(super) const MAX_STEPS: u32 = 40;
 /// Longest task prompt or `output_schema` (bytes).
 const MAX_PROMPT: usize = 32 * 1024;
 const MAX_SCHEMA: usize = 16 * 1024;
@@ -465,6 +465,7 @@ pub(super) struct Env<'a> {
     pub layout: Option<&'a Layout>,
     pub harness: &'a Harness,
     pub interrupt: &'a std::sync::Arc<AtomicBool>,
+    pub usage: Option<&'a crate::llm::usage::Scope>,
 }
 
 pub(super) enum Status {
@@ -475,6 +476,7 @@ pub(super) enum Status {
 
 pub(super) struct Outcome {
     pub status: Status,
+    pub data: Option<Value>,
     /// Model requests made.
     pub steps: u32,
 }
@@ -483,12 +485,14 @@ impl Outcome {
     pub fn failed(steps: u32, why: impl Into<String>) -> Self {
         Self {
             status: Status::Failed(why.into()),
+            data: None,
             steps,
         }
     }
     pub fn interrupted(steps: u32) -> Self {
         Self {
             status: Status::Interrupted,
+            data: None,
             steps,
         }
     }
@@ -496,6 +500,7 @@ impl Outcome {
 
 /// Asks the user (or applies the mode) for a child's approval-requiring call.
 pub(super) trait Approver {
+    fn progress(&mut self, _steps: u32, _phase: &str, _text: &str) {}
     fn authorize(
         &mut self,
         call: &ToolCall,
@@ -569,9 +574,29 @@ enum Message {
 }
 
 /// Approves from a worker thread by asking the calling thread and waiting for its answer.
-struct Remote(mpsc::Sender<Message>);
+struct Remote(mpsc::Sender<Message>, Option<crate::runtime::Body>);
 
 impl Approver for Remote {
+    fn tool_started(&mut self, name: &str, _registry: &Registry) {
+        if let Some(body) = &self.1 {
+            let steps = body.read(|n| {
+                n.result
+                    .data
+                    .as_ref()
+                    .and_then(|d| d["steps"].as_u64())
+                    .unwrap_or(0) as u32
+            });
+            body.progress(&format!("tool: {name}"), steps);
+        }
+    }
+    fn progress(&mut self, steps: u32, phase: &str, text: &str) {
+        if let Some(body) = &self.1 {
+            body.progress(phase, steps);
+            if !text.is_empty() {
+                body.append(text);
+            }
+        }
+    }
     fn notice(&mut self, message: &str) {
         let _ = self.0.send(Message::Notice(message.to_owned()));
     }
@@ -628,6 +653,7 @@ pub(super) fn run(parent: Parent<'_>, args: &Value, ui: &mut dyn Ui) -> ToolOutp
         Ok(request) => request,
         Err(why) => {
             return ToolOutput {
+                data: None,
                 text: why,
                 is_error: true,
             };
@@ -639,6 +665,7 @@ pub(super) fn run(parent: Parent<'_>, args: &Value, ui: &mut dyn Ui) -> ToolOutp
         Ok(harness) => harness,
         Err(e) => {
             return ToolOutput {
+                data: None,
                 text: format!("subagent model profile: {e:#}"),
                 is_error: true,
             };
@@ -714,6 +741,39 @@ fn announce_start(ui: &mut dyn Ui, job: &Job, total: usize) {
     ));
 }
 
+fn worker_body(ui: &mut dyn Ui, job: &Job, role: &Config) -> Option<crate::runtime::Body> {
+    let tree = ui.runtime_tree()?;
+    let parent = tree
+        .bodies("tool")
+        .into_iter()
+        .rev()
+        .find(|b| b.read(|n| n.label == "task" && n.result.phase == crate::runtime::Phase::Running))
+        .map(|b| b.read(|n| n.id.clone()));
+    let body = tree.start("worker", &job.label, parent);
+    body.settle(String::new(),Some(json!({"name":job.label,"agent":job.kind,"model":role.model,"status":"running","phase":"starting","steps":0})),crate::runtime::Phase::Running);
+    ui.result_node(&body);
+    Some(body)
+}
+
+fn finish_worker(body: &Option<crate::runtime::Body>, outcome: &Outcome) {
+    if let Some(body) = body {
+        let (phase, text) = match &outcome.status {
+            Status::Done(t) => (crate::runtime::Phase::Done, t.clone()),
+            Status::Failed(t) => (crate::runtime::Phase::Failed, t.clone()),
+            Status::Interrupted => (crate::runtime::Phase::Interrupted, "interrupted".into()),
+        };
+        let mut data = body.read(|n| n.result.data.clone().unwrap_or(json!({})));
+        data["steps"] = json!(outcome.steps);
+        data["result"] = outcome.data.clone().unwrap_or_else(|| json!(text));
+        data["status"] = json!(match phase {
+            crate::runtime::Phase::Done => "done",
+            crate::runtime::Phase::Failed => "failed",
+            _ => "interrupted",
+        });
+        body.settle(text, Some(data), phase);
+    }
+}
+
 fn announce_end(ui: &mut dyn Ui, job: &Job, outcome: &Outcome) {
     let verdict = match &outcome.status {
         Status::Done(_) => "finished".to_owned(),
@@ -748,6 +808,9 @@ fn rebase_value(value: &mut Value, from: &str, to: &str) {
 }
 
 impl Approver for Rebase<'_> {
+    fn progress(&mut self, steps: u32, phase: &str, text: &str) {
+        self.inner.progress(steps, phase, text)
+    }
     fn authorize(
         &mut self,
         call: &ToolCall,
@@ -859,8 +922,10 @@ fn run_concurrent(
     std::thread::scope(|scope| {
         for &job in jobs {
             let tx = tx.clone();
+            let body = worker_body(direct.ui, job, role);
             scope.spawn(move || {
-                let outcome = run_isolated(env, role, job, &mut Remote(tx.clone()));
+                let outcome = run_isolated(env, role, job, &mut Remote(tx.clone(), body.clone()));
+                finish_worker(&body, &outcome);
                 let _ = tx.send(Message::Done(job.index, outcome));
             });
         }
@@ -958,13 +1023,14 @@ fn run_serial(
             continue;
         }
         announce_start(direct.ui, job, total);
+        let body = worker_body(direct.ui, job, role);
         let (tx, rx) = mpsc::channel();
         std::thread::scope(|scope| {
             let own = &mut own;
             let main = &mut *main;
             scope.spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut remote = Remote(tx.clone());
+                    let mut remote = Remote(tx.clone(), body.clone());
                     match (own, shared) {
                         (Some(backend), _) => run_job(env, job, &mut remote, |env, approver| {
                             child::run(env, job, backend, None, approver)
@@ -977,6 +1043,7 @@ fn run_serial(
                 }));
                 let outcome =
                     result.unwrap_or_else(|_| Outcome::failed(0, "subagent crashed unexpectedly"));
+                finish_worker(&body, &outcome);
                 let _ = tx.send(Message::Done(job.index, outcome));
             });
             pump_messages(&rx, env, &[job], &mut direct, outcomes);
@@ -994,6 +1061,14 @@ fn render(request: &Request, outcomes: Vec<Option<Outcome>>) -> ToolOutput {
         .into_iter()
         .map(|o| o.unwrap_or_else(|| Outcome::failed(0, "subagent produced no result")))
         .collect();
+    let data = json!({"jobs": request.jobs.iter().zip(&outcomes).map(|(job,outcome)| {
+        let (status, text) = match &outcome.status {
+            Status::Done(t) => ("done", t.as_str()),
+            Status::Failed(t) => ("failed", t.as_str()),
+            Status::Interrupted => ("interrupted", "interrupted"),
+        };
+        json!({"name":job.label,"agent":job.kind,"status":status,"steps":outcome.steps,"result":outcome.data.clone().unwrap_or_else(|| json!(clip(text, job.limit)))})
+    }).collect::<Vec<_>>()});
     let answer = |job: &Job, outcome: &Outcome| match &outcome.status {
         // Structured answers are already bounded by the task limit; cutting JSON would corrupt it.
         Status::Done(text) if job.schema.is_some() => Ok(text.clone()),
@@ -1007,10 +1082,12 @@ fn render(request: &Request, outcomes: Vec<Option<Outcome>>) -> ToolOutput {
     if !request.batch {
         return match answer(&request.jobs[0], &outcomes[0]) {
             Ok(text) => ToolOutput {
+                data: Some(data),
                 text,
                 is_error: false,
             },
             Err(text) => ToolOutput {
+                data: Some(data),
                 text,
                 is_error: true,
             },
@@ -1036,6 +1113,7 @@ fn render(request: &Request, outcomes: Vec<Option<Outcome>>) -> ToolOutput {
     }
     let total = outcomes.len();
     ToolOutput {
+        data: Some(data),
         text: format!(
             "{total} subagent task(s): {} ok, {failed} failed.\n{sections}",
             total - failed
@@ -1049,12 +1127,13 @@ mod tests {
     use super::*;
 
     fn config(presets: &[(&str, &str)]) -> Config {
-        let mut config = Config::default();
-        config.subagents = presets
-            .iter()
-            .map(|(n, p)| (n.to_string(), p.to_string()))
-            .collect();
-        config
+        Config {
+            subagents: presets
+                .iter()
+                .map(|(n, p)| (n.to_string(), p.to_string()))
+                .collect(),
+            ..Config::default()
+        }
     }
 
     #[test]

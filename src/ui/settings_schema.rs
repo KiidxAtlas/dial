@@ -16,6 +16,12 @@ pub enum Kind {
         max: i64,
         step: i64,
     },
+    /// Auto follows the model; an integer sets a retained-context cap.
+    AutoInt {
+        min: i64,
+        max: i64,
+        step: i64,
+    },
     Float {
         min: f64,
         max: f64,
@@ -307,6 +313,24 @@ static REGISTRY: &[SettingDef] = &[
         "8"
     ),
     def!(
+        "ui.session_rail",
+        AP,
+        "Display",
+        "Session rail",
+        "Pin the current session and per-file change counts above the composer.",
+        Kind::Bool,
+        "true"
+    ),
+    def!(
+        "ui.worker_shards",
+        AP,
+        "Display",
+        "Live worker cards",
+        "Show worker phases and streaming previews above the composer.",
+        Kind::Bool,
+        "true"
+    ),
+    def!(
         "ui.show_turn_stats",
         AP,
         "Display",
@@ -328,15 +352,41 @@ static REGISTRY: &[SettingDef] = &[
     def!(
         "context_window",
         MO,
-        "Roles & Sampling",
-        "Context window",
-        "Tokens of context to plan against. A server that loaded a smaller window overrides this downward.",
-        Kind::Int {
+        "Context",
+        "Current model context",
+        "Auto follows this model's capacity and the cloud/local default. Enter auto or a token cap. Model changes reset this override to Auto; smaller loaded server limits still apply.",
+        Kind::AutoInt {
             min: 2048,
-            max: 1_048_576,
+            max: crate::llm::model_config::MAX_CONTEXT_WINDOW as i64,
             step: 1024
         },
-        "32768"
+        "\"auto\""
+    ),
+    def!(
+        "cloud_context_window",
+        MO,
+        "Context",
+        "Cloud context default",
+        "Auto uses each cloud model's reported capacity. Enter a token cap to compact cloud history earlier; a numeric current-model override takes precedence.",
+        Kind::AutoInt {
+            min: 2048,
+            max: crate::llm::model_config::MAX_CONTEXT_WINDOW as i64,
+            step: 1024
+        },
+        "\"auto\""
+    ),
+    def!(
+        "local_context_window",
+        MO,
+        "Context",
+        "Local context default",
+        "Auto uses downloaded model metadata or the local server's loaded capacity. Enter a token cap for local models and local/LAN endpoints. This budgets history without preallocating model memory.",
+        Kind::AutoInt {
+            min: 2048,
+            max: crate::llm::model_config::MAX_CONTEXT_WINDOW as i64,
+            step: 1024
+        },
+        "\"auto\""
     ),
     def!(
         "harness.temperature",
@@ -369,9 +419,9 @@ static REGISTRY: &[SettingDef] = &[
         MO,
         "Roles & Sampling",
         "Max steps per turn",
-        "Tool-use steps allowed before a turn stops. The improvement loop may replace the admitted harness, including this value.",
+        "Model steps allowed before a turn stops; 0 means unlimited. An explicit 0 keeps interactive turns unlimited even if the admitted harness has a finite budget. Automatic repair and evaluation remain bounded.",
         Kind::Int {
-            min: 1,
+            min: 0,
             max: 64,
             step: 1
         },
@@ -792,6 +842,15 @@ static REGISTRY: &[SettingDef] = &[
         "8"
     ),
     // Learning: training
+    def!(
+        "browser.auto_localhost",
+        TO,
+        "Browser",
+        "Permit approved localhost pages",
+        "An approved browser open/navigation permits its exact localhost or 127.0.0.1 host:port for that browser session. Other local endpoints, redirects and private addresses remain guarded. Off requires browser.allowed_hosts for every local target.",
+        Kind::Bool,
+        "true"
+    ),
     def!(
         "training.enabled",
         LE,
@@ -1378,13 +1437,16 @@ mod tests {
                     );
                     values.extend(options.iter().map(|(v, _)| Value::String((*v).into())));
                 }
-                Kind::Int { min, max, step } => {
+                Kind::Int { min, max, step } | Kind::AutoInt { min, max, step } => {
                     assert!(
                         min < max && step > 0 && step <= max - min,
                         "{} bad int bounds",
                         def.path
                     );
                     values.extend([Value::Integer(min), Value::Integer(max)]);
+                    if matches!(def.kind, Kind::AutoInt { .. }) {
+                        values.push(Value::String("auto".into()));
+                    }
                 }
                 Kind::Float { min, max, step } => {
                     assert!(min < max && step > 0.0, "{} bad float bounds", def.path);

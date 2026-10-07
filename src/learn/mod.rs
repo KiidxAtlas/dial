@@ -10,6 +10,7 @@ pub mod harvest;
 pub mod improve;
 pub mod mutate;
 pub mod probe;
+pub mod processes;
 pub mod resources;
 pub mod verify;
 pub mod worker;

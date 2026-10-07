@@ -270,6 +270,39 @@ pub fn render(value: &Value) -> String {
             .unwrap_or_else(|| "no calls yet".into());
         out.push_str(&format!("\nTool success rate: {rate}"));
         out.push_str(&format!("\nTurn: {} successful / {} calls · {} contract errors · {} runtime errors · {} corrections\nChecks: {} passed / {} failed · first useful action: {}\nInterface: {} · verification: {}",s["successes"],s["calls"],s["contract_errors"],s["runtime_errors"],s["corrections"],json!(s["passing_checks"].as_u64().unwrap_or(0)+session["automatic_passing_checks"].as_u64().unwrap_or(0)),json!(s["failing_checks"].as_u64().unwrap_or(0)+session["automatic_failing_checks"].as_u64().unwrap_or(0)),first_action,session["interface"].as_str().unwrap_or("standard"),session["verification"].as_str().unwrap_or("not recorded")));
+        if session["edit_loop"].is_object() {
+            out.push_str(&format!(
+                "\nEdit loop: {} · {} edits · {} checked · {} diffs surfaced · {} shell commands ({} disclosed) · {} extension calls ({} disclosed)",
+                session["edit_loop"]["phase"].as_str().unwrap_or("unknown"),
+                session["edit_loop"]["mutations"].as_u64().unwrap_or(0),
+                session["edit_loop"]["checked_mutations"].as_u64().unwrap_or(0),
+                session["edit_loop"]["diff_surfaced_mutations"].as_u64().unwrap_or(0),
+                session["edit_loop"]["uncheckpointed_shell_commands"].as_u64().unwrap_or(0),
+                session["edit_loop"]["disclosed_shell_commands"].as_u64().unwrap_or(0),
+                session["edit_loop"]["uncheckpointed_extension_calls"].as_u64().unwrap_or(0),
+                session["edit_loop"]["disclosed_extension_calls"].as_u64().unwrap_or(0),
+            ));
+            if let Some(failed) = session["edit_loop"]["failed_checks"].as_array()
+                && !failed.is_empty()
+            {
+                let names = failed
+                    .iter()
+                    .filter_map(|name| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("\nFailed focused checks: {names}"));
+            }
+            if let Some(tools) = session["edit_loop"]["uncheckpointed_extension_tools"].as_array()
+                && !tools.is_empty()
+            {
+                let names = tools
+                    .iter()
+                    .filter_map(|tool| tool.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("\nUncheckpointed extension tools: {names}"));
+            }
+        }
     }
     out
 }
@@ -668,6 +701,35 @@ pub fn simplify(schemas: &mut Vec<Value>, loaded: &HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn renders_edit_verification_progress() {
+        let rendered = render(&json!({
+            "enabled":true,
+            "session":{
+                "stats":{},
+                "edit_loop":{
+                    "phase":"checks_passed_diff_surfaced_review_pending",
+                    "mutations":2,
+                    "checked_mutations":2,
+                    "diff_surfaced_mutations":1,
+                    "failed_checks":["related Rust tests: api::parser::tests::"],
+                    "uncheckpointed_shell_commands":1,
+                    "disclosed_shell_commands":0,
+                    "uncheckpointed_extension_calls":2,
+                    "disclosed_extension_calls":1,
+                    "uncheckpointed_extension_tools":["mcp__fixture"]
+                }
+            }
+        }));
+        assert!(rendered.contains(
+            "Edit loop: checks_passed_diff_surfaced_review_pending · 2 edits · 2 checked · 1 diffs surfaced · 1 shell commands (0 disclosed) · 2 extension calls (1 disclosed)"
+        ));
+        assert!(
+            rendered.contains("Failed focused checks: related Rust tests: api::parser::tests::")
+        );
+        assert!(rendered.contains("Uncheckpointed extension tools: mcp__fixture"));
+    }
+
     #[test]
     fn capability_deadline_aborts_incomplete_reply_without_scoring_it() {
         use std::{

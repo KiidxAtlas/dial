@@ -201,6 +201,9 @@ fn step_temperature(active: &Harness, _: &Context, _: &mut dyn RngCore) -> Vec<M
 
 fn scale_max_steps(active: &Harness, _: &Context, _: &mut dyn RngCore) -> Vec<Mutation> {
     let from = active.max_steps;
+    if from == 0 {
+        return Vec::new();
+    }
     [
         (1.5, "more room to finish multi-step tasks"),
         (0.67, "a tighter budget stops aimless wandering"),
@@ -267,7 +270,7 @@ fn failure_note(active: &Harness, ctx: &Context, _: &mut dyn RngCore) -> Vec<Mut
         }
     }
     let mut ranked: Vec<_> = by_advice.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    ranked.sort_by_key(|a| std::cmp::Reverse(a.1.0));
     ranked
         .into_iter()
         .filter_map(|(advice, (count, kinds))| {
@@ -375,7 +378,9 @@ mod tests {
         }
     }
 
-    fn signals() -> (BTreeMap<String, usize>, Vec<(String, usize, usize)>) {
+    type Signals = (BTreeMap<String, usize>, Vec<(String, usize, usize)>);
+
+    fn signals() -> Signals {
         (
             BTreeMap::from([("text_call".into(), 4), ("schema".into(), 2)]),
             vec![
@@ -485,8 +490,10 @@ mod tests {
         let tried = HashSet::new();
         let yes = |_: &Harness| true;
         let temps = |t: f64| -> Vec<f64> {
-            let mut h = Harness::default();
-            h.temperature = t;
+            let h = Harness {
+                temperature: t,
+                ..Harness::default()
+            };
             let mut seen = HashSet::new();
             let mut out = vec![];
             // One mutation per call; mark each result tried to enumerate the operator's options.
@@ -539,6 +546,10 @@ mod tests {
         assert_eq!(steps(64), vec![43]);
         assert_eq!(steps(8), vec![12]);
         assert_eq!(steps(10), vec![8, 15]);
+        assert!(
+            steps(0).is_empty(),
+            "unlimited is an operator choice, not a tiny budget"
+        );
     }
 
     #[test]

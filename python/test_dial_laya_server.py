@@ -16,6 +16,31 @@ class FakeAgent:
 
 
 class ServiceTests(unittest.TestCase):
+    def test_busy_requests_are_rejected_without_queueing(self):
+        packet = server.Prediction(state={"input": "hello"}, questions={"retrieval": {"type": "choice"}})
+        server.prediction_lock.acquire()
+        try:
+            with patch.object(server, "agent", FakeAgent()):
+                self.assertTrue(server.health()["busy"])
+                with self.assertRaises(server.HTTPException) as error:
+                    server.predict(packet)
+                self.assertEqual(error.exception.status_code, 503)
+        finally:
+            server.prediction_lock.release()
+        self.assertFalse(server.health()["busy"])
+
+    def test_failed_predictions_release_the_lock(self):
+        class Broken:
+            def predict(self, *_):
+                raise RuntimeError("fixture failure")
+        packet = server.Prediction(state={"input": "hello"}, questions={"retrieval": {"type": "choice"}})
+        with patch.object(server, "agent", Broken()), patch.object(server.log, "exception"):
+            with self.assertRaises(server.HTTPException):
+                server.predict(packet)
+        self.assertFalse(server.prediction_lock.locked())
+        with patch.object(server, "agent", FakeAgent()):
+            self.assertIn("answers", server.predict(packet))
+
     def test_identity_and_loading_are_dial_owned(self):
         with patch.object(server, "agent", None):
             health = server.health()

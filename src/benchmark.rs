@@ -1107,6 +1107,23 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
+    fn efficiency_suite_and_fixture_are_valid() {
+        let suite =
+            BenchmarkSuite::parse_toml(include_str!("../examples/benchmarks/efficiency.toml"))
+                .unwrap();
+        assert_eq!(suite.cases.len(), 5);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for case in &suite.cases {
+            let fixture = root.join(case.project.as_ref().unwrap());
+            assert!(fixture.join("calc.py").is_file());
+            assert!(fixture.join("message.py").is_file());
+            assert!(!case.checks.is_empty());
+        }
+        assert_eq!(suite.cases[4].turns.len(), 2);
+        assert!(suite.cases[4].turns[1].compact_before);
+    }
+
+    #[test]
     fn parsing_limits_and_scoring_are_deterministic_and_serializable() {
         let suite = BenchmarkSuite::parse_toml(
             r#"version = 1

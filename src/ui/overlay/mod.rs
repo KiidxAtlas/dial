@@ -4,6 +4,7 @@
 //! change, then reports back so the overlay can show the real outcome (including errors).
 pub mod compute;
 pub mod models;
+pub mod palette;
 pub mod providers;
 pub mod settings;
 pub mod shortcuts;

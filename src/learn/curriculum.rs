@@ -1463,6 +1463,10 @@ fn fix_bug_py(rng: &mut StdRng) -> Task {
     )
 }
 
+/// `json_set` config: sections of `(key, type, value)` entries.
+type JsonEntry<'a> = (&'a str, Ty, Value);
+type JsonConfig<'a> = Vec<(&'a str, Vec<JsonEntry<'a>>)>;
+
 /// Typed config keys for json_set.
 #[derive(Clone, Copy)]
 enum Ty {
@@ -1509,7 +1513,7 @@ fn json_value(rng: &mut StdRng, key: &str, ty: Ty) -> Value {
 fn json_set(rng: &mut StdRng) -> Task {
     let n_sections = rng.random_range(2..=4usize);
     let sections = sample(rng, JSON_SECTIONS, n_sections);
-    let mut config: Vec<(&str, Vec<(&str, Ty, Value)>)> = Vec::new();
+    let mut config: JsonConfig = Vec::new();
     for s in &sections {
         let n_keys = rng.random_range(2..=4usize);
         let keys = sample(rng, JSON_KEYS, n_keys);
@@ -1559,7 +1563,7 @@ fn json_set(rng: &mut StdRng) -> Task {
         )
     };
     let key = config[at].1[leaf].0;
-    let render = |config: &[(&str, Vec<(&str, Ty, Value)>)], skip_new: bool| -> Value {
+    let render = |config: &[(&str, Vec<JsonEntry>)], skip_new: bool| -> Value {
         let mut root = serde_json::Map::new();
         for (s, entries) in config {
             let mut m = serde_json::Map::new();

@@ -145,6 +145,7 @@ impl Background {
         };
         let is_error = lock(&snap.ring).error.is_some();
         Ok(ToolOutput {
+            data: None,
             text: render_output(&snap, &bytes, lost, tail),
             is_error,
         })

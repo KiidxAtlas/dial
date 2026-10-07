@@ -54,6 +54,7 @@ pub struct TranscriptCtx<'a> {
     pub tools_expanded: bool,
 }
 
+#[derive(Clone)]
 struct Tool {
     id: String,
     name: String,
@@ -73,6 +74,7 @@ enum Kind {
     Tool(Tool),
     Notice { title: String, text: String },
     Error(String),
+    Image(super::images::Thumbnail),
     Stats(TurnStats),
 }
 
@@ -98,6 +100,23 @@ struct Block {
     active: bool,
     spill: Spill,
     markdown: std::cell::RefCell<StreamingRows>,
+    shared: Option<crate::runtime::Body>,
+    revision: std::cell::Cell<u64>,
+    rendered: std::cell::RefCell<Option<(RenderKey, u64, Rows)>>,
+}
+
+#[derive(PartialEq)]
+struct RenderKey {
+    width: u16,
+    theme: Theme,
+    thinking: bool,
+    tools: bool,
+    expanded: bool,
+    tool_lines: usize,
+    turn_stats: bool,
+    revision: u64,
+    shared_revision: u64,
+    active: bool,
 }
 
 impl Block {
@@ -107,27 +126,99 @@ impl Block {
             active,
             spill: Spill::default(),
             markdown: std::cell::RefCell::new(StreamingRows::default()),
+            shared: None,
+            revision: std::cell::Cell::new(0),
+            rendered: std::cell::RefCell::new(None),
         }
     }
 
-    fn prose(&self) -> Option<(Prose, &str)> {
+    fn prose(&self) -> Option<(Prose, std::borrow::Cow<'_, str>)> {
         match &self.kind {
-            Kind::Assistant(t) => Some((Prose::Assistant, t.as_str())),
-            Kind::Thinking(t) => Some((Prose::Thinking, t.as_str())),
+            Kind::Assistant(t) => Some((
+                Prose::Assistant,
+                self.shared.as_ref().map_or_else(
+                    || std::borrow::Cow::Borrowed(t.as_str()),
+                    |b| std::borrow::Cow::Owned(b.read(|n| n.result.text.clone())),
+                ),
+            )),
+            Kind::Thinking(t) => Some((
+                Prose::Thinking,
+                self.shared.as_ref().map_or_else(
+                    || std::borrow::Cow::Borrowed(t.as_str()),
+                    |b| std::borrow::Cow::Owned(b.read(|n| n.result.text.clone())),
+                ),
+            )),
             _ => None,
         }
     }
 
     fn render(&self, w: u16, ctx: &TranscriptCtx) -> Rows {
-        match &self.kind {
+        let key = RenderKey {
+            width: w,
+            theme: ctx.theme.clone(),
+            thinking: ctx.ui.show_thinking,
+            tools: ctx.ui.show_tools,
+            expanded: ctx.tools_expanded,
+            tool_lines: ctx.ui.tool_output_lines as usize,
+            turn_stats: ctx.ui.show_turn_stats,
+            revision: self.revision.get(),
+            shared_revision: self
+                .shared
+                .as_ref()
+                .map_or(0, crate::runtime::Body::revision),
+            active: self.active,
+        };
+        if let Some((old, tick, rows)) = &*self.rendered.borrow() {
+            if *old == key {
+                let mut rows = rows.clone();
+                if matches!(&self.kind,Kind::Tool(t) if t.state==ToolState::Pending)
+                    && *tick != ctx.tick
+                {
+                    if let Some(span) = rows
+                        .iter_mut()
+                        .flat_map(|r| r.spans.iter_mut())
+                        .find(|s| s.content == ctx.theme.spinner(*tick))
+                    {
+                        span.content = ctx.theme.spinner(ctx.tick).to_owned().into();
+                    }
+                }
+                return rows;
+            }
+        }
+        let rows = match &self.kind {
             Kind::User(t) => user_rows(t, w, ctx),
-            Kind::Assistant(t) => self.markdown.borrow_mut().render(t, w, ctx.theme),
-            Kind::Thinking(t) => prose_rows(Prose::Thinking, t, w, ctx),
-            Kind::Tool(t) => tool_rows(t, w, ctx),
+            Kind::Assistant(t) => match &self.shared {
+                Some(b) => b.read(|n| {
+                    self.markdown
+                        .borrow_mut()
+                        .render(&n.result.text, w, ctx.theme)
+                }),
+                None => self.markdown.borrow_mut().render(t, w, ctx.theme),
+            },
+            Kind::Thinking(t) => match &self.shared {
+                Some(b) => b.read(|n| prose_rows(Prose::Thinking, &n.result.text, w, ctx)),
+                None => prose_rows(Prose::Thinking, t, w, ctx),
+            },
+            Kind::Tool(t) => match &self.shared {
+                Some(b) => b.read(|n| {
+                    let mut view = t.clone();
+                    view.output = n.result.text.clone();
+                    view.state = match n.result.phase {
+                        crate::runtime::Phase::Running => ToolState::Pending,
+                        crate::runtime::Phase::Done => ToolState::Ok,
+                        _ => ToolState::Err,
+                    };
+                    tool_rows(&view, w, ctx)
+                }),
+                None => tool_rows(t, w, ctx),
+            },
             Kind::Notice { title, text } => notice_rows(title, text, w, ctx),
             Kind::Error(t) => error_rows(t, w, ctx),
+            Kind::Image(image) => image.rows(w, ctx.theme),
             Kind::Stats(s) => stats_rows(s, w, ctx),
-        }
+        };
+        *self.rendered.borrow_mut() = Some((key, ctx.tick, rows.clone()));
+        rows
     }
 
     /// Rows of this block already in scrollback because of a spill (re-measured on width change).
@@ -163,7 +254,7 @@ impl Block {
         if kind == Prose::Thinking && !ctx.ui.show_thinking {
             return None;
         }
-        for &cut in stable_cuts(text, self.spill.src).iter().rev().take(4) {
+        for &cut in stable_cuts(&text, self.spill.src).iter().rev().take(4) {
             let prefix = prose_rows(kind, &text[..cut], w, ctx);
             let p = prefix.len();
             if p > skip && p <= full.len() && full[..p] == prefix[..] {
@@ -764,7 +855,15 @@ fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> (Rows, usize) {
                 },
             )]
         };
-        for wrapped in text::wrap(vec![Line::from(spans)], inner.max(1)) {
+        let wrapped_rows = if err {
+            text::wrap_words(line, inner.max(1))
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, theme.fg(Tok::Error))))
+                .collect()
+        } else {
+            text::wrap(vec![Line::from(spans)], inner.max(1))
+        };
+        for wrapped in wrapped_rows {
             total += 1;
             if rows.len() < limit {
                 rows.push(wrapped);
@@ -975,6 +1074,49 @@ impl Default for Transcript {
 }
 
 impl Transcript {
+    fn invalidate_tail(&self) {
+        for block in &self.blocks[self.cursor..] {
+            block.revision.set(block.revision.get().saturating_add(1));
+        }
+    }
+
+    pub fn bind_prose(&mut self, body: &crate::runtime::Body) {
+        let (id, kind, running) = body.read(|n| {
+            (
+                n.id.clone(),
+                n.kind.clone(),
+                n.result.phase == crate::runtime::Phase::Running,
+            )
+        });
+        if let Some(block) = self.blocks[self.cursor..]
+            .iter_mut()
+            .find(|b| b.shared.as_ref().is_some_and(|b| b.read(|n| n.id == id)))
+        {
+            block.active = running;
+            return;
+        }
+        if !running {
+            return;
+        }
+        let kind = match kind.as_str() {
+            "assistant" => Kind::Assistant(String::new()),
+            "reasoning" => Kind::Thinking(String::new()),
+            _ => return,
+        };
+        self.close_streaming_text();
+        let mut block = Block::new(kind, true);
+        block.shared = Some(body.clone());
+        self.blocks.push(block);
+    }
+
+    pub fn bind_tool(&mut self, id: &str, body: crate::runtime::Body) {
+        if let Some(block) = self.blocks[self.cursor..]
+            .iter_mut()
+            .find(|b| matches!(&b.kind,Kind::Tool(t) if t.id==id))
+        {
+            block.shared = Some(body);
+        }
+    }
     pub fn new() -> Self {
         Transcript {
             blocks: Vec::new(),
@@ -1001,6 +1143,7 @@ impl Transcript {
     }
 
     pub fn assistant_delta(&mut self, text: &str) {
+        self.invalidate_tail();
         if text.is_empty() {
             return;
         }
@@ -1018,6 +1161,7 @@ impl Transcript {
     }
 
     pub fn thinking_delta(&mut self, text: &str) {
+        self.invalidate_tail();
         if text.is_empty() {
             return;
         }
@@ -1053,6 +1197,13 @@ impl Transcript {
 
     /// Append a live chunk to a pending card; full output is retained separately in artifacts.
     pub fn tool_delta(&mut self, id: &str, text: &str) {
+        if self.blocks[self.cursor..]
+            .iter()
+            .any(|b| b.shared.is_some() && matches!(&b.kind,Kind::Tool(t) if t.id==id))
+        {
+            return;
+        }
+        self.invalidate_tail();
         let Some(tool) =
             self.blocks[self.cursor..]
                 .iter_mut()
@@ -1077,6 +1228,7 @@ impl Transcript {
 
     /// Attach the task list a pending `todo` call produced, so its card shows what changed.
     pub fn tool_todo(&mut self, id: &str, tasks: Vec<(crate::agent::todo::Task, bool)>) {
+        self.invalidate_tail();
         if let Some(tool) =
             self.blocks[self.cursor..]
                 .iter_mut()
@@ -1091,6 +1243,7 @@ impl Transcript {
     }
 
     pub fn tool_end(&mut self, id: &str, output: &str, is_error: bool, elapsed_secs: f64) {
+        self.invalidate_tail();
         let state = if is_error {
             ToolState::Err
         } else {
@@ -1101,14 +1254,16 @@ impl Transcript {
             .rev()
             .find_map(|b| match &mut b.kind {
                 Kind::Tool(t) if t.id == id && t.state == ToolState::Pending => {
-                    Some((&mut b.active, t))
+                    Some((&mut b.active, t, b.shared.is_some()))
                 }
                 _ => None,
             });
         match found {
-            Some((active, tool)) => {
+            Some((active, tool, shared)) => {
                 tool.state = state;
-                tool.output = output.to_owned();
+                if !shared {
+                    tool.output = output.to_owned();
+                }
                 tool.elapsed = Some(elapsed_secs);
                 *active = false;
             }
@@ -1142,6 +1297,11 @@ impl Transcript {
         );
     }
 
+    pub fn image(&mut self, thumbnail: super::images::Thumbnail) {
+        self.close_streaming_text();
+        self.push(Kind::Image(thumbnail), false);
+    }
+
     pub fn error(&mut self, text: &str) {
         self.close_streaming_text();
         self.push(Kind::Error(text.to_owned()), false);
@@ -1154,6 +1314,7 @@ impl Transcript {
 
     /// Finalize every streaming block; a tool that never reported back is shown as interrupted.
     pub fn finish_turn(&mut self) {
+        self.invalidate_tail();
         for block in self.blocks[self.cursor..].iter_mut() {
             if let Kind::Tool(t) = &mut block.kind
                 && t.state == ToolState::Pending
@@ -1175,7 +1336,18 @@ impl Transcript {
     /// that is still active. Every block that has rows ends with one blank separator row. A block that
     /// was partly spilled by [`live`](Self::live) contributes only its remainder.
     pub fn take_settled(&mut self, width: u16, ctx: &TranscriptCtx) -> Rows {
+        self.take_settled_with_images(width, ctx).0
+    }
+
+    /// Native overlays are anchored to the separator after the preview and emitted once, together
+    /// with settled history. Portable cells remain underneath as a fallback.
+    pub fn take_settled_with_images(
+        &mut self,
+        width: u16,
+        ctx: &TranscriptCtx,
+    ) -> (Rows, Vec<(usize, super::images::NativeImage)>) {
         let mut out = Vec::new();
+        let mut images = Vec::new();
         while let Some(block) = self.blocks.get_mut(self.cursor) {
             if block.active {
                 break;
@@ -1183,13 +1355,19 @@ impl Transcript {
             let rows = block.render(width, ctx);
             let skip = block.emitted(width, ctx);
             let had_rows = !rows.is_empty() || skip > 0;
+            if skip == 0
+                && let Kind::Image(image) = &block.kind
+                && let Some(native) = image.native(width)
+            {
+                images.push((out.len() + rows.len(), native));
+            }
             out.extend(rows.into_iter().skip(skip));
             if had_rows {
                 out.push(blank_row());
             }
             self.cursor += 1;
         }
-        out
+        (out, images)
     }
 
     /// `(spilled, live)`: rows that must be committed to scrollback now (the stable head of the
@@ -1615,6 +1793,34 @@ mod tests {
     }
 
     #[test]
+    fn failed_tool_output_wraps_at_word_boundaries() {
+        let env = Env::new();
+        let mut t = Transcript::new();
+        t.tool_start("1", "bash", "probe", "");
+        t.tool_end(
+            "1",
+            "connection refused while talking to the model server",
+            true,
+            0.01,
+        );
+        let rows = t.all_rows(24, &env.ctx());
+        assert_fits(&rows, 24);
+        let output = plain(&rows);
+        assert!(
+            output
+                .iter()
+                .any(|line| line.contains("connection refused")),
+            "{output:?}"
+        );
+        assert!(
+            output
+                .iter()
+                .any(|line| line.contains("while talking to the")),
+            "{output:?}"
+        );
+    }
+
+    #[test]
     fn tool_tint_follows_state() {
         let env = Env::new();
         let render = |end: Option<bool>| {
@@ -1689,6 +1895,34 @@ mod tests {
             },
         ));
         assert!(expanded.contains("line 20") && !expanded.contains("more lines"));
+    }
+
+    #[test]
+    fn shared_result_revisions_update_cached_rows_and_output_settings_invalidate_them() {
+        let mut env = Env::new();
+        let tree = crate::runtime::Tree::default();
+        let body = tree.start("tool", "bash", None);
+        let mut t = Transcript::new();
+        t.tool_start("shared", "bash", "check", "");
+        t.bind_tool("shared", body.clone());
+        body.append("one\ntwo\nthree\nfour\n");
+        env.ui.tool_output_lines = 2;
+        let first = text_of(&t.all_rows(80, &env.ctx()));
+        assert!(first.contains("one"));
+        assert!(!first.contains("four"));
+        env.ui.tool_output_lines = 10;
+        assert!(text_of(&t.all_rows(80, &env.ctx())).contains("four"));
+        body.settle(
+            "typed result".into(),
+            Some(serde_json::json!({"ok":true})),
+            crate::runtime::Phase::Done,
+        );
+        t.tool_end("shared", "legacy projection", false, 0.2);
+        let done = text_of(&t.all_rows(80, &env.ctx()));
+        assert!(done.contains("typed result"));
+        assert!(!done.contains("legacy projection"));
+        assert!(t.take_settled(80, &env.ctx()).len() > 0);
+        assert!(t.take_settled(80, &env.ctx()).is_empty());
     }
 
     #[test]

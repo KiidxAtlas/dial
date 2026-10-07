@@ -206,6 +206,9 @@ impl Config {
         }
         config.project_root = layout.project_root.clone();
         config.user_dir = layout.user_dir.clone();
+        let mut selection = config.selection();
+        selection.context_window = config.context_limit.tokens();
+        config.context_window = config.resolve_context_window(&selection);
         let python = layout.user_dir.join("python");
         if config.python.as_os_str().is_empty() {
             config.python = python.join(".venv/bin/python");
@@ -336,10 +339,51 @@ impl Config {
                 api_key_env: selection.api_key_env.clone(),
                 allow_insecure: selection.allow_insecure,
             });
-        if let Some(window) = selection.context_window {
-            config.context_window = window;
-        }
+        // Role selections may carry an explicit cap; the main model's cap never leaks to them.
+        config.context_limit = selection
+            .context_window
+            .map(types::ContextWindow::Tokens)
+            .unwrap_or_default();
+        config.context_window = config.resolve_context_window(selection);
         config
+    }
+
+    fn family_context_limit(
+        &self,
+        selection: &crate::llm::model_config::ModelSelection,
+    ) -> types::ContextWindow {
+        let local = (selection.provider == "mlx" && selection.base_url.is_none())
+            || selection
+                .base_url
+                .as_deref()
+                .and_then(crate::llm::host_of)
+                .is_some_and(|host| crate::llm::is_local_host(&host));
+        if local {
+            self.local_context_window
+        } else {
+            self.cloud_context_window
+        }
+    }
+
+    /// Operator cap before capacity resolution, used when a local server reports a fresh loaded size.
+    pub(crate) fn requested_context_window(&self) -> Option<u32> {
+        self.context_limit
+            .tokens()
+            .or_else(|| self.family_context_limit(&self.selection()).tokens())
+    }
+
+    fn resolve_context_window(&self, selection: &crate::llm::model_config::ModelSelection) -> u32 {
+        let family = self.family_context_limit(selection);
+        let mut metadata = selection.clone();
+        metadata.context_window = None;
+        let capacity = crate::llm::catalog::model_context_window(&self.user_dir, &metadata);
+        let requested = selection.context_window.or_else(|| family.tokens());
+        match (requested, capacity) {
+            (Some(limit), Some(capacity)) => limit.min(capacity),
+            (Some(limit), None) => limit,
+            (None, Some(capacity)) => capacity,
+            (None, None) => types::Config::default().context_window,
+        }
     }
 
     pub fn for_role(&self, role: &str) -> Self {
@@ -479,9 +523,20 @@ impl Config {
             "codebase.context_max_bytes must be 1024..24000"
         );
         self.laya.validate()?;
+        for (name, mode) in [
+            ("context_window", self.context_limit),
+            ("cloud_context_window", self.cloud_context_window),
+            ("local_context_window", self.local_context_window),
+        ] {
+            ensure!(
+                mode.tokens()
+                    .is_none_or(|n| (2048..=types::MAX_CONTEXT_WINDOW).contains(&n)),
+                "{name} must be auto or 2048..2097152 tokens"
+            );
+        }
         ensure!(
-            (2048..=1_048_576).contains(&self.context_window),
-            "context_window must be 2048..1048576 tokens"
+            (2048..=types::MAX_CONTEXT_WINDOW).contains(&self.context_window),
+            "context_window must be 2048..2097152 tokens"
         );
         ensure!(
             (1..=10000).contains(&self.ui.history_limit),
@@ -571,7 +626,7 @@ impl Config {
             ensure!(
                 selection
                     .context_window
-                    .is_none_or(|w| (2048..=1_048_576).contains(&w)),
+                    .is_none_or(|w| (2048..=types::MAX_CONTEXT_WINDOW).contains(&w)),
                 "invalid role context window"
             );
         }
@@ -953,6 +1008,142 @@ mod chatgpt_tests {
     }
 
     #[test]
+    fn context_auto_and_family_caps_follow_model_capacity_without_loading_weights() {
+        use crate::llm::{chatgpt, model_config::ModelSelection};
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+        chatgpt::test_account(home.path(), false);
+        chatgpt::test_catalog(
+            home.path(),
+            &serde_json::json!({"models":[
+                {"slug":"large","context_window":272000},
+                {"slug":"small","context_window":16000}
+            ]}),
+        );
+        let load = |text: &str| Config::from_table(&layout, toml::from_str(text).unwrap()).unwrap();
+        let auto = load("provider='chatgpt'\nmodel='large'\ncontext_window='auto'\n");
+        assert_eq!(auto.context_window, 272000);
+        assert_eq!(
+            toml::Table::try_from(&auto).unwrap()["context_window"].as_str(),
+            Some("auto")
+        );
+        let capped = load(
+            "provider='chatgpt'\nmodel='large'\ncloud_context_window=64000\nlocal_context_window=8192\n",
+        );
+        assert_eq!(capped.context_window, 64000);
+        let small = ModelSelection {
+            provider: "chatgpt".into(),
+            model: "small".into(),
+            ..Default::default()
+        };
+        assert_eq!(capped.with_selection(&small).context_window, 16000);
+        let unknown = ModelSelection {
+            provider: "chatgpt".into(),
+            model: "unknown".into(),
+            ..Default::default()
+        };
+        assert_eq!(capped.with_selection(&unknown).context_window, 64000);
+        let override_main = load(
+            "provider='chatgpt'\nmodel='large'\ncontext_window=96000\ncloud_context_window=64000\n",
+        );
+        assert_eq!(override_main.context_window, 96000);
+        assert_eq!(override_main.with_selection(&small).context_window, 16000);
+        assert_eq!(
+            load("provider='chatgpt'\nmodel='small'\ncontext_window=96000\n").context_window,
+            16000
+        );
+
+        let model = home.path().join("local-model");
+        std::fs::create_dir(&model).unwrap();
+        std::fs::write(
+            model.join("config.json"),
+            r#"{"max_position_embeddings":131072}"#,
+        )
+        .unwrap();
+        std::fs::write(model.join("model.safetensors"), b"metadata-only fixture").unwrap();
+        let local = ModelSelection {
+            model: model.to_string_lossy().into(),
+            ..Default::default()
+        };
+        assert_eq!(auto.with_selection(&local).context_window, 131072);
+        assert_eq!(capped.with_selection(&local).context_window, 8192);
+        let server = ModelSelection {
+            provider: "lm-studio".into(),
+            model: "unknown".into(),
+            base_url: Some("http://127.0.0.1:1234/v1".into()),
+            ..Default::default()
+        };
+        assert_eq!(capped.with_selection(&server).context_window, 8192);
+        assert_eq!(
+            std::fs::read_dir(home.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("process"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn context_settings_reject_invalid_caps_and_accept_legacy_numbers() {
+        for key in [
+            "context_window",
+            "cloud_context_window",
+            "local_context_window",
+        ] {
+            for invalid in ["2047", "2097153", "-1", "'banana'", "2.5"] {
+                assert!(
+                    resolve(&format!("{key}={invalid}\n")).is_err(),
+                    "{key}={invalid}"
+                );
+            }
+            assert!(resolve(&format!("{key}='auto'\n")).is_ok());
+            assert!(resolve(&format!("{key}=64000\n")).is_ok());
+            assert!(resolve(&format!("{key}=1050000\n")).is_ok());
+            assert!(resolve(&format!("{key}=2000000\n")).is_ok());
+        }
+    }
+
+    #[test]
+    fn claude_context_resolves_on_load_and_selection_without_overriding_user_limits() {
+        let config = resolve("provider='anthropic'\nmodel='claude-opus-5-5'\n").unwrap();
+        assert_eq!(config.context_window, 1_000_000);
+        let capped =
+            resolve("provider='anthropic'\nmodel='claude-opus-5-5'\ncontext_window=32768\n")
+                .unwrap();
+        assert_eq!(capped.context_window, 32768);
+        let mut selection = crate::llm::model_config::ModelSelection {
+            provider: "anthropic".into(),
+            model: "claude-opus-5-5".into(),
+            base_url: Some(crate::llm::anthropic::BASE_URL.into()),
+            ..Default::default()
+        };
+        assert_eq!(capped.with_selection(&selection).context_window, 1_000_000);
+        selection.context_window = Some(200_000);
+        assert_eq!(config.with_selection(&selection).context_window, 200_000);
+        selection.base_url = Some("https://proxy.example/v1".into());
+        selection.context_window = None;
+        assert_eq!(config.with_selection(&selection).context_window, 32768);
+    }
+
+    #[test]
+    fn unassigned_children_inherit_parent_controls_and_profile() {
+        let parent = resolve("provider='chatgpt'\nmodel='account-model'\nworker_timeout_secs=91\nremote_model_idle_timeout_secs=73\nmodel_profile='main'\n[model_profiles.main]\nprovider='chatgpt'\nmodel='account-model'\nmax_tokens=1234\n[harness]\nmax_steps=0\ntemperature=0.3\n").unwrap();
+        let child = parent.for_role("subagent");
+        assert_eq!(child.model, parent.model);
+        assert_eq!(child.model_profile, parent.model_profile);
+        assert_eq!(child.worker_timeout_secs, 91);
+        assert_eq!(child.remote_model_idle_timeout_secs, 73);
+        assert_eq!(child.harness.max_steps, 0);
+        assert_eq!(child.harness.temperature, parent.harness.temperature);
+        assert_eq!(
+            child.active_model_profile().unwrap().max_tokens,
+            parent.active_model_profile().unwrap().max_tokens
+        );
+    }
+
+    #[test]
     fn subscription_main_and_roles_resolve_without_local_compute_or_api_keys() {
         let config = resolve("provider='chatgpt'\nmodel='account-model'\n[model_roles.compaction]\nprovider='chatgpt'\nmodel='account-small'\n[codebase]\narchitecture_model=''\n").unwrap();
         assert!(!config.uses_local_compute());
@@ -1171,6 +1362,24 @@ mod memory_migration_tests {
         fs::write(&path, original).unwrap();
         assert!(Config::load(&layout, None).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn zero_step_limit_saves_and_reloads_as_unlimited() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+        let saved = crate::storage::settings_store::save_config(
+            &layout,
+            crate::storage::settings_store::Scope::Global,
+            &[crate::storage::settings_store::Change::Set {
+                path: "harness.max_steps".into(),
+                value: 0.into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(saved.harness.max_steps, 0);
+        assert_eq!(Config::load(&layout, None).unwrap().harness.max_steps, 0);
     }
     #[test]
     fn stale_selected_profile_is_ignored_without_deleting_its_definition() {

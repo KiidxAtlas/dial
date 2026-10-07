@@ -25,6 +25,9 @@ pub struct TrainingState {
     pub validation_digest: Option<String>,
 }
 
+/// A verified trajectory: (id, version, domain, score, source, payload).
+pub type VerifiedSuccess = (i64, i64, String, f64, String, Value);
+
 pub struct Store {
     conn: Connection,
 }
@@ -738,11 +741,7 @@ impl Store {
 
     /// Trajectories with an externally assigned score >= `min_score` and saved messages, oldest first:
     /// (trajectory, version, domain, score, source, payload).
-    pub fn verified_successes(
-        &self,
-        min_score: f64,
-        limit: usize,
-    ) -> Result<Vec<(i64, i64, String, f64, String, Value)>> {
+    pub fn verified_successes(&self, min_score: f64, limit: usize) -> Result<Vec<VerifiedSuccess>> {
         let mut statement = self.conn.prepare("SELECT t.id,t.version,t.domain,o.score,o.source,m.payload
             FROM trajectories t JOIN outcomes o ON o.trajectory=t.id JOIN trajectory_messages m ON m.trajectory=t.id
             WHERE t.finished_at IS NOT NULL AND o.score>=?1 AND o.source NOT LIKE 'check:%' ORDER BY t.id LIMIT ?2")?;

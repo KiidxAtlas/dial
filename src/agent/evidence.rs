@@ -71,7 +71,7 @@ impl Policy {
 ///  * a successful observation of a resource+range that a later result repeats becomes a short placeholder,
 ///    but only while the text after it is small (`warm_tokens`) or the context is under `pressure`. Replacing a
 ///    read buried under a long warm suffix would force that whole suffix to be prefilled again for little saving.
-/// Mutations and errors stay verbatim, and the placeholder text never changes once written.
+///    Mutations and errors stay verbatim, and the placeholder text never changes once written.
 pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy) {
     let Policy {
         warm_tokens,

@@ -145,6 +145,9 @@ impl Ui for StateUi<'_> {
     fn usage(&mut self, p: Option<u64>, o: Option<u64>, s: f64) {
         self.inner.usage(p, o, s)
     }
+    fn context_usage(&mut self, tokens: u64, estimated: bool) {
+        self.inner.context_usage(tokens, estimated)
+    }
     fn model_progress(&mut self, p: &ModelProgress) {
         self.inner.model_progress(p)
     }

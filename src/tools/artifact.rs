@@ -172,10 +172,12 @@ impl ArtifactStore {
         };
         match result {
             Ok(text) => ToolOutput {
+                data: None,
                 text,
                 is_error: false,
             },
             Err(e) => ToolOutput {
+                data: None,
                 text: format!("{e:#}"),
                 is_error: true,
             },
@@ -226,7 +228,11 @@ pub fn capture_image(
     store: Option<&ArtifactStore>,
     output: &mut ToolOutput,
 ) -> Result<Option<Value>> {
-    let Ok(mut value) = serde_json::from_str::<Value>(&output.text) else {
+    let Some(mut value) = output
+        .data
+        .clone()
+        .or_else(|| serde_json::from_str::<Value>(&output.text).ok())
+    else {
         return Ok(None);
     };
     let Some(data) = value["artifact"]["data"].as_str() else {
@@ -251,6 +257,7 @@ pub fn capture_image(
     let uri = spool.finish()?;
     value["artifact"] = json!({"uri":uri,"media_type":"image/png","bytes":bytes.len()});
     output.text = value.to_string();
+    output.data = Some(value);
     Ok(Some(store.image_reference(&uri)?))
 }
 
@@ -336,7 +343,8 @@ mod security_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ArtifactStore::new(dir.path()).unwrap();
         let png = b"\x89PNG\r\n\x1a\nreal-image-bytes";
-        let mut output = ToolOutput { text: json!({"artifact":{"media_type":"image/png","encoding":"base64","data":base64::engine::general_purpose::STANDARD.encode(png)}}).to_string(), is_error:false };
+        let mut output = ToolOutput { data: None,
+text: json!({"artifact":{"media_type":"image/png","encoding":"base64","data":base64::engine::general_purpose::STANDARD.encode(png)}}).to_string(), is_error:false };
         let image = capture_image(Some(&store), &mut output).unwrap().unwrap();
         assert_eq!(
             fs::read(store.root.join(image["path"].as_str().unwrap())).unwrap(),

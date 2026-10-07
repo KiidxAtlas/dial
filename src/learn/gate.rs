@@ -650,10 +650,10 @@ mod tests {
         let suites = [suite("primary", true, 2), suite("guard", false, 2)];
         // Candidate solves p0,p1 (baseline none); baseline solves guard g0, candidate not.
         let report = evaluate(&rules(), &suites, &baseline, &candidate, |v, c| {
-            Ok(match (v.id, c.id.as_str()) {
-                (2, "primary0" | "primary1") | (1, "guard0" | "guard1") => true,
-                _ => false,
-            })
+            Ok(matches!(
+                (v.id, c.id.as_str()),
+                (2, "primary0" | "primary1") | (1, "guard0" | "guard1")
+            ))
         })
         .unwrap();
         assert!(!report.passed);

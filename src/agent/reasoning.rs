@@ -30,6 +30,8 @@ impl std::error::Error for GateHit {}
 struct Gate {
     started: Instant,
     first_output: bool,
+    preparing: bool,
+    generation_started: bool,
     reasoning_bytes: usize,
     hit: Option<String>,
 }
@@ -39,6 +41,8 @@ impl Gate {
         Self {
             started: Instant::now(),
             first_output: false,
+            preparing: false,
+            generation_started: false,
             reasoning_bytes: 0,
             hit: None,
         }
@@ -56,7 +60,8 @@ impl Gate {
                 "{} bytes of streamed reasoning in one generation",
                 config.max_reasoning_bytes
             ));
-        } else if !self.first_output
+        } else if !self.preparing
+            && !self.first_output
             && self.started.elapsed() >= Duration::from_secs(config.max_pre_action_secs)
         {
             self.hit = Some(format!(
@@ -67,7 +72,31 @@ impl Gate {
         self.hit.is_none()
     }
 
+    fn progress(&mut self, phase: llm::InferencePhase) {
+        match phase {
+            llm::InferencePhase::Loading | llm::InferencePhase::Processing
+                if !self.generation_started =>
+            {
+                // Model startup and prefill have their own provider timeout, not a reasoning budget.
+                self.preparing = true;
+            }
+            llm::InferencePhase::Generating => self.begin_generation(),
+            _ => {}
+        }
+    }
+
+    fn begin_generation(&mut self) {
+        if !self.generation_started {
+            if self.preparing {
+                self.started = Instant::now();
+            }
+            self.preparing = false;
+            self.generation_started = true;
+        }
+    }
+
     fn output(&mut self, config: &ReasoningGuardConfig, nonempty: bool) -> bool {
+        self.begin_generation();
         if !self.check(config) {
             return false;
         }
@@ -139,7 +168,12 @@ pub(super) fn chat(
             let allowed = {
                 let mut gate = state.lock();
                 match event {
+                    StreamEvent::Progress(progress) => {
+                        gate.progress(progress.phase);
+                        gate.check(config)
+                    }
                     StreamEvent::Reasoning(text) => {
+                        gate.begin_generation();
                         gate.reasoning_bytes = gate.reasoning_bytes.saturating_add(text.len());
                         gate.check(config)
                     }
@@ -183,6 +217,27 @@ pub(super) fn chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_and_prefill_do_not_consume_the_reasoning_deadline() {
+        let config = ReasoningGuardConfig::default();
+        let mut gate = Gate::new();
+        gate.progress(llm::InferencePhase::Loading);
+        gate.started -= Duration::from_secs(120);
+        assert!(
+            gate.check(&config),
+            "loading uses the server startup timeout"
+        );
+        gate.progress(llm::InferencePhase::Processing);
+        assert!(gate.check(&config), "prefill is not reasoning");
+        gate.progress(llm::InferencePhase::Generating);
+        assert!(gate.check(&config));
+        gate.started -= Duration::from_secs(61);
+        // Repeated progress cannot restart the reasoning budget or pause it again.
+        gate.progress(llm::InferencePhase::Processing);
+        gate.progress(llm::InferencePhase::Generating);
+        assert!(!gate.check(&config));
+    }
 
     #[test]
     fn reasoning_never_resets_the_deadline_and_empty_deltas_do_not_disarm_it() {

@@ -176,6 +176,45 @@ fn bash_path() -> String {
     }
 }
 
+/// Recognize only simple, conventional preview commands. This is a routing diagnostic, never an
+/// approval exemption; compound shell scripts and one-shot flags retain normal bash handling.
+fn preview_server(command: &str) -> bool {
+    if command.chars().any(|c| ";&|`$\n\r".contains(c)) {
+        return false;
+    }
+    let words: Vec<_> = command.split_whitespace().collect();
+    let Some(program) = words.first() else {
+        return false;
+    };
+    if words
+        .iter()
+        .any(|w| matches!(*w, "--help" | "-h" | "--version" | "-v" | "--once"))
+    {
+        return false;
+    }
+    let args = &words[1..];
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|p| p.to_str())
+        .unwrap_or(program);
+    match program {
+        "pnpm" | "yarn" | "bun" | "npm" => {
+            let args = args.strip_prefix(&["run"]).unwrap_or(args);
+            args.first()
+                .is_some_and(|arg| matches!(*arg, "dev" | "serve" | "preview" | "watch"))
+        }
+        "nuxt" | "nuxi" | "next" | "astro" => args.first() == Some(&"dev"),
+        "vite" => {
+            args.is_empty()
+                || args.first().is_some_and(|arg| {
+                    arg.starts_with('-') || matches!(*arg, "dev" | "serve" | "preview")
+                })
+        }
+        "python" | "python3" => args.starts_with(&["-m", "http.server"]),
+        _ => false,
+    }
+}
+
 pub(super) fn bash_tool(
     ws: &Workspace,
     args: &Value,
@@ -203,6 +242,12 @@ pub fn bash_tool_streaming(
     }
     if timeout_secs == 0 {
         return Err("the harness bash timeout must be positive".to_string());
+    }
+    if preview_server(command) {
+        let start = serde_json::json!({"action":"start","name":"preview","command":command});
+        return Ok(ToolOutput::err(format!(
+            "Command not started: this is a long-running preview server. Foreground bash kills its process group at the deadline, so the browser would later get Connection refused. Discover/load bg, inspect bg action=list to reuse an existing server, then use bg {start}. Wait for readiness with bg action=wait and an until regex; open the actual HTTP URL with browser. Stop only the preview process you created when inspection is done, unless the user requested keeping it running."
+        )));
     }
     let timeout_secs = match opt_u64(args, "timeout")? {
         Some(0) => return Err("timeout must be at least 1 second".to_string()),
@@ -305,6 +350,7 @@ pub fn bash_tool_streaming(
         text.push_str(&format!(
             "[timed out after {timeout_secs}s; process group killed]\n"
         ));
+        text.push_str("[foreground commands do not survive this timeout; for a dev server/watcher discover/load bg, reuse an existing process or start it with bg, then wait for readiness before browser navigation]\n");
     } else if let Some(code) = status.code() {
         text.push_str(&format!("[exit code: {code}]\n"));
     } else if let Some(signal) = status.signal() {
@@ -320,6 +366,7 @@ pub fn bash_tool_streaming(
         text.push_str(&format!("[complete output: {uri}]\n"));
     }
     Ok(ToolOutput {
+        data: None,
         text,
         is_error: !success,
     })
@@ -400,6 +447,65 @@ mod tests {
 
     fn bash(ws: &Workspace, command: &str) -> ToolOutput {
         run(ws, "bash", json!({"command": command}))
+    }
+
+    #[test]
+    fn preview_servers_are_redirected_before_spawn_but_finite_commands_still_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, ws) = workspace();
+        let ws = ws.without_sandbox();
+        fs::write(
+            dir.path().join("pnpm"),
+            "#!/bin/sh\necho launched > launched.txt\n",
+        )
+        .unwrap();
+        fs::set_permissions(dir.path().join("pnpm"), fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = bash(&ws, "./pnpm dev --host 127.0.0.1 --port 3000");
+        assert!(
+            refused.is_error
+                && refused.text.contains("Command not started")
+                && refused.text.contains("bg"),
+            "{}",
+            refused.text
+        );
+        assert!(
+            !dir.path().join("launched.txt").exists(),
+            "no unmanaged process may start"
+        );
+        let build = bash(&ws, "./pnpm run build");
+        assert!(
+            !build.is_error && build.text.contains("[exit code: 0]"),
+            "{}",
+            build.text
+        );
+        assert!(dir.path().join("launched.txt").exists());
+        for command in [
+            "npm run dev",
+            "pnpm dev",
+            "yarn dev",
+            "bun run dev",
+            "nuxt dev",
+            "nuxi dev",
+            "next dev",
+            "astro dev",
+            "vite --host 127.0.0.1",
+            "python3 -m http.server 3000",
+        ] {
+            assert!(preview_server(command), "{command}");
+        }
+        for command in [
+            "pnpm dev --help",
+            "pnpm watch --once",
+            "vite --version",
+            "vite build",
+            "pnpm run build",
+            "npm test",
+            "cargo test",
+            "printf 'pnpm dev'",
+            "echo ok; pnpm dev",
+        ] {
+            assert!(!preview_server(command), "{command}");
+        }
     }
 
     #[test]

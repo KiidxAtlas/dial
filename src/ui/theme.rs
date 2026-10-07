@@ -307,6 +307,10 @@ symbols!(
     IconLocal,
     IconKeyboard,
     IconTab,
+    IconVision,
+    IconTools,
+    IconReasoning,
+    IconEmbedding,
 );
 
 /// Which glyph set is active (after `auto` has been resolved).
@@ -1369,6 +1373,19 @@ fn symbol(glyphs: Glyphs, s: Sym) -> &'static str {
         (Unicode, IconLocal) => "○",
         (Unicode, IconKeyboard) => "⌨",
         (Unicode, IconTab) => "▤",
+        (Nerd, IconVision) => "\u{f06e}",
+        (Nerd, IconTools) => "\u{f0ad}",
+        (Nerd, IconReasoning) => "\u{f5dc}",
+        (Nerd, IconEmbedding) => "\u{f1b3}",
+        // Plain text symbols avoid color emoji fallback in Unicode terminals.
+        (Unicode, IconVision) => "◉",
+        (Unicode, IconTools) => "⌘",
+        (Unicode, IconReasoning) => "◇",
+        (Unicode, IconEmbedding) => "≋",
+        (Ascii, IconVision) => "V",
+        (Ascii, IconTools) => "T",
+        (Ascii, IconReasoning) => "R",
+        (Ascii, IconEmbedding) => "E",
         (
             Ascii,
             IconCommand | IconSkill | IconSettings | IconProvider | IconLocal | IconKeyboard

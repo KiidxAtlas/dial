@@ -75,7 +75,7 @@ impl Policy {
         let initial_reasoning_secs = configured_secs.min(if complex {
             60
         } else if kind == Kind::General {
-            20
+            10
         } else {
             40
         });
@@ -111,6 +111,11 @@ mod tests {
             10
         );
         assert_eq!(Policy::for_prompt("hello", 5).initial_reasoning_secs, 5);
+        assert_eq!(Policy::for_prompt("hello", 60).initial_reasoning_secs, 10);
+        assert_eq!(
+            Policy::for_prompt("review architecture across modules", 60).initial_reasoning_secs,
+            60
+        );
         assert_eq!(Kind::classify("prefixing values"), Kind::General);
     }
 }

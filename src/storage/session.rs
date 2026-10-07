@@ -61,6 +61,7 @@ pub struct SearchHit {
 #[derive(Debug, Clone)]
 enum Kind {
     Message(Value),
+    Runtime(crate::runtime::Node),
     Compaction {
         summary: String,
         first_kept: Option<String>,
@@ -81,6 +82,7 @@ struct Entry {
 }
 
 pub struct Session {
+    runtime: crate::runtime::Tree,
     id: String,
     model: String,
     started: String,
@@ -263,6 +265,9 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 fn entry_json(e: &Entry, copied: bool) -> Value {
     let mut v = match &e.kind {
+        Kind::Runtime(node) => {
+            json!({"type":"runtime","id":e.id,"parent":e.parent,"ts":e.ts,"node":node})
+        }
         Kind::Message(m) => {
             json!({"type": "message", "id": e.id, "parent": e.parent, "ts": e.ts, "message": m})
         }
@@ -297,6 +302,7 @@ fn parse_entry(v: &Value) -> Option<Entry> {
         .unwrap_or("")
         .to_string();
     let kind = match v.get("type")?.as_str()? {
+        "runtime" => Kind::Runtime(serde_json::from_value(v.get("node")?.clone()).ok()?),
         "message" => {
             let m = v.get("message")?;
             m.is_object().then_some(())?;
@@ -361,6 +367,7 @@ impl Session {
         file.write_all(format!("{header}\n").as_bytes())
             .context("writing session header")?;
         Ok(Session {
+            runtime: crate::runtime::Tree::default(),
             id,
             model: model.to_string(),
             started,
@@ -377,6 +384,7 @@ impl Session {
     /// In-memory only: nothing is written or indexed.
     pub fn ephemeral() -> Session {
         Session {
+            runtime: crate::runtime::Tree::default(),
             id: random_hex(8),
             model: String::new(),
             started: iso_now(),
@@ -416,6 +424,7 @@ impl Session {
             .and_then(file_id)
             .map(str::to_string);
         let mut s = Session {
+            runtime: crate::runtime::Tree::default(),
             id: String::new(),
             model: String::new(),
             started: String::new(),
@@ -478,6 +487,7 @@ impl Session {
         s.id = header_id
             .or(name_id)
             .unwrap_or_else(|| "unknown".to_string());
+        s.restore_runtime();
         Ok(s)
     }
 
@@ -704,6 +714,7 @@ impl Session {
             message.is_object() && message.get("role").is_some_and(Value::is_string),
             "session messages must be objects with a string `role`"
         );
+        self.flush_runtime()?;
         if role_of(&message) == "user"
             && !self.entries.iter().any(|e| {
                 matches!(&e.kind, Kind::Title(title) if !title.is_empty())
@@ -721,7 +732,9 @@ impl Session {
                 self.push(Kind::Title(title))?;
             }
         }
-        self.push(Kind::Message(message))
+        let id = self.push(Kind::Message(message))?;
+        self.runtime.anchor(Some(id.clone()));
+        Ok(id)
     }
 
     /// Durable harness state is append-only but never sent as a chat role to providers.
@@ -734,6 +747,88 @@ impl Session {
                 _ => None,
             })
             .unwrap_or_else(|| json!({}))
+    }
+
+    pub fn runtime(&self) -> crate::runtime::Tree {
+        // Runtime children are anchored in this session's append-only branch tree.
+        self.runtime.anchor_if_empty(self.id.clone());
+        self.runtime.clone()
+    }
+
+    /// Active conversation nodes and mutable result children, with resolvable parent ids.
+    pub fn execution_tree(&self) -> Vec<crate::runtime::Node> {
+        use crate::runtime::{Node, Phase, ResultBody};
+        let mut nodes = vec![Node {
+            id: self.id.clone(),
+            parent: None,
+            kind: "session".into(),
+            label: self.title(),
+            result: ResultBody {
+                text: String::new(),
+                data: Some(json!({"model":self.model})),
+                phase: Phase::Done,
+                revision: 0,
+            },
+        }];
+        let mut parent = Some(self.id.clone());
+        for i in self.branch() {
+            let entry = &self.entries[i];
+            if let Kind::Message(message) = &entry.kind {
+                nodes.push(Node {
+                    id: entry.id.clone(),
+                    parent,
+                    kind: "message".into(),
+                    label: role_of(message).into(),
+                    result: ResultBody {
+                        text: content_text(message),
+                        data: Some(message.clone()),
+                        phase: Phase::Done,
+                        revision: 0,
+                    },
+                });
+                parent = Some(entry.id.clone());
+            }
+        }
+        nodes.extend(self.runtime.snapshots());
+        nodes
+    }
+
+    /// Journal typed execution snapshots on the same active branch as messages. Streaming bodies
+    /// stay in memory; request/tool boundaries persist changed snapshots without per-token disk I/O.
+    pub fn flush_runtime(&mut self) -> Result<()> {
+        for node in self.runtime.pending() {
+            self.push(Kind::Runtime(node.clone()))?;
+            self.runtime.persisted(&node);
+        }
+        Ok(())
+    }
+    pub fn flush_settled_runtime(&mut self) -> Result<()> {
+        for node in self.runtime.pending_settled() {
+            self.push(Kind::Runtime(node.clone()))?;
+            self.runtime.persisted(&node);
+        }
+        Ok(())
+    }
+
+    fn restore_runtime(&mut self) {
+        self.runtime = crate::runtime::Tree::default();
+        // Never recycle result ids from abandoned branches.
+        for entry in &self.entries {
+            if let Kind::Runtime(node) = &entry.kind {
+                self.runtime.reserve(&node.id);
+            }
+        }
+        for i in self.branch() {
+            if let Kind::Runtime(node) = &self.entries[i].kind {
+                self.runtime.restore(node.clone());
+            }
+        }
+        self.runtime.interrupt_open();
+        let parent = self.branch().into_iter().rev().find_map(|i| {
+            matches!(self.entries[i].kind, Kind::Message(_)).then(|| self.entries[i].id.clone())
+        });
+        self.runtime
+            .anchor(parent.or_else(|| Some(self.id.clone())));
     }
     pub fn set_control_state(&mut self, state: Value) -> Result<()> {
         self.append(json!({"role":"dial_state","state":state}))
@@ -944,17 +1039,24 @@ impl Session {
                 removed,
             },
         )?;
+        self.restore_runtime();
         Ok(removed)
     }
 
     /// A new session file holding the active branch (rewind markers dropped, ids preserved).
     pub fn fork(&self, layout: &Layout) -> Result<Session> {
+        let mut s = Self::create_file(layout, &self.model, Some(&self.id))?;
         let mut kept: Vec<Entry> = Vec::new();
         for i in self.branch() {
             if matches!(self.entries[i].kind, Kind::Meta { .. }) {
                 continue;
             }
             let mut e = self.entries[i].clone();
+            if let Kind::Runtime(node) = &mut e.kind {
+                if node.parent.as_deref() == Some(&self.id) {
+                    node.parent = Some(s.id.clone());
+                }
+            }
             e.parent = kept.last().map(|p| p.id.clone());
             kept.push(e);
         }
@@ -965,7 +1067,6 @@ impl Session {
             body.push_str(&line);
             body.push('\n');
         }
-        let mut s = Self::create_file(layout, &self.model, Some(&self.id))?;
         if let Some(file) = s.file.as_mut() {
             file.write_all(body.as_bytes())
                 .context("writing forked session")?;
@@ -975,6 +1076,7 @@ impl Session {
             s.leaf = Some(e.id.clone());
             s.entries.push(e);
         }
+        s.restore_runtime();
         Ok(s)
     }
 
@@ -1186,6 +1288,7 @@ pub mod session_search_tool {
 
     pub fn call(layout: &Layout, args: &Value) -> ToolOutput {
         let err = |text: String| ToolOutput {
+            data: None,
             text,
             is_error: true,
         };
@@ -1200,6 +1303,7 @@ pub mod session_search_tool {
         match Session::search(layout, query, limit) {
             Err(e) => err(format!("session search failed: {e:#}")),
             Ok(hits) if hits.is_empty() => ToolOutput {
+                data: None,
                 text: "no matching messages in earlier sessions".into(),
                 is_error: false,
             },
@@ -1213,6 +1317,7 @@ pub mod session_search_tool {
                     ));
                 }
                 ToolOutput {
+                    data: None,
                     text,
                     is_error: false,
                 }
@@ -1314,6 +1419,77 @@ mod tests {
         loaded.rename("new title").unwrap();
         assert_eq!(Session::open(path).unwrap().title(), "new title");
         assert_eq!(loaded.messages(), vec![user("old first message")]);
+    }
+
+    #[test]
+    fn root_workers_round_trip_and_forks_reparent_to_the_new_session() {
+        let e = env();
+        let mut session = new_session(&e);
+        let worker = session
+            .runtime()
+            .start("worker", "before first message", None);
+        session.flush_runtime().unwrap();
+        assert_eq!(worker.read(|n| n.parent.clone()), Some(session.id().into()));
+        let loaded = Session::open(session.path().unwrap()).unwrap();
+        let fresh = loaded.runtime().start("worker", "after reopen", None);
+        assert_eq!(fresh.read(|n| n.parent.clone()), Some(loaded.id().into()));
+        let fork = loaded.fork(&e.layout).unwrap();
+        assert_eq!(
+            fork.runtime().snapshots()[0].parent.as_deref(),
+            Some(fork.id())
+        );
+    }
+
+    #[test]
+    fn runtime_journal_recovers_typed_results_and_rewind_prunes_only_the_active_view() {
+        use crate::runtime::Phase;
+        let e = env();
+        let mut session = new_session(&e);
+        let first = session.append(user("first")).unwrap();
+        let tool = session.runtime().start("tool", "browser", None);
+        tool.settle(
+            "shown text".into(),
+            Some(json!({"tabs":[{"id":7}]})),
+            Phase::Done,
+        );
+        session.flush_runtime().unwrap();
+        session.append(assistant("first answer")).unwrap();
+        session.append(user("second")).unwrap();
+        let worker = session.runtime().start("worker", "inspect", None);
+        worker.settle(
+            "working".into(),
+            Some(json!({"status":"running"})),
+            Phase::Running,
+        );
+        session.flush_runtime().unwrap();
+        let path = session.path().unwrap().to_owned();
+        let mut reopened = Session::open(&path).unwrap();
+        let nodes = reopened.runtime().snapshots();
+        assert_eq!(nodes[0].parent.as_deref(), Some(first.as_str()));
+        assert_eq!(nodes[0].result.data.as_ref().unwrap()["tabs"][0]["id"], 7);
+        assert_eq!(nodes[1].result.phase, Phase::Interrupted);
+        assert_eq!(
+            nodes[1].result.data.as_ref().unwrap()["status"],
+            "interrupted"
+        );
+        let tree = reopened.execution_tree();
+        for node in &tree {
+            if let Some(parent) = &node.parent {
+                assert!(tree.iter().any(|n| &n.id == parent), "orphan {}", node.id);
+            }
+        }
+        let fork = reopened.fork(&e.layout).unwrap();
+        assert_eq!(fork.runtime().snapshots().len(), 2);
+        reopened.rewind(1).unwrap();
+        assert_eq!(reopened.runtime().snapshots().len(), 1);
+        let fresh = reopened.runtime().start("assistant", "new branch", None);
+        assert_ne!(fresh.read(|n| n.id.clone()), worker.read(|n| n.id.clone()));
+        assert_eq!(Session::open(&path).unwrap().runtime().snapshots().len(), 1);
+        assert_eq!(
+            reopened.messages().len(),
+            2,
+            "runtime snapshots are not provider messages"
+        );
     }
 
     #[test]

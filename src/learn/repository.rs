@@ -422,9 +422,11 @@ mod tests {
             command: "python3 test.py".into(),
         };
         fs::write(&manifest, serde_json::to_vec(&spec).unwrap()).unwrap();
-        let mut config = Config::default();
-        config.project_root = root.path().into();
-        config.state_dir = state.path().into();
+        let config = Config {
+            project_root: root.path().into(),
+            state_dir: state.path().into(),
+            ..Config::default()
+        };
         register(&config, &manifest).unwrap();
         spec.id = "leak".into();
         spec.split = "evaluation".into();
@@ -444,10 +446,12 @@ mod tests {
         use crate::agent::repair_evidence::{CheckKind, CheckRun, FileChange, Tracker};
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.project_root = project.path().canonicalize().unwrap();
-        config.user_dir = home.path().into();
-        config.state_dir = home.path().join("model");
+        let config = Config {
+            project_root: project.path().canonicalize().unwrap(),
+            user_dir: home.path().into(),
+            state_dir: home.path().join("model"),
+            ..Config::default()
+        };
         let layout = crate::storage::paths::Layout::with_user_dir(
             &config.project_root,
             config.user_dir.clone(),

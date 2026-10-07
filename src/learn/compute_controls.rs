@@ -56,16 +56,41 @@ pub fn snapshot(user: &Path) -> Result<Value> {
                 .flatten()
                 .cloned()
             {
-                let id = job["state_id"].as_str().unwrap_or("");
-                job["state"] = json!(project.join("models").join(id));
+                let id = job["state_id"].as_str().unwrap_or("").to_owned();
+                job["state"] = json!(project.join("models").join(&id));
                 job["project"] = json!(project.file_name().unwrap_or_default().to_string_lossy());
+                if project
+                    .join("models")
+                    .join(&id)
+                    .join("compute.hidden")
+                    .exists()
+                    && job["control_busy"] != true
+                {
+                    continue;
+                }
+                job["active"] = json!(
+                    (busy && owner["state"] == job["state"])
+                        || (job["control_busy"] == true && job["scheduler"]["state"] == "running")
+                );
                 jobs.push(job);
             }
         }
     }
     jobs.sort_by_key(|job| job["control_busy"] != true);
+    let (processes, session_memory_bytes, session_count, process_error) =
+        match super::processes::snapshot_with_usage(user) {
+            Ok(usage) => (
+                usage.processes,
+                usage.session_memory_bytes,
+                usage.session_count,
+                None,
+            ),
+            Err(error) => (Vec::new(), 0, 0, Some(error.to_string())),
+        };
     Ok(
-        json!({"busy":busy,"owner":owner,"background_paused":super::compute::paused(user),"jobs":jobs}),
+        json!({"busy":busy,"owner":owner,"background_paused":super::compute::paused(user),"jobs":jobs,
+        "processes":processes,"session_memory_bytes":session_memory_bytes,
+        "session_count":session_count,"process_error":process_error}),
     )
 }
 
@@ -102,6 +127,22 @@ pub fn action(user: &Path, state: Option<&str>, action: &str) -> Result<String> 
     }
     let state = state_path(user, state.context("select a job")?)?;
     let store = Store::open_read_only(&state)?;
+    if action == "remove" {
+        settings_store::write_private(&state.join("improvement.stop"), b"stop")?;
+        // Disable future scheduling, but retain sessions, checkpoints and admitted adapters.
+        let lock = super::auto::lock_file(&state.join("control.lock"))?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => {
+                FileExt::unlock(&lock)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                stop_legacy(user, state.to_str().context("invalid state path")?)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        settings_store::write_private(&state.join("compute.hidden"), b"removed")?;
+        return Ok("Job removed and automatic work disabled. Saved models, adapters and history are preserved.".into());
+    }
     if action == "stop" {
         settings_store::write_private(&state.join("improvement.stop"), b"stop")?;
         return Ok("Stop requested; this model stays paused until Start is selected.".into());
@@ -307,5 +348,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot(home.path()).unwrap()["owner"], Value::Null);
+    }
+
+    #[test]
+    fn removing_a_job_disables_scheduling_and_preserves_its_model_store() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().into()).unwrap();
+        let state = layout.state_dir.join("models/test");
+        let store = Store::open(
+            &state,
+            "model",
+            "test",
+            &crate::config::types::Harness::default(),
+        )
+        .unwrap();
+        let active = store.active().unwrap().id;
+        action(home.path(), Some(state.to_str().unwrap()), "remove").unwrap();
+        assert!(state.join("improvement.stop").exists());
+        assert!(state.join("compute.hidden").exists());
+        assert_eq!(store.active().unwrap().id, active);
+        assert!(
+            snapshot(home.path()).unwrap()["jobs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let mut config = Config::load(&layout, None).unwrap();
+        config.state_dir = state.clone();
+        config.improve.enabled = true;
+        assert!(!super::super::auto::enabled(&config, &store).unwrap());
+        super::super::auto::resume(&state).unwrap();
+        assert!(!state.join("compute.hidden").exists());
+        assert_eq!(
+            snapshot(home.path()).unwrap()["jobs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

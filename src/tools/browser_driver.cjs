@@ -81,7 +81,7 @@ function register(page) {
           const response=await http({postDataBuffer:()=>body,url:()=>request.url,method:()=>request.method,headers:()=>request.headers});
           await session.send('Fetch.fulfillRequest',{requestId:event.requestId,responseCode:response.status,responseHeaders:Object.entries(response.headers).map(([name,value])=>({name,value})),body:response.body});
         } catch (error) {
-          record(tab.network,{kind:'blocked',url:clip(event.request.url),error:clip(error.message)});
+          record(tab.network,{kind:'blocked',operation_id:operationId,url:clip(event.request.url),error:clip(error.message)});
           await session.send('Fetch.failRequest',{requestId:event.requestId,errorReason:'BlockedByClient'}).catch(()=>{});
         }
       })().catch(error=>record(tab.console,{type:'bridge-error',text:clip(error.message)}));
@@ -103,9 +103,14 @@ async function initialize(request) {
   return { initialized:true, engine:'chromium', version:browser.version() };
 }
 function tabFor(request) {
+  if (request.tab === undefined) {
+    if (tabs.size === 1) request.tab = tabs.keys().next().value;
+    else if (tabs.size === 0) throw new Error('No browser tab is open. Use action=open with the actual HTTP(S) URL first, then use the returned tab id.');
+    else throw new Error('Multiple browser tabs are open. Use action=tabs and pass an explicit tab id.');
+  }
   const id = request.tab;
   const tab = tabs.get(id);
-  if (!tab) throw new Error('tab must identify an open tab; use tabs/open');
+  if (!tab) throw new Error(`Browser tab ${id} is not open. Use action=tabs to find an open tab or action=open to create one.`);
   return tab;
 }
 function required(request, key) {
@@ -159,6 +164,12 @@ async function run(request) {
   }
   return {tab:request.tab,url:clip(page.url()),action:request.action,completed:true};
 }
+function failureMessage(error, id) {
+  const evidence = [...tabs].map(([tab,t]) => ({tab,console:t.console.slice(-10),network:t.network.slice(-20)}));
+  const failures = evidence.flatMap(tab=>tab.network).filter(event=>event.kind==='blocked' && event.operation_id===id);
+  const reason = failures.at(-1)?.error;
+  return ((reason ? 'Browser network failure: '+reason+'\n' : '') + String(error.stack || error) + '\nBrowser failure evidence: ' + JSON.stringify(evidence)).slice(0,20000);
+}
 let queue = Promise.resolve();
 readline.createInterface({input:process.stdin}).on('line', line => {
   let request;
@@ -176,8 +187,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
       await send({id:request.id,result});
     }
     catch (error) {
-      const evidence = [...tabs].map(([id,t]) => ({tab:id,console:t.console.slice(-10),network:t.network.slice(-20)}));
-      try { await send({id:request.id,error:(String(error.stack || error) + '\nBrowser failure evidence: ' + JSON.stringify(evidence)).slice(0,20000)}); }
+      try { await send({id:request.id,error:failureMessage(error,request.id)}); }
       catch (_) { process.exit(1); }
     } finally {
       operationId = 0;
