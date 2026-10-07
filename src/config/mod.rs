@@ -846,10 +846,9 @@ impl Config {
 
     pub fn validate_harness(&self, h: &Harness) -> Result<()> {
         ensure!(
-            !h.system_prompt.trim().is_empty() && h.system_prompt.len() <= 16384,
-            "system prompt must be 1..16384 bytes"
+            h.max_steps <= 64,
+            "max_steps must be 0 (unlimited) or 1..64"
         );
-        ensure!((1..=64).contains(&h.max_steps), "max_steps must be 1..64");
         ensure!(
             h.temperature.is_finite() && (0.0..=2.0).contains(&h.temperature),
             "temperature must be 0..2"
@@ -939,6 +938,18 @@ mod chatgpt_tests {
         let home = tempfile::tempdir()?;
         let layout = Layout::with_user_dir(project.path(), home.path().to_owned())?;
         Config::from_table(&layout, toml::from_str(text)?)
+    }
+
+    #[test]
+    fn context_window_accepts_auto_and_numeric_values() {
+        assert_eq!(
+            resolve("context_window='auto'\n").unwrap().context_window,
+            32768
+        );
+        assert_eq!(
+            resolve("context_window=8192\n").unwrap().context_window,
+            8192
+        );
     }
 
     #[test]
@@ -1139,12 +1150,24 @@ mod memory_migration_tests {
     }
 
     #[test]
+    fn zero_harness_steps_means_unlimited() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+        let path = layout.config_files()[0].clone();
+        fs::write(&path, "[harness]\nmax_steps=0\n").unwrap();
+
+        let config = Config::load(&layout, None).unwrap();
+        assert_eq!(config.harness.max_steps, 0);
+    }
+
+    #[test]
     fn invalid_configuration_is_not_rewritten_during_migration() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
         let path = layout.config_files()[0].clone();
-        let original = "[harness]\ntools=['memory']\nmax_steps=0\n";
+        let original = "[harness]\ntools=['memory']\nmax_steps=65\n";
         fs::write(&path, original).unwrap();
         assert!(Config::load(&layout, None).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), original);

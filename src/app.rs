@@ -1759,7 +1759,9 @@ impl Shell {
         status.branch = branch;
         status.git_counts = counts;
         status.session = short(agent.session().id());
-        status.prompt_tokens = (agent.last_prompt_tokens > 0).then_some(agent.last_prompt_tokens);
+        let (tokens, estimated) = agent.context_usage();
+        status.prompt_tokens = (tokens > 0).then_some(tokens);
+        status.context_estimated = estimated;
         status.context_window = agent.context_window();
         status.approval = format!("{:?}", agent.approval()).to_lowercase();
         status.sandbox = format!("{:?}", app.config.sandbox.mode).to_lowercase();
@@ -4832,9 +4834,13 @@ impl Ui for Bridge<'_> {
         messages
     }
 
-    fn usage(&mut self, prompt: Option<u64>, output: Option<u64>, seconds: f64) {
+    fn context_usage(&mut self, tokens: u64, estimated: bool) {
+        self.shell.status.prompt_tokens = Some(tokens);
+        self.shell.status.context_estimated = estimated;
+        self.repaint(false);
+    }
+    fn usage(&mut self, _prompt: Option<u64>, output: Option<u64>, seconds: f64) {
         let status = &mut self.shell.status;
-        status.prompt_tokens = prompt;
         if let Some(tokens) = output {
             self.shell.turn_output_tokens = self.shell.turn_output_tokens.saturating_add(tokens);
             status.output_tokens = self.shell.turn_output_tokens;

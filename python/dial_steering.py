@@ -147,8 +147,14 @@ def steering_callback(vector, strength, counted=False):
 
 
 def install_server(server, specification):
-    """Patch the pinned provider load boundary; no request-dependent global vector switching."""
-    original=server.ModelProvider._load
+    """Patch compatible MLX-LM APIs; other backends may run without steering."""
+    provider_class=getattr(server,'ModelProvider',None)
+    handler_class=getattr(server,'APIHandler',None)
+    original=getattr(provider_class,'_load',None)
+    get=getattr(handler_class,'do_GET',None)
+    if not callable(original) or not callable(get):
+        require(specification is None, 'steering requires a compatible MLX-LM server with ModelProvider._load and APIHandler.do_GET; disable steering for this backend')
+        return
     def load(provider, model_path, adapter_path=None, draft_model_path=None):
         original(provider,model_path,adapter_path,draft_model_path)
         STATUS.clear();STATUS.update(state='bypassed',uses=0)
@@ -169,14 +175,13 @@ def install_server(server, specification):
         except Exception as error:
             STATUS.update(state='bypassed',reason=str(error),uses=0)
     if specification is not None:
-        server.ModelProvider._load=load
-    get=server.APIHandler.do_GET
+        provider_class._load=load
     def do_get(handler):
         if handler.path=='/dial/steering':
             raw=json.dumps(STATUS,allow_nan=False).encode();handler.send_response(200);handler.send_header('Content-Type','application/json');handler.send_header('Content-Length',str(len(raw)));handler.end_headers();handler.wfile.write(raw)
         else:
             get(handler)
-    server.APIHandler.do_GET=do_get
+    handler_class.do_GET=do_get
 
 
 def atomic_json(path, value):

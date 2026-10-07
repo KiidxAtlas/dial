@@ -374,7 +374,11 @@ fn parse_anchor(target: &str) -> Result<Anchor, String> {
         }
         return Ok(Anchor::After(parse_line_number(rest, "`>N`")?));
     }
-    if let Some((a, b)) = target.split_once(".=") {
+    if target.bytes().all(|c| c.is_ascii_digit()) && !target.is_empty() {
+        let n = parse_line_number(target, "line")?;
+        return Ok(Anchor::Range(n, n));
+    }
+    if let Some((a, b)) = target.split_once(".=").or_else(|| target.split_once(',')) {
         let (a, b) = (
             parse_line_number(a, "range start")?,
             parse_line_number(b, "range end")?,
@@ -2159,6 +2163,49 @@ mod tests {
     }
 
     #[test]
+    fn anchor_aliases_preserve_read_before_edit_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "a\nb\nc\n").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let tag = ws.store().record(&path, "a\nb\nc\n", &[(1, 1)]);
+        for target in ["2", "2,3"] {
+            let patch = format!("[a.txt#{tag}]\nPUT {target}:\n+x\n");
+            assert!(
+                edit(&ws, &patch)
+                    .unwrap_err()
+                    .contains("have not been shown")
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "a\nb\nc\n");
+        }
+        ws.store().record_all(&path, "a\nb\nc\n");
+        edit(&ws, &format!("[a.txt#{tag}]\nPUT 2,3:\n+x\n")).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\nx\n");
+    }
+
+    #[test]
+    fn parser_accepts_unambiguous_line_and_comma_range_aliases() {
+        for (alias, canonical) in [("2", "2.=2"), ("2,3", "2.=3"), ("2, 3", "2.=3")] {
+            assert_eq!(
+                parse_anchor(alias).unwrap(),
+                parse_anchor(canonical).unwrap()
+            );
+            for verb in ["PUT", "CUT"] {
+                let suffix = if verb == "PUT" { ":\n+x\n" } else { "\n" };
+                let alias_patch = format!("[a.rs#1234]\n{verb} {alias}{suffix}");
+                let canonical_patch = format!("[a.rs#1234]\n{verb} {canonical}{suffix}");
+                assert_eq!(
+                    parse_patch(&alias_patch).unwrap()[0].ops[0].kind,
+                    parse_patch(&canonical_patch).unwrap()[0].ops[0].kind
+                );
+            }
+        }
+        for invalid in ["0", "0,2", "3,2", "2,3,4", "2,3=2", "2.=3=2"] {
+            assert!(parse_anchor(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
     fn parser_rejects_malformed_patches_with_actionable_messages() {
         let cases: &[(&str, &str)] = &[
             ("", "empty patch"),
@@ -2173,7 +2220,7 @@ mod tests {
             ("[a.rs#1234]\nPUT 0.=1:\n+x\n", "1-based"),
             ("[a.rs#1234]\nPUT 1.=2 \n", "needs `@name`"),
             ("[a.rs#1234]\nPUT 2*\n", "needs `@name`"),
-            ("[a.rs#1234]\nPUT 2:\n+x\n", "unknown target"),
+            ("[a.rs#1234]\nPUT 2,3=2:\n+x\n", "range end"),
             ("[a.rs#1234]\nCUT >2\n", "CUT takes"),
             ("[a.rs#1234]\nPUT >2 @bad name\n", "invalid register name"),
             ("[a.rs#1234]\n@@ -1 +1 @@\n", "unified diff"),

@@ -24,6 +24,7 @@ enum Reply {
     Text(&'static str),
     Say(String),
     Call(&'static str, Value),
+    IdentifiedCall(&'static str, Value, String),
     RawCall(&'static str, String),
     Calls(Vec<(&'static str, Value)>),
     Cut,
@@ -169,6 +170,11 @@ fn answer(
         Reply::Cut => (json!({"role":"assistant","content":""}), "length"),
         Reply::Call(name, args) => (
             json!({"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function",
+            "function":{"name":name,"arguments":args.to_string()}}]}),
+            "tool_calls",
+        ),
+        Reply::IdentifiedCall(name, args, id) => (
+            json!({"role":"assistant","tool_calls":[{"index":0,"id":id,"type":"function",
             "function":{"name":name,"arguments":args.to_string()}}]}),
             "tool_calls",
         ),
@@ -595,6 +601,394 @@ fn investigation_gates_findings_redirects_duplicate_reads_and_survives_resume() 
     );
     assert_eq!(a.todo().tasks()[0].evidence, ["marker.txt:1"]);
     assert!(a.todo().has_open());
+}
+
+#[test]
+fn repeated_reads_across_failed_checks_stop_and_keep_compact_evidence() {
+    let mut script = vec![
+        open_todo(),
+        Reply::IdentifiedCall("read", json!({"path":"marker.txt"}), "original".into()),
+    ];
+    for attempt in 0..5 {
+        script.push(Reply::IdentifiedCall(
+            "bash",
+            json!({"command":format!("false # check {attempt}")}),
+            format!("check-{attempt}"),
+        ));
+        script.push(Reply::IdentifiedCall(
+            "read",
+            json!({"path":format!("other-{attempt}.txt")}),
+            format!("other-{attempt}"),
+        ));
+        script.push(Reply::IdentifiedCall(
+            "read",
+            json!({"path":"marker.txt"}),
+            format!("repeat-{attempt}"),
+        ));
+    }
+    script.push(Reply::Text("Must never reach this request"));
+    let server = serve(script);
+    let e = env(&server.url, "auto");
+    let original = format!("ORIGINAL_EVIDENCE\n{}", "evidence ".repeat(400));
+    std::fs::write(e.project.path().join("marker.txt"), &original).unwrap();
+    for attempt in 0..5 {
+        std::fs::write(
+            e.project.path().join(format!("other-{attempt}.txt")),
+            "other evidence",
+        )
+        .unwrap();
+    }
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let report = a
+        .turn("Inspect the current code and fix the build", &mut ui)
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert!(
+        report
+            .text
+            .contains("consecutive tool-contract failures without useful recovery"),
+        "{}",
+        report.text
+    );
+    let requests = server.requests.lock();
+    assert!(
+        requests.len() < 17,
+        "ignored checkpoint requests must stop before further reads"
+    );
+    assert!(
+        !requests[5]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["function"]["name"] == "read")
+    );
+    let messages = requests.last().unwrap()["messages"].as_array().unwrap();
+    let duplicates: Vec<_> = messages
+        .iter()
+        .filter(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("[Investigation check"))
+        })
+        .collect();
+    assert_eq!(duplicates.len(), 1);
+    for message in duplicates {
+        assert!(
+            !message["content"]
+                .as_str()
+                .unwrap()
+                .contains("ORIGINAL_EVIDENCE")
+        );
+        assert!(message["content"].as_str().unwrap().contains("artifact://"));
+    }
+    let original_message = a
+        .session()
+        .messages()
+        .into_iter()
+        .find(|m| m["tool_call_id"] == "original")
+        .unwrap();
+    assert!(
+        original_message["content"]
+            .as_str()
+            .unwrap()
+            .contains("ORIGINAL_EVIDENCE")
+    );
+    assert!(
+        original_message["dial_evidence"]["artifact"]
+            .as_str()
+            .unwrap()
+            .starts_with("artifact://")
+    );
+    assert!(
+        requests[5]["messages"]
+            .to_string()
+            .contains("ORIGINAL_EVIDENCE"),
+        "duplicate must not supersede the original observation"
+    );
+}
+
+#[test]
+fn loop_checkpoint_withholds_reads_rejects_ignored_feedback_and_restores_after_progress() {
+    let read = |id: &str| Reply::IdentifiedCall("read", json!({"path":"marker.txt"}), id.into());
+    let server = serve(vec![
+        open_todo(),
+        read("original"),
+        read("duplicate"),
+        read("ignored"),
+        Reply::IdentifiedCall(
+            "grep",
+            json!({"path":"marker.txt","pattern":"original"}),
+            "different-check".into(),
+        ),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"needs_input","summary":"Inspected the value","reason":"Which value should replace original?"}),
+        ),
+    ]);
+    let e = env(&server.url, "auto");
+    std::fs::write(e.project.path().join("marker.txt"), "original\n").unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a
+        .turn("Investigate marker.txt", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::NeedsInput);
+    let requests = server.requests.lock();
+    let offered = |index: usize, name: &str| {
+        requests[index]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["function"]["name"] == name)
+    };
+    assert!(!offered(3, "read") && !offered(4, "read"));
+    assert!(offered(4, "grep") && offered(4, "finish"));
+    assert!(
+        offered(5, "read"),
+        "a successful different check restores read"
+    );
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("Recovery checkpoint from Dial")
+    );
+    let rejected = a
+        .session()
+        .messages()
+        .into_iter()
+        .find(|m| m["tool_call_id"] == "ignored")
+        .unwrap();
+    assert!(
+        rejected["content"]
+            .as_str()
+            .unwrap()
+            .contains("This call was not executed")
+    );
+}
+
+#[test]
+fn user_steering_can_override_a_recovery_checkpoint() {
+    #[derive(Default)]
+    struct SteeringUi {
+        queued: bool,
+    }
+    impl Ui for SteeringUi {
+        fn notice(&mut self, text: &str) {
+            if text.contains("unchanged observation") {
+                self.queued = true;
+            }
+        }
+        fn take_steering(&mut self) -> Vec<String> {
+            if std::mem::take(&mut self.queued) {
+                vec!["Read another.txt instead".into()]
+            } else {
+                vec![]
+            }
+        }
+    }
+    let server = serve(vec![
+        open_todo(),
+        Reply::IdentifiedCall("read", json!({"path":"marker.txt"}), "original".into()),
+        Reply::IdentifiedCall("read", json!({"path":"marker.txt"}), "duplicate".into()),
+        Reply::IdentifiedCall("read", json!({"path":"another.txt"}), "steered".into()),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"needs_input","summary":"Read the requested file","reason":"Which value should change?"}),
+        ),
+    ]);
+    let e = env(&server.url, "auto");
+    std::fs::write(e.project.path().join("marker.txt"), "original\n").unwrap();
+    std::fs::write(e.project.path().join("another.txt"), "STEERED_SOURCE\n").unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    assert_eq!(
+        a.turn("Inspect marker.txt", &mut SteeringUi::default())
+            .unwrap()
+            .outcome,
+        TurnOutcome::NeedsInput
+    );
+    let requests = server.requests.lock();
+    assert!(
+        requests[3]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["function"]["name"] == "read")
+    );
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("Read another.txt instead")
+    );
+    assert!(
+        requests[4]["messages"]
+            .to_string()
+            .contains("STEERED_SOURCE")
+    );
+}
+
+#[test]
+fn recovery_consumes_prefetched_reads_without_relabeling_or_shifting_results() {
+    let server = serve(vec![
+        open_todo(),
+        Reply::Calls(vec![
+            ("read", json!({"path":"marker.txt"})),
+            ("read", json!({"path":"marker.txt"})),
+            ("read", json!({"path":"marker.txt"})),
+            ("read", json!({"path":"another.txt"})),
+        ]),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"needs_input","summary":"Inspected both files","reason":"Which value should change?"}),
+        ),
+    ]);
+    let e = env(&server.url, "auto");
+    std::fs::write(e.project.path().join("marker.txt"), "ORIGINAL_SOURCE\n").unwrap();
+    std::fs::write(e.project.path().join("another.txt"), "ANOTHER_SOURCE\n").unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    assert_eq!(
+        a.turn("Inspect both files", &mut Recorder::default())
+            .unwrap()
+            .outcome,
+        TurnOutcome::NeedsInput
+    );
+    let messages = a.session().messages();
+    let third = messages
+        .iter()
+        .find(|m| m["tool_call_id"] == "call_2")
+        .unwrap();
+    assert!(
+        third["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Investigation check")
+    );
+    let fourth = messages
+        .iter()
+        .find(|m| m["tool_call_id"] == "call_3")
+        .unwrap();
+    assert!(
+        fourth["content"]
+            .as_str()
+            .unwrap()
+            .contains("ANOTHER_SOURCE")
+    );
+    assert!(
+        !fourth["content"]
+            .as_str()
+            .unwrap()
+            .contains("This call was not executed")
+    );
+}
+
+#[test]
+fn repeated_edit_failures_withhold_mutations_until_a_different_check_succeeds() {
+    let edit = |id: &str, old: &str| {
+        Reply::IdentifiedCall(
+            "edit",
+            json!({"path":"marker.txt","old":old,"new":"fixed\n"}),
+            id.into(),
+        )
+    };
+    let server = serve(vec![
+        open_todo(),
+        Reply::IdentifiedCall("read", json!({"path":"marker.txt"}), "original".into()),
+        edit("bad-1", "wrong"),
+        edit("bad-2", "wrong"),
+        edit("bad-3", "wrong"),
+        edit("withheld", "original\n"),
+        Reply::IdentifiedCall("read", json!({"path":"marker.txt"}), "fresh-check".into()),
+        edit("corrected", "original\n"),
+        Reply::Call(
+            "finish",
+            json!({"outcome":"needs_input","summary":"Updated the value","reason":"Which build command should verify this change?"}),
+        ),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.edit_mode = dial::config::types::EditModeConfig::Replace;
+    std::fs::write(e.project.path().join("marker.txt"), "original\n").unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    assert_eq!(
+        a.turn("Update marker.txt", &mut Recorder::default())
+            .unwrap()
+            .outcome,
+        TurnOutcome::NeedsInput
+    );
+    let rejected = a
+        .session()
+        .messages()
+        .into_iter()
+        .find(|m| m["tool_call_id"] == "withheld")
+        .unwrap();
+    assert!(
+        rejected["content"]
+            .as_str()
+            .unwrap()
+            .contains("This call was not executed")
+    );
+    let requests = server.requests.lock();
+    let offered = |index: usize, name: &str| {
+        requests[index]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["function"]["name"] == name)
+    };
+    assert!(!offered(5, "edit") && !offered(6, "edit"));
+    assert!(offered(7, "edit"));
+    assert!(
+        offered(8, "read"),
+        "successful mutation restores verification reads"
+    );
+    assert_eq!(
+        std::fs::read_to_string(e.project.path().join("marker.txt")).unwrap(),
+        "fixed\n"
+    );
+}
+
+#[test]
+fn context_includes_tool_evidence_before_the_next_request_without_changing_usage() {
+    struct ContextUi {
+        requests: Arc<Mutex<Vec<Value>>>,
+        pending_read: bool,
+        after_read: Option<(u64, bool, usize)>,
+        usage: Vec<(Option<u64>, Option<u64>)>,
+    }
+    impl Ui for ContextUi {
+        fn tool_result(&mut self, name: &str, _: &ToolOutput) {
+            self.pending_read = name == "read";
+        }
+        fn context_usage(&mut self, tokens: u64, estimated: bool) {
+            if self.pending_read {
+                self.after_read = Some((tokens, estimated, self.requests.lock().len()));
+                self.pending_read = false;
+            }
+        }
+        fn usage(&mut self, prompt: Option<u64>, output: Option<u64>, _: f64) {
+            self.usage.push((prompt, output));
+        }
+    }
+    let server = serve(vec![
+        Reply::Call("read", json!({"path":"marker.txt"})),
+        Reply::Text("Inspected."),
+    ]);
+    let e = env(&server.url, "auto");
+    std::fs::write(
+        e.project.path().join("marker.txt"),
+        "evidence\n".repeat(1000),
+    )
+    .unwrap();
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = ContextUi {
+        requests: server.requests.clone(),
+        pending_read: false,
+        after_read: None,
+        usage: Vec::new(),
+    };
+    a.turn("Read marker.txt", &mut ui).unwrap();
+    let (tokens, estimated, requests) = ui.after_read.expect("tool results must update the meter");
+    assert!(tokens > 2000 && estimated);
+    assert_eq!(requests, 1, "update before starting the next request");
+    assert_eq!(ui.usage, [(Some(100), Some(5)), (Some(100), Some(5))]);
 }
 
 #[test]
@@ -1035,6 +1429,40 @@ fn cancellation_during_a_completion_reminder_stops_continuation() {
     assert!(report.interrupted);
     assert_eq!(report.outcome, TurnOutcome::Interrupted);
     assert_eq!(server.requests.lock().len(), 2);
+}
+
+#[test]
+fn oversized_tool_recovery_does_not_abort_the_session() {
+    let server = serve(vec![
+        Reply::Text("{\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}"),
+        Reply::Call("read", json!({"path":"a.txt"})),
+        Reply::Text("It says hello."),
+        Reply::Text("Still available."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.context_window = 200000;
+    std::fs::write(e.project.path().join("a.txt"), "hello\n").unwrap();
+    std::fs::create_dir_all(&e.layout.state_dir).unwrap();
+    let store = Store::open(&e.layout.state_dir, "scripted", "t", &e.config.harness).unwrap();
+    let mut a = agent_with(&e, Some(&store), Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    let prompt = format!(
+        "What does a.txt say? Archive data follows: {}",
+        "x".repeat(250 * 1024)
+    );
+    let report = a.turn(&prompt, &mut ui).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert_eq!(report.text, "It says hello.");
+    assert_eq!(
+        ui.calls,
+        ["read"],
+        "a malformed call must not execute, or replay the repaired call"
+    );
+    assert!(store.tool_recoveries().unwrap().is_empty());
+    assert!(server.requests.lock()[1]["messages"].to_string().len() > 256 * 1024);
+    let next = a.turn("Are you still available?", &mut ui).unwrap();
+    assert_eq!(next.outcome, TurnOutcome::Completed);
+    assert_eq!(next.text, "Still available.");
 }
 
 #[test]
@@ -4450,12 +4878,12 @@ fn cut_off_replies_do_not_spend_the_step_budget() {
 
 #[test]
 fn a_tool_that_keeps_failing_with_a_new_guess_each_time_is_warned_then_the_turn_ends_incomplete() {
-    // Each round reads the file successfully and then guesses again, so no round fails completely and only the
-    // per-tool streak can catch this: the read-guess-read-guess loop.
+    // Read a distinct range each round so this exercises the failing-tool streak,
+    // independently of the unchanged-observation guard. No whole round fails.
     let guesses = (1..=12)
         .map(|n| {
             Reply::Calls(vec![
-                ("read", json!({"path":"f.txt"})),
+                ("read", json!({"path":format!("f.txt:{n}-{n}")})),
                 (
                     "edit",
                     json!({"path":"f.txt","old":format!("guess number {n}"),"new":"x"}),
@@ -4466,7 +4894,7 @@ fn a_tool_that_keeps_failing_with_a_new_guess_each_time_is_warned_then_the_turn_
     let server = serve(guesses);
     let mut e = env(&server.url, "auto");
     e.config.edit_mode = dial::config::types::EditModeConfig::Replace; // These are valid replace calls with unmatched text, not schema failures.
-    std::fs::write(e.project.path().join("f.txt"), "the real text\n").unwrap();
+    std::fs::write(e.project.path().join("f.txt"), "the real text\n".repeat(12)).unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     let report = a
@@ -4500,7 +4928,7 @@ fn a_tool_that_keeps_failing_with_a_new_guess_each_time_is_warned_then_the_turn_
     );
     assert_eq!(
         std::fs::read_to_string(e.project.path().join("f.txt")).unwrap(),
-        "the real text\n"
+        "the real text\n".repeat(12)
     );
     let last = a.session().messages().pop().unwrap();
     assert_eq!(
@@ -4522,7 +4950,8 @@ fn rounds_in_which_nothing_worked_end_the_turn_even_when_no_single_tool_streak_d
             .map(|n| Reply::Call("read", json!({"path":format!("missing-{n}.txt")})))
             .collect(),
     );
-    let e = env(&server.url, "auto");
+    let mut e = env(&server.url, "auto");
+    e.config.reliability.enabled = false; // Isolate the round guard from earlier rejected checkpoint calls.
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("read the notes", &mut Recorder::default()).unwrap();
     assert_eq!(report.outcome, TurnOutcome::Incomplete);

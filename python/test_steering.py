@@ -63,6 +63,41 @@ class Contracts(unittest.TestCase):
         bad=copy.deepcopy(good);bad[-1]['tool_calls'][0]['function']['arguments']='broken'
         with self.assertRaises(ValueError):s.messages(bad,True)
 
+    def test_backend_without_provider_starts_without_steering(self):
+        from types import ModuleType
+        server=ModuleType('mlx_vlm.server')
+        def missing(name):
+            raise AttributeError(f'no attribute {name}')
+        server.__getattr__=missing
+        s.install_server(server,None)
+        self.assertNotIn('ModelProvider',vars(server))
+        self.assertNotIn('APIHandler',vars(server))
+
+    def test_backend_without_provider_rejects_explicit_steering(self):
+        from types import ModuleType
+        server=ModuleType('mlx_vlm.server')
+        with self.assertRaisesRegex(s.SteeringError,'requires.*ModelProvider'):
+            s.install_server(server,{'path':'unused'})
+
+    def test_supported_backend_without_steering_preserves_load_and_status(self):
+        import io
+        class Provider:
+            def _load(self,*args):pass
+        class Handler:
+            def do_GET(self):self.forwarded=True
+            def send_response(self,status):self.status=status
+            def send_header(self,*args):pass
+            def end_headers(self):pass
+        original=Provider._load
+        server=type('Server',(),{'ModelProvider':Provider,'APIHandler':Handler})()
+        s.install_server(server,None)
+        self.assertIs(Provider._load,original)
+        handler=Handler();handler.path='/dial/steering';handler.wfile=io.BytesIO()
+        handler.do_GET()
+        self.assertEqual(handler.status,200)
+        self.assertEqual(json.loads(handler.wfile.getvalue()),s.STATUS)
+        handler.path='/other';handler.do_GET();self.assertTrue(handler.forwarded)
+
     def test_server_mismatch_bypasses_hook_without_breaking_loaded_model(self):
         class Provider:
             def _load(self,*args):self.model=object();self.is_distributed=False;self.draft_model=None

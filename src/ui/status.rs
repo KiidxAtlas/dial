@@ -102,8 +102,9 @@ pub struct StatusData {
     /// (staged, modified, untracked) when git status is known.
     pub git_counts: Option<(u32, u32, u32)>,
     pub session: String,
-    /// Prompt tokens of the last request, with the window actually available.
+    /// Current context occupancy, including streamed output and newly added evidence.
     pub prompt_tokens: Option<u64>,
+    pub context_estimated: bool,
     pub context_window: u32,
     pub output_tokens: u64,
     pub tokens_per_second: Option<f64>,

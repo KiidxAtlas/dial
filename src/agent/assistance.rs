@@ -380,6 +380,7 @@ impl Agent<'_> {
                                 timeout,
                                 cancel,
                                 false,
+                                None,
                                 ui,
                                 None,
                                 &mut |ui| {

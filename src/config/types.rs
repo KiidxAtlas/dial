@@ -2,6 +2,26 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+fn deserialize_context_window<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ContextWindow {
+        Tokens(u32),
+        Auto(String),
+    }
+
+    match ContextWindow::deserialize(deserializer)? {
+        ContextWindow::Tokens(tokens) => Ok(tokens),
+        ContextWindow::Auto(value) if value.eq_ignore_ascii_case("auto") => Ok(32768),
+        ContextWindow::Auto(value) => Err(serde::de::Error::custom(format!(
+            "expected an integer or \"auto\", found {value:?}"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Harness {
@@ -227,6 +247,8 @@ pub struct Config {
     pub adaptive: crate::adaptive::Config,
     pub reliability: crate::reliability::Config,
     pub laya: crate::agent::laya::Config,
+    /// Configured context budget; `auto` uses the standard budget, then honors reported server caps.
+    #[serde(deserialize_with = "deserialize_context_window")]
     pub context_window: u32,
     pub harness: Harness,
     pub gate: Option<GateConfig>,

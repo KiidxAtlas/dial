@@ -100,6 +100,10 @@ impl Ui for RpcUi {
     fn notice(&mut self, message: &str) {
         self.out.emit(json!({"event":"notice","message":message}));
     }
+    fn context_usage(&mut self, tokens: u64, estimated: bool) {
+        self.out
+            .emit(json!({"event":"context_usage","tokens":tokens,"estimated":estimated}));
+    }
     fn usage(&mut self, prompt: Option<u64>, output: Option<u64>, seconds: f64) {
         self.out.emit(json!({"event":"usage","prompt_tokens":prompt,"output_tokens":output,"seconds":seconds}));
     }

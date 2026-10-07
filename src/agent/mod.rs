@@ -9,6 +9,7 @@ mod assistance;
 pub mod calls;
 mod child;
 mod completion;
+mod context_meter;
 pub mod hooks;
 pub use completion::TurnOutcome;
 pub mod context;
@@ -21,6 +22,7 @@ mod live_tasks;
 pub mod output_schema;
 pub mod prompt;
 mod reasoning;
+mod recovery_checkpoint;
 pub(crate) mod repair_evidence;
 pub mod solve;
 pub mod subagents;
@@ -83,6 +85,8 @@ pub trait Ui {
     fn laya_activity(&mut self, status: &str, message: &str) {
         self.notice(&format!("Laya · {status}: {message}"));
     }
+    /// Context occupancy for display; estimates do not affect billing or compaction.
+    fn context_usage(&mut self, _tokens: u64, _estimated: bool) {}
     fn usage(&mut self, _prompt: Option<u64>, _output: Option<u64>, _seconds: f64) {}
     fn tool_output(&mut self, _name: &str, _text: &str) {}
     fn background_notice(&mut self, _message: &str) {}
@@ -161,10 +165,15 @@ fn chat_with_ui(
     timeout: u64,
     interrupt: Arc<AtomicBool>,
     render_text: bool,
+    context_tokens: Option<u64>,
     ui: &mut dyn Ui,
     policy: Option<&crate::config::types::ReasoningGuardConfig>,
     on_idle: &mut dyn FnMut(&mut dyn Ui),
 ) -> Result<llm::Reply> {
+    let mut context = context_tokens.map(context_meter::StreamingContext::new);
+    if let Some(tokens) = context_tokens {
+        ui.context_usage(tokens, true);
+    }
     let (tx, rx) = mpsc::channel();
     ui.model_wait(Duration::ZERO);
     thread::scope(|scope| {
@@ -232,6 +241,9 @@ fn chat_with_ui(
                 Ok(ChatEvent::Text(text)) => {
                     last_progress = Instant::now();
                     if render_text {
+                        if let Some(context) = &mut context {
+                            ui.context_usage(context.observe(&text), true);
+                        }
                         ui.text_delta(&text);
                     }
                 }
@@ -242,6 +254,9 @@ fn chat_with_ui(
                 Ok(ChatEvent::Reasoning(text)) => {
                     last_progress = Instant::now();
                     if render_text {
+                        if let Some(context) = &mut context {
+                            ui.context_usage(context.observe(&text), true);
+                        }
                         ui.reasoning_delta(&text);
                     }
                 }
@@ -253,10 +268,20 @@ fn chat_with_ui(
                 }) => {
                     last_progress = Instant::now();
                     if render_text {
+                        if let Some(context) = &mut context {
+                            ui.context_usage(context.observe(&delta), true);
+                        }
                         ui.tool_arguments_delta(index, &id, &name, &delta);
                     }
                 }
-                Ok(ChatEvent::Finished(result)) => break result,
+                Ok(ChatEvent::Finished(result)) => {
+                    if let (Some(context), Ok(reply)) = (&context, &result) {
+                        let (tokens, estimated) =
+                            context.finish(reply.prompt_tokens, reply.completion_tokens);
+                        ui.context_usage(tokens, estimated);
+                    }
+                    break result;
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     break Err(anyhow::anyhow!("model worker ended without a result"));
@@ -557,6 +582,7 @@ pub struct Agent<'a> {
     step_checks: StepChecks,
     cur_step: u32,
     pub last_prompt_tokens: u64,
+    context_meter: context_meter::ContextMeter,
     /// How many conversation messages the request behind `last_prompt_tokens` carried.
     reported_messages: usize,
     step_probe: Option<crate::learn::probe::StepProbe>,
@@ -674,6 +700,7 @@ impl<'a> Agent<'a> {
             step_checks: StepChecks::default(),
             cur_step: 0,
             last_prompt_tokens: 0,
+            context_meter: context_meter::ContextMeter::default(),
             reported_messages: 0,
             version,
             system: String::new(),
@@ -770,6 +797,7 @@ impl<'a> Agent<'a> {
             step_checks: StepChecks::default(),
             cur_step: 0,
             last_prompt_tokens: 0,
+            context_meter: context_meter::ContextMeter::default(),
             reported_messages: 0,
             version,
             workflow_metrics: Default::default(),
@@ -933,6 +961,7 @@ impl<'a> Agent<'a> {
         self.live_tasks.cancel_all();
         self.session = session;
         self.last_prompt_tokens = 0;
+        self.context_meter = context_meter::ContextMeter::default();
         self.reported_messages = 0;
         self.restore_control();
         if let Some(memory) = &self.memory {
@@ -2297,6 +2326,7 @@ impl<'a> Agent<'a> {
                 60,
                 local,
                 false,
+                None,
                 ui,
                 Some(&self.config.reasoning_guard),
                 &mut |ui| {
@@ -2367,6 +2397,7 @@ impl<'a> Agent<'a> {
         let mut recovering_output = false;
         let mut reasoning_budget = None;
         let mut repeats = guard::RepeatGuard::default();
+        let mut recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
         let mut investigation = investigation::InvestigationGuard::default();
         let mut unplanned_inspections = 0usize;
         let mut planning_notice = false;
@@ -2431,6 +2462,7 @@ impl<'a> Agent<'a> {
             }
             if self.take_steering(ui)? {
                 completion.reset_for_steering();
+                recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
             }
             self.pump_subagents(ui);
             self.cur_step = step;
@@ -2540,6 +2572,7 @@ impl<'a> Agent<'a> {
                 names.retain(|name| name == "todo");
             }
             planning_notice = planning_required;
+            recovery_checkpoint.apply(schemas, &mut names, &mut messages);
             let single_call = !self.hermetic
                 && crate::reliability::single_call(self.config, measured.as_ref(), &reliability);
             let contract = crate::reliability::Contract::new(std::mem::take(schemas))?;
@@ -2609,6 +2642,8 @@ impl<'a> Agent<'a> {
                     ui,
                 )?;
             }
+            let request_estimate = context_meter::estimate_request(&request);
+            let request_context = self.context_meter.predict(request_estimate);
             let started = Instant::now();
             let timeout = self.config.worker_timeout_secs;
             let mut reasoning_policy = self.config.reasoning_guard.clone();
@@ -2640,6 +2675,7 @@ impl<'a> Agent<'a> {
                     timeout,
                     interrupt,
                     true,
+                    Some(request_context),
                     ui,
                     Some(&reasoning_policy),
                     &mut |ui| self.pump_subagents(ui),
@@ -2705,6 +2741,12 @@ impl<'a> Agent<'a> {
                     return Err(error);
                 }
             };
+            self.context_meter.complete(
+                request_estimate,
+                request_context,
+                reply.prompt_tokens,
+                sent_messages,
+            );
             reasoning_budget = None;
             self.save_request_policy(None,json!({"state":"response received","prompt_tokens":reply.prompt_tokens,"completion_tokens":reply.completion_tokens,"elapsed_ms":started.elapsed().as_millis(),"tool_calls":reply.tool_calls.len(),"finish_reason":reply.finish_reason}),ui)?;
             ui.usage(
@@ -2814,6 +2856,7 @@ impl<'a> Agent<'a> {
                 self.push(json!({"role":"assistant","content":reply.text}))?;
                 if self.take_steering(ui)? {
                     completion.reset_for_steering();
+                    recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
                     continue;
                 }
                 if self.interrupt.load(Ordering::SeqCst) {
@@ -2891,7 +2934,12 @@ impl<'a> Agent<'a> {
                     });
                 }
                 let observed_sources = self.experience_sources(call, ui);
-                let form = (if single_call && reply.tool_calls.len() > 1 {
+                // Read-only batch results may already have finished before a prior
+                // result arms recovery. Consume those results honestly; never label
+                // a prefetched operation as unexecuted or shift its result to another call.
+                let form = (if parallel.is_empty() && let Some(reason) = recovery_checkpoint.rejection(&call.name) {
+                    Some(("recovery_checkpoint", reason))
+                } else if single_call && reply.tool_calls.len() > 1 {
                     Some(("batch_contract", "This request permits one tool call. The entire batch is rejected without executing it; choose one action and await its result.".into()))
                 } else { call_form_error(call, schemas, &names) }).map(|(kind, why)| {
                     if planning_required && call.name != "todo" && kind == "unknown_tool" {
@@ -3139,16 +3187,22 @@ impl<'a> Agent<'a> {
                         completion::Finish::parse(&call.arguments).map_err(anyhow::Error::msg)?,
                     );
                 }
-                if let Some(advice) = investigation.observe(call, &output.text, output.is_error) {
+                recovery_checkpoint.progress(
+                    call,
+                    !output.is_error && !check_failed,
+                    todo_before != self.todo.snapshot(),
+                );
+                let duplicate = investigation.observe(call, &output.text, output.is_error);
+                let is_duplicate = duplicate.is_some();
+                if duplicate.is_some() {
                     // An unchanged observation consumes the remaining unplanned allowance;
                     // concrete new evidence continues under the ordinary task budget.
                     if !self.todo.has_open() {
                         unplanned_inspections = self.task_policy.inspection_limit;
                     }
                     self.record(step, "investigation_gate", json!({"name":call.name}))?;
-                    ui.notice("Investigation repeated an unchanged observation; directing the agent to reuse the evidence.");
-                    output.text.push_str("\n\n");
-                    output.text.push_str(&advice);
+                    recovery_checkpoint.arm(&call.name, duplicate.as_deref().unwrap());
+                    ui.notice(&format!("Investigation repeated an unchanged observation. Recovery checkpoint: `{}` is temporarily withheld until a different action succeeds.", call.name));
                 }
                 if stop.is_none() {
                     stop = investigation.stop_message();
@@ -3159,11 +3213,15 @@ impl<'a> Agent<'a> {
                     output.text.push_str(advice);
                 }
                 if let Some(advice) = repeats.observe(call, output.is_error) {
+                    recovery_checkpoint.arm(&call.name, &advice);
+                    ui.notice(&format!("Recovery checkpoint: `{}` repeated a failing call; choose a different action to restore it.", call.name));
                     output.text.push_str("\n\n");
                     output.text.push_str(&advice);
                 }
                 match stall.call(call, output.is_error) {
                     guard::Stall::Warn(advice) => {
+                        recovery_checkpoint.arm(&call.name, &advice);
+                        ui.notice(&format!("Recovery checkpoint: `{}` keeps failing; choose a different action to restore it.", call.name));
                         output.text.push_str("\n\n");
                         output.text.push_str(&advice);
                     }
@@ -3193,8 +3251,12 @@ impl<'a> Agent<'a> {
                     None => None,
                 };
                 let limit = tools::model_output_limit(self.context_window());
-                let mut body = guard::clip_evidence(&output.text, limit);
-                if output.text.len() > limit
+                // Retain the complete observation, but send only its reference on a
+                // duplicate. Replaying identical file contents wastes context and
+                // rewards the same read loop after its corrective feedback.
+                let mut body =
+                    duplicate.unwrap_or_else(|| guard::clip_evidence(&output.text, limit));
+                if (output.text.len() > limit || body.starts_with("[Investigation check"))
                     && let Some(uri) = &artifact
                 {
                     body.push_str(&format!(
@@ -3225,7 +3287,7 @@ impl<'a> Agent<'a> {
                     state["truncated_artifacts"] = json!(uris);
                     self.session.set_control_state(state)?;
                 }
-                if call.name == "read" && !output.is_error {
+                if call.name == "read" && !output.is_error && !is_duplicate {
                     let mut observation = call.arguments.clone();
                     if let Some(args) = observation.as_object_mut() {
                         args.remove("i");
@@ -3261,6 +3323,8 @@ impl<'a> Agent<'a> {
                     }
                 }
                 self.push(message)?;
+                let (tokens, estimated) = self.context_usage();
+                ui.context_usage(tokens, estimated);
             }
             let warning = match stall.round(!round_succeeded) {
                 guard::Stall::Stop(message) => {
@@ -3314,6 +3378,7 @@ impl<'a> Agent<'a> {
             if let Some(finish) = finished {
                 if self.take_steering(ui)? {
                     completion.reset_for_steering();
+                    recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
                     continue;
                 }
                 if self.interrupt.load(Ordering::SeqCst) {
@@ -3356,6 +3421,7 @@ impl<'a> Agent<'a> {
             }
             if self.take_steering(ui)? {
                 completion.reset_for_steering();
+                recovery_checkpoint = recovery_checkpoint::RecoveryCheckpoint::default();
             }
             if form_kinds.is_empty() && !execution_failed && self.logging {
                 self.training_capture.record(
@@ -3375,12 +3441,19 @@ impl<'a> Agent<'a> {
                     (pending.take(), self.store, &self.trajectory)
             {
                 // Corrected turn: every call validated and ran without error.
-                store.tool_recovery(*id, self.version.id, &json!({
+                match store.tool_recovery(*id, self.version.id, &json!({
                         "context": failed.context, "tools": request_tools, "corrected": llm::assistant_message(&reply),
                         "failure_kinds": failed.kinds, "rejected": failed.rejected,
                         "project_root": self.workspace.root().to_string_lossy(),
-                    }))?;
-                self.record(step, "tool_recovery", json!({"failure_kinds":failed.kinds}))?;
+                    })) {
+                    Ok(true) => {
+                        if self.record(step, "tool_recovery", json!({"failure_kinds":failed.kinds})).is_err() {
+                            ui.notice("Tool recovery was captured, but its optional learning event could not be recorded; continuing.");
+                        }
+                    }
+                    Ok(false) => {} // Duplicate or oversized learning sample, not a failed tool call.
+                    Err(_) => ui.notice("Optional tool-recovery capture unavailable; continuing the task."),
+                }
             }
         }
         if self.hermetic {
@@ -3391,6 +3464,11 @@ impl<'a> Agent<'a> {
             "Stopped: step limit reached. Say \"continue\" to keep going.".to_owned(),
             iteration,
         )
+    }
+
+    /// Context occupancy for display, including evidence added since the last request.
+    pub fn context_usage(&self) -> (u64, bool) {
+        self.context_meter.current(&self.session)
     }
 
     /// The prompt size the next request will have: the provider's own count for the last request plus a local
@@ -3408,6 +3486,8 @@ impl<'a> Agent<'a> {
     pub fn record_prompt_usage(&mut self, tokens: u64) {
         self.last_prompt_tokens = tokens;
         self.reported_messages = self.session.message_count();
+        self.context_meter
+            .record_prompt(tokens, self.reported_messages);
     }
 
     /// End the turn without an answer: keep the reason in the conversation, show it, and report `Incomplete`.
@@ -4425,7 +4505,10 @@ impl<'a> Agent<'a> {
         self.session.compact(summary, messages.len() - cut)?;
         self.metrics.compactions += 1;
         self.last_prompt_tokens = 0;
+        self.context_meter = context_meter::ContextMeter::default();
         self.reported_messages = 0;
+        let (tokens, estimated) = self.context_usage();
+        ui.context_usage(tokens, estimated);
         ui.notice(&format!(
             "Context compacted: summarised {cut} messages; retained {} recent messages.",
             messages.len() - cut
@@ -4532,6 +4615,7 @@ impl<'a> Agent<'a> {
                     timeout,
                     interrupt,
                     false,
+                    None,
                     ui,
                     None,
                     &mut |ui| self.pump_subagents(ui),
@@ -4570,6 +4654,7 @@ impl<'a> Agent<'a> {
                 timeout,
                 interrupt,
                 false,
+                None,
                 ui,
                 None,
                 &mut |ui| self.pump_subagents(ui),
@@ -5362,6 +5447,7 @@ mod tests {
             5,
             Arc::new(AtomicBool::new(false)),
             true,
+            None,
             &mut ui,
             None,
             &mut |_| {},
@@ -5374,6 +5460,81 @@ mod tests {
             "the UI should repaint during the fake model's initial delay"
         );
         assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn context_updates_before_stream_callbacks_and_reconciles_reported_usage() {
+        #[derive(Default)]
+        struct RecordingUi {
+            current: (u64, bool),
+            observed: Vec<(u64, bool)>,
+        }
+        impl Ui for RecordingUi {
+            fn context_usage(&mut self, tokens: u64, estimated: bool) {
+                self.current = (tokens, estimated);
+            }
+            fn text_delta(&mut self, _: &str) {
+                self.observed.push(self.current);
+            }
+            fn reasoning_delta(&mut self, _: &str) {
+                self.observed.push(self.current);
+            }
+            fn tool_arguments_delta(&mut self, _: u64, _: &str, _: &str, _: &str) {
+                self.observed.push(self.current);
+            }
+        }
+        let content = "x".repeat(80);
+        let arguments = json!({"path":content}).to_string();
+        let chunks = [
+            json!({"choices":[{"delta":{"reasoning_content":content}}]}),
+            json!({"choices":[{"delta":{"content":content}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"r","type":"function","function":{"name":"read","arguments":arguments}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":512,"completion_tokens":7,"total_tokens":519}}),
+        ];
+        let mut pieces: Vec<_> = chunks
+            .iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .collect();
+        pieces.push("data: [DONE]\n\n".into());
+        let server = crate::llm::fake::serve(vec![crate::llm::fake::Script::SseSlow {
+            pieces,
+            pause: Duration::from_millis(90),
+        }]);
+        let mut backend = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: format!("{}/v1", server.url),
+                model: "test-model".into(),
+                api_key: None,
+            },
+            Path::new("/nonexistent/python").to_owned(),
+            5,
+        );
+        let request = Chat {
+            messages: vec![json!({"role":"user","content":"inspect"})],
+            tools: vec![],
+            temperature: 0.2,
+            max_tokens: 128,
+            seed: None,
+        };
+        let mut ui = RecordingUi::default();
+        chat_with_ui(
+            &mut backend,
+            None,
+            &request,
+            5,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            Some(1000),
+            &mut ui,
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(ui.observed.len(), 3);
+        assert_eq!(ui.observed[0], (1020, true));
+        assert_eq!(ui.observed[1], (1040, true));
+        assert!(ui.observed[2].0 > 1040 && ui.observed[2].1);
+        assert_eq!(ui.current, (519, false));
     }
 
     #[test]
@@ -5452,6 +5613,7 @@ mod tests {
             5,
             Arc::new(AtomicBool::new(false)),
             false,
+            None,
             &mut ui,
             None,
             &mut |_| {},
@@ -5515,6 +5677,7 @@ mod tests {
             5,
             Arc::new(AtomicBool::new(false)),
             true,
+            None,
             &mut ui,
             None,
             &mut |_| {},

@@ -140,12 +140,12 @@ impl StepBudget {
         }
     }
 
-    /// Start a step; false once the budget is used up.
+    /// Start a step; false once a nonzero budget is used up. Zero means unlimited.
     pub fn begin(&mut self) -> bool {
-        if self.spent >= self.max {
+        if self.max != 0 && self.spent >= self.max {
             return false;
         }
-        self.spent += 1;
+        self.spent = self.spent.saturating_add(1);
         true
     }
 
@@ -448,6 +448,14 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+    #[test]
+    fn zero_step_budget_is_unlimited() {
+        let mut budget = StepBudget::new(0, 0);
+        for _ in 0..100 {
+            assert!(budget.begin());
+        }
+    }
+
     #[test]
     fn unusable_replies_are_refunded_a_bounded_number_of_times() {
         let mut budget = StepBudget::new(3, 2);

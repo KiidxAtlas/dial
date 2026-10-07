@@ -750,6 +750,7 @@ pub(super) fn escalate(
             role.worker_timeout_secs,
             Arc::clone(env.interrupt),
             false,
+            None,
             ui,
             Some(&role.reasoning_guard),
             &mut |_| {},

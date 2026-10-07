@@ -482,12 +482,20 @@ impl Env<'_> {
         let bar_on = self.theme.sym(Sym::ScrollThumb).repeat(filled);
         let bar_off = self.theme.sym(Sym::Dot).repeat(CONTEXT_BAR_CELLS - filled);
         let mut parts: Vec<Part> = icon.into_iter().collect();
-        parts.push(self.part(format!("{}%", (fraction * 100.0).round() as u32), tok));
+        let approx = if data.context_estimated { "~" } else { "" };
+        parts.push(self.part(
+            format!("{approx}{}%", (fraction * 100.0).round() as u32),
+            tok,
+        ));
         parts.push(self.part(" ", Tok::StatusContext));
         parts.push(self.part(bar_on, tok));
         parts.push(self.part(bar_off, Tok::StatusSep));
         parts.push(self.part(
-            format!(" {}/{}", human(used), human(u64::from(data.context_window))),
+            format!(
+                " {approx}{}/{}",
+                human(used),
+                human(u64::from(data.context_window))
+            ),
             Tok::StatusContext,
         ));
         Seg {
@@ -1345,6 +1353,27 @@ mod tests {
         assert_eq!(color_of(84, "84%"), theme.fg(Tok::Warning).fg);
         assert_eq!(color_of(85, "85%"), theme.fg(Tok::Error).fg);
         assert_ne!(theme.fg(Tok::Success).fg, theme.fg(Tok::Error).fg);
+    }
+
+    #[test]
+    fn context_estimates_update_percentage_and_count_and_are_marked() {
+        let mut d = data();
+        d.context_estimated = true;
+        let before = plain(&render(&UiConfig::default(), &d, 120));
+        assert!(
+            before.contains("~12%") && before.contains("~3.9k/32k"),
+            "{before}"
+        );
+        d.prompt_tokens = Some(16_000);
+        let after = plain(&render(&UiConfig::default(), &d, 120));
+        assert!(
+            after.contains("~50%") && after.contains("~16k/32k"),
+            "{after}"
+        );
+        d.context_estimated = false;
+        let exact = plain(&render(&UiConfig::default(), &d, 120));
+        assert!(exact.contains("50%") && exact.contains("16k/32k"));
+        assert!(!exact.contains("~50%") && !exact.contains("~16k/32k"));
     }
 
     #[test]

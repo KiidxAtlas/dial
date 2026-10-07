@@ -8,20 +8,20 @@ use std::{
 
 #[derive(Default)]
 pub(super) struct InvestigationGuard {
-    observations: VecDeque<(u64, String)>,
+    observations: VecDeque<(u64, String, usize)>,
     unchanged: usize,
 }
 
 impl InvestigationGuard {
     pub fn observe(&mut self, call: &ToolCall, text: &str, is_error: bool) -> Option<String> {
-        // Error recovery has its own guards; it is not a run of successful unchanged observations.
+        // A failed check is not progress and must not erase earlier duplicate evidence.
         if is_error {
-            self.unchanged = 0;
             return None;
         }
         match call.name.as_str() {
-            // Mutations and arbitrary commands may invalidate earlier observations.
-            "write" | "edit" | "ast_edit" | "bash" => {
+            // Successful edits allow fresh verification. Commands alone do not prove
+            // a change; observations are executed again and compared with their result.
+            "write" | "edit" | "ast_edit" => {
                 self.observations.clear();
                 self.unchanged = 0;
                 return None;
@@ -39,8 +39,13 @@ impl InvestigationGuard {
         args.to_string().hash(&mut hash);
         text.hash(&mut hash);
         let key = hash.finish();
-        if let Some((_, first)) = self.observations.iter().find(|(seen, _)| *seen == key) {
-            self.unchanged += 1;
+        if let Some((_, first, repeats)) = self
+            .observations
+            .iter_mut()
+            .find(|(seen, _, _)| *seen == key)
+        {
+            *repeats += 1;
+            self.unchanged = *repeats;
             return Some(format!(
                 "[Investigation check from dial] This observation is unchanged from tool call {first}. Reuse that evidence and record the finding on the current investigation todo. If the question is still unresolved, choose a different, narrower check that can distinguish the remaining possibilities. Reread only for changed sources, missing context or a specific verification need; once the answer supports a change and its check, move on."
             ));
@@ -49,14 +54,14 @@ impl InvestigationGuard {
         if self.observations.len() == 128 {
             self.observations.pop_front();
         }
-        self.observations.push_back((key, call.id.clone()));
+        self.observations.push_back((key, call.id.clone(), 0));
         None
     }
 
     /// Several unchanged observations after corrective feedback are not further investigation.
-    /// New evidence or an operation that may change the workspace rearms the guard.
+    /// Intervening reads, commands and failures cannot reset an observation's repeat count.
     pub fn stop_message(&self) -> Option<String> {
-        (self.unchanged >= 4).then(|| "Stopped: four consecutive observations repeated unchanged evidence despite investigation feedback. No further useful evidence was obtained. The work remains incomplete; narrow the unresolved question before continuing.".into())
+        (self.unchanged >= 4).then(|| "Stopped: the same observation was repeated four times without changing despite investigation feedback. The work remains incomplete; reuse the existing evidence and choose a different next action before continuing.".into())
     }
 }
 
@@ -133,6 +138,38 @@ mod tests {
         guard.observe(&read, "original", false);
         assert!(guard.stop_message().is_some());
         guard.observe(&read, "changed externally", false);
+        assert!(guard.stop_message().is_none());
+    }
+
+    #[test]
+    fn intervening_checks_errors_and_other_reads_do_not_hide_a_loop() {
+        let mut guard = InvestigationGuard::default();
+        let read = call("read", json!({"path":"src/steering.rs"}));
+        guard.observe(&read, "pub(crate) fn local_unsupported_reason", false);
+        for attempt in 0..4 {
+            guard.observe(
+                &call("bash", json!({"command":"cargo check"})),
+                "subagents.rs: compile error",
+                true,
+            );
+            guard.observe(
+                &call("bash", json!({"command":"git status"})),
+                "unchanged",
+                false,
+            );
+            guard.observe(
+                &call("read", json!({"path":format!("other-{attempt}.rs")})),
+                "other evidence",
+                false,
+            );
+            assert!(
+                guard
+                    .observe(&read, "pub(crate) fn local_unsupported_reason", false)
+                    .is_some()
+            );
+        }
+        assert!(guard.stop_message().is_some());
+        assert!(guard.observe(&read, "changed externally", false).is_none());
         assert!(guard.stop_message().is_none());
     }
 }

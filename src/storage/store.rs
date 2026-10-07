@@ -589,10 +589,13 @@ impl Store {
 
     /// Persist a tool-call recovery: the context before a malformed call and the later call that was
     /// schema-valid and executed successfully. Kept apart from `events` so the feedback model never
-    /// sees raw training context. Returns false when an identical recovery already exists.
+    /// sees raw training context. Returns false for duplicate or oversized (>256 KiB) records.
     pub fn tool_recovery(&self, trajectory: i64, version: i64, payload: &Value) -> Result<bool> {
         let text = serde_json::to_string(payload)?;
-        ensure!(text.len() <= 256 * 1024, "tool recovery exceeds 256 KiB");
+        if text.len() > 256 * 1024 {
+            // Optional learning capture must not abort the coding turn. Never train on truncated context.
+            return Ok(false);
+        }
         let digest = format!("{:x}", sha2::Sha256::digest(text.as_bytes()));
         let changed = self.conn.execute("INSERT OR IGNORE INTO tool_recoveries(trajectory,version,digest,payload) VALUES(?1,?2,?3,?4)",
             params![trajectory, version, digest, text])?;
@@ -877,6 +880,29 @@ mod tests {
             max_tokens: 32,
             edit_mode: None,
         }
+    }
+
+    #[test]
+    fn oversized_tool_recovery_is_skipped_without_truncation_or_poisoning_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "model", "case", &harness()).unwrap();
+        let version = store.active().unwrap().id;
+        let trajectory = store
+            .begin_trajectory(version, "coding", "repair", "input")
+            .unwrap();
+        for large in [
+            json!({"context":"x".repeat(256 * 1024)}),
+            json!({"context":"\u{0}".repeat(50000)}),
+        ] {
+            assert!(!store.tool_recovery(trajectory, version, &large).unwrap());
+        }
+        assert!(store.tool_recoveries().unwrap().is_empty());
+        let small = json!({"context":[{"role":"user","content":"fix the call"}],"tools":[],"corrected":{"role":"assistant","content":"done"}});
+        assert!(store.tool_recovery(trajectory, version, &small).unwrap());
+        assert!(!store.tool_recovery(trajectory, version, &small).unwrap());
+        let records = store.tool_recoveries().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1, small);
     }
 
     fn passing(candidate: &Version) -> Admission {

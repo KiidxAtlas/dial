@@ -1,4 +1,6 @@
 CARGO ?= cargo
+INSTALL_DIR ?= $(HOME)/.local/bin
+
 
 .DEFAULT_GOAL := help
 .PHONY: help update install build check test
@@ -13,10 +15,12 @@ help:
 
 update:
 	$(CARGO) build --release --locked
-	mkdir -p bin
-	cp target/release/dial bin/dial
-	@printf '%s\n' 'Updated the dial binary at bin/dial. Run ./bin/dial or add this directory to your PATH.' \
-		'If your shell runs another copy, check: command -v dial.'
+	mkdir -p bin "$(INSTALL_DIR)"
+	install -m 755 target/release/dial bin/dial
+	install -m 755 target/release/dial "$(INSTALL_DIR)/dial"
+	@printf 'Updated %s and %s\n' '$(CURDIR)/bin/dial' '$(INSTALL_DIR)/dial'
+	@printf '%s\n' 'If your shell cached another dial path, run: hash -r (bash) or rehash (zsh).'
+
 
 install: update
 
