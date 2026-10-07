@@ -814,7 +814,10 @@ impl Backend {
                 };
                 return Err(error.context(format!("provider authentication failed (HTTP {status}); check {key} or sign in through /providers")));
             }
-            if !llm::is_transient(&error) {
+            let incomplete = error
+                .downcast_ref::<llm::anthropic::IncompleteStream>()
+                .is_some();
+            if !incomplete && !llm::is_transient(&error) {
                 return Err(error);
             }
             if attempt == llm::retry::MAX_ATTEMPTS {
@@ -825,6 +828,11 @@ impl Backend {
             let hinted = error
                 .downcast_ref::<llm::HttpError>()
                 .and_then(|http| http.retry_after);
+            if incomplete {
+                on_notice(
+                    "Anthropic stream was incomplete; discarding the partial reply and retrying. No partial tool calls will execute.",
+                );
+            }
             let exponential = self
                 .retry_backoff
                 .saturating_mul(1 << (attempt - 1))
@@ -2746,10 +2754,71 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_anthropic_stream_retries_without_returning_partial_calls() {
+        let events = thinking_tool_events();
+        let mut missing_reason = events.clone();
+        missing_reason.remove(missing_reason.len() - 2);
+        let mut open_call = events[..12].to_vec();
+        open_call.push(json!({"type":"message_stop"}));
+        for incomplete in [
+            events[..events.len() - 1].to_vec(),
+            missing_reason,
+            open_call,
+        ] {
+            let server = fake::serve(vec![
+                Script::Sse(anthropic_sse(&incomplete)),
+                Script::Sse(anthropic_sse(&events)),
+            ]);
+            let mut remote = backend(anthropic_endpoint(&server.url));
+            let mut notices = Vec::new();
+            let reply = remote
+                .chat_with_control(
+                    None,
+                    &request(),
+                    5,
+                    Some(&mut |_| true),
+                    &mut |n| notices.push(n.to_owned()),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+            let requests = server.requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(reply.tool_calls.len(), 1);
+            assert_eq!(reply.tool_calls[0].arguments, json!({"path":"a.rs"}));
+            assert!(
+                notices
+                    .iter()
+                    .any(|n| n.contains("discarding the partial reply"))
+            );
+            assert_eq!(fake::body(&requests[0]), fake::body(&requests[1]));
+        }
+    }
+
+    #[test]
+    fn incomplete_anthropic_stream_stops_at_existing_retry_bound() {
+        let events = thinking_tool_events();
+        let server = fake::serve(
+            (0..llm::retry::MAX_ATTEMPTS)
+                .map(|_| Script::Sse(anthropic_sse(&events[..events.len() - 1])))
+                .collect(),
+        );
+        let mut remote = backend(anthropic_endpoint(&server.url));
+        let error = remote
+            .chat(None, &request(), 5, Some(&mut |_| true))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("after {} attempts", llm::retry::MAX_ATTEMPTS)),
+            "{error:#}"
+        );
+        assert_eq!(server.requests().len(), llm::retry::MAX_ATTEMPTS as usize);
+    }
+
+    #[test]
     fn native_anthropic_post_response_failures_never_replay_and_cancel_is_typed() {
         let events = thinking_tool_events();
         for script in [
-            Script::Sse(anthropic_sse(&events[..events.len()-1])),
             Script::Sse("data: not-json\n\n".into()),
             Script::Sse("data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"anth-secret SECRET-PROMPT\"}}\n\n".into()),
         ] {

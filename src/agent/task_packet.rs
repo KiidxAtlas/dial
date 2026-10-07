@@ -92,7 +92,8 @@ impl PacketCache {
             // Previously projected bodies keep their exact placeholders across task changes too.
             let (index, task) = active.expect("checked active task");
             let mut packet = json!({
-                "active_task":{"index":index,"content":task.content,"investigation":task.investigation},
+                "active_task":{"index":index+1,"content":task.content,"investigation":task.investigation},
+                "completion":todo.completion_hint(),
                 "verification_objective":clipped(verification_objective, 512),
                 "constraints":[], "findings":[], "evidence":[],
                 "history":{"session_id":session_id,"session_file":history_ref,"retrieve":"session_search (session files are outside the read tool workspace)"},
@@ -268,6 +269,30 @@ mod tests {
             messages.push(json!({"role":"assistant","content":format!("recent {i}")}));
         }
         messages
+    }
+
+    #[test]
+    fn projected_task_numbers_and_completion_match_todo_contract() {
+        let mut todo = TodoList::new();
+        assert!(!todo.call(&json!({"op":"set","tasks":[{"content":"Inspect","investigation":true},{"content":"Implement"}]})).is_error);
+        let mut cache = PacketCache::default();
+        let first = cache
+            .project(&mut [], &todo, &json!({}), "s", None, "check", 4096)
+            .unwrap();
+        let first: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["active_task"]["index"], 1);
+        assert_eq!(first["completion"]["op"], "done");
+        assert!(first["completion"]["finding"].is_string());
+        assert!(todo.call(&json!({"op":"done"})).is_error);
+        assert!(!todo.call(&json!({"op":"done","index":first["active_task"]["index"],"finding":"Found owner","evidence":["src/lib.rs:1"]})).is_error);
+        let second = cache
+            .project(&mut [], &todo, &json!({}), "s", None, "check", 4096)
+            .unwrap();
+        let second: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second["active_task"]["index"], 2);
+        assert_eq!(second["completion"], json!({"op":"done"}));
+        assert!(!todo.call(&second["completion"]).is_error);
+        assert!(!todo.has_open());
     }
 
     #[test]

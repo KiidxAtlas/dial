@@ -846,11 +846,20 @@ impl Composer {
             if boxed {
                 spans.push(Span::styled(format!("{side} "), border));
             }
-            let used: usize = row.iter().map(|(t, _)| text::width(t)).sum();
-            spans.extend(
-                row.iter()
-                    .map(|(t, kind)| Span::styled(t.clone(), kind.style(theme))),
-            );
+            let placeholder = self.editor.text.is_empty() && !self.busy;
+            let used = if placeholder {
+                let label = text::clip("Ask anything, or describe what to build", inner);
+                let used = text::width(&label);
+                spans.push(Span::styled(label, theme.fg(Tok::Muted)));
+                used
+            } else {
+                let used: usize = row.iter().map(|(t, _)| text::width(t)).sum();
+                spans.extend(
+                    row.iter()
+                        .map(|(t, kind)| Span::styled(t.clone(), kind.style(theme))),
+                );
+                used
+            };
             if boxed {
                 spans.push(Span::raw(" ".repeat(inner - used + 1)));
                 spans.push(Span::styled(side.to_owned(), border));
@@ -1053,8 +1062,9 @@ impl Composer {
                 }
             } else {
                 pieces.extend([
+                    hint(Action::Submit, "send"),
                     Some("/ commands".into()),
-                    Some("/help help".into()),
+                    hint(Action::CommandPalette, "actions"),
                     hint(Action::ModelSelect, "model"),
                     hint(Action::Settings, "settings"),
                     hint(Action::HistorySearch, "history"),
@@ -2129,7 +2139,7 @@ mod tests {
     fn primary_hints_follow_context_and_effective_bindings() {
         let mut env = Env::new();
         let mut c = with_commands();
-        assert_eq!(&c.hint(&env.ctx())[..2], ["/ commands", "/help help"]);
+        assert_eq!(&c.hint(&env.ctx())[..2], ["Enter send", "/ commands"]);
         env.keys.rebind(Action::Submit, &["F2"]).unwrap();
         env.keys.rebind(Action::Newline, &["F3"]).unwrap();
         c.set_draft("a draft");

@@ -1465,7 +1465,7 @@ mod tests {
         );
         assert_eq!(
             Theme::dark().bg(Tok::UserBg).bg,
-            Some(Color::Rgb(0x17, 0x1c, 0x26))
+            Some(Color::Rgb(0x1d, 0x1b, 0x18))
         );
     }
 
@@ -1901,13 +1901,13 @@ mod tests {
         // The shipped themes name variables `blue`, `red`, `gray`…; they must resolve to the RGB values
         // declared in the file, never to the terminal palette entries of the same name.
         let dark = Theme::dark();
-        assert_eq!(dark.fg(Tok::Accent).fg, Some(Color::Rgb(0x7a, 0xa2, 0xf7)));
+        assert_eq!(dark.fg(Tok::Accent).fg, Some(Color::Rgb(0xf5, 0xb1, 0x4c)));
         assert_eq!(
             dark.fg(Tok::DiffAdded).fg,
-            Some(Color::Rgb(0x9e, 0xce, 0x6a))
+            Some(Color::Rgb(0x8f, 0xd6, 0x94))
         );
-        assert_eq!(dark.fg(Tok::Error).fg, Some(Color::Rgb(0xf7, 0x76, 0x8e)));
-        assert_eq!(dark.fg(Tok::Muted).fg, Some(Color::Rgb(0x6b, 0x72, 0x80)));
+        assert_eq!(dark.fg(Tok::Error).fg, Some(Color::Rgb(0xff, 0x6b, 0x81)));
+        assert_eq!(dark.fg(Tok::Muted).fg, Some(Color::Rgb(0x7c, 0x82, 0x93)));
         for name in ["dark", "light", "gruvbox", "nord", "paper"] {
             let theme = Theme::builtin(name).unwrap();
             let named = Tok::ALL

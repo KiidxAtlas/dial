@@ -1578,14 +1578,18 @@ impl Shell {
                 .collect();
             let tips = if self.ui.tips {
                 vec![
-                    format!(
-                        "{} search actions",
-                        self.keys.labels(Action::CommandPalette)
+                    (
+                        self.keys.label(Action::CommandPalette),
+                        "actions".to_owned(),
                     ),
-                    "/model choose a model".to_owned(),
-                    "/settings make it yours".to_owned(),
-                    "/hotkeys edit keyboard shortcuts".to_owned(),
+                    ("/".to_owned(), "commands".to_owned()),
+                    ("@".to_owned(), "files".to_owned()),
+                    ("!".to_owned(), "shell".to_owned()),
+                    (self.keys.label(Action::ModelSelect), "model".to_owned()),
                 ]
+                .into_iter()
+                .filter(|(key, _)| !key.is_empty())
+                .collect()
             } else {
                 Vec::new()
             };
@@ -1597,7 +1601,18 @@ impl Shell {
                     .display_name()
                     .trim_start_matches(&format!("{}/", selection.provider))
                     .to_owned(),
-                project: app.layout.project_root.display().to_string(),
+                project: {
+                    let root = app.layout.project_root.display().to_string();
+                    match std::env::var("HOME") {
+                        Ok(home)
+                            if !home.is_empty()
+                                && (root == home || root.starts_with(&format!("{home}/"))) =>
+                        {
+                            format!("~{}", &root[home.len()..])
+                        }
+                        _ => root,
+                    }
+                },
                 tips,
                 recent,
             };

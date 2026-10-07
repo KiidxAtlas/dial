@@ -409,20 +409,29 @@ fn user_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
         return Vec::new();
     }
     let style = ctx.theme.on(Tok::UserText, Tok::UserBg);
-    let mut rows = vec![tinted_row("", w, style)];
-    if w < 3 {
+    let mut rows = Vec::new();
+    if w < 4 {
         rows.push(tinted_row(&body.replace('\n', " "), w, style));
     } else {
-        let inner = w - 2;
-        for line in text::wrap_words(body, inner) {
-            rows.push(tinted_row(
-                &format!(" {} ", text::pad(&text::clip(&line, inner), inner)),
-                w,
-                style,
-            ));
+        let inner = w - 4;
+        for (i, line) in text::wrap_words(body, inner).into_iter().enumerate() {
+            let marker = if i == 0 {
+                ctx.theme.sym(Sym::Prompt)
+            } else {
+                " "
+            };
+            rows.push(Line::from(vec![
+                Span::styled(
+                    format!(" {marker} "),
+                    ctx.theme.on(Tok::Accent, Tok::UserBg),
+                ),
+                Span::styled(
+                    format!("{} ", text::pad(&text::clip(&line, inner), inner)),
+                    style,
+                ),
+            ]));
         }
     }
-    rows.push(tinted_row("", w, style));
     rows
 }
 
@@ -450,9 +459,23 @@ fn thinking_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
         );
         return vec![fitted(vec![Span::styled(label, style)], w, ctx.theme)];
     }
-    text::wrap_words(body, w)
+    let prefix = format!("{} ", ctx.theme.sym(Sym::Quote));
+    let lead = text::width(&prefix);
+    if w <= lead {
+        return vec![fitted(
+            vec![Span::styled(body.to_owned(), style)],
+            w,
+            ctx.theme,
+        )];
+    }
+    text::wrap_words(body, w - lead)
         .into_iter()
-        .map(|row| Line::from(Span::styled(text::clip(&row, w), style)))
+        .map(|row| {
+            Line::from(vec![
+                Span::styled(prefix.clone(), ctx.theme.fg(Tok::Border)),
+                Span::styled(text::clip(&row, w - lead), style),
+            ])
+        })
         .collect()
 }
 
@@ -563,7 +586,7 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
         parts.push(tokens.join(" "));
     }
     vec![fitted(
-        vec![Span::styled(parts.join("  "), theme.fg(Tok::Dim))],
+        vec![Span::styled(parts.join("  "), theme.fg(Tok::Muted))],
         w as usize,
         theme,
     )]
@@ -1034,7 +1057,7 @@ fn compact_tool(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
         {
             spans.push(Span::styled(
                 format!("  {} {first}", theme.sym(Sym::Dot)),
-                theme.fg(Tok::Dim),
+                theme.fg(Tok::Muted),
             ));
         }
     }
@@ -1681,7 +1704,7 @@ mod tests {
     // ---- user / reasoning / stats / errors ----
 
     #[test]
-    fn user_block_is_a_full_width_tinted_block_without_a_label() {
+    fn user_block_is_compact_tinted_and_has_a_prompt_marker() {
         let env = Env::new();
         let ctx = env.ctx();
         let mut t = Transcript::new();
@@ -1694,8 +1717,8 @@ mod tests {
             assert_eq!(text::line_width(row), 20);
             assert!(row.spans.iter().all(|s| s.style.bg == tint));
         }
-        assert!(plain(&rows)[1].starts_with(" hello"));
-        assert!(!text_of(&rows).to_lowercase().contains("you"));
+        assert!(plain(&rows)[0].starts_with(" › hello"));
+        assert_eq!(body[0].spans[0].style.fg, env.theme.fg(Tok::Accent).fg);
     }
 
     #[test]
@@ -1715,8 +1738,8 @@ mod tests {
         t.thinking_delta("first thought\nsecond thought\n\nthird");
         t.finish_turn();
         let rows = t.all_rows(40, &env.ctx());
-        assert!(plain(&rows).contains(&"first thought".to_owned()));
-        assert_eq!(rows[0].spans[0].style, env.theme.fg(Tok::ThinkingText));
+        assert!(plain(&rows).contains(&"▎ first thought".to_owned()));
+        assert_eq!(rows[0].spans[1].style, env.theme.fg(Tok::ThinkingText));
         env.ui.show_thinking = false;
         let rows = t.all_rows(40, &env.ctx());
         assert_eq!(plain(&rows), ["› reasoning (3 lines)", ""]);
@@ -1740,7 +1763,7 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("2.2/s"), "{line}");
-        assert_eq!(rows[0].spans[0].style, env.theme.fg(Tok::Dim));
+        assert_eq!(rows[0].spans[0].style, env.theme.fg(Tok::Muted));
         env.ui.show_turn_stats = false;
         assert!(t.all_rows(80, &env.ctx()).is_empty());
         let mut t2 = Transcript::new();

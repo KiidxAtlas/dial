@@ -289,6 +289,19 @@ impl TodoList {
         out.join("\n")
     }
 
+    /// Completion hints avoid index drift after automatic advancement or pruning.
+    /// A call template, not evidence. Investigation placeholders must be filled
+    /// from observed sources before calling; ordinary completion needs only op.
+    pub fn completion_hint(&self) -> Option<Value> {
+        self.tasks.iter().find(|t| t.status == Status::InProgress).map(|task| {
+            if task.investigation {
+                json!({"op":"done","finding":"<answer from inspection>","evidence":["<source:line, check result or artifact reference>"]})
+            } else {
+                json!({"op":"done"})
+            }
+        })
+    }
+
     /// Current step plus a bounded tail of investigation findings. Ordinary single-step lists
     /// need no reminder. Appended transiently to mid-turn requests to preserve the cached prefix.
     pub fn focus(&self) -> Option<String> {
@@ -392,7 +405,9 @@ impl TodoList {
                     "{error}\nNo tasks were changed. Current plan:\n{}\nUse op=done to close the active task; do not replace an existing plan to record findings.",
                     self.summary()
                 ));
-                output.data = Some(serde_json::json!({"tasks": self.snapshot()}));
+                output.data = Some(
+                    serde_json::json!({"tasks": self.snapshot(), "completion": self.completion_hint()}),
+                );
                 return output;
             }
         };
@@ -417,8 +432,13 @@ impl TodoList {
         }
         text.push('\n');
         text.push_str(&self.summary());
+        if let Some(hint) = self.completion_hint() {
+            text.push_str(&format!("\nAfter work/checks, close the current task with {hint}; replace placeholders with observed findings. Omit index for the current task (explicit indices are 1-based)."));
+        }
         ToolOutput {
-            data: Some(serde_json::json!({"tasks": self.snapshot()})),
+            data: Some(
+                serde_json::json!({"tasks": self.snapshot(), "completion": self.completion_hint()}),
+            ),
             text,
             is_error: false,
         }
@@ -564,7 +584,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": "todo",
-            "description": "Track a multi-step task as a numbered list. op=set plans the whole list (replaces it); op=append adds tasks; op=done/drop/block close the in-progress task (or the task at index); op=start switches to the task at index (reopening or unblocking it); op=view shows the list. Whenever nothing is in progress the earliest pending task starts automatically, so finishing a step and moving on is one done call. block needs reason; blocked tasks stay open until started again. phase labels a group: set it on the first task of each group and following tasks inherit it. Resolved tasks do not pile up: once more than three are closed, the oldest are removed automatically. Max 50 tasks, 200 chars each. Skip it for trivial one-step requests.",
+            "description": "Track a numbered plan. For the current task call {\"op\":\"done\"} after work/checks; omit index. Investigation done also requires finding and evidence from inspection. Do not resend set to mark tasks done. set replaces the plan, append adds tasks, start switches to a 1-based index, done/drop/block closes the active task and automatically starts the next pending one; block requires a reason. view shows the plan. Explicit indices are 1-based and may change when old closed tasks are pruned. Use completion hints in results; fill investigation placeholders with observed evidence. Skip for trivial requests.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -599,6 +619,30 @@ pub fn schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_hints_follow_the_active_task_without_weakening_findings() {
+        let mut list = TodoList::new();
+        let out = set(
+            &mut list,
+            json!([{"content":"Inspect","investigation":true},{"content":"Edit"}]),
+        );
+        assert!(out.text.contains("Omit index"));
+        assert_eq!(out.data.unwrap()["completion"]["op"], "done");
+        let before = list.snapshot();
+        let rejected = list.call(&json!({"op":"done"}));
+        assert!(rejected.is_error);
+        assert_eq!(list.snapshot(), before);
+        assert!(rejected.data.unwrap()["completion"]["evidence"].is_array());
+        assert!(
+            !list
+                .call(&json!({"op":"done","finding":"Found owner","evidence":["src/lib.rs:1"]}))
+                .is_error
+        );
+        assert_eq!(list.completion_hint(), Some(json!({"op":"done"})));
+        assert!(!list.call(&list.completion_hint().unwrap()).is_error);
+        assert_eq!(list.completion_hint(), None);
+    }
 
     #[test]
     fn detailed_findings_close_tasks_and_survive_resume_without_truncation() {

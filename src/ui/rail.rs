@@ -39,10 +39,7 @@ pub fn session(
         title
     };
     let mut rows = vec![fit(vec![
-        Span::styled(
-            "Session ",
-            theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("session ", theme.fg(Tok::Dim)),
         Span::styled(
             text::ellipsize(
                 &text::one_line(label),
@@ -57,7 +54,11 @@ pub fn session(
                 files.len(),
                 if files.len() == 1 { "" } else { "s" }
             ),
-            theme.fg(Tok::Dim),
+            theme.fg(if files.is_empty() {
+                Tok::Dim
+            } else {
+                Tok::Muted
+            }),
         ),
     ])];
     for file in files.iter().take(max.saturating_sub(1)) {
@@ -75,7 +76,11 @@ pub fn session(
             Span::styled(format!("  {path}"), theme.fg(Tok::Muted)),
             Span::styled(
                 format!("{}{stats}", " ".repeat(padding)),
-                theme.fg(Tok::Dim),
+                theme.fg(if file.untracked {
+                    Tok::Accent
+                } else {
+                    Tok::Success
+                }),
             ),
         ]));
     }

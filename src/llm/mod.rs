@@ -710,7 +710,11 @@ fn redact(text: &str, auth: Option<&str>) -> String {
 
 /// Post-response failures are never transport failures, even if their source was I/O.
 fn response_error(error: anyhow::Error, auth: Option<&str>) -> anyhow::Error {
-    if error.downcast_ref::<Interrupted>().is_some() {
+    if error.downcast_ref::<Interrupted>().is_some()
+        || error
+            .downcast_ref::<anthropic::IncompleteStream>()
+            .is_some()
+    {
         error
     } else {
         anyhow::anyhow!("{}", redact(&format!("{error:#}"), auth))

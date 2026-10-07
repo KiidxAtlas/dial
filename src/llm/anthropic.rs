@@ -6,6 +6,17 @@ use std::collections::BTreeMap;
 
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com/v1";
 
+/// A structurally unfinished generation, not a completed reply or executable call.
+/// Static text only: safe to preserve through provider error redaction.
+#[derive(Debug)]
+pub(super) struct IncompleteStream;
+impl std::fmt::Display for IncompleteStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Anthropic stream ended before blocks or stop reason completed")
+    }
+}
+impl std::error::Error for IncompleteStream {}
+
 /// Documented fallback when older Models API responses omit max_input_tokens.
 /// Live catalog values and explicit operator limits take precedence.
 pub(crate) fn documented_context_window(model: &str) -> Option<u32> {
@@ -335,10 +346,9 @@ impl Accumulator {
                 }
             }
             "message_stop" => {
-                ensure!(
-                    self.started && self.open.is_empty() && self.stop_reason.is_some(),
-                    "Anthropic message stopped before blocks or stop reason completed"
-                );
+                if !(self.started && self.open.is_empty() && self.stop_reason.is_some()) {
+                    return Err(IncompleteStream.into());
+                }
                 self.stopped = true;
                 return Ok(true);
             }
@@ -347,10 +357,9 @@ impl Accumulator {
         Ok(false)
     }
     pub(super) fn finish(self) -> Result<Reply> {
-        ensure!(
-            self.stopped,
-            "Anthropic stream ended before message_stop (connection closed early)"
-        );
+        if !self.stopped {
+            return Err(IncompleteStream.into());
+        }
         super::provider::anthropic_reply(
             &json!({"content":self.blocks.into_values().collect::<Vec<_>>(),"stop_reason":self.stop_reason,"usage":self.usage}),
         )
