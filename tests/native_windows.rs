@@ -193,7 +193,7 @@ fn background_and_python_kernel_work_natively() {
 fn native_file_paths_and_state_survive_reopen() {
     use dial::storage::{
         paths::Layout,
-        settings_store::{self, Scope},
+        settings_store::{self},
         store::Store,
     };
     let project = tempfile::Builder::new()
@@ -207,9 +207,9 @@ fn native_file_paths_and_state_survive_reopen() {
         settings_store::load_history(&layout, 10).unwrap(),
         ["hello 雪"]
     );
-    let store = Store::open(&layout.state_dir, "model", "coding").unwrap();
+    let store = Store::open(&layout.state_dir, "model", "coding", &Default::default()).unwrap();
     drop(store);
-    Store::open(&layout.state_dir, "model", "coding").unwrap();
+    Store::open(&layout.state_dir, "model", "coding", &Default::default()).unwrap();
     let ws = Workspace::new(project.path()).unwrap();
     fs::write(project.path().join("file.txt"), "hello").unwrap();
     assert_eq!(
@@ -218,5 +218,4 @@ fn native_file_paths_and_state_survive_reopen() {
         project.path().join("file.txt").canonicalize().unwrap()
     );
     assert!(ws.resolve("file.txt:hidden").is_err());
-    let _ = Scope::Global;
 }
