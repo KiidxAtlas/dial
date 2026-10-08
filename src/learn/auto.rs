@@ -139,7 +139,7 @@ pub fn jobs(layout: &Layout) -> Result<Value> {
         };
         match file.try_lock_exclusive() {
             Ok(()) => Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) if crate::platform::fs::lock_contended(&error) => Ok(true),
             Err(error) => Err(error.into()),
         }
     }

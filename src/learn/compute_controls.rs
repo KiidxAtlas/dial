@@ -19,7 +19,7 @@ pub fn snapshot(user: &Path) -> Result<Value> {
             FileExt::unlock(&lock)?;
             false
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(error) if crate::platform::fs::lock_contended(&error) => true,
         Err(error) => return Err(error.into()),
     };
     let owner = if busy {
@@ -135,7 +135,7 @@ pub fn action(user: &Path, state: Option<&str>, action: &str) -> Result<String> 
             Ok(()) => {
                 FileExt::unlock(&lock)?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if crate::platform::fs::lock_contended(&error) => {
                 stop_legacy(user, state.to_str().context("invalid state path")?)?;
             }
             Err(error) => return Err(error.into()),
@@ -186,7 +186,7 @@ pub fn stop_legacy(user: &Path, state: &str) -> Result<String> {
     let lock = super::auto::lock_file(&state.join("control.lock"))?;
     match lock.try_lock_exclusive() {
         Ok(()) => anyhow::bail!("job is no longer running"),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) if crate::platform::fs::lock_contended(&error) => {}
         Err(error) => return Err(error.into()),
     }
     let store = Store::open_read_only(&state)?;

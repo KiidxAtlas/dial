@@ -214,3 +214,10 @@ impl PermissionsExt for Permissions {
 #[cfg(windows)]
 #[path = "fs_windows.rs"]
 mod windows;
+
+/// fs2 reports Windows byte-range lock contention as ERROR_LOCK_VIOLATION,
+/// whose std::io kind is not WouldBlock on every Rust version.
+pub fn lock_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
