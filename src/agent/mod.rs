@@ -6355,18 +6355,22 @@ mod tests {
 
     #[test]
     fn background_waits_keep_the_ui_pumping() {
-        struct CountingUi(usize);
+        struct CountingUi(usize, mpsc::Sender<()>);
         impl Ui for CountingUi {
             fn heartbeat(&mut self) {
                 self.0 += 1;
+                let _ = self.1.send(());
             }
         }
         let (tx, rx) = mpsc::channel();
+        let (repainted, observed) = mpsc::channel();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(200));
+            // Keep the operation pending until the UI repaints, independent of host load.
+            // A missing heartbeat still ends the fixture and fails the assertion below.
+            let _ = observed.recv_timeout(Duration::from_secs(5));
             let _ = tx.send(());
         });
-        let mut ui = CountingUi(0);
+        let mut ui = CountingUi(0, repainted);
         receive_with_heartbeat(&rx, &mut ui).unwrap();
         assert!(
             ui.0 >= 1,

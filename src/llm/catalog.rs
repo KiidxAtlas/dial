@@ -2069,12 +2069,7 @@ mod tests {
             r#"{"weight_map":{"w":"missing.safetensors"}}"#,
         )
         .unwrap();
-        assert!(
-            local_models(cache.path(), None)[0]
-                .selection
-                .model
-                .ends_with("/old")
-        );
+        assert!(Path::new(&local_models(cache.path(), None)[0].selection.model).ends_with("old"));
     }
     #[test]
     fn local_resolution_uses_complete_snapshot_without_main_ref() {

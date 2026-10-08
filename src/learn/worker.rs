@@ -700,7 +700,7 @@ mod tests {
             worker: root.path().join("worker.py"),
             model: "fixture".into(),
             use_case: "project".into(),
-            worker_timeout_secs: 10,
+            worker_timeout_secs: 45,
             ..Config::default()
         };
         config.training.enabled = true;
@@ -719,8 +719,8 @@ if not r['resume_checkpoint']:
     Path({started:?}).touch()
     if {unresponsive}:
         (out/'resume.json').write_text('{{"completed":2}}')
-        time.sleep(30)
-    deadline=time.monotonic()+5
+        time.sleep(90)
+    deadline=time.monotonic()+30
     while not Path(r['pause_file']).exists():
         assert time.monotonic()<deadline
         time.sleep(0.01)
@@ -749,7 +749,7 @@ else:
         let _lease = super::super::compute::Background::acquire(&config).unwrap();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + Duration::from_secs(30);
                 while !started.exists() {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));

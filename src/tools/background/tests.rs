@@ -325,7 +325,13 @@ fn dropping_the_tool_kills_every_process_and_its_children() {
 fn a_finished_leader_takes_its_stragglers_with_it() {
     let (_dir, ws) = open_workspace();
     let tool = tool();
-    start(&tool, &ws, "leaky", "sleep 300 & echo child $!");
+    // Git Bash's $! is an MSYS PID; use a native Python PID for the Windows check.
+    let command = if cfg!(windows) {
+        r#"python -c 'import subprocess,sys; p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(300)"]); print("child",p.pid)'"#
+    } else {
+        "sleep 300 & echo child $!"
+    };
+    start(&tool, &ws, "leaky", command);
     let wait = bg(
         &tool,
         &ws,
