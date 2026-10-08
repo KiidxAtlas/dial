@@ -63,7 +63,13 @@ fn pending(user: &Path, kind: &str) -> Result<bool> {
             Ok(()) => {
                 FileExt::unlock(&file)?;
             } // A crashed requester never blocks work.
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
+            Err(error)
+                if error.raw_os_error()
+                    == Some(fs2::lock_contended_error().raw_os_error().unwrap_or(-1))
+                    || error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                return Ok(true);
+            }
             Err(error) => return Err(error.into()),
         }
     }

@@ -6207,6 +6207,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn local_startup_is_visible_and_does_not_trigger_the_reasoning_gate() {
         #[derive(Default)]
         struct StartupUi {

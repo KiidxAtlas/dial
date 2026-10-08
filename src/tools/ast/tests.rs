@@ -488,6 +488,7 @@ fn hashline_tags_from_before_the_rewrite_are_rejected() {
 }
 
 #[test]
+#[cfg(unix)]
 fn permissions_and_crlf_line_endings_are_preserved() {
     let (dir, ws) = workspace();
     let script = put(&dir, "run.py", "import os\r\nfoo(1)\r\n");

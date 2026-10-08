@@ -1483,6 +1483,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(unix)]
     fn lora_runtime_distinguishes_loading_use_failure_and_release() {
         let dir = tempfile::tempdir().unwrap();
         let python = super::server::tests::fake_python(dir.path());
@@ -2187,6 +2188,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn local_vision_model_receives_pixels_and_uses_one_supervised_vlm_server() {
         use base64::{Engine, engine::general_purpose::STANDARD};
         let root = tempfile::tempdir().unwrap();
@@ -2272,6 +2274,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn vision_steering_status_and_notice_respect_manual_automatic_and_disabled_settings() {
         for (enabled, automatic, strength, state, notice_count) in [
             (true, false, 0.5, "bypassed", 1),

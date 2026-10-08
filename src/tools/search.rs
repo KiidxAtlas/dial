@@ -221,19 +221,16 @@ pub(super) fn glob_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
     let mut total = 0;
     let mut walk = Walk::new(ws);
     walk.run_with_prefix(&ws.root, &ws.root.join(&glob.prefix), &mut |path| {
-        let rel = path
-            .strip_prefix(&ws.root)
-            .unwrap_or(path)
-            .to_string_lossy();
+        let rel = crate::platform::shell_path(path.strip_prefix(&ws.root).unwrap_or(path));
         if glob.matches(&rel) {
             total += 1;
             if matches.len() < MAX_LIST {
-                matches.push(rel.into_owned());
+                matches.push(rel.clone());
             } else if matches
                 .peek()
-                .is_some_and(|last| rel.as_ref() < last.as_str())
+                .is_some_and(|last| rel.as_str() < last.as_str())
             {
-                *matches.peek_mut().unwrap() = rel.into_owned();
+                *matches.peek_mut().unwrap() = rel.to_owned();
             }
         }
         true
@@ -467,10 +464,7 @@ pub(super) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
             .map_or_else(|| ws.root.clone(), |g| ws.root.join(&g.prefix));
         walk.run_with_prefix(&start, &prefix, &mut |path| {
             if glob.as_ref().is_none_or(|g| {
-                let rel = path
-                    .strip_prefix(&ws.root)
-                    .unwrap_or(path)
-                    .to_string_lossy();
+                let rel = crate::platform::shell_path(path.strip_prefix(&ws.root).unwrap_or(path));
                 g.matches(&rel)
             }) {
                 state.search_file(ws, path, &mut bytes);

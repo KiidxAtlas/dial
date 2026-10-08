@@ -148,7 +148,7 @@ fn architecture_view(findings: &[Value], files: &[Value]) -> Value {
         let parent = Path::new(path)
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .map_or_else(|| "(root)".into(), |p| p.to_string_lossy().into_owned());
+            .map_or_else(|| "(root)".into(), |p| crate::platform::shell_path(p));
         areas
             .entry(parent)
             .or_default()
@@ -644,7 +644,7 @@ impl Codebase {
             }
             if !supported(absolute) { return true; }
             let Ok(relative) = absolute.strip_prefix(ws.root()) else { return true };
-            let path = relative.to_string_lossy().into_owned();
+            let path = crate::platform::shell_path(relative);
             if screen(&path).is_err() { return true; }
             seen.insert(path.clone());
             let Some((text, digest)) = source(&self.root, &path) else {
@@ -1023,7 +1023,7 @@ impl Codebase {
                 .components()
                 .all(|c| matches!(c, Component::Normal(_)))
             {
-                let path = relative.to_string_lossy().into_owned();
+                let path = crate::platform::shell_path(relative);
                 if source(&self.root, &path).is_some() && !paths.contains(&path) {
                     paths.push(path);
                 }

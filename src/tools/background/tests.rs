@@ -282,6 +282,7 @@ fn ring_keeps_newest_bytes_and_tracks_what_was_lost() {
 }
 
 #[test]
+#[cfg(unix)]
 fn kill_takes_down_the_whole_process_group() {
     let (_dir, ws) = open_workspace();
     let tool = tool();
@@ -298,6 +299,7 @@ fn kill_takes_down_the_whole_process_group() {
 }
 
 #[test]
+#[cfg(unix)]
 fn dropping_the_tool_kills_every_process_and_its_children() {
     let (_dir, ws) = open_workspace();
     let tool = tool();

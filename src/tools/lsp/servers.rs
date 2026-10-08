@@ -215,7 +215,11 @@ mod tests {
     use std::fs;
 
     fn fake_bin(dir: &Path, name: &str) -> PathBuf {
-        let path = dir.join(name);
+        let path = dir.join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.into()
+        });
         fs::write(&path, "#!/bin/sh\n").unwrap();
         crate::platform::fs::set_mode(&path, 0o755).unwrap();
         path

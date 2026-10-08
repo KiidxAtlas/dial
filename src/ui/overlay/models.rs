@@ -1837,6 +1837,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn lora_verification_uses_highlighted_local_model_without_assigning_it() {
         let rig = Rig::new();
         let selection = ModelSelection {

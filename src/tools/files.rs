@@ -645,7 +645,9 @@ mod tests {
             "{}",
             both.text
         );
+        #[cfg(unix)]
         fs::write(dir.path().join("weird:5"), "x\n").unwrap();
+        #[cfg(unix)]
         assert_eq!(
             run(&ws, "read", json!({"path": "weird:5"})).text,
             "     1\tx\n"

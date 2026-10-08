@@ -209,7 +209,7 @@ impl Codebase {
             let Ok(path) = absolute.strip_prefix(&self.root) else {
                 return true;
             };
-            let path = path.to_string_lossy().into_owned();
+            let path = crate::platform::shell_path(path);
             paths.push(path.clone());
             if let Some((text, digest)) = source(&self.root, &path) {
                 bytes += text.len();
@@ -573,7 +573,7 @@ impl Codebase {
             if snapshot.files.contains_key(path) {
                 let parent = Path::new(path).parent().unwrap_or(Path::new(""));
                 layout
-                    .entry(parent.to_string_lossy().into_owned())
+                    .entry(crate::platform::shell_path(parent))
                     .or_default()
                     .push(path.clone());
             }

@@ -119,7 +119,7 @@ pub fn plan(root: &Path, python: &Path, changed_paths: &[PathBuf]) -> Vec<Focuse
         checks.push(FocusedCheck {
             name: format!("python AST: {path}"),
             command: [
-                shell_quote(&python.to_string_lossy()),
+                shell_quote(&crate::platform::shell_path(python)),
                 shell_quote("-I"),
                 shell_quote("-c"),
                 shell_quote(python_code),
@@ -244,13 +244,16 @@ fn javascript_test_command(root: &Path, changed: &Path) -> Option<FocusedCheck> 
     if !executable.is_file() {
         return None;
     }
-    let mut command = format!("{} ", shell_quote(&executable.to_string_lossy()));
+    let mut command = format!(
+        "{} ",
+        shell_quote(&crate::platform::shell_path(&executable))
+    );
     if runner == "vitest" {
         command.push_str("run ");
     } else {
         command.push_str("--runInBand ");
     }
-    command.push_str(&shell_quote(&test.to_string_lossy()));
+    command.push_str(&shell_quote(&crate::platform::shell_path(&test)));
     Some(FocusedCheck {
         name: format!("related {runner} test: {}", test.display()),
         command,
@@ -295,13 +298,13 @@ pub fn related_tests(root: &Path, python: &Path, changed: &[PathBuf]) -> Vec<Foc
                     let command = if pytest {
                         format!(
                             "{} -m pytest -q {}",
-                            shell_quote(&python.to_string_lossy()),
-                            shell_quote(&relative.to_string_lossy())
+                            shell_quote(&crate::platform::shell_path(python)),
+                            shell_quote(&crate::platform::shell_path(relative))
                         )
                     } else {
                         format!(
                             "{} -m unittest discover -s tests -p {}",
-                            shell_quote(&python.to_string_lossy()),
+                            shell_quote(&crate::platform::shell_path(python)),
                             shell_quote(&format!("test_{stem}.py"))
                         )
                     };

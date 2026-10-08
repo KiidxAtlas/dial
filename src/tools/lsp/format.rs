@@ -575,6 +575,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn locations_outside_the_workspace_show_only_the_path() {
         let (_dir, ws) = project();
         let result = json!([{"uri": "file:///etc/hosts", "range": at(0, 0)}]);

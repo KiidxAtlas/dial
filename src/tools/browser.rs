@@ -614,12 +614,14 @@ fn bridge(
 mod tests {
     use super::*;
     #[test]
+    #[cfg(unix)]
     fn sandbox_dependency_paths_are_not_profile_injection() {
         assert!(profile_path(Path::new("/tmp/a\"(allow network*)")).is_err());
         assert!(profile_path(Path::new("relative")).is_err());
         assert_eq!(profile_path(Path::new("/tmp/ok")).unwrap(), "\"/tmp/ok\"");
     }
     #[test]
+    #[cfg(unix)]
     fn dependency_ancestors_only_receive_literal_metadata_permission() {
         let rules = dependency_metadata(&[
             Path::new("/private/tmp/operator/node_modules"),
@@ -636,6 +638,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(unix)]
     fn browser_ipc_permission_is_restricted_to_private_state_unix_sockets() {
         let rules = state_unix_ipc(Path::new("/private/tmp/dial-browser-owned")).unwrap();
         assert!(rules.contains("local unix-socket") && rules.contains("remote unix-socket"));

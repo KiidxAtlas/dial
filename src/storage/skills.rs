@@ -484,7 +484,10 @@ pub mod skill_tool {
                     continue;
                 };
                 if out.len() < MAX_LISTED_FILES {
-                    out.push((one_line(text), meta.len()));
+                    out.push((
+                        one_line(&crate::platform::shell_path(Path::new(text))),
+                        meta.len(),
+                    ));
                 }
             }
         }

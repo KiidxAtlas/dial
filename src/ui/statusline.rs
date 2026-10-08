@@ -549,7 +549,7 @@ fn short_model(model: &str) -> String {
     }) {
         return name.replace("--", "/");
     }
-    if path.is_absolute()
+    if (path.is_absolute() || model.starts_with('/'))
         && let Some(name) = path.file_name()
     {
         return name.to_string_lossy().into_owned();

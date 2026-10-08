@@ -466,6 +466,10 @@ impl Workspace {
     }
 
     pub(crate) fn rel(&self, path: &Path) -> String {
+        #[cfg(windows)]
+        let normalized = crate::storage::paths::resolve_prefix(path);
+        #[cfg(windows)]
+        let path = normalized.as_path();
         match path.strip_prefix(&self.root) {
             Ok(rest) if rest.as_os_str().is_empty() => ".".to_string(),
             Ok(rest) => crate::platform::shell_path(rest),

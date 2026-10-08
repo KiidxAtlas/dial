@@ -267,12 +267,17 @@ pub fn retrieval_text(records: &[(i64, serde_json::Value)], max_bytes: usize) ->
 
 #[cfg(test)]
 mod tests {
+    const WORKSPACE: &str = if cfg!(windows) {
+        r"C:\workspace"
+    } else {
+        "/workspace"
+    };
     use super::*;
 
     fn run(sequence: u64, code: i32, kind: CheckKind) -> CheckRun {
         CheckRun {
             command: "cargo test regression".into(),
-            cwd: "/workspace".into(),
+            cwd: WORKSPACE.into(),
             objective: "reject duplicate keys".into(),
             kind,
             tool_call_id: format!("check-{sequence}"),
@@ -304,7 +309,7 @@ mod tests {
             .unwrap();
         assert!(record.valid());
         assert!(record.applies_to(
-            "/workspace",
+            WORKSPACE,
             &BTreeMap::from([("src/lib.rs".into(), Some("a".repeat(64)))])
         ));
         assert!(!record.applies_to(
@@ -312,7 +317,7 @@ mod tests {
             &BTreeMap::from([("src/lib.rs".into(), Some("a".repeat(64)))])
         ));
         assert!(!record.applies_to(
-            "/workspace",
+            WORKSPACE,
             &BTreeMap::from([("src/lib.rs".into(), Some("b".repeat(64)))])
         ));
         assert!(

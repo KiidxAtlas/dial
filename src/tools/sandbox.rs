@@ -297,6 +297,10 @@ pub fn already_sandboxed() -> bool {
 /// this process is already sandboxed and nesting is impossible; otherwise the missing sandbox fails the test.
 #[cfg(test)]
 pub(crate) fn require_for_test() -> bool {
+    if cfg!(windows) {
+        eprintln!("skipping: native Windows has no filesystem sandbox backend");
+        return false;
+    }
     match Sandbox::detect().available() {
         Ok(()) => true,
         Err(_) if already_sandboxed() => {
@@ -749,6 +753,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn profile_scopes_access_to_workspace() {
         let text = profile(Path::new("/private/tmp/my ws"), false).unwrap();
         assert!(text.contains("(deny default)"));
@@ -844,6 +849,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn dev_profile_orders_denials_last_and_rejects_unsafe_paths() {
         let fx = Fixture::new();
         let text = dev_profile(

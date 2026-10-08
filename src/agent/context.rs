@@ -205,10 +205,10 @@ fn load_context_file(
 
 fn display_for(layout: &Layout, home: Option<&Path>, path: &Path) -> String {
     if let Ok(rel) = path.strip_prefix(&layout.project_root) {
-        return rel.display().to_string();
+        return crate::platform::shell_path(rel);
     }
     if let Some(rel) = home.and_then(|h| path.strip_prefix(h).ok()) {
-        return format!("~/{}", rel.display());
+        return format!("~/{}", crate::platform::shell_path(rel));
     }
     path.display().to_string()
 }
@@ -336,7 +336,10 @@ fn pasted_image_tokens(text: &str) -> Vec<&str> {
             (&rest[..end], end)
         };
         let token = token.trim_end_matches([',', ';', '.', ')', ']', '}']);
-        if (token.starts_with('/') || token.starts_with("~/") || token.starts_with("./"))
+        if (Path::new(token).is_absolute()
+            || token.starts_with('/')
+            || token.starts_with("~/")
+            || token.starts_with("./"))
             && crate::llm::images::is_image(Path::new(token))
         {
             out.push(token);
@@ -986,6 +989,7 @@ mod tests {
         for i in 0..11 {
             dir = dir.join(format!("d{i}"));
         }
+        fs::create_dir_all(&dir).unwrap();
         write(dir.join("../AGENTS.md"), "level 1 up"); // d9
         write(dir.join("../../../../../../../AGENTS.md"), "7 up"); // d3: 8th directory counting the project
         write(dir.join("../../../../../../../../AGENTS.md"), "8 up"); // d2: beyond the limit

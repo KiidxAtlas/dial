@@ -786,7 +786,7 @@ mod tests {
     fn state(text: &str) -> FileState {
         FileState {
             bytes: text.as_bytes().to_vec(),
-            mode: 0o644,
+            mode: if cfg!(windows) { 0o666 } else { 0o644 },
         }
     }
     #[test]

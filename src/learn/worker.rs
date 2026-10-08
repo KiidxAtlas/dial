@@ -788,6 +788,7 @@ else:
     }
 
     #[test]
+    #[cfg(unix)]
     fn stop_request_terminates_running_training_subprocess() {
         let root = tempfile::tempdir().unwrap();
         let stop = root.path().join("improvement.stop");
@@ -812,6 +813,7 @@ else:
     }
 
     #[test]
+    #[cfg(unix)]
     fn lora_verification_cancellation_stops_the_worker_promptly() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let cancel = AtomicBool::new(false);
