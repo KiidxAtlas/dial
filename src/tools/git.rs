@@ -361,7 +361,6 @@ impl Tool for Git {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::fs::PermissionsExt;
 
     fn repo() -> (tempfile::TempDir, Workspace) {
         let dir = tempfile::tempdir().unwrap();

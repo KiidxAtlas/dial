@@ -11,7 +11,6 @@
 //! search first catches up on every session file from the byte offset it last indexed, so it also
 //! picks up lines written by other processes and survives a crash between append and indexing.
 use crate::platform::fs::OpenOptions;
-use crate::platform::fs::PermissionsExt;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};

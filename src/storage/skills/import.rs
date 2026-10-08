@@ -1,6 +1,5 @@
 //! Explicit, copy-based imports; no network access or script execution.
 use super::*;
-use crate::platform::fs::OpenOptions;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

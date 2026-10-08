@@ -1,5 +1,4 @@
 use crate::config::types::{Admission, Event, Harness, Outcome, Version};
-use crate::platform::fs::OpenOptions;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};

@@ -1,6 +1,5 @@
 //! Shared memory security screening and atomic private-file persistence.
 //! Durable provenance/retrieval lives in [`super::provenance`].
-use crate::platform::fs::PermissionsExt;
 use anyhow::{Context, Result};
 use std::{fs, io::Write, path::Path};
 

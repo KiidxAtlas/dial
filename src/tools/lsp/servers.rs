@@ -3,8 +3,6 @@
 //! Built-in defaults are looked up on `PATH` only. `[lsp.<language>]` config entries replace the
 //! default of the same name and take priority over every default for the extensions they list.
 
-use crate::platform::fs::PermissionsExt;
-
 use crate::config::types::LspServerConfig;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;

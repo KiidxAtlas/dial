@@ -3,7 +3,6 @@ use super::ext::{Tool, ToolContext};
 use super::shell::{ProcessGroup, shell_command};
 use super::{ToolOutput, tool_schema};
 use crate::config::types::Config;
-use crate::platform::fs::PermissionsExt;
 use crate::platform::process::CommandExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -182,7 +181,6 @@ pub(crate) fn resolve_operator_executable(
     program: &str,
     label: &str,
 ) -> Result<PathBuf, String> {
-    use crate::platform::fs::PermissionsExt;
     let path = Path::new(program);
     let candidate = if path.is_absolute() || path.components().count() > 1 {
         if path.is_absolute() {
@@ -660,7 +658,6 @@ mod tests {
     }
     #[test]
     fn workspace_python_launcher_is_rejected_before_execution() {
-        use crate::platform::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let marker = outside.path().join("escaped");

@@ -13,19 +13,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-15-intel, ubuntu-22.04]
+        os: [macos-15, macos-15-intel, ubuntu-22.04, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install Rust
         run: rustup update stable --no-self-update
       - name: Test terminal installer
+        if: runner.os != 'Windows'
         run: bash scripts/test-install.sh
       - name: Verify Linux sandbox enforcement
         if: runner.os == 'Linux'
@@ -35,5 +37,8 @@ jobs:
         run: cargo fmt --check
       - name: Build
         run: cargo build --locked --all-targets
+      - name: Test PowerShell installer
+        if: runner.os == 'Windows'
+        run: ./scripts/test-install.ps1
       - name: Test
         run: cargo test --locked -- --test-threads=4

@@ -5829,7 +5829,6 @@ mod tests {
 
     #[test]
     fn browsing_model_catalog_reads_cached_lora_without_starting_python() {
-        use crate::platform::fs::PermissionsExt;
         let (_home, project, layout, mut config) = config();
         config.endpoint = None;
         config.provider = Some("mlx".into());

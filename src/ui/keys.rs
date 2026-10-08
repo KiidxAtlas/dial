@@ -15,7 +15,6 @@
 //! Terminal limits (not Dial's): without the kitty keyboard protocol a terminal cannot report
 //! `Shift+Enter`, `Ctrl+,` or `Ctrl+Shift+<key>`; the defaults therefore include fallbacks
 //! (`Alt+Enter`, `Ctrl+4`). On macOS Terminal.app, `Alt` chords need "Use Option as Meta key".
-use crate::platform::fs::PermissionsExt;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{collections::HashSet, fs, path::Path};
 

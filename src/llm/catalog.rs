@@ -2,7 +2,6 @@
 //! Saved credentials are plaintext JSON, protected by owner-only directories/files,
 //! not an OS keychain. They are URL-scoped and written only on explicit user action.
 use super::model_config::{ModelSelection, ProviderSpec};
-use crate::platform::fs::PermissionsExt;
 use crate::storage::{
     paths::Layout,
     settings_store::{locked, read_private, write_private},

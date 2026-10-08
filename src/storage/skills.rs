@@ -11,7 +11,6 @@ use super::{
     memory::{atomic_write, find_secret, has_hidden_chars},
     paths::Layout,
 };
-use crate::platform::fs::OpenOptions;
 use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::{

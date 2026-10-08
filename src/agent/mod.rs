@@ -6208,7 +6208,6 @@ mod tests {
 
     #[test]
     fn local_startup_is_visible_and_does_not_trigger_the_reasoning_gate() {
-        use crate::platform::fs::PermissionsExt;
         #[derive(Default)]
         struct StartupUi {
             phases: Vec<llm::InferencePhase>,

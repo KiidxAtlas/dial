@@ -211,7 +211,6 @@ pub fn install(
             let output = model.join(file);
             settings_store::private_dir(output.parent().unwrap())?;
             std::fs::copy(&input, &output)?;
-            use crate::platform::fs::PermissionsExt;
             crate::platform::fs::set_mode(&output, 0o600)?;
         }
         std::fs::rename(model, directory.join("model"))?;

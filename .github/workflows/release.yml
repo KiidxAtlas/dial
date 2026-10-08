@@ -24,6 +24,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -33,6 +35,7 @@ jobs:
       - name: Install Linux sandbox
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -56,6 +59,7 @@ jobs:
               raise SystemExit(f'Tag {tag} must match Cargo.toml version v{version}')
           PY
       - name: Test terminal installer
+        if: runner.os != 'Windows'
         run: bash scripts/test-install.sh
       - name: Verify Linux sandbox enforcement
         if: runner.os == 'Linux'
@@ -65,11 +69,19 @@ jobs:
         run: cargo fmt --check
       - name: Test
         run: cargo test --locked -- --test-threads=4
+      - name: Test PowerShell installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          cargo build --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test-install.ps1
       - name: Build release binary
         env:
           MACOSX_DEPLOYMENT_TARGET: '13.0'
         run: cargo build --release --locked --target "${{ matrix.target }}"
       - name: Package and smoke-test outside the checkout
+        if: runner.os != 'Windows'
         env:
           RELEASE_TARGET: ${{ matrix.target }}
         run: |
@@ -86,11 +98,34 @@ jobs:
           cd "$smoke/$package"
           ./dial --version | grep -Fx "dial ${GITHUB_REF_NAME#v}"
           ./dial --help
+      - name: Package and smoke-test native Windows outside the checkout
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = "dial-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$package" -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/dial.exe" "dist/$package/"
+          Copy-Item LICENSE, README.md "dist/$package/"
+          Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
+          $hash = (Get-FileHash "dist/$package.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content "dist/$package.zip.sha256" "$hash  $package.zip" -Encoding Ascii
+          $smoke = Join-Path $env:RUNNER_TEMP ("dial-release-" + [guid]::NewGuid().ToString('N'))
+          try {
+            Expand-Archive "dist/$package.zip" $smoke
+            Push-Location "$smoke/$package"
+            $reported = & ./dial.exe --version
+            if ($LASTEXITCODE -ne 0 -or $reported.Trim() -ne "dial $($env:GITHUB_REF_NAME.Substring(1))") { throw 'Packaged binary failed version check.' }
+            & ./dial.exe --help
+            if ($LASTEXITCODE -ne 0) { throw 'Packaged binary failed outside checkout.' }
+            Pop-Location
+          } finally { Remove-Item $smoke -Recurse -Force -ErrorAction SilentlyContinue }
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets-${{ matrix.target }}
           path: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
           if-no-files-found: error
 
@@ -115,7 +150,9 @@ jobs:
         run: |
           set -euo pipefail
           cp scripts/install.sh dist/install.sh
+          cp scripts/install.ps1 dist/install.ps1
+          (cd dist && sha256sum install.ps1 > install.ps1.sha256)
           (cd dist && sha256sum install.sh > install.sh.sha256)
           cat dist/*.sha256 > dist/SHA256SUMS
-          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS dist/install.sh \
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 dist/SHA256SUMS dist/install.sh dist/install.ps1 \
             --verify-tag --generate-notes --title "Dial $RELEASE_TAG"

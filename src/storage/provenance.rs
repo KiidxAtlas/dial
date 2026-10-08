@@ -4,8 +4,6 @@
 //! paths; global facts are visible in every project. Legacy text files are only read by an explicit
 //! approved import and are never overwritten. Retrieved notes are untrusted data, not instructions.
 use super::{memory::screen, paths::Layout};
-use crate::platform::fs::OpenOptions;
-use crate::platform::fs::PermissionsExt;
 use crate::tools::{
     ToolOutput,
     ext::{Tool, ToolContext},

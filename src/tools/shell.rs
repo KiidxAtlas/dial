@@ -437,7 +437,6 @@ mod tests {
 
     #[test]
     fn preview_servers_are_redirected_before_spawn_but_finite_commands_still_run() {
-        use crate::platform::fs::PermissionsExt;
         let (dir, ws) = workspace();
         let ws = ws.without_sandbox();
         fs::write(

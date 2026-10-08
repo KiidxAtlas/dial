@@ -591,7 +591,6 @@ fn wait_ready(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::platform::fs::PermissionsExt;
     use std::fs;
 
     /// Stands in for `python -m mlx_lm.server`. The `--model` value selects a

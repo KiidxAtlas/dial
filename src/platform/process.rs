@@ -1,5 +1,7 @@
 use std::io;
-use std::process::{Command, ExitStatus};
+use std::process::Command;
+#[cfg(windows)]
+use std::process::ExitStatus;
 
 #[cfg(unix)]
 pub use std::os::unix::process::{CommandExt, ExitStatusExt};

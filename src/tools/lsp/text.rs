@@ -19,6 +19,16 @@ pub fn uri_from_path(path: &Path) -> String {
 }
 
 pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
+    let bytes = uri.as_bytes();
+    for (i, byte) in bytes.iter().enumerate() {
+        if *byte == b'%'
+            && (i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit())
+        {
+            return None;
+        }
+    }
     url::Url::parse(uri).ok()?.to_file_path().ok()
 }
 
@@ -275,6 +285,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn uri_round_trips_awkward_paths() {
         for path in [
             "/tmp/a b/c#d.rs",
@@ -292,6 +303,7 @@ mod tests {
     #[test]
     fn path_from_uri_rejects_non_file_and_malformed_uris() {
         assert_eq!(path_from_uri("https://example.com/a"), None);
+        #[cfg(unix)]
         assert_eq!(path_from_uri("file://host/a"), None);
         assert_eq!(path_from_uri("file:///a%2"), None);
         assert_eq!(path_from_uri("file:///a%zz"), None);

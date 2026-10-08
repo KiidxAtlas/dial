@@ -1,17 +1,16 @@
 # dial
 
-A local-first coding agent harness for macOS and Linux, including Windows through WSL2. Run it in a project directory like any agent CLI. Self-improvement is automatic: observations feed verified practice, harness proposals and local LoRA training; only an external evaluation gate can activate a candidate. Local MLX inference and training require Apple Silicon; Intel Macs and Linux/WSL2 use hosted or OpenAI-compatible providers.
+A local-first coding agent harness for macOS, native Windows, and Linux. Run it in a project directory like any agent CLI. Self-improvement is automatic: observations feed verified practice, harness proposals and local LoRA training; only an external evaluation gate can activate a candidate. Local MLX inference and training require Apple Silicon; Intel Macs, Windows, and Linux use hosted or OpenAI-compatible providers.
 
 Standalone: no dependency on omp, Hermes, or any hosted service. Rust control plane and tools; Python for local MLX inference/training (`mlx-lm`, plus `mlx-vlm` for vision).
 
 ## Install
 
-Release targets are **macOS 13+ on Apple Silicon (arm64) or Intel (x86-64)** and **Linux x86-64 (Ubuntu
-22.04 or newer), including Windows through WSL2**. There is no native Windows
-`.exe`; run Dial in the WSL terminal, not PowerShell. No Rust compiler or source
-checkout is needed for prebuilt releases. Download the archive for your platform
-and its matching `.tar.gz.sha256` file from
-[GitHub Releases](https://github.com/KiidxAtlas/dial/releases).
+Release targets are **macOS 13+ on Apple Silicon or Intel**, **native Windows x64**,
+and **Linux x86-64 (Ubuntu 22.04+)**. Download a prebuilt executable; no Rust
+compiler or source checkout is required. Windows runs directly in PowerShell,
+Command Prompt or Windows Terminal. Command tools use Git Bash from Git for Windows,
+like OMP; you do not need WSL for native use.
 
 This repository remains private. Download access requires a GitHub account that
 has been granted repository access. You can download the matching archive and
@@ -34,15 +33,15 @@ credentials stay managed by GitHub CLI. The curl path remains available for publ
 releases. Complete the platform prerequisites below before installing.
 
 The installer selects the correct archive and verifies its SHA-256 before installing.
-Run `bash install.sh v0.1.1` to select a specific release. On Windows these commands
-run in your WSL2 Ubuntu terminal; the PowerShell command below installs WSL2 first.
+Run `bash install.sh v0.1.2` to select a specific release. The commands above are
+for macOS/Linux; use the PowerShell installer below on native Windows.
 
 ### macOS (Apple Silicon or Intel)
 
-In the download directory (replace `v0.1.1` with the release you downloaded):
+In the download directory (replace `v0.1.2` with the release you downloaded):
 
 ```sh
-version=v0.1.1
+version=v0.1.2
 # Apple Silicon: aarch64-apple-darwin; Intel: x86_64-apple-darwin
 target=aarch64-apple-darwin
 shasum -a 256 -c "dial-$version-$target.tar.gz.sha256"
@@ -63,6 +62,44 @@ Hosted providers need an account/API key configured through first-run setup, but
 do not need Python. Local MLX inference is **macOS/Apple Silicon only** and
 additionally requires `uv`, network access for runtime/model downloads, and sufficient memory for the selected model. The
 Python worker is embedded in the binary; no repository checkout is needed.
+
+### Native Windows
+
+Install Git for Windows and GitHub CLI, then open a new PowerShell terminal:
+
+```powershell
+winget install --id Git.Git -e
+winget install --id GitHub.cli -e
+gh auth login --hostname github.com
+gh release download --repo KiidxAtlas/dial --pattern install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+# Open a new terminal after installation:
+dial --version
+cd C:\path\to\your\project
+dial --sandbox off
+```
+
+The installer downloads the native `.exe`, verifies its SHA-256 and version, and
+installs it under `%LOCALAPPDATA%\Dial\bin`, adding that directory to your user
+PATH. An update that fails verification preserves the existing executable.
+Use `-Version v0.1.2` for a specific release. Access to this private repository is
+required. You can also download the Windows ZIP and its `.zip.sha256` in your
+signed-in browser, verify it with `Get-FileHash`, extract it, and run `dial.exe`.
+
+Complete first-run provider setup. Hosted providers need no Python; local Windows
+inference can use an OpenAI-compatible server such as LM Studio or Ollama.
+Apple MLX inference/training remains Apple Silicon only. Python 3 is optional for
+the Python kernel; configure `kernel.python` if `python` is not on PATH.
+
+Native Windows command tools require an **explicit** `--sandbox off` (or
+`[sandbox] mode = "off"` in your own config). They run with your normal user permissions
+and retain tool approval prompts. Windows Job Objects supervise command descendants
+for cancellation, timeout and normal shutdown; they do not restrict filesystem or
+network access. Dev/strict OS sandbox modes remain unavailable on native Windows.
+Use the WSL2 instructions below when Linux filesystem/network confinement is required.
+Set `DIAL_BASH` to an operator-installed `bash.exe` if Git Bash cannot be discovered.
+Dial keeps state in `%USERPROFILE%\.dial` unless `DIAL_HOME` is set, and protects
+private state files with the current user's Windows ACL.
 
 ### Windows through WSL2 / Linux x86-64
 
@@ -98,7 +135,7 @@ sudo apt-get install -y bubblewrap ca-certificates
 Download the Linux archive and checksum into a Linux directory, then:
 
 ```sh
-version=v0.1.1
+version=v0.1.2
 sha256sum -c "dial-$version-x86_64-unknown-linux-gnu.tar.gz.sha256"
 tar -xzf "dial-$version-x86_64-unknown-linux-gnu.tar.gz"
 mkdir -p "$HOME/.local/bin"
@@ -156,9 +193,9 @@ The release workflow runs on pushed `v*` tags and requires the tag to match
 the release changes and push that commit and its tag, for example:
 
 ```sh
-git tag v0.1.1
+git tag v0.1.2
 git push origin main
-git push origin v0.1.1
+git push origin v0.1.2
 ```
 
 `.github/workflows/release.yml` checks formatting, runs the Rust tests (including
@@ -1152,7 +1189,7 @@ models never wait for local compute; only local models and explicit local roles 
   While waiting for compute, the elapsed timer advances and commands follow the same live/deferred/interrupting policy as during inference. Turn duration includes that wait; acquiring compute returns the status to Working rather than leaving it marked as waiting.
 - The TUI is keyboard-driven; not every terminal supports modified Enter keys. `dial schedule` provides scheduling but no daemon installer; there is no voice integration. Browser and kernel require available OS containment; they fail closed rather than falling back to unrestricted execution.
 - Live memory/skill edits are the user's working state and are not gated; only the admitted harness is.
-- Operator tools are trusted programs and are not sandboxed during live work; they are excluded from automatic evaluation. Non-macOS: `bash` is unavailable unless `sandbox.mode = "off"` for live use, while generated evaluations still require the strict sandbox.
+- Operator tools are trusted programs and are not sandboxed during live work; they are excluded from automatic evaluation. Native Windows command tools require `sandbox.mode = "off"` for live use. Linux uses bubblewrap; generated evaluations require an available strict OS sandbox.
 
 ## Source layout
 
