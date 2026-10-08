@@ -124,6 +124,7 @@ function Install-Dial {
         $expected = $Matches[1]
         $actual = (Get-FileHash (Join-Path $temp $archive) -Algorithm SHA256).Hash
         if ($actual -ne $expected) { throw 'Checksum verification failed; the existing installation was preserved.' }
+        Add-Type -AssemblyName System.IO.Compression
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [IO.Compression.ZipFile]::OpenRead((Join-Path $temp $archive))
         try {

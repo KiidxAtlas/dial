@@ -21,6 +21,12 @@ $previousUserBash = [Environment]::GetEnvironmentVariable('DIAL_BASH', 'User')
 $previousGitRoot = $env:GIT_INSTALL_ROOT
 $previousPath = $env:Path
 try {
+    # Exercise the actual `irm | iex` entry point without installing anything.
+    $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install.ps1'))
+    $guardedSource = $source.Replace('[string]$Version = ''latest''', '[string]$Version = ''invalid''')
+    $previousPreference = $ErrorActionPreference
+    Assert-DialRefused { Invoke-Expression $guardedSource } 'Invalid release version'
+    Assert-DialTest ($ErrorActionPreference -eq $previousPreference) 'Piped install did not restore the caller error preference'
     # Missing gh installs through winget and becomes discoverable in the same session.
     $script:ghQueries = 0; $script:pathRefreshes = 0; $script:wingetArguments = ''
     function Get-Command {
@@ -74,7 +80,7 @@ try {
     $script:gitInitialized = 0
     function Initialize-DialGitBash { $script:gitInitialized++ }
     $script:release.assets = @()
-    $destination = Join-Path $root 'Installed space Unicode'
+    $destination = Join-Path $root ('Installed space ' + [char]0x96EA)
     Assert-DialRefused { Install-Dial -Version latest -InstallDirectory $destination -NoPathUpdate } 'native Windows download is not published'
     Assert-DialTest ($script:gitInitialized -eq 0 -and -not (Test-Path $destination)) 'Missing release installed unnecessary prerequisites or touched Dial'
 
@@ -88,6 +94,7 @@ try {
         Set-Content $payload 'portable fixture'
         function Get-DialBinaryVersion { param($Binary); return 'dial 0.1.0' }
     }
+    Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archiveName = 'dial-v0.1.0-x86_64-pc-windows-msvc.zip'
     $archive = Join-Path $assets $archiveName
@@ -96,6 +103,11 @@ try {
     Set-Content "$archive.sha256" "$((Get-FileHash $archive -Algorithm SHA256).Hash)  $archiveName" -Encoding Ascii
     Install-Dial -Version v0.1.0 -InstallDirectory $destination -AssetDirectory $assets -NoPathUpdate
     $before = (Get-FileHash (Join-Path $destination 'dial.exe')).Hash
+    if ($env:OS -eq 'Windows_NT' -and $PSVersionTable.PSEdition -eq 'Desktop') {
+        $fullDestination = Join-Path $root 'full script install'
+        & ([scriptblock]::Create($source)) -Version v0.1.0 -InstallDirectory $fullDestination -AssetDirectory $assets -NoPathUpdate
+        Assert-DialTest ((Get-FileHash (Join-Path $fullDestination 'dial.exe')).Hash -eq $before) 'Full script invocation installed the wrong executable'
+    }
     function Get-DialBinaryVersion { param($Binary); return 'dial 9.9.9' }
     Assert-DialRefused { Install-Dial -Version v0.1.0 -InstallDirectory $destination -AssetDirectory $assets -NoPathUpdate } 'version check'
     Assert-DialTest ((Get-FileHash (Join-Path $destination 'dial.exe')).Hash -eq $before) 'Wrong-version update replaced Dial'

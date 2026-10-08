@@ -14,7 +14,7 @@ case "$(uname -s):$(uname -m)" in
     Darwin:arm64) target=aarch64-apple-darwin ;;
     Darwin:x86_64) target=x86_64-apple-darwin ;;
     Linux:x86_64) target=x86_64-unknown-linux-gnu ;;
-    *) echo 'Supported: macOS Apple Silicon/Intel or Linux x86-64 (Windows users: run in WSL2 Ubuntu).' >&2; exit 1 ;;
+    *) echo 'Supported: macOS Apple Silicon/Intel or Linux x86-64 (native Windows: use the PowerShell installer).' >&2; exit 1 ;;
 esac
 
 # Authenticated GitHub CLI also supports private releases without exposing tokens
