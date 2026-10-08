@@ -121,6 +121,7 @@ fn sqlite_tables_rows_primary_key_and_injection_boundaries() {
     );
 }
 #[test]
+#[cfg(unix)]
 fn rich_dispatch_preserves_plain_reads_and_confines_symlinks() {
     let (dir, ws) = crate::tools::testkit::workspace();
     fs::write(dir.path().join("plain.rs"), "fn plain() {}\n").unwrap();

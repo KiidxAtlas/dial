@@ -1,17 +1,15 @@
 use super::{MAX_CONTENT, Workspace};
+use crate::platform::process::{Child, CommandExt};
 use std::{
     io::{self, Read},
-    os::{fd::AsRawFd, unix::process::CommandExt},
     path::Path,
-    process::{Child, Stdio},
+    process::Stdio,
     time::{Duration, Instant},
 };
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
-        unsafe {
-            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
-        }
+        crate::platform::process::terminate(&mut self.0);
         let _ = self.0.wait();
     }
 }
@@ -40,26 +38,17 @@ pub(super) fn read(ws: &Workspace, path: &Path, selector: Option<&str>) -> Resul
         quote(file)
     );
     let mut command = crate::tools::shell::shell_command(ws, &script, ws.root())?;
-    let (mut reader, writer) = io::pipe().map_err(|e| e.to_string())?;
+    let (reader, writer) = io::pipe().map_err(|e| e.to_string())?;
     let err = writer.try_clone().map_err(|e| e.to_string())?;
     command
         .stdin(Stdio::null())
         .stdout(writer)
         .stderr(err)
         .process_group(0);
-    let child = command
-        .spawn()
+    let child = crate::platform::process::spawn(command)
         .map_err(|e| format!("starting sandboxed PDF parser: {e}"))?;
-    drop(command);
     let mut process = Process(child);
-    let fd = reader.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(format!(
-            "configuring PDF output pipe: {}",
-            io::Error::last_os_error()
-        ));
-    }
+    let mut reader = crate::platform::pipe::Reader::new(reader).map_err(|e| e.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut data = Vec::new();
     let mut buffer = [0u8; 8192];

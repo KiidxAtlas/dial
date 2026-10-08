@@ -3084,7 +3084,7 @@ mod real_server {
     }
 
     fn snapshot(repo_dir: &str) -> Option<String> {
-        let home = std::env::var("HOME").ok()?;
+        let home = crate::platform::home_var().ok()?;
         let snapshots = Path::new(&home)
             .join(".cache/huggingface/hub")
             .join(repo_dir)

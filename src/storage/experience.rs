@@ -12,7 +12,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
-    os::unix::fs::PermissionsExt,
     path::{Component, Path},
     time::Duration,
 };
@@ -141,7 +140,7 @@ impl Experience {
         fs::create_dir_all(&layout.state_dir)?;
         let path = layout.state_dir.join("experience.sqlite3");
         let conn = Connection::open(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        crate::platform::fs::set_mode(&path, 0o600)?;
         conn.busy_timeout(Duration::from_millis(200))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS experience (
             id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, model TEXT NOT NULL,

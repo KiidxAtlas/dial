@@ -38,7 +38,7 @@ fn start(tool: &Background, ws: &Workspace, name: &str, command: &str) -> ToolOu
 }
 
 fn alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    crate::platform::process::pid_alive(pid)
 }
 
 /// Wait for `pid` to disappear (it is reparented to launchd once killed, which reaps it).

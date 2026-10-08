@@ -286,22 +286,16 @@ fn short(id: &str) -> String {
 }
 
 fn session_age(started: &str) -> String {
-    let Some(stamp) = started
-        .get(..19)
-        .and_then(|s| std::ffi::CString::new(s).ok())
-    else {
+    let Some(stamp) = started.get(..19) else {
         return started.to_owned();
     };
-    // SAFETY: both strings are NUL-terminated; strptime/timegm receive a valid writable tm.
-    let seconds = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::strptime(stamp.as_ptr(), c"%Y-%m-%dT%H:%M:%S".as_ptr(), &mut tm).is_null() {
-            return started.to_owned();
-        }
-        libc::time(std::ptr::null_mut())
-            .saturating_sub(libc::timegm(&mut tm))
-            .max(0) as u64
+    let Ok(time) = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M:%S") else {
+        return started.to_owned();
     };
+    let seconds = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(time.and_utc().timestamp())
+        .max(0) as u64;
     if seconds < 60 {
         "now".into()
     } else if seconds < 3600 {
@@ -855,27 +849,14 @@ fn improvement_label(config: &Config, store: Option<&Store>) -> String {
     }
 }
 
-/// `HH:MM`-style local time without a date library.
+/// Formatted local wall-clock time on every supported platform.
 fn local_time(format: &str) -> String {
-    let Ok(format) = std::ffi::CString::new(format) else {
+    use std::fmt::Write;
+    let mut output = String::new();
+    if write!(&mut output, "{}", chrono::Local::now().format(format)).is_err() {
         return String::new();
-    };
-    // SAFETY: `localtime_r` and `strftime` write only into the zeroed `tm` and the bounded buffer.
-    unsafe {
-        let now = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&now, &mut tm).is_null() {
-            return String::new();
-        }
-        let mut buffer = [0u8; 64];
-        let written = libc::strftime(
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            format.as_ptr(),
-            &tm,
-        );
-        String::from_utf8_lossy(&buffer[..written]).into_owned()
     }
+    output
 }
 
 /// Dark or light terminal background from `COLORFGBG` (`fg;bg`, bg index < 8 is dark); `None` = unknown.
@@ -1608,7 +1589,7 @@ impl Shell {
                     .to_owned(),
                 project: {
                     let root = app.layout.project_root.display().to_string();
-                    match std::env::var("HOME") {
+                    match crate::platform::home_var() {
                         Ok(home)
                             if !home.is_empty()
                                 && (root == home || root.starts_with(&format!("{home}/"))) =>
@@ -2121,11 +2102,11 @@ impl Shell {
         }
         let ran = self.term.suspend(|| {
             // The editor setting may carry arguments (`code --wait`), so it goes through the shell.
-            Command::new("/bin/sh")
+            Command::new(crate::platform::programs::bash().map_err(std::io::Error::other)?)
                 .arg("-c")
                 .arg(format!("{editor} \"$1\""))
                 .arg("dial-editor")
-                .arg(&path)
+                .arg(crate::platform::shell_path(&path))
                 .status()
         });
         match ran {
@@ -5848,13 +5829,13 @@ mod tests {
 
     #[test]
     fn browsing_model_catalog_reads_cached_lora_without_starting_python() {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::platform::fs::PermissionsExt;
         let (_home, project, layout, mut config) = config();
         config.endpoint = None;
         config.provider = Some("mlx".into());
         let python = project.path().join("unexpected-python");
         std::fs::write(&python, "#!/bin/sh\nprintf ran > \"$0.called\"\nexit 1\n").unwrap();
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::fs::set_mode(&python, 0o755).unwrap();
         config.python = python;
         let mut paths = Vec::new();
         for (name, supported) in [("main-model", true), ("role-model", false)] {
@@ -6048,6 +6029,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn idle_unload_stops_a_resident_server_without_a_background_request() {
         if crate::learn::processes::live_inspection_unavailable() {
             return;

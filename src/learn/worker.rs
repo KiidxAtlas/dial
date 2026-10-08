@@ -1,12 +1,12 @@
 use crate::config::types::{Config, Version};
+use crate::platform::process::Child;
+use crate::platform::process::CommandExt;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;
@@ -21,29 +21,13 @@ impl ProcessGroup {
     fn terminate(&mut self) {
         if !self.terminated {
             // The leader is not reaped until after killpg, so its PID cannot be reused.
-            unsafe { libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL) };
+            crate::platform::process::terminate(&mut self.child);
             self.terminated = true;
         }
     }
 
     fn exited(&self) -> io::Result<bool> {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                self.child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(error);
-        }
-        Ok(unsafe { info.si_pid() } != 0)
+        crate::platform::process::exited(&self.child)
     }
 }
 
@@ -52,14 +36,6 @@ impl Drop for ProcessGroup {
         self.terminate();
         let _ = self.child.wait();
     }
-}
-
-fn nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 // Limit work per pass so a noisy child cannot starve the deadline or stdin writer.
@@ -152,15 +128,16 @@ fn run_command_handoff(
     ensure!(input.len() <= MAX_OUTPUT, "subprocess input exceeds 8 MiB");
     let started = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .env("DIAL_PARENT_PID", std::process::id().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .context("starting configured subprocess")?;
+        .process_group(0);
+    let child =
+        crate::platform::process::spawn(command).context("starting configured subprocess")?;
     let mut group = ProcessGroup {
         child,
         terminated: false,
@@ -197,9 +174,9 @@ fn run_command_handoff(
         .stderr
         .take()
         .context("missing subprocess stderr")?;
-    nonblocking(stdin.as_raw_fd()).context("setting stdin nonblocking")?;
-    nonblocking(stdout.as_raw_fd()).context("setting stdout nonblocking")?;
-    nonblocking(stderr.as_raw_fd()).context("setting stderr nonblocking")?;
+    let stdin = crate::platform::pipe::Writer::new(stdin)?;
+    let mut stdout = crate::platform::pipe::Reader::new(stdout)?;
+    let mut stderr = crate::platform::pipe::Reader::new(stderr)?;
     let mut sent = 0;
     let mut stdin = Some(stdin);
     let mut output = Vec::new();

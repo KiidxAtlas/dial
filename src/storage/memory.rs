@@ -1,7 +1,8 @@
 //! Shared memory security screening and atomic private-file persistence.
 //! Durable provenance/retrieval lives in [`super::provenance`].
+use crate::platform::fs::PermissionsExt;
 use anyhow::{Context, Result};
-use std::{fs, io::Write, os::unix::fs::PermissionsExt, path::Path};
+use std::{fs, io::Write, path::Path};
 
 const DELIMITER: &str = "§";
 
@@ -14,7 +15,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         .with_context(|| format!("creating temp file in {}", dir.display()))?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
-    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode))?;
+    crate::platform::fs::set_mode(tmp.path(), mode)?;
     tmp.persist(path)
         .map_err(|e| e.error)
         .with_context(|| format!("replacing {}", path.display()))?;

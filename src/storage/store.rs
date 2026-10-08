@@ -1,4 +1,5 @@
 use crate::config::types::{Admission, Event, Harness, Outcome, Version};
+use crate::platform::fs::OpenOptions;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -93,31 +94,21 @@ impl Store {
             !fs::symlink_metadata(state_dir)?.file_type().is_symlink(),
             "state directory must not be a symlink"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
-        }
+        crate::platform::fs::private(state_dir)?;
         let path = state_dir.join("state.sqlite3");
         if let Ok(metadata) = fs::symlink_metadata(&path) {
             ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
+                metadata.is_file() && !crate::platform::fs::is_alias(&metadata),
                 "state database must be a regular file"
             );
         }
-        let mut options = fs::OpenOptions::new();
+        let mut options = crate::platform::fs::OpenOptions::new();
         options.create(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        options
+            .mode(0o600)
+            .custom_flags(crate::platform::fs::NOFOLLOW);
         options.open(&path).context("open state database file")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        }
+        crate::platform::fs::private(&path)?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;

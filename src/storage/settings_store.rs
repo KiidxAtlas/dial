@@ -1,16 +1,19 @@
 //! Locked, owner-private settings and submitted-prompt history. TOML values outside
 //! the requested paths survive updates; invalid existing files are never replaced.
 use super::paths::Layout;
+use crate::platform::fs::OpenOptions;
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_HISTORY: usize = 10_000;
@@ -36,7 +39,7 @@ pub(crate) fn validate_private_path(dir: &Path) -> Result<()> {
     for ancestor in dir.ancestors() {
         if let Ok(meta) = fs::symlink_metadata(ancestor) {
             ensure!(
-                !meta.file_type().is_symlink() || meta.uid() == 0,
+                trusted_alias(&meta),
                 "private storage path contains a user-owned symlink"
             );
         }
@@ -49,9 +52,10 @@ pub(crate) fn private_dir(dir: &Path) -> Result<()> {
     match fs::symlink_metadata(dir) {
         Ok(meta) => {
             ensure!(
-                meta.is_dir() && !meta.file_type().is_symlink(),
+                meta.is_dir() && !crate::platform::fs::is_alias(&meta),
                 "private storage directory is not a regular directory"
             );
+            #[cfg(unix)]
             ensure!(
                 meta.uid() == unsafe { libc::geteuid() },
                 "private storage directory has another owner"
@@ -67,9 +71,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let meta = fs::symlink_metadata(dir)?;
                     ensure!(
-                        meta.is_dir()
-                            && !meta.file_type().is_symlink()
-                            && meta.uid() == unsafe { libc::geteuid() },
+                        meta.is_dir() && !crate::platform::fs::is_alias(&meta),
                         "unsafe private storage directory"
                     );
                 }
@@ -78,17 +80,20 @@ pub(crate) fn private_dir(dir: &Path) -> Result<()> {
         }
         Err(e) => return Err(e.into()),
     }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    crate::platform::fs::private(dir)?;
     Ok(())
 }
 
 fn check_file(file: &File) -> Result<()> {
     let meta = file.metadata()?;
     ensure!(
-        meta.is_file() && meta.nlink() == 1 && meta.uid() == unsafe { libc::geteuid() },
+        meta.is_file()
+            && !crate::platform::fs::is_alias(&meta)
+            && crate::platform::fs::single_link(file)?
+            && crate::platform::fs::owned(file)?,
         "private storage target must be an owner-owned regular file without hard links"
     );
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    crate::platform::fs::seal_file(file)?;
     Ok(())
 }
 
@@ -104,7 +109,11 @@ pub(crate) fn locked(path: &Path) -> Result<File> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .custom_flags(
+            crate::platform::fs::NOFOLLOW
+                | crate::platform::fs::CLOEXEC
+                | crate::platform::fs::NONBLOCK,
+        )
         .open(lock_path)?;
     check_file(&lock)?;
     lock.lock_exclusive()?;
@@ -114,7 +123,11 @@ pub(crate) fn locked(path: &Path) -> Result<File> {
 pub(crate) fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
     let file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .custom_flags(
+            crate::platform::fs::NOFOLLOW
+                | crate::platform::fs::CLOEXEC
+                | crate::platform::fs::NONBLOCK,
+        )
         .open(path)
     {
         Ok(file) => file,
@@ -140,22 +153,21 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         bytes.len() as u64 <= MAX_FILE_BYTES,
         "private storage file exceeds size limit"
     );
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        ensure!(
-            meta.is_file()
-                && !meta.file_type().is_symlink()
-                && meta.nlink() == 1
-                && meta.uid() == unsafe { libc::geteuid() },
-            "unsafe private storage target"
-        );
+    if fs::symlink_metadata(path).is_ok() {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(crate::platform::fs::NOFOLLOW)
+            .open(path)?;
+        check_file(&file)?;
     }
     let dir = path.parent().context("storage path has no parent")?;
+    private_dir(dir)?;
     let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    temp.as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    crate::platform::fs::seal_file(temp.as_file())?;
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|e| e.error)?;
+    #[cfg(unix)]
     File::open(dir)?.sync_all()?;
     Ok(())
 }
@@ -371,6 +383,7 @@ mod tests {
         .unwrap();
         save_history(&l, &["a\n雪".into(), "new".into(), "new".into()], 5).unwrap();
         assert_eq!(load_history(&l, 5).unwrap(), ["a\n雪", "external", "new"]);
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(history_path(&l).unwrap()).unwrap().mode() & 0o777,
             0o600
@@ -379,6 +392,7 @@ mod tests {
         assert_eq!(load_history(&l, 2).unwrap(), ["new", "last"]);
     }
     #[test]
+    #[cfg(unix)]
     fn refuses_symlink_and_hardlink_targets() {
         let (_h, _p, l) = fixture();
         let outside = tempfile::NamedTempFile::new().unwrap();
@@ -387,5 +401,16 @@ mod tests {
         fs::remove_file(&l.config_files()[0]).unwrap();
         fs::hard_link(outside.path(), &l.config_files()[0]).unwrap();
         assert!(save(&l, Scope::Global, &[]).is_err());
+    }
+}
+
+fn trusted_alias(meta: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        !meta.file_type().is_symlink() || meta.uid() == 0
+    }
+    #[cfg(windows)]
+    {
+        !crate::platform::fs::is_alias(meta)
     }
 }

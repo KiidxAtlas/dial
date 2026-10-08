@@ -20,7 +20,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
-    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -606,7 +605,7 @@ impl Codebase {
             "codebase database must not be a symlink"
         );
         let conn = Connection::open(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        crate::platform::fs::set_mode(&path, 0o600)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS codebase_files(path TEXT PRIMARY KEY,digest TEXT NOT NULL,outline TEXT NOT NULL);
@@ -1738,6 +1737,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn ignored_generated_linked_and_secret_data_are_not_cached() {
         let (_home, project, layout, ws) = fixture();
         fs::write(project.path().join(".gitignore"), "ignored/\n").unwrap();

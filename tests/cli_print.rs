@@ -500,6 +500,7 @@ fn sessions_cli_renames_exports_and_lists_across_projects() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sigint_during_inference_emits_an_interrupted_result() {
     let e = Env::new();
     let server = Server::new(vec![json!({"wait_for_interrupt":true})]);

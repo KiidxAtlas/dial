@@ -737,7 +737,7 @@ pub fn apply_sandbox_config(
             allow_network: false,
         }),
         SandboxMode::Dev => {
-            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let home = crate::platform::home_var_os().map(PathBuf::from);
             let mut deny_read: Vec<PathBuf> = Vec::new();
             if let Some((state, user)) = protected {
                 deny_read.push(state.to_owned());
@@ -778,6 +778,7 @@ pub fn apply_sandbox_config(
 mod tests {
     use super::testkit::*;
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     #[test]
@@ -808,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn paths_cannot_escape_workspace() {
         let (dir, ws) = workspace();
         let outside = tempfile::tempdir().unwrap();

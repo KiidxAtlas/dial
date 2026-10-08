@@ -11,13 +11,14 @@
 //! files the process can read. Nothing here authenticates the port.
 
 use super::{self as llm, Chat, SERVER_MODEL};
+use crate::platform::process::Child;
+use crate::platform::process::CommandExt;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::json;
 use std::io::{self, Read};
 use std::net::{Ipv4Addr, TcpListener};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PROMPT_CACHE_MEMORY_DIVISOR: u64 = 4;
 
 /// The `--prompt-cache-bytes` budget, or `None` when physical memory cannot be read.
+#[cfg(unix)]
 fn prompt_cache_bytes() -> Option<u64> {
     // SAFETY: sysconf only reads static system configuration.
     let (pages, page_size) = unsafe {
@@ -47,6 +49,11 @@ fn prompt_cache_bytes() -> Option<u64> {
         .ok()?
         .checked_mul(u64::try_from(page_size).ok()?)?;
     (total > 0).then_some(total / PROMPT_CACHE_MEMORY_DIVISOR)
+}
+
+#[cfg(windows)]
+fn prompt_cache_bytes() -> Option<u64> {
+    None
 }
 
 #[derive(Default)]
@@ -121,28 +128,12 @@ impl Supervised {
     /// Exit status is only observed (WNOWAIT), not consumed, so the group id
     /// cannot be recycled before `stop` signals the group.
     fn exited(&self) -> io::Result<bool> {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                self.child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(error);
-        }
-        Ok(unsafe { info.si_pid() } != 0)
+        crate::platform::process::exited(&self.child)
     }
 
     fn stop(&mut self) {
         if !self.stopped {
-            unsafe { libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL) };
+            crate::platform::process::terminate(&mut self.child);
             let _ = self.child.wait();
             self.stopped = true;
         }
@@ -430,7 +421,7 @@ fn launch(
         flag.push(adapter);
         command.arg(flag);
     }
-    let mut child = command
+    command
         .env(
             "DIAL_MODEL_ENGINE",
             if vision { "mlx-vlm" } else { "mlx-lm" },
@@ -447,8 +438,8 @@ fn launch(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
+        .process_group(0);
+    let mut child = crate::platform::process::spawn(command)
         .context("starting local MLX server")
         .map_err(Failure::Fatal)?;
     let stderr = child.stderr.take();
@@ -600,8 +591,8 @@ fn wait_ready(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::platform::fs::PermissionsExt;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     /// Stands in for `python -m mlx_lm.server`. The `--model` value selects a
     /// behaviour: `exit-early`, `never-ready`, `bad-model`, or a path that
@@ -654,7 +645,7 @@ server.serve_forever()
     pub(crate) fn fake_python(dir: &Path) -> PathBuf {
         let path = dir.join("fake-python");
         fs::write(&path, FAKE_SERVER).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::fs::set_mode(&path, 0o755).unwrap();
         path
     }
 
@@ -703,7 +694,7 @@ server.serve_forever()
     }
 
     fn alive(pid: i64) -> bool {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        crate::platform::process::pid_alive(pid as i32)
     }
 
     fn wait_dead(pid: i64) -> bool {
@@ -855,6 +846,7 @@ server.serve_forever()
     }
 
     #[test]
+    #[cfg(unix)]
     fn ensure_reuses_and_restarts() {
         let dir = tempfile::tempdir().unwrap();
         let python = fake_python(dir.path());
@@ -951,7 +943,7 @@ server.serve_forever()
     }
 
     fn snapshot(repo_dir: &str) -> String {
-        let home = std::env::var("HOME").unwrap();
+        let home = crate::platform::home_var().unwrap();
         let snapshots = Path::new(&home)
             .join(".cache/huggingface/hub")
             .join(repo_dir)

@@ -30,7 +30,7 @@ pub fn snapshot(user: &Path) -> Result<Value> {
                 value["pid"]
                     .as_i64()
                     .and_then(|pid| i32::try_from(pid).ok())
-                    .is_some_and(|pid| pid > 1 && unsafe { libc::kill(pid, 0) } == 0)
+                    .is_some_and(|pid| pid > 1 && crate::platform::process::pid_alive(pid))
             })
             .unwrap_or(Value::Null)
     } else {
@@ -180,6 +180,7 @@ pub fn action(user: &Path, state: Option<&str>, action: &str) -> Result<String> 
 
 /// Old workers have no preemption protocol. Stop only a positively identified detached Dial
 /// background job, never a foreground chat. Collect children before terminating their parent.
+#[cfg(unix)]
 pub fn stop_legacy(user: &Path, state: &str) -> Result<String> {
     let state = state_path(user, state)?;
     let lock = super::auto::lock_file(&state.join("control.lock"))?;
@@ -388,4 +389,9 @@ mod tests {
             1
         );
     }
+}
+
+#[cfg(windows)]
+pub fn stop_legacy(_: &Path, _: &str) -> Result<String> {
+    anyhow::bail!("Legacy Unix background jobs cannot be controlled from native Windows")
 }

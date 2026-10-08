@@ -2,14 +2,13 @@
 
 use super::sandbox::{Policy, Sandbox, is_secret_env};
 use super::{SCRATCH_DIR, ToolOutput, Workspace, opt_u64, req_str};
+use crate::platform::process::{Child, CommandExt, ExitStatusExt};
 use anyhow::Result;
 use serde_json::Value;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -37,30 +36,14 @@ impl ProcessGroup {
     pub(super) fn terminate(&mut self) {
         if !self.terminated {
             // The leader is not reaped until after killpg, so its PID cannot be reused.
-            unsafe { libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL) };
+            crate::platform::process::terminate(&mut self.child);
             self.terminated = true;
         }
     }
 
     /// True once the leader has exited. It is not reaped, so its PID stays reserved.
     pub(super) fn exited(&self) -> io::Result<bool> {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                self.child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(error);
-        }
-        Ok(unsafe { info.si_pid() } != 0)
+        crate::platform::process::exited(&self.child)
     }
 }
 
@@ -159,13 +142,8 @@ fn drain_pipe(
     Ok(false)
 }
 
-fn wait_readable(fd: i32, millis: i32) {
-    let mut poll = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    unsafe { libc::poll(&mut poll, 1, millis) };
+fn wait_readable(fd: crate::platform::pipe::Handle, millis: i32) {
+    crate::platform::pipe::wait(fd, false, millis);
 }
 
 fn bash_path() -> String {
@@ -268,7 +246,7 @@ pub fn bash_tool_streaming(
         .transpose()
         .map_err(|e| format!("creating command output artifact: {e}"))?;
     let mut spawn = shell_command(ws, command, &ws.root)?;
-    let (mut reader, writer) = io::pipe().map_err(|e| format!("creating output pipe: {e}"))?;
+    let (reader, writer) = io::pipe().map_err(|e| format!("creating output pipe: {e}"))?;
     let writer_err = writer
         .try_clone()
         .map_err(|e| format!("creating output pipe: {e}"))?;
@@ -277,21 +255,14 @@ pub fn bash_tool_streaming(
         .stdout(writer)
         .stderr(writer_err)
         .process_group(0);
-    let child = spawn
-        .spawn()
+    let child = crate::platform::process::spawn(spawn)
         .map_err(|e| format!("starting sandboxed bash: {e}"))?;
     // The Command owns the pipe's write ends; release them so EOF is observable.
-    drop(spawn);
 
     let mut group = ProcessGroup::new(child);
-    let fd = reader.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(format!(
-            "configuring output pipe: {}",
-            io::Error::last_os_error()
-        ));
-    }
+    let mut reader = crate::platform::pipe::Reader::new(reader)
+        .map_err(|e| format!("configuring output pipe: {e}"))?;
+    let fd = reader.handle();
 
     let timeout = Duration::from_secs(timeout_secs);
     let started = Instant::now();
@@ -396,15 +367,26 @@ pub(super) fn shell_command(
     let strict = matches!(ws.policy, None | Some(Policy::Strict { .. }));
     let mut spawn;
     if ws.unsandboxed {
-        spawn = std::process::Command::new("/bin/bash");
-        spawn.args(["-c", script]).env_clear();
+        let bash = crate::platform::programs::bash()?;
+        if bash
+            .canonicalize()
+            .is_ok_and(|path| path.starts_with(&ws.root))
+        {
+            return Err("bash must be installed outside the editable workspace".into());
+        }
+        spawn = std::process::Command::new(bash);
+        spawn
+            .args(["--noprofile", "--norc", "-c", script])
+            .env_clear();
+        #[cfg(windows)]
+        spawn.env("MSYS_NO_PATHCONV", "1");
         for (key, value) in std::env::vars() {
             if !is_secret_env(&key, &value) {
                 spawn.env(key, value);
             }
         }
         spawn
-            .env("TMPDIR", &scratch_str)
+            .env("TMPDIR", crate::platform::shell_path(&scratch))
             .env("PAGER", "cat")
             .env("GIT_PAGER", "cat");
     } else {
@@ -455,7 +437,7 @@ mod tests {
 
     #[test]
     fn preview_servers_are_redirected_before_spawn_but_finite_commands_still_run() {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::platform::fs::PermissionsExt;
         let (dir, ws) = workspace();
         let ws = ws.without_sandbox();
         fs::write(
@@ -463,7 +445,7 @@ mod tests {
             "#!/bin/sh\necho launched > launched.txt\n",
         )
         .unwrap();
-        fs::set_permissions(dir.path().join("pnpm"), fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::fs::set_mode(dir.path().join("pnpm"), 0o755).unwrap();
         let refused = bash(&ws, "./pnpm dev --host 127.0.0.1 --port 3000");
         assert!(
             refused.is_error
@@ -579,7 +561,7 @@ mod tests {
             return;
         }
         let (_dir, ws) = workspace();
-        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let home = PathBuf::from(crate::platform::home_var().expect("HOME"));
         let mut canary = tempfile::Builder::new()
             .prefix(".dial-sandbox-canary-")
             .tempfile_in(&home)
@@ -949,6 +931,7 @@ mod tests {
     // Run in its own test process: installing SIGINT must not affect concurrent tests.
     #[test]
     #[ignore]
+    #[cfg(unix)]
     fn sigint_shell_helper() {
         let root = std::env::var("DIAL_TEST_SHELL_SIGINT_ROOT")
             .expect("launched by SIGINT regression test");
@@ -981,6 +964,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn sigint_cancellation_kills_shell_and_process_group_promptly() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())

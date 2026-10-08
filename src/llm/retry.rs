@@ -70,13 +70,8 @@ fn reset_date(value: &str) -> Option<SystemTime> {
     if whole.len() != 19 {
         return None;
     }
-    let input = std::ffi::CString::new(whole).ok()?;
-    let mut time: libc::tm = unsafe { std::mem::zeroed() };
-    let end = unsafe { libc::strptime(input.as_ptr(), c"%Y-%m-%dT%H:%M:%S".as_ptr(), &mut time) };
-    if end.is_null() || unsafe { *end } != 0 {
-        return None;
-    }
-    let seconds = unsafe { libc::timegm(&mut time) };
+    let time = chrono::NaiveDateTime::parse_from_str(whole, "%Y-%m-%dT%H:%M:%S").ok()?;
+    let seconds = time.and_utc().timestamp();
     (seconds >= 0).then(|| UNIX_EPOCH + Duration::from_secs(seconds as u64))
 }
 

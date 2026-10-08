@@ -9,12 +9,12 @@
 //! Only turns that touched files are materialised: a read-only turn leaves no trace and does not
 //! count toward `rollback(n)`.
 use super::memory::atomic_write;
+use crate::platform::fs::PermissionsExt;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use similar::{Algorithm, ChangeTag, TextDiff};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     sync::Mutex,
 };
@@ -105,7 +105,7 @@ impl Checkpoints {
         let root = fs::canonicalize(&project_root)
             .with_context(|| format!("project root {}", project_root.display()))?;
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        crate::platform::fs::private(&dir)?;
         let dir = fs::canonicalize(&dir)?;
         if dir.starts_with(&root) {
             fs::remove_dir(&dir).ok();
@@ -863,12 +863,12 @@ mod tests {
         let fx = Fixture::new();
         let bin: Vec<u8> = (0..=255u8).collect();
         fs::write(fx.path("blob.bin"), &bin).unwrap();
-        fs::set_permissions(fx.path("blob.bin"), fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::fs::set_mode(fx.path("blob.bin"), 0o755).unwrap();
         let cp = fx.open();
         cp.begin_turn("t").unwrap();
         cp.before_write(&fx.path("blob.bin")).unwrap();
         fs::write(fx.path("blob.bin"), b"x").unwrap();
-        fs::set_permissions(fx.path("blob.bin"), fs::Permissions::from_mode(0o600)).unwrap();
+        crate::platform::fs::set_mode(fx.path("blob.bin"), 0o600).unwrap();
         cp.rollback(1).unwrap();
         assert_eq!(fs::read(fx.path("blob.bin")).unwrap(), bin);
         assert_eq!(
@@ -882,6 +882,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn refuses_paths_outside_the_project() {
         let fx = Fixture::new();
         let outside = tempfile::tempdir().unwrap();

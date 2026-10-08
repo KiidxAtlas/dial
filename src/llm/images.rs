@@ -76,7 +76,7 @@ pub fn user_attachment(root: &Path, path: &Path) -> Result<Value> {
         .to_str()
         .and_then(|p| p.strip_prefix("~/"))
         .map(|p| {
-            std::env::var_os("HOME")
+            crate::platform::home_var_os()
                 .map(|home| std::path::PathBuf::from(home).join(p))
                 .context("home directory is unavailable")
         })
@@ -96,7 +96,9 @@ pub(crate) fn authorized_user_reference(messages: &[Value], path: &Path) -> Opti
     let expanded = path
         .to_str()
         .and_then(|p| p.strip_prefix("~/"))
-        .and_then(|p| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(p)));
+        .and_then(|p| {
+            crate::platform::home_var_os().map(|home| std::path::PathBuf::from(home).join(p))
+        });
     let requested = expanded.as_deref().unwrap_or(path);
     if !requested.is_absolute() || !is_image(requested) {
         return None;
@@ -346,6 +348,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(unix)]
     fn compact_references_reject_changed_oversized_and_escaped_images() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("tiny.png"), b"\x89PNG\r\n\x1a\noriginal").unwrap();

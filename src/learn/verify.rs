@@ -213,6 +213,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn paths_cannot_escape_or_follow_symlinks() {
         let outer = tempfile::tempdir().unwrap();
         let dir = outer.path().join("w");

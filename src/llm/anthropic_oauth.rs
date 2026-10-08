@@ -170,30 +170,7 @@ fn callback_code(stream: &mut TcpStream, expected_state: &str) -> Result<String>
         .context("Anthropic OAuth callback did not contain a code")
 }
 fn browser(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let opened = Command::new("open")
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    #[cfg(target_os = "linux")]
-    let opened = Command::new("xdg-open")
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    #[cfg(target_os = "windows")]
-    let opened = Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let opened = open::that(url).is_ok();
     ensure!(opened, "could not open the browser for Anthropic sign-in");
     Ok(())
 }

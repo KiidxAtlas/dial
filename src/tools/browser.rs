@@ -119,9 +119,7 @@ impl Tool for BrowserTool {
         self.interrupt.store(true, Ordering::Release);
         let pid = self.pid.load(Ordering::Acquire);
         if pid > 0 {
-            unsafe {
-                libc::killpg(pid, libc::SIGKILL);
-            }
+            crate::platform::process::terminate_pid(pid);
         }
     }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
@@ -326,6 +324,7 @@ fn start(
     pid: Arc<AtomicI32>,
 ) -> Result<BrowserSession, String> {
     // Fail closed even if the operator disabled the bash sandbox: browser JS must not escape the bridge.
+    #[cfg(not(windows))]
     Sandbox::detect()
         .available()
         .map_err(|e| format!("browser requires an OS sandbox: {e}"))?;
@@ -372,29 +371,45 @@ fn start(
         .find(|p| p.file_name().is_some_and(|n| n == "node_modules"))
         .unwrap_or_else(|| entry.parent().unwrap());
     let executable_root = chromium_bundle_root(&executable)?;
-    let mut policy = profile(ctx.workspace.root(), false)?;
-    policy.push_str(&format!("(allow file-read* (subpath {}) (subpath {}) (subpath {}))\n(allow file-read* file-write* (subpath {}))\n", profile_path(package_root)?, profile_path(executable_root)?, profile_path(node.parent().ok_or("Node executable has no parent")?)?, profile_path(&state_path)?));
-    // Node realpathSync/lstat and Chromium's loader traverse dependency ancestors, not their contents.
-    policy.push_str(&dependency_metadata(&[
-        package_root,
-        executable_root,
-        &node,
-        &state_path,
-    ])?);
-    policy.push_str(&state_unix_ipc(&state_path)?);
-    // Power notifications and compositor surfaces; do not grant general device/GPU access.
-    policy.push_str("(allow iokit-open (iokit-user-client-class \"RootDomainUserClient\") (iokit-user-client-class \"IOSurfaceRootUserClient\") (iokit-user-client-class \"IOSurfaceSendRight\"))\n");
-    policy.push_str("(allow mach-register (global-name-regex #\"(^|\\.)MachPortRendezvousServer\\.[0-9]+$\"))\n");
-    policy.push_str("(allow mach-register (global-name-regex #\"(^|\\.)apps\\.[A-F0-9]+$\"))\n");
-    let mut command = Command::new("/usr/bin/sandbox-exec");
+    #[cfg(windows)]
+    if !ctx.workspace.unsandboxed {
+        return Err("Native Windows browser requires an explicit sandbox.mode = off; no filesystem sandbox is available".into());
+    }
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut policy = profile(ctx.workspace.root(), false)?;
+        policy.push_str(&format!("(allow file-read* (subpath {}) (subpath {}) (subpath {}))\n(allow file-read* file-write* (subpath {}))\n", profile_path(package_root)?, profile_path(executable_root)?, profile_path(node.parent().ok_or("Node executable has no parent")?)?, profile_path(&state_path)?));
+        // Node realpathSync/lstat and Chromium's loader traverse dependency ancestors, not their contents.
+        policy.push_str(&dependency_metadata(&[
+            package_root,
+            executable_root,
+            &node,
+            &state_path,
+        ])?);
+        policy.push_str(&state_unix_ipc(&state_path)?);
+        // Power notifications and compositor surfaces; do not grant general device/GPU access.
+        policy.push_str("(allow iokit-open (iokit-user-client-class \"RootDomainUserClient\") (iokit-user-client-class \"IOSurfaceRootUserClient\") (iokit-user-client-class \"IOSurfaceSendRight\"))\n");
+        policy.push_str("(allow mach-register (global-name-regex #\"(^|\\.)MachPortRendezvousServer\\.[0-9]+$\"))\n");
+        policy
+            .push_str("(allow mach-register (global-name-regex #\"(^|\\.)apps\\.[A-F0-9]+$\"))\n");
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command.args(["-p", &policy]).arg(&node);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = Command::new(&node);
     command
-        .args(["-p", &policy])
-        .arg(&node)
         .args(["-e", BROWSER_DRIVER])
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", &state_path)
         .env("TMPDIR", &state_path)
+        .env("TEMP", &state_path)
+        .env("TMP", &state_path)
+        .env(
+            "SystemRoot",
+            std::env::var_os("SystemRoot").unwrap_or_default(),
+        )
         .env("MAC_CHROMIUM_TMPDIR", &state_path)
         .env("DIAL_PLAYWRIGHT", &entry)
         .env("DIAL_CHROMIUM", &executable)
@@ -815,6 +830,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(unix)]
     fn workspace_playwright_is_resolved_without_executing_it_then_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();

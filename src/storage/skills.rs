@@ -11,12 +11,12 @@ use super::{
     memory::{atomic_write, find_secret, has_hidden_chars},
     paths::Layout,
 };
+use crate::platform::fs::OpenOptions;
 use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::{
     fs,
     io::Read,
-    os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
 };
 
@@ -217,9 +217,13 @@ fn valid_name(name: &str) -> bool {
 /// Read up to `max` bytes of a regular file without following a symlink at the final component.
 /// Returns the bytes and whether the file was longer.
 fn read_head(path: &Path, max: usize) -> std::io::Result<(Vec<u8>, bool)> {
-    let file = fs::OpenOptions::new()
+    let file = crate::platform::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(
+            crate::platform::fs::NOFOLLOW
+                | crate::platform::fs::NONBLOCK
+                | crate::platform::fs::CLOEXEC,
+        )
         .open(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other("not a regular file"));
@@ -804,6 +808,7 @@ pub mod manage_tool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     struct Env {
@@ -968,6 +973,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn discovery_ignores_symlinked_skills_and_escaping_project_dir() {
         let e = env();
         let [project, user] = e.layout.skills_dirs();
@@ -1073,6 +1079,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn skill_tool_refuses_traversal_symlinks_and_oversize() {
         let e = env();
         let [project, _] = e.layout.skills_dirs();
@@ -1315,6 +1322,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn manage_never_follows_symlinks() {
         let e = env();
         let [project, user] = e.layout.skills_dirs();

@@ -64,13 +64,7 @@ pub fn openrouter_login() -> Result<SecretToken> {
     let verifier = SecretToken::new(random_verifier());
     let challenge = pkce_challenge(verifier.as_str());
     let url = authorization_url(&challenge);
-    let opened = Command::new("open")
-        .arg(&url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
+    let opened = open::that(&url).is_ok();
     if !opened {
         bail!("could not open browser; open this URL to sign in to OpenRouter: {url}");
     }

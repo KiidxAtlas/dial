@@ -7,12 +7,12 @@
 //! reported as conflicts and never overwritten; the copy is then kept so nothing is lost. Merges go
 //! through the project's checkpoint observer, so `/undo` reverts them like any other edit.
 use super::solve::{FileState, Tree, confined_destination, install, read_state};
+use crate::platform::fs::PermissionsExt;
 use crate::tools::Workspace;
 use anyhow::{Result, ensure};
 use std::{
     collections::BTreeSet,
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 

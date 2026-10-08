@@ -468,7 +468,7 @@ mod selection_tests {
 
     #[test]
     fn related_checks_follow_project_metadata_and_source_layout() {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::platform::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let path = root.path();
         for dir in ["src/agent", "tests", "app", "src", "node_modules/.bin"] {
@@ -504,6 +504,7 @@ mod selection_tests {
         let vitest = path.join("node_modules/.bin/vitest");
         std::fs::write(&vitest, "#!/bin/sh\n").unwrap();
         let mut permissions = std::fs::metadata(&vitest).unwrap().permissions();
+        #[cfg(unix)]
         permissions.set_mode(0o755);
         std::fs::set_permissions(&vitest, permissions).unwrap();
 

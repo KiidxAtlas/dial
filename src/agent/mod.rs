@@ -6208,7 +6208,7 @@ mod tests {
 
     #[test]
     fn local_startup_is_visible_and_does_not_trigger_the_reasoning_gate() {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::platform::fs::PermissionsExt;
         #[derive(Default)]
         struct StartupUi {
             phases: Vec<llm::InferencePhase>,
@@ -6231,7 +6231,7 @@ mod tests {
             format!("{shebang}\nimport time; time.sleep(1.3)\n{rest}"),
         )
         .unwrap();
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::fs::set_mode(&python, 0o755).unwrap();
         let mut backend = Backend::new(
             ProviderKind::Local {
                 model_dir: dir

@@ -4,14 +4,13 @@
 //! [`Proc`] is dropped (see `ProcessGroup`), so removing an entry, dropping the table and
 //! dropping the tool all reap everything they started.
 
+use crate::platform::process::{CommandExt, ExitStatusExt};
 use crate::tools::Workspace;
 use crate::tools::artifact::ArtifactSpool;
 use crate::tools::ext::ToolEvent;
 use crate::tools::shell::{ProcessGroup, shell_command};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,11 +101,7 @@ fn spawn_reader(
     stop: Arc<AtomicBool>,
     mut spool: Option<ArtifactSpool>,
 ) -> io::Result<JoinHandle<()>> {
-    let fd = pipe.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    let mut pipe = crate::platform::pipe::Reader::new(pipe)?;
     std::thread::Builder::new()
         .name("dial-bg-reader".into())
         .spawn(move || {
@@ -209,11 +204,10 @@ impl Proc {
             .stdout(writer)
             .stderr(writer_err)
             .process_group(0);
-        let child = spawn
-            .spawn()
+        let child = crate::platform::process::spawn(spawn)
             .map_err(|e| format!("starting sandboxed bash: {e}"))?;
         // The Command owns the pipe's write ends; release them so EOF is observable.
-        drop(spawn);
+
         let pid = child.id();
         let group = ProcessGroup::new(child);
         let ring = Arc::new(Mutex::new(Ring::new(MAX_BUFFER)));

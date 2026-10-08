@@ -162,7 +162,7 @@ fn browse(layout: &Layout, home: Option<&Path>) -> String {
 }
 
 pub fn sources(layout: &Layout) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::platform::home_var_os().map(PathBuf::from);
     browse(layout, home.as_deref())
 }
 
@@ -194,7 +194,8 @@ pub fn command(layout: &Layout, mut words: Vec<String>) -> Result<String> {
         }
         ("import", [path]) => {
             let path = if let Some(suffix) = path.strip_prefix("~/") {
-                PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(suffix)
+                PathBuf::from(crate::platform::home_var_os().context("HOME is not set")?)
+                    .join(suffix)
             } else {
                 layout.project_root.join(path)
             };
@@ -286,6 +287,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn redirected_preferences_are_rejected_without_writing_workspace() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -303,6 +305,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn special_files_do_not_block_source_browsing_or_preferences() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();

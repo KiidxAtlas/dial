@@ -19,8 +19,10 @@ impl Layout {
     pub fn discover(cwd: &Path) -> Result<Self> {
         let user_dir = match std::env::var_os("DIAL_HOME") {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ => PathBuf::from(std::env::var_os("HOME").context("HOME is not set; set DIAL_HOME")?)
-                .join(".dial"),
+            _ => PathBuf::from(
+                crate::platform::home_var_os().context("HOME is not set; set DIAL_HOME")?,
+            )
+            .join(".dial"),
         };
         Self::with_user_dir(cwd, user_dir)
     }

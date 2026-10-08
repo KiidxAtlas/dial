@@ -482,7 +482,8 @@ mod tests {
     use super::*;
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn adapter_config_deserializes_defaults_and_rejects_unknown_fields() {
@@ -518,7 +519,7 @@ while True:
  sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n'%len(out)).encode()+out);sys.stdout.buffer.flush()
  if req['command'] in ('disconnect','terminate'): sys.exit(0)
 "#).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::platform::fs::set_mode(&script, 0o700).unwrap();
         DapAdapterConfig {
             program: PathBuf::from("python3"),
             args: vec![script.to_string_lossy().into_owned()],
@@ -537,6 +538,7 @@ while True:
 
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn fake_adapter_exercises_framing_lifecycle_and_workspace_validation() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("program"), "").unwrap();

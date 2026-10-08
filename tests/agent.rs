@@ -74,6 +74,7 @@ type Choose = Arc<dyn Fn(&Value) -> Reply + Send + Sync>;
 /// which the suite exceeds. Raise this process's soft limit (never above the hard limit), once.
 fn raise_fd_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
+    #[cfg(unix)]
     ONCE.call_once(|| {
         let mut lim = libc::rlimit {
             rlim_cur: 0,

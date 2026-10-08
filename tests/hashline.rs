@@ -752,6 +752,7 @@ fn move_and_remove_files() {
 }
 
 #[test]
+#[cfg(unix)]
 fn paths_cannot_escape_the_workspace_through_edit_write_or_mv() {
     let (dir, ws) = workspace();
     let outside = tempfile::tempdir().unwrap();

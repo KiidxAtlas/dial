@@ -361,7 +361,7 @@ impl Tool for Git {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::platform::fs::PermissionsExt;
 
     fn repo() -> (tempfile::TempDir, Workspace) {
         let dir = tempfile::tempdir().unwrap();
@@ -459,7 +459,7 @@ mod tests {
         let (dir, ws) = repo();
         let hook = dir.path().join(".git/hooks/pre-commit");
         std::fs::write(&hook, "#!/bin/sh\ntouch hook-ran\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::fs::set_mode(&hook, 0o755).unwrap();
         std::fs::write(dir.path().join("c.txt"), "c\n").unwrap();
         assert!(!call(&ws, json!({"action":"add","paths":["c.txt"]})).is_error);
         let commit = call(&ws, json!({"action":"commit","message":"x"}));

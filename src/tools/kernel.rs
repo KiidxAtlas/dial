@@ -3,12 +3,12 @@ use super::ext::{Tool, ToolContext};
 use super::shell::{ProcessGroup, shell_command};
 use super::{ToolOutput, tool_schema};
 use crate::config::types::Config;
+use crate::platform::fs::PermissionsExt;
+use crate::platform::process::CommandExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{
@@ -33,7 +33,7 @@ pub struct KernelConfig {
 impl Default for KernelConfig {
     fn default() -> Self {
         Self {
-            python: "python3".into(),
+            python: if cfg!(windows) { "python" } else { "python3" }.into(),
             timeout_secs: 30,
         }
     }
@@ -60,7 +60,7 @@ impl Tool for KernelTool {
     fn schema(&self) -> Value {
         tool_schema(
             "kernel",
-            "Persistent Python namespace. Every call requires approval. eval executes code under the workspace sandbox plus an OS process-fork fence: subprocess creation/fork/spawn is disabled so detached descendants cannot survive reset. The fork fence is required even if filesystem sandboxing is disabled. stdout, stderr, final expression and tracebacks are returned. Timeout/cancel destroys the namespace; reset starts a fresh namespace lazily.",
+            "Persistent Python namespace. Every call requires approval. macOS uses an OS process-fork fence; native Windows requires sandbox off and supervises Python and descendants in a Job Object. Timeout, cancel and reset terminate the namespace and its child processes. stdout, stderr, final expression and tracebacks are returned. Timeout/cancel destroys the namespace; reset starts a fresh namespace lazily.",
             json!({
                 "action":{"type":"string","enum":["eval","reset","cancel","status"]},
                 "code":{"type":"string"}, "timeout":{"type":"integer","minimum":1,"maximum":3600}
@@ -75,9 +75,7 @@ impl Tool for KernelTool {
         self.interrupt.store(true, Ordering::Release);
         let pid = self.pid.load(Ordering::Acquire);
         if pid > 0 {
-            unsafe {
-                libc::killpg(pid, libc::SIGKILL);
-            }
+            crate::platform::process::terminate_pid(pid);
         }
     }
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
@@ -98,9 +96,7 @@ impl KernelTool {
             self.interrupt.store(true, Ordering::Release);
             let pid = self.pid.load(Ordering::Acquire);
             if pid > 0 {
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
-                }
+                crate::platform::process::terminate_pid(pid);
             }
             // Do not take the session mutex: cancellation must interrupt an in-flight eval.
             return Ok(json!({"cancelled":pid > 0,"namespace_discarded":true}));
@@ -139,6 +135,7 @@ impl KernelTool {
             if self.interrupt.load(Ordering::Acquire) {
                 return Err("kernel startup cancelled".into());
             }
+            #[cfg(not(windows))]
             let script = format!(
                 "exec /usr/bin/sandbox-exec -p {} {} -u -c {}",
                 shell_quote(FORK_FENCE),
@@ -149,7 +146,14 @@ impl KernelTool {
                 ),
                 shell_quote(PYTHON_DRIVER)
             );
+            #[cfg(windows)]
+            let script = format!(
+                "exec {} -u -c {}",
+                shell_quote(&crate::platform::shell_path(&python)),
+                shell_quote(PYTHON_DRIVER)
+            );
             let command = shell_command(ctx.workspace, &script, ctx.workspace.root())?;
+            #[cfg(not(windows))]
             super::sandbox::Sandbox::detect().available().map_err(|e| format!("kernel requires the OS process-fork containment fence even when filesystem sandboxing is disabled: {e}"))?;
             *slot = Some(JsonProcess::start(command, self.pid.clone()).map_err(|e| {
                 format!("starting Python kernel (install/configure kernel.python): {e}")
@@ -178,7 +182,7 @@ pub(crate) fn resolve_operator_executable(
     program: &str,
     label: &str,
 ) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt;
+    use crate::platform::fs::PermissionsExt;
     let path = Path::new(program);
     let candidate = if path.is_absolute() || path.components().count() > 1 {
         if path.is_absolute() {
@@ -187,16 +191,14 @@ pub(crate) fn resolve_operator_executable(
             workspace.join(path)
         }
     } else {
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|directory| directory.join(program))
-            .find(|candidate| {
-                candidate
-                    .metadata()
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            })
-            .ok_or_else(|| {
-                format!("cannot find {label} {program:?}; install its operator-owned executable")
-            })?
+        crate::platform::programs::find(
+            path,
+            &std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .collect::<Vec<_>>(),
+        )
+        .ok_or_else(|| {
+            format!("cannot find {label} {program:?}; install its operator-owned executable")
+        })?
     };
     let resolved = candidate
         .canonicalize()
@@ -264,9 +266,9 @@ pub(crate) fn shell_quote(text: &str) -> String {
 /// Bounded JSON-lines protocol. Pipes are nonblocking so neither output nor input can defeat deadlines.
 pub(crate) struct JsonProcess {
     group: ProcessGroup,
-    input: ChildStdin,
-    output: ChildStdout,
-    errors: ChildStderr,
+    input: crate::platform::pipe::Writer<ChildStdin>,
+    output: crate::platform::pipe::Reader<ChildStdout>,
+    errors: crate::platform::pipe::Reader<ChildStderr>,
     pending: Vec<u8>,
     stderr: Vec<u8>,
     stderr_dropped: usize,
@@ -275,24 +277,19 @@ pub(crate) struct JsonProcess {
 }
 impl JsonProcess {
     pub(crate) fn start(mut command: Command, pid: Arc<AtomicI32>) -> Result<Self, String> {
-        let mut child = command
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+            .process_group(0);
+        let mut child = crate::platform::process::spawn(command).map_err(|e| e.to_string())?;
         let input = child.stdin.take().ok_or("child stdin unavailable")?;
         let output = child.stdout.take().ok_or("child stdout unavailable")?;
         let errors = child.stderr.take().ok_or("child stderr unavailable")?;
         let group = ProcessGroup::new(child);
-        for fd in [input.as_raw_fd(), output.as_raw_fd(), errors.as_raw_fd()] {
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-            {
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-        }
+        let input = crate::platform::pipe::Writer::new(input).map_err(|e| e.to_string())?;
+        let output = crate::platform::pipe::Reader::new(output).map_err(|e| e.to_string())?;
+        let errors = crate::platform::pipe::Reader::new(errors).map_err(|e| e.to_string())?;
         pid.store(group.child.id() as i32, Ordering::Release);
         Ok(Self {
             group,
@@ -323,27 +320,20 @@ impl JsonProcess {
             match self.input.write(&bytes[offset..]) {
                 Ok(0) => return Err("child stdin closed".into()),
                 Ok(n) => offset += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.poll(libc::POLLOUT),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.poll(true),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e.to_string()),
             }
         }
         Ok(())
     }
-    fn poll(&self, event: i16) {
-        let fd = if event == libc::POLLOUT {
-            self.input.as_raw_fd()
+    fn poll(&self, writable: bool) {
+        let handle = if writable {
+            self.input.handle()
         } else {
-            self.output.as_raw_fd()
+            self.output.handle()
         };
-        let mut poll = libc::pollfd {
-            fd,
-            events: event,
-            revents: 0,
-        };
-        unsafe {
-            libc::poll(&mut poll, 1, 10);
-        }
+        crate::platform::pipe::wait(handle, writable, 10);
     }
     pub(crate) fn request(
         &mut self,
@@ -432,7 +422,7 @@ impl JsonProcess {
                     }
                     self.pending.extend_from_slice(&buffer[..n]);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.poll(libc::POLLIN),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.poll(false),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e.to_string()),
             }
@@ -536,6 +526,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(unix)]
     fn drop_kills_and_reaps_the_process_group_leader() {
         let p = process();
         let pid = p.group.child.id() as libc::pid_t;
@@ -607,6 +598,7 @@ mod tests {
     }
     #[cfg(target_os = "macos")]
     #[test]
+    #[cfg(unix)]
     fn kernel_denies_fork_spawn_and_detached_descendants_even_without_filesystem_sandbox() {
         if !crate::tools::sandbox::require_for_test() {
             return;
@@ -668,7 +660,7 @@ mod tests {
     }
     #[test]
     fn workspace_python_launcher_is_rejected_before_execution() {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::platform::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let marker = outside.path().join("escaped");
@@ -681,7 +673,7 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::fs::set_mode(&launcher, 0o755).unwrap();
         let root = dir.path().canonicalize().unwrap();
         let error = resolve_python(
             &root,

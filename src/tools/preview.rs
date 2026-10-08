@@ -198,7 +198,7 @@ mod compiler_tests {
         // Compiler previews need the operator's installed toolchain. Give only this
         // disposable test an explicit Dev policy and its Cargo/Rustup directories;
         // production previews retain their workspace's configured sandbox policy.
-        let home = std::env::var_os("HOME")
+        let home = crate::platform::home_var_os()
             .map(std::path::PathBuf::from)
             .unwrap();
         let mut toolchains = Vec::new();

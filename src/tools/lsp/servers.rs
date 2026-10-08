@@ -3,10 +3,11 @@
 //! Built-in defaults are looked up on `PATH` only. `[lsp.<language>]` config entries replace the
 //! default of the same name and take priority over every default for the extensions they list.
 
+use crate::platform::fs::PermissionsExt;
+
 use crate::config::types::LspServerConfig;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// A program to try (first found on `PATH` wins) and the arguments to start it with.
@@ -117,19 +118,9 @@ pub fn path_dirs() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn is_executable(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-/// A program with a path separator is taken as is; a bare name is searched in `dirs`.
+/// A program with a separator is taken as is; bare names use PATH/PATHEXT.
 fn find_program(program: &Path, dirs: &[PathBuf]) -> Option<PathBuf> {
-    if program.components().count() > 1 {
-        return is_executable(program).then(|| program.to_owned());
-    }
-    dirs.iter()
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable(candidate))
+    crate::platform::programs::find(program, dirs)
 }
 
 impl Servers {
@@ -228,7 +219,7 @@ mod tests {
     fn fake_bin(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::fs::set_mode(&path, 0o755).unwrap();
         path
     }
 

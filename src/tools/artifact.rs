@@ -1,12 +1,12 @@
 //! Immutable, content-addressed output outside the editable workspace.
 use super::ToolOutput;
+use crate::platform::fs::OpenOptions;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -28,7 +28,7 @@ impl ArtifactStore {
             "artifact root cannot be a symlink"
         );
         fs::create_dir_all(root).context("creating artifact store")?;
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+        crate::platform::fs::private(root)?;
         Ok(Self {
             root: root.canonicalize()?,
         })
@@ -79,7 +79,7 @@ impl ArtifactStore {
         ensure!((1..=16384).contains(&count), "bytes must be 1..16384");
         let mut file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(crate::platform::fs::NOFOLLOW)
             .open(self.path(uri)?)?;
         ensure!(
             file.metadata()?.is_file(),
@@ -100,7 +100,7 @@ impl ArtifactStore {
         );
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(crate::platform::fs::NOFOLLOW)
             .open(self.path(uri)?)
             .context("opening retained artifact")?;
         ensure!(
@@ -300,6 +300,7 @@ mod tests {
 mod security_tests {
     use super::*;
     #[test]
+    #[cfg(unix)]
     fn rejects_symlink_store_and_symlink_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let real = tempfile::tempdir().unwrap();

@@ -519,6 +519,7 @@ mod tests {
         assert!(store.verified_successes(100.0, 100).unwrap().is_empty());
     }
     #[test]
+    #[cfg(unix)]
     fn solver_cannot_replace_sealed_tests_or_follow_symlinks() {
         if !crate::tools::sandbox::require_for_test() {
             return;

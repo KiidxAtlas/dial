@@ -4,6 +4,8 @@
 //! paths; global facts are visible in every project. Legacy text files are only read by an explicit
 //! approved import and are never overwritten. Retrieved notes are untrusted data, not instructions.
 use super::{memory::screen, paths::Layout};
+use crate::platform::fs::OpenOptions;
+use crate::platform::fs::PermissionsExt;
 use crate::tools::{
     ToolOutput,
     ext::{Tool, ToolContext},
@@ -194,31 +196,21 @@ impl ProvenanceMemory {
                 && !layout.project_root.starts_with(&directory),
             "memory directory resolves inside workspace"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        }
+        crate::platform::fs::private(&directory)?;
         let path = directory.join("memory.sqlite3");
         if let Ok(meta) = fs::symlink_metadata(&path) {
             ensure!(
-                meta.is_file() && !meta.file_type().is_symlink(),
+                meta.is_file() && !crate::platform::fs::is_alias(&meta),
                 "memory database must be a regular file, not a symlink"
             );
         }
-        let mut options = fs::OpenOptions::new();
+        let mut options = crate::platform::fs::OpenOptions::new();
         options.create(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
+        options
+            .mode(0o600)
+            .custom_flags(crate::platform::fs::NOFOLLOW);
         options.open(&path).context("open memory database file")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        }
+        crate::platform::fs::private(&path)?;
         let conn = Connection::open(&path).context("open provenance memory database")?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
@@ -551,19 +543,18 @@ impl ProvenanceMemory {
         let meta = fs::symlink_metadata(path)
             .with_context(|| format!("read legacy memory {}", path.display()))?;
         ensure!(
-            meta.is_file() && !meta.file_type().is_symlink(),
+            meta.is_file() && !crate::platform::fs::is_alias(&meta),
             "legacy memory must be a regular file, not a symlink"
         );
         ensure!(
             meta.len() <= MAX_LEGACY_BYTES,
             "legacy memory exceeds {MAX_LEGACY_BYTES} bytes; originals are untouched"
         );
-        let mut options = fs::OpenOptions::new();
+        let mut options = crate::platform::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
+            options.custom_flags(crate::platform::fs::NOFOLLOW);
         }
         let mut text = String::new();
         options
@@ -903,7 +894,7 @@ mod tests {
         assert_eq!(recalled.entries[0].source, "src/storage/provenance.rs:1");
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use crate::platform::fs::PermissionsExt;
             assert_eq!(
                 fs::metadata(layout.user_dir.join("memory.sqlite3"))
                     .unwrap()
@@ -1455,6 +1446,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn state_overlap_symlinks_and_oversized_legacy_files_are_rejected() {
         let (_home, _project, layout) = layout();
         let inside =

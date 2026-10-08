@@ -1104,6 +1104,7 @@ fn category_metrics(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     #[test]
@@ -1304,6 +1305,7 @@ prompt = "do work"
     }
 
     #[test]
+    #[cfg(unix)]
     fn rejects_escape_paths_and_symlinks_and_detects_baseline_regressions() {
         let outer = tempfile::tempdir().unwrap();
         let source = outer.path().join("source");
@@ -1369,6 +1371,7 @@ prompt = "do work"
         );
     }
     #[test]
+    #[cfg(unix)]
     fn benchmark_copy_omits_common_credentials_but_keeps_templates() {
         let source = tempfile::tempdir().unwrap();
         fs::write(source.path().join(".env"), "OPENAI_API_KEY=secret").unwrap();

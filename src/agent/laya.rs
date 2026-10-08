@@ -1,4 +1,6 @@
 //! Dial-owned typed decisions, independent of other coding-agent applications.
+use crate::platform::fs::OpenOptions;
+use crate::platform::process::CommandExt;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -119,7 +121,7 @@ pub fn runtime_dir() -> Result<std::path::PathBuf> {
     let root = match std::env::var_os("DIAL_HOME").filter(|s| !s.is_empty()) {
         Some(root) => std::path::PathBuf::from(root),
         None => std::path::PathBuf::from(
-            std::env::var_os("HOME").context("HOME is unavailable; set DIAL_HOME")?,
+            crate::platform::home_var_os().context("HOME is unavailable; set DIAL_HOME")?,
         )
         .join(".dial"),
     };
@@ -209,8 +211,8 @@ pub fn install(
             let output = model.join(file);
             settings_store::private_dir(output.parent().unwrap())?;
             std::fs::copy(&input, &output)?;
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))?;
+            use crate::platform::fs::PermissionsExt;
+            crate::platform::fs::set_mode(&output, 0o600)?;
         }
         std::fs::rename(model, directory.join("model"))?;
     }
@@ -222,11 +224,7 @@ pub fn install(
 }
 
 fn launch_managed(config: &Config) -> Result<Arc<AtomicBool>> {
-    use std::{
-        fs::OpenOptions,
-        os::unix::{fs::OpenOptionsExt, process::CommandExt},
-        process::{Command, Stdio},
-    };
+    use std::process::{Command, Stdio};
     let directory = runtime_dir()?;
     let python = directory.join("venv/bin/python");
     ensure!(
@@ -241,7 +239,7 @@ fn launch_managed(config: &Config) -> Result<Arc<AtomicBool>> {
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(crate::platform::fs::NOFOLLOW)
         .open(directory.join("server.log"))
         .context("cannot open Dial Laya service log")?;
     let mut command = Command::new(python);

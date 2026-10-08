@@ -783,7 +783,7 @@ fn compose(
         data,
         theme,
         base,
-        home: std::env::var("HOME").ok(),
+        home: crate::platform::home_var().ok(),
     };
     let (left_names, right_names) = segments(cfg);
     let build = |names: &[String]| {

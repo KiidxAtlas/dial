@@ -7,14 +7,15 @@
 
 use super::framing::{read_message, write_message};
 use super::text::{path_from_uri, read_source, uri_from_path};
+use crate::platform::process::Child;
+use crate::platform::process::CommandExt;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufReader, Read, Write};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Condvar, Mutex, MutexGuard};
@@ -228,14 +229,15 @@ impl Client {
         root: &Path,
         timeouts: Timeouts,
     ) -> Result<Self> {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
+            .process_group(0);
+        let mut child = crate::platform::process::spawn(command)
             .map_err(|e| anyhow!("starting {} ({}): {e}", name, program.display()))?;
         let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
         let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
@@ -485,7 +487,7 @@ impl Client {
 
 fn kill_group(child: &mut Child) {
     // The leader is not reaped until after killpg, so its PID cannot be reused.
-    unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+    crate::platform::process::terminate(child);
     let _ = child.kill();
     let _ = child.wait();
 }

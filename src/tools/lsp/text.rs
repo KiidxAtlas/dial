@@ -4,51 +4,22 @@
 //! code units (0-based). Every conversion between the two lives here, together with `file://`
 //! URI handling and bounded source reading.
 
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 /// Largest source file dial will read for line text or document sync.
 const MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Characters that stay literal in a `file://` path (the same set the `url` crate leaves alone).
-fn is_uri_literal(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"-._~/:@!$&'()*+,;=".contains(&byte)
-}
-
+/// Encode native paths, including Windows drive letters and UNC paths, as LSP file URIs.
 pub fn uri_from_path(path: &Path) -> String {
-    let mut uri = String::from("file://");
-    for &byte in path.as_os_str().as_bytes() {
-        if is_uri_literal(byte) {
-            uri.push(byte as char);
-        } else {
-            uri.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    uri
+    url::Url::from_file_path(path)
+        .map(|url| url.into())
+        .unwrap_or_default()
 }
 
 pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
-    let encoded = uri.strip_prefix("file://")?;
-    if !encoded.starts_with('/') {
-        return None;
-    }
-    let raw = encoded.as_bytes();
-    let mut bytes = Vec::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        if raw[i] == b'%' {
-            let hex = std::str::from_utf8(raw.get(i + 1..i + 3)?).ok()?;
-            bytes.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
-        } else {
-            bytes.push(raw[i]);
-            i += 1;
-        }
-    }
-    Some(PathBuf::from(OsString::from_vec(bytes)))
+    url::Url::parse(uri).ok()?.to_file_path().ok()
 }
 
 /// Read a source file as UTF-8, refusing anything larger than [`MAX_SOURCE_BYTES`].

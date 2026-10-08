@@ -1,3 +1,4 @@
+use dial::platform::fs::OpenOptions;
 mod rpc;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -15,9 +16,8 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 use tempfile::TempDir;
@@ -310,18 +310,9 @@ fn copy_private_if_present(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn machine_identity() -> MachineIdentity {
-    let mut hostname = [0u8; 256];
-    // gethostname is a local OS query; no network discovery or hardware fitness inference.
-    let hostname =
-        if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } == 0 {
-            let end = hostname
-                .iter()
-                .position(|byte| *byte == 0)
-                .unwrap_or(hostname.len());
-            String::from_utf8_lossy(&hostname[..end]).into_owned()
-        } else {
-            "unavailable".into()
-        };
+    let hostname = hostname::get()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "unavailable".into());
     MachineIdentity {
         hostname,
         operating_system: std::env::consts::OS.into(),

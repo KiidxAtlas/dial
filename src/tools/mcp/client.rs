@@ -11,13 +11,14 @@
 //! immediately with the reason, so a crash surfaces as a clear error, never a hang.
 
 use crate::config::types::McpServerConfig;
+use crate::platform::process::Child;
+use crate::platform::process::CommandExt;
 use crate::tools::sandbox::is_secret_env;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -107,8 +108,7 @@ impl Client {
             .stderr(Stdio::piped())
             // Own process group, so dropping the client also kills what an `npx`/shell wrapper started.
             .process_group(0);
-        let mut child = command
-            .spawn()
+        let mut child = crate::platform::process::spawn(command)
             .with_context(|| format!("starting `{}`", config.program.display()))?;
         let (stdin, stdout, stderr) =
             match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
@@ -286,7 +286,7 @@ impl Drop for Client {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The leader is not reaped until after killpg, so its PID cannot be reused in between.
-        unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        crate::platform::process::terminate(&mut child);
         let _ = child.kill();
         let _ = child.wait();
     }

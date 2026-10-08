@@ -60,7 +60,7 @@
 //! * Hard links: creating one to a denied file is refused (needs read access),
 //!   but a hard link made before the sandbox started is a distinct path.
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 mod linux;
 
 use std::ffi::OsString;
@@ -558,7 +558,7 @@ fn scrubbed_env(env: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsStrin
 
 fn platform_check() -> Result<(), String> {
     if !cfg!(target_os = "macos") {
-        return Err("sandbox-exec exists only on macOS".to_string());
+        return Err("No native Windows filesystem sandbox is available; use --sandbox off explicitly for native command tools, or WSL2 for Linux confinement".to_string());
     }
     if !Path::new(SANDBOX_EXEC).exists() {
         return Err(format!("{SANDBOX_EXEC} not found"));
@@ -566,7 +566,13 @@ fn platform_check() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn dev_self_test(_: bool) -> Result<(), String> {
+    Err("Native Windows OS confinement is unavailable; select --sandbox off explicitly for native commands, or use WSL2 for Linux confinement".into())
+}
+
 /// Enforcement probe for the Dev policy mechanism (synthetic paths).
+#[cfg(unix)]
 fn dev_self_test(allow_network: bool) -> Result<(), String> {
     let scratch = tempfile::tempdir().map_err(|e| format!("creating scratch dir: {e}"))?;
     let base = scratch
@@ -643,7 +649,7 @@ fn probe() -> Sandbox {
 #[cfg(not(target_os = "linux"))]
 fn probe() -> Sandbox {
     if !cfg!(target_os = "macos") {
-        return Sandbox::Unavailable("sandbox-exec exists only on macOS".to_string());
+        return Sandbox::Unavailable("No native Windows filesystem sandbox is available; use --sandbox off explicitly for native command tools, or WSL2 for Linux confinement".to_string());
     }
     if !Path::new(SANDBOX_EXEC).exists() {
         return Sandbox::Unavailable(format!("{SANDBOX_EXEC} not found"));
@@ -881,6 +887,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn resolve_follows_symlinks_and_dotdot_and_keeps_missing_tails() {
         let fx = Fixture::new();
         let link = fx.ws.join("link");
@@ -971,6 +978,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[cfg(unix)]
     fn dev_reads_widely_but_not_denied_paths() {
         if !require_for_test() {
             return;
@@ -1001,6 +1009,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[cfg(unix)]
     fn dev_denied_path_given_via_symlink_or_dotdot_is_enforced() {
         let fx = Fixture::new();
         let link = fx.ws.join("alias");
@@ -1190,6 +1199,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[cfg(unix)]
     fn dev_timeout_kills_the_whole_process_group() {
         if !require_for_test() {
             return;

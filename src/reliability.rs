@@ -157,7 +157,7 @@ fn binding(config: &AppConfig) -> String {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HF_HOME").map(|p| std::path::PathBuf::from(p).join("hub")))
         .or_else(|| {
-            std::env::var_os("HOME")
+            crate::platform::home_var_os()
                 .map(|p| std::path::PathBuf::from(p).join(".cache/huggingface/hub"))
         });
     let revision = cache.and_then(|cache| {

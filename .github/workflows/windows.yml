@@ -8,6 +8,7 @@ permissions:
 jobs:
   windows:
     runs-on: windows-2022
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -15,5 +16,9 @@ jobs:
           python-version: '3.12'
       - name: Rust
         run: rustup update stable --no-self-update
-      - name: Check native Windows
-        run: cargo check --locked --lib
+      - name: Build all native Windows targets
+        run: cargo build --locked --all-targets
+      - name: Native process, storage, shell and CLI contracts
+        run: cargo test --locked --test native_windows --test cli_print --test ui_configuration -- --test-threads=4
+      - name: All library tests
+        run: cargo test --locked --lib -- --test-threads=4

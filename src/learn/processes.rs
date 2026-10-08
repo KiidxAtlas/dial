@@ -103,7 +103,7 @@ fn classify(user: &Path, process: &Process, all: &[Process]) -> Option<(&'static
     if laya_python && command.contains("dial_laya_server:app") {
         return Some(("services", "Laya decisions".into()));
     }
-    let shared_laya_python = std::env::var_os("HOME").is_some_and(|home| {
+    let shared_laya_python = crate::platform::home_var_os().is_some_and(|home| {
         Path::new(program).starts_with(Path::new(&home).join(".omp/agent/laya-venv"))
     });
     if shared_laya_python
@@ -239,6 +239,7 @@ pub fn snapshot(user: &Path) -> Result<Vec<Value>> {
     Ok(snapshot_with_usage(user)?.processes)
 }
 
+#[cfg(unix)]
 pub fn stop(user: &Path, pid: i32, identity: &str) -> Result<String> {
     ensure!(
         pid > 1 && pid != std::process::id() as i32,
@@ -290,7 +291,7 @@ mod tests {
     #[test]
     fn shared_omp_laya_is_visible_and_unrelated_services_are_excluded() {
         let user = tempfile::tempdir().unwrap();
-        let home = std::env::var_os("HOME").unwrap();
+        let home = crate::platform::home_var_os().unwrap();
         let python = Path::new(&home).join(".omp/agent/laya-venv/bin/python");
         let all = parse(&format!(
             "42 1 42 1.0 307200 Tue Oct 6 08:00:00 2026 {} -m uvicorn laya_server:app --port 8001\n43 1 43 1.0 100 Tue Oct 6 08:00:00 2026 {} -m uvicorn other:app\n44 1 44 1.0 100 Tue Oct 6 08:00:00 2026 /other/laya-venv/bin/python -m uvicorn laya_server:app\n",
@@ -362,7 +363,7 @@ mod tests {
         if live_inspection_unavailable() {
             return;
         }
-        use std::os::unix::process::CommandExt;
+        use crate::platform::process::CommandExt;
         let home = tempfile::tempdir().unwrap();
         let mut child = Command::new("/bin/sleep")
             .arg("30")
@@ -405,4 +406,9 @@ mod tests {
                 .any(|row| row["pid"] == child.id())
         );
     }
+}
+
+#[cfg(windows)]
+pub fn stop(_: &Path, _: i32, _: &str) -> Result<String> {
+    anyhow::bail!("Native Windows process inventory controls are unavailable")
 }

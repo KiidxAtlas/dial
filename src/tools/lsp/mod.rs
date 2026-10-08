@@ -17,7 +17,7 @@ mod client;
 mod format;
 mod framing;
 mod servers;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 mod text;
 

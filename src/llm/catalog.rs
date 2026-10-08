@@ -2,6 +2,7 @@
 //! Saved credentials are plaintext JSON, protected by owner-only directories/files,
 //! not an OS keychain. They are URL-scoped and written only on explicit user action.
 use super::model_config::{ModelSelection, ProviderSpec};
+use crate::platform::fs::PermissionsExt;
 use crate::storage::{
     paths::Layout,
     settings_store::{locked, read_private, write_private},
@@ -1127,7 +1128,7 @@ fn hf_cache() -> Option<PathBuf> {
                 .map(|s| PathBuf::from(s).join("hub"))
         })
         .or_else(|| {
-            std::env::var_os("HOME").map(|s| PathBuf::from(s).join(".cache/huggingface/hub"))
+            crate::platform::home_var_os().map(|s| PathBuf::from(s).join(".cache/huggingface/hub"))
         })
 }
 /// The `mlx_lm/models` directory of dial's Python environment (`dial setup` creates it under the user dir).
@@ -1161,7 +1162,7 @@ fn lora_support(architectures: Option<&Path>, model: &Path) -> Option<bool> {
 }
 /// LM Studio's download folder: its `downloadsFolder` setting, else `~/.lmstudio/models`.
 fn lmstudio_folder() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME").filter(|s| !s.is_empty())?);
+    let home = PathBuf::from(crate::platform::home_var_os().filter(|s| !s.is_empty())?);
     let configured = read_json(&home.join(".lmstudio/settings.json")).and_then(|settings| {
         settings["downloadsFolder"]
             .as_str()
@@ -2030,7 +2031,7 @@ mod tests {
         ] {
             assert!(save_credential(dir.path(), url, "ok").is_err());
         }
-        use std::os::unix::fs::PermissionsExt;
+        use crate::platform::fs::PermissionsExt;
         assert_eq!(
             fs::metadata(dir.path().join("credentials.json"))
                 .unwrap()

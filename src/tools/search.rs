@@ -506,8 +506,10 @@ mod tests {
     use super::*;
     use crate::tools::testkit::*;
     use serde_json::json;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     #[test]
+    #[cfg(unix)]
     fn glob_and_grep_do_not_follow_symlinks() {
         let (dir, ws) = workspace();
         let outside = tempfile::tempdir().unwrap();
@@ -854,6 +856,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn anchored_globs_preserve_ignore_and_symlink_boundaries() {
         let (dir, ws) = workspace();
         let outside = tempfile::tempdir().unwrap();

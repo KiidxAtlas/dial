@@ -1,6 +1,8 @@
 //! Sign in with ChatGPT for Dial's own public OAuth registration. Credentials never enter config,
 //! model history, or API-key storage. Protected atomic records and a process lock serialize refresh.
 use super::auth::SecretToken;
+use crate::platform::fs::OpenOptions;
+use crate::platform::fs::PermissionsExt;
 use crate::storage::settings_store::{locked, read_private, write_private};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -656,13 +658,7 @@ fn tokens(value: &Value, previous: Option<&Tokens>) -> Result<Tokens> {
 /// Browser authorization occurs outside storage locks and activates an account only after validation.
 pub fn login(dir: &Path, selected: Option<&str>, cancel: Arc<AtomicBool>) -> Result<String> {
     login_at(dir, selected, cancel, TOKEN_URL, CALLBACK_PORT, |url| {
-        let opened = Command::new("open")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+        let opened = open::that(url).is_ok();
         ensure!(
             opened,
             "could not open the system browser for ChatGPT sign-in"
@@ -994,21 +990,24 @@ fn parse_models(value: &Value) -> Result<Vec<super::catalog::ModelEntry>> {
 }
 
 fn codex_model_metadata() -> Option<Value> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let home = std::env::var_os("CODEX_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".codex"))
+            crate::platform::home_var_os().map(|home| std::path::PathBuf::from(home).join(".codex"))
         })?;
     let path = home.join("models_cache.json");
-    let file = std::fs::OpenOptions::new()
+    let file = crate::platform::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .custom_flags(
+            crate::platform::fs::NOFOLLOW
+                | crate::platform::fs::CLOEXEC
+                | crate::platform::fs::NONBLOCK,
+        )
         .open(path)
         .ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || !crate::platform::fs::owned(&file).ok()?
         || metadata.len() > MAX_CATALOG_JSON
     {
         return None;
@@ -1150,7 +1149,8 @@ mod tests {
     use super::*;
     use ring::signature::KeyPair;
     use serde_json::json;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     fn attempt() -> Attempt {
         Attempt {
             state: "pending-state".into(),
@@ -1581,6 +1581,7 @@ mod tests {
         server.requests();
     }
     #[test]
+    #[cfg(unix)]
     fn account_switching_is_isolated_and_corrupt_or_symlink_storage_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         test_account(dir.path(), false);

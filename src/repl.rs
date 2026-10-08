@@ -10,19 +10,39 @@ use std::{
 
 static INTERRUPT: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
 extern "C" fn on_sigint(_: libc::c_int) {
     if INTERRUPT.swap(true, Ordering::SeqCst) {
         unsafe { libc::_exit(130) };
     }
 }
 
+#[cfg(windows)]
+unsafe extern "system" fn on_console_control(event: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    if !matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+        return 0;
+    }
+    if INTERRUPT.swap(true, Ordering::SeqCst) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ExitProcess(130);
+        }
+    }
+    1
+}
+
 pub fn install_sigint() -> Arc<AtomicBool> {
+    #[cfg(unix)]
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = on_sigint as *const () as usize;
         libc::sigemptyset(&mut action.sa_mask);
         action.sa_flags = 0;
         libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+    }
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console_control), 1);
     }
     let shared = Arc::new(AtomicBool::new(false));
     let mirror = shared.clone();

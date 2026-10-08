@@ -240,6 +240,7 @@ fn a_server_that_dies_mid_session_yields_clear_errors_without_hanging() {
 }
 
 #[test]
+#[cfg(unix)]
 fn dropping_the_tools_kills_the_server_process() {
     let loaded = load_fake();
     let pid: libc::pid_t = call(&loaded, "mcp__fake__pid", json!({}))

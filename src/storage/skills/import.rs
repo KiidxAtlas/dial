@@ -1,5 +1,6 @@
 //! Explicit, copy-based imports; no network access or script execution.
 use super::*;
+use crate::platform::fs::OpenOptions;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,11 +13,11 @@ type Files = BTreeMap<PathBuf, Vec<u8>>;
 // Serialize installers targeting the same root. Dry runs remain entirely read-only.
 fn lock_root(root: &Path) -> Result<std::fs::File> {
     fs::create_dir_all(root)?;
-    let file = fs::OpenOptions::new()
+    let file = crate::platform::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(crate::platform::fs::NOFOLLOW)
         .open(root.join(".import.lock"))?;
     fs2::FileExt::try_lock_exclusive(&file).context("another skill import is running")?;
     Ok(file)
@@ -229,6 +230,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn rejects_links_and_oversized_bundles() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -257,6 +259,7 @@ mod source_tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn bulk_import_reports_invalid_skills_and_preserves_source_identity() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();

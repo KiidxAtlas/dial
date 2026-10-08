@@ -5,6 +5,7 @@
 //! separate strict, network-disabled workspaces. Only explicitly allowed files can return.
 //! A passing check means exactly that command passed, not that the goal is proven correct.
 use super::{Ui, approval, subagents, verification};
+use crate::platform::fs::PermissionsExt;
 use crate::{
     config::types::Config,
     llm::{Chat, ToolCall},
@@ -18,7 +19,6 @@ use std::{
     fs,
     io::Write,
     net::IpAddr,
-    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     sync::{Arc, atomic::Ordering},
 };
@@ -536,8 +536,7 @@ pub(super) fn install(path: &Path, state: Option<&FileState>) -> Result<()> {
             fs::create_dir_all(dir)?;
             let mut file = tempfile::NamedTempFile::new_in(dir)?;
             file.write_all(&state.bytes)?;
-            file.as_file()
-                .set_permissions(fs::Permissions::from_mode(state.mode))?;
+            crate::platform::fs::set_file_mode(file.as_file(), state.mode)?;
             file.as_file().sync_all()?;
             file.persist(path).map_err(|e| e.error)?;
         }
@@ -980,6 +979,7 @@ mod tests {
         assert!(request.validate(&SolveConfig::default()).is_err());
     }
     #[test]
+    #[cfg(unix)]
     fn symlinks_cannot_return_to_source() {
         let source = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();

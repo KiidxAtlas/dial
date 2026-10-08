@@ -1,10 +1,13 @@
 use super::engine::lang_names;
 use super::*;
+use crate::platform::fs::PermissionsExt;
 use crate::tools::{EditMode, WriteObserver, execute};
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+#[cfg(unix)]
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 fn workspace() -> (tempfile::TempDir, Workspace) {
@@ -152,6 +155,7 @@ fn auto_detection_notes_languages_the_pattern_does_not_fit() {
 }
 
 #[test]
+#[cfg(unix)]
 fn walk_skips_build_dirs_scratch_binaries_and_symlinks() {
     let (dir, ws) = workspace();
     put(&dir, "src/a.rs", "fn f() { go(); }\n");
@@ -362,10 +366,10 @@ fn staging_failure_on_a_later_file_leaves_every_file_untouched() {
     let first = put(&dir, "a/one.rs", "fn f() { foo(1); }\n");
     let second = put(&dir, "b/two.rs", "fn g() { foo(2); }\n");
     let locked = dir.path().join("b");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    crate::platform::fs::set_mode(&locked, 0o555).unwrap();
     if fs::write(locked.join("probe"), "").is_ok() {
         // Running with privileges that ignore directory permissions; the scenario cannot be staged.
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::fs::set_mode(&locked, 0o755).unwrap();
         eprintln!("skipped: directory permissions are not enforced for this user");
         return;
     }
@@ -373,7 +377,7 @@ fn staging_failure_on_a_later_file_leaves_every_file_untouched() {
         &ws,
         json!({"pattern": "foo($A)", "rewrite": "bar($A)", "dry_run": false}),
     );
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    crate::platform::fs::set_mode(&locked, 0o755).unwrap();
     assert!(
         out.is_error && out.text.contains("nothing was written"),
         "{}",
@@ -487,7 +491,7 @@ fn hashline_tags_from_before_the_rewrite_are_rejected() {
 fn permissions_and_crlf_line_endings_are_preserved() {
     let (dir, ws) = workspace();
     let script = put(&dir, "run.py", "import os\r\nfoo(1)\r\n");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o750)).unwrap();
+    crate::platform::fs::set_mode(&script, 0o750).unwrap();
     let out = edit(
         &ws,
         json!({"pattern": "foo($A)", "rewrite": "bar(\n    $A,\n)", "dry_run": false}),

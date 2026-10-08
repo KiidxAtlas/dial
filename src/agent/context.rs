@@ -62,7 +62,7 @@ fn read_text(path: &Path, cap: usize) -> Option<(String, bool)> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    let home = crate::platform::home_var_os().filter(|h| !h.is_empty())?;
     fs::canonicalize(home).ok()
 }
 
@@ -779,6 +779,7 @@ pub(crate) fn split_words(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn canon(dir: &tempfile::TempDir) -> PathBuf {
@@ -1023,6 +1024,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlinked_instruction_files_must_stay_inside_the_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let base = canon(&tmp);
@@ -1111,6 +1113,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn references_cannot_escape_the_project() {
         let (_t, base) = project();
         let root = base.join("proj");

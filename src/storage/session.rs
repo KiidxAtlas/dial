@@ -10,14 +10,15 @@
 //! Search keeps an FTS5 index in `<state_dir>/sessions.sqlite3`. The index is derived data: each
 //! search first catches up on every session file from the byte offset it last indexed, so it also
 //! picks up lines written by other processes and survives a crash between append and indexing.
+use crate::platform::fs::OpenOptions;
+use crate::platform::fs::PermissionsExt;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -168,14 +169,7 @@ fn file_id(name: &str) -> Option<&str> {
 // ---------------------------------------------------------------- file helpers
 
 fn private_dir(dir: &Path) -> Result<()> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
-    // Tighten a directory that already existed with looser permissions (best effort; we may not own it).
-    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
-    Ok(())
+    crate::storage::settings_store::private_dir(dir)
 }
 
 struct RawLine {
@@ -1135,7 +1129,7 @@ fn open_index(layout: &Layout) -> Result<Connection> {
     let db = layout.state_dir.join("sessions.sqlite3");
     let conn = Connection::open(&db).with_context(|| format!("opening {}", db.display()))?;
     conn.busy_timeout(Duration::from_secs(10))?;
-    let _ = fs::set_permissions(&db, fs::Permissions::from_mode(0o600));
+    let _ = crate::platform::fs::set_mode(&db, 0o600);
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS indexed(session_id TEXT PRIMARY KEY, bytes INTEGER NOT NULL);
          CREATE VIRTUAL TABLE IF NOT EXISTS msgs USING fts5(text, session_id UNINDEXED, role UNINDEXED, ts UNINDEXED, tokenize='porter unicode61');",

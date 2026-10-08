@@ -1,5 +1,7 @@
 //! Automatic background scheduling. Training and admission run outside the foreground session.
 use super::improve;
+use crate::platform::fs::OpenOptions;
+use crate::platform::process::CommandExt;
 use crate::{
     agent::Runtime,
     config::types::Config,
@@ -10,11 +12,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs::{self, File, OpenOptions},
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        process::CommandExt,
-    },
+    fs::{self, File},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -504,7 +502,7 @@ pub fn execute(
 
 pub fn prepare_state(layout: &Layout) -> Result<()> {
     fs::create_dir_all(&layout.state_dir)?;
-    fs::set_permissions(&layout.state_dir, fs::Permissions::from_mode(0o700))?;
+    crate::platform::fs::set_mode(&layout.state_dir, 0o700)?;
     Ok(())
 }
 
