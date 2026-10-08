@@ -272,6 +272,12 @@ fn env(url: &str, approval: &str) -> Env {
     let overlay: toml::Table = toml::from_str(&format!(
         "model = \"scripted\"\napproval = \"{approval}\"\nedit_mode = \"hashline\"\nintegrations = []\n[endpoint]\nbase_url = \"{url}\"\n[sandbox]\nmode = \"strict\"\n")).unwrap();
     let mut config = Config::load(&layout, Some(overlay)).unwrap();
+    // Native Windows deliberately requires the operator to opt out of confinement.
+    // Exercise real Git Bash tools in these disposable scripted-provider fixtures.
+    #[cfg(windows)]
+    {
+        config.sandbox.mode = dial::config::types::SandboxMode::Off;
+    }
     // Most scripted providers test one agent task, not the separate architecture maintenance call.
     config.codebase.synthesize_architecture = false;
     config.codebase.architecture_model.clear(); // Scripted architecture tests use their configured HTTP provider.
@@ -5080,6 +5086,7 @@ fn web_search_is_discoverable_loadable_and_respects_network_restrictions() {
     let mut e = env(&server.url, "ask");
     e.config.integrations = vec!["web_search".into(), "web_fetch".into()];
     e.config.sandbox.allow_network = false;
+    e.config.sandbox.mode = dial::config::types::SandboxMode::Strict;
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     a.turn("search the web for Rust release notes", &mut ui)
@@ -7158,7 +7165,7 @@ fn adaptive_settings_follow_real_reads_edits_checks_and_review_handoff() {
         Reply::Call("write", json!({"path":"marker.txt","content":"after\n"})),
         Reply::Call(
             "bash",
-            json!({"command":"python3 -m unittest discover -s tests"}),
+            json!({"command": if cfg!(windows) { "python -m unittest discover -s tests" } else { "python3 -m unittest discover -s tests" }}),
         ),
         Reply::Call("read", json!({"path":"missing.txt"})),
         Reply::Text("Updated and checked the marker."),
