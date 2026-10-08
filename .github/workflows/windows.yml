@@ -28,6 +28,8 @@ jobs:
       - name: Native OS boundary contracts
         if: always() && steps.build.outcome == 'success'
         run: cargo test --locked --test native_windows -- --test-threads=4
+      - name: Installer bootstrap
+        run: ./scripts/test-install-bootstrap.ps1
       - name: PowerShell installer
         run: ./scripts/test-install.ps1
       - name: Native process, storage, shell and CLI contracts

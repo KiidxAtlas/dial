@@ -69,6 +69,10 @@ jobs:
         run: cargo fmt --check
       - name: Test
         run: cargo test --locked -- --test-threads=4
+      - name: Test installer bootstrap
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-install-bootstrap.ps1
       - name: Test PowerShell installer
         if: runner.os == 'Windows'
         shell: powershell

@@ -17,24 +17,34 @@ has been granted repository access. You can download the matching archive and
 checksum from the release page in your signed-in browser, then follow the manual
 instructions below.
 
-For the terminal installer, install [GitHub CLI](https://cli.github.com/), then sign
-in with an account that has access and download the release's installer:
+Install with one command. The public [installer repository](https://github.com/KiidxAtlas/dial-install)
+contains only installer scripts; Dial's source code and release archives remain private.
+The installer sets up GitHub CLI if needed, opens GitHub login, downloads your platform's
+release, verifies its SHA-256 and executable version, and configures your user PATH.
+A GitHub account granted access to `KiidxAtlas/dial` is still required.
 
-```sh
-gh auth login --hostname github.com
-gh release download --repo KiidxAtlas/dial --pattern install.sh
-bash install.sh
-export PATH="$HOME/.local/bin:$PATH"
-dial
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/KiidxAtlas/dial-install/main/install.ps1 | iex
 ```
 
-The installer uses authenticated GitHub CLI downloads for private releases;
-credentials stay managed by GitHub CLI. The curl path remains available for public
-releases. Complete the platform prerequisites below before installing.
+**macOS / Linux:**
 
-The installer selects the correct archive and verifies its SHA-256 before installing.
-Run `bash install.sh v0.1.3` to select a specific release. The commands above are
-for macOS/Linux; use the PowerShell installer below on native Windows.
+```sh
+curl -fsSL https://raw.githubusercontent.com/KiidxAtlas/dial-install/main/install.sh | bash
+```
+
+Windows also installs Git for Windows automatically when Git Bash is missing. The
+Windows command updates PATH in the same PowerShell session. On Mac/Linux, open a
+new terminal afterwards, or start immediately with `~/.local/bin/dial`.
+Run the same command again to update. Verification failures preserve your existing binary.
+If a platform's release has not been published, the installer explains this and exits.
+
+To pin a version, download the script and run `bash install.sh v0.1.3` or
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.1.3`.
+Set `DIAL_INSTALL_BOOTSTRAP=0` only for Unix automation with prerequisites and
+credentials already configured; this skips prerequisite/login and shell-profile setup.
 
 ### macOS (Apple Silicon or Intel)
 
@@ -65,26 +75,21 @@ Python worker is embedded in the binary; no repository checkout is needed.
 
 ### Native Windows
 
-Install Git for Windows and GitHub CLI, then open a new PowerShell terminal:
+Open PowerShell and run:
 
 ```powershell
-winget install --id Git.Git -e
-winget install --id GitHub.cli -e
-gh auth login --hostname github.com
-gh release download --repo KiidxAtlas/dial --pattern install.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
-# Open a new terminal after installation:
+irm https://raw.githubusercontent.com/KiidxAtlas/dial-install/main/install.ps1 | iex
 dial --version
 cd C:\path\to\your\project
 dial --sandbox off
 ```
 
-The installer downloads the native `.exe`, verifies its SHA-256 and version, and
-installs it under `%LOCALAPPDATA%\Dial\bin`, adding that directory to your user
-PATH. An update that fails verification preserves the existing executable.
-Use `-Version v0.1.3` for a specific release. Access to this private repository is
-required. You can also download the Windows ZIP and its `.zip.sha256` in your
-signed-in browser, verify it with `Get-FileHash`, extract it, and run `dial.exe`.
+The installer handles GitHub CLI, Git Bash and sign-in, downloads the native `.exe`,
+verifies its SHA-256 and version, and installs it under `%LOCALAPPDATA%\Dial\bin`.
+It adds this directory to your user PATH and the current PowerShell session.
+Use the same command to update. An update that fails verification preserves the existing executable.
+Access to this private repository is required. Manual ZIP downloads remain available
+through the signed-in GitHub release page.
 
 Complete first-run provider setup. Hosted providers need no Python; local Windows
 inference can use an OpenAI-compatible server such as LM Studio or Ollama.
