@@ -2,6 +2,7 @@
 //! Chromium has no OS network permission: all HTTP requests cross the guarded Rust bridge.
 use super::ext::{Tool, ToolContext};
 use super::kernel::{JsonProcess, deadline, resolve_operator_executable};
+#[cfg(not(windows))]
 use super::sandbox::{Sandbox, profile};
 use super::web::{fetch::parse_url, guard::blocked_reason};
 use super::{ToolOutput, tool_schema};
@@ -366,10 +367,12 @@ fn start(
         .tempdir()
         .map_err(|e| e.to_string())?;
     let state_path = state.path().canonicalize().map_err(|e| e.to_string())?;
+    #[cfg(not(windows))]
     let package_root = entry
         .ancestors()
         .find(|p| p.file_name().is_some_and(|n| n == "node_modules"))
         .unwrap_or_else(|| entry.parent().unwrap());
+    #[cfg(not(windows))]
     let executable_root = chromium_bundle_root(&executable)?;
     #[cfg(windows)]
     if !ctx.workspace.unsandboxed {

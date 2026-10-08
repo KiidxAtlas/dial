@@ -14,6 +14,9 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("creating temp file in {}", dir.display()))?;
+    if mode & 0o077 == 0 {
+        crate::platform::fs::seal_file(tmp.as_file())?;
+    }
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     crate::platform::fs::set_mode(tmp.path(), mode)?;

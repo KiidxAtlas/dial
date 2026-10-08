@@ -121,7 +121,10 @@ pub(super) fn seal(file: &File) -> io::Result<()> {
         ));
     }
     let reopened = unsafe { File::from_raw_handle(handle) };
-    let file = &reopened;
+    seal_handle(&reopened)
+}
+
+pub(super) fn seal_handle(file: &File) -> io::Result<()> {
     if super::is_alias(&file.metadata()?) || !owned(file)? {
         return Err(io::Error::other(
             "private storage must be owned by the current user and cannot be an alias",

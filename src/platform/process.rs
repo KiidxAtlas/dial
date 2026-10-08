@@ -92,9 +92,10 @@ mod windows {
 pub use windows::{Child, CommandExt, ExitStatusExt};
 
 /// Spawn a supervised child. Unix callers configure their process group first.
-pub fn spawn(mut command: Command) -> io::Result<Child> {
+pub fn spawn(command: Command) -> io::Result<Child> {
     #[cfg(unix)]
     {
+        let mut command = command;
         command.spawn()
     }
     #[cfg(windows)]

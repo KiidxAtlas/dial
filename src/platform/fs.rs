@@ -117,7 +117,7 @@ impl OpenOptions {
         }
         #[cfg(windows)]
         if self.mode.is_some() {
-            windows::seal(&file)?;
+            windows::seal_handle(&file)?;
         }
         Ok(file)
     }
@@ -167,7 +167,7 @@ pub fn private(path: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        windows::seal(&windows::open_security(path)?)
+        windows::seal_handle(&windows::open_security(path)?)
     }
 }
 pub fn owned(file: &File) -> io::Result<bool> {

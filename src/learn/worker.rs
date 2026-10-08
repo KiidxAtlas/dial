@@ -164,12 +164,12 @@ fn run_command_handoff(
         .stdin
         .take()
         .context("missing subprocess stdin")?;
-    let mut stdout = group
+    let stdout = group
         .child
         .stdout
         .take()
         .context("missing subprocess stdout")?;
-    let mut stderr = group
+    let stderr = group
         .child
         .stderr
         .take()

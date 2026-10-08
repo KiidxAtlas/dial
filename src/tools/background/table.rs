@@ -96,7 +96,7 @@ impl Ring {
 
 /// Spool every byte before clipping. Nonblocking reads let drop stop escaped pipe holders.
 fn spawn_reader(
-    mut pipe: io::PipeReader,
+    pipe: io::PipeReader,
     ring: Arc<Mutex<Ring>>,
     stop: Arc<AtomicBool>,
     mut spool: Option<ArtifactSpool>,
