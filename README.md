@@ -34,7 +34,7 @@ credentials stay managed by GitHub CLI. The curl path remains available for publ
 releases. Complete the platform prerequisites below before installing.
 
 The installer selects the correct archive and verifies its SHA-256 before installing.
-Run `bash dial-install.sh v0.1.0` to select a specific release. On Windows these commands
+Run `bash install.sh v0.1.0` to select a specific release. On Windows these commands
 run in your WSL2 Ubuntu terminal; the PowerShell command below installs WSL2 first.
 
 ### macOS (Apple Silicon or Intel)
