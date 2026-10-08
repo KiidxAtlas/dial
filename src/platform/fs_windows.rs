@@ -10,7 +10,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, LocalFree},
-    Security::{self, Authorization::*, *},
+    Security::{Authorization::*, *},
     Storage::FileSystem::*,
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
@@ -30,7 +30,7 @@ impl Drop for Descriptor {
         }
     }
 }
-fn user() -> io::Result<Vec<u8>> {
+fn token_info(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<u8>> {
     let mut token = ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
@@ -38,22 +38,18 @@ fn user() -> io::Result<Vec<u8>> {
     let token = Token(token);
     let mut size = 0;
     unsafe {
-        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut size);
+        GetTokenInformation(token.0, class, ptr::null_mut(), 0, &mut size);
     }
     let mut bytes = vec![0; size as usize];
-    if unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            bytes.as_mut_ptr().cast(),
-            size,
-            &mut size,
-        )
-    } == 0
+    if unsafe { GetTokenInformation(token.0, class, bytes.as_mut_ptr().cast(), size, &mut size) }
+        == 0
     {
         return Err(io::Error::last_os_error());
     }
     Ok(bytes)
+}
+fn user() -> io::Result<Vec<u8>> {
+    token_info(TokenUser)
 }
 fn user_sid(bytes: &[u8]) -> PSID {
     unsafe {
@@ -82,7 +78,15 @@ pub(super) fn owned(file: &File) -> io::Result<bool> {
         return Err(io::Error::from_raw_os_error(error as i32));
     }
     let _sd = Descriptor(sd);
-    Ok(unsafe { EqualSid(owner, user_sid(&user)) } != 0)
+    if unsafe { EqualSid(owner, user_sid(&user)) } != 0 {
+        return Ok(true);
+    }
+    // Elevated Windows tokens can create files owned by their default owner
+    // group (Administrators), rather than TokenUser. Accept only this token's
+    // default owner; the protected DACL still names TokenUser and SYSTEM.
+    let default_owner = token_info(TokenOwner)?;
+    let sid = unsafe { ptr::read_unaligned(default_owner.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+    Ok(unsafe { EqualSid(owner, sid) } != 0)
 }
 pub(super) fn single_link(file: &File) -> io::Result<bool> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -96,6 +100,9 @@ pub(super) fn open_security(path: &Path) -> io::Result<File> {
         .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
+        .map_err(|error| {
+            io::Error::new(error.kind(), format!("opening private ACL handle: {error}"))
+        })
 }
 pub(super) fn seal(file: &File) -> io::Result<()> {
     let handle = unsafe {
@@ -107,7 +114,11 @@ pub(super) fn seal(file: &File) -> io::Result<()> {
         )
     };
     if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("reopening private ACL handle: {error}"),
+        ));
     }
     let reopened = unsafe { File::from_raw_handle(handle) };
     let file = &reopened;
@@ -174,7 +185,11 @@ pub(super) fn seal(file: &File) -> io::Result<()> {
         )
     };
     if error != 0 {
-        return Err(io::Error::from_raw_os_error(error as i32));
+        let error = io::Error::from_raw_os_error(error as i32);
+        return Err(io::Error::new(
+            error.kind(),
+            format!("protecting private DACL: {error}"),
+        ));
     }
     Ok(())
 }

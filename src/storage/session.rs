@@ -11,7 +11,7 @@
 //! search first catches up on every session file from the byte offset it last indexed, so it also
 //! picks up lines written by other processes and survives a crash between append and indexing.
 use crate::platform::fs::OpenOptions;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::platform::fs::PermissionsExt;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -1511,10 +1511,12 @@ mod tests {
         assert_eq!(reopened.id(), s.id());
         assert_eq!(reopened.messages(), s.messages());
         assert_eq!(reopened.messages()[1], call);
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(path.parent().unwrap())
                 .unwrap()
@@ -1864,6 +1866,7 @@ mod tests {
         );
 
         let db = e.layout.state_dir.join("sessions.sqlite3");
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(db).unwrap().permissions().mode() & 0o777,
             0o600

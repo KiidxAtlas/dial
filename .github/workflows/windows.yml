@@ -22,10 +22,13 @@ jobs:
       - name: Build all native Windows targets
         id: build
         run: cargo build --locked --all-targets
+      - name: Native OS boundary contracts
+        if: always() && steps.build.outcome == 'success'
+        run: cargo test --locked --test native_windows -- --test-threads=4
       - name: PowerShell installer
         run: ./scripts/test-install.ps1
       - name: Native process, storage, shell and CLI contracts
-        run: cargo test --locked --test native_windows --test cli_print --test ui_configuration -- --test-threads=4
+        run: cargo test --locked --test cli_print --test ui_configuration -- --test-threads=4
       - name: All library tests
         if: always() && steps.build.outcome == 'success'
         run: cargo test --locked --lib -- --test-threads=4

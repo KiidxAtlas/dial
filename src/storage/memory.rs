@@ -1,6 +1,6 @@
 //! Shared memory security screening and atomic private-file persistence.
 //! Durable provenance/retrieval lives in [`super::provenance`].
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::platform::fs::PermissionsExt;
 use anyhow::{Context, Result};
 use std::{fs, io::Write, path::Path};
@@ -283,6 +283,7 @@ mod tests {
         atomic_write(&path, b"one", 0o600).unwrap();
         atomic_write(&path, b"two", 0o644).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o644

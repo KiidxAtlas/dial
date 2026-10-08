@@ -378,8 +378,6 @@ pub(super) fn shell_command(
         spawn
             .args(["--noprofile", "--norc", "-c", script])
             .env_clear();
-        #[cfg(windows)]
-        spawn.env("MSYS_NO_PATHCONV", "1");
         for (key, value) in std::env::vars() {
             if !is_secret_env(&key, &value) {
                 spawn.env(key, value);

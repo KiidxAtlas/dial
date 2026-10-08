@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const CALLBACK_PATH: &str = "/callback";

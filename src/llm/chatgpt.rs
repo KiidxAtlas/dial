@@ -1,7 +1,7 @@
 //! Sign in with ChatGPT for Dial's own public OAuth registration. Credentials never enter config,
 //! model history, or API-key storage. Protected atomic records and a process lock serialize refresh.
 use super::auth::SecretToken;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::platform::fs::PermissionsExt;
 use crate::storage::settings_store::{locked, read_private, write_private};
 use anyhow::{Context, Result, bail, ensure};
@@ -1520,6 +1520,7 @@ mod tests {
         let t = state.accounts["oaiapp_test"].tokens.as_ref().unwrap();
         assert_eq!(t.refresh_token, "rotated");
         assert_eq!(t.id_token, "test-id");
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(dir.path().join(FILE))
                 .unwrap()
