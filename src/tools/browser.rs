@@ -895,6 +895,13 @@ mod tests {
                     match socket.read(&mut buffer) {
                         Ok(0) => break true,
                         Ok(_) => {}
+                        // Linux may reset a connection when cancellation drops
+                        // unread response bytes. RST proves closure just as EOF does;
+                        // a read timeout still fails this leak check.
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                            break true;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break false,
                     }
                 };
