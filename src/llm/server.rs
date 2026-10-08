@@ -589,6 +589,7 @@ fn wait_ready(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) mod tests {
     use super::*;
     use std::fs;

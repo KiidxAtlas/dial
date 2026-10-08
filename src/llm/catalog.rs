@@ -2030,7 +2030,9 @@ mod tests {
         ] {
             assert!(save_credential(dir.path(), url, "ok").is_err());
         }
+        #[cfg(unix)]
         use crate::platform::fs::PermissionsExt;
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(dir.path().join("credentials.json"))
                 .unwrap()
@@ -2060,7 +2062,7 @@ mod tests {
         }
         let entries = local_models(cache.path(), None);
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].selection.model.ends_with("/current"));
+        assert!(Path::new(&entries[0].selection.model).ends_with("current"));
         assert_eq!(entries[0].selection.context_window, Some(8192));
         fs::write(
             repo.join("snapshots/current/model.safetensors.index.json"),
@@ -2151,7 +2153,7 @@ mod tests {
             None,
             "unknown without an mlx-lm install"
         );
-        assert_eq!(entries[0].selection.model, mlx.to_string_lossy());
+        assert_eq!(Path::new(&entries[0].selection.model), mlx);
         assert_eq!(entries[0].selection.context_window, Some(32768));
         assert!(
             entries[0].selection.base_url.is_none(),

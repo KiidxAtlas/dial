@@ -1348,7 +1348,12 @@ mod tests {
         let mut tracker = Tracker::default();
         let run = |sequence, exit_code| CheckRun {
             command: "cargo check".into(),
-            cwd: "/workspace/a".into(),
+            cwd: if cfg!(windows) {
+                r"C:\workspace\a"
+            } else {
+                "/workspace/a"
+            }
+            .into(),
             objective: "type correctness".into(),
             kind: CheckKind::SyntaxOnly,
             tool_call_id: format!("check-{sequence}"),
@@ -1381,7 +1386,17 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            store.recent_executable_repairs("/workspace/a", 1).unwrap()[0].1,
+            store
+                .recent_executable_repairs(
+                    if cfg!(windows) {
+                        r"C:\workspace\a"
+                    } else {
+                        "/workspace/a"
+                    },
+                    1
+                )
+                .unwrap()[0]
+                .1,
             payload
         );
         assert!(
@@ -1392,7 +1407,14 @@ mod tests {
         );
         assert!(
             store
-                .recent_executable_repairs("/workspace/a", 1025)
+                .recent_executable_repairs(
+                    if cfg!(windows) {
+                        r"C:\workspace\a"
+                    } else {
+                        "/workspace/a"
+                    },
+                    1025
+                )
                 .is_err()
         );
         assert!(store.tool_recoveries().unwrap().is_empty());

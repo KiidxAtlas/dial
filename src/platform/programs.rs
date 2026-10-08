@@ -30,7 +30,7 @@ fn extensions() -> Vec<String> {
         .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
         .split(';')
         .filter(|ext| !ext.is_empty())
-        .map(str::to_owned)
+        .map(str::to_ascii_lowercase)
         .collect()
 }
 pub fn find(program: &Path, directories: &[PathBuf]) -> Option<PathBuf> {

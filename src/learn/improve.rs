@@ -811,7 +811,7 @@ impl Drop for LoraPhase<'_> {
 pub fn lora_phase(config: &Config, store: &Store) -> Option<String> {
     let lock = std::fs::File::open(config.state_dir.join("lora-progress.lock")).ok()?;
     match fs2::FileExt::try_lock_shared(&lock) {
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(error) if crate::platform::fs::lock_contended(&error) => {
             store.get_meta("lora_phase").ok().flatten()
         }
         _ => None,

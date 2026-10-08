@@ -36,7 +36,7 @@ pub(crate) fn refresh_worker(config: &Config) -> Result<()> {
 pub fn ensure_runtime(layout: &Layout) -> Result<()> {
     ensure!(
         cfg!(target_os = "macos") && cfg!(target_arch = "aarch64"),
-        "local MLX requires macOS on Apple Silicon; use /providers to configure a hosted or OpenAI-compatible provider on Intel Macs or Linux/WSL2"
+        "local MLX requires macOS on Apple Silicon; use /providers to configure a hosted or OpenAI-compatible provider on Intel Macs, Windows, or Linux"
     );
     let dir = layout.user_dir.join("python");
     settings_store::private_dir(&dir)?;

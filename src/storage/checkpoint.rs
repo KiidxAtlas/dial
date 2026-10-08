@@ -523,7 +523,8 @@ impl Checkpoints {
         let rel = resolved
             .strip_prefix(&self.root)
             .map_err(|_| anyhow::anyhow!("{} is outside the project root", abs.display()))?;
-        let rel = rel.to_str().context("path is not valid UTF-8")?.to_string();
+        rel.to_str().context("path is not valid UTF-8")?;
+        let rel = crate::platform::shell_path(rel);
         ensure!(!rel.is_empty(), "cannot checkpoint the project root itself");
         Ok((resolved, rel))
     }
@@ -871,6 +872,7 @@ mod tests {
         crate::platform::fs::set_mode(fx.path("blob.bin"), 0o600).unwrap();
         cp.rollback(1).unwrap();
         assert_eq!(fs::read(fx.path("blob.bin")).unwrap(), bin);
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(fx.path("blob.bin"))
                 .unwrap()
@@ -915,10 +917,10 @@ mod tests {
         let manifest_path = turn_dir(&cp.dir, 1).join("manifest.json");
         let evil = tempfile::tempdir().unwrap();
         let target = evil.path().join("pwned");
-        let text = fs::read_to_string(&manifest_path)
-            .unwrap()
-            .replace("a.txt", &format!("../../..{}", target.display()));
-        fs::write(&manifest_path, text).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["entries"][0]["rel"] = serde_json::json!(format!("../../..{}", target.display()));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         let report = cp.rollback(1).unwrap();
         assert!(report.restored.is_empty() && !report.warnings.is_empty());
         assert!(!target.exists());

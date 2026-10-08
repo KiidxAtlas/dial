@@ -6011,10 +6011,9 @@ mod tests {
         let mut agent = app.make_agent(session).unwrap();
         let id = agent.session().id().to_owned();
         let worker = auto::lock_file(&lock_path).unwrap();
-        assert_eq!(
-            worker.try_lock_exclusive().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+        assert!(crate::platform::fs::lock_contended(
+            &worker.try_lock_exclusive().unwrap_err()
+        ));
         let inherited = app.compute.borrow().as_ref().unwrap().try_clone().unwrap();
         assert!(app.release_idle_compute(&mut agent));
         worker.try_lock_exclusive().unwrap();

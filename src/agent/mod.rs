@@ -4121,7 +4121,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
         let python = if self.config.python.is_file() {
             self.config.python.clone()
         } else {
-            PathBuf::from("python3")
+            PathBuf::from(if cfg!(windows) { "python" } else { "python3" })
         };
         let mut checks = verification::plan(self.workspace.root(), &python, &paths);
         if self.config.assistance.enabled && self.config.assistance.selective_verification {

@@ -1,4 +1,4 @@
-# Tests use the actual compiled executable and a local archive; no credentials/network needed.
+﻿# Tests use the actual compiled executable and a local archive; no credentials/network needed.
 $ErrorActionPreference = 'Stop'
 $temp = Join-Path $env:RUNNER_TEMP ("dial-installer-test-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $temp | Out-Null

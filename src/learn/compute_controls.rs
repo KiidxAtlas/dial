@@ -312,6 +312,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn immediate_stop_rejects_a_foreground_process() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();

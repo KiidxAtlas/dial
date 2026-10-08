@@ -681,10 +681,12 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn training_exits_before_coding_and_resumes_after_compute_is_released() {
         handoff_fixture(false);
     }
     #[test]
+    #[cfg(unix)]
     fn unresponsive_training_is_preempted_and_retries_its_committed_checkpoint() {
         handoff_fixture(true);
     }
