@@ -109,7 +109,7 @@ impl Layout {
 
 /// Canonicalize the longest existing prefix (the directory may not exist yet) so symlinked
 /// locations such as macOS `/var` -> `/private/var` compare equal.
-fn resolve_prefix(path: &Path) -> PathBuf {
+pub(crate) fn resolve_prefix(path: &Path) -> PathBuf {
     let mut probe = path;
     let mut tail = Vec::new();
     loop {

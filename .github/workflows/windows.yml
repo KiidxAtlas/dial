@@ -12,16 +12,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-always: true
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Rust
         run: rustup update stable --no-self-update
       - name: Build all native Windows targets
+        id: build
         run: cargo build --locked --all-targets
       - name: PowerShell installer
         run: ./scripts/test-install.ps1
       - name: Native process, storage, shell and CLI contracts
         run: cargo test --locked --test native_windows --test cli_print --test ui_configuration -- --test-threads=4
       - name: All library tests
+        if: always() && steps.build.outcome == 'success'
         run: cargo test --locked --lib -- --test-threads=4

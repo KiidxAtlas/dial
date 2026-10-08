@@ -402,6 +402,15 @@ impl Workspace {
         if input.contains('\0') {
             return Err("path contains a NUL byte".to_string());
         }
+        #[cfg(windows)]
+        let normalized = if Path::new(input).is_absolute() {
+            crate::storage::paths::resolve_prefix(Path::new(input))
+        } else {
+            PathBuf::from(input)
+        };
+        #[cfg(windows)]
+        let path = normalized.as_path();
+        #[cfg(unix)]
         let path = Path::new(input);
         let relative = if path.is_absolute() {
             path.strip_prefix(&self.root).map_err(|_| {
@@ -424,12 +433,16 @@ impl Workspace {
                     current.pop();
                 }
                 Component::Normal(name) => {
+                    #[cfg(windows)]
+                    if name.to_string_lossy().contains(':') {
+                        return Err("alternate data streams are not workspace file paths".into());
+                    }
                     current.push(name);
                     if missing {
                         continue;
                     }
                     match fs::symlink_metadata(&current) {
-                        Ok(meta) if meta.file_type().is_symlink() => {
+                        Ok(meta) if crate::platform::fs::is_alias(&meta) => {
                             current = fs::canonicalize(&current).map_err(|_| {
                                 format!("path {input:?} goes through a dangling symlink")
                             })?;
@@ -455,7 +468,7 @@ impl Workspace {
     pub(crate) fn rel(&self, path: &Path) -> String {
         match path.strip_prefix(&self.root) {
             Ok(rest) if rest.as_os_str().is_empty() => ".".to_string(),
-            Ok(rest) => rest.to_string_lossy().into_owned(),
+            Ok(rest) => crate::platform::shell_path(rest),
             Err(_) => path.to_string_lossy().into_owned(),
         }
     }

@@ -132,3 +132,91 @@ fn paths_and_programs_are_native() {
     assert!(platform::programs::find(std::path::Path::new("python"), &dirs).is_some());
     assert!(platform::programs::bash().unwrap().is_file());
 }
+
+#[test]
+fn background_and_python_kernel_work_natively() {
+    use dial::{
+        config::types::Config,
+        tools::{background, ext::ToolContext, kernel},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap().without_sandbox();
+    let config = Config::default();
+    let ctx = ToolContext {
+        workspace: &ws,
+        config: &config,
+    };
+    let background = background::tools(&config).remove(0);
+    let started = background.call(
+        &ctx,
+        &json!({"action":"start", "name":"native", "command":"printf 'ready'; sleep 30"}),
+    );
+    assert!(!started.is_error, "{}", started.text);
+    let ready = background.call(
+        &ctx,
+        &json!({"action":"wait", "name":"native", "until":"ready", "timeout":5}),
+    );
+    assert!(
+        !ready.is_error && ready.text.contains("ready"),
+        "{}",
+        ready.text
+    );
+    let killed = background.call(&ctx, &json!({"action":"kill", "name":"native"}));
+    assert!(!killed.is_error, "{}", killed.text);
+    let kernel = kernel::tools(&config).remove(0);
+    let first = kernel.call(&ctx, &json!({"action":"eval", "code":"x = 40\nx + 2"}));
+    assert!(
+        !first.is_error && first.text.contains("42"),
+        "{}",
+        first.text
+    );
+    let retained = kernel.call(&ctx, &json!({"action":"eval", "code":"x + 3"}));
+    assert!(
+        !retained.is_error && retained.text.contains("43"),
+        "{}",
+        retained.text
+    );
+    let timed_out = kernel.call(
+        &ctx,
+        &json!({"action":"eval", "code":"import time; time.sleep(30)", "timeout":1}),
+    );
+    assert!(timed_out.is_error, "{}", timed_out.text);
+    let fresh = kernel.call(&ctx, &json!({"action":"eval", "code":"'x' in globals()"}));
+    assert!(
+        !fresh.is_error && fresh.text.contains("False"),
+        "{}",
+        fresh.text
+    );
+}
+
+#[test]
+fn native_file_paths_and_state_survive_reopen() {
+    use dial::storage::{
+        paths::Layout,
+        settings_store::{self, Scope},
+        store::Store,
+    };
+    let project = tempfile::Builder::new()
+        .prefix("dial project 雪 ")
+        .tempdir()
+        .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().join("state")).unwrap();
+    settings_store::save_history(&layout, &["hello 雪".into()], 10).unwrap();
+    assert_eq!(
+        settings_store::load_history(&layout, 10).unwrap(),
+        ["hello 雪"]
+    );
+    let store = Store::open(&layout.state_dir, "model", "coding").unwrap();
+    drop(store);
+    Store::open(&layout.state_dir, "model", "coding").unwrap();
+    let ws = Workspace::new(project.path()).unwrap();
+    fs::write(project.path().join("file.txt"), "hello").unwrap();
+    assert_eq!(
+        ws.resolve(project.path().join("file.txt").to_str().unwrap())
+            .unwrap(),
+        project.path().join("file.txt").canonicalize().unwrap()
+    );
+    assert!(ws.resolve("file.txt:hidden").is_err());
+    let _ = Scope::Global;
+}
