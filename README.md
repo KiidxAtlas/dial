@@ -34,15 +34,15 @@ credentials stay managed by GitHub CLI. The curl path remains available for publ
 releases. Complete the platform prerequisites below before installing.
 
 The installer selects the correct archive and verifies its SHA-256 before installing.
-Run `bash install.sh v0.1.0` to select a specific release. On Windows these commands
+Run `bash install.sh v0.1.1` to select a specific release. On Windows these commands
 run in your WSL2 Ubuntu terminal; the PowerShell command below installs WSL2 first.
 
 ### macOS (Apple Silicon or Intel)
 
-In the download directory (replace `v0.1.0` with the release you downloaded):
+In the download directory (replace `v0.1.1` with the release you downloaded):
 
 ```sh
-version=v0.1.0
+version=v0.1.1
 # Apple Silicon: aarch64-apple-darwin; Intel: x86_64-apple-darwin
 target=aarch64-apple-darwin
 shasum -a 256 -c "dial-$version-$target.tar.gz.sha256"
@@ -98,7 +98,7 @@ sudo apt-get install -y bubblewrap ca-certificates
 Download the Linux archive and checksum into a Linux directory, then:
 
 ```sh
-version=v0.1.0
+version=v0.1.1
 sha256sum -c "dial-$version-x86_64-unknown-linux-gnu.tar.gz.sha256"
 tar -xzf "dial-$version-x86_64-unknown-linux-gnu.tar.gz"
 mkdir -p "$HOME/.local/bin"
@@ -156,9 +156,9 @@ The release workflow runs on pushed `v*` tags and requires the tag to match
 the release changes and push that commit and its tag, for example:
 
 ```sh
-git tag v0.1.0
+git tag v0.1.1
 git push origin main
-git push origin v0.1.0
+git push origin v0.1.1
 ```
 
 `.github/workflows/release.yml` checks formatting, runs the Rust tests (including

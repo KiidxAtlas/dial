@@ -171,6 +171,10 @@ fn wait_readable(fd: i32, millis: i32) {
 fn bash_path() -> String {
     if Path::new("/opt/homebrew/bin").is_dir() {
         "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+    } else if Path::new("/usr/local/bin").is_dir() {
+        // Intel Homebrew installs here. Prefer its tools to the Apple xcrun
+        // shims, which need cache writes outside the strict workspace.
+        "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
     } else {
         "/usr/bin:/bin:/usr/sbin:/sbin".to_string()
     }
