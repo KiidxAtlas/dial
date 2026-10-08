@@ -1,0 +1,19 @@
+name: Native Windows
+on:
+  push:
+    branches: [codex/native-windows]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Rust
+        run: rustup update stable --no-self-update
+      - name: Check native Windows
+        run: cargo check --locked --lib
