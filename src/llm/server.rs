@@ -607,7 +607,7 @@ pub(crate) mod tests {
     /// behaviour: `exit-early`, `never-ready`, `bad-model`, or a path that
     /// receives `{"pid", "child", "argv"}` once the server is listening.
     const FAKE_SERVER: &str = r#"#!/usr/bin/env python3
-import http.server, json, os, subprocess, sys
+import http.server, json, os, socketserver, subprocess, sys
 opts = dict(a.split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
 mode = opts["--model"]
 if mode == "exit-early":
@@ -638,7 +638,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with open(marker, "w") as f: json.dump(info, f)
             self.reply(200, {"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "pong"}}],
                              "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
-server = http.server.ThreadingHTTPServer((opts["--host"], int(opts["--port"])), Handler)
+# A fixture has no public hostname. HTTPServer's default server_bind calls
+# getfqdn(), which can hang on hosted macOS reverse-DNS resolution before serving.
+class FixtureServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+server = FixtureServer((opts["--host"], int(opts["--port"])), Handler)
 if mode != "bad-model":
     open(marker, "w").write(json.dumps({"pid": os.getpid(), "child": helper.pid, "argv": sys.argv[1:], "engine": os.environ.get("DIAL_MODEL_ENGINE"), "apc": os.environ.get("APC_ENABLED")}))
 server.serve_forever()
@@ -905,8 +912,20 @@ server.serve_forever()
 
     #[test]
     fn free_ports_are_loopback_and_usable() {
-        let port = free_port().unwrap();
-        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+        // free_port returns a candidate, not a reservation. Other tests or local
+        // processes may claim it before bind; startup already retries that race.
+        for _ in 0..PORT_ATTEMPTS {
+            let port = free_port().unwrap();
+            match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => {
+                    assert!(listener.local_addr().unwrap().ip().is_loopback());
+                    return;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
+                Err(error) => panic!("binding the loopback candidate: {error}"),
+            }
+        }
+        panic!("all loopback candidates were claimed before binding");
     }
 
     #[test]
