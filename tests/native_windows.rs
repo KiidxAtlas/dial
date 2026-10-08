@@ -32,6 +32,50 @@ fn private_files_reject_hardlinks_and_preserve_append() {
     append.open(&path).unwrap().write_all(b"two").unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"onetwo");
     let file = fs::File::open(&path).unwrap();
+    // Check the actual protected native DACL, rather than POSIX-style mode bits.
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{
+                Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+                DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+            },
+        };
+        let mut descriptor = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, 0);
+        let mut control = 0;
+        let mut revision = 0;
+        let valid =
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+        let entries = if dacl.is_null() {
+            0
+        } else {
+            unsafe { (*dacl).AceCount }
+        };
+        unsafe {
+            LocalFree(descriptor);
+        }
+        assert_ne!(valid, 0);
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        assert_eq!(
+            entries, 2,
+            "only the current user and SYSTEM may have explicit access"
+        );
+    }
     assert!(platform::fs::owned(&file).unwrap());
     assert!(platform::fs::single_link(&file).unwrap());
     fs::hard_link(&path, dir.path().join("alias")).unwrap();

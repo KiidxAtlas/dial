@@ -199,7 +199,7 @@ git push origin v0.1.2
 ```
 
 `.github/workflows/release.yml` checks formatting, runs the Rust tests (including
-required Linux sandbox probes), builds Apple Silicon/Intel Mac and Linux x86-64 binaries,
+required Linux sandbox probes), builds Apple Silicon/Intel Mac, native Windows x64, and Linux x86-64 binaries,
 and smoke-tests each extracted archive outside the checkout. Only after **all three**
 platform builds pass does it create a GitHub release with the archives, bundled MIT
 license and README, per-archive SHA-256 checksums, a combined `SHA256SUMS`, and

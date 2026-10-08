@@ -79,6 +79,7 @@ jobs:
       - name: Build release binary
         env:
           MACOSX_DEPLOYMENT_TARGET: '13.0'
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
         run: cargo build --release --locked --target "${{ matrix.target }}"
       - name: Package and smoke-test outside the checkout
         if: runner.os != 'Windows'

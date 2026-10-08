@@ -1,8 +1,8 @@
 [package]
 name = "dial"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
-description = "Local, gated model and harness improvement on Apple Silicon"
+description = "Cross-platform coding agent with gated local model and harness improvement"
 license = "MIT"
 
 [dependencies]

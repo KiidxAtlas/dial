@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
-          save-always: true
+          cache-on-failure: true
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
