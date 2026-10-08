@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "dial"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "ast-grep-core",

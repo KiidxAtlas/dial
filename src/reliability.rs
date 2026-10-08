@@ -400,6 +400,14 @@ pub fn check(config: &AppConfig) -> Result<Value> {
     let root = tempfile::tempdir()?;
     let workspace =
         tools::Workspace::new(root.path())?.with_edit_mode(tools::EditMode::from(config.edit_mode));
+    // Native Windows honours the same explicit opt-out as foreground command tools.
+    // Calls still must exactly match the known disposable fixture before execution.
+    #[cfg(windows)]
+    let workspace = if config.sandbox.mode == crate::config::types::SandboxMode::Off {
+        workspace.without_sandbox()
+    } else {
+        workspace
+    };
     let mut backend = crate::agent::make_backend(config)?.without_steering();
     let edit_mode = tools::EditMode::from(config.edit_mode);
     let source = "def value():\n    return 1\n";

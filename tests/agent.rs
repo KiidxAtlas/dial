@@ -6592,7 +6592,7 @@ fn independent_training_failure_gets_one_repair_and_only_success_is_harvestable(
 }
 
 #[test]
-fn isolated_search_applies_smallest_verified_patch_without_touching_other_files() {
+fn isolated_search_requires_confinement_and_applies_smallest_verified_patch() {
     if skip_without_sandbox() {
         return;
     }
@@ -6640,13 +6640,30 @@ fn isolated_search_applies_smallest_verified_patch_without_touching_other_files(
     std::fs::write(e.project.path().join("value.txt"), "broken\n").unwrap();
     std::fs::write(e.project.path().join("unrelated.txt"), "dirty user work\n").unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
     let report = a
-        .turn(
-            "Fix the value using verified candidates",
-            &mut Recorder::default(),
-        )
+        .turn("Fix the value using verified candidates", &mut ui)
         .unwrap();
     assert_eq!(report.outcome, TurnOutcome::Completed);
+    if cfg!(windows) {
+        assert_eq!(
+            std::fs::read_to_string(e.project.path().join("value.txt")).unwrap(),
+            "broken\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(e.project.path().join("unrelated.txt")).unwrap(),
+            "dirty user work\n"
+        );
+        assert!(ui.results.iter().any(|(name, text, error)| name == "solve"
+            && *error
+            && text.contains("No native Windows filesystem sandbox")));
+        assert_eq!(
+            server.requests.lock().len(),
+            2,
+            "no candidate may run without confinement"
+        );
+        return;
+    }
     assert_eq!(
         std::fs::read_to_string(e.project.path().join("value.txt")).unwrap(),
         "fixed\n"

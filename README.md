@@ -33,15 +33,15 @@ credentials stay managed by GitHub CLI. The curl path remains available for publ
 releases. Complete the platform prerequisites below before installing.
 
 The installer selects the correct archive and verifies its SHA-256 before installing.
-Run `bash install.sh v0.1.2` to select a specific release. The commands above are
+Run `bash install.sh v0.1.3` to select a specific release. The commands above are
 for macOS/Linux; use the PowerShell installer below on native Windows.
 
 ### macOS (Apple Silicon or Intel)
 
-In the download directory (replace `v0.1.2` with the release you downloaded):
+In the download directory (replace `v0.1.3` with the release you downloaded):
 
 ```sh
-version=v0.1.2
+version=v0.1.3
 # Apple Silicon: aarch64-apple-darwin; Intel: x86_64-apple-darwin
 target=aarch64-apple-darwin
 shasum -a 256 -c "dial-$version-$target.tar.gz.sha256"
@@ -82,7 +82,7 @@ dial --sandbox off
 The installer downloads the native `.exe`, verifies its SHA-256 and version, and
 installs it under `%LOCALAPPDATA%\Dial\bin`, adding that directory to your user
 PATH. An update that fails verification preserves the existing executable.
-Use `-Version v0.1.2` for a specific release. Access to this private repository is
+Use `-Version v0.1.3` for a specific release. Access to this private repository is
 required. You can also download the Windows ZIP and its `.zip.sha256` in your
 signed-in browser, verify it with `Get-FileHash`, extract it, and run `dial.exe`.
 
@@ -96,7 +96,9 @@ Native Windows command tools require an **explicit** `--sandbox off` (or
 and retain tool approval prompts. Windows Job Objects supervise command descendants
 for cancellation, timeout and normal shutdown; they do not restrict filesystem or
 network access. Dev/strict OS sandbox modes remain unavailable on native Windows.
-Use the WSL2 instructions below when Linux filesystem/network confinement is required.
+Verified candidate search (`solve`) also requires filesystem confinement and stays disabled
+on native Windows. Use the WSL2 instructions below for this feature or when Linux
+filesystem/network confinement is required.
 Set `DIAL_BASH` to an operator-installed `bash.exe` if Git Bash cannot be discovered.
 Dial keeps state in `%USERPROFILE%\.dial` unless `DIAL_HOME` is set, and protects
 private state files with the current user's Windows ACL.
@@ -135,7 +137,7 @@ sudo apt-get install -y bubblewrap ca-certificates
 Download the Linux archive and checksum into a Linux directory, then:
 
 ```sh
-version=v0.1.2
+version=v0.1.3
 sha256sum -c "dial-$version-x86_64-unknown-linux-gnu.tar.gz.sha256"
 tar -xzf "dial-$version-x86_64-unknown-linux-gnu.tar.gz"
 mkdir -p "$HOME/.local/bin"
@@ -193,9 +195,9 @@ The release workflow runs on pushed `v*` tags and requires the tag to match
 the release changes and push that commit and its tag, for example:
 
 ```sh
-git tag v0.1.2
+git tag v0.1.3
 git push origin main
-git push origin v0.1.2
+git push origin v0.1.3
 ```
 
 `.github/workflows/release.yml` checks formatting, runs the Rust tests (including

@@ -373,26 +373,33 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
+        // Queue complete requests before starting the callback reader, so a heavily
+        // loaded runner cannot let its preconnection timeout race the test writer.
+        let mut clients = Vec::new();
+        for target in [
+            "/favicon.ico",
+            "/callback?state=wrong&code=no",
+            "/callback?code=valid-code&state=state-good",
+        ] {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            write!(stream, "GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            clients.push(stream);
+        }
         let job = std::thread::spawn(move || {
             read_callback(&listener, "state-good", &AtomicBool::new(false))
         });
-        for target in ["/favicon.ico", "/callback?state=wrong&code=no"] {
-            let mut stream = TcpStream::connect(addr).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            write!(stream, "GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        for (index, mut stream) in clients.into_iter().enumerate() {
             let mut response = String::new();
-            let _ = stream.read_to_string(&mut response);
+            if index == 2 {
+                stream.read_to_string(&mut response).unwrap();
+                assert!(response.starts_with("HTTP/1.1 200"));
+            } else {
+                let _ = stream.read_to_string(&mut response);
+            }
         }
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream.write_all(b"GET /callback?code=valid-code&state=state-good HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 200"));
         assert_eq!(job.join().unwrap().unwrap(), "valid-code");
     }
 
