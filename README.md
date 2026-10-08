@@ -13,15 +13,25 @@ checkout is needed for prebuilt releases. Download the archive for your platform
 and its matching `.tar.gz.sha256` file from
 [GitHub Releases](https://github.com/KiidxAtlas/dial/releases).
 
-For a terminal install, after the platform prerequisites below are satisfied,
-download and review the installer from the latest published release, then run it:
+This repository remains private. Download access requires a GitHub account that
+has been granted repository access. You can download the matching archive and
+checksum from the release page in your signed-in browser, then follow the manual
+instructions below.
+
+For the terminal installer, install [GitHub CLI](https://cli.github.com/), then sign
+in with an account that has access and download the release's installer:
 
 ```sh
-curl -fL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh -o dial-install.sh
-bash dial-install.sh
+gh auth login --hostname github.com
+gh release download --repo KiidxAtlas/dial --pattern install.sh
+bash install.sh
 export PATH="$HOME/.local/bin:$PATH"
 dial
 ```
+
+The installer uses authenticated GitHub CLI downloads for private releases;
+credentials stay managed by GitHub CLI. The curl path remains available for public
+releases. Complete the platform prerequisites below before installing.
 
 The installer selects the correct archive and verifies its SHA-256 before installing.
 Run `bash dial-install.sh v0.1.0` to select a specific release. On Windows these commands
@@ -157,8 +167,8 @@ and smoke-tests each extracted archive outside the checkout. Only after **all th
 platform builds pass does it create a GitHub release with the archives, bundled MIT
 license and README, per-archive SHA-256 checksums, a combined `SHA256SUMS`, and
 generated notes. CI runs on both macOS and Ubuntu without weakening host security.
-The repository must be public for everyone to download releases; this workflow
-does not change repository visibility. Dial is MIT licensed; see `LICENSE` for
+The workflow preserves repository visibility. Private releases are available only
+to accounts with repository access; publishing a release does not grant that access. Dial is MIT licensed; see `LICENSE` for
 permission to use, modify, and redistribute it.
 
 ### Anthropic subscription sign-in

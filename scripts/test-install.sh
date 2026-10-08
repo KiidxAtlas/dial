@@ -27,6 +27,9 @@ SH
 cat > "$test_root/bin/curl" <<'SH'
 #!/bin/bash
 set -eu
+if [ "${PRIVATE_REPO:-0}" = 1 ]; then
+    echo 'Unauthenticated access to private releases is forbidden' >&2; exit 1
+fi
 output= url=
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -50,7 +53,33 @@ if [ "${BAD_MANIFEST:-0}" = 1 ] && [[ "$url" = *.sha256 ]]; then
     printf '%064d  ../outside\n' 0 > "$output"
 fi
 SH
-chmod +x "$test_root/bin/uname" "$test_root/bin/curl"
+cat > "$test_root/bin/gh" <<'SH'
+#!/bin/bash
+set -eu
+if [ "${FAKE_GH_AUTH:-0}" != 1 ] || [ "${FAKE_GH_DENIED:-0}" = 1 ]; then exit 1; fi
+case "$1 $2" in
+    'auth status') exit 0 ;;
+    'release view') echo v0.1.0; exit 0 ;;
+    'release download')
+        shift 2
+        [ "$1" = v0.1.0 ] || exit 1
+        shift
+        destination= repository=
+        files=()
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --repo) repository=$2; shift 2 ;;
+                --dir) destination=$2; shift 2 ;;
+                --pattern) files+=("$2"); shift 2 ;;
+                *) exit 1 ;;
+            esac
+        done
+        [ "$repository" = KiidxAtlas/dial ] || exit 1
+        for file in "${files[@]}"; do cp "$FIXTURES/$file" "$destination/$file"; done ;;
+    *) exit 1 ;;
+esac
+SH
+chmod +x "$test_root/bin/uname" "$test_root/bin/curl" "$test_root/bin/gh"
 export PATH="$test_root/bin:$PATH" FIXTURES="$test_root/releases" TMPDIR="$test_root/temp"
 export FAKE_OS=Darwin FAKE_ARCH=arm64 DIAL_INSTALL_DIR="$test_root/mac/bin"
 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/mac.log"
@@ -61,6 +90,15 @@ bash "$root/scripts/install.sh" latest > "$test_root/intel.log"
 export FAKE_OS=Linux FAKE_ARCH=x86_64 DIAL_INSTALL_DIR="$test_root/linux/bin"
 bash "$root/scripts/install.sh" latest > "$test_root/linux.log"
 [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial fixture' ]
+export FAKE_GH_AUTH=1 PRIVATE_REPO=1 DIAL_INSTALL_DIR="$test_root/private/bin"
+bash "$root/scripts/install.sh" latest > "$test_root/private.log"
+[ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial fixture' ]
+cp "$DIAL_INSTALL_DIR/dial" "$test_root/private-original"
+if FAKE_GH_DENIED=1 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/denied.log" 2>&1; then
+    echo 'Denied private release access was accepted' >&2; exit 1
+fi
+cmp "$DIAL_INSTALL_DIR/dial" "$test_root/private-original"
+export FAKE_GH_AUTH=0 PRIVATE_REPO=0 DIAL_INSTALL_DIR="$test_root/linux/bin"
 cp "$DIAL_INSTALL_DIR/dial" "$test_root/original"
 if TAMPER=1 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/tamper.log" 2>&1; then
     echo 'Tampered archive was accepted' >&2; exit 1
@@ -78,4 +116,4 @@ if bash "$root/scripts/install.sh" v0.1.0 > "$test_root/platform.log" 2>&1; then
     echo 'Unsupported native Windows was accepted' >&2; exit 1
 fi
 [ ! -e "$DIAL_INSTALL_DIR/dial" ]
-echo 'Installer tests passed: Apple Silicon/Intel macOS, Linux/WSL target selection, latest version, tamper rejection, no overwrite on failure, unsafe manifest/version/platform rejection.'
+echo 'Installer tests passed: Apple Silicon/Intel macOS, Linux/WSL target selection, latest version, authenticated private downloads and access denial, tamper rejection, no overwrite on failure, unsafe manifest/version/platform rejection.'

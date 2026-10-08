@@ -17,7 +17,15 @@ case "$(uname -s):$(uname -m)" in
     *) echo 'Supported: macOS Apple Silicon/Intel or Linux x86-64 (Windows users: run in WSL2 Ubuntu).' >&2; exit 1 ;;
 esac
 
-for tool in curl tar install mktemp; do
+# Authenticated GitHub CLI also supports private releases without exposing tokens
+# in command arguments, logs, or URLs. Public releases retain the curl path.
+use_gh=false
+if command -v gh >/dev/null && gh auth status --hostname github.com >/dev/null 2>&1; then
+    use_gh=true
+fi
+required_tools='tar install mktemp'
+if [ "$use_gh" = false ]; then required_tools="$required_tools curl"; fi
+for tool in $required_tools; do
     command -v "$tool" >/dev/null || { echo "Missing required tool: $tool" >&2; exit 1; }
 done
 if command -v sha256sum >/dev/null; then
@@ -32,9 +40,13 @@ fi
 version=${1:-latest}
 repository=https://github.com/KiidxAtlas/dial
 if [ "$version" = latest ]; then
-    release_url=$(curl --fail --silent --show-error --location --retry 2 \
-        --output /dev/null --write-out '%{url_effective}' "$repository/releases/latest")
-    version=${release_url##*/}
+    if [ "$use_gh" = true ]; then
+        version=$(gh release view --repo KiidxAtlas/dial --json tagName --jq .tagName)
+    else
+        release_url=$(curl --fail --silent --show-error --location --retry 2 \
+            --output /dev/null --write-out '%{url_effective}' "$repository/releases/latest")
+        version=${release_url##*/}
+    fi
 fi
 if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
     echo "Invalid release version (or no published release): $version" >&2
@@ -46,8 +58,16 @@ archive="$package.tar.gz"
 base="$repository/releases/download/$version"
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/dial-install.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
-curl --fail --silent --show-error --location --retry 2 "$base/$archive" --output "$scratch/$archive"
-curl --fail --silent --show-error --location --retry 2 "$base/$archive.sha256" --output "$scratch/$archive.sha256"
+if [ "$use_gh" = true ]; then
+    gh release download "$version" --repo KiidxAtlas/dial --dir "$scratch" \
+        --pattern "$archive" --pattern "$archive.sha256"
+else
+    curl --fail --silent --show-error --location --retry 2 "$base/$archive" --output "$scratch/$archive" || {
+        echo 'For private releases, install GitHub CLI and run gh auth login with an account granted repository access.' >&2
+        exit 1
+    }
+    curl --fail --silent --show-error --location --retry 2 "$base/$archive.sha256" --output "$scratch/$archive.sha256"
+fi
 
 read -r expected filename < "$scratch/$archive.sha256"
 if ! [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || [ "$filename" != "$archive" ]; then
