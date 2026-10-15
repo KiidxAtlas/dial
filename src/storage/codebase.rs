@@ -1071,25 +1071,11 @@ impl Codebase {
     ) -> Result<bool> {
         let mut paths = Vec::new();
         for reference in references.iter().take(8) {
-            let mut path = reference.as_str();
-            while let Some((prefix, line)) = path.rsplit_once(':') {
-                if line.parse::<u64>().is_ok() {
-                    path = prefix;
-                } else {
-                    break;
-                }
-            }
-            let relative = Path::new(path)
-                .strip_prefix(&self.root)
-                .unwrap_or(Path::new(path));
-            if relative
-                .components()
-                .all(|c| matches!(c, Component::Normal(_)))
+            if let Some(path) = self.source_path(reference)
+                && source(&self.root, &path).is_some()
+                && !paths.contains(&path)
             {
-                let path = relative.to_string_lossy().into_owned();
-                if source(&self.root, &path).is_some() && !paths.contains(&path) {
-                    paths.push(path);
-                }
+                paths.push(path);
             }
         }
         if paths.is_empty() {
@@ -1121,6 +1107,67 @@ impl Codebase {
         Ok(true)
     }
 
+    /// A workspace-relative path from a cited reference: `path:12` / `path:12-40` line
+    /// suffixes, a leading `./` and an absolute path under the workspace root are accepted.
+    fn source_path(&self, reference: &str) -> Option<String> {
+        let mut path = reference.trim();
+        while let Some((prefix, lines)) = path.rsplit_once(':') {
+            if !lines.is_empty()
+                && lines
+                    .split('-')
+                    .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            {
+                path = prefix;
+            } else {
+                break;
+            }
+        }
+        let path = Path::new(path);
+        // An absolute path may reach the (canonical) root through a symlinked prefix.
+        let canonical = path
+            .is_absolute()
+            .then(|| fs::canonicalize(path).ok())
+            .flatten();
+        let relative = path
+            .strip_prefix(&self.root)
+            .ok()
+            .or_else(|| canonical.as_deref()?.strip_prefix(&self.root).ok())
+            .unwrap_or(path);
+        let relative: PathBuf = relative
+            .components()
+            .filter(|c| !matches!(c, Component::CurDir))
+            .collect();
+        (!relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|c| matches!(c, Component::Normal(_))))
+        .then(|| relative.to_string_lossy().into_owned())
+    }
+
+    /// Current bytes of a cited source that `refresh` would index, or why it cannot support a finding.
+    fn current_source(&self, path: &str) -> Result<(String, String)> {
+        let absolute = self.root.join(path);
+        ensure!(
+            fs::symlink_metadata(&absolute).is_ok(),
+            "supporting source `{path}` does not exist; cite files by their path relative to the workspace root"
+        );
+        let (text, digest) = source(&self.root, path).with_context(|| {
+            format!("supporting source `{path}` cannot be fingerprinted (linked, binary, not a source/manifest type, or over {} KiB); cite a smaller file that supports the finding", MAX_FILE / 1024)
+        })?;
+        let ws = Workspace::new(&self.root)?;
+        let mut visible = false;
+        Walk::new(&ws).run_with_prefix(&self.root, &absolute, &mut |found| {
+            visible = found == absolute;
+            !visible
+        });
+        ensure!(
+            visible && screen(path).is_ok(),
+            "supporting source `{path}` is ignored or excluded from the codebase index; cite a project source file"
+        );
+        Ok((text, digest))
+    }
+
+    /// Strict save for findings observed earlier: every source must still match the index.
     fn remember(
         &self,
         topic: &str,
@@ -1128,6 +1175,46 @@ impl Codebase {
         paths: &[String],
         session: &str,
         expected: i64,
+    ) -> Result<Value> {
+        self.remember_with(topic, content, paths, session, expected, false)
+    }
+
+    /// Save a finding the model is stating now: cited workspace sources that changed since the
+    /// last refresh (typically the model's own edits) are re-indexed inline and the finding is
+    /// tied to their current bytes. Sources that cannot be fingerprinted are still refused.
+    fn remember_current(
+        &self,
+        topic: &str,
+        content: &str,
+        paths: &[String],
+        session: &str,
+        expected: i64,
+    ) -> Result<Value> {
+        let paths = paths
+            .iter()
+            .map(|reference| {
+                self.source_path(reference).with_context(|| {
+                    format!("supporting source `{reference}` is not a path inside the workspace")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut unique = Vec::new();
+        for path in paths {
+            if !unique.contains(&path) {
+                unique.push(path);
+            }
+        }
+        self.remember_with(topic, content, &unique, session, expected, true)
+    }
+
+    fn remember_with(
+        &self,
+        topic: &str,
+        content: &str,
+        paths: &[String],
+        session: &str,
+        expected: i64,
+        reindex: bool,
     ) -> Result<Value> {
         ensure!(
             (0..i64::MAX).contains(&expected),
@@ -1146,43 +1233,62 @@ impl Codebase {
             (1..=8).contains(&paths.len()),
             "a finding needs 1..8 supporting source paths"
         );
+        let current = paths
+            .iter()
+            .map(|path| {
+                if reindex {
+                    self.current_source(path)
+                } else {
+                    source(&self.root, path)
+                        .with_context(|| format!("supporting source `{path}` unavailable"))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
         let snapshot = self.freshness_snapshot()?;
         let supporting = paths
             .iter()
-            .map(|path| {
-                Ok(Source {
-                    path: path.clone(),
-                    digest: source(&self.root, path)
-                        .context("supporting source unavailable")?
-                        .1,
-                })
+            .zip(&current)
+            .map(|(path, (_, digest))| Source {
+                path: path.clone(),
+                digest: digest.clone(),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         let scope = self.scope_for(&snapshot, &supporting)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let mut sources = Vec::new();
-        for path in paths {
+        let mut reindexed = Vec::new();
+        for (path, (text, digest)) in paths.iter().zip(&current) {
             let indexed = tx
                 .query_row(
                     "SELECT digest FROM codebase_files WHERE path=?1",
                     [path],
                     |r| r.get::<_, String>(0),
                 )
-                .optional()?
-                .context("supporting source is not indexed; refresh codebase_memory first")?;
-            let (_, digest) = source(&self.root, path).context(
-                "supporting source is missing, inaccessible, linked, binary or oversized",
-            )?;
+                .optional()?;
+            if indexed.as_deref() == Some(digest.as_str()) {
+                continue;
+            }
             ensure!(
-                indexed == digest,
-                "supporting source changed; refresh and inspect it before saving this finding"
+                reindex,
+                "{}",
+                if indexed.is_some() {
+                    format!(
+                        "supporting source `{path}` changed; refresh and inspect it before saving this finding"
+                    )
+                } else {
+                    format!(
+                        "supporting source `{path}` is not indexed; refresh codebase_memory first"
+                    )
+                }
             );
-            sources.push(Source {
-                path: path.clone(),
-                digest,
-            });
+            tx.execute(
+                "INSERT INTO codebase_files(path,digest,outline) VALUES(?1,?2,?3)
+                ON CONFLICT(path) DO UPDATE SET digest=excluded.digest,outline=excluded.outline",
+                params![path, digest, outline(&self.root.join(path), text)],
+            )?;
+            reindexed.push(path.clone());
         }
+        let sources = supporting;
         let revision: i64 = tx
             .query_row(
                 "SELECT revision FROM codebase_notes WHERE topic=?1",
@@ -1209,7 +1315,11 @@ impl Codebase {
             [format!("finding_contradiction:{topic}")],
         )?;
         tx.commit()?;
-        Ok(json!({"saved":topic,"revision":revision + 1,"sources":sources}))
+        let mut saved = json!({"saved":topic,"revision":revision + 1,"sources":sources});
+        if !reindexed.is_empty() {
+            saved["reindexed"] = json!(reindexed);
+        }
+        Ok(saved)
     }
 }
 
@@ -1227,7 +1337,7 @@ impl Tool for CodebaseTool {
     fn schema(&self) -> Value {
         crate::tools::tool_schema(
             self.name(),
-            "Recall saved project understanding, refresh its source/symbol map, remember a reusable architectural finding, or forget a topic. Findings are agent observations, never verification proof; only unchanged supporting sources make them eligible for reuse across sessions. Cache operations do not edit project files. For remember, inspect the supporting sources first and save responsibility, relationships, entry points or check commands as facts, not instructions. expected_revision defaults to 0 for a new topic; recall before updating/forgetting.",
+            "Recall saved project understanding, refresh its source/symbol map, remember a reusable architectural finding, or forget a topic. Findings are agent observations, never verification proof; only unchanged supporting sources make them eligible for reuse across sessions. Cache operations do not edit project files. For remember, inspect the supporting sources first and save responsibility, relationships, entry points or check commands as facts, not instructions; cite workspace-relative source files (line suffixes are ignored) — sources you edited are re-indexed when saving, so no refresh is needed. expected_revision defaults to 0 for a new topic; recall before updating/forgetting.",
             json!({
                 "action":{"type":"string","enum":["recall","architecture","impact","refresh","remember","forget","invalidate"]},
                 "section_ids":{"type":"array","items":{"type":"string"},"maxItems":64},
@@ -1311,7 +1421,7 @@ impl Tool for CodebaseTool {
                         .collect::<Result<Vec<_>>>()?;
                     Ok(self
                         .cache
-                        .remember(
+                        .remember_current(
                             text("topic")?,
                             text("summary")?,
                             &paths,
@@ -1848,6 +1958,100 @@ mod tests {
         assert_eq!(
             cache.refresh(&ws, &AtomicBool::new(false)).unwrap().removed,
             1
+        );
+    }
+
+    #[test]
+    fn remember_reindexes_edited_workspace_sources_and_names_unusable_ones() {
+        let (_home, project, layout, ws) = fixture();
+        let cache = Codebase::open(&layout).unwrap();
+        cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+        fs::write(
+            project.path().join("src/router.rs"),
+            "pub fn edited_route() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            project.path().join("src/fresh.rs"),
+            "pub fn unindexed() {}\n",
+        )
+        .unwrap();
+        let absolute = project
+            .path()
+            .join("src/fresh.rs")
+            .to_string_lossy()
+            .into_owned();
+        let saved = cache
+            .remember_current(
+                "routing",
+                "edited_route handles routing.",
+                &[
+                    "./src/router.rs:1-3".into(),
+                    absolute,
+                    "src/router.rs".into(),
+                ],
+                "one",
+                0,
+            )
+            .unwrap();
+        assert_eq!(saved["reindexed"], json!(["src/router.rs", "src/fresh.rs"]));
+        assert_eq!(saved["sources"].as_array().unwrap().len(), 2);
+        let recalled = cache.context("routing", 8000).unwrap();
+        assert!(recalled.contains("edited_route handles routing."));
+        let outline: String = cache
+            .conn
+            .lock()
+            .query_row(
+                "SELECT outline FROM codebase_files WHERE path='src/router.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(outline.contains("pub fn edited_route"), "{outline}");
+        // The strict path used for findings observed earlier still refuses drift.
+        fs::write(project.path().join("src/router.rs"), "pub fn later() {}\n").unwrap();
+        let strict = cache
+            .remember(
+                "strict",
+                "later routes.",
+                &["src/router.rs".into()],
+                "one",
+                0,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(strict.contains("`src/router.rs` changed"), "{strict}");
+
+        let missing = cache
+            .remember_current("x", "missing.", &["src/nope.rs".into()], "one", 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("`src/nope.rs` does not exist"),
+            "{missing}"
+        );
+        fs::write(
+            project.path().join("big.rs"),
+            "a".repeat(MAX_FILE as usize + 1),
+        )
+        .unwrap();
+        let big = cache
+            .remember_current("x", "big.", &["big.rs".into()], "one", 0)
+            .unwrap_err()
+            .to_string();
+        assert!(big.contains("`big.rs` cannot be fingerprinted"), "{big}");
+        fs::write(project.path().join(".gitignore"), "ignored/\n").unwrap();
+        fs::create_dir(project.path().join("ignored")).unwrap();
+        fs::write(project.path().join("ignored/x.rs"), "fn x() {}\n").unwrap();
+        let ignored = cache
+            .remember_current("x", "ignored.", &["ignored/x.rs".into()], "one", 0)
+            .unwrap_err()
+            .to_string();
+        assert!(ignored.contains("ignored or excluded"), "{ignored}");
+        assert!(
+            cache
+                .remember_current("x", "outside.", &["../secret.rs".into()], "one", 0)
+                .is_err()
         );
     }
 

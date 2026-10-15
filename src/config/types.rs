@@ -453,7 +453,8 @@ pub struct Config {
     /// Every tool schema costs the model context and attention; trim this list for small models.
     /// MCP tools follow `[mcp.*]` instead.
     pub integrations: Vec<String>,
-    /// `[bash_interceptor]`: rejects bash commands that duplicate a dedicated tool. Off by default.
+    /// `[bash_interceptor]`: points bash commands that duplicate a dedicated tool at it. On by
+    /// default in `hint` mode (the command runs and gains a one-line pointer); `block` refuses it.
     pub bash_interceptor: crate::tools::bash_interceptor::BashInterceptorConfig,
     /// `[ssh]`: host key policy and connection timing for the ssh tool. Hosts come from `~/.ssh/config`.
     pub ssh: crate::tools::ssh::SshConfig,
@@ -957,6 +958,9 @@ impl Default for AssistanceConfig {
     }
 }
 
+/// Default `efficiency.history_token_cap` (2^18, a multiple of the settings step).
+pub const DEFAULT_HISTORY_TOKEN_CAP: u32 = 262_144;
+
 /// Shared context economy; does not change approvals, output/reasoning budgets or verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -971,9 +975,10 @@ pub struct EfficiencyConfig {
     pub task_packet: bool,
     pub lightweight_requests: u32,
     pub cache_pressure_percent: u32,
-    /// Absolute ceiling (tokens) on the history a request carries before pruning and compaction
-    /// start, whatever the model's window. Every step resends the history, so a 1M-token window
-    /// must not mean a 750k-token request. Smaller model windows are unaffected.
+    /// Window (tokens) that compaction and pruning plan against when the model's window is larger;
+    /// 0 plans against the full window. Every step resends the history, so a 1M-token window must
+    /// not mean a 600k-token request: at the default the auto trigger fires near 178k instead of
+    /// 680k. Smaller model windows are unaffected.
     pub history_token_cap: u32,
 }
 impl Default for EfficiencyConfig {
@@ -985,7 +990,7 @@ impl Default for EfficiencyConfig {
             task_packet: false,
             lightweight_requests: 4,
             cache_pressure_percent: 75,
-            history_token_cap: 0,
+            history_token_cap: DEFAULT_HISTORY_TOKEN_CAP,
         }
     }
 }

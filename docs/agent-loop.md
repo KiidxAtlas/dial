@@ -141,6 +141,17 @@ limits, reasoning budgets, approvals or verification requirements:
   cached prefix survives every step. Compaction uses the configured token/percentage/model/agent
   policy, with output and reserve headroom checked against the current model window. Observation
   projection never mutates archived evidence.
+- Very large windows are planned against `efficiency.history_token_cap` (default 262144) rather
+  than their full size, because every step resends the whole history. With `threshold_*` on `auto`,
+  the trigger is 80% of the planning window after its reserve (15%, at least 16k): about 178k on a
+  1M-token model instead of about 680k, and unchanged (about 136k) on a 200k model. The prefix
+  stays byte-stable between compactions, so caching is unaffected; compaction still keeps
+  `keep_recent_tokens` of recent history verbatim, a summary of up to 16k tokens, and the
+  carried-forward read/modified file lists. Requests sent while a background summary is still
+  running may exceed the cap up to the real window's safe budget. Set the cap to 0 (or
+  `efficiency.enabled = false`) to plan against the full window; an explicit
+  `compaction.threshold_tokens` / `threshold_percent` or model threshold is applied to the capped
+  window.
 - The transient task evidence packet is off by default (`efficiency.task_packet`); requests carry the
   conversation plus a one-line task focus while a todo is in progress.
 - Request accounting measures serialized JSON bytes once for context estimates, overhead events and
@@ -154,7 +165,7 @@ ambient_context_bytes = 0       # unlimited per ambient source
 tool_preview_bytes = 0          # unlimited successful-result previews
 lightweight_requests = 4         # 0 disables the lightweight contract
 cache_pressure_percent = 75     # 50..79; below the normal compaction threshold
-history_token_cap = 0           # no operator history cap; actual model context still applies
+history_token_cap = 262144      # planning window for larger models; 0 = the model's full window
 ```
 
 ## Loop feedback and experimental workflows

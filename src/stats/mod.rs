@@ -71,6 +71,20 @@ pub struct RequestRecord {
     pub duration_ms: u64,
     pub finish_reason: String,
     pub error: bool,
+    pub wire: Option<WireRecord>,
+}
+
+/// Cache diagnostics for one request: `invalidation` is `none`/`transport_changed` when the
+/// prompt extended the previous one, so a low `cache_read` there is provider-side.
+#[derive(Debug, Clone, Default)]
+pub struct WireRecord {
+    /// `http`, `websocket` or `websocket_chained` (delta over `previous_response_id`).
+    pub transport: String,
+    /// `initial`, `none`, `prompt_changed`, `model_changed` or `transport_changed`.
+    pub invalidation: String,
+    /// Serialized prompt bytes shared with the previous request of the same backend.
+    pub common_prompt_bytes: u64,
+    pub prompt_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -226,6 +240,33 @@ fn private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("creating private directory {}", dir.display()))
 }
 
+/// Columns added after the first release; NULL on rows recorded before them.
+const REQUEST_COLUMNS: [(&str, &str); 4] = [
+    ("transport", "TEXT"),
+    ("invalidation", "TEXT"),
+    ("common_prompt_bytes", "INTEGER"),
+    ("prompt_bytes", "INTEGER"),
+];
+
+/// Idempotent and safe against a concurrent opener: the write lock is held across check and alter.
+fn migrate(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let existing = conn
+            .prepare("SELECT name FROM pragma_table_info('requests')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        for (name, kind) in REQUEST_COLUMNS {
+            if !existing.contains(name) {
+                conn.execute_batch(&format!("ALTER TABLE requests ADD COLUMN {name} {kind}"))?;
+            }
+        }
+        Ok(())
+    })();
+    conn.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    result
+}
+
 fn sql_u64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -241,6 +282,7 @@ impl Db {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)
             .context("creating the stats schema")?;
+        migrate(&conn).context("migrating the stats schema")?;
         Ok(Self { conn })
     }
 
@@ -252,11 +294,15 @@ impl Db {
         let tx = self.conn.transaction()?;
         let cost = r.cost_usd.filter(|c| c.is_finite() && *c >= 0.0);
         tx.execute(
-            "INSERT INTO requests(ts, session, project, model, input, output, cache_read, cache_write, reasoning, reported, cost, duration_ms, finish, error)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO requests(ts, session, project, model, input, output, cache_read, cache_write, reasoning, reported, cost, duration_ms, finish, error,
+               transport, invalidation, common_prompt_bytes, prompt_bytes)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![r.ts_ms, r.session, r.project, r.model, sql_u64(r.input), sql_u64(r.output),
                 sql_u64(r.cache_read), sql_u64(r.cache_write), sql_u64(r.reasoning), r.reported,
-                cost, sql_u64(r.duration_ms), r.finish_reason, r.error],
+                cost, sql_u64(r.duration_ms), r.finish_reason, r.error,
+                r.wire.as_ref().map(|w| &w.transport), r.wire.as_ref().map(|w| &w.invalidation),
+                r.wire.as_ref().map(|w| sql_u64(w.common_prompt_bytes)),
+                r.wire.as_ref().map(|w| sql_u64(w.prompt_bytes))],
         )?;
         tx.execute(
             "INSERT INTO request_hourly VALUES(?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -1199,6 +1245,55 @@ mod tests {
             finish_reason: "stop".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn legacy_request_table_gains_wire_columns_and_records_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(dir.path());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE requests(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, session TEXT NOT NULL,
+                  project TEXT NOT NULL, model TEXT NOT NULL, input INTEGER NOT NULL, output INTEGER NOT NULL,
+                  cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL, reasoning INTEGER NOT NULL,
+                  reported INTEGER NOT NULL, cost REAL, duration_ms INTEGER NOT NULL, finish TEXT NOT NULL, error INTEGER NOT NULL);
+                 INSERT INTO requests VALUES(1,1,'old','p','m',10,1,0,0,0,1,NULL,5,'stop',0);",
+            )
+            .unwrap();
+        let mut db = Db::open(&path).unwrap();
+        drop(Db::open(&path).unwrap());
+        db.record_request(&RequestRecord {
+            wire: Some(WireRecord {
+                transport: "http".into(),
+                invalidation: "none".into(),
+                common_prompt_bytes: 900,
+                prompt_bytes: 1000,
+            }),
+            ..request(2, "m", 1000, 10, 0, None, 5)
+        })
+        .unwrap();
+        let rows: Vec<(String, Option<String>, Option<String>, Option<i64>, Option<i64>)> = db
+            .conn
+            .prepare("SELECT session, transport, invalidation, common_prompt_bytes, prompt_bytes FROM requests ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("old".into(), None, None, None, None),
+                (
+                    "s1".into(),
+                    Some("http".into()),
+                    Some("none".into()),
+                    Some(900),
+                    Some(1000)
+                ),
+            ]
+        );
     }
 
     #[test]

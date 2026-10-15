@@ -264,6 +264,8 @@ pub struct Reply {
     /// `committedAcuCost`). `None` when the provider reported none; each field is set only when
     /// the provider reported it non-zero.
     pub credits: Option<ReplyCredits>,
+    /// Fingerprint of the final outbound payload that produced this reply (cache diagnostics).
+    pub wire: Option<wire::Observation>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

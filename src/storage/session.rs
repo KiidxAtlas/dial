@@ -32,6 +32,27 @@ use super::paths::Layout;
 use super::session_pins;
 use crate::tools::ToolOutput;
 
+/// How long a reopen waits for a writer lock that looks busy.
+const WRITER_CLAIM_WAIT: Duration = Duration::from_secs(2);
+
+/// Claims the exclusive writer lock. A child forked by any thread (tool processes start with
+/// fork+exec) shares the descriptor, and so the `flock`, until it execs; a writer that has just
+/// closed can therefore look busy for a moment. Retry briefly before treating it as a live writer.
+fn claim_writer(file: &File) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + WRITER_CLAIM_WAIT;
+    loop {
+        match FileExt::try_lock_exclusive(file) {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Longest line we write or read. Longer lines on disk are skipped; an oversized message append is
 /// stored truncated with an artifact pointer to the full original (see `fit_oversized_message`).
 const MAX_LINE: usize = 8 * 1024 * 1024;
@@ -44,6 +65,7 @@ const COMPACTION_FRAME_CLOSE: &str = "\n</summary>";
 const MAX_INDEXED_TOOL_BODY: usize = 2048;
 const MAX_INDEXED_TEXT: usize = 16 * 1024;
 const TITLE_CHARS: usize = 80;
+const PICKER_PREVIEW_CHARS: usize = 1200;
 
 pub const MAX_CONTEXT_NOTES_BYTES: usize = 16_384;
 const CONTEXT_NOTES_ENTRY_TYPE: &str = "experimental_context_notes";
@@ -150,11 +172,19 @@ pub struct SessionInfo {
     pub id: String,
     pub path: PathBuf,
     pub started: String,
+    /// Timestamp of the last accepted journal entry, falling back to `started`.
+    pub updated: String,
     pub title: String,
     pub messages: usize,
     pub model: String,
     pub parent_id: Option<String>,
     pub first_message: String,
+    /// Latest real user request on the active branch (bounded preview).
+    pub last_message: String,
+    /// Latest nonempty assistant text on the active branch (bounded preview).
+    pub last_answer: String,
+    /// Real user requests on the active branch, including compacted history.
+    pub user_messages: usize,
     pub project: String,
 }
 
@@ -462,6 +492,15 @@ fn role_of(message: &Value) -> &str {
     message.get("role").and_then(Value::as_str).unwrap_or("")
 }
 
+/// Shared exclusion rules for original conversation records, not synthetic context.
+fn is_conversation_message(message: &Value) -> bool {
+    matches!(role_of(message), "user" | "assistant")
+        && message["dial_transient"] != true
+        && message["dial_portable_rules"] != true
+        && message["dial_context_notes"] != true
+        && message["dial_context_rollover"] != true
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}…", &s[..i]),
@@ -741,7 +780,7 @@ impl Session {
                 && platform_fs::owned_by_current_user(&file)?,
             "session writer requires an owner-owned regular file without hard links"
         );
-        FileExt::try_lock_exclusive(&file).with_context(|| {
+        claim_writer(&file).with_context(|| {
             format!(
                 "session {} is already open for writing; close its owning Dial session before resuming or renaming it",
                 path.display()
@@ -881,6 +920,35 @@ impl Session {
     /// Newest first by creation, ignoring pins, so `.first()` is the most recent session.
     pub fn list_newest(layout: &Layout, limit: usize) -> Result<Vec<SessionInfo>> {
         Self::list_paths(session_files(&layout.sessions_dir())?, limit)
+    }
+
+    /// Activity-ordered picker snapshot, pinned first. Reads journals once without mutating them.
+    /// `limit` budgets conversations and empty sessions separately (at most `2 * limit` rows),
+    /// so recent empty journals cannot displace conversations and callers can toggle empties.
+    /// Original active-branch records supply previews; bootstrap/compaction prefixes do not.
+    pub fn list_for_picker(layout: &Layout, limit: usize) -> Result<Vec<SessionInfo>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pinned = session_pins::load(&layout.user_dir)?;
+        let mut sessions = Self::list_paths(session_files(&layout.sessions_dir())?, usize::MAX)?;
+        // Stable sorting preserves newest-created order for equal activity timestamps.
+        sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
+        let mut sessions = session_pins::sort_pinned_first(sessions, &pinned, |s| &s.id);
+        let (mut conversations, mut empty) = (0usize, 0usize);
+        sessions.retain(|session| {
+            let count = if session.user_messages == 0 {
+                &mut empty
+            } else {
+                &mut conversations
+            };
+            if *count >= limit {
+                return false;
+            }
+            *count += 1;
+            true
+        });
+        Ok(sessions)
     }
 
     /// Sessions across every project, newest first.
@@ -1081,6 +1149,35 @@ impl Session {
             }
             let Ok(s) = Self::load(&path) else { continue };
             let first_message = s.first_message();
+            let updated = s
+                .entries
+                .iter()
+                .rev()
+                .find(|e| !e.ts.is_empty())
+                .map_or_else(|| s.started.clone(), |e| e.ts.clone());
+            let (mut last_message, mut last_answer, mut user_messages) =
+                (String::new(), String::new(), 0usize);
+            for &i in &s.active.branch {
+                let Kind::Message(message) = &s.entries[i].kind else {
+                    continue;
+                };
+                if !is_conversation_message(message) {
+                    continue;
+                }
+                if role_of(message) == "user" {
+                    user_messages += 1;
+                    last_message = truncate_chars(&content_text(message), PICKER_PREVIEW_CHARS);
+                } else {
+                    let original = message
+                        .get("dial_child_original_response")
+                        .filter(|original| role_of(original) == "assistant")
+                        .unwrap_or(message);
+                    let text = content_text(original);
+                    if !text.trim().is_empty() {
+                        last_answer = truncate_chars(&text, PICKER_PREVIEW_CHARS);
+                    }
+                }
+            }
             let project = path
                 .parent()
                 .and_then(Path::parent)
@@ -1091,6 +1188,10 @@ impl Session {
                 title: s.title(),
                 messages: s.message_count(),
                 first_message,
+                updated,
+                last_message,
+                last_answer,
+                user_messages,
                 project,
                 id: s.id,
                 path,
@@ -1223,13 +1324,7 @@ impl Session {
             .branch
             .iter()
             .filter_map(|&i| match &self.entries[i].kind {
-                Kind::Message(message)
-                    if matches!(role_of(message), "user" | "assistant")
-                        && message["dial_transient"] != true
-                        && message["dial_portable_rules"] != true
-                        && message["dial_context_notes"] != true
-                        && message["dial_context_rollover"] != true =>
-                {
+                Kind::Message(message) if is_conversation_message(message) => {
                     let original = message
                         .get("dial_child_original_response")
                         .filter(|original| matches!(role_of(original), "user" | "assistant"))
@@ -1329,13 +1424,8 @@ impl Session {
 
     /// Recover the authoritative request verbatim even across repeated notes-backed windows.
     pub fn context_request(&self) -> Option<Value> {
-        let is_request = |message: &Value| {
-            message["role"] == "user"
-                && message["dial_transient"] != true
-                && message["dial_portable_rules"] != true
-                && message["dial_context_notes"] != true
-                && message["dial_context_rollover"] != true
-        };
+        let is_request =
+            |message: &Value| role_of(message) == "user" && is_conversation_message(message);
         if let Some(id) = self.active.control_state["current_instruction_entry_id"].as_str()
             && self.contains_branch_leaf(id)
             && let Some(&i) = self.by_id.get(id)
@@ -4050,6 +4140,130 @@ mod tests {
         assert_eq!(Session::list(&e.layout, 10).unwrap()[0].id, ids[0]);
         assert_eq!(Session::list_newest(&e.layout, 10).unwrap()[0].id, long);
         assert_eq!(Session::list_newest(&e.layout, 1).unwrap()[0].id, long);
+    }
+
+    #[test]
+    fn picker_activity_pins_and_separate_empty_budget() {
+        let e = env();
+        let mut old = new_session(&e);
+        old.append(user("older conversation")).unwrap();
+        let mut newer = new_session(&e);
+        newer.append(user("newer conversation")).unwrap();
+        let mut empty_id = String::new();
+        for _ in 0..201 {
+            let mut empty = new_session(&e);
+            empty
+                .append(json!({"role":"user","content":"bootstrap","dial_transient":true}))
+                .unwrap();
+            empty_id = empty.id().to_owned();
+        }
+        old.rename("recent journal activity").unwrap();
+        let last_ts = old.entries.last().unwrap().ts.clone();
+        let rows = Session::list_for_picker(&e.layout, 1).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, old.id());
+        assert_eq!(rows[0].updated, last_ts);
+        assert_eq!(rows[1].id, empty_id);
+        assert_eq!(rows[1].user_messages, 0);
+        assert!(rows[1].last_message.is_empty());
+        assert_eq!(Session::list_newest(&e.layout, 1).unwrap()[0].id, empty_id);
+        session_pins::toggle(&e.layout.user_dir, newer.id()).unwrap();
+        let rows = Session::list_for_picker(&e.layout, 1).unwrap();
+        assert_eq!(rows[0].id, newer.id());
+        session_pins::toggle(&e.layout.user_dir, &empty_id).unwrap();
+        let rows = Session::list_for_picker(&e.layout, 2).unwrap();
+        assert_eq!(rows[0].id, empty_id);
+        assert_eq!(rows[1].id, newer.id());
+        assert_eq!(rows.len(), 4);
+        assert!(Session::list_for_picker(&e.layout, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn picker_previews_filter_context_and_tools_and_bound_unicode() {
+        let e = env();
+        let mut s = new_session(&e);
+        s.append(user("first request")).unwrap();
+        let prompt = "雪".repeat(1300);
+        let answer = "🦀".repeat(1300);
+        s.append(json!({"role":"user","content":[{"type":"text","text":prompt}]}))
+            .unwrap();
+        s.append(assistant(&answer)).unwrap();
+        for flag in [
+            "dial_transient",
+            "dial_portable_rules",
+            "dial_context_notes",
+            "dial_context_rollover",
+        ] {
+            for role in ["user", "assistant"] {
+                let mut message = json!({"role":role,"content":"synthetic context"});
+                message[flag] = json!(true);
+                s.append(message).unwrap();
+            }
+        }
+        s.append(json!({"role":"tool","content":"tool output"}))
+            .unwrap();
+        s.append(json!({"role":"assistant","content":null,"tool_calls":[]}))
+            .unwrap();
+        s.push(Kind::Compaction {
+            summary: "synthetic summary".into(),
+            first_kept: None,
+            prefix: Some(vec![user("synthetic prefix")]),
+        })
+        .unwrap();
+        s.push(Kind::ContextReset {
+            bootstrap: vec![user("bootstrap request"), assistant("bootstrap answer")],
+            notes: None,
+            digest: String::new(),
+        })
+        .unwrap();
+        let path = s.path().unwrap().to_owned();
+        let before = fs::read(&path).unwrap();
+        let rows = Session::list_for_picker(&e.layout, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user_messages, 2);
+        assert_eq!(
+            rows[0].last_message,
+            truncate_chars(&prompt, PICKER_PREVIEW_CHARS)
+        );
+        assert_eq!(
+            rows[0].last_answer,
+            truncate_chars(&answer, PICKER_PREVIEW_CHARS)
+        );
+        assert_eq!(
+            rows[0].last_message.chars().count(),
+            PICKER_PREVIEW_CHARS + 1
+        );
+        assert_eq!(
+            rows[0].last_answer.chars().count(),
+            PICKER_PREVIEW_CHARS + 1
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // An unparseable tail must neither change previews nor be healed by listing.
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{torn")
+            .unwrap();
+        let torn = fs::read(&path).unwrap();
+        let rows = Session::list_for_picker(&e.layout, 10).unwrap();
+        assert_eq!(rows[0].user_messages, 2);
+        assert_eq!(
+            rows[0].last_answer,
+            truncate_chars(&answer, PICKER_PREVIEW_CHARS)
+        );
+        assert_eq!(fs::read(&path).unwrap(), torn);
+    }
+
+    #[test]
+    fn picker_header_only_session_uses_creation_time() {
+        let e = env();
+        let s = new_session(&e);
+        let rows = Session::list_for_picker(&e.layout, 1).unwrap();
+        assert_eq!(rows[0].id, s.id());
+        assert_eq!(rows[0].updated, rows[0].started);
+        assert_eq!(rows[0].user_messages, 0);
+        assert!(rows[0].last_message.is_empty() && rows[0].last_answer.is_empty());
     }
 
     #[test]

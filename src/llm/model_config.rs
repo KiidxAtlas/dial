@@ -621,13 +621,17 @@ impl Default for UiConfig {
 }
 
 /// Model roles a user can assign, each with the consumers it drives. `main` is the session model and is
-/// always assigned. Unassigned `judge` follows `small`, which follows `main`; `coach`, `tester`, `planner`
-/// and `memory` follow `main`. `decision` is the Laya checkpoint (never a chat model) and has no chat fallback.
+/// always assigned. Unassigned `judge` follows `small`, which follows `main`; `task`, `coach`, `tester`,
+/// `planner` and `memory` follow `main`. `decision` is the Laya checkpoint (never a chat model) and has no chat fallback.
 pub const ROLES: &[(&str, &str)] = &[
-    ("main", "Conversation and coding agent; worker subagents"),
+    ("main", "Conversation and coding agent"),
     (
         "small",
-        "Fast background work: compaction, commit messages, architecture synthesis, scout and solve workers",
+        "Fast background work: compaction, commit messages, architecture synthesis and solve workers; assigned small also serves scout and custom read-only subagents",
+    ),
+    (
+        "task",
+        "Implementation tasks and worker subagents; fallback for scout, custom read-only, reviewer, test-runner and planner subagents when their preferred role is unassigned",
     ),
     (
         "coach",
@@ -692,8 +696,7 @@ pub const LEGACY_ROLE_MIGRATIONS: &[(&str, &str)] = &[
     ("compaction", "small"),
     ("architecture", "small"),
     ("memory", "memory"),
-    ("task", "small"),
-    ("subagent", "small"),
+    ("subagent", "task"),
     ("slow", "coach"),
     ("stronger", "coach"),
     ("advisor", "coach"),

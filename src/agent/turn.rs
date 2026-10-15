@@ -80,6 +80,7 @@ impl Agent<'_> {
             }
         }
         let mut todo_recovery = todo_recovery::TodoRecovery::default();
+        let mut solo_todo_noted = false;
         let mut pending_nudges: Vec<Value> = Vec::new();
         let mut coach_turn = modes::advisor::CoachTurn::default();
         let mut automatic_coach_pending = false;
@@ -1950,11 +1951,24 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                         (stall.streak(&call.name) >= 1
                             || matches!(call.name.as_str(), "edit" | "ast_edit"))
                         .then(|| crate::learn::task_policy::recovery_hint(&call.name, &output.text))
+                        .flatten()
                     });
                     if let Some(advice) = advice {
                         output.text.push_str("\n\n");
                         output.text.push_str(advice);
                     }
+                }
+                if call.name == "todo"
+                    && !output.is_error
+                    && let Some(note) = todo_recovery::solo_update_note(
+                        &reply.tool_calls,
+                        planning_required,
+                        solo_todo_noted,
+                    )
+                {
+                    solo_todo_noted = true;
+                    output.text.push_str("\n\n");
+                    output.text.push_str(note);
                 }
                 if let Some(advice) = repeat_advice {
                     ui.diagnostic(&format!("Recovery checkpoint: `{}` failed; correct its arguments or choose a different concrete action.", call.name));

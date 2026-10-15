@@ -63,30 +63,6 @@ jobs:
           if tag != f'v{version}':
               raise SystemExit(f'Tag {tag} must match Cargo.toml version v{version}')
           PY
-      - name: Require passing CI for this commit
-        # CI runs the full suite on these same platforms for every push to main; re-running it
-        # here doubled release time (10-21 min per macOS job). Wait for CI on the tagged commit.
-        env:
-          GH_TOKEN: ${{ github.token }}
-        timeout-minutes: 90
-        run: |
-          set -euo pipefail
-          waited=0
-          while :; do
-            runs=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --json status,conclusion)
-            if jq -e 'any(.[]; .conclusion == "success")' <<<"$runs" >/dev/null; then
-              echo "CI passed for $GITHUB_SHA"
-              break
-            fi
-            pending=$(jq 'any(.[]; .status != "completed")' <<<"$runs")
-            # A tag pushed with its commit can start before CI has registered a run.
-            if [ "$pending" != true ] && { [ "$runs" != '[]' ] || [ "$waited" -ge 300 ]; }; then
-              echo "No successful CI run for $GITHUB_SHA: $runs. Push the commit to main and let CI pass before tagging." >&2
-              exit 1
-            fi
-            sleep 30
-            waited=$((waited + 30))
-          done
       - name: Test terminal installer
         run: bash scripts/test-install.sh
       - name: Build release binary
@@ -183,6 +159,8 @@ jobs:
     permissions:
       contents: write
       packages: write
+      # Reads CI's result for the tagged commit.
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -190,6 +168,31 @@ jobs:
           pattern: release-assets-*
           merge-multiple: true
           path: dist
+      - name: Require passing CI for this commit
+        # CI runs the full suite on these same platforms for every push to main; re-running it
+        # here doubled release time (10-21 min per macOS job). Builds run while CI is still going;
+        # nothing is published until CI has passed for the tagged commit.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          waited=0
+          while :; do
+            runs=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --json status,conclusion)
+            if jq -e 'any(.[]; .conclusion == "success")' <<<"$runs" >/dev/null; then
+              echo "CI passed for $GITHUB_SHA"
+              break
+            fi
+            pending=$(jq 'any(.[]; .status != "completed")' <<<"$runs")
+            # A tag pushed with its commit can start before CI has registered a run.
+            if [ "$pending" != true ] && { [ "$runs" != '[]' ] || [ "$waited" -ge 300 ]; }; then
+              echo "No successful CI run for $GITHUB_SHA: $runs. Push the commit to main and let CI pass before tagging." >&2
+              exit 1
+            fi
+            sleep 30
+            waited=$((waited + 30))
+          done
       - name: Validate release signing configuration
         env:
           DIAL_RELEASE_SIGNING_KEY: ${{ secrets.DIAL_RELEASE_SIGNING_KEY }}

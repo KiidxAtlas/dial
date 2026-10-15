@@ -182,4 +182,18 @@ mod tests {
         let schema = super::super::schema("read", crate::config::types::EditMode::Replace).unwrap();
         assert!(Catalog::from_schemas(&[schema.clone(), schema], &Registry::new()).is_err());
     }
+    #[test]
+    fn oversized_grep_context_is_capped_at_runtime_not_rejected() {
+        let schema = super::super::schema("grep", crate::config::types::EditMode::Replace).unwrap();
+        let call = crate::llm::ToolCall {
+            id: "1".into(),
+            name: "grep".into(),
+            arguments: json!({"pattern": "fn", "context": 25}),
+            malformed_arguments: false,
+        };
+        assert_eq!(
+            validate_offered_call(&call, &[schema], &["grep".into()]),
+            None
+        );
+    }
 }

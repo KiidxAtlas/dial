@@ -151,6 +151,7 @@ const SHAPE: EnumValues = &[("box", "Box"), ("line", "Line")];
 const MODEL_ROLES: EnumValues = &[
     ("main", "Main"),
     ("small", "Small"),
+    ("task", "Task"),
     ("judge", "Judge"),
     ("coach", "Coach"),
     ("tester", "Tester"),

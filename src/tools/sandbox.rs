@@ -38,7 +38,12 @@
 //!    a symlink inside the workspace to a denied path is therefore refused.
 //!
 //! The Dev environment is rebuilt from the caller's, minus likely secrets
-//! ([`is_secret_env`]), with `TMPDIR` pointing at the scratch dir.
+//! ([`is_secret_env`]), with `TMPDIR` pointing at the scratch dir. Toolchain
+//! caches (`UV_CACHE_DIR`, `PIP_CACHE_DIR`, `npm_config_cache`, `GOCACHE`,
+//! `XDG_CACHE_HOME`) that are not already writable point at a dial-owned
+//! sandbox cache (`~/Library/Caches/dial/sandbox`, `~/.cache/dial/sandbox` on
+//! Linux), which is added to the write set; the user's own caches stay
+//! read-only. Strict commands are unaffected.
 //!
 //! Dev residual limits:
 //! * Other same-user processes' environment and arguments remain readable
@@ -260,7 +265,7 @@ impl Sandbox {
         owned_terminal: Option<i32>,
     ) -> Result<Command, String> {
         self.available()?;
-        let (allow_network, deny_read, extra_write) = match policy {
+        let (allow_network, deny_read, mut extra_write) = match policy {
             Policy::Strict { .. } => {
                 return self.command_mode(workspace, policy, program, args, owned_terminal);
             }
@@ -268,8 +273,23 @@ impl Sandbox {
                 deny_read,
                 extra_write,
                 allow_network,
-            } => (*allow_network, deny_read, extra_write),
+            } => (*allow_network, deny_read, extra_write.clone()),
         };
+        // Toolchains (uv, pip, npm, go) refuse to start when their home-directory cache is
+        // read-only; give them a dial-owned cache instead of widening writes to the real one.
+        let cache = toolchain_cache_root().filter(|root| std::fs::create_dir_all(root).is_ok());
+        if let Some(root) = &cache
+            && !extra_write.iter().any(|path| root.starts_with(path))
+        {
+            extra_write.push(root.clone());
+        }
+        #[cfg(target_os = "linux")]
+        let policy = &Policy::Dev {
+            deny_read: deny_read.clone(),
+            extra_write: extra_write.clone(),
+            allow_network,
+        };
+        let extra_write = &extra_write;
         #[cfg(windows)]
         {
             let _ = (allow_network, deny_read, extra_write, env);
@@ -299,10 +319,13 @@ impl Sandbox {
                 command.arg("-p").arg(profile).arg(program).args(args);
                 command
             };
-            command
-                .env_clear()
-                .envs(scrubbed_env(env))
-                .env("TMPDIR", &scratch);
+            let mut env = scrubbed_env(env);
+            if let Some(root) = &cache {
+                let mut writable = vec![workspace.to_path_buf()];
+                writable.extend(extra_write.iter().cloned());
+                redirect_toolchain_caches(&mut env, root, &writable);
+            }
+            command.env_clear().envs(env).env("TMPDIR", &scratch);
             Ok(command)
         }
     }
@@ -755,6 +778,60 @@ pub fn is_secret_env(name: &str, value: &str) -> bool {
             .rsplit_once('@')
             .is_some_and(|(userinfo, _)| userinfo.contains(':'))
     })
+}
+
+/// Cache variables a Dev command gets pointed at [`toolchain_cache_root`] (the empty
+/// subdirectory means the root itself), unless already set to a writable location.
+#[cfg(not(windows))]
+const TOOLCHAIN_CACHES: &[(&str, &str)] = &[
+    ("XDG_CACHE_HOME", ""),
+    ("UV_CACHE_DIR", "uv"),
+    ("PIP_CACHE_DIR", "pip"),
+    ("npm_config_cache", "npm"),
+    ("GOCACHE", "go-build"),
+];
+
+/// A dial-owned cache that only sandboxed Dev commands use, so a cache poisoned inside the
+/// sandbox never reaches the user's unsandboxed toolchains. Outside the dial state and user
+/// dirs (which Dev denies) and outside the workspace (so it is not indexed or committed).
+#[cfg(not(windows))]
+fn toolchain_cache_root() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    if !home.is_absolute() || home.parent().is_none() {
+        return None;
+    }
+    // Not `$XDG_CACHE_HOME`: on Linux it could name a system tree bubblewrap refuses to make writable.
+    #[cfg(target_os = "macos")]
+    let base = home.join("Library/Caches");
+    #[cfg(not(target_os = "macos"))]
+    let base = home.join(".cache");
+    Some(base.join("dial").join("sandbox"))
+}
+
+/// Point each cache variable in [`TOOLCHAIN_CACHES`] below `root` unless its current value
+/// is already inside one of the `writable` roots.
+#[cfg(not(windows))]
+fn redirect_toolchain_caches(
+    env: &mut Vec<(OsString, OsString)>,
+    root: &Path,
+    writable: &[PathBuf],
+) {
+    for (name, sub) in TOOLCHAIN_CACHES {
+        let current = env.iter().position(|(key, _)| key == name);
+        if let Some(index) = current {
+            let value = Path::new(&env[index].1);
+            if value.is_absolute() && writable.iter().any(|root| value.starts_with(root)) {
+                continue;
+            }
+            env.remove(index);
+        }
+        let path = if sub.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(sub)
+        };
+        env.push(((*name).into(), path.into_os_string()));
+    }
 }
 
 /// `env` minus secrets and non-UTF-8 entries; `PATH` is inherited (with a
@@ -1409,6 +1486,57 @@ mod tests {
         assert_ne!(blocked, Some(0), "network must be blocked: {out}");
         let (allowed, out) = fx.run(&fx.policy(true), &script);
         assert_eq!(allowed, Some(0), "network must be allowed: {out}");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn toolchain_caches_redirect_unless_already_writable() {
+        let root = PathBuf::from("/home/u/.cache/dial/sandbox");
+        let writable = vec![PathBuf::from("/work"), PathBuf::from("/extra")];
+        let mut env: Vec<(OsString, OsString)> = [
+            ("UV_CACHE_DIR", "/home/u/.cache/uv"),
+            ("PIP_CACHE_DIR", "/extra/pip"),
+            ("GOCACHE", "relative"),
+            ("KEEP_ME", "1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        redirect_toolchain_caches(&mut env, &root, &writable);
+        let get = |name: &str| {
+            let hits: Vec<_> = env.iter().filter(|(k, _)| k == name).collect();
+            assert_eq!(hits.len(), 1, "{name} set once: {env:?}");
+            hits[0].1.to_string_lossy().into_owned()
+        };
+        assert_eq!(get("UV_CACHE_DIR"), "/home/u/.cache/dial/sandbox/uv");
+        assert_eq!(get("PIP_CACHE_DIR"), "/extra/pip", "writable choice kept");
+        assert_eq!(get("GOCACHE"), "/home/u/.cache/dial/sandbox/go-build");
+        assert_eq!(get("npm_config_cache"), "/home/u/.cache/dial/sandbox/npm");
+        assert_eq!(get("XDG_CACHE_HOME"), "/home/u/.cache/dial/sandbox");
+        assert_eq!(get("KEEP_ME"), "1");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dev_toolchain_caches_are_writable_but_real_caches_stay_read_only() {
+        if !require_for_test() {
+            return;
+        }
+        let fx = Fixture::new();
+        let home = std::env::var("HOME").unwrap();
+        let script = format!(
+            "probe=\"$UV_CACHE_DIR/probe-$$\"; mkdir -p \"$UV_CACHE_DIR\" && touch \"$probe\" && rm \"$probe\" && echo cache-ok; \
+             touch \"{home}/Library/Caches/dial-sandbox-escape-$$\" 2>/dev/null && echo escaped; \
+             echo \"$UV_CACHE_DIR\""
+        );
+        let (code, out) = fx.run(&fx.policy(false), &script);
+        assert_eq!(code, Some(0), "{out}");
+        assert!(out.contains("cache-ok"), "{out}");
+        assert!(!out.contains("escaped"), "{out}");
+        assert!(
+            out.contains(&format!("{home}/Library/Caches/dial/sandbox/uv")),
+            "{out}"
+        );
     }
 
     #[cfg(target_os = "macos")]

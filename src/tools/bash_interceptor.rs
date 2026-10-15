@@ -1,7 +1,10 @@
-//! Bash intent interceptor: blocks shell commands that have a dedicated tool.
+//! Bash intent interceptor: points shell commands that duplicate a dedicated tool at that tool.
 //!
-//! Bash command interception: default rules and a flat segment extractor for conservative
-//! command splitting.
+//! In the default `hint` mode the command runs and its result gains one line naming the tool;
+//! only a command that is nothing but the duplicate (optionally trimmed by `head`/`tail`) is
+//! hinted, so batched compound commands, which save model round trips, pass untouched. `block`
+//! mode refuses any command with a matching segment instead. [`ci_poll_hint`] separately steers
+//! repeated `gh run` status checks toward one blocking wait.
 //!
 //! Rules are written as JavaScript `RegExp` patterns. Dial uses `fancy-regex` (lookaround
 //! support, backtracking like JS). Rule patterns are JS syntax, so [`translate_pattern`]
@@ -26,12 +29,43 @@ pub struct Rule {
     pub allow_subcommands: Option<Vec<String>>,
 }
 
-/// `[bashInterceptor]` configuration. `patterns: None` selects [`default_rules`].
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+/// What a matching command gets.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InterceptMode {
+    /// Run the command and append a one-line pointer to the dedicated tool.
+    #[default]
+    Hint,
+    /// Refuse the command with the rule's message; the model must reissue it.
+    Block,
+}
+
+/// `[bash_interceptor]` configuration. `patterns: None` selects [`default_rules`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct BashInterceptorConfig {
     pub enabled: bool,
+    pub mode: InterceptMode,
     pub patterns: Option<Vec<Rule>>,
+}
+
+impl Default for BashInterceptorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: InterceptMode::Hint,
+            patterns: None,
+        }
+    }
+}
+
+/// The interceptor's decision for one command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Do not run the command; the text is the tool error.
+    Block(String),
+    /// Run the command and append this line to its output.
+    Hint(String),
 }
 
 fn rule(pattern: &str, tool: &str, message: &str) -> Rule {
@@ -47,35 +81,47 @@ fn rule(pattern: &str, tool: &str, message: &str) -> Rule {
 /// Built-in interception rules, in priority order (first match wins).
 pub fn default_rules() -> Vec<Rule> {
     vec![
+        // `cat >file` / `cat <<EOF` write rather than read and fall through to the write rule;
+        // `tail -f` follows a live file, which `read` cannot, and falls through to the bg rule.
         rule(
-            r"^\s*(cat|head|tail|less|more)\s+",
+            r"^\s*(?:cat(?!\s*(?:>|<<))|head|tail(?!\s+-[fF](?:\s|$))|less|more)\s+",
             "read",
             "Use the `read` tool instead of cat/head/tail. It provides better context and handles binary files.",
+        ),
+        // Only a bare line-range print with a file operand; `sed -n '/re/p'`, multi-command
+        // scripts and stdin filters are left alone.
+        rule(
+            r#"^\s*sed\s+-n\s+(?:'\d+(?:,\d+)?p'|"\d+(?:,\d+)?p"|\d+(?:,\d+)?p)\s+[^\s|;&<>]+\s*$"#,
+            "read",
+            "Use the `read` tool with offset/limit instead of sed -n 'A,Bp'.",
         ),
         rule(
             r"^\s*(grep|rg|ripgrep|ag|ack)\s+",
             "grep",
             "Use the `grep` tool instead of grep/rg. It respects .gitignore and provides structured output.",
         ),
+        // Predicates and actions a glob cannot express (`-exec`, `-delete`, times, sizes,
+        // permissions, custom output) keep `find`.
         rule(
-            r"^\s*(find|fd|locate)\s+.*(-name|-iname|-type|--type|-glob)",
+            r"^\s*(?!.*\s-(?:exec|execdir|ok|okdir|delete|newer|[acm]min|[acm]time|size|perm|user|group|links|empty|printf|fprint|print0)\b)(find|fd|locate)\s+.*(-name|-iname|-type|--type|-glob)",
             "glob",
             "Use the `glob` tool instead of find/fd. It respects .gitignore and is faster for glob patterns.",
         ),
         rule(
             r"^\s*sed\s+(-i|--in-place)",
             "edit",
-            "Use the `edit` tool instead of sed -i. It provides diff preview and fuzzy matching.",
+            "Use the `edit` tool instead of sed -i. It provides diff preview, and /undo can restore it.",
         ),
+        // `-i` must be one of perl's leading switches; an `-i` inside the program text is not.
         rule(
-            r"^\s*perl\s+.*-[pn]?i",
+            r"^\s*perl(?:\s+-[A-Za-z]+)*?\s+-[A-Za-z]*i[A-Za-z.]*(?:\s|$)",
             "edit",
-            "Use the `edit` tool instead of perl -i. It provides diff preview and fuzzy matching.",
+            "Use the `edit` tool instead of perl -i. It provides diff preview, and /undo can restore it.",
         ),
         rule(
             r"^\s*awk\s+.*-i\s+inplace",
             "edit",
-            "Use the `edit` tool instead of awk -i inplace. It provides diff preview and fuzzy matching.",
+            "Use the `edit` tool instead of awk -i inplace. It provides diff preview, and /undo can restore it.",
         ),
         // `>` must sit outside quoted regions (so `echo "a -> b"` passes) and be followed by a
         // plausible filename, including `$VAR` targets; `>|` (clobber) counts as a redirect;
@@ -89,36 +135,44 @@ pub fn default_rules() -> Vec<Rule> {
         ),
         rule(
             r"^\s*nohup\s+|(?<!&)&\s*$",
-            "bash",
-            "Use `bash` with `name` instead of nohup or background shell syntax so the service stays observable and managed.",
+            "bg",
+            "Use `bg` with `action: start` and `name` instead of nohup or a trailing `&`, so the process stays observable and managed.",
         ),
         rule(
-            r"^\s*(?:(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|start)(?:\s|$)|(?:vite|next\s+dev|nuxt\s+dev|nodemon|lldb|gdb|tail\s+-f)(?:\s|$)|docker\s+compose\s+up(?!.*(?:\s-d(?:\s|$)|--detach))(?:\s|$))",
-            "bash",
+            r"^\s*(?:(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|start)(?:\s|$)|(?:vite|next\s+dev|nuxt\s+dev|nodemon|lldb|gdb|tail\s+-[fF])(?:\s|$)|docker\s+compose\s+up(?!.*(?:\s-d(?:\s|$)|--detach))(?:\s|$))",
+            "bg",
             "Use `bg` with `action: start` and `name` for services, watchers, and debuggers; inspect with `bg` action `output` or `wait`.",
         ),
         rule(
             r"^\s*(?:(?:(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?\S+|jest)(?:.|\n)*--watch|(?:cargo\s+watch|watchexec|pytest|vitest|tsc)(?:.|\n)*(?:--watch|-w))(?:\s|$)",
-            "bash",
-            "Use `bash` with `name` for watch mode so its output, input, and lifecycle stay managed.",
+            "bg",
+            "Use `bg` with `action: start` and `name` for watch mode so its output, input, and lifecycle stay managed.",
         ),
     ]
 }
 
-/// Returns the redirect/interception message when `command` should not run because a
-/// dedicated tool in `available_tools` covers it; `None` lets the command run.
+/// Decides what happens to `command` when a dedicated tool in `available_tools` covers it;
+/// `None` runs it unchanged.
 ///
-/// Candidates are the trimmed command, each flat segment not fed by a pipe, and that segment
-/// without leading `NAME=value` assignments. Rules run in order; the first match wins.
+/// `block` checks the trimmed command, each flat segment not fed by a pipe, and that segment
+/// without leading `NAME=value` assignments. `hint` checks only a command that is a single
+/// duplicate: one segment, optionally after a leading `cd DIR` and before `| head`/`| tail`
+/// stages. Rules run in order; the first match wins.
 pub fn check(
     config: &BashInterceptorConfig,
     available_tools: &[&str],
     command: &str,
-) -> Option<String> {
+) -> Option<Verdict> {
     if !config.enabled {
         return None;
     }
-    let candidates = interception_candidates(command);
+    let candidates = match config.mode {
+        InterceptMode::Block => interception_candidates(command),
+        InterceptMode::Hint => hint_candidates(command),
+    };
+    if candidates.is_empty() {
+        return None;
+    }
     let custom: Vec<Compiled>;
     let rules: &[Compiled] = match &config.patterns {
         None => DEFAULT_COMPILED.as_slice(),
@@ -133,14 +187,59 @@ pub fn check(
         }
         for candidate in &candidates {
             if compiled.matches(candidate) {
-                return Some(format!(
-                    "Blocked: {}\n\nOriginal command: {command}",
-                    compiled.message
-                ));
+                return Some(match config.mode {
+                    InterceptMode::Block => Verdict::Block(format!(
+                        "Blocked: {}\n\nOriginal command: {command}",
+                        compiled.message
+                    )),
+                    InterceptMode::Hint => Verdict::Hint(format!("[hint] {}", compiled.message)),
+                });
             }
         }
     }
     None
+}
+
+/// `gh` commands that read a workflow run's or a PR's check status.
+static CI_STATUS_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bgh\s+(?:run\s+(?:view|list)|pr\s+checks)\b").expect("valid CI status regex")
+});
+/// A shell loop that sleeps between status checks.
+static SLEEP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bsleep\s+\d").expect("valid sleep regex"));
+/// Statuses GitHub reports for a run or check that has not finished.
+static UNFINISHED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:in_progress|queued|pending|waiting|requested)\b")
+        .expect("valid unfinished-status regex")
+});
+
+/// One line steering a CI status poll toward a single blocking wait: a `gh run view|list` or
+/// `gh pr checks` whose output still shows an unfinished run, or one that sleeps before or
+/// between checks without already using `gh run watch`. Each repeated poll costs a full model
+/// request; a wait costs one.
+pub fn ci_poll_hint(
+    config: &BashInterceptorConfig,
+    available_tools: &[&str],
+    command: &str,
+    output: &str,
+) -> Option<String> {
+    if !config.enabled
+        || !CI_STATUS_COMMAND.is_match(command).unwrap_or(false)
+        || command.contains("--log")
+    {
+        return None;
+    }
+    let sleeps = SLEEP.is_match(command).unwrap_or(false) && !command.contains("gh run watch");
+    if !sleeps && !UNFINISHED.is_match(output).unwrap_or(false) {
+        return None;
+    }
+    Some(if available_tools.contains(&"github") {
+        "[hint] To wait for CI, call `github` op `run_watch` once (it returns when the run ends, with failed-job logs) instead of polling `gh run`.".to_owned()
+    } else if available_tools.contains(&"bg") {
+        "[hint] To wait for CI, run `gh run watch <id> --exit-status > /dev/null` once: it moves to the background, you are notified when the run ends, and `bg` action `wait` blocks on it. Do not poll `gh run`.".to_owned()
+    } else {
+        "[hint] To wait for CI, run `gh run watch <id> --exit-status > /dev/null` once instead of polling `gh run`.".to_owned()
+    })
 }
 
 struct Compiled {
@@ -325,6 +424,47 @@ fn interception_candidates(command: &str) -> Vec<String> {
         }
     }
     candidates
+}
+
+/// Candidates for `hint` mode: empty unless the command is one duplicate. A leading `cd DIR`
+/// segment is skipped and trailing `| head` / `| tail` stages are allowed, since the dedicated
+/// tools take a directory and limit their own output. Anything else (a second command, a pipe
+/// into another program, syntax the flat scanner declines) is deliberate shell work.
+fn hint_candidates(command: &str) -> Vec<String> {
+    let mut segments = extract_flat_shell_command_segments(command);
+    if segments.len() > 1 && !segments[1].piped_stdin && is_cd(&segments[0].text) {
+        segments.remove(0);
+    }
+    let Some((head, rest)) = segments.split_first() else {
+        return Vec::new();
+    };
+    if head.piped_stdin
+        || !rest
+            .iter()
+            .all(|stage| stage.piped_stdin && is_trim(&stage.text))
+    {
+        return Vec::new();
+    }
+    let mut candidates = vec![head.text.clone()];
+    if let Some(without) = without_leading_environment_assignments(&head.text) {
+        candidates.push(without);
+    }
+    if rest.is_empty() {
+        // Background syntax (`cmd &`) is consumed by the segment split; keep the whole command.
+        candidates.push(command.trim().to_owned());
+    }
+    candidates
+}
+
+fn is_cd(segment: &str) -> bool {
+    segment == "cd" || segment.starts_with("cd ") || segment.starts_with("cd\t")
+}
+
+/// `head`/`tail` stages that only trim output (not `tail -f`).
+fn is_trim(stage: &str) -> bool {
+    let mut words = stage.split_whitespace();
+    matches!(words.next(), Some("head" | "tail"))
+        && words.all(|word| !matches!(word, "-f" | "-F" | "--follow"))
 }
 
 /// One flat command segment with whether its stdin is fed by a preceding `|` / `|&`.
@@ -586,13 +726,36 @@ fn without_leading_environment_assignments(command: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    const TOOLS: &[&str] = &["read", "grep", "glob", "edit", "write", "bash"];
+    const TOOLS: &[&str] = &["read", "grep", "glob", "edit", "write", "bash", "bg"];
 
     fn on() -> BashInterceptorConfig {
         BashInterceptorConfig {
             enabled: true,
+            mode: InterceptMode::Block,
             patterns: None,
         }
+    }
+
+    fn hint_mode() -> BashInterceptorConfig {
+        BashInterceptorConfig::default()
+    }
+
+    fn blocked(config: &BashInterceptorConfig, command: &str) -> Option<String> {
+        match check(config, TOOLS, command)? {
+            Verdict::Block(message) => Some(message),
+            Verdict::Hint(line) => panic!("expected a block, got {line}"),
+        }
+    }
+
+    /// Tool of the default rule whose hint `command` gets.
+    fn hinted_tool(command: &str) -> Option<String> {
+        let Verdict::Hint(line) = check(&hint_mode(), TOOLS, command)? else {
+            panic!("expected a hint for {command}");
+        };
+        default_rules()
+            .into_iter()
+            .find(|r| line == format!("[hint] {}", r.message))
+            .map(|r| r.tool)
     }
 
     /// Tool of the default rule that blocked `command`, exactly matched by message.
@@ -601,7 +764,9 @@ mod tests {
         tools: &[&str],
         command: &str,
     ) -> Option<String> {
-        let message = check(config, tools, command)?;
+        let Verdict::Block(message) = check(config, tools, command)? else {
+            panic!("expected a block for {command}");
+        };
         default_rules()
             .into_iter()
             .find(|r| message == format!("Blocked: {}\n\nOriginal command: {command}", r.message))
@@ -622,7 +787,7 @@ mod tests {
     #[test]
     fn default_rules_all_compile_and_match_count() {
         let rules = default_rules();
-        assert_eq!(rules.len(), 10);
+        assert_eq!(rules.len(), 11);
         for r in &rules {
             assert!(
                 compile_rule(r).is_some(),
@@ -634,15 +799,30 @@ mod tests {
 
     #[test]
     fn disabled_config_returns_none() {
-        assert_eq!(
-            check(&BashInterceptorConfig::default(), TOOLS, "cat x"),
-            None
-        );
-        let explicit = BashInterceptorConfig {
-            enabled: false,
-            patterns: None,
-        };
-        assert_eq!(check(&explicit, TOOLS, "cat x"), None);
+        for mode in [InterceptMode::Hint, InterceptMode::Block] {
+            let off = BashInterceptorConfig {
+                enabled: false,
+                mode,
+                patterns: None,
+            };
+            assert_eq!(check(&off, TOOLS, "cat x"), None);
+            assert_eq!(
+                ci_poll_hint(&off, TOOLS, "gh run view 1", "run: in_progress"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn default_is_enabled_hint_mode() {
+        let config = BashInterceptorConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.mode, InterceptMode::Hint);
+        let parsed: BashInterceptorConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, config);
+        let block: BashInterceptorConfig = serde_json::from_str(r#"{"mode":"block"}"#).unwrap();
+        assert_eq!(block.mode, InterceptMode::Block);
+        assert!(serde_json::from_str::<BashInterceptorConfig>(r#"{"mode":"warn"}"#).is_err());
     }
 
     #[test]
@@ -657,6 +837,28 @@ mod tests {
             assert_eq!(blocked_tool(c).as_deref(), Some("read"), "{c}");
         }
         for c in ["catalog x", "cat", "echo cat x", "bat x"] {
+            assert_eq!(blocked_tool(c), None, "{c}");
+        }
+        // Writing through `cat` is not a read.
+        assert_eq!(blocked_tool("cat > notes.md"), None);
+        assert_eq!(blocked_tool("cat >> notes.md"), None);
+    }
+
+    #[test]
+    fn sed_line_range_print_is_read() {
+        for c in [
+            "sed -n 10,20p src/main.rs",
+            "sed -n '1,40p' README.md",
+            "sed -n \"5p\" a.txt",
+        ] {
+            assert_eq!(blocked_tool(c).as_deref(), Some("read"), "{c}");
+        }
+        for c in [
+            "sed -n '/fn main/,/^}/p' src/main.rs",
+            "sed -n 1,5p",
+            "sed -n '1,40p' a.rs b.rs",
+            "sed 's/a/b/' f",
+        ] {
             assert_eq!(blocked_tool(c), None, "{c}");
         }
     }
@@ -688,7 +890,17 @@ mod tests {
         ] {
             assert_eq!(blocked_tool(c).as_deref(), Some("glob"), "{c}");
         }
-        for c in ["find . -print", "fdisk -l", "findstr x"] {
+        for c in [
+            "find . -print",
+            "fdisk -l",
+            "findstr x",
+            "find . -name '*.pyc' -delete",
+            "find src -name '*.rs' -exec wc -l {} +",
+            "find . -type f -mtime -1",
+            "find . -type f -newer Cargo.lock",
+            "find . -name '*.log' -size +1M",
+            "find . -type f -print0",
+        ] {
             assert_eq!(blocked_tool(c), None, "{c}");
         }
     }
@@ -698,7 +910,7 @@ mod tests {
         for c in ["sed -i 's/a/b/' f", "sed --in-place=.bak s/a/b/ f"] {
             assert_eq!(blocked_tool(c).as_deref(), Some("edit"), "{c}");
         }
-        for c in ["sed 's/a/b/' f", "sed -n 1p f"] {
+        for c in ["sed 's/a/b/' f", "sed -n '/x/p' f"] {
             assert_eq!(blocked_tool(c), None, "{c}");
         }
         for c in [
@@ -708,7 +920,16 @@ mod tests {
         ] {
             assert_eq!(blocked_tool(c).as_deref(), Some("edit"), "{c}");
         }
-        for c in ["perl -e 'print 1'", "perl script.pl"] {
+        for c in ["perl -i.bak -pe 's/a/b/' f", "perl -w -i -pe x f"] {
+            assert_eq!(blocked_tool(c).as_deref(), Some("edit"), "{c}");
+        }
+        for c in [
+            "perl -e 'print 1'",
+            "perl script.pl",
+            "perl -ne 'print if /x-id/' f",
+            "perl -pe 's/-i//' f",
+            "perl -I lib t/run.pl",
+        ] {
             assert_eq!(blocked_tool(c), None, "{c}");
         }
         assert_eq!(
@@ -733,10 +954,10 @@ mod tests {
         ] {
             assert_eq!(blocked_tool(c).as_deref(), Some("write"), "{c}");
         }
-        // The earlier `cat` rule claims this command first, so the redirect rule never sees it.
+        // A heredoc into a file is a write, not a read.
         assert_eq!(
             blocked_tool("cat << 'EOF' > notes.md").as_deref(),
-            Some("read")
+            Some("write")
         );
     }
 
@@ -767,7 +988,7 @@ mod tests {
     #[test]
     fn nohup_and_background_rule() {
         for c in ["nohup node server.js", "node server.js &", "sleep 100 &"] {
-            assert_eq!(blocked_tool(c).as_deref(), Some("bash"), "{c}");
+            assert_eq!(blocked_tool(c).as_deref(), Some("bg"), "{c}");
         }
         for c in ["make && test", "echo a && b"] {
             assert_eq!(blocked_tool(c), None, "{c}");
@@ -790,7 +1011,7 @@ mod tests {
             "docker compose up",
             "docker compose up --build",
         ] {
-            assert_eq!(blocked_tool(c).as_deref(), Some("bash"), "{c}");
+            assert_eq!(blocked_tool(c).as_deref(), Some("bg"), "{c}");
         }
         for c in [
             "docker compose up -d",
@@ -803,12 +1024,12 @@ mod tests {
     }
 
     #[test]
-    fn tail_follow_is_read_when_read_available_else_service() {
-        assert_eq!(blocked_tool("tail -f app.log").as_deref(), Some("read"));
-        assert_eq!(
-            blocked_tool_with(&on(), &["bash"], "tail -f app.log").as_deref(),
-            Some("bash")
-        );
+    fn tail_follow_is_a_service_not_a_read() {
+        for c in ["tail -f app.log", "tail -F app.log"] {
+            assert_eq!(blocked_tool(c).as_deref(), Some("bg"), "{c}");
+        }
+        assert_eq!(blocked_tool("tail -n 5 app.log").as_deref(), Some("read"));
+        assert_eq!(blocked_tool_with(&on(), &["read"], "tail -f app.log"), None);
     }
 
     #[test]
@@ -822,7 +1043,7 @@ mod tests {
             "npm run build\n--watch",
             "pytest --watch",
         ] {
-            assert_eq!(blocked_tool(c).as_deref(), Some("bash"), "{c}");
+            assert_eq!(blocked_tool(c).as_deref(), Some("bg"), "{c}");
         }
         for c in [
             "cargo watch -x test",
@@ -864,6 +1085,8 @@ mod tests {
     fn tool_availability_gates_rules() {
         assert_eq!(check(&on(), &["grep"], "cat x"), None);
         assert!(check(&on(), &["read"], "cat x").is_some());
+        assert_eq!(check(&on(), &["bash"], "npm run dev"), None);
+        assert_eq!(check(&hint_mode(), &["bash"], "grep -rn foo src"), None);
     }
 
     #[test]
@@ -871,16 +1094,25 @@ mod tests {
         let config = BashInterceptorConfig {
             enabled: true,
             patterns: Some(vec![rule(r"^\s*rm\s+", "bash", "no rm")]),
+            ..on()
         };
         assert_eq!(
-            check(&config, TOOLS, "rm -rf x").as_deref(),
+            blocked(&config, "rm -rf x").as_deref(),
             Some("Blocked: no rm\n\nOriginal command: rm -rf x")
         );
         assert_eq!(check(&config, TOOLS, "cat x"), None);
+        let hinting = BashInterceptorConfig {
+            mode: InterceptMode::Hint,
+            ..config
+        };
+        assert_eq!(
+            check(&hinting, TOOLS, "rm -rf x"),
+            Some(Verdict::Hint("[hint] no rm".into()))
+        );
 
         let empty = BashInterceptorConfig {
-            enabled: true,
             patterns: Some(Vec::new()),
+            ..on()
         };
         assert_eq!(check(&empty, TOOLS, "cat x"), None);
     }
@@ -888,7 +1120,6 @@ mod tests {
     #[test]
     fn invalid_regex_and_flags_are_skipped() {
         let config = BashInterceptorConfig {
-            enabled: true,
             patterns: Some(vec![
                 rule("(", "bash", "bad regex"),
                 Rule {
@@ -904,9 +1135,10 @@ mod tests {
                     ..rule("^cat", "read", "ci")
                 },
             ]),
+            ..on()
         };
         assert_eq!(
-            check(&config, TOOLS, "CAT x").as_deref(),
+            blocked(&config, "CAT x").as_deref(),
             Some("Blocked: ci\n\nOriginal command: CAT x")
         );
     }
@@ -914,21 +1146,21 @@ mod tests {
     #[test]
     fn sticky_and_multiline_flags() {
         let sticky = BashInterceptorConfig {
-            enabled: true,
             patterns: Some(vec![Rule {
                 flags: Some("y".into()),
                 ..rule("cat", "read", "sticky")
             }]),
+            ..on()
         };
         assert!(check(&sticky, TOOLS, "cat x").is_some());
         assert!(check(&sticky, TOOLS, "x cat").is_none());
 
         let multi = BashInterceptorConfig {
-            enabled: true,
             patterns: Some(vec![Rule {
                 flags: Some("m".into()),
                 ..rule("^cat", "read", "multi")
             }]),
+            ..on()
         };
         // Candidates are split on `\n`, so this also works via the whole command.
         assert!(check(&multi, TOOLS, "ls\ncat x").is_some());
@@ -954,6 +1186,140 @@ mod tests {
         assert!(
             serde_json::from_str::<BashInterceptorConfig>(r#"{"enabled":true,"extra":1}"#).is_err()
         );
+    }
+
+    #[test]
+    fn hint_mode_hints_a_lone_duplicate() {
+        for (c, tool) in [
+            ("grep -rn \"fn check\" src", "grep"),
+            ("rg -n foo src", "grep"),
+            ("cat Cargo.toml", "read"),
+            ("sed -n 120,185p src/tools/execution.rs", "read"),
+            ("find . -name '*.rs' -type f", "glob"),
+            ("sed -i '' 's/a/b/' src/lib.rs", "edit"),
+            ("npm run dev", "bg"),
+            ("node server.js &", "bg"),
+            // A leading `cd DIR` and output trimming do not change what the command is.
+            ("cd crates/core && grep -rn foo src", "grep"),
+            ("grep -n \"QListWidget\" src/ui/settings.py | head", "grep"),
+            ("cat log.txt | tail -n 40", "read"),
+            ("RUST_LOG=debug cat x", "read"),
+        ] {
+            assert_eq!(hinted_tool(c).as_deref(), Some(tool), "{c}");
+        }
+    }
+
+    #[test]
+    fn hint_mode_leaves_batched_and_scripted_commands_alone() {
+        // Commands taken from session transcripts: batching several reads into one call saves
+        // model round trips, and piping into another program is shell work a tool cannot do.
+        for c in [
+            "sed -n 30,60p src/ui/overlay/settings.rs; sed -n 285,345p src/ui/overlay/settings.rs",
+            "grep -n \"set_title_fields\" src/ui/main_page.py; grep -n \"def title_fields\" src/ui/settings.py",
+            "grep '^version' pyproject.toml && grep '__version__' src/simple_stipple/__init__.py",
+            "grep -ohE \"page\\.[a-z_]+\" tests/test_shipping_ui.py | sort | uniq -c | sort -rn",
+            "cat file | wc -l",
+            "find . -name '*.rs' | xargs wc -l",
+            "sed -i '' 's/a/b/' .tmp/audit.py && .venv/bin/python .tmp/audit.py",
+            "cat > .tmp/set.py <<'EOF'\nprint(1)\nEOF",
+            "tail -f app.log | grep ERROR",
+            "grep -q foo f && echo yes",
+            "cd src && ls",
+            "ls -la",
+            "cargo test --lib bash_interceptor",
+            "git grep -n foo",
+        ] {
+            assert_eq!(check(&hint_mode(), TOOLS, c), None, "{c}");
+        }
+        // Block mode still inspects every standalone segment.
+        assert!(matches!(
+            check(&on(), TOOLS, "cargo build; grep -rn foo src"),
+            Some(Verdict::Block(_))
+        ));
+    }
+
+    #[test]
+    fn hint_is_one_line() {
+        for c in [
+            "grep -rn foo src",
+            "cat x",
+            "npm run dev",
+            "sed -i s/a/b/ f",
+        ] {
+            let Some(Verdict::Hint(line)) = check(&hint_mode(), TOOLS, c) else {
+                panic!("expected a hint for {c}");
+            };
+            assert!(
+                line.starts_with("[hint] ") && !line.contains('\n'),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_poll_hint_fires_on_unfinished_status_or_sleep_loop() {
+        let config = hint_mode();
+        let view = "gh run view 38768263506 -R KiidxAtlas/dial --json status,conclusion,jobs --jq '\"run: \\(.status) \\(.conclusion)\"'";
+        let running = "run: in_progress \nBuild and package Windows release: in_progress \n";
+        let hint = ci_poll_hint(&config, TOOLS, view, running).expect("in_progress view");
+        assert!(
+            hint.contains("gh run watch") && hint.contains("bg"),
+            "{hint}"
+        );
+        assert!(!hint.contains('\n'));
+        assert!(
+            ci_poll_hint(&config, &["github"], view, running)
+                .is_some_and(|hint| hint.contains("run_watch"))
+        );
+        assert!(
+            ci_poll_hint(&config, &[], view, running)
+                .is_some_and(|hint| hint.contains("gh run watch") && !hint.contains("`bg`"))
+        );
+        for (command, output) in [
+            (
+                "gh run list -L 3",
+                "in_progress\t\tfix ci\tci\tmain\tpush\t1\t39s\n",
+            ),
+            ("gh pr checks 12", "build\tpending\t0\thttps://x\n"),
+            (
+                "gh run list -L 3 --json status",
+                "[{\"status\":\"queued\"}]",
+            ),
+            (
+                "for i in $(seq 1 19); do s=$(gh run view 1 --json status --jq .status); [ \"$s\" = completed ] && break; sleep 15; done",
+                "command is running as background job bg20 (after 15s)",
+            ),
+        ] {
+            assert!(
+                ci_poll_hint(&config, TOOLS, command, output).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_poll_hint_ignores_finished_runs_logs_and_watches() {
+        let config = hint_mode();
+        for (command, output) in [
+            ("gh run view 1 --json status", "run: completed success\n"),
+            ("gh run view 1 --log-failed", "step in_progress marker\n"),
+            (
+                "gh run watch 1 --exit-status > /dev/null; gh run view 1",
+                "command is running as background job bg3",
+            ),
+            ("gh pr view 12", "state: OPEN pending review\n"),
+            (
+                "sleep 10; id=$(gh run list --limit 1 --json databaseId -q '.[0].databaseId'); gh run watch $id --exit-status",
+                "command is running as background job bg5",
+            ),
+            ("cargo test", "test in_progress ... ok\n"),
+        ] {
+            assert_eq!(
+                ci_poll_hint(&config, TOOLS, command, output),
+                None,
+                "{command}"
+            );
+        }
     }
 
     #[test]

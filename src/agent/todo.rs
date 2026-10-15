@@ -660,7 +660,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": "todo",
-            "description": "Track a numbered plan. Calls: {\"op\":\"set\",\"tasks\":[{\"content\":\"...\"}]} replaces the plan; {\"op\":\"append\",\"tasks\":[...]} adds tasks; {\"op\":\"start\"} or {\"op\":\"start\",\"index\":2} switches focus (no index: first pending task); {\"op\":\"done\"} closes the active task and starts the next pending one; {\"op\":\"drop\"} or {\"op\":\"block\",\"reason\":\"...\"} close without completing; {\"op\":\"view\"} shows the plan. Findings and evidence are optional notes. Do not resend set to mark tasks done. Explicit indices are 1-based and may change when old closed tasks are pruned. Skip for trivial requests.",
+            "description": "Track a numbered plan. Calls: {\"op\":\"set\",\"tasks\":[{\"content\":\"...\"}]} replaces the plan; {\"op\":\"append\",\"tasks\":[...]} adds tasks; {\"op\":\"start\"} or {\"op\":\"start\",\"index\":2} switches focus (no index: first pending task); {\"op\":\"done\"} closes the active task and starts the next pending one; {\"op\":\"drop\"} or {\"op\":\"block\",\"reason\":\"...\"} close without completing; {\"op\":\"view\"} shows the plan. Findings and evidence are optional notes. Do not resend set to mark tasks done. Explicit indices are 1-based and may change when old closed tasks are pruned. Skip for trivial requests. Never call todo alone: send it in parallel with the call that starts or continues the work, and skip a closing update before the final answer (it closes remaining tasks).",
             "parameters": {
                 "type": "object",
                 "properties": {

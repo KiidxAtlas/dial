@@ -198,7 +198,7 @@ pub fn migrate_removed_settings(table: &mut toml::Table) -> bool {
 
 /// Current roles that a legacy `default` role fills when they are not otherwise assigned. `decision` is the
 /// Laya checkpoint, so it is not filled.
-const DEFAULT_FILLS: &[&str] = &["small", "coach", "tester", "planner", "memory"];
+const DEFAULT_FILLS: &[&str] = &["task", "small", "coach", "tester", "planner", "memory"];
 
 /// The current role a legacy role name maps to, if it is one.
 fn legacy_role_target(name: &str) -> Option<&'static str> {
@@ -265,7 +265,7 @@ fn rewrite_memory_role_fields(table: &mut toml::Table) -> bool {
     changed
 }
 
-/// Migrates legacy `model_roles` keys to the eight current roles (see `LEGACY_ROLE_MIGRATIONS`).
+/// Migrates legacy `model_roles` keys to the current roles (see `LEGACY_ROLE_MIGRATIONS`).
 /// Precedence: an explicit current key wins; among legacy keys for one role the first in
 /// `LEGACY_ROLE_MIGRATIONS` wins; `default` fills unassigned roles in `DEFAULT_FILLS`; `vision` is
 /// dropped. Also removes the retired `escalation.role` (escalation always uses coach) and rewrites
@@ -301,6 +301,11 @@ pub fn migrate_model_role_table(table: &mut toml::Table) -> bool {
     let before = roles.clone();
     let mut migrated = toml::Table::new();
     for (legacy, target) in crate::llm::model_config::LEGACY_ROLE_MIGRATIONS {
+        // Current-role identities are not migrations: preserve them in place, including
+        // explicit selections that must win over legacy aliases for the same role.
+        if legacy == target {
+            continue;
+        }
         if let Some(value) = roles.remove(*legacy) {
             migrated.entry((*target).to_owned()).or_insert(value);
         }
@@ -2802,7 +2807,7 @@ mod model_role_tests {
     }
 
     #[test]
-    fn legacy_role_keys_map_to_the_eight_roles() {
+    fn legacy_role_keys_map_to_current_roles() {
         let table = migrated(
             "[model_roles.smol]\nprovider='mlx'\nmodel='small-a'\n\
              [model_roles.stronger]\nprovider='x'\nmodel='coach-c'\n\
@@ -2854,7 +2859,7 @@ mod model_role_tests {
         assert!(!roles.contains_key("default"));
         assert!(!roles.contains_key("vision"));
         assert_eq!(roles["planner"]["model"].as_str(), Some("plan"));
-        for role in ["small", "coach", "tester", "memory"] {
+        for role in ["task", "small", "coach", "tester", "memory"] {
             assert_eq!(roles[role]["model"].as_str(), Some("base"), "{role}");
         }
         assert!(!roles.contains_key("decision"));
@@ -2863,13 +2868,15 @@ mod model_role_tests {
     #[test]
     fn legacy_at_references_and_memory_role_fields_are_renamed() {
         let table = migrated(
-            "[profile]\nmodels=['@smol', '@stronger', 'anthropic/x']\n\
+            "[profile]\nmodels=['@smol', '@stronger', 'anthropic/x', '@subagent', '@task']\n\
              [memory.local]\nextraction_role='memory'\nconsolidation_role='stronger'\n",
         );
         let models = table["profile"]["models"].as_array().unwrap();
         assert_eq!(models[0].as_str(), Some("@small"));
         assert_eq!(models[1].as_str(), Some("@coach"));
         assert_eq!(models[2].as_str(), Some("anthropic/x"));
+        assert_eq!(models[3].as_str(), Some("@task"));
+        assert_eq!(models[4].as_str(), Some("@task"));
         assert_eq!(
             table["memory"]["local"]["extraction_role"].as_str(),
             Some("memory")
@@ -2960,7 +2967,15 @@ mod model_role_tests {
 
     #[test]
     fn validation_accepts_only_assignable_roles() {
-        for role in ["small", "coach", "tester", "planner", "memory", "embedding"] {
+        for role in [
+            "task",
+            "small",
+            "coach",
+            "tester",
+            "planner",
+            "memory",
+            "embedding",
+        ] {
             resolve(&format!(
                 "model='local'\nprovider='mlx'\n[model_roles.{role}]\nprovider='mlx'\nmodel='m'\n"
             ))
@@ -3060,6 +3075,98 @@ mod model_role_tests {
         config.validate().unwrap();
         assert_eq!(config.harness.max_steps, 3);
         assert_eq!(config.role_selection("embedding").unwrap().model, "e");
+    }
+
+    #[test]
+    fn task_and_small_coexist_and_current_roles_are_migration_safe() {
+        let mut table: toml::Table = toml::from_str(
+            "[model_roles.task]\nprovider='mlx'\nmodel='implementation'\n\
+             [model_roles.small]\nprovider='mlx'\nmodel='maintenance'\n\
+             [model_roles.memory]\nprovider='mlx'\nmodel='memory'\n",
+        )
+        .unwrap();
+        let original = table.clone();
+        assert!(!migrate_model_role_table(&mut table));
+        assert_eq!(table, original);
+        let roles = role_table(&table);
+        assert_eq!(roles["task"]["model"].as_str(), Some("implementation"));
+        assert_eq!(roles["small"]["model"].as_str(), Some("maintenance"));
+        table
+            .get_mut("model_roles")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "subagent".into(),
+                toml::Value::try_from(crate::llm::model_config::ModelSelection::new(
+                    "mlx", "legacy",
+                ))
+                .unwrap(),
+            );
+        assert!(migrate_model_role_table(&mut table));
+        assert_eq!(
+            table, original,
+            "explicit task must win over legacy subagent"
+        );
+        assert!(!migrate_model_role_table(&mut table));
+    }
+
+    #[test]
+    fn task_survives_persistent_legacy_migration_and_serialization() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+        let path = layout.config_files()[0].clone();
+        fs::write(
+            &path,
+            "model='main-model'\nprovider='mlx'\n\
+             [model_roles.subagent]\nprovider='mlx'\nmodel='implementation'\n\
+             [model_roles.small]\nprovider='mlx'\nmodel='maintenance'\n",
+        )
+        .unwrap();
+        let config = Config::load(&layout, None).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.for_role("task").model, "implementation");
+        assert_eq!(config.for_role("small").model, "maintenance");
+        let persisted = fs::read_to_string(&path).unwrap();
+        let mut table: toml::Table = toml::from_str(&persisted).unwrap();
+        assert!(role_table(&table).contains_key("task"));
+        assert!(!role_table(&table).contains_key("subagent"));
+        assert!(!migrate_model_role_table(&mut table));
+        let reloaded = Config::load(&layout, None).unwrap();
+        assert_eq!(reloaded.model_roles, config.model_roles);
+        assert_eq!(fs::read_to_string(&path).unwrap(), persisted);
+        let serialized = toml::Value::try_from(&config).unwrap();
+        let round_trip =
+            Config::from_table(&layout, serialized.as_table().unwrap().clone()).unwrap();
+        assert_eq!(round_trip.model_roles, config.model_roles);
+    }
+
+    #[test]
+    fn task_status_shows_assigned_model_or_main_without_changing_small_fallback() {
+        use crate::llm::model_config::{ModelSelection, RoleSource};
+        let mut config = Config::default();
+        config.model = "main-model".into();
+        let task = config
+            .role_statuses()
+            .into_iter()
+            .find(|row| row.role == "task")
+            .unwrap();
+        assert_eq!(task.source, RoleSource::FollowsMain);
+        assert_eq!(task.effective, Some(config.selection().display_name()));
+        assert!(task.assigned.is_none());
+        assert_eq!(config.for_role("task").selection(), config.selection());
+        let selection = ModelSelection::new("mlx", "implementation");
+        config.model_roles.insert("task".into(), selection.clone());
+        let task = config
+            .role_statuses()
+            .into_iter()
+            .find(|row| row.role == "task")
+            .unwrap();
+        assert_eq!(task.source, RoleSource::Assigned);
+        assert_eq!(task.effective, Some(selection.display_name()));
+        assert_eq!(task.assigned, Some(selection));
+        assert_eq!(config.for_role("small").selection(), config.selection());
     }
 
     #[test]

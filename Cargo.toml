@@ -1,6 +1,6 @@
 [package]
 name = "dial"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Local, gated model and harness improvement on Apple Silicon"
 license = "MIT"
@@ -117,10 +117,12 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
-# Shipped binaries: whole-program optimization, one codegen unit, no symbols.
+# Shipped binaries: thin cross-crate LTO, no symbols. Fat LTO with one codegen unit took
+# 14-43 min per release target for no measurable gain in an I/O-bound agent; thin LTO keeps
+# cross-crate inlining and compiles in parallel.
 [profile.release]
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 strip = true
 
 # Optimized local executable without whole-program LTO; keep shipping release unchanged.
