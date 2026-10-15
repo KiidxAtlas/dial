@@ -42,7 +42,12 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Build
-        run: cargo build --locked --all-targets
+        # The `dial` library and its unit-test build each peak near 5 GB in rustc. Built together
+        # they exceed the 7 GB macOS arm64 runner and swap (11-16 min); one at a time they fit.
+        run: |
+          cargo build --locked --lib
+          cargo test --locked --lib --no-run
+          cargo build --locked --all-targets
       - name: Test
         # Parallel: tests that change process HOME/PATH hold a shared lock; process fixtures set
         # their environment per child. Serial execution made the lib tests ~4x slower.

@@ -188,11 +188,17 @@ git push origin main
 git push origin v0.1.1
 ```
 
-`.github/workflows/release.yml` checks formatting, runs the Rust tests (including
-required Linux sandbox probes), builds Apple Silicon/Intel Mac and Linux x86-64 binaries,
-and smoke-tests each extracted archive outside the checkout. Only after **all four**
-platform builds (macOS arm64, macOS Intel, Linux x86-64 and Windows x86-64) pass does it create a GitHub release with the archives, bundled MIT
-license and README, a combined `SHA256SUMS` with its `SHA256SUMS.sig` signature, and
-generated notes. CI runs on both macOS and Ubuntu without weakening host security. The Rust test suite gates the macOS and Linux builds only; the Windows release job builds `dial.exe`, smoke-tests the packaged archive (`--version`, `--help`), and runs `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS` and `SHA256SUMS.sig`.
+`.github/workflows/release.yml` does not re-run the test suite. Each macOS and Linux build job
+first requires a successful `CI` run (formatting, clippy, the full Rust suite including the Linux
+sandbox probes, and the terminal smoke test, on macOS arm64, macOS Intel and Ubuntu) for the exact
+tagged commit, waiting while that run is in progress; with no successful run it fails. Push the
+commit to `main` and let CI pass before tagging. The jobs then build Apple Silicon/Intel Mac and
+Linux x86-64 release binaries and smoke-test each extracted archive outside the checkout. Only
+after **all four** platform builds (macOS arm64, macOS Intel, Linux x86-64 and Windows x86-64)
+pass does it create a GitHub release with the archives, bundled MIT license and README, a
+combined `SHA256SUMS` with its `SHA256SUMS.sig` signature, and generated notes. CI runs on both
+macOS and Ubuntu without weakening host security. CI builds the `dial` library and its unit-test
+build one after the other: each peaks near 5 GB in rustc, and together they would swap on the
+7 GB macOS arm64 runner. The Windows release job builds `dial.exe`, smoke-tests the packaged archive (`--version`, `--help`), and runs `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS` and `SHA256SUMS.sig`.
 The workflow preserves repository visibility. Dial is MIT licensed; see `LICENSE` for
 permission to use, modify, and redistribute it.
