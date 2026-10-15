@@ -641,6 +641,7 @@ static REGISTRY: &[SettingDef] = &[
     model::DECLARATIONS[9],
     model::DECLARATIONS[10],
     model::DECLARATIONS[11],
+    model::DECLARATIONS[33],
     model::DECLARATIONS[12],
     model::DECLARATIONS[13],
     model::DECLARATIONS[14],

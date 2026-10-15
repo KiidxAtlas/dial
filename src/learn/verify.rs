@@ -141,6 +141,7 @@ fn run_command(
     };
     let ws = ws.with_policy(Policy::Strict {
         allow_network: false,
+        deny_read: Vec::new(),
         extra_write: Vec::new(),
     });
     let out = tools::execute(&ws, "bash", &json!({"command": command, "timeout": 30}), 30);
@@ -264,6 +265,7 @@ mod tests {
                     .unwrap()
                     .with_policy(Policy::Strict {
                         allow_network: false,
+                        deny_read: Vec::new(),
                         extra_write: Vec::new(),
                     });
                 tools::execute(

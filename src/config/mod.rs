@@ -343,10 +343,10 @@ impl Config {
     }
 
     /// Layered configuration: `<user>/config.toml`, then `<state>/config.toml` (per project), then
-    /// `overlay` (command-line flags). Both files live outside the project, so the agent cannot
-    /// edit its own sandbox, approval or gate settings.
+    /// `overlay` (command-line flags). Both files live in private storage, excluded from agent
+    /// tools, so the agent cannot edit its own sandbox, approval or gate settings.
     pub fn load(layout: &Layout, overlay: Option<toml::Table>) -> Result<Self> {
-        layout.ensure_state_outside_project()?;
+        layout.ensure_project_outside_storage()?;
         let mut layers: [toml::Table; 2] = Default::default();
         let mut migrations = Vec::new();
         for (index, path) in layout.config_files().into_iter().enumerate() {
@@ -491,7 +491,7 @@ impl Config {
             }
         }
         table.remove("chatgpt_accounts");
-        layout.ensure_state_outside_project()?;
+        layout.ensure_project_outside_storage()?;
         let mut config: Config = toml::Value::Table(table)
             .try_into()
             .context("invalid configuration")?;
@@ -1199,6 +1199,9 @@ impl Config {
 
     fn memory_role_is_local(&self, role: &str, model: Option<&str>) -> bool {
         let selection = self.role_selection(role);
+        if selection.is_some_and(|model| model.provider == crate::agent::laya::PROVIDER) {
+            return false;
+        }
         let provider = selection
             .map(|selection| selection.provider.as_str())
             .or(self.provider.as_deref())
@@ -1414,11 +1417,15 @@ impl Config {
     /// Whether this session needs the shared local-compute lock: a local main model or any explicit local role.
     pub fn uses_local_compute(&self) -> bool {
         (!self.model.is_empty() && self.endpoint.is_none())
-            || self
-                .model_roles
-                .values()
-                .any(|model| model.base_url.is_none())
+            || self.model_roles.values().any(|model| {
+                model.provider != crate::agent::laya::PROVIDER && model.base_url.is_none()
+            })
             || self.memory_uses_local_compute()
+    }
+
+    /// Lock policy is independent of route classification and model-cost accounting.
+    pub fn requires_compute_lock(&self) -> bool {
+        self.compute_locks && self.uses_local_compute()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -2054,8 +2061,8 @@ impl Config {
         Ok(())
     }
 
-    /// State, gate suites and training data must stay outside the project the agent can edit; this
-    /// is what keeps sealed evaluation sealed from a tool-using agent.
+    /// Gate suites and training data must be outside editable paths. Private storage remains
+    /// excluded from tools even when the workspace is its parent (for example HOME).
     fn validate_protected(&self) -> Result<()> {
         if self.project_root.as_os_str().is_empty() {
             return Ok(());
@@ -2079,9 +2086,12 @@ impl Config {
                     .parent()
                     .context("protected path has no existing ancestor")?;
             };
+            let private = [&self.user_dir, &self.state_dir]
+                .into_iter()
+                .any(|dir| !dir.as_os_str().is_empty() && resolved.starts_with(dir));
             ensure!(
-                !resolved.starts_with(&self.project_root),
-                "protected path {} lies inside the project; keep it outside",
+                !resolved.starts_with(&self.project_root) || private,
+                "protected path {} lies inside the editable project; keep it in private storage or outside the project",
                 path.display()
             );
             ensure!(
@@ -2103,6 +2113,17 @@ fn valid_name(name: &str) -> bool {
 #[cfg(test)]
 mod harness_pin_tests {
     use super::*;
+
+    #[test]
+    fn home_workspace_protects_training_data_without_requiring_external_storage() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(home.path(), home.path().join(".dial")).unwrap();
+        let mut config = Config::load(&layout, None).unwrap();
+        config.training.train_data = layout.state_dir.join("training/train.jsonl");
+        config.validate_protected().unwrap();
+        config.training.train_data = layout.project_root.join("editable-train.jsonl");
+        assert!(config.validate_protected().is_err());
+    }
 
     #[test]
     fn operator_harness_pins_override_stored_harness_only_when_they_differ_from_defaults() {
@@ -2485,6 +2506,33 @@ mod chatgpt_tests {
                 .unwrap()
                 .uses_local_compute()
         );
+    }
+
+    #[test]
+    fn compute_locks_can_be_disabled_without_changing_local_routing() {
+        let mut config =
+            resolve("provider='mlx'\nmodel='local-model'\ncompute_locks=false\n").unwrap();
+        assert!(config.uses_local_compute());
+        assert!(!config.requires_compute_lock());
+        config.compute_locks = true;
+        assert!(config.requires_compute_lock());
+    }
+
+    #[test]
+    fn laya_roles_never_require_compute_locks_for_cloud_sessions() {
+        let mut config = resolve("provider='chatgpt'\nmodel='account-model'\n").unwrap();
+        for role in ["decision", "judge"] {
+            config.model_roles.insert(
+                role.into(),
+                crate::llm::model_config::ModelSelection::new(
+                    crate::agent::laya::PROVIDER,
+                    crate::agent::laya::JUDGE_MODEL,
+                ),
+            );
+        }
+        assert!(!config.uses_local_compute());
+        assert!(!config.requires_compute_lock());
+        assert!(!config.memory_role_is_local("judge", None));
     }
 
     #[test]

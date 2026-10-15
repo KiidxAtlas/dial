@@ -134,14 +134,10 @@ impl Checkpoints {
         );
         platform_fs::set_owner_only(&dir)?;
         let dir = fs::canonicalize(&dir)?;
-        if dir.starts_with(&root) {
-            fs::remove_dir(&dir).ok();
-            bail!(
-                "checkpoint directory {} must be outside the project {}",
-                dir.display(),
-                root.display()
-            );
-        }
+        ensure!(
+            !root.starts_with(&dir),
+            "project directory must not be inside its checkpoint storage"
+        );
         let next_turn = disk_turns(&dir).last().map_or(1, |t| t + 1);
         Ok(Self {
             dir,
@@ -551,6 +547,10 @@ impl Checkpoints {
         for name in tail.iter().rev() {
             resolved.push(name);
         }
+        ensure!(
+            !resolved.starts_with(&self.dir) && !self.dir.starts_with(&resolved),
+            "cannot checkpoint private checkpoint storage or its ancestors"
+        );
         let added = self.added_roots();
         let root = std::iter::once((None, self.root.as_path()))
             .chain(added.iter().map(|root| (Some(root), root.as_path())))
@@ -955,13 +955,23 @@ mod tests {
     }
 
     #[test]
-    fn implicit_turn_when_none_begun_and_new_rejects_dir_inside_project() {
+    fn implicit_turn_and_nested_checkpoint_storage_stay_separate() {
         let fx = Fixture::new();
         fx.write("a.txt", "A0");
         let cp = fx.open();
         modify(&cp, &fx, "a.txt", "A1");
         assert_eq!(cp.list().len(), 1);
-        assert!(Checkpoints::new(fx.root().join(".cp"), fx.root()).is_err());
+        let nested_dir = fx.root().join(".cp");
+        let nested = Checkpoints::new(nested_dir.clone(), fx.root()).unwrap();
+        assert!(
+            nested
+                .before_write(&nested_dir.join("manifest.json"))
+                .is_err()
+        );
+        nested.before_write(&fx.path("a.txt")).unwrap();
+        fs::write(fx.path("a.txt"), "A2").unwrap();
+        assert_eq!(nested.rollback(1).unwrap().restored, ["a.txt"]);
+        assert_eq!(fs::read_to_string(fx.path("a.txt")).unwrap(), "A1");
         assert!(cp.rollback(0).is_err());
     }
 

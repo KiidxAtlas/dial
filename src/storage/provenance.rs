@@ -185,13 +185,7 @@ fn valid_expiration(expires_at: Option<i64>, at: i64) -> Result<()> {
 
 impl ProvenanceMemory {
     pub fn open(layout: &Layout) -> Result<Self> {
-        layout.ensure_state_outside_project()?;
-        // Unlike per-project state, this database contains global facts, so check its own location.
-        ensure!(
-            !layout.user_dir.starts_with(&layout.project_root)
-                && !layout.project_root.starts_with(&layout.user_dir),
-            "memory directory must not overlap the workspace; set DIAL_HOME elsewhere"
-        );
+        layout.ensure_project_outside_storage()?;
         match platform_fs::create_dir_owner_only(
             &fs::DirBuilder::new().recursive(true),
             &layout.user_dir,
@@ -207,9 +201,8 @@ impl ProvenanceMemory {
         );
         let directory = fs::canonicalize(&layout.user_dir)?;
         ensure!(
-            !directory.starts_with(&layout.project_root)
-                && !layout.project_root.starts_with(&directory),
-            "memory directory resolves inside workspace"
+            !layout.project_root.starts_with(&directory),
+            "workspace resolves inside private memory directory"
         );
         platform_fs::set_owner_only(&directory)?;
         let path = directory.join("memory.sqlite3");
@@ -917,6 +910,29 @@ mod tests {
     }
 
     #[test]
+    fn home_workspace_keeps_durable_memory_available() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(home.path(), home.path().join(".dial")).unwrap();
+        let memory = ProvenanceMemory::open(&layout).unwrap();
+        let saved = memory
+            .retain(
+                Scope::Project,
+                "Home workspace fact",
+                "user report",
+                "session",
+                None,
+            )
+            .unwrap();
+        drop(memory);
+        let reopened = ProvenanceMemory::open(&layout).unwrap();
+        let found = reopened
+            .recall("workspace", Some(Scope::Project), 8, 6000)
+            .unwrap();
+        assert_eq!(found.entries.len(), 1);
+        assert_eq!(found.entries[0].id, saved.id);
+    }
+
+    #[test]
     fn durable_restart_keeps_provenance_and_rebuilds_live_lookup() {
         let (_home, _project, layout) = layout();
         let memory = ProvenanceMemory::open(&layout).unwrap();
@@ -1553,10 +1569,11 @@ mod tests {
     }
 
     #[test]
-    fn state_overlap_symlinks_and_oversized_legacy_files_are_rejected() {
+    fn private_workspace_symlinks_and_oversized_legacy_files_are_rejected() {
         let (_home, _project, layout) = layout();
-        let inside =
-            Layout::with_user_dir(&layout.project_root, layout.project_root.join("state")).unwrap();
+        let private = layout.user_dir.join("workspace");
+        fs::create_dir_all(&private).unwrap();
+        let inside = Layout::with_user_dir(&private, layout.user_dir.clone()).unwrap();
         assert!(ProvenanceMemory::open(&inside).is_err());
         let memory = ProvenanceMemory::open(&layout).unwrap();
         fs::create_dir_all(&layout.state_dir).unwrap();

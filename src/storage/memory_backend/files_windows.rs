@@ -116,20 +116,15 @@ fn open_directory_path(path: &Path, create: bool) -> Result<File> {
 impl PrivateDirectory {
     fn open_mode(layout: &Layout, id: &str, create: bool) -> Result<Self> {
         let id = component_name(id)?;
-        ensure!(
-            !layout.project_root.starts_with(&layout.user_dir)
-                && !layout.user_dir.starts_with(&layout.project_root),
-            "memory directory must not overlap the workspace; set DIAL_HOME elsewhere"
-        );
+        layout.ensure_project_outside_storage()?;
         let base = Self {
             path: layout.user_dir.clone(),
             handle: Arc::new(open_directory_path(&layout.user_dir, create)?),
         };
         let resolved = std::fs::canonicalize(&layout.user_dir)?;
         ensure!(
-            !layout.project_root.starts_with(&resolved)
-                && !resolved.starts_with(&layout.project_root),
-            "memory directory resolves inside workspace"
+            !layout.project_root.starts_with(&resolved),
+            "workspace resolves inside private memory directory"
         );
         let backends = if create {
             base.child("memory-backends")?

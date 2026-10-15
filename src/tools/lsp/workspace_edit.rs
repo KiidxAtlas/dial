@@ -72,6 +72,9 @@ impl Snapshot {
                     continue;
                 }
                 let path = entry.path();
+                if ws.is_protected(&path) {
+                    continue;
+                }
                 let meta = fs::symlink_metadata(&path)
                     .map_err(|e| format!("cannot snapshot {}: {e}", path.display()))?;
                 if meta.is_dir() {

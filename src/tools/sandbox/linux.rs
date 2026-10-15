@@ -2,7 +2,7 @@
 //!
 //! Unlike macOS Dev mode, Linux Dev reads are bounded to the system runtime, the workspace
 //! and explicit extra-write directories. No host home, /run or /tmp is exposed wholesale.
-//! A denied path overlapping any exposed tree is rejected rather than silently ignored.
+//! Nested private paths are masked after all binds; unsafe overlaps fail closed.
 //! This deliberately stricter policy avoids host IPC sockets and protects absent secret paths
 //! without an unsafe allow-by-default mount. There is never an unsandboxed fallback.
 // Compiled on macOS only for tests; its helpers are used by the Linux build and self-tests.
@@ -22,6 +22,8 @@ struct Mounts {
     read: Vec<(PathBuf, PathBuf)>,
     write: Vec<PathBuf>,
     network: bool,
+    denied: Vec<PathBuf>,
+    masks: Vec<(PathBuf, bool)>,
 }
 
 impl Mounts {
@@ -29,9 +31,10 @@ impl Mounts {
         let workspace = directory(workspace)?;
         let (network, denied, extra) = match policy {
             Policy::Strict {
+                deny_read,
                 allow_network,
                 extra_write,
-            } => (*allow_network, &[][..], extra_write.as_slice()),
+            } => (*allow_network, deny_read.as_slice(), extra_write.as_slice()),
             Policy::Dev {
                 deny_read,
                 extra_write,
@@ -47,7 +50,8 @@ impl Mounts {
         }
         // Home toolchain roots are read-only by default, but an explicit write root at or below one
         // (for example `extra_write = ["~/.cargo"]`) may shadow it: write binds are mounted after
-        // read binds. A write root above one (such as `$HOME`) is still refused.
+        // read binds. The workspace may itself be the home directory; its existing
+        // write grant covers nested toolchains too. System runtime trees stay read-only.
         let mut toolchain_read = Vec::new();
         for path in [".cargo", ".rustup", ".nvm", ".pyenv", ".local/bin"] {
             if let Some(home) = std::env::var_os("HOME") {
@@ -91,9 +95,11 @@ impl Mounts {
                 .any(|root| overlaps(path, Path::new(root)))
                 || read.iter().any(|(source, target)| {
                     (overlaps(path, source) || overlaps(path, target))
-                        && !toolchain_read
-                            .iter()
-                            .any(|root| source == root && path.starts_with(root))
+                        && !toolchain_read.iter().any(|root| {
+                            source == root
+                                && (path.starts_with(root)
+                                    || (path == &write[0] && root.starts_with(path)))
+                        })
                 })
             {
                 return Err(format!(
@@ -102,26 +108,60 @@ impl Mounts {
                 ));
             }
         }
+        let mut denied = denied
+            .iter()
+            .map(|p| resolve(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Reduce resolved exclusions before inspecting their contents. An outer
+        // private tree already hides all descendants, including state directories
+        // that have not yet been created inside it.
+        denied.sort_by_key(|path| path.components().count());
+        let mut outer: Vec<PathBuf> = Vec::new();
         for path in denied {
-            let denied = resolve(path)?;
-            if write.iter().any(|path| overlaps(path, &denied))
+            if !outer.iter().any(|root| path.starts_with(root)) {
+                outer.push(path);
+            }
+        }
+        let denied = outer;
+        let mut masks = Vec::new();
+        for denied in &denied {
+            // Never mask runtime mounts or an entire writable root. Nested exclusions
+            // are applied only after every writable bind, so extra roots cannot undo them.
+            if write.iter().any(|path| path.starts_with(denied))
                 || read
                     .iter()
-                    .any(|(source, target)| overlaps(source, &denied) || overlaps(target, &denied))
+                    .any(|(source, target)| overlaps(source, denied) || overlaps(target, denied))
                 || ["/proc", "/dev"]
                     .iter()
-                    .any(|root| overlaps(Path::new(root), &denied))
+                    .any(|root| overlaps(Path::new(root), denied))
             {
                 return Err(format!(
-                    "Linux sandbox refuses overlapping allowed and denied paths: {}; keep secrets outside the workspace and extra_write directories",
+                    "Linux sandbox refuses overlapping allowed and denied paths: {}",
                     denied.display()
                 ));
+            }
+            if write.iter().any(|path| denied.starts_with(path)) {
+                let metadata = fs::metadata(denied).map_err(|e| {
+                    format!(
+                        "cannot safely mask private path {} (must already exist): {e}",
+                        denied.display()
+                    )
+                })?;
+                if !metadata.is_dir() && !metadata.is_file() {
+                    return Err(format!(
+                        "cannot safely mask private special file {}",
+                        denied.display()
+                    ));
+                }
+                masks.push((denied.clone(), metadata.is_dir()));
             }
         }
         Ok(Self {
             read,
             write,
             network,
+            denied,
+            masks,
         })
     }
 
@@ -133,6 +173,16 @@ impl Mounts {
             return Ok(());
         }
         let resolved = resolve(path)?;
+        if self
+            .denied
+            .iter()
+            .any(|denied| resolved.starts_with(denied))
+        {
+            return Err(format!(
+                "program is inside a denied path: {}",
+                resolved.display()
+            ));
+        }
         if self.write.iter().any(|root| resolved.starts_with(root))
             || self
                 .read
@@ -266,6 +316,14 @@ pub(super) fn command_mode(
     for path in mounts.write {
         command.arg("--bind").arg(&path).arg(path);
     }
+    for (path, directory) in mounts.masks {
+        if directory {
+            command.args(["--perms", "000", "--tmpfs"]).arg(&path);
+            command.arg("--remount-ro").arg(path);
+        } else {
+            command.args(["--ro-bind", "/dev/null"]).arg(path);
+        }
+    }
     // Synthetic ancestors created by bwrap must not become writable escape paths.
     // Separate workspace/extra-write mounts stay writable when the root mount is sealed.
     command
@@ -379,7 +437,40 @@ fn self_test(network: bool) -> Result<(), String> {
     if code != Some(0) || output.trim() != "ok" {
         return Err(format!("enforcement probe exited with {code:?}: {output}"));
     }
+    let private = workspace.join("state/private");
+    fs::create_dir_all(&private).map_err(|e| e.to_string())?;
+    fs::write(private.join("secret"), "private").map_err(|e| e.to_string())?;
+    for policy in [
+        Policy::Strict {
+            deny_read: vec![private.clone()],
+            extra_write: vec![],
+            allow_network: network,
+        },
+        Policy::Dev {
+            deny_read: vec![private.clone()],
+            extra_write: vec![],
+            allow_network: network,
+        },
+    ] {
+        let (code, output) = run(
+            &workspace,
+            &policy,
+            r#"
+            echo ordinary > ordinary && [ "$(cat ordinary)" = ordinary ] || exit 20
+            if cat state/private/secret 2>/dev/null; then exit 21; fi
+            if echo bad > state/private/new 2>/dev/null; then exit 22; fi
+            echo ok
+        "#,
+            &[],
+        )?;
+        if code != Some(0) || output.trim() != "ok" {
+            return Err(format!(
+                "nested private state probe exited with {code:?}: {output}"
+            ));
+        }
+    }
     let strict = Policy::Strict {
+        deny_read: Vec::new(),
         allow_network: false,
         extra_write: Vec::new(),
     };
@@ -404,6 +495,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let ws = temp.path().canonicalize().unwrap();
         let strict = Policy::Strict {
+            deny_read: Vec::new(),
             allow_network: false,
             extra_write: vec![],
         };
@@ -423,6 +515,80 @@ mod tests {
             allow_network: false,
         };
         assert!(Mounts::new(&ws, &policy).is_err());
+    }
+
+    #[test]
+    fn both_policies_mask_nested_private_trees_and_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws = temp.path().canonicalize().unwrap();
+        let private = ws.join("state/private");
+        fs::create_dir_all(&private).unwrap();
+        let secret = ws.join("secret-file");
+        fs::write(&secret, "private").unwrap();
+        for policy in [
+            Policy::Strict {
+                deny_read: vec![private.clone(), secret.clone()],
+                extra_write: vec![],
+                allow_network: false,
+            },
+            Policy::Dev {
+                deny_read: vec![private.clone(), secret.clone()],
+                extra_write: vec![],
+                allow_network: false,
+            },
+        ] {
+            let mut mounts = Mounts::new(&ws, &policy).unwrap();
+            assert!(mounts.write.contains(&ws));
+            assert!(mounts.masks.contains(&(private.clone(), true)));
+            assert!(mounts.masks.contains(&(secret.clone(), false)));
+            assert!(
+                mounts
+                    .grant_program(private.join("program").to_str().unwrap())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn outer_private_mask_covers_absent_nested_state_before_metadata_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws = temp.path().canonicalize().unwrap();
+        let private = ws.join(".dial");
+        fs::create_dir(&private).unwrap();
+        let absent = private.join("projects/not-created/models");
+        for policy in [
+            Policy::Strict {
+                deny_read: vec![absent.clone(), private.clone()],
+                extra_write: vec![],
+                allow_network: false,
+            },
+            Policy::Dev {
+                deny_read: vec![absent.clone(), private.clone()],
+                extra_write: vec![],
+                allow_network: false,
+            },
+        ] {
+            let mounts = Mounts::new(&ws, &policy).unwrap();
+            assert_eq!(mounts.masks, vec![(private.clone(), true)]);
+            assert!(!absent.exists());
+        }
+    }
+
+    #[test]
+    fn absent_top_level_credentials_fail_closed_without_creating_host_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws = temp.path().canonicalize().unwrap();
+        let absent = ws.join(".aws");
+        let policy = Policy::Dev {
+            deny_read: vec![absent.clone()],
+            extra_write: vec![],
+            allow_network: false,
+        };
+        let error = Mounts::new(&ws, &policy)
+            .err()
+            .expect("missing private path must fail closed");
+        assert!(error.contains("must already exist"));
+        assert!(!absent.exists());
     }
 
     #[test]
@@ -471,6 +637,7 @@ mod tests {
         fs::create_dir_all(&ws).unwrap();
         fs::create_dir_all(&extra).unwrap();
         let policy = Policy::Strict {
+            deny_read: Vec::new(),
             allow_network: false,
             extra_write: vec![extra.clone()],
         };

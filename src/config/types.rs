@@ -397,6 +397,8 @@ pub struct Config {
     /// Defaults to the project directory name.
     pub use_case: String,
     pub worker_timeout_secs: u64,
+    /// Coordinate local model work across sessions. Disable to allow concurrent compute.
+    pub compute_locks: bool,
     /// Silence limit for remote model responses, independent of long local workers. Covers both the
     /// wait for the first event and silence between events. `0` disables it explicitly; local model
     /// servers are never limited.
@@ -1133,6 +1135,7 @@ impl Default for Config {
             model_profile: None,
             thinking_auto: false,
             worker_timeout_secs: 0,
+            compute_locks: true,
             context_window: 32768,
             context_limit: ContextWindow::Auto,
             cloud_context_window: ContextWindow::Auto,

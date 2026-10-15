@@ -604,7 +604,7 @@ pub(crate) fn run_acp(layout: Layout, config: Config) -> Result<()> {
 }
 fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
     config.require_model()?;
-    layout.ensure_state_outside_project()?;
+    layout.ensure_project_outside_storage()?;
     let interrupt = Arc::new(AtomicBool::new(false));
     let mut writer =
         crate::output::StdoutWriter::new().context("opening nonblocking control stdout")?;
@@ -708,7 +708,8 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                         agent.pump_subagents(&mut ui);
                         if current {
                             let queued = worker_prompt_queued.load(Ordering::SeqCst);
-                            let foreground = agent.foreground_idle_pending(queued)?;
+                            let foreground =
+                                config.compute_locks && agent.foreground_idle_pending(queued)?;
                             let mut ready = !foreground || compute.is_some();
                             if foreground && compute.is_none() {
                                 let lock = crate::learn::auto::lock_file(
@@ -768,8 +769,9 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                         None | Some("status" | "queue")
                     );
                 if compute.is_none()
+                    && config.compute_locks
                     && (memory_compute
-                        || (config.uses_local_compute()
+                        || (config.requires_compute_lock()
                             && matches!(
                                 request["method"].as_str(),
                                 Some("send" | "live_listen" | "compact" | "task_start")

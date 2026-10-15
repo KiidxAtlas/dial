@@ -55,9 +55,13 @@ Changing a rule means editing that test and stating why here.
   run in `tools/mod.rs` and `tools/sandbox.rs`.
 - Shell confinement is platform-owned: macOS retains `sandbox-exec`; Linux/WSL2 uses
   bubblewrap namespaces (`tools/sandbox/linux.rs`). Linux exposes only the system
-  runtime, workspace and explicit extra-write directories, and refuses denied/allowed
-  overlaps and enabled WSL Windows interop. Both backends fail closed after real
-  enforcement probes; approvals never grant an unsandboxed fallback. MLX remains
+  runtime, workspace and explicit extra-write directories. Nested private storage is
+  excluded from native tools and sandboxed commands, allowing a containing workspace
+  such as HOME. Linux masks existing private paths after writable mounts; missing
+  denied paths beneath writable roots still fail closed rather than creating host
+  directories. Unsafe runtime overlaps and enabled WSL Windows interop are refused.
+  Both backends fail closed after real enforcement probes; approvals never grant an
+  unsandboxed fallback. MLX remains
   macOS/Apple Silicon only; Linux/WSL2 uses hosted or OpenAI-compatible providers.
 - Every completed live edit turn, including text-only completion, surfaces a bounded checkpoint diff; shell and approval-requiring extension calls are tracked as uncheckpointed and require staged/unstaged Git review (`agent/mod.rs`, `storage/checkpoint.rs`).
 - Failed focused checks remain named repair obligations and are re-run alongside checks selected from new changed files; project-aware mappings use Python, Rust, Go and JavaScript test metadata (`agent/verification.rs`, `agent/mod.rs`).

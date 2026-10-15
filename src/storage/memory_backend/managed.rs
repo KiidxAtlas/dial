@@ -356,7 +356,7 @@ impl Publication {
 }
 /// Pure target plan: no parent directory, manifest, journal or staging file is created before owner authorization.
 pub fn prepare(layout: &Layout, values: &[Value]) -> Result<Publication> {
-    layout.ensure_state_outside_project()?;
+    layout.ensure_project_outside_storage()?;
     let path = directory_path(layout);
     let previous = manifests(layout)?;
     let generation = format!(

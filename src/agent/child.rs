@@ -158,7 +158,7 @@ impl ChildBackends {
             user_dir: env.config.user_dir.clone(),
             state_dir,
         };
-        layout.ensure_state_outside_project()?;
+        layout.ensure_project_outside_storage()?;
         let session = crate::storage::session::Session::create(
             &layout,
             crate::storage::session::SessionMeta {

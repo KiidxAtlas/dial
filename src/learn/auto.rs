@@ -71,7 +71,7 @@ pub fn check_stop(config: &Config) -> Result<()> {
         "improvement stopped by operator"
     );
     // A running background job also stops when today's compute budget is spent.
-    if super::compute::can_yield() {
+    if super::compute::background_active() {
         let used =
             super::resources::used_today(&config.user_dir) + super::compute::lease_elapsed_secs();
         if super::resources::budget_left(&config.improve, used) == Some(0) {
@@ -453,6 +453,7 @@ pub fn background(path: &Path) -> Result<()> {
     let control = lock_file(&config.state_dir.join("control.lock"))?;
     control.lock_exclusive()?;
     let current = Config::load(&layout, None)?;
+    config.compute_locks = current.compute_locks;
     if !request.force {
         // The operator's current setting decides; the request snapshot may predate a change to it.
         config.improve.enabled = current.improve.enabled;

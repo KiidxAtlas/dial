@@ -92,7 +92,9 @@ const WRITABLE_DEVICES: &[&str] = &["/dev/null", "/dev/dtracehelper"];
 pub enum Policy {
     /// Deny-by-default: the system read set plus the workspace and `extra_write`, the
     /// attached workspace roots that get the same access as the workspace (see [`profile`]).
+    /// `deny_read` excludes protected state from reads and writes, overriding those grants.
     Strict {
+        deny_read: Vec<PathBuf>,
         allow_network: bool,
         extra_write: Vec<PathBuf>,
     },
@@ -150,6 +152,7 @@ impl Sandbox {
         args: &[&str],
     ) -> Result<Command, String> {
         let policy = Policy::Strict {
+            deny_read: Vec::new(),
             allow_network,
             extra_write: Vec::new(),
         };
@@ -178,17 +181,19 @@ impl Sandbox {
         #[cfg(not(any(target_os = "linux", windows)))]
         {
             let Policy::Strict {
+                deny_read,
                 allow_network,
                 extra_write,
             } = policy
             else {
                 return Err("command_mode requires a Strict policy on this platform".into());
             };
-            let mut profile = profile(workspace, extra_write, *allow_network)?;
+            let mut profile = strict_profile(workspace, deny_read, extra_write, *allow_network)?;
             profile.push_str(&program_rule(program)?);
             if let Some(fd) = owned_terminal {
                 profile.push_str(&owned_terminal_rule(fd)?);
             }
+            append_denials(&mut profile, deny_read)?;
             let mut command = Command::new(SANDBOX_EXEC);
             command.arg("-p").arg(profile).arg(program).args(args);
             Ok(command)
@@ -289,6 +294,7 @@ impl Sandbox {
                 if let Some(fd) = owned_terminal {
                     profile.push_str(&owned_terminal_rule(fd)?);
                 }
+                append_denials(&mut profile, deny_read)?;
                 let mut command = Command::new(SANDBOX_EXEC);
                 command.arg("-p").arg(profile).arg(program).args(args);
                 command
@@ -323,13 +329,17 @@ impl Sandbox {
             }
             let (mechanism, real_profile) = match policy {
                 Policy::Strict {
+                    deny_read,
                     allow_network,
                     extra_write,
                 } => {
                     if let Sandbox::Unavailable(reason) = Sandbox::detect() {
                         return Sandbox::Unavailable(reason);
                     }
-                    (Ok(()), profile(workspace, extra_write, *allow_network))
+                    (
+                        Ok(()),
+                        strict_profile(workspace, deny_read, extra_write, *allow_network),
+                    )
                 }
                 Policy::Dev {
                     deny_read,
@@ -539,6 +549,48 @@ pub fn profile(
     Ok(out)
 }
 
+/// Strict profile with protected state excluded even when nested below a writable root.
+pub fn strict_profile(
+    workspace: &Path,
+    deny_read: &[PathBuf],
+    extra_write: &[PathBuf],
+    allow_network: bool,
+) -> Result<String, String> {
+    let workspace = resolve(workspace)?;
+    for denied in deny_read {
+        let denied = resolve(denied)?;
+        if workspace.starts_with(&denied) {
+            return Err(format!(
+                "the workspace {} is inside a denied path {}",
+                workspace.display(),
+                denied.display()
+            ));
+        }
+    }
+    let mut out = profile(&workspace, extra_write, allow_network)?;
+    append_denials(&mut out, deny_read)?;
+    Ok(out)
+}
+
+/// Shared by both policies. Protect the path and prevent renaming/removing an ancestor
+/// to move its contents outside the path-based denial. Ordinary sibling writes remain allowed.
+fn append_denials(out: &mut String, deny_read: &[PathBuf]) -> Result<(), String> {
+    for path in deny_read {
+        let path = resolve(path)?;
+        for ancestor in path.ancestors().skip(1) {
+            out.push_str(&format!(
+                "(deny file-write-unlink (literal {}))\n",
+                quote(ancestor)?
+            ));
+        }
+        out.push_str(&format!(
+            "(deny file-read* file-write* (subpath {}))\n",
+            quote(&path)?
+        ));
+    }
+    Ok(())
+}
+
 /// Devices commands may write to under the Dev policy.
 const DEV_WRITABLE_DEVICES: &[&str] = &[
     "/dev/null",
@@ -646,12 +698,7 @@ pub fn dev_profile(
     }
     out.push_str(")\n");
     // Last, so they override the workspace and extra_write allowances.
-    for path in &denied {
-        out.push_str(&format!(
-            "(deny file-read* file-write* (subpath {}))\n",
-            quote(path)?
-        ));
-    }
+    append_denials(&mut out, &denied)?;
     Ok(out)
 }
 
@@ -949,6 +996,65 @@ mod tests {
     }
 
     #[test]
+    fn strict_and_dev_profiles_exclude_nested_private_tree_last() {
+        let fx = Fixture::new();
+        let private = fx.ws.join("state/private");
+        std::fs::create_dir_all(&private).unwrap();
+        let denied = vec![private.clone()];
+        for text in [
+            strict_profile(&fx.ws, &denied, std::slice::from_ref(&private), false).unwrap(),
+            dev_profile(&fx.ws, &denied, std::slice::from_ref(&private), false).unwrap(),
+        ] {
+            let rule = format!(
+                "(deny file-read* file-write* (subpath {}))\n",
+                quote(&private).unwrap()
+            );
+            assert!(text.ends_with(&rule));
+            assert!(text.contains(&format!(
+                "(deny file-write-unlink (literal {}))",
+                quote(&fx.ws.join("state")).unwrap()
+            )));
+            assert!(!text.contains("(deny file-write* (subpath"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strict_and_dev_deny_nested_private_state_without_blocking_ordinary_files() {
+        if !require_for_test() {
+            return;
+        }
+        let fx = Fixture::new();
+        let private = fx.ws.join("state/private");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(private.join("secret"), "private").unwrap();
+        for policy in [
+            Policy::Strict {
+                deny_read: vec![private.clone()],
+                extra_write: vec![],
+                allow_network: false,
+            },
+            Policy::Dev {
+                deny_read: vec![private.clone()],
+                extra_write: vec![],
+                allow_network: false,
+            },
+        ] {
+            let (code, output) = fx.run(
+                &policy,
+                r#"
+                echo ordinary > ordinary && [ "$(cat ordinary)" = ordinary ] || exit 10
+                if cat state/private/secret 2>/dev/null; then exit 11; fi
+                if echo bad > state/private/new 2>/dev/null; then exit 12; fi
+                if mv state moved 2>/dev/null; then exit 13; fi
+                echo ok
+            "#,
+            );
+            assert_eq!(code, Some(0), "{output}");
+        }
+    }
+
+    #[test]
     fn unavailable_sandbox_refuses_to_build_commands() {
         let sandbox = Sandbox::Unavailable("nope".to_string());
         assert!(sandbox.available().unwrap_err().contains("nope"));
@@ -1152,6 +1258,7 @@ mod tests {
                 .is_err()
         );
         let strict = Policy::Strict {
+            deny_read: Vec::new(),
             allow_network: false,
             extra_write: Vec::new(),
         };
@@ -1434,6 +1541,7 @@ mod tests {
                 Sandbox::probe_policy(
                     &fx.ws,
                     &Policy::Strict {
+                        deny_read: Vec::new(),
                         allow_network,
                         extra_write: Vec::new(),
                     },
@@ -1465,6 +1573,7 @@ mod tests {
             .command_with_policy(
                 &fx.ws,
                 &Policy::Strict {
+                    deny_read: Vec::new(),
                     allow_network: false,
                     extra_write: Vec::new(),
                 },

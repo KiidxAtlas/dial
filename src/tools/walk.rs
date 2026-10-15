@@ -69,6 +69,7 @@ impl<'a> Walk<'a> {
     ) {
         let prefix = prefix.to_path_buf();
         let root = self.ws.root.clone();
+        let ws = self.ws.clone();
         let walker = WalkBuilder::new(start)
             .hidden(false)
             .follow_links(false)
@@ -78,6 +79,9 @@ impl<'a> Walk<'a> {
             .max_depth(Some(MAX_WALK_DEPTH))
             .sort_by_file_name(|a, b| a.cmp(b))
             .filter_entry(move |entry| {
+                if ws.is_protected(entry.path()) {
+                    return false;
+                }
                 if entry.depth() == 0 || !entry.file_type().is_some_and(|t| t.is_dir()) {
                     return true;
                 }
@@ -208,6 +212,10 @@ impl<'a> SearchWalk<'a> {
         rules: &mut Vec<ignore::gitignore::Gitignore>,
         visit: &mut dyn FnMut(&Path) -> bool,
     ) -> bool {
+        if self.ws.is_protected(path) {
+            self.excluded += 1;
+            return true;
+        }
         let directory = kind.is_dir();
         if depth > 0 && !path.starts_with(prefix) && !(directory && prefix.starts_with(path)) {
             return true;

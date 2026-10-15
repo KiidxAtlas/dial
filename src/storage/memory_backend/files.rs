@@ -83,12 +83,7 @@ fn resolved_prefix(path: &Path) -> Result<PathBuf> {
 }
 impl PrivateDirectory {
     fn open_mode(layout: &Layout, id: &str, create: bool) -> Result<Self> {
-        layout.ensure_state_outside_project()?;
-        ensure!(
-            !layout.user_dir.starts_with(&layout.project_root)
-                && !layout.project_root.starts_with(&layout.user_dir),
-            "memory storage overlaps workspace"
-        );
+        layout.ensure_project_outside_storage()?;
         ensure!(
             layout.user_dir.is_absolute(),
             "memory storage must be absolute"

@@ -105,6 +105,9 @@ pub(super) fn list_dir(ws: &Workspace, dir: &Path) -> Result<String, String> {
                 match item {
                     Ok(entry) => {
                         let path = entry.path();
+                        if self.ws.is_protected(&path) {
+                            continue;
+                        }
                         let kind = entry
                             .file_type()
                             .map_err(|e| format!("unreadable entry {}: {e}", path.display()))?;

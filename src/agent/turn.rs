@@ -635,7 +635,7 @@ impl Agent<'_> {
                             policy: Some(&reasoning_policy),
                             recovery: Some(&self.config.request_recovery),
                         },
-                        if crate::learn::compute::can_yield() {
+                        if crate::learn::compute::background_active() {
                             cancel
                         } else {
                             interrupt.clone()

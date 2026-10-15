@@ -616,7 +616,7 @@ impl<'a> Agent<'a> {
                 .layout
                 .as_ref()
                 .context("persistent permissions unavailable here")?;
-            layout.ensure_state_outside_project()?;
+            layout.ensure_project_outside_storage()?;
             approval::save(&layout.state_dir.join("permissions.toml"), &rules)?;
         }
         self.always = rules;
@@ -628,7 +628,7 @@ impl<'a> Agent<'a> {
             .layout
             .as_ref()
             .context("persistent permissions unavailable here")?;
-        layout.ensure_state_outside_project()?;
+        layout.ensure_project_outside_storage()?;
         approval::save(&layout.state_dir.join("permissions.toml"), &self.always)
     }
     pub fn remove_permission_rule(&mut self, index: usize, persist: bool) -> Result<()> {
@@ -643,7 +643,7 @@ impl<'a> Agent<'a> {
                 .layout
                 .as_ref()
                 .context("persistent permissions unavailable here")?;
-            layout.ensure_state_outside_project()?;
+            layout.ensure_project_outside_storage()?;
             approval::save(&layout.state_dir.join("permissions.toml"), &rules)?;
         }
         self.always = rules;
