@@ -50,6 +50,7 @@ const TREE_POLL: Duration = Duration::from_millis(200);
 const GRACEFUL_STOP: Duration = Duration::from_millis(300);
 const CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const TREE_SCAN_GRACE: Duration = Duration::from_millis(200);
+#[cfg(unix)]
 const MAX_PROCESSES: usize = 65_536;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -685,6 +686,7 @@ fn process_info(_: libc::pid_t) -> Result<Option<ProcessInfo>> {
     bail!("scheduler owned-process cancellation requires macOS or Linux")
 }
 
+#[cfg(unix)]
 fn scan_deadline(deadline: Instant) -> Result<()> {
     ensure!(
         Instant::now() < deadline,

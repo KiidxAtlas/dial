@@ -583,6 +583,8 @@ fn permit_requested_localhost(
     Ok(())
 }
 
+// Seatbelt profile helpers: only the macOS driver sandbox (and its tests) builds profiles.
+#[cfg(any(target_os = "macos", test))]
 fn profile_path(path: &Path) -> Result<String, String> {
     let path = path.to_str().ok_or("dependency path is not UTF-8")?;
     if !Path::new(path).is_absolute()
@@ -603,6 +605,7 @@ fn operator_dependency(workspace: &Path, entry: &Path) -> Result<PathBuf, String
     }
     Ok(entry)
 }
+#[cfg(any(target_os = "macos", test))]
 fn dependency_metadata(paths: &[&Path]) -> Result<String, String> {
     let ancestors = paths
         .iter()
@@ -615,6 +618,7 @@ fn dependency_metadata(paths: &[&Path]) -> Result<String, String> {
     rules.push_str(")\n");
     Ok(rules)
 }
+#[cfg(any(target_os = "macos", test))]
 fn state_unix_ipc(state: &Path) -> Result<String, String> {
     profile_path(state)?;
     let prefix = regex::escape(state.to_str().ok_or("browser state path is not UTF-8")?);

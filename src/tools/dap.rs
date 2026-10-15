@@ -969,7 +969,10 @@ impl Session {
         #[cfg(not(unix))]
         let mut tcp_listener: Option<TcpListener> = None;
         let mut args = config.args.clone();
+        // Assigned only by the Unix socket transport below.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut cleanup_dir: Option<tempfile::TempDir> = None;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut socket_path: Option<PathBuf> = None;
         let mut tcp_address = None;
         match config.transport {

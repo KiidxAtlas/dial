@@ -2,18 +2,28 @@
 //! lsof is an explicit OS prerequisite, never a best-effort ownership guess.
 #[cfg(unix)]
 use super::wake::{self, Waker};
+#[cfg(unix)]
 use crate::tools::shell::ProcessGroup;
 use serde_json::Value;
+#[cfg(unix)]
 use std::io::{self, Read};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+#[cfg(unix)]
+use std::net::TcpStream;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
+#[cfg(unix)]
+use std::time::Duration;
+use std::time::Instant;
 
 pub(super) struct Ready {
     pub(super) log: Option<regex::Regex>,

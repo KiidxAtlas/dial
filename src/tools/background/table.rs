@@ -4,7 +4,9 @@
 //! [`Proc`] is dropped (see `ProcessGroup`), so removing an entry, dropping the table and
 //! dropping the tool all reap everything they started.
 
-use super::input::{self, Handle, Input};
+#[cfg(not(windows))]
+use super::input;
+use super::input::{Handle, Input};
 use super::wake;
 use crate::tools::Workspace;
 use crate::tools::artifact::ArtifactSpool;

@@ -215,6 +215,7 @@ impl Sandbox {
 
     /// Retain only the caller's freshly allocated private controlling PTY, never a host TTY.
     /// All filesystem, network, PID namespace and die-with-parent restrictions are unchanged.
+    #[cfg(not(windows))]
     pub(super) fn command_with_owned_terminal(
         &self,
         workspace: &Path,
@@ -711,6 +712,7 @@ pub fn is_secret_env(name: &str, value: &str) -> bool {
 
 /// `env` minus secrets and non-UTF-8 entries; `PATH` is inherited (with a
 /// system default when unset) so toolchains resolve, `HOME` is left as is.
+#[cfg(not(windows))]
 fn scrubbed_env(env: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
     let mut kept: Vec<(OsString, OsString)> = env
         .filter(|(name, value)| match (name.to_str(), value.to_str()) {

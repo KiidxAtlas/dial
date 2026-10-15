@@ -57,6 +57,7 @@ fn adc_path() -> Result<Option<String>> {
         let path = format!("{dir}/application_default_credentials.json");
         return Ok(std::path::Path::new(&path).is_file().then_some(path));
     }
+    #[cfg(not(windows))]
     let home = std::env::var("HOME").ok();
     #[cfg(windows)]
     let home = std::env::var("APPDATA").ok().map(|p| format!("{p}/gcloud"));
