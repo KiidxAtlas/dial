@@ -507,13 +507,13 @@ fn remove_subtree(snapshot: &mut Snapshot, relative: &Path) {
 
 /// A whiteout is a character device 0:0 in the upper directory.
 #[cfg(unix)]
-fn is_whiteout(meta: &fs::Metadata) -> bool {
+pub(super) fn is_whiteout(meta: &fs::Metadata) -> bool {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     meta.file_type().is_char_device() && meta.rdev() == 0
 }
 
 #[cfg(not(unix))]
-fn is_whiteout(_meta: &fs::Metadata) -> bool {
+pub(super) fn is_whiteout(_meta: &fs::Metadata) -> bool {
     false
 }
 

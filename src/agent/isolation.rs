@@ -284,11 +284,18 @@ fn changed(before: &Snapshot, after: &Snapshot) -> Vec<PathBuf> {
         .collect()
 }
 
-fn materialize(path: &Path, expected: Option<&FileStamp>) -> Result<Option<FileState>> {
+/// `whiteouts`: the worker tree is an overlay upper layer, where a deleted name is recorded as a
+/// whiteout (character device 0:0) under that same name rather than being absent.
+fn materialize(
+    path: &Path,
+    expected: Option<&FileStamp>,
+    whiteouts: bool,
+) -> Result<Option<FileState>> {
     let Some(expected) = expected else {
         return match fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
+            Ok(meta) if whiteouts && overlay::is_whiteout(&meta) => Ok(None),
             Ok(_) => anyhow::bail!("worker deleted file reappeared after snapshot"),
         };
     };
@@ -533,7 +540,7 @@ impl Isolated {
                 stage = "confinement";
                 let worker_path = confined_destination(self.source_root(), relative)?;
                 stage = "read";
-                let state = materialize(&worker_path, after.get(relative))?;
+                let state = materialize(&worker_path, after.get(relative), self._mount.is_some())?;
                 stage = "observer";
                 if state.is_some() {
                     project.observe_write(&path)
@@ -679,6 +686,23 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.path().join("new.txt")).unwrap(), "n");
         assert!(!dir.path().join("gone.txt").exists());
         assert!(!root.exists(), "copy removed");
+    }
+
+    /// An overlay upper layer records a deletion as a whiteout under the deleted name; merging must
+    /// treat it as the deletion, and anything else in that place as a reappeared file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlay_whiteouts_materialize_as_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone.txt");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path for the duration of the call.
+        if unsafe { libc::mknod(name.as_ptr(), libc::S_IFCHR | 0o600, 0) } != 0 {
+            // Unprivileged whiteouts need Linux 5.8+; the overlay backend is unavailable without them.
+            return;
+        }
+        assert!(materialize(&path, None, true).unwrap().is_none());
+        assert!(materialize(&path, None, false).is_err());
     }
 
     #[test]
