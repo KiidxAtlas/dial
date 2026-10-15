@@ -252,7 +252,6 @@ try {
             tag.trim_start_matches('v'),
             backup.display()
         );
-        return Ok(());
     }
     #[cfg(not(windows))]
     {

@@ -5,6 +5,7 @@ use super::wake::Waker;
 use parking_lot::{Mutex, MutexGuard};
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
 use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;

@@ -124,6 +124,7 @@ pub fn run_interactive(layout: Layout, config: Config, options: Options) -> Resu
         options.add_dirs,
         options.mode_flags,
     )?;
+    #[cfg(unix)]
     let startup_prompt = options.prompt.clone();
     let mut shell = Shell::new(&app, options.prompt)?;
     for notice in &options.notices {

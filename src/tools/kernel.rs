@@ -14,6 +14,7 @@ use crate::config::types::Config;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
@@ -473,6 +474,8 @@ fn resolve_python(
 struct Launch {
     python: PathBuf,
     site: Option<PathBuf>,
+    /// Unix launches choose `-S` from this; Windows always passes `-I -S`.
+    #[cfg_attr(windows, allow(dead_code))]
     isolate_site: bool,
 }
 

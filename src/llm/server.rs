@@ -31,6 +31,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Share of physical memory the server's prompt (KV prefix) cache may hold. mlx_lm keeps up to ten
 /// caches with no byte limit by default; a few long-context caches next to the weights push unified
 /// memory into swap, which costs far more than the occasional re-prefill an evicted cache causes.
+#[cfg(unix)]
 const PROMPT_CACHE_MEMORY_DIVISOR: u64 = 4;
 
 fn prompt_cache_bytes() -> Option<u64> {

@@ -11,14 +11,18 @@ use super::Settings;
 use super::process::{self, Finished};
 use super::url::{check_destination_part, sh_quote};
 use serde::{Deserialize, Serialize};
+#[cfg(any(unix, test))]
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::sync::Once;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, LazyLock, Mutex, Once};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 static ONCE: Once = Once::new();
 
 /// Socket file name; `%C` is OpenSSH's 40-hex digest of the connection. The sandbox matches the
@@ -195,6 +199,7 @@ pub fn control_path_fits(dir: &Path, macos: bool) -> bool {
 }
 
 /// Short per-user fallback for control directories that overflow `sun_path`.
+#[cfg(any(unix, test))]
 pub fn fallback_control_dir(canonical: &Path, uid: u32) -> PathBuf {
     let mut hash = Sha256::new();
     hash.update(uid.to_string());
@@ -863,7 +868,8 @@ pub fn active() -> Vec<String> {
     names
 }
 
-/// Close every master this process opened. Runs at exit; never blocks on a held lock.
+/// Close every master this process opened. Runs at exit (Unix `atexit`); never blocks on a held lock.
+#[cfg(unix)]
 pub fn close_all(settings: &Settings) {
     let targets: Vec<Target> = match STATE.try_lock() {
         Ok(mut state) => {

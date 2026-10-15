@@ -402,11 +402,13 @@ impl Ui for RpcUi {
     }
 }
 
+#[cfg(any(unix, test))]
 fn read_request(
     reader: &mut impl BufRead,
 ) -> std::io::Result<Option<Result<Vec<u8>, &'static str>>> {
     read_request_limit(reader, MAX_REQUEST)
 }
+#[cfg(any(unix, test))]
 fn read_request_limit(
     reader: &mut impl BufRead,
     limit: usize,
