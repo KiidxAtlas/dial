@@ -1,6 +1,6 @@
 [package]
 name = "dial"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "Local, gated model and harness improvement on Apple Silicon"
 license = "MIT"
