@@ -334,9 +334,16 @@ impl App {
     }
 
     fn reopen_store(&mut self) {
-        // Learning is entered through explicit improvement operations, never a coding session.
+        // Coding opens the learning store only for "Teach this model"; everything else enters
+        // learning through explicit improvement operations.
         self.store = None;
         self.store_error = None;
+        if self.config.teaching() {
+            match Self::open_store(&self.config) {
+                Ok(store) => self.store = Some(store),
+                Err(error) => self.store_error = Some(format!("{error:#}")),
+            }
+        }
     }
 
     /// The effective configuration as the files and the command-line flags define it right now.

@@ -321,12 +321,19 @@ pub fn migrate_model_role_table(table: &mut toml::Table) -> bool {
 
 impl Config {
     /// Coding has no implicit learning lifecycle, even with preferences saved by older releases.
+    /// The one opt-in is "Teach this model" ([`Self::teaching`]): verified turns of a local model
+    /// are recorded and the latest admitted version serves. Background cycles stay off either way.
     /// This is a runtime view only; persisted learning configuration remains available to `dial improve`.
     pub fn for_coding(mut self) -> Self {
-        self.improve.enabled = false;
+        if self.teaching() {
+            self.improve.enabled = true;
+            self.improve.learn_from_sessions = true;
+        } else {
+            self.improve.enabled = false;
+            self.improve.learn_from_sessions = false;
+            self.training.enabled = false;
+        }
         self.improve.background = false;
-        self.improve.learn_from_sessions = false;
-        self.training.enabled = false;
         self.assistance.teacher_enabled = false;
         self.codebase.synthesize_architecture = false;
         self.laya.enabled = false;
@@ -1389,6 +1396,19 @@ impl Config {
             }
         }
         Ok(effective)
+    }
+
+    /// "Teach this model" is on and the main model runs locally: Dial's MLX runtime, or a server on
+    /// this machine or the local network (Ollama, LM Studio). Hosted models are never taught.
+    pub fn teaching(&self) -> bool {
+        self.improve.teach && !self.model.is_empty() && self.local_main_model()
+    }
+
+    fn local_main_model(&self) -> bool {
+        self.endpoint.as_ref().is_none_or(|endpoint| {
+            crate::llm::host_of(&endpoint.base_url)
+                .is_some_and(|host| crate::llm::is_local_host(&host))
+        })
     }
 
     /// Whether this session needs the shared local-compute lock: a local main model or any explicit local role.

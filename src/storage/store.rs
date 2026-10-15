@@ -658,6 +658,21 @@ impl Store {
         Ok(())
     }
 
+    /// Record an implicit signal (a commit) unless a person already judged this trajectory with
+    /// `/outcome`, a rating key or `/undo`. Returns whether it was recorded.
+    pub fn implicit_outcome(&self, outcome: &Outcome) -> Result<bool> {
+        let judged: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outcomes WHERE trajectory=?1 AND source LIKE 'user%')",
+            [outcome.trajectory],
+            |row| row.get(0),
+        )?;
+        if judged {
+            return Ok(false);
+        }
+        self.outcome(outcome)?;
+        Ok(true)
+    }
+
     pub fn outcome(&self, outcome: &Outcome) -> Result<()> {
         validate_score(outcome.score)?;
         ensure!(

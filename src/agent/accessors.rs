@@ -141,6 +141,7 @@ impl<'a> Agent<'a> {
             ) {
                 Ok(checkpoints) => {
                     let checkpoints = Arc::new(checkpoints);
+                    checkpoints.set_added_roots(self.workspace.additional_roots());
                     self.workspace = self
                         .workspace
                         .clone()
