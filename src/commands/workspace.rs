@@ -64,8 +64,12 @@ pub(super) fn run(
     Some(result)
 }
 
-/// Resolve a user-typed directory: absolute paths as given, relative paths against the primary root.
+/// Resolve a user-typed directory: `~` and `~/…` against the home directory, absolute paths as
+/// given, relative paths against the primary root.
 fn resolve_dir(root: &Path, arg: &str) -> PathBuf {
+    if arg == "~" || arg.starts_with("~/") {
+        return crate::storage::archive::expand_home(arg);
+    }
     let path = PathBuf::from(arg);
     if path.is_absolute() {
         path
@@ -406,9 +410,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dir_joins_relative_paths_only() {
+    fn resolve_dir_joins_relative_paths_and_expands_home() {
         assert_eq!(resolve_dir(Path::new("/r"), "x/y"), PathBuf::from("/r/x/y"));
         assert_eq!(resolve_dir(Path::new("/r"), "/abs"), PathBuf::from("/abs"));
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        let home = home.canonicalize().unwrap_or(home);
+        assert_eq!(resolve_dir(Path::new("/r"), "~"), home);
+        assert!(resolve_dir(Path::new("/r"), "~/x").starts_with(&home));
+        assert_eq!(resolve_dir(Path::new("/r"), "~x"), PathBuf::from("/r/~x"));
     }
 
     #[test]

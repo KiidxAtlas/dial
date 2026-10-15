@@ -268,7 +268,7 @@ jobs:
                   raise SystemExit(f'missing release checksum for {archive}')
               # Formula urls use #{version}, so match on the target suffix, then the sha256 line that follows it.
               suffix = archive.removeprefix(f'dial-v{version}')
-              pattern = r'(' + re.escape(suffix) + r'"\n\s*sha256 )(?:no_check|"[^"]*")'
+              pattern = r'(' + re.escape(suffix) + r'"\n\s*sha256 )(?::no_check|"[^"]*")'
               formula, count = re.subn(pattern, lambda m: m.group(1) + f'"{sums[archive]}"', formula, count=1)
               if count != 1:
                   raise SystemExit(f'could not update formula checksum for {archive}')

@@ -841,3 +841,46 @@ fn bash_adopted_job_is_awaited_until_it_is_killed() {
     let _ = bg(&tool, &ws, json!({"action": "kill", "name": name}));
     assert!(tool.awaited_work().is_empty());
 }
+
+/// A new user message (steering) ends a `bg wait` as an ordinary result: the job keeps running and
+/// the effects are not unknown, so the agent continues with the message instead of stopping the
+/// turn. A hard interrupt still aborts the wait.
+#[cfg(unix)]
+#[test]
+fn steering_ends_a_wait_cleanly_and_a_hard_interrupt_still_aborts_it() {
+    use crate::tools::outcome::Effects;
+    use crate::tools::signals::{CallSignals, scope};
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    start(&tool, &ws, "svc", "sleep 30");
+    let wait = json!({"action": "wait", "name": "svc", "timeout": 20});
+    assert!(tool.interruptible(&wait), "bg wait must be interruptible");
+
+    let steering = CallSignals::new();
+    steering.request_steering();
+    steering.interrupt_waits();
+    let steered = scope(&steering, || {
+        crate::tools::execution::run(&AtomicBool::new(false), || bg(&tool, &ws, wait.clone()))
+    });
+    assert!(!steered.is_error, "{}", steered.text);
+    assert_ne!(
+        steered.execution.effects,
+        Effects::Unknown,
+        "{}",
+        steered.text
+    );
+    assert!(steered.text.contains("still running"), "{}", steered.text);
+    let listed = bg(&tool, &ws, json!({"action": "list"}));
+    assert!(listed.text.contains("svc"), "{}", listed.text);
+
+    let hard = CallSignals::new();
+    hard.interrupt_waits();
+    let aborted = scope(&hard, || bg(&tool, &ws, wait.clone()));
+    assert!(aborted.is_error, "{}", aborted.text);
+    assert!(
+        aborted.text.contains("cancelled waiting"),
+        "{}",
+        aborted.text
+    );
+    let _ = bg(&tool, &ws, json!({"action": "kill", "name": "svc"}));
+}

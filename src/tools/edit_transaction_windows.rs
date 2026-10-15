@@ -94,17 +94,21 @@ impl Directory {
         create: bool,
         mut parents: Option<&mut ParentCleanup>,
     ) -> Result<Self, String> {
+        // Added directories are workspace roots too; confine the walk to the one holding `target`.
+        let base = ws
+            .root_containing(target)
+            .ok_or("edit target escapes workspace")?;
         let relative = target
-            .strip_prefix(ws.root())
+            .strip_prefix(base)
             .map_err(|_| "edit target escapes workspace")?;
         let parent = relative.parent().unwrap_or(Path::new(""));
         let mut held = if create {
-            crate::platform::fs::open_dir_nofollow_write(ws.root())
+            crate::platform::fs::open_dir_nofollow_write(base)
         } else {
-            crate::platform::fs::open_dir_nofollow(ws.root())
+            crate::platform::fs::open_dir_nofollow(base)
         }
-        .map_err(|e| err("opening workspace", ws.root(), e))?;
-        let mut path = ws.root().to_owned();
+        .map_err(|e| err("opening workspace", base, e))?;
+        let mut path = base.to_owned();
         for component in parent.components() {
             let Component::Normal(part) = component else {
                 return Err("edit path has a non-normal component".into());

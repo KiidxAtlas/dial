@@ -378,11 +378,21 @@ impl Background {
                     on_event(event);
                 }
             }
-            if cancel.load(Ordering::Acquire)
+            let hard_cancel = cancel.load(Ordering::Acquire);
+            if hard_cancel
                 || self.interrupt.load(Ordering::Acquire)
                 || super::signals::wait_interrupted()
             {
                 self.interrupt.store(false, Ordering::Release);
+                // A new user message (steering) ends a pure wait with nothing to undo: the job
+                // keeps running under bg. Reporting it as aborted marked the result as having
+                // unknown effects, which stopped the turn before the new message was answered.
+                if !hard_cancel && super::signals::steering_requested() {
+                    return Ok(ToolOutput::ok(format!(
+                        "stopped waiting for {name} because a new user message arrived; {name} is still running under bg (use output or wait to check it again)"
+                    ))
+                    .with_effects(super::outcome::Effects::None));
+                }
                 return Ok(ToolOutput::err(format!(
                     "cancelled waiting for {name}; background process remains managed by bg"
                 ))
@@ -729,7 +739,7 @@ impl Tool for Background {
     }
 
     fn interruptible(&self, args: &Value) -> bool {
-        args["op"] == "wait"
+        args["action"] == "wait"
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
