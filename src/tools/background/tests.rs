@@ -1,8 +1,11 @@
 use super::table::{MAX_BUFFER, MAX_PROCESSES, Ring};
 use super::*;
-use crate::tools::sandbox::{Policy, Sandbox};
+#[cfg(target_os = "macos")]
+use crate::tools::sandbox::Policy;
+use crate::tools::sandbox::Sandbox;
 use crate::tools::testkit::workspace;
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 
 /// A workspace whose commands run unsandboxed (scrubbed env only), so these tests do not depend on

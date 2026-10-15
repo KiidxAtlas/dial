@@ -1126,9 +1126,11 @@ mod backend_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::tools::execute;
     use crate::tools::testkit::*;
     use serde_json::json;
+    #[cfg(target_os = "macos")]
     use std::path::PathBuf;
     fn sandboxed() -> bool {
         super::super::sandbox::require_for_test()
