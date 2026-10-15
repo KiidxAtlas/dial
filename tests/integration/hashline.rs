@@ -533,7 +533,7 @@ fn unknown_tags_and_unseen_lines_are_rejected_with_guidance() {
     );
     let unseen = patch(&ws, &format!("[f.txt#{real}]\nPUT 3.=10:\n+x\n"));
     assert!(
-        unseen.is_error && unseen.text.contains("`f.txt:6-10`"),
+        unseen.is_error && unseen.text.contains("6:l6") && unseen.text.contains("10:l10"),
         "{}",
         unseen.text
     );
@@ -550,8 +550,7 @@ fn unknown_tags_and_unseen_lines_are_rejected_with_guidance() {
         beyond.text
     );
     assert_eq!(content(&dir, "f.txt"), numbered(20));
-    // Reading the missing range makes it editable under the same tag.
-    assert_eq!(read_tag(&ws, "f.txt:6-10"), real);
+    // The refusal itself shows the missing range and makes a direct retry safe.
     assert!(!patch(&ws, &format!("[f.txt#{real}]\nPUT 3.=10:\n+x\n")).is_error);
     let recovered = patch(&ws, &format!("[f.txt#{real}]\nPUT 1.=1:\n+one\n"));
     assert!(
