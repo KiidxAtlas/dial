@@ -5,15 +5,15 @@ mod control;
 pub mod error;
 mod frame;
 mod keys;
-#[cfg(target_os = "linux")]
+#[cfg(dial_desktop_linux)]
 mod linux;
-#[cfg(target_os = "macos")]
+#[cfg(dial_desktop_macos)]
 mod macos;
 mod menus;
-#[cfg(target_os = "macos")]
+#[cfg(dial_desktop_macos)]
 mod native_helper;
 pub mod types;
-#[cfg(target_os = "windows")]
+#[cfg(dial_desktop_windows)]
 mod win32;
 
 use std::{
@@ -1035,26 +1035,24 @@ impl Worker {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(dial_desktop_macos)]
 fn create_backend(selector: DisplaySelector) -> CoreResult<Box<dyn Backend>> {
     Ok(Box::new(macos::MacosBackend::new(selector)?))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(dial_desktop_windows)]
 fn create_backend(selector: DisplaySelector) -> CoreResult<Box<dyn Backend>> {
     Ok(Box::new(win32::Win32Backend::new(selector)?))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(dial_desktop_linux)]
 fn create_backend(selector: DisplaySelector) -> CoreResult<Box<dyn Backend>> {
     linux::new_backend(selector)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux)))]
 fn create_backend(_: DisplaySelector) -> CoreResult<Box<dyn Backend>> {
-    Err(DesktopError::capture_failed(
-        "desktop backend unavailable on this platform",
-    ))
+    Err(DesktopError::native_unavailable("desktop control"))
 }
 
 struct Lifecycle {
@@ -1684,5 +1682,38 @@ impl DesktopSession {
     pub fn close(&self) -> CoreResult<()> {
         self.cancel();
         self.core.close()
+    }
+}
+
+#[cfg(all(test, not(feature = "desktop")))]
+mod native_absent_tests {
+    use super::error::ErrorCode;
+    use super::*;
+
+    /// A slim build has no native backend: desktop operations must fail with `Unsupported` and
+    /// say why, while capabilities report nothing as available.
+    #[test]
+    fn slim_build_fails_desktop_operations_without_claiming_capability() {
+        let session = DesktopSession::new(None).expect("construction does not touch the platform");
+        let caps = session
+            .capabilities()
+            .expect("capabilities report unavailability");
+        assert_eq!(caps.backend, "unavailable");
+        assert!(!caps.capture && !caps.input && !caps.ax && !caps.applications);
+        assert_eq!(caps.display_count, 0);
+
+        let Err(error) = session.list_displays() else {
+            panic!("slim build must not list displays");
+        };
+        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert!(
+            error.message.contains("desktop feature is disabled"),
+            "{error}"
+        );
+
+        let Err(error) = session.list_applications(None) else {
+            panic!("slim build must not list applications");
+        };
+        assert_eq!(error.code, ErrorCode::Unsupported);
     }
 }

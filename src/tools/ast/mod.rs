@@ -11,7 +11,7 @@ mod scan;
 #[cfg(test)]
 mod tests;
 
-use super::ext::{Tool, ToolContext};
+use super::ext::{Concurrency, Tool, ToolContext};
 use super::{ToolOutput, Workspace, opt_str, opt_u64, req_str, tool_schema};
 use crate::config::types::Config;
 use commit::{Change, commit};
@@ -75,6 +75,11 @@ impl Tool for AstSearch {
 
     fn needs_approval(&self, _args: &Value) -> bool {
         false
+    }
+
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        // Pure search: no writes, no state shared with sibling calls.
+        Concurrency::Shared
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
@@ -332,5 +337,23 @@ fn append_previews(out: &mut String, files: &[Planned]) {
             return;
         }
         out.push_str(&planned.preview);
+    }
+}
+
+#[cfg(test)]
+mod registration {
+    use super::*;
+    use crate::agent::approval::parallel_read;
+    use crate::tools::ext::Registry;
+
+    #[test]
+    fn registered_ast_search_is_declared_shared_and_runs_in_parallel_reads() {
+        let registry = Registry::standard(&Config::default());
+        let args = json!({"pattern": "foo($A)"});
+        let tool = registry
+            .get("ast_search")
+            .expect("ast_search is registered");
+        assert_eq!(tool.concurrency(&args), Concurrency::Shared);
+        assert!(parallel_read(&registry, "ast_search", &args));
     }
 }

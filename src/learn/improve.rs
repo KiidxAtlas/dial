@@ -911,11 +911,21 @@ impl Drop for LoraPhase<'_> {
 
 pub fn lora_phase(config: &Config, store: &Store) -> Option<String> {
     let lock = std::fs::File::open(config.state_dir.join("lora-progress.lock")).ok()?;
-    match fs2::FileExt::try_lock_shared(&lock) {
+    lora_phase_from_lock(&lock, store)
+}
+
+fn lora_phase_from_lock(lock: &std::fs::File, store: &Store) -> Option<String> {
+    match fs2::FileExt::try_lock_shared(lock) {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             store.get_meta("lora_phase").ok().flatten()
         }
-        _ => None,
+        Ok(()) => {
+            // A concurrent spawn can duplicate the open descriptor. Releasing the probe explicitly
+            // prevents that child from retaining a shared lock after this status read returns.
+            let _ = fs2::FileExt::unlock(lock);
+            None
+        }
+        Err(_) => None,
     }
 }
 
@@ -2506,6 +2516,18 @@ mod lora_status_tests {
         .unwrap();
         store.set_meta("lora_phase", "training").unwrap();
         assert!(lora_phase(&config, &store).is_none());
+        // Model a descriptor inherited by a concurrent process: it must not retain the probe's
+        // shared lock and prevent the next real worker from taking its exclusive lock.
+        let probe =
+            crate::learn::auto::lock_file(&config.state_dir.join("lora-progress.lock")).unwrap();
+        let inherited = probe.try_clone().unwrap();
+        assert!(lora_phase_from_lock(&probe, &store).is_none());
+        let next =
+            crate::learn::auto::lock_file(&config.state_dir.join("lora-progress.lock")).unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&next).is_ok());
+        fs2::FileExt::unlock(&next).unwrap();
+        drop(inherited);
+        drop(probe);
         {
             let _phase = LoraPhase::start(&config, &store, "training").unwrap();
             assert_eq!(lora_phase(&config, &store).as_deref(), Some("training"));

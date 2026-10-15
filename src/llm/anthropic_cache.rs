@@ -17,7 +17,9 @@ pub(super) fn apply(body: &mut Value, profile: Option<&ModelProfile>, official_o
 
     // Native tool order must not depend on registry insertion order. Do not retain withdrawn
     // tools: exposing them would contradict approval/recovery and tool-loading contracts.
-    if let Some(tools) = body["tools"].as_array_mut() {
+    // Mutable indexing inserts null for absent keys. Tool-free compaction requests must
+    // retain absent optional fields instead of sending invalid tools/system null values.
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
         tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         if enabled && let Some(last) = tools.last_mut() {
             last["cache_control"] = control.clone();
@@ -26,11 +28,11 @@ pub(super) fn apply(body: &mut Value, profile: Option<&ModelProfile>, official_o
     if enabled {
         if let Some(text) = body["system"].as_str().map(str::to_owned) {
             body["system"] = json!([{"type":"text", "text":text, "cache_control":control}]);
-        } else if let Some(blocks) = body["system"].as_array_mut() {
+        } else if let Some(blocks) = body.get_mut("system").and_then(Value::as_array_mut) {
             mark_last(blocks, &control);
         }
     }
-    if let Some(messages) = body["messages"].as_array_mut() {
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
         let mut stable_end = messages.len();
         for (index, message) in messages.iter_mut().enumerate() {
             if message
@@ -51,8 +53,9 @@ pub(super) fn apply(body: &mut Value, profile: Option<&ModelProfile>, official_o
                         json!([{"type":"text","text":text,"cache_control":control.clone()}]);
                     true
                 } else {
-                    message["content"]
-                        .as_array_mut()
+                    message
+                        .get_mut("content")
+                        .and_then(Value::as_array_mut)
                         .is_some_and(|blocks| mark_last(blocks, &control))
                 };
                 if cached {
@@ -101,6 +104,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tool_free_requests_do_not_gain_null_optional_fields() {
+        for enabled in [true, false] {
+            let profile = ModelProfile {
+                prompt_cache: Some(enabled),
+                ..Default::default()
+            };
+            let mut body = json!({"messages":[{"role":"user","content":"summarize history"}]});
+            apply(&mut body, Some(&profile), false);
+            assert!(!body.as_object().unwrap().contains_key("tools"), "{body}");
+            assert!(!body.as_object().unwrap().contains_key("system"), "{body}");
+        }
+    }
     #[test]
     fn growing_history_keeps_the_previous_tail_and_four_marker_budget() {
         let mut first = body();

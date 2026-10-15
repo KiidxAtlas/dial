@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// One focused-check pass. `failures` keeps every final problem visible; `actionable` holds only the
+/// diagnostics of confirmed code failures, the sole input to automatic repair.
+pub(super) struct CheckRun {
+    pub(super) failures: Vec<String>,
+    pub(super) actionable: Vec<String>,
+}
+
 impl<'a> Agent<'a> {
     pub(super) fn note_verification(
         &mut self,
@@ -35,7 +42,10 @@ impl<'a> Agent<'a> {
             repair_evidence::CheckKind::SyntaxOnly
         };
         let exit = verification::exit_code(&output.text);
-        let passed = !output.is_error && exit == Some(0) && !verification::zero_tests(&output.text);
+        // The same verdict `run_checks` records, so cache, assistance and behavior credit cannot disagree with it.
+        let verdict =
+            verification::classify_output(None, output, self.interrupt.load(Ordering::SeqCst));
+        let passed = verdict == verification::CheckStatus::Passed;
         if !self.hermetic
             && matches!(kind, repair_evidence::CheckKind::Behavioral)
             && let Some(cache) = self.codebase.clone()
@@ -266,11 +276,12 @@ impl<'a> Agent<'a> {
         &mut self,
         checks: &[verification::FocusedCheck],
         ui: &mut dyn Ui,
-    ) -> Vec<String> {
+    ) -> CheckRun {
         if !checks.is_empty() {
             self.step_checks.failed_checks.clear();
         }
         let mut failures = Vec::new();
+        let mut actionable = Vec::new();
         let mut results = Vec::new();
         let mut outcomes = Vec::new();
         let receipts = self.config.experimental.verification_receipts && !self.hermetic;
@@ -320,12 +331,18 @@ impl<'a> Agent<'a> {
                 let description = verification::environment_problem(check, &output.text).unwrap_or(
                     "Check failed; inspect the diagnostics and repair the observed failure.",
                 );
-                failures.push(format!(
+                let message = format!(
                     "{} failed:\n{description}\nCommand: {}\n{}",
                     check.name,
                     check.command,
                     guard::clip_evidence(&output.text, 4096)
-                ));
+                );
+                // Infrastructure, permission, cancellation, timeout and unverified problems are reported
+                // without sending the model into code repair.
+                if status.repairable() {
+                    actionable.push(message.clone());
+                }
+                failures.push(message);
             }
         }
         let passed_count = results
@@ -342,10 +359,11 @@ impl<'a> Agent<'a> {
                 .map(|(turn, checkpoints)| checkpoints.changed_files(*turn))
                 .filter(|paths| !paths.is_empty())
         {
-            failures.insert(
-                0,
-                format!("Files changed in this turn: {}", paths.join(", ")),
-            );
+            let header = format!("Files changed in this turn: {}", paths.join(", "));
+            if !actionable.is_empty() {
+                actionable.insert(0, header.clone());
+            }
+            failures.insert(0, header);
         }
         self.step_checks.failed = !failures.is_empty();
 
@@ -385,7 +403,10 @@ impl<'a> Agent<'a> {
                 }
             }
         }
-        failures
+        CheckRun {
+            failures,
+            actionable,
+        }
     }
 
     /// One completion boundary for plain reports and explicit finish calls.
@@ -432,5 +453,128 @@ impl<'a> Agent<'a> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hermetic_agent<'a>(config: &'a Config, root: &Path) -> Agent<'a> {
+        // Construction only: hermetic agents make no provider request and write no session state.
+        let backend = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                model: "test".into(),
+                api_key: None,
+            },
+            PathBuf::new(),
+            5,
+        );
+        let version = Version {
+            id: 0,
+            parent: None,
+            kind: "config".into(),
+            harness: config.harness.clone(),
+            adapter: None,
+            status: "active".into(),
+        };
+        Agent::hermetic(config, backend, &version, root, None, None).unwrap()
+    }
+
+    fn completed_process(exit_code: i32) -> crate::runtime::execution::ProcessOutcome {
+        crate::runtime::execution::ProcessOutcome {
+            started: true,
+            exit_code: Some(exit_code),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            output_complete: true,
+        }
+    }
+
+    #[test]
+    fn printed_exit_code_earns_no_behavior_credit_without_observed_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config
+            .verification
+            .commands
+            .push(crate::config::types::VerificationCommand {
+                name: "behavior".into(),
+                command: "cargo test focused".into(),
+                file_extensions: vec![],
+                timeout_secs: 5,
+            });
+        config
+            .verification
+            .behavioral_checks
+            .push("behavior".into());
+        let mut agent = hermetic_agent(&config, root.path());
+        let call = ToolCall {
+            id: "focused-check:behavior".into(),
+            name: "bash".into(),
+            arguments: json!({"command":"cargo test focused"}),
+            malformed_arguments: false,
+        };
+        let prose = ToolOutput {
+            text: "running 2 tests\ntest result: ok. 2 passed\n[exit code: 0]".into(),
+            is_error: false,
+            data: None,
+            execution: Default::default(),
+        };
+        agent.note_verification(&call, &prose, &mut NullUi);
+        assert_eq!(agent.verifications, vec![false]);
+        assert_eq!(agent.behavioral_checks, vec![false]);
+
+        let observed = prose.with_process(completed_process(0));
+        agent.note_verification(&call, &observed, &mut NullUi);
+        assert_eq!(agent.verifications, vec![false, true]);
+        assert_eq!(agent.behavioral_checks, vec![false, true]);
+    }
+
+    #[test]
+    fn only_confirmed_code_failures_drive_automatic_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let mut agent = hermetic_agent(&config, root.path());
+        let check = |command: &str| verification::FocusedCheck {
+            name: "probe".into(),
+            command: command.into(),
+            timeout_secs: 30,
+        };
+
+        let failed = agent.run_checks(&[check("echo assertion failed; exit 1")], &mut NullUi);
+        assert_eq!(failed.actionable.len(), 1);
+        assert_eq!(failed.failures.len(), 1);
+
+        // Exit 0 without any executed test is unverifiable: report it, but never send it to code repair.
+        let empty = agent.run_checks(&[check("echo 'Ran 0 tests'; exit 0")], &mut NullUi);
+        assert!(empty.actionable.is_empty());
+        assert_eq!(empty.failures.len(), 1);
+    }
+
+    #[test]
+    fn mixed_results_send_only_code_failures_to_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let mut agent = hermetic_agent(&config, root.path());
+        let environment = verification::FocusedCheck {
+            name: "python AST: probe".into(),
+            command: "echo 'No module named pytest'; exit 1".into(),
+            timeout_secs: 30,
+        };
+        let code = verification::FocusedCheck {
+            name: "probe".into(),
+            command: "echo 'assertion failed'; exit 1".into(),
+            timeout_secs: 30,
+        };
+        let run = agent.run_checks(&[environment, code], &mut NullUi);
+        // Every final problem stays visible; only the confirmed code failure is an actionable diagnosis.
+        assert_eq!(run.failures.len(), 2);
+        assert!(run.failures[0].contains("Verification environment unavailable"));
+        assert_eq!(run.actionable.len(), 1);
+        assert!(run.actionable[0].starts_with("probe failed"));
+        assert!(!run.actionable[0].contains("pytest"));
     }
 }

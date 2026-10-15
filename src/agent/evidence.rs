@@ -104,7 +104,12 @@ pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy)
         running += estimate(&messages[i]);
     }
     let mut latest: HashSet<String> = HashSet::new();
+    let mut stale = vec![false; messages.len()];
     for i in (0..messages.len()).rev() {
+        // An unsuccessful repeat neither supersedes earlier success nor loses its diagnostics.
+        if messages[i]["dial_evidence"]["is_error"] == true {
+            continue;
+        }
         let Some(key) = messages[i]["dial_evidence"]["observation"]
             .as_str()
             .map(str::to_owned)
@@ -115,6 +120,7 @@ pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy)
             latest.insert(key);
             continue;
         }
+        stale[i] = true;
         let id = result_id(&messages[i]);
         // A result already dropped for space keeps that one placeholder; rewriting it would change cached text.
         if memo.pruned.contains(&id) {
@@ -122,7 +128,7 @@ pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy)
         }
         let supersede = memo.replaced.contains(&id)
             || (supersede_reads && (pressure || suffix[i] <= warm_tokens));
-        if !supersede {
+        if !supersede || !messages[i]["dial_evidence"]["artifact"].is_string() {
             continue;
         }
         if !id.is_empty() {
@@ -138,9 +144,15 @@ pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy)
             object.remove("dial_images");
         }
     }
-    if drop_useless {
-        prune(messages, memo, &suffix, pressure, protect_tokens);
-    }
+    prune(
+        messages,
+        memo,
+        &suffix,
+        &stale,
+        pressure,
+        protect_tokens,
+        drop_useless,
+    );
     for message in messages {
         crate::llm::messages::canonicalize(message);
     }
@@ -180,8 +192,10 @@ fn prune(
     messages: &mut [Value],
     memo: &mut Supersession,
     suffix: &[usize],
+    stale: &[bool],
     pressure: bool,
     protect_tokens: usize,
+    drop_useless: bool,
 ) {
     let mut tool_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for message in messages.iter() {
@@ -207,7 +221,8 @@ fn prune(
         .iter()
         .enumerate()
         .filter(|(i, message)| {
-            eligible(message, &tool_of)
+            (drop_useless || stale[*i])
+                && eligible(message, &tool_of)
                 && !memo.pruned.contains(&result_id(message))
                 && fresh(*i, message)
         })
@@ -238,7 +253,7 @@ fn prune(
             continue;
         };
         let bytes = messages[i]["content"].as_str().map_or(0, str::len);
-        let worth_it = prune_new && fresh(i, &messages[i]);
+        let worth_it = prune_new && fresh(i, &messages[i]) && (drop_useless || stale[i]);
         if !already && !worth_it {
             continue;
         }
@@ -574,6 +589,84 @@ mod tests {
             first_placeholder,
             "the repeat must not turn the placeholder into a different one"
         );
+    }
+    #[test]
+    fn default_pressure_reduces_only_superseded_observations_with_before_after_sizes() {
+        let mut m = vec![json!({"role":"user","content":"task"})];
+        let mut err = exchange("err", "read", 40_000);
+        err[1]["dial_evidence"]["observation"] = json!("k");
+        err[1]["dial_evidence"]["is_error"] = json!(true);
+        m.extend(err);
+        let mut stale = exchange("stale", "read", 40_000);
+        stale[1]["dial_evidence"]["observation"] = json!("k");
+        m.extend(stale);
+        m.extend(exchange("edit", "edit", 20_000));
+        let mut latest = exchange("latest", "read", 40_000);
+        latest[1]["dial_evidence"]["observation"] = json!("k");
+        m.extend(latest);
+        m.extend(exchange("tail", "grep", 20_000));
+        fn bytes(m: &[Value]) -> usize {
+            m.iter()
+                .map(|x| x["content"].as_str().map_or(0, str::len))
+                .sum()
+        }
+        let policy = |pressure| Policy {
+            warm_tokens: 0,
+            pressure,
+            protect_tokens: 4_000,
+            supersede_reads: false,
+            drop_useless: false,
+        };
+        let before = bytes(&m);
+        let mut calm = m.clone();
+        project(&mut calm, &mut Supersession::default(), &policy(false));
+        assert_eq!(bytes(&calm), before, "calm requests keep every result");
+        project(&mut m, &mut Supersession::default(), &policy(true));
+        let after = bytes(&m);
+        eprintln!("superseded observations under pressure: {before} -> {after} bytes");
+        assert!(after < before);
+        assert!(content(&m, "stale").starts_with("[Older read result omitted"));
+        assert!(content(&m, "stale").contains("artifact://stale"));
+        assert_eq!(
+            content(&m, "latest").len(),
+            40_000,
+            "the newest copy stays in full"
+        );
+        assert_eq!(content(&m, "err").len(), 40_000, "failures stay verbatim");
+        assert_eq!(content(&m, "edit").len(), 20_000, "mutations stay verbatim");
+        assert_eq!(
+            content(&m, "tail").len(),
+            20_000,
+            "the protected tail stays verbatim"
+        );
+    }
+    #[test]
+    fn repeated_errors_never_supersede_success_or_lose_diagnostics() {
+        for failed in [0, 1] {
+            let mut messages = exchange("old", "read", 40_000);
+            messages.extend(exchange("new", "read", 20_000));
+            messages[1]["dial_evidence"]["observation"] = json!("same-range");
+            messages[3]["dial_evidence"]["observation"] = json!("same-range");
+            messages[1 + failed * 2]["dial_evidence"]["is_error"] = json!(true);
+            let before = messages.clone();
+            project(
+                &mut messages,
+                &mut Supersession::default(),
+                &Policy {
+                    pressure: true,
+                    protect_tokens: 0,
+                    warm_tokens: 0,
+                    supersede_reads: true,
+                    drop_useless: false,
+                },
+            );
+            for id in ["old", "new"] {
+                assert!(
+                    content(&messages, id) == content(&before, id),
+                    "{id} diagnostics changed"
+                );
+            }
+        }
     }
 }
 

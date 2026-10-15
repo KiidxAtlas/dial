@@ -1,4 +1,5 @@
 //! Amazon Bedrock Converse streaming, using the AWS credential chain and SigV4 signer.
+use super::aws_credentials::Credentials;
 use super::profiles::{CacheRetention, ModelProfile, ReasoningApi};
 use super::transports::{OnText, Route};
 use super::{Chat, Interrupted, Reply, StreamEvent, ToolCall};
@@ -12,7 +13,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -62,11 +63,11 @@ fn endpoint(route: &Route<'_>) -> Result<(String, String)> {
         region,
     ))
 }
-fn scope(route: &Route<'_>, credentials: Option<&super::aws_credentials::Credentials>) -> String {
+fn scope(route: &Route<'_>, credentials: Option<&Credentials>) -> String {
     let identity = route
         .account_id
-        .or_else(|| credentials.and_then(|c| c.sdk().account_id().map(|id| id.as_str())))
-        .or_else(|| credentials.map(|c| c.sdk().access_key_id()))
+        .or_else(|| credentials.and_then(|c| c.account_id()))
+        .or_else(|| credentials.map(|c| c.access_key_id()))
         .or(route.auth)
         .unwrap_or("");
     let mut hash = Sha256::new();
@@ -776,38 +777,20 @@ pub(super) fn exchange(
         ("accept", "application/vnd.amazon.eventstream"),
     ]);
     let authorization;
-    let instructions;
+    let signed;
     if let Some(token) = route.auth {
         authorization = format!("Bearer {token}");
         headers.push(("authorization", &authorization));
     } else {
-        use aws_sigv4::http_request::{
-            PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
-        };
-        let identity = credentials
+        signed = credentials
             .as_ref()
             .context("Bedrock credentials unavailable")?
-            .sdk()
-            .clone()
-            .into();
-        let mut settings = SigningSettings::default();
-        settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-        let params = aws_sigv4::sign::v4::SigningParams::builder()
-            .identity(&identity)
-            .region(&region)
-            .name("bedrock")
-            .time(SystemTime::now())
-            .settings(settings)
-            .build()?
-            .into();
-        let signable = SignableRequest::new(
-            "POST",
-            &url,
-            headers.iter().copied(),
-            SignableBody::Bytes(&bytes),
-        )?;
-        (instructions, _) = sign(signable, &params)?.into_parts();
-        headers.extend(instructions.headers());
+            .sign(&region, &url, &headers, &bytes)?;
+        headers.extend(
+            signed
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
     }
     let patience = super::Patience::for_stream(timeout, false);
     let mut response = super::send_prepared_with_headers(

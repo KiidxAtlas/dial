@@ -12,13 +12,13 @@ use super::{
 
 #[derive(Clone)]
 pub enum AxHandle {
-    #[cfg(target_os = "macos")]
+    #[cfg(dial_desktop_macos)]
     Mac(objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>),
     /// The element and its `RuntimeId`, read once when the handle is made;
     /// `None` when the element reports none.
-    #[cfg(target_os = "windows")]
+    #[cfg(dial_desktop_windows)]
     Uia(uiautomation::UIElement, Option<Box<[i32]>>),
-    #[cfg(target_os = "linux")]
+    #[cfg(dial_desktop_linux)]
     AtSpi(atspi::ObjectRefOwned),
     #[cfg(test)]
     Test(u64),
@@ -34,16 +34,18 @@ impl AxHandle {
     /// index.
     const fn identified(&self) -> bool {
         match self {
-            #[cfg(target_os = "macos")]
+            #[cfg(dial_desktop_macos)]
             Self::Mac(_) => true,
-            #[cfg(target_os = "windows")]
+            #[cfg(dial_desktop_windows)]
             Self::Uia(_, runtime_id) => runtime_id.is_some(),
-            #[cfg(target_os = "linux")]
+            #[cfg(dial_desktop_linux)]
             Self::AtSpi(_) => true,
             #[cfg(test)]
             Self::Test(_) => true,
             #[cfg(test)]
             Self::TestUnidentified(_) => false,
+            #[cfg(not(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux, test)))]
+            _ => match *self {},
         }
     }
 }
@@ -54,11 +56,11 @@ impl AxHandle {
 impl PartialEq for AxHandle {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            #[cfg(target_os = "macos")]
+            #[cfg(dial_desktop_macos)]
             (Self::Mac(a), Self::Mac(b)) => **a == **b,
-            #[cfg(target_os = "windows")]
+            #[cfg(dial_desktop_windows)]
             (Self::Uia(_, a), Self::Uia(_, b)) => a == b,
-            #[cfg(target_os = "linux")]
+            #[cfg(dial_desktop_linux)]
             (Self::AtSpi(a), Self::AtSpi(b)) => a == b,
             #[cfg(test)]
             (Self::Test(a), Self::Test(b)) => a == b,
@@ -66,6 +68,8 @@ impl PartialEq for AxHandle {
             (Self::TestUnidentified(_), Self::TestUnidentified(_)) => true,
             #[cfg(test)]
             _ => false,
+            #[cfg(not(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux, test)))]
+            _ => match *self {},
         }
     }
 }
@@ -73,18 +77,20 @@ impl PartialEq for AxHandle {
 impl Eq for AxHandle {}
 
 impl Hash for AxHandle {
-    fn hash<H: Hasher>(&self, state: &mut H) {
+    fn hash<H: Hasher>(&self, _state: &mut H) {
         match self {
-            #[cfg(target_os = "macos")]
-            Self::Mac(element) => (**element).hash(state),
-            #[cfg(target_os = "windows")]
-            Self::Uia(_, runtime_id) => runtime_id.hash(state),
-            #[cfg(target_os = "linux")]
-            Self::AtSpi(object) => object.hash(state),
+            #[cfg(dial_desktop_macos)]
+            Self::Mac(element) => (**element).hash(_state),
+            #[cfg(dial_desktop_windows)]
+            Self::Uia(_, runtime_id) => runtime_id.hash(_state),
+            #[cfg(dial_desktop_linux)]
+            Self::AtSpi(object) => object.hash(_state),
             #[cfg(test)]
-            Self::Test(id) => id.hash(state),
+            Self::Test(id) => id.hash(_state),
             #[cfg(test)]
             Self::TestUnidentified(_) => {}
+            #[cfg(not(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux, test)))]
+            _ => match *self {},
         }
     }
 }
@@ -643,7 +649,7 @@ pub fn ax_press(backend: &mut dyn AxBackend, handle: &AxHandle) -> CoreResult<()
 
 /// Maps a raw `AX*` macOS accessibility role onto the cross-platform role
 /// vocabulary. Compiled only where it has a caller (macOS backend + tests).
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(dial_desktop_macos, test))]
 pub fn normalize_role_macos(native: &str) -> String {
     match native {
         "AXTextArea" => "textarea",
@@ -662,7 +668,7 @@ pub fn normalize_role_macos(native: &str) -> String {
     }
     .to_ascii_lowercase()
 }
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(dial_desktop_windows, test))]
 pub fn normalize_role_uia(native: &str) -> String {
     match native {
         "Edit" => "textfield",
@@ -679,7 +685,7 @@ pub fn normalize_role_uia(native: &str) -> String {
     }
     .to_string()
 }
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(dial_desktop_linux, test))]
 pub fn normalize_role_atspi(native: &str, multiline: bool) -> String {
     match native.to_ascii_lowercase().as_str() {
         "push button" | "toggle button" => "button".into(),
@@ -723,6 +729,7 @@ mod tests {
     fn node(h: &AxHandle) -> u64 {
         match h {
             AxHandle::Test(id) | AxHandle::TestUnidentified(id) => *id,
+            #[cfg(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
             _ => unreachable!(),
         }
     }

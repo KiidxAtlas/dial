@@ -88,9 +88,14 @@ Control state exposes `verification_results` with per-check `passed`, `code_fail
 `environment_unavailable`, `permission_denied`, `cancelled`, `timed_out`, or `unverified` status,
 along with the exact command/runner. Cancelled or empty checks never count as passing checks.
 `[verification].commands` can add operator-owned sandboxed commands (name, command, optional file
-extensions and timeout); a failure is sent to the agent for the configured bounded repair attempts,
-then the edited tree and final diagnostics remain visible for `/undo` or manual repair. Approval-denied
-writes are not treated as successful verification. `todo` is optional progress bookkeeping, not a verification checkpoint. `done` closes the current item and starts the next; findings and references are optional notes, including for legacy investigation entries. No separate tool-activity, citation or text-delivery gate applies. Accepted completion reconciles pending progress entries, while explicit blockers and running workers remain completion prerequisites. Failed checks remain failures independently of todo state.
+extensions and timeout). Only confirmed `code_failed` diagnostics enter automatic bounded repair;
+environment, permission, cancellation, timeout and unverified failures remain visible without
+asking the model to edit code to fix missing prerequisites. Mixed runs send only actionable code
+diagnostics to repair. Initial work, verification repair and stop-hook continuations share one
+finite `max_steps` budget; zero remains unlimited. The edited tree and final diagnostics remain
+visible for `/undo` or manual repair. Behavioral credit and final verification use the same
+observed-process verdict; printed success without complete process evidence earns no credit.
+Approval-denied writes are not treated as successful verification. `todo` is optional progress bookkeeping, not a verification checkpoint. `done` closes the current item and starts the next; findings and references are optional notes, including for legacy investigation entries. No separate tool-activity, citation or text-delivery gate applies. Accepted completion reconciles pending progress entries, while explicit blockers and running workers remain completion prerequisites. Failed checks remain failures independently of todo state.
 
 Plain final replies and `finish` use the same completion prerequisites and final configured verification/repair pipeline. Empty replies, action-only promises and explicit admissions of unfinished work share bounded parent/child reply recovery. Invalid todo arguments still receive a simple corrected call and bounded recovery; there is no separate budget of todo-closing reminder turns. Productive work remains unlimited with `max_steps = 0`.
 
@@ -98,9 +103,9 @@ Default guidance starts with focused source inspection and moves to implementati
 
 Mid-turn requests end with a never-stored reminder of the current todo step, next step and recent findings.
 Because it sits after the newest tool result, every earlier byte stays identical between requests and a
-prefix (KV) cache only needs to process the appended reminder. Tool results are clipped to about an eighth of the
-context window (4–24 KiB); successful retrievable read/search/shell/web previews are additionally capped
-at 8 KiB. Failed diagnostics and mutation results retain the larger context-dependent budget.
+prefix (KV) cache only needs to process the appended reminder. Tool results are clipped to the
+context-dependent per-model budget (4–48 KiB); optional `efficiency.tool_preview_bytes` further
+reduces successful retrievable inspections. Errors and mutation results retain their diagnostics.
 Clipping keeps both ends plus error, panic, failed-test and traceback lines from the omitted middle;
 full output stays in artifacts. `bash` also bounds the output it holds in memory.
 
@@ -123,9 +128,12 @@ limits, reasoning budgets, approvals or verification requirements:
   loads it with `tool_load` in one round; schemas and recorded tool contracts are unchanged. The
   list is stable for the session, so the provider's cached prefix survives.
   `assistance.compact_tools=true` switches to discovery mode for small local models: a core set
-  bounded by `assistance.initial_tool_limit` (default 16) plus `tool_search`/`tool_load`. An
-  operator-pinned `[harness] tools` list or a model-profile allowlist restricts the offer either
-  way; a pinned list also keeps any deferred tool it names offered.
+  bounded by `assistance.initial_tool_limit` (default 16) plus `tool_search`/`tool_load`.
+  Automatic search and compatibility activation retain at most eight discovered tools, oldest
+  activation evicted first. Explicit `tool_load` names are pins and are never evicted by discovery;
+  unloading clears both sets. Additive `discovered_tools` control state survives resume, and older
+  `enabled_tools` state remains pinned for compatibility. A pinned `[harness] tools` list or a
+  model-profile allowlist still restricts the offer; discovery never grants execution permission.
 - Ambient codebase retrieval is off by default (`codebase.ambient_context`); the model calls
   `codebase_memory` when it wants the saved understanding. When on, it selects task-relevant
   sources/findings, prefers fresh evidence, omits the directory inventory and bounds stale notices.
@@ -136,11 +144,14 @@ limits, reasoning budgets, approvals or verification requirements:
 - Brief, non-complex tasks omit redundant tool-argument examples for the first few requests. An
   explicit plan, a tool error, debugging work or exhausting that allowance restores full guidance;
   todo enforcement and finish/verification gates do not change.
-- History is byte-stable until compaction: older observations are neither superseded nor pruned
-  unless `compaction.supersede_reads` / `compaction.drop_useless` are turned on, so the provider's
-  cached prefix survives every step. Compaction uses the configured token/percentage/model/agent
-  policy, with output and reserve headroom checked against the current model window. Observation
-  projection never mutates archived evidence.
+- Calm history remains byte-stable. Under context pressure, older large artifact-backed observations
+  repeated successfully later can now be reduced in batches by default; failures, mutations,
+  unrelated ranges and the protected recent suffix stay intact. Pressure begins no later than the
+  effective automatic-compaction threshold, so this reduction can avoid an unnecessary summary.
+  `compaction.supersede_reads` permits additional supersession and `compaction.drop_useless` permits
+  broader old-observation pruning. Both pressure and tail protection use the effective capped
+  planning window. Once projected, placeholders stay stable; archived evidence is never mutated.
+  Compaction still uses configured token/percentage/model/agent policy with output/reserve headroom.
 - Very large windows are planned against `efficiency.history_token_cap` (default 262144) rather
   than their full size, because every step resends the whole history. With `threshold_*` on `auto`,
   the trigger is 80% of the planning window after its reserve (15%, at least 16k): about 178k on a
@@ -249,6 +260,18 @@ CLI overrides include `--compaction-strategy`, `--compaction-threshold-tokens` a
 an inherited value. Omission follows persisted configuration.
 All editor and compaction policy fields, including typed model/agent maps, are available through `/settings`.
 
+Automatic method selection skips native Remote compaction when the route has no declared
+compatible capability (unless a custom summary endpoint is configured). Explicit `/compact remote`
+still reports an unsupported route honestly. Portable Soft/Handoff requests send an explicit empty
+`tools` array to OpenAI-compatible servers. Shake only elides recoverable tool evidence: if the
+result still exceeds the safe request budget it tries the next configured method, never drops
+conversation messages or commits an oversized replacement.
+The compaction banner compares the previous and replacement **final projected requests** using
+the same provider calibration. Automatic continuation requires a reduced request below the
+compaction trigger and within the safe prompt budget, with `auto_continue` enabled and no
+durability warning. The stricter recovery band still gates speculative results with live growth;
+it does not pause an otherwise safe foreground continuation.
+
 ```toml
 [compaction]
 enabled = true
@@ -303,8 +326,13 @@ Native compaction requires an explicit compatible route declaration; protocol se
 not evidence that an endpoint supports it. A custom summary endpoint resolves credentials for its
 own URL. Image archives use actual bundled fonts, PNG dimensions and declared model billing;
 unknown billing uses a conservative pixel ceiling and may legitimately fail to fit. All 17 font/
-layout variants are selectable in settings. Unsupported glyphs, opaque native payloads and
-non-replayable image formats produce errors, not silent source loss.
+layout variants are selectable in settings. Characters a shape cannot draw (no bitmap or Silver ink,
+including Arabic in every bundled font, controls and bidi/format marks) are rendered as exact JSON
+`\uXXXX` escapes (surrogate pairs above U+FFFF), with literal backslashes doubled to distinguish
+existing escapes. Decode that rendering layer before interpreting transcript JSON. The durable
+source keeps the original characters; escaped text consumes normal cell and frame budget, and
+overflow fails instead of truncating. Opaque native payloads and non-replayable image formats
+still produce errors, not silent source loss.
 
 Async maintenance owns a frozen snapshot and independent cancellation. Only the current owner
 may claim a still-valid prefix; changed branches/models/configuration invalidate it. Accepted

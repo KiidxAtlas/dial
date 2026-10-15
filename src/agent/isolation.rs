@@ -31,6 +31,16 @@ use backend::{Backend, Preference};
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// The per-file limit is fixed, so the error says where the file is and how to get it out of the
+/// copy: build outputs live in excluded directories, and the rest must move out of the project.
+fn oversized_file(relative: &Path, bytes: u64) -> String {
+    format!(
+        "{} is {bytes} bytes, above the {MAX_BYTES} byte per-file isolation limit ({} MiB); this limit is not configurable, so move the file out of the project or into a build-output directory (bin/, target/, .cargo-work/, .tmp/) that isolation does not copy",
+        relative.display(),
+        MAX_BYTES >> 20
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Identity {
     file: platform_fs::FileIdentity,
@@ -180,7 +190,16 @@ fn snapshot(
     ) -> Result<()> {
         for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
             let path = entry?.path();
-            if crate::benchmark::is_excluded_source_path(root, &path)
+            // Preserve copied source that was tracked under an ignored bin directory, even
+            // before the private Git baseline exists (or when isolation_git is disabled).
+            let preserved_source = baseline.is_some_and(|tree| {
+                path.strip_prefix(root).ok().is_some_and(|relative| {
+                    tree.range(relative.to_path_buf()..)
+                        .next()
+                        .is_some_and(|(source, _)| source.starts_with(relative))
+                })
+            });
+            if !preserved_source && crate::benchmark::is_excluded_source_path(root, &path)
                 || path
                     .file_name()
                     .is_some_and(|n| n == crate::tools::SCRATCH_DIR)
@@ -192,13 +211,26 @@ fn snapshot(
             if meta.is_dir() {
                 walk(root, &path, out, baseline, remaining, limits)?;
             } else if meta.is_file() {
-                ensure!(
-                    out.len() < limits.isolation_source_files && meta.len() <= *remaining as u64,
-                    "project is too large to isolate (limit {} files, {} MiB)",
-                    limits.isolation_source_files,
-                    limits.isolation_source_bytes >> 20
-                );
                 let relative = path.strip_prefix(root)?.to_path_buf();
+                ensure!(
+                    out.len() < limits.isolation_source_files,
+                    "project has more than {} files, the isolation file limit (task.isolation_source_files); next file: {}",
+                    limits.isolation_source_files,
+                    relative.display()
+                );
+                ensure!(
+                    meta.len() <= MAX_BYTES as u64,
+                    "{}",
+                    oversized_file(&relative, meta.len())
+                );
+                ensure!(
+                    meta.len() <= *remaining as u64,
+                    "{} is {} bytes, but the copied source is limited to {} bytes in total (task.isolation_source_bytes; {} bytes already counted)",
+                    relative.display(),
+                    meta.len(),
+                    limits.isolation_source_bytes,
+                    limits.isolation_source_bytes - *remaining
+                );
                 let identity = Identity::of(&meta, platform_fs::path_identity(&path)?);
                 let stamp = match baseline.and_then(|tree| tree.get(&relative)) {
                     Some(previous) if previous.identity == identity => previous.clone(),
@@ -230,7 +262,11 @@ fn stamp(path: &Path) -> Result<Option<FileStamp>> {
     ensure!(meta.is_file(), "source destination is not a regular file");
     ensure!(
         meta.len() <= MAX_BYTES as u64,
-        "file exceeds isolation byte limit"
+        "{} is {} bytes, above the {} byte per-file isolation limit ({} MiB)",
+        path.display(),
+        meta.len(),
+        MAX_BYTES,
+        MAX_BYTES >> 20
     );
     let mut file = platform_fs::open_nofollow(&fs::OpenOptions::new().read(true), path)?;
     let identity = Identity::of(&file.metadata()?, platform_fs::identity(&file)?);
@@ -245,7 +281,9 @@ fn stamp(path: &Path) -> Result<Option<FileStamp>> {
         bytes += count as u64;
         ensure!(
             bytes <= MAX_BYTES as u64,
-            "file exceeds isolation byte limit"
+            "{} grew past the {} byte per-file isolation limit while it was hashed (at least {bytes} bytes)",
+            path.display(),
+            MAX_BYTES
         );
         digest.update(&buffer[..count]);
     }
@@ -341,8 +379,10 @@ impl Isolated {
         config: &super::agent_defs::TaskConfig,
         preference: Preference,
     ) -> Result<Self> {
-        // Bound source scanning before copying any tree.
-        snapshot(project.root(), None, config)?;
+        // Bound source scanning before copying any tree; a failure here leaves nothing copied.
+        let source_snapshot = snapshot(project.root(), None, config).context(
+            "isolation preflight failed before any copy was made; no files were copied and the project is unchanged",
+        )?;
         let selection = backend::select(preference, |candidate| {
             backend::probe(candidate, project.root(), config.isolation_source_files)
         })
@@ -398,7 +438,7 @@ impl Isolated {
         // The source snapshot is the baseline for ProjFS: walking the instance would read every placeholder.
         let before = match kind {
             Backend::ProjFs => snapshot(project.root(), None, config)?,
-            _ => snapshot(&root, None, config)?,
+            _ => snapshot(&root, Some(&source_snapshot), config)?,
         };
         // The overlay's lower layer and the worktree's copied ignored files already provide
         // dependencies, so only the plain copies need the dependency copy.
@@ -835,5 +875,152 @@ mod tests {
     #[test]
     fn copy_backend_merges_back_and_is_removed() {
         round_trip(Preference::Copy, "copy");
+    }
+
+    /// Sparse files keep the oversized fixtures cheap: only the logical length is set.
+    #[test]
+    fn oversized_project_file_is_reported_by_path_before_any_copy() {
+        let (dir, ws) = project();
+        fs::File::create(dir.path().join("model.bin"))
+            .unwrap()
+            .set_len(MAX_BYTES as u64 + 1)
+            .unwrap();
+        let error = format!(
+            "{:#}",
+            Isolated::create(&ws)
+                .err()
+                .expect("an oversized file is refused")
+        );
+        for expected in [
+            "preflight",
+            "no files were copied",
+            "model.bin",
+            &(MAX_BYTES + 1).to_string(),
+            &MAX_BYTES.to_string(),
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+        assert_eq!(
+            fs::metadata(dir.path().join("model.bin")).unwrap().len(),
+            MAX_BYTES as u64 + 1,
+            "the project file is untouched"
+        );
+    }
+
+    #[test]
+    fn worker_file_growing_past_the_limit_is_reported_by_path() {
+        let (_dir, ws) = project();
+        let iso = Isolated::with_config(
+            &ws,
+            &super::super::agent_defs::TaskConfig::default(),
+            Preference::Copy,
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(iso.root().join("b.txt"))
+            .unwrap()
+            .set_len(MAX_BYTES as u64 + 1)
+            .unwrap();
+        let error = format!(
+            "{:#}",
+            iso.current().expect_err("growth past the limit is refused")
+        );
+        assert!(error.contains("b.txt"), "{error}");
+        assert!(error.contains(&(MAX_BYTES + 1).to_string()), "{error}");
+    }
+
+    /// Build outputs and scratch directories are never copied, so a large `bin/dial` cannot fail a
+    /// copy worker. A real oversized source file is still refused, and the error names its path.
+    #[test]
+    fn generated_build_outputs_do_not_block_a_copy_worker_but_oversized_source_is_reported() {
+        let (dir, ws) = project();
+        fs::write(dir.path().join(".gitignore"), "/bin/\n").unwrap();
+        let generated = [
+            "bin/dial",
+            "bin/dial.bak-20261015-131809",
+            ".cargo-work/cache/librustc.rlib",
+            ".tmp/dial-debug-dump-1",
+        ];
+        for relative in generated {
+            let path = dir.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::File::create(&path)
+                .unwrap()
+                .set_len(MAX_BYTES as u64 + 1)
+                .unwrap();
+        }
+        let config = super::super::agent_defs::TaskConfig::default();
+        let iso = Isolated::with_config(&ws, &config, Preference::Copy)
+            .expect("generated build outputs must not block the worker copy");
+        assert_eq!(fs::read_to_string(iso.root().join("a.txt")).unwrap(), "a1");
+        for relative in generated {
+            assert!(
+                !iso.root().join(relative).exists(),
+                "{relative} is a build output and is not copied"
+            );
+            assert_eq!(
+                fs::metadata(dir.path().join(relative)).unwrap().len(),
+                MAX_BYTES as u64 + 1,
+                "the project copy of {relative} is untouched"
+            );
+        }
+
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::File::create(dir.path().join("src/model.bin"))
+            .unwrap()
+            .set_len(MAX_BYTES as u64 + 1)
+            .unwrap();
+        let error = format!(
+            "{:#}",
+            Isolated::with_config(&ws, &config, Preference::Copy)
+                .err()
+                .expect("oversized source is refused")
+        );
+        for expected in [
+            "preflight",
+            "src/model.bin",
+            &(MAX_BYTES + 1).to_string(),
+            "not configurable",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn tracked_bin_scripts_survive_copy_and_merge_without_private_git() {
+        let (dir, ws) = project();
+        fs::create_dir_all(dir.path().join("bin")).unwrap();
+        fs::write(dir.path().join("bin/script"), "original").unwrap();
+        crate::tools::git::initialize_private_snapshot(dir.path()).unwrap();
+        fs::write(dir.path().join(".gitignore"), "/bin/\n").unwrap();
+        fs::File::create(dir.path().join("bin/dial"))
+            .unwrap()
+            .set_len(MAX_BYTES as u64 + 1)
+            .unwrap();
+        let config = super::super::agent_defs::TaskConfig {
+            isolation_git: false,
+            ..Default::default()
+        };
+        let iso = Isolated::with_config(&ws, &config, Preference::Copy).unwrap();
+        assert_eq!(
+            fs::read_to_string(iso.root().join("bin/script")).unwrap(),
+            "original"
+        );
+        assert!(!iso.root().join("bin/dial").exists());
+        fs::write(iso.root().join("bin/script"), "updated").unwrap();
+        let merged = iso.merge(&ws, &AtomicBool::new(false));
+        assert!(
+            merged.errors.is_empty() && merged.conflicts.is_empty(),
+            "{merged:?}"
+        );
+        assert!(
+            merged.applied.contains(&PathBuf::from("bin/script")),
+            "{merged:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("bin/script")).unwrap(),
+            "updated"
+        );
     }
 }

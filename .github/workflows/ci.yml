@@ -29,12 +29,15 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install Rust
-        run: rustup update stable --no-self-update
+        # Honor rust-toolchain.toml instead of downloading an unrelated moving stable toolchain.
+        run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.os }}
       - name: Test terminal installer
         run: bash scripts/test-install.sh
+      - name: Test local build and update commands
+        run: python3 scripts/test-build.py
       - name: Verify Linux sandbox enforcement
         if: runner.os == 'Linux'
         timeout-minutes: 10
@@ -53,6 +56,8 @@ jobs:
         # Parallel: tests that change process HOME/PATH hold a shared lock; process fixtures set
         # their environment per child. Serial execution made the lib tests ~4x slower.
         run: cargo test --locked --profile ci
+      - name: Check slim build
+        run: cargo check --locked --profile ci --no-default-features --bin dial
       - name: Install executable and verify artifact contracts
         timeout-minutes: 10
         run: |
@@ -61,6 +66,9 @@ jobs:
       - name: Real terminal and crash lifecycle
         timeout-minutes: 5
         run: python3 examples/benchmarks/interactive_smoke.py --dial target/installed/bin/dial --captures target/pty-captures
+      - name: Repeated scripted harness outcomes
+        timeout-minutes: 5
+        run: python3 examples/benchmarks/smoke.py --dial target/installed/bin/dial --suite recovery --machine-repetitions 2
       - name: Record runtime overhead
         continue-on-error: true
         run: cargo run --locked --profile ci --example runtime_baseline -- target/runtime-baseline.json
@@ -81,9 +89,10 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install pinned Rust and Clippy
+        run: |
+          rustup show active-toolchain
+          rustup component add clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: lint
@@ -104,6 +113,8 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install pytest fastapi==0.141.1 pydantic uvicorn
       - run: python -m pytest python/test_*.py
+      - name: Benchmark graders and repeated-trial reporting
+        run: python -m unittest discover -s examples/benchmarks -p 'test_*.py'
   installer-windows:
     name: Windows installer (${{ matrix.shell }})
     strategy:

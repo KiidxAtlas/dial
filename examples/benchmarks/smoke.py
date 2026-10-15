@@ -188,7 +188,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dial", required=True, type=pathlib.Path)
     parser.add_argument("--report", type=pathlib.Path, help="persist the observed report outside the disposable workspace")
-    parser.add_argument("--profiles", type=pathlib.Path, help="operator profile-comparison file; copied unchanged, configurations must exist")
+    variants = parser.add_mutually_exclusive_group()
+    variants.add_argument("--profiles", type=pathlib.Path, help="operator profile-comparison file; copied unchanged, configurations must exist")
+    variants.add_argument("--machine-repetitions", type=int, choices=range(1, 11), help="exercise repeated baseline/compact-tool configurations against the local scripted provider")
     parser.add_argument("--suite", choices=("capabilities", "recovery"), default="capabilities", help="select executable harness cases; scripted runs are not model-quality evidence")
     args = parser.parse_args()
     binary = args.dial.resolve(strict=True)
@@ -226,6 +228,15 @@ def main():
             command = [str(binary), "--dir", str(project), "benchmark", str(manifest), "--report", str(report_path)]
             if args.profiles:
                 command += ["--profiles", str(args.profiles.resolve(strict=True))]
+            elif args.machine_repetitions:
+                profiles = root / "machine.toml"
+                profiles.write_text(
+                    '[machine]\nrepetitions=' + str(args.machine_repetitions) + '\nminimum_correctness=1.0\n'
+                    '[[configurations]]\nname="baseline"\nprovider="openai"\nmodel="scripted"\ncontext_window=32768\n'
+                    '[[configurations]]\nname="compact-tools"\nprovider="openai"\nmodel="scripted"\ncontext_window=32768\n'
+                    '[configurations.assistance]\ncompact_tools=true\ninitial_tool_limit=16\n'
+                )
+                command += ["--profiles", str(profiles)]
             import os
             environment = dict(os.environ, DIAL_HOME=str(home))
             for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY"):
@@ -234,9 +245,17 @@ def main():
             if result.returncode:
                 raise RuntimeError("benchmark process failed:\n" + result.stdout + result.stderr)
             observed = json.loads(report_path.read_text())
-            report = observed.get("profile_comparison", observed.get("report", observed))
-            reports = [item["report"] for item in report["profiles"]] if "profiles" in report else [report]
-            baseline = next((item["report"] for item in report.get("profiles", []) if item["profile"]["name"] == report.get("baseline_profile")), reports[0])
+            report = observed.get("machine_benchmark", observed.get("profile_comparison", observed.get("report", observed)))
+            reliability = None
+            if "configurations" in report:
+                from reliability import summarize
+                reliability = summarize(observed)
+                reports = [item["report"] for item in report["configurations"]]
+                baseline = next(item["report"] for item in report["configurations"] if item["configuration"]["name"] == report["baseline_configuration"])
+                expected_cases *= report["policy"]["repetitions"]
+            else:
+                reports = [item["report"] for item in report["profiles"]] if "profiles" in report else [report]
+                baseline = next((item["report"] for item in report.get("profiles", []) if item["profile"]["name"] == report.get("baseline_profile")), reports[0])
             if len(baseline["cases"]) != expected_cases or any(not case["passed"] for case in baseline["cases"]):
                 raise RuntimeError("baseline deterministic capability checks failed:\n" + json.dumps(observed, indent=2) + "\nBenchmark diagnostics:\n" + result.stderr)
             for profile in reports:
@@ -251,7 +270,12 @@ def main():
                 raise RuntimeError("no provider requests were exercised")
             if args.report:
                 args.report.resolve().write_text(json.dumps(observed, indent=2) + "\n")
-            print(json.dumps({"kind": "scripted-harness-regression", "exercised_cases": sum(len(profile["cases"]) for profile in reports), "passed_cases": sum(case["passed"] for profile in reports for case in profile["cases"]), "provider_requests": len(server.requests), "model_quality_evidence": False}))
+            summary = {"kind": "scripted-harness-regression", "exercised_cases": sum(len(profile["cases"]) for profile in reports), "passed_cases": sum(case["passed"] for profile in reports for case in profile["cases"]), "provider_requests": len(server.requests), "model_quality_evidence": False}
+            if reliability is not None:
+                summary["repeated_checked_tasks"] = sum(item["checked_tasks"] for item in reliability["configurations"])
+                if any(item["observed_all_trials_passed_fraction"] != 1 for item in reliability["configurations"]):
+                    raise RuntimeError("scripted repeated outcome checks were not consistently successful")
+            print(json.dumps(summary))
     finally:
         server.shutdown()
         server.server_close()

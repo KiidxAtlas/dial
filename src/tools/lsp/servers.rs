@@ -653,13 +653,24 @@ mod tests {
             (got.language.as_str(), got.program, got.root),
             ("rust-analyzer", ra, root.join("crates/a"))
         );
+        // A marker above the workspace roots the server there (a workspace nested in a larger
+        // project), and temp directories can sit inside a checkout that has a Cargo.toml. Swap in
+        // a marker that cannot exist so the unrooted error is checked without ambient ancestors.
+        let mut config = LspConfig::default();
+        config.servers.insert(
+            "rust-analyzer".into(),
+            LspServerConfig {
+                root_markers: Some(vec!["dial-absent.marker".into()]),
+                ..LspServerConfig::default()
+            },
+        );
         let bare = project(&[]);
         let bare = fs::canonicalize(bare.path()).unwrap();
-        let error = servers
+        let error = Servers::new(&config)
             .select(&bare, &bare.join("main.rs"), &dirs)
             .unwrap_err();
         assert!(
-            error.contains("root marker") && error.contains("Cargo.toml"),
+            error.contains("root marker") && error.contains("dial-absent.marker"),
             "{error}"
         );
     }

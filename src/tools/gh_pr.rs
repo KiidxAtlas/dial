@@ -23,6 +23,13 @@ const MAX_WORKTREE_SUFFIX: usize = 100;
 const PR_VIEW_FIELDS: &str = "author,baseRefName,body,createdAt,files,headRefName,isDraft,labels,mergeStateStatus,number,reviews,reviewDecision,state,title,updatedAt,url";
 const PR_CHECKOUT_FIELDS: &str = "baseRefName,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,maintainerCanModify,number,title,url";
 
+// Keep PR-test executable/home overrides local to the thread constructing the operation. Mutating
+// process PATH/HOME races unrelated Git, browser and configuration tests, even with a writer lock.
+#[cfg(test)]
+thread_local! {
+    static TEST_ENV: std::cell::RefCell<Option<(PathBuf, PathBuf)>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(super) fn run(
     op: &str,
     ws: &Workspace,
@@ -59,6 +66,14 @@ impl Env<'_> {
     /// Run `git` with a fixed argv in the workspace root. Never uses a shell.
     fn git(&self, args: &[&str], timeout: Duration) -> Result<GitRun, String> {
         let mut command = Command::new("git");
+        #[cfg(test)]
+        if let Some((bin, home)) = TEST_ENV.with(|value| value.borrow().clone()) {
+            let fake = bin.join("git");
+            if fake.is_file() {
+                command = Command::new(fake);
+            }
+            command.env("HOME", home);
+        }
         // Repository config is untrusted: no fsmonitor, pager, external diff or ext transport.
         command
             .args([
@@ -727,6 +742,10 @@ fn primary_root(env: &Env) -> Result<PathBuf, String> {
 
 /// `~/.dial/wt`, the worktree root.
 pub(crate) fn worktrees_root() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some((_, home)) = TEST_ENV.with(|value| value.borrow().clone()) {
+        return Ok(home.join(".dial").join("wt"));
+    }
     let home = std::env::var_os("HOME")
         .ok_or_else(|| "HOME is not set; cannot place the PR worktree".to_owned())?;
     Ok(PathBuf::from(home).join(".dial").join("wt"))
@@ -1019,47 +1038,24 @@ fn pr_push(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> Result<ToolOutp
 mod tests {
     use super::*;
 
-    /// Serializes every test that edits the process PATH/HOME for the git fakes.
-    use crate::tools::gh_common::test_support::{GhOverride, PATH_LOCK as ENV_LOCK};
+    use crate::tools::gh_common::test_support::GhOverride;
 
-    /// Prepends a fake-binary directory to PATH and points HOME at a temp dir for one test.
+    /// Scoped inputs for PR test commands, never process-global environment mutations.
     struct FakeEnv {
-        old_path: Option<std::ffi::OsString>,
-        old_home: Option<std::ffi::OsString>,
+        previous: Option<(PathBuf, PathBuf)>,
     }
 
     impl FakeEnv {
         fn install(bin: &Path, home: &Path) -> Self {
-            let old_path = std::env::var_os("PATH");
-            let old_home = std::env::var_os("HOME");
-            let mut path = bin.as_os_str().to_owned();
-            if let Some(old) = &old_path {
-                path.push(":");
-                path.push(old);
-            }
-            // SAFETY: every test using this guard holds ENV_LOCK, so no other test reads or
-            // writes the environment concurrently.
-            unsafe {
-                std::env::set_var("PATH", path);
-                std::env::set_var("HOME", home);
-            }
-            Self { old_path, old_home }
+            let previous =
+                TEST_ENV.with(|value| value.replace(Some((bin.to_owned(), home.to_owned()))));
+            Self { previous }
         }
     }
 
     impl Drop for FakeEnv {
         fn drop(&mut self) {
-            // SAFETY: see `FakeEnv::install`; the guard is still held while this runs.
-            unsafe {
-                match &self.old_path {
-                    Some(value) => std::env::set_var("PATH", value),
-                    None => std::env::remove_var("PATH"),
-                }
-                match &self.old_home {
-                    Some(value) => std::env::set_var("HOME", value),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
+            TEST_ENV.with(|value| value.replace(self.previous.take()));
         }
     }
 
@@ -1121,7 +1117,6 @@ esac"#,
 
     #[test]
     fn pr_create_builds_gh_argv_with_body_file() {
-        let _guard = ENV_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir(&bin).unwrap();
@@ -1161,7 +1156,6 @@ esac"#,
 
     #[test]
     fn pr_create_fill_omits_title_and_body_flags() {
-        let _guard = ENV_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir(&bin).unwrap();
@@ -1179,7 +1173,6 @@ esac"#,
 
     #[test]
     fn pr_create_without_body_passes_empty_body() {
-        let _guard = ENV_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir(&bin).unwrap();
@@ -1200,7 +1193,6 @@ esac"#,
 
     #[test]
     fn pr_push_adds_force_with_lease_only_when_requested() {
-        let _guard = ENV_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir(&bin).unwrap();
@@ -1249,7 +1241,6 @@ esac"#,
 
     #[test]
     fn pr_checkout_resolves_pr_number_and_creates_worktree() {
-        let _guard = ENV_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir(&bin).unwrap();
@@ -1297,5 +1288,38 @@ esac"#,
         );
         assert!(git_calls.iter().any(|l| l.starts_with("worktree add ")));
         assert!(out.text.starts_with("# Checked Out Pull Request #42"));
+    }
+
+    #[test]
+    fn fake_environment_is_scoped_to_pr_commands_not_other_git_consumers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let log = tmp.path().join("git.log");
+        fake_git(&bin, &log, r#"  "--version") echo scoped-fake ;;"#);
+        let before = (std::env::var_os("PATH"), std::env::var_os("HOME"));
+        let _env = FakeEnv::install(&bin, tmp.path());
+        let ws = Workspace::new(tmp.path()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let output = Env {
+            ws: &ws,
+            cancel: &cancel,
+        }
+        .git(&["--version"], GIT_TIMEOUT)
+        .unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout.trim(), "scoped-fake");
+        assert_eq!(worktrees_root().unwrap(), tmp.path().join(".dial/wt"));
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let real = Command::new("git").arg("--version").output().unwrap();
+                    assert!(real.status.success());
+                    assert!(String::from_utf8_lossy(&real.stdout).starts_with("git version "));
+                    assert_eq!((std::env::var_os("PATH"), std::env::var_os("HOME")), before);
+                })
+                .join()
+                .unwrap();
+        });
     }
 }

@@ -118,9 +118,20 @@ impl DesktopError {
         Self::new(ErrorCode::AxFailed, message)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn unsupported(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Unsupported, message)
+    }
+
+    /// The native backend is absent: this build omits the `desktop` feature or the platform has no
+    /// backend. Reports `Unsupported` with the reason, never a silent empty result.
+    #[cfg(not(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux)))]
+    pub(crate) fn native_unavailable(operation: &str) -> Self {
+        let reason = if cfg!(feature = "desktop") {
+            "on this platform"
+        } else {
+            "in this build (the desktop feature is disabled)"
+        };
+        Self::unsupported(format!("{operation} is unsupported {reason}"))
     }
 
     pub(crate) fn timeout(message: impl Into<String>) -> Self {

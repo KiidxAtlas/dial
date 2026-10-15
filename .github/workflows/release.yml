@@ -43,7 +43,7 @@ jobs:
           python-version: '3.12'
       - name: Install Rust
         run: |
-          rustup update stable --no-self-update
+          rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
       - uses: Swatinem/rust-cache@v2
         with:
@@ -100,10 +100,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          target: x86_64-pc-windows-msvc
-          components: clippy, rustfmt
+      - name: Install pinned Rust
+        run: |
+          rustup show active-toolchain
+          rustup target add x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-x86_64-pc-windows-msvc

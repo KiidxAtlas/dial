@@ -521,7 +521,7 @@ impl<'a> Agent<'a> {
                     crate::agent::ui_event::EventKind::Verification,
                     "Recording the configured behavioral baseline before edits.",
                 ));
-                let failures = self.run_checks(&baseline, ui);
+                let failures = self.run_checks(&baseline, ui).failures;
                 let baseline_context = if failures.is_empty() {
                     "Configured behavioral baseline passed before editing. Preserve these behaviors and rerun relevant checks after the change.".to_owned()
                 } else {
@@ -542,8 +542,13 @@ impl<'a> Agent<'a> {
         self.plan_model_resume()?;
         self.switch_resume();
         let mut backend = self.backend.take().context("backend is already in use")?;
+        // One finite budget: the initial run, verification repairs and stop-hook continuations all draw from it.
+        let mut turn_steps = TurnSteps::new(max_steps);
         let mut result =
             self.run_loop(&mut backend, &names, &mut schemas, max_steps, user_text, ui);
+        if let Ok(report) = &mut result {
+            report.steps = turn_steps.charge(report.steps);
+        }
         // A turn that ended before the next request still must not lose accepted steering.
         if let Err(error) = self.flush_accepted_live_steering(ui) {
             result = Err(error);
@@ -561,8 +566,8 @@ impl<'a> Agent<'a> {
             let mut checks = self.focused_checks(turn);
             self.step_checks.include_failed_checks(&mut checks);
             self.step_checks.record_checked();
-            let mut failures = self.run_checks(&checks, ui);
-            self.step_checks.failed = !failures.is_empty();
+            let mut run = self.run_checks(&checks, ui);
+            self.step_checks.failed = !run.failures.is_empty();
             // `repair_attempts = 0` used to mean unlimited, so a check that can never pass re-prompted the
             // model forever. Zero now selects this ceiling; an explicit count is used as configured.
             const DEFAULT_REPAIR_ROUNDS: u64 = 3;
@@ -570,21 +575,25 @@ impl<'a> Agent<'a> {
                 0 => DEFAULT_REPAIR_ROUNDS,
                 configured => u64::from(configured),
             };
+            // Repairs draw from the same `turn_steps` as the initial run and stop-hook continuations.
+            let mut repair_attempts = 0u64;
             let repair_outcome = (|| -> Result<()> {
-                let mut attempt = 0u64;
-                while attempt < limit {
-                    if failures.is_empty() || self.interrupt.load(Ordering::SeqCst) {
+                while repair_attempts < limit {
+                    // Only confirmed code failures are repaired; infrastructure, permission, cancellation,
+                    // timeout and unverified problems stay visible in the final diagnostic.
+                    if run.actionable.is_empty() || self.interrupt.load(Ordering::SeqCst) {
                         break;
                     }
+                    let Some(repair_steps) = turn_steps.remaining() else {
+                        break;
+                    };
                     self.metrics.repair_attempts += 1;
-                    self.record(0, "repair_round", json!({"attempt":attempt+1}))?;
+                    self.record(0, "repair_round", json!({"attempt":repair_attempts+1}))?;
                     self.push(json!({"role":"user","content":format!(
                                 "Automatic focused verification failed (repair attempt {}). Fix the diagnostics, then rerun the checks:\n{}",
-                                attempt + 1, failures.join("\n")
+                                repair_attempts + 1, run.actionable.join("\n")
                             )}))?;
-                    // Repairs follow the same operator-selected budget as ordinary turns.
-                    attempt = attempt.saturating_add(1);
-                    let repair_steps = max_steps;
+                    repair_attempts = repair_attempts.saturating_add(1);
                     let repaired = self.run_loop(
                         &mut backend,
                         &names,
@@ -594,20 +603,22 @@ impl<'a> Agent<'a> {
                         ui,
                     );
                     self.flush_accepted_live_steering(ui)?;
-                    let repaired = repaired?;
+                    let mut repaired = repaired?;
+                    repaired.steps = turn_steps.charge(repaired.steps);
                     if repaired.outcome != TurnOutcome::Completed {
                         result = Ok(repaired);
                         break;
                     }
                     result = Ok(repaired);
                     if self.step_checks.clean() {
-                        failures.clear();
+                        run.actionable.clear();
+                        run.failures.clear();
                     } else {
                         checks = self.focused_checks(turn);
                         self.step_checks.include_failed_checks(&mut checks);
                         self.step_checks.record_checked();
-                        failures = self.run_checks(&checks, ui);
-                        self.step_checks.failed = !failures.is_empty();
+                        run = self.run_checks(&checks, ui);
+                        self.step_checks.failed = !run.failures.is_empty();
                     }
                 }
                 Ok(())
@@ -625,7 +636,7 @@ impl<'a> Agent<'a> {
                     interrupted: true,
                     trajectory: None,
                 });
-            } else if !failures.is_empty()
+            } else if !run.failures.is_empty()
                 && result.as_ref().is_ok_and(|report| {
                     matches!(
                         report.outcome,
@@ -633,10 +644,18 @@ impl<'a> Agent<'a> {
                     )
                 })
             {
-                let diagnostic = format!(
-                    "Focused verification still fails after bounded repair: {}",
-                    failures.join("; ")
-                );
+                let problems = run.failures.join("; ");
+                let diagnostic = if repair_attempts > 0 {
+                    format!("Focused verification still fails after bounded repair: {problems}")
+                } else if !run.actionable.is_empty() {
+                    format!(
+                        "Focused verification failed and the turn's step budget ran out before an automatic repair: {problems}"
+                    )
+                } else {
+                    format!(
+                        "Focused verification failed without a repairable code diagnosis, so no automatic repair ran. Inspect the environment or permissions and rerun the check: {problems}"
+                    )
+                };
                 ui.notice(&diagnostic);
                 let steps = result.as_ref().map_or(0, |report| report.steps);
                 result = Ok(TurnReport {
@@ -714,19 +733,39 @@ impl<'a> Agent<'a> {
                 }
                 break;
             }
+            let Some(resume_steps) = turn_steps.remaining() else {
+                let diagnostic = format!(
+                    "Stopped: this turn used its {max_steps}-step limit before the stop hook's requested change could run. {reason}"
+                );
+                ui.notice(&diagnostic);
+                if let Ok(report) = &mut result {
+                    report.outcome = TurnOutcome::Incomplete;
+                    report.text = diagnostic;
+                }
+                break;
+            };
             stop_rounds += 1;
-            let resumed = (|| -> Result<TurnReport> {
+            let mut resumed = (|| -> Result<TurnReport> {
                 self.record(
                     0,
                     "stop_hook_block",
                     json!({"reason":reason,"round":stop_rounds}),
                 )?;
                 self.push(json!({"role":"user","content":format!("A stop hook blocked completion. Address this before finishing:\n{reason}")}))?;
-                let report =
-                    self.run_loop(&mut backend, &names, &mut schemas, max_steps, user_text, ui);
+                let report = self.run_loop(
+                    &mut backend,
+                    &names,
+                    &mut schemas,
+                    resume_steps,
+                    user_text,
+                    ui,
+                );
                 self.flush_accepted_live_steering(ui)?;
                 report
             })();
+            if let Ok(report) = &mut resumed {
+                report.steps = turn_steps.charge(report.steps);
+            }
             result = resumed;
         }
         self.ext.fire_lifecycle(&LifecycleEvent {
@@ -889,5 +928,58 @@ impl<'a> Agent<'a> {
     /// successful test invocation; only a separate verifier or user verdict supplies training labels.
     pub(super) fn persist_turn(&self, store: &Store, trajectory: i64) -> Result<()> {
         store.save_messages(trajectory, &self.training_capture.payload())
+    }
+}
+
+/// One finite `max_steps` per user turn. The initial run, verification repairs and stop-hook
+/// continuations all charge it; zero is the operator's unlimited choice and never runs out.
+#[derive(Clone, Copy, Debug)]
+struct TurnSteps {
+    max: u32,
+    spent: u32,
+}
+
+impl TurnSteps {
+    fn new(max: u32) -> Self {
+        Self { max, spent: 0 }
+    }
+
+    /// Steps the next round may spend (0 = unlimited); `None` once the shared budget is spent.
+    fn remaining(self) -> Option<u32> {
+        match self.max {
+            0 => Some(0),
+            max => max.checked_sub(self.spent).filter(|left| *left > 0),
+        }
+    }
+
+    /// Charge one run's own step count and return the turn's cumulative count for its report.
+    fn charge(&mut self, run_steps: u32) -> u32 {
+        self.spent = self.spent.saturating_add(run_steps);
+        self.spent
+    }
+}
+
+#[cfg(test)]
+mod turn_steps_tests {
+    use super::TurnSteps;
+
+    #[test]
+    fn initial_repair_and_stop_hook_rounds_share_one_finite_budget() {
+        let mut steps = TurnSteps::new(10);
+        assert_eq!(steps.charge(4), 4);
+        assert_eq!(steps.remaining(), Some(6));
+        // A repair round reports the cumulative turn count, not only its own steps.
+        assert_eq!(steps.charge(5), 9);
+        assert_eq!(steps.remaining(), Some(1));
+        // The stop-hook continuation gets only what is left.
+        assert_eq!(steps.charge(1), 10);
+        assert_eq!(steps.remaining(), None);
+    }
+
+    #[test]
+    fn zero_budget_stays_unlimited_but_still_counts_steps() {
+        let mut steps = TurnSteps::new(0);
+        assert_eq!(steps.charge(1_000), 1_000);
+        assert_eq!(steps.remaining(), Some(0));
     }
 }

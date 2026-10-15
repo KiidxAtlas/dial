@@ -12,20 +12,44 @@ use ureq::unversioned::{
     },
 };
 
-/// Test seam: the one-second idle limit that stall tests use, scaled down so they run in milliseconds. Process-wide
-/// because the model call runs on a worker thread that a thread-local would not reach. Zero leaves production limits.
+// Test seam: scale one-second stall-test limits down without leaking into concurrent tests.
+// Each test drives its model call on its own thread; zero preserves production limits. Backends
+// carry their own limit (see `TestIdleLimitScope`) for calls that run on a worker thread.
 #[cfg(test)]
-static TEST_IDLE_LIMIT_MILLIS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static TEST_IDLE_LIMIT_MILLIS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Pre-progress budget under the test seam: connect, request write, response head, and the wait for the
+/// first meaningful event. Generous on purpose: a loaded machine can delay the scripted server's head past
+/// the 200 ms idle limit, which then fails as a setup timeout rather than a stalled body. Silence after
+/// progress keeps the tight test idle limit, so body stalls are still measured tightly.
+#[cfg(test)]
+const TEST_SETUP_BUDGET: Duration = Duration::from_millis(1500);
+
+#[cfg(test)]
+fn test_limit_active(idle_secs: u64) -> bool {
+    idle_secs == 1 && TEST_IDLE_LIMIT_MILLIS.with(std::cell::Cell::get) != 0
+}
 
 fn stream_idle_limit(idle_secs: u64) -> Duration {
     #[cfg(test)]
     {
-        let millis = TEST_IDLE_LIMIT_MILLIS.load(Ordering::SeqCst);
-        if idle_secs == 1 && millis != 0 {
-            return Duration::from_millis(millis);
+        if test_limit_active(idle_secs) {
+            return Duration::from_millis(TEST_IDLE_LIMIT_MILLIS.with(std::cell::Cell::get));
         }
     }
     Duration::from_secs(idle_secs)
+}
+
+fn first_event_limit(_idle_secs: u64, idle: Duration) -> Duration {
+    #[cfg(test)]
+    {
+        if test_limit_active(_idle_secs) {
+            return TEST_SETUP_BUDGET;
+        }
+    }
+    idle
 }
 
 /// How long a streaming reply may stay silent. A local model can spend minutes reading a long prompt before
@@ -68,7 +92,7 @@ impl Patience {
             if local || idle_secs == 0 {
                 None
             } else {
-                Some(idle)
+                Some(first_event_limit(idle_secs, idle))
             },
             idle,
         )
@@ -76,7 +100,7 @@ impl Patience {
 
     #[cfg(test)]
     pub(crate) fn with_test_idle_limit(limit: Duration) {
-        TEST_IDLE_LIMIT_MILLIS.store(limit.as_millis() as u64, Ordering::SeqCst);
+        TEST_IDLE_LIMIT_MILLIS.with(|millis| millis.set(limit.as_millis() as u64));
     }
 
     pub(super) fn first_event_seen(&self) -> bool {
@@ -111,6 +135,30 @@ impl Patience {
             (None, Some(deadline)) => Some(deadline.saturating_duration_since(Instant::now())),
             (remaining, None) => remaining,
         }
+    }
+}
+/// Test-only: the thread-local idle limit set for one model call, restored when the call returns. A backend
+/// carries its limit to the worker thread that runs the call; no other thread observes it.
+#[cfg(test)]
+pub(crate) struct TestIdleLimitScope {
+    previous: u64,
+}
+
+#[cfg(test)]
+impl TestIdleLimitScope {
+    pub(crate) fn enter(limit: Option<Duration>) -> Self {
+        let previous = TEST_IDLE_LIMIT_MILLIS.with(std::cell::Cell::get);
+        if let Some(limit) = limit {
+            TEST_IDLE_LIMIT_MILLIS.with(|millis| millis.set(limit.as_millis() as u64));
+        }
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestIdleLimitScope {
+    fn drop(&mut self) {
+        TEST_IDLE_LIMIT_MILLIS.with(|millis| millis.set(self.previous));
     }
 }
 
@@ -274,6 +322,49 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn test_idle_limits_are_isolated_from_concurrent_request_threads() {
+        let (ready, started) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                Patience::with_test_idle_limit(Duration::from_millis(37));
+                ready.send(Patience::for_stream(1, false).idle).unwrap();
+                wait.recv().unwrap();
+            });
+            let overridden = started.recv().unwrap();
+            let unaffected = Patience::for_stream(1, false).idle;
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            assert_eq!(overridden, Duration::from_millis(37));
+            assert_eq!(unaffected, Duration::from_secs(1));
+        });
+        assert_eq!(Patience::for_stream(1, false).idle, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_setup_budget_is_generous_while_idle_after_progress_stays_tight() {
+        Patience::with_test_idle_limit(Duration::from_millis(37));
+        let patience = Patience::for_stream(1, false);
+        assert_eq!(patience.idle, Duration::from_millis(37));
+        assert_eq!(patience.first_event, Some(TEST_SETUP_BUDGET));
+        patience.mark_event();
+        assert!(patience.remaining().unwrap() <= Duration::from_millis(37));
+    }
+
+    #[test]
+    fn test_idle_limit_scope_is_restored_after_the_call() {
+        assert_eq!(Patience::for_stream(1, false).idle, Duration::from_secs(1));
+        {
+            let _scope = TestIdleLimitScope::enter(Some(Duration::from_millis(41)));
+            assert_eq!(
+                Patience::for_stream(1, false).idle,
+                Duration::from_millis(41)
+            );
+        }
+        assert_eq!(Patience::for_stream(1, false).idle, Duration::from_secs(1));
+    }
 
     #[derive(Debug)]
     struct RecordingResolver {

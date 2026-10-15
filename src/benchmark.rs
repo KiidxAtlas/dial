@@ -43,6 +43,8 @@ const DEPENDENCY_DIRS: &[&str] = &[
     "node_modules",
     "vendor",
 ];
+/// Root-only build caches and tool scratch; unlike these, `bin/` often contains real source.
+const ROOT_GENERATED_DIRS: &[&str] = &[".cargo-work", crate::tools::SCRATCH_DIR];
 const EXCLUDED_FILES: &[&str] = &[
     ".env",
     ".env.local",
@@ -1191,15 +1193,44 @@ pub(crate) fn is_secret_source_path(root: &Path, path: &Path) -> bool {
     })
 }
 
-/// Whether `path` lies in a build output, cache, or installed-dependency directory under `root`.
-/// Overlay leaves these visible and ignores changes made under them.
+/// Whether `path` lies in a build output, cache, or installed-dependency directory under `root`,
+/// or is one of the root-level generated directories. Overlay leaves these visible and ignores
+/// changes made under them.
 pub(crate) fn is_dependency_source_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
     relative.components().any(|component| {
         matches!(component, Component::Normal(name) if DEPENDENCY_DIRS.contains(&name.to_string_lossy().as_ref()))
-    })
+    }) || matches!(
+        relative.components().next(),
+        Some(Component::Normal(name)) if ROOT_GENERATED_DIRS.contains(&name.to_string_lossy().as_ref())
+    ) || ignored_bin_output(root, &relative)
+}
+
+/// Require the project's own ignore rule for `/bin/` and preserve tracked source scripts.
+fn ignored_bin_output(root: &Path, relative: &Path) -> bool {
+    if !relative.starts_with("bin") {
+        return false;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    builder.add(root.join(".gitignore"));
+    let Ok(ignore) = builder.build() else {
+        return false;
+    };
+    if !ignore.matched(root.join("bin"), true).is_ignore() {
+        return false;
+    }
+    // A tracked descendant keeps the directory visible; individual ignored outputs below it
+    // can still be excluded. This local query runs no hooks and reads no file contents.
+    let tracked = std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(format!(":(literal){}", relative.display()))
+        .current_dir(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    !tracked.is_ok_and(|status| status.success())
 }
 
 /// Whether the copy backends leave `path` out of their copies and change sets: a secret entry or
@@ -1481,6 +1512,38 @@ mod tests {
     use std::os::unix::fs::symlink;
     #[cfg(windows)]
     use std::os::windows::fs::symlink_file as symlink;
+
+    #[test]
+    fn root_build_outputs_are_excluded_but_nested_sources_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(!is_excluded_source_path(root, &root.join("bin/script")));
+        fs::write(root.join(".gitignore"), "/bin/\n").unwrap();
+        for excluded in [
+            "bin",
+            "bin/dial",
+            "bin/dial.bak-20261015-131809",
+            ".cargo-work/windows/rustc/lib/librustc_driver.dylib",
+            ".tmp/dial-debug-dump-1",
+        ] {
+            assert!(
+                is_excluded_source_path(root, &root.join(excluded)),
+                "{excluded}"
+            );
+        }
+        for kept in [
+            "src/bin/tool.rs",
+            "src/main.rs",
+            "docs/bin/readme.md",
+            "binary.txt",
+            ".cargo/config.toml",
+        ] {
+            assert!(
+                !is_excluded_source_path(root, &root.join(kept)),
+                "{kept} is source and must be copied"
+            );
+        }
+    }
 
     #[test]
     fn efficiency_suite_and_fixture_are_valid() {

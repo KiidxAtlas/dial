@@ -784,23 +784,13 @@ impl<'a> Agent<'a> {
                     })
                     .collect();
                 let matches = assistance::discover(query, candidates);
-                let mut enabled = self.enabled_tools.clone();
-                enabled.extend(
-                    matches
-                        .iter()
-                        .filter(|entry| entry.2)
-                        .map(|entry| entry.0.clone()),
-                );
-                if enabled != self.enabled_tools {
-                    let mut state = self.session.control_state();
-                    let mut sorted: Vec<_> = enabled.iter().cloned().collect();
-                    sorted.sort();
-                    state["enabled_tools"] = json!(sorted);
-                    if let Err(error) = self.session.set_control_state(state) {
-                        return denied(&format!("persisting discovered tools: {error:#}"));
-                    }
-                    self.enabled_tools = enabled;
-                    self.rebuild_system();
+                let activated: Vec<String> = matches
+                    .iter()
+                    .filter(|entry| entry.2)
+                    .map(|entry| entry.0.clone())
+                    .collect();
+                if let Err(error) = self.activate_tools(&activated) {
+                    return denied(&format!("persisting discovered tools: {error:#}"));
                 }
                 let offered = self.offered();
                 let matches: Vec<Value> = matches.into_iter().map(|(name, description, activate)| {
@@ -842,10 +832,13 @@ impl<'a> Agent<'a> {
                 for name in &unload {
                     enabled.remove(name);
                 }
+                let mut discovered = self.discovered_tools();
+                discovered.retain(|name| !unload.contains(name) && !enabled.contains(name));
                 let mut state = self.session.control_state();
                 let mut sorted: Vec<_> = enabled.iter().cloned().collect();
                 sorted.sort();
                 state["enabled_tools"] = json!(sorted);
+                state["discovered_tools"] = json!(discovered);
                 if let Err(e) = self.session.set_control_state(state) {
                     return denied(&format!("persisting enabled tools: {e:#}"));
                 }

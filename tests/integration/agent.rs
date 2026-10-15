@@ -43,6 +43,7 @@ enum Reply {
     Http(u16, &'static str),
     Text(&'static str),
     Say(String),
+    MeasuredSay(String, u64),
     Call(&'static str, Value),
     IdentifiedCall(&'static str, Value, String),
     NarratedCall(&'static str, &'static str, Value),
@@ -582,6 +583,7 @@ fn answer(
         }
     }
     let say = |text: &str| (json!({"role":"assistant","content":text}), "stop");
+    let mut measured_prompt = None;
     let (delta, finish) = match choose(&request) {
         Reply::Http(code, message) => {
             let payload = json!({"error":{"message":message}}).to_string();
@@ -616,6 +618,10 @@ fn answer(
         }
         Reply::Text(t) => say(t),
         Reply::Say(t) => say(&t),
+        Reply::MeasuredSay(text, tokens) => {
+            measured_prompt = Some(tokens);
+            say(&text)
+        }
         Reply::Cut => (json!({"role":"assistant","content":""}), "length"),
         Reply::Call(name, args) => (
             json!({"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function",
@@ -645,7 +651,7 @@ fn answer(
         ),
     };
     // Report what a real provider would: the request's own size, at the estimator's rate of about four bytes per token.
-    let prompt_tokens = body.len() as u64 / 4;
+    let prompt_tokens = measured_prompt.unwrap_or(body.len() as u64 / 4);
     let usage = json!({"prompt_tokens":prompt_tokens,"completion_tokens":5,"total_tokens":prompt_tokens + 5});
     let (kind, payload) = if streaming {
         let chunk = |c: Value| format!("data: {c}\n\n");
@@ -3210,6 +3216,81 @@ fn compaction_keeps_recent_turns_and_replaces_older_ones_with_a_summary() {
             .any(|m| m["role"] == "user" && m["content"] == "one?"),
         "the oldest standalone turn is removed from active context"
     );
+}
+
+#[test]
+fn calibrated_compaction_reports_a_reduction_and_continues_below_the_trigger() {
+    use dial::agent::compaction::{CompactionMethod, CompactionOptions};
+
+    let mut recovered_tokens = None;
+    for (auto_continue, suppress, at_trigger) in [
+        (true, false, false),
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let normal = AtomicUsize::new(0);
+        let server = serve_fn(
+            Arc::new(move |request: &Value| {
+                // Exercise the real tool-free summary route, rejecting the reported bad shape.
+                if !request.get("tools").is_some_and(Value::is_array) {
+                    return Reply::Http(400, "tools: Input should be a valid array");
+                }
+                if request["tools"].as_array().unwrap().is_empty() {
+                    return Reply::Text(
+                        "SUMMARY: preserve the task and continue the unfinished work.",
+                    );
+                }
+                let text = if normal.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (0..1500)
+                        .map(|i| format!("Inspected item {i}: recorded its current state.\n"))
+                        .collect()
+                } else {
+                    "Recent answer.".into()
+                };
+                // Provider tokenization is deliberately much larger than bytes/4. Comparing
+                // the raw prepared estimate to the calibrated replacement used to show growth.
+                Reply::MeasuredSay(text, 70_000)
+            }),
+            None,
+            None,
+        );
+        let mut e = env(&server.url, "auto");
+        e.config.context_window = 200_000;
+        e.config.compaction.enabled = false;
+        e.config.compaction.mid_turn_enabled = false;
+        e.config.compaction.keep_recent_tokens = 100;
+        e.config.compaction.auto_continue = auto_continue;
+        if let Some(tokens) = recovered_tokens {
+            e.config.compaction.threshold_tokens = Some(if at_trigger {
+                tokens - 128
+            } else {
+                tokens + 128
+            });
+        }
+        let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+        let mut ui = Recorder::default();
+        a.turn("Inspect the project", &mut ui).unwrap();
+        a.turn("Continue the work", &mut ui).unwrap();
+        let outcome = a
+            .compact_with_options(
+                &mut ui,
+                CompactionOptions {
+                    method: Some(CompactionMethod::Soft),
+                    suppress_continuation: suppress,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(outcome.tokens_before > outcome.tokens_after, "{outcome:?}");
+        assert_eq!(
+            outcome.continue_allowed,
+            auto_continue && !suppress && !at_trigger,
+            "safe foreground compaction must not pause merely for missing the recovery band: {outcome:?}"
+        );
+        recovered_tokens.get_or_insert(outcome.tokens_after);
+    }
 }
 
 #[test]
@@ -6519,6 +6600,129 @@ fn failed_focused_check_repairs_boundedly_and_never_reports_success() {
     let rollback = a.checkpoints().unwrap().rollback(1).unwrap();
     assert_eq!(rollback.removed, ["marker.txt"]);
     assert!(!e.project.path().join("marker.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_verification_prerequisite_failures_do_not_request_code_repairs() {
+    if skip_without_sandbox() {
+        return;
+    }
+    for (name, command, status) in [
+        (
+            "python AST: probe",
+            "printf 'No module named pytest\\n'; exit 1",
+            "environment_unavailable",
+        ),
+        ("empty-suite", "printf 'Ran 0 tests\\n'", "unverified"),
+    ] {
+        let server = serve(vec![
+            Reply::Call(
+                "write",
+                json!({"path":"marker.txt","content":"original work"}),
+            ),
+            Reply::Text("Marker written."),
+            Reply::Call(
+                "write",
+                json!({"path":"marker.txt","content":"unrequested repair"}),
+            ),
+        ]);
+        let mut e = env(&server.url, "auto");
+        e.config.verification.automatic_checks = true;
+        e.config.verification.commands.push(VerificationCommand {
+            name: name.into(),
+            command: command.into(),
+            file_extensions: vec![],
+            timeout_secs: 5,
+        });
+        let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+        let report = agent
+            .turn("Create marker", &mut Recorder::default())
+            .unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Failed);
+        assert_eq!(
+            server.requests.lock().len(),
+            2,
+            "{status} must not prompt a code repair"
+        );
+        assert_eq!(agent.metrics().repair_attempts, 0);
+        assert_eq!(
+            agent.session().control_state()["reliability"]["verification_results"][0]["status"],
+            status
+        );
+        assert_eq!(
+            std::fs::read_to_string(e.project.path().join("marker.txt")).unwrap(),
+            "original work"
+        );
+    }
+}
+
+#[test]
+fn automatic_verification_repairs_share_the_turn_request_budget() {
+    if skip_without_sandbox() {
+        return;
+    }
+    for max_steps in [2, 3] {
+        let server = serve(vec![
+            Reply::Call("write", json!({"path":"marker.txt","content":"bad"})),
+            Reply::Text("Marker written."),
+            Reply::Text("The check still fails."),
+            Reply::Call(
+                "write",
+                json!({"path":"marker.txt","content":"beyond budget"}),
+            ),
+        ]);
+        let mut e = env(&server.url, "auto");
+        e.config.harness.max_steps = max_steps;
+        e.config.verification.automatic_checks = true;
+        e.config.verification.commands.push(VerificationCommand {
+            name: "code-failure".into(),
+            command: "false".into(),
+            file_extensions: vec![],
+            timeout_secs: 5,
+        });
+        let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+        let report = agent
+            .turn("Create marker", &mut Recorder::default())
+            .unwrap();
+        assert_eq!(report.outcome, TurnOutcome::Failed);
+        assert_eq!(server.requests.lock().len(), max_steps as usize);
+        assert_eq!(
+            report.steps, max_steps,
+            "report includes the initial and repair requests"
+        );
+        assert_eq!(agent.metrics().repair_attempts, u64::from(max_steps - 2));
+        assert_eq!(
+            std::fs::read_to_string(e.project.path().join("marker.txt")).unwrap(),
+            "bad"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_hook_reentry_cannot_reset_an_exhausted_turn_budget() {
+    let server = serve(vec![
+        Reply::Text("Report complete."),
+        Reply::Text("Report complete."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.harness.max_steps = 1;
+    e.config.hooks.push(dial::config::types::HookConfig {
+        event: "stop".into(),
+        matcher: None,
+        command: vec!["sh".into(), "-c".into(), r#"cat >/dev/null; printf '{"decision":"block","reason":"Missing acceptance condition."}'"#.into()],
+        timeout_secs: 5,
+        fail_closed: None,
+    });
+    let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = agent
+        .turn("Produce a report", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert_eq!(report.steps, 1);
+    assert_eq!(server.requests.lock().len(), 1);
+    assert_eq!(agent.metrics().turns_completed, 0);
 }
 
 #[test]

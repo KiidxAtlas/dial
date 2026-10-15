@@ -55,12 +55,12 @@ pub enum KeyName {
 }
 
 impl KeyName {
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(any(dial_desktop_windows, dial_desktop_macos))]
     pub(crate) const fn is_modifier(self) -> bool {
         matches!(self, Self::Ctrl | Self::Alt | Self::Shift | Self::Meta)
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(dial_desktop_windows)]
     pub(crate) const fn to_enigo(self) -> enigo::Key {
         use enigo::Key;
         match self {
@@ -235,7 +235,7 @@ pub fn parse_modifiers(mods: &[String]) -> CoreResult<Modifiers> {
     Ok(result)
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(dial_desktop_windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyDirection {
     Press,
@@ -249,7 +249,7 @@ pub enum KeyDirection {
 /// `merge(primary, cleanup)` folds each release result into the cleanup
 /// result and that into the primary result, so each backend keeps its own
 /// policy for reporting cleanup failures next to the delivery failure.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(dial_desktop_windows, test))]
 pub(crate) fn hold_keys<C, E>(
     ctx: &mut C,
     keys: impl IntoIterator<Item = KeyName>,

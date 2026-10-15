@@ -3170,7 +3170,12 @@ mod tests {
     /// Runs `f` on every item using scoped threads; a panic in `f` fails the test.
     fn par_each<T: Sync>(items: &[T], f: impl Fn(&T) + Sync) {
         let next = AtomicUsize::new(0);
-        let workers = std::thread::available_parallelism().map_or(2, |n| n.get());
+        // Libtest already runs tests concurrently, and these workers can each spawn a sandboxed
+        // interpreter. Multiplying every CPU by every test can exhaust process/timeout budgets.
+        let workers = std::thread::available_parallelism()
+            .map_or(2, |n| n.get())
+            .min(4)
+            .min(items.len());
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| {
