@@ -33,7 +33,7 @@ const MAX_INPUT_ROWS: usize = 10;
 const MIN_BOX_WIDTH: usize = 8;
 const MAX_NAME_COLUMN: usize = 24;
 /// App-level shortcuts the composer reports instead of handling.
-const APP_ACTIONS: [Action; 15] = [
+const APP_ACTIONS: [Action; 17] = [
     Action::CommandPalette,
     Action::ModelSelect,
     Action::ModelRoles,
@@ -49,6 +49,8 @@ const APP_ACTIONS: [Action; 15] = [
     Action::PasteImage,
     Action::VoiceInput,
     Action::SubagentsRecent,
+    Action::RateGood,
+    Action::RateBad,
 ];
 
 /// Two presses of one key inside this window count as a double tap.

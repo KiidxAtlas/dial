@@ -5,6 +5,12 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Added
+- **Teach this model** (`/settings` → Model → Learning, `improve.teach`): an opt-in switch that lets a local model (MLX, Ollama, LM Studio) learn from your coding sessions. Turns are recorded, and the latest version admitted by the evaluation gate serves the session, LoRA adapter included. Turns are approved without typing scores: committing a turn's exact changes, Alt+Up, or passing behavioral checks counts as good; Alt+Down or `/undo` as bad. Hosted models are never recorded.
+
+### Fixed
+- `/outcome` and `/undo` feedback had nowhere to go in coding sessions, and `/improve` told you to use them anyway; both now record when Teach this model is on and say how to turn it on otherwise.
+
 ## [0.1.4] - 2026-10-14
 
 ### Added

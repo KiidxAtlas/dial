@@ -136,19 +136,20 @@ mod tests {
 
     fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let git = git_in(dir.path());
-        for args in [
-            &["init", "-q"][..],
-            &["config", "user.email", "test@example.com"],
-            &["config", "user.name", "Test"],
-            &["config", "commit.gpgsign", "false"],
-        ] {
-            git(args).unwrap();
+        {
+            let git = git_in(dir.path());
+            for args in [
+                &["init", "-q"][..],
+                &["config", "user.email", "test@example.com"],
+                &["config", "user.name", "Test"],
+                &["config", "commit.gpgsign", "false"],
+            ] {
+                git(args).unwrap();
+            }
         }
         fs::write(dir.path().join("a.txt"), "one\n").unwrap();
         fs::write(dir.path().join("gone.txt"), "bye\n").unwrap();
-        git(&["add", "-A"]).unwrap();
-        git(&["commit", "-q", "-m", "base"]).unwrap();
+        commit_all(dir.path());
         dir
     }
 

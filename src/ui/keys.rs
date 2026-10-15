@@ -47,6 +47,8 @@ pub enum Action {
     ApprovalCycle,
     SubagentsHub,
     SubagentsRecent,
+    RateGood,
+    RateBad,
     // navigation inside lists, menus and overlays
     SelectUp,
     SelectDown,
@@ -104,6 +106,8 @@ impl Action {
         Action::ApprovalCycle,
         Action::SubagentsHub,
         Action::SubagentsRecent,
+        Action::RateGood,
+        Action::RateBad,
         Action::SelectUp,
         Action::SelectDown,
         Action::SelectPageUp,
@@ -183,6 +187,8 @@ impl Action {
             Action::ApprovalCycle => "app.approval.cycle",
             Action::SubagentsHub => "app.subagents.hub",
             Action::SubagentsRecent => "app.subagents.recent",
+            Action::RateGood => "app.turn.rateGood",
+            Action::RateBad => "app.turn.rateBad",
             Action::SelectUp => "tui.select.up",
             Action::SelectDown => "tui.select.down",
             Action::SelectPageUp => "tui.select.pageUp",
@@ -249,6 +255,8 @@ impl Action {
             Action::SubagentsRecent => {
                 "Open the most recent running worker's transcript; press again to cycle"
             }
+            Action::RateGood => "Mark the last turn good (Teach this model)",
+            Action::RateBad => "Mark the last turn bad (Teach this model)",
             Action::SelectUp => "Move up in lists",
             Action::SelectDown => "Move down in lists",
             Action::SelectPageUp => "Page up in lists",
@@ -304,7 +312,9 @@ impl Action {
             | Action::Settings
             | Action::ApprovalCycle
             | Action::SubagentsHub
-            | Action::SubagentsRecent => "Application",
+            | Action::SubagentsRecent
+            | Action::RateGood
+            | Action::RateBad => "Application",
             Action::ToolsExpand
             | Action::ToolsToggle
             | Action::ThinkingToggle
@@ -357,6 +367,8 @@ impl Action {
             Action::ApprovalCycle => &["Shift+Tab"],
             Action::SubagentsHub => &["Alt+A"],
             Action::SubagentsRecent => &["Alt+Shift+A"],
+            Action::RateGood => &["Alt+Up"],
+            Action::RateBad => &["Alt+Down"],
             Action::SelectUp => &["Up", "Ctrl+P"],
             Action::SelectDown => &["Down", "Ctrl+N"],
             Action::SelectPageUp => &["PageUp"],

@@ -146,6 +146,7 @@ max_candidates = 0
 alpha = 0.1
 min_net_wins = 2
 lora_min_examples = 24
+teach = false              # "Teach this model": record local-model coding sessions and serve admitted versions
 learn_from_sessions = true
 monitor_min_turns = 8
 monitor_drop = 15.0

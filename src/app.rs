@@ -79,6 +79,34 @@ const TICK: Duration = Duration::from_millis(80);
 /// A git call may never hold the interface hostage.
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 const GIT_TTL: Duration = Duration::from_secs(5);
+/// "Teach this model" watches this many recent turns for a commit of their changes.
+const TEACH_PENDING_TURNS: usize = 8;
+const TEACH_OFF: &str = "Turn on Teach this model (/settings → Model → Learning) while using a local model to rate turns and teach it from your work.";
+
+#[derive(Clone, PartialEq, Eq)]
+struct TeachState {
+    model: String,
+    /// The setting is on.
+    wanted: bool,
+    /// The learning store is open, so turns are recorded.
+    active: bool,
+}
+
+impl TeachState {
+    fn of(app: &App) -> Self {
+        Self {
+            model: app.config.model.clone(),
+            wanted: app.config.improve.teach,
+            active: app.store.is_some(),
+        }
+    }
+}
+
+/// Where a "Teach this model" turn started: HEAD (when in a repository) and the checkpoint counter.
+struct TeachStart {
+    base: Option<String>,
+    checkpoint: Option<u64>,
+}
 /// Learning state is a store query, so it is refreshed on a timer, not per keystroke.
 const STATUS_TTL: Duration = Duration::from_secs(2);
 /// Streaming text repaints at most this often; tool events always repaint.
@@ -2389,6 +2417,12 @@ struct Shell {
     started: Instant,
     request_phase: agent::RequestPhase,
     last_trajectory: Option<i64>,
+    /// "Teach this model": recent turns whose changes may still be committed, oldest first.
+    teach_pending: Vec<crate::learn::signals::TurnChange>,
+    /// The rating-keys tip is shown once per shell.
+    teach_hint_shown: bool,
+    /// What the shell last saw of "Teach this model", to announce changes after a rebuild.
+    teach_state: TeachState,
     startup: Option<String>,
     /// The configured approval mode last applied to the agent (session cycling may differ from it).
     cfg_approval: Approval,
@@ -2628,6 +2662,9 @@ impl Shell {
             started: Instant::now(),
             request_phase: agent::RequestPhase::Waiting,
             last_trajectory: None,
+            teach_pending: Vec::new(),
+            teach_hint_shown: false,
+            teach_state: TeachState::of(app),
             startup: (!startup.trim().is_empty()).then_some(startup),
             cfg_approval: app.config.approval,
             dark,
@@ -2942,6 +2979,7 @@ impl Shell {
     }
 
     fn after_adopt(&mut self, app: &App) {
+        self.teach_changed(app);
         self.ui = app.config.ui.clone();
         self.cfg_approval = app.config.approval;
         self.catalog.refresh(app);
@@ -3734,6 +3772,10 @@ impl Shell {
             Action::ModelSelect => self.open(app, agent, Which::Models),
             Action::ModelRoles => self.open(app, agent, Which::ModelRoles),
             Action::ModelFavoriteNext => self.command(app, agent, "/model next"),
+            Action::RateGood | Action::RateBad => {
+                self.rate_last_turn(app, action == Action::RateGood);
+                Ok(Step::Done)
+            }
             Action::ProviderSetup => self.open(app, agent, Which::Providers),
             Action::Settings => self.open(app, agent, Which::Settings),
             Action::ToolsExpand => {
@@ -4131,6 +4173,168 @@ impl Shell {
         }
     }
 
+    /// "Teach this model": settle earlier turns whose changes were committed since, then note HEAD
+    /// and the checkpoint counter so the end of this turn can tell what it changed.
+    fn teach_turn_start(&mut self, app: &App, agent: &Agent<'_>) -> Option<TeachStart> {
+        app.store.as_ref()?;
+        self.settle_commits(app, agent);
+        let root = agent.workspace().root().to_path_buf();
+        Some(TeachStart {
+            base: crate::learn::signals::head(&|args| git_output(&root, args)),
+            checkpoint: agent
+                .checkpoints()
+                .map(|checkpoints| checkpoints.next_turn()),
+        })
+    }
+
+    fn teach_turn_end(&mut self, app: &App, agent: &Agent<'_>, trajectory: i64, start: TeachStart) {
+        if let (Some(base), Some(first), Some(checkpoints)) =
+            (start.base, start.checkpoint, agent.checkpoints())
+        {
+            // Every checkpointed turn since the start belongs to this one (workers included).
+            let mut changed: Vec<String> = (first..checkpoints.next_turn())
+                .flat_map(|turn| checkpoints.changed_files(turn))
+                .collect();
+            changed.sort();
+            changed.dedup();
+            let root = agent.workspace().root().to_path_buf();
+            let git = |args: &[&str]| git_output(&root, args);
+            if let Some(change) =
+                crate::learn::signals::capture(&git, &root, trajectory, base, &changed)
+            {
+                self.teach_pending.push(change);
+                let excess = self.teach_pending.len().saturating_sub(TEACH_PENDING_TURNS);
+                self.teach_pending.drain(..excess);
+                // The turn may have committed its own work.
+                self.settle_commits(app, agent);
+            }
+        }
+        if !self.teach_hint_shown {
+            self.teach_hint_shown = true;
+            self.note(
+                "Teaching",
+                format!(
+                    "{} marks a turn good and {} bad. Committing a turn's changes also counts as good; /undo counts as bad.",
+                    self.keys.label(Action::RateGood),
+                    self.keys.label(Action::RateBad)
+                ),
+            );
+        }
+    }
+
+    /// Announce what changed for "Teach this model". Each model has its own learning database, so
+    /// turn references do not survive a model change.
+    fn teach_changed(&mut self, app: &App) {
+        let now = TeachState::of(app);
+        let before = std::mem::replace(&mut self.teach_state, now.clone());
+        if before.model != now.model {
+            self.last_trajectory = None;
+            self.teach_pending.clear();
+        }
+        if before == now {
+            return;
+        }
+        let message = if !now.wanted {
+            if !before.active {
+                return;
+            }
+            "Teaching off: sessions are no longer recorded.".to_owned()
+        } else if !app.config.teaching() {
+            format!(
+                "Teach this model works with local models; {} is hosted, so this session is not recorded.",
+                now.model
+            )
+        } else if let Some(error) = &app.store_error {
+            format!("Teaching is on, but the learning store could not open: {error}")
+        } else if before.active && before.model == now.model {
+            return;
+        } else {
+            format!(
+                "Teaching {}: turns you approve become training examples. /improve train trains and tests a new version; it serves only if it scores better.",
+                now.model
+            )
+        };
+        self.note("Teaching", message);
+    }
+
+    /// Credit pending turns whose exact changes have since been committed.
+    fn settle_commits(&mut self, app: &App, agent: &Agent<'_>) {
+        let Some(store) = app.store.as_ref() else {
+            return;
+        };
+        if self.teach_pending.is_empty() {
+            return;
+        }
+        let root = agent.workspace().root().to_path_buf();
+        let git = |args: &[&str]| git_output(&root, args);
+        let (mut kept, mut errors) = (0, Vec::new());
+        self.teach_pending.retain(|change| {
+            if crate::learn::signals::committed(&git, change) != Some(true) {
+                return true;
+            }
+            let outcome = Outcome {
+                trajectory: change.trajectory,
+                score: 100.0,
+                source: "git:commit".into(),
+                reference: None,
+            };
+            match store.implicit_outcome(&outcome) {
+                Ok(true) => kept += 1,
+                Ok(false) => {}
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+            false
+        });
+        match kept {
+            0 => {}
+            1 => self.note(
+                "Teaching",
+                "Committed a turn's changes: saved as a good example.",
+            ),
+            n => self.note(
+                "Teaching",
+                format!("Committed {n} turns' changes: saved as good examples."),
+            ),
+        }
+        for error in errors {
+            self.note("Teaching", format!("could not record the commit: {error}"));
+        }
+    }
+
+    /// Alt+Up / Alt+Down: rate the last finished turn for "Teach this model".
+    fn rate_last_turn(&mut self, app: &App, good: bool) {
+        let Some(store) = app.store.as_ref() else {
+            self.note("Teaching", TEACH_OFF);
+            return;
+        };
+        let Some(trajectory) = self.last_trajectory else {
+            self.note("Teaching", "No finished turn to rate yet.");
+            return;
+        };
+        let outcome = Outcome {
+            trajectory,
+            score: if good { 100.0 } else { 0.0 },
+            source: "user:rating".into(),
+            reference: None,
+        };
+        match store.outcome(&outcome) {
+            Ok(()) => {
+                self.teach_pending
+                    .retain(|change| change.trajectory != trajectory);
+                self.note(
+                    "Teaching",
+                    if good {
+                        "Marked the last turn good: saved as a training example."
+                    } else {
+                        "Marked the last turn bad: it will not be used as an example."
+                    },
+                );
+                self.start_live_monitor("Teaching", app.config.clone());
+            }
+            Err(error) => self.transcript.error(&format!("{error:#}")),
+        }
+    }
+
     fn run_turn(&mut self, app: &App, agent: &mut Agent<'_>, text: &str) -> Result<Step> {
         self.loop_mode.turn_started(text);
         self.retry_noted = false;
@@ -4170,6 +4374,7 @@ impl Shell {
         self.status.output_tokens = 0;
         self.status.tokens_per_second = None;
         self.status.activity = "thinking".into();
+        let teach = self.teach_turn_start(app, agent);
         let (result, failed, streamed_tokens) = {
             let mut bridge = Bridge {
                 app,
@@ -4201,6 +4406,9 @@ impl Shell {
                 }
                 if report.trajectory.is_some() {
                     self.last_trajectory = report.trajectory;
+                }
+                if let (Some(trajectory), Some(start)) = (report.trajectory, teach) {
+                    self.teach_turn_end(app, agent, trajectory, start);
                 }
             }
             Err(error) => self.transcript.error(&format!("{error:#}")),
@@ -6165,6 +6373,7 @@ impl Shell {
                 );
             }
             "improve" => {
+                self.settle_commits(app, agent);
                 self.learning.read(app);
                 let mut summary = improve_summary(app);
                 if let Some(monitor) = &self.adapter_monitor {
@@ -6932,10 +7141,7 @@ impl Shell {
                     }
                     (None, _, _) => self.note("Outcome", Self::OUTCOME_USAGE),
                     (_, None, _) => self.note("Outcome", "No completed turn to score yet. Finish a turn, then rate it with /outcome <0-100>."),
-                    (_, _, None) => self.note(
-                        "Outcome",
-                        "self-improvement is not configured, so there is nowhere to record this",
-                    ),
+                    (_, _, None) => self.note("Outcome", TEACH_OFF),
                 }
             }
             other if other.starts_with("skill:") => {
@@ -7051,7 +7257,9 @@ fn app_home_hint() -> String {
 fn improve_summary(app: &App) -> String {
     let cached = Store::open_read_only(&app.config.state_dir).ok();
     let Some(store) = app.store.as_ref().or(cached.as_ref()) else {
-        return "Learning is separate from coding. Run `dial improve status` to inspect it or `dial improve cycle` to start an explicit evaluation. Coding sessions do not record training trajectories or launch improvement jobs.".into();
+        return format!(
+            "{TEACH_OFF}\nWithout it, coding sessions are not recorded; `dial improve cycle` still runs an explicit evaluation."
+        );
     };
     let version = store
         .active()
@@ -7088,9 +7296,14 @@ fn improve_summary(app: &App) -> String {
         Err(error) => summary.push_str(&format!("\nLoRA cooldown unavailable: {error:#}")),
     }
     summary.push_str(&format!("\nTraining requires at least {} verified examples and a validation split. Cooldowns are eligibility delays, not training-duration estimates.", app.config.improve.lora_min_examples.max(app.config.training.batch_size)));
+    if app.store.is_none() {
+        summary.push_str(&format!("\n{TEACH_OFF}"));
+    }
     match store.verified_live_turns() {
-        Ok(0) => summary.push_str("\nSession learning: 0 verified live turns so far. Live turns teach only when verified: run /outcome <score> after a turn, or make behavioral checks pass (a clean turn whose behavioral checks all passed is recorded automatically). /undo records a failure."),
-        Ok(n) => summary.push_str(&format!("\nSession learning: {n} verified live turns recorded.")),
+        Ok(n) if app.store.is_some() => summary.push_str(&format!(
+            "\nTeaching: {n} approved turns recorded. A turn is approved when you commit its changes, press Alt+Up, or its behavioral checks pass; /undo or Alt+Down rejects it."
+        )),
+        Ok(n) => summary.push_str(&format!("\nSession learning: {n} verified live turns recorded earlier.")),
         Err(error) => summary.push_str(&format!("\nSession learning unavailable: {error:#}")),
     }
     if state == "running"
@@ -9221,6 +9434,38 @@ mod tests {
             saved.improve.enabled && saved.training.enabled,
             "Saved learning preferences stay intact"
         );
+    }
+
+    #[test]
+    fn teaching_a_local_model_opens_its_learning_store_for_coding() {
+        let (_home, _project, layout, mut saved) = config();
+        saved.model = "scripted".into();
+        saved.endpoint = None;
+        saved.improve.teach = true;
+        let path = saved.state_dir.join("state.sqlite3");
+        let mut app = App::new(
+            layout,
+            saved.clone(),
+            toml::Table::new(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+        )
+        .unwrap();
+        assert!(app.store.is_some() && app.store_error.is_none());
+        assert!(path.exists());
+        assert!(app.config.improve.enabled && !app.config.improve.background);
+        // A hosted model is never recorded, even with the switch on.
+        saved.endpoint = Some(crate::config::types::EndpointConfig {
+            base_url: "https://api.example.com/v1".into(),
+            api_key_env: None,
+            allow_insecure: false,
+            protocol: None,
+            headers: None,
+            account_id: None,
+        });
+        app.adopt(saved);
+        assert!(app.store.is_none() && !app.config.improve.enabled);
     }
 
     #[test]

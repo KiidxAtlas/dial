@@ -1531,6 +1531,48 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_never_overrides_a_persons_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "model", "case", &harness()).unwrap();
+        let version = store.active().unwrap().id;
+        let turn = |prompt: &str| {
+            let id = store
+                .begin_trajectory(version, "coding", "session:1", prompt)
+                .unwrap();
+            store.finish_trajectory(id, Some("done"), None).unwrap();
+            id
+        };
+        let commit = |trajectory| Outcome {
+            trajectory,
+            score: 100.0,
+            source: "git:commit".into(),
+            reference: None,
+        };
+        let (checked, rejected, plain) = (turn("a"), turn("b"), turn("c"));
+        for (id, source, score) in [
+            (checked, "checks:behavioral", 100.0),
+            (rejected, "user:rating", 0.0),
+        ] {
+            store
+                .outcome(&Outcome {
+                    trajectory: id,
+                    score,
+                    source: source.into(),
+                    reference: None,
+                })
+                .unwrap();
+        }
+        assert!(store.implicit_outcome(&commit(checked)).unwrap());
+        assert!(!store.implicit_outcome(&commit(rejected)).unwrap());
+        assert!(store.implicit_outcome(&commit(plain)).unwrap());
+        assert_eq!(
+            store.verified_live_turns().unwrap(),
+            2,
+            "commits count as verified; the rejected turn does not"
+        );
+    }
+
+    #[test]
     fn recent_excludes_pending_work_and_bounds_events_without_losing_latest() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), "model", "case", &harness()).unwrap();

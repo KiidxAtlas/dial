@@ -2232,6 +2232,8 @@ mod tests {
             coding.search = query.into();
             assert!(coding.visible().iter().all(|row| !matches!(row, Row::Setting(i) if SettingsOverlay::learning_setting(&settings_schema::registry()[*i]))));
         }
+        coding.search = "teach this model".into();
+        assert!(coding.visible().iter().any(|row| matches!(row, Row::Setting(i) if settings_schema::registry()[*i].path == "improve.teach")));
         let mut learning = overlay().learning_only();
         learning.search = "laya".into();
         assert!(learning.visible().iter().any(|row| matches!(row, Row::Setting(i) if settings_schema::registry()[*i].path == "laya.enabled")));
