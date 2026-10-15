@@ -180,6 +180,11 @@ impl Checkpoints {
         });
         Ok(turn)
     }
+    /// The number the next `begin_turn` returns; turns in `[before, after)` of two reads ran
+    /// between them.
+    pub fn next_turn(&self) -> u64 {
+        self.lock().next_turn
+    }
     /// Workspace-relative paths changed or skipped in `turn`, whether it is active or completed;
     /// an unknown turn id is empty.
     pub fn changed_files(&self, turn: u64) -> Vec<String> {

@@ -1,6 +1,35 @@
 # Optional learning and harness improvement
 
-Coding and learning have separate lifecycles. Normal terminal, print, RPC and ACP launches use configured model/harness settings and do not record training trajectories, apply learned versions, start Laya/automatic learned-skill capture, generate project-learning summaries, run startup model evaluations, monitor learning adapters, or queue improvement at startup/exit. Legacy automatic-learning preferences remain on disk and cannot opt a coding session back into this work.
+Coding and learning have separate lifecycles. Normal terminal, print, RPC and ACP launches use configured model/harness settings and do not record training trajectories, apply learned versions, start Laya/automatic learned-skill capture, generate project-learning summaries, run startup model evaluations, monitor learning adapters, or queue improvement at startup/exit. Legacy automatic-learning preferences remain on disk and cannot opt a coding session back into this work. The one opt-in is **Teach this model**, below.
+
+## Teach this model
+
+Turn on `/settings` → Model → Learning → **Teach this model** (`[improve] teach = true`) to let a local
+model learn from the work you do with it. It applies to Dial's MLX runtime and to OpenAI-compatible
+servers on this machine or your network (Ollama, LM Studio); hosted models are never recorded, even
+with the switch on. While it is on, coding sessions with that model:
+
+- record each turn in the model's learning database, and
+- run on the model's latest admitted version: its harness changes and, for MLX models, its LoRA adapter.
+
+A recorded turn becomes a training example only once it is approved. Dial approves a turn when:
+
+| Signal | Recorded as |
+|---|---|
+| You commit the turn's changes exactly as it left them (any commit tool; checked when the next turn starts, after a turn and on `/improve`) | good (`git:commit`) |
+| You press **Alt+Up** (`app.turn.rateGood`) after the turn | good (`user:rating`) |
+| Its configured behavioral checks all pass after its last edit | good (`checks:behavioral`) |
+| You press **Alt+Down** (`app.turn.rateBad`) | bad (`user:rating`) |
+| You run `/undo` | bad (`user:undo`) |
+| `/outcome <0-100>` | that score (`user`) |
+
+Your own verdict always wins: a commit never overwrites a rating, `/undo` or `/outcome`, while a
+later rating replaces anything. Files you edit by hand before committing change the content, so a
+corrected turn is not credited. Dial watches the last eight turns that changed files in the project
+root; changes in added directories are not tracked. Turns that do not change files need Alt+Up,
+checks or `/outcome` to count. Training still waits for `lora_min_examples` approved examples and
+runs only when you ask (`/improve train` or `/improve cycle`); a new version serves only after it
+passes the evaluation gate. `/improve` shows how many approved turns are recorded.
 
 Run `dial improve status` to inspect learning, `dial improve cycle` for an explicit gated cycle, or `dial improve train` for explicit training. Inside the terminal, `/improve settings` and `/improve models` expose the separate learning controls; `/improve jobs` and `/improve stop <state_id>` manage explicitly launched work. These operations retain compute, power, budget and evaluation gates. Learning workers yield to coding at their existing safe handoff boundaries.
 

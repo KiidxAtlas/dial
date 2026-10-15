@@ -1,6 +1,6 @@
 # dial
 
-A local-first coding agent harness for macOS, Linux and Windows (native or through WSL2). Run it in a project directory like any agent CLI. Learning is optional and separate: `dial improve` runs verified practice, harness proposals and local LoRA training behind an external evaluation gate. Ordinary coding sessions do not open a learning store, collect training trajectories, apply learned candidates or launch training/evaluation workers. Local MLX inference and training require Apple Silicon; Intel Macs and Linux/WSL2 use hosted or OpenAI-compatible providers.
+A local-first coding agent harness for macOS, Linux and Windows (native or through WSL2). Run it in a project directory like any agent CLI. Learning is optional and separate: `dial improve` runs verified practice, harness proposals and local LoRA training behind an external evaluation gate. Ordinary coding sessions do not open a learning store, collect training trajectories, apply learned candidates or launch training/evaluation workers, unless you turn on **Teach this model** for a local model (`/settings` → Model → Learning). Local MLX inference and training require Apple Silicon; Intel Macs and Linux/WSL2 use hosted or OpenAI-compatible providers.
 
 Standalone: no dependency on any external agent harness or hosted service. Rust control plane and tools; Python for local MLX inference/training (`mlx-lm`, plus `mlx-vlm` for vision).
 
