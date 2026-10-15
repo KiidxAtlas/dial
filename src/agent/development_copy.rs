@@ -220,14 +220,15 @@ fn relocate_environment_text(
     };
     let origin = root.to_string_lossy();
     let replacement = dest_root.to_string_lossy();
-    let mut updated =
+    let updated =
         super::subagents::rebase_text(&text, &origin, &replacement).unwrap_or_else(|| text.clone());
     // macOS's /tmp and /var aliases may have been used when creating the venv.
     #[cfg(target_os = "macos")]
-    if let Some(alias) = origin.strip_prefix("/private/") {
-        updated = super::subagents::rebase_text(&updated, &format!("/{alias}"), &replacement)
-            .unwrap_or(updated);
-    }
+    let updated = match origin.strip_prefix("/private/") {
+        Some(alias) => super::subagents::rebase_text(&updated, &format!("/{alias}"), &replacement)
+            .unwrap_or(updated),
+        None => updated,
+    };
     if updated != text {
         fs::write(dest, updated)?;
     }
