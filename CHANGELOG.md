@@ -1,13 +1,13 @@
 # Changelog
 
 All notable changes to Dial are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Entries are taken from the git history (commit subjects, shown by short hash) and tags `v0.1.0` through `v0.1.6`.
+Entries are taken from the git history (commit subjects, shown by short hash) and tags `v0.1.0` through `v0.1.7`.
 
 ## [Unreleased]
 
-## [0.1.6] - 2026-10-15
+## [0.1.7] - 2026-10-15
 
-Includes the changes prepared for v0.1.5, whose publication was blocked by an outdated integration test. The test now verifies that unseen-line errors provide read evidence for a direct retry.
+Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was blocked by an outdated integration test and a Windows compile error. The test now verifies that unseen-line errors provide read evidence for a direct retry; sandbox cache setup is correctly limited to non-Windows platforms.
 
 ### Added
 - The stats ledger records each request's transport and cache-invalidation fingerprint (`transport`, `invalidation`, `common_prompt_bytes`, `prompt_bytes` in `requests`), so a prompt-cache miss can be attributed to a prompt change or to the provider.
