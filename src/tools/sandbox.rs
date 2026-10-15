@@ -265,7 +265,7 @@ impl Sandbox {
         owned_terminal: Option<i32>,
     ) -> Result<Command, String> {
         self.available()?;
-        let (allow_network, deny_read, mut extra_write) = match policy {
+        let (allow_network, deny_read, extra_write) = match policy {
             Policy::Strict { .. } => {
                 return self.command_mode(workspace, policy, program, args, owned_terminal);
             }
@@ -275,9 +275,13 @@ impl Sandbox {
                 allow_network,
             } => (*allow_network, deny_read, extra_write.clone()),
         };
+        #[cfg(not(windows))]
+        let mut extra_write = extra_write;
         // Toolchains (uv, pip, npm, go) refuse to start when their home-directory cache is
         // read-only; give them a dial-owned cache instead of widening writes to the real one.
+        #[cfg(not(windows))]
         let cache = toolchain_cache_root().filter(|root| std::fs::create_dir_all(root).is_ok());
+        #[cfg(not(windows))]
         if let Some(root) = &cache
             && !extra_write.iter().any(|path| root.starts_with(path))
         {
