@@ -125,10 +125,14 @@ impl Directory {
         create: bool,
         mut parents: Option<&mut ParentCleanup>,
     ) -> Result<Self, String> {
+        // Added directories are workspace roots too; confine the walk to the one holding `target`.
+        let base = ws
+            .root_containing(target)
+            .ok_or("edit target escapes workspace")?;
         let relative = target
-            .strip_prefix(ws.root())
+            .strip_prefix(base)
             .map_err(|_| "edit target escapes workspace")?;
-        let root = cstr(ws.root().as_os_str())?;
+        let root = cstr(base.as_os_str())?;
         let fd = unsafe {
             libc::open(
                 root.as_ptr(),
@@ -136,10 +140,10 @@ impl Directory {
             )
         };
         if fd < 0 {
-            return Err(err("opening workspace", ws.root()));
+            return Err(err("opening workspace", base));
         }
         let mut file = unsafe { File::from_raw_fd(fd) };
-        let mut path = ws.root().to_owned();
+        let mut path = base.to_owned();
         for part in relative.parent().unwrap_or(Path::new("")).components() {
             let Component::Normal(name) = part else {
                 return Err("edit path has a non-normal component".into());
