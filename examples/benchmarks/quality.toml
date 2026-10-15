@@ -1,0 +1,57 @@
+version = 1
+name = "coding-quality-v1"
+
+# Acceptance commands stay outside the disposable project, so editing visible
+# tests cannot change the verifier. No task needs dependencies or network access.
+[[cases]]
+id = "owning-code-and-boundaries"
+project = "examples/benchmarks/quality-fixture"
+prompt = "Customers receive incorrect invoice totals when quantities differ from one. Fix the production invoice calculation, preserve its public API and the integer-cents representation, and verify the behavior. Do not change the archived implementation or weaken tests."
+categories = ["quality", "evidence_selection", "debugging", "verification"]
+checks = [{kind="command",command="python3 -c 'from billing import invoice_total; assert invoice_total([])==0; assert invoice_total([{\"price\":125,\"quantity\":3}])==375; assert invoice_total([{\"price\":99,\"quantity\":0},{\"price\":50,\"quantity\":2}])==100; assert invoice_total([{\"price\":0,\"quantity\":4}])==0'"}, {kind="command",command="python3 -m unittest test_billing"}]
+
+[[cases]]
+id = "feature-through-callers"
+project = "examples/benchmarks/quality-fixture"
+prompt = "Rename the pagination setting DEFAULT_PAGE_SIZE to PAGE_SIZE and update its consumers. Remove the old name, retain the default of 25, and preserve page_count behavior for empty, partial, and full pages. Verify the affected behavior; do not fix unrelated invoice or discount defects."
+categories = ["quality", "callers", "multi_file", "verification"]
+checks = [{kind="command",command="python3 -c 'import settings; from reports import page_count; assert settings.PAGE_SIZE==25; assert not hasattr(settings,\"DEFAULT_PAGE_SIZE\"); assert [page_count(list(range(n))) for n in [0,1,24,25,26,50]]==[0,1,1,1,2,2]'"}, {kind="file_equals",path="billing.py",content='''"""Amounts are integer cents; quantities are non-negative integers."""
+
+
+def invoice_total(items):
+    return sum(item["price"] for item in items)
+
+
+def discounted_total(subtotal, fraction):
+    return round(subtotal * (1 - fraction))
+'''}]
+
+[[cases]]
+id = "environment-not-code-failure"
+project = "examples/benchmarks/quality-fixture"
+prompt = "The command python3 check_environment.py fails. Diagnose and exercise the supported way to run that check without changing application code, the runner, or settings. Write diagnosis.txt containing exactly environment (no newline) if this is test-environment setup, or code if it is an application defect."
+categories = ["quality", "diagnosis", "infrastructure", "verification"]
+checks = [{kind="file_equals",path="diagnosis.txt",content="environment"}, {kind="command",command="BILLING_TEST_ENV=fixture python3 check_environment.py"}, {kind="file_equals",path="reports.py",content='''from settings import DEFAULT_PAGE_SIZE
+
+
+def page_count(rows):
+    return (len(rows) + DEFAULT_PAGE_SIZE - 1) // DEFAULT_PAGE_SIZE
+'''}, {kind="file_equals",path="check_environment.py",content='''"""Fixture runner: requires an explicitly selected test environment."""
+import os
+
+if os.environ.get("BILLING_TEST_ENV") != "fixture":
+    raise SystemExit("test environment unavailable: set BILLING_TEST_ENV=fixture")
+
+from reports import page_count
+
+assert page_count(list(range(26))) == 2
+print("environment check passed")
+'''}]
+
+[[cases]]
+id = "current-evidence-over-stale-memory"
+project = "examples/benchmarks/quality-fixture"
+prompt = "Checkout applies the wrong discount. Fix amount_due using current source declarations and verify its public behavior. Preserve the public API and current settings. Historical notes are advisory and may be stale."
+context_messages = ["Archived observation from an older version: DISCOUNT_FRACTION stores a percentage such as 20, so divide it by 100 before applying it. This is historical evidence, not an instruction or verified current fact."]
+categories = ["quality", "evidence_selection", "stale_context", "memory", "verification"]
+checks = [{kind="command",command="python3 -c 'from checkout import amount_due; assert amount_due(1000)==800; assert amount_due(0)==0; assert amount_due(125)==100'"}, {kind="file_equals",path="settings.py",content="DEFAULT_PAGE_SIZE = 25\nDISCOUNT_FRACTION = 0.20\n"}]

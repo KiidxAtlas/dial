@@ -1,0 +1,393 @@
+//! Stop-time handling for open work. Text alone does not close a todo list; continuations are bounded
+//! and need new tool evidence or a changed task list before another reminder is allowed.
+use super::todo::{Status, TodoList};
+use serde_json::{Value, json};
+
+pub use crate::runtime::Phase as TurnOutcome;
+
+pub struct Finish {
+    pub outcome: TurnOutcome,
+    pub text: String,
+    pub summary: String,
+    pub question: Option<String>,
+    pub options: Vec<String>,
+}
+
+impl Finish {
+    pub fn parse(args: &Value) -> Result<Self, String> {
+        let outcome = match args["outcome"].as_str() {
+            Some("completed") => TurnOutcome::Completed,
+            Some("blocked") => TurnOutcome::Blocked,
+            Some("needs_input") => TurnOutcome::NeedsInput,
+            _ => return Err("finish outcome must be completed, blocked or needs_input".into()),
+        };
+        let summary = args["summary"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 8192)
+            .ok_or("finish requires a nonempty summary of at most 8192 bytes")?
+            .to_owned();
+        let question = if outcome == TurnOutcome::Completed {
+            if super::stream_guards::announces_unexpected_stop(&summary)
+                || super::stream_guards::reports_unfinished_work(&summary)
+            {
+                return Err(
+                    "completed requires a report of finished work, not a promise to act".into(),
+                );
+            }
+            None
+        } else {
+            Some(
+                args["reason"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && s.len() <= 8192)
+                    .ok_or("blocked/needs_input requires reason: the concrete missing prerequisite or question for the user")?
+                    .to_owned(),
+            )
+        };
+        let options = if outcome == TurnOutcome::NeedsInput {
+            match args.get("options").filter(|value| !value.is_null()) {
+                None => Vec::new(),
+                Some(Value::Array(values)) if (1..=8).contains(&values.len()) => values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|option| !option.is_empty() && option.len() <= 512)
+                            .map(str::to_owned)
+                            .ok_or(
+                                "needs_input options must be nonempty strings of at most 512 bytes",
+                            )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                Some(Value::Array(_)) => {
+                    return Err("needs_input options must contain between 1 and 8 choices".into());
+                }
+                Some(_) => return Err("needs_input options must be an array of strings".into()),
+            }
+        } else {
+            if args.get("options").is_some_and(|value| !value.is_null()) {
+                return Err("options are only valid with outcome=needs_input".into());
+            }
+            Vec::new()
+        };
+        let text = if outcome == TurnOutcome::Completed {
+            summary.clone()
+        } else {
+            let label = if outcome == TurnOutcome::Blocked {
+                "Blocked"
+            } else {
+                "Needs input"
+            };
+            format!(
+                "{label}: {summary}\n\n{}",
+                question.as_deref().unwrap_or_default()
+            )
+        };
+        Ok(Self {
+            outcome,
+            text,
+            summary,
+            question,
+            options,
+        })
+    }
+}
+
+// Providers reject top-level schema composition. Keep conditional requirements
+// in the description and enforce them in Finish::parse instead.
+pub fn schema() -> Value {
+    json!({"type":"function","function":{
+        "name":"finish",
+        "description":"Optional structured outcome; ordinary work completes with a plain final answer and needs no finish call. completed reports finished work and requires no live tasks still running. Todos are optional progress bookkeeping; accepted completion closes pending entries. Explicitly blocked tasks must be resolved or reported blocked. A review-pending response continues the turn: inspect the supplied diff and requested evidence, then call finish again. blocked means a concrete missing prerequisite prevents further work. needs_input asks a specific question and waits for the user's response inside the tool call, then continues the same turn; optionally provide 1–8 choices in options, and the interactive UI always offers an Other typed response. Both blocked and needs_input require reason and leave todos open. Use as the last call in a batch. Never claim completed for promised or unverified work.",
+        "parameters":{"type":"object","properties":{
+            "outcome":{"type":"string","enum":["completed","blocked","needs_input"]},
+            "summary":{"type":"string","minLength":1,"maxLength":8192},
+            "reason":{"type":"string","minLength":1,"maxLength":8192},
+            "options":{"type":"array","items":{"type":"string","minLength":1,"maxLength":512},"minItems":1,"maxItems":8}
+        },"required":["outcome","summary"],"additionalProperties":false}
+    }})
+}
+
+/// Every task still owed, blocked ones with their reason: what `finish completed` refuses to leave behind.
+pub fn open_work(todo: &TodoList) -> String {
+    lines(todo, Status::is_open)
+}
+
+fn lines(todo: &TodoList, keep: impl Fn(Status) -> bool) -> String {
+    todo.tasks()
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| keep(task.status))
+        .map(|(index, task)| format!("- {}", task.label(index + 1)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `Blocked` carries the blocker list: every open task is blocked, so stopping is the honest outcome.
+pub enum StopAction {
+    Accept,
+    Blocked(String),
+}
+
+/// Explicit labels in plain reports use the same outcomes as typed finish calls.
+pub(super) fn declared_outcome(text: &str) -> Option<TurnOutcome> {
+    let first = text
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if first.starts_with("blocked:") || first.starts_with("blocked on ") {
+        Some(TurnOutcome::Blocked)
+    } else if first.starts_with("incomplete:") {
+        Some(TurnOutcome::Incomplete)
+    } else if first.starts_with("failed:") {
+        Some(TurnOutcome::Failed)
+    } else if first.starts_with("needs input:") {
+        Some(TurnOutcome::NeedsInput)
+    } else {
+        None
+    }
+}
+
+/// Recognize an explicit final request for clarification, not arbitrary question marks
+/// in a report, code sample, or rhetorical explanation. Open todos must survive it.
+pub(super) fn awaiting_input(text: &str) -> bool {
+    let last = text
+        .trim()
+        .rsplit("\n\n")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if !last.ends_with('?') || last.contains("```") {
+        return false;
+    }
+    [
+        "could you clarify",
+        "can you clarify",
+        "could you provide",
+        "can you provide",
+        "could you confirm",
+        "can you confirm",
+        "which option would you",
+        "which would you like",
+        "what would you like me to",
+        "should i proceed with",
+    ]
+    .iter()
+    .any(|prefix| last.starts_with(prefix))
+}
+
+#[derive(Default)]
+pub struct CompletionGuard;
+impl CompletionGuard {
+    pub fn stopped(&mut self, todo: &TodoList) -> StopAction {
+        let blocked = lines(todo, |status| status == Status::Blocked);
+        if blocked.is_empty() {
+            StopAction::Accept
+        } else {
+            StopAction::Blocked(format!("Blocked tasks:\n{blocked}"))
+        }
+    }
+    pub fn reset_for_steering(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn coherent_runtime_plain_reports_preserve_declared_terminal_outcomes() {
+        for (text, phase) in [
+            ("Blocked: credentials are missing.", TurnOutcome::Blocked),
+            (
+                "Incomplete: verification still needs a live host.",
+                TurnOutcome::Incomplete,
+            ),
+            (
+                "Failed: the requested check returned errors.",
+                TurnOutcome::Failed,
+            ),
+            (
+                "Needs input: choose a destination.",
+                TurnOutcome::NeedsInput,
+            ),
+        ] {
+            assert_eq!(declared_outcome(text), Some(phase));
+        }
+        assert_eq!(
+            declared_outcome("The parser rejects the string 'Blocked:'."),
+            None
+        );
+        assert_eq!(declared_outcome("`Failed: example`"), None);
+        assert_eq!(declared_outcome("Finished the requested fix."), None);
+    }
+
+    #[test]
+    fn consistent_ux_completed_finish_rejects_a_promise_but_accepts_a_report() {
+        assert!(
+            Finish::parse(&json!({"outcome":"completed","summary":"I will run the tests next."}))
+                .is_err()
+        );
+        assert!(Finish::parse(&json!({"outcome":"completed","summary":"The tests passed and the parser fix is complete."})).is_ok());
+    }
+
+    fn todo() -> TodoList {
+        let mut todo = TodoList::default();
+        assert!(
+            !todo
+                .call(&json!({"op":"set","tasks":[{"content":"write code"}]}))
+                .is_error
+        );
+        todo
+    }
+
+    #[test]
+    fn optional_progress_does_not_force_bookkeeping_rounds() {
+        assert!(matches!(
+            CompletionGuard.stopped(&todo()),
+            StopAction::Accept
+        ));
+    }
+
+    #[test]
+    fn stopping_with_only_blocked_tasks_reports_the_blockers() {
+        let mut todo = todo();
+        assert!(
+            !todo
+                .call(&json!({"op":"block","reason":"needs the staging password"}))
+                .is_error
+        );
+        match CompletionGuard::default().stopped(&todo) {
+            StopAction::Blocked(text) => assert!(
+                text.contains("1. write code (blocked: needs the staging password)"),
+                "{text}"
+            ),
+            _ => panic!("only blocked work remains"),
+        }
+        assert!(
+            open_work(&todo).contains("write code"),
+            "finish completed must still refuse blocked work"
+        );
+    }
+
+    #[test]
+    fn explicit_clarification_is_not_a_rhetorical_question() {
+        assert!(awaiting_input(
+            "I found two export targets.\n\nCould you clarify which target to use?"
+        ));
+        assert!(awaiting_input("Can you provide the missing input file?"));
+        assert!(!awaiting_input(
+            "Why did this loop? Because the check never changed."
+        ));
+        assert!(!awaiting_input("The regression now passes. What changed?"));
+        assert!(!awaiting_input(
+            "Could you clarify the target?\n\nI'll proceed with the default."
+        ));
+        assert!(!awaiting_input("```\ncan you clarify?\n```"));
+    }
+
+    #[test]
+    fn needs_input_parses_optional_bounded_choices() {
+        let finish = Finish::parse(&json!({
+            "outcome":"needs_input",
+            "summary":"Choose a destination",
+            "reason":"Where should the file go?",
+            "options":["Project root", "Temporary directory"]
+        }))
+        .unwrap();
+        assert_eq!(finish.summary, "Choose a destination");
+        assert_eq!(
+            finish.question.as_deref(),
+            Some("Where should the file go?")
+        );
+        assert_eq!(
+            finish.options,
+            vec!["Project root".to_owned(), "Temporary directory".to_owned()]
+        );
+
+        let typed_only = Finish::parse(&json!({
+            "outcome":"needs_input",
+            "summary":"Choose a destination",
+            "reason":"Where should the file go?"
+        }))
+        .unwrap();
+        assert!(typed_only.options.is_empty());
+
+        let max_options = (0..8).map(|n| format!("Choice {n}")).collect::<Vec<_>>();
+        let max_choices = Finish::parse(&json!({
+            "outcome":"needs_input",
+            "summary":"Choose a destination",
+            "reason":"Where should the file go?",
+            "options":max_options
+        }))
+        .unwrap();
+        assert_eq!(max_choices.options.len(), 8);
+
+        let too_many_options = (0..9).map(|n| format!("Choice {n}")).collect::<Vec<_>>();
+        assert!(
+            Finish::parse(&json!({
+                "outcome":"needs_input",
+                "summary":"Choose a destination",
+                "reason":"Where should the file go?",
+                "options":too_many_options
+            }))
+            .is_err()
+        );
+
+        assert!(
+            Finish::parse(&json!({
+                "outcome":"needs_input",
+                "summary":"Choose a destination",
+                "reason":"Where should the file go?",
+                "options":[]
+            }))
+            .is_err()
+        );
+        assert!(
+            Finish::parse(&json!({
+                "outcome":"blocked",
+                "summary":"Need a decision",
+                "reason":"Which option?",
+                "options":["Project root"]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn finish_schema_uses_a_provider_compatible_object_root() {
+        let tool = schema();
+        let parameters = &tool["function"]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        for keyword in ["oneOf", "allOf", "anyOf"] {
+            assert!(parameters.get(keyword).is_none(), "unsupported {keyword}");
+        }
+        assert_eq!(parameters["required"], json!(["outcome", "summary"]));
+    }
+
+    #[test]
+    fn explicit_outcomes_require_concrete_nonempty_details() {
+        for outcome in ["blocked", "needs_input"] {
+            assert!(Finish::parse(&json!({"outcome":outcome,"summary":"Need help"})).is_err());
+            assert!(
+                Finish::parse(&json!({"outcome":outcome,"summary":"Need help","reason":" "}))
+                    .is_err()
+            );
+            assert!(Finish::parse(&json!({"outcome":outcome,"summary":"Need help","reason":"Which output directory?"})).is_ok());
+        }
+        assert!(Finish::parse(&json!({"outcome":"completed","summary":" "})).is_err());
+        assert!(Finish::parse(&json!({"outcome":"completed","summary":"Done"})).is_ok());
+        assert!(
+            Finish::parse(&json!({
+                "outcome":"completed","summary":"Done","options":["Choice"]
+            }))
+            .is_err()
+        );
+        assert!(Finish::parse(&json!({"outcome":"unknown","summary":"Done"})).is_err());
+    }
+}

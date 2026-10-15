@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "instructions": "Recent tool calls on this task failed repeatedly. Use the observed results to identify the likely blocker, a concrete alternative to the failed approach, and one discriminating local check. Stay within the user's original goal; do not merely summarize failures.",
+  "criteria": {},
+  "required": []
+}

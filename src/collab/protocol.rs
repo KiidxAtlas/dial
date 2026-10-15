@@ -1,0 +1,508 @@
+//! Collab wire protocol.
+//!
+//! Relay contract:
+//! - `GET /r/<roomId>?role=host|guest` upgrades to a WebSocket.
+//! - Binary frames carry the envelope `[4B uint32 BE peerId][sealed payload]`.
+//!   Host→relay: peerId 0 broadcasts, N targets guest N. Guest→relay: always 0;
+//!   the relay rewrites it to the sender's id.
+//! - TEXT control frames (unencrypted, no session data): relay→host
+//!   `{"t":"peer-joined"|"peer-left","peer":N}`, relay→guest `{"t":"room-closed"}`.
+//!
+//! Sealed payloads are JSON frames (see [`Frame`] helpers). Dial frames carry Dial's own
+//! session records, so clients speaking other protocol versions are refused
+//! at `hello` instead of silently misrendering.
+use super::crypto::{ROOM_ID_BYTES, ROOM_KEY_BYTES, WRITE_TOKEN_BYTES, random_bytes};
+use anyhow::{Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde_json::{Value, json};
+
+/// Wire protocol version carried in `hello`/`welcome`; the host rejects mismatches.
+pub const COLLAB_PROTO: u64 = 1001;
+/// Plaintext envelope prefix length.
+pub const ENVELOPE_HEADER_LENGTH: usize = 4;
+/// Upper bound for one replicated entry/node payload before shrinking.
+pub const MAX_REPLICATED_PAYLOAD_BYTES: usize = 256 * 1024;
+/// Snapshot chunks are bounded by this many serialized bytes (at least one entry each).
+pub const SNAPSHOT_CHUNK_BYTES: usize = 512 * 1024;
+/// Relay per-message ceiling. Hosts never produce larger frames.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+pub fn pack_envelope(peer: u32, sealed: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ENVELOPE_HEADER_LENGTH + sealed.len());
+    out.extend_from_slice(&peer.to_be_bytes());
+    out.extend_from_slice(sealed);
+    out
+}
+
+pub fn unpack_envelope(data: &[u8]) -> Option<(u32, &[u8])> {
+    if data.len() < ENVELOPE_HEADER_LENGTH {
+        return None;
+    }
+    let peer = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    Some((peer, &data[ENVELOPE_HEADER_LENGTH..]))
+}
+
+/// Rewrite the peer id in place without copying the payload.
+pub fn rewrite_envelope_peer(data: &mut [u8], peer: u32) -> bool {
+    if data.len() < ENVELOPE_HEADER_LENGTH {
+        return false;
+    }
+    data[..ENVELOPE_HEADER_LENGTH].copy_from_slice(&peer.to_be_bytes());
+    true
+}
+
+pub fn generate_room_id() -> Result<String> {
+    Ok(URL_SAFE_NO_PAD.encode(random_bytes::<ROOM_ID_BYTES>()?))
+}
+
+pub fn valid_room_id(id: &str) -> bool {
+    (10..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn is_local_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+/// Normalize a relay base URL (ws/wss/http/https) into a ws/wss origin.
+pub fn normalize_relay_origin(relay_url: &str) -> Result<String> {
+    let url = url::Url::parse(relay_url.trim())
+        .map_err(|_| anyhow::anyhow!("invalid relay URL: {relay_url}"))?;
+    let scheme = match url.scheme() {
+        "wss" | "https" => "wss",
+        "ws" | "http" => "ws",
+        other => bail!("unsupported relay URL scheme: {other}:"),
+    };
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("relay URL has no host: {relay_url}"))?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    if scheme == "ws" && !is_local_host(&host) {
+        bail!("relay link must be wss:// (plain ws:// is only allowed for localhost)");
+    }
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    Ok(format!("{scheme}://{host}{port}"))
+}
+
+/// Render the shareable link `host[:port]/r/<roomId>.<key>` (`ws://…` kept for localhost).
+/// Full links append the write token to the key; view links carry the bare key.
+pub fn format_link(
+    relay_url: &str,
+    room_id: &str,
+    key: &[u8],
+    write_token: Option<&[u8]>,
+) -> Result<String> {
+    let origin = normalize_relay_origin(relay_url)?;
+    let mut secret = key.to_vec();
+    if let Some(token) = write_token {
+        secret.extend_from_slice(token);
+    }
+    let key_text = URL_SAFE_NO_PAD.encode(&secret);
+    let compact = origin.strip_prefix("wss://").unwrap_or(&origin);
+    Ok(format!("{compact}/r/{room_id}.{key_text}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedLink {
+    /// `wss://host[:port]/r/<roomId>`: no query, no fragment, no key.
+    pub ws_url: String,
+    pub room_id: String,
+    pub key: [u8; ROOM_KEY_BYTES],
+    /// Present for full links; absent for read-only (view) links.
+    pub write_token: Option<[u8; WRITE_TOKEN_BYTES]>,
+}
+
+/// Parse any collab link form: full `wss://…/r/<id>.<key>`, scheme-less `host/r/…`, a browser
+/// deep link `https://…/#<link>`, legacy `#`-joined keys, or bare `<id>.<key>` resolved
+/// against `default_relay` (Dial has no public default relay).
+pub fn parse_link(link: &str, default_relay: &str) -> Result<ParsedLink> {
+    let mut text = link.trim().replace("%23", "#");
+    if let Some((id, key)) = bare_link(&text) {
+        let relay = default_relay.trim();
+        ensure!(
+            !relay.is_empty(),
+            "bare collab link needs a relay; set collab.relay_url or paste the full link"
+        );
+        text = format!("{}/r/{id}.{key}", normalize_relay_origin(relay)?);
+    } else if !text.contains("://") {
+        text = format!("wss://{text}");
+    }
+    let url = url::Url::parse(&text).map_err(|_| anyhow::anyhow!("invalid collab link: {link}"))?;
+    let fragment = url.fragment().unwrap_or("");
+    if matches!(url.scheme(), "http" | "https") && !fragment.is_empty() {
+        if let Ok(parsed) = parse_link(fragment, default_relay) {
+            return Ok(parsed);
+        }
+    }
+    let origin = normalize_relay_origin(url.as_str())?;
+    let path = url.path();
+    let Some(rest) = path.strip_prefix("/r/") else {
+        if !fragment.is_empty() && !matches!(url.scheme(), "http" | "https") {
+            return parse_link(fragment, default_relay);
+        }
+        bail!("collab link must contain a /r/<roomId> path");
+    };
+    let (room_id, key_text) = match rest.split_once('.') {
+        Some((id, key)) => (id, key),
+        None => (rest, fragment),
+    };
+    ensure!(valid_room_id(room_id), "collab link has an invalid room id");
+    ensure!(
+        !key_text.is_empty(),
+        "collab link is missing the <key> part"
+    );
+    let secret = key_text
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        .then(|| URL_SAFE_NO_PAD.decode(key_text).ok())
+        .flatten();
+    let Some(secret) = secret
+        .filter(|s| s.len() == ROOM_KEY_BYTES || s.len() == ROOM_KEY_BYTES + WRITE_TOKEN_BYTES)
+    else {
+        bail!("collab link key must be 32 (view) or 48 (full) base64url bytes");
+    };
+    let mut key = [0u8; ROOM_KEY_BYTES];
+    key.copy_from_slice(&secret[..ROOM_KEY_BYTES]);
+    let write_token = (secret.len() > ROOM_KEY_BYTES).then(|| {
+        let mut token = [0u8; WRITE_TOKEN_BYTES];
+        token.copy_from_slice(&secret[ROOM_KEY_BYTES..]);
+        token
+    });
+    Ok(ParsedLink {
+        ws_url: format!("{origin}/r/{room_id}"),
+        room_id: room_id.to_owned(),
+        key,
+        write_token,
+    })
+}
+
+fn bare_link(text: &str) -> Option<(&str, &str)> {
+    let at = text.find(['.', '#'])?;
+    let (id, key) = (&text[..at], &text[at + 1..]);
+    let b64 = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    (valid_room_id(id) && b64(key)).then_some((id, key))
+}
+
+// ---------------------------------------------------------------------------
+// Frames (JSON inside the seal)
+// ---------------------------------------------------------------------------
+
+/// Relay control message (TEXT JSON, unencrypted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Control {
+    PeerJoined(u32),
+    PeerLeft(u32),
+    RoomClosed,
+}
+
+impl Control {
+    pub fn parse(text: &str) -> Option<Self> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        let peer = || value["peer"].as_u64().and_then(|p| u32::try_from(p).ok());
+        match value["t"].as_str()? {
+            "peer-joined" => Some(Self::PeerJoined(peer()?)),
+            "peer-left" => Some(Self::PeerLeft(peer()?)),
+            "room-closed" => Some(Self::RoomClosed),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn encode(&self) -> String {
+        match self {
+            Self::PeerJoined(peer) => json!({"t":"peer-joined","peer":peer}).to_string(),
+            Self::PeerLeft(peer) => json!({"t":"peer-left","peer":peer}).to_string(),
+            Self::RoomClosed => json!({"t":"room-closed"}).to_string(),
+        }
+    }
+}
+
+/// Frame constructors. Frames are JSON objects tagged by `t`.
+pub mod frame {
+    use super::*;
+
+    pub fn hello(name: &str, write_token: Option<&[u8]>) -> Value {
+        let mut frame = json!({"t":"hello","proto":COLLAB_PROTO,"name":name});
+        if let Some(token) = write_token {
+            frame["writeToken"] = json!(URL_SAFE_NO_PAD.encode(token));
+        }
+        frame
+    }
+    pub fn notice(message: &str) -> Value {
+        json!({"t":"notice","message":message})
+    }
+    /// `{"t":"reset"}`: guests clear their replicated log before the host replays it.
+    pub fn reset() -> Value {
+        json!({"t":"reset"})
+    }
+    pub fn error(message: &str) -> Value {
+        json!({"t":"error","message":message})
+    }
+    pub fn bye(reason: &str) -> Value {
+        json!({"t":"bye","reason":reason})
+    }
+    /// `{"t":"entry","entry":…}` from the entry's JSON, without re-serializing it.
+    pub fn entry_json(entry_json: &str) -> String {
+        format!("{{\"t\":\"entry\",\"entry\":{entry_json}}}")
+    }
+    /// `{"t":"snapshot-chunk","entries":[…],"final":…}` from each entry's JSON.
+    pub fn snapshot_chunk(entries: &[String], last: bool) -> String {
+        format!(
+            "{{\"t\":\"snapshot-chunk\",\"entries\":[{}],\"final\":{last}}}",
+            entries.join(",")
+        )
+    }
+}
+
+/// Byte-bounded snapshot chunking. Every chunk carries at least one entry; an empty snapshot
+/// still yields one `final` chunk so guests never wait for a missing terminator.
+pub fn snapshot_chunks(entries: Vec<String>) -> impl Iterator<Item = String> + Send {
+    let mut entries = entries.into_iter().peekable();
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let mut batch = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(next) = entries.peek() {
+            if !batch.is_empty() && bytes + next.len() > SNAPSHOT_CHUNK_BYTES {
+                break;
+            }
+            bytes += next.len();
+            batch.push(entries.next().expect("peeked"));
+        }
+        let last = entries.peek().is_none();
+        done = last;
+        Some(frame::snapshot_chunk(&batch, last))
+    })
+}
+
+/// Serialize a replicated value under [`MAX_REPLICATED_PAYLOAD_BYTES`]. Oversized values first
+/// lose inline image data, then have long strings clipped (head and tail kept); a value that
+/// still does not fit ships as a bounded placeholder so a snapshot train always terminates.
+pub fn bounded_json(value: &Value) -> String {
+    bounded_json_with(value, MAX_REPLICATED_PAYLOAD_BYTES)
+}
+
+pub fn bounded_json_with(value: &Value, max: usize) -> String {
+    let text = value.to_string();
+    if text.len() <= max {
+        return text;
+    }
+    let mut copy = value.clone();
+    strip_images(&mut copy);
+    let text = copy.to_string();
+    if text.len() <= max {
+        return text;
+    }
+    for limit in [16 * 1024, 4 * 1024, 1024, 256] {
+        let mut clipped = copy.clone();
+        clip_strings(&mut clipped, limit);
+        let text = clipped.to_string();
+        if text.len() <= max {
+            return text;
+        }
+    }
+    let mut placeholder = json!({"type":"placeholder","note":"entry too large to replicate"});
+    for key in ["type", "id", "parent", "ts"] {
+        if let Some(v) = value.get(key).filter(|v| v.is_string() || v.is_null()) {
+            placeholder[if key == "type" { "originalType" } else { key }] = v.clone();
+        }
+    }
+    let text = placeholder.to_string();
+    if text.len() <= max {
+        text
+    } else {
+        json!({"type":"placeholder","note":"entry too large to replicate"}).to_string()
+    }
+}
+
+fn strip_images(value: &mut Value) {
+    match value {
+        Value::String(s) if s.starts_with("data:image/") && s.len() > 512 => {
+            *s = "[image omitted from collab replica]".into();
+        }
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("image")
+                && let Some(Value::String(data)) = map.get_mut("data")
+                && data.len() > 512
+            {
+                *data = String::new();
+            }
+            map.values_mut().for_each(strip_images);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_images),
+        _ => {}
+    }
+}
+
+fn clip_strings(value: &mut Value, limit: usize) {
+    match value {
+        Value::String(s) if s.len() > limit => *s = clip_middle(s, limit),
+        Value::Object(map) => map.values_mut().for_each(|v| clip_strings(v, limit)),
+        Value::Array(items) => items.iter_mut().for_each(|v| clip_strings(v, limit)),
+        _ => {}
+    }
+}
+
+/// Keep the head and tail of `text` within about `limit` bytes, on char boundaries.
+pub fn clip_middle(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let half = limit / 2;
+    let mut head = half.min(text.len());
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len().saturating_sub(half);
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!(
+        "{}\n…[{} bytes clipped for collab]…\n{}",
+        &text[..head],
+        tail - head,
+        &text[tail..]
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_codec_roundtrip_and_rewrite() {
+        let packed = pack_envelope(0xDEAD_BEEF, b"sealed");
+        assert_eq!(&packed[..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        let (peer, payload) = unpack_envelope(&packed).unwrap();
+        assert_eq!(peer, 0xDEAD_BEEF);
+        assert_eq!(payload, b"sealed");
+        let mut packed = pack_envelope(0, b"x");
+        assert!(rewrite_envelope_peer(&mut packed, 7));
+        assert_eq!(unpack_envelope(&packed).unwrap(), (7, &b"x"[..]));
+        assert!(unpack_envelope(&[1, 2, 3]).is_none());
+        assert_eq!(unpack_envelope(&[0, 0, 0, 1]).unwrap(), (1, &b""[..]));
+        assert!(!rewrite_envelope_peer(&mut [0u8; 2], 1));
+    }
+
+    #[test]
+    fn control_messages_roundtrip() {
+        for control in [
+            Control::PeerJoined(3),
+            Control::PeerLeft(9),
+            Control::RoomClosed,
+        ] {
+            assert_eq!(Control::parse(&control.encode()), Some(control));
+        }
+        assert_eq!(Control::parse("{\"t\":\"other\"}"), None);
+        assert_eq!(Control::parse("not json"), None);
+    }
+
+    #[test]
+    fn links_roundtrip_full_view_web_and_legacy_forms() {
+        let key = [5u8; 32];
+        let token = [9u8; 16];
+        let id = "AAAAAAAAAAAAAAAAAAAAAA";
+        let full = format_link("wss://relay.example.com", id, &key, Some(&token)).unwrap();
+        assert!(full.starts_with("relay.example.com/r/AAAAAAAAAAAAAAAAAAAAAA."));
+        let parsed = parse_link(&full, "").unwrap();
+        assert_eq!(
+            parsed.ws_url,
+            "wss://relay.example.com/r/AAAAAAAAAAAAAAAAAAAAAA"
+        );
+        assert_eq!(parsed.key, key);
+        assert_eq!(parsed.write_token, Some(token));
+
+        let view = format_link("https://relay.example.com:8443", id, &key, None).unwrap();
+        let parsed = parse_link(&view, "").unwrap();
+        assert_eq!(
+            parsed.ws_url,
+            "wss://relay.example.com:8443/r/AAAAAAAAAAAAAAAAAAAAAA"
+        );
+        assert_eq!(parsed.write_token, None);
+
+        let local = format_link("http://127.0.0.1:7466", id, &key, Some(&token)).unwrap();
+        assert!(local.starts_with("ws://127.0.0.1:7466/r/"));
+        assert_eq!(
+            parse_link(&local, "").unwrap().ws_url,
+            "ws://127.0.0.1:7466/r/AAAAAAAAAAAAAAAAAAAAAA"
+        );
+
+        let legacy = format!(
+            "wss://relay.example.com/r/{id}%23{}",
+            URL_SAFE_NO_PAD.encode(key)
+        );
+        assert_eq!(parse_link(&legacy, "").unwrap().key, key);
+
+        let bare = format!("{id}.{}", URL_SAFE_NO_PAD.encode(key));
+        assert!(parse_link(&bare, "").is_err());
+        assert_eq!(
+            parse_link(&bare, "wss://relay.example.com").unwrap().ws_url,
+            "wss://relay.example.com/r/AAAAAAAAAAAAAAAAAAAAAA"
+        );
+    }
+
+    #[test]
+    fn links_refuse_insecure_remote_and_malformed_keys() {
+        let key = [1u8; 32];
+        assert!(format_link("ws://relay.example.com", "AAAAAAAAAAAA", &key, None).is_err());
+        assert!(parse_link("ws://relay.example.com/r/AAAAAAAAAAAA.AAAA", "").is_err());
+        assert!(parse_link("wss://relay.example.com/r/AAAAAAAAAAAA.AAAA", "").is_err());
+        assert!(parse_link("wss://relay.example.com/x/AAAAAAAAAAAA", "").is_err());
+        assert!(parse_link("wss://relay.example.com/r/short.AAAA", "").is_err());
+    }
+
+    #[test]
+    fn snapshot_chunks_are_bounded_and_terminated() {
+        let empty: Vec<String> = snapshot_chunks(Vec::new()).collect();
+        assert_eq!(
+            empty,
+            vec!["{\"t\":\"snapshot-chunk\",\"entries\":[],\"final\":true}"]
+        );
+        let big = "x".repeat(SNAPSHOT_CHUNK_BYTES / 2 + 1);
+        let entries = vec![format!("\"{big}\""), format!("\"{big}\""), "1".into()];
+        let chunks: Vec<Value> = snapshot_chunks(entries)
+            .map(|c| serde_json::from_str(&c).unwrap())
+            .collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0]["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(chunks[0]["final"], false);
+        assert_eq!(chunks[1]["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(chunks[1]["final"], true);
+    }
+
+    #[test]
+    fn bounded_json_strips_images_then_clips_then_placeholders() {
+        let image = format!("data:image/png;base64,{}", "A".repeat(4000));
+        let value = json!({"type":"message","id":"m1","message":{"role":"user","content":[{"type":"image_url","image_url":{"url":image}}]}});
+        let text = bounded_json_with(&value, 1000);
+        assert!(text.len() <= 1000);
+        assert!(text.contains("image omitted"));
+        let long = json!({"type":"message","id":"m2","message":{"role":"tool","content":"y".repeat(100_000)}});
+        let text = bounded_json_with(&long, 20_000);
+        assert!(text.len() <= 20_000);
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            parsed["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("clipped for collab")
+        );
+        let wide = Value::Array((0..5000).map(|i| json!(i)).collect());
+        let text = bounded_json_with(&wide, 200);
+        assert!(text.contains("placeholder"));
+        assert_eq!(clip_middle("héllo wörld", 4).chars().count() > 0, true);
+    }
+}

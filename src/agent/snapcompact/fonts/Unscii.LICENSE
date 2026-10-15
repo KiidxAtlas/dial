@@ -1,0 +1,3 @@
+Unscii by Viznut. The bundled unscii-8 Latin-1 glyphs are public domain / CC0, not the GPL unscii-16-full font.
+Source and licensing: https://github.com/viznut/unscii/blob/main/README.md
+Licensing: You can consider it Public Domain (or CC-0) except for the files derived from or containing parts of Roman Czyborra's Unifont project (unifont.hex, hex2bdf.pl, unscii-16-full.*) which fall under GPL.

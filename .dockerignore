@@ -1,0 +1,9 @@
+.git
+.github
+.tmp
+bin
+target
+python/.venv
+python/.pytest_cache
+**/__pycache__
+**/*.pyc

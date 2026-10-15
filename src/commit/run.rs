@@ -1,0 +1,553 @@
+//! Commit command runner: the agentic flow or the deterministic legacy flow, plus the
+//! model-call seam both flows use.
+
+use std::fmt;
+use std::path::Path;
+
+use super::agentic::{AgenticOutcome, run_agentic_commit};
+use super::changelog::{ChangelogFlowArgs, run_changelog_flow};
+use super::config::GenerationConfig;
+use super::execute::{IndexSnapshot, commit_with_message, git_output, push_or_abort, repo_top};
+use super::model_selection::resolve_commit_config;
+use super::repo_context::generation_context;
+use super::types::CommitCommandArgs;
+use super::{GenerationInput, format_conventional_commit, generate_with_backend};
+use crate::config::types::Config;
+use crate::llm::{Chat, Reply};
+
+/// One completion: the model reply plus its provider price, when the backend can price it.
+pub(crate) struct Completion {
+    pub reply: Reply,
+    pub cost_usd: Option<f64>,
+}
+
+/// Model access for commit generation and the agentic tool loop.
+///
+/// `complete` runs one chat turn against the model selected by `config`. The production
+/// implementation is [`ProviderBackend`]; tests substitute a fake.
+pub(crate) trait CommitBackend: Send + Sync {
+    fn complete(&self, config: &Config, request: &Chat) -> Result<Completion, String>;
+}
+
+/// Production backend: a one-shot provider call through the agent backend factory.
+pub(crate) struct ProviderBackend;
+
+impl CommitBackend for ProviderBackend {
+    fn complete(&self, cfg: &Config, request: &Chat) -> Result<Completion, String> {
+        let mut backend = crate::agent::make_backend(cfg).map_err(|error| error.to_string())?;
+        let result = backend
+            .chat(None, request, cfg.worker_timeout_secs, None)
+            .map_err(|error| error.to_string());
+        // Price must come from the backend that made the call, so read it before releasing.
+        let cost_usd = result
+            .as_ref()
+            .ok()
+            .and_then(|reply| backend.reply_cost(reply));
+        // One-shot commit calls must not keep a local model server resident.
+        backend.release();
+        let reply = result?;
+        if reply.text.trim().is_empty() {
+            return Err("Model returned an empty reply".to_owned());
+        }
+        Ok(Completion { reply, cost_usd })
+    }
+}
+
+/// Failure of the commit command. Maps to exit code 1 at the CLI boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommitError {
+    /// Model generation or completion failed.
+    Model(String),
+    /// A git command (commit, push, diff) failed; the message carries git's own output.
+    Git(String),
+    /// The generated message failed validation and was not committed.
+    Validation(String),
+}
+
+impl fmt::Display for CommitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Model(message) | Self::Git(message) | Self::Validation(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for CommitError {}
+
+impl From<String> for CommitError {
+    fn from(message: String) -> Self {
+        Self::Model(message)
+    }
+}
+
+/// Result of a commit run. Each variant states what happened; callers print it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommitRunOutcome {
+    /// No changes were staged. `pushed` reports whether existing commits were pushed (`--push`).
+    NothingToCommit { pushed: bool },
+    /// `--dry-run`: the generated message, plus a validation warning when it needs correction.
+    DryRun {
+        message: String,
+        validation_error: Option<String>,
+    },
+    /// The message was generated but not committed (the user declined, or the agent did not commit).
+    NotCommitted { message: String },
+    /// A commit was created. `used_fallback` marks a mechanical fallback commit, a degraded outcome.
+    Committed {
+        message: String,
+        pushed: bool,
+        used_fallback: bool,
+    },
+}
+
+impl CommitRunOutcome {
+    /// Process exit code: a fallback commit is degraded and exits 1; everything else exits 0.
+    pub(crate) fn exit_code(&self) -> i32 {
+        match self {
+            Self::Committed {
+                used_fallback: true,
+                ..
+            } => 1,
+            _ => 0,
+        }
+    }
+}
+
+impl CommitRunOutcome {
+    /// Human-readable report of the run, shown in the TUI transcript and printed by `dial commit`.
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::NothingToCommit { pushed: true } => {
+                "No changes to commit; pushed existing commits.".to_owned()
+            }
+            Self::NothingToCommit { pushed: false } => "No changes to commit.".to_owned(),
+            Self::DryRun {
+                message,
+                validation_error: None,
+            } => format!("Dry run. Message:\n{message}"),
+            Self::DryRun {
+                message,
+                validation_error: Some(error),
+            } => format!("Dry run. Message:\n{message}\n\nWarning: {error}"),
+            Self::NotCommitted { message } => format!("Commit cancelled. Message was:\n{message}"),
+            Self::Committed {
+                message,
+                pushed,
+                used_fallback,
+            } => {
+                let mut text = format!("Commit created.\n{message}");
+                if *pushed {
+                    text = format!("{text}\n\nPushed to remote.");
+                }
+                if *used_fallback {
+                    text = format!(
+                        "{text}\n\nWarning: the agent did not finish; a fallback commit was used."
+                    );
+                }
+                text
+            }
+        }
+    }
+}
+
+/// Run the commit command. `confirm` receives the generated message and returns whether to commit.
+/// The legacy flow consults it before committing; non-interactive callers pass `&mut |_| true`.
+/// The agentic flow commits from inside its own tool loop, so `confirm` does not apply to it.
+pub(crate) fn run_commit_command(
+    args: &CommitCommandArgs,
+    cwd: &Path,
+    config: &Config,
+    backend: &dyn CommitBackend,
+    confirm: &mut dyn FnMut(&str) -> bool,
+) -> Result<CommitRunOutcome, CommitError> {
+    // Paths from git are top-level relative, but pathspecs resolve from the working directory.
+    let top = repo_top(cwd)?;
+    let cwd = top.as_path();
+    // A dry run stages through `git add -A`, so the index is restored explicitly when the run ends.
+    let preview = args
+        .dry_run
+        .then(|| IndexSnapshot::capture(cwd))
+        .transpose()?;
+    let outcome = run_commit_steps(args, cwd, config, backend, confirm);
+    if let Some(preview) = preview {
+        preview.restore()?;
+    }
+    outcome
+}
+
+fn run_commit_steps(
+    args: &CommitCommandArgs,
+    cwd: &Path,
+    config: &Config,
+    backend: &dyn CommitBackend,
+    confirm: &mut dyn FnMut(&str) -> bool,
+) -> Result<CommitRunOutcome, CommitError> {
+    if args.legacy {
+        return run_legacy_commit(args, cwd, config, backend, confirm);
+    }
+    let cfg = resolve_commit_config(config, args.model.as_deref());
+    let AgenticOutcome {
+        used_fallback,
+        committed,
+        message,
+    } = run_agentic_commit(args, cwd, &cfg, backend, confirm)?;
+    if !committed {
+        return Ok(if args.dry_run {
+            CommitRunOutcome::DryRun {
+                message,
+                validation_error: None,
+            }
+        } else {
+            CommitRunOutcome::NotCommitted { message }
+        });
+    }
+    let pushed = args.push;
+    if pushed {
+        push_or_abort(cwd, config.git.bypass_hooks)?;
+    }
+    Ok(CommitRunOutcome::Committed {
+        message,
+        pushed,
+        used_fallback,
+    })
+}
+
+/// Deterministic legacy pipeline: stage everything if nothing is staged, generate one conventional
+/// message from the staged diff, then (after confirmation) update the changelog, commit, and push.
+fn run_legacy_commit(
+    args: &CommitCommandArgs,
+    cwd: &Path,
+    config: &Config,
+    backend: &dyn CommitBackend,
+    confirm: &mut dyn FnMut(&str) -> bool,
+) -> Result<CommitRunOutcome, CommitError> {
+    const CONTEXT: &str = "Commit generation failed";
+    let cfg = resolve_commit_config(config, args.model.as_deref());
+
+    if git_output(cwd, &["diff", "--cached", "--name-only"], CONTEXT)?
+        .trim()
+        .is_empty()
+    {
+        git_output(cwd, &["add", "-A"], CONTEXT)?;
+    }
+    let diff = git_output(
+        cwd,
+        &[
+            "diff",
+            "--cached",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+        ],
+        CONTEXT,
+    )?;
+    if diff.trim().is_empty() {
+        if args.push {
+            push_or_abort(cwd, config.git.bypass_hooks)?;
+            return Ok(CommitRunOutcome::NothingToCommit { pushed: true });
+        }
+        return Ok(CommitRunOutcome::NothingToCommit { pushed: false });
+    }
+    let stat = git_output(
+        cwd,
+        &["diff", "--cached", "--no-color", "--stat", "--no-renames"],
+        CONTEXT,
+    )?;
+    let numstat = git_output(
+        cwd,
+        &[
+            "diff",
+            "--cached",
+            "--no-color",
+            "--numstat",
+            "--no-renames",
+        ],
+        CONTEXT,
+    )?;
+
+    let mut context = generation_context(cwd);
+    context.user_context = args.context.clone();
+    let input = GenerationInput {
+        diff: &diff,
+        stat: &stat,
+        numstat: &numstat,
+        context: &context,
+    };
+    let result = generate_with_backend(
+        backend,
+        &cfg,
+        &GenerationConfig::from_settings(&cfg.commit),
+        input,
+    )?;
+    let message = format_conventional_commit(&result.commit);
+
+    if args.dry_run {
+        return Ok(CommitRunOutcome::DryRun {
+            message,
+            validation_error: result.validation_error,
+        });
+    }
+    if let Some(error) = result.validation_error {
+        return Err(CommitError::Validation(format!(
+            "Generated commit message failed validation: {error}"
+        )));
+    }
+    if !confirm(&message) {
+        return Ok(CommitRunOutcome::NotCommitted { message });
+    }
+    if !args.no_changelog {
+        update_changelog(cwd, &cfg, backend)?;
+    }
+    commit_with_message(cwd, &message, config.git.bypass_hooks)?;
+    let pushed = args.push;
+    if pushed {
+        push_or_abort(cwd, config.git.bypass_hooks)?;
+    }
+    Ok(CommitRunOutcome::Committed {
+        message,
+        pushed,
+        used_fallback: false,
+    })
+}
+
+/// Changelog step of the legacy flow: update changelogs for the staged files, then stage the files
+/// the flow wrote so they land in the same commit.
+fn update_changelog(
+    cwd: &Path,
+    cfg: &Config,
+    backend: &dyn CommitBackend,
+) -> Result<(), CommitError> {
+    const CONTEXT: &str = "Changelog update failed";
+    let staged = git_output(cwd, &["diff", "--cached", "--name-only", "-z"], CONTEXT)?;
+    let staged_files: Vec<String> = staged
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let outcome = run_changelog_flow(&ChangelogFlowArgs {
+        cwd,
+        config: cfg,
+        backend,
+        staged_files: &staged_files,
+        dry_run: false,
+    })?;
+    if outcome.changed_files.is_empty() {
+        return Ok(());
+    }
+    let mut add = vec!["add", "--"];
+    add.extend(outcome.changed_files.iter().map(String::as_str));
+    git_output(cwd, &add, CONTEXT)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::config::types::Config;
+    use crate::llm::{Chat, Reply};
+
+    const REPLY: &str = "# feat(demo): added greeting\n\n- Added the greeting helper.";
+
+    /// Canned model: every completion returns `REPLY` and is counted.
+    struct FakeBackend {
+        calls: AtomicUsize,
+    }
+
+    impl FakeBackend {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CommitBackend for FakeBackend {
+        fn complete(&self, _config: &Config, _request: &Chat) -> Result<Completion, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Completion {
+                reply: Reply {
+                    text: REPLY.to_owned(),
+                    ..Reply::default()
+                },
+                cost_usd: None,
+            })
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Dial Test",
+                "-c",
+                "user.email=test@example.com",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// A repository with one commit and no remote.
+    fn repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        git(dir.path(), &["init", "-q"]);
+        // Dial's own commit runs plain `git commit`; CI runners have no global identity.
+        git(dir.path(), &["config", "user.name", "Dial Test"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.path().join("README.md"), "demo\n").expect("write readme");
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    /// Config whose user directory (commit cache) lives outside the repository.
+    fn test_config(user_dir: &Path) -> Config {
+        let mut config = Config::default();
+        config.user_dir = user_dir.to_path_buf();
+        config
+    }
+
+    fn legacy_args() -> CommitCommandArgs {
+        CommitCommandArgs {
+            legacy: true,
+            no_changelog: true,
+            ..CommitCommandArgs::default()
+        }
+    }
+
+    fn write_change(dir: &Path) {
+        std::fs::write(dir.join("greeting.txt"), "hello\n").expect("write change");
+    }
+
+    fn run_legacy(
+        args: &CommitCommandArgs,
+        repo: &Path,
+        user: &TempDir,
+        backend: &FakeBackend,
+    ) -> Result<CommitRunOutcome, CommitError> {
+        run_commit_command(
+            args,
+            repo,
+            &test_config(user.path()),
+            backend,
+            &mut |_: &str| true,
+        )
+    }
+
+    #[test]
+    fn legacy_dry_run_returns_message_and_creates_no_commit() {
+        let repo = repo();
+        let user = TempDir::new().expect("tempdir");
+        write_change(repo.path());
+        let backend = FakeBackend::new();
+        let args = CommitCommandArgs {
+            dry_run: true,
+            ..legacy_args()
+        };
+        let outcome = run_legacy(&args, repo.path(), &user, &backend).expect("dry run succeeds");
+        let CommitRunOutcome::DryRun { message, .. } = outcome else {
+            panic!("expected DryRun, got {outcome:?}");
+        };
+        assert!(message.contains("feat(demo): added greeting"), "{message}");
+        assert_eq!(
+            git(repo.path(), &["rev-list", "--count", "HEAD"]).trim(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn legacy_commit_creates_commit_with_generated_message() {
+        let repo = repo();
+        let user = TempDir::new().expect("tempdir");
+        write_change(repo.path());
+        let backend = FakeBackend::new();
+        let outcome =
+            run_legacy(&legacy_args(), repo.path(), &user, &backend).expect("commit succeeds");
+        let CommitRunOutcome::Committed {
+            message,
+            pushed,
+            used_fallback,
+        } = outcome
+        else {
+            panic!("expected Committed, got {outcome:?}");
+        };
+        assert!(!pushed);
+        assert!(!used_fallback);
+        assert!(message.contains("feat(demo): added greeting"), "{message}");
+        assert_eq!(
+            git(repo.path(), &["log", "-1", "--format=%s"]).trim(),
+            "feat(demo): added greeting"
+        );
+    }
+
+    #[test]
+    fn push_without_remote_is_a_git_error() {
+        let repo = repo();
+        let user = TempDir::new().expect("tempdir");
+        write_change(repo.path());
+        let backend = FakeBackend::new();
+        let args = CommitCommandArgs {
+            push: true,
+            ..legacy_args()
+        };
+        let error = run_legacy(&args, repo.path(), &user, &backend)
+            .expect_err("push must fail without a remote");
+        assert!(matches!(error, CommitError::Git(_)), "{error:?}");
+    }
+
+    #[test]
+    fn clean_repo_is_nothing_to_commit() {
+        let repo = repo();
+        let user = TempDir::new().expect("tempdir");
+        let backend = FakeBackend::new();
+        let outcome =
+            run_legacy(&legacy_args(), repo.path(), &user, &backend).expect("clean run succeeds");
+        assert_eq!(outcome, CommitRunOutcome::NothingToCommit { pushed: false });
+        assert_eq!(backend.calls(), 0);
+    }
+
+    #[test]
+    fn fallback_commit_exits_with_code_one() {
+        let fallback = CommitRunOutcome::Committed {
+            message: String::new(),
+            pushed: false,
+            used_fallback: true,
+        };
+        assert_eq!(fallback.exit_code(), 1);
+        let clean = CommitRunOutcome::Committed {
+            message: String::new(),
+            pushed: false,
+            used_fallback: false,
+        };
+        assert_eq!(clean.exit_code(), 0);
+        assert_eq!(
+            CommitRunOutcome::NotCommitted {
+                message: String::new()
+            }
+            .exit_code(),
+            0
+        );
+    }
+}

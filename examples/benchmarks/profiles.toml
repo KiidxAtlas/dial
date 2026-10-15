@@ -1,0 +1,11 @@
+# The first profile is the comparison baseline. Names select exact model_profiles.
+[[profiles]]
+name = "baseline"
+
+[[profiles]]
+name = "without-integrations"
+ablations = ["no_integrations"]
+
+[[profiles]]
+name = "hashline"
+ablations = ["hashline_edit"]

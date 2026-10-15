@@ -1,0 +1,180 @@
+//! Small shared helpers: workspace configuration, text utilities and history thresholds.
+
+use super::*;
+
+pub(super) struct CheckpointObserver(pub(super) Arc<Checkpoints>);
+
+impl tools::WriteObserver for CheckpointObserver {
+    fn before_write(&self, abs: &Path) -> Result<()> {
+        self.0.before_write(abs)
+    }
+}
+
+pub(super) fn result_clone(report: &TurnReport) -> TurnReport {
+    TurnReport {
+        text: report.text.clone(),
+        outcome: report.outcome,
+        steps: report.steps,
+        interrupted: report.interrupted,
+        trajectory: report.trajectory,
+    }
+}
+
+pub(super) fn configure(
+    ws: Workspace,
+    config: &Config,
+    mode: crate::config::types::EditMode,
+    layout: Option<&Layout>,
+    checkpoints: Option<Arc<Checkpoints>>,
+) -> Result<Workspace> {
+    let mut ws = ws
+        .with_edit_settings(config.edit.clone())
+        .with_ssh_config(config.ssh.clone())
+        .with_ssh_hosts(&config.ssh_hosts)
+        .with_edit_mode(mode)
+        .with_syntax_guard(config.assistance.enabled && config.assistance.syntax_guard);
+    if let Some(layout) = layout {
+        ws = ws.with_edit_blackbox_dir(layout.state_dir.join("edit-blackbox"));
+    }
+    if let Some(checkpoints) = checkpoints {
+        ws = ws.with_observer(Arc::new(CheckpointObserver(checkpoints)));
+    }
+    configure_sandbox(ws, config, layout)
+}
+
+pub(super) fn configure_strict(
+    ws: Workspace,
+    config: &Config,
+    mode: crate::config::types::EditMode,
+) -> Result<Workspace> {
+    configure_sandbox(
+        ws.with_edit_settings(config.edit.clone())
+            .with_ssh_config(config.ssh.clone())
+            .with_ssh_hosts(&config.ssh_hosts)
+            .with_edit_mode(mode),
+        config,
+        None,
+    )
+}
+
+pub(super) fn configure_sandbox(
+    ws: Workspace,
+    config: &Config,
+    layout: Option<&Layout>,
+) -> Result<Workspace> {
+    let ws = tools::apply_sandbox_config(
+        ws,
+        &config.sandbox,
+        layout.map(|l| (l.state_dir.as_path(), l.user_dir.as_path())),
+    )?;
+    Ok(ws.with_shell_backend(config.shell.backend))
+}
+
+/// A superseded read is replaced only if no more than this many estimated tokens follow it (or the context is
+/// under pressure): replacing one buried deeper would force the provider to prefill everything after it again.
+pub(super) const CACHE_WARM_SUFFIX_TOKENS: usize = 6_000;
+/// Old observation results are dropped under context pressure, except in the newest part of the conversation:
+/// a fifth of the window, never less than this, so the model keeps the evidence it is working from right now.
+pub(super) const PRUNE_PROTECT_MIN_TOKENS: usize = 4_000;
+/// Longest search query sent to memory recall, in characters; the store itself refuses queries over 8 KiB.
+pub(super) const RECALL_QUERY_CHARS: usize = 2_000;
+
+pub fn json_text(text: &str) -> &str {
+    let text = text.trim();
+    if let Some(body) = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+    {
+        body.trim().strip_suffix("```").unwrap_or(body).trim()
+    } else {
+        text
+    }
+}
+
+pub use crate::runtime::presentation::truncate;
+
+pub(super) fn looks_like_overflow(error: &anyhow::Error) -> bool {
+    crate::llm::errors::is_context_overflow(error)
+}
+
+/// Merge this request's plain harness notes (transient user messages with text content and no
+/// other Dial marker) from `start` on into one message at the first note's position, so the model
+/// reads one harness note per request instead of a stack of competing instructions.
+pub(super) fn coalesce_harness_notes(messages: &mut Vec<Value>, start: usize) {
+    let plain = |message: &Value| {
+        message["role"] == "user"
+            && message["dial_transient"] == true
+            && message["content"].is_string()
+            && message.as_object().is_some_and(|object| {
+                object
+                    .keys()
+                    .all(|key| !key.starts_with("dial_") || key == "dial_transient")
+            })
+    };
+    let Some(first) = (start..messages.len()).find(|&index| plain(&messages[index])) else {
+        return;
+    };
+    let mut texts = vec![
+        messages[first]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    ];
+    let mut index = first + 1;
+    while index < messages.len() {
+        if plain(&messages[index]) {
+            texts.push(
+                messages.remove(index)["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+        } else {
+            index += 1;
+        }
+    }
+    if texts.len() > 1 {
+        messages[first]["content"] = json!(texts.join("\n\n"));
+    }
+}
+
+/// A reply that is just a JSON-looking object naming an offered tool. Small models often emit
+/// slightly broken ones (`{{"name": ...}` with unbalanced braces), so this matches the shape
+/// rather than requiring valid JSON.
+pub(super) fn looks_like_text_call(text: &str, names: &[String]) -> bool {
+    let t = text.trim();
+    if !t.starts_with('{')
+        || t.len() > 8000
+        || !t.contains("\"arguments\"") && !t.contains("\"parameters\"")
+    {
+        return false;
+    }
+    names.iter().any(|n| {
+        t.contains(&format!("\"name\": \"{n}\"")) || t.contains(&format!("\"name\":\"{n}\""))
+    })
+}
+
+/// Window that history thresholds are planned against: the model window, limited by the operator's
+/// absolute history ceiling when the economy policy is on (a ceiling of 0 means no ceiling). Never
+/// below 8192 tokens.
+pub(super) fn capped_window(window: u32, cap: u32, economy: bool) -> u32 {
+    if economy && cap > 0 {
+        window.min(cap.max(8192))
+    } else {
+        window
+    }
+}
+
+#[cfg(test)]
+mod history_cap_tests {
+    use super::capped_window;
+
+    #[test]
+    fn ceiling_limits_huge_windows_only_when_economy_is_on() {
+        assert_eq!(capped_window(1_000_000, 120_000, true), 120_000);
+        assert_eq!(capped_window(32_768, 120_000, true), 32_768);
+        assert_eq!(capped_window(1_000_000, 120_000, false), 1_000_000);
+        assert_eq!(capped_window(1_000_000, 100, true), 8192);
+        assert_eq!(capped_window(1_000_000, 0, true), 1_000_000);
+    }
+}

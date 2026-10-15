@@ -1,0 +1,116 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: fmt, build, test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux sandbox
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap tmux
+      - name: Install terminal fixture and OpenSSL 3 on macOS
+        if: runner.os == 'macOS'
+        run: |
+          command -v tmux || brew install tmux
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust
+        run: rustup update stable --no-self-update
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+      - name: Test terminal installer
+        run: bash scripts/test-install.sh
+      - name: Verify Linux sandbox enforcement
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: cargo test --locked linux_sandbox_enforces_filesystem_and_both_network_modes
+      - name: Format
+        run: cargo fmt --check
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Test
+        # Process-level fixtures also exercise HOME/PATH configuration; keep their environment deterministic.
+        run: cargo test --locked -- --test-threads=1
+      - name: Install executable and verify artifact contracts
+        timeout-minutes: 10
+        run: |
+          cargo install --locked --path . --debug --root target/installed
+          python3 scripts/check-artifact.py --dial target/installed/bin/dial
+      - name: Real terminal and crash lifecycle
+        timeout-minutes: 5
+        run: python3 examples/benchmarks/interactive_smoke.py --dial target/installed/bin/dial --captures target/pty-captures
+      - name: Record runtime overhead
+        continue-on-error: true
+        run: cargo run --locked --example runtime_baseline -- target/runtime-baseline.json
+      - name: Preserve runtime baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-baseline-${{ matrix.os }}
+          path: target/runtime-baseline.json
+      - name: Preserve terminal failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-${{ matrix.os }}
+          path: target/pty-captures
+  lint:
+    name: Clippy and dependency policy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          command-arguments: advisories licenses bans sources
+
+  python:
+    name: Python tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pytest fastapi==0.141.1 pydantic uvicorn
+      - run: python -m pytest python/test_*.py
+  installer-windows:
+    name: Windows installer (${{ matrix.shell }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test install.ps1
+        run: ./scripts/test-install.ps1

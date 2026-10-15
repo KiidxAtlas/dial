@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "instructions": "Review the goal against the proposed reply and bounded tool evidence. Return ONLY JSON: {\"gaps\":[{\"requirement\":\"specific unmet requirement or unsupported claim\",\"evidence\":0,\"next_check\":\"concrete local check or repair to resolve it\"}]}. Evidence indexes are zero-based in the supplied evidence array. At most three gaps. Use gaps=[] when there is no actionable gap. Missing evidence is uncertainty, not proof of failure; avoid speculative improvements, style commentary, and widening scope. You cannot certify correctness.",
+  "criteria": {},
+  "required": []
+}

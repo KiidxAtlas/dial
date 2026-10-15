@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "default_image_edge": 2048,
+  "providers": {
+    "chatgpt": {
+      "protocol": "responses",
+      "service_tiers": [
+        "default",
+        "flex",
+        "scale",
+        "priority"
+      ]
+    },
+    "openai-codex": {
+      "protocol": "responses",
+      "service_tiers": [
+        "default",
+        "flex",
+        "scale",
+        "priority"
+      ]
+    },
+    "openai": {
+      "service_tiers": [
+        "default",
+        "flex",
+        "scale",
+        "priority",
+        "ultrafast"
+      ]
+    },
+    "openrouter": {
+      "service_tiers": [
+        "flex",
+        "scale",
+        "priority"
+      ]
+    },
+    "google": {
+      "service_tiers": [
+        "flex",
+        "priority"
+      ]
+    },
+    "gemini": {
+      "service_tiers": [
+        "flex",
+        "priority"
+      ],
+      "protocol": "gemini"
+    },
+    "google-vertex": {
+      "service_tiers": [
+        "priority"
+      ],
+      "protocol": "vertex"
+    },
+    "fireworks": {
+      "service_tiers": [
+        "priority"
+      ]
+    },
+    "anthropic": {
+      "fast_tier": "priority",
+      "protocol": "anthropic"
+    },
+    "lm-studio": {
+      "structured_output": "json_schema"
+    },
+    "ollama": {
+      "structured_output": "ollama_format",
+      "protocol": "ollama"
+    },
+    "amazon-bedrock": {
+      "protocol": "bedrock"
+    },
+    "google-vertex-anthropic": {
+      "protocol": "vertex-anthropic"
+    },
+    "azure": {
+      "protocol": "azure-responses"
+    },
+    "copilot": {
+      "protocol": "copilot"
+    },
+    "google-gemini-cli": {
+      "protocol": "cloud-code-assist"
+    },
+    "google-antigravity": {
+      "protocol": "antigravity"
+    },
+    "gitlab-duo": {
+      "protocol": "gitlab-duo"
+    },
+    "factory-droid": {
+      "protocol": "factory-droid"
+    }
+  }
+}

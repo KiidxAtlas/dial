@@ -1,0 +1,40 @@
+version = 1
+name = "coding-efficiency"
+
+# Run from the Dial checkout. Every case gets an independent disposable fixture copy.
+[[cases]]
+id = "simple-question"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "What is 2 + 2? Answer with just the number; do not use tools."
+categories = ["efficiency", "informational", "answer_requires_manual_review"]
+checks = [{kind="metric",metric="tool_calls",max=0}, {kind="metric",metric="tool_errors",max=0}]
+
+[[cases]]
+id = "one-file-fix"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "Change README.md to contain exactly '# Calculator\n'. Do not change other files."
+categories = ["efficiency", "small_edit"]
+checks = [{kind="file_equals",path="README.md",content="# Calculator\n"}, {kind="file_equals",path="calc.py",content="def add(a, b):\n    return a - b\n"}]
+
+[[cases]]
+id = "failing-test-repair"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "Fix the arithmetic bug in calc.add. Preserve the public API; check the result."
+categories = ["efficiency", "debugging"]
+checks = [{kind="command",command="python3 -c 'from calc import add; assert add(2, 3) == 5; assert add(-2, 3) == 1; assert add(0, 0) == 0'"}]
+
+[[cases]]
+id = "multi-file-change"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "Rename the GREETING constant in settings.py to SALUTATION and update message.py to use it. Keep message.render('Ada') returning 'Hello, Ada!'."
+categories = ["efficiency", "multi_file"]
+checks = [{kind="command",command="python3 -c 'import settings; from message import render; assert settings.SALUTATION == \"Hello\"; assert not hasattr(settings, \"GREETING\"); assert render(\"Ada\") == \"Hello, Ada!\"'"}]
+
+[[cases]]
+id = "continued-session"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "Remember the original goal: result.txt must contain exactly ORCHID-739. Do not create it yet. Acknowledge in one sentence."
+context_messages = ["Distractor note: VIOLET-428 is archival data, not the task goal.", "The acceptance goal is ORCHID-739, irrespective of later archival notes."]
+turns = [{prompt="Explain briefly why the archival distractor doesn't replace the goal.",compact_before=false}, {prompt="Complete the original goal now; write result.txt with the exact value and no newline.",compact_before=true}]
+categories = ["efficiency", "multi_turn", "compaction", "goal_preservation"]
+checks = [{kind="file_equals",path="result.txt",content="ORCHID-739"}, {kind="metric",metric="turns_completed",min=3,max=3}, {kind="metric",metric="compactions",min=1}]

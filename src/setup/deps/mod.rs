@@ -1,0 +1,445 @@
+//! Registry of the external software that optional Dial features depend on.
+//!
+//! Each [`Recipe`] says how to detect a dependency, which install methods exist, and which
+//! settings to save once the install succeeds and the health check passes. Detection and
+//! planning are pure over an [`Env`], so tests can fake the package managers on `PATH`.
+
+pub mod plan;
+pub mod run;
+
+use std::path::{Path, PathBuf};
+
+/// Minimum Bun version that the `bun` recipe accepts.
+pub const BUN_MIN: (u64, u64, u64) = (1, 3, 14);
+
+/// One way to obtain a dependency. Every method installs only into Dial's user directory,
+/// or uses an existing package manager without elevated privileges. Nothing runs with sudo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Method {
+    /// npm packages installed with `npm install --prefix <install dir>`.
+    Npm(&'static [&'static str]),
+    /// A Python tool installed with `uv tool install` into the install dir.
+    Uv(&'static str),
+    /// A Homebrew formula. Homebrew installs into its own prefix, without sudo.
+    Brew(&'static str),
+    /// Needs the user: a service, a model file, or a privileged install. Dial shows the hint.
+    Manual(&'static str),
+}
+
+/// Where the artifact a recipe detects lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Base {
+    /// `<user_dir>/tools/<id>/…`: Dial's own install directory.
+    Install,
+    /// `<user_dir>/…`: shared Dial state, such as the MLX runtime.
+    UserDir,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Recipe {
+    pub id: &'static str,
+    pub title: &'static str,
+    /// Recipe ids that must be ready first.
+    pub requires: &'static [&'static str],
+    /// Program searched for on `PATH` (empty: none).
+    pub program: &'static str,
+    pub base: Base,
+    /// Artifact relative to `base` that proves a Dial install exists (empty: none).
+    pub artifact: &'static str,
+    /// Install methods in order of preference.
+    pub methods: &'static [Method],
+}
+
+const LSP_TS: &[&str] = &["typescript", "typescript-language-server"];
+
+pub const RECIPES: &[Recipe] = &[
+    Recipe {
+        id: "bun",
+        title: "Bun",
+        requires: &[],
+        program: "bun",
+        base: Base::Install,
+        artifact: "node_modules/.bin/bun",
+        methods: &[Method::Npm(&["bun"]), Method::Brew("bun")],
+    },
+    Recipe {
+        id: "hindsight",
+        title: "Hindsight service",
+        requires: &[],
+        program: "",
+        base: Base::Install,
+        artifact: "",
+        methods: &[Method::Manual(
+            "run ghcr.io/vectorize-io/hindsight with Docker, then set memory.hindsight.endpoint",
+        )],
+    },
+    Recipe {
+        id: "mlx-runtime",
+        title: "Local MLX runtime",
+        requires: &[],
+        program: "",
+        base: Base::UserDir,
+        artifact: "python/.venv/bin/python",
+        methods: &[Method::Manual(
+            "run `dial setup -m` (needs uv and Apple Silicon)",
+        )],
+    },
+    Recipe {
+        id: "espeak-ng",
+        title: "espeak-ng",
+        requires: &[],
+        program: "espeak-ng",
+        base: Base::Install,
+        artifact: "",
+        methods: &[Method::Brew("espeak-ng")],
+    },
+    Recipe {
+        id: "piper",
+        title: "Piper",
+        requires: &[],
+        program: "piper",
+        base: Base::Install,
+        artifact: "bin/piper",
+        methods: &[
+            Method::Uv("piper-tts"),
+            Method::Manual("pip install piper-tts"),
+        ],
+    },
+    Recipe {
+        id: "whisper-cpp",
+        title: "whisper.cpp",
+        requires: &[],
+        program: "whisper-cli",
+        base: Base::Install,
+        artifact: "",
+        methods: &[Method::Brew("whisper-cpp")],
+    },
+    Recipe {
+        id: "mlx-whisper",
+        title: "mlx-whisper",
+        requires: &[],
+        program: "mlx_whisper",
+        base: Base::Install,
+        artifact: "bin/mlx_whisper",
+        methods: &[Method::Uv("mlx-whisper")],
+    },
+    Recipe {
+        id: "rust-analyzer",
+        title: "rust-analyzer",
+        requires: &[],
+        program: "rust-analyzer",
+        base: Base::Install,
+        artifact: "",
+        methods: &[Method::Brew("rust-analyzer")],
+    },
+    Recipe {
+        id: "typescript-language-server",
+        title: "typescript-language-server",
+        requires: &[],
+        program: "typescript-language-server",
+        base: Base::Install,
+        artifact: "node_modules/.bin/typescript-language-server",
+        methods: &[Method::Npm(LSP_TS)],
+    },
+    Recipe {
+        id: "pyright-langserver",
+        title: "pyright",
+        requires: &[],
+        program: "pyright-langserver",
+        base: Base::Install,
+        artifact: "node_modules/.bin/pyright-langserver",
+        methods: &[Method::Npm(&["pyright"])],
+    },
+    Recipe {
+        id: "gopls",
+        title: "gopls",
+        requires: &[],
+        program: "gopls",
+        base: Base::Install,
+        artifact: "",
+        methods: &[Method::Brew("gopls")],
+    },
+    Recipe {
+        id: "lua-language-server",
+        title: "lua-language-server",
+        requires: &[],
+        program: "lua-language-server",
+        base: Base::Install,
+        artifact: "",
+        methods: &[Method::Brew("lua-language-server")],
+    },
+    Recipe {
+        id: "zls",
+        title: "zls",
+        requires: &[],
+        program: "zls",
+        base: Base::Install,
+        artifact: "",
+        methods: &[Method::Brew("zls")],
+    },
+    Recipe {
+        id: "node",
+        title: "Node.js",
+        requires: &[],
+        program: "node",
+        base: Base::Install,
+        artifact: "",
+        methods: &[Method::Brew("node")],
+    },
+    Recipe {
+        id: "uv",
+        title: "uv",
+        requires: &[],
+        program: "uv",
+        base: Base::Install,
+        artifact: "",
+        methods: &[Method::Brew("uv")],
+    },
+];
+
+pub fn recipe(id: &str) -> Option<&'static Recipe> {
+    RECIPES.iter().find(|recipe| recipe.id == id)
+}
+
+/// Dial's own install directory for one dependency.
+pub fn install_dir(user_dir: &Path, id: &str) -> PathBuf {
+    user_dir.join("tools").join(id)
+}
+
+/// What `PATH` and the user directory look like at one moment.
+#[derive(Clone, Debug)]
+pub struct Env {
+    pub path: Vec<PathBuf>,
+    pub user_dir: PathBuf,
+}
+
+impl Env {
+    pub fn current(user_dir: &Path) -> Self {
+        let path = std::env::var_os("PATH")
+            .map(|value| std::env::split_paths(&value).collect())
+            .unwrap_or_default();
+        Self {
+            path,
+            user_dir: user_dir.to_path_buf(),
+        }
+    }
+
+    pub fn find(&self, program: &str) -> Option<PathBuf> {
+        if program.is_empty() {
+            return None;
+        }
+        self.path
+            .iter()
+            .map(|dir| dir.join(program))
+            .find(|candidate| is_executable(candidate))
+    }
+}
+
+pub fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Where a recipe's artifact lives under `env`: a Dial install first, then `PATH`.
+pub fn locate(recipe: &Recipe, env: &Env) -> Option<PathBuf> {
+    if !recipe.artifact.is_empty() {
+        let base = match recipe.base {
+            Base::Install => install_dir(&env.user_dir, recipe.id),
+            Base::UserDir => env.user_dir.clone(),
+        };
+        let path = base.join(recipe.artifact);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    env.find(recipe.program)
+}
+
+/// The default whisper.cpp model (`ggml-base.en.bin`) from whisper.cpp's own download source.
+/// The Hugging Face LFS etag publishes its SHA-256; the download is refused unless it matches.
+pub const WHISPER_MODEL_URL: &str =
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+pub const WHISPER_MODEL_SHA256: &str =
+    "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
+pub const WHISPER_MODEL_BYTES: u64 = 147_964_211;
+
+/// Where Dial keeps the whisper.cpp model it downloads during setup.
+pub fn whisper_model_path(user_dir: &Path) -> PathBuf {
+    user_dir
+        .join("models")
+        .join("whisper")
+        .join("ggml-base.en.bin")
+}
+
+/// Installed and usable. whisper.cpp also needs its model file, so a program alone is not enough.
+pub fn is_ready(recipe: &Recipe, env: &Env) -> bool {
+    locate(recipe, env).is_some()
+        && (recipe.id != "whisper-cpp" || whisper_model_path(&env.user_dir).is_file())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Ready,
+    Missing,
+}
+
+#[derive(Clone, Debug)]
+pub struct Row {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub status: Status,
+    pub detail: String,
+}
+
+/// Detection for `dial doctor` and the `/setup` list.
+pub fn report(env: &Env) -> Vec<Row> {
+    RECIPES
+        .iter()
+        .map(
+            |recipe| match locate(recipe, env).filter(|_| is_ready(recipe, env)) {
+                Some(path) => Row {
+                    id: recipe.id,
+                    title: recipe.title,
+                    status: Status::Ready,
+                    detail: path.display().to_string(),
+                },
+                None => Row {
+                    id: recipe.id,
+                    title: recipe.title,
+                    status: Status::Missing,
+                    detail: recipe
+                        .methods
+                        .iter()
+                        .find_map(|method| match method {
+                            Method::Manual(hint) => Some((*hint).to_owned()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "not installed".to_owned()),
+                },
+            },
+        )
+        .collect()
+}
+
+/// Settings written after a dependency is installed and healthy. Empty for prerequisites.
+pub fn settings_for(id: &str, location: &Path) -> Vec<(String, String)> {
+    let value = location.display().to_string();
+    let set = |path: &str| vec![(path.to_owned(), value.clone())];
+    match id {
+        "espeak-ng" => set("voice.tts.espeak_program"),
+        "piper" => set("voice.tts.piper_program"),
+        "whisper-cpp" => set("voice.stt.whisper_cpp_program"),
+        "mlx-whisper" => set("voice.stt.mlx_whisper_program"),
+        "rust-analyzer" => lsp("rust-analyzer", &value),
+        "typescript-language-server" => lsp("typescript-language-server", &value),
+        "pyright-langserver" => lsp("pyright", &value),
+        "gopls" => lsp("gopls", &value),
+        "lua-language-server" => lsp("lua-language-server", &value),
+        "zls" => lsp("zls", &value),
+        _ => Vec::new(),
+    }
+}
+
+fn lsp(name: &str, value: &str) -> Vec<(String, String)> {
+    vec![(format!("lsp.{name}.program"), value.to_owned())]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_bin(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn registry_ids_are_unique_and_requirements_resolve() {
+        let mut ids = std::collections::BTreeSet::new();
+        for recipe in RECIPES {
+            assert!(ids.insert(recipe.id), "duplicate id {}", recipe.id);
+            for required in recipe.requires {
+                assert!(
+                    recipe_exists(required),
+                    "{} requires missing {required}",
+                    recipe.id
+                );
+            }
+            assert!(!recipe.methods.is_empty(), "{} has no method", recipe.id);
+        }
+    }
+
+    fn recipe_exists(id: &str) -> bool {
+        recipe(id).is_some()
+    }
+
+    #[test]
+    fn install_dir_lives_under_user_dir() {
+        let dir = install_dir(Path::new("/home/x/.dial"), "bun");
+        assert_eq!(dir, Path::new("/home/x/.dial/tools/bun"));
+    }
+
+    #[test]
+    fn locate_prefers_dial_install_then_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user = tmp.path().join("user");
+        let path_dir = tmp.path().join("path");
+        fake_bin(&path_dir, "bun");
+        let env = Env {
+            path: vec![path_dir.clone()],
+            user_dir: user.clone(),
+        };
+        let bun = recipe("bun").unwrap();
+        assert_eq!(locate(bun, &env), Some(path_dir.join("bun")));
+
+        fake_bin(&install_dir(&user, "bun").join("node_modules/.bin"), "bun");
+        assert_eq!(
+            locate(bun, &env),
+            Some(install_dir(&user, "bun").join("node_modules/.bin/bun"))
+        );
+    }
+
+    #[test]
+    fn report_marks_missing_and_manual_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = Env {
+            path: Vec::new(),
+            user_dir: tmp.path().join("user"),
+        };
+        let rows = report(&env);
+        let hindsight = rows.iter().find(|row| row.id == "hindsight").unwrap();
+        assert_eq!(hindsight.status, Status::Missing);
+        assert!(hindsight.detail.contains("Docker"));
+        assert!(rows.iter().all(|row| row.status == Status::Missing));
+    }
+
+    #[test]
+    fn settings_map_to_config_keys() {
+        let path = Path::new("/x/bun");
+        assert!(settings_for("bun", path).is_empty());
+        assert_eq!(
+            settings_for("gopls", path),
+            vec![("lsp.gopls.program".into(), "/x/bun".into())]
+        );
+        assert!(settings_for("node", path).is_empty());
+    }
+}

@@ -1,0 +1,701 @@
+//! MCP "streamable HTTP" transport: every message is a POST to one endpoint.
+//!
+//! The server answers a request with either a JSON body or a `text/event-stream` carrying the
+//! response (and possibly progress notifications or requests, read as they arrive). A session id
+//! handed out on `initialize` is echoed on every later call, and once initialized a GET stream is
+//! opened for server-initiated messages (`list_changed`, resource updates); servers that do not
+//! offer one answer 405 and nothing more is tried. Credentials come from `bearer_env` (an
+//! environment variable name, so the secret never sits in the config file), non-secret `headers`,
+//! or tokens from an OAuth sign-in (`/mcp login`, see `oauth`).
+//!
+//! Legacy HTTP+SSE (`transport = "sse"`) uses this module too: the GET stream is opened first, its
+//! `endpoint` event names the POST target, and replies arrive on that stream.
+use super::client::{Remote, Shared};
+use super::oauth::TokenSource;
+use crate::config::types::{McpServerConfig, McpTransport};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::Value;
+use std::io::{BufRead, BufReader, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, RecvTimeoutError},
+};
+use std::time::{Duration, Instant};
+
+/// Largest response body accepted.
+const MAX_BODY: u64 = 16 * 1024 * 1024;
+/// Bound for answers posted back to the server from the GET stream.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a waiting connect checks for cancellation.
+const CANCEL_POLL: Duration = Duration::from_millis(50);
+/// Longest single line accepted from an event stream, including the unbounded GET stream.
+const MAX_EVENT_LINE: u64 = 16 * 1024 * 1024;
+
+/// The server dropped the session (HTTP 404 for a known session id); the connection must be redone.
+#[derive(Debug)]
+pub struct SessionEnded(pub String);
+
+impl std::fmt::Display for SessionEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MCP server `{}` ended the session (HTTP 404)", self.0)
+    }
+}
+
+impl std::error::Error for SessionEnded {}
+
+/// The server wants authorization dial does not have (HTTP 401 without static credentials).
+#[derive(Debug)]
+pub struct AuthRequired(pub String);
+
+impl std::fmt::Display for AuthRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MCP server `{0}` requires authorization (HTTP 401); run `/mcp login {0}` to sign in",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for AuthRequired {}
+
+/// Plain HTTP only to loopback; everything else must be HTTPS.
+pub fn validate_url(url: &str) -> Result<()> {
+    let uri: ureq::http::Uri = url
+        .parse()
+        .with_context(|| format!("invalid MCP url {url:?}"))?;
+    let host = uri.host().unwrap_or("");
+    match uri.scheme_str() {
+        Some("https") if !host.is_empty() => Ok(()),
+        Some("http") if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1") => Ok(()),
+        _ => bail!("MCP url must be https (http is allowed only for localhost): {url}"),
+    }
+}
+
+/// Request credentials for one remote server.
+pub(super) struct Auth {
+    server: String,
+    headers: Vec<(String, String)>,
+    /// `bearer_env` or an explicit `Authorization` header: a 401 means they are wrong.
+    fixed: bool,
+    oauth: Option<Arc<TokenSource>>,
+    challenge: Mutex<Option<String>>,
+}
+
+impl Auth {
+    pub(super) fn new(
+        server: &str,
+        config: &McpServerConfig,
+        oauth: Option<Arc<TokenSource>>,
+    ) -> Result<Self> {
+        let mut headers: Vec<(String, String)> = config
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if let Some(var) = &config.bearer_env {
+            let token = std::env::var(var)
+                .map_err(|_| anyhow!("environment variable {var} (bearer_env) is not set"))?;
+            headers.push(("Authorization".into(), format!("Bearer {}", token.trim())));
+        }
+        let fixed = headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+        Ok(Auth {
+            server: server.to_owned(),
+            headers,
+            fixed,
+            oauth: if fixed { None } else { oauth },
+            challenge: Mutex::default(),
+        })
+    }
+
+    /// Every header to send, plus the OAuth access token they carry (None without a usable grant).
+    pub(super) fn headers(&self) -> (Vec<(String, String)>, Option<String>) {
+        let mut headers = self.headers.clone();
+        let bearer = self.oauth.as_ref().and_then(|oauth| oauth.bearer());
+        if let Some(token) = &bearer {
+            headers.push(("Authorization".into(), format!("Bearer {token}")));
+        }
+        (headers, bearer)
+    }
+
+    /// Like [`Auth::headers`] but never refreshes the grant; used when dropping a connection.
+    pub(super) fn headers_stored(&self) -> Vec<(String, String)> {
+        let mut headers = self.headers.clone();
+        if let Some(token) = self.oauth.as_ref().and_then(|oauth| oauth.stored_access()) {
+            headers.push(("Authorization".into(), format!("Bearer {token}")));
+        }
+        headers
+    }
+
+    /// The error for a 401/403, remembering the challenge so the manager can offer a sign-in.
+    pub(super) fn refused(&self, status: u16, challenge: Option<&str>) -> anyhow::Error {
+        if self.fixed {
+            return anyhow!(
+                "MCP server `{}` refused the credentials (HTTP {status}); set bearer_env to a valid token",
+                self.server
+            );
+        }
+        *self.challenge.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(challenge.unwrap_or("").to_owned());
+        anyhow::Error::new(AuthRequired(self.server.clone()))
+    }
+
+    /// After a 401 that carried `stale`: refresh the grant unless another request already did.
+    pub(super) fn refresh(&self, stale: &str) -> bool {
+        self.oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth.refresh(stale))
+    }
+
+    pub(super) fn challenge(&self) -> Option<String> {
+        self.challenge
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+pub fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
+pub struct Http {
+    server: String,
+    url: String,
+    auth: Auth,
+    agent: ureq::Agent,
+    session: Mutex<Option<String>>,
+    protocol: Mutex<Option<String>>,
+    stop: AtomicBool,
+    sse: bool,
+    endpoint: Mutex<Option<String>>,
+}
+
+impl Http {
+    pub fn new(
+        server: &str,
+        url: &str,
+        config: &McpServerConfig,
+        oauth: Option<Arc<TokenSource>>,
+    ) -> Result<Self> {
+        validate_url(url)?;
+        Ok(Self {
+            server: server.to_owned(),
+            url: url.to_owned(),
+            auth: Auth::new(server, config, oauth)?,
+            agent: agent(),
+            session: Mutex::default(),
+            protocol: Mutex::default(),
+            stop: AtomicBool::new(false),
+            sse: config.transport == Some(McpTransport::Sse),
+            endpoint: Mutex::default(),
+        })
+    }
+
+    fn session(&self) -> Option<String> {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Where requests are POSTed: the configured URL, or for legacy SSE the announced endpoint.
+    fn target(&self) -> Result<String> {
+        if !self.sse {
+            return Ok(self.url.clone());
+        }
+        self.endpoint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                anyhow!(
+                    "MCP server `{}` has not announced its SSE endpoint",
+                    self.server
+                )
+            })
+    }
+
+    fn protocol(&self) -> Option<String> {
+        self.protocol
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn post_once(
+        &self,
+        message: &Value,
+        timeout: Duration,
+        sink: &mut dyn FnMut(Value),
+        auth: &[(String, String)],
+    ) -> Result<()> {
+        let target = self.target()?;
+        let mut request = self
+            .agent
+            .post(&target)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json");
+        for (name, value) in auth {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        if let Some(id) = self.session() {
+            request = request.header("Mcp-Session-Id", id.as_str());
+        }
+        if let Some(version) = self.protocol() {
+            request = request.header("MCP-Protocol-Version", version.as_str());
+        }
+        let mut response = request
+            .config()
+            .timeout_global((!timeout.is_zero()).then_some(timeout))
+            .build()
+            .send(message.to_string())
+            .map_err(|e| anyhow!("MCP server `{}` request failed: {e}", self.server))?;
+        let status = response.status().as_u16();
+        if let Some(id) = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_owned());
+        }
+        if status == 401 || status == 403 {
+            let challenge = response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            return Err(self.auth.refused(status, challenge.as_deref()));
+        }
+        if status == 404 && self.session().is_some() {
+            return Err(anyhow::Error::new(SessionEnded(self.server.clone())));
+        }
+        let is_sse = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|t| t.starts_with("text/event-stream"));
+        let reader = response.body_mut().with_config().limit(MAX_BODY).reader();
+        if !(200..300).contains(&status) {
+            let mut excerpt = String::new();
+            let _ = reader.take(300).read_to_string(&mut excerpt);
+            bail!(
+                "MCP server `{}` returned HTTP {status}: {}",
+                self.server,
+                excerpt.trim()
+            );
+        }
+        if is_sse {
+            read_events(BufReader::new(reader), &mut |_, data| {
+                if self.stop.load(Ordering::Relaxed) {
+                    return false;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(data) {
+                    for message in flatten(value) {
+                        sink(message);
+                    }
+                }
+                true
+            })
+            .map_err(|e| {
+                anyhow!(
+                    "MCP server `{}`: reading the event stream failed: {e}",
+                    self.server
+                )
+            })?;
+            return Ok(());
+        }
+        let mut body = String::new();
+        BufReader::new(reader)
+            .read_to_string(&mut body)
+            .map_err(|e| {
+                anyhow!(
+                    "MCP server `{}`: reading the response failed: {e}",
+                    self.server
+                )
+            })?;
+        if body.trim().is_empty() {
+            return Ok(());
+        }
+        let value: Value = serde_json::from_str(&body).with_context(|| {
+            format!("MCP server `{}` sent a body that is not JSON", self.server)
+        })?;
+        for message in flatten(value) {
+            sink(message);
+        }
+        Ok(())
+    }
+
+    /// The stream for server-initiated messages. Streamable HTTP keeps an optional GET stream that
+    /// ends quietly when the server has none. Legacy SSE has no other channel: the stream names the
+    /// POST endpoint and carries every reply, so its end is a lost connection.
+    fn listen(self: Arc<Self>, shared: Arc<Shared>, ready: Option<mpsc::Sender<Result<()>>>) {
+        let mut ready = ready;
+        let result = self.read_stream(&shared, &mut ready);
+        if !self.sse {
+            return;
+        }
+        let error = result
+            .err()
+            .unwrap_or_else(|| anyhow!("MCP server `{}` closed its event stream", self.server));
+        let reason = format!("{error:#}");
+        if let Some(tx) = ready.take() {
+            let _ = tx.send(Err(error));
+        }
+        if !self.stop.load(Ordering::Relaxed) {
+            shared.close(reason);
+        }
+    }
+
+    /// Opens the GET stream and reads it until it ends. A 401 with a refreshable grant is retried once.
+    fn read_stream(
+        &self,
+        shared: &Shared,
+        ready: &mut Option<mpsc::Sender<Result<()>>>,
+    ) -> Result<()> {
+        let mut refreshed = false;
+        let mut response = loop {
+            let (headers, sent) = self.auth.headers();
+            let mut request = self
+                .agent
+                .get(&self.url)
+                .header("Accept", "text/event-stream");
+            for (name, value) in &headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            if let Some(id) = self.session() {
+                request = request.header("Mcp-Session-Id", id.as_str());
+            }
+            if let Some(version) = self.protocol() {
+                request = request.header("MCP-Protocol-Version", version.as_str());
+            }
+            let response = request
+                .call()
+                .map_err(|e| anyhow!("MCP server `{}` event stream failed: {e}", self.server))?;
+            let status = response.status().as_u16();
+            if status == 401 || status == 403 {
+                if status == 401
+                    && !refreshed
+                    && sent
+                        .as_deref()
+                        .is_some_and(|stale| self.auth.refresh(stale))
+                {
+                    refreshed = true;
+                    continue;
+                }
+                let challenge = response
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                return Err(self.auth.refused(status, challenge.as_deref()));
+            }
+            let is_sse = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|t| t.starts_with("text/event-stream"));
+            if status != 200 || !is_sse {
+                if self.sse {
+                    bail!(
+                        "MCP server `{}` did not open an event stream (HTTP {status})",
+                        self.server
+                    );
+                }
+                return Ok(());
+            }
+            break response;
+        };
+        // Stop-observation limit: ureq 3.4.2 offers no idle timeout for a body read.
+        // `timeout_recv_body` is a total budget that ends the stream outright (reconnecting on it
+        // would change legacy session semantics), and there is no handle to shut the socket. So
+        // this read blocks until the server sends an event or closes; `stop` is checked on the
+        // next event and the thread then exits. `shutdown`, `Drop`, and the `connect_sse` timeout
+        // only set the flag and never join this thread, so the wait never blocks a caller.
+        let reader = BufReader::new(response.body_mut().with_config().limit(u64::MAX).reader());
+        read_events(reader, &mut |event, data| {
+            if self.stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            if self.sse && event == "endpoint" {
+                let outcome = self.set_endpoint(data);
+                let stop_reading = outcome.is_err();
+                if let Some(tx) = ready.take() {
+                    let _ = tx.send(outcome);
+                }
+                return !stop_reading;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(data) {
+                for message in flatten(value) {
+                    if let Some(answer) = shared.handle(&message) {
+                        let _ = self.post(&answer, ANSWER_TIMEOUT, &mut |_| {});
+                    }
+                }
+            }
+            true
+        })
+        .map_err(|e| {
+            anyhow!(
+                "MCP server `{}`: reading the event stream failed: {e}",
+                self.server
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Legacy SSE: the `endpoint` event names where requests are POSTed. It must pass the same URL
+    /// validation and stay on the configured server's origin.
+    fn set_endpoint(&self, data: &str) -> Result<()> {
+        let base = url::Url::parse(&self.url).context("parsing the MCP server URL")?;
+        let endpoint = base.join(data.trim()).with_context(|| {
+            format!(
+                "MCP server `{}` sent an invalid endpoint `{data}`",
+                self.server
+            )
+        })?;
+        if endpoint.origin() != base.origin() {
+            bail!(
+                "MCP server `{}` announced an endpoint on another origin: {endpoint}",
+                self.server
+            );
+        }
+        validate_url(endpoint.as_str())?;
+        *self.endpoint.lock().unwrap_or_else(|e| e.into_inner()) = Some(endpoint.to_string());
+        Ok(())
+    }
+
+    /// Legacy HTTP+SSE: opens the event stream before `initialize` and waits up to `wait` (zero
+    /// waits indefinitely) for the endpoint. Replies to requests then arrive on this stream.
+    pub(super) fn connect_sse(
+        self: Arc<Self>,
+        shared: Arc<Shared>,
+        wait: Duration,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        let worker = self.clone();
+        std::thread::Builder::new()
+            .name(format!("mcp-{}-sse", self.server))
+            .spawn(move || worker.listen(shared, Some(tx)))
+            .context("starting the event stream thread")?;
+        let deadline = (!wait.is_zero()).then(|| Instant::now() + wait);
+        let outcome = loop {
+            match rx.recv_timeout(CANCEL_POLL) {
+                Ok(result) => break Some(result),
+                Err(RecvTimeoutError::Disconnected) => break None,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            if cancel() {
+                self.stop.store(true, Ordering::Relaxed);
+                bail!("connecting to MCP server `{}` was cancelled", self.server);
+            }
+            if deadline.is_some_and(|end| Instant::now() >= end) {
+                break None;
+            }
+        };
+        match outcome {
+            Some(result) => result,
+            None => {
+                self.stop.store(true, Ordering::Relaxed);
+                bail!(
+                    "MCP server `{}` did not announce its SSE endpoint in time",
+                    self.server
+                )
+            }
+        }
+    }
+}
+
+impl Remote for Http {
+    fn post(&self, message: &Value, timeout: Duration, sink: &mut dyn FnMut(Value)) -> Result<()> {
+        let (headers, sent) = self.auth.headers();
+        match self.post_once(message, timeout, sink, &headers) {
+            Err(error)
+                if error.downcast_ref::<AuthRequired>().is_some()
+                    && sent
+                        .as_deref()
+                        .is_some_and(|stale| self.auth.refresh(stale)) =>
+            {
+                let (headers, _) = self.auth.headers();
+                self.post_once(message, timeout, sink, &headers)
+            }
+            other => other,
+        }
+    }
+
+    fn replies_on_stream(&self) -> bool {
+        self.sse
+    }
+
+    fn after_initialize(self: Arc<Self>, _version: &str, shared: Arc<Shared>) {
+        // Legacy SSE opened its stream before `initialize`; streamable HTTP opens it here.
+        if self.sse {
+            return;
+        }
+        let name = format!("mcp-{}-listen", self.server);
+        let _ = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || self.listen(shared, None));
+    }
+
+    fn set_protocol(&self, version: &str) {
+        *self.protocol.lock().unwrap_or_else(|e| e.into_inner()) = Some(version.to_owned());
+    }
+
+    fn auth_challenge(&self) -> Option<String> {
+        self.auth.challenge()
+    }
+
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Spec: a client that is done with a session SHOULD end it. Best effort, off the caller.
+        let Some(session) = self.session() else {
+            return;
+        };
+        let (agent, url, headers) = (
+            self.agent.clone(),
+            self.url.clone(),
+            self.auth.headers_stored(),
+        );
+        let _ = std::thread::Builder::new()
+            .name(format!("mcp-{}-close", self.server))
+            .spawn(move || {
+                let mut request = agent
+                    .delete(&url)
+                    .header("Mcp-Session-Id", session.as_str());
+                for (name, value) in &headers {
+                    request = request.header(name.as_str(), value.as_str());
+                }
+                let _ = request
+                    .config()
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    .build()
+                    .call();
+            });
+    }
+}
+
+/// A JSON-RPC batch is an array; anything else is one message.
+pub(super) fn flatten(value: Value) -> Vec<Value> {
+    match value {
+        Value::Array(items) => items,
+        other => vec![other],
+    }
+}
+
+/// Reads server-sent events as they arrive, calling `on_event(event_name, data)` per event (the
+/// name defaults to `message`; multi-line data is joined with newlines). Stops when it returns
+/// false or the stream ends. Comments and fields other than `event`/`data` are ignored.
+pub(super) fn read_events(
+    mut reader: impl BufRead,
+    on_event: &mut dyn FnMut(&str, &str) -> bool,
+) -> std::io::Result<()> {
+    let mut event = String::new();
+    let mut data: Vec<String> = Vec::new();
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        raw.clear();
+        // Bounded: a server that never sends a newline cannot grow this buffer without limit.
+        let read = (&mut reader)
+            .take(MAX_EVENT_LINE + 1)
+            .read_until(b'\n', &mut raw)?;
+        if read as u64 > MAX_EVENT_LINE && !raw.ends_with(b"\n") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "server-sent event line is too long",
+            ));
+        }
+        let line = std::str::from_utf8(&raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let text = line.trim_end_matches(['\r', '\n']);
+        if read == 0 || text.is_empty() {
+            if !data.is_empty() {
+                let name = if event.is_empty() { "message" } else { &event };
+                if !on_event(name, &data.join("\n")) {
+                    return Ok(());
+                }
+            }
+            data.clear();
+            event.clear();
+            if read == 0 {
+                return Ok(());
+            }
+        } else if let Some(rest) = text.strip_prefix("data:") {
+            data.push(rest.strip_prefix(' ').unwrap_or(rest).to_owned());
+        } else if let Some(rest) = text.strip_prefix("event:") {
+            event = rest.trim().to_owned();
+        }
+    }
+}
+
+/// The JSON `data:` payloads of a complete server-sent-event body, in order. Non-JSON events are skipped.
+#[cfg(test)]
+pub fn parse_sse(body: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let _ = read_events(body.as_bytes(), &mut |_, data| {
+        if let Ok(value) = serde_json::from_str::<Value>(data) {
+            out.push(value);
+        }
+        true
+    });
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sse_events_join_data_lines_and_skip_noise() {
+        let body = ": keep-alive\nevent: message\ndata: {\"id\":1,\ndata: \"result\":{}}\n\ndata: not json\n\ndata:{\"id\":2}\n";
+        assert_eq!(
+            parse_sse(body),
+            vec![json!({"id":1,"result":{}}), json!({"id":2})]
+        );
+    }
+
+    #[test]
+    fn sse_event_names_reach_the_callback_and_crlf_is_accepted() {
+        let body = "event: endpoint\r\ndata: /messages?session=1\r\n\r\ndata: {\"a\":1}\r\n\r\n";
+        let mut seen = Vec::new();
+        read_events(body.as_bytes(), &mut |event, data| {
+            seen.push((event.to_owned(), data.to_owned()));
+            true
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                ("endpoint".to_owned(), "/messages?session=1".to_owned()),
+                ("message".to_owned(), "{\"a\":1}".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn urls_must_be_https_or_loopback() {
+        for ok in [
+            "https://mcp.example.com/mcp",
+            "http://localhost:8080/mcp",
+            "http://127.0.0.1:1/x",
+        ] {
+            assert!(validate_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://example.com/mcp",
+            "ftp://x/y",
+            "mcp.example.com",
+            "file:///etc/passwd",
+            "https://",
+        ] {
+            assert!(validate_url(bad).is_err(), "{bad}");
+        }
+    }
+}
