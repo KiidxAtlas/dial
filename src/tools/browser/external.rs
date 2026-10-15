@@ -576,6 +576,9 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("accept");
             assert_eq!(read_frame(&mut stream), json!({ "hello": {} }));
             write_frame(&mut stream, &json!({ "welcome": { "ops": ["browser"] } }));
+            // Dial closes its tracked tab on drop: read that frame, then hang up so the drop
+            // sees EOF instead of waiting out a request timeout.
+            let _ = read_frame(&mut stream);
         });
 
         let mut session = tern_session(&path);
@@ -593,6 +596,7 @@ mod tests {
             error.contains("does not advertise the \"fork\" op"),
             "{error}"
         );
+        drop(session);
         server.join().expect("server");
     }
 }

@@ -44,8 +44,9 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
       - name: Test
-        # Process-level fixtures also exercise HOME/PATH configuration; keep their environment deterministic.
-        run: cargo test --locked -- --test-threads=1
+        # Parallel: tests that change process HOME/PATH hold a shared lock; process fixtures set
+        # their environment per child. Serial execution made the lib tests ~4x slower.
+        run: cargo test --locked
       - name: Install executable and verify artifact contracts
         timeout-minutes: 10
         run: |

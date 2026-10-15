@@ -82,12 +82,18 @@ pub(crate) fn serve(scripts: Vec<Script>) -> Fake {
     let url = format!("http://{}", listener.local_addr().expect("addr"));
     let handle = std::thread::spawn(move || {
         let mut seen = Vec::new();
+        let mut responders = Vec::new();
         for script in scripts {
             let Ok((mut stream, _)) = listener.accept() else {
                 break;
             };
             seen.push(read_request(&mut stream));
-            respond(&mut stream, script);
+            // Each connection gets its own responder: a stalled script must not queue the
+            // client's retry behind it, or the retry's own deadline races the stall.
+            responders.push(std::thread::spawn(move || respond(&mut stream, script)));
+        }
+        for responder in responders {
+            responder.join().expect("fake responder");
         }
         seen
     });

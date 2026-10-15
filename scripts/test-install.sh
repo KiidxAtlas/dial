@@ -92,17 +92,50 @@ case "$1 $2" in
     *) exit 1 ;;
 esac
 SH
-chmod +x "$test_root/bin/uname" "$test_root/bin/curl" "$test_root/bin/gh"
-export PATH="$test_root/bin:$PATH" FIXTURES="$test_root/releases" TMPDIR="$test_root/temp"
+cat > "$test_root/bin/libressl" <<'SH'
+#!/bin/sh
+# Stands in for macOS LibreSSL: no Ed25519 `pkeyutl -rawin`.
+echo 'usage: pkeyutl [-verify] [-sign] [-inkey file]' >&2
+exit 1
+SH
+chmod +x "$test_root/bin/uname" "$test_root/bin/curl" "$test_root/bin/gh" "$test_root/bin/libressl"
+# The installer edits shell profiles; keep HOME inside the fixture.
+export PATH="$test_root/bin:$PATH" FIXTURES="$test_root/releases" TMPDIR="$test_root/temp" \
+    HOME="$test_root/home" SHELL=/bin/zsh
+mkdir -p "$HOME"
 export FAKE_OS=Darwin FAKE_ARCH=arm64 DIAL_INSTALL_DIR="$test_root/mac/bin"
 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/mac.log"
  [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0' ]
+mac_path_line="export PATH=\"$DIAL_INSTALL_DIR:\$PATH\""
+[ "$(grep -Fxc "$mac_path_line" "$HOME/.zshrc")" = 1 ] || { echo 'PATH was not added to ~/.zshrc' >&2; exit 1; }
+bash "$root/scripts/install.sh" v0.1.0 > "$test_root/mac-again.log"
+[ "$(grep -Fxc "$mac_path_line" "$HOME/.zshrc")" = 1 ] || { echo 'Reinstall duplicated the PATH line' >&2; exit 1; }
 export FAKE_OS=Darwin FAKE_ARCH=x86_64 DIAL_INSTALL_DIR="$test_root/intel/bin"
 bash "$root/scripts/install.sh" latest > "$test_root/intel.log"
  [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0' ]
 export FAKE_OS=Linux FAKE_ARCH=x86_64 DIAL_INSTALL_DIR="$test_root/linux/bin"
 bash "$root/scripts/install.sh" latest > "$test_root/linux.log"
  [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0' ]
+[ ! -e "$HOME/.bashrc" ] && [ ! -e "$HOME/.profile" ] || { echo 'A zsh install edited another profile' >&2; exit 1; }
+SHELL=/bin/bash DIAL_NO_MODIFY_PATH=1 DIAL_INSTALL_DIR="$test_root/unlisted/bin" \
+    bash "$root/scripts/install.sh" v0.1.0 > "$test_root/no-path.log"
+[ ! -e "$HOME/.bashrc" ] || { echo 'DIAL_NO_MODIFY_PATH=1 edited ~/.bashrc' >&2; exit 1; }
+grep -Fq "Add $test_root/unlisted/bin to your PATH" "$test_root/no-path.log"
+# Without OpenSSL 3 (stock macOS), the SHA-256 checksum still gates installation.
+export FAKE_OS=Darwin FAKE_ARCH=arm64 DIAL_INSTALL_DIR="$test_root/nosig/bin" DIAL_OPENSSL="$test_root/bin/libressl"
+bash "$root/scripts/install.sh" v0.1.0 > "$test_root/nosig.log" 2> "$test_root/nosig.err"
+ [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0' ]
+grep -q 'release signature is not checked' "$test_root/nosig.err"
+cp "$DIAL_INSTALL_DIR/dial" "$test_root/nosig-original"
+if TAMPER=1 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/nosig-tamper.log" 2>&1; then
+    echo 'Tampered archive was accepted without OpenSSL 3' >&2; exit 1
+fi
+if DIAL_REQUIRE_SIGNATURE=1 bash "$root/scripts/install.sh" v0.1.0 > "$test_root/nosig-required.log" 2>&1; then
+    echo 'DIAL_REQUIRE_SIGNATURE=1 installed without signature verification' >&2; exit 1
+fi
+cmp "$DIAL_INSTALL_DIR/dial" "$test_root/nosig-original"
+unset DIAL_OPENSSL
+export FAKE_OS=Linux FAKE_ARCH=x86_64
 export FAKE_GH_AUTH=1 PRIVATE_REPO=1 DIAL_INSTALL_DIR="$test_root/private/bin"
 bash "$root/scripts/install.sh" latest > "$test_root/private.log"
  [ "$("$DIAL_INSTALL_DIR/dial" --version)" = 'dial 0.1.0' ]
@@ -129,4 +162,4 @@ if bash "$root/scripts/install.sh" v0.1.0 > "$test_root/platform.log" 2>&1; then
     echo 'Unsupported native Windows was accepted' >&2; exit 1
 fi
 [ ! -e "$DIAL_INSTALL_DIR/dial" ]
-echo 'Installer tests passed: Apple Silicon/Intel macOS, Linux/WSL target selection, latest version, authenticated private downloads and access denial, tamper rejection, no overwrite on failure, unsafe manifest/version/platform rejection.'
+echo 'Installer tests passed: Apple Silicon/Intel macOS, Linux/WSL target selection, latest version, authenticated private downloads and access denial, tamper rejection with and without OpenSSL 3, required-signature refusal, shell profile PATH setup (idempotent, opt-out), no overwrite on failure, unsafe manifest/version/platform rejection.'

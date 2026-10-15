@@ -10,7 +10,7 @@ curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.s
 
 Published targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`. The Windows archive is `dial-<tag>-x86_64-pc-windows-msvc.zip` containing `dial.exe`; install it with the release's `install.ps1` in Windows PowerShell 5.1 or PowerShell 7 (one-line commands in [windows.md](windows.md)).
 
-The published installers (`install.sh` and `install.ps1`) embed the release's Ed25519 public key, select the host target, verify the detached signature over `SHA256SUMS`, and check the archive digest before extraction. `install.sh` installs into `~/.local/bin` (override with `DIAL_INSTALL_DIR`), validates the binary version before and after activation, and restores the previous executable if activation fails. Add the directory to `PATH`. For a pinned version, download `install.sh` and pass a tag such as `v0.1.1` to it. Release archives include `LICENSE`, `THIRD_PARTY_NOTICES`, and the Silver/Unscii font notices.
+The published installers (`install.sh` and `install.ps1`) embed the release's Ed25519 public key, select the host target, and check the archive digest against `SHA256SUMS` before extraction. `install.ps1` always verifies the detached signature over `SHA256SUMS`. `install.sh` verifies it whenever OpenSSL 3 is available (on `PATH`, Homebrew's `openssl@3`, or `DIAL_OPENSSL`); stock macOS ships LibreSSL, which cannot verify Ed25519, so without OpenSSL 3 the script prints a notice and relies on the HTTPS-fetched checksum alone. Set `DIAL_REQUIRE_SIGNATURE=1` to refuse installation instead. `install.sh` installs into `~/.local/bin` (override with `DIAL_INSTALL_DIR`), validates the binary version before and after activation, and restores the previous executable if activation fails. When the directory is not on `PATH`, it appends one `export PATH=…` line (`fish_add_path` for fish) to the login shell's profile (`~/.zshrc`, `~/.bash_profile` on macOS bash, `~/.bashrc` on Linux bash, otherwise `~/.profile`), once; `DIAL_NO_MODIFY_PATH=1` prints the line instead. For a pinned version, download `install.sh` and pass a tag such as `v0.1.1` to it. Release archives include `LICENSE`, `THIRD_PARTY_NOTICES`, and the Silver/Unscii font notices.
 
 `dial update` checks the GitHub latest release (or `dial update --version 0.1.1`), verifies the same signed manifest and asset digest, stages on the install filesystem, checks `--version`, and atomically activates the binary with rollback. Windows uses a deferred PowerShell swap after the running process exits. Homebrew, Cargo, and Nix-managed installations are left to their package managers; the command prints the matching update instruction.
 
@@ -47,14 +47,13 @@ For the terminal installer:
 
 ```sh
 curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
 dial
 ```
 
 When GitHub CLI is installed and signed in, the installer downloads through it; otherwise it uses
 plain HTTPS. Complete the platform prerequisites below before installing.
 
-The installer selects the correct archive, verifies the Ed25519 signature on `SHA256SUMS` against the release public key embedded in the published `install.sh`, then verifies the archive's SHA-256 before installing. `install.ps1` does the same with the key embedded in it.
+The installer selects the correct archive, verifies the Ed25519 signature on `SHA256SUMS` against the release public key embedded in the published `install.sh` (when OpenSSL 3 is available; see above), then verifies the archive's SHA-256 before installing. `install.ps1` does the same with the key embedded in it.
 Run `bash install.sh v0.1.1` to select a specific release. On Windows, run the release's `install.ps1` in PowerShell for the native `dial.exe` (commands in [windows.md](windows.md)), or run the Linux commands in your WSL2 Ubuntu terminal; the PowerShell command in the WSL2 section below installs WSL2 first.
 
 ### macOS (Apple Silicon or Intel)
@@ -194,6 +193,6 @@ required Linux sandbox probes), builds Apple Silicon/Intel Mac and Linux x86-64 
 and smoke-tests each extracted archive outside the checkout. Only after **all four**
 platform builds (macOS arm64, macOS Intel, Linux x86-64 and Windows x86-64) pass does it create a GitHub release with the archives, bundled MIT
 license and README, a combined `SHA256SUMS` with its `SHA256SUMS.sig` signature, and
-generated notes. CI runs on both macOS and Ubuntu without weakening host security. The Windows release job and the CI `installer-windows` job run `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7; the release job also tests the packaged archive. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS` and `SHA256SUMS.sig`.
+generated notes. CI runs on both macOS and Ubuntu without weakening host security. The Rust test suite gates the macOS and Linux builds only; the Windows release job builds `dial.exe`, smoke-tests the packaged archive (`--version`, `--help`), and runs `scripts/test-install.ps1` under Windows PowerShell 5.1 and PowerShell 7, as does the CI `installer-windows` job. The publish job builds `install.ps1` with the release key embedded and publishes it with `SHA256SUMS` and `SHA256SUMS.sig`.
 The workflow preserves repository visibility. Dial is MIT licensed; see `LICENSE` for
 permission to use, modify, and redistribute it.

@@ -5,7 +5,7 @@ A local-first coding agent harness for macOS, Linux and Windows (native or throu
 Standalone: no dependency on any external agent harness or hosted service. Rust control plane and tools; Python for local MLX inference/training (`mlx-lm`, plus `mlx-vlm` for vision).
 
 Inspect the executable you are actually running with `dial --version` (compiled revision and
-build-time dirty state) or `dial --build-info` (JSON including target, profile, build time and
+whether its compiled sources differed from that revision at build time) or `dial --build-info` (JSON including target, profile, build time and
 actual executable path). This does not read runtime configuration or contact a model. Builds
 without Git metadata report `unknown`; release/archive builders can set `DIAL_BUILD_REVISION`
 and `SOURCE_DATE_EPOCH` explicitly. Rebuild/restart to pick up source changes.
@@ -22,12 +22,13 @@ macOS and Linux:
 
 ```sh
 curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
-dial --version
 ```
 
-The installers verify the Ed25519 signature on `SHA256SUMS` and the archive digest before
-installing. Windows (PowerShell 5.1 or 7; no OpenSSL or admin rights needed):
+The installer adds `~/.local/bin` to your shell profile when it is not already on `PATH`
+(`DIAL_NO_MODIFY_PATH=1` skips this). It checks the archive's SHA-256 against the release's
+`SHA256SUMS`, and also verifies that file's Ed25519 signature when OpenSSL 3 is available
+(`brew install openssl@3` on macOS; `DIAL_REQUIRE_SIGNATURE=1` makes the signature mandatory).
+Windows (PowerShell 5.1 or 7; no OpenSSL or admin rights needed):
 
 ```powershell
 irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 | iex

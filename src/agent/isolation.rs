@@ -466,7 +466,8 @@ impl Isolated {
         }
         if !merge.changed.is_empty() || !merge.errors.is_empty() {
             merge.recovery_reason = Some(reason.to_owned());
-            merge.kept = Some(self.dir.keep());
+            let sub = self.kept_subdir();
+            merge.kept = Some(self.dir.keep().join(sub));
         }
         release_link(link, &mut merge);
         merge
@@ -496,7 +497,8 @@ impl Isolated {
                 });
                 merge.recovery_reason = Some("could not inspect worker changes".into());
                 merge.interrupted = cancel.load(Ordering::SeqCst);
-                merge.kept = Some(self.dir.keep());
+                let sub = self.kept_subdir();
+                merge.kept = Some(self.dir.keep().join(sub));
                 return merge;
             }
         };
@@ -509,7 +511,8 @@ impl Isolated {
             merge.interrupted = true;
             merge.recovery_reason = Some("worker interrupted before merge".into());
             if !merge.changed.is_empty() {
-                merge.kept = Some(self.dir.keep());
+                let sub = self.kept_subdir();
+                merge.kept = Some(self.dir.keep().join(sub));
             }
             return merge;
         }
@@ -566,9 +569,22 @@ impl Isolated {
         }
         if !merge.conflicts.is_empty() || !merge.errors.is_empty() {
             merge.recovery_reason = Some("unmerged changes".into());
-            merge.kept = Some(self.dir.keep());
+            let sub = self.kept_subdir();
+            merge.kept = Some(self.dir.keep().join(sub));
         }
         merge
+    }
+
+    /// Where the worker's files sit inside the kept directory: the copy root, the worktree's
+    /// `work`, or an overlay's `upper` layer (the view itself is unmounted on release).
+    fn kept_subdir(&self) -> PathBuf {
+        let dir = fs::canonicalize(self.dir.path()).unwrap_or_else(|_| self.dir.path().into());
+        let files =
+            fs::canonicalize(self.source_root()).unwrap_or_else(|_| self.source_root().into());
+        files
+            .strip_prefix(&dir)
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
     }
 }
 

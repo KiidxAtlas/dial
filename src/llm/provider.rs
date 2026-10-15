@@ -3958,7 +3958,7 @@ mod tests {
         let ping = anthropic_sse(&[json!({"type":"ping"})]);
         for first in [None, Some(anthropic_sse(&events[..1]))] {
             let mut pieces = vec![first.unwrap_or_default()];
-            pieces.extend(std::iter::repeat_n(ping.clone(), 20));
+            pieces.extend(std::iter::repeat_n(ping.clone(), 100));
             let server = fake::serve(vec![
                 Script::SseSlow {
                     pieces,
