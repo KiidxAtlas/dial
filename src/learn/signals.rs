@@ -202,6 +202,22 @@ mod tests {
     #[test]
     fn outside_a_repository_nothing_is_tracked() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(head(&git_in(dir.path())).is_none());
+        // Temp directories can live inside another checkout, and git's ceiling does not stop the
+        // lookup at the directory itself. An explicit GIT_DIR naming no repository makes this
+        // probe fail without discovery, leaving the parent checkout out of the picture.
+        let git = |args: &[&str]| -> Option<String> {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .env("GIT_DIR", dir.path().join(".git"))
+                .args(args)
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8(output.stdout).ok())?
+        };
+        assert!(head(&git).is_none());
     }
 }

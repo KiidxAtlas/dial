@@ -790,6 +790,9 @@ fn request_body(
     let mut body = json!({
         "model": model_label,
         "messages": req.messages,
+        // Some OpenAI-compatible servers validate even tool-free maintenance requests
+        // against a required array field. Never send null or rely on their default.
+        "tools": req.tools,
         "temperature": req.temperature,
         "max_tokens": req.max_tokens,
         "stream": streaming,
@@ -802,9 +805,6 @@ fn request_body(
     }
     if streaming {
         body["stream_options"] = json!({ "include_usage": true });
-    }
-    if !req.tools.is_empty() {
-        body["tools"] = Value::Array(req.tools.clone());
     }
     if let Some(seed) = req.seed {
         body["seed"] = json!(seed);
@@ -1408,10 +1408,7 @@ mod tests {
         assert_eq!(sent["seed"], 9);
         assert_eq!(sent["stream"], false);
         assert_eq!(sent["max_tokens"], 16);
-        assert!(
-            sent.get("tools").is_none(),
-            "empty tool list must be omitted"
-        );
+        assert_eq!(sent.get("tools"), Some(&json!([])));
     }
 
     #[test]
@@ -1696,6 +1693,7 @@ mod net_tests {
         let sent = fake::body(&request);
         assert_eq!(sent["stream"], true);
         assert_eq!(sent["stream_options"]["include_usage"], true);
+        assert_eq!(sent.get("tools"), Some(&json!([])));
     }
 
     #[test]

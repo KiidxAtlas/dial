@@ -638,7 +638,11 @@ pub fn strict_parameters(schema: &Value) -> Option<Value> {
     Some(schema)
 }
 pub fn constrain_openai(body: &mut Value, profile: &llm::profiles::ModelProfile) {
-    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+    if let Some(tools) = body
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .filter(|tools| !tools.is_empty())
+    {
         for tool in tools {
             if profile.capabilities.strict_tools
                 && let Some(parameters) = strict_parameters(&tool["function"]["parameters"])
@@ -871,6 +875,17 @@ mod tests {
             )
             .is_none()
         );
+    }
+    #[test]
+    fn tool_free_maintenance_requests_do_not_gain_tool_execution_controls() {
+        let mut profile = llm::profiles::ModelProfile::default();
+        profile.capabilities.strict_tools = true;
+        profile.capabilities.parallel_tool_calls = Some(false);
+        for mut body in [json!({"tools":[]}), json!({})] {
+            let before = body.clone();
+            constrain_openai(&mut body, &profile);
+            assert_eq!(body, before);
+        }
     }
     #[test]
     fn recovery_counts_failed_rounds_and_only_progress_resets_them() {

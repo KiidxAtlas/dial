@@ -19,13 +19,13 @@ use parking_lot::{Condvar, Mutex};
 
 use super::error::{CoreResult, DesktopError};
 
-#[cfg(target_os = "linux")]
+#[cfg(dial_desktop_linux)]
 mod linux;
-#[cfg(target_os = "macos")]
+#[cfg(dial_desktop_macos)]
 mod macos;
-#[cfg(windows)]
+#[cfg(dial_desktop_windows)]
 mod windows;
-#[cfg(target_os = "macos")]
+#[cfg(dial_desktop_macos)]
 pub(crate) use macos::SYNTHETIC_EVENT_TAG;
 
 #[derive(Default)]
@@ -33,7 +33,7 @@ struct CancellationState {
     generation: AtomicU64,
     state: Mutex<Option<Arc<ControlLease>>>,
     wake: Condvar,
-    #[cfg(target_os = "linux")]
+    #[cfg(dial_desktop_linux)]
     async_wake: tokio::sync::Notify,
 }
 
@@ -54,7 +54,7 @@ impl CancellationSource {
         let _state = self.0.state.lock();
         self.0.generation.fetch_add(1, Ordering::AcqRel);
         self.0.wake.notify_all();
-        #[cfg(target_os = "linux")]
+        #[cfg(dial_desktop_linux)]
         self.0.async_wake.notify_waiters();
     }
 
@@ -64,7 +64,7 @@ impl CancellationSource {
             let mut state = self.0.state.lock();
             self.0.generation.fetch_add(1, Ordering::AcqRel);
             self.0.wake.notify_all();
-            #[cfg(target_os = "linux")]
+            #[cfg(dial_desktop_linux)]
             self.0.async_wake.notify_waiters();
             state.take()
         };
@@ -135,7 +135,7 @@ impl OperationToken {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(dial_desktop_linux)]
     pub(crate) async fn cancelled(&self) -> DesktopError {
         loop {
             let notified = self.source.0.async_wake.notified();
@@ -178,12 +178,12 @@ impl Drop for OperationScope {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(dial_desktop_linux)]
 pub(crate) fn is_cleaning_up() -> bool {
     CLEANUP.get()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(dial_desktop_linux)]
 pub(crate) fn current_token() -> Option<OperationToken> {
     if CLEANUP.get() {
         None
@@ -258,7 +258,7 @@ pub(crate) fn key_modifiers(keys: &[super::keys::KeyName]) -> super::backend::Mo
 }
 
 /// Merge modifier options into the already-owned arbitrary-key gesture list.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(dial_desktop_macos, dial_desktop_windows))]
 pub(crate) fn add_modifiers(
     keys: &mut Vec<super::keys::KeyName>,
     modifiers: super::backend::Modifiers,
@@ -282,10 +282,10 @@ pub(crate) fn with_token_for_test<T>(token: &OperationToken, action: impl FnOnce
     action()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(dial_desktop_macos)]
 static USER_ACTIVITY: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(target_os = "macos")]
+#[cfg(dial_desktop_macos)]
 pub(crate) fn user_activity() -> u64 {
     USER_ACTIVITY.load(Ordering::Acquire)
 }
@@ -317,29 +317,29 @@ fn busy() -> DesktopError {
 /// on the same thread that acquired it, even when the session is disposed from
 /// another host thread. Closing/crashing the process releases the OS resource.
 struct ControlLease {
-    #[cfg(target_os = "macos")]
+    #[cfg(dial_desktop_macos)]
     _escape: Option<macos::EscapeMonitor>,
-    #[cfg(windows)]
+    #[cfg(dial_desktop_windows)]
     _escape: Option<windows::EscapeMonitor>,
-    #[cfg(target_os = "linux")]
+    #[cfg(dial_desktop_linux)]
     _escape: Option<linux::EscapeMonitor>,
     _kernel: KernelOwner,
     running: AtomicBool,
 }
 
 impl ControlLease {
-    fn acquire(source: &CancellationSource) -> CoreResult<Self> {
+    fn acquire(_source: &CancellationSource) -> CoreResult<Self> {
         let kernel = KernelOwner::acquire()?;
-        #[cfg(target_os = "macos")]
-        let escape = macos::EscapeMonitor::start(EmergencyStop(Arc::downgrade(&source.0)))?;
-        #[cfg(windows)]
-        let escape = windows::EscapeMonitor::start(EmergencyStop(Arc::downgrade(&source.0)))?;
-        #[cfg(target_os = "linux")]
-        let escape = linux::EscapeMonitor::start(EmergencyStop(Arc::downgrade(&source.0)))?;
+        #[cfg(dial_desktop_macos)]
+        let escape = macos::EscapeMonitor::start(EmergencyStop(Arc::downgrade(&_source.0)))?;
+        #[cfg(dial_desktop_windows)]
+        let escape = windows::EscapeMonitor::start(EmergencyStop(Arc::downgrade(&_source.0)))?;
+        #[cfg(dial_desktop_linux)]
+        let escape = linux::EscapeMonitor::start(EmergencyStop(Arc::downgrade(&_source.0)))?;
         Ok(Self {
-            #[cfg(any(target_os = "macos", windows))]
+            #[cfg(any(dial_desktop_macos, dial_desktop_windows))]
             _escape: Some(escape),
-            #[cfg(target_os = "linux")]
+            #[cfg(dial_desktop_linux)]
             _escape: escape,
             _kernel: kernel,
             running: AtomicBool::new(false),
@@ -586,6 +586,7 @@ mod tests {
     /// not depend on an interactive desktop or Accessibility permissions.
     fn grant_for_test(source: &CancellationSource) {
         let owner = ControlLease {
+            #[cfg(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
             _escape: None,
             _kernel: KernelOwner::acquire().expect("test kernel owner"),
             running: AtomicBool::new(false),

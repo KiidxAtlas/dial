@@ -27,7 +27,7 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
         steps: u32,
     ) -> Result<TurnReport> {
-        let text = "Context compacted; continuation is paused by compaction policy or its recovery band. Resume explicitly when ready; unfinished work remains in the session.".to_owned();
+        let text = "Context compacted; continuation is paused by compaction policy or because the next request is still at the compaction trigger. Resume explicitly when ready; unfinished work remains in the session.".to_owned();
         self.save_request_policy(None, json!({"state":"paused after compaction","auto_continue":self.config.compaction.auto_continue}), ui)?;
         ui.notice(&text);
         Ok(TurnReport {
@@ -347,8 +347,9 @@ impl<'a> Agent<'a> {
             );
         }
         let previous = self.projected_request(&current, template)?;
+        let previous_tokens = self.projected_tokens(&previous);
         ensure!(
-            remaining < self.projected_tokens(&previous),
+            remaining < previous_tokens,
             "compaction would not reduce the actual next projected request; no compaction was committed"
         );
         {
@@ -438,14 +439,19 @@ impl<'a> Agent<'a> {
             compaction::request_tokens_with_policy(&projected, &self.config.compaction, identity);
         self.context_meter
             .rebase(estimate, self.session.message_count());
+        // Both sides must use the same final projection and provider calibration. The prepared
+        // estimate excludes live growth/notes and is not comparable to `remaining`.
+        prepared.outcome.tokens_before = previous_tokens;
         prepared.outcome.tokens_after = remaining;
         prepared.outcome.retained_messages += growth.len();
+        // Hysteresis gates speculative results above, not a successfully reduced foreground
+        // request. Pausing inside that band needlessly interrupts work that can safely dispatch
+        // without immediately triggering another compaction.
         prepared.outcome.continue_allowed = remaining
-            <= compaction::continue_band(
-                self.config
-                    .compaction
-                    .effective_threshold(identity, self.budget_window())?,
-            )
+            < self
+                .config
+                .compaction
+                .effective_threshold(identity, self.budget_window())?
             && self.config.compaction.auto_continue
             && !options.suppress_continuation
             && options.reason != compaction::CompactionReason::Idle

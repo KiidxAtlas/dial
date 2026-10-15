@@ -148,7 +148,7 @@ With Rust and a C toolchain installed (Xcode Command Line Tools on macOS;
 `build-essential` on Ubuntu), clone this repository and run:
 
 ```sh
-cargo install --path . --locked
+make update
 cd ~/code/my-project
 dial                                  # native terminal UI; first run opens model/provider setup
 dial "fix the failing test in src/lib.rs"   # interactive, opening with a message
@@ -157,9 +157,9 @@ dial -c                               # continue the latest session   (-r <id-pr
 ```
 
 To rebuild after changing this checkout, run `make update` here (or `make -C /path/to/dial update`).
-This runs `cargo build --profile local --locked`: an optimized, incremental build without the shipping profile's thin LTO. It copies the binary to `bin/dial` in this checkout (git-ignored), and installs it over the `dial` your PATH resolves to (or `~/.local/bin/dial` if none), also refreshing `~/.cargo/bin/dial` when present. Previous copies are kept as `dial.bak-<stamp>` (three most recent). Use `make update PROFILE=release` for shipping-equivalent optimization; published releases and `cargo install` still use the unchanged release profile.
-`cargo install --path .`
-installs into Cargo's bin directory instead. `command -v dial` shows which copy your terminal
+This runs `cargo build --bin dial --profile local --locked --timings`: an incremental build without the shipping profile's thin LTO. Dependencies stay optimized at level 2; Dial itself uses level 1 and more parallel codegen to reduce rebuild time. Published releases and `cargo install` still use the unchanged release profile. It copies the binary to `bin/dial` in this checkout (git-ignored), and installs it over the `dial` your PATH resolves to (or `~/.local/bin/dial` if none), also refreshing `~/.cargo/bin/dial` when present. Previous copies are kept as `dial.bak-<stamp>` (three most recent). Use `make update PROFILE=release` for shipping-equivalent optimization.
+`cargo install --path . --locked` remains available when you specifically want a release build
+installed into Cargo's bin directory instead. `command -v dial` shows which copy your terminal
 will run, and `make help` lists the other build and check targets. Restart any running dial
 session afterward. See `ARCHITECTURE.md` for the module layout.
 
@@ -170,6 +170,33 @@ process/API fixtures; `make test` still runs the full Rust suite. Tests use the
 usual dev profile, so these commands share its build cache. `make build` uses the
 optimized `local` profile; its first build creates a separate cache in
 `target/local`, with subsequent edits benefiting from incremental compilation.
+
+### Faster builds and optional integrations
+
+```sh
+make update                         # all capabilities, faster local compilation
+make update SLIM=1                  # omit optional integrations
+make update SLIM=1 FEATURES=aws      # slim, but keep the AWS credential chain / SigV4
+make build SLIM=1 FEATURES=desktop   # slim, but keep native desktop control
+make check SLIM=1                   # typecheck the same feature selection
+```
+
+Default builds retain voice, embedded shell, native desktop control and AWS support.
+Slim builds omit these optional integrations, retaining the external shell, browser,
+coding tools and non-AWS model providers. Bedrock bearer-token authentication remains
+available; AWS credential-chain/SigV4 authentication requires `FEATURES=aws`. Native
+desktop operations require `FEATURES=desktop`; the `voice` and `embedded-shell` features
+can also be restored individually. Use a quoted, comma-separated list for several,
+for example `FEATURES='aws,desktop'`. Missing optional capabilities report an explicit
+error rather than silently succeeding. Select the same flags on subsequent updates.
+
+Builds automatically write Cargo's timing report to
+`target/cargo-timings/cargo-timing.html`. Keep `target` between builds: the first build
+of a profile or feature selection compiles its dependencies, and switching toolchains
+or features can invalidate cached work. `CARGO_TARGET_DIR=/path/to/cache make update`
+uses that persistent cache for both compilation and installation; its timing report
+is under that directory instead. No clean step or toolchain update is part of `make update`.
+For a compile-only, unoptimized development binary, use `make build PROFILE=dev`.
 
 For local MLX you can also prepare the runtime and model explicitly:
 `dial setup -m mlx-community/Qwen2.5-7B-Instruct-4bit` (requires `uv`).

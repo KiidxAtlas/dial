@@ -35,6 +35,41 @@ session recovery and concurrent edits are covered separately by terminal/transac
 Provider runs may consume quota. Report infrastructure failures separately, and never infer
 model quality, dollar cost, or a provider cache hit from a scripted run or a missing usage counter.
 
+### Repeated outcomes, not best-run scores
+
+Use the existing machine-configuration runner with `[machine] repetitions = 3` (1–10)
+and `minimum_correctness = 1.0` in the configuration file below, then analyze its actual report:
+
+```sh
+dial benchmark examples/benchmarks/quality.toml --profiles machine.toml --report quality-repeated.json
+python3 examples/benchmarks/reliability.py quality-repeated.json --output quality-reliability.json
+```
+
+The offline analyzer requires matching task/source hashes, complete repetition sets, and
+outcome-check evidence. It reports per-task success frequency and Wilson intervals, empirical
+all-trials/any-trial task fractions, unavailable checks, agent errors, tool calls/errors, repair
+attempts, and observed tokens. Unavailable trials stay in the denominator; unknown usage stays
+null. Latency ratios use only tasks passing every trial in both configurations. Exit status 1
+means an observed per-task correctness-frequency regression against the named baseline, not a
+statistical significance claim. Existing summary files are never overwritten.
+
+These are descriptive measurements, not independent `pass@k`/`pass^k` estimates or proof that a
+small sample generalizes. Metric-only/manual-review tasks are excluded from checked correctness.
+Keep model/configuration and fixture versions fixed when comparing harness revisions, and inspect
+traces and final patches for output quality that executable checks do not capture. The underlying
+runner already isolates each task and repetition; this analyzer does not launch more model calls.
+
+To exercise the real repeated-run/reporting path without credentials or a remote model:
+
+```sh
+python3 examples/benchmarks/smoke.py --dial ./target/debug/dial --suite recovery --machine-repetitions 2
+python3 -m unittest discover -s examples/benchmarks -p 'test_*.py'
+```
+
+The smoke uses a loopback scripted provider with baseline and compact-tool configurations.
+It verifies orchestration and graders, **not real-model performance**. See
+[Harness quality design](harness-quality.md) for the research rationale and interpretation rules.
+
 ## Repository benchmark suites
 
 For repeatable repository checks, create a TOML suite and run `dial bench suite.toml --report result.json`.

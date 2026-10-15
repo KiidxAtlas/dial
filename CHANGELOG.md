@@ -5,6 +5,9 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Fixed
+- The `browser` tool failed with "Chromium is not installed" when `browser.playwright_module` pointed at a Playwright whose own Chromium revision was never downloaded, even though other Chromium builds were installed. It now falls back to the newest complete Playwright build (dial's private runtime, `PLAYWRIGHT_BROWSERS_PATH`, or Playwright's per-user cache such as `~/Library/Caches/ms-playwright`) and then to an installed Chrome, Chromium or Edge. The built-in runtime also uses this fallback when its Chromium download fails, for example offline. When no browser is found, the error gives the exact `node …/cli.js install chromium` command for the configured Playwright.
+
 ## [0.1.7] - 2026-10-15
 
 Includes the changes prepared for v0.1.5 and v0.1.6, whose publication was blocked by an outdated integration test and a Windows compile error. The test now verifies that unseen-line errors provide read evidence for a direct retry; sandbox cache setup is correctly limited to non-Windows platforms.

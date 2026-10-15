@@ -55,6 +55,61 @@ impl<'a> Agent<'a> {
         !self.hermetic && self.config.efficiency.enabled && self.config.assistance.compact_tools
     }
 
+    /// Most tools that discovery (`tool_search`, harness compatibility loads) keeps active at once in compact
+    /// mode. Explicit `tool_load` pins live in `enabled_tools` and are never evicted by discovery.
+    const DISCOVERED_TOOL_LIMIT: usize = 8;
+
+    /// Working set of tools activated by discovery, least recently activated first. It is stored in the session
+    /// control state, so a resumed session restores it; pins are restored separately from `enabled_tools`.
+    pub(super) fn discovered_tools(&self) -> Vec<String> {
+        self.session.control_state()["discovered_tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Activate tools chosen by discovery. In compact discovery mode they join the bounded working set and the
+    /// oldest entries are evicted; otherwise they keep the legacy `enabled_tools` behaviour. Pinned tools are not
+    /// recorded as discovered.
+    pub(super) fn activate_tools(&mut self, names: &[String]) -> Result<()> {
+        let mut state = self.session.control_state();
+        if self.tool_discovery() {
+            let before = self.discovered_tools();
+            let mut working = before.clone();
+            for name in names {
+                if self.enabled_tools.contains(name) {
+                    continue;
+                }
+                working.retain(|existing| existing != name);
+                working.push(name.clone());
+            }
+            let excess = working.len().saturating_sub(Self::DISCOVERED_TOOL_LIMIT);
+            working.drain(..excess);
+            if working == before {
+                return Ok(());
+            }
+            state["discovered_tools"] = json!(working);
+            self.session.set_control_state(state)?;
+            self.rebuild_system();
+            return Ok(());
+        }
+        let mut enabled = self.enabled_tools.clone();
+        enabled.extend(names.iter().cloned());
+        if enabled == self.enabled_tools {
+            return Ok(());
+        }
+        let mut sorted: Vec<_> = enabled.iter().cloned().collect();
+        sorted.sort();
+        state["enabled_tools"] = json!(sorted);
+        self.session.set_control_state(state)?;
+        self.enabled_tools = enabled;
+        self.rebuild_system();
+        Ok(())
+    }
+
     /// Integrations that earn a place in every request's schema when configured: the ones a
     /// coding turn reaches for without being told. Everything else in the catalog (browser,
     /// debug adapters, kernels, archives, MCP servers, and the overlapping specialists in
@@ -138,6 +193,13 @@ impl<'a> Agent<'a> {
     pub(super) fn offered_with(&self, selection_only: bool) -> Vec<String> {
         let catalog = self.catalog();
         let discovery = self.tool_discovery();
+        let discovered = self.discovered_tools();
+        let loaded: std::collections::HashSet<String> = self
+            .enabled_tools
+            .iter()
+            .chain(discovered.iter())
+            .cloned()
+            .collect();
         let pinned = self.config.harness.tools != tools::default_tools();
         let mut names: Vec<String> = self
             .version
@@ -145,6 +207,7 @@ impl<'a> Agent<'a> {
             .tools
             .iter()
             .chain(self.enabled_tools.iter())
+            .chain(discovered.iter())
             .filter(|n| catalog.contains(n))
             .cloned()
             .collect();
@@ -185,8 +248,7 @@ impl<'a> Agent<'a> {
         // children keep them offered.
         if !(pinned || self.hermetic || selection_only) {
             names.retain(|name| {
-                !tools::DEFERRED_BY_DEFAULT.contains(&name.as_str())
-                    || self.enabled_tools.contains(name)
+                !tools::DEFERRED_BY_DEFAULT.contains(&name.as_str()) || loaded.contains(name)
             });
         }
 
@@ -224,7 +286,7 @@ impl<'a> Agent<'a> {
         {
             assistance::compact(
                 &mut names,
-                &self.enabled_tools,
+                &loaded,
                 self.config.assistance.initial_tool_limit,
                 &self.assistance.scores,
             );
@@ -262,9 +324,7 @@ impl<'a> Agent<'a> {
             names.sort();
         }
         if self.lean_tools {
-            names.retain(|name| {
-                Self::LEAN_TOOLS.contains(&name.as_str()) || self.enabled_tools.contains(name)
-            });
+            names.retain(|name| Self::LEAN_TOOLS.contains(&name.as_str()) || loaded.contains(name));
         }
         names
     }
@@ -586,6 +646,146 @@ mod default_offer_tests {
                 assert!(
                     offered.iter().any(|name| name == "memory_update"),
                     "{offered:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn discovered_working_set_is_bounded_persisted_and_separate_from_pins() {
+        with_agent("[assistance]\ncompact_tools=true", |agent| {
+            let base = agent.offered();
+            let limit = Agent::DISCOVERED_TOOL_LIMIT;
+            let candidates: Vec<String> = agent
+                .catalog()
+                .into_iter()
+                .filter(|name| {
+                    !base.contains(name) && !matches!(name.as_str(), "tool_search" | "tool_load")
+                })
+                .collect();
+            assert!(candidates.len() > limit, "{candidates:?}");
+            for name in &candidates {
+                agent.activate_tools(std::slice::from_ref(name)).unwrap();
+            }
+            let working = agent.discovered_tools();
+            assert_eq!(working.len(), limit);
+            assert_eq!(working, candidates[candidates.len() - limit..].to_vec());
+            let offered = agent.offered();
+            assert!(working.iter().all(|name| offered.contains(name)));
+            assert!(
+                !offered.contains(&candidates[0]),
+                "evicted tools stop being offered"
+            );
+            // Persisted in the session control state, which a resumed session restores from.
+            assert_eq!(
+                agent.session.control_state()["discovered_tools"],
+                json!(working)
+            );
+            // A pinned tool is never recorded as discovered and survives discovery eviction.
+            let pin = candidates[0].clone();
+            agent.enabled_tools.insert(pin.clone());
+            agent.activate_tools(std::slice::from_ref(&pin)).unwrap();
+            assert_eq!(agent.discovered_tools(), working);
+            assert!(agent.offered().contains(&pin));
+        });
+    }
+
+    #[test]
+    fn compact_discovery_pins_and_unloads_do_not_leave_hidden_activation_state() {
+        with_agent("[assistance]\ncompact_tools=true", |agent| {
+            struct Quiet;
+            impl Ui for Quiet {}
+            let name = "ast_search".to_owned();
+            agent.activate_tools(std::slice::from_ref(&name)).unwrap();
+            let mut backend = agent.backend.take().unwrap();
+            for arguments in [json!({"names":[name]}), json!({"unload":[name]})] {
+                let call = ToolCall {
+                    id: "pin-discovered".into(),
+                    name: "tool_load".into(),
+                    arguments,
+                    malformed_arguments: false,
+                };
+                let output = agent.dispatch(&mut backend, &call, &mut Quiet);
+                assert!(!output.is_error, "{}", output.text);
+                assert!(!agent.discovered_tools().contains(&name));
+            }
+            assert!(!agent.offered().contains(&name));
+            assert!(!agent.enabled_tools.contains(&name));
+            assert_eq!(agent.session.control_state()["discovered_tools"], json!([]));
+        });
+    }
+
+    #[test]
+    fn default_stale_reduction_precedes_automatic_summary_pressure() {
+        with_agent("context_window=128000", |agent| {
+            let mut messages = vec![
+                json!({"role":"user","content":"task"}),
+                json!({"role":"assistant","content":"","tool_calls":[{"id":"old","function":{"name":"read","arguments":"{}"}}]}),
+                json!({"role":"tool","tool_call_id":"old","content":"x".repeat(200_000),"dial_evidence":{"artifact":"artifact://old","observation":"same-range"}}),
+                json!({"role":"assistant","content":"","tool_calls":[{"id":"new","function":{"name":"read","arguments":"{}"}}]}),
+                json!({"role":"tool","tool_call_id":"new","content":"y".repeat(160_000),"dial_evidence":{"artifact":"artifact://new","observation":"same-range"}}),
+            ];
+            let raw = context_meter::estimate_parts(&messages, &[]);
+            let selection = agent.auth_config.selection();
+            let threshold = agent
+                .config
+                .compaction
+                .effective_threshold(
+                    compaction::CompactionIdentity {
+                        provider: &selection.provider,
+                        model: &selection.model,
+                        agent: None,
+                    },
+                    agent.budget_window(),
+                )
+                .unwrap();
+            assert!(raw > threshold);
+            assert!(raw < u64::from(agent.budget_window()) * 75 / 100);
+            let mut packet = task_packet::PacketCache::default();
+            let mut memo = evidence::Supersession::default();
+            agent
+                .project_history(&mut messages, &[], 0, &mut packet, &mut memo, None)
+                .unwrap();
+            let old = messages
+                .iter()
+                .find(|m| m["tool_call_id"] == "old")
+                .unwrap();
+            assert!(
+                old["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("[Older read result omitted")
+            );
+            assert!(context_meter::estimate_parts(&messages, &[]) < threshold);
+        });
+    }
+
+    #[test]
+    fn pruning_protects_the_capped_budget_tail_not_the_raw_model_window() {
+        with_agent(
+            "context_window=1000000\n[efficiency]\nhistory_token_cap=16000",
+            |agent| {
+                assert_eq!(agent.budget_window(), 16_000);
+                let mut messages = vec![
+                    json!({"role":"user","content":"task"}),
+                    json!({"role":"assistant","content":"","tool_calls":[{"id":"old","function":{"name":"read","arguments":"{}"}}]}),
+                    json!({"role":"tool","tool_call_id":"old","content":"x".repeat(80_000),"dial_evidence":{"artifact":"artifact://old","observation":"k"}}),
+                    json!({"role":"assistant","content":"","tool_calls":[{"id":"new","function":{"name":"read","arguments":"{}"}}]}),
+                    json!({"role":"tool","tool_call_id":"new","content":"y".repeat(20_000),"dial_evidence":{"artifact":"artifact://new","observation":"k"}}),
+                ];
+                let mut packet = task_packet::PacketCache::default();
+                let mut superseded = evidence::Supersession::default();
+                agent
+                    .project_history(&mut messages, &[], 0, &mut packet, &mut superseded, None)
+                    .unwrap();
+                let old = messages
+                    .iter()
+                    .find(|m| m["tool_call_id"] == "old")
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap();
+                assert!(
+                    old.starts_with("[Older read result omitted"),
+                    "a 1M-token model under a 16k history cap must not protect a 200k-token tail: {old}"
                 );
             },
         );

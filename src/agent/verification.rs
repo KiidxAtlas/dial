@@ -21,8 +21,27 @@ pub enum CheckStatus {
     Unverified,
 }
 
+impl CheckStatus {
+    /// Only an observed code failure may be sent to the repair loop. Infrastructure, permission,
+    /// cancellation, timeout and unverifiable runs are reported without editing application code.
+    pub fn repairable(self) -> bool {
+        self == CheckStatus::CodeFailed
+    }
+}
+
 pub fn classify(
     check: &FocusedCheck,
+    output: &crate::tools::ToolOutput,
+    cancelled: bool,
+) -> CheckStatus {
+    classify_output(Some(check), output, cancelled)
+}
+
+/// The one verdict for a finished run, shared by cache, assistance and repair bookkeeping.
+/// `check` supplies the configured runner for setup diagnosis; undeclared commands pass `None`.
+/// Success requires observed process completion, not printed prose such as `[exit code: 0]`.
+pub(super) fn classify_output(
+    check: Option<&FocusedCheck>,
     output: &crate::tools::ToolOutput,
     cancelled: bool,
 ) -> CheckStatus {
@@ -55,7 +74,9 @@ pub fn classify(
     {
         return CheckStatus::Passed;
     }
-    if output.is_error && environment_problem(check, &output.text).is_some() {
+    if output.is_error
+        && check.is_some_and(|check| environment_problem(check, &output.text).is_some())
+    {
         return CheckStatus::EnvironmentUnavailable;
     }
     let Some(process) = process.filter(|_| complete) else {

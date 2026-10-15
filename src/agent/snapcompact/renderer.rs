@@ -1022,6 +1022,70 @@ pub(super) fn cell_units(ch: char, font: &str) -> usize {
     }
 }
 
+/// Whether the selected shape can draw `ch` with real ink: the bitmap glyph when the
+/// font has one, otherwise the bundled Silver fallback that `render_bitmap` also uses.
+/// Glyph-index 0 (tofu) and blank non-space glyphs are unsupported.
+fn glyph_supported(font: &RenderFont<'_>, ch: char) -> bool {
+    let bitmap = match font {
+        RenderFont::Bitmap(font) => font.glyphs.get(&(ch as u32)),
+        RenderFont::Ttf(_) => None,
+    };
+    if let Some(glyph) = bitmap {
+        return ch == ' ' || glyph.rows.iter().any(|bits| *bits != 0);
+    }
+    if FONT_SILVER.face.lookup_glyph_index(ch) == 0 {
+        return false;
+    }
+    ch == ' '
+        || FONT_SILVER
+            .face
+            .rasterize(ch, SILVER_PX)
+            .1
+            .iter()
+            .any(|coverage| *coverage != 0)
+}
+
+/// Makes every character the shape cannot draw visible as an exact JSON escape (`\uXXXX`,
+/// a surrogate pair above U+FFFF) rather than as tofu, a silent drop or a substitute glyph.
+/// Control characters and the layout-control code point `FULL_BLOCK` are escaped as well, so
+/// no source character can change layout or be confused with generated boundaries. `\n` is
+/// kept for the caller's boundary mapping. Escapes are valid JSON string escapes, so a reader
+/// recovers the exact code point; the caller keeps the unescaped source text for archival.
+pub(super) fn escape_unrenderable(text: &str, name: &str, cancel: &AtomicBool) -> Result<String> {
+    let font = resolve_font(name).ok_or_else(|| anyhow::anyhow!("unsupported font {name}"))?;
+    let mut out = String::with_capacity(text.len());
+    // Keys are code points, so the cache is bounded by the Unicode range (≤ 0x110000).
+    let mut support: HashMap<char, bool> = HashMap::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index % 1024 == 0 {
+            check_cancel(cancel)?;
+        }
+        if ch == '\n' {
+            out.push(ch);
+            continue;
+        }
+        // Escape the render layer's escape introducer too: literal `\u0647` is not Arabic.
+        if ch == '\\' {
+            out.push_str("\\\\");
+            continue;
+        }
+        let layout_control = ch.is_control() || ch as u32 == FULL_BLOCK;
+        let drawable = !layout_control
+            && *support
+                .entry(ch)
+                .or_insert_with(|| glyph_supported(&font, ch));
+        if drawable {
+            out.push(ch);
+            continue;
+        }
+        let mut units = [0u16; 2];
+        for unit in ch.encode_utf16(&mut units) {
+            out.push_str(&format!("\\u{unit:04x}"));
+        }
+    }
+    Ok(out)
+}
+
 pub(super) fn validate_text(text: &str, name: &str, cancel: &AtomicBool) -> Result<()> {
     let font = resolve_font(name).ok_or_else(|| anyhow::anyhow!("unsupported font {name}"))?;
     // Bundled fonts are immutable (<5 MiB total); no user font files are parsed.
@@ -1031,31 +1095,16 @@ pub(super) fn validate_text(text: &str, name: &str, cancel: &AtomicBool) -> Resu
         if index % 1024 == 0 {
             check_cancel(cancel)?;
         }
+        // Generated boundary blocks (newline mapping) and dim toggles are layout tokens, not glyphs.
         if matches!(ch as u32, DIM_ON | DIM_OFF | FULL_BLOCK | 0x0a) {
             continue;
         }
         if !glyphs.contains_key(&ch) && glyphs.len() >= 65_536 {
             bail!("snapcompact distinct glyph limit exceeded; no source was omitted");
         }
-        let supported = *glyphs.entry(ch).or_insert_with(|| {
-            let bitmap = match &font {
-                RenderFont::Bitmap(font) => font.glyphs.get(&(ch as u32)),
-                RenderFont::Ttf(_) => None,
-            };
-            if let Some(glyph) = bitmap {
-                return ch == ' ' || glyph.rows.iter().any(|bits| *bits != 0);
-            }
-            if FONT_SILVER.face.lookup_glyph_index(ch) == 0 {
-                return false;
-            }
-            ch == ' '
-                || FONT_SILVER
-                    .face
-                    .rasterize(ch, SILVER_PX)
-                    .1
-                    .iter()
-                    .any(|coverage| *coverage != 0)
-        });
+        let supported = *glyphs
+            .entry(ch)
+            .or_insert_with(|| glyph_supported(&font, ch));
         if !supported || (ch != ' ' && ch.is_control()) {
             bail!(
                 "snapcompact font {name} has no printable glyph for U+{:04X} at transcript character {index}; archive refused without replacing or dropping it",

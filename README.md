@@ -41,8 +41,9 @@ Or use the Linux commands inside WSL2. See [docs/windows.md](docs/windows.md) fo
   `/etc/wsl.conf`; Dial refuses sandboxed commands while it is enabled.
 - **Local MLX inference and training** require macOS on Apple Silicon plus `uv`; hosted and
   OpenAI-compatible providers work everywhere without Python.
-- **From source:** `cargo install --path . --locked`, or `make update` to rebuild and install the
-  optimized `local` profile from a checkout.
+- **From source:** `make update` builds and installs the faster, incremental `local` profile
+  from a checkout; `make update SLIM=1` omits optional integrations. Use
+  `cargo install --path . --locked` when you specifically want shipping optimization.
 
 Manual installation per platform, WSL2 interop settings, the Linux sandbox model, build-from-source
 details, the development loop and release publishing are in

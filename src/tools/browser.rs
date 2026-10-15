@@ -30,6 +30,7 @@ mod attach;
 #[cfg(target_os = "linux")]
 mod bwrap;
 mod cmux;
+mod discover;
 mod external;
 mod orphans;
 mod profile;
@@ -721,8 +722,19 @@ fn start(
         && cdp.is_none()
         && !chromium_path(config, &meta)?.is_file()
     {
-        runtime::install_chromium(&node, &runtime, interrupt)?;
-        (entry, meta) = probe(ctx, &trusted, &module, browsers, &pid, interrupt, end)?;
+        match runtime::install_chromium(&node, &runtime, interrupt) {
+            Ok(()) => {
+                (entry, meta) = probe(ctx, &trusted, &module, browsers, &pid, interrupt, end)?
+            }
+            // Offline or a failed download still works when another Chromium is installed.
+            Err(error)
+                if discover::installed_chromium(&discover::playwright_roots(&runtime.browsers))
+                    .is_none() =>
+            {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
     }
     if interrupt.load(Ordering::Acquire) {
         return Err("browser startup cancelled".into());
@@ -739,11 +751,24 @@ fn start(
     let executable = match executable_path.canonicalize() {
         Ok(path) => path,
         Err(_) if cdp.is_some() => executable_path,
-        Err(e) => {
+        Err(e) if config.chromium_executable.is_some() => {
             return Err(format!(
-                "Chromium is not installed; run `npx playwright install chromium` for browser.playwright_module or set browser.chromium_executable: {e}"
+                "browser.chromium_executable {executable_path:?} is not usable: {e}; point it at an installed Chrome/Chromium or remove it"
             ));
         }
+        // The build this Playwright expects is missing (e.g. a playwright_module whose Chromium
+        // revision was never downloaded): use another installed Chromium before giving up.
+        Err(e) => discover::installed_chromium(&discover::playwright_roots(&runtime.browsers))
+            .and_then(|path| path.canonicalize().ok())
+            .ok_or_else(|| {
+                let cli = entry.with_file_name("cli.js");
+                format!(
+                    "Chromium is not installed ({executable_path:?}: {e}) and no other Chromium, Chrome or Edge was found. Fix: run `{} {} install chromium`, or set browser.chromium_executable to an installed Chrome/Chromium{}",
+                    node.display(),
+                    cli.display(),
+                    if builtin { "" } else { ", or remove browser.playwright_module to use the built-in runtime" }
+                )
+            })?,
     };
     // Stealth applies to launched headless Chromium only, never to an attached user browser.
     let stealth_request =
@@ -1581,6 +1606,10 @@ mod tests {
     }
     impl LocalApp {
         fn start() -> Self {
+            Self::start_with_header_poll(Duration::from_millis(25))
+        }
+
+        fn start_with_header_poll(header_poll: Duration) -> Self {
             use std::io::Write;
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -1594,9 +1623,10 @@ mod tests {
                     while !stopping.load(Ordering::Acquire) {
                         match listener.accept() {
                             Ok((mut stream, _)) => {
+                                let stopping = &stopping;
                                 scope.spawn(move || {
                             stream
-                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .set_read_timeout(Some(header_poll))
                                 .unwrap();
                             // TCP can split even the request line. Wait for a complete bounded
                             // header before routing or replying; an early close also races the
@@ -1604,6 +1634,7 @@ mod tests {
                             let mut request = Vec::new();
                             let mut chunk = [0u8; 4096];
                             while request.len() < 16 * 1024
+                                && !stopping.load(Ordering::Acquire)
                                 && !request.windows(4).any(|bytes| bytes == b"\r\n\r\n")
                             {
                                 match stream.read(&mut chunk) {
@@ -1612,6 +1643,11 @@ mod tests {
                                     Err(error)
                                         if error.kind() == std::io::ErrorKind::Interrupted =>
                                     {
+                                        continue;
+                                    }
+                                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                                        // A preconnect or partial request can stay idle legitimately. This
+                                        // timeout only polls fixture shutdown; it is not a header deadline.
                                         continue;
                                     }
                                     Err(error) => {
@@ -1690,6 +1726,44 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("Dial local smoke"));
         drop(idle);
+    }
+
+    #[test]
+    fn local_http_fixture_preserves_delayed_headers_and_closes_idle_connections_on_shutdown() {
+        use std::io::{Read, Write};
+        let app = LocalApp::start_with_header_poll(Duration::from_millis(5));
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", app.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        client.write_all(b"GET /fi").unwrap();
+        let error = client
+            .read(&mut [0u8; 1])
+            .expect_err("partial headers cannot receive a response or be closed");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        client
+            .write_all(b"rst HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let idle = std::net::TcpStream::connect(("127.0.0.1", app.port)).unwrap();
+        let (closed, shutdown) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            drop(app);
+            closed.send(()).unwrap();
+        });
+        shutdown
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fixture shutdown must not wait for idle clients to send headers");
+        drop(idle);
+        join.join().unwrap();
     }
     #[cfg(target_os = "macos")]
     #[test]

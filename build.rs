@@ -116,7 +116,24 @@ fn main() {
     ] {
         println!("cargo:rustc-env=DIAL_BUILD_{name}={value}");
     }
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+    emit_desktop_cfgs();
+}
+
+/// Native desktop backends (`desktop` feature, default on) are selected by these cfgs in
+/// `src/computer/desktop`. Without the feature no cfg is set, so the platform crates and the macOS
+/// capture helper are not compiled and every desktop operation reports `Unsupported`.
+fn emit_desktop_cfgs() {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    for os in ["macos", "windows", "linux"] {
+        println!("cargo:rustc-check-cfg=cfg(dial_desktop_{os})");
+    }
+    if env::var_os("CARGO_FEATURE_DESKTOP").is_none() {
+        return;
+    }
+    if matches!(target_os.as_str(), "macos" | "windows" | "linux") {
+        println!("cargo:rustc-cfg=dial_desktop_{target_os}");
+    }
+    if target_os == "macos" {
         build_darwin_capture_helper();
     }
 }

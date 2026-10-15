@@ -274,7 +274,8 @@ impl Agent<'_> {
             let contract = crate::reliability::Contract::new(schemas.clone())?;
             let mut offered_schemas = contract.schemas;
             if single_call {
-                crate::reliability::simplify(&mut offered_schemas, &self.enabled_tools);
+                let loaded = self.enabled_tools.iter().cloned().chain(self.discovered_tools()).collect();
+                crate::reliability::simplify(&mut offered_schemas, &loaded);
             }
             let snapshot = crate::reliability::Contract::new(offered_schemas.clone())?;
             names = snapshot.names.clone();
@@ -1390,17 +1391,9 @@ impl Agent<'_> {
                     }
                 }
                 if !compatibility_loaded.is_empty() {
-                    let mut enabled = self.enabled_tools.clone();
-                    enabled.extend(compatibility_loaded.iter().cloned());
-                    let mut sorted: Vec<_> = enabled.iter().cloned().collect();
-                    sorted.sort();
-                    let mut state = self.session.control_state();
-                    state["enabled_tools"] = json!(sorted);
-                    self.session.set_control_state(state)?;
-                    self.enabled_tools = enabled;
-                    self.rebuild_system();
                     let mut loaded: Vec<_> = compatibility_loaded.iter().cloned().collect();
                     loaded.sort();
+                    self.activate_tools(&loaded)?;
                     ui.event(&crate::agent::ui_event::UiEvent::new(
                         crate::agent::ui_event::EventKind::Tools,
                         format!("Enabled {} for the next round", loaded.join(", ")),
@@ -1703,7 +1696,9 @@ impl Agent<'_> {
                         "tool_call",
                         json!({"name":call.name,"input":call.arguments}),
                     )?;
-                    if self.enabled_tools.contains(&call.name) {
+                    if self.enabled_tools.contains(&call.name)
+                        || self.discovered_tools().contains(&call.name)
+                    {
                         self.metrics.dynamic_tools_used += 1;
                     }
                     if !single_call

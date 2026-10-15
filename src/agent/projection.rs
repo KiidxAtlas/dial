@@ -26,15 +26,33 @@ impl<'a> Agent<'a> {
         } else {
             50
         };
+        let window = self.budget_window();
+        let mut pressure_at = u64::from(window) * pressure_fraction / 100;
+        if self.config.compaction.enabled
+            && self.config.compaction.strategy != compaction::CompactionStrategy::Off
+        {
+            let selection = self.auth_config.selection();
+            let identity = compaction::CompactionIdentity {
+                provider: &selection.provider,
+                model: &selection.model,
+                agent: None,
+            };
+            // Clear stale evidence before paying for a summary. The configured cache-pressure
+            // threshold may be higher than automatic compaction's usable-window threshold.
+            pressure_at = pressure_at.min(
+                self.config
+                    .compaction
+                    .effective_threshold(identity, window)?,
+            );
+        }
         let policy = evidence::Policy {
             warm_tokens: if economy || self.config.compaction.preserve_prefix {
                 0
             } else {
                 CACHE_WARM_SUFFIX_TOKENS
             },
-            pressure: self.context_meter.predict(raw_estimate).max(raw_estimate)
-                > u64::from(self.budget_window()) * pressure_fraction / 100,
-            protect_tokens: (self.context_window() as usize / 5).max(PRUNE_PROTECT_MIN_TOKENS),
+            pressure: self.context_meter.predict(raw_estimate).max(raw_estimate) > pressure_at,
+            protect_tokens: (window as usize / 5).max(PRUNE_PROTECT_MIN_TOKENS),
             supersede_reads: self.config.compaction.supersede_reads,
             drop_useless: self.config.compaction.drop_useless,
         };

@@ -414,6 +414,14 @@ mod tests {
     #[test]
     fn generation_context_without_git_history_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
+        // A bare repository with no commits is the boundary: temp directories can live inside
+        // another checkout, and git would otherwise discover that repository's history.
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git init");
+        assert!(init.success());
         let context = generation_context(dir.path());
         assert_eq!(context.recent_commits, None);
         assert_eq!(context.common_scopes, None);

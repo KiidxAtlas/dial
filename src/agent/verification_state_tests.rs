@@ -76,7 +76,15 @@ fn empty_suites_do_not_supply_passing_behavioral_evidence() {
                 is_error: false,
                 data: None,
                 execution: Default::default(),
-            },
+            }
+            .with_process(crate::runtime::execution::ProcessOutcome {
+                started: true,
+                exit_code: Some(0),
+                signal: None,
+                timed_out: false,
+                cancelled: false,
+                output_complete: true,
+            }),
             &mut NullUi,
         );
         assert_eq!(cached_result()["passed"], false);
@@ -90,7 +98,15 @@ fn empty_suites_do_not_supply_passing_behavioral_evidence() {
             is_error: false,
             data: None,
             execution: Default::default(),
-        },
+        }
+        .with_process(crate::runtime::execution::ProcessOutcome {
+            started: true,
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            output_complete: true,
+        }),
         &mut NullUi,
     );
     assert_eq!(agent.behavioral_checks.last(), Some(&true));

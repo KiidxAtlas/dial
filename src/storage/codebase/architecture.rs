@@ -1020,11 +1020,11 @@ impl Codebase {
 
     /// A compact purpose plus task-local owners, relationships, constraints and test evidence.
     pub fn architecture_context(&self, query: &str, max_bytes: usize) -> Result<String> {
-        self.architecture_context_inner(query, max_bytes, false)
+        self.architecture_context_inner(query, max_bytes, false, false)
     }
 
     pub fn task_architecture_context(&self, query: &str, max_bytes: usize) -> Result<String> {
-        self.architecture_context_inner(query, max_bytes, true)
+        self.architecture_context_inner(query, max_bytes, true, false)
     }
 
     fn architecture_context_inner(
@@ -1032,6 +1032,7 @@ impl Codebase {
         query: &str,
         max_bytes: usize,
         scoped: bool,
+        fresh_only: bool,
     ) -> Result<String> {
         let max_bytes = if max_bytes == 0 {
             usize::MAX
@@ -1091,6 +1092,9 @@ impl Codebase {
         let header_len = out.len();
         let mut stale_notices = 0;
         for section in ranked {
+            if fresh_only && statuses.get(&section.id) != Some(&"fresh") {
+                continue;
+            }
             let row = if statuses.get(&section.id) == Some(&"fresh") {
                 format!(
                     "{}: {}\nSources: {}\n",
@@ -1124,34 +1128,125 @@ impl Codebase {
             paths.len() <= 64 && (1024..=12000).contains(&max_bytes),
             "invalid impact context bounds"
         );
-        let mut out = self.architecture_context(&paths.join(" "), max_bytes / 2)?;
-        out.push_str("\nChange review: verify affected callers and interfaces, config/serialization compatibility, state ownership and existing helpers. Resolve symbol definitions/references with lsp where configured; lexical candidates below are unverified. Run relevant behavioral checks; build success alone is not behavioral evidence.\n");
-        let conn = self.conn.lock();
-        let mut statement =
-            conn.prepare("SELECT path,outline FROM codebase_files ORDER BY path")?;
         let stems = paths
             .iter()
             .filter_map(|p| Path::new(p).file_stem().and_then(|s| s.to_str()))
             .filter(|s| s.len() > 2 && !matches!(*s, "mod" | "main" | "lib" | "index"))
-            .collect::<Vec<_>>();
-        for row in
-            statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        {
-            let (path, outline) = row?;
-            if paths.contains(&path)
-                || !stems
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        if stems.is_empty() {
+            return Ok(String::new());
+        }
+        // Extension/directory tokens such as `rs` and `src` match nearly every saved section.
+        // Change context needs relevant, current findings rather than another stale-map reminder.
+        let query = stems.iter().cloned().collect::<Vec<_>>().join(" ");
+        let mut out = self.architecture_context_inner(&query, max_bytes / 2, true, true)?;
+        let rows = self
+            .conn
+            .lock()
+            .prepare("SELECT path,digest,outline FROM codebase_files ORDER BY path")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut ranked = rows
+            .into_iter()
+            .filter(|(path, _, _)| !paths.contains(path))
+            .filter_map(|(path, digest, outline)| {
+                let rank = impact_rank(&outline, &stems)?;
+                let proximity = paths
                     .iter()
-                    .any(|s| navigation::tokens(&outline).contains(*s))
-            {
+                    .map(|changed| {
+                        Path::new(changed)
+                            .components()
+                            .zip(Path::new(&path).components())
+                            .take_while(|(a, b)| a == b)
+                            .count()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                Some((rank, proximity, path, digest))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        const REVIEW: &str = "\nRelated-source hints (not a resolved dependency graph; inspect current sources before relying on them):\n";
+        let mut hints = String::new();
+        // Bound filesystem validation as well as output. Reuse the index's normal visibility and
+        // digest rules, including ignores, linked worktrees, symlinks and missing/changed files.
+        for (rank, _, path, digest) in ranked.into_iter().take(MAX_SCOPE_NEIGHBOURS) {
+            let Ok((_, current)) = self.current_source(&path) else {
+                continue;
+            };
+            if current != digest {
                 continue;
             }
-            let row = format!("Possible consumer/test: {path}\n");
-            if out.len() + row.len() <= max_bytes {
-                out.push_str(&row);
+            let reason = if rank == 2 {
+                "Import/module match"
+            } else {
+                "Lexical identifier match"
+            };
+            let row = format!("{reason}: {path}\n");
+            if out.len() + REVIEW.len() + hints.len() + row.len() <= max_bytes {
+                hints.push_str(&row);
             }
+        }
+        if !hints.is_empty() {
+            out.push_str(REVIEW);
+            out.push_str(&hints);
         }
         Ok(out)
     }
+}
+
+/// Exact identifiers keep `tool_exposure` distinct from generic `tool`/`exposure` prose. Imports
+/// and module declarations rank ahead of other mentions, but remain lexical hints, not proof.
+fn impact_rank(outline: &str, stems: &BTreeSet<String>) -> Option<u8> {
+    outline
+        .lines()
+        .filter_map(|line| {
+            let code = line
+                .split_once(": ")
+                .map_or(line, |(_, code)| code)
+                .trim_start();
+            if code.starts_with("//")
+                || code.starts_with("/*")
+                || code.starts_with('*')
+                || (code.starts_with('#') && !code.starts_with("#include "))
+            {
+                return None;
+            }
+            let matched = code
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|identifier| stems.contains(identifier));
+            matched.then(|| {
+                if [
+                    "use ",
+                    "pub use ",
+                    "mod ",
+                    "pub mod ",
+                    "import ",
+                    "from ",
+                    "export ",
+                    "#include ",
+                ]
+                .iter()
+                .any(|prefix| code.starts_with(prefix))
+                {
+                    2
+                } else {
+                    1
+                }
+            })
+        })
+        .max()
 }
 
 /// Keep only the outermost `{...}` span, so markdown fences or prose around the reply do not break the parse.
@@ -1831,5 +1926,123 @@ mod tests {
             assert_eq!(section["status"], "stale", "{section}");
             assert_eq!(section["source_status"], "missing", "{section}");
         }
+    }
+
+    #[test]
+    fn impact_hints_rank_imports_before_lexical_names_and_match_whole_identifiers() {
+        let (_home, project, cache, ws) = fixture();
+        fs::create_dir_all(project.path().join("src/owning")).unwrap();
+        for (path, text) in [
+            (
+                "src/owning/feature_flags.rs",
+                "pub const ACTIVE: bool = true;\n",
+            ),
+            (
+                "src/owning/z_consumer.rs",
+                "use crate::owning::feature_flags;\n",
+            ),
+            ("aaa_lexical.rs", "pub fn feature_flags() {}\n"),
+            ("prefix_only.rs", "pub fn feature_flags_backup() {}\n"),
+            (
+                "word_noise.rs",
+                "//! feature flags are unrelated prose\npub fn noise() {}\n",
+            ),
+            (
+                "comment_only.rs",
+                "//! feature_flags are unrelated prose\npub fn noise() {}\n",
+            ),
+        ] {
+            fs::write(project.path().join(path), text).unwrap();
+        }
+        cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+        let context = cache
+            .impact_context(&["src/owning/feature_flags.rs".into()], 1024)
+            .unwrap();
+        let direct = context
+            .find("src/owning/z_consumer.rs")
+            .expect("import is suggested");
+        let lexical = context
+            .find("aaa_lexical.rs")
+            .expect("lexical hint remains distinguishable");
+        assert!(
+            direct < lexical,
+            "an alphabetically earlier weak match must not crowd out an import"
+        );
+        for unrelated in ["prefix_only.rs", "word_noise.rs", "comment_only.rs"] {
+            assert!(
+                !context.contains(unrelated),
+                "{unrelated} is not an identifier reference"
+            );
+        }
+        assert!(context.len() <= 1024);
+        assert!(
+            cache
+                .impact_context(&["new_unrelated.rs".into()], 1024)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn impact_hints_revalidate_digest_and_index_visibility_without_a_refresh() {
+        let (_home, project, cache, ws) = fixture();
+        fs::create_dir_all(project.path().join("historical/checkout")).unwrap();
+        for path in [
+            "changed.rs",
+            "deleted.rs",
+            "ignored.rs",
+            "historical/checkout/old.rs",
+        ] {
+            fs::write(project.path().join(path), "use crate::routing;\n").unwrap();
+        }
+        cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+        fs::write(project.path().join("changed.rs"), "pub fn unrelated() {}\n").unwrap();
+        fs::remove_file(project.path().join("deleted.rs")).unwrap();
+        fs::write(project.path().join(".gitignore"), "/ignored.rs\n").unwrap();
+        fs::write(
+            project.path().join("historical/checkout/.git"),
+            "gitdir: /repo/.git/worktrees/old\n",
+        )
+        .unwrap();
+        let context = cache.impact_context(&["routing.rs".into()], 2000).unwrap();
+        assert!(
+            context.contains("main.rs"),
+            "the current importer stays available"
+        );
+        for excluded in [
+            "changed.rs",
+            "deleted.rs",
+            "ignored.rs",
+            "historical/checkout/old.rs",
+        ] {
+            assert!(
+                !context.contains(excluded),
+                "stale/excluded index entry {excluded} leaked into change context"
+            );
+        }
+    }
+
+    #[test]
+    fn impact_context_omits_stale_findings_and_generic_filename_noise() {
+        let (_home, project, cache, _ws) = fixture();
+        let packet = cache.architecture_synthesis(8000, true).unwrap().unwrap();
+        cache
+            .save_architecture(&packet, &answer().to_string(), "model")
+            .unwrap();
+        fs::write(
+            project.path().join("routing.rs"),
+            "pub fn replacement() {}\n",
+        )
+        .unwrap();
+        let context = cache.impact_context(&["routing.rs".into()], 2000).unwrap();
+        assert!(!context.contains("Routing is implemented"));
+        assert!(!context.contains("Needs refresh:"));
+        assert!(context.contains("main.rs"));
+        assert!(
+            cache
+                .impact_context(&["main.rs".into()], 1024)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

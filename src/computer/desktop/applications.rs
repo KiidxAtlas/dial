@@ -1,19 +1,20 @@
 //! Installed application discovery does not require capture or input
 //! permission.
 
+#[cfg(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::error::{CoreResult, DesktopError};
 
-#[cfg(target_os = "linux")]
+#[cfg(dial_desktop_linux)]
 #[path = "linux/applications.rs"]
 mod platform;
-#[cfg(target_os = "macos")]
+#[cfg(dial_desktop_macos)]
 #[path = "macos/applications.rs"]
 mod platform;
-#[cfg(target_os = "windows")]
+#[cfg(dial_desktop_windows)]
 #[path = "win32/applications.rs"]
 mod platform;
 
@@ -46,19 +47,22 @@ pub struct ApplicationOpenOptions {
 
 pub(crate) const fn supported() -> bool {
     cfg!(any(
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "linux"
+        dial_desktop_macos,
+        dial_desktop_windows,
+        dial_desktop_linux
     ))
 }
 
+#[cfg(not(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux)))]
+pub(crate) fn list(_options: ApplicationQuery) -> CoreResult<Vec<Application>> {
+    Err(DesktopError::native_unavailable(
+        "installed application discovery",
+    ))
+}
+
+#[cfg(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
 pub(crate) fn list(options: ApplicationQuery) -> CoreResult<Vec<Application>> {
-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     let mut apps = platform::list()?;
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    let mut apps: Vec<Application> = return Err(DesktopError::invalid_target(
-        "installed application discovery is unsupported on this operating system",
-    ));
     let query = options.query.as_deref().unwrap_or_default().to_lowercase();
     apps.retain(|app| {
         (!options.running_only.unwrap_or(false) || app.running)
@@ -78,6 +82,7 @@ pub(crate) fn list(options: ApplicationQuery) -> CoreResult<Vec<Application>> {
 
 /// Resolve identity before display name; ambiguity never launches an arbitrary
 /// app.
+#[cfg(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux, test))]
 fn resolve<'a>(apps: &'a [Application], input: &str) -> CoreResult<Option<&'a Application>> {
     let mut exact = apps
         .iter()
@@ -93,6 +98,7 @@ fn resolve<'a>(apps: &'a [Application], input: &str) -> CoreResult<Option<&'a Ap
         .transpose()
 }
 
+#[cfg(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux, test))]
 fn unique<'a>(
     first: &'a Application,
     second: Option<&Application>,
@@ -114,7 +120,7 @@ pub(crate) fn open(input: &str, options: ApplicationOpenOptions) -> CoreResult<A
             "application identity must be nonempty and contain no NUL",
         ));
     }
-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[cfg(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux))]
     {
         let apps = platform::list()?;
         // Native paths are checked before display names so a real package path is
@@ -137,11 +143,11 @@ pub(crate) fn open(input: &str, options: ApplicationOpenOptions) -> CoreResult<A
         };
         platform::open(app, options.activate.unwrap_or(false))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(dial_desktop_macos, dial_desktop_windows, dial_desktop_linux)))]
     {
         let _ = options;
-        Err(DesktopError::invalid_target(
-            "native application launch is unsupported on this operating system",
+        Err(DesktopError::native_unavailable(
+            "native application launch",
         ))
     }
 }

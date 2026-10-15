@@ -1092,7 +1092,7 @@ fn local_binary(name: &str, cwd: &Path, root: &Path) -> Option<String> {
     while let Some(current) = dir {
         for bin_dir in LOCAL_BIN_DIRS {
             let candidate = current.join(bin_dir).join(name);
-            if candidate.is_file() {
+            if crate::platform::fs::is_executable(&candidate) {
                 return Some(candidate.to_string_lossy().into_owned());
             }
         }
@@ -1105,8 +1105,9 @@ fn local_binary(name: &str, cwd: &Path, root: &Path) -> Option<String> {
 }
 
 fn path_binary(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| crate::platform::fs::is_executable(&dir.join(name)))
+    })
 }
 
 /// Shell-quotes arguments that contain anything beyond a safe character set.
@@ -1143,8 +1144,25 @@ mod tests {
     fn discovers_local_eslint_and_prefers_it_over_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        std::fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
-        std::fs::write(root.join("node_modules/.bin/eslint"), "#!/bin/sh\n").unwrap();
+        // Discovery lists files through git, so the fixture is its own repository. An enclosing
+        // checkout's ignore rules (this one ignores `/.tmp/`) would otherwise hide every file.
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let name = if cfg!(windows) {
+            "eslint.cmd"
+        } else {
+            "eslint"
+        };
+        let local = root.join("node_modules/.bin").join(name);
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, "#!/bin/sh\n").unwrap();
+        crate::platform::fs::set_mode(&local, 0o755).unwrap();
         std::fs::write(root.join(".eslintrc.json"), "{}").unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.js"), "let a = 1;\n").unwrap();
@@ -1155,7 +1173,7 @@ mod tests {
             .iter()
             .find(|plan| plan.id == "eslint:.")
             .expect("eslint plan discovered");
-        assert!(plan.argv[0].ends_with("node_modules/.bin/eslint"));
+        assert!(Path::new(&plan.argv[0]).ends_with(Path::new("node_modules/.bin").join(name)));
         assert_eq!(plan.display, "eslint . --format=json");
         assert_eq!(plan.parser, Kind::Eslint);
     }

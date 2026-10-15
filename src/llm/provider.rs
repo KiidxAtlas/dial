@@ -273,6 +273,9 @@ pub struct Backend {
     codex_websocket: bool,
     image_notices: llm::images::NoticeTracker,
     wire: llm::wire::Shared,
+    /// Test-only idle limit for this backend's model calls, carried to the worker thread that runs them.
+    #[cfg(test)]
+    idle_limit: Option<Duration>,
 }
 
 impl Backend {
@@ -316,6 +319,8 @@ impl Backend {
             codex_websocket: false,
             image_notices: Default::default(),
             wire: Default::default(),
+            #[cfg(test)]
+            idle_limit: None,
         }
     }
 
@@ -573,6 +578,13 @@ impl Backend {
 
     pub fn with_remote_idle_timeout(mut self, seconds: u64) -> Self {
         self.remote_idle_timeout_secs = seconds;
+        self
+    }
+
+    /// Test-only: bound this backend's streamed silence after progress without touching other threads.
+    #[cfg(test)]
+    pub(crate) fn with_test_idle_limit(mut self, limit: Duration) -> Self {
+        self.idle_limit = Some(limit);
         self
     }
 
@@ -870,6 +882,8 @@ impl Backend {
         on_event: &mut dyn FnMut(&llm::StreamEvent) -> bool,
     ) -> Result<Reply> {
         let _wire = llm::wire::Scope::enter(self.wire.clone());
+        #[cfg(test)]
+        let _idle_limit = llm::cancel::TestIdleLimitScope::enter(self.idle_limit);
         let billing = match &self.kind {
             ProviderKind::Local { .. } => llm::usage::Billing::Local,
             ProviderKind::ChatGpt { .. } | ProviderKind::AnthropicSubscription { .. } => {
@@ -3015,6 +3029,46 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_tool_free_compaction_wire_never_contains_null_tools() {
+        for streaming in [false, true] {
+            for cache in [false, true] {
+                let server = fake::serve(vec![fake::json(
+                    200,
+                    &json!({
+                        "content":[{"type":"text","text":"summary"}], "stop_reason":"end_turn"
+                    }),
+                )]);
+                let mut remote = backend(anthropic_endpoint(&format!("{}/v1", server.url)));
+                remote.profile = Some(llm::profiles::ModelProfile {
+                    prompt_cache: Some(cache),
+                    ..llm::profiles::ModelProfile::minimal("anthropic", "claude-test")
+                });
+                remote.profile.as_mut().unwrap().capabilities.prompt_cache = true;
+                let mut request = request();
+                request.messages = vec![
+                    json!({"role":"system","content":"Summarize the archived conversation."}),
+                    json!({"role":"user","content":"<conversation>history</conversation>"}),
+                ];
+                let mut visible = String::new();
+                let mut callback = |text: &str| {
+                    visible.push_str(text);
+                    true
+                };
+                let reply = remote
+                    .chat(None, &request, 5, streaming.then_some(&mut callback))
+                    .unwrap();
+                assert_eq!(reply.text, "summary");
+                let sent = fake::body(&server.requests()[0]);
+                assert!(
+                    sent.get("tools").is_none_or(serde_json::Value::is_array),
+                    "invalid tools on final wire: {sent}"
+                );
+                assert_eq!(sent["stream"], streaming);
+            }
+        }
+    }
+
+    #[test]
     fn anthropic_auth_errors_do_not_expose_key_or_prompt() {
         let server = fake::serve(vec![fake::json(
             401,
@@ -3149,6 +3203,34 @@ mod tests {
         assert_eq!(reply.text, "ab");
         assert_eq!(seen, "ab");
         assert_eq!(fake::body(&server.requests()[0])["stream"], true);
+    }
+
+    #[test]
+    fn tool_free_auxiliary_requests_keep_an_array_tools_field_on_the_wire() {
+        // Semantic find and other ranking calls offer no tools. Strict OpenAI-compatible servers reject a
+        // missing or null `tools`, so the empty array must survive profile transforms. Constrained repair
+        // is skipped when there is nothing to repair; a toolful request keeps its tools.
+        let mut repair = llm::profiles::ModelProfile::minimal("lm-studio", "gpt-x");
+        repair.tool_repair = true;
+        let read = json!({"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}});
+        for (profile, tools) in [(None, vec![]), (Some(repair), vec![]), (None, vec![read])] {
+            let toolful = !tools.is_empty();
+            let server = fake::serve(vec![ok("ranked")]);
+            let mut remote = backend(endpoint(&format!("{}/v1", server.url)));
+            if let Some(profile) = profile {
+                remote = remote.with_profile(profile);
+            }
+            let mut req = request();
+            req.tools = tools;
+            assert_eq!(remote.chat(None, &req, 5, None).unwrap().text, "ranked");
+            let body = fake::body(&server.requests()[0]);
+            if toolful {
+                assert_eq!(body["tools"][0]["function"]["name"], "read_file", "{body}");
+            } else {
+                assert_eq!(body.get("tools"), Some(&json!([])), "{body}");
+                assert!(body.get("response_format").is_none(), "{body}");
+            }
+        }
     }
 
     #[test]
@@ -4009,7 +4091,8 @@ mod tests {
         let ping = anthropic_sse(&[json!({"type":"ping"})]);
         for first in [None, Some(anthropic_sse(&events[..1]))] {
             let mut pieces = vec![first.unwrap_or_default()];
-            pieces.extend(std::iter::repeat_n(ping.clone(), 100));
+            // Long enough to outlast the setup budget, so a ping-only stream ends by the idle limit, not EOF.
+            pieces.extend(std::iter::repeat_n(ping.clone(), 250));
             let server = fake::serve(vec![
                 Script::SseSlow {
                     pieces,
@@ -4038,7 +4121,8 @@ mod tests {
         }
         for script in [
             Script::Stall {
-                silence: Duration::from_millis(320),
+                // Silence beyond the setup budget: the client's deadline, not end-of-stream, ends this attempt.
+                silence: Duration::from_millis(2000),
             },
             Script::StallAfter {
                 first: anthropic_sse(&events[..12]),
@@ -4089,7 +4173,9 @@ mod tests {
             ),
         ] {
             let mut pieces = vec![anthropic_sse(&events[..prefix])];
-            pieces.extend(std::iter::repeat_n(anthropic_sse(&[noise]), 20));
+            // The noise must outlast the 200ms idle limit. A stream that closes first is an incomplete-stream
+            // retry, not the idle path this case asserts, so the two would race on a loaded machine.
+            pieces.extend(std::iter::repeat_n(anthropic_sse(&[noise]), 60));
             let server = fake::serve(vec![
                 Script::SseSlow {
                     pieces,
@@ -4761,7 +4847,6 @@ mod real_server {
 #[cfg(test)]
 mod chatgpt_tests {
     use super::*;
-    use crate::llm::cancel::Patience;
     use serde_json::json;
     #[test]
     fn remote_silence_limit_preserves_local_worker_allowances() {
@@ -4824,7 +4909,6 @@ mod chatgpt_tests {
 
     #[test]
     fn subscription_stall_is_bounded_retried_and_never_executes_partial_calls() {
-        Patience::with_test_idle_limit(Duration::from_millis(200));
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir(&project).unwrap();
@@ -4846,7 +4930,9 @@ mod chatgpt_tests {
             silence: Duration::from_millis(320),
         };
         let server = llm::fake::serve(vec![stall(), stall()]);
-        let mut backend = crate::agent::make_backend(&config).unwrap();
+        let mut backend = crate::agent::make_backend(&config)
+            .unwrap()
+            .with_test_idle_limit(Duration::from_millis(200));
         backend.chatgpt_url = Some(format!("{}/codex/responses", server.url));
         backend.retry_backoff = Duration::from_millis(1);
         let session = crate::storage::session::Session::create(

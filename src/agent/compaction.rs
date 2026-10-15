@@ -519,6 +519,23 @@ impl CompactionConfig {
             CompactionStrategy::Off => Vec::new(),
         }
     }
+    /// Unsupported native compaction is not a failed recovery attempt. Automatic selection
+    /// skips it; an explicitly requested method still runs and explains why it is unavailable.
+    fn available_methods(
+        &self,
+        options: &CompactionOptions,
+        native_supported: bool,
+    ) -> Vec<CompactionMethod> {
+        self.methods(options)
+            .into_iter()
+            .filter(|method| {
+                *method != CompactionMethod::Remote
+                    || options.method == Some(CompactionMethod::Remote)
+                    || options.require_method
+                    || self.remote_enabled && (self.remote_endpoint.is_some() || native_supported)
+            })
+            .collect()
+    }
 }
 fn validate_selector(selector: &str) -> Result<()> {
     let (provider, model) = selector
@@ -992,7 +1009,13 @@ pub fn compact_history(
         !non_summary || focus.is_empty(),
         "snapcompact and shake do not take summary focus instructions"
     );
-    let methods = policy.methods(options);
+    let methods = policy.available_methods(
+        options,
+        backend.supports_native_compaction(
+            policy.native_capability(context.identity),
+            policy.remote_streaming_v2_enabled,
+        ),
+    );
     ensure!(
         !methods.is_empty(),
         "no compaction method is enabled for this invocation"
@@ -1507,6 +1530,40 @@ pub(super) fn with_ui<T: Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_compaction_skips_unsupported_native_but_honors_explicit_requests() {
+        let mut policy = CompactionConfig::default();
+        let automatic = CompactionOptions::default();
+        let methods = policy.available_methods(&automatic, false);
+        assert!(!methods.contains(&CompactionMethod::Remote));
+        assert!(methods.contains(&CompactionMethod::Soft));
+        assert!(
+            policy
+                .available_methods(&automatic, true)
+                .contains(&CompactionMethod::Remote)
+        );
+        let explicit = CompactionOptions {
+            method: Some(CompactionMethod::Remote),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.available_methods(&explicit, false),
+            vec![CompactionMethod::Remote, CompactionMethod::Soft]
+        );
+        policy.remote_endpoint = Some("https://example.com/compact".into());
+        assert!(
+            policy
+                .available_methods(&automatic, false)
+                .contains(&CompactionMethod::Remote)
+        );
+        policy.remote_enabled = false;
+        assert!(
+            !policy
+                .available_methods(&automatic, false)
+                .contains(&CompactionMethod::Remote)
+        );
+    }
 
     #[test]
     fn cut_works_inside_one_user_turn_and_never_splits_a_tool_pair() {
