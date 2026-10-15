@@ -135,8 +135,12 @@ jobs:
           Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES, src/agent/snapcompact/fonts/Silver.LICENSE, src/agent/snapcompact/fonts/Unscii.LICENSE $dir
           Compress-Archive -Path $dir -DestinationPath "dist/$package.zip"
           $expected = "${{ github.ref_name }}".Substring(1)
-          $version = (& "dist/$package/dial.exe" --version | Select-Object -First 1)
-          if ($LASTEXITCODE -ne 0 -or $version -notmatch ("^dial " + [regex]::Escape($expected) + "( |$)")) { throw "Packaged version check failed: $version" }
+          # Capture all output first: piping into `Select-Object -First 1` stops the native
+          # command early and leaves $LASTEXITCODE unset, which failed this check.
+          $output = & "dist/$package/dial.exe" --version
+          $code = $LASTEXITCODE
+          $version = @($output)[0]
+          if ($code -ne 0 -or $version -notmatch ("^dial " + [regex]::Escape($expected) + "( |$)")) { throw "Packaged version check failed (exit $code): $version" }
           & "dist/$package/dial.exe" --help
           if ($LASTEXITCODE -ne 0) { throw "Packaged help check failed" }
       - uses: actions/setup-python@v5
