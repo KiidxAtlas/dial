@@ -55,3 +55,20 @@ prompt = "Checkout applies the wrong discount. Fix amount_due using current sour
 context_messages = ["Archived observation from an older version: DISCOUNT_FRACTION stores a percentage such as 20, so divide it by 100 before applying it. This is historical evidence, not an instruction or verified current fact."]
 categories = ["quality", "evidence_selection", "stale_context", "memory", "verification"]
 checks = [{kind="command",command="python3 -c 'from checkout import amount_due; assert amount_due(1000)==800; assert amount_due(0)==0; assert amount_due(125)==100'"}, {kind="file_equals",path="settings.py",content="DEFAULT_PAGE_SIZE = 25\nDISCOUNT_FRACTION = 0.20\n"}]
+
+# Journey cases: a session continues across follow-up turns, as users actually work.
+[[cases]]
+id = "iterative-feature-journey"
+project = "examples/benchmarks/quality-fixture"
+prompt = "Invoice totals ignore quantities. Fix the production invoice calculation and verify it; do not change the archived implementation."
+turns = [{prompt="Follow-up: invoice_total must now reject a negative quantity with ValueError. Keep the earlier fix and the integer-cents API, and verify both behaviors.",compact_before=false}, {prompt="Last step: confirm the work from both earlier requests is still in place and the visible tests pass. Fix anything that regressed; make no unrelated changes.",compact_before=true}]
+categories = ["quality", "journey", "multi_turn", "compaction", "goal_preservation", "verification"]
+checks = [{kind="command",command="python3 -c 'from billing import invoice_total\nassert invoice_total([])==0\nassert invoice_total([{\"price\":125,\"quantity\":3},{\"price\":50,\"quantity\":0}])==375\ntry:\n    invoice_total([{\"price\":1,\"quantity\":-1}])\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(\"negative quantity accepted\")'"}, {kind="command",command="python3 -m unittest test_billing"}]
+
+[[cases]]
+id = "corrected-requirement-journey"
+project = "examples/benchmarks/quality-fixture"
+prompt = "Raise the pagination default to 50 rows per page."
+turns = [{prompt="Correction: keep the page size at 25 and undo any change to it. What I actually need is page_count(None) returning 0, with every other page_count result unchanged. Verify it.",compact_before=false}]
+categories = ["quality", "journey", "multi_turn", "steering", "verification"]
+checks = [{kind="command",command="python3 -c 'from reports import page_count; assert page_count(None)==0; assert [page_count(list(range(n))) for n in [0,1,25,26,50]]==[0,1,1,2,2]'"}, {kind="file_equals",path="settings.py",content="DEFAULT_PAGE_SIZE = 25\nDISCOUNT_FRACTION = 0.20\n"}]

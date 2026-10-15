@@ -45,6 +45,18 @@ class QualityFixtureTests(unittest.TestCase):
                 elif case["id"] == "current-evidence-over-stale-memory":
                     path = workspace / "checkout.py"
                     path.write_text(path.read_text().replace("DISCOUNT_FRACTION / 100", "DISCOUNT_FRACTION"))
+                elif case["id"] == "iterative-feature-journey":
+                    path = workspace / "billing.py"
+                    path.write_text(path.read_text().replace(
+                        '    return sum(item["price"] for item in items)',
+                        '    if any(item["quantity"] < 0 for item in items):\n'
+                        '        raise ValueError("quantity must be non-negative")\n'
+                        '    return sum(item["price"] * item["quantity"] for item in items)'))
+                elif case["id"] == "corrected-requirement-journey":
+                    path = workspace / "reports.py"
+                    path.write_text(path.read_text().replace(
+                        "def page_count(rows):\n",
+                        "def page_count(rows):\n    if rows is None:\n        return 0\n"))
                 else:
                     self.fail("case has no independently tested solution")
                 self.assertTrue(checks_pass(case, workspace))

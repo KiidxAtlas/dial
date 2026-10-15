@@ -82,7 +82,7 @@ static FIELDS: &[Field] = &[
         label: "Context size",
         section: "Context",
         kind: int(2048.0, 2_097_152.0, 1024.0, 32768.0),
-        help: "Token cap for retained history and compaction, limited by model/server capacity. Reset follows shared context settings; this does not resize an externally managed server.",
+        help: "This model's history/compaction cap, limited by model/server capacity. Reset follows shared defaults. Press d to change the local/cloud defaults for future model selections; this does not resize an external server.",
     },
     Field {
         path: "temperature",
@@ -641,6 +641,7 @@ impl ModelSettingsOverlay {
                     ));
                     return OverlayEvent::None;
                 }
+                KeyCode::Char('d') => return OverlayEvent::Action("open:context-defaults".into()),
                 KeyCode::Char('g') => return OverlayEvent::Action("open:settings".into()),
                 _ => {}
             }
@@ -951,6 +952,7 @@ impl ModelSettingsOverlay {
                 hint(keys, Action::SelectConfirm, "edit"),
                 "r reset".to_owned(),
                 format!("s save to {}", scope_name(other_scope(self.scope))),
+                "d context defaults".to_owned(),
                 "g all settings".to_owned(),
                 hint(keys, Action::SelectCancel, "close"),
             ];
@@ -1035,6 +1037,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("quotes"), "{message}");
+    }
+
+    #[test]
+    fn context_defaults_shortcut_navigates_without_modifying_the_profile() {
+        let rig = Rig::new();
+        let mut overlay = ModelSettingsOverlay::new("local".into(), mlx());
+        assert!(matches!(overlay.event(&ch('d'), &rig.keys),
+            OverlayEvent::Action(action) if action == "open:context-defaults"));
+        assert!(overlay.profile.context_window.is_none());
+        assert!(overlay.pending.is_none());
     }
 
     #[test]

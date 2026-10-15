@@ -405,8 +405,10 @@ impl TodoList {
                 .map(|n| clean_text(n, MAX_REASON_CHARS, "note"))
                 .transpose()?;
             if task.finding.is_some() || !task.evidence.is_empty() {
-                let (answer, refs) =
-                    finding(&json!({"finding":task.finding,"evidence":task.evidence}))?;
+                // A finding may be recorded without evidence; that stores an empty list, which must
+                // restore as "no evidence" rather than fail the 1-4 reference rule for supplied evidence.
+                let evidence = (!task.evidence.is_empty()).then_some(&task.evidence);
+                let (answer, refs) = finding(&json!({"finding":task.finding,"evidence":evidence}))?;
                 task.finding = answer;
                 task.evidence = refs;
             }
@@ -1187,6 +1189,20 @@ mod tests {
         let mut other = TodoList::new();
         other.restore(&snap).unwrap();
         assert_eq!(other, list);
+        // A finding recorded without evidence persists as an empty list and must still restore.
+        let mut found = TodoList::new();
+        set(&mut found, json!([{"content": "a"}, {"content": "b"}]));
+        assert!(
+            !found
+                .call(&json!({"op": "done", "finding": "answered"}))
+                .is_error
+        );
+        let mut resumed = TodoList::new();
+        resumed.restore(&found.snapshot()).unwrap();
+        assert_eq!(resumed, found);
+        resumed
+            .restore(&json!([{"content": "old", "status": "completed", "finding": "f", "evidence": []}, {"content": "next", "status": "pending"}]))
+            .unwrap();
         // Snapshots written before phases and notes existed still load.
         other
             .restore(&json!([{"content": "old", "status": "pending"}]))

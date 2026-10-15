@@ -492,6 +492,8 @@ struct GrepState {
     page_matches: Vec<PageMatch>,
     row_ends: Vec<usize>,
     blocked_row: bool,
+    /// Why this page stopped before the scan ended; named in the footer when a continuation exists.
+    cap: Option<String>,
 }
 
 impl GrepState {
@@ -532,6 +534,15 @@ impl GrepState {
                 && self.out.len() + before.len() + matched.len() > MAX_GREP_OUTPUT)
         {
             self.blocked_row = self.out.is_empty() && matched.len() > MAX_GREP_OUTPUT;
+            self.cap = Some(if file_count >= GREP_PER_FILE {
+                format!("per-file cap of {GREP_PER_FILE} matches")
+            } else if file_limit {
+                format!("file cap of {GREP_FILES} files with matches")
+            } else if self.matches >= self.max_matches {
+                format!("match limit of {}", self.max_matches)
+            } else {
+                "output size limit of 48 KiB".to_string()
+            });
             self.next = Some((path.to_path_buf(), consumed));
             return false;
         }
@@ -906,6 +917,18 @@ impl GrepState {
                 || self.unreadable > 0
                 || self.oversized > 0
                 || self.context_capped > 0;
+            // Name what the page left out and how to resume. Counts past the cap are not known
+            // without scanning on, so the footer says so instead of guessing.
+            let omitted = if next.is_some() {
+                format!(
+                    "; page_capped_by={}; page_files_with_matches={}; matches and files past the cap are omitted from this page and not counted; continue by repeating this grep with cursor=next_cursor and skip=remaining_skip from [page]",
+                    self.cap.as_deref().unwrap_or("output size limit of 48 KiB"),
+                    self.matched_files.len(),
+                )
+            } else {
+                String::new()
+            };
+            let walk_coverage = format!("{walk_coverage}{omitted}");
             let coverage = if limited {
                 format!(
                     "results={}; scanned_files={}; bytes={}; unreadable_files={}; partial_files={}; binary_files={}; context_rows_capped={}; file_limit=4MiB; byte_limit=64MiB; {}; omitted coverage is not exhaustive",
@@ -1133,6 +1156,7 @@ pub(super) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
         page_matches: Vec::new(),
         row_ends: Vec::new(),
         blocked_row: false,
+        cap: None,
     };
     let mut bytes = Vec::new();
     for root in roots {
@@ -1570,6 +1594,38 @@ mod tests {
             near.contains("short.js:1:NEEDLE_HERE") && !body(&near).contains("skipped"),
             "{near}"
         );
+    }
+
+    #[test]
+    fn grep_footer_names_the_files_a_capped_page_left_out() {
+        let (dir, ws) = workspace();
+        for i in 0..GREP_FILES + 3 {
+            fs::write(dir.path().join(format!("f{i:02}.txt")), "needle\n").unwrap();
+        }
+        let capped = grep(&ws, json!({"pattern": "needle"}));
+        assert!(
+            capped.contains(&format!(
+                "page_capped_by=file cap of {GREP_FILES} files with matches"
+            )) && capped.contains(&format!("page_files_with_matches={GREP_FILES}"))
+                && capped.contains("cursor=next_cursor and skip=remaining_skip"),
+            "{capped}"
+        );
+        let (dir, ws) = workspace();
+        fs::write(dir.path().join("many.log"), "hit\n".repeat(1000)).unwrap();
+        let capped = grep(&ws, json!({"pattern": "hit", "path": "many.log"}));
+        assert!(
+            capped.contains(&format!(
+                "page_capped_by=per-file cap of {GREP_PER_FILE} matches"
+            )) && capped.contains("page_files_with_matches=1"),
+            "{capped}"
+        );
+        let whole = grep(
+            &ws,
+            json!({"pattern": "hit", "path": "many.log", "max_results": 5}),
+        );
+        assert!(whole.contains("page_capped_by=match limit of 5"), "{whole}");
+        let small = grep(&ws, json!({"pattern": "NOPE_NEVER"}));
+        assert!(!small.contains("page_capped_by"), "{small}");
     }
 
     #[test]

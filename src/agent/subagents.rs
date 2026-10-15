@@ -2833,6 +2833,35 @@ mod tests {
     }
 
     #[test]
+    fn sibling_jobs_share_system_prompt_and_brief_prefix_up_to_their_assignment() {
+        let config = config(&[]);
+        let request = parse(
+            &json!({
+                "tasks": [
+                    {"task": "audit module a", "solution_space": "s"},
+                    {"task": "audit module b", "solution_space": "s"}
+                ],
+                "context": "Shared batch context."
+            }),
+            &config,
+        )
+        .unwrap();
+        assert!(request.batch);
+        let (first, second) = (&request.jobs[0], &request.jobs[1]);
+        let tools = ["read", "grep", "codebase_memory"].map(str::to_owned);
+        let root = Path::new("/repo");
+        // Same kind and no per-item contract: the system prompt is byte-identical across siblings.
+        assert_eq!(first.system(root, &tools), second.system(root, &tools));
+        // The brief carries the shared context before the per-job scope and assignment.
+        let (a, b) = (first.brief(), second.brief());
+        let split = a.find("Scope:").unwrap();
+        assert_eq!(a[..split], b[..b.find("Scope:").unwrap()]);
+        assert!(a[split..].contains("audit module a"));
+        assert!(b[split..].contains("audit module b"));
+        assert!(a.contains("Shared batch context."));
+    }
+
+    #[test]
     fn a_single_prompt_defaults_to_a_scout_with_the_types_step_budget() {
         let config = config(&[]);
         let request = parse(&json!({"task":"look around","solution_space":"s"}), &config).unwrap();

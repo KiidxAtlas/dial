@@ -61,6 +61,8 @@ pub struct TranscriptCtx<'a> {
     /// Animation frame (~12 fps) for pending spinners.
     pub tick: u64,
     pub tools_expanded: bool,
+    /// Label of the expand/collapse shortcut, as the keymap shows it (for example `Ctrl+O`).
+    pub expand_key: &'a str,
 }
 
 enum Kind {
@@ -1945,6 +1947,7 @@ mod tests {
                 ui: &self.ui,
                 tick: 0,
                 tools_expanded: false,
+                expand_key: "Ctrl+O",
             }
         }
     }

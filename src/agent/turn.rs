@@ -689,8 +689,12 @@ impl Agent<'_> {
                 self.record(step, "provider_wire", serde_json::to_value(observation)?)?;
             }
             backend.next_request_profile(None);
-            let request_tools = provider_request.tools.clone();
-            let context_before = provider_request.messages.clone();
+            // The projected request is not reused after inference: move its history instead of
+            // deep-copying it each iteration. Recovery and training still see the exact bytes sent.
+            let (context_before, request_tools) = match rewritten {
+                Some(rewritten) => (rewritten.messages, rewritten.tools),
+                None => (std::mem::take(&mut request.messages), request.tools.clone()),
+            };
             *schemas = request.tools;
             // Receipts still outstanding after the stream ends: wait to their deadline, then commit.
             match self.settle_live_steering(ui, &mut live_steering) {
@@ -1736,7 +1740,13 @@ impl Agent<'_> {
                         }
                     }
                     let (mut out, seconds) = match parallel.pop_front() {
-                        Some(result) => result,
+                        Some(result) => {
+                            // Batched bash skips `dispatch`; record verification evidence as the serial path does.
+                            if call.name == "bash" {
+                                self.note_verification(call, &result.0, ui);
+                            }
+                            result
+                        }
                         None if call.name == "finish" && call.arguments["outcome"] == "completed" && (execution_failed || !form_kinds.is_empty()) => {
                             (ToolOutput { execution: Default::default(),  data: None,
 text: "finish completed cannot follow a failed call in the same batch; address its error first".into(), is_error: true }, 0.0)
@@ -1969,6 +1979,9 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     ui.diagnostic(&format!("Recovery checkpoint: `{}` failed; correct its arguments or choose a different concrete action.", call.name));
                     output.text.push_str("\n\n");
                     output.text.push_str(&advice);
+                }
+                if output.is_error {
+                    stall.note_error(&call.name, &output.text);
                 }
                 match stall.call(call, output.is_error) {
                     guard::Stall::Warn(advice) => {
@@ -2212,7 +2225,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             }
             if let Some(advice) = narration_warning {
                 ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, advice.as_str()));
-                self.push(json!({"role":"user","content":advice}))?;
+                pending_nudges.push(json!({"role":"user","content":advice,"dial_transient":true}));
             }
             let warning = match stall.round(!round_succeeded) {
                 guard::Stall::Stop(message) => {
@@ -2223,7 +2236,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 guard::Stall::None => None,
             };
             if let Some(advice) = warning {
-                self.push(json!({"role":"user","content":advice}))?;
+                pending_nudges.push(json!({"role":"user","content":advice,"dial_transient":true}));
             }
             if let Some(plan) = self.pending_plan.take() {
                 self.push(json!({"role":"user","content":format!("Approved plan:\n{plan}\nProceed with implementation.")}))?;

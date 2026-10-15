@@ -371,13 +371,26 @@ impl<'a> Agent<'a> {
             let mut control = self.session.control_state();
             if control["reliability"].is_object() {
                 let state = &mut control["reliability"];
+                let changed = self
+                    .step_checks
+                    .turn
+                    .zip(self.checkpoints.as_ref())
+                    .map(|(turn, checkpoints)| checkpoints.changed_files(turn))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                let limits = verification::coverage_limits(&changed);
                 state["verification"] = json!(if checks.is_empty() {
                     "no automatic focused check available; behavior unverified"
+                } else if failures.is_empty() && !limits.is_empty() {
+                    "focused checks passed with partial coverage; see coverage_limits"
                 } else if failures.is_empty() {
                     "focused checks passed; assess coverage against requirements"
                 } else {
                     "focused checks failed"
                 });
+                state["coverage_limits"] = json!(limits);
                 state["checked_commands"] =
                     json!(checks.iter().map(|c| &c.name).collect::<Vec<_>>());
                 state["verification_results"] = json!(results);

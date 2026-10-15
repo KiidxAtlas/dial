@@ -328,7 +328,9 @@ pub(super) fn environment_problem(check: &FocusedCheck, output: &str) -> Option<
                 || line == format!("env: '{program}': No such file or directory")
         })
     };
-    let cargo = (check.name == "cargo check" || check.name.starts_with("related Rust tests:"))
+    let cargo = (check.name == "cargo check"
+        || check.name.starts_with("cargo check: ")
+        || check.name.starts_with("related Rust tests:"))
         && check.command.starts_with("cargo ");
     let go = check.name.starts_with("related Go package tests:")
         && check.command.starts_with("go test ");
@@ -386,18 +388,43 @@ pub fn plan_with_runner(
     changed_paths: &[PathBuf],
     override_argv: &[String],
 ) -> Vec<FocusedCheck> {
-    let has_rust_changes = changed_paths.iter().any(|path| {
-        path.extension().and_then(|extension| extension.to_str()) == Some("rs")
-            || path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
-    });
+    let rust_paths = changed_paths
+        .iter()
+        .filter(|path| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+                || path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
+        })
+        .collect::<Vec<_>>();
 
     let mut checks = Vec::new();
-    if has_rust_changes && root.join("Cargo.toml").is_file() {
+    if !rust_paths.is_empty() && root.join("Cargo.toml").is_file() {
         checks.push(FocusedCheck {
             name: "cargo check".to_owned(),
             command: "cargo check --offline --all-targets --quiet".to_owned(),
             timeout_secs: 0,
         });
+    } else {
+        // Without a root manifest, check each nested crate that owns a changed file instead of
+        // silently skipping Rust verification.
+        let mut owners = Vec::new();
+        for path in rust_paths {
+            if let Some(manifest) = cargo_owner(root, path)
+                && !owners.contains(&manifest)
+            {
+                owners.push(manifest);
+            }
+        }
+        for manifest in owners {
+            let crate_dir = manifest.parent().unwrap_or(Path::new(""));
+            checks.push(FocusedCheck {
+                name: format!("cargo check: {}", crate_dir.display()),
+                command: format!(
+                    "cargo check --offline --all-targets --quiet --manifest-path {}",
+                    shell_quote(&manifest.to_string_lossy())
+                ),
+                timeout_secs: 0,
+            });
+        }
     }
 
     let mut seen_python_paths = HashSet::new();
@@ -431,6 +458,44 @@ pub fn plan_with_runner(
     }
 
     checks
+}
+
+/// Workspace-relative manifest of the nearest crate below `root` that owns `changed`.
+fn cargo_owner(root: &Path, changed: &Path) -> Option<PathBuf> {
+    if changed.is_absolute()
+        || changed
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let mut dir = changed.parent();
+    while let Some(current) = dir {
+        if current.as_os_str().is_empty() {
+            return None;
+        }
+        let manifest = current.join("Cargo.toml");
+        if root.join(&manifest).is_file() {
+            return Some(manifest);
+        }
+        dir = current.parent();
+    }
+    None
+}
+
+/// Changed paths beyond this count are not mapped to related tests.
+pub const RELATED_TEST_PATH_LIMIT: usize = 32;
+
+/// Explicit gaps in automatic test selection, so a passing run is not read as full coverage.
+pub fn coverage_limits(changed: &[PathBuf]) -> Vec<String> {
+    let mut limits = Vec::new();
+    if changed.len() > RELATED_TEST_PATH_LIMIT {
+        limits.push(format!(
+            "related-test selection covered the first {RELATED_TEST_PATH_LIMIT} of {} changed paths; run broader tests for the rest",
+            changed.len()
+        ));
+    }
+    limits
 }
 
 fn config_contains(root: &Path, file: &str, marker: &str) -> bool {
@@ -579,7 +644,7 @@ pub fn related_tests_with_runner(
     let mut selected = Vec::new();
     let cargo_project = root.join("Cargo.toml").is_file() && root.join("src/lib.rs").is_file();
     let go_project = root.join("go.mod").is_file();
-    for path in changed.iter().take(32) {
+    for path in changed.iter().take(RELATED_TEST_PATH_LIMIT) {
         if path.is_absolute()
             || path.components().any(|part| {
                 matches!(
@@ -973,6 +1038,43 @@ mod selection_tests {
                 && checks[3].command.contains("run")
                 && checks[3].command.contains("src/ui.test.ts")
         );
+    }
+
+    #[test]
+    fn nested_crates_without_a_root_manifest_are_checked_by_their_owner() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("tools/gen/src")).unwrap();
+        std::fs::write(
+            root.path().join("tools/gen/Cargo.toml"),
+            "[package]\nname='gen'\n",
+        )
+        .unwrap();
+        let checks = plan(
+            root.path(),
+            Path::new("python3"),
+            &[
+                "tools/gen/src/main.rs".into(),
+                "tools/gen/src/lib.rs".into(),
+                "loose.rs".into(),
+            ],
+        );
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].name, "cargo check: tools/gen");
+        assert!(
+            checks[0]
+                .command
+                .ends_with("--manifest-path 'tools/gen/Cargo.toml'")
+        );
+    }
+
+    #[test]
+    fn coverage_limits_name_paths_beyond_the_related_test_cap() {
+        let few = vec![PathBuf::from("a.rs"); RELATED_TEST_PATH_LIMIT];
+        assert!(coverage_limits(&few).is_empty());
+        let many = vec![PathBuf::from("a.rs"); RELATED_TEST_PATH_LIMIT + 3];
+        let limits = coverage_limits(&many);
+        assert_eq!(limits.len(), 1);
+        assert!(limits[0].contains("first 32 of 35"), "{limits:?}");
     }
     #[test]
     fn empty_suites_are_not_behavioral_evidence() {

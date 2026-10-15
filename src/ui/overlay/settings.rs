@@ -820,6 +820,22 @@ impl SettingsOverlay {
         self.filter_tabs();
         self
     }
+
+    /// Shared defaults for future model selections, rather than a current-model override.
+    pub fn context_defaults(mut self) -> Self {
+        let def = settings_schema::registry()
+            .iter()
+            .find(|def| def.path == "local_context_window")
+            .expect("local context setting is registered");
+        self.tab = self
+            .tabs
+            .iter()
+            .position(|(tab, _)| *tab == def.tab)
+            .expect("model settings tab is visible");
+        self.scope = Scope::Global;
+        self.move_to_path(def.path);
+        self
+    }
     fn learning_setting(def: &SettingDef) -> bool {
         def.tab == "Improvement"
             || def.path.starts_with("laya.")
@@ -2692,6 +2708,24 @@ mod tests {
                 Value::String("context".into())
             ])
         );
+    }
+
+    #[test]
+    fn context_defaults_opens_the_shared_local_cap_and_saves_globally() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.scope = Scope::Project;
+        let mut o = o.coding_only().context_defaults();
+        let screen = draw(&mut o, &rig, 130, 30);
+        assert!(screen.contains("Local context default"), "{screen}");
+        assert!(screen.contains("Cloud context default"), "{screen}");
+        send(&mut o, &rig.keys, key(KeyCode::Enter));
+        send(&mut o, &rig.keys, ctrl('u'));
+        send_all(&mut o, &rig.keys, typed("131072"));
+        let (path, value, scope) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        assert_eq!(path, "local_context_window");
+        assert_eq!(value, Value::Integer(131072));
+        assert_eq!(scope, Scope::Global);
     }
 
     #[test]

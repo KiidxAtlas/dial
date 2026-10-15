@@ -341,6 +341,7 @@ mod tests {
                 ui: &ui,
                 tick: 0,
                 tools_expanded: false,
+                expand_key: "Ctrl+O",
             };
             let (rows, images) = transcript.take_settled_with_images(90, &ctx);
             assert_eq!(images.len(), 1);
@@ -505,6 +506,7 @@ mod tests {
             ui: &ui,
             tick: 0,
             tools_expanded: false,
+            expand_key: "Ctrl+O",
         };
         let settled = transcript.take_settled(80, &ctx);
         assert!(settled[0].to_string().contains("viewed.png"));

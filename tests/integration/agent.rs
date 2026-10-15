@@ -4210,7 +4210,7 @@ fn child_repeated_successful_shell_inspections_stop_before_exhausting_steps() {
 }
 
 #[test]
-fn parent_and_child_stop_after_uncertain_effects_without_running_pending_writes() {
+fn parent_and_child_continue_after_reaped_timeouts() {
     if skip_without_sandbox() {
         return;
     }
@@ -4226,31 +4226,30 @@ fn parent_and_child_stop_after_uncertain_effects_without_running_pending_writes(
             ),
         ])
     };
-    let parent = serve(vec![calls()]);
+    let parent = serve(vec![calls(), Reply::Text("Recovered after timeout.")]);
     let e = env(&parent.url, "auto");
     let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     let report = agent.turn("Perform the operations", &mut ui).unwrap();
-    assert_ne!(
-        report.outcome,
-        TurnOutcome::Completed,
-        "results: {:?}; report: {}",
-        ui.results,
-        report.text
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(report.text, "Recovered after timeout.");
+    assert!(
+        ui.results
+            .iter()
+            .any(|(name, text, failed)| name == "bash" && *failed && text.contains("timed out"))
     );
-    assert!(report.text.contains("uncertain effects"), "{}", report.text);
     assert_eq!(
         std::fs::read_to_string(e.project.path().join("effect.txt")).unwrap(),
         "before"
     );
-    assert!(!e.project.path().join("must-not-run.txt").exists());
-    assert_eq!(parent.requests.lock().len(), 1);
+    assert!(e.project.path().join("must-not-run.txt").exists());
+    assert_eq!(parent.requests.lock().len(), 2);
     assert!(
         agent
             .session()
             .messages()
             .iter()
-            .any(|m| m["dial_effects"] == "unknown")
+            .all(|m| m["dial_effects"] != "unknown")
     );
 
     let main = serve(vec![
@@ -4258,14 +4257,14 @@ fn parent_and_child_stop_after_uncertain_effects_without_running_pending_writes(
             "task",
             json!({"task":"Perform the operations", "solution_space":"s", "agent":"worker", "max_steps":8}),
         ),
-        Reply::Text("The worker stopped with preserved effects."),
+        Reply::Text("The worker recovered after timeout."),
     ]);
-    let side = serve(vec![calls()]);
+    let side = serve(vec![calls(), Reply::Text("Recovered after timeout.")]);
     let mut e = env(&main.url, "auto");
     with_subagent_role(&mut e, &side.url);
     run_turn(&e, &mut Recorder::default());
     assert!(
-        task_result(&main).contains("uncertain effects"),
+        task_result(&main).contains("Recovered after timeout."),
         "{}",
         task_result(&main)
     );
@@ -4273,8 +4272,8 @@ fn parent_and_child_stop_after_uncertain_effects_without_running_pending_writes(
         std::fs::read_to_string(e.project.path().join("effect.txt")).unwrap(),
         "before"
     );
-    assert!(!e.project.path().join("must-not-run.txt").exists());
-    assert_eq!(side.requests.lock().len(), 1);
+    assert!(e.project.path().join("must-not-run.txt").exists());
+    assert_eq!(side.requests.lock().len(), 2);
 }
 
 #[test]
@@ -5489,32 +5488,35 @@ fn codebase_understanding_is_saved_across_new_sessions_and_invalidated_by_edits(
 }
 
 #[test]
-fn independent_child_reuses_saved_codebase_context() {
-    let main = serve(vec![
-        Reply::Call(
-            "task",
-            json!({"task":"inspect request router","solution_space":"s"}),
-        ),
-        Reply::Text("received"),
-    ]);
-    let side = serve(vec![Reply::Text("located")]);
-    let mut e = env(&main.url, "auto");
-    e.config.codebase.ambient_context = true;
-    std::fs::write(
-        e.project.path().join("router.rs"),
-        "pub fn request_router() {}\n",
-    )
-    .unwrap();
-    with_subagent_role(&mut e, &side.url);
-    run_turn(&e, &mut Recorder::default());
-    let child = side.requests.lock()[0].clone();
-    assert_eq!(prompt_of(&child), "inspect request router");
-    assert!(
-        child["messages"].to_string().contains("request_router")
-            && child["messages"]
-                .to_string()
-                .contains("Saved codebase understanding")
-    );
+fn independent_child_follows_the_ambient_codebase_context_setting() {
+    for ambient in [true, false] {
+        let main = serve(vec![
+            Reply::Call(
+                "task",
+                json!({"task":"inspect request router","solution_space":"s"}),
+            ),
+            Reply::Text("received"),
+        ]);
+        let side = serve(vec![Reply::Text("located")]);
+        let mut e = env(&main.url, "auto");
+        e.config.codebase.ambient_context = ambient;
+        std::fs::write(
+            e.project.path().join("router.rs"),
+            "pub fn request_router() {}\n",
+        )
+        .unwrap();
+        with_subagent_role(&mut e, &side.url);
+        run_turn(&e, &mut Recorder::default());
+        let child = side.requests.lock()[0].clone();
+        assert_eq!(prompt_of(&child), "inspect request router");
+        let messages = child["messages"].to_string();
+        assert_eq!(
+            messages.contains("request_router")
+                && messages.contains("Saved codebase understanding"),
+            ambient,
+            "ambient_context = {ambient}: {messages}"
+        );
+    }
 }
 
 #[test]
@@ -8542,13 +8544,19 @@ fn rounds_in_which_nothing_worked_end_the_turn_even_when_no_single_tool_streak_d
         after_fourth.iter().any(|m| m["role"] == "user"
             && m["content"]
                 .as_str()
-                .is_some_and(|c| c.starts_with("4 rounds of tool calls"))),
+                .is_some_and(|c| c.contains("4 rounds of tool calls"))),
         "warned after the fourth round"
     );
     assert!(
         !requests[3]["messages"]
             .to_string()
             .contains("rounds of tool calls in a row")
+    );
+    assert!(
+        !requests[5]["messages"]
+            .to_string()
+            .contains("4 rounds of tool calls"),
+        "the warning reaches one request without persisting in history"
     );
 }
 

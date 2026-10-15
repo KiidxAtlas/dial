@@ -360,6 +360,15 @@ pub fn needs_approval(ext: &Registry, call: &ToolCall) -> bool {
 
 /// Stateful reads (background output cursors, memory, todo) remain serial barriers.
 pub fn parallel_read(ext: &Registry, name: &str, args: &Value) -> bool {
+    // Read-only shell commands join parallel groups unless they name a stateful or managed form:
+    // a retained `session` (cwd and exports) or a background/async job is a serial barrier.
+    if name == "bash" {
+        let flag_off = |key| matches!(args.get(key), None | Some(Value::Null | Value::Bool(false)));
+        return flag_off("background")
+            && flag_off("async")
+            && args["session"].is_null()
+            && is_read_only(ext, name, args);
+    }
     // Explicit user attachments are resolved against the conversation by the serial controller.
     if name == "read" {
         let mut targets = Vec::new();
@@ -1462,5 +1471,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod parallel_bash_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn only_stateless_read_only_bash_joins_parallel_groups() {
+        let ext = Registry::new();
+        for args in [
+            json!({"command":"ls -la"}),
+            json!({"command":"cat README.md","timeout":30}),
+            json!({"command":"ls","background":false}),
+        ] {
+            assert!(parallel_read(&ext, "bash", &args), "{args}");
+        }
+        for args in [
+            json!({"command":"rm -rf target"}),
+            json!({"command":"ls > out.txt"}),
+            json!({"command":"ls","background":true}),
+            json!({"command":"ls","async":true}),
+            json!({"command":"ls","session":"review"}),
+            json!({"command":"ls","background":"yes"}),
+        ] {
+            assert!(!parallel_read(&ext, "bash", &args), "{args}");
+        }
     }
 }

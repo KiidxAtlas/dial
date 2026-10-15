@@ -4,7 +4,7 @@
 //! Its tools are the job's allowlist; every effect is authorized by the live
 //! parent's [`Approver`], and cancellation remains local to the child.
 use super::{
-    approval, call_form_error,
+    approval, call_form_error, describe,
     guard::{LengthAction, clip_evidence},
     json_text, looks_like_text_call, output_schema, reasoning,
     subagents::{Approver, Env, Job, Outcome, Status, toolset},
@@ -1723,7 +1723,9 @@ fn run_inner(
         messages.push(json!({"role":"user","content":job.prompt,"dial_child_coordination":true}));
     }
     // Independent child conversations reuse the same project cache without rebuilding the map.
+    // Automatic retrieval follows the parent's ambient-context policy; explicit lookups stay available.
     if env.config.codebase.enabled
+        && env.config.codebase.ambient_context
         && let Some(layout) = env.layout
     {
         match crate::storage::codebase::Codebase::open(layout).and_then(|cache| {
@@ -2067,12 +2069,6 @@ fn run_inner(
             approver.add_cost(cost);
         }
         record_child_request(env, &children.namespace, backend, &result, started);
-        if let Some(observation) = backend.wire_observation() {
-            approver.notice(&format!(
-                "Provider wire: {}; {} common prompt bytes (not cached tokens)",
-                observation.invalidation, observation.common_prompt_bytes
-            ));
-        }
         messages = request.messages;
         schemas = request.tools;
         if append_coordination(&mut messages, approver.take_messages())
@@ -2959,7 +2955,7 @@ fn run_inner(
         }
         if let Some(advice) = narration_warning {
             approver.notice(&advice);
-            messages.push(json!({"role":"user","content":advice}));
+            messages.push(json!({"role":"user","content":advice,"dial_transient":true}));
         }
         if env.interrupt.load(Ordering::SeqCst) {
             return Ok(super::engine::Tick::Finished(Outcome::interrupted(steps)));
@@ -3397,7 +3393,7 @@ fn call_tool_inner(
         }
         if let Err(denial) = approver.authorize(
             call,
-            &super::summarize(call),
+            &describe(call),
             approval::needs_approval(env.ext, call),
         ) {
             return refuse(denial.message().into());
@@ -3455,7 +3451,7 @@ fn call_tool_inner(
     if !job.spec.mutates && needs_approval {
         return refuse("denied: read-only subagent cannot execute this operation".into());
     }
-    let summary = format!("[{}] {}", job.label, summarize(call));
+    let summary = format!("[{}] {}", job.label, describe(call));
     if let Err(denial) =
         approver
             .borrow_mut()

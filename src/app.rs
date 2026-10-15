@@ -1287,7 +1287,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "model",
-        "choose the main model and assign roles; /model settings tunes it",
+        "choose the main model and assign roles; /model settings tunes it; /model defaults sets context defaults",
     ),
     ("providers", "set up providers, keys and endpoints"),
     ("settings", "appearance, tools and coding preferences"),
@@ -1410,7 +1410,7 @@ fn command_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> 
             .then(|| {
                 match *name {
                     "resume" => "[id]",
-                    "model" => "[settings]",
+                    "model" => "[settings|defaults]",
                     "search" => "<query>",
                     "review" => "[uncommitted|base <ref>|ref <ref>|commit <ref>|pr://N|pr://owner/repo/N|GitHub PR URL]",
                     "review-file" => "<turn> [path]",
@@ -1554,7 +1554,7 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
     for (name, args) in [
         (
             "model",
-            &["settings", "next", "prev", "cancel", "restart"][..],
+            &["settings", "defaults", "next", "prev", "cancel", "restart"][..],
         ),
         ("understanding", &["architecture", "build", "clear"][..]),
         ("memory", &["clear"][..]),
@@ -2487,6 +2487,7 @@ enum Which {
     LearningSettings,
     LearningModels,
     ModelSettings,
+    ContextDefaults,
     Models,
     ModelRoles,
     Providers,
@@ -2519,6 +2520,7 @@ fn overlay_destination(action: &str) -> Option<Which> {
         "open:providers" => Some(Which::Providers),
         "open:settings" => Some(Which::Settings),
         "open:model-settings" => Some(Which::ModelSettings),
+        "open:context-defaults" => Some(Which::ContextDefaults),
         "open:shortcuts" => Some(Which::Shortcuts),
         "open:compute" => Some(Which::Compute),
         "open:extensions" => Some(Which::Extensions),
@@ -2995,11 +2997,13 @@ impl Shell {
             ..
         } = self;
         let theme = themes.current();
+        let expand_key = keys.label(Action::ToolsExpand);
         let tctx = TranscriptCtx {
             theme,
             ui,
             tick: status.tick,
             tools_expanded: *tools_expanded,
+            expand_key: &expand_key,
         };
         let (settled, images) = transcript.take_settled_with_images(cols, &tctx);
         if !settled.is_empty() {
@@ -3789,13 +3793,16 @@ impl Shell {
             ui,
             status,
             tools_expanded,
+            keys,
             ..
         } = self;
+        let expand_key = keys.label(Action::ToolsExpand);
         let ctx = TranscriptCtx {
             theme: themes.current(),
             ui,
             tick: status.tick,
             tools_expanded: *tools_expanded,
+            expand_key: &expand_key,
         };
         // Only what already reached scrollback is replayed; the still-streaming tail stays live.
         let rows = transcript.committed_rows(cols, &ctx);
@@ -4353,7 +4360,12 @@ impl Shell {
             }
             Err(error) => self.transcript.error(&format!("{error:#}")),
         }
-        if self.ui.notify && (!matches!(&result, Err(_)) || self.ui.notify_errors) {
+        // A turn the user stopped is not a completion; failures still notify when enabled.
+        let notify = match &result {
+            Ok(report) => !report.interrupted,
+            Err(_) => self.ui.notify_errors,
+        };
+        if self.ui.notify && notify {
             let kind = if matches!(&result, Err(_)) {
                 crate::ui::termcaps::NotifyKind::Error
             } else {
@@ -4441,17 +4453,16 @@ impl Shell {
             match read() {
                 Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    if self.keys.matches(Action::SelectPageDown, &key) {
-                        let lines = text::wrap_words(
-                            &text::sanitize(&shown),
-                            (self.term.size().0 as usize).saturating_sub(4).max(1),
-                        )
-                        .len();
-                        body_offset = body_offset.saturating_add(6).min(lines.saturating_sub(1));
-                        continue;
-                    }
-                    if self.keys.matches(Action::SelectPageUp, &key) {
-                        body_offset = body_offset.saturating_sub(6);
+                    // Page by the body rows actually visible, keeping one row of overlap, so a short
+                    // terminal never skips details the user has not seen.
+                    let down = self.keys.matches(Action::SelectPageDown, &key);
+                    if down || self.keys.matches(Action::SelectPageUp, &key) {
+                        let (cols, height) = self.term.size();
+                        let lines =
+                            text::wrap_words(&text::sanitize(&shown), panel_inner(cols)).len();
+                        let visible =
+                            panel_body_limit(options.len(), height.saturating_sub(6) as usize);
+                        body_offset = panel_scroll(body_offset, lines, visible, down);
                         continue;
                     }
                     if title == RECOVERY_PANEL && self.keys.matches(Action::ToolsExpand, &key) {
@@ -4894,6 +4905,7 @@ impl Shell {
         };
         let discovery = self.catalog.get();
         let learning_settings = matches!(which, Which::LearningSettings);
+        let context_defaults = matches!(which, Which::ContextDefaults);
         let learning_models = matches!(which, Which::LearningModels);
         let overlay = match which {
             Which::Palette => ActiveOverlay::Palette(PaletteOverlay::new(
@@ -4945,7 +4957,7 @@ impl Shell {
                     crate::ui::overlay::model_settings::ModelSettingsOverlay::new(name, profile),
                 ))
             }
-            Which::Settings | Which::LearningSettings => {
+            Which::Settings | Which::LearningSettings | Which::ContextDefaults => {
                 let (values, global, project) = settings_tables(app, &effective);
                 let themes = self
                     .themes
@@ -4960,6 +4972,9 @@ impl Shell {
                 } else {
                     overlay.coding_only()
                 };
+                if context_defaults {
+                    overlay = overlay.context_defaults();
+                }
                 apply_settings_hints(&mut overlay, &effective);
                 overlay.set_setup_offers(setting_setup_offers(&app.layout.user_dir, &effective));
                 ActiveOverlay::Settings(Box::new(overlay))
@@ -5503,8 +5518,16 @@ impl Shell {
         }
     }
 
-    /// Shared by inference and local-compute waiting. Only explicit session/work changes cancel.
+    /// Shared by inference and local-compute waiting. Only explicit session/work changes, or an
+    /// explicit send-now of a queued message, cancel the running turn.
     fn route_busy_command(&mut self, app: &App, text: String) -> bool {
+        // Plain Submit while busy is the explicit empty-Enter queue flush.
+        // Stop at the next safe point and dispatch it in this same chat, ahead
+        // of deferred commands and the remaining queued messages.
+        if !text.trim_start().starts_with('/') {
+            self.startup = Some(text);
+            return true;
+        }
         if text.split_whitespace().next() == Some("/reload") {
             if text.trim() == "/reload" {
                 self.refresh_resources(app, true, true);
@@ -5526,6 +5549,7 @@ impl Shell {
             "/model" | "/models" => Some(Which::Models),
             "/roles" => Some(Which::ModelRoles),
             "/model settings" => Some(Which::ModelSettings),
+            "/model defaults" => Some(Which::ContextDefaults),
             "/providers" | "/provider" => Some(Which::Providers),
             "/settings" => Some(Which::Settings),
             "/model-settings" => Some(Which::ModelSettings),
@@ -6090,10 +6114,13 @@ impl Shell {
             "model" if matches!(args, "settings" | "setting") => {
                 return self.open(app, agent, Which::ModelSettings);
             }
+            "model" if args == "defaults" => {
+                return self.open(app, agent, Which::ContextDefaults);
+            }
             "model" if !args.is_empty() => {
                 self.note(
                     "Model",
-                    "Unknown option. Use /model to choose a model or /model settings to tune the current one.",
+                    "Unknown option. Use /model to choose a model, /model settings to tune it, or /model defaults for shared context defaults.",
                 );
             }
             "model" | "models" => return self.open(app, agent, Which::Models),
@@ -8387,7 +8414,22 @@ impl Bridge<'_> {
         }
     }
 
+    /// Immediate feedback for an interrupt: the turn only stops at its next safe point, so name
+    /// the tool it is waiting on. Activity stays on this label until the turn settles.
+    fn show_stopping(&mut self) {
+        let activity = match self.pending.last() {
+            Some((_, name, _)) => format!("stopping after {name}"),
+            None => "stopping".to_owned(),
+        };
+        // Set directly: `set_activity` holds the label once the interrupt flag is up.
+        self.shell.status.activity = activity;
+        self.repaint(true);
+    }
+
     fn set_activity(&mut self, activity: &str) {
+        if self.interrupt.load(Ordering::SeqCst) {
+            return;
+        }
         if self.shell.status.activity != activity {
             self.shell.status.activity = activity.to_owned();
         }
@@ -8456,7 +8498,8 @@ impl Bridge<'_> {
                             }
                         }
                         ComposerEvent::Interrupt | ComposerEvent::Exit => {
-                            self.interrupt.store(true, Ordering::SeqCst)
+                            self.interrupt.store(true, Ordering::SeqCst);
+                            self.show_stopping();
                         }
                         ComposerEvent::Submit(text) => {
                             if shell.route_busy_command(self.app, text) {
@@ -8903,7 +8946,7 @@ impl Ui for Bridge<'_> {
         self.shell.status.phase = Phase::Working;
         let choice = self.shell.ask_with_cancel(
             &format!("Allow {tool}?"),
-            &agent::truncate(summary, 1500),
+            summary,
             &[
                 ("Allow once", 'y'),
                 ("Always allow this session", 'a'),
@@ -9112,7 +9155,7 @@ fn panel_rows_window(
     if width < 6 {
         return vec![Line::from(text::clip(title, width))];
     }
-    let inner = width - 4;
+    let inner = panel_inner(width as u16);
     let border = theme.fg(Tok::Warning);
     let pad_row = |spans: Vec<Span<'static>>| -> Line<'static> {
         let spans = truncate_spans(spans, inner, "");
@@ -9165,18 +9208,16 @@ fn panel_rows_window(
             border,
         ),
     ]));
-    let option_limit = options.len().min(height.saturating_sub(5).max(1));
-    let body_limit = height.saturating_sub(option_limit + 3).clamp(1, 8);
-    for line in text::wrap_words(&text::sanitize(body), inner)
-        .into_iter()
-        .skip(offset)
-        .take(body_limit)
-    {
+    let lines = text::wrap_words(&text::sanitize(body), inner);
+    let body_limit = panel_body_limit(options.len(), height);
+    let offset = offset.min(lines.len().saturating_sub(body_limit));
+    for line in lines.iter().skip(offset).take(body_limit) {
         rows.push(pad_row(vec![Span::styled(
-            text::clip(&line, inner),
+            text::clip(line, inner),
             theme.fg(Tok::ToolOutput),
         )]));
     }
+    let option_limit = options.len().min(height.saturating_sub(5).max(1));
     let start = selected
         .saturating_sub(option_limit.saturating_sub(1))
         .min(options.len().saturating_sub(option_limit));
@@ -9196,10 +9237,17 @@ fn panel_rows_window(
             Span::styled(format!("  ({hotkey})"), theme.fg(Tok::Muted)),
         ]));
     }
-    rows.push(pad_row(vec![Span::styled(
-        "Choose · Enter confirm · Esc cancel · Page keys scroll details",
-        theme.fg(Tok::Dim),
-    )]));
+    let hint = if lines.len() > body_limit {
+        format!(
+            "Choose · Enter confirm · Esc cancel · Page keys scroll details {}-{} of {}",
+            offset + 1,
+            (offset + body_limit).min(lines.len()),
+            lines.len()
+        )
+    } else {
+        "Choose · Enter confirm · Esc cancel · Page keys scroll details".to_owned()
+    };
+    rows.push(pad_row(vec![Span::styled(hint, theme.fg(Tok::Dim))]));
     rows.push(Line::from(Span::styled(
         format!(
             "{}{}{}",
@@ -9210,6 +9258,30 @@ fn panel_rows_window(
         border,
     )));
     rows
+}
+
+/// Text columns inside a modal panel's border and padding.
+fn panel_inner(width: u16) -> usize {
+    (width as usize).saturating_sub(4).max(1)
+}
+
+/// Body rows a modal panel shows for `options` choices within `height` rows: the same budget the renderer and
+/// the page keys use, so paging never jumps past rows the user has not seen.
+fn panel_body_limit(options: usize, height: usize) -> usize {
+    let option_limit = options.min(height.saturating_sub(5).max(1));
+    height.saturating_sub(option_limit + 3).clamp(1, 8)
+}
+
+/// The next body offset for a page key: one visible page minus a row of overlap, never past the last page.
+fn panel_scroll(offset: usize, lines: usize, visible: usize, down: bool) -> usize {
+    let page = visible.saturating_sub(1).max(1);
+    if down {
+        offset
+            .saturating_add(page)
+            .min(lines.saturating_sub(visible))
+    } else {
+        offset.saturating_sub(page)
+    }
 }
 
 /// Show an earlier session's conversation as transcript blocks (for `dial -c`).
@@ -9253,6 +9325,10 @@ mod tests {
         assert!(matches!(
             overlay_destination("open:models"),
             Some(Which::Models)
+        ));
+        assert!(matches!(
+            overlay_destination("open:context-defaults"),
+            Some(Which::ContextDefaults)
         ));
         assert!(overlay_destination("open:unknown").is_none());
     }
@@ -9444,7 +9520,7 @@ mod tests {
         assert_eq!(find("rename").command.args_hint.as_deref(), Some("<title>"));
         assert_eq!(
             find("model").command.args_hint.as_deref(),
-            Some("[settings]")
+            Some("[settings|defaults]")
         );
         assert!(
             find("model")
@@ -10773,6 +10849,7 @@ mod tests {
         let choices = command_argument_completions(&Config::default(), &[skill]);
         for expected in [
             "/model settings",
+            "/model defaults",
             "/understanding architecture",
             "/understanding build",
             "/understanding clear",
@@ -10932,6 +11009,64 @@ mod tests {
             first.iter().map(ToString::to_string).collect::<Vec<_>>(),
             later.iter().map(ToString::to_string).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn paging_long_approval_details_reaches_every_line_at_any_height() {
+        let theme = Theme::mono();
+        let options = [
+            ("Allow once", 'y'),
+            ("Always allow this session", 'a'),
+            ("Always allow in this project", 'p'),
+            ("Deny", 'n'),
+        ];
+        // Longer than the old 1,500-byte approval cap, with the consequential part at the end.
+        let body = format!(
+            "{}\nSENTINEL-END rm -rf /important",
+            (0..120)
+                .map(|index| format!("line-{index:03} echo safe"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(body.len() > 1500);
+        for (cols, terminal_height) in [(40u16, 8usize), (40, 10), (60, 14), (100, 40)] {
+            let height = terminal_height.saturating_sub(6);
+            let lines = text::wrap_words(&text::sanitize(&body), panel_inner(cols)).len();
+            let visible = panel_body_limit(options.len(), height);
+            let mut seen = std::collections::BTreeSet::new();
+            let mut offset = 0;
+            loop {
+                for row in panel_rows_window(
+                    &theme,
+                    cols,
+                    "Allow bash?",
+                    &body,
+                    &options,
+                    0,
+                    offset,
+                    height,
+                ) {
+                    let row = row.to_string();
+                    if let Some(at) = row.find("line-") {
+                        seen.insert(row[at..at + 8].to_owned());
+                    }
+                    if row.contains("SENTINEL-END") {
+                        seen.insert("end".to_owned());
+                    }
+                }
+                let next = panel_scroll(offset, lines, visible, true);
+                if next == offset {
+                    break;
+                }
+                offset = next;
+            }
+            assert_eq!(seen.len(), 121, "cols {cols} height {terminal_height}");
+            assert!(seen.contains("end"));
+            assert_eq!(
+                panel_scroll(offset, lines, visible, false),
+                offset - (visible - 1).max(1)
+            );
+        }
     }
 
     #[test]
