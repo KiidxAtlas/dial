@@ -1,0 +1,19 @@
+version = 1
+name = "recovery-efficiency"
+
+# Run from the checkout for real-model measurements. The smoke driver also runs
+# these exact checks against a scripted local provider; that tests the harness,
+# not model quality or an improvement relative to a measured model baseline.
+[[cases]]
+id = "selector-recovery"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "BENCH_CASE=selector-recovery. Exercise one read of calc.py with the invalid line selector :1- many, inspect its error, then correct the selector and fix calc.add to add its arguments. Preserve the public API and verify the result. Do not repeat the malformed call or read unchanged evidence for reassurance."
+categories = ["efficiency", "recovery", "tool_contract", "debugging"]
+checks = [{kind="command",command="python3 -c 'from calc import add; assert add(2,3)==5; assert add(-7,3)==-4; assert add(0,0)==0; assert add(11,-2)==9'"}, {kind="metric",metric="tool_errors",min=1,max=1}, {kind="metric",metric="tool_calls",max=12}]
+
+[[cases]]
+id = "reuse-evidence"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "BENCH_CASE=reuse-evidence. Fix the arithmetic bug in calc.add, preserving its public API. Read the relevant source once, reuse that evidence for the edit, and verify the behavior. Avoid unrelated tools and unchanged rereads."
+categories = ["efficiency", "evidence_reuse", "debugging"]
+checks = [{kind="command",command="python3 -c 'from calc import add; assert add(2,3)==5; assert add(-7,3)==-4; assert add(0,0)==0; assert add(11,-2)==9'"}, {kind="metric",metric="tool_errors",max=0}, {kind="metric",metric="tool_calls",max=8}]

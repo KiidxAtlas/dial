@@ -1,0 +1,19 @@
+{
+  "bootstrap": "bootstrap.js",
+  "scripts": [
+    "00_stealth_tampering.txt",
+    "01_stealth_activity.txt",
+    "02_stealth_hairline.txt",
+    "03_stealth_botd.txt",
+    "04_stealth_iframe.txt",
+    "05_stealth_webgl.txt",
+    "06_stealth_screen.txt",
+    "07_stealth_fonts.txt",
+    "08_stealth_audio.txt",
+    "09_stealth_locale.txt",
+    "10_stealth_plugins.txt",
+    "11_stealth_hardware.txt",
+    "12_stealth_codecs.txt",
+    "13_stealth_worker.txt"
+  ]
+}

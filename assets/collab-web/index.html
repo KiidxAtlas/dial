@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dial collaboration viewer</title>
+<style>body{font:15px system-ui;max-width:900px;margin:2rem auto;padding:0 1rem;background:#101318;color:#e5e7eb}header{position:sticky;top:0;background:#101318;padding:1rem 0;border-bottom:1px solid #394150}#status{color:#9ca3af}#transcript{white-space:pre-wrap;overflow-wrap:anywhere}article{padding:.75rem;margin:.5rem 0;border-left:3px solid #5376b8;background:#1b2029;border-radius:4px}.error{color:#fca5a5}</style>
+<header><h1>Dial session</h1><div id="status">Connecting…</div></header><main id="transcript"></main>
+<script type="module">
+const status=document.querySelector('#status'), transcript=document.querySelector('#transcript');
+const b64=s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');return Uint8Array.from(atob(s+'='.repeat((4-s.length%4)%4)),c=>c.charCodeAt(0))};
+function fail(message){status.textContent=message;status.className='error'}
+try {
+  const fragment=decodeURIComponent(location.hash.slice(1)); if(!fragment) throw Error('Open a full Dial collaboration link.');
+  let link=fragment; if(link.startsWith('http://')||link.startsWith('https://')){const parsed=new URL(link);link=decodeURIComponent(parsed.hash.slice(1));}
+  if(!link.includes('://'))link='wss://'+link;
+  const u=new URL(link); if(!u.hash&&u.pathname.includes('.')){};
+  const match=u.pathname.match(/^\/r\/([A-Za-z0-9_-]+)(?:\.([A-Za-z0-9_-]+))?$/); if(!match)throw Error('Invalid collaboration link.');
+  let secret=match[2]||u.hash.slice(1); if(!secret)throw Error('Link is missing its key.');
+  const secretBytes=b64(secret);if(secretBytes.length!==32&&secretBytes.length!==48)throw Error('Invalid room key.');
+  const key=await crypto.subtle.importKey('raw',secretBytes.slice(0,32),{name:'AES-GCM'},false,['encrypt','decrypt']);
+  const socketUrl=`${u.protocol}//${u.host}/r/${match[1]}?role=guest`; const ws=new WebSocket(socketUrl);ws.binaryType='arraybuffer';
+  const add=(kind,text)=>{const el=document.createElement('article');el.textContent=`${kind}: ${text}`;transcript.append(el)};
+  ws.onopen=async()=>{status.textContent='Connected · end-to-end encrypted';const iv=crypto.getRandomValues(new Uint8Array(12));const body=new TextEncoder().encode(JSON.stringify({t:'hello',proto:1001,name:'web viewer'}));const sealed=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv,tagLength:128},key,body));const out=new Uint8Array(16+sealed.length);out.set(iv,4);out.set(sealed,16);ws.send(out);};
+  ws.onclose=()=>{status.textContent='Disconnected';};ws.onerror=()=>fail('Relay connection failed.');
+  ws.onmessage=async event=>{
+    if(typeof event.data==='string'){try{const ctl=JSON.parse(event.data);if(ctl.t==='room-closed')status.textContent='Host ended this session';}catch{}return;}
+    try {
+      const bytes=new Uint8Array(event.data);if(bytes.length<20)throw Error('Short frame');
+      const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(4,16),tagLength:128},key,bytes.slice(16));
+      const frame=JSON.parse(new TextDecoder().decode(plain));
+      if(frame.t==='state')add('Session',JSON.stringify(frame.state));
+      else if(frame.t==='entry')add(frame.entry?.type||'Entry',JSON.stringify(frame.entry));
+      else if(frame.t==='node')add('Runtime',JSON.stringify(frame.node));
+      else if(frame.t==='snapshot-chunk')for(const entry of frame.entries||[])add(entry?.type||'Entry',JSON.stringify(entry));
+      else if(frame.t==='notice')add('Notice',frame.message||'');
+      else if(frame.t==='error')add('Error',frame.message||'Unknown error');
+      else if(frame.t==='welcome')status.textContent=`Connected · ${frame.name||'host'}`;
+      else if(frame.t==='reset')transcript.replaceChildren();
+      else if(frame.t==='bye')status.textContent=`Host ended this session${frame.reason?': '+frame.reason:''}`;
+      window.scrollTo(0,document.body.scrollHeight);
+    } catch(error){add('Frame unavailable',String(error));}
+  };
+} catch(error){fail(error.message||String(error));}
+</script></html>

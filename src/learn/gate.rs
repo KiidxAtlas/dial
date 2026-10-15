@@ -1,0 +1,1646 @@
+//! The sealed admission gate: a candidate version replaces the baseline only if the primary suite
+//! improves (by a margin and, optionally, with statistical significance) and no guard suite regresses.
+//! Cases are verified by deterministic `Check`s; suites come from `load_manual` (private JSONL files)
+//! or are generated in memory by the caller.
+use super::verify::Check;
+use crate::config::types::{Admission, GateConfig, SuiteScore, Version};
+use crate::llm::errors::{self, ErrorClass, ThinkingLoop};
+use anyhow::{Result, bail, ensure};
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::time::Duration;
+
+/// Workspace files a case seeds before the agent runs (relative path -> content).
+pub type Files = BTreeMap<String, String>;
+
+/// One gate task: a prompt, the workspace it starts from and the deterministic check of its outcome.
+#[derive(Debug, Clone)]
+pub struct Case {
+    pub id: String,
+    pub prompt: String,
+    pub files: Files,
+    pub check: Check,
+}
+
+#[derive(Debug, Clone)]
+pub struct Suite {
+    pub name: String,
+    pub primary: bool,
+    pub cases: Vec<Case>,
+}
+
+/// Admission thresholds. Percentages are on a 0..100 scale; case counts are paired differences
+/// (`candidate_only` = cases only the candidate solved, `baseline_only` = only the baseline solved).
+#[derive(Clone, Debug)]
+pub struct Rules {
+    /// Largest tolerated drop, in percentage points, of any suite.
+    pub max_regression: f64,
+    /// Smallest required primary gain, in percentage points.
+    pub min_improvement: f64,
+    /// One-sided sign-test level for the primary gain; `1.0` disables the test.
+    pub alpha: f64,
+    /// Required `candidate_only - baseline_only` on the primary suite.
+    pub min_net_wins: u32,
+    /// Stop as soon as the outcome cannot change: a rejection already certain (a suite over its
+    /// regression bound, or a primary suite that could not reach the required gain even if every
+    /// remaining case went the candidate's way). Never accepts earlier and never changes whether
+    /// a candidate is admitted; it only skips cases that could not matter.
+    pub stop_when_futile: bool,
+}
+
+impl Rules {
+    /// Legacy semantics: point thresholds only, no significance test, no net-win or slack allowances.
+    pub fn from_gate(g: &GateConfig) -> Rules {
+        Rules {
+            max_regression: g.max_regression,
+            min_improvement: g.min_improvement,
+            alpha: 1.0,
+            min_net_wins: 0,
+            stop_when_futile: false,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_regression.is_finite() && (0.0..=100.0).contains(&self.max_regression),
+            "gate max_regression must be finite and between 0 and 100 percentage points"
+        );
+        ensure!(
+            self.min_improvement.is_finite() && self.min_improvement > 0.0,
+            "gate min_improvement must be finite and positive in percentage points"
+        );
+        ensure!(
+            self.alpha.is_finite() && self.alpha > 0.0 && self.alpha <= 1.0,
+            "gate alpha must be in (0, 1]"
+        );
+        Ok(())
+    }
+}
+
+fn validate_files(files: &Files, suite: usize) -> Result<()> {
+    ensure!(files.len() <= 64, "too many seeded files in suite {suite}");
+    for (path, content) in files {
+        let p = Path::new(path);
+        ensure!(
+            !path.is_empty()
+                && !path.contains('\0')
+                && p.is_relative()
+                && p.components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+                && content.len() <= 256 * 1024,
+            "invalid seeded file in suite {suite}"
+        );
+    }
+    Ok(())
+}
+
+/// Structure every suite set must have, wherever it came from. Errors name suites by position only.
+fn validate_suites(suites: &[Suite]) -> Result<()> {
+    ensure!(!suites.is_empty(), "gate requires at least one suite");
+    ensure!(
+        suites.iter().filter(|s| s.primary).count() == 1,
+        "gate requires exactly one primary suite"
+    );
+    let mut names = HashSet::new();
+    for (index, suite) in suites.iter().enumerate() {
+        let n = index + 1;
+        ensure!(
+            !suite.name.trim().is_empty() && names.insert(suite.name.trim()),
+            "gate suite names must be nonempty and distinct"
+        );
+        ensure!(!suite.cases.is_empty(), "private gate suite {n} is empty");
+        let mut ids = HashSet::new();
+        for case in &suite.cases {
+            ensure!(
+                !case.id.trim().is_empty() && ids.insert(case.id.trim()),
+                "empty or duplicate private case identifier in suite {n}"
+            );
+            ensure!(
+                !case.prompt.trim().is_empty(),
+                "empty private gate prompt in suite {n}"
+            );
+            validate_files(&case.files, n)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Matcher {
+    #[default]
+    Exact,
+    Json,
+}
+
+/// Keeps an explicit `null` expectation (valid for the json matcher) distinct from an absent one.
+fn present<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCase {
+    id: String,
+    prompt: String,
+    #[serde(default, deserialize_with = "present")]
+    expected: Option<Value>,
+    #[serde(default)]
+    matcher: Option<Matcher>,
+    #[serde(default)]
+    files: Files,
+    #[serde(default)]
+    check: Option<Check>,
+}
+
+impl RawCase {
+    /// `None` when the case is not exactly one of `check` or legacy `expected`(+`matcher`).
+    fn into_case(self) -> Option<Case> {
+        let check = match (self.check, self.expected, self.matcher) {
+            (Some(check), None, None) => check,
+            (None, Some(Value::String(expected)), None | Some(Matcher::Exact)) => {
+                Check::AnswerExact { expected }
+            }
+            (None, Some(expected), Some(Matcher::Json)) => Check::AnswerJson { expected },
+            _ => return None,
+        };
+        Some(Case {
+            id: self.id,
+            prompt: self.prompt,
+            files: self.files,
+            check,
+        })
+    }
+}
+
+/// Reads the private JSONL suites named by the config. I/O and serde errors are never attached:
+/// they could contain private paths or cases.
+pub fn load_manual(config: &GateConfig) -> Result<Vec<Suite>> {
+    ensure!(
+        config.max_regression.is_finite() && (0.0..=100.0).contains(&config.max_regression),
+        "gate max_regression must be finite and between 0 and 100 percentage points"
+    );
+    ensure!(
+        config.min_improvement.is_finite() && config.min_improvement > 0.0,
+        "gate min_improvement must be finite and positive in percentage points"
+    );
+    ensure!(
+        config.suites.len() >= 2,
+        "gate requires at least two suites"
+    );
+    ensure!(
+        config.suites.iter().filter(|s| s.primary).count() == 1,
+        "gate requires exactly one primary suite"
+    );
+    let mut previous_prompts = HashSet::new();
+    let mut suites = Vec::with_capacity(config.suites.len());
+    for (index, suite) in config.suites.iter().enumerate() {
+        let n = index + 1;
+        let file = File::open(&suite.path)
+            .map_err(|_| anyhow::anyhow!("cannot open private gate suite {n}"))?;
+        let mut cases = Vec::new();
+        for (line, text) in BufReader::new(file).lines().enumerate() {
+            let text = text.map_err(|_| anyhow::anyhow!("cannot read private gate suite {n}"))?;
+            let invalid = || {
+                anyhow::anyhow!(
+                    "invalid private gate case in suite {n} at line {}",
+                    line + 1
+                )
+            };
+            let raw: RawCase = serde_json::from_str(&text).map_err(|_| invalid())?;
+            let case = raw.into_case().ok_or_else(invalid)?;
+            ensure!(
+                !previous_prompts.contains(case.prompt.trim()),
+                "private gate suites must not share prompts"
+            );
+            cases.push(case);
+        }
+        previous_prompts.extend(cases.iter().map(|case| case.prompt.trim().to_owned()));
+        suites.push(Suite {
+            name: suite.name.clone(),
+            primary: suite.primary,
+            cases,
+        });
+    }
+    validate_suites(&suites)?;
+    Ok(suites)
+}
+
+/// Trimmed prompts of every gate case, for filtering training data. Never logged or reported.
+pub fn held_out_prompts(suites: &[Suite]) -> HashSet<String> {
+    suites
+        .iter()
+        .flat_map(|suite| suite.cases.iter().map(|case| case.prompt.trim().to_owned()))
+        .collect()
+}
+
+/// Exact trimmed prompt overlap is prevented; this cannot prove semantic disjointness.
+pub fn check_training_isolation(
+    prompts: &HashSet<String>,
+    train: &Path,
+    valid: &Path,
+) -> Result<()> {
+    for (index, path) in [train, valid].iter().enumerate() {
+        let file = File::open(path)
+            .map_err(|_| anyhow::anyhow!("cannot open training isolation input {}", index + 1))?;
+        for (line, text) in BufReader::new(file).lines().enumerate() {
+            let text = text.map_err(|_| {
+                anyhow::anyhow!("cannot read training isolation input {}", index + 1)
+            })?;
+            let record: Value = serde_json::from_str(&text).map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid training isolation record in input {} at line {}",
+                    index + 1,
+                    line + 1
+                )
+            })?;
+            let messages = record
+                .get("messages")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "training isolation requires message records in input {} at line {}",
+                        index + 1,
+                        line + 1
+                    )
+                })?;
+            for message in messages {
+                let role = message.get("role").and_then(Value::as_str);
+                // Assistant tool-call turns legitimately carry no text content.
+                let content = message.get("content");
+                ensure!(
+                    role.is_some()
+                        && (content.is_some_and(|c| c.is_string())
+                            || (role == Some("assistant") && message.get("tool_calls").is_some())),
+                    "invalid training isolation message in input {} at line {}",
+                    index + 1,
+                    line + 1
+                );
+                if role == Some("user")
+                    && prompts.contains(content.and_then(Value::as_str).unwrap_or("").trim())
+                {
+                    bail!(
+                        "training isolation rejected held-out prompt overlap in input {}",
+                        index + 1
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One-sided exact binomial tail `P(X >= wins)` for `X ~ Binomial(wins + losses, 1/2)`: the chance
+/// of at least this many candidate-only wins if candidate and baseline were equally good.
+/// Exact integer arithmetic for small samples, log-space summation (no overflow) for large ones.
+pub fn sign_test_p(wins: usize, losses: usize) -> f64 {
+    if wins == 0 {
+        return 1.0;
+    }
+    let n = wins + losses;
+    if n <= 100 {
+        let (n, wins) = (n as u128, wins as u128);
+        // Binomial coefficients C(n, k) <= 2^100 stay far below u128::MAX in the multiply below.
+        let mut c: u128 = 1;
+        let mut tail: u128 = 0;
+        for k in 0..=n {
+            if k >= wins {
+                tail += c;
+            }
+            c = c * (n - k) / (k + 1);
+        }
+        return tail as f64 / 2f64.powi(n as i32);
+    }
+    // Sum the smaller tail. Directly summing an almost-one tail accumulates cancellation error
+    // and can make p-values spuriously increase as evidence improves.
+    if wins <= losses {
+        return (1.0 - sign_test_p(losses + 1, wins - 1)).clamp(0.0, 1.0);
+    }
+    // ln C(n, wins) accumulated as a product of ratios, then walked up the tail term by term.
+    let mut ln_term = (1..=wins)
+        .map(|i| (((n - wins + i) as f64) / i as f64).ln())
+        .sum::<f64>();
+    let ln_total = n as f64 * std::f64::consts::LN_2;
+    let mut p = 0.0;
+    for k in wins..=n {
+        p += (ln_term - ln_total).exp();
+        if k < n {
+            ln_term += ((n - k) as f64).ln() - ((k + 1) as f64).ln();
+        }
+    }
+    p.clamp(0.0, 1.0)
+}
+
+fn percent(count: usize, total: usize) -> f64 {
+    100.0 * count as f64 / total as f64
+}
+
+/// Retry delays for an infrastructure failure: one further attempt after each, then the pair is excluded.
+const INFRA_BACKOFF: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(8)];
+
+/// Largest share of a suite that infrastructure failures may exclude; beyond it nothing is admissible.
+const MAX_EXCLUDED_PERCENT: usize = 20;
+
+/// Why a runner failure matters to the evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureKind {
+    /// Provider or transport trouble unrelated to the model: retried, then the pair is excluded.
+    Infra(&'static str),
+    /// The model's own output failed (thinking loop, rejected tool-call JSON, context overflow): unsolved.
+    Model,
+    /// Operator stop, budgets, auth, quota, cancellation or anything unrecognised: aborts the evaluation.
+    Fatal,
+}
+
+/// One side of one case after infrastructure retries.
+enum Measured {
+    Solved(bool),
+    /// Infrastructure failure that survived every retry; carries a fixed, non-private category.
+    Excluded(&'static str),
+}
+
+/// Classifies a runner error by cause. Categories are fixed labels: they never carry prompts,
+/// outputs or server text.
+pub(crate) fn classify_failure(error: &anyhow::Error) -> FailureKind {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<ThinkingLoop>().is_some())
+        || errors::is_model_output_rejection(error)
+    {
+        return FailureKind::Model;
+    }
+    let text = format!("{error:#}");
+    if text.contains("Failed to load model") {
+        return FailureKind::Infra("model_load");
+    }
+    match errors::classify(error) {
+        ErrorClass::ContextOverflow => FailureKind::Model,
+        ErrorClass::RateLimited { .. } if http_status(&text) == Some(529) => {
+            FailureKind::Infra("transport_5xx")
+        }
+        ErrorClass::RateLimited { .. } => FailureKind::Infra("transport_429"),
+        ErrorClass::Transient => FailureKind::Infra(transient_category(&text)),
+        _ => FailureKind::Fatal,
+    }
+}
+
+fn http_status(text: &str) -> Option<u16> {
+    text.split("HTTP ").nth(1)?.get(..3)?.parse().ok()
+}
+
+fn transient_category(text: &str) -> &'static str {
+    if let Some(status) = http_status(text) {
+        return if status == 408 {
+            "timeout"
+        } else {
+            "transport_5xx"
+        };
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        "timeout"
+    } else if ["connection", "connect", "socket", "reset"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        "transport_connection"
+    } else {
+        "transport_error"
+    }
+}
+
+fn describe_infra(counts: &BTreeMap<&'static str, usize>) -> String {
+    counts
+        .iter()
+        .map(|(category, n)| format!("{category} x{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One side of one case. Infrastructure failures are retried with `backoff`, then reported as excluded;
+/// model-caused failures count as unsolved; any other failure aborts with a detail-free `Err`.
+fn measure(
+    run: &mut impl FnMut(&Version, &Case) -> Result<bool>,
+    version: &Version,
+    case: &Case,
+    backoff: &[Duration],
+    stop: &dyn Fn() -> bool,
+) -> std::result::Result<Measured, ()> {
+    let mut retries = 0;
+    loop {
+        if stop() {
+            return Err(());
+        }
+        match run(version, case) {
+            Ok(solved) => return Ok(Measured::Solved(solved)),
+            Err(error) => match classify_failure(&error) {
+                FailureKind::Model => return Ok(Measured::Solved(false)),
+                FailureKind::Fatal => return Err(()),
+                FailureKind::Infra(category) => match backoff.get(retries) {
+                    Some(delay) => {
+                        retries += 1;
+                        if !sleep_unless(*delay, stop) {
+                            return Err(());
+                        }
+                    }
+                    None => return Ok(Measured::Excluded(category)),
+                },
+            },
+        }
+    }
+}
+
+fn measure_error(stop: &dyn Fn() -> bool, detail: String) -> anyhow::Error {
+    if stop() {
+        crate::llm::Interrupted.into()
+    } else {
+        anyhow::anyhow!(detail)
+    }
+}
+
+/// Sleeps for `delay` in short slices; false when `stop` fired first.
+fn sleep_unless(delay: Duration, stop: &dyn Fn() -> bool) -> bool {
+    let until = std::time::Instant::now() + delay;
+    loop {
+        if stop() {
+            return false;
+        }
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
+/// Runs baseline and candidate on every case, interleaved per case so that drift in the model server
+/// affects both equally. Private prompts, checks, outputs and runner errors never enter the report.
+pub fn evaluate(
+    rules: &Rules,
+    suites: &[Suite],
+    baseline: &Version,
+    candidate: &Version,
+    stop: &dyn Fn() -> bool,
+    run: impl FnMut(&Version, &Case) -> Result<bool>,
+) -> Result<Admission> {
+    evaluate_with(
+        rules,
+        suites,
+        baseline,
+        candidate,
+        run,
+        &INFRA_BACKOFF,
+        stop,
+    )
+}
+
+/// [`evaluate`] with explicit infrastructure-retry delays: one further attempt after each delay.
+fn evaluate_with(
+    rules: &Rules,
+    suites: &[Suite],
+    baseline: &Version,
+    candidate: &Version,
+    mut run: impl FnMut(&Version, &Case) -> Result<bool>,
+    backoff: &[Duration],
+    stop: &dyn Fn() -> bool,
+) -> Result<Admission> {
+    ensure!(
+        candidate.parent == Some(baseline.id) && candidate.id != baseline.id,
+        "candidate does not descend directly from the baseline"
+    );
+    ensure!(
+        candidate.status == "candidate",
+        "version is not a pending candidate"
+    );
+    rules.validate()?;
+    validate_suites(suites)?;
+    let mut scores = Vec::with_capacity(suites.len());
+    let mut regression = false;
+    let mut primary = Primary::TooSmall;
+    let mut exclusions = Vec::new();
+    for (index, suite) in suites.iter().enumerate() {
+        let (mut base_ok, mut cand_ok, mut base_only, mut cand_only) = (0, 0, 0, 0);
+        let (mut evaluated, mut excluded, mut processed) = (0, 0, 0);
+        let mut infra = BTreeMap::new();
+        let mut futile_stop = false;
+        for case in &suite.cases {
+            let before = measure(&mut run, baseline, case, backoff, stop).map_err(|()| {
+                measure_error(
+                    stop,
+                    format!("baseline evaluation failed in private suite {}", index + 1),
+                )
+            })?;
+            // A pair is measured or excluded as a whole, so both sides always score the same cases.
+            let pair = match before {
+                Measured::Excluded(category) => Err(category),
+                Measured::Solved(before) => {
+                    match measure(&mut run, candidate, case, backoff, stop).map_err(|()| {
+                        measure_error(
+                            stop,
+                            format!("candidate evaluation failed in private suite {}", index + 1),
+                        )
+                    })? {
+                        Measured::Solved(after) => Ok((before, after)),
+                        Measured::Excluded(category) => Err(category),
+                    }
+                }
+            };
+            processed += 1;
+            match pair {
+                Ok((before, after)) => {
+                    base_ok += usize::from(before);
+                    cand_ok += usize::from(after);
+                    base_only += usize::from(before && !after);
+                    cand_only += usize::from(after && !before);
+                    evaluated += 1;
+                }
+                Err(category) => {
+                    excluded += 1;
+                    *infra.entry(category).or_insert(0usize) += 1;
+                    ensure!(
+                        excluded * 100 <= suite.cases.len() * MAX_EXCLUDED_PERCENT,
+                        "evaluation did not complete: infrastructure failures ({}) excluded too many cases of private suite {}",
+                        describe_infra(&infra),
+                        index + 1
+                    );
+                }
+            }
+            let remaining = suite.cases.len() - processed;
+            // Futility projects the full suite; once a pair is excluded that projection no longer holds.
+            if rules.stop_when_futile
+                && suite.primary
+                && remaining > 0
+                && excluded == 0
+                && !regression
+                && primary_futile(
+                    rules,
+                    suite.cases.len(),
+                    (base_ok, cand_ok, base_only, cand_only),
+                    remaining,
+                )
+            {
+                futile_stop = true;
+                break;
+            }
+        }
+        // Scores are over the cases actually measured; a regression bound is judged on the full suite only.
+        let total = evaluated;
+        let (base_pts, cand_pts) = (percent(base_ok, total), percent(cand_ok, total));
+        regression |= !futile_stop && cand_pts < base_pts - rules.max_regression;
+        if futile_stop {
+            primary = Primary::Futile;
+        } else if suite.primary {
+            let net_wins = cand_only as i64 - base_only as i64;
+            primary = if cand_pts < base_pts + rules.min_improvement {
+                Primary::TooSmall
+            } else if net_wins < i64::from(rules.min_net_wins) {
+                Primary::TooFewNetWins
+            } else if rules.alpha < 1.0 && sign_test_p(cand_only, base_only) > rules.alpha {
+                Primary::NotSignificant
+            } else {
+                Primary::Improved
+            };
+        }
+        if excluded > 0 {
+            exclusions.push(format!(
+                "private suite {}: {excluded} case pairs excluded after infrastructure failures ({})",
+                index + 1,
+                describe_infra(&infra)
+            ));
+        }
+        scores.push(SuiteScore {
+            name: suite.name.clone(),
+            primary: suite.primary,
+            baseline: base_pts,
+            candidate: cand_pts,
+            cases: total,
+            candidate_only: cand_only,
+            baseline_only: base_only,
+            tier: None,
+        });
+        if rules.stop_when_futile && (regression || futile_stop) {
+            break;
+        }
+    }
+    let reason = match (regression, &primary) {
+        (true, _) => "rejected: at least one suite exceeds the permitted regression",
+        (false, Primary::Futile) => {
+            "rejected: primary suite cannot reach the required improvement (stopped early)"
+        }
+        (false, Primary::TooSmall) => {
+            "rejected: primary suite does not meet the required improvement"
+        }
+        (false, Primary::TooFewNetWins) => "rejected: primary suite has too few net case wins",
+        (false, Primary::NotSignificant) => {
+            "rejected: primary improvement is not statistically significant"
+        }
+        (false, Primary::Improved) => {
+            "accepted: primary improvement and every suite regression bound satisfied"
+        }
+    };
+    let mut reason = reason.to_owned();
+    if !exclusions.is_empty() {
+        reason.push_str(&format!(" ({})", exclusions.join("; ")));
+    }
+    let passed = !regression && matches!(primary, Primary::Improved);
+    Ok(Admission {
+        candidate: candidate.id,
+        baseline: baseline.id,
+        passed,
+        reason,
+        scores,
+    })
+}
+
+enum Primary {
+    Futile,
+    Improved,
+    TooSmall,
+    TooFewNetWins,
+    NotSignificant,
+}
+
+/// Whether the primary suite is certain to fail its gain, net-win or significance requirement even
+/// if every remaining case were solved only by the candidate (the best case for admission).
+fn primary_futile(
+    rules: &Rules,
+    total: usize,
+    now: (usize, usize, usize, usize),
+    remaining: usize,
+) -> bool {
+    let (base_ok, cand_ok, base_only, cand_only) = now;
+    let best_cand_ok = cand_ok + remaining;
+    let best_cand_only = cand_only + remaining;
+    percent(best_cand_ok, total) < percent(base_ok, total) + rules.min_improvement
+        || (best_cand_only as i64 - base_only as i64) < i64::from(rules.min_net_wins)
+        || (rules.alpha < 1.0 && sign_test_p(best_cand_only, base_only) > rules.alpha)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{Harness, SuiteConfig};
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn versions() -> (Version, Version) {
+        let baseline = Version {
+            id: 1,
+            parent: None,
+            kind: "bootstrap".into(),
+            harness: Harness {
+                system_prompt: "original".into(),
+                memory: vec![],
+                tools: vec![],
+                subagents: vec![],
+                max_steps: 1,
+                temperature: 0.0,
+                max_tokens: 8,
+                edit_mode: None,
+            },
+            adapter: None,
+            status: "active".into(),
+        };
+        let mut candidate = baseline.clone();
+        candidate.id = 2;
+        candidate.parent = Some(1);
+        candidate.status = "candidate".into();
+        candidate.harness.system_prompt = "improved".into();
+        (baseline, candidate)
+    }
+
+    fn rules() -> Rules {
+        Rules {
+            max_regression: 0.0,
+            min_improvement: 1.0,
+            alpha: 1.0,
+            min_net_wins: 0,
+            stop_when_futile: false,
+        }
+    }
+
+    fn case(id: &str, prompt: &str, expected: &str) -> Case {
+        Case {
+            id: id.into(),
+            prompt: prompt.into(),
+            files: Files::new(),
+            check: Check::AnswerExact {
+                expected: expected.into(),
+            },
+        }
+    }
+
+    fn suite(name: &str, primary: bool, n: usize) -> Suite {
+        Suite {
+            name: name.into(),
+            primary,
+            cases: (0..n)
+                .map(|i| case(&format!("{name}{i}"), &format!("{name} prompt {i}"), "yes"))
+                .collect(),
+        }
+    }
+
+    /// Candidate solves exactly the cases of `suite` whose index is below `cand`; baseline those below `base`.
+    fn runner<'a>(
+        base: usize,
+        cand: usize,
+        suite_name: &'a str,
+    ) -> impl Fn(&Version, &Case) -> Result<bool> + 'a {
+        move |v, c| {
+            let Some(index) =
+                c.id.strip_prefix(suite_name)
+                    .and_then(|i| i.parse::<usize>().ok())
+            else {
+                return Ok(true);
+            };
+            Ok(index < if v.id == 2 { cand } else { base })
+        }
+    }
+
+    #[test]
+    fn sign_test_matches_exact_binomial_tails() {
+        assert_eq!(sign_test_p(0, 0), 1.0);
+        assert_eq!(sign_test_p(0, 7), 1.0);
+        assert_eq!(sign_test_p(1, 0), 0.5);
+        assert_eq!(sign_test_p(5, 0), 1.0 / 32.0);
+        assert_eq!(sign_test_p(3, 1), 5.0 / 16.0);
+        assert_eq!(sign_test_p(8, 2), 56.0 / 1024.0);
+        assert_eq!(sign_test_p(4, 4), 163.0 / 256.0);
+    }
+
+    #[test]
+    fn sign_test_is_monotonic() {
+        for losses in [0, 1, 5, 40, 150] {
+            let mut last = f64::INFINITY;
+            for wins in 0..200 {
+                let p = sign_test_p(wins, losses);
+                assert!(
+                    (0.0..=1.0).contains(&p),
+                    "p out of range for {wins} vs {losses}"
+                );
+                assert!(
+                    p <= last,
+                    "p must not grow with more wins ({wins} vs {losses})"
+                );
+                last = p;
+            }
+        }
+        for wins in [1, 5, 40] {
+            let mut last = 0.0;
+            for losses in 0..200 {
+                let p = sign_test_p(wins, losses);
+                assert!(
+                    p >= last,
+                    "p must not shrink with more losses ({wins} vs {losses})"
+                );
+                last = p;
+            }
+        }
+    }
+
+    #[test]
+    fn sign_test_is_stable_for_large_samples() {
+        // Continuity across the exact / log-space boundary.
+        assert!((sign_test_p(60, 41) - sign_test_p(60, 40)).abs() < 0.1);
+        let (exact, logspace) = (sign_test_p(55, 45), sign_test_p(56, 45));
+        assert!((0.1..0.2).contains(&exact) && logspace < exact && exact - logspace < 0.05);
+        let even = sign_test_p(2500, 2500);
+        assert!((0.5..0.52).contains(&even), "{even}");
+        let lead = sign_test_p(2600, 2400);
+        assert!(lead > 0.0 && lead < 0.01, "{lead}");
+        assert_eq!(sign_test_p(5000, 0), 0.0);
+        assert!((sign_test_p(1, 4999) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn primary_gain_does_not_excuse_guard_regression() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 2), suite("guard", false, 2)];
+        // Candidate solves p0,p1 (baseline none); baseline solves guard g0, candidate not.
+        let report = evaluate(
+            &rules(),
+            &suites,
+            &baseline,
+            &candidate,
+            &|| false,
+            |v, c| {
+                Ok(matches!(
+                    (v.id, c.id.as_str()),
+                    (2, "primary0" | "primary1") | (1, "guard0" | "guard1")
+                ))
+            },
+        )
+        .unwrap();
+        assert!(!report.passed);
+        assert_eq!(report.scores[0].candidate, 100.0);
+        assert_eq!(report.scores[0].candidate_only, 2);
+        assert_eq!(report.scores[1].baseline, 100.0);
+        assert_eq!(report.scores[1].baseline_only, 2);
+        assert!(report.reason.contains("regression"));
+        assert!(!serde_json::to_string(&report).unwrap().contains("prompt"));
+    }
+
+    #[test]
+    fn tolerances_are_percentage_points_with_inclusive_boundaries() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 1), suite("guard", false, 100)];
+        // Primary: candidate solves its only case, baseline fails it. Guard: candidate loses guard0.
+        let run = |v: &Version, c: &Case| -> Result<bool> {
+            Ok(if c.id == "primary0" {
+                v.id == 2
+            } else {
+                !(c.id == "guard0" && v.id == 2)
+            })
+        };
+        let at = |max_regression, min_improvement| {
+            let r = Rules {
+                max_regression,
+                min_improvement,
+                ..rules()
+            };
+            evaluate(&r, &suites, &baseline, &candidate, &|| false, run)
+                .unwrap()
+                .passed
+        };
+        assert!(at(1.0, 100.0));
+        assert!(!at(0.99, 100.0));
+        assert!(!at(1.0, 100.01));
+        let error = evaluate(
+            &Rules {
+                min_improvement: 0.0,
+                ..rules()
+            },
+            &suites,
+            &baseline,
+            &candidate,
+            &|| false,
+            run,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("min_improvement"));
+    }
+
+    #[test]
+    fn failures_are_classified_by_cause() {
+        let class = |text: &str| classify_failure(&anyhow::anyhow!("{text}"));
+        assert_eq!(
+            class("model server returned HTTP 429: rate limited upstream"),
+            FailureKind::Infra("transport_429")
+        );
+        assert_eq!(
+            class("model server returned HTTP 503: service unavailable"),
+            FailureKind::Infra("transport_5xx")
+        );
+        assert_eq!(
+            class("model server returned HTTP 400: Failed to load model"),
+            FailureKind::Infra("model_load")
+        );
+        assert_eq!(
+            classify_failure(&anyhow::Error::new(ThinkingLoop("loop".into()))),
+            FailureKind::Model
+        );
+        assert_eq!(class("SECRET prompt and output"), FailureKind::Fatal);
+    }
+
+    #[test]
+    fn transient_failure_recovers_on_retry_without_exclusion() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 10)];
+        let attempts = std::cell::Cell::new(0);
+        let report = evaluate_with(
+            &rules(),
+            &suites,
+            &baseline,
+            &candidate,
+            |v, c| {
+                if v.id == 2 && c.id == "primary2" && attempts.get() == 0 {
+                    attempts.set(1);
+                    bail!("model server returned HTTP 503: service unavailable");
+                }
+                Ok(true)
+            },
+            &[Duration::ZERO; 2],
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(report.scores[0].cases, 10);
+        assert!(!report.reason.contains("excluded"), "{}", report.reason);
+    }
+
+    #[test]
+    fn persistent_candidate_infrastructure_failure_excludes_the_pair() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 10)];
+        let attempts = std::cell::Cell::new(0);
+        let report = evaluate_with(
+            &rules(),
+            &suites,
+            &baseline,
+            &candidate,
+            |v, c| {
+                if v.id == 2 && c.id == "primary3" {
+                    attempts.set(attempts.get() + 1);
+                    bail!("model server returned HTTP 429: rate limited upstream");
+                }
+                Ok(true)
+            },
+            &[Duration::ZERO; 2],
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(report.scores[0].cases, 9);
+        assert!(
+            report.reason.contains("1 case pairs excluded"),
+            "{}",
+            report.reason
+        );
+        assert!(
+            report.reason.contains("transport_429 x1"),
+            "{}",
+            report.reason
+        );
+    }
+
+    #[test]
+    fn baseline_infrastructure_failure_skips_the_candidate_for_that_pair() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 5)];
+        let candidate_calls = std::cell::Cell::new(0);
+        let report = evaluate_with(
+            &rules(),
+            &suites,
+            &baseline,
+            &candidate,
+            |v, c| {
+                if v.id == 1 && c.id == "primary0" {
+                    bail!("model server returned HTTP 503: service unavailable");
+                }
+                if v.id == 2 && c.id == "primary0" {
+                    candidate_calls.set(candidate_calls.get() + 1);
+                }
+                Ok(true)
+            },
+            &[Duration::ZERO; 2],
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(candidate_calls.get(), 0);
+        assert_eq!(report.scores[0].cases, 4);
+    }
+
+    #[test]
+    fn excessive_infrastructure_failures_abort_the_evaluation() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 10)];
+        let error = evaluate_with(
+            &rules(),
+            &suites,
+            &baseline,
+            &candidate,
+            |v, c| {
+                if v.id == 2 && ["primary0", "primary1", "primary2"].contains(&c.id.as_str()) {
+                    bail!("model server returned HTTP 503: service unavailable");
+                }
+                Ok(true)
+            },
+            &[],
+            &|| false,
+        )
+        .err()
+        .expect("3 of 10 excluded cases must abort");
+        assert!(error.to_string().contains("did not complete"), "{error}");
+    }
+
+    #[test]
+    fn model_failures_still_count_against_the_candidate() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 10)];
+        let report = evaluate_with(
+            &rules(),
+            &suites,
+            &baseline,
+            &candidate,
+            |v, c| {
+                if v.id == 2 && c.id == "primary0" {
+                    return Err(anyhow::Error::new(ThinkingLoop("loop".into())));
+                }
+                Ok(true)
+            },
+            &[],
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(report.scores[0].cases, 10);
+        assert_eq!(report.scores[0].baseline, 100.0);
+        assert_eq!(report.scores[0].candidate, 90.0);
+        assert!(!report.reason.contains("excluded"), "{}", report.reason);
+    }
+
+    #[test]
+    fn failures_are_sealed() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 1), suite("guard", false, 1)];
+        let error = evaluate(
+            &rules(),
+            &suites,
+            &baseline,
+            &candidate,
+            &|| false,
+            |_, _| bail!("SECRET prompt and output"),
+        )
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains("SECRET"));
+    }
+
+    #[test]
+    fn invalid_input_is_rejected_before_any_inference() {
+        let (baseline, candidate) = versions();
+        let never =
+            |_: &Version, _: &Case| -> Result<bool> { panic!("must validate before inference") };
+        let good = || [suite("primary", true, 1), suite("guard", false, 1)];
+
+        let mut dup_ids = good();
+        dup_ids[0].cases.push(dup_ids[0].cases[0].clone());
+        let mut empty = good();
+        empty[1].cases.clear();
+        let mut dup_names = good();
+        dup_names[1].name = "primary".into();
+        let mut bad_file = good();
+        bad_file[1].cases[0]
+            .files
+            .insert("../escape".into(), "x".into());
+        let mut many_files = good();
+        many_files[1].cases[0].files = (0..65).map(|i| (format!("f{i}"), String::new())).collect();
+        let mut big_file = good();
+        big_file[1].cases[0]
+            .files
+            .insert("big".into(), "x".repeat(256 * 1024 + 1));
+        let mut two_primary = good();
+        two_primary[1].primary = true;
+        let mut no_primary = good();
+        no_primary[0].primary = false;
+        let mut blank_prompt = good();
+        blank_prompt[0].cases[0].prompt = "  ".into();
+        for (label, suites) in [
+            ("dup ids", dup_ids.to_vec()),
+            ("empty", empty.to_vec()),
+            ("dup names", dup_names.to_vec()),
+            ("bad file", bad_file.to_vec()),
+            ("many files", many_files.to_vec()),
+            ("big file", big_file.to_vec()),
+            ("two primary", two_primary.to_vec()),
+            ("no primary", no_primary.to_vec()),
+            ("blank prompt", blank_prompt.to_vec()),
+            ("none", vec![]),
+        ] {
+            assert!(
+                evaluate(&rules(), &suites, &baseline, &candidate, &|| false, never).is_err(),
+                "{label} must be rejected"
+            );
+        }
+
+        for bad in [
+            Rules {
+                max_regression: f64::NAN,
+                ..rules()
+            },
+            Rules {
+                min_improvement: f64::INFINITY,
+                ..rules()
+            },
+            Rules {
+                max_regression: -1.0,
+                ..rules()
+            },
+            Rules {
+                alpha: 0.0,
+                ..rules()
+            },
+            Rules {
+                alpha: 1.5,
+                ..rules()
+            },
+        ] {
+            assert!(evaluate(&bad, &good(), &baseline, &candidate, &|| false, never).is_err());
+        }
+
+        // Lineage and status.
+        let stranger = Version {
+            parent: Some(9),
+            ..candidate.clone()
+        };
+        let same = Version {
+            id: 1,
+            parent: Some(1),
+            ..candidate.clone()
+        };
+        let active = Version {
+            status: "active".into(),
+            ..candidate.clone()
+        };
+        for v in [&stranger, &same, &active, &baseline] {
+            assert!(evaluate(&rules(), &good(), &baseline, v, &|| false, never).is_err());
+        }
+    }
+
+    #[test]
+    fn interleaves_baseline_and_candidate_per_case() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 3), suite("guard", false, 2)];
+        let mut order = Vec::new();
+        evaluate(
+            &rules(),
+            &suites,
+            &baseline,
+            &candidate,
+            &|| false,
+            |v, c| {
+                order.push((v.id, c.id.clone()));
+                Ok(true)
+            },
+        )
+        .unwrap();
+        let expected: Vec<(i64, String)> = ["primary0", "primary1", "primary2", "guard0", "guard1"]
+            .iter()
+            .flat_map(|id| [(1, id.to_string()), (2, id.to_string())])
+            .collect();
+        assert_eq!(order, expected);
+    }
+
+    #[test]
+    fn net_wins_and_significance_gate_the_primary() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 20), suite("guard", false, 2)];
+        let gate = Rules {
+            alpha: 0.1,
+            ..rules()
+        };
+        // 5 candidate-only wins, no losses: p = 1/32.
+        let report = evaluate(
+            &gate,
+            &suites,
+            &baseline,
+            &candidate,
+            &|| false,
+            runner(10, 15, "primary"),
+        )
+        .unwrap();
+        assert!(report.passed, "{}", report.reason);
+        assert_eq!(
+            (
+                report.scores[0].candidate_only,
+                report.scores[0].baseline_only
+            ),
+            (5, 0)
+        );
+        // 3 wins vs 1 loss (baseline solves index 5 only, candidate solves 0..5 minus nothing else).
+        let mixed = |v: &Version, c: &Case| -> Result<bool> {
+            let Some(i) =
+                c.id.strip_prefix("primary")
+                    .and_then(|i| i.parse::<usize>().ok())
+            else {
+                return Ok(true);
+            };
+            Ok(if v.id == 2 {
+                (10..13).contains(&i) || (0..9).contains(&i)
+            } else {
+                (0..9).contains(&i) && i != 0 || i == 9
+            })
+        };
+        // candidate: 0..9 + 10..13 = 12 solved; baseline: 1..9 + 9 = 1..=9 -> 9 solved.
+        let report = evaluate(&gate, &suites, &baseline, &candidate, &|| false, mixed).unwrap();
+        assert_eq!(
+            (
+                report.scores[0].candidate_only,
+                report.scores[0].baseline_only
+            ),
+            (4, 1)
+        );
+        assert!(!report.passed);
+        assert!(report.reason.contains("significant"), "{}", report.reason);
+        // Same data, legacy rules pass: significance is opt-in.
+        assert!(
+            evaluate(&rules(), &suites, &baseline, &candidate, &|| false, mixed)
+                .unwrap()
+                .passed
+        );
+        // The sign test boundary is inclusive.
+        let exact = Rules {
+            alpha: 1.0 / 32.0,
+            ..rules()
+        };
+        assert!(
+            evaluate(
+                &exact,
+                &suites,
+                &baseline,
+                &candidate,
+                &|| false,
+                runner(10, 15, "primary")
+            )
+            .unwrap()
+            .passed
+        );
+        // min_net_wins is checked independently of alpha.
+        let need = Rules {
+            min_net_wins: 6,
+            ..rules()
+        };
+        let report = evaluate(
+            &need,
+            &suites,
+            &baseline,
+            &candidate,
+            &|| false,
+            runner(10, 15, "primary"),
+        )
+        .unwrap();
+        assert!(
+            !report.passed && report.reason.contains("net"),
+            "{}",
+            report.reason
+        );
+        let enough = Rules {
+            min_net_wins: 5,
+            ..rules()
+        };
+        assert!(
+            evaluate(
+                &enough,
+                &suites,
+                &baseline,
+                &candidate,
+                &|| false,
+                runner(10, 15, "primary")
+            )
+            .unwrap()
+            .passed
+        );
+        // An insufficient point gain keeps the legacy reason regardless of the other criteria.
+        let big = Rules {
+            min_improvement: 30.0,
+            alpha: 0.1,
+            ..rules()
+        };
+        let report = evaluate(
+            &big,
+            &suites,
+            &baseline,
+            &candidate,
+            &|| false,
+            runner(10, 15, "primary"),
+        )
+        .unwrap();
+        assert!(!report.passed && report.reason.contains("required improvement"));
+    }
+
+    #[test]
+    fn check_cases_verify_files_in_the_seeded_workspace() {
+        let (baseline, candidate) = versions();
+        let mut seeded = Files::new();
+        seeded.insert("data/in.txt".into(), "alpha".into());
+        let file_case = Case {
+            id: "file".into(),
+            prompt: "uppercase the file".into(),
+            files: seeded,
+            check: Check::All {
+                checks: vec![
+                    Check::FileEquals {
+                        path: "data/in.txt".into(),
+                        content: "ALPHA".into(),
+                    },
+                    Check::AnswerContains {
+                        needle: "done".into(),
+                    },
+                ],
+            },
+        };
+        let primary = Suite {
+            name: "primary".into(),
+            primary: true,
+            cases: vec![file_case.clone()],
+        };
+        let guard = suite("guard", false, 1);
+        // The "agent" under the candidate rewrites the file and says done; the baseline does nothing.
+        let run = |v: &Version, c: &Case| -> Result<bool> {
+            let dir = tempfile::tempdir()?;
+            for (path, content) in &c.files {
+                let full = dir.path().join(path);
+                fs::create_dir_all(full.parent().unwrap())?;
+                fs::write(full, content)?;
+            }
+            let answer = if c.id == "file" && v.id == 2 {
+                fs::write(dir.path().join("data/in.txt"), "ALPHA\n")?;
+                "done"
+            } else {
+                "yes"
+            };
+            Ok(c.check.verify(dir.path(), answer))
+        };
+        let report = evaluate(
+            &rules(),
+            &[primary, guard],
+            &baseline,
+            &candidate,
+            &|| false,
+            run,
+        )
+        .unwrap();
+        assert!(report.passed, "{}", report.reason);
+        assert_eq!(
+            (report.scores[0].baseline, report.scores[0].candidate),
+            (0.0, 100.0)
+        );
+    }
+
+    fn write_suites(dir: &TempDir, primary: &str, guard: &str) -> GateConfig {
+        let p = dir.path().join("primary.jsonl");
+        let g = dir.path().join("guard.jsonl");
+        fs::write(&p, primary).unwrap();
+        fs::write(&g, guard).unwrap();
+        GateConfig {
+            suites: vec![
+                SuiteConfig {
+                    name: "primary".into(),
+                    path: p,
+                    primary: true,
+                },
+                SuiteConfig {
+                    name: "guard".into(),
+                    path: g,
+                    primary: false,
+                },
+            ],
+            max_regression: 0.0,
+            min_improvement: 1.0,
+        }
+    }
+
+    #[test]
+    fn manual_suites_accept_checks_and_legacy_expectations() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_suites(
+            &dir,
+            "{\"id\":\"a\",\"prompt\":\"private primary\",\"expected\":{\"ok\":true},\"matcher\":\"json\"}\n\
+             {\"id\":\"b\",\"prompt\":\"private file\",\"files\":{\"x.txt\":\"1\"},\"check\":{\"kind\":\"file_equals\",\"path\":\"x.txt\",\"content\":\"2\"}}\n",
+            "{\"id\":\"c\",\"prompt\":\"private guard\",\"expected\":\"yes\"}\n",
+        );
+        let suites = load_manual(&config).unwrap();
+        assert_eq!(
+            suites[0].cases[0].check,
+            Check::AnswerJson {
+                expected: serde_json::json!({"ok": true})
+            }
+        );
+        assert_eq!(
+            suites[0].cases[1].check,
+            Check::FileEquals {
+                path: "x.txt".into(),
+                content: "2".into()
+            }
+        );
+        assert_eq!(suites[0].cases[1].files["x.txt"], "1");
+        assert_eq!(
+            suites[1].cases[0].check,
+            Check::AnswerExact {
+                expected: "yes".into()
+            }
+        );
+        let prompts = held_out_prompts(&suites);
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts.contains("private guard"));
+    }
+
+    #[test]
+    fn whole_output_json_must_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_suites(
+            &dir,
+            "{\"id\":\"a\",\"prompt\":\"p\",\"expected\":{\"ok\":true},\"matcher\":\"json\"}\n",
+            "{\"id\":\"b\",\"prompt\":\"g\",\"expected\":\"yes\"}\n",
+        );
+        let suites = load_manual(&config).unwrap();
+        let check = &suites[0].cases[0].check;
+        let ws = tempfile::tempdir().unwrap();
+        assert!(check.verify(ws.path(), "{\"ok\":true}"));
+        assert!(!check.verify(ws.path(), "{\"ok\":true} trailing"));
+        assert!(suites[1].cases[0].check.verify(ws.path(), " yes \n"));
+    }
+
+    #[test]
+    fn manual_suites_reject_invalid_configuration_without_leaking() {
+        let dir = tempfile::tempdir().unwrap();
+        let exact = "{\"id\":\"b\",\"prompt\":\"g\",\"expected\":\"yes\"}\n";
+        let base = "{\"id\":\"a\",\"prompt\":\"SECRET p\",\"expected\":\"yes\"}\n";
+        let bad_cases = [
+            ("neither", "{\"id\":\"a\",\"prompt\":\"SECRET p\"}\n"),
+            (
+                "both",
+                "{\"id\":\"a\",\"prompt\":\"SECRET p\",\"expected\":\"y\",\"check\":{\"kind\":\"answer_exact\",\"expected\":\"y\"}}\n",
+            ),
+            (
+                "matcher with check",
+                "{\"id\":\"a\",\"prompt\":\"SECRET p\",\"matcher\":\"exact\",\"check\":{\"kind\":\"answer_exact\",\"expected\":\"y\"}}\n",
+            ),
+            (
+                "exact non-string",
+                "{\"id\":\"a\",\"prompt\":\"SECRET p\",\"expected\":3}\n",
+            ),
+            (
+                "unknown field",
+                "{\"id\":\"a\",\"prompt\":\"SECRET p\",\"expected\":\"y\",\"extra\":1}\n",
+            ),
+            (
+                "bad check",
+                "{\"id\":\"a\",\"prompt\":\"SECRET p\",\"check\":{\"kind\":\"nope\"}}\n",
+            ),
+            ("blank line", "\n"),
+            ("duplicate id", &format!("{base}{base}")),
+            (
+                "empty prompt",
+                "{\"id\":\"a\",\"prompt\":\" \",\"expected\":\"y\"}\n",
+            ),
+            (
+                "absolute file",
+                "{\"id\":\"a\",\"prompt\":\"SECRET p\",\"expected\":\"y\",\"files\":{\"/etc/x\":\"\"}}\n",
+            ),
+            (
+                "dotdot file",
+                "{\"id\":\"a\",\"prompt\":\"SECRET p\",\"expected\":\"y\",\"files\":{\"a/../../x\":\"\"}}\n",
+            ),
+            ("empty suite", ""),
+        ];
+        for (label, text) in bad_cases {
+            let error = load_manual(&write_suites(&dir, text, exact)).unwrap_err();
+            assert!(!format!("{error:#}").contains("SECRET"), "{label} leaked");
+        }
+        // Shared prompts across suites.
+        let shared = "{\"id\":\"z\",\"prompt\":\"  SECRET p \",\"expected\":\"yes\"}\n";
+        assert!(load_manual(&write_suites(&dir, base, shared)).is_err());
+        // Config-level checks.
+        let mut config = write_suites(&dir, base, exact);
+        assert!(load_manual(&config).is_ok());
+        config.max_regression = f64::NAN;
+        assert!(load_manual(&config).is_err());
+        config.max_regression = 0.0;
+        config.min_improvement = 0.0;
+        assert!(load_manual(&config).is_err());
+        config.min_improvement = 1.0;
+        config.suites[1].primary = true;
+        assert!(load_manual(&config).is_err());
+        config.suites[1].primary = false;
+        config.suites[1].name = "primary".into();
+        assert!(load_manual(&config).is_err());
+        config.suites[1].name = "guard".into();
+        config.suites.truncate(1);
+        assert!(load_manual(&config).is_err());
+    }
+
+    #[test]
+    fn training_overlap_is_rejected_without_disclosing_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts: HashSet<String> = ["private primary".to_owned()].into();
+        let train = dir.path().join("train.jsonl");
+        let valid = dir.path().join("valid.jsonl");
+        fs::write(
+            &train,
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"  private primary  \"}]}\n",
+        )
+        .unwrap();
+        fs::write(
+            &valid,
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"unseen task\"}]}\n",
+        )
+        .unwrap();
+        let error = check_training_isolation(&prompts, &train, &valid).unwrap_err();
+        assert!(!error.to_string().contains("private primary"));
+        fs::write(&train, "{\"messages\":[{\"role\":\"user\",\"content\":\"different task\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[]},{\"role\":\"tool\",\"content\":\"private primary\"}]}\n").unwrap();
+        check_training_isolation(&prompts, &train, &valid).unwrap();
+        // Overlap in the validation split is caught too, and malformed records are errors.
+        fs::write(
+            &valid,
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"private primary\"}]}\n",
+        )
+        .unwrap();
+        assert!(check_training_isolation(&prompts, &train, &valid).is_err());
+        fs::write(&valid, "{\"messages\":[{\"role\":\"user\"}]}\n").unwrap();
+        assert!(check_training_isolation(&prompts, &train, &valid).is_err());
+    }
+
+    /// The early stop only skips cases that cannot matter: for every outcome pattern and rule set,
+    /// admission is identical with and without it, and it never runs more cases.
+    #[test]
+    fn stopping_when_futile_never_changes_admission() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 5), suite("guard", false, 2)];
+        let mut stopped_somewhere = false;
+        for pattern in 0..4usize.pow(7) {
+            let outcome = |v: &Version, c: &Case| -> Result<bool> {
+                let index = if let Some(i) = c.id.strip_prefix("primary") {
+                    i.parse::<usize>().unwrap()
+                } else {
+                    5 + c
+                        .id
+                        .strip_prefix("guard")
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap()
+                };
+                let pair = pattern / 4usize.pow(index as u32) % 4;
+                Ok(if v.id == 1 {
+                    pair & 1 == 1
+                } else {
+                    pair & 2 == 2
+                })
+            };
+            for (min_improvement, min_net_wins, alpha) in [
+                (1.0, 0, 1.0),
+                (40.0, 0, 1.0),
+                (1.0, 2, 1.0),
+                (1.0, 0, 0.2),
+                (20.0, 3, 0.1),
+            ] {
+                let base = Rules {
+                    min_improvement,
+                    min_net_wins,
+                    alpha,
+                    ..rules()
+                };
+                let (mut full_calls, mut early_calls) = (0, 0);
+                let full = evaluate(&base, &suites, &baseline, &candidate, &|| false, |v, c| {
+                    full_calls += 1;
+                    outcome(v, c)
+                })
+                .unwrap();
+                let early = evaluate(
+                    &Rules {
+                        stop_when_futile: true,
+                        ..base
+                    },
+                    &suites,
+                    &baseline,
+                    &candidate,
+                    &|| false,
+                    |v, c| {
+                        early_calls += 1;
+                        outcome(v, c)
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    full.passed, early.passed,
+                    "pattern {pattern} rules {min_improvement}/{min_net_wins}/{alpha}"
+                );
+                assert!(early_calls <= full_calls);
+                if early.passed {
+                    assert_eq!(
+                        early_calls, full_calls,
+                        "an accepted candidate is always fully evaluated"
+                    );
+                    assert_eq!(full.reason, early.reason);
+                }
+                stopped_somewhere |= early_calls < full_calls;
+            }
+        }
+        assert!(stopped_somewhere, "the early stop never triggered");
+    }
+
+    #[test]
+    fn a_hopeless_primary_suite_skips_its_remaining_cases_and_says_so() {
+        let (baseline, candidate) = versions();
+        let suites = [suite("primary", true, 20), suite("guard", false, 20)];
+        let mut calls = 0;
+        let report = evaluate(
+            &Rules {
+                min_improvement: 50.0,
+                stop_when_futile: true,
+                ..rules()
+            },
+            &suites,
+            &baseline,
+            &candidate,
+            &|| false,
+            |_, _| {
+                calls += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(
+            !report.passed && report.reason.contains("stopped early"),
+            "{}",
+            report.reason
+        );
+        assert_eq!(
+            calls, 22,
+            "stops once 11 of 20 cases are done (best case can no longer gain 50 points); a full run is 80 calls"
+        );
+        assert_eq!(report.scores.len(), 1, "the guard suite was skipped");
+    }
+}

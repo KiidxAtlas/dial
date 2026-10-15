@@ -1,0 +1,387 @@
+//! AI staging: decides which unstaged change units match a user instruction.
+//! Each unit is scored independently; the top candidates are then
+//! checked against a "none of these" option that can veto the whole selection.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use parking_lot::Mutex;
+use serde_json::json;
+
+use super::config::GenerationConfig;
+use super::inference::{Inference, Tier};
+use crate::config::types::Config;
+
+/// Characters of one unit sent to the judge.
+pub(crate) const UNIT_CHARS: usize = 2400;
+/// Characters of one candidate sent to the verifier.
+const VERIFY_CHARS: usize = 600;
+/// Minimum part-of-it probability for a unit to be accepted.
+const STAGE_THRESHOLD: f64 = 0.6;
+/// Probability of "none of the candidates" that rejects every unit.
+const NONE_THRESHOLD: f64 = 0.5;
+/// Candidates shown to the verifier.
+const MAX_CANDIDATES: usize = 8;
+/// Concurrent judgments.
+const WORKERS: usize = 8;
+
+const LEVEL_UNRELATED: &str = "0";
+const LEVEL_TANGENTIAL: &str = "1";
+const PART_OF_IT: &str = "2";
+const NONE_KEY: &str = "none";
+
+const UNIT_SYSTEM: &str = "You judge one unit of an unstaged git change against the user's staging instruction. \
+The input is JSON with instruction, all_changed_files, path, kind, and change (the bounded +/- lines of the unit). \
+Reply with only a JSON object giving a probability for each level, summing to 1: \
+\"0\" Unrelated: the unit has nothing to do with the instruction. \
+\"1\" Tangential: same area, file, or vocabulary, but the instruction does not describe this change. \
+\"2\" Part of it: the instruction describes this change itself. \
+Probabilities only, no prose.";
+
+const VERIFY_SYSTEM: &str = "You pick the change the user described from a list of candidates. \
+The input is JSON with instruction, all_changed_files, and candidates (key, path, kind, change). \
+Reply with only a JSON object giving a probability for each key, summing to 1: \
+\"none\" means none of the candidates is the change the user described; \
+each candidate key (c0, c1, ...) means that candidate is the change the user described. \
+Probabilities only, no prose.";
+
+/// What a unit is, for the judge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnitKind {
+    /// One hunk of a modified tracked file.
+    Hunk,
+    /// An untracked file, judged by its head.
+    NewFile,
+    /// One hunk of a deleted tracked file.
+    DeletedFile,
+    /// A binary file, judged by path only.
+    Binary,
+}
+
+impl UnitKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hunk => "hunk",
+            Self::NewFile => "new file",
+            Self::DeletedFile => "deleted file",
+            Self::Binary => "binary file",
+        }
+    }
+}
+
+/// One independently stageable piece of the working tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StageUnit {
+    pub(crate) path: String,
+    pub(crate) kind: UnitKind,
+    /// The changed lines (`+`/`-`), or empty for binary files.
+    pub(crate) change: String,
+}
+
+/// The verdict for one unit, aligned with the input units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct StageDecision {
+    pub(crate) score: f64,
+    pub(crate) accepted: bool,
+}
+
+/// Classifies `units` against `instruction`. `paths` lists every changed file for context.
+/// Judgments run on eight worker threads. If every judgment fails, the first error is returned.
+pub(crate) fn classify_units(
+    config: &Config,
+    generation: &GenerationConfig,
+    instruction: &str,
+    paths: &[String],
+    units: &[StageUnit],
+) -> Result<Vec<StageDecision>, String> {
+    if units.is_empty() {
+        return Ok(Vec::new());
+    }
+    let inference = Inference::new(config, generation);
+    let mut scores = Vec::with_capacity(units.len());
+    let mut failures = 0usize;
+    let mut first_error: Option<String> = None;
+    for result in judge_all(&inference, instruction, paths, units) {
+        match result {
+            Ok(score) => scores.push(score),
+            Err(error) => {
+                failures += 1;
+                first_error.get_or_insert(error);
+                scores.push(0.0);
+            }
+        }
+    }
+    if failures == units.len() {
+        return Err(first_error.unwrap_or_else(|| "AI staging judgments failed".to_owned()));
+    }
+
+    let mut accepted: Vec<bool> = scores
+        .iter()
+        .map(|score| *score >= STAGE_THRESHOLD)
+        .collect();
+    let candidates = verify_candidates(&scores);
+    if !candidates.is_empty() {
+        let none = verify(&inference, instruction, paths, units, &candidates)?;
+        if none >= NONE_THRESHOLD {
+            accepted.iter_mut().for_each(|flag| *flag = false);
+        }
+    }
+    Ok(scores
+        .into_iter()
+        .zip(accepted)
+        .map(|(score, accepted)| StageDecision { score, accepted })
+        .collect())
+}
+
+fn judge_all(
+    inference: &Inference<'_>,
+    instruction: &str,
+    paths: &[String],
+    units: &[StageUnit],
+) -> Vec<Result<f64, String>> {
+    let next = AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<Result<f64, String>>>> =
+        Mutex::new((0..units.len()).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..WORKERS.min(units.len()) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(unit) = units.get(index) else {
+                        break;
+                    };
+                    let result = judge_unit(inference, instruction, paths, unit);
+                    slots.lock()[index] = Some(result);
+                }
+            });
+        }
+    });
+    slots
+        .into_inner()
+        .into_iter()
+        .map(|slot| slot.unwrap_or_else(|| Err("AI staging judgment did not run".to_owned())))
+        .collect()
+}
+
+fn judge_unit(
+    inference: &Inference<'_>,
+    instruction: &str,
+    paths: &[String],
+    unit: &StageUnit,
+) -> Result<f64, String> {
+    let state = json!({
+        "instruction": instruction,
+        "all_changed_files": paths,
+        "path": unit.path,
+        "kind": unit.kind.label(),
+        "change": bound(&unit.change, UNIT_CHARS),
+    });
+    inference.complete(Tier::Fast, UNIT_SYSTEM, &state.to_string(), |reply| {
+        parse_score(&reply.text)
+    })
+}
+
+/// Indices of the best units (score at least the threshold), highest score first, capped.
+pub(crate) fn verify_candidates(scores: &[f64]) -> Vec<usize> {
+    let mut ranked: Vec<usize> = (0..scores.len())
+        .filter(|&index| scores[index] >= STAGE_THRESHOLD)
+        .collect();
+    ranked.sort_by(|&left, &right| {
+        scores[right]
+            .total_cmp(&scores[left])
+            .then(left.cmp(&right))
+    });
+    ranked.truncate(MAX_CANDIDATES);
+    ranked
+}
+
+/// Asks the verifier to pick among `candidates` and returns the probability of "none".
+fn verify(
+    inference: &Inference<'_>,
+    instruction: &str,
+    paths: &[String],
+    units: &[StageUnit],
+    candidates: &[usize],
+) -> Result<f64, String> {
+    let options: Vec<serde_json::Value> = candidates
+        .iter()
+        .enumerate()
+        .map(|(position, &unit_index)| {
+            let unit = &units[unit_index];
+            json!({
+                "key": format!("c{position}"),
+                "path": unit.path,
+                "kind": unit.kind.label(),
+                "change": bound(&unit.change, VERIFY_CHARS),
+            })
+        })
+        .collect();
+    let state = json!({
+        "instruction": instruction,
+        "all_changed_files": paths,
+        "candidates": options,
+    });
+    let count = candidates.len();
+    inference.complete(Tier::Fast, VERIFY_SYSTEM, &state.to_string(), |reply| {
+        parse_pick(&reply.text, count)
+    })
+}
+
+/// Bounds `text` to `limit` characters, marking the cut with an ellipsis line.
+pub(crate) fn bound(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(limit).collect();
+    out.push_str("\n…");
+    out
+}
+
+/// The `+`/`-` lines of a hunk, joined by newlines.
+pub(crate) fn changed_lines(lines: &[String]) -> String {
+    lines
+        .iter()
+        .filter(|line| line.starts_with('+') || line.starts_with('-'))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Extracts the JSON object from a model reply, tolerating surrounding prose or code fences.
+fn json_object(text: &str) -> Result<serde_json::Value, String> {
+    let missing = || "reply has no JSON object".to_owned();
+    let start = text.find('{').ok_or_else(missing)?;
+    let end = text.rfind('}').ok_or_else(missing)?;
+    if end < start {
+        return Err(missing());
+    }
+    serde_json::from_str(&text[start..=end])
+        .map_err(|error| format!("reply is not valid JSON: {error}"))
+}
+
+/// Reads the named probabilities, rejecting negatives and normalising them to sum to one.
+pub(crate) fn parse_probabilities(
+    text: &str,
+    keys: &[&str],
+) -> Result<BTreeMap<String, f64>, String> {
+    let value = json_object(text)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "reply JSON is not an object".to_owned())?;
+    let mut probabilities = BTreeMap::new();
+    for key in keys {
+        let probability = object
+            .get(*key)
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| format!("reply has no probability for \"{key}\""))?;
+        if !probability.is_finite() || probability < 0.0 {
+            return Err(format!("invalid probability for \"{key}\""));
+        }
+        probabilities.insert((*key).to_owned(), probability);
+    }
+    let total: f64 = probabilities.values().sum();
+    if total <= 0.0 {
+        return Err("reply probabilities sum to zero".to_owned());
+    }
+    for probability in probabilities.values_mut() {
+        *probability /= total;
+    }
+    Ok(probabilities)
+}
+
+/// The probability that a unit is part of the instruction.
+pub(crate) fn parse_score(text: &str) -> Result<f64, String> {
+    let probabilities =
+        parse_probabilities(text, &[LEVEL_UNRELATED, LEVEL_TANGENTIAL, PART_OF_IT])?;
+    Ok(probabilities[PART_OF_IT])
+}
+
+/// The probability that none of `candidates` candidates is the described change.
+pub(crate) fn parse_pick(text: &str, candidates: usize) -> Result<f64, String> {
+    let mut keys = vec![NONE_KEY.to_owned()];
+    keys.extend((0..candidates).map(|position| format!("c{position}")));
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let probabilities = parse_probabilities(text, &refs)?;
+    Ok(probabilities[NONE_KEY])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_score_reads_part_of_it_from_fenced_json() {
+        let reply = "```json\n{\"0\": 0.1, \"1\": 0.2, \"2\": 0.7}\n```";
+        let score = parse_score(reply).expect("score");
+        assert!((score - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_score_normalizes_probabilities() {
+        let score = parse_score("{\"0\": 1, \"1\": 1, \"2\": 2}").expect("score");
+        assert!((score - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_score_rejects_missing_level() {
+        let error = parse_score("{\"0\": 0.5, \"2\": 0.5}").expect_err("missing level");
+        assert!(error.contains("\"1\""), "{error}");
+    }
+
+    #[test]
+    fn parse_score_rejects_reply_without_json() {
+        assert!(parse_score("I think it matches").is_err());
+    }
+
+    #[test]
+    fn parse_probabilities_rejects_zero_sum_and_negatives() {
+        assert!(parse_probabilities("{\"0\": 0, \"2\": 0}", &["0", "2"]).is_err());
+        assert!(parse_probabilities("{\"0\": -1, \"2\": 1}", &["0", "2"]).is_err());
+    }
+
+    #[test]
+    fn parse_pick_reads_none_probability() {
+        let reply = "{\"none\": 0.8, \"c0\": 0.1, \"c1\": 0.1}";
+        let none = parse_pick(reply, 2).expect("pick");
+        assert!((none - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_pick_requires_every_candidate_key() {
+        assert!(parse_pick("{\"none\": 0.5, \"c0\": 0.5}", 2).is_err());
+    }
+
+    #[test]
+    fn verify_candidates_ranks_thresholds_and_caps() {
+        let scores = [
+            0.2, 0.9, 0.65, 0.61, 0.95, 0.7, 0.8, 0.99, 0.62, 0.66, 0.6, 0.1,
+        ];
+        let picked = verify_candidates(&scores);
+        assert_eq!(picked, vec![7, 4, 1, 6, 5, 9, 2, 8]);
+    }
+
+    #[test]
+    fn verify_candidates_empty_when_nothing_clears_threshold() {
+        assert!(verify_candidates(&[0.1, 0.59]).is_empty());
+    }
+
+    #[test]
+    fn changed_lines_keeps_only_edits() {
+        let lines: Vec<String> = [
+            " context",
+            "+added",
+            "-removed",
+            "\\ No newline at end of file",
+        ]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect();
+        assert_eq!(changed_lines(&lines), "+added\n-removed");
+    }
+
+    #[test]
+    fn bound_marks_truncation() {
+        assert_eq!(bound("abcdef", 10), "abcdef");
+        assert_eq!(bound("abcdef", 3), "abc\n…");
+    }
+}

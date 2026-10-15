@@ -1,0 +1,243 @@
+//! Immutable run contracts and durable case checkpoints. No source or credentials in manifests.
+use super::*;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Contract {
+    pub schema_version: u32,
+    pub suite_sha256: String,
+    pub source_sha256: String,
+    pub executable_sha256: String,
+    pub configuration_sha256: String,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Checkpoints {
+    contract: Contract,
+    cases: BTreeMap<String, CaseResult>,
+}
+pub struct Recorder {
+    _lock: fs::File,
+    path: PathBuf,
+    data: Checkpoints,
+}
+
+pub use crate::runtime::fingerprint::sha256_file as digest_file;
+/// Hash the exact isolated copy, after the existing isolation code has excluded private state.
+pub fn source_digest(root: &Path) -> Result<String> {
+    fn visit(root: &Path, path: &Path, digest: &mut Sha256, count: &mut usize) -> Result<()> {
+        let mut entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            *count += 1;
+            ensure!(
+                *count <= 100_000,
+                "benchmark source manifest exceeds 100000 entries"
+            );
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "benchmark manifest requires an isolated source copy"
+            );
+            digest.update(path.strip_prefix(root)?.to_string_lossy().as_bytes());
+            digest.update([0]);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                digest.update((metadata.permissions().mode() & 0o777).to_le_bytes());
+            }
+            #[cfg(windows)]
+            digest.update([u8::from(metadata.permissions().readonly())]);
+            if metadata.is_dir() {
+                digest.update(b"directory\0");
+                visit(root, &path, digest, count)?;
+            } else if metadata.is_file() {
+                digest.update(b"file\0");
+                digest.update(digest_file(&path)?.as_bytes());
+            } else {
+                bail!("unsupported benchmark source entry");
+            }
+        }
+        Ok(())
+    }
+    let mut digest = Sha256::new();
+    visit(root, root, &mut digest, &mut 0)?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+impl Contract {
+    pub fn new(
+        suite: &BenchmarkSuite,
+        isolated_source: &Path,
+        configuration: &serde_json::Value,
+    ) -> Result<Self> {
+        // Omit sensitive fields entirely: their values must not affect a public digest.
+        fn scrub(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.retain(|key, _| {
+                        let key = key.to_ascii_lowercase();
+                        ![
+                            "secret",
+                            "token",
+                            "password",
+                            "api_key",
+                            "authorization",
+                            "credential",
+                            "headers",
+                            "env",
+                        ]
+                        .iter()
+                        .any(|part| key.contains(part))
+                    });
+                    for value in map.values_mut() {
+                        scrub(value);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        scrub(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut configuration = configuration.clone();
+        scrub(&mut configuration);
+        Ok(Self {
+            schema_version: 1,
+            suite_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(suite)?)),
+            source_sha256: source_digest(isolated_source)?,
+            executable_sha256: digest_file(&std::env::current_exe()?)?,
+            configuration_sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&configuration)?)
+            ),
+        })
+    }
+    /// Matched quality comparisons can change executable/model configuration, but not task/source.
+    pub fn matched_tasks(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.suite_sha256 == other.suite_sha256
+            && self.source_sha256 == other.source_sha256
+    }
+}
+impl Recorder {
+    pub fn open(path: &Path, contract: Contract, resume: bool) -> Result<Self> {
+        ensure!(
+            contract.schema_version == 1,
+            "unsupported run contract version"
+        );
+        let lock = crate::storage::settings_store::try_locked(path)?;
+        let data =
+            if resume && let Some(bytes) = crate::storage::settings_store::read_private(path)? {
+                let data: Checkpoints =
+                    serde_json::from_slice(&bytes).context("invalid benchmark checkpoint")?;
+                ensure!(
+                    data.contract == contract,
+                    "resume refused: suite, source, executable or configuration changed"
+                );
+                data
+            } else {
+                ensure!(
+                    !path.exists(),
+                    "run checkpoint already exists; select resume or a new path"
+                );
+                Checkpoints {
+                    contract,
+                    cases: BTreeMap::new(),
+                }
+            };
+        let recorder = Self {
+            _lock: lock,
+            path: path.to_owned(),
+            data,
+        };
+        recorder.flush()?;
+        Ok(recorder)
+    }
+    pub fn completed(&self, case: &BenchmarkCase) -> Option<CaseResult> {
+        self.data
+            .cases
+            .get(&case.id)
+            .filter(|result| {
+                !result.metrics.agent_error
+                    && !result.metrics.token_usage_incomplete
+                    && result.metrics.token_usage_observed
+                    && result.evidence.as_ref().is_some_and(|evidence| {
+                        serde_json::to_vec(case).is_ok_and(|bytes| {
+                            evidence.contract_sha256 == format!("{:x}", Sha256::digest(bytes))
+                        })
+                    })
+            })
+            .cloned()
+    }
+    pub fn record(&mut self, result: &CaseResult) -> Result<()> {
+        self.data.cases.insert(result.id.clone(), result.clone());
+        self.flush()
+    }
+    pub fn contract(&self) -> &Contract {
+        &self.data.contract
+    }
+    fn flush(&self) -> Result<()> {
+        crate::storage::settings_store::write_private(&self.path, &serde_json::to_vec(&self.data)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn contract() -> Contract {
+        Contract {
+            schema_version: 1,
+            suite_sha256: "suite".into(),
+            source_sha256: "source".into(),
+            executable_sha256: "build".into(),
+            configuration_sha256: "configuration".into(),
+        }
+    }
+    #[test]
+    fn resume_requires_the_exact_execution_contract_and_one_active_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("run.json");
+        let recorder = Recorder::open(&path, contract(), false).unwrap();
+        assert!(Recorder::open(&path, contract(), true).is_err());
+        drop(recorder);
+        assert!(Recorder::open(&path, contract(), true).is_ok());
+        let mut changed = contract();
+        changed.executable_sha256 = "different-build".into();
+        assert!(Recorder::open(&path, changed, true).is_err());
+        assert!(Recorder::open(&path, contract(), false).is_err());
+    }
+    #[test]
+    fn source_identity_observes_contents_and_configuration_omits_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.rs");
+        fs::write(&path, "first").unwrap();
+        let first = source_digest(root.path()).unwrap();
+        fs::write(&path, "second").unwrap();
+        assert_ne!(first, source_digest(root.path()).unwrap());
+        let suite = BenchmarkSuite {
+            version: 1,
+            name: "fixture".into(),
+            cases: vec![],
+        };
+        let a = Contract::new(
+            &suite,
+            root.path(),
+            &serde_json::json!({"model":"a","api_key":"secret-a"}),
+        )
+        .unwrap();
+        let b = Contract::new(
+            &suite,
+            root.path(),
+            &serde_json::json!({"model":"a","api_key":"secret-b"}),
+        )
+        .unwrap();
+        assert_eq!(a.configuration_sha256, b.configuration_sha256);
+        assert!(a.matched_tasks(&b));
+        let c = Contract::new(&suite, root.path(), &serde_json::json!({"model":"b"})).unwrap();
+        assert_ne!(a.configuration_sha256, c.configuration_sha256);
+    }
+}

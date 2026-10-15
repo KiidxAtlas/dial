@@ -1,0 +1,8 @@
+[project]
+name = "dial-worker"
+version = "0.1.0"
+requires-python = ">=3.11,<3.14"
+dependencies = ["mlx-lm[train]==0.32.0", "mlx-vlm==0.7.6", "rich>=14,<15"]
+
+[tool.uv]
+package = false

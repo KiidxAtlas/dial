@@ -1,0 +1,11 @@
+# Composer and editor
+
+The prompt editor is a grapheme-aware multiline editor whose editing operations are keymap `Action`s, so bindings remain inspectable and rebindable. Consecutive typing is coalesced into undo units; kill operations feed a bounded kill ring with yank and yank-pop. Word movement and deletion are implemented by the editor. Long bracketed pastes are represented by a draft placeholder and expanded on submit, so the visible prompt does not need to render an unbounded payload.
+
+Autocomplete candidates are ranked on worker threads and delivered back to the composer tagged with the originating query. Results are only applied while that query still matches the active menu. Refresh project candidates outside keystroke handling with `Composer::set_files` and `Composer::set_commands`.
+
+Image file paths explicitly pasted into a prompt are recognized during user-message expansion and converted into integrity-checked local image references. Clipboard image paste uses platform clipboard utilities and stores temporary image files for the lifetime needed by submission. The LLM image layer verifies references and applies model-specific resizing before inference. Tool-originated image references remain constrained by the project permission rules.
+
+Word completion offers the rest of the word under the cursor as dim ghost text when no history or command-argument suggestion applies. Candidates come from two sources. The first is a learned model in `learned-words.json` under the Dial home directory. Prompts are learned when submitted, including queued follow-ups, and older words decay as newer prompts arrive. The second is a project index of identifiers and file stems, built on a worker thread from the workspace file list and cancelled when the list is refreshed. Prefixes shorter than two characters get no suggestion. Text that looks like a credential is never learned. The file is stored with owner-only permissions, and it is capped at 20,000 words. `Tab` or `Right` accepts the suggestion. The setting is `ui.word_completion` (default `true`), which is also the "Word completion" row in Settings. Turning it off stops both suggestions and learning.
+
+Editor behavior is covered in `src/ui/editor.rs` and composer behavior in `src/ui/composer.rs`; run `cargo test ui::editor` and `cargo test ui::composer` from the repository root.

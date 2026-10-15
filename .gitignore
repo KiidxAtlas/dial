@@ -1,0 +1,15 @@
+/target/
+/python/.venv/
+**/__pycache__/
+/.dial/
+/dial.toml
+/private/
+/grounded/
+/plans/
+.DS_Store
+/.cargo-work/
+/.tmp/
+/.codegraph
+/bin/
+.venv/
+*.pyc

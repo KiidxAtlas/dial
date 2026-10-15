@@ -1,0 +1,6 @@
+# Pinned toolchain for CI and releases (rustup honours this file; Homebrew/distro cargo ignores it).
+# Bump deliberately: update the channel, then run `make lint test` before tagging.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

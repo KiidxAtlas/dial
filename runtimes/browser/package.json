@@ -1,0 +1,10 @@
+{
+  "name": "dial-browser-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned Playwright and Readability runtime for Dial's built-in browser tool. Provisioned into a private owner-only cache; never installed into the workspace.",
+  "dependencies": {
+    "@mozilla/readability": "0.6.0",
+    "playwright-core": "1.64.0"
+  }
+}

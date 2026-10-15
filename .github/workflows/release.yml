@@ -1,0 +1,291 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and package ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux sandbox
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Install OpenSSL 3 on macOS
+        if: runner.os == 'macOS'
+        run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup target add "${{ matrix.target }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cargo metadata --no-deps --format-version 1 --locked > release-metadata.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          metadata = json.loads(Path('release-metadata.json').read_text())
+          version = next(p['version'] for p in metadata['packages'] if p['name'] == 'dial')
+          tag = os.environ['RELEASE_TAG']
+          if tag != f'v{version}':
+              raise SystemExit(f'Tag {tag} must match Cargo.toml version v{version}')
+          PY
+      - name: Test terminal installer
+        run: bash scripts/test-install.sh
+      - name: Verify Linux sandbox enforcement
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: cargo test --locked linux_sandbox_enforces_filesystem_and_both_network_modes
+      - name: Format
+        run: cargo fmt --check
+      - name: Test
+        run: cargo test --locked -- --test-threads=4
+      - name: Build release binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package and smoke-test outside the checkout
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          package="dial-${GITHUB_REF_NAME}-${RELEASE_TARGET}"
+          mkdir -p "dist/$package"
+          install -m 755 "target/$RELEASE_TARGET/release/dial" "dist/$package/dial"
+          cp LICENSE README.md THIRD_PARTY_NOTICES src/agent/snapcompact/fonts/Silver.LICENSE src/agent/snapcompact/fonts/Unscii.LICENSE "dist/$package/"
+          tar -czf "dist/$package.tar.gz" -C dist "$package"
+          smoke="$(mktemp -d "${RUNNER_TEMP:-$PWD/dist}/dial-smoke.XXXXXX")"
+          trap 'rm -rf "$smoke"' EXIT
+          tar -xzf "dist/$package.tar.gz" -C "$smoke"
+          python3 scripts/check-artifact.py --dial "$smoke/$package/dial"
+          cd "$smoke/$package"
+          ./dial --version | awk 'NR==1 {print $1, $2}' | grep -Fx "dial ${GITHUB_REF_NAME#v}"
+          ./dial --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  windows-build:
+    name: Build and package Windows release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-pc-windows-msvc
+      - name: Validate release tag
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object { $_.name -eq 'dial' } | Select-Object -First 1).version
+          if ($env:RELEASE_TAG -ne "v$version") { throw "Tag $env:RELEASE_TAG must match Cargo.toml version v$version" }
+      - name: Test
+        run: cargo test --locked -- --test-threads=4
+      - name: Build release binary
+        env:
+          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Package and smoke-test outside the checkout
+        shell: pwsh
+        run: |
+          $package = "dial-${{ github.ref_name }}-x86_64-pc-windows-msvc"
+          $dir = "dist/$package"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/dial.exe "$dir/dial.exe"
+          Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES, src/agent/snapcompact/fonts/Silver.LICENSE, src/agent/snapcompact/fonts/Unscii.LICENSE $dir
+          Compress-Archive -Path $dir -DestinationPath "dist/$package.zip"
+          $expected = "${{ github.ref_name }}".Substring(1)
+          $version = (& "dist/$package/dial.exe" --version | Select-Object -First 1)
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch ("^dial " + [regex]::Escape($expected) + "( |$)")) { throw "Packaged version check failed: $version" }
+          & "dist/$package/dial.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw "Packaged help check failed" }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test installer under Windows PowerShell 5.1
+        shell: powershell
+        run: ./scripts/test-install.ps1 -ArchivePath "${{ github.workspace }}/dist/dial-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
+      - name: Test installer under PowerShell 7
+        shell: pwsh
+        run: ./scripts/test-install.ps1 -ArchivePath "${{ github.workspace }}/dist/dial-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-x86_64-pc-windows-msvc
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [build, windows-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          merge-multiple: true
+          path: dist
+      - name: Validate release signing configuration
+        env:
+          DIAL_RELEASE_SIGNING_KEY: ${{ secrets.DIAL_RELEASE_SIGNING_KEY }}
+          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          test -n "$DIAL_RELEASE_SIGNING_KEY" || { echo 'Required secret DIAL_RELEASE_SIGNING_KEY is missing' >&2; exit 1; }
+          test -n "$DIAL_RELEASE_PUBLIC_KEY" || { echo 'Required variable DIAL_RELEASE_PUBLIC_KEY (base64 Ed25519 raw public key) is missing' >&2; exit 1; }
+          test -n "$DIAL_RELEASE_PUBLIC_KEY_PEM" || { echo 'Required variable DIAL_RELEASE_PUBLIC_KEY_PEM is missing' >&2; exit 1; }
+          printf '%s\n' "$DIAL_RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/release-key.pem"
+          printf '%s\n' "$DIAL_RELEASE_PUBLIC_KEY_PEM" > "$RUNNER_TEMP/release-public.pem"
+          derived="$(openssl pkey -pubout -outform DER -in "$RUNNER_TEMP/release-key.pem" | tail -c 32 | base64 -w0)"
+          test "$derived" = "$DIAL_RELEASE_PUBLIC_KEY" || { echo 'Public key does not match signing key' >&2; exit 1; }
+          pem_raw="$(openssl pkey -pubin -in "$RUNNER_TEMP/release-public.pem" -outform DER | tail -c 32 | base64 -w0)"
+          test "$pem_raw" = "$DIAL_RELEASE_PUBLIC_KEY" || { echo 'Installer public key does not match embedded update key' >&2; exit 1; }
+      - name: Sign release manifest and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          DIAL_RELEASE_SIGNING_KEY: ${{ secrets.DIAL_RELEASE_SIGNING_KEY }}
+          DIAL_RELEASE_PUBLIC_KEY_PEM: ${{ vars.DIAL_RELEASE_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          printf 'export DIAL_RELEASE_PUBLIC_KEY=%q\n' "$DIAL_RELEASE_PUBLIC_KEY_PEM" > dist/install.sh
+          cat scripts/install.sh >> dist/install.sh
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          pem = os.environ['DIAL_RELEASE_PUBLIC_KEY_PEM'].replace('\r\n', '\n').strip('\n')
+          if '-----BEGIN PUBLIC KEY-----' not in pem or "'@" in pem:
+              raise SystemExit('DIAL_RELEASE_PUBLIC_KEY_PEM is not a PEM public key')
+          source = Path('scripts/install.ps1').read_text(encoding='utf-8')
+          placeholder = re.compile(r"^    \$DialReleasePublicKeyPem = ''\r?$", re.M)
+          if len(placeholder.findall(source)) != 1:
+              raise SystemExit('install.ps1 key placeholder must appear exactly once')
+          embedded = placeholder.sub(lambda m: "    $DialReleasePublicKeyPem = @'\n" + pem + "\n'@", source, count=1)
+          Path('dist/install.ps1').write_text(embedded, encoding='utf-8', newline='\n')
+          PY
+          (cd dist && sha256sum *.tar.gz *.zip install.sh install.ps1 > SHA256SUMS)
+          printf '%s\n' "$DIAL_RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/release-key.pem"
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/release-key.pem" -rawin \
+            -in dist/SHA256SUMS -out "$RUNNER_TEMP/SHA256SUMS.sig"
+          base64 -w0 "$RUNNER_TEMP/SHA256SUMS.sig" > dist/SHA256SUMS.sig
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS dist/SHA256SUMS.sig dist/install.sh dist/install.ps1 \
+            --verify-tag --generate-notes --title "Dial $RELEASE_TAG"
+      - name: Update Homebrew formula and Nix flake
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          git fetch origin main
+          git checkout -B release-packaging origin/main
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          version = __import__('os').environ['RELEASE_TAG'].removeprefix('v')
+          sums = {}
+          for line in Path('dist/SHA256SUMS').read_text().splitlines():
+              digest, name = line.split(maxsplit=1)
+              sums[name.lstrip('*')] = digest
+          formula_path = Path('Formula/dial.rb')
+          formula = formula_path.read_text()
+          formula = re.sub(r'^  version ".*"$', f'  version "{version}"', formula, count=1, flags=re.M)
+          targets = [
+              f'dial-v{version}-aarch64-apple-darwin.tar.gz',
+              f'dial-v{version}-x86_64-apple-darwin.tar.gz',
+              f'dial-v{version}-x86_64-unknown-linux-gnu.tar.gz',
+          ]
+          for archive in targets:
+              if archive not in sums:
+                  raise SystemExit(f'missing release checksum for {archive}')
+              # Formula urls use #{version}, so match on the target suffix, then the sha256 line that follows it.
+              suffix = archive.removeprefix(f'dial-v{version}')
+              pattern = r'(' + re.escape(suffix) + r'"\n\s*sha256 )(?:no_check|"[^"]*")'
+              formula, count = re.subn(pattern, lambda m: m.group(1) + f'"{sums[archive]}"', formula, count=1)
+              if count != 1:
+                  raise SystemExit(f'could not update formula checksum for {archive}')
+          formula_path.write_text(formula)
+          flake_path = Path('flake.nix')
+          flake, count = re.subn(r'version = "[^"]+";', f'version = "{version}";', flake_path.read_text(), count=1)
+          if count != 1:
+              raise SystemExit('could not update flake version')
+          flake_path.write_text(flake)
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Formula/dial.rb flake.nix
+          git commit -m "release: update package metadata for $version"
+          git push origin HEAD:main
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Resolve container tags
+        id: docker-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+      - name: Publish container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.docker-meta.outputs.tags }}
+          labels: ${{ steps.docker-meta.outputs.labels }}
