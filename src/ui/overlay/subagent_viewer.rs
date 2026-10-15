@@ -606,6 +606,7 @@ impl SubagentViewer {
             ui: &self.ui,
             tick: ctx.status.tick,
             tools_expanded: self.expanded,
+            expand_key: &ctx.keys.label(Action::ToolsExpand),
         };
         let (rows, anchors) = self
             .conversation

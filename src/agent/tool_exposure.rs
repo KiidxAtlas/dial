@@ -226,8 +226,11 @@ impl<'a> Agent<'a> {
                 names.push(tool.into());
             }
         }
-        // Peer messaging is offered while a worker is live, so the parent can answer or steer it.
-        if self.live_task_control().any_running() && catalog.iter().any(|name| name == "message") {
+        // Peer messaging is offered whenever `task` is, not only while a worker is live, so the
+        // offer and the system prompt's loadable list do not change as workers start and stop.
+        // `message` is a live-task tool rather than a catalog entry: dispatch and schema come from
+        // `live_tasks`. With no live worker it lists an empty roster or reports an unknown recipient.
+        if names.iter().any(|name| name == "task") {
             names.push("message".into());
         }
         // Completion is a control tool, including for older admitted harnesses that predate it.
@@ -322,6 +325,10 @@ impl<'a> Agent<'a> {
         if catalog.iter().any(|name| name == "bg") && !names.iter().any(|name| name == "bg") {
             names.push("bg".into());
             names.sort();
+        }
+        // Peer messaging follows the `task` offer after mode and profile filters have settled.
+        if !names.iter().any(|name| name == "task") {
+            names.retain(|name| name != "message");
         }
         if self.lean_tools {
             names.retain(|name| Self::LEAN_TOOLS.contains(&name.as_str()) || loaded.contains(name));
@@ -556,6 +563,22 @@ mod default_offer_tests {
         serde_json::to_string(&agent.schemas(names).unwrap())
             .unwrap()
             .len()
+    }
+
+    #[test]
+    fn message_is_offered_with_task_whether_or_not_a_worker_is_live() {
+        with_agent("", |agent| {
+            // No worker runs here, so the offer must already include `message` with `task`; a live
+            // worker cannot change it because the offer no longer reads worker state.
+            assert!(!agent.live_task_control().any_running());
+            let offered = agent.offered();
+            assert!(offered.iter().any(|name| name == "task"), "{offered:?}");
+            assert!(offered.iter().any(|name| name == "message"), "{offered:?}");
+            let discoverable = agent.discoverable_tools(&offered);
+            assert!(!discoverable.iter().any(|(name, _)| name == "message"));
+            let prompt = serde_json::to_string(&agent.system_messages()).unwrap();
+            assert!(prompt.contains("Descendants require explicit role spawn permissions"));
+        });
     }
 
     #[test]

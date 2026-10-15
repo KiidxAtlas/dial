@@ -15,9 +15,11 @@ The continued-session case tests multi-turn compaction, not process restart/resu
 are claimed by these fixtures, and prompt cache hits need not be free under a subscription limit.
 
 For evidence-led quality work, use `dial benchmark examples/benchmarks/quality.toml --report target/quality.json`.
-Its four independent billing fixtures cover locating production code among archival decoys,
+Its billing fixtures cover locating production code among archival decoys,
 quantity/empty-input boundaries, a rename through callers, environment-versus-code diagnosis,
-and rejecting stale historical discount advice. Acceptance commands are outside the copied
+and rejecting stale historical discount advice. Two journey cases continue one session across
+follow-up turns: an iterative feature that must survive a forced compaction, and a corrected
+requirement where the latest instruction overrides the first request. Acceptance commands are outside the copied
 project, so changing visible tests cannot weaken them. No third-party Python packages are needed.
 Run `python3 -m unittest discover -s examples/benchmarks -p 'test_*.py'` to verify the
 evaluation machinery and fixture acceptance contracts without making model calls.

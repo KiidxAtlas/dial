@@ -256,6 +256,51 @@ fn independent_slow_reads_overlap_and_results_stay_ordered() {
 }
 
 #[test]
+fn batched_read_only_bash_runs_through_parallel_tools_in_call_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let calls: Vec<_> = ["printf one", "printf two", "printf one"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, command)| ToolCall {
+            id: index.to_string(),
+            name: "bash".into(),
+            arguments: json!({"command": command}),
+            malformed_arguments: false,
+        })
+        .collect();
+    assert!(calls.iter().all(|call| approval::parallel_read(
+        &Registry::new(),
+        &call.name,
+        &call.arguments
+    )));
+    let outputs = parallel_tools(
+        &workspace,
+        &Config::default(),
+        &Registry::new(),
+        &calls,
+        &AtomicBool::new(false),
+        &mut NullUi,
+        &mut Vec::new(),
+    );
+    assert_eq!(
+        outputs
+            .iter()
+            .map(|(out, _)| (
+                out.is_error,
+                out.text.lines().next().unwrap_or_default().to_owned()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (false, "one".into()),
+            (false, "two".into()),
+            (false, "one".into())
+        ],
+        "batched bash results must stay in call order with their own output"
+    );
+}
+
+#[test]
 fn repair_hints_are_project_scoped_relevant_and_omit_old_values() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(

@@ -91,12 +91,15 @@ impl Finished {
         }
     }
     pub fn execution(&self, may_mutate: bool) -> super::execution::Execution {
+        // A timeout whose leader was reaped after the group kill is an ordinary failure: nothing
+        // still runs and any partial effects are on disk to inspect, like a non-zero exit.
+        let reaped_timeout = self.timed_out && self.status.is_some();
         super::execution::Execution {
             status: Some(self.tool_status()),
             effects: if !self.started || !may_mutate {
                 super::execution::Effects::None
             } else if self.cancelled
-                || self.timed_out
+                || (self.timed_out && !reaped_timeout)
                 || self.output_limited
                 || self.io_error.is_some()
             {

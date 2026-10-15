@@ -41,9 +41,20 @@ pub(super) fn summarize(call: &ToolCall) -> String {
     summarize_call(&call.name, &call.arguments)
 }
 
-/// One line a person can read for a tool call: tool lines, approval prompts and replayed sessions. Tools that can
-/// need approval keep their full arguments unless a field below already says everything the approver must see.
+/// Full description for approval prompts; unlike [`summarize`] it is never truncated.
+pub(super) fn describe(call: &ToolCall) -> String {
+    describe_call(&call.name, &call.arguments)
+}
+
+/// One line a person can read for a tool call: tool lines and replayed sessions. Bounded for display; approval
+/// prompts use [`describe_call`] so the approver can reach every byte of what they are allowing.
 pub fn summarize_call(name: &str, a: &Value) -> String {
+    truncate(&describe_call(name, a), 1500)
+}
+
+/// The complete, unbounded description behind [`summarize_call`]. Tools that can need approval keep their full
+/// arguments unless a field below already says everything the approver must see.
+pub fn describe_call(name: &str, a: &Value) -> String {
     let s = |key: &str| a[key].as_str().unwrap_or("");
     let within = |pattern: &str| match (s("path"), s("glob")) {
         ("", "") => pattern.to_owned(),
@@ -51,7 +62,7 @@ pub fn summarize_call(name: &str, a: &Value) -> String {
         ("", glob) => format!("{pattern} ({glob})"),
         (path, glob) => format!("{pattern} in {path} ({glob})"),
     };
-    let text = match name {
+    match name {
         "bash" => s("command").to_owned(),
         "write" | "read" => s("path").to_owned(),
         "edit" => a["input"]
@@ -78,8 +89,7 @@ pub fn summarize_call(name: &str, a: &Value) -> String {
         "working_state" => s("action").to_owned(),
         _ if a.is_null() => String::new(),
         _ => a.to_string(),
-    };
-    truncate(&text, 1500)
+    }
 }
 
 pub(super) fn summarize_todo(a: &Value) -> String {

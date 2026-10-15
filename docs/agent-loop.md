@@ -121,12 +121,15 @@ Dial's shared agent loop applies these controls to cloud and local models withou
 limits, reasoning budgets, approvals or verification requirements:
 
 - The default tool offer is the core roster plus the essential integrations when configured
-  (`find`, `lsp`, `bg`, `git`, `web_fetch`, `web_search`). Overlapping specialists are deferred
+  (`ask` when enabled, `find`, `lsp`, `bg`, `git`, `web_fetch`, `web_search`). `task` and `skill` are
+  offered with them, and `message` is offered whenever `task` is, so peer messaging does not appear or
+  disappear as workers start and stop. Overlapping specialists are deferred
   (`tools::DEFERRED_BY_DEFAULT`: `memory_update`, which needs an id and revision from `recall`, and
   `ast_search`, the structural variant of `grep`/`find`). Every catalog tool not offered is
   listed in the system prompt under "Loadable tools" with a one-line description, so the model
   loads it with `tool_load` in one round; schemas and recorded tool contracts are unchanged. The
-  list is stable for the session, so the provider's cached prefix survives.
+  list changes only when a tool is loaded or unloaded, and the offer never reads live-worker state,
+  so the provider's cached prefix survives ordinary rounds.
   `assistance.compact_tools=true` switches to discovery mode for small local models: a core set
   bounded by `assistance.initial_tool_limit` (default 16) plus `tool_search`/`tool_load`.
   Automatic search and compatibility activation retain at most eight discovered tools, oldest
@@ -172,7 +175,7 @@ limits, reasoning budgets, approvals or verification requirements:
 ```toml
 [efficiency]
 enabled = true
-ambient_context_bytes = 0       # unlimited per ambient source
+ambient_context_bytes = 8192    # per ambient source; 0 = unlimited
 tool_preview_bytes = 0          # unlimited successful-result previews
 lightweight_requests = 4         # 0 disables the lightweight contract
 cache_pressure_percent = 75     # 50..79; below the normal compaction threshold
@@ -293,8 +296,8 @@ idle_enabled = false
 idle_threshold_tokens = 200000
 idle_timeout_seconds = 300
 handoff_save_to_disk = false
-supersede_reads = true
-drop_useless = true
+supersede_reads = false
+drop_useless = false
 experimental_context_management = false
 summary_instructions = "inherit"
 

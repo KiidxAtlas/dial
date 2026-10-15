@@ -499,6 +499,8 @@ pub enum Stall {
 pub struct StallGuard {
     streaks: std::collections::HashMap<String, u32>,
     failed_rounds: u32,
+    /// Last failure cause per tool, recorded by `note_error`; named in the stop text.
+    causes: std::collections::HashMap<String, String>,
 }
 
 impl StallGuard {
@@ -506,20 +508,32 @@ impl StallGuard {
     pub fn streak(&self, tool: &str) -> u32 {
         self.streaks.get(tool).copied().unwrap_or(0)
     }
+    /// Record why the latest failing call of `tool` failed. The first non-empty line is kept
+    /// and clipped, so the stop text can say what went wrong without repeating the whole output.
+    pub fn note_error(&mut self, tool: &str, error: &str) {
+        if let Some(line) = error.lines().map(str::trim).find(|line| !line.is_empty()) {
+            self.causes.insert(tool.to_owned(), clip_middle(line, 160));
+        }
+    }
     pub fn call(&mut self, call: &ToolCall, failed: bool) -> Stall {
         if !CALL_TOOLS.contains(&call.name.as_str()) {
             return Stall::None;
         }
         if !failed {
             self.streaks.remove(&call.name);
+            self.causes.remove(&call.name);
             return Stall::None;
         }
         let count = self.streaks.entry(call.name.clone()).or_default();
         *count += 1;
         let (count, name) = (*count, &call.name);
+        let cause = self
+            .causes
+            .get(name)
+            .map_or(String::new(), |cause| format!(" Last error: {cause}."));
         if count >= STREAK_STOP {
             Stall::Stop(format!(
-                "Stopped: `{name}` failed {count} times in a row without one success. The model is not recovering from the errors it is shown. Try a smaller request, a different edit mode, or a different model."
+                "Stopped: `{name}` failed {count} times in a row without one success.{cause} The model is not recovering from the errors it is shown. Try a smaller request, a different edit mode, or a different model."
             ))
         } else if count == STREAK_WARN {
             Stall::Warn(format!(
@@ -984,6 +998,36 @@ mod tests {
             panic!("stops at the tenth")
         };
         assert!(text.contains("`edit`") && text.contains("10 times"));
+    }
+
+    #[test]
+    fn stop_text_names_the_last_error_of_the_failing_tool() {
+        let mut guard = StallGuard::default();
+        let edit = |n: u32| {
+            call(
+                "edit",
+                json!({"path": "a.rs", "old_string": format!("guess {n}"), "new_string": "x"}),
+            )
+        };
+        for n in 1..10 {
+            guard.note_error(
+                "edit",
+                &format!("\n  old_string not found in a.rs\nattempt {n}"),
+            );
+            guard.call(&edit(n), true);
+        }
+        guard.note_error("edit", "old_string not found in a.rs\nattempt 10");
+        let Stall::Stop(text) = guard.call(&edit(10), true) else {
+            panic!("stops at the tenth")
+        };
+        assert!(
+            text.contains("`edit`") && text.contains("Last error: old_string not found in a.rs."),
+            "{text}"
+        );
+        assert!(
+            !text.contains("attempt"),
+            "only the first line is kept: {text}"
+        );
     }
 
     #[test]

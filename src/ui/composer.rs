@@ -142,6 +142,13 @@ struct Search {
     scroll: usize,
 }
 
+/// A queued message loaded into the composer for editing, kept so cancelling restores it exactly.
+struct QueuedEdit {
+    index: usize,
+    text: String,
+    follow_up: bool,
+}
+
 pub struct Composer {
     editor: Editor,
     double_left: DoubleTap,
@@ -166,7 +173,9 @@ pub struct Composer {
     search: Option<Search>,
     busy: bool,
     queued: std::collections::VecDeque<(String, bool)>,
-    editing_queue: Option<bool>,
+    /// The queued message currently loaded into the draft. Cancelling or replacing the draft restores it
+    /// unchanged at its original position; only submitting replaces it.
+    editing_queue: Option<QueuedEdit>,
     queue_notice: Option<String>,
     exit_armed: bool,
     /// `(placeholder, full text)` for collapsed pastes still referenced by the draft.
@@ -277,7 +286,8 @@ impl Composer {
         self.exit_armed = false;
         self.dismissed = None;
         self.pastes.clear();
-        self.editing_queue = None;
+        // Replacing the draft abandons an in-progress queue edit: put the original back, never drop it.
+        self.restore_queued_edit();
         self.queue_notice = None;
         self.refresh();
     }
@@ -471,12 +481,29 @@ impl Composer {
         if !self.editor.text.is_empty() {
             return false;
         }
+        self.restore_queued_edit();
         let Some((text, follow_up)) = self.queued.remove(index) else {
             return false;
         };
-        self.set_draft(&text);
-        self.editing_queue = Some(follow_up);
+        self.begin_queued_edit(index, text, follow_up);
         true
+    }
+
+    /// Load a queued item (already removed from the queue) into the draft, remembering where it came from.
+    fn begin_queued_edit(&mut self, index: usize, text: String, follow_up: bool) {
+        self.set_draft(&text);
+        self.editing_queue = Some(QueuedEdit {
+            index,
+            text,
+            follow_up,
+        });
+    }
+
+    fn restore_queued_edit(&mut self) {
+        if let Some(edit) = self.editing_queue.take() {
+            let index = edit.index.min(self.queued.len());
+            self.queued.insert(index, (edit.text, edit.follow_up));
+        }
     }
 
     pub fn mode(&self) -> InputMode {
@@ -541,17 +568,16 @@ impl Composer {
             && !self.menu_open()
             && self.ghost().is_none()
         {
-            self.editing_queue = None;
             self.clear();
             return ComposerEvent::None;
         }
-        if self.editor.text.is_empty()
-            && key.code == KeyCode::Up
-            && let Some((text, follow_up)) = self.queued.pop_back()
-        {
-            self.set_draft(&text);
-            self.editing_queue = Some(follow_up);
-            return ComposerEvent::None;
+        if self.editor.text.is_empty() && key.code == KeyCode::Up {
+            self.restore_queued_edit();
+            if let Some((text, follow_up)) = self.queued.pop_back() {
+                let index = self.queued.len();
+                self.begin_queued_edit(index, text, follow_up);
+                return ComposerEvent::None;
+            }
         }
         if keys.matches(Action::FollowUp, &key) {
             if !self.busy {
@@ -672,6 +698,14 @@ impl Composer {
             self.complete_menu();
             return ComposerEvent::None;
         }
+        // A second Enter explicitly sends the oldest queued message now. Do not
+        // add it to history again: queuing already recorded the original draft.
+        if self.editor.text.is_empty()
+            && let Some((text, _)) = self.queued.pop_front()
+        {
+            self.queue_notice = None;
+            return ComposerEvent::Submit(text);
+        }
         if self.busy && !self.editor.text.trim_start().starts_with('/') {
             return self.submit_queued(false);
         }
@@ -685,6 +719,7 @@ impl Composer {
         self.pastes.clear();
         self.history_index = None;
         self.saved_draft = None;
+        // Sending an edited queue item consumes it; the original is intentionally not restored.
         self.editing_queue = None;
         self.push_history(sent.clone());
         ComposerEvent::Submit(sent)
@@ -707,10 +742,12 @@ impl Composer {
         }
         self.learn_words(&sent);
         self.push_history(sent.clone());
-        self.queued
-            .push_back((sent, follow_up || self.editing_queue.unwrap_or(false)));
+        // A saved edit replaces the original in place, so editing never reorders the queue.
+        let edit = self.editing_queue.take();
+        let follow_up = follow_up || edit.as_ref().is_some_and(|edit| edit.follow_up);
+        let index = edit.map_or(self.queued.len(), |edit| edit.index.min(self.queued.len()));
+        self.queued.insert(index, (sent, follow_up));
         self.clear();
-        self.editing_queue = None;
         self.queue_notice = None;
         ComposerEvent::None
     }
@@ -1309,11 +1346,19 @@ impl Composer {
                     theme.fg(Tok::Accent),
                 )));
             }
+            let hidden = self.queued.len().saturating_sub(3);
+            if hidden > 0 {
+                queued.push(Line::from(Span::styled(
+                    text::ellipsize(&format!("+{hidden} more queued"), w, theme.ascii()),
+                    theme.fg(Tok::Dim),
+                )));
+            }
             queued.push(Line::from(Span::styled(
                 text::ellipsize(
                     &format!(
-                        "{} queued · {} edit last · /queue manage · Esc cancels edited item",
+                        "{} queued · {} stop turn & send oldest · {} edit last · /queue manage · Esc keeps original when editing",
                         self.queued.len(),
+                        ctx.keys.label(Action::Submit),
                         ctx.keys.label(Action::SelectUp)
                     ),
                     w,
@@ -1427,7 +1472,7 @@ impl Composer {
             if self.busy {
                 pieces.push(hint(Action::Interrupt, "interrupt"));
             }
-            if let Some(follow_up) = self.editing_queue {
+            if let Some(QueuedEdit { follow_up, .. }) = self.editing_queue {
                 pieces.push(plain(format!(
                     "editing queued {}",
                     if follow_up { "follow-up" } else { "steering" }
@@ -1451,11 +1496,20 @@ impl Composer {
                 ]);
             } else if self.busy {
                 let command = self.editor.text.trim_start().starts_with('/');
-                pieces.push(hint(
-                    Action::Submit,
-                    if command { "run command" } else { "steer" },
-                ));
-                if !command {
+                let blank = self.editor.text.trim().is_empty();
+                // Mirrors `submit`: an empty Enter flushes the oldest queued message (stopping the
+                // turn); a blank draft is ignored; otherwise Enter steers with the draft.
+                if command {
+                    pieces.push(hint(Action::Submit, "run command"));
+                } else if self.editor.text.is_empty() {
+                    if !self.queued.is_empty() {
+                        pieces.push(hint(Action::Submit, "stop & send queued"));
+                    }
+                } else if !blank {
+                    pieces.push(hint(Action::Submit, "steer"));
+                }
+                // Alt-Enter only queues a non-blank draft.
+                if !command && !blank {
                     pieces.push(hint(Action::FollowUp, "follow-up"));
                 }
             } else if !self.editor.text.is_empty() {
@@ -2196,7 +2250,50 @@ mod tests {
         composer.set_draft("");
         assert!(composer.edit_queued(1));
         assert_eq!(composer.draft(), "message 2");
-        assert_eq!(composer.editing_queue, Some(true));
+        assert!(
+            composer
+                .editing_queue
+                .as_ref()
+                .is_some_and(|edit| edit.follow_up)
+        );
+    }
+
+    #[test]
+    fn cancelling_a_queued_edit_restores_the_original_item_in_place() {
+        let env = Env::new();
+        let mut c = composer();
+        c.set_busy(true);
+        for (text, follow_up) in [("first", false), ("second", true), ("third", false)] {
+            c.set_draft(text);
+            c.submit_queued(follow_up);
+        }
+        let original = c.queued_messages();
+        // Edit the middle item, change it, then cancel: content, order and routing are unchanged.
+        assert!(c.edit_queued(1));
+        c.set_draft("");
+        assert!(c.edit_queued(1), "replacing the draft restored the item");
+        typed(&mut c, &env, " changed");
+        assert_eq!(c.queued_messages().len(), 2);
+        assert_eq!(press(&mut c, &env, KeyCode::Esc), ComposerEvent::None);
+        assert_eq!(c.queued_messages(), original);
+        assert_eq!(c.draft(), "");
+        // Up edits the last item; cancelling puts it back last.
+        assert_eq!(press(&mut c, &env, KeyCode::Up), ComposerEvent::None);
+        assert_eq!(c.draft(), "third");
+        assert_eq!(press(&mut c, &env, KeyCode::Esc), ComposerEvent::None);
+        assert_eq!(c.queued_messages(), original);
+        // Saving an edit replaces the item at its original position and keeps its routing.
+        assert!(c.edit_queued(1));
+        c.editor.set("second edited");
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+        assert_eq!(
+            c.queued_messages(),
+            vec![
+                ("first".into(), false),
+                ("second edited".into(), true),
+                ("third".into(), false)
+            ]
+        );
     }
 
     #[test]
@@ -3227,13 +3324,126 @@ mod tests {
         assert_eq!(c.take_steering(), vec!["steer"]);
         assert_eq!(c.take_follow_up().as_deref(), Some("later"));
         assert_eq!(c.take_follow_up(), None);
-        typed(&mut c, &env, "cancel this");
+        typed(&mut c, &env, "keep this");
         press(&mut c, &env, KeyCode::Enter);
         press(&mut c, &env, KeyCode::Up);
-        assert_eq!(c.draft(), "cancel this");
+        assert_eq!(c.draft(), "keep this");
         press(&mut c, &env, KeyCode::Esc);
-        assert!(c.take_steering().is_empty());
         assert_eq!(c.draft(), "");
+        assert_eq!(
+            c.take_steering(),
+            vec!["keep this"],
+            "Esc cancels the edit, not the queued message"
+        );
+    }
+
+    #[test]
+    fn busy_hints_follow_the_draft_and_queue() {
+        let env = Env::new();
+        let mut c = composer();
+        c.set_busy(true);
+        let submit = env.keys.label(Action::Submit);
+        let follow_up = env.keys.label(Action::FollowUp);
+        let hints = |c: &Composer| c.hint(&env.ctx());
+        assert!(
+            hints(&c)
+                .iter()
+                .all(|h| !h.contains("steer") && !h.contains("queued")),
+            "an empty Enter with nothing queued advertises no send: {:?}",
+            hints(&c)
+        );
+        typed(&mut c, &env, "later");
+        assert!(hints(&c).contains(&format!("{submit} steer")));
+        assert!(hints(&c).contains(&format!("{follow_up} follow-up")));
+        c.set_draft("");
+        c.queued.push_back(("oldest".into(), false));
+        c.queued.push_back(("newer".into(), true));
+        assert!(
+            hints(&c).contains(&format!("{submit} stop & send queued")),
+            "an empty Enter with a queue stops the turn: {:?}",
+            hints(&c)
+        );
+        assert!(
+            hints(&c)
+                .iter()
+                .all(|h| !h.contains("steer") && !h.contains("follow-up")),
+            "an empty draft neither steers nor queues"
+        );
+    }
+
+    #[test]
+    fn busy_queue_panel_counts_messages_beyond_its_three_rows() {
+        let env = Env::new();
+        let mut c = composer();
+        c.set_busy(true);
+        for index in 0..3 {
+            c.queued.push_back((format!("message {index}"), false));
+        }
+        let rows = lines(&c.view(100, &env.ctx()).rows).join("\n");
+        assert!(!rows.contains("more queued"), "{rows}");
+        c.queued.push_back(("message 3".into(), true));
+        c.queued.push_back(("message 4".into(), false));
+        let rows = lines(&c.view(100, &env.ctx()).rows).join("\n");
+        assert!(rows.contains("+2 more queued"), "{rows}");
+        assert!(
+            !rows.contains("message 4"),
+            "only three messages are listed: {rows}"
+        );
+        assert!(
+            rows.contains(&format!(
+                "5 queued · {} stop turn & send oldest",
+                env.keys.label(Action::Submit)
+            )),
+            "{rows}"
+        );
+    }
+
+    #[test]
+    fn empty_enter_sends_oldest_queued_message_once_without_losing_other_work() {
+        let mut env = Env::new();
+        for follow_up in [false, true] {
+            for busy in [false, true] {
+                let mut c = composer();
+                c.set_busy(true);
+                c.set_draft("send now");
+                let modifiers = if follow_up {
+                    KeyModifiers::ALT
+                } else {
+                    KeyModifiers::NONE
+                };
+                key(&mut c, &env, KeyCode::Enter, modifiers);
+                c.set_draft("keep queued");
+                key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
+                let history = c.history().to_vec();
+                c.set_busy(busy);
+                assert_eq!(
+                    press(&mut c, &env, KeyCode::Enter),
+                    ComposerEvent::Submit("send now".into())
+                );
+                assert_eq!(c.queued_messages(), vec![("keep queued".into(), true)]);
+                assert_eq!(c.history(), history);
+                assert_eq!(c.draft(), "");
+                assert_eq!(c.take_follow_up().as_deref(), Some("keep queued"));
+                assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+            }
+        }
+        env.keys.rebind(Action::Submit, &["F2"]).unwrap();
+        let mut c = composer();
+        c.set_busy(true);
+        c.set_draft("queued");
+        key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
+        c.set_draft("   ");
+        assert_eq!(press(&mut c, &env, KeyCode::F(2)), ComposerEvent::None);
+        assert_eq!(
+            c.queued_messages().len(),
+            1,
+            "a nonempty draft never flushes the queue"
+        );
+        c.set_draft("");
+        assert_eq!(
+            press(&mut c, &env, KeyCode::F(2)),
+            ComposerEvent::Submit("queued".into())
+        );
     }
 
     #[test]
@@ -3511,7 +3721,7 @@ mod tests {
         let env = Env::new();
         let mut c = Composer::new(vec![], 10);
         c.set_commands(vec![cmd("model", "Switch model", CommandKind::Builtin)]);
-        c.set_argument_completions(vec!["/model settings".into()]);
+        c.set_argument_completions(vec!["/model settings".into(), "/model defaults".into()]);
         typed(&mut c, &env, "/model");
         assert_eq!(
             press(&mut c, &env, KeyCode::Enter),
@@ -3530,6 +3740,13 @@ mod tests {
         assert_eq!(
             press(&mut c, &env, KeyCode::Enter),
             ComposerEvent::Submit("/model settings".into())
+        );
+        c.set_draft("/model de");
+        assert_eq!(press(&mut c, &env, KeyCode::Tab), ComposerEvent::None);
+        assert_eq!(c.draft(), "/model defaults");
+        assert_eq!(
+            press(&mut c, &env, KeyCode::Enter),
+            ComposerEvent::Submit("/model defaults".into())
         );
     }
 

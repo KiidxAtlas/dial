@@ -124,8 +124,11 @@ Toggles persist by skill name in `skills.json` outside the workspace: project st
 default, or Dial's user directory with `--user`. A project setting overrides the user
 default, including for same-name shadowed skills. Disabling never deletes a skill; it
 removes it from completion, the model catalog and skill-tool loading. Imports and toggles
-refresh chat completion immediately and the model catalog on the next turn. While a turn runs, plain
-messages are queued for the next turn (Enter steers the running turn); slash commands run immediately or are refused. Previously loaded skill text
+refresh chat completion immediately and the model catalog on the next turn. While a turn runs,
+Enter queues steering for the running turn and Option/Alt+Enter queues a follow-up for the next
+turn. With an empty composer, Enter sends the oldest queued message now: the current turn stops
+at its next safe point and the message starts a new turn in the same chat. Other queued messages
+are preserved. Slash commands run immediately or are deferred. Previously loaded skill text
 remains in conversation history; disabling is not a sandbox or a way to erase that text.
 
 Folders need lowercase/digit/hyphen names and frontmatter with a nonempty

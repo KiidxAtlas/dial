@@ -126,7 +126,7 @@ fn line(event: &UiEvent, w: usize, ctx: &TranscriptCtx) -> Rows {
                 vec![
                     Span::raw(" ".repeat(hang)),
                     Span::styled(
-                        format!("{} more lines · ctrl+o", rest.len()),
+                        format!("{} more lines · {}", rest.len(), ctx.expand_key),
                         theme.fg(Tok::Dim),
                     ),
                 ],
@@ -148,7 +148,7 @@ fn compact_tokens(n: u64) -> String {
     }
 }
 
-/// `──── ⟲ compacted · 172k → 31k · ctrl+o ────`, with the full report under the expand toggle.
+/// `──── ⟲ compacted · 172k → 31k · Ctrl+O ────`, with the full report under the expand toggle.
 fn divider(event: &UiEvent, w: usize, ctx: &TranscriptCtx) -> Rows {
     let theme = ctx.theme;
     let ascii = theme.ascii();
@@ -164,7 +164,7 @@ fn divider(event: &UiEvent, w: usize, ctx: &TranscriptCtx) -> Rows {
         ));
     }
     if !ctx.tools_expanded {
-        label.push_str(&format!(" {dot} ctrl+o"));
+        label.push_str(&format!(" {dot} {}", ctx.expand_key));
     }
     let label = text::clip(&label, w.saturating_sub(4).max(1));
     let side = w.saturating_sub(text::width(&label) + 2);

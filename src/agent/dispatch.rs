@@ -275,7 +275,7 @@ impl<'a> Agent<'a> {
                 &mut self.always,
                 self.workspace.root(),
                 call,
-                &summarize(call),
+                &describe(call),
                 ui,
                 self.interrupt.as_ref(),
             )

@@ -34,14 +34,18 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   appear only at the end of an idle draft, never in secret prompts or mid-line.
 - **Slash commands:** typing `/` opens a list of every command (built-in and your `.dial/commands/*.md`)
   that filters as you type. `Up`/`Down` move (wrapping, with a position counter for long lists), `Tab`/`Right`
-  complete, `Esc` dismisses without losing the draft. `Enter` on a partial name completes it so you can add
-  arguments; `Enter` on a complete name runs it. Built-ins win over a custom command with the same name.
+  complete, `Esc` dismisses without losing the draft. `Enter` sends exactly what you typed, so a full command
+  runs at once; accept a highlighted suggestion with `Tab`/`Right` first. File mentions (`@path`) are the
+  exception: `Enter` completes the highlighted file. Built-ins win over a custom command with the same name.
 - While a turn runs, `Enter` steers the current turn: Dial cancels the pending model request or
   discards its stale response before executing tools. A tool already running may finish; unstarted
   actions in its batch are skipped, and completed results are retained. The latest instruction takes
   precedence over conflicting older plans and task summaries. `Option+Enter` on macOS (`Alt+Enter` elsewhere) queues a follow-up for the
-  next turn. The queue is visible above the composer. `Up` brings back the last queued
-  message for editing. Interrupting preserves queued messages and the draft. Slash commands never become
+  next turn. The queue is visible above the composer, showing up to three messages and a `+N more` line for the rest.
+  With an empty draft and queued messages, `Enter` stops the turn and sends the oldest queued message; the hint says so.
+  Hints advertise `steer` or `follow-up` only when the draft is not blank. `Up` brings back the last queued
+  message for editing (`/queue` edits any item); saving keeps its position and steering/follow-up routing, and
+  `Esc` cancels the edit with the original message restored unchanged. Interrupting preserves queued messages and the draft; the status line shows `stopping after <tool>` (or `stopping`) at once, and an interrupted turn does not send a "Turn finished" notification. Slash commands never become
   model steering: `/help`, `/hotkeys`, `/todo`, `/skills`, `/commands` and `/context` run at once
   without stopping the turn. `/model`, `/models`, and the model shortcut (`Ctrl+K` on macOS,
   `Alt+M` elsewhere) open the picker immediately; a selection
@@ -148,12 +152,16 @@ source and restart requirements. The **Setup** category opens models, providers 
 Settings are grouped into sections, with a description and the accepted range for the selected row.
 `↑/↓` move, `←/→` cycle a choice or toggle and step a number (the first press starts from a sensible
 value), `Enter` types an exact value, `r` resets a row to its default, `s` switches between project and
-global storage, and `g` opens the shared settings. Changes validate against the model's declared
+global storage, `d` opens shared context defaults, and `g` opens all shared settings. Changes validate against the model's declared
 capabilities and save immediately, applying on the next request; a dot marks values you changed.
 Profiles match an exact provider/model pair, so switching models never reuses another model's overrides.
 The **Context size** row sets a per-profile token cap (2,048–2,097,152), taking precedence over shared
 context settings while still respecting model/server capacity. Reset it with `r` to follow shared
 settings again. This controls history and compaction, not an external server's loaded context size.
+Use `/model defaults` to open **Local context default** and **Cloud context default** directly.
+This shortcut starts in global scope so the defaults persist across projects and model changes;
+switch scope to set a project-only default instead. Enter a token count (for example `131072`)
+or `auto` to follow model capacity. Per-model overrides and smaller loaded-server limits still apply.
 Local MLX models (and LM Studio, with a subset of these controls) additionally expose top-k, min-p, XTC, seed, repetition/presence/frequency penalties with
 their windows, and chat-template arguments (for example `{ enable_thinking = false }`); LM Studio rejects XTC and chat-template arguments. Those request
 controls are never sent to cloud providers. Startup options of externally managed servers belong to

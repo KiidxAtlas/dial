@@ -752,14 +752,14 @@ fn run_bash(
         cancelled,
         output_complete: capture_error.is_none() && artifact_error.is_none() && eof,
     });
+    // The group was killed and its leader reaped above, so a timeout is a known (failed)
+    // outcome the model can inspect and retry; only a user cancel stays uncertain.
     Ok(if cancelled {
         output
             .with_status(super::ToolStatus::Aborted)
             .with_effects(super::outcome::Effects::Unknown)
     } else if timed_out {
-        output
-            .with_status(super::ToolStatus::Timeout)
-            .with_effects(super::outcome::Effects::Unknown)
+        output.with_status(super::ToolStatus::Timeout)
     } else {
         output
     })
@@ -1630,6 +1630,15 @@ mod tests {
             out.is_error && out.text.contains("timed out after 1s") && out.text.contains("partial"),
             "{}",
             out.text
+        );
+        assert_eq!(
+            out.execution.status,
+            Some(crate::tools::ToolStatus::Timeout)
+        );
+        assert_eq!(
+            out.execution.effects,
+            crate::tools::outcome::Effects::Known,
+            "a reaped timeout is an ordinary failure, not an uncertain effect that ends the turn"
         );
         std::thread::sleep(Duration::from_millis(200));
         assert!(

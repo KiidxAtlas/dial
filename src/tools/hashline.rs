@@ -1787,6 +1787,17 @@ fn show_unseen(job: &mut Job, store: &mut EditStore, error: String) -> String {
     )
 }
 
+/// Where to find the current content before retrying: its tag and the range to read. Uses the
+/// same content tag that a read of the whole file returns, so the model needs no guessing.
+fn reread_hint(job: &Job) -> String {
+    let fresh = tag_of(&job.cur_lf);
+    let lines = job.cur.len().max(1);
+    format!(
+        "Current content is [{rel}#{fresh}] ({lines} lines): read `{rel}:1-{lines}` and then retry against [{rel}#{fresh}].",
+        rel = job.rel,
+    )
+}
+
 fn finalize(job: &mut Job, store: &mut EditStore) -> Result<Prepared, String> {
     if job.rem {
         if !job.edits.is_empty() || job.mv.is_some() {
@@ -1797,8 +1808,10 @@ fn finalize(job: &mut Job, store: &mut EditStore) -> Result<Prepared, String> {
         }
         if job.stale {
             return Err(format!(
-                "{}#{}: the file changed since that snapshot; read it again before deleting",
-                job.rel, job.tag
+                "{}#{}: the file changed since that snapshot, so nothing was deleted. {}",
+                job.rel,
+                job.tag,
+                reread_hint(job)
             ));
         }
         if !job.base.is_empty() {
@@ -1829,8 +1842,8 @@ fn finalize(job: &mut Job, store: &mut EditStore) -> Result<Prepared, String> {
     if job.stale {
         let map = line_map(&job.base, &job.cur).ok_or_else(|| {
             format!(
-                "{}#{}: the file changed since that snapshot and is too large or too different to re-anchor; read it again",
-                job.rel, job.tag
+                "{}#{}: the file changed since that snapshot and is too large or too different to re-anchor, so nothing was written. {}",
+                job.rel, job.tag, reread_hint(job)
             )
         })?;
         if let Err(blocked) = translate(&mut edits, &map, job.cur.len()) {
@@ -2747,6 +2760,22 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "one\nTWO\nTHREE\nfour\n"
         );
+    }
+
+    #[test]
+    fn stale_remove_names_the_fresh_tag_and_the_range_to_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "a\nb\nc\n").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let path = ws.resolve("a.txt").unwrap();
+        let tag = ws.store().record(&path, "a\nb\nc\n", &[(1, 3)]);
+        fs::write(&path, "a\nB\nc\n").unwrap();
+        let error = edit(&ws, &format!("[a.txt#{tag}]\nREM\n")).unwrap_err();
+        let fresh = tag_of("a\nB\nc\n");
+        assert!(error.contains(&format!("[a.txt#{fresh}]")), "{error}");
+        assert!(error.contains("`a.txt:1-3`"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\nB\nc\n");
     }
 
     #[test]

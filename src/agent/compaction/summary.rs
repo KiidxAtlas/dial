@@ -618,7 +618,15 @@ fn fold(
         }
     };
     let mut carried = previous.map(str::to_owned);
+    // The largest window the provider is still believed to accept. A rejection lowers it for every
+    // remaining sibling window, so one compaction never relearns the same limit window by window.
+    let mut ceiling = budget;
     while let Some((range, window_budget)) = pending.front().cloned() {
+        if window_budget > ceiling {
+            pending.pop_front();
+            replan(&mut pending, range, ceiling);
+            continue;
+        }
         interrupted(interrupt)?;
         let joined = parts[range.clone()].join("\n");
         let tokens = text_tokens(&joined);
@@ -683,6 +691,7 @@ fn fold(
                 }
                 ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, &format!("Summary window of about {tokens} tokens exceeded the compaction model's accepted input; re-planning at {halved} tokens.")));
                 pending.pop_front();
+                ceiling = ceiling.min(halved);
                 replan(&mut pending, range, halved);
             }
         }
@@ -744,6 +753,76 @@ mod tests {
         assert_eq!(input_budget(200_000, 16_384), 160_000 - 32_768);
         assert_eq!(input_budget(8_000, 2_000), 1_024);
         assert_eq!(min_input_tokens(1_000_000), MIN_SUMMARY_INPUT_TOKENS);
+    }
+
+    #[test]
+    fn a_rejected_window_lowers_the_budget_for_every_remaining_sibling() {
+        use crate::llm::{
+            errors::{Classified, ErrorClass},
+            provider::ProviderKind,
+        };
+        let mut backend = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                model: "summarizer".to_owned(),
+                api_key: None,
+            },
+            std::path::Path::new("/nonexistent/python").to_owned(),
+            5,
+        );
+        let user_dir = std::env::temp_dir();
+        let context = CompactionContext {
+            identity: super::super::CompactionIdentity {
+                provider: "endpoint",
+                model: "summarizer",
+                agent: None,
+            },
+            window: 100_000,
+            summary_window: 100_000,
+            summary_output_limit: Some(1_000),
+            timeout_secs: 5,
+            user_dir: &user_dir,
+            native_request: None,
+        };
+        // 24 parts of ~10k tokens: four ~60k-token windows under the planned budget, while the
+        // provider actually accepts only ~40k tokens of conversation.
+        let parts: Vec<String> = (0..24)
+            .map(|i| format!("{i:02}{}", "x".repeat(29_998)))
+            .collect();
+        let accepted_bytes = 40_000 * 3;
+        let (mut calls, mut rejected) = (0, 0);
+        let mut complete = |_: &mut Backend, request: &Chat, _: &mut dyn Ui| -> Result<String> {
+            calls += 1;
+            let bytes: usize = request.messages.iter().map(|m| m.to_string().len()).sum();
+            if bytes > accepted_bytes {
+                rejected += 1;
+                return Err(anyhow::Error::new(Classified::new(
+                    ErrorClass::ContextOverflow,
+                    "prompt is too long",
+                )));
+            }
+            Ok("summary".to_owned())
+        };
+        let summary = fold(
+            &mut backend,
+            &parts,
+            None,
+            Prompt::Main,
+            &CompactionConfig::default(),
+            &context,
+            CompactionMethod::Soft,
+            "",
+            &Arc::new(AtomicBool::new(false)),
+            &mut crate::agent::NullUi,
+            &mut complete,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(summary, "summary");
+        assert_eq!(
+            rejected, 1,
+            "the learned limit applies to later windows ({calls} calls)"
+        );
     }
 
     #[test]

@@ -97,12 +97,12 @@ pub(crate) fn run(cancel: &AtomicBool, action: impl FnOnce() -> ToolOutput) -> T
     let capture = Capture::begin();
     let mut output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action))
         .unwrap_or_else(|_| ToolOutput::err("tool worker panicked").with_effects(Effects::Unknown));
+    // Timeouts come only from owners that kill and reap the process group first, so they are
+    // ordinary known failures. An abort, or an error raised under cancellation, stays unsettled.
     if output.execution.effects == Effects::Unknown
         || (output.execution.effects == Effects::Known
-            && (matches!(
-                ToolStatus::from_output(&output),
-                ToolStatus::Timeout | ToolStatus::Aborted
-            ) || (output.is_error && cancel.load(Ordering::SeqCst))))
+            && (ToolStatus::from_output(&output) == ToolStatus::Aborted
+                || (output.is_error && cancel.load(Ordering::SeqCst))))
     {
         unsettled();
     }
@@ -185,26 +185,29 @@ pub(crate) fn native(
 mod process_outcome_tests {
     use super::*;
     #[test]
-    fn nested_catches_cannot_erase_interrupted_process_effects_or_termination() {
+    fn a_caught_reaped_timeout_is_an_ordinary_handled_failure() {
         let output = run(&AtomicBool::new(false), || {
             let _ = run(&AtomicBool::new(false), || {
                 let mut command = std::process::Command::new("/bin/sh");
                 command.args(["-c", "sleep 5"]);
-                let _ = crate::runtime::process::run(
+                let finished = crate::runtime::process::run(
                     command,
                     None,
                     std::time::Duration::from_millis(20),
                     128,
                     &AtomicBool::new(false),
                     &mut |_, _| {},
-                );
+                )
+                .unwrap();
+                assert!(finished.timed_out);
                 ToolOutput::ok("caller caught the physical timeout".into())
             });
             ToolOutput::ok("outer caller also returned success".into())
         });
-        assert_eq!(output.execution.status, Some(ToolStatus::Timeout));
-        assert_eq!(output.execution.effects, Effects::Unknown);
-        assert!(output.is_error);
+        // The group was killed and reaped, so nothing is uncertain: like a caught non-zero
+        // exit, the handling tool's own result stands and the turn is not stopped.
+        assert_eq!(output.execution.effects, Effects::Known);
+        assert!(!output.is_error);
     }
 }
 

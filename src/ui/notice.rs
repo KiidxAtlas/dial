@@ -489,6 +489,7 @@ mod tests {
                 ui: &self.ui,
                 tick: 0,
                 tools_expanded: false,
+                expand_key: "Ctrl+O",
             }
         }
     }
