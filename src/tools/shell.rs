@@ -941,6 +941,20 @@ fn shell_command_with_state(
             .ok_or("scratch path is not UTF-8")?
             .to_owned();
         let strict = matches!(ws.policy, None | Some(Policy::Strict { .. }));
+        // bubblewrap starts every sandboxed program in the workspace root (`--chdir`), so the
+        // process working directory set below does not reach the shell; enter `cwd` explicitly.
+        #[cfg(target_os = "linux")]
+        let entered;
+        #[cfg(target_os = "linux")]
+        let script = if !ws.unsandboxed && cwd != ws.root.as_path() {
+            entered = format!(
+                "cd {} || exit 1\n{script}",
+                crate::tools::kernel::shell_quote(cwd_str)
+            );
+            entered.as_str()
+        } else {
+            script
+        };
         let (program, args) = match runner {
             Runner::Bash(bash) => (
                 bash.to_str().ok_or("bash path is not UTF-8")?.to_owned(),

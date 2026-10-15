@@ -1,9 +1,35 @@
 use std::{
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// Tracked inputs compiled into the executable: `src`, the manifests and build script, and the
+/// files outside `src` embedded with `include_str!`/`include_bytes!` (keep in sync when embedding
+/// a new file from outside `src`). The script reruns only when these or the checked-out commit
+/// change, and `DIRTY` reports whether these inputs differ from that commit.
+///
+/// Do not watch `.git/index`: Git, editors and dial itself rewrite it on every status refresh, and
+/// each rerun of this script recompiles the whole crate even when no source changed.
+const INPUTS: &[&str] = &[
+    "src",
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "assets",
+    "runtimes",
+    "themes",
+    "CHANGELOG.md",
+    "examples/benchmarks/efficiency.toml",
+    "python/dial_laya_server.py",
+    "python/dial_server.py",
+    "python/dial_steering.py",
+    "python/dial_tool_grammar.py",
+    "python/dial_worker.py",
+    "python/laya-requirements.txt",
+    "python/pyproject.toml",
+];
 
 fn git(args: &[&str]) -> Option<std::process::Output> {
     Command::new("git")
@@ -14,18 +40,31 @@ fn git(args: &[&str]) -> Option<std::process::Output> {
         .ok()
 }
 
+/// Watches an existing path; Cargo treats a missing path as always changed, which would rerun
+/// this script and recompile the crate on every build.
+fn rerun_if_exists(path: &Path) {
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
 fn main() {
     for name in ["DIAL_BUILD_REVISION", "SOURCE_DATE_EPOCH"] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    for path in ["src", "Cargo.toml", "Cargo.lock", "build.rs"] {
+    for path in INPUTS {
         println!("cargo:rerun-if-changed={path}");
     }
-    if let Some(output) = git(&["rev-parse", "--git-dir"]).filter(|output| output.status.success())
+    // A linked worktree keeps HEAD in its own Git directory and branch refs in the common one.
+    if let Some(output) = git(&["rev-parse", "--git-dir", "--git-common-dir"])
+        .filter(|output| output.status.success())
     {
-        let dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-        for path in ["HEAD", "index", "refs", "packed-refs"] {
-            println!("cargo:rerun-if-changed={}", dir.join(path).display());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut dirs = stdout.lines().map(|line| PathBuf::from(line.trim()));
+        if let (Some(git_dir), Some(common_dir)) = (dirs.next(), dirs.next()) {
+            rerun_if_exists(&git_dir.join("HEAD"));
+            rerun_if_exists(&common_dir.join("refs"));
+            rerun_if_exists(&common_dir.join("packed-refs"));
         }
     }
     let revision = env::var("DIAL_BUILD_REVISION")
@@ -42,13 +81,20 @@ fn main() {
                 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())),
         "DIAL_BUILD_REVISION must be a Git hash or unknown"
     );
-    let dirty = match git(&["diff", "--no-ext-diff", "--no-textconv", "--quiet", "HEAD"])
-        .and_then(|output| output.status.code())
-    {
-        Some(0) => "false",
-        Some(1) => "true",
-        _ => "unknown",
-    };
+    let diff_args = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--quiet",
+        "HEAD",
+        "--",
+    ];
+    let dirty =
+        match git(&[&diff_args[..], INPUTS].concat()).and_then(|output| output.status.code()) {
+            Some(0) => "false",
+            Some(1) => "true",
+            _ => "unknown",
+        };
     let epoch = env::var("SOURCE_DATE_EPOCH")
         .map(|value| {
             value

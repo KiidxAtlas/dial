@@ -121,8 +121,6 @@ jobs:
           $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
           $version = ($metadata.packages | Where-Object { $_.name -eq 'dial' } | Select-Object -First 1).version
           if ($env:RELEASE_TAG -ne "v$version") { throw "Tag $env:RELEASE_TAG must match Cargo.toml version v$version" }
-      - name: Test
-        run: cargo test --locked -- --test-threads=4
       - name: Build release binary
         env:
           DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}

@@ -56,17 +56,18 @@ pub mod fs {
         {
             use std::os::fd::AsRawFd;
             let input = std::fs::File::open(source)?;
-            let output = std::fs::OpenOptions::new()
+            // An existing destination is replaced, as on macOS: `std::fs::copy` below overwrites.
+            if let Ok(output) = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(dest)?;
-            if unsafe {
-                libc::ioctl(
-                    output.as_raw_fd(),
-                    0x40049409 as libc::c_ulong,
-                    input.as_raw_fd(),
-                )
-            } == 0
+                .open(dest)
+                && unsafe {
+                    libc::ioctl(
+                        output.as_raw_fd(),
+                        0x40049409 as libc::c_ulong,
+                        input.as_raw_fd(),
+                    )
+                } == 0
             {
                 std::fs::set_permissions(dest, input.metadata()?.permissions())?;
                 return Ok(());
