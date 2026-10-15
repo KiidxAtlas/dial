@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: read
+  # The build jobs read CI's result for the tagged commit instead of re-running its tests.
+  actions: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -13,7 +15,7 @@ concurrency:
 
 jobs:
   build:
-    name: Test and package ${{ matrix.target }}
+    name: Package ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -61,16 +63,32 @@ jobs:
           if tag != f'v{version}':
               raise SystemExit(f'Tag {tag} must match Cargo.toml version v{version}')
           PY
+      - name: Require passing CI for this commit
+        # CI runs the full suite on these same platforms for every push to main; re-running it
+        # here doubled release time (10-21 min per macOS job). Wait for CI on the tagged commit.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          waited=0
+          while :; do
+            runs=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --json status,conclusion)
+            if jq -e 'any(.[]; .conclusion == "success")' <<<"$runs" >/dev/null; then
+              echo "CI passed for $GITHUB_SHA"
+              break
+            fi
+            pending=$(jq 'any(.[]; .status != "completed")' <<<"$runs")
+            # A tag pushed with its commit can start before CI has registered a run.
+            if [ "$pending" != true ] && { [ "$runs" != '[]' ] || [ "$waited" -ge 300 ]; }; then
+              echo "No successful CI run for $GITHUB_SHA: $runs. Push the commit to main and let CI pass before tagging." >&2
+              exit 1
+            fi
+            sleep 30
+            waited=$((waited + 30))
+          done
       - name: Test terminal installer
         run: bash scripts/test-install.sh
-      - name: Verify Linux sandbox enforcement
-        if: runner.os == 'Linux'
-        timeout-minutes: 10
-        run: cargo test --locked linux_sandbox_enforces_filesystem_and_both_network_modes
-      - name: Format
-        run: cargo fmt --check
-      - name: Test
-        run: cargo test --locked -- --test-threads=4
       - name: Build release binary
         env:
           MACOSX_DEPLOYMENT_TARGET: '13.0'
