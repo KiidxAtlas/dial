@@ -196,7 +196,7 @@ pub fn run_print(
     let mut ui = PrintUi::new(format, allowed);
     ui.set_print_thoughts(options.print_thoughts);
     config.require_model()?;
-    let _compute = if config.uses_local_compute() {
+    let _compute = if config.requires_compute_lock() {
         Some(auto::compute_lock(&layout)?)
     } else {
         None
@@ -355,8 +355,11 @@ impl App {
     /// Adopt a freshly loaded, validated configuration and keep the per-model store in step.
     fn adopt(&mut self, config: Config) {
         self.config = config.for_coding();
-        if !self.config.uses_local_compute() {
-            self.compute.get_mut().take();
+        if !self.config.requires_compute_lock()
+            && let Some(lock) = self.compute.get_mut().take()
+        {
+            crate::learn::compute::clear_owner(&self.layout.user_dir);
+            let _ = fs2::FileExt::unlock(&lock);
         }
         self.reopen_store();
     }
@@ -4024,7 +4027,7 @@ impl Shell {
             .layout()
             .context("agent has no project layout")?
             .clone();
-        layout.ensure_state_outside_project()?;
+        layout.ensure_project_outside_storage()?;
         let ws = Workspace::new(&layout.project_root)
             .and_then(|ws| {
                 tools::apply_sandbox_config(
@@ -4563,7 +4566,7 @@ impl Shell {
         required: bool,
         maintenance: bool,
     ) -> Result<bool> {
-        if !required || app.compute.borrow().is_some() {
+        if !app.config.compute_locks || !required || app.compute.borrow().is_some() {
             return Ok(true);
         }
         let _request = crate::learn::compute::Request::foreground(&app.layout.user_dir)?;
@@ -4733,12 +4736,16 @@ impl Shell {
             );
             return Ok(());
         }
-        let lock = auto::lock_file(&app.layout.user_dir.join("compute.lock"))?;
-        if let Err(error) = lock.try_lock_exclusive() {
-            self.note("LoRA verification", format!("Local compute is busy; retry F6 after the other session or improvement cycle finishes. {error}"));
-            return Ok(());
-        }
-        let _lease = ProbeLease(lock);
+        let _lease = if app.config.compute_locks {
+            let lock = auto::lock_file(&app.layout.user_dir.join("compute.lock"))?;
+            if let Err(error) = lock.try_lock_exclusive() {
+                self.note("LoRA verification", format!("Local compute is busy; retry F6 after the other session or improvement cycle finishes. {error}"));
+                return Ok(());
+            }
+            Some(ProbeLease(lock))
+        } else {
+            None
+        };
         let mut config = app.config.with_selection(selection);
         config.state_dir = config.learning_dir(&app.layout);
         app.interrupt.store(false, Ordering::SeqCst);
@@ -10042,6 +10049,43 @@ mod tests {
         let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
         let config = Config::load(&layout, None).unwrap();
         (home, project, layout, config)
+    }
+
+    #[test]
+    fn disabling_compute_locks_releases_an_existing_session_lease() {
+        let (_home, _project, layout, mut config) = config();
+        config.model = "local-model".into();
+        config.endpoint = None;
+        config.provider = Some("mlx".into());
+        let mut app = App::new(
+            layout,
+            config.clone(),
+            toml::Table::new(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+        )
+        .unwrap();
+        let path = app.layout.user_dir.join("compute.lock");
+        let lock = auto::lock_file(&path).unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let inherited = lock.try_clone().unwrap();
+        *app.compute.borrow_mut() = Some(lock);
+        crate::learn::compute::register(
+            &app.layout.user_dir,
+            "session",
+            &app.layout.project_root,
+            &app.config.state_dir,
+            &app.config.model,
+        )
+        .unwrap();
+        config.compute_locks = false;
+        app.adopt(config);
+        assert!(app.compute.borrow().is_none());
+        assert!(!app.layout.user_dir.join("compute-owner.json").exists());
+        let contender = auto::lock_file(&path).unwrap();
+        contender.try_lock_exclusive().unwrap();
+        drop(inherited);
     }
 
     #[cfg(unix)]

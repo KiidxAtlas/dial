@@ -297,11 +297,7 @@ fn changed_document(path: &Path, changes: &[Change]) -> Result<toml::Table> {
 }
 
 pub fn save(layout: &Layout, scope: Scope, changes: &[Change]) -> Result<()> {
-    layout.ensure_state_outside_project()?;
-    ensure!(
-        !layout.user_dir.starts_with(&layout.project_root),
-        "global storage must be outside the project"
-    );
+    layout.ensure_project_outside_storage()?;
     let path = layout.config_files()[if scope == Scope::Global { 0 } else { 1 }].clone();
     let _lock = locked(&path)?;
     let doc = changed_document(&path, changes)?;
@@ -354,7 +350,7 @@ fn save_config_with_project_resets(
     changes: &[Change],
     project_resets: &[Change],
 ) -> Result<crate::config::types::Config> {
-    layout.ensure_state_outside_project()?;
+    layout.ensure_project_outside_storage()?;
     let files = layout.config_files();
     let selected = if scope == Scope::Global { 0 } else { 1 };
     // Always lock global before project when both are involved.
@@ -548,7 +544,7 @@ impl SettingsReload {
 static HISTORY_BASELINES: LazyLock<Mutex<BTreeMap<PathBuf, Vec<String>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 fn history_path(layout: &Layout) -> Result<PathBuf> {
-    layout.ensure_state_outside_project()?;
+    layout.ensure_project_outside_storage()?;
     Ok(layout.state_dir.join("prompt-history.json"))
 }
 fn history_read(path: &Path) -> Result<Vec<String>> {
@@ -611,6 +607,34 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
         (home, project, layout)
+    }
+
+    #[test]
+    fn home_workspace_loads_and_saves_existing_user_configuration() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(home.path(), home.path().join(".dial")).unwrap();
+        save(
+            &layout,
+            Scope::Global,
+            &[Change::Set {
+                path: "model".into(),
+                value: "home-model".into(),
+            }],
+        )
+        .unwrap();
+        let loaded = crate::config::types::Config::load(&layout, None).unwrap();
+        assert_eq!(loaded.model, "home-model");
+        save(
+            &layout,
+            Scope::Project,
+            &[Change::Set {
+                path: "model".into(),
+                value: "project-model".into(),
+            }],
+        )
+        .unwrap();
+        let loaded = crate::config::types::Config::load(&layout, None).unwrap();
+        assert_eq!(loaded.model, "project-model");
     }
 
     #[test]

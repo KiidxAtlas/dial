@@ -582,25 +582,29 @@ pub fn run_at(
     fs2::FileExt::try_lock_exclusive(&lock)
         .context("another steering job already owns this vector")?;
     let progress_path = path.with_extension("progress.json");
-    if !progress_path.exists() {
+    if !progress_path.exists() && config.compute_locks {
         settings_store::write_private(
             &progress_path,
             b"{\"phase\":\"queued; waiting for idle compute\"}",
         )?;
     }
-    eprintln!(
-        "Steering {kind}: waiting for idle compute; checkpoints: {}. Foreground coding preempts this job. Ctrl+C stops; rerun resumes.",
-        progress_path.display()
-    );
+    if config.compute_locks {
+        eprintln!(
+            "Steering {kind}: waiting for idle compute; checkpoints: {}. Foreground coding preempts this job. Ctrl+C stops; rerun resumes.",
+            progress_path.display()
+        );
+    }
     let cancel = crate::repl::install_sigint();
     let _lease = compute::Background::acquire_controlled(config, Some(&cancel))?;
-    compute::register(
-        &config.user_dir,
-        &format!("steering {kind}"),
-        &config.project_root,
-        &config.state_dir,
-        &config.model,
-    )?;
+    if config.compute_locks {
+        compute::register(
+            &config.user_dir,
+            &format!("steering {kind}"),
+            &config.project_root,
+            &config.state_dir,
+            &config.model,
+        )?;
+    }
     let mut request = json!({"op":format!("steering_{kind}"),"model":config.model,"adapter":adapter,"output":path,"progress":progress_path,"strength":config.steering.strength});
     if kind == "extract" {
         request["pairs"] = data;

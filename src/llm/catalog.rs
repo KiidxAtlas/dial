@@ -1991,17 +1991,14 @@ pub fn discover(
             ));
         }
     }
-    let storage_safe = layout.ensure_state_outside_project().is_ok()
-        && !layout.user_dir.starts_with(&layout.project_root);
+    let storage_safe = layout.ensure_project_outside_storage().is_ok();
     if !storage_safe {
         discovery.providers.push(ProviderStatus {
             id: "storage".into(),
             label: "Private storage".into(),
             base_url: None,
             state: "unavailable".into(),
-            detail:
-                "Private storage must be outside the editable workspace; endpoint discovery skipped"
-                    .into(),
+            detail: "Project must not be inside private storage; endpoint discovery skipped".into(),
             models: 0,
         });
     } else {

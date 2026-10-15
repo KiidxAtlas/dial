@@ -496,6 +496,8 @@ impl LspTool {
         let _workspace = workspace_lock(ws, cancel)?;
         let from = ws.resolve(file)?;
         let to = ws.resolve(destination)?;
+        ws.check_protected_mutation(&from)?;
+        ws.check_protected_mutation(&to)?;
         let pairs = rename_pairs(ws, &from, &to)?;
 
         // Files no server understands need no request; configured-but-missing servers still error.

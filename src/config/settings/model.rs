@@ -379,4 +379,13 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Local models only (MLX, Ollama, LM Studio). Turns that prove good become training examples: passing behavioral checks, committing the changes, or Alt+Up. /undo and Alt+Down mark a bad turn. The latest version admitted by /improve train serves your sessions. Hosted models are never recorded.",
         Kind::Bool,
     ),
+    field!(
+        "compute_locks",
+        compute_locks,
+        MO,
+        "Local worker",
+        "Compute locks",
+        "Coordinate local models, training and maintenance across sessions. Turn off to run concurrently without waiting for compute; concurrent work may exhaust RAM/GPU memory. Pause and stop controls still apply. Laya never requires this lock.",
+        Kind::Bool,
+    ),
 ];

@@ -1,5 +1,5 @@
 //! User-facing skill inventory, opt-in imports and enablement. Foreign sources are never activated
-//! by browsing them. Preferences live outside the workspace, separate from agent-authored skills.
+//! by browsing them. Preferences live in private storage, separate from agent-authored skills.
 use super::*;
 use crate::storage::settings_store;
 use anyhow::{Context, Result, ensure};
@@ -7,11 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 
 fn preferences_path(layout: &Layout, scope: Scope) -> Result<PathBuf> {
-    layout.ensure_state_outside_project()?;
-    ensure!(
-        !layout.user_dir.starts_with(&layout.project_root),
-        "skill preferences must be outside the project"
-    );
+    layout.ensure_project_outside_storage()?;
     let dir = match scope {
         Scope::Project => &layout.state_dir,
         Scope::User => &layout.user_dir,
@@ -232,6 +228,17 @@ mod tests {
             &cancel,
             &mut |_| {},
         )
+    }
+
+    #[test]
+    fn home_workspace_can_persist_user_skill_preferences() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(home.path(), home.path().join(".dial")).unwrap();
+        skill(&Scope::User.root(&layout), "review");
+        set_enabled(&layout, "review", false, Scope::User).unwrap();
+        assert!(discover(&layout).is_empty());
+        set_enabled(&layout, "review", true, Scope::User).unwrap();
+        assert_eq!(discover(&layout)[0].name, "review");
     }
 
     #[test]

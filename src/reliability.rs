@@ -383,7 +383,7 @@ pub fn check(config: &AppConfig) -> Result<Value> {
     fs2::FileExt::try_lock_exclusive(&lock)
         .context("another capability check is already running")?;
     let cancel = crate::repl::install_sigint();
-    if config.uses_local_compute() {
+    if config.requires_compute_lock() {
         eprintln!(
             "Capability check queued; waiting for idle compute. Foreground coding preempts; Ctrl+C stops."
         );
@@ -396,7 +396,7 @@ pub fn check(config: &AppConfig) -> Result<Value> {
     } else {
         None
     };
-    if config.uses_local_compute() {
+    if config.requires_compute_lock() {
         crate::learn::compute::register(
             &config.user_dir,
             "reliability check",

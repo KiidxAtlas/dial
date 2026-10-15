@@ -327,7 +327,7 @@ impl Adapter {
             fs::canonicalize(cwd)? == self.layout.project_root,
             "cwd differs from launched project; launch dial -C <cwd> acp"
         );
-        self.layout.ensure_state_outside_project()
+        self.layout.ensure_project_outside_storage()
     }
     fn prompt(&self, blocks: &[Value]) -> Result<(String, Value)> {
         ensure!(blocks.len() <= 64, "at most 64 prompt content blocks");

@@ -377,7 +377,11 @@ pub fn call_controlled(
                 tracking: Some(config),
             },
             &mut || {
-                if super::compute::can_yield() && super::compute::should_yield(&config.user_dir)? {
+                if super::compute::background_active()
+                    && (super::compute::paused(&config.user_dir)
+                        || (config.compute_locks
+                            && super::compute::foreground_pending(&config.user_dir)?))
+                {
                     return Err(super::compute::Preempted.into());
                 }
                 Ok(())
@@ -531,7 +535,7 @@ pub fn train(config: &Config, active: &Version, output_dir: &Path) -> Result<Pat
         "output_dir": output_dir, "iters": training.iters, "batch_size": training.batch_size,
         "num_layers": training.num_layers, "rank": training.rank, "max_seq_length": training.max_seq_length,
     });
-    let response = if super::compute::can_yield() {
+    let response = if super::compute::background_active() {
         crate::setup::refresh_worker(config)?;
         ensure!(
             config.python.is_absolute() && config.worker.is_absolute(),
@@ -573,7 +577,10 @@ pub fn train(config: &Config, active: &Version, output_dir: &Path) -> Result<Pat
                     tracking: Some(config),
                 },
                 &mut || {
-                    if super::compute::should_yield(&config.user_dir)? {
+                    if super::compute::paused(&config.user_dir)
+                        || (config.compute_locks
+                            && super::compute::foreground_pending(&config.user_dir)?)
+                    {
                         if !pause.exists() {
                             std::fs::write(&pause, "")?;
                         }

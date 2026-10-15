@@ -15,6 +15,9 @@
 //! * Hard links to files outside the workspace cannot be detected by path.
 //!   The sandbox forbids creating them from inside bash, but a pre-existing
 //!   hard link in the workspace would be readable.
+//!   Likewise, pre-existing hard links to protected Dial files are not identified by path checks.
+//! * Native protected-path checks do not confine external language servers, plugins, remote SSH
+//!   tools, or unsandboxed shell commands; those need their own execution/approval boundary.
 //! * Timeouts kill the bash process group. A command that calls `setsid` can
 //!   outlive the call (still sandboxed, but orphaned).
 
@@ -344,6 +347,8 @@ pub struct Workspace {
     syntax_guard: bool,
     root: PathBuf,
     additional_roots: Vec<PathBuf>,
+    /// Private application trees excluded independently of shell sandbox mode.
+    protected_paths: Vec<PathBuf>,
     sandbox: Option<Sandbox>,
     allow_network: bool,
     policy: Option<sandbox::Policy>,
@@ -389,6 +394,7 @@ impl Workspace {
             syntax_guard: false,
             root,
             additional_roots: Vec::new(),
+            protected_paths: Vec::new(),
             sandbox: None,
             allow_network: false,
             policy: None,
@@ -467,19 +473,30 @@ impl Workspace {
                 extra_write,
                 allow_network,
             }) => sandbox::Policy::Dev {
-                deny_read: deny_read.clone(),
+                deny_read: deny_read
+                    .iter()
+                    .chain(&self.protected_paths)
+                    .cloned()
+                    .collect(),
                 extra_write: extra_write.iter().cloned().chain(roots).collect(),
                 allow_network: *allow_network,
             },
             Some(sandbox::Policy::Strict {
                 allow_network,
+                deny_read,
                 extra_write,
             }) => sandbox::Policy::Strict {
                 allow_network: *allow_network,
+                deny_read: deny_read
+                    .iter()
+                    .chain(&self.protected_paths)
+                    .cloned()
+                    .collect(),
                 extra_write: extra_write.iter().cloned().chain(roots).collect(),
             },
             None => sandbox::Policy::Strict {
                 allow_network: self.allow_network,
+                deny_read: self.protected_paths.clone(),
                 extra_write: roots.collect(),
             },
         }
@@ -676,6 +693,7 @@ impl Workspace {
     }
 
     pub(crate) fn observe_write(&self, abs: &Path) -> Result<(), String> {
+        self.check_protected_mutation(abs)?;
         navigation::invalidate(abs);
         match &self.observer.0 {
             Some(observer) => observer
@@ -686,6 +704,7 @@ impl Workspace {
     }
 
     pub(crate) fn observe_delete(&self, abs: &Path) -> Result<(), String> {
+        self.check_protected_mutation(abs)?;
         navigation::invalidate(abs);
         match &self.observer.0 {
             Some(observer) => observer.before_delete(abs).map_err(|e| {
@@ -707,6 +726,51 @@ impl Workspace {
     pub fn roots(&self) -> impl Iterator<Item = &Path> {
         std::iter::once(self.root.as_path())
             .chain(self.additional_roots.iter().map(PathBuf::as_path))
+    }
+
+    /// Exclude private trees from native tools, including when the shell sandbox is off.
+    /// Missing tails are retained so protection also covers state created later.
+    pub fn with_protected_paths(mut self, paths: &[PathBuf]) -> Self {
+        self.protected_paths = paths
+            .iter()
+            .map(|path| {
+                let absolute = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    self.root.join(path)
+                };
+                Self::canonical_prefix(&absolute)
+            })
+            .collect();
+        self
+    }
+
+    pub(crate) fn is_protected(&self, path: &Path) -> bool {
+        if self.protected_paths.is_empty() {
+            return false;
+        }
+        let canonical = Self::canonical_prefix(path);
+        self.protected_paths.iter().any(|protected| {
+            path.starts_with(protected)
+                || canonical.starts_with(protected)
+                || canonical.starts_with(Self::canonical_prefix(protected))
+        })
+    }
+
+    fn check_protected_mutation(&self, path: &Path) -> Result<(), String> {
+        if self.protected_paths.is_empty() {
+            return Ok(());
+        }
+        let canonical = Self::canonical_prefix(path);
+        if self.is_protected(path)
+            || self.protected_paths.iter().any(|protected| {
+                protected.starts_with(path)
+                    || Self::canonical_prefix(protected).starts_with(&canonical)
+            })
+        {
+            return Err("mutation would affect protected Dial storage".into());
+        }
+        Ok(())
     }
 
     /// Resolve a model-supplied path to a canonical-prefixed absolute path that
@@ -739,6 +803,9 @@ impl Workspace {
             (self.root.as_path(), path.to_path_buf())
         };
         let mut current = root.to_path_buf();
+        if self.is_protected(&current) {
+            return Err(format!("path {input:?} enters protected Dial storage"));
+        }
         let mut missing = false;
         for component in relative.components() {
             match component {
@@ -751,6 +818,9 @@ impl Workspace {
                 }
                 Component::Normal(name) => {
                     current.push(name);
+                    if self.is_protected(&current) {
+                        return Err(format!("path {input:?} enters protected Dial storage"));
+                    }
                     if missing {
                         continue;
                     }
@@ -773,6 +843,9 @@ impl Workspace {
                 Component::RootDir | Component::Prefix(_) => {
                     return Err(format!("path {input:?} is not a valid workspace path"));
                 }
+            }
+            if self.is_protected(&current) {
+                return Err(format!("path {input:?} enters protected Dial storage"));
             }
         }
         Ok(current)
@@ -1455,10 +1528,15 @@ pub fn apply_sandbox_config(
 ) -> Result<Workspace> {
     use crate::config::types::SandboxMode;
     use sandbox::Policy;
+    let ws = match protected {
+        Some((state, user)) => ws.with_protected_paths(&[state.to_owned(), user.to_owned()]),
+        None => ws,
+    };
     Ok(match config.mode {
         SandboxMode::Off => ws.without_sandbox(),
         SandboxMode::Strict => ws.with_policy(Policy::Strict {
             allow_network: false,
+            deny_read: Vec::new(),
             extra_write: Vec::new(),
         }),
         SandboxMode::Dev => {
@@ -1570,6 +1648,113 @@ mod tests {
         // Absolute paths inside the workspace are fine too.
         let abs = dir.path().canonicalize().unwrap().join("inside.txt");
         assert!(!run(&ws, "read", json!({"path": abs})).is_error);
+    }
+
+    #[test]
+    fn home_workspace_sandbox_policies_keep_private_storage_excluded() {
+        use crate::config::types::SandboxMode;
+        let (dir, ws) = workspace();
+        let user = dir.path().canonicalize().unwrap().join(".dial");
+        let state = user.join("projects/home");
+        fs::create_dir_all(&state).unwrap();
+        for mode in [SandboxMode::Dev, SandboxMode::Strict] {
+            let ws = apply_sandbox_config(
+                ws.clone(),
+                &SandboxConfig {
+                    mode,
+                    ..Default::default()
+                },
+                Some((&state, &user)),
+            )
+            .unwrap();
+            assert!(ws.resolve(".dial/config.toml").is_err());
+            assert!(ws.resolve("public.txt").is_ok());
+            let denied = match ws.sandbox_policy() {
+                sandbox::Policy::Dev { deny_read, .. }
+                | sandbox::Policy::Strict { deny_read, .. } => deny_read,
+            };
+            assert!(denied.contains(&user));
+            assert!(denied.contains(&state));
+        }
+    }
+
+    #[test]
+    fn protected_storage_is_excluded_even_without_sandbox_or_gitignore() {
+        let (dir, ws) = workspace();
+        let private = dir.path().join("storage/private");
+        fs::create_dir_all(&private).unwrap();
+        fs::write(private.join("secret.txt"), "private-canary").unwrap();
+        fs::write(dir.path().join("public.txt"), "public-canary").unwrap();
+        let ws = apply_sandbox_config(
+            ws,
+            &SandboxConfig {
+                mode: crate::config::types::SandboxMode::Off,
+                ..Default::default()
+            },
+            Some((&private, &private)),
+        )
+        .unwrap();
+        for path in [
+            "storage/private",
+            "storage/private/secret.txt",
+            "storage/private/new.txt",
+            "storage/private/../escape.txt",
+        ] {
+            assert!(ws.resolve(path).is_err(), "{path}");
+            assert!(run(&ws, "read", json!({"path":path})).is_error);
+            assert!(run(&ws, "write", json!({"path":path,"content":"changed"})).is_error);
+        }
+        assert!(ws.observe_delete(&ws.root().join("storage")).is_err());
+        assert!(ws.observe_write(&ws.root().join("storage")).is_err());
+        for (tool, args) in [
+            ("read", json!({"path":"."})),
+            ("glob", json!({"pattern":"**/*","gitignore":false})),
+            ("grep", json!({"pattern":"canary","gitignore":false})),
+        ] {
+            let out = run(&ws, tool, args);
+            assert!(!out.is_error, "{tool}: {}", out.text);
+            assert!(
+                !out.text.contains("secret.txt") && !out.text.contains("private-canary"),
+                "{tool}: {}",
+                out.text
+            );
+            assert!(out.text.contains("public.txt"), "{tool}: {}", out.text);
+        }
+        assert_eq!(
+            fs::read_to_string(private.join("secret.txt")).unwrap(),
+            "private-canary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_storage_rejects_symlink_aliases_and_missing_tails() {
+        let (dir, ws) = workspace();
+        let private = dir.path().join("private");
+        fs::create_dir(&private).unwrap();
+        fs::write(private.join("secret.txt"), "private-canary").unwrap();
+        symlink(&private, dir.path().join("alias")).unwrap();
+        symlink(private.join("secret.txt"), dir.path().join("file-alias")).unwrap();
+        let ws =
+            ws.with_protected_paths(&[dir.path().join("alias"), dir.path().join("future/state")]);
+        for path in [
+            "private/secret.txt",
+            "alias/secret.txt",
+            "alias/new.txt",
+            "file-alias",
+            "future/state/new.txt",
+        ] {
+            assert!(run(&ws, "read", json!({"path":path})).is_error, "{path}");
+            assert!(
+                run(&ws, "write", json!({"path":path,"content":"changed"})).is_error,
+                "{path}"
+            );
+        }
+        assert!(ws.resolve("future/public.txt").is_ok());
+        assert_eq!(
+            fs::read_to_string(private.join("secret.txt")).unwrap(),
+            "private-canary"
+        );
     }
 }
 

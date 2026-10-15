@@ -1,5 +1,5 @@
-//! Where dial keeps things. The state directory lives outside the project so a tool-using agent
-//! confined to the project cannot read or rewrite gate suites, sessions, memory or adapters.
+//! Where dial keeps things. Private state is normally outside the project. A containing workspace
+//! (such as HOME) is allowed, with the state tree excluded from agent tools and sandboxed commands.
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{
@@ -92,14 +92,15 @@ impl Layout {
         ]
     }
 
-    /// The state directory must never sit inside the project the agent can edit.
-    pub fn ensure_state_outside_project(&self) -> Result<()> {
+    /// A workspace may contain private storage, but must not itself be inside it: tools exclude
+    /// the private tree, which would otherwise exclude the entire workspace.
+    pub fn ensure_project_outside_storage(&self) -> Result<()> {
         ensure!(
-            !self.state_dir.starts_with(&self.project_root)
+            !self.project_root.starts_with(&self.user_dir)
                 && !self.project_root.starts_with(&self.state_dir),
-            "dial state directory {} overlaps the project {}; set DIAL_HOME elsewhere",
-            self.state_dir.display(),
-            self.project_root.display()
+            "project {} is inside dial's private storage {}; choose a different project directory",
+            self.project_root.display(),
+            self.user_dir.display()
         );
         Ok(())
     }
@@ -129,7 +130,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_is_per_project_and_outside_it() {
+    fn state_is_per_project_and_private_workspaces_are_rejected() {
         let home = tempfile::tempdir().unwrap();
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
@@ -138,9 +139,26 @@ mod tests {
             Layout::with_user_dir(b.path(), home.path().into()).unwrap(),
         );
         assert_ne!(la.state_dir, lb.state_dir);
-        la.ensure_state_outside_project().unwrap();
-        // A DIAL_HOME inside the project is rejected: the agent could otherwise reach its own state.
+        la.ensure_project_outside_storage().unwrap();
         let inside = Layout::with_user_dir(a.path(), a.path().join(".dialhome")).unwrap();
-        assert!(inside.ensure_state_outside_project().is_err());
+        inside.ensure_project_outside_storage().unwrap();
+        let private_project = a.path().join(".dialhome/private");
+        fs::create_dir_all(&private_project).unwrap();
+        let private = Layout::with_user_dir(&private_project, a.path().join(".dialhome")).unwrap();
+        assert!(private.ensure_project_outside_storage().is_err());
+    }
+
+    #[test]
+    fn home_directory_can_be_the_project_without_moving_state() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(home.path(), home.path().join(".dial")).unwrap();
+        layout.ensure_project_outside_storage().unwrap();
+        assert_eq!(layout.project_root, fs::canonicalize(home.path()).unwrap());
+        assert_eq!(layout.user_dir, layout.project_root.join(".dial"));
+        assert!(layout.state_dir.starts_with(&layout.user_dir));
+        assert_eq!(
+            layout.config_files()[0],
+            layout.user_dir.join("config.toml")
+        );
     }
 }

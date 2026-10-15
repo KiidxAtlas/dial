@@ -233,7 +233,7 @@ pub struct Store {
 
 impl Store {
     pub fn new(layout: &Layout) -> Result<Self> {
-        layout.ensure_state_outside_project()?;
+        layout.ensure_project_outside_storage()?;
         Ok(Self {
             dir: layout.state_dir.clone(),
         })

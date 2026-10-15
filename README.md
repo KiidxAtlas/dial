@@ -127,7 +127,7 @@ fallback chains are in [docs/model-routing.md](docs/model-routing.md).
 ## Known limits
 
 - Tool-calling quality depends on the model: 7B-class instruct models handle the tool set; sub-1B models often emit unreadable calls (which become training signal rather than being hidden).
-- Local compute is serialized across projects. A session that queues improvement releases compute when idle and its child agents have finished; a subsequent turn waits if the cycle holds compute. There is no claim of zero-downtime training.
+- Local compute is serialized across projects by default. Disable **Compute locks** in Settings → Model → Local worker (`compute_locks = false`) to allow concurrent model work; this can exhaust RAM/GPU memory. Laya roles never require the compute lock. With locks enabled, a session that queues improvement releases compute when idle and its child agents have finished; a subsequent turn waits if the cycle holds compute. There is no claim of zero-downtime training.
   While waiting for compute, the elapsed timer advances and commands follow the same live/deferred/interrupting policy as during inference. Turn duration includes that wait; acquiring compute returns the status to Working rather than leaving it marked as waiting.
 - The TUI is keyboard-driven; not every terminal supports modified Enter keys. `dial schedule` provides scheduling but no daemon installer. Voice (text-to-speech, push-to-talk dictation and protocol live sessions) is described in `docs/voice.md`. Browser and kernel require available OS containment; they fail closed rather than falling back to unrestricted execution.
 - Live memory/skill edits are the user's working state and are not gated; only the admitted harness is.

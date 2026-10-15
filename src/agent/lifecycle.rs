@@ -158,7 +158,7 @@ impl<'a> Agent<'a> {
             layout.project_root.clone(),
         )?);
         let mode = config.resolved_edit_mode(&version.harness);
-        layout.ensure_state_outside_project()?;
+        layout.ensure_project_outside_storage()?;
         let workspace = configure(
             Workspace::new(&layout.project_root)?,
             config,
@@ -183,7 +183,7 @@ impl<'a> Agent<'a> {
             system_template: None,
             system_template_error: None,
         };
-        layout.ensure_state_outside_project()?;
+        layout.ensure_project_outside_storage()?;
         let always = approval::load(&layout.state_dir.join("permissions.toml"))?;
         let context_rule_catalog = (config.compaction.experimental_context_management
             && config.portable_rules.enabled)

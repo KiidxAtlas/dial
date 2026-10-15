@@ -73,6 +73,15 @@ remove and disable a background job. Saved model weights, adapters and session h
 models reload on their next use. Orphaned model servers from older Dial versions are included too.
 Pause/Resume background work and Start/Stop controls remain available. While waiting for compute,
 Ctrl+, opens these controls directly. Status refresh and job controls run off the terminal thread.
+
+**Compute locks** in **Settings → Model → Local worker** defaults to on. Turn it off
+(`compute_locks = false` in TOML) to run local models, training, verification and maintenance
+concurrently, without acquiring or waiting for the shared compute lock. This is a per-configuration
+policy: other sessions and already-running workers retain their own settings; restart background
+workers to apply a change. Concurrent work can exhaust RAM/GPU memory. Explicit background pause,
+stop and cancellation controls remain active; data-integrity locks are not disabled.
+Laya decision and judge roles never make a session acquire the shared compute lock.
+
 Idle chats unload resident main and role models as soon as the turn and its child agents finish,
 including when no other job is waiting. Queued follow-ups keep their models; the next turn reloads
 an unloaded model. Verification and evaluation also yield for coding requests.

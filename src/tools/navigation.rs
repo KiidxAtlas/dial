@@ -715,6 +715,24 @@ fn rank(a: &Evidence, b: &Evidence) -> std::cmp::Ordering {
 mod tests {
     use super::*;
     #[test]
+    fn protected_trees_are_not_retrieved_from_warm_cache() {
+        let (dir, ws) = crate::tools::testkit::workspace();
+        let private = dir.path().join("private");
+        fs::create_dir(&private).unwrap();
+        fs::write(private.join("secret.rs"), "fn private_canary() {}\n").unwrap();
+        let args = json!({"query":"private_canary","mode":"exact"});
+        assert!(find(&ws, &args).unwrap().contains("secret.rs"));
+        let ws = ws.with_protected_paths(&[private]);
+        assert!(!find(&ws, &args).unwrap().contains("secret.rs"));
+        assert!(
+            find(
+                &ws,
+                &json!({"query":"private_canary","path":"private","mode":"exact"})
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn finds_declarations_and_literal_multiline_deterministically() {
         let (dir, ws) = crate::tools::testkit::workspace();
         fs::write(
