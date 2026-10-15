@@ -365,7 +365,9 @@ def main():
                 raise
             terminal.wait("Switched to")
             terminal.capture("favorite-applied-after-discovery")
-            terminal.key("C-k")
+            # Alt+M selects a model on every platform; Ctrl+K does only on macOS (elsewhere it
+            # cuts to line end), so it would leave the Linux picker closed.
+            terminal.key("M-m")
             terminal.wait("scope: global")
             terminal.capture("picker")
             terminal.run("resize-window", "-t", "smoke", "-x", "72", "-y", "22")
