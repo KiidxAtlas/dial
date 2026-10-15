@@ -200,6 +200,14 @@ stopped by them (`/cost` shows whether pricing is available).
 optional `description`, `tools` (can only narrow the base's tools) and `max_steps`. Writers are not
 configurable because approving a worker launch is decided without the configuration.
 
+**Task model routing.** Delegation uses the first assigned model in a purpose-specific chain:
+implementation workers try `task`, `coach`, then `small`; scouts and custom read-only agents try
+`small`, then `task`; reviewers and test-runners try `tester`, `coach`, `task`, then `small`;
+planners try `planner`, `coach`, `task`, then `small`. Main is used only if no helper in that chain
+is assigned. This does not change maintenance roles or select unconfigured providers. Explicit
+operator agent definitions and explicit per-call `model_profile` selections remain deliberate
+overrides of the automatic role routing. See [Model routing](model-routing.md).
+
 **HTTP MCP.** `[mcp.<name>]` takes `url` instead of `program` (https, or http on localhost) with
 `bearer_env` naming an environment variable that holds a token, optional `headers`, and OAuth 2.1
 sign-in (protected-resource and authorization-server discovery, dynamic client registration, PKCE)

@@ -1,5 +1,5 @@
 CARGO ?= cargo
-# Use PROFILE=release for shipping-equivalent optimization (fat LTO).
+# Use PROFILE=release for shipping-equivalent optimization (thin LTO).
 PROFILE ?= local
 BUILD_DIR = target/$(PROFILE)
 INSTALL_DIR ?= $(shell path="$$(command -v dial 2>/dev/null)"; if [ -n "$$path" ]; then dirname "$$path"; else printf '%s' "$(HOME)/.local/bin"; fi)

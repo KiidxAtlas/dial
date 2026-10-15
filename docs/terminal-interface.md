@@ -62,9 +62,19 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   On the first press, if discovery is needed, the switch is retained and applies when ready.
   Escape or `/model cancel` cancels that pending switch. Changes to the selected model, saved
   favorites, scope, or discovery request also cancel it rather than applying a stale choice.
-- `/sessions` and `/resume` open searchable session pickers; `/tree` shows forks. `/rename <title>`
-  names a session; `/export [path] [--html]` exports Markdown or self-contained HTML without
-  overwriting existing files. `/copy` copies the last answer; `Ctrl-G` opens the draft in an external editor.
+- `/sessions` and `/resume` open the current project's conversation picker. Pinned sessions lead,
+  followed by recent journal activity rather than creation time. Empty sessions are hidden unless
+  pinned; **Tab** includes them. Titles take priority over IDs and model details; the selected
+  conversation shows its latest user prompt and assistant answer. Search matches words in any
+  order across titles, prompt/answer previews, model and ID, with exact title matches first.
+  **Ctrl-U** clears search, **Ctrl-P** pins/unpins without resuming, **Home/End** and
+  **PageUp/PageDown** navigate, **Enter** resumes and **Esc** cancels. `/resume <id-prefix>`
+  still opens a unique ID directly, including empty sessions. `/tree` keeps fork ordering and
+  includes empty sessions initially. The picker keeps up to 200 conversations and 200 empty
+  sessions; listing occurs once per open, not per keystroke.
+- `/rename <title>` names a session; `/export [path] [--html]` exports Markdown or self-contained
+  HTML without overwriting existing files. `/copy` copies the last answer; `Ctrl-G` opens the
+  draft in an external editor.
 - Resuming displays durable todos and recorded check statuses; these are history, not fresh test
   results. Completed tools are not replayed automatically. `/review` reviews a frozen local or GitHub
   PR scope with source-backed findings; `/review-file` lists checkpoint turns, and

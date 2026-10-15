@@ -384,12 +384,57 @@ pub fn bash_tool_streaming_with_adopter(
     if command.len() > MAX_COMMAND {
         return Err(format!("command is longer than {MAX_COMMAND} bytes"));
     }
-    if let Some((config, offered)) = ws.bash_interceptor() {
-        let offered: Vec<&str> = offered.iter().map(String::as_str).collect();
-        if let Some(message) = crate::tools::bash_interceptor::check(config, &offered, command) {
-            return Ok(ToolOutput::err(message));
+    let Some((config, offered)) = ws.bash_interceptor() else {
+        return run_bash(
+            ws,
+            args,
+            command,
+            timeout_secs,
+            auto_background_secs,
+            on_output,
+            cancel,
+            on_adopt,
+        );
+    };
+    use crate::tools::bash_interceptor::{self, Verdict};
+    let offered: Vec<&str> = offered.iter().map(String::as_str).collect();
+    let hint = match bash_interceptor::check(config, &offered, command) {
+        Some(Verdict::Block(message)) => return Ok(ToolOutput::err(message)),
+        Some(Verdict::Hint(line)) => Some(line),
+        None => None,
+    };
+    let mut output = run_bash(
+        ws,
+        args,
+        command,
+        timeout_secs,
+        auto_background_secs,
+        on_output,
+        cancel,
+        on_adopt,
+    )?;
+    if let Some(line) =
+        hint.or_else(|| bash_interceptor::ci_poll_hint(config, &offered, command, &output.text))
+    {
+        if !output.text.ends_with('\n') {
+            output.text.push('\n');
         }
+        output.text.push_str(&line);
     }
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bash(
+    ws: &Workspace,
+    args: &Value,
+    command: &str,
+    timeout_secs: u64,
+    auto_background_secs: u64,
+    on_output: &(dyn Fn(&[u8]) + Sync),
+    cancel: &AtomicBool,
+    on_adopt: &(dyn Fn(ForegroundJob) -> Result<String, String> + Sync),
+) -> Result<ToolOutput, String> {
     let session = super::opt_str(args, "session")?;
     let asynchronous = opt_bool(args, "async")? || opt_bool(args, "background")?;
     if let Some(name) = session {

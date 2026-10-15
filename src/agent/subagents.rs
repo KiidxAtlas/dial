@@ -117,15 +117,33 @@ pub fn builtin(name: &str) -> Option<&'static AgentSpec> {
     AGENTS.iter().find(|spec| spec.name == name)
 }
 
-/// Default model role follows the base agent purpose, including custom definitions.
-/// Test writers use tester; implementation workers use main. Explicit selectors override it.
+/// Default specialist follows the base agent purpose, including custom definitions.
+/// Implementation workers use task; an assigned specialist wins over task in model_routes.
 fn role_for_agent(spec: &AgentSpec, _custom: bool) -> &'static str {
     match spec.name {
         "reviewer" | "test-runner" => "tester",
         "planner" => "planner",
-        _ if spec.mutates => "main",
+        _ if spec.mutates => "task",
         _ => "small",
     }
+}
+
+/// Resolve missing task roles through configured helpers, never an arbitrary catalogue model.
+/// These chains are delegation-only: maintenance requests keep their own role semantics.
+fn default_task_role(config: &Config, preferred: &'static str) -> &'static str {
+    let candidates: &[&str] = match preferred {
+        "task" => &["task", "coach", "small"],
+        "small" => &["small", "task"],
+        "tester" => &["tester", "coach", "task", "small"],
+        "planner" => &["planner", "coach", "task", "small"],
+        _ => return preferred,
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|role| config.role_selection(role).is_some())
+        // Retain the requested role in diagnostics when its final fallback is Main.
+        .unwrap_or(preferred)
 }
 
 /// Whether `name` is an agent type and so unavailable as a `[subagents]` preset name.
@@ -281,7 +299,7 @@ pub fn schema(config: &Config) -> Value {
     let mut properties = serde_json::Map::from_iter([
         (
             "action".into(),
-            json!({"type":"string","enum":["run","start","resume","status","wait","cancel"],"description":"Default run waits for results. start returns live job IDs. resume continues a retained worker by id and message, only after its previous execution stopped safely. Use the message tool to talk to a live worker."}),
+            json!({"type":"string","enum":["run","start","resume","status","wait","cancel"],"description":"Default run waits for results and blocks you until every task finishes; for work that may take more than a few minutes, use start and then wait, so you can keep working and check progress. start returns live job IDs. resume continues a retained worker by id and message, only after its previous execution stopped safely. Use the message tool to talk to a live worker."}),
         ),
         (
             "id".into(),
@@ -293,7 +311,7 @@ pub fn schema(config: &Config) -> Value {
         ),
         (
             "timeout".into(),
-            json!({"type":"integer","minimum":0,"maximum":120}),
+            json!({"type":"integer","minimum":0,"maximum":120,"description":"wait only: seconds to block for results before returning current status (default 30). Jobs keep running after a timeout."}),
         ),
         (
             "task".into(),
@@ -354,7 +372,7 @@ pub fn schema(config: &Config) -> Value {
         properties.insert("model_profile".into(), json!({
             "type":"string",
             "enum":names,
-            "description":"Use this operator-configured model profile for this delegated call. Choose a profile appropriate to the requested work; no arbitrary model identifiers are accepted."
+            "description":"Explicitly override the task's configured role with this operator-configured model profile only when the assignment requests it. Omit this field to honor role assignments. No arbitrary model identifiers are accepted."
         }));
     }
     json!({"type":"function","function":{"name":"task","description":description,
@@ -485,7 +503,7 @@ fn model_routes(
     selectors
         .into_iter()
         .map(|selector| {
-            let mut role = job.role;
+            let mut role = default_task_role(config, job.role);
             let mut suffix_thinking = None;
             let mut selected = config.for_role(role);
             if let Some(selector) = selector {
@@ -3015,12 +3033,142 @@ mod tests {
         assert_eq!(builtin_role("scout"), "small");
         assert_eq!(builtin_role("reviewer"), "tester");
         assert_eq!(builtin_role("planner"), "planner");
-        assert_eq!(builtin_role("worker"), "main");
+        assert_eq!(builtin_role("worker"), "task");
         assert_eq!(builtin_role("test-runner"), "tester");
         assert_eq!(role_for_agent(builtin("scout").unwrap(), true), "small");
-        assert_eq!(role_for_agent(builtin("worker").unwrap(), true), "main");
+        assert_eq!(role_for_agent(builtin("worker").unwrap(), true), "task");
         assert_eq!(role_for_agent(builtin("reviewer").unwrap(), true), "tester");
         assert_eq!(role_for_agent(builtin("planner").unwrap(), true), "planner");
+    }
+
+    #[test]
+    fn task_defaults_do_not_override_assigned_specialists_or_explicit_routes() {
+        use crate::llm::model_config::ModelSelection;
+        let mut config = config(&[]);
+        config.model = "main-model".into();
+        let selection = |model: &str| ModelSelection {
+            provider: "openai".into(),
+            model: model.into(),
+            ..Default::default()
+        };
+        config
+            .model_roles
+            .insert("task".into(), selection("task-model"));
+        let args = json!({"tasks":[
+            {"agent":"worker","task":"implement","solution_space":"s"},
+            {"agent":"scout","task":"inspect","solution_space":"s"},
+            {"agent":"reviewer","task":"review","solution_space":"s"},
+            {"agent":"planner","task":"plan","solution_space":"s"},
+            {"agent":"test-runner","task":"test","solution_space":"s"}
+        ]});
+        let request = parse(&args, &config).unwrap();
+        assert!(
+            request
+                .jobs
+                .iter()
+                .all(|job| job.role == "task" && job.model_routes[0].config.model == "task-model")
+        );
+        for role in ["small", "tester", "planner"] {
+            config
+                .model_roles
+                .insert(role.into(), selection(&format!("{role}-model")));
+        }
+        let request = parse(&args, &config).unwrap();
+        let roles: Vec<_> = request.jobs.iter().map(|job| job.role).collect();
+        assert_eq!(roles, ["task", "small", "tester", "planner", "tester"]);
+        for job in &request.jobs {
+            assert_eq!(
+                job.model_routes[0].config.model,
+                format!("{}-model", job.role)
+            );
+            assert_eq!(job.model_routes[0].source, "assigned");
+        }
+        config.experimental.profile_matching = true;
+        config.model_profiles.insert(
+            "explicit".into(),
+            crate::llm::profiles::ModelProfile {
+                provider: "openai".into(),
+                model: "explicit-model".into(),
+                ..Default::default()
+            },
+        );
+        // Merely exposing profiles must never change the configured role.
+        assert_eq!(
+            parse(&args, &config).unwrap().jobs[0].model_routes[0]
+                .config
+                .model,
+            "task-model"
+        );
+        let override_args = json!({"agent":"worker","task":"implement","solution_space":"s","model_profile":"explicit"});
+        let request = parse(&override_args, &config).unwrap();
+        assert_eq!(
+            request.jobs[0].model_routes[0].config.model,
+            "explicit-model"
+        );
+        assert_eq!(request.jobs[0].model_routes[0].source, "profile");
+        config.model_roles.clear();
+        assert_eq!(
+            parse(&args, &config).unwrap().jobs[0].model_routes[0]
+                .config
+                .model,
+            "main-model"
+        );
+    }
+
+    #[test]
+    fn task_defaults_use_configured_helper_chains_before_main() {
+        use crate::llm::model_config::ModelSelection;
+        let helpers = ["task", "small", "coach", "tester", "planner"];
+        let cases = [
+            ("worker", &["task", "coach", "small"][..]),
+            ("scout", &["small", "task"][..]),
+            ("reviewer", &["tester", "coach", "task", "small"][..]),
+            ("test-runner", &["tester", "coach", "task", "small"][..]),
+            ("planner", &["planner", "coach", "task", "small"][..]),
+        ];
+        // Exercise every assignment combination, including no helpers and all specialists.
+        for mask in 0..(1 << helpers.len()) {
+            let mut config = config(&[]);
+            config.model = "main-model".into();
+            for (i, role) in helpers.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    config.model_roles.insert(
+                        (*role).into(),
+                        ModelSelection::new("openai", &format!("{role}-model")),
+                    );
+                }
+            }
+            for (agent, chain) in cases {
+                let expected = chain
+                    .iter()
+                    .find(|role| config.model_roles.contains_key(**role));
+                let args = json!({"agent":agent,"task":"slice","solution_space":"s"});
+                let request = parse(&args, &config).unwrap();
+                let route = &request.jobs[0].model_routes[0];
+                let expected_model =
+                    expected.map_or("main-model".to_owned(), |role| format!("{role}-model"));
+                assert_eq!(route.config.model, expected_model, "{agent}, mask={mask}");
+                if let Some(role) = expected {
+                    assert_eq!(route.role, *role);
+                }
+            }
+        }
+        let mut config = config(&[]);
+        config.model = "main-model".into();
+        config
+            .model_roles
+            .insert("coach".into(), ModelSelection::new("openai", "coach-model"));
+        config.agents.insert(
+            "explicit-main".into(),
+            serde_json::from_value(json!({
+                "base":"worker", "prompt":"Implement", "model":["@main"]
+            }))
+            .unwrap(),
+        );
+        let args = json!({"agent":"explicit-main","task":"slice","solution_space":"s"});
+        let request = parse(&args, &config).unwrap();
+        assert_eq!(request.jobs[0].model_routes[0].config.model, "main-model");
+        assert_eq!(request.jobs[0].model_routes[0].source, "definition");
     }
 
     #[test]

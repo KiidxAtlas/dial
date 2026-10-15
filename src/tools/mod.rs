@@ -795,8 +795,16 @@ impl Workspace {
             within(path)
                 .or_else(|| within(&Self::canonical_prefix(path)))
                 .ok_or_else(|| {
+                    // Name the directory to add, so the model can ask for it instead of giving up.
+                    let project = path
+                        .ancestors()
+                        .skip(1)
+                        .find(|dir| dir.join(".git").exists())
+                        .or_else(|| path.parent())
+                        .unwrap_or(path);
                     format!(
-                        "path {input:?} is outside the workspace; use a path relative to the workspace root or an added directory"
+                        "path {input:?} is outside the workspace; use a path relative to the workspace root or an added directory. To work there, ask the user to run `/add-dir {}`",
+                        project.display()
                     )
                 })?
         } else {
@@ -1105,7 +1113,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "path": {"type": "string", "description": "Workspace file/directory or one `ssh://host/path` remote file (requires approval); semicolon-separated local scopes are supported."},
                 "glob": {"type": "string", "description": "Only search files whose workspace-relative path matches this glob."},
                 "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default false)."},
-                "context": {"type": "integer", "minimum": 0, "maximum": 10, "description": "Lines of context to show before and after each match (default 0)."},
+                "context": {"type": "integer", "minimum": 0, "description": "Lines of context to show before and after each match (default 0; values above 10 are capped at 10)."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum number of matching lines (default 400)."},
                 "multiline": {"type": "boolean", "description": "Match whole-file bytes (default false, automatic for actual newlines or regex \\n). Anchors match each line; use (?s) to make dot match newline."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},

@@ -2211,7 +2211,10 @@ mod tests {
             effective: Some(name.clone()),
             source: RoleSource::Main,
         }];
-        for role in ["small", "coach", "tester", "planner"] {
+        for &(role, _) in ROLES
+            .iter()
+            .filter(|(role, _)| !matches!(*role, "main" | "decision" | "embedding"))
+        {
             roles.push(RoleStatus {
                 role,
                 assigned: None,
@@ -2372,6 +2375,39 @@ mod tests {
             matches!(send(&mut o, &rig, ch('x')), OverlayEvent::ClearRole { role, .. } if role == "small")
         );
         assert_eq!(o.group, Group::Roles);
+    }
+
+    #[test]
+    fn task_role_assignment_and_clear_use_registry_row_and_selected_scope() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.scope = Scope::Project;
+        o.show_roles();
+        let index = ROLES.iter().position(|(role, _)| *role == "task").unwrap();
+        o.cursor = index;
+        send(&mut o, &rig, key(KeyCode::Enter));
+        assert_eq!(o.target_role.as_deref(), Some("task"));
+        let OverlayEvent::AssignModel {
+            role,
+            selection,
+            scope,
+        } = send(&mut o, &rig, key(KeyCode::Enter))
+        else {
+            panic!("expected task assignment");
+        };
+        assert_eq!(role, "task");
+        assert_eq!(scope, Scope::Project);
+        assert_eq!(o.cursor, index);
+        let mut roles = roles_with_main();
+        assign(
+            roles.iter_mut().find(|row| row.role == "task").unwrap(),
+            selection,
+        );
+        o.set_roles(roles);
+        assert!(matches!(
+            send(&mut o, &rig, ch('x')),
+            OverlayEvent::ClearRole { role, scope: Scope::Project } if role == "task"
+        ));
     }
 
     #[test]
@@ -2877,7 +2913,10 @@ mod tests {
     fn detail_lines_name_context_state_and_roles_using_the_model() {
         let rig = Rig::new();
         let mut roles = roles_with_main();
-        assign(&mut roles[2], discovery().models[0].selection.clone());
+        assign(
+            roles.iter_mut().find(|row| row.role == "coach").unwrap(),
+            discovery().models[0].selection.clone(),
+        );
         let mut o = ModelOverlay::new(Some(discovery()), roles, Scope::Global);
         let shown = draw(&mut o, &rig, 130, 30);
         assert!(shown.contains("used by: main, coach"), "{shown}");
@@ -3154,7 +3193,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        o.cursor = 2;
+        o.cursor = ROLES.iter().position(|(role, _)| *role == "coach").unwrap();
         assert!(matches!(
             send(&mut o, &rig, key(KeyCode::Delete)),
             OverlayEvent::None

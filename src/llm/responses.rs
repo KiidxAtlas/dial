@@ -231,6 +231,7 @@ pub(super) fn exchange_api(
         profile,
         on_event,
         cache_key,
+        None,
     )
 }
 
@@ -291,7 +292,7 @@ fn request_inner(
             _=>bail!("unsupported Responses message role"),
         }
     }
-    let mut body = json!({"model":model,"input":input,"store":false,"stream":true,"include":["reasoning.encrypted_content"]});
+    let mut body = json!({"model":model,"input":input,"tools":[],"store":false,"stream":true,"include":["reasoning.encrypted_content"]});
     if !chat.tools.is_empty() {
         let mut functions = Vec::new();
         for tool in &chat.tools {
@@ -731,7 +732,7 @@ pub(super) fn exchange(
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
     exchange_inner(
-        endpoint, chat, timeout, on_text, interrupt, profile, on_event, None,
+        endpoint, chat, timeout, on_text, interrupt, profile, on_event, None, None,
     )
 }
 pub(super) fn exchange_codex(
@@ -743,9 +744,18 @@ pub(super) fn exchange_codex(
     profile: Option<&super::profiles::ModelProfile>,
     cache_key: Option<&str>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
+    session_key: Option<&str>,
 ) -> Result<Reply> {
     exchange_inner(
-        endpoint, chat, timeout, on_text, interrupt, profile, on_event, cache_key,
+        endpoint,
+        chat,
+        timeout,
+        on_text,
+        interrupt,
+        profile,
+        on_event,
+        cache_key,
+        session_key,
     )
 }
 fn exchange_inner(
@@ -757,6 +767,7 @@ fn exchange_inner(
     profile: Option<&super::profiles::ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
     cache_key: Option<&str>,
+    session_key: Option<&str>,
 ) -> Result<Reply> {
     let Endpoint {
         url,
@@ -799,6 +810,11 @@ fn exchange_inner(
             ]
         })
         .unwrap_or_default();
+    // The backend derives prompt-cache affinity from the session headers, not `prompt_cache_key`;
+    // without them a WebSocket-to-SSE fallback lands on arbitrary replicas and rarely hits cache.
+    if let (Some(_), Some(session)) = (codex_account_id, session_key) {
+        headers.extend([("session_id", session), ("conversation_id", session)]);
+    }
     headers.extend_from_slice(custom_headers);
     let mut response = super::send_with_headers(
         url,
@@ -1309,6 +1325,16 @@ pub(super) fn compact(
 mod tests {
     use super::super::fake::{self, Script};
     use super::*;
+    #[test]
+    fn tool_free_requests_send_an_empty_tools_array() {
+        let mut chat = chat();
+        chat.tools.clear();
+        for subscription in [false, true] {
+            let body = request_flat("gpt", &chat, None, subscription).unwrap();
+            assert_eq!(body.get("tools"), Some(&json!([])));
+        }
+    }
+
     fn chat() -> Chat {
         Chat {
             messages: vec![
@@ -1387,6 +1413,118 @@ mod tests {
         ] {
             assert!(body.get(field).is_none(), "unexpected {field}");
         }
+    }
+    #[test]
+    fn sse_codex_requests_carry_session_affinity_headers() {
+        let done = json!({"type":"response.completed","response":response(vec![])});
+        let server = fake::serve(vec![
+            Script::Sse(sse(vec![done.clone()])),
+            Script::Sse(sse(vec![done])),
+        ]);
+        for session in [Some("session-1"), None] {
+            exchange_codex(
+                Endpoint {
+                    headers: &[],
+                    url: &server.url,
+                    token: "fixture-token",
+                    account_id: Some("acct"),
+                    model: "account-model",
+                },
+                &chat(),
+                5,
+                &mut None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Some("cache-key"),
+                &mut |_| true,
+                session,
+            )
+            .unwrap();
+        }
+        let requests = server.requests();
+        let head = |raw: &[u8]| String::from_utf8_lossy(raw).to_ascii_lowercase();
+        let (keyed, unkeyed) = (head(&requests[0]), head(&requests[1]));
+        assert!(keyed.contains("\r\nsession_id: session-1\r\n"), "{keyed}");
+        assert!(keyed.contains("\r\nconversation_id: session-1\r\n"));
+        assert!(keyed.contains("\"prompt_cache_key\":\"cache-key\""));
+        assert!(!unkeyed.contains("session_id:") && !unkeyed.contains("conversation_id:"));
+    }
+    /// The bytes the backend tokenizes, in order: instructions, tools, then each input item.
+    fn prompt_stream(body: &Value) -> String {
+        let mut stream = format!("{}{}", body["instructions"], body["tools"]);
+        for item in body["input"].as_array().unwrap() {
+            stream.push_str(&item.to_string());
+        }
+        stream
+    }
+    #[test]
+    fn consecutive_codex_requests_extend_the_previous_prompt_byte_for_byte() {
+        let mut c = chat();
+        // Schemas whose keys are not in sorted order, as tool registries produce them.
+        c.tools.push(json!({"type":"function","function":{"name":"bash","description":"run","parameters":{"type":"object","required":["command"],"properties":{"timeout":{"type":"integer"},"command":{"type":"string"}}}}}));
+        c.tools.push(json!({"type":"function","function":{"name":"read","description":"read","parameters":{"type":"object","properties":{"path":{"type":"string"},"lines":{"type":"array","items":{"type":"integer"}}}}}}));
+        let first = request_codex("account-model", &c, None).unwrap();
+        let reasoning =
+            json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"});
+        let reply = completed(&response(vec![reasoning, call()])).unwrap();
+        c.messages.push(super::super::assistant_message(&reply));
+        c.messages
+            .push(json!({"role":"tool","tool_call_id":"call_write","content":"wrote marker"}));
+        let second = request_codex("account-model", &c, None).unwrap();
+        let text = json!({"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"done","annotations":[]}]});
+        c.messages.push(super::super::assistant_message(
+            &completed(&response(vec![text])).unwrap(),
+        ));
+        c.messages
+            .push(json!({"role":"user","content":"now check it"}));
+        let third = request_codex("account-model", &c, None).unwrap();
+        for (earlier, later) in [(&first, &second), (&second, &third)] {
+            let (earlier, later) = (prompt_stream(earlier), prompt_stream(later));
+            assert!(
+                later.len() > earlier.len() && later.starts_with(&earlier),
+                "request is not a byte-identical prefix of the next:\n{earlier}\n---\n{later}"
+            );
+        }
+        // Everything else that selects the cache entry is unchanged across the turn.
+        for key in [
+            "model",
+            "reasoning",
+            "text",
+            "tool_choice",
+            "parallel_tool_calls",
+            "store",
+        ] {
+            assert_eq!(first.get(key), third.get(key), "{key} changed");
+        }
+        // A resumed session serializes the same bytes as the live one.
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout =
+            crate::storage::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
+                .unwrap();
+        let mut session = crate::storage::session::Session::create(
+            &layout,
+            crate::storage::session::SessionMeta {
+                model: "account-model".into(),
+            },
+        )
+        .unwrap();
+        for message in &c.messages[chat().messages.len()..] {
+            session.append(message.clone()).unwrap();
+        }
+        let path = session.path().unwrap().to_owned();
+        drop(session);
+        let mut resumed = chat();
+        resumed.messages.extend(
+            crate::storage::session::Session::open(&path)
+                .unwrap()
+                .messages(),
+        );
+        resumed.tools = c.tools.clone();
+        assert_eq!(
+            prompt_stream(&request_codex("account-model", &resumed, None).unwrap()),
+            prompt_stream(&third)
+        );
     }
     #[test]
     fn tool_results_and_encrypted_reasoning_roundtrip_after_session_resume() {

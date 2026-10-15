@@ -1399,6 +1399,8 @@ struct Job {
     base: Vec<String>,
     seen: Seen,
     enforce_seen: bool,
+    /// The unseen range that last blocked an anchor, for [`show_unseen`].
+    unseen: Option<(usize, usize)>,
     original: super::edit_transaction::Original,
     syntactic_blocks: Option<std::collections::BTreeMap<usize, Result<usize, String>>>,
     carrier: Option<super::edit_source::Carrier>,
@@ -1422,11 +1424,12 @@ impl Job {
             None => block_end(&self.base, line, &self.ext),
         }
     }
-    fn check_seen(&self, a: usize, b: usize) -> Result<(), String> {
+    fn check_seen(&mut self, a: usize, b: usize) -> Result<(), String> {
         if !self.enforce_seen {
             return Ok(());
         }
-        match self.seen.first_unseen(a, b) {
+        self.unseen = self.seen.first_unseen(a, b);
+        match self.unseen {
             None => Ok(()),
             Some((x, y)) => Err(format!(
                 "{}#{}: lines {} have not been shown by a read; read `{}:{x}-{y}` first (anchors may only touch lines you have seen)",
@@ -1544,6 +1547,7 @@ fn load_job(
         base,
         seen: snap.seen.clone(),
         enforce_seen: ws.edit_settings.enforce_seen_lines,
+        unseen: None,
         original,
         syntactic_blocks,
         carrier: Some(carrier),
@@ -1752,6 +1756,34 @@ fn mismatch_error(
         rel = job.rel,
         tag = job.tag,
         spans = spans.join(", "),
+    )
+}
+
+/// An anchor on unseen lines costs a read and a retry. When the snapshot is current, show those
+/// lines in the error and count them as read, so the re-issued edit needs no separate read. Nothing
+/// is written either way; the model still sees the lines before it edits them.
+fn show_unseen(job: &mut Job, store: &mut EditStore, error: String) -> String {
+    let Some(range) = job.unseen.take() else {
+        return error;
+    };
+    let Some(raw_revision) = store.snapshot(&job.abs, &job.tag).map(|s| s.raw_revision) else {
+        return error;
+    };
+    if job.stale {
+        return error;
+    }
+    let (rows, shown) = preview_rows(&job.cur, &[range], 0, MISMATCH_MAX_ROWS);
+    store.record_version(&job.abs, &job.cur_lf, raw_revision, &shown);
+    let (x, y) = range;
+    format!(
+        "{rel}#{tag}: lines {span} have not been shown by a read, so nothing was written. They are shown below and now count as read; check them, then re-issue the edit against [{rel}#{tag}].\n[{rel}#{tag}]\n{rows}",
+        rel = job.rel,
+        tag = job.tag,
+        span = if x == y {
+            x.to_string()
+        } else {
+            format!("{x}-{y}")
+        },
     )
 }
 
@@ -1992,7 +2024,10 @@ pub(crate) fn edit_with(
                     if op.bare > 0 {
                         job.warnings.push(format!("line {}: {} body row(s) had no `+` prefix and were taken as content; check the diff, and start every body row with `+` (a lone `+` for a blank line)", op.line_no, op.bare));
                     }
-                    match resolve_anchor(job, anchor).map_err(located)? {
+                    match resolve_anchor(job, anchor)
+                        .map_err(|e| show_unseen(job, &mut store, e))
+                        .map_err(located)?
+                    {
                         Resolved::Replace(a, b) => job.edits.push(Edit {
                             lo: a,
                             hi: b,
@@ -2008,7 +2043,9 @@ pub(crate) fn edit_with(
                     }
                 }
                 OpKind::Cut { anchor, name } => {
-                    let Resolved::Replace(a, b) = resolve_anchor(job, anchor).map_err(located)?
+                    let Resolved::Replace(a, b) = resolve_anchor(job, anchor)
+                        .map_err(|e| show_unseen(job, &mut store, e))
+                        .map_err(located)?
                     else {
                         return Err(located("CUT takes N.=M or N*".to_owned()));
                     };
@@ -2684,6 +2721,32 @@ mod tests {
         ws.store().record_all(&path, "a\nb\nc\n");
         edit(&ws, &format!("[a.txt#{tag}]\nPUT 2,3:\n+x\n")).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "a\nx\n");
+    }
+
+    #[test]
+    fn unseen_anchor_error_shows_the_lines_so_the_retry_needs_no_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let path = ws.resolve("a.txt").unwrap();
+        let tag = ws
+            .store()
+            .record(&path, "one\ntwo\nthree\nfour\n", &[(1, 1)]);
+        let patch = format!("[a.txt#{tag}]\nPUT 2.=3:\n+TWO\n+THREE\n");
+        let error = edit(&ws, &patch).unwrap_err();
+        assert!(error.contains("have not been shown"), "{error}");
+        assert!(error.contains("2:two\n3:three\n"), "{error}");
+        assert!(!error.contains("4:four"), "{error}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "one\ntwo\nthree\nfour\n"
+        );
+        edit(&ws, &patch).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "one\nTWO\nTHREE\nfour\n"
+        );
     }
 
     #[test]

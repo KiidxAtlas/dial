@@ -78,10 +78,59 @@ impl Policy {
         }
     }
 }
+/// Tools whose failures come from running project code or commands, where a failure is
+/// evidence about behaviour and the hypothesis-revision checkpoint applies.
+const EXECUTION_TOOLS: &[&str] = &[
+    "bash",
+    "bg",
+    "eval",
+    "kernel",
+    "notebook",
+    "test",
+    "ssh",
+    "harness_probe",
+    "autoresearch",
+];
+
+/// Failures that already name their exact correction: argument/schema validation, tool
+/// protocol, bookkeeping preconditions and patch grammar. Debugging advice adds nothing there
+/// and pads every retry, so they get no checkpoint.
+fn mechanical(tool: &str, error: &str) -> bool {
+    matches!(tool, "todo" | "codebase_memory" | "memory" | "forget")
+        || error.starts_with("invalid tool call")
+        || [
+            "missing required argument",
+            "missing string",
+            "unknown or unavailable tool",
+            "not a valid json object",
+            "needs at least one",
+            "the limit is",
+            "shorten it",
+            "expected_revision",
+        ]
+        .iter()
+        .any(|needle| error.contains(needle))
+        || (matches!(tool, "edit" | "ast_edit")
+            && [
+                "`put",
+                "`cut",
+                "`+` row",
+                "empty patch",
+                "section header",
+                "duplicate rem",
+            ]
+            .iter()
+            .any(|needle| error.contains(needle)))
+}
+
 /// Fixed recovery guidance derived from actual failed operations, never executable error text.
-pub fn recovery_hint(tool: &str, output: &str) -> &'static str {
-    let error = output.to_lowercase();
-    if tool == "read"
+/// `None` when the error is mechanical or no specific guidance applies.
+pub fn recovery_hint(tool: &str, output: &str) -> Option<&'static str> {
+    let error = output.trim_start().to_lowercase();
+    if mechanical(tool, &error) {
+        return None;
+    }
+    let hint = if tool == "read"
         && (error.contains("line selector")
             || error.contains("range end")
             || error.contains("offset/limit"))
@@ -96,6 +145,7 @@ pub fn recovery_hint(tool: &str, output: &str) -> &'static str {
     } else if error.contains("permission denied")
         || error.contains("approval denied")
         || error.contains("sandbox")
+        || error.contains("outside the workspace")
     {
         "Recovery checkpoint: respect the permission or sandbox boundary. Explain the needed permission or choose an allowed operation; do not bypass it with another tool or path."
     } else if error.contains("timed out") || error.contains("timeout") {
@@ -109,9 +159,12 @@ pub fn recovery_hint(tool: &str, output: &str) -> &'static str {
         "Recovery checkpoint: inspect the exact syntax diagnostic and smallest affected region, correct its structure, then rerun the same check."
     } else if matches!(tool, "edit" | "ast_edit") {
         "Recovery checkpoint: refresh the exact edit region once, rebuild the edit against current content, and verify the resulting diff. Do not retry an unchanged failed patch."
-    } else {
+    } else if EXECUTION_TOOLS.contains(&tool) {
         "Recovery checkpoint: identify what the failure disproves, choose one check that distinguishes the remaining causes, and change the attempted approach before retrying. Preserve the original acceptance criteria."
-    }
+    } else {
+        return None;
+    };
+    Some(hint)
 }
 #[cfg(test)]
 mod tests {
@@ -121,24 +174,111 @@ mod tests {
         let hint = recovery_hint(
             "edit",
             "line 2: range end: expected a line number, got \"\"",
-        );
+        )
+        .unwrap();
         assert!(hint.contains("PUT N.=N:"));
         assert!(hint.contains("PUT >N:"));
         assert!(hint.contains("not the file"));
         assert!(!hint.contains("refresh the exact edit region"));
-        assert!(recovery_hint("edit", "stale tag").contains("refresh the exact edit region"));
-        assert!(recovery_hint("read", "no such file").contains("verify the path"));
+        assert!(
+            recovery_hint("edit", "stale tag")
+                .unwrap()
+                .contains("refresh the exact edit region")
+        );
+        assert!(
+            recovery_hint("read", "no such file")
+                .unwrap()
+                .contains("verify the path")
+        );
     }
 
     #[test]
     fn recovery_guidance_distinguishes_selector_environment_and_permissions() {
-        assert!(recovery_hint("read", "Invalid line selector").contains("numeric line selector"));
-        assert!(recovery_hint("bash", "No module named pytest").contains("environment/runner"));
-        assert!(recovery_hint("bash", "permission denied").contains("do not bypass"));
-        assert!(recovery_hint("bash", "timed out").contains("Do not start duplicate"));
+        assert!(
+            recovery_hint("read", "Invalid line selector")
+                .unwrap()
+                .contains("numeric line selector")
+        );
+        assert!(
+            recovery_hint("bash", "No module named pytest")
+                .unwrap()
+                .contains("environment/runner")
+        );
+        assert!(
+            recovery_hint("bash", "permission denied")
+                .unwrap()
+                .contains("do not bypass")
+        );
+        assert!(
+            recovery_hint("bash", "timed out")
+                .unwrap()
+                .contains("Do not start duplicate")
+        );
         assert!(
             !recovery_hint("bash", "AssertionError: answer incorrect")
+                .unwrap()
                 .contains("environment/runner")
+        );
+    }
+
+    #[test]
+    fn mechanical_precondition_errors_get_no_debugging_checkpoint() {
+        for (tool, error) in [
+            (
+                "edit",
+                "the last `PUT ...:` operation needs at least one `+` row",
+            ),
+            (
+                "edit",
+                "line 4: a `PUT ...:` operation needs at least one `+` row (a blank line is a lone `+`)",
+            ),
+            (
+                "edit",
+                "empty patch: expected at least one [PATH#TAG] section",
+            ),
+            (
+                "codebase_memory",
+                "supporting source `src/a.rs` changed; refresh and inspect it before saving this finding",
+            ),
+            (
+                "todo",
+                "Step not closed: the last focused checks failed. Repair the failure before closing.",
+            ),
+            (
+                "todo",
+                "reason is 1400 chars; the limit is 1000. Shorten it",
+            ),
+            (
+                "grep",
+                "invalid tool call: unknown or unavailable tool: grep",
+            ),
+            (
+                "read",
+                "invalid tool call: tool arguments were not a valid JSON object",
+            ),
+            ("browser", "invalid artifact identifier"),
+        ] {
+            assert_eq!(recovery_hint(tool, error), None, "{tool}: {error}");
+        }
+    }
+
+    #[test]
+    fn hypothesis_checkpoint_is_kept_for_failed_runs() {
+        for (tool, error) in [
+            ("bash", "error: test failed, to rerun pass `--test agent`"),
+            ("bg", "process exited with status 101"),
+            ("eval", "AssertionError: expected 3, got 4"),
+        ] {
+            assert!(
+                recovery_hint(tool, error)
+                    .is_some_and(|hint| hint.contains("what the failure disproves")),
+                "{tool}: {error}"
+            );
+        }
+        assert!(
+            recovery_hint("read", "path \"/etc/x\" is outside the workspace")
+                .unwrap()
+                .contains("boundary")
         );
     }
 

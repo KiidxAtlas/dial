@@ -895,8 +895,11 @@ impl Backend {
             scope.begin(billing)?;
         }
         let transport = llm::usage::Transport::enter(scope.clone());
-        let result =
+        let mut result =
             self.chat_with_control_events_inner(adapter, req, limits, on_text, on_notice, on_event);
+        if let Ok(reply) = &mut result {
+            reply.wire = self.wire.lock().latest();
+        }
         if let Some(scope) = scope {
             let cost = result
                 .as_ref()
@@ -1370,6 +1373,7 @@ impl Backend {
                         profile.as_ref(),
                         self.prompt_cache_key.as_deref(),
                         on_event,
+                        self.session_id.as_deref(),
                     ),
                     Err(error) => Err(error),
                 }
@@ -1966,7 +1970,19 @@ fn anthropic_request_variant(
                 if message["is_error"] == true {
                     block["is_error"] = json!(true);
                 }
-                messages.push(json!({"role":"user","content":[block]}));
+                // Results of one parallel batch share a single user message: one message per
+                // result teaches Claude to stop issuing parallel tool calls.
+                let batch = messages.last_mut().filter(|last: &&mut Value| {
+                    message["dial_transient"] != true
+                        && last["role"] == "user"
+                        && last["content"].as_array().is_some_and(|blocks| {
+                            blocks.iter().all(|block| block["type"] == "tool_result")
+                        })
+                });
+                match batch.and_then(|last| last["content"].as_array_mut()) {
+                    Some(blocks) => blocks.push(block),
+                    None => messages.push(json!({"role":"user","content":[block]})),
+                }
             }
             "assistant" if message["tool_calls"].is_array() => {
                 let mut content = Vec::new();
@@ -2727,6 +2743,41 @@ mod tests {
         assert_eq!(body["messages"][1]["content"][0]["input"]["path"], "a.txt");
         assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call-1");
+    }
+
+    #[test]
+    fn anthropic_request_returns_a_parallel_batch_in_one_user_message() {
+        let call = |id: &str| json!({"id":id,"type":"function","function":{"name":"read","arguments":"{}"}});
+        let result = |id: &str| json!({"role":"tool","tool_call_id":id,"content":id});
+        let request = Chat {
+            messages: vec![
+                json!({"role":"user","content":"Read both"}),
+                json!({"role":"assistant","content":null,"tool_calls":[call("a"), call("b")]}),
+                result("a"),
+                result("b"),
+                json!({"role":"user","content":"steer"}),
+                json!({"role":"assistant","content":null,"tool_calls":[call("c")]}),
+                result("c"),
+            ],
+            tools: Vec::new(),
+            temperature: 0.0,
+            max_tokens: 128,
+            seed: None,
+        };
+        let body = anthropic_request("claude-test", &request).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let ids = |m: &serde_json::Value| -> Vec<String> {
+            m["content"].as_array().map_or_else(Vec::new, |blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|b| b["tool_use_id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+        };
+        assert_eq!(messages.len(), 6);
+        assert_eq!(ids(&messages[2]), ["a", "b"]);
+        assert_eq!(messages[3]["content"], "steer");
+        assert_eq!(ids(&messages[5]), ["c"]);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! OpenAI Codex Responses over its WebSocket transport.
 //!
-//! One socket per session/account/model is reused across turns. A request whose input extends the
+//! One socket per session/account/model is reused across turns while it has been idle for at most
+//! `MAX_IDLE_REUSE`; a reused socket that fails before any event is replaced and the request
+//! replayed in full. A request whose input extends the
 //! previous request plus that response's native output items chains with `previous_response_id`
 //! and sends only the delta; any mismatch replays the full transcript. Live steering is submitted as
 //! `response.steer` and governed by explicit receipts. Steering the server accepted for the final
@@ -27,6 +29,9 @@ use tungstenite::{Message, WebSocket, client::IntoClientRequest, stream::MaybeTl
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 /// Steering commands queued for one active response.
 const STEER_QUEUE: usize = 8;
+/// Longest quiet period a cached socket is trusted for. The backend evicts idle sockets without
+/// a close frame; reusing one fails on first use (OMP: `CODEX_WEBSOCKET_MAX_IDLE_REUSE_MS`).
+const MAX_IDLE_REUSE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SteerOutcome {
@@ -68,10 +73,13 @@ struct Session {
     can_append: bool,
     /// Steering accepted on this socket for `last_response_id`: (steer id, submitted items).
     accepted: Vec<(String, Vec<Value>)>,
+    /// When the socket last finished a response (or connected).
+    idle_since: Instant,
 }
 impl Session {
     fn new(socket: Socket) -> Self {
         Self {
+            idle_since: Instant::now(),
             socket,
             last_request: None,
             last_response_id: None,
@@ -280,7 +288,15 @@ pub(super) fn exchange(
         endpoint.account_id.unwrap_or(""),
         endpoint.model
     );
-    let cached = SESSIONS.lock().remove(&socket_key);
+    let cached = match SESSIONS.lock().remove(&socket_key) {
+        Some(mut idle) if idle.idle_since.elapsed() > MAX_IDLE_REUSE => {
+            // Replay in full on a fresh socket; any accepted steering is carried as history.
+            let _ = idle.socket.close(None);
+            None
+        }
+        cached => cached,
+    };
+    let reused = cached.is_some();
     let mut session = match cached {
         Some(session) => session,
         None if SSE_ONLY.lock().contains(&socket_key) => return Ok(None),
@@ -359,6 +375,7 @@ pub(super) fn exchange(
     let mut result = stream(
         &mut session.socket,
         outgoing.as_ref(),
+        &body,
         &attach,
         &rx,
         &mut run,
@@ -367,9 +384,16 @@ pub(super) fn exchange(
         on_text,
         on_event,
     );
-    if matches!(&result, Err(error) if error.downcast_ref::<SteerCommitFailed>().is_some()) {
+    let replay = match &result {
         // Accepted steering never reached a successor: send this request explicitly, steering
         // included as ordinary history, on a fresh socket.
+        Err(error) if error.downcast_ref::<SteerCommitFailed>().is_some() => true,
+        // A reused socket the server already dropped fails before any event: nothing reached
+        // the caller, so replay in full on a fresh socket rather than pin this key to SSE.
+        Err(error) => reused && error.downcast_ref::<SocketGone>().is_some(),
+        Ok(_) => false,
+    };
+    if replay {
         let _ = session.socket.close(None);
         for (_, _, ticket) in run.pending.drain(..) {
             let _ = ticket.send(SteerOutcome::Uncertain);
@@ -394,6 +418,7 @@ pub(super) fn exchange(
         result = stream(
             &mut session.socket,
             Some(&body),
+            &body,
             &HashSet::new(),
             &rx,
             &mut run,
@@ -403,6 +428,10 @@ pub(super) fn exchange(
             on_event,
         );
     }
+    let mut result = result.map_err(|error| match error.downcast::<SocketGone>() {
+        Ok(gone) => super::stream::IncompleteStream(gone.0).into(),
+        Err(error) => error,
+    });
     LIVE.lock().remove(session_key);
     // Commands queued after the response ended were never submitted.
     while let Ok(command) = rx.try_recv() {
@@ -447,6 +476,7 @@ pub(super) fn exchange(
                     return result.map(Some);
                 }
             }
+            session.idle_since = Instant::now();
             SESSIONS.lock().insert(socket_key, session);
         }
         Err(error) => {
@@ -508,8 +538,20 @@ impl std::fmt::Display for SteerCommitFailed {
 }
 impl std::error::Error for SteerCommitFailed {}
 
-/// Writes can discover dead cached sockets just as reads can. Recover via an incomplete
-/// stream so retries use SSE; never replay inline after callbacks.
+/// The socket failed before the server sent any event for this request; leaves `exchange` as
+/// `IncompleteStream`.
+#[derive(Debug)]
+struct SocketGone(&'static str);
+impl std::fmt::Display for SocketGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for SocketGone {}
+
+/// Writes can discover dead cached sockets just as reads can. Mid-response writes recover via an
+/// incomplete stream so retries use SSE; never replay inline after callbacks. The request write
+/// itself reports `SocketGone`, which `exchange` may replay on a fresh socket.
 fn write_error(error: tungstenite::Error) -> anyhow::Error {
     match error {
         tungstenite::Error::Io(_)
@@ -529,6 +571,7 @@ fn write_error(error: tungstenite::Error) -> anyhow::Error {
 fn stream(
     socket: &mut Socket,
     outgoing: Option<&Value>,
+    full: &Value,
     attach: &HashSet<String>,
     rx: &Receiver<SteerCommand>,
     run: &mut Run,
@@ -544,11 +587,16 @@ fn stream(
             .context("invalid Codex request body")?;
         request.insert("type".into(), json!("response.create"));
         let wire = Value::Object(request).to_string();
-        super::wire::record(wire.as_bytes(), "websocket");
-        socket
-            .send(Message::Text(wire.into()))
-            .map_err(write_error)?;
+        let prompt = body.get("previous_response_id").is_some().then_some(full);
+        super::wire::record_with_prompt(wire.as_bytes(), prompt, "websocket");
+        socket.send(Message::Text(wire.into())).map_err(|error| {
+            match write_error(error).downcast::<super::stream::IncompleteStream>() {
+                Ok(gone) => SocketGone(gone.0).into(),
+                Err(error) => error,
+            }
+        })?;
     }
+    let mut received = false;
     let patience = super::Patience::for_stream(timeout, false);
     let mut acc = super::responses::Accumulator::default();
     let mut bytes = 0usize;
@@ -578,6 +626,7 @@ fn stream(
         }
         match socket.read() {
             Ok(Message::Text(text)) => {
+                received = true;
                 bytes = bytes.saturating_add(text.len());
                 ensure!(
                     bytes <= super::MAX_STREAM_BYTES,
@@ -638,10 +687,13 @@ fn stream(
                 socket.send(Message::Pong(payload)).map_err(write_error)?
             }
             Ok(Message::Close(_)) => {
-                return Err(super::stream::IncompleteStream(
-                    "Codex WebSocket closed before response.completed; no tool calls were executed",
-                )
-                .into());
+                const CLOSED: &str =
+                    "Codex WebSocket closed before response.completed; no tool calls were executed";
+                return Err(if received {
+                    super::stream::IncompleteStream(CLOSED).into()
+                } else {
+                    SocketGone(CLOSED).into()
+                });
             }
             Ok(_) => {}
             Err(tungstenite::Error::Io(error))
@@ -662,10 +714,12 @@ fn stream(
                     tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
                 ),
             ) => {
-                return Err(super::stream::IncompleteStream(
-                    "Codex WebSocket dropped before response.completed; no tool calls were executed",
-                )
-                .into());
+                const DROPPED: &str = "Codex WebSocket dropped before response.completed; no tool calls were executed";
+                return Err(if received {
+                    super::stream::IncompleteStream(DROPPED).into()
+                } else {
+                    SocketGone(DROPPED).into()
+                });
             }
             Err(error) => return Err(error.into()),
         }
@@ -698,6 +752,9 @@ fn connect(
     request
         .headers_mut()
         .insert("x-session-id", session_id.parse()?);
+    request
+        .headers_mut()
+        .insert("session_id", session_id.parse()?);
     request
         .headers_mut()
         .insert("conversation_id", session_id.parse()?);
@@ -854,21 +911,53 @@ mod loopback {
         }
     }
 
+    /// Serves one stale connection (which must receive no request) and then one fresh connection
+    /// that answers the full replay. Returns the replayed request.
+    fn stale_then_fresh(listener: TcpListener) -> std::thread::JoinHandle<Value> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stale = tungstenite::accept(stream).unwrap();
+            loop {
+                match stale.read() {
+                    Ok(Message::Text(text)) => panic!("stale socket received a request: {text}"),
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let (stream, _) = listener.accept().unwrap();
+            let mut fresh = tungstenite::accept(stream).unwrap();
+            let request = text(&mut fresh);
+            send(&mut fresh, completed("r1", "ok"));
+            request
+        })
+    }
+
+    fn run_exchange(endpoint: super::super::responses::Endpoint<'_>, key: &str) -> Option<Reply> {
+        exchange(
+            endpoint,
+            &chat(),
+            5,
+            &mut None,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            &mut |_| true,
+            key,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn cached_socket_broken_pipe_selects_sse_without_callbacks() {
+    fn cached_socket_broken_pipe_replays_on_a_fresh_socket_without_pinning_sse() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}/codex/responses");
         let key = format!("loopback-write-{addr}");
         let socket_key = format!("{key}\0acct\0gpt-test");
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut socket = tungstenite::accept(stream).unwrap();
-            assert!(socket.read().is_err(), "no request should reach the server");
-        });
+        let server = stale_then_fresh(listener);
         let endpoint = super::super::responses::Endpoint {
             url: &url,
             token: "test-token",
@@ -884,46 +973,37 @@ mod loopback {
         SESSIONS
             .lock()
             .insert(socket_key.clone(), Session::new(socket));
-        let callbacks = std::cell::Cell::new(0);
-        let mut on_text = |_: &str| {
-            callbacks.set(callbacks.get() + 1);
-            true
+        let reply = run_exchange(endpoint, &key).expect("replayed over WebSocket, not SSE");
+        assert_eq!(reply.text, "ok");
+        let request = server.join().unwrap();
+        assert!(request["previous_response_id"].is_null());
+        assert_eq!(request["input"][0]["role"], "user");
+        assert!(!SSE_ONLY.lock().contains(&socket_key));
+        assert!(SESSIONS.lock().remove(&socket_key).is_some());
+    }
+
+    #[test]
+    fn idle_cached_socket_is_replaced_before_sending() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/codex/responses");
+        let key = format!("loopback-idle-{addr}");
+        let socket_key = format!("{key}\0acct\0gpt-test");
+        let server = stale_then_fresh(listener);
+        let endpoint = super::super::responses::Endpoint {
+            url: &url,
+            token: "test-token",
+            account_id: Some("acct"),
+            model: "gpt-test",
+            headers: &[],
         };
-        let mut on_event = |_: &StreamEvent| {
-            callbacks.set(callbacks.get() + 1);
-            true
-        };
-        let error = exchange(
-            endpoint,
-            &chat(),
-            5,
-            &mut Some(&mut on_text),
-            Arc::new(AtomicBool::new(false)),
-            None,
-            None,
-            &mut on_event,
-            &key,
-        )
-        .unwrap_err();
-        assert!(super::super::errors::classify(&error).is_retryable());
-        assert!(!SESSIONS.lock().contains_key(&socket_key));
-        assert!(SSE_ONLY.lock().contains(&socket_key));
-        let retry = exchange(
-            endpoint,
-            &chat(),
-            5,
-            &mut Some(&mut on_text),
-            Arc::new(AtomicBool::new(false)),
-            None,
-            None,
-            &mut on_event,
-            &key,
-        )
-        .unwrap();
-        assert!(retry.is_none(), "next exchange must select HTTP streaming");
-        assert_eq!(callbacks.get(), 0);
-        SSE_ONLY.lock().remove(&socket_key);
-        server.join().unwrap();
+        let mut idle = Session::new(connect(endpoint, &key, 5).unwrap());
+        idle.idle_since = Instant::now() - MAX_IDLE_REUSE - Duration::from_secs(1);
+        SESSIONS.lock().insert(socket_key.clone(), idle);
+        assert_eq!(run_exchange(endpoint, &key).unwrap().text, "ok");
+        assert!(server.join().unwrap()["previous_response_id"].is_null());
+        assert!(!SSE_ONLY.lock().contains(&socket_key));
+        assert!(SESSIONS.lock().remove(&socket_key).is_some());
     }
 
     #[test]
@@ -1054,6 +1134,7 @@ mod loopback {
                 None,
                 None,
                 &mut |_| panic!("invalid history must not emit callbacks"),
+                None,
             )
             .unwrap_err();
             assert!(error.to_string().contains("native history belongs"));
@@ -1071,6 +1152,7 @@ mod loopback {
             None,
             None,
             &mut |_| true,
+            None,
         )
         .unwrap();
         assert_eq!(reply.text, "second");

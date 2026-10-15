@@ -38,31 +38,32 @@ jobs:
       - name: Verify Linux sandbox enforcement
         if: runner.os == 'Linux'
         timeout-minutes: 10
-        run: cargo test --locked linux_sandbox_enforces_filesystem_and_both_network_modes
+        run: cargo test --locked --profile ci linux_sandbox_enforces_filesystem_and_both_network_modes
       - name: Format
         run: cargo fmt --check
       - name: Build
         # The `dial` library and its unit-test build each peak near 5 GB in rustc. Built together
         # they exceed the 7 GB macOS arm64 runner and swap (11-16 min); one at a time they fit.
+        # The `ci` profile drops debug info, which cuts rustc memory, link time and cache size.
         run: |
-          cargo build --locked --lib
-          cargo test --locked --lib --no-run
-          cargo build --locked --all-targets
+          cargo build --locked --profile ci --lib
+          cargo test --locked --profile ci --lib --no-run
+          cargo build --locked --profile ci --all-targets
       - name: Test
         # Parallel: tests that change process HOME/PATH hold a shared lock; process fixtures set
         # their environment per child. Serial execution made the lib tests ~4x slower.
-        run: cargo test --locked
+        run: cargo test --locked --profile ci
       - name: Install executable and verify artifact contracts
         timeout-minutes: 10
         run: |
-          cargo install --locked --path . --debug --root target/installed
+          cargo install --locked --path . --profile ci --root target/installed
           python3 scripts/check-artifact.py --dial target/installed/bin/dial
       - name: Real terminal and crash lifecycle
         timeout-minutes: 5
         run: python3 examples/benchmarks/interactive_smoke.py --dial target/installed/bin/dial --captures target/pty-captures
       - name: Record runtime overhead
         continue-on-error: true
-        run: cargo run --locked --example runtime_baseline -- target/runtime-baseline.json
+        run: cargo run --locked --profile ci --example runtime_baseline -- target/runtime-baseline.json
       - name: Preserve runtime baseline
         if: always()
         uses: actions/upload-artifact@v4

@@ -439,6 +439,11 @@ impl<'a> Agent<'a> {
 
     pub(super) fn rebuild_system(&mut self) {
         let offered = self.offered();
+        // The interceptor names a dedicated tool only when this request offers it.
+        self.workspace = self
+            .workspace
+            .clone()
+            .with_bash_interceptor(self.config.bash_interceptor.clone(), offered.clone());
         let discoverable = self.discoverable_tools(&offered);
         let built = prompt::system_messages(prompt::Inputs {
             cwd: self.workspace.root(),

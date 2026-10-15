@@ -540,69 +540,6 @@ fn memory_age(then: i64) -> String {
     }
 }
 
-/// One picker row: `> title …  2h ago · 28 msgs · model · id`. The title (or the first message,
-/// for an untitled session) takes the room; the facts sit right-aligned and dimmer.
-fn session_row(
-    session: &crate::storage::session::SessionInfo,
-    branch: &str,
-    selected: bool,
-    cols: usize,
-    theme: &crate::ui::theme::Theme,
-) -> Line<'static> {
-    let title = [session.title.trim(), session.first_message.trim()]
-        .into_iter()
-        .find(|t| !t.is_empty())
-        .map(text::one_line)
-        .unwrap_or_else(|| "(empty session)".to_owned());
-    // A model path's last component is its name.
-    let model = session.model.rsplit('/').next().unwrap_or(&session.model);
-    let facts = format!(
-        "{branch}{} · {} msg{} · {model} · {}",
-        session_age(&session.started),
-        session.messages,
-        if session.messages == 1 { "" } else { "s" },
-        short(&session.id)
-    );
-    let marker = if selected {
-        format!("{} ", theme.sym(crate::ui::theme::Sym::Pointer))
-    } else {
-        "  ".to_owned()
-    };
-    let facts = text::ellipsize(
-        &text::one_line(&facts),
-        cols.saturating_sub(14).max(1),
-        theme.ascii(),
-    );
-    let facts_w = text::width(&facts);
-    let room = cols.saturating_sub(facts_w + 2 + text::width(&marker));
-    let title = text::ellipsize(&title, room.max(1), theme.ascii());
-    let gap = cols.saturating_sub(text::width(&marker) + text::width(&title) + facts_w);
-    let title_tok = if selected {
-        Tok::Accent
-    } else if session.messages == 0 {
-        Tok::Dim
-    } else {
-        Tok::Text
-    };
-    let mut title_style = theme.fg(title_tok);
-    if selected {
-        title_style = title_style.add_modifier(ratatui::style::Modifier::BOLD);
-    }
-    // The selected session gets the same selection fill as every other list.
-    let fill = if selected {
-        theme.bg(Tok::SelectedBg)
-    } else {
-        ratatui::style::Style::default()
-    };
-    Line::from(vec![
-        Span::styled(marker, theme.fg(Tok::Accent).patch(fill)),
-        Span::styled(title, title_style.patch(fill)),
-        Span::styled(" ".repeat(gap), fill),
-        Span::styled(facts, theme.fg(Tok::Muted).patch(fill)),
-    ])
-    .style(fill)
-}
-
 fn session_age(started: &str) -> String {
     let Some(stamp) = started.get(..19).and_then(crate::platform::time::parse_utc) else {
         return started.to_owned();
@@ -5824,7 +5761,7 @@ impl Shell {
                 anyhow::bail!("ambiguous session prefix {query:?}");
             }
         }
-        let mut sessions = Session::list(layout, PICKER_SESSION_LIMIT)?;
+        let mut sessions = Session::list_for_picker(layout, PICKER_SESSION_LIMIT)?;
         if sessions.is_empty() {
             self.note("Sessions", "no sessions yet");
             return Ok(None);
@@ -5851,128 +5788,40 @@ impl Shell {
                 .map(|s| (s.id.clone(), ancestry(s)))
                 .collect();
             sessions.sort_by(|a, b| order[&a.id].cmp(&order[&b.id]));
-        } else {
-            // Conversations first; empty sessions (opened and left) stay findable at the end.
-            sessions.sort_by_key(|s| s.messages == 0);
         }
-        let searchable: Vec<_> = sessions
-            .iter()
-            .map(|s| {
-                format!(
-                    "{} {} {} {} {} {}",
-                    s.id,
-                    s.title,
-                    s.first_message,
-                    s.started,
-                    s.path.display(),
-                    s.model
-                )
-            })
-            .collect();
-        let mut filter = query.to_owned();
-        let mut selected = 0usize;
+        let pinned = crate::storage::session_pins::load(&layout.user_dir)?;
+        let mut picker = crate::ui::session_picker::Picker::new(
+            sessions,
+            pinned,
+            agent.session().id(),
+            query,
+            tree,
+        );
         loop {
-            let found: Vec<_> = searchable
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| text::fuzzy(&filter, s).is_some())
-                .map(|(i, _)| i)
-                .collect();
-            selected = selected.min(found.len().saturating_sub(1));
             let (cols, height) = self.term.size();
-            let visible = (height as usize).saturating_sub(6).max(1);
-            let start = selected.saturating_sub(visible - 1);
-            let theme = self.themes.current();
-            // Drawn as a standard panel: search row, sessions, key hints.
-            let inner = (cols as usize).saturating_sub(4);
-            let mut body = vec![Line::from(vec![
-                Span::styled("Search: ", theme.fg(Tok::Accent)),
-                Span::styled(text::one_line(&filter), theme.fg(Tok::Text)),
-                Span::styled(theme.sym(Sym::BoxV).to_owned(), theme.fg(Tok::Accent)),
-            ])];
-            if found.is_empty() {
-                body.push(Line::from(Span::styled(
-                    if filter.is_empty() {
-                        "No sessions yet in this project."
-                    } else {
-                        "No session matches; Backspace widens the search."
-                    },
-                    theme.fg(Tok::Muted),
-                )));
-            }
-            for (position, &index) in found.iter().enumerate().skip(start).take(visible) {
-                let session = &sessions[index];
-                let branch = session
-                    .parent_id
-                    .as_ref()
-                    .map(|id| format!("fork of {} ", short(id)))
-                    .unwrap_or_default();
-                body.push(session_row(
-                    session,
-                    &branch,
-                    position == selected,
-                    inner,
-                    theme,
-                ));
-            }
-            body.push(Line::from(Span::styled(
-                "Type to filter · \u{2191}\u{2193} move · Enter resume · Esc cancel",
-                theme.fg(Tok::Muted),
-            )));
-            let found_label = match found.len() {
-                0 => "none found".to_owned(),
-                1 => "1 session".to_owned(),
-                n => format!("{n} sessions"),
-            };
-            let rows = crate::ui::chrome::framed_lines(
-                theme,
-                crate::ui::chrome::Section::Dial,
-                if tree { "Session tree" } else { "Sessions" },
-                &found_label,
-                body,
-                cols as usize,
-            );
+            let rows = picker.rows(cols as usize, height as usize, self.themes.current());
             self.paint(Some(rows))?;
-            match read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let event = read()?;
+            if matches!(event, Event::Resize(..)) {
+                self.term.on_resize();
+            }
+            match picker.handle(&event, height as usize) {
+                crate::ui::session_picker::Action::Cancel => return Ok(None),
+                crate::ui::session_picker::Action::Resume(index) => {
+                    let session = &picker.sessions[index];
+                    if session.id == agent.session().id() {
                         return Ok(None);
                     }
-                    KeyCode::Up => selected = selected.saturating_sub(1),
-                    KeyCode::Down => selected = (selected + 1).min(found.len().saturating_sub(1)),
-                    KeyCode::PageUp => selected = selected.saturating_sub(visible),
-                    KeyCode::PageDown => {
-                        selected = (selected + visible).min(found.len().saturating_sub(1))
-                    }
-                    KeyCode::Enter => {
-                        if let Some(&index) = found.get(selected) {
-                            if sessions[index].id == agent.session().id() {
-                                return Ok(None);
-                            }
-                            return Session::open(&sessions[index].path).map(Some);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        filter.pop();
-                        selected = 0;
-                    }
-                    KeyCode::Char(c)
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        filter.push(c);
-                        selected = 0;
-                    }
-                    _ => {}
-                },
-                Event::Paste(value) => {
-                    filter.push_str(&text::one_line(&value));
-                    selected = 0;
+                    return Session::open(&session.path).map(Some);
                 }
-                Event::Resize(..) => self.term.on_resize(),
-                _ => {}
+                crate::ui::session_picker::Action::Pin(index) => {
+                    let pinned = crate::storage::session_pins::toggle(
+                        &layout.user_dir,
+                        &picker.sessions[index].id,
+                    )?;
+                    picker.set_pinned(index, pinned);
+                }
+                crate::ui::session_picker::Action::None => {}
             }
         }
     }

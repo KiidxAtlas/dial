@@ -23,7 +23,8 @@ solve/escalation budgets, background daily compute, recalled context, history re
 case deadlines. A positive value restores a cap. Other deadlines and previews have finite defaults:
 `shell.bash_timeout_secs` 300, hook `timeout_secs` 30, MCP `timeout_secs` 120 and `connect_timeout_secs`
 30, extension `timeout_secs` 30, `request_recovery.silence_secs` 120, `efficiency.ambient_context_bytes`
-8192, `efficiency.lightweight_requests` 4 and `efficiency.cache_pressure_percent` 75. The exception is
+8192, `efficiency.lightweight_requests` 4, `efficiency.cache_pressure_percent` 75 and
+`efficiency.history_token_cap` 262144 (see below). The exception is
 `verification.repair_attempts`: `0` selects the default of 3 automatic repair rounds (when
 `verification.automatic_checks` is on), because a check that can never pass would otherwise re-prompt
 the model forever.
@@ -36,6 +37,13 @@ remain `auto`, rather than pretending a model has infinite context. Sampling/tra
 approvals, sandboxing, host restrictions, protocol frame protections and loop-safety rules are unchanged.
 Unlimited calls can wait indefinitely or consume substantial memory and money; Esc/Ctrl-C still cancels
 interactive work. Configure positive limits where that is not acceptable.
+
+`efficiency.history_token_cap` is the window that compaction and history pruning plan against when
+the model's window is larger (0 = the model's full window). Every step resends the history, so on a
+1M-token model the `auto` compaction trigger would otherwise fire near 680k tokens; at the default
+it fires near 178k, while models with windows of 262144 tokens or less are unaffected. Change it under
+`/settings` → **Model** → **Roles & Sampling** → **History token ceiling** (under *Show advanced*) or in
+`[efficiency]`; validation accepts 0 or 8192..2000000.
 
 Set `efficiency.enabled=false` to disable these shared economy policies. Each completed/failed task
 stores an `efficiency` completion snapshot in session control state. Structured print output and RPC
@@ -103,6 +111,9 @@ api_key_env = "LMSTUDIO_KEY"
 [harness]                 # the part the improvement loop is allowed to change
 system_prompt = "Work in small verified steps."
 tools = ["read","edit","write","glob","grep","bash","todo","tool_search","tool_load","artifact_read","working_state"]
+[bash_interceptor]        # bash commands that duplicate a dedicated tool
+mode = "hint"             # hint (default): run it and add a one-line pointer | block: refuse it
+# enabled = false         # turn it off; patterns = [...] replaces the built-in rules
 [tools.lint]              # operator tools: trusted programs, not sandboxed
 program = "/usr/local/bin/mylint"
 timeout_secs = 0

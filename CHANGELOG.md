@@ -1,14 +1,28 @@
 # Changelog
 
 All notable changes to Dial are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Entries are taken from the git history (commit subjects, shown by short hash) and tags `v0.1.0` through `v0.1.4`.
+Entries are taken from the git history (commit subjects, shown by short hash) and tags `v0.1.0` through `v0.1.5`.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-10-15
+
 ### Added
+- The stats ledger records each request's transport and cache-invalidation fingerprint (`transport`, `invalidation`, `common_prompt_bytes`, `prompt_bytes` in `requests`), so a prompt-cache miss can be attributed to a prompt change or to the provider.
 - **Teach this model** (`/settings` → Model → Learning, `improve.teach`): an opt-in switch that lets a local model (MLX, Ollama, LM Studio) learn from your coding sessions. Turns are recorded, and the latest version admitted by the evaluation gate serves the session, LoRA adapter included. Turns are approved without typing scores: committing a turn's exact changes, Alt+Up, or passing behavioral checks counts as good; Alt+Down or `/undo` as bad. Hosted models are never recorded.
 
+### Changed
+- Faster releases and CI. Release binaries use thin LTO instead of fat LTO with one codegen unit, which had taken 14-43 minutes per target. Release builds start when the tag is pushed and run alongside CI; publishing still waits for CI to pass on the tagged commit. CI builds and tests with the `ci` profile (no debug info), which lowers memory use and link time on the macOS runners.
+- On models with very large context windows, the history used for compaction and pruning is now capped at 262,144 tokens by default (`efficiency.history_token_cap`; 0 restores the full window). On a 1M-token window, automatic compaction now starts at about 178k tokens instead of 680k. Windows of 262k tokens or less are unaffected.
+- The bash interceptor (`[bash_interceptor]`) is now wired into the agent's `bash` tool and on by default in a new `hint` mode. A command that only duplicates a dedicated tool (`cat`, `sed -n 'A,Bp'`, `grep`/`rg`, `find -name`, `sed -i`, `echo >`, `nohup`, dev servers) still runs, and its result gains one line naming `read`, `grep`, `glob`, `edit`, `write` or `bg`. Batched compound commands are left alone, because one batched call saves model round trips. `gh run view|list` and `gh pr checks` results that still show an unfinished run get a hint to wait once (`github` op `run_watch`, or `gh run watch` with `bg` `wait`) instead of polling. `mode = "block"` keeps the old refusal behavior. Before this change the setting was accepted but never applied.
+- Interceptor rules: `cat >file` and `cat <<EOF >file` count as writes, not reads; `tail -f` points to `bg`, not `read`; `find` with `-exec`, `-delete`, time, size or permission predicates is no longer flagged; `perl` counts as an in-place edit only when `-i` is one of its leading switches; and the service, background and watch rules name `bg`.
+
 ### Fixed
+- GPT background compaction requests now send an empty tools array instead of null, avoiding HTTP 400 errors from endpoints that require an array.
+- Resuming or reopening a session could fail with "already open for writing" right after its writer closed, because a tool process being started at the same moment briefly holds a copy of the session file's lock. Reopening now waits up to two seconds for such a lock before refusing. This also removes intermittent failures in the session and resume tests.
+- Fewer avoidable tool failures and bookkeeping rounds. `codebase_memory remember` normalizes cited paths (`./`, `path:12-40`, absolute paths in the root) and re-indexes changed sources inline instead of refusing, and names the path when it still cannot. Sandboxed dev commands get writable uv/pip/npm/Go/XDG caches under dial's cache directory. Generic recovery advice is no longer attached to mechanical errors. A response that sends only `todo` updates gets a once-per-turn nudge to do the work in the same response.
+- An edit that touched lines no read had shown failed with "read them first", which cost a read call plus a retry. The error now shows those lines and counts them as read, so the same edit can be re-issued directly. Nothing is written until then, and lines whose snapshot is stale still need a fresh read.
+- ChatGPT/Codex sessions lost nearly all prompt caching after an idle gap (a background wait, a long tool, a pause before the next message). The reused websocket had been dropped by the server, its first write failed, and the session was moved to SSE for the rest of the process. SSE requests carried no session affinity headers, so they reached arbitrary servers. Idle sockets are now replaced before use, a dead reused socket is reconnected and the request replayed instead of switching to SSE, and SSE requests send `session_id`/`conversation_id`.
 - `/outcome` and `/undo` feedback had nowhere to go in coding sessions, and `/improve` told you to use them anyway; both now record when Teach this model is on and say how to turn it on otherwise.
 
 ## [0.1.4] - 2026-10-14

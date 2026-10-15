@@ -1,6 +1,6 @@
 # Model routing
 
-`[model_roles]` assigns provider/model selections to the current roles: `main`, `small`, `coach`, `tester`, `planner`, `memory`, and `decision`. Legacy keys migrate to these roles: `smol`, `tiny`, `commit`, `compaction`, `architecture`, `task`, and `subagent` become `small`; `slow`, `stronger`, `advisor`, `feedback`, `feedback-helper`, and `experience` become `coach`; `plan` becomes `planner`; `memory` stays `memory`. A legacy `default` key fills unassigned roles, and `vision` is dropped. The retired `embedding` role is removed from `[model_roles]` and from model presets on load. Explicit role selections take precedence.
+`[model_roles]` assigns provider/model selections to the roles in the shared role registry, including `task` for implementation tasks and worker subagents. Legacy keys migrate as follows: `smol`, `tiny`, `commit`, `compaction`, and `architecture` become `small`; `subagent` becomes `task`; `slow`, `stronger`, `advisor`, `feedback`, `feedback-helper`, and `experience` become `coach`; `plan` becomes `planner`. Current keys such as `task`, `small`, and `memory` stay unchanged. A legacy `default` key fills unassigned helper roles, including `task`, and `vision` is dropped. Explicit current role selections take precedence over legacy aliases, so assigned `task` and `small` models are preserved independently.
 
 In the TUI, `/roles` opens role assignments. Select a role with Enter, then search or
 browse providers and favorites to choose its model. Switching provider groups keeps
@@ -27,27 +27,45 @@ default = ["openai/gpt-4o-mini", "@small"]
 
 [model_roles]
 small = { provider = "openai", model = "gpt-4o-mini" }
+task = { provider = "anthropic", model = "claude-sonnet-4-5" }
 ```
 
 Model capabilities and supported reasoning levels come from the bundled catalog when known, with explicit operator profiles remaining authoritative. Catalog context windows are used when available; otherwise remote requests use a conservative 32768-token capacity. Output budgets remain separately bounded rather than reserving the entire context window.
 
 ## Model roles in the picker
 
-**Model roles.** The model picker (/roles) assigns coding helper roles. `/improve models` additionally exposes the learning decision role. Dial has eight: `main`, `small`, `judge`, `coach`, `tester`, `planner`, `memory` and `decision`. Each row shows the effective model and where it comes from. An unassigned role uses the main model, except `judge` (the `small` role, then the main model) and `decision` (the installed Laya checkpoint, if any). “Use the main model” clears an assignment. The `memory` role is required while a memory backend that calls a model (`local` or `sharpshooter`) is enabled; /roles marks it required until assigned.
+**Model roles.** The model picker (/roles) assigns the roles in the shared registry. `/improve models` additionally exposes the learning decision role. Each row shows the effective model and where it comes from. An unassigned chat role uses the main model, except `judge` (the `small` role, then the main model). `decision` uses the installed Laya checkpoint, if any; unassigned `embedding` uses lexical recall. “Use the main model” clears a chat-role assignment. The `memory` role is required while a memory backend that calls a model (`local` or `sharpshooter`) is enabled; /roles marks it required until assigned.
 Missing memory model assignments do not prevent Dial from opening: the selected memory backend stays inactive with a setup error. Assign its required roles in /roles, then restart Dial to activate memory. No backend or chat-model fallback is silently selected.
 
 In the picker, `Tab` switches between the sidebar and the list; `Enter` or `Right` moves from the sidebar into its selected list. In **Roles**, highlight a role and press `Enter` to choose its model, or `x` / `Delete` to clear an explicit assignment (the main model cannot be cleared). Role selection starts with a fresh search and kind filter; `Esc` returns to the same role. `Ctrl+A` on a model opens the role-assignment chooser. For the Laya checkpoint entry, pasted text goes into the checkpoint field.
 
 | Role | Used for | Falls back to |
 |---|---|---|
-| `main` | Conversation and coding agent; worker subagents | Always assigned (the session model) |
-| `small` | Compaction, commit messages (all tiers), architecture synthesis, scout subagents, solve patch-search workers | `main` |
+| `main` | Conversation and coding agent | Always assigned (the session model) |
+| `task` | Implementation tasks and worker subagents | For task-tool delegation: `coach`, then `small`, then `main` |
+| `small` | Compaction, commit messages (all tiers), architecture synthesis, solve patch-search workers; preferred when assigned for scout and custom read-only subagents | `main` for maintenance; task-tool subagents follow `task` when `small` is unassigned |
 | `judge` | Cheap typed decisions, such as `thinking = "auto"` (one reasoning level per user turn, judged from its prompt) and cached locally. Can be a chat model or the Laya decision engine (“laya/decision checkpoint”) | `small`, then `main` |
 | `coach` | Escalate tool and automatic escalation, self-improvement feedback proposals, experience teacher, advisor mode, feedback-helper edit repair | `main` |
-| `tester` | Reviewer subagent (including `/security` scan batches and finding validation) and review-workflow model calls | `main` |
-| `planner` | Plan mode and planner subagents | `main` |
+| `tester` | Reviewer subagent (including `/security` scan batches and finding validation), test-runner subagent and review-workflow model calls | Task-tool reviewer/test-runner: `coach`, `task`, `small`, then `main`; other review workflows: `main` |
+| `planner` | Plan mode and planner subagents | Task-tool planner: `coach`, `task`, `small`, then `main`; plan mode: `main` |
 | `memory` | Memory extraction and consolidation (`local`) and sharpshooter model calls, including sharpshooter decision memory (`memory.sharpshooter.model_role`). Required when a model-calling memory backend is enabled | No chat fallback for model-calling memory; backend stays inactive until assigned |
 | `decision` | Laya decision engine: the assigned value is the Laya checkpoint (local path or HF repo id), passed to the managed service as `DIAL_LAYA_CHECKPOINT`. Set with `dial laya install --checkpoint` or /roles | Installed Laya checkpoint (shown as “Laya · <checkpoint>”), else not set |
+| `embedding` | Semantic memory recall through an embedding-capable endpoint | Lexical recall |
+
+### Task-tool routing and deliberate overrides
+
+Delegated jobs choose the first **explicitly assigned** role in the following purpose-specific chains:
+
+| Task type | Default model-role chain |
+|---|---|
+| Implementation worker | `task` → `coach` → `small` → `main` |
+| Scout / custom read-only | `small` → `task` → `main` |
+| Reviewer / test-runner | `tester` → `coach` → `task` → `small` → `main` |
+| Planner | `planner` → `coach` → `task` → `small` → `main` |
+
+Main is the last resort when no helper in that chain is assigned. Dial does not select an unconfigured catalogue model or provider. These are missing-assignment defaults, not provider-error retry chains: they do not silently restart a job on another model after work has begun. They apply only to task-tool delegation; unassigned maintenance roles retain their existing behavior.
+
+Explicit operator agent definitions and an explicit per-call `model_profile` are deliberate overrides of this routing. They are not silently replaced by the preferred helper role or by `task`.
 
 ## Judge role and automatic thinking
 

@@ -3402,6 +3402,89 @@ fn delegated_task_uses_its_role_and_returns_to_the_main_model() {
 }
 
 #[test]
+fn task_role_models_reach_sync_and_background_requests_without_changing_the_parent() {
+    for action in ["run", "start"] {
+        for scenario in ["task", "specialists", "helper-defaults"] {
+            let mut replies = vec![Reply::Call(
+                "task",
+                json!({"action":action,"tasks":[
+                    {"agent":"worker","task":"implement","solution_space":"s"},
+                    {"agent":"scout","task":"inspect","solution_space":"s"},
+                    {"agent":"reviewer","task":"review","solution_space":"s"},
+                    {"agent":"planner","task":"plan","solution_space":"s"},
+                    {"agent":"test-runner","task":"test","solution_space":"s"}
+                ]}),
+            )];
+            if action == "start" {
+                replies.push(Reply::Call("task", json!({"action":"wait"})));
+            }
+            replies.push(Reply::Text("parent finished"));
+            let main = serve(replies);
+            let side = serve_fn(Arc::new(|_| Reply::Text("child finished")), None, None);
+            let mut e = env(&main.url, "auto");
+            let roles: &[&str] = match scenario {
+                "task" => &["task"],
+                "specialists" => &["task", "small", "tester", "planner"],
+                _ => &["coach", "small"],
+            };
+            for role in roles {
+                e.config.model_roles.insert(
+                    (*role).into(),
+                    dial::llm::model_config::ModelSelection {
+                        provider: "reviewer".into(),
+                        model: format!("{role}-model"),
+                        base_url: Some(side.url.clone()),
+                        ..Default::default()
+                    },
+                );
+            }
+            let mut ui = Recorder::default();
+            assert_eq!(
+                run_turn(&e, &mut ui).text,
+                "parent finished",
+                "{action}, scenario={scenario}"
+            );
+            let mut models: Vec<_> = side
+                .requests
+                .lock()
+                .iter()
+                .map(|r| r["model"].as_str().unwrap().to_owned())
+                .collect();
+            models.sort();
+            let mut expected = match scenario {
+                "specialists" => vec![
+                    "task-model",
+                    "small-model",
+                    "tester-model",
+                    "planner-model",
+                    "tester-model",
+                ],
+                "helper-defaults" => vec![
+                    "coach-model",
+                    "small-model",
+                    "coach-model",
+                    "coach-model",
+                    "coach-model",
+                ],
+                _ => vec!["task-model"; 5],
+            };
+            expected.sort();
+            assert_eq!(
+                models, expected,
+                "{action}, scenario={scenario}: {:?}",
+                ui.results
+            );
+            assert!(
+                main.requests
+                    .lock()
+                    .iter()
+                    .all(|r| r["model"] == "scripted")
+            );
+        }
+    }
+}
+
+#[test]
 fn ordinary_turns_offer_task_and_skill_and_state_the_delegation_rules() {
     let server = serve(vec![Reply::Text("done")]);
     let e = env(&server.url, "auto");
@@ -3945,8 +4028,8 @@ fn roomy_window_keeps_the_full_tool_set_without_notice() {
 // ------------------------------------------------------------------------------------ subagents
 
 fn with_subagent_role(e: &mut Env, url: &str) {
-    // Roles follow the agent type: scouts use `small`, reviewers `tester`, planners `planner`, writers `main`.
-    for role in ["main", "small", "tester", "planner"] {
+    // Specialist assignments win; implementation workers use the task role.
+    for role in ["main", "task", "small", "tester", "planner"] {
         e.config.model_roles.insert(
             role.into(),
             dial::llm::model_config::ModelSelection {

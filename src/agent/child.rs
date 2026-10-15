@@ -2722,8 +2722,10 @@ fn run_inner(
             if let Some(reason) = stop {
                 investigation_stop = Some(reason);
             }
-            if output.is_error {
-                let advice = crate::learn::task_policy::recovery_hint(&call.name, &output.text);
+            if output.is_error
+                && let Some(advice) =
+                    crate::learn::task_policy::recovery_hint(&call.name, &output.text)
+            {
                 output.text.push_str("\n\n");
                 output.text.push_str(advice);
             }

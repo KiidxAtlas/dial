@@ -77,6 +77,8 @@ pub struct Request {
     pub tool_calls: usize,
     pub error: bool,
     pub end: SystemTime,
+    /// Final-wire fingerprint: separates client prompt changes from provider cache misses.
+    pub wire: Option<crate::llm::wire::Observation>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +159,7 @@ pub fn request(
             tool_calls: reply.tool_calls.len(),
             error: false,
             end: SystemTime::now(),
+            wire: reply.wire.clone(),
         }),
     );
 }
@@ -189,6 +192,7 @@ pub fn request_failed(
             tool_calls: 0,
             error: true,
             end: SystemTime::now(),
+            wire: None,
         }),
     );
 }
@@ -454,6 +458,16 @@ fn record_stats(db: &mut crate::stats::Db, event: &Event) -> Result<()> {
             duration_ms: r.duration.as_millis() as u64,
             finish_reason: r.finish_reason.clone(),
             error: r.error,
+            wire: r.wire.as_ref().map(|w| crate::stats::WireRecord {
+                transport: if w.chained {
+                    format!("{}_chained", w.transport)
+                } else {
+                    w.transport.into()
+                },
+                invalidation: w.invalidation.into(),
+                common_prompt_bytes: w.common_prompt_bytes as u64,
+                prompt_bytes: w.prompt_bytes as u64,
+            }),
         }),
         Event::Tool(t) => db.record_tool(&crate::stats::ToolRecord {
             status: Some(t.status),
@@ -1282,6 +1296,7 @@ mod tests {
             tool_calls: 1,
             error,
             end: SystemTime::now(),
+            wire: None,
         })
     }
 

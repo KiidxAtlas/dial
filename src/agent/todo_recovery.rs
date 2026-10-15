@@ -68,6 +68,23 @@ impl TodoRecovery {
     }
 }
 
+/// A response whose only calls are `todo` spends a full request (the whole context re-sent)
+/// on bookkeeping. Say so once per turn, in the todo result, so later updates ride along with
+/// real work. Not when only `todo` was offered.
+pub(super) fn solo_update_note(
+    calls: &[ToolCall],
+    planning_required: bool,
+    already_noted: bool,
+) -> Option<&'static str> {
+    (!already_noted
+        && !planning_required
+        && !calls.is_empty()
+        && calls.iter().all(|call| call.name == "todo"))
+    .then_some(
+        "[Dial] This response held only `todo`, which costs a full request. Send todo updates in the same response as real work: set with the first reads, done with the next step's first call. Skip closing updates before the final answer; it closes remaining tasks.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +96,21 @@ mod tests {
             arguments: json!({"op":op}),
             malformed_arguments: false,
         }
+    }
+
+    #[test]
+    fn todo_only_responses_are_noted_once_and_not_when_forced() {
+        let read = ToolCall {
+            id: "r".into(),
+            name: "read".into(),
+            arguments: json!({"path":"a.rs"}),
+            malformed_arguments: false,
+        };
+        assert!(solo_update_note(&[call("done")], false, false).is_some());
+        assert!(solo_update_note(&[call("done"), call("start")], false, false).is_some());
+        assert!(solo_update_note(&[call("done"), read], false, false).is_none());
+        assert!(solo_update_note(&[call("done")], false, true).is_none());
+        assert!(solo_update_note(&[call("set")], true, false).is_none());
     }
 
     #[test]
