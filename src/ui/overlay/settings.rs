@@ -827,6 +827,10 @@ impl SettingsOverlay {
             || def.path.starts_with("memory.learn_")
     }
     fn scope_shown(&self, def: &SettingDef) -> bool {
+        // The one learning switch that changes coding sessions belongs in both views.
+        if def.path == "improve.teach" {
+            return true;
+        }
         let learning = Self::learning_setting(def);
         (!self.coding_only || !learning) && (!self.learning_only || learning)
     }

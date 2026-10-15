@@ -1247,6 +1247,9 @@ pub const DEFAULT_REMOTE_IDLE_TIMEOUT_SECS: u64 = 300;
 #[serde(default, deny_unknown_fields)]
 pub struct ImproveConfig {
     pub enabled: bool,
+    /// "Teach this model": coding sessions with a local model record verified turns as training
+    /// examples and run on the latest admitted version (harness and LoRA adapter). Off by default.
+    pub teach: bool,
     /// Minimum seconds between background cycles.
     pub interval_secs: u64,
     /// A cycle needs at least this many new recorded turns (or tool-call repairs) since the last one.
@@ -1285,6 +1288,7 @@ impl Default for ImproveConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            teach: false,
             interval_secs: 6 * 3600,
             min_new_turns: 5,
             selfplay_tasks: 24,

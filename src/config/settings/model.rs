@@ -370,4 +370,13 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         },
         true
     ),
+    field!(
+        "improve.teach",
+        improve.teach,
+        MO,
+        "Learning",
+        "Teach this model",
+        "Local models only (MLX, Ollama, LM Studio). Turns that prove good become training examples: passing behavioral checks, committing the changes, or Alt+Up. /undo and Alt+Down mark a bad turn. The latest version admitted by /improve train serves your sessions. Hosted models are never recorded.",
+        Kind::Bool,
+    ),
 ];

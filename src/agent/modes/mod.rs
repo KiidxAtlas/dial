@@ -92,9 +92,13 @@ impl Agent<'_> {
         Ok(())
     }
 
-    /// Writes the attached roots into the session header so a resumed session restores them.
+    /// Writes the attached roots into the session header so a resumed session restores them, and
+    /// lets checkpoints record and restore files under them. Every root change ends here.
     pub(crate) fn persist_workspace_roots(&mut self) -> Result<()> {
         let dirs = self.workspace.additional_roots().to_vec();
+        if let Some(checkpoints) = &self.checkpoints {
+            checkpoints.set_added_roots(&dirs);
+        }
         self.session.set_additional_dirs(&dirs)
     }
 

@@ -4,7 +4,8 @@
 //! file's original bytes (or the fact that it did not exist) under
 //! `<dir>/<turn>/{manifest.json,files/<n>}`. `rollback(n)` puts the files of the most recent `n`
 //! turns back, newest first, so the oldest recorded state wins. Everything is on disk, so a rollback
-//! works after dial restarts. Nothing outside the project root is ever read or written.
+//! works after dial restarts. Nothing outside the project root and the directories attached to the
+//! workspace (`/add-dir`) is ever read or written.
 //!
 //! Only turns that touched files are materialised: a read-only turn leaves no trace and does not
 //! count toward `rollback(n)`.
@@ -42,11 +43,25 @@ pub struct RollbackReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Entry {
-    /// Path relative to the project root, `/`-separated.
+    /// Path relative to its workspace root, `/`-separated.
     rel: String,
+    /// The added workspace directory holding the file; `None` is the project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<PathBuf>,
     existed: bool,
     /// Unix permission bits of the original file.
     mode: u32,
+}
+
+impl Entry {
+    /// The path shown to users and used to select the entry: project-relative for the project
+    /// root, absolute for an added directory.
+    fn display(&self) -> String {
+        match &self.root {
+            None => self.rel.clone(),
+            Some(root) => root.join(&self.rel).to_string_lossy().into_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -67,6 +82,8 @@ struct Inner {
 pub struct Checkpoints {
     dir: PathBuf,
     root: PathBuf,
+    /// Directories attached to the workspace; files under them are recorded and restored too.
+    added: Mutex<Vec<PathBuf>>,
     inner: Mutex<Inner>,
 }
 
@@ -129,11 +146,22 @@ impl Checkpoints {
         Ok(Self {
             dir,
             root,
+            added: Mutex::new(Vec::new()),
             inner: Mutex::new(Inner {
                 next_turn,
                 current: None,
             }),
         })
+    }
+
+    /// Replace the directories attached to the workspace (canonical paths, as the workspace keeps
+    /// them). Entries recorded under a directory that is later detached are not restored.
+    pub fn set_added_roots(&self, roots: &[PathBuf]) {
+        *self.added.lock().unwrap_or_else(|p| p.into_inner()) = roots.to_vec();
+    }
+
+    fn added_roots(&self) -> Vec<PathBuf> {
+        self.added.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -158,11 +186,7 @@ impl Checkpoints {
         let Ok(manifest) = self.manifest(turn) else {
             return Vec::new();
         };
-        let mut paths: Vec<_> = manifest
-            .entries
-            .iter()
-            .map(|entry| entry.rel.clone())
-            .collect();
+        let mut paths: Vec<_> = manifest.entries.iter().map(Entry::display).collect();
         paths.extend(manifest.skipped.iter().cloned());
         paths.sort();
         paths.dedup();
@@ -190,7 +214,7 @@ impl Checkpoints {
             .entries
             .iter()
             .enumerate()
-            .find(|(_, entry)| entry.rel == path)
+            .find(|(_, entry)| entry.display() == path)
             .context("file is not in this checkpoint")?;
         let before = if entry.existed {
             fs::read(
@@ -201,7 +225,7 @@ impl Checkpoints {
         } else {
             Vec::new()
         };
-        let (target, _) = self.resolve(&self.root.join(path))?;
+        let (target, _) = self.target_of(entry)?;
         let (after, mode, exists) = match fs::symlink_metadata(&target) {
             Ok(metadata) => {
                 ensure!(
@@ -253,13 +277,13 @@ impl Checkpoints {
             .entries
             .iter()
             .enumerate()
-            .find(|(_, entry)| entry.rel == path)
+            .find(|(_, entry)| entry.display() == path)
             .context("file is not in this checkpoint")?;
         ensure!(
             self.review_file(turn, path)?.1 == expected,
             "file or saved checkpoint changed after review; nothing restored"
         );
-        let (target, _) = self.resolve(&self.root.join(path))?;
+        let (target, _) = self.target_of(entry)?;
         self.begin_turn(&format!("Selective revert: {path}"))?;
         self.before_write(&target)?;
         ensure!(
@@ -309,13 +333,13 @@ impl Checkpoints {
             } else {
                 (None, None)
             };
-            let (target, _) = self.resolve(&self.root.join(&entry.rel))?;
+            let (target, _) = self.target_of(entry)?;
             let (after_sha256, after_ref) = match fs::metadata(&target) {
                 Ok(metadata) => {
                     ensure!(
                         metadata.is_file() && metadata.len() <= MAX_FILE_BYTES,
                         "repair evidence cannot snapshot {}",
-                        entry.rel
+                        entry.display()
                     );
                     let bytes = fs::read(&target)?;
                     ensure!(
@@ -333,7 +357,7 @@ impl Checkpoints {
                 Err(error) => return Err(error.into()),
             };
             changes.push(FileChange {
-                path: entry.rel.clone(),
+                path: entry.display(),
                 before_sha256,
                 after_sha256,
                 before_ref,
@@ -344,10 +368,18 @@ impl Checkpoints {
     }
 
     /// Record `abs` as it is now, unless this turn already did. Must be called BEFORE the file is
-    /// changed or deleted. A path outside the project root is an error (the write must not
-    /// proceed); a file over `MAX_FILE_BYTES` is not recorded and is listed as skipped.
+    /// changed or deleted. A path outside the project root and the added directories is an error
+    /// (the write must not proceed); a file over `MAX_FILE_BYTES` is not recorded and is listed as
+    /// skipped.
     pub fn before_write(&self, abs: &Path) -> Result<()> {
-        let (resolved, rel) = self.resolve(abs)?;
+        let (resolved, root, rel) = self.resolve(abs)?;
+        let shown = Entry {
+            rel: rel.clone(),
+            root: root.clone(),
+            existed: false,
+            mode: 0,
+        }
+        .display();
         let mut inner = self.lock();
         if inner.current.is_none() {
             let turn = inner.next_turn;
@@ -361,7 +393,12 @@ impl Checkpoints {
         let Some(manifest) = inner.current.as_ref() else {
             bail!("no active checkpoint turn")
         };
-        if manifest.entries.iter().any(|e| e.rel == rel) || manifest.skipped.contains(&rel) {
+        if manifest
+            .entries
+            .iter()
+            .any(|e| e.rel == rel && e.root == root)
+            || manifest.skipped.contains(&shown)
+        {
             return Ok(());
         }
         let mut manifest = manifest.clone();
@@ -369,32 +406,34 @@ impl Checkpoints {
         match fs::symlink_metadata(&resolved) {
             Ok(meta) if meta.is_file() => {
                 if meta.len() > MAX_FILE_BYTES {
-                    manifest.skipped.push(rel);
+                    manifest.skipped.push(shown);
                     write_manifest(&self.dir, &manifest)?;
                     inner.current = Some(manifest);
                     return Ok(());
                 }
-                let bytes =
-                    fs::read(&resolved).with_context(|| format!("reading {rel} for checkpoint"))?;
+                let bytes = fs::read(&resolved)
+                    .with_context(|| format!("reading {shown} for checkpoint"))?;
                 let blob = turn_dir(&self.dir, manifest.turn)
                     .join("files")
                     .join(manifest.entries.len().to_string());
                 atomic_write(&blob, &bytes, 0o600)?;
                 manifest.entries.push(Entry {
                     rel,
+                    root,
                     existed: true,
                     mode: platform_fs::mode(&meta) & 0o7777,
                 });
             }
-            Ok(_) => bail!("{rel} is not a regular file; refusing to checkpoint it"),
+            Ok(_) => bail!("{shown} is not a regular file; refusing to checkpoint it"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 manifest.entries.push(Entry {
                     rel,
+                    root,
                     existed: false,
                     mode: 0,
                 });
             }
-            Err(e) => return Err(e).with_context(|| format!("inspecting {rel}")),
+            Err(e) => return Err(e).with_context(|| format!("inspecting {shown}")),
         }
         write_manifest(&self.dir, &manifest)?;
         inner.current = Some(manifest);
@@ -452,13 +491,15 @@ impl Checkpoints {
             }
             for (index, entry) in manifest.entries.iter().enumerate().rev() {
                 match self.restore_entry(manifest.turn, index, entry) {
-                    Ok(true) => report.restored.push(entry.rel.clone()),
-                    Ok(false) => report.removed.push(entry.rel.clone()),
+                    Ok(true) => report.restored.push(entry.display()),
+                    Ok(false) => report.removed.push(entry.display()),
                     Err(e) => {
                         failed = true;
-                        report
-                            .warnings
-                            .push(format!("turn {}: {}: {e:#}", manifest.turn, entry.rel));
+                        report.warnings.push(format!(
+                            "turn {}: {}: {e:#}",
+                            manifest.turn,
+                            entry.display()
+                        ));
                     }
                 }
             }
@@ -471,9 +512,10 @@ impl Checkpoints {
         Ok(report)
     }
 
-    /// Map a path the tools hand us to (resolved absolute path, project-relative `/` path),
-    /// rejecting anything that resolves outside the root. Symlinks are resolved before checking.
-    fn resolve(&self, abs: &Path) -> Result<(PathBuf, String)> {
+    /// Map a path the tools hand us to (resolved absolute path, added root holding it or `None`
+    /// for the project root, root-relative `/` path), rejecting anything that resolves outside
+    /// every root. Symlinks are resolved before checking; the deepest containing root wins.
+    fn resolve(&self, abs: &Path) -> Result<(PathBuf, Option<PathBuf>, String)> {
         ensure!(
             abs.is_absolute(),
             "checkpoint path must be absolute: {}",
@@ -504,22 +546,54 @@ impl Checkpoints {
         for name in tail.iter().rev() {
             resolved.push(name);
         }
-        let rel = resolved
-            .strip_prefix(&self.root)
-            .map_err(|_| anyhow::anyhow!("{} is outside the project root", abs.display()))?;
+        let added = self.added_roots();
+        let root = std::iter::once((None, self.root.as_path()))
+            .chain(added.iter().map(|root| (Some(root), root.as_path())))
+            .filter(|(_, root)| resolved.starts_with(root))
+            .max_by_key(|(_, root)| root.components().count())
+            .map(|(added, root)| (added.cloned(), root))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is outside the project root and the added workspace directories",
+                    abs.display()
+                )
+            })?;
+        let rel = resolved.strip_prefix(root.1)?;
         let rel = rel.to_str().context("path is not valid UTF-8")?.to_string();
-        ensure!(!rel.is_empty(), "cannot checkpoint the project root itself");
-        Ok((resolved, rel))
+        ensure!(!rel.is_empty(), "cannot checkpoint a workspace root itself");
+        Ok((resolved, root.0, rel))
     }
 
-    /// Restore one entry. `Ok(true)` = content written back, `Ok(false)` = created file removed.
-    fn restore_entry(&self, turn: u64, index: usize, entry: &Entry) -> Result<bool> {
+    /// Where `entry` lives now: (target path, the root it belongs to). Refuses unsafe relative
+    /// paths, directories no longer attached, and paths that now resolve into another root.
+    fn target_of(&self, entry: &Entry) -> Result<(PathBuf, PathBuf)> {
         let rel = Path::new(&entry.rel);
         ensure!(
             rel.components().all(|c| matches!(c, Component::Normal(_))),
             "unsafe path in checkpoint"
         );
-        let (target, _) = self.resolve(&self.root.join(rel))?;
+        let base = match &entry.root {
+            None => self.root.clone(),
+            Some(root) => {
+                ensure!(
+                    self.added_roots().contains(root),
+                    "{} is no longer attached to the workspace; not touching it",
+                    root.display()
+                );
+                root.clone()
+            }
+        };
+        let (target, root, _) = self.resolve(&base.join(rel))?;
+        ensure!(
+            root == entry.root,
+            "checkpoint path now resolves into another workspace directory"
+        );
+        Ok((target, base))
+    }
+
+    /// Restore one entry. `Ok(true)` = content written back, `Ok(false)` = created file removed.
+    fn restore_entry(&self, turn: u64, index: usize, entry: &Entry) -> Result<bool> {
+        let (target, base) = self.target_of(entry)?;
         if entry.existed {
             let blob = turn_dir(&self.dir, turn)
                 .join("files")
@@ -541,9 +615,9 @@ impl Checkpoints {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
-            // Drop directories the turn created and left empty.
+            // Drop directories the turn created and left empty, never the root itself.
             let mut parent = target.parent();
-            while let Some(dir) = parent.filter(|d| *d != self.root && d.starts_with(&self.root)) {
+            while let Some(dir) = parent.filter(|d| *d != base && d.starts_with(&base)) {
                 if fs::remove_dir(dir).is_err() {
                     break;
                 }
@@ -884,5 +958,85 @@ mod tests {
         assert_eq!(cp.list().len(), 1);
         assert!(Checkpoints::new(fx.root().join(".cp"), fx.root()).is_err());
         assert!(cp.rollback(0).is_err());
+    }
+
+    /// Files under a directory attached with `/add-dir` are recorded and rolled back like project
+    /// files; created files are removed together with the directories the turn made.
+    #[test]
+    fn added_directories_are_recorded_and_rolled_back() {
+        let fx = Fixture::new();
+        let extra = tempfile::tempdir().unwrap();
+        let extra_root = fs::canonicalize(extra.path()).unwrap();
+        fs::write(extra_root.join("page.vue"), "old").unwrap();
+        let cp = fx.open();
+        assert!(
+            cp.before_write(&extra_root.join("page.vue")).is_err(),
+            "not attached yet"
+        );
+        cp.set_added_roots(std::slice::from_ref(&extra_root));
+        cp.begin_turn("t").unwrap();
+        cp.before_write(&extra_root.join("page.vue")).unwrap();
+        fs::write(extra_root.join("page.vue"), "new").unwrap();
+        let created = extra_root.join("public/install.sh");
+        cp.before_write(&created).unwrap();
+        fs::create_dir_all(created.parent().unwrap()).unwrap();
+        fs::write(&created, "#!/bin/sh").unwrap();
+
+        let shown = extra_root.join("page.vue").to_string_lossy().into_owned();
+        assert!(
+            cp.changed_files(1).contains(&shown),
+            "{:?}",
+            cp.changed_files(1)
+        );
+        let report = cp.rollback(1).unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.restored, [shown]);
+        assert_eq!(
+            fs::read_to_string(extra_root.join("page.vue")).unwrap(),
+            "old"
+        );
+        assert!(!created.exists() && !extra_root.join("public").exists());
+        assert!(
+            extra_root.exists(),
+            "the added root itself is never removed"
+        );
+    }
+
+    /// Detaching a directory stops restores into it; a manifest naming a root that is not
+    /// attached cannot write there.
+    #[test]
+    fn detached_or_forged_added_roots_are_not_restored_into() {
+        let fx = Fixture::new();
+        let extra = tempfile::tempdir().unwrap();
+        let extra_root = fs::canonicalize(extra.path()).unwrap();
+        fs::write(extra_root.join("f.txt"), "old").unwrap();
+        let cp = fx.open();
+        cp.set_added_roots(std::slice::from_ref(&extra_root));
+        cp.begin_turn("t").unwrap();
+        cp.before_write(&extra_root.join("f.txt")).unwrap();
+        fs::write(extra_root.join("f.txt"), "new").unwrap();
+        cp.set_added_roots(&[]);
+        let report = cp.rollback(1).unwrap();
+        assert!(report.restored.is_empty());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("no longer attached"))
+        );
+        assert_eq!(fs::read_to_string(extra_root.join("f.txt")).unwrap(), "new");
+
+        let evil = tempfile::tempdir().unwrap();
+        let evil_root = fs::canonicalize(evil.path()).unwrap();
+        let manifest_path = turn_dir(&cp.dir, 1).join("manifest.json");
+        let text = fs::read_to_string(&manifest_path).unwrap().replace(
+            &serde_json::to_string(&extra_root).unwrap(),
+            &serde_json::to_string(&evil_root).unwrap(),
+        );
+        fs::write(&manifest_path, text).unwrap();
+        cp.set_added_roots(std::slice::from_ref(&extra_root));
+        let report = cp.rollback(1).unwrap();
+        assert!(report.restored.is_empty() && !report.warnings.is_empty());
+        assert!(!evil_root.join("f.txt").exists());
     }
 }
