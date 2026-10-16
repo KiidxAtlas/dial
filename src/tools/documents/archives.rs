@@ -86,8 +86,10 @@ fn validate_zip(archive: &mut zip::ZipArchive<File>) -> Result<(), String> {
         let entry = archive
             .by_index(i)
             .map_err(|e| format!("reading ZIP member: {e}"))?;
-        let name = entry.name();
-        if !safe(name) || !names.insert(name.to_owned()) {
+        let name = entry
+            .name()
+            .map_err(|e| format!("unreadable ZIP member name: {e}"))?;
+        if !safe(&name) || !names.insert(name.to_string()) {
             return Err(format!(
                 "unsafe or duplicate archive member {name:?}; archive rejected"
             ));
@@ -165,7 +167,10 @@ fn zip_text(archive: &mut zip::ZipArchive<File>, member: Option<&str>) -> Result
         let entry = archive
             .by_index(i)
             .map_err(|e| format!("reading ZIP member: {e}"))?;
-        let row = format!("{}\t{} bytes\n", entry.name(), entry.size());
+        let name = entry
+            .name()
+            .map_err(|e| format!("unreadable ZIP member name: {e}"))?;
+        let row = format!("{}\t{} bytes\n", name, entry.size());
         if out.len() + row.len() > 1024 * 1024 {
             return Err("archive listing exceeds 1 MiB; select a member".into());
         }

@@ -1,6 +1,6 @@
 [package]
 name = "dial"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "Local, gated model and harness improvement on Apple Silicon"
 license = "MIT"
@@ -67,7 +67,7 @@ ast-grep-language = "0.45.3"
 ignore = "0.4.33"
 globset = "0.4"
 httpdate = "1"
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
 parking_lot = "0.12"

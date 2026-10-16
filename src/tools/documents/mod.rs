@@ -397,7 +397,7 @@ fn convert_stream(file: fs::File, format: &str) -> Result<String, String> {
                 zip::ZipArchive::new(file).map_err(|e| format!("invalid ZIP: {e}"))?;
             for i in 0..archive.len() {
                 let entry = archive.by_index(i).map_err(|e| e.to_string())?;
-                if !archives::safe(entry.name()) {
+                if !entry.name().is_ok_and(|name| archives::safe(&name)) {
                     continue;
                 }
                 if entry.is_file() && entry.size() <= MAX_CONTENT {

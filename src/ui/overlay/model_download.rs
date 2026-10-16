@@ -944,9 +944,8 @@ impl ModelDownloads {
         self.metadata_attempted.clear();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(
-                download::search_embedding(&query).map_err(|error| format!("{error:#}")),
-            );
+            let _ =
+                tx.send(download::search_embedding(&query).map_err(|error| format!("{error:#}")));
         });
         self.search = Some(rx);
         self.status = "loading embedding models from Hugging Face…".into();
@@ -2189,12 +2188,14 @@ mod tests {
     }
 
     #[test]
-    fn shelves_cycle_through_mlx_gguf_and_embedding_both_ways() {
+    fn shelves_cycle_through_mlx_gguf_embeddings_and_curated_both_ways() {
         assert_eq!(Shelf::Hub(Family::Mlx).next(), Shelf::Hub(Family::Gguf));
-        assert_eq!(Shelf::Hub(Family::Gguf).next(), Shelf::Embedding);
+        assert_eq!(Shelf::Hub(Family::Gguf).next(), Shelf::EmbeddingHub);
+        assert_eq!(Shelf::EmbeddingHub.next(), Shelf::Embedding);
         assert_eq!(Shelf::Embedding.next(), Shelf::Hub(Family::Mlx));
         assert_eq!(Shelf::Hub(Family::Mlx).prev(), Shelf::Embedding);
-        assert_eq!(Shelf::Embedding.prev(), Shelf::Hub(Family::Gguf));
+        assert_eq!(Shelf::Embedding.prev(), Shelf::EmbeddingHub);
+        assert_eq!(Shelf::EmbeddingHub.prev(), Shelf::Hub(Family::Gguf));
     }
 
     #[test]
@@ -2203,6 +2204,7 @@ mod tests {
         let keys = Keymap::defaults();
         for shelf in [
             Shelf::Hub(Family::Gguf),
+            Shelf::EmbeddingHub,
             Shelf::Embedding,
             Shelf::Hub(Family::Mlx),
         ] {
@@ -2213,7 +2215,7 @@ mod tests {
         group.key(&key(KeyCode::Left), &keys);
         assert_eq!(group.shelf, Shelf::Embedding);
         group.key(&key(KeyCode::BackTab), &keys);
-        assert_eq!(group.shelf, Shelf::Hub(Family::Gguf));
+        assert_eq!(group.shelf, Shelf::EmbeddingHub);
     }
 
     #[test]
@@ -2320,4 +2322,4 @@ mod tests {
         assert!(shown.contains("repo unknown"));
         assert!(shown.contains("published unknown"));
     }
-}   
+}

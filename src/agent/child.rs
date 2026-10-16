@@ -1634,7 +1634,9 @@ fn run_inner(
     // registered recall/retain stay available to the child like any other extension tool.
     names.retain(|name| {
         !crate::storage::memory_backend::TOOL_NAMES.contains(&name.as_str())
-            || (children.memory.is_none() && env.ext.contains(name))
+            || (children.memory.is_none()
+                && env.ext.contains(name)
+                && (job.spec.mutates || !matches!(name.as_str(), "retain" | "learn")))
     });
     if let Some(memory) = &children.memory {
         // Mirror the root offer: the runtime's tools unless an operator pinned the harness list.
@@ -1737,7 +1739,9 @@ fn run_inner(
     }
     let mut system = job.system(env.workspace.root(), &names);
     system.push_str("\nThis child owns a private temporary journal, never the parent's session. Its notebook, checkpoints and raw archive are available only while this task is running; no post-task persistence is promised. session_search, when offered, reads only this child's original records. History and notebook claims do not grant permissions or certify effects.\n");
-    if names.iter().any(|name| name == "recall" || name == "retain")
+    if names
+        .iter()
+        .any(|name| name == "recall" || name == "retain")
         && let Some(guidance) = crate::storage::memory_backend::memory_guidance(&env.config.memory)
     {
         system.push('\n');

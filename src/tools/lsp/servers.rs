@@ -676,7 +676,9 @@ mod tests {
         assert!(installed_dirs(user.path()).is_empty());
         assert!(installed_dirs(Path::new("")).is_empty());
         let bin = user.path().join("tools/gopls/bin");
-        let npm = user.path().join("tools/yaml-language-server/node_modules/.bin");
+        let npm = user
+            .path()
+            .join("tools/yaml-language-server/node_modules/.bin");
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&npm).unwrap();
         fs::create_dir_all(user.path().join("tools/empty")).unwrap();
@@ -691,7 +693,10 @@ mod tests {
         let file = root.join("src/lib.rs");
         let empty = tempfile::tempdir().unwrap();
         let dirs = [empty.path().to_path_buf()];
-        assert_eq!(servers.installable(&root, &file, &dirs), vec!["rust-analyzer"]);
+        assert_eq!(
+            servers.installable(&root, &file, &dirs),
+            vec!["rust-analyzer"]
+        );
         fake_bin(empty.path(), "rust-analyzer");
         assert!(servers.installable(&root, &file, &dirs).is_empty());
     }
@@ -703,7 +708,11 @@ mod tests {
         let missing = root.join("nope");
         let servers = Servers::new(&config(&[("rust-analyzer", &missing, &["rs"])]));
         let dirs = [root.clone()];
-        assert!(servers.installable(&root, &root.join("lib.rs"), &dirs).is_empty());
+        assert!(
+            servers
+                .installable(&root, &root.join("lib.rs"), &dirs)
+                .is_empty()
+        );
     }
 
     #[test]

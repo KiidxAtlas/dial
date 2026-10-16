@@ -2187,7 +2187,10 @@ mod tests {
     #[test]
     fn extraction_accepts_one_markdown_fence_around_strict_json() {
         let fenced = "```json\n{\"facts\":[{\"content\":\"Use pnpm\"}]}\n```";
-        assert_eq!(parse_extracted(fenced), vec![("Use pnpm".to_owned(), false)]);
+        assert_eq!(
+            parse_extracted(fenced),
+            vec![("Use pnpm".to_owned(), false)]
+        );
         let bare = "```\n{\"facts\":[{\"content\":\"Use pnpm\"}]}\n```";
         assert_eq!(parse_extracted(bare).len(), 1);
         assert!(parse_extracted("```json\nnot json\n```").is_empty());

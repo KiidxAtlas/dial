@@ -676,7 +676,12 @@ pub(in crate::platform) fn is_owner_only(file: &File) -> io::Result<bool> {
     let (_sd, owner, acl) = security(file)?;
     let token = current_user()?;
     let sid = user_sid(&token);
-    if owner.is_null() || unsafe { EqualSid(owner, sid) } == 0 || acl.is_null() {
+    // An elevated administrator token creates objects owned by BUILTIN\Administrators rather than by
+    // its own user SID; the DACL below still grants access to the current user alone.
+    let owned = !owner.is_null()
+        && (unsafe { EqualSid(owner, sid) } != 0
+            || unsafe { IsWellKnownSid(owner, WinBuiltinAdministratorsSid) } != 0);
+    if !owned || acl.is_null() {
         return Ok(false);
     }
     for index in 0..unsafe { (*acl).AceCount } as u32 {
@@ -888,7 +893,10 @@ mod transaction_tests {
         assert!(create_new_beneath(&root, Path::new("one"), false).is_err());
         assert!(create_new_beneath(&root, Path::new("name:stream"), false).is_err());
         assert!(link_beneath(&root, Path::new("one"), Path::new("two")).is_ok());
-        assert!(rename_beneath(&root, Path::new("one"), Path::new("two")).is_err());
+        // Same-file hard links are a no-op rename on newer Windows; collide with a distinct file instead.
+        create_new_beneath(&root, Path::new("other"), false).unwrap();
+        assert!(rename_beneath(&root, Path::new("one"), Path::new("other")).is_err());
+        assert!(remove_beneath(&root, Path::new("other")).is_ok());
         assert!(rename_beneath(&root, Path::new("one"), Path::new("three")).is_ok());
         assert!(remove_beneath(&root, Path::new("three")).is_ok());
         assert!(remove_beneath(&root, Path::new("two")).is_ok());
