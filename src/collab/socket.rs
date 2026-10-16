@@ -5,8 +5,11 @@
 //! the relay's host-drop room teardown (4001) while the host recreates the room; a host whose
 //! connection dropped keeps retrying the relay's duplicate-host refusal (4009) inside a reclaim
 //! window, because the relay may still hold the dead socket. Other fatal close codes and guest
-//! decryption failures never reconnect. Hosts discard undecryptable guest frames.
-use super::crypto::RoomKey;
+//! decryption failures never reconnect. Hosts discard undecryptable guest frames. Every frame is
+//! stamped with its sender role, epoch and sequence number; frames that are not from the peer role
+//! or that repeat a sequence number inside the replay window are dropped before they reach the
+//! host or guest.
+use super::crypto::{RoomKey, SenderWindows, generate_epoch};
 use super::protocol::{Control, MAX_FRAME_BYTES, pack_envelope, unpack_envelope};
 use serde_json::Value;
 use std::{
@@ -97,6 +100,17 @@ pub fn close_reason(code: u16) -> Option<&'static str> {
     }
 }
 
+/// Identity and serialized size of the shared log version a snapshot stream reads from. Queued
+/// streams that read the same version are charged its bytes once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotCharge {
+    pub id: usize,
+    pub bytes: usize,
+}
+
+/// Most snapshot bytes queued streams may reference at once. Each distinct log version counts once.
+pub const MAX_RETAINED_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
 enum Pending {
     One {
         target: u32,
@@ -105,6 +119,7 @@ enum Pending {
     },
     Batch {
         target: u32,
+        charge: SnapshotCharge,
         frames: Box<dyn Iterator<Item = String> + Send>,
     },
 }
@@ -115,6 +130,7 @@ impl Pending {
             Pending::One { target, .. } | Pending::Batch { target, .. } => *target,
         }
     }
+    /// Bytes charged against the frame queue budget. Snapshot streams are charged via `SnapshotCharge`.
     fn bytes(&self) -> usize {
         match self {
             Pending::One { bytes, .. } => *bytes,
@@ -163,6 +179,46 @@ impl Queue {
         self.retired_set.clear();
         self.discard_where(|p| p.target() != 0);
     }
+    /// Snapshot bytes referenced by queued streams, counting each shared log version once.
+    fn snapshot_bytes(&self) -> usize {
+        let mut seen = HashSet::new();
+        self.items
+            .iter()
+            .filter_map(|p| match p {
+                Pending::Batch { charge, .. } if seen.insert(charge.id) => Some(charge.bytes),
+                _ => None,
+            })
+            .sum()
+    }
+    /// Admit one queued item or refuse it. Refused snapshots are not overload: only the frame count
+    /// and frame byte budgets mark the queue overloaded.
+    fn push(&mut self, pending: Pending) -> bool {
+        let target = pending.target();
+        if target != 0 && self.retired_set.contains(&target) {
+            return false;
+        }
+        if let Pending::Batch { charge, .. } = &pending {
+            // A peer that asks again supersedes its unfinished snapshot; its new welcome restarts it.
+            self.discard_where(|p| matches!(p, Pending::Batch { target: t, .. } if *t == target));
+            let shares_version = self
+                .items
+                .iter()
+                .any(|p| matches!(p, Pending::Batch { charge: c, .. } if c.id == charge.id));
+            if !shares_version && self.snapshot_bytes() + charge.bytes > MAX_RETAINED_SNAPSHOT_BYTES
+            {
+                return false;
+            }
+        }
+        if self.items.len() >= MAX_PENDING_SENDS
+            || self.bytes + pending.bytes() > MAX_PENDING_SEND_BYTES
+        {
+            self.overloaded = true;
+            return false;
+        }
+        self.bytes += pending.bytes();
+        self.items.push_back(pending);
+        true
+    }
 }
 
 struct Shared {
@@ -189,10 +245,11 @@ impl Socket {
             open: AtomicBool::new(false),
         });
         let (tx, events) = sync_channel(EVENT_CAPACITY);
+        let epoch = generate_epoch().map_err(|e| std::io::Error::other(e.to_string()))?;
         let worker = shared.clone();
         thread::Builder::new()
             .name(format!("dial-collab-{}", opts.role.as_str()))
-            .spawn(move || Worker::new(worker, opts, tx).run())?;
+            .spawn(move || Worker::new(worker, opts, epoch, tx).run())?;
         Ok(Self { shared, events })
     }
 
@@ -220,10 +277,12 @@ impl Socket {
     }
 
     /// Keeps a snapshot contiguous with its welcome and ahead of later live traffic. Frames are
-    /// pulled lazily as the transport drains, so a large transcript never sits in the queue.
+    /// pulled lazily as the transport drains. The stream reads shared log storage identified by
+    /// `charge`, so queued snapshots do not each hold a copy of the history.
     pub fn send_batch(
         &self,
         frames: impl Iterator<Item = String> + Send + 'static,
+        charge: SnapshotCharge,
         target: u32,
     ) -> bool {
         if self.shared.stop.load(Ordering::SeqCst) {
@@ -231,25 +290,13 @@ impl Socket {
         }
         self.enqueue(Pending::Batch {
             target,
+            charge,
             frames: Box::new(frames),
         })
     }
 
     fn enqueue(&self, pending: Pending) -> bool {
-        let mut queue = lock(&self.shared);
-        let target = pending.target();
-        if target != 0 && queue.retired_set.contains(&target) {
-            return false;
-        }
-        if queue.items.len() >= MAX_PENDING_SENDS
-            || queue.bytes + pending.bytes() > MAX_PENDING_SEND_BYTES
-        {
-            queue.overloaded = true;
-            return false;
-        }
-        queue.bytes += pending.bytes();
-        queue.items.push_back(pending);
-        true
+        lock(&self.shared).push(pending)
     }
 
     /// Discard everything still queued for a peer that left.
@@ -283,6 +330,12 @@ struct Worker {
     shared: Arc<Shared>,
     opts: SocketOptions,
     tx: SyncSender<SocketEvent>,
+    /// Random per-socket epoch stamped on every sealed frame. Kept across reconnects.
+    epoch: String,
+    /// Sequence number of the last sealed frame. Monotonic across reconnects.
+    send_seq: u64,
+    /// Replay windows for frames received from the peer role.
+    windows: SenderWindows,
     attempt: u32,
     rejoining: bool,
     retry_missing_room: bool,
@@ -293,11 +346,19 @@ struct Worker {
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
 impl Worker {
-    fn new(shared: Arc<Shared>, opts: SocketOptions, tx: SyncSender<SocketEvent>) -> Self {
+    fn new(
+        shared: Arc<Shared>,
+        opts: SocketOptions,
+        epoch: String,
+        tx: SyncSender<SocketEvent>,
+    ) -> Self {
         Self {
             shared,
             opts,
             tx,
+            epoch,
+            send_seq: 0,
+            windows: SenderWindows::default(),
             attempt: 0,
             rejoining: false,
             retry_missing_room: false,
@@ -665,6 +726,9 @@ impl Worker {
                 Role::Guest => Some(Ended::Fatal("bad key or corrupted frame".into())),
             };
         };
+        if !accept_sequenced(&mut self.windows, self.opts.role, &frame) {
+            return None;
+        }
         self.retry_missing_room = false;
         self.attempt = 0;
         if !self.emit(SocketEvent::Frame { peer, frame }) {
@@ -705,7 +769,7 @@ impl Worker {
                         queue.bytes -= bytes;
                         (target, text)
                     }
-                    Pending::Batch { target, frames } => {
+                    Pending::Batch { target, frames, .. } => {
                         let target = *target;
                         match frames.next() {
                             Some(text) => (target, text),
@@ -718,7 +782,12 @@ impl Worker {
                 }
             };
             let (target, text) = next;
-            let sealed = match self.opts.key.seal(text.as_bytes()) {
+            self.send_seq += 1;
+            let Some(stamped) = stamp_frame(self.opts.role, &self.epoch, self.send_seq, &text)
+            else {
+                return Err(Ended::Fatal("could not stamp collab frame".into()));
+            };
+            let sealed = match self.opts.key.seal(stamped.as_bytes()) {
                 Ok(sealed) => sealed,
                 Err(error) => {
                     return Err(Ended::Fatal(format!(
@@ -743,6 +812,33 @@ impl Worker {
 enum Connect {
     Fatal(String),
     Transient(String),
+}
+
+/// Stamp a frame object with its sender role, socket epoch and sequence number before sealing.
+/// Frames are JSON objects built by this crate, so the stamp is spliced after the opening brace.
+fn stamp_frame(role: Role, epoch: &str, seq: u64, text: &str) -> Option<String> {
+    let rest = text.strip_prefix('{')?;
+    let separator = if rest.trim_start() == "}" { "" } else { "," };
+    Some(format!(
+        "{{\"role\":\"{}\",\"epoch\":\"{epoch}\",\"seq\":{seq}{separator}{rest}",
+        role.as_str()
+    ))
+}
+
+/// Authenticate a decrypted frame's sender. Only the peer role is accepted, and each
+/// `(epoch, seq)` pair at most once inside the replay window. Callers must have opened the frame.
+fn accept_sequenced(windows: &mut SenderWindows, local: Role, frame: &Value) -> bool {
+    let sender = match local {
+        Role::Host => Role::Guest,
+        Role::Guest => Role::Host,
+    };
+    if frame["role"].as_str() != Some(sender.as_str()) {
+        return false;
+    }
+    match (frame["epoch"].as_str(), frame["seq"].as_u64()) {
+        (Some(epoch), Some(seq)) => windows.accept(epoch, seq),
+        _ => false,
+    }
 }
 
 fn closed_reason(code: Option<u16>, text: &str) -> String {
@@ -796,6 +892,7 @@ mod tests {
         });
         queue.items.push_back(Pending::Batch {
             target: 2,
+            charge: SnapshotCharge { id: 1, bytes: 0 },
             frames: Box::new(std::iter::empty()),
         });
         queue.bytes = 2;
@@ -820,6 +917,69 @@ mod tests {
             1,
             "broadcast work survives a room recreation"
         );
+    }
+
+    #[test]
+    fn snapshot_streams_coalesce_per_peer_and_share_versions() {
+        let stream = |id: usize, bytes: usize| Pending::Batch {
+            target: 4,
+            charge: SnapshotCharge { id, bytes },
+            frames: Box::new(std::iter::empty()),
+        };
+        let mut queue = Queue::default();
+        assert!(queue.push(stream(1, 100)));
+        // The same peer asking again supersedes its unfinished snapshot instead of stacking one.
+        assert!(queue.push(stream(1, 100)));
+        assert_eq!(queue.items.len(), 1);
+        // A second stream over the same log version is charged its bytes once.
+        let other_peer = Pending::Batch {
+            target: 5,
+            charge: SnapshotCharge { id: 1, bytes: 100 },
+            frames: Box::new(std::iter::empty()),
+        };
+        assert!(queue.push(other_peer));
+        assert_eq!(queue.snapshot_bytes(), 100);
+        assert_eq!(
+            queue.bytes, 0,
+            "snapshot streams are not frame-budget bytes"
+        );
+        // Distinct versions accumulate and are refused once the retained budget is exhausted.
+        assert!(!queue.push(Pending::Batch {
+            target: 6,
+            charge: SnapshotCharge {
+                id: 2,
+                bytes: MAX_RETAINED_SNAPSHOT_BYTES,
+            },
+            frames: Box::new(std::iter::empty()),
+        }));
+        assert!(
+            !queue.overloaded,
+            "a refused snapshot is not a frame overload"
+        );
+    }
+
+    #[test]
+    fn frames_are_stamped_and_sequence_checked() {
+        let stamped =
+            stamp_frame(Role::Guest, "epoch", 7, r#"{"t":"prompt","text":"hi"}"#).unwrap();
+        let value: Value = serde_json::from_str(&stamped).unwrap();
+        assert_eq!(value["role"], "guest");
+        assert_eq!(value["epoch"], "epoch");
+        assert_eq!(value["seq"], 7);
+        assert_eq!(value["t"], "prompt");
+        let empty: Value =
+            serde_json::from_str(&stamp_frame(Role::Host, "e", 1, "{}").unwrap()).unwrap();
+        assert_eq!(empty["seq"], 1);
+        assert!(stamp_frame(Role::Host, "e", 1, "[]").is_none());
+
+        let mut windows = SenderWindows::default();
+        // A host accepts guest frames once; the identical ciphertext replayed later is rejected.
+        assert!(accept_sequenced(&mut windows, Role::Host, &value));
+        assert!(!accept_sequenced(&mut windows, Role::Host, &value));
+        // A frame reflected back from the other role is refused even when it is fresh.
+        let reflected = serde_json::json!({"role": "host", "epoch": "h", "seq": 1, "t": "prompt"});
+        assert!(!accept_sequenced(&mut windows, Role::Host, &reflected));
+        assert!(accept_sequenced(&mut windows, Role::Guest, &reflected));
     }
 
     #[test]

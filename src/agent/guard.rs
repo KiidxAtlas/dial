@@ -4,14 +4,22 @@
 
 use crate::llm::{Reply, ToolCall};
 
-/// Ignore only top-level presentation metadata, never nested tool payload fields.
-/// Bash timeouts affect waiting, not the identity of the requested command.
+/// Argument identity for one tool call. This is the only normalizer: duplicate detection, result
+/// matching and execution-side identity all read through it.
 pub(super) fn normalized_arguments(call: &ToolCall) -> serde_json::Value {
-    let mut args = call.arguments.clone();
+    normalize_arguments(&call.name, &call.arguments)
+}
+
+/// Removes only top-level harness metadata: presentation keys (`i`, `__intent`, legacy `_intent`)
+/// and, for bash, the waiting timeout. Nested fields are application payload and are never
+/// removed, so `{"filter":{"i":1}}` and `{"filter":{"i":2}}` remain distinct calls.
+fn normalize_arguments(name: &str, arguments: &serde_json::Value) -> serde_json::Value {
+    let mut args = arguments.clone();
     if let Some(object) = args.as_object_mut() {
         object.remove("i");
+        object.remove("__intent");
         object.remove("_intent");
-        if call.name == "bash" {
+        if name == "bash" {
             object.remove("timeout");
             if let Some(command) = object.get("command").and_then(|v| v.as_str())
                 // Expansions and escapes depend on quoting; keep them exact.
@@ -53,7 +61,9 @@ struct EarlierCall {
 fn call_key(calls: &[(String, String, serde_json::Value)]) -> String {
     let mut parts: Vec<String> = calls
         .iter()
-        .map(|(_, name, args)| serde_json::json!([name, canonical_arguments(args)]).to_string())
+        .map(|(_, name, args)| {
+            serde_json::json!([name, identity_arguments(name, args)]).to_string()
+        })
         .collect();
     parts.sort();
     serde_json::to_string(&parts).unwrap_or_default()
@@ -75,18 +85,21 @@ fn result_text_for(messages: &[serde_json::Value], id: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Argument identity stays stable by dropping the intent field (`i`, legacy `__intent`) at
-/// every depth and sorting keys; the result is the fingerprint of one call.
-fn canonical_arguments(value: &serde_json::Value) -> serde_json::Value {
+/// Canonical identity of a call's arguments: the top-level normalizer, then object keys sorted at
+/// every depth so key order never changes identity. Sorting never removes a field.
+fn identity_arguments(name: &str, arguments: &serde_json::Value) -> serde_json::Value {
+    sorted_keys(&normalize_arguments(name, arguments))
+}
+
+fn sorted_keys(value: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match value {
-        Value::Array(items) => Value::Array(items.iter().map(canonical_arguments).collect()),
+        Value::Array(items) => Value::Array(items.iter().map(sorted_keys).collect()),
         Value::Object(map) => {
             let sorted: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
             sorted
                 .into_iter()
-                .filter(|(key, _)| key.as_str() != "i" && key.as_str() != "__intent")
-                .map(|(key, value)| (key.clone(), canonical_arguments(value)))
+                .map(|(key, value)| (key.clone(), sorted_keys(value)))
                 .collect::<serde_json::Map<String, Value>>()
                 .into()
         }
@@ -174,15 +187,16 @@ impl RepeatedToolCall {
             .iter()
             .map(|(id, name, args)| EarlierCall {
                 name: name.clone(),
-                arguments: canonical_arguments(args),
+                arguments: identity_arguments(name, args),
                 id: id.clone(),
                 result: result_text_for(messages, id),
             })
             .collect();
+        let arguments_summary = summarize_text(&identity_arguments(&name, &args).to_string(), 400);
         Some(Self {
             tool_name: name,
             count,
-            arguments_summary: summarize_text(&canonical_arguments(&args).to_string(), 400),
+            arguments_summary,
             result_summary: result_text_for(messages, &id),
             key: streak_key.unwrap_or_default(),
             earlier,
@@ -207,7 +221,7 @@ impl RepeatedToolCall {
         parsed
             .iter()
             .map(|(_, name, args)| {
-                let canonical = canonical_arguments(args);
+                let canonical = identity_arguments(name, args);
                 let at = unmatched
                     .iter()
                     .position(|earlier| earlier.name == *name && earlier.arguments == canonical)?;
@@ -300,8 +314,16 @@ mod repeated_tool_call_tests {
             messages.extend(turn(&format!("c{n}"), "read", "{\"path\":\"a\"}"));
         }
         let repeat = RepeatedToolCall::detect(&messages, 5, &["wait"]).expect("streak of six");
-        assert!(repeat.short_circuit(&[call("x", "read", json!({"path": "b"}))]).is_none());
-        assert!(repeat.short_circuit(&[call("x", "grep", json!({"path": "a"}))]).is_none());
+        assert!(
+            repeat
+                .short_circuit(&[call("x", "read", json!({"path": "b"}))])
+                .is_none()
+        );
+        assert!(
+            repeat
+                .short_circuit(&[call("x", "grep", json!({"path": "a"}))])
+                .is_none()
+        );
         let mixed = [
             call("x", "read", json!({"path": "a"})),
             call("y", "read", json!({"path": "b"})),
@@ -322,6 +344,68 @@ mod repeated_tool_call_tests {
         malformed.malformed_arguments = true;
         assert!(repeat.short_circuit(&[malformed]).is_none());
         assert!(repeat.short_circuit(&[]).is_none());
+    }
+
+    #[test]
+    fn nested_intent_keys_are_payload_and_never_form_or_short_circuit_a_repeat() {
+        let mut messages = Vec::new();
+        for n in 0..6 {
+            messages.extend(turn(
+                &format!("c{n}"),
+                "query",
+                "{\"filter\":{\"i\":1,\"__intent\":\"same\"}}",
+            ));
+        }
+        let repeat = RepeatedToolCall::detect(&messages, 5, &["wait"])
+            .expect("identical nested payloads trip");
+        assert_eq!(repeat.count, 6);
+        // A genuinely different nested payload executes, even though its top-level shape matches.
+        assert!(
+            repeat
+                .short_circuit(&[call(
+                    "x",
+                    "query",
+                    json!({"filter": {"i": 2, "__intent": "same"}})
+                )])
+                .is_none()
+        );
+        assert!(
+            repeat
+                .short_circuit(&[call("x", "query", json!({"filter": {"__intent": "other"}}))])
+                .is_none()
+        );
+        assert!(
+            repeat
+                .short_circuit(&[call(
+                    "x",
+                    "query",
+                    json!({"filter": {"i": 1, "__intent": "same"}})
+                )])
+                .is_some()
+        );
+
+        let mut varying = Vec::new();
+        for n in 0..6 {
+            varying.extend(turn(
+                &format!("v{n}"),
+                "query",
+                &format!("{{\"filter\":{{\"i\":{n}}}}}"),
+            ));
+        }
+        assert!(RepeatedToolCall::detect(&varying, 5, &["wait"]).is_none());
+    }
+
+    #[test]
+    fn top_level_presentation_differences_still_count_as_repeats() {
+        let mut messages = Vec::new();
+        for n in 0..6 {
+            messages.extend(turn(
+                &format!("c{n}"),
+                "read",
+                &format!("{{\"path\":\"a\",\"__intent\":\"step {n}\"}}"),
+            ));
+        }
+        assert!(RepeatedToolCall::detect(&messages, 5, &["wait"]).is_some());
     }
 
     #[test]
@@ -996,9 +1080,19 @@ mod tests {
         // Failed reads get recovery guidance on every failure; they never escalate into a stop.
         let other = call("read", json!({"path":"src/b.rs:1-20"}));
         assert!(guard.observe(&other, false).is_none());
-        assert!(guard.observe(&malformed, true).unwrap().contains("Read recovery"));
+        assert!(
+            guard
+                .observe(&malformed, true)
+                .unwrap()
+                .contains("Read recovery")
+        );
         let corrected = call("read", json!({"path":"src/a.rs:25-50"}));
-        assert!(guard.observe(&corrected, true).unwrap().contains("Read recovery"));
+        assert!(
+            guard
+                .observe(&corrected, true)
+                .unwrap()
+                .contains("Read recovery")
+        );
         assert!(guard.observe(&malformed, false).is_none());
     }
 
@@ -1081,7 +1175,11 @@ mod tests {
         );
         match recover_from_length(8192, 8192, 6000, &reply("", vec![]), MAX_LENGTH_NUDGES) {
             LengthAction::Nudge { message, .. } => {
-                assert!(message.contains("Escalation") && message.contains("8192 tokens") && message.contains("Think less"))
+                assert!(
+                    message.contains("Escalation")
+                        && message.contains("8192 tokens")
+                        && message.contains("Think less")
+                )
             }
             other => panic!("{other:?}"),
         }
@@ -1170,7 +1268,9 @@ mod tests {
         let Stall::Warn(text) = guard.call(&edit(10), true) else {
             panic!("escalates at the tenth")
         };
-        assert!(text.contains("`edit`") && text.contains("10 times") && text.contains("Escalation"));
+        assert!(
+            text.contains("`edit`") && text.contains("10 times") && text.contains("Escalation")
+        );
     }
 
     #[test]

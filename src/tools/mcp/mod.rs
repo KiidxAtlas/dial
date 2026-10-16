@@ -23,10 +23,10 @@
 //! registry), `sampling` and `roots` are not offered, and servers are killed when the returned
 //! tools are dropped.
 
+pub mod catalog;
 mod client;
 mod http;
 mod inventory;
-pub mod catalog;
 pub mod registry;
 pub mod smithery;
 pub use http::validate_url;

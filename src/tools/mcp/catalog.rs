@@ -209,7 +209,11 @@ pub const CURATED: &[Curated] = &[
         takes_root: false,
         tools: "create_merge_request, list_issues, get_file_contents and more",
         env: &[
-            ("GITLAB_PERSONAL_ACCESS_TOKEN", "GitLab personal access token", true),
+            (
+                "GITLAB_PERSONAL_ACCESS_TOKEN",
+                "GitLab personal access token",
+                true,
+            ),
             ("GITLAB_API_URL", "API URL of a self-hosted GitLab", false),
         ],
     },
@@ -309,7 +313,11 @@ impl Candidate {
             Install::Blocked(reason) => bail!("{reason}"),
         };
         if let Some(input) = self.missing_required(values) {
-            bail!("`{}` is required before `{}` can start", input.key, self.name);
+            bail!(
+                "`{}` is required before `{}` can start",
+                input.key,
+                self.name
+            );
         }
         for input in &self.inputs {
             if let Some(value) = values
@@ -397,9 +405,8 @@ pub fn config_name(name: &str) -> String {
 
 /// Finds an executable on PATH without running it.
 pub fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| dir.join(program).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
 /// Starts `server` once and counts its tools. `Err(why)` when it lists none or fails to start.
@@ -621,7 +628,12 @@ mod tests {
                 "{}",
                 item.id
             );
-            assert_eq!(item.id, config_name(item.id), "{} must be a valid table name", item.id);
+            assert_eq!(
+                item.id,
+                config_name(item.id),
+                "{} must be a valid table name",
+                item.id
+            );
         }
     }
 
@@ -631,10 +643,14 @@ mod tests {
         let found = curated_matches("NuXt", &config.user_dir, &config.project_root);
         assert_eq!(found.len(), 1);
         let candidate = resolve(
-            &Endpoints { official: "invalid://unused".into(), smithery: "invalid://unused".into() },
+            &Endpoints {
+                official: "invalid://unused".into(),
+                smithery: "invalid://unused".into(),
+            },
             &config,
             &found[0].name,
-        ).unwrap();
+        )
+        .unwrap();
         let server = candidate.server(&BTreeMap::new()).unwrap();
         assert_eq!(server.program, PathBuf::from("npx"));
         assert_eq!(server.args, ["-y", "mcp-remote", "https://nuxt.com/mcp"]);
@@ -647,7 +663,8 @@ mod tests {
         let candidate = curated_candidate(item, Path::new("/u"), Path::new("/p"));
         assert_eq!(candidate.inputs.len(), 1);
         assert!(candidate.inputs[0].secret && candidate.inputs[0].required);
-        let blank = BTreeMap::from([("GITHUB_PERSONAL_ACCESS_TOKEN".to_string(), "  ".to_string())]);
+        let blank =
+            BTreeMap::from([("GITHUB_PERSONAL_ACCESS_TOKEN".to_string(), "  ".to_string())]);
         assert!(candidate.missing_required(&blank).is_some());
         assert!(candidate.server(&BTreeMap::new()).is_err());
         let filled = BTreeMap::from([(
@@ -655,7 +672,13 @@ mod tests {
             " tok ".to_string(),
         )]);
         let server = candidate.server(&filled).unwrap();
-        assert_eq!(server.env.get("GITHUB_PERSONAL_ACCESS_TOKEN").map(String::as_str), Some("tok"));
+        assert_eq!(
+            server
+                .env
+                .get("GITHUB_PERSONAL_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("tok")
+        );
     }
 
     #[test]
@@ -675,7 +698,10 @@ mod tests {
     #[test]
     fn config_names_never_contain_dots_or_slashes() {
         assert_eq!(config_name("memory"), "memory");
-        assert_eq!(config_name("io.github.github/github-mcp-server"), "github-mcp-server");
+        assert_eq!(
+            config_name("io.github.github/github-mcp-server"),
+            "github-mcp-server"
+        );
         assert_eq!(config_name("@Acme/Notes.v2"), "notes-v2");
         assert_eq!(config_name("a//b  c"), "b-c");
         assert_eq!(config_name("///"), "mcp-server");

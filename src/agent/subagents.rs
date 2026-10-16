@@ -390,7 +390,9 @@ pub(super) struct WorkPacket {
 /// Parent state a child receives with its assignment, captured when the `task` call starts.
 #[derive(Clone, Default)]
 pub struct Handoff {
-    /// The parent's original user goal, bounded.
+    /// The parent's current request, bounded: the assignment context the worker serves.
+    pub current_instruction: Option<String>,
+    /// The session's first user goal, bounded. Historical context only once a newer request exists.
     pub goal: Option<String>,
     /// Open todo items (in progress first), as `[status] content` lines.
     pub todos: Vec<String>,
@@ -430,6 +432,9 @@ impl Handoff {
             .collect();
         let state = &control["working_state"];
         Self {
+            current_instruction: control["current_instruction"]
+                .as_str()
+                .map(|text| prompt::truncate_chars(text, MAX_HANDOFF_GOAL)),
             goal: control["original_goal"]
                 .as_str()
                 .map(|goal| prompt::truncate_chars(goal, MAX_HANDOFF_GOAL)),
@@ -596,10 +601,25 @@ impl Job<'_> {
     /// assignment. The child cannot see the parent's conversation, so the brief carries what it needs.
     pub fn brief(&self) -> String {
         let mut out = String::new();
-        if let Some(goal) = &self.handoff.goal {
-            out.push_str(&format!(
-                "Parent goal (background, not your assignment):\n{goal}\n\n"
-            ));
+        // The current request leads: once a newer instruction exists, the session's first goal is
+        // historical context and must not frame the assignment.
+        match (&self.handoff.current_instruction, &self.handoff.goal) {
+            (Some(current), goal) => {
+                out.push_str(&format!(
+                    "Parent's current request (background for your assignment; it takes precedence):\n{current}\n\n"
+                ));
+                if let Some(goal) = goal.as_ref().filter(|goal| *goal != current) {
+                    out.push_str(&format!(
+                        "Session-start context (historical, may be unrelated to the current request):\n{goal}\n\n"
+                    ));
+                }
+            }
+            (None, Some(goal)) => {
+                out.push_str(&format!(
+                    "Parent goal (background, not your assignment):\n{goal}\n\n"
+                ));
+            }
+            (None, None) => {}
         }
         if !self.handoff.todos.is_empty() {
             out.push_str("Parent open todos:\n");
@@ -2936,6 +2956,36 @@ mod tests {
         assert!(request.jobs[0].handoff.goal.is_none());
         assert!(request.jobs[0].brief().contains("saved context"));
         assert!(!request.jobs[0].brief().contains("new parent goal"));
+    }
+
+    #[test]
+    fn handoff_brief_leads_with_the_current_request_and_labels_the_first_goal_as_history() {
+        let config = config(&[]);
+        let mut request = parse(
+            &json!({"task":"fix the CSS regression", "solution_space":"s"}),
+            &config,
+        )
+        .unwrap();
+        let control = json!({
+            "original_goal": "explain the repo layout",
+            "current_instruction": "fix the CSS regression"
+        });
+        Handoff::capture(&control, &[]).apply(&mut request.jobs);
+        let brief = request.jobs[0].brief();
+        assert!(brief.starts_with("Parent's current request"));
+        assert!(
+            brief.find("fix the CSS regression").unwrap()
+                < brief.find("explain the repo layout").unwrap()
+        );
+        assert!(brief.contains("Session-start context (historical"));
+        assert!(!brief.contains("Parent goal (background"));
+
+        // Before any newer instruction, the first goal is still the framing context.
+        let first = json!({"original_goal": "explain the repo layout", "current_instruction": "explain the repo layout"});
+        Handoff::capture(&first, &[]).apply(&mut request.jobs);
+        let brief = request.jobs[0].brief();
+        assert_eq!(brief.matches("explain the repo layout").count(), 1);
+        assert!(brief.contains("Parent's current request"));
     }
 
     #[test]

@@ -295,11 +295,14 @@ fn installed(recipe: &Recipe, env: &Env) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    recipe.methods.iter().find_map(|method| match method {
-        Method::Download(prebuilt) => Some(dir.join(prebuilt.binary)),
-        _ => None,
-    })
-    .filter(|path| path.exists())
+    recipe
+        .methods
+        .iter()
+        .find_map(|method| match method {
+            Method::Download(prebuilt) => Some(dir.join(prebuilt.binary)),
+            _ => None,
+        })
+        .filter(|path| path.exists())
 }
 
 /// The default whisper.cpp model (`ggml-base.en.bin`) from whisper.cpp's own download source.

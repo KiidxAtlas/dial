@@ -175,6 +175,13 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
     .with_allow_insecure(config.endpoint.as_ref().is_some_and(|e| e.allow_insecure))
     .with_metadata(metadata)
     .with_steering(config);
+    if let Some(endpoint) = &config.endpoint {
+        backend = backend.with_credential_source(
+            &config.user_dir,
+            &endpoint.base_url,
+            endpoint.api_key_env.as_deref(),
+        );
+    }
     if let Some(id) = account_id {
         backend = backend.with_account(id);
     }

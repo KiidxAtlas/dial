@@ -14,11 +14,12 @@ pub(crate) mod validation;
 
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use agent::{ExistingEntries, run_agent};
 use fallback::generate_fallback_proposal;
 use lock_files::assign_lock_files_to_plan;
-use stage::execute_split;
+use stage::{StagedSnapshot, execute_split, preview_split};
 use state::{
     ChangelogProposal, CommitAgentState, CommitProposal, ConventionalAnalysis, FileChange,
     SplitCommitPlan,
@@ -30,7 +31,7 @@ use trivial::{TrivialChange, detect_trivial_change};
 use crate::commit::changelog::detect::detect_targets;
 use crate::commit::changelog::{apply_changelog_proposals, read_unreleased};
 use crate::commit::commit_types::format_conventional_commit;
-use crate::commit::execute::{commit_with_message, git_output};
+use crate::commit::execute::{commit_with_message, git_output_indexed};
 use crate::commit::run::{CommitBackend, CommitError};
 use crate::commit::types::CommitCommandArgs;
 use crate::config::types::Config;
@@ -66,6 +67,7 @@ fn env_flag(name: &str) -> bool {
 pub(crate) fn run_agentic_commit(
     args: &CommitCommandArgs,
     cwd: &Path,
+    index: Option<&Path>,
     config: &Config,
     backend: &dyn CommitBackend,
     confirm: &mut dyn FnMut(&str) -> bool,
@@ -73,6 +75,7 @@ pub(crate) fn run_agentic_commit(
     run_with(
         args,
         cwd,
+        index,
         config,
         backend,
         confirm,
@@ -93,10 +96,11 @@ fn split_confirmed(commits: usize, confirm: &mut dyn FnMut(&str) -> bool) -> boo
     ))
 }
 
-fn staged_files(cwd: &Path) -> Result<Vec<String>, CommitError> {
+fn staged_files(cwd: &Path, index: Option<&Path>) -> Result<Vec<String>, CommitError> {
     // `-z` keeps paths unquoted; without it git quotes non-ASCII names and `git add` cannot find them.
-    let output = git_output(
+    let output = git_output_indexed(
         cwd,
+        index,
         &["diff", "--cached", "--name-only", "--no-renames", "-z"],
         "Failed to list staged files",
     )?;
@@ -151,21 +155,25 @@ fn apply_changelog(
 fn run_with(
     args: &CommitCommandArgs,
     cwd: &Path,
+    index: Option<&Path>,
     config: &Config,
     backend: &dyn CommitBackend,
     confirm: &mut dyn FnMut(&str) -> bool,
     mode: Mode,
 ) -> Result<AgenticOutcome, CommitError> {
-    let mut staged = staged_files(cwd)?;
+    // Staging, diffs and tool reads all go through `index`: the repository's own index, or a
+    // private copy for a dry run.
+    let mut staged = staged_files(cwd, index)?;
     if staged.is_empty() {
-        git_output(cwd, &["add", "-A"], "Failed to stage changes")?;
-        staged = staged_files(cwd)?;
+        git_output_indexed(cwd, index, &["add", "-A"], "Failed to stage changes")?;
+        staged = staged_files(cwd, index)?;
     }
     if staged.is_empty() {
         return Err(CommitError::Validation("No changes to commit".to_owned()));
     }
-    let full_diff = git_output(
+    let full_diff = git_output_indexed(
         cwd,
+        index,
         &[
             "diff",
             "--cached",
@@ -175,8 +183,11 @@ fn run_with(
         ],
         "Failed to read staged diff",
     )?;
-    let numstat_text = git_output(
+    // The staged state is captured before the model runs; a split is executed against it only.
+    let mut snapshot = StagedSnapshot::capture(cwd, index, &full_diff)?;
+    let numstat_text = git_output_indexed(
         cwd,
+        index,
         &["diff", "--cached", "--numstat", "--no-renames", "-z"],
         "Failed to read numstat",
     )?;
@@ -205,12 +216,17 @@ fn run_with(
             .iter()
             .filter_map(|path| read_unreleased(cwd, path).map(|sections| (path.clone(), sections)))
             .collect();
+        // No interrupt reaches the commit flow yet; the flag is the seam `analyze_files` checks
+        // before admitting each model call.
+        let cancel = AtomicBool::new(false);
         let mut env = ToolEnv {
             root: cwd,
             config,
             backend,
             staged: staged.clone(),
             numstat: numstat.clone(),
+            index: index.map(Path::to_path_buf),
+            cancel: &cancel,
             changelog_targets: targets,
             state: CommitAgentState::default(),
         };
@@ -238,7 +254,7 @@ fn run_with(
             if !args.dry_run && !changed.is_empty() {
                 let mut add: Vec<&str> = vec!["add", "--"];
                 add.extend(changed.iter().map(String::as_str));
-                git_output(cwd, &add, "Failed to stage changelog updates")?;
+                git_output_indexed(cwd, index, &add, "Failed to stage changelog updates")?;
             }
             let message = format_conventional_commit(&proposal.to_message());
             if !args.dry_run {
@@ -266,6 +282,10 @@ fn run_with(
                 .ok_or_else(|| CommitError::Validation("split plan has no commits".to_owned()))?;
             let changed = apply_changelog(cwd, changelog.as_ref(), args.dry_run)?;
             for path in changed {
+                if !args.dry_run {
+                    // The changelog bytes Dial just wrote are the content the split commits.
+                    snapshot.add_written_file(cwd, &path)?;
+                }
                 let planned = plan
                     .commits
                     .iter()
@@ -274,14 +294,11 @@ fn run_with(
                     plan.commits[last].changes.push(FileChange::All { path });
                 }
             }
-            let messages = execute_split(
-                cwd,
-                &plan,
-                &order,
-                &full_diff,
-                args.dry_run,
-                config.git.bypass_hooks,
-            )?;
+            let messages = if args.dry_run {
+                preview_split(&plan, &order)
+            } else {
+                execute_split(cwd, &plan, &order, &snapshot, config.git.bypass_hooks)?
+            };
             Ok(AgenticOutcome {
                 used_fallback,
                 committed: !args.dry_run,
@@ -353,6 +370,7 @@ mod tests {
         let outcome = run_with(
             &args(false),
             dir.path(),
+            None,
             &Config::default(),
             &NoModel,
             &mut |_| true,
@@ -375,6 +393,7 @@ mod tests {
         let outcome = run_with(
             &args(true),
             dir.path(),
+            None,
             &Config::default(),
             &NoModel,
             &mut |_| true,
@@ -395,6 +414,7 @@ mod tests {
         let result = run_with(
             &args(true),
             dir.path(),
+            None,
             &Config::default(),
             &NoModel,
             &mut |_| true,

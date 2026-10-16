@@ -54,3 +54,21 @@ pub fn take_aborts() -> bool {
         _ => false,
     })
 }
+
+/// Route a local prompt while this process is a joined guest. `None` when this process is not a
+/// guest, so the local agent handles the prompt. `Some` means the prompt belongs to the host; it
+/// is either sent or refused, and the local agent never runs it.
+pub fn route_guest_prompt(text: &str) -> Option<Result<(), &'static str>> {
+    with(|slot| match slot {
+        Some(Room::Guest(guest)) => Some(guest.send_prompt(text)),
+        _ => None,
+    })
+}
+
+/// Ask the host to abort its running turn. `None` unless this process is a joined guest.
+pub fn send_guest_abort() -> Option<Result<(), &'static str>> {
+    with(|slot| match slot {
+        Some(Room::Guest(guest)) => Some(guest.send_abort()),
+        _ => None,
+    })
+}

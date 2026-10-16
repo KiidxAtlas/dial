@@ -91,6 +91,28 @@ fn output_tail(bytes: &[u8]) -> String {
     lines[lines.len().saturating_sub(MAX_LINES)..].join("\n")
 }
 
+/// The moment a foreground command is handed to the background owner, or `None` when it may not be.
+/// Named sessions keep their state in this foreground call, and a zero threshold disables
+/// automatic backgrounding, so neither gets a deadline (and no zero-length waits).
+fn adoption_deadline(auto_background: Duration, named_session: bool) -> Option<Duration> {
+    (!named_session && !auto_background.is_zero()).then_some(auto_background)
+}
+
+/// Whether this pass should adopt: an explicit background request, steering, or the deadline.
+fn adoption_due(
+    asynchronous: bool,
+    steering: bool,
+    elapsed: Duration,
+    deadline: Option<Duration>,
+) -> bool {
+    asynchronous || steering || deadline.is_some_and(|deadline| elapsed >= deadline)
+}
+
+/// Hard cancellation outranks adoption on the same pass: a cancelled command is never transferred.
+fn may_adopt(cancelled: bool, due: bool) -> bool {
+    !cancelled && due
+}
+
 impl ForegroundJob {
     pub(crate) fn into_parts(
         self,
@@ -498,14 +520,21 @@ fn run_bash(
     let mut timed_out = false;
     let mut cancelled = false;
     let auto_background = Duration::from_secs(auto_background_secs);
+    let adopt_after = adoption_deadline(auto_background, session.is_some());
     let waiter = crate::platform::wake::Waiter::new()
         .map_err(|e| format!("creating command wait channel: {e}"))?;
     loop {
-        if session.is_none()
-            && (asynchronous
-                || crate::tools::signals::steering_requested()
-                || (!auto_background.is_zero() && started.elapsed() >= auto_background))
-        {
+        // Hard cancellation is read once per pass and outranks adoption: a cancelled command stays
+        // with this owner, and the group kill below reaps it.
+        let cancel_now = cancel.load(Ordering::Acquire);
+        let adoption_wanted = session.is_none()
+            && adoption_due(
+                asynchronous,
+                crate::tools::signals::steering_requested(),
+                started.elapsed(),
+                adopt_after,
+            );
+        if may_adopt(cancel_now, adoption_wanted) {
             crate::platform::io::set_blocking(&reader)
                 .map_err(|e| format!("restoring adopted output pipe mode: {e}"))?;
             let captured = capture.retained();
@@ -531,7 +560,7 @@ fn run_bash(
                 ))
             });
         }
-        if cancel.load(Ordering::Acquire) {
+        if cancel_now {
             cancelled = true;
             break;
         }
@@ -565,8 +594,8 @@ fn run_bash(
         // Cap each slice so a cancel flag stored without a wake signal is still seen promptly.
         let slice = Duration::from_millis(100);
         let mut limit = (!timeout.is_zero()).then(|| timeout.saturating_sub(started.elapsed()));
-        if !auto_background.is_zero() {
-            let until = auto_background.saturating_sub(started.elapsed());
+        if let Some(adopt_after) = adopt_after {
+            let until = adopt_after.saturating_sub(started.elapsed());
             limit = Some(limit.map_or(until, |l| l.min(until)));
         }
         let limit = Some(limit.map_or(slice, |l| l.min(slice)));
@@ -1261,6 +1290,83 @@ mod tests {
             threshold.text
         );
         assert_eq!(*adopted.lock(), 2);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn hard_cancel_with_steering_kills_the_command_instead_of_adopting_it() {
+        let (dir, ws) = workspace();
+        let ws = ws.without_sandbox();
+        let signals = super::super::signals::CallSignals::new();
+        let cancel = AtomicBool::new(false);
+        let adopted = AtomicBool::new(false);
+        // The first output arrives while nothing is pending; then both triggers become true
+        // before the next pass, which must choose the hard cancel.
+        let on_output = |_: &[u8]| {
+            signals.request_steering();
+            cancel.store(true, Ordering::SeqCst);
+        };
+        let began = Instant::now();
+        let output = super::super::signals::scope(&signals, || {
+            bash_tool_streaming_with_adopter(
+                &ws,
+                &json!({"command": "echo started; sleep 5; printf survived > result.txt"}),
+                0,
+                0,
+                &on_output,
+                &cancel,
+                &|_job| {
+                    adopted.store(true, Ordering::SeqCst);
+                    Ok("bg-unexpected".into())
+                },
+            )
+        })
+        .unwrap();
+        assert!(!adopted.load(Ordering::SeqCst), "{}", output.text);
+        assert!(
+            output.text.contains("[cancelled; process group killed]"),
+            "{}",
+            output.text
+        );
+        assert!(output.is_error);
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "cancel waited for the sleep"
+        );
+        // The owner killed the group, so the command never reached its final write.
+        assert!(!dir.path().join("result.txt").exists());
+    }
+
+    #[test]
+    fn named_sessions_never_get_an_adoption_deadline() {
+        let threshold = Duration::from_secs(5);
+        assert_eq!(adoption_deadline(threshold, false), Some(threshold));
+        assert_eq!(adoption_deadline(threshold, true), None);
+        assert_eq!(adoption_deadline(Duration::ZERO, false), None);
+        assert_eq!(adoption_deadline(Duration::ZERO, true), None);
+    }
+
+    #[test]
+    fn adoption_is_due_only_for_the_policy_triggers() {
+        let deadline = Some(Duration::from_secs(5));
+        assert!(!adoption_due(
+            false,
+            false,
+            Duration::from_secs(4),
+            deadline
+        ));
+        assert!(adoption_due(false, false, Duration::from_secs(5), deadline));
+        // Explicit background and steering adopt at once, whatever the threshold.
+        assert!(adoption_due(true, false, Duration::ZERO, None));
+        assert!(adoption_due(false, true, Duration::ZERO, None));
+        assert!(!adoption_due(false, false, Duration::from_secs(600), None));
+    }
+
+    #[test]
+    fn hard_cancel_outranks_every_adoption_trigger() {
+        assert!(!may_adopt(true, true));
+        assert!(!may_adopt(true, false));
+        assert!(may_adopt(false, true));
+        assert!(!may_adopt(false, false));
     }
     #[cfg(unix)]
     #[test]

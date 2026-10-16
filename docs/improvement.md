@@ -417,8 +417,10 @@ reducing the incumbent vector's held-out score. Failed candidates preserve the a
 These are response-contract checks, not proof of overall coding improvement. Manual vectors are
 preserved. Unchanged completed attempts have a 24-hour cooldown; new evidence can trigger a new attempt.
 
-`/improve settings` → Activation steering → **Automatic vector creation** controls both automatic
-creation and use. **Enable manual vector** controls explicit vectors independently. `/steering`
+`/improve settings` → Activation steering → **Automatic vector creation** controls automatic creation
+and, while **Enable manual vector** is off, automatic use. **Enable manual vector** uses the selected
+admitted vector whatever its origin, so it can also use an automatic vector while automatic creation
+is off. Both paths require passing evaluation. `/steering`
 shows collecting `N/8` prompts, candidate extraction/evaluation progress, rejection/admission and
 actual runtime use. Jobs share the improvement cycle's compute lease, budget, stop controls and
 foreground handoff. Auxiliary roles and sealed harness evaluation remain unsteered.

@@ -1,6 +1,7 @@
 //! Local MLX setup shared by the CLI and guided provider UI.
 pub mod deps;
 pub mod embeddings;
+pub mod memory;
 use crate::{
     config::types::Config,
     learn::worker,

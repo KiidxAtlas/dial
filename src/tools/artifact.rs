@@ -5,6 +5,7 @@
 //! `[ARTIFACT TRUNCATED: …]` marker and the tail. The content hash covers the stored bytes.
 use super::ToolOutput;
 use anyhow::{Context, Result, ensure};
+use fs2::FileExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -41,6 +42,8 @@ pub struct ArtifactStore {
     root: PathBuf,
     limits: ArtifactConfig,
 }
+/// A spool holds an exclusive lock on its file and tail ring for its whole lifetime. GC claims
+/// spools without blocking, so a locked spool is live and is never deleted under its writer.
 pub struct ArtifactSpool {
     root: PathBuf,
     limits: ArtifactConfig,
@@ -92,6 +95,7 @@ impl ArtifactStore {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         let file = crate::platform::fs::open_owner_only(&options, &path)?;
+        FileExt::lock_exclusive(&file)?;
         Ok(ArtifactSpool {
             root: self.root.clone(),
             limits: self.limits.clone(),
@@ -380,6 +384,7 @@ impl TailRing {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         let file = crate::platform::fs::open_owner_only(&options, &path)?;
+        FileExt::lock_exclusive(&file)?;
         Ok(Self {
             path,
             file,

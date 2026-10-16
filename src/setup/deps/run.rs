@@ -330,7 +330,13 @@ pub fn ensure_whisper_model(
         "downloading ggml-base.en.bin (about {} MB) from {WHISPER_MODEL_URL}",
         WHISPER_MODEL_BYTES / 1_000_000
     ));
-    download_to(WHISPER_MODEL_URL, &partial, WHISPER_MODEL_BYTES, cancel, progress)?;
+    download_to(
+        WHISPER_MODEL_URL,
+        &partial,
+        WHISPER_MODEL_BYTES,
+        cancel,
+        progress,
+    )?;
     let got = sha256_file(&partial)?;
     if got != WHISPER_MODEL_SHA256 {
         let _ = fs::remove_file(&partial);
@@ -361,7 +367,11 @@ pub(super) fn download_to(
         fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
-    let step = if expected > 0 { expected / 10 } else { 10_000_000 };
+    let step = if expected > 0 {
+        expected / 10
+    } else {
+        10_000_000
+    };
     let mut next_report = step;
     loop {
         if cancel.load(Ordering::Relaxed) {

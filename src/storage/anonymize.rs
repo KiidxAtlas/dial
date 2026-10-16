@@ -7,6 +7,7 @@
 //! - Free text and unknown fields are replaced wholesale (default deny) by
 //!   `<text:n>` placeholders. Identical values map to identical placeholders
 //!   within one `Anonymizer`, so correlation survives.
+//! - Object keys outside the session schema are data: they become correlated `<key:n>` placeholders.
 //! - Paths map each segment, keep extensions and common structural segments,
 //!   and rewrite the home prefix to `~`.
 //! - Credentials are redacted first via `redact_text_counted`.
@@ -49,8 +50,39 @@ const KEEP_SEGMENTS: &[&str] = &[
     ".dial",
 ];
 
-/// Object keys whose string values are structural labels, not content.
-const LABEL_KEYS: &[&str] = &["type", "role", "kind", "name", "custom_type"];
+/// Field names the session and request schemas define. Only these keys keep their text; any other
+/// object key is data.
+const SCHEMA_KEYS: &[&str] = &[
+    "type",
+    "id",
+    "parent",
+    "ts",
+    "started",
+    "version",
+    "model",
+    "forked_from",
+    "cwd",
+    "message",
+    "title",
+    "summary",
+    "first_kept",
+    "custom_type",
+    "role",
+    "content",
+    "tool_calls",
+    "tool_call_id",
+    "function",
+    "name",
+    "arguments",
+    "dial_context_request",
+    "dial_context_source_entry_id",
+    "messages",
+    "tools",
+    "stream",
+    "max_tokens",
+    "temperature",
+    "tool_choice",
+];
 
 /// Host identity used to scrub usernames and hostnames from paths and text.
 #[derive(Debug, Clone, Default)]
@@ -163,9 +195,13 @@ impl Anonymizer {
         })
     }
 
-    /// Anonymizes an arbitrary JSON value (e.g. the LLM request) with default-deny rules.
+    /// Anonymizes an arbitrary JSON value (e.g. the LLM request message). An object is read with the
+    /// message envelope rules, so its role and tool-call ids survive; everything else is default-deny.
     pub fn value(&mut self, value: &Value) -> Value {
-        self.opaque(value)
+        match value {
+            Value::Object(_) => self.message(value),
+            _ => self.opaque(value),
+        }
     }
 
     fn record(&mut self, map: &Map<String, Value>) -> Value {
@@ -186,7 +222,13 @@ impl Anonymizer {
                 ("parent", Rule::Id),
                 ("ts", Rule::Time),
             ],
-            _ => return self.opaque(&Value::Object(map.clone())),
+            // Unknown record types keep only the envelope fields; every other key is data.
+            _ => &[
+                ("type", Rule::Label),
+                ("id", Rule::Id),
+                ("parent", Rule::Id),
+                ("ts", Rule::Time),
+            ],
         };
         let mut out = Map::new();
         for (key, value) in map {
@@ -216,6 +258,7 @@ impl Anonymizer {
             let mapped = match key.as_str() {
                 "role" => self.apply(Rule::Label, value),
                 "tool_call_id" => self.apply(Rule::Id, value),
+                "dial_context_source_entry_id" => self.apply(Rule::Id, value),
                 "content" if value.is_string() => self.text_value(value),
                 "tool_calls" => self.tool_calls(value),
                 _ => self.opaque(value),
@@ -289,34 +332,55 @@ impl Anonymizer {
         for (key, value) in map {
             let mapped = match (key.as_str(), value) {
                 ("command" | "cmd", Value::String(s)) => Value::String(self.command(s)),
-                (k, Value::String(_)) if k.contains("path") || k == "file" => {
-                    self.apply(Rule::Path, value)
-                }
+                (k, Value::String(_)) if is_path_argument(k) => self.apply(Rule::Path, value),
                 _ => self.opaque(value),
             };
-            out.insert(self.key(key), mapped);
+            let name = if is_argument_key(key) {
+                self.clean_key(key)
+            } else {
+                self.key(key)
+            };
+            out.insert(name, mapped);
         }
         Value::Object(out)
     }
 
-    /// Shell command: redact credentials, keep plain flags/program names, and map
-    /// path-like or other words to placeholders. Whitespace collapses to single spaces.
+    /// Shell command: redact credentials first, then map each word. Only the program name (first
+    /// word) and genuine flags keep their text; `--flag=value` keeps the flag and maps the value.
+    /// Every other word is a value and becomes a placeholder. Whitespace collapses to single spaces.
     fn command(&mut self, command: &str) -> String {
         let (redacted, n) = redact_text_counted(command);
         self.redacted += n;
         redacted
             .split_whitespace()
-            .map(|word| {
-                if word.contains('/') || word.starts_with('~') {
-                    self.path(word)
-                } else if is_flag_like(word) {
-                    word.to_string()
-                } else {
-                    self.text_word(word)
-                }
-            })
+            .enumerate()
+            .map(|(index, word)| self.command_word(index == 0, word))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn command_word(&mut self, program_position: bool, word: &str) -> String {
+        if is_flag(word) {
+            return word.to_string();
+        }
+        if let Some((flag, value)) = word.split_once('=') {
+            if is_flag(flag) {
+                return format!("{flag}={}", self.value_word(value));
+            }
+        }
+        if program_position && is_label(word) {
+            return word.to_string();
+        }
+        self.value_word(word)
+    }
+
+    /// A value word: paths keep their structure, anything else becomes a text placeholder.
+    fn value_word(&mut self, word: &str) -> String {
+        if word.contains('/') || word.starts_with('~') {
+            self.path(word)
+        } else {
+            self.text_word(word)
+        }
     }
 
     fn apply(&mut self, rule: Rule, value: &Value) -> Value {
@@ -374,7 +438,9 @@ impl Anonymizer {
         self.token("text", word)
     }
 
-    /// Default-deny: every string is replaced, keys kept (redacted), numbers and bools kept.
+    /// Default-deny: every string is replaced and every key outside the schema becomes a placeholder.
+    /// Numbers, bools and nulls are kept. Only the explicit envelope rules keep structural strings,
+    /// so a nested `name` or `type` value is data like any other.
     fn opaque(&mut self, value: &Value) -> Value {
         match value {
             Value::String(s) => Value::String(self.text(s)),
@@ -382,11 +448,7 @@ impl Anonymizer {
             Value::Object(map) => {
                 let mut out = Map::new();
                 for (key, value) in map {
-                    let mapped = if LABEL_KEYS.contains(&key.as_str()) {
-                        self.apply(Rule::Label, value)
-                    } else {
-                        self.opaque(value)
-                    };
+                    let mapped = self.opaque(value);
                     out.insert(self.key(key), mapped);
                 }
                 Value::Object(out)
@@ -395,8 +457,18 @@ impl Anonymizer {
         }
     }
 
-    /// Object keys are structure: kept verbatim unless they carry a credential.
+    /// Object keys: schema field names stay (credential-redacted). Any other key is data and becomes
+    /// a correlated `<key:n>` placeholder, so path-, email- or name-keyed maps leak nothing.
     fn key(&mut self, key: &str) -> String {
+        if SCHEMA_KEYS.contains(&key) {
+            return self.clean_key(key);
+        }
+        let clean = self.clean_key(key);
+        self.token("key", &clean)
+    }
+
+    /// Credential redaction for a key, keeping its shape.
+    fn clean_key(&mut self, key: &str) -> String {
         let (clean, n) = redact_text_counted(key);
         self.redacted += n;
         clean
@@ -496,14 +568,26 @@ fn is_iso_time(s: &str) -> bool {
             .all(|c| c.is_ascii_digit() || matches!(c, '-' | ':' | '.' | 'T' | 'Z' | '+'))
 }
 
-fn is_flag_like(word: &str) -> bool {
+/// A genuine flag: one or two leading dashes, then a short alphanumeric name. Bare words are never
+/// flags, so a value that merely looks like a word is replaced.
+fn is_flag(word: &str) -> bool {
     let body = word.trim_start_matches('-');
-    word.len() <= 40
-        && word.len() - body.len() <= 2
+    (1..=2).contains(&(word.len() - body.len()))
+        && word.len() <= 40
         && body.starts_with(|c: char| c.is_ascii_alphabetic())
         && body
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+}
+
+/// Tool-argument keys whose string values are paths.
+fn is_path_argument(key: &str) -> bool {
+    key.contains("path") || key == "file"
+}
+
+/// Tool-argument keys that keep their structure: the shell command and path arguments.
+fn is_argument_key(key: &str) -> bool {
+    matches!(key, "command" | "cmd") || is_path_argument(key)
 }
 
 /// `name.ext` → (`name`, `ext`) when the extension is short and alphanumeric.
@@ -587,10 +671,57 @@ mod tests {
     #[test]
     fn same_input_yields_same_placeholder() {
         let mut a = Anonymizer::new(ident());
-        let first = a.value(&serde_json::json!({"x": "hello", "y": "hello"}));
-        assert_eq!(first["x"], first["y"]);
-        let again = a.value(&serde_json::json!({"z": "hello"}));
-        assert_eq!(first["x"], again["z"]);
+        let first = a.value(&serde_json::json!(["hello", "hello"]));
+        assert_eq!(first[0], first[1]);
+        let again = a.value(&serde_json::json!(["hello"]));
+        assert_eq!(first[0], again[0]);
+    }
+
+    #[test]
+    fn bare_command_words_are_replaced_while_program_and_flags_stay() {
+        let mut a = Anonymizer::new(ident());
+        let echo = a.command("echo ConfidentialAcquisition");
+        assert!(echo.starts_with("echo "), "{echo}");
+        assert!(!echo.contains("Confidential"), "{echo}");
+        let curl = a.command("curl -u alice --data=hunter2 /Users/alice/x.txt");
+        assert!(curl.starts_with("curl -u "), "{curl}");
+        assert!(curl.contains("--data="), "{curl}");
+        assert!(!curl.contains("alice"), "{curl}");
+        assert!(!curl.contains("hunter2"), "{curl}");
+    }
+
+    #[test]
+    fn nested_data_keys_and_values_are_anonymized_but_envelope_is_kept() {
+        let mut a = Anonymizer::new(ident());
+        let input = concat!(
+            r#"{"type":"session","id":"s1","started":"2026-01-01T00:00:00.000Z","cwd":"/tmp/work","model":"m1","version":1}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parent":null,"ts":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"customer\":{\"name\":\"AliceSmith\"},\"alice@example.com\":1}"}}]}}"#,
+            "\n",
+            r#"{"type":"mystery","id":"x1","customer":{"name":"AliceSmith"},"/Users/alice/notes":{"owner":"bob"}}"#,
+        );
+        let out = a.session_jsonl(input.as_bytes()).unwrap();
+        let text = String::from_utf8(out.bytes).unwrap();
+        assert!(!text.contains("AliceSmith"), "{text}");
+        assert!(!text.contains("alice@example.com"), "{text}");
+        assert!(!text.contains("alice"), "{text}");
+        assert!(!text.contains("customer"), "{text}");
+        assert!(text.contains("\"name\":\"lookup\""), "{text}");
+        assert!(text.contains("\"id\":\"call_1\""), "{text}");
+        assert!(text.contains("\"role\":\"assistant\""), "{text}");
+        assert!(text.contains("\"type\":\"mystery\""), "{text}");
+        assert!(text.contains("\"id\":\"x1\""), "{text}");
+
+        let value = a.value(&serde_json::json!({
+            "role": "user",
+            "content": "hi",
+            "customer": {"name": "AliceSmith"},
+            "/Users/alice/x": "v",
+        }));
+        let rendered = value.to_string();
+        assert_eq!(value["role"], "user");
+        assert!(!rendered.contains("AliceSmith"), "{rendered}");
+        assert!(!rendered.contains("alice"), "{rendered}");
     }
 
     #[test]

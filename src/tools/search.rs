@@ -27,8 +27,9 @@ const MAX_PATTERN: usize = 512;
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
 const REGEX_DFA_LIMIT: usize = 8 << 20;
 const MAX_GREP_BYTES: u64 = 64 * 1024 * 1024;
+/// Matching lines one file may add to a page when `max_results` is defaulted. An explicit
+/// `max_results` lifts it; otherwise the rest of that file is named in the footer.
 const GREP_PER_FILE: usize = 20;
-const GREP_FILES: usize = 20;
 const GREP_WITNESS_WARNING: &str = "[edit witnesses: some observed files changed or could not be verified; no new edit authority was recorded for those files]\n";
 
 fn bool_default(args: &Value, key: &str, default: bool) -> Result<bool, String> {
@@ -469,6 +470,14 @@ struct PageMatch {
     end: usize,
 }
 
+/// What became of one match: shown on the page, held back (skipped or past its file's cap), or
+/// the page must stop and resume at it.
+enum Emitted {
+    Shown,
+    Hidden,
+    Stop,
+}
+
 struct GrepState {
     matcher: Regex,
     multiline: bool,
@@ -494,6 +503,10 @@ struct GrepState {
     blocked_row: bool,
     /// Why this page stopped before the scan ended; named in the footer when a continuation exists.
     cap: Option<String>,
+    /// The most matching lines one file may add to this page; unbounded when max_results is explicit.
+    per_file: usize,
+    /// Files whose matches were held back by `per_file`, in walk order (one entry per file).
+    capped_files: Vec<PathBuf>,
 }
 
 impl GrepState {
@@ -518,33 +531,33 @@ impl GrepState {
     }
 
     /// A match and its preceding context are committed together. Never advance
-    /// the result cursor until the matching row itself is visible.
-    fn emit(&mut self, path: &Path, consumed: usize, matched: &str, before: &str) -> bool {
+    /// the result cursor until the matching row itself is visible. A match that is
+    /// held back (skipped, or past its file's cap) is `Hidden`: the walk goes on.
+    fn emit(&mut self, path: &Path, consumed: usize, matched: &str, before: &str) -> Emitted {
         if self.skip > 0 {
             self.skip -= 1;
-            return true;
+            return Emitted::Hidden;
         }
         let file_count = self.file_matches.get(path).copied().unwrap_or(0);
-        let file_limit = file_count >= GREP_PER_FILE
-            || (file_count == 0 && self.matched_files.len() >= GREP_FILES);
+        if file_count >= self.per_file {
+            if self.capped_files.last().map(PathBuf::as_path) != Some(path) {
+                self.capped_files.push(path.to_path_buf());
+            }
+            return Emitted::Hidden;
+        }
         if self.matches >= self.max_matches
-            || file_limit
             || self.out.len() + matched.len() > MAX_GREP_OUTPUT
             || (!self.out.is_empty()
                 && self.out.len() + before.len() + matched.len() > MAX_GREP_OUTPUT)
         {
             self.blocked_row = self.out.is_empty() && matched.len() > MAX_GREP_OUTPUT;
-            self.cap = Some(if file_count >= GREP_PER_FILE {
-                format!("per-file cap of {GREP_PER_FILE} matches")
-            } else if file_limit {
-                format!("file cap of {GREP_FILES} files with matches")
-            } else if self.matches >= self.max_matches {
+            self.cap = Some(if self.matches >= self.max_matches {
                 format!("match limit of {}", self.max_matches)
             } else {
                 "output size limit of 48 KiB".to_string()
             });
             self.next = Some((path.to_path_buf(), consumed));
-            return false;
+            return Emitted::Stop;
         }
         *self.file_matches.entry(path.to_path_buf()).or_default() += 1;
         self.matched_files.insert(path.to_path_buf());
@@ -563,7 +576,7 @@ impl GrepState {
             end: self.out.len(),
         });
         self.row_ends.push(self.out.len());
-        true
+        Emitted::Shown
     }
 
     fn search_file(&mut self, ws: &Workspace, path: &Path, bytes: &mut Vec<u8>) {
@@ -718,11 +731,12 @@ impl GrepState {
                     }
                 }
                 let row = self.match_row(rel, number, raw);
-                let shown = self.skip == 0;
                 let start = self.out.len();
-                if !self.emit(path, seen - 1, &row.text, &preceding) {
-                    return;
-                }
+                let shown = match self.emit(path, seen - 1, &row.text, &preceding) {
+                    Emitted::Stop => return,
+                    Emitted::Shown => true,
+                    Emitted::Hidden => false,
+                };
                 if shown {
                     if self.out.len() - start == preceding.len() + row.text.len() {
                         rows.extend(preceding_rows.iter().map(|&(number, end)| CompleteRow {
@@ -847,11 +861,12 @@ impl GrepState {
                     ),
                     escaped.as_bytes(),
                 );
-                let shown = self.skip == 0;
                 let output_start = self.out.len();
-                if !self.emit(path, seen - 1, &row.text, &preceding) {
-                    return;
-                }
+                let shown = match self.emit(path, seen - 1, &row.text, &preceding) {
+                    Emitted::Stop => return,
+                    Emitted::Shown => true,
+                    Emitted::Hidden => false,
+                };
                 if shown {
                     if self.out.len() - output_start == preceding.len() + row.text.len() {
                         rows.extend(preceding_rows.iter().map(|&(number, end)| CompleteRow {
@@ -914,12 +929,13 @@ impl GrepState {
         let footer = loop {
             let limited = !walk_complete
                 || next.is_some()
+                || !self.capped_files.is_empty()
                 || self.unreadable > 0
                 || self.oversized > 0
                 || self.context_capped > 0;
             // Name what the page left out and how to resume. Counts past the cap are not known
             // without scanning on, so the footer says so instead of guessing.
-            let omitted = if next.is_some() {
+            let mut omitted = if next.is_some() {
                 format!(
                     "; page_capped_by={}; page_files_with_matches={}; matches and files past the cap are omitted from this page and not counted; continue by repeating this grep with cursor=next_cursor and skip=remaining_skip from [page]",
                     self.cap.as_deref().unwrap_or("output size limit of 48 KiB"),
@@ -928,6 +944,30 @@ impl GrepState {
             } else {
                 String::new()
             };
+            if !self.capped_files.is_empty() {
+                let listed: Vec<String> = self
+                    .capped_files
+                    .iter()
+                    .take(8)
+                    .map(|path| {
+                        path.strip_prefix(&ws.root)
+                            .unwrap_or(path)
+                            .display()
+                            .to_string()
+                    })
+                    .collect();
+                let more = self.capped_files.len().saturating_sub(listed.len());
+                let more = if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                };
+                omitted.push_str(&format!(
+                    "; per_file_cap={} reached in: {}{more}; rows past it are not shown; repeat with path=<file> and an explicit max_results (which lifts the per-file cap) to see them",
+                    self.per_file,
+                    listed.join(", "),
+                ));
+            }
             let walk_coverage = format!("{walk_coverage}{omitted}");
             let coverage = if limited {
                 format!(
@@ -1133,6 +1173,14 @@ pub(super) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
         bool_default(args, "gitignore", true)?,
         resume.as_ref().map(|(p, _)| p.clone()),
     );
+    let per_file = if args
+        .get("max_results")
+        .is_some_and(|value| !value.is_null())
+    {
+        usize::MAX
+    } else {
+        GREP_PER_FILE
+    };
     let mut state = GrepState {
         matcher,
         multiline,
@@ -1157,6 +1205,8 @@ pub(super) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String, String> 
         row_ends: Vec::new(),
         blocked_row: false,
         cap: None,
+        per_file,
+        capped_files: Vec::new(),
     };
     let mut bytes = Vec::new();
     for root in roots {
@@ -1494,25 +1544,30 @@ mod tests {
         let (dir, ws) = workspace();
         let many: String = (0..1000).map(|_| "hit\n").collect();
         fs::write(dir.path().join("many.log"), many).unwrap();
-        // One file contributes at most GREP_PER_FILE matches; the cursor resumes after them.
+        // Without max_results, one file contributes at most GREP_PER_FILE matches to the page; the
+        // rest of it is named in the footer, and the walk goes on to later files.
         let capped = grep(&ws, json!({"pattern": "hit", "path": "many.log"}));
         assert_eq!(capped.matches("many.log:").count(), GREP_PER_FILE);
         assert!(
-            capped.contains(&format!("\"match\":{GREP_PER_FILE}"))
-                && capped.contains("\"next_cursor\":{")
+            capped.contains(&format!(
+                "per_file_cap={GREP_PER_FILE} reached in: many.log"
+            )),
+            "{capped}"
         );
+        assert!(capped.contains("\"next_cursor\":null"), "{capped}");
         let five = grep(
             &ws,
             json!({"pattern": "hit", "path": "many.log", "max_results": 5}),
         );
         assert_eq!(five.matches("many.log:").count(), 5);
+        // An explicit max_results lifts the per-file cap; an oversized one is clamped, not refused.
         let raised = grep(
             &ws,
             json!({"pattern": "hit", "path": "many.log", "max_results": 5000}),
         );
         assert_eq!(
             raised.matches("many.log:").count(),
-            GREP_PER_FILE,
+            MAX_GREP_MATCHES,
             "an oversized max_results is clamped, not refused"
         );
         fs::write(
@@ -1599,29 +1654,23 @@ mod tests {
     #[test]
     fn grep_footer_names_the_files_a_capped_page_left_out() {
         let (dir, ws) = workspace();
-        for i in 0..GREP_FILES + 3 {
-            fs::write(dir.path().join(format!("f{i:02}.txt")), "needle\n").unwrap();
+        // A file past its per-file cap does not end the page: later files still appear on it.
+        fs::write(dir.path().join("a_many.txt"), "hit\n".repeat(30)).unwrap();
+        for i in 0..25 {
+            fs::write(dir.path().join(format!("f{i:02}.txt")), "hit\n").unwrap();
         }
-        let capped = grep(&ws, json!({"pattern": "needle"}));
+        let capped = grep(&ws, json!({"pattern": "hit"}));
+        assert!(capped.contains("f24.txt:1:hit"), "{capped}");
         assert!(
             capped.contains(&format!(
-                "page_capped_by=file cap of {GREP_FILES} files with matches"
-            )) && capped.contains(&format!("page_files_with_matches={GREP_FILES}"))
-                && capped.contains("cursor=next_cursor and skip=remaining_skip"),
+                "per_file_cap={GREP_PER_FILE} reached in: a_many.txt"
+            )),
             "{capped}"
         );
-        let (dir, ws) = workspace();
-        fs::write(dir.path().join("many.log"), "hit\n".repeat(1000)).unwrap();
-        let capped = grep(&ws, json!({"pattern": "hit", "path": "many.log"}));
-        assert!(
-            capped.contains(&format!(
-                "page_capped_by=per-file cap of {GREP_PER_FILE} matches"
-            )) && capped.contains("page_files_with_matches=1"),
-            "{capped}"
-        );
+        assert!(!capped.contains("page_capped_by"), "{capped}");
         let whole = grep(
             &ws,
-            json!({"pattern": "hit", "path": "many.log", "max_results": 5}),
+            json!({"pattern": "hit", "path": "a_many.txt", "max_results": 5}),
         );
         assert!(whole.contains("page_capped_by=match limit of 5"), "{whole}");
         let small = grep(&ws, json!({"pattern": "NOPE_NEVER"}));

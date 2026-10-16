@@ -168,6 +168,10 @@ struct RpcUi {
     next: u64,
     node_cursors: std::collections::BTreeMap<String, usize>,
     node_revisions: std::collections::BTreeMap<String, u64>,
+    /// Last emitted metadata per node. Comparing it across revisions tells a text append from a metadata edit.
+    node_meta: std::collections::BTreeMap<String, Value>,
+    /// Set by runtime changes; the idle worker republishes the query projection when this is set.
+    projection_dirty: bool,
     tree: Option<crate::runtime::Tree>,
 }
 impl RpcUi {
@@ -175,6 +179,7 @@ impl RpcUi {
         &mut self,
         tool: &str,
         summary: &str,
+        call_id: Option<&str>,
         cancel: Option<&AtomicBool>,
     ) -> Decision {
         self.next += 1;
@@ -184,9 +189,13 @@ impl RpcUi {
         } else {
             return Decision::Deny;
         }
-        let delivered = self.out.emit(
-            json!({"event":"approval","approval_id":approval_id,"tool":tool,"summary":summary}),
-        );
+        let mut event =
+            json!({"event":"approval","approval_id":approval_id,"tool":tool,"summary":summary});
+        // The call card's ID lets clients attach the request to that exact call, even among same-name calls.
+        if let Some(call_id) = call_id {
+            event["call_id"] = json!(call_id);
+        }
+        let delivered = self.out.emit(event);
         // ACP without an active session drops the event: no client can answer it, so deny.
         let decision = if !delivered {
             Decision::Deny
@@ -206,6 +215,11 @@ impl RpcUi {
                 }
             }
         };
+        if delivered {
+            // The request is no longer pending for any client once decided, so clients can retire it.
+            self.out
+                .emit(json!({"event":"approval_resolved","approval_id":approval_id}));
+        }
         if let Ok(mut pending) = self.pending_approval.lock()
             && pending.as_deref() == Some(&approval_id)
         {
@@ -214,12 +228,28 @@ impl RpcUi {
         decision
     }
 }
+/// Everything a client renders about a node except its text. Comparing it across revisions tells a
+/// text append apart from a metadata edit without copying the text.
+fn node_metadata(node: &crate::runtime::Node) -> Value {
+    json!({
+        "kind": node.kind,
+        "label": node.label,
+        "parent": node.parent,
+        "call_id": node.call_id,
+        "presentation": node.presentation,
+        "phase": node.result.phase,
+        "execution": node.result.execution,
+        "data": node.result.data,
+    })
+}
 impl Ui for RpcUi {
     fn runtime(&mut self, tree: &crate::runtime::Tree) {
         if self.tree.as_ref().is_none_or(|old| !old.same(tree)) {
             self.node_cursors.clear();
             self.node_revisions.clear();
+            self.node_meta.clear();
             self.tree = Some(tree.clone());
+            self.projection_dirty = true;
             self.out.emit(json!({"event":"state_reset"}));
         }
     }
@@ -236,11 +266,23 @@ impl Ui for RpcUi {
     fn result_node(&mut self, body: &crate::runtime::Body) {
         body.read(|node| {
             if self.node_revisions.insert(node.id.clone(), node.result.revision) == Some(node.result.revision) { return; }
-            let bytes=self.node_cursors.insert(node.id.clone(),node.result.text.len());
-            if node.kind != "worker" && node.result.phase==crate::runtime::Phase::Running && let Some(bytes)=bytes
-                && bytes<=node.result.text.len() && node.result.text.is_char_boundary(bytes) {
-                self.out.emit(json!({"event":"state_delta","id":node.id,"revision":node.result.revision,"append":&node.result.text[bytes..]}));
-            } else {self.out.emit(json!({"event":"state_node","node":node}));}
+            self.projection_dirty = true;
+            let metadata = node_metadata(node);
+            let metadata_changed = self.node_meta.insert(node.id.clone(), metadata.clone()).as_ref() != Some(&metadata);
+            let len = node.result.text.len();
+            let previous = self.node_cursors.insert(node.id.clone(), len);
+            // Only growth of a running, non-worker node's text is a delta; anything else sends the node.
+            let text_only = !metadata_changed && node.kind != "worker" && node.result.phase.is_running();
+            match previous {
+                Some(bytes) if text_only && bytes <= len && node.result.text.is_char_boundary(bytes) => {
+                    if bytes < len {
+                        self.out.emit(json!({"event":"state_delta","id":node.id,"revision":node.result.revision,"append":&node.result.text[bytes..]}));
+                    }
+                }
+                _ => {
+                    self.out.emit(json!({"event":"state_node","node":node}));
+                }
+            }
         });
     }
     fn text_delta(&mut self, text: &str) {
@@ -317,10 +359,20 @@ impl Ui for RpcUi {
             .unwrap_or_default()
     }
     fn approve(&mut self, tool: &str, summary: &str) -> Decision {
-        self.request_approval(tool, summary, None)
+        self.request_approval(tool, summary, None, None)
     }
     fn approve_with_cancel(&mut self, tool: &str, summary: &str, cancel: &AtomicBool) -> Decision {
-        self.request_approval(tool, summary, Some(cancel))
+        self.request_approval(tool, summary, None, Some(cancel))
+    }
+    fn approve_call(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        summary: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Decision {
+        let call_id = (!call_id.is_empty()).then_some(call_id);
+        self.request_approval(tool, summary, call_id, cancel)
     }
     fn ask_questions(
         &mut self,
@@ -762,6 +814,8 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                 next: 0,
                 node_cursors: Default::default(),
                 node_revisions: Default::default(),
+                node_meta: Default::default(),
+                projection_dirty: false,
                 tree: None,
             };
             worker_out.emit(json!({"event":"ready","protocol_version":PROTOCOL_VERSION,"session_id":agent.session().id(),"model":config.model,"tools":agent.tool_names(),"image_input":image_input,
@@ -770,6 +824,8 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                 agent.live_task_control(),
                 agent.background_compaction_control(),
             ));
+            // Tracks the message count the published projection was built from.
+            let mut projected_messages = agent.session().message_count();
             let mut parked = std::collections::HashMap::<String, Session>::new();
             let mut parked_tools =
                 std::collections::HashMap::<String, crate::tools::ext::Registry>::new();
@@ -821,6 +877,16 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                         {
                             crate::learn::compute::clear_owner(&layout.user_dir);
                             fs2::FileExt::unlock(&lock)?;
+                        }
+                        // Idle work (background workers, compaction) can change state without any actor
+                        // command. Republish the projection only when runtime or history changed.
+                        let messages = agent.session().message_count();
+                        if std::mem::take(&mut ui.projection_dirty)
+                            || messages != projected_messages
+                        {
+                            projected_messages = messages;
+                            *worker_query_cache.lock().unwrap_or_else(|p| p.into_inner()) =
+                                query_snapshot(&agent);
                         }
                         continue;
                     }
@@ -946,7 +1012,12 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                             if !report.interrupted {
                                 speak_reply(&worker_live, &worker_out, &report.text);
                             }
+                            // The turn spent its whole step budget; clients need that distinct from other incomplete turns.
+                            let step_limit = report.outcome == crate::runtime::Phase::Incomplete
+                                && config.harness.max_steps > 0
+                                && report.steps >= config.harness.max_steps;
                             let mut result = json!({"text":report.text,"outcome":report.outcome,"steps":report.steps,"interrupted":report.interrupted,"duration_ms":started.elapsed().as_millis(),"session_id":agent.session().id(),"plan_mode":agent.plan_mode(),"metrics":agent.metrics(),"efficiency":agent.efficiency_report(),"speculation":agent.speculation_stats()});
+                            result["step_limit"] = json!(step_limit);
                             if let Some(transcript) = transcript {
                                 result["transcript"] = json!(transcript);
                             }
@@ -1777,5 +1848,39 @@ mod tests {
         let alert = typed_notice(&UiEvent::new(EventKind::Recovery, "retrying"));
         assert_eq!(alert["lane"], "alert");
         assert!(alert["tokens"].is_null());
+    }
+
+    #[test]
+    fn node_metadata_ignores_text_growth_and_tracks_every_other_field() {
+        use crate::runtime::{Node, Phase, ResultBody};
+        let mut node = Node {
+            id: "n1".into(),
+            parent: None,
+            kind: "tool".into(),
+            label: "read".into(),
+            call_id: None,
+            result: ResultBody {
+                execution: None,
+                text: "a".into(),
+                data: None,
+                phase: Phase::Running,
+                revision: 1,
+            },
+            presentation: None,
+        };
+        let before = node_metadata(&node);
+        // Text-only growth keeps the metadata equal, so the observer may send a delta.
+        node.result.text.push('b');
+        node.result.revision = 2;
+        assert_eq!(node_metadata(&node), before);
+        // Each metadata field counts as a change that requires a full node.
+        node.call_id = Some("c1".into());
+        assert_ne!(node_metadata(&node), before);
+        node.call_id = None;
+        node.result.data = Some(json!({"progress": 1}));
+        assert_ne!(node_metadata(&node), before);
+        node.result.data = None;
+        node.result.phase = Phase::Completed;
+        assert_ne!(node_metadata(&node), before);
     }
 }

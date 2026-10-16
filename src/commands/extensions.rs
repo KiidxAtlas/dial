@@ -9,7 +9,9 @@ use crate::llm::oauth::BannerInteraction;
 use crate::storage::settings_store::{Change, Scope, load_layer};
 use crate::tools::mcp::{connect_extra, validate_server};
 use crate::tools::plugin::installer::{InstalledPlugin, PluginStore};
-use crate::tools::plugin::marketplace::{MarketplaceEntry, MarketplaceInfo, Marketplaces, SkillListing};
+use crate::tools::plugin::marketplace::{
+    MarketplaceEntry, MarketplaceInfo, Marketplaces, SkillListing,
+};
 use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -832,7 +834,10 @@ fn offerings(entries: &[MarketplaceEntry], skills: &[SkillListing]) -> String {
                 entry.name,
                 entry.marketplace,
                 entry.version.as_deref().unwrap_or("-"),
-                entry.description.as_deref().unwrap_or(entry.source.as_str())
+                entry
+                    .description
+                    .as_deref()
+                    .unwrap_or(entry.source.as_str())
             )
         })
         .collect();

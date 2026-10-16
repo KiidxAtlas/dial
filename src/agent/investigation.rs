@@ -51,6 +51,18 @@ impl InvestigationGuard {
         None
     }
 
+    /// Forgets observations whose result the model no longer sees in full (compacted, pruned or
+    /// superseded). A repeat of such a result is new evidence: it executes and returns full content.
+    pub fn retain_visible(&mut self, visible: impl Fn(&str) -> bool) {
+        self.observations.retain(|(_, id, _)| visible(id.as_str()));
+    }
+
+    /// Releases all duplicate memory, e.g. after compaction rewrote the context.
+    pub fn forget(&mut self) {
+        self.observations.clear();
+        self.unchanged = 0;
+    }
+
     /// Count a retry of cached evidence without pretending the withheld tool executed.
     pub fn repeat_known(&mut self, key: u64) -> Option<String> {
         let (_, first, repeats) = self
@@ -107,6 +119,14 @@ pub(super) fn observation_key(call: &ToolCall, text: &str) -> u64 {
     hash.finish()
 }
 
+/// Opening of the pointer that answers an identical re-read whose earlier full result is still shown.
+pub(super) const UNCHANGED_READ: &str = "[Unchanged read]";
+
+/// Whether a withheld or replacement body is such a pointer rather than advice or the result itself.
+pub(super) fn is_unchanged_read(body: &str) -> bool {
+    body.starts_with(UNCHANGED_READ)
+}
+
 /// Turn-local record of each read target's last full result. An identical re-read whose earlier result is still
 /// shown in full gets a short pointer instead of the same text again.
 #[derive(Default)]
@@ -135,7 +155,7 @@ impl ReturnedReads {
             && still_full(id)
         {
             return Some(format!(
-                "[Unchanged read] This read of the same range returned identical content in tool call {id}, which is still shown above. Reuse that text; reread only after a change or if it is no longer visible."
+                "{UNCHANGED_READ} This read of the same range returned identical content in tool call {id}, which is still shown above. Reuse that text; reread only after a change or if it is no longer visible."
             ));
         }
         if self.seen.len() >= 256 {

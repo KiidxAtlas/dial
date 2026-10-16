@@ -211,6 +211,38 @@ pub fn migrate_removed_settings(table: &mut toml::Table) -> bool {
     changed
 }
 
+/// A semantic embedding override set on one side only, across the global and project layers:
+/// `(the set key, its value)`. The pre-role Settings picker wrote `embedding_model` alone.
+fn lone_embedding_override(layers: &[toml::Table; 2]) -> Option<(&'static str, String)> {
+    let value = |key: &str| {
+        layers.iter().rev().find_map(|layer| {
+            layer
+                .get("memory")?
+                .get("semantic")?
+                .get(key)?
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+    };
+    match (value("embedding_base_url"), value("embedding_model")) {
+        (None, Some(model)) => Some(("embedding_model", model)),
+        (Some(url), None) => Some(("embedding_base_url", url)),
+        _ => None,
+    }
+}
+
+/// Removes `memory.semantic.<key>`; returns whether it was present.
+fn drop_semantic_key(table: &mut toml::Table, key: &str) -> bool {
+    table
+        .get_mut("memory")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|memory| memory.get_mut("semantic"))
+        .and_then(toml::Value::as_table_mut)
+        .is_some_and(|semantic| semantic.remove(key).is_some())
+}
+
 /// Current roles that a legacy `default` role fills when they are not otherwise assigned. `decision` is the
 /// Laya checkpoint, so it is not filled.
 const DEFAULT_FILLS: &[&str] = &["task", "small", "coach", "tester", "planner", "memory"];
@@ -388,6 +420,27 @@ impl Config {
             }
             layers[index] = part;
         }
+        // A half embedding override never worked and no longer validates; drop it with a notice so
+        // saved settings from the old Settings picker still load.
+        let mut half_override = Vec::new();
+        if let Some((key, value)) = lone_embedding_override(&layers) {
+            for (index, path) in layout.config_files().into_iter().enumerate() {
+                if drop_semantic_key(&mut layers[index], key) {
+                    if !migrations.contains(&path) {
+                        migrations.push(path.clone());
+                    }
+                    half_override.push((path, key));
+                }
+            }
+            eprintln!(
+                "memory.semantic.{key} = {value:?} was set without its partner ({}), so it was never used; removed it. Assign the embedding role (Alt+M) or run /setup embeddings.",
+                if key == "embedding_model" {
+                    "embedding_base_url"
+                } else {
+                    "embedding_model"
+                }
+            );
+        }
         let config =
             Self::from_layers(layout, &layers[0], &layers[1], &overlay.unwrap_or_default())?;
         // Migrate persisted sources only after the complete layered configuration validates.
@@ -399,10 +452,15 @@ impl Config {
             };
             let mut current: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)
                 .with_context(|| format!("invalid configuration {}", path.display()))?;
+            let half = half_override
+                .iter()
+                .find(|(dropped, _)| *dropped == path)
+                .map(|(_, key)| *key);
             if migrate_memory_tool_table(&mut current)
                 | migrate_edit_configuration(&mut current)
                 | migrate_model_role_table(&mut current)
                 | migrate_removed_settings(&mut current)
+                | half.is_some_and(|key| drop_semantic_key(&mut current, key))
             {
                 write_private(&path, toml::to_string_pretty(&current)?.as_bytes())?;
                 eprintln!(
@@ -1164,6 +1222,9 @@ impl Config {
                         None => (Some(main.clone()), RoleSource::FollowsMain),
                     },
                     ("embedding", None) => (None, RoleSource::NotSet),
+                    // The memory role never falls back to main: local and sharpshooter stay inactive
+                    // and semantic pauses automatic fact saving until it is assigned.
+                    ("memory", None) => (None, RoleSource::NotSet),
                     (_, None) => (Some(main.clone()), RoleSource::FollowsMain),
                 };
                 RoleStatus {
@@ -1187,7 +1248,10 @@ impl Config {
                 self.memory.local.extraction_role.as_str(),
                 self.memory.local.consolidation_role.as_str(),
             ],
-            MemoryBackendId::Sharpshooter => vec![self.memory.sharpshooter.model_role.as_str()],
+            // A non-empty model override replaces the role (the driver resolves it directly).
+            MemoryBackendId::Sharpshooter if self.memory.sharpshooter.model.trim().is_empty() => {
+                vec![self.memory.sharpshooter.model_role.as_str()]
+            }
             _ => Vec::new(),
         };
         roles
@@ -1195,8 +1259,8 @@ impl Config {
             .find(|role| self.role_selection(role).is_none())
             .map(|role| {
                 format!(
-                    "the {} backend needs a model, so assign the {role} role in /roles",
-                    format!("{:?}", self.memory.backend).to_lowercase()
+                    "the {} backend needs a model, so assign the {role} role in /roles (Alt+M)",
+                    self.memory.backend.as_str()
                 )
             })
     }
@@ -1272,6 +1336,12 @@ impl Config {
                 &self.memory.sharpshooter.model_role,
                 Some(&self.memory.sharpshooter.model),
             ),
+            // Automatic fact saving runs on the memory role and pauses while it is unassigned.
+            MemoryBackendId::Semantic => {
+                self.memory.semantic.auto_retain
+                    && self.role_selection("memory").is_some()
+                    && self.memory_role_is_local("memory", None)
+            }
             _ => false,
         }
     }

@@ -4,7 +4,9 @@
 //! `..` escapes, absolute paths outside the root and symlinks that lead out of
 //! it are rejected, and directory walks (glob, grep) never follow symlinks.
 //! `bash` runs inside the platform sandbox (macOS sandbox-exec or Linux/WSL2 bubblewrap;
-//! see [`sandbox`]) and refuses to run at all when no sandbox is available.
+//! see [`sandbox`]) and refuses to run at all when no sandbox is available. There is no implicit
+//! unsandboxed fallback; only an explicit operator opt-out (`Workspace::without_sandbox`) runs
+//! unsandboxed, and that is a separate trust mode rather than something an approval grants.
 //!
 //! Residual limits, stated plainly:
 //! * Path checks and later file operations are not atomic. Tools run one at a
@@ -1093,7 +1095,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
              by sorted component/depth-first files then matching lines/non-overlapping matches. Always inspect \
              coverage and JSON next_cursor/remaining_skip; copy to cursor/skip with the same query and unchanged \
              workspace. Limits: 50,000 considered walk entries, 2,050,000 directory entries enumerated, \
-             64 MiB scanned, 2 MiB/file and 48 KiB result rows. Directories over 50,000 immediate entries \
+             64 MiB scanned, 4 MiB/file and 48 KiB result rows. Directories over 50,000 immediate entries \
              are explicitly omitted before sorting; narrow to children. Skipped/unreadable/ignored/depth-capped \
              coverage is explicit, never exhaustive empty success.",
             json!({
@@ -1103,7 +1105,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "glob": {"type": "string", "description": "Only search files whose workspace-relative path matches this glob."},
                 "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default false)."},
                 "context": {"type": "integer", "minimum": 0, "description": "Lines of context to show before and after each match (default 0; values above 10 are capped at 10)."},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum number of matching lines (default 400)."},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum number of matching lines (default 400). Without max_results a single file contributes at most 20 matching lines to a page; its remaining matches are named in the footer and later files still appear. An explicit max_results lifts that per-file cap."},
                 "multiline": {"type": "boolean", "description": "Match whole-file bytes (default false, automatic for actual newlines or regex \\n). Anchors match each line; use (?s) to make dot match newline."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},
                 "gitignore": {"type": "boolean", "description": "Honor local ignore rules and skip dependency/build directories (default true); false includes them, never .git/scratch/symlinks."},
@@ -1151,17 +1153,20 @@ pub fn execute(ws: &Workspace, name: &str, args: &Value, timeout_secs: u64) -> T
 }
 
 /// Read through the same confined parser pipeline while allowing managed
-/// converter/cache misses to observe the execution owner's cancellation.
+/// converter/cache misses to observe the execution owner's cancellation. `budget` is the
+/// model-facing byte budget of this result (see [`model_output_limit`]): pages stop there and
+/// only the rows they show are witnessed for editing.
 pub fn read_tool_streaming(
     ws: &Workspace,
     args: &Value,
     cancel: &std::sync::atomic::AtomicBool,
+    budget: usize,
 ) -> ToolOutput {
     if !args.is_object() {
         return ToolOutput::err("tool arguments must be a JSON object");
     }
     execution::run(cancel, || {
-        match files::read_tool_streaming(ws, args, cancel) {
+        match files::read_tool_streaming(ws, args, cancel, budget) {
             Ok(text) => ToolOutput::ok(text),
             Err(error) => ToolOutput::err(error),
         }

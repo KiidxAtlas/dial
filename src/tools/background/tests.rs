@@ -945,3 +945,94 @@ fn steering_ends_a_wait_cleanly_and_a_hard_interrupt_still_aborts_it() {
     );
     let _ = bg(&tool, &ws, json!({"action": "kill", "name": "svc"}));
 }
+
+#[cfg(unix)]
+#[test]
+fn escaped_writer_is_drained_bounded_and_kill_yields_one_incomplete_artifact() {
+    let setsid_available = std::process::Command::new("setsid")
+        .arg("true")
+        .status()
+        .is_ok_and(|status| status.success());
+    if !setsid_available {
+        eprintln!("setsid is unavailable; skipping the escaped-writer fixture");
+        return;
+    }
+    let (_dir, ws) = open_workspace();
+    let artifacts = tempfile::tempdir().unwrap();
+    let store = crate::tools::artifact::ArtifactStore::new(artifacts.path()).unwrap();
+    let ws = ws.with_artifacts(store);
+    let tool = tool();
+    // The inner shell starts its own session, so it survives the group kill and keeps the pipe open.
+    start(
+        &tool,
+        &ws,
+        "escaped",
+        "setsid sh -c 'echo \"escaped $$\"; printf \"kept\\n\"; sleep 60' & sleep 0.3; echo leader",
+    );
+    let wait = bg(
+        &tool,
+        &ws,
+        json!({"action": "wait", "name": "escaped", "until": "escaped \\d+", "timeout": 10}),
+    );
+    let child = pid_from(&wait.text, "escaped ");
+    let kept = bg(
+        &tool,
+        &ws,
+        json!({"action": "wait", "name": "escaped", "until": "kept", "timeout": 10}),
+    );
+    assert!(!kept.is_error, "{}", kept.text);
+
+    let began = Instant::now();
+    let killed = bg(&tool, &ws, json!({"action": "kill", "name": "escaped"}));
+    assert!(!killed.is_error, "{}", killed.text);
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "kill waited {:?} for the reader",
+        began.elapsed()
+    );
+    // Dial's reader and spool are released, while the escaped writer is outside the group.
+    assert!(
+        alive(child),
+        "the escaped writer should survive the group kill"
+    );
+
+    let mut completions = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let seen = super::wake::generation();
+        completions.extend(
+            tool.drain_notifications()
+                .into_iter()
+                .filter(|event| event.kind == "complete"),
+        );
+        if !completions.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the reader never completed");
+        super::wake::wait_past(seen, Some(deadline));
+    }
+    assert!(
+        tool.drain_notifications()
+            .iter()
+            .all(|event| event.kind != "complete"),
+        "completion must be delivered once"
+    );
+    assert_eq!(completions.len(), 1);
+    let complete = &completions[0];
+    assert!(complete.text.contains("incomplete"), "{}", complete.text);
+    let uri = complete.artifact.as_ref().expect("a partial artifact");
+    let bytes = fs::read(
+        artifacts
+            .path()
+            .join(uri.strip_prefix("artifact://").unwrap()),
+    )
+    .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("escaped ") && text.contains("kept"), "{text}");
+
+    // Reap the fixture explicitly; it is not in any group Dial can signal.
+    unsafe {
+        libc::kill(child, libc::SIGKILL);
+    }
+    assert!(gone_soon(child), "escaped writer {child} survived SIGKILL");
+}

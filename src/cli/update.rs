@@ -148,6 +148,8 @@ pub fn run(version: Option<&str>) -> Result<()> {
     let install_dir = executable
         .parent()
         .context("running executable has no parent directory")?;
+    #[cfg(unix)]
+    let _install_lock = lock_install_dir(install_dir)?;
     let temp = tempfile::tempdir_in(install_dir)
         .context("creating same-filesystem update staging directory")?;
     let staged = if cfg!(windows) {
@@ -253,36 +255,15 @@ try {
             backup.display()
         );
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        if backup.exists() {
-            fs::remove_file(&backup)?;
-        }
-        fs::rename(&executable, &backup).context("moving current executable to rollback backup")?;
-        match fs::rename(&staged, &executable) {
-            Ok(()) => {
-                let check = run_version_check(&executable);
-                let expected = tag.trim_start_matches('v');
-                if !check.is_ok_and(|o| {
-                    o.status.success()
-                        && String::from_utf8_lossy(&o.stdout)
-                            .lines()
-                            .any(|line| dial_version_token(line) == Some(expected))
-                }) {
-                    let _ = fs::remove_file(&executable);
-                    fs::rename(&backup, &executable)
-                        .context("new version failed; restoring previous executable")?;
-                    bail!(
-                        "new executable failed its post-install version check; previous version restored"
-                    )
-                }
-            }
-            Err(error) => {
-                fs::rename(&backup, &executable)
-                    .context("install failed; restoring previous executable")?;
-                return Err(error.into());
-            }
-        }
+        activate_unix(
+            &executable,
+            &staged,
+            &backup,
+            temp.path(),
+            &|path: &Path| verify_version(path, tag.trim_start_matches('v')),
+        )?;
         println!(
             "Updated Dial to {} (backup: {})",
             tag.trim_start_matches('v'),
@@ -320,6 +301,117 @@ fn run_version_check(path: &Path) -> Result<std::process::Output> {
             )
         }
     }
+}
+
+/// Exclusive lease on an install directory, so two `dial update` runs cannot interleave their
+/// activation. Released when dropped.
+#[cfg(unix)]
+struct InstallLock {
+    _file: fs::File,
+}
+
+#[cfg(unix)]
+fn lock_install_dir(dir: &Path) -> Result<InstallLock> {
+    use fs2::FileExt;
+    let path = dir.join(".dial-update.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening update lock {}", path.display()))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(InstallLock { _file: file }),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => bail!(
+            "another dial update is changing {}; wait for it to finish and retry",
+            dir.display()
+        ),
+        Err(error) => Err(error).with_context(|| format!("locking {}", path.display())),
+    }
+}
+
+/// Crash-safe activation of a verified staged executable (Unix). The active name is only ever
+/// renamed over, never removed, so an interruption leaves a complete previous or complete new
+/// executable at `executable`:
+/// 1. copy the current executable to `backup`, verified by digest, without touching the active name;
+/// 2. rename the staged file over the active name (atomic on the same filesystem);
+/// 3. fsync the install directory and run `verify` on the active name.
+/// A failure in 3 renames the verified backup back. If that rollback also fails, both errors are
+/// reported and the backup stays at `backup` for manual recovery.
+#[cfg(unix)]
+fn activate_unix(
+    executable: &Path,
+    staged: &Path,
+    backup: &Path,
+    staging: &Path,
+    verify: &dyn Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    let dir = executable
+        .parent()
+        .context("running executable has no parent directory")?;
+    preserve_backup(executable, backup, staging)?;
+    fs::rename(staged, executable).context("replacing the executable with the verified update")?;
+    if let Err(error) = sync_dir(dir).and_then(|()| verify(executable)) {
+        if let Err(restore) = fs::rename(backup, executable) {
+            bail!(
+                "{error:#}; restoring the previous executable also failed ({restore}); the previous executable is kept at {}",
+                backup.display()
+            );
+        }
+        return Err(error.context("new executable failed activation; previous version restored"));
+    }
+    Ok(())
+}
+
+/// Copies the current executable to `backup` through `staging` (same filesystem) and renames it
+/// into place only after its digest matches the original.
+#[cfg(unix)]
+fn preserve_backup(executable: &Path, backup: &Path, staging: &Path) -> Result<()> {
+    let copy = staging.join("rollback.dial");
+    fs::copy(executable, &copy).context("copying the current executable for rollback")?;
+    fs::File::open(&copy)
+        .and_then(|file| file.sync_all())
+        .context("syncing the rollback copy")?;
+    ensure!(
+        digest_file(&copy)? == digest_file(executable)?,
+        "rollback copy does not match the current executable"
+    );
+    fs::rename(&copy, backup)
+        .with_context(|| format!("preserving rollback copy at {}", backup.display()))?;
+    sync_dir(
+        backup
+            .parent()
+            .context("rollback path has no parent directory")?,
+    )
+}
+
+#[cfg(unix)]
+fn digest_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    fs::File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("syncing directory {}", dir.display()))
+}
+
+/// Runs the candidate executable and requires it to report exactly `expected` as its version.
+#[cfg(unix)]
+fn verify_version(path: &Path, expected: &str) -> Result<()> {
+    let output = run_version_check(path)?;
+    ensure!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| dial_version_token(line) == Some(expected)),
+        "{} does not report Dial {expected} from --version",
+        path.display()
+    );
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -370,5 +462,116 @@ mod tests {
             installation_kind(Path::new(r"C:\Users\user\.cargo\bin\dial.exe")),
             "Cargo"
         );
+    }
+
+    #[cfg(unix)]
+    mod activation_fixtures {
+        use super::*;
+        use std::path::PathBuf;
+
+        fn accept(_: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn reject(_: &Path) -> Result<()> {
+            bail!("post-install check rejected the update")
+        }
+
+        /// Active `dial` holding "old", a staged "new" candidate and its staging directory.
+        fn fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+            let staging = root.join("staging");
+            fs::create_dir_all(&staging).unwrap();
+            let executable = root.join("dial");
+            let staged = staging.join("dial.new");
+            fs::write(&executable, "old").unwrap();
+            fs::write(&staged, "new").unwrap();
+            (executable, staged, root.join("dial.bak"), staging)
+        }
+
+        #[test]
+        fn success_keeps_the_previous_executable_as_a_verified_backup() {
+            let root = tempfile::tempdir().unwrap();
+            let (exe, staged, backup, staging) = fixture(root.path());
+            activate_unix(&exe, &staged, &backup, &staging, &accept).unwrap();
+            assert_eq!(fs::read_to_string(&exe).unwrap(), "new");
+            assert_eq!(fs::read_to_string(&backup).unwrap(), "old");
+            assert!(!staged.exists());
+        }
+
+        #[test]
+        fn failed_post_check_restores_the_previous_executable() {
+            let root = tempfile::tempdir().unwrap();
+            let (exe, staged, backup, staging) = fixture(root.path());
+            let error = activate_unix(&exe, &staged, &backup, &staging, &reject).unwrap_err();
+            assert!(format!("{error:#}").contains("previous version restored"));
+            assert_eq!(fs::read_to_string(&exe).unwrap(), "old");
+            assert!(!backup.exists());
+        }
+
+        #[test]
+        fn failed_rollback_reports_both_errors_and_keeps_an_active_executable() {
+            let root = tempfile::tempdir().unwrap();
+            let (exe, staged, backup, staging) = fixture(root.path());
+            // The rollback point disappears after the swap, so restoring it must fail.
+            let sabotage = |path: &Path| -> Result<()> {
+                fs::remove_file(&backup)?;
+                reject(path)
+            };
+            let error = activate_unix(&exe, &staged, &backup, &staging, &sabotage).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("post-install check rejected the update"),
+                "{message}"
+            );
+            assert!(
+                message.contains("restoring the previous executable also failed"),
+                "{message}"
+            );
+            assert_eq!(fs::read_to_string(&exe).unwrap(), "new");
+        }
+
+        #[test]
+        fn a_missing_candidate_leaves_the_active_executable_untouched() {
+            let root = tempfile::tempdir().unwrap();
+            let (exe, staged, backup, staging) = fixture(root.path());
+            fs::remove_file(&staged).unwrap();
+            assert!(activate_unix(&exe, &staged, &backup, &staging, &accept).is_err());
+            assert_eq!(fs::read_to_string(&exe).unwrap(), "old");
+            assert_eq!(fs::read_to_string(&backup).unwrap(), "old");
+        }
+
+        #[test]
+        fn a_failed_backup_stops_before_the_active_name_changes() {
+            let root = tempfile::tempdir().unwrap();
+            let (exe, staged, backup, staging) = fixture(root.path());
+            fs::create_dir_all(backup.join("occupied")).unwrap();
+            assert!(activate_unix(&exe, &staged, &backup, &staging, &accept).is_err());
+            assert_eq!(fs::read_to_string(&exe).unwrap(), "old");
+            assert!(
+                staged.exists(),
+                "the candidate is consumed only after the backup is preserved"
+            );
+        }
+
+        #[test]
+        fn an_interruption_after_backup_leaves_the_original_executable_active() {
+            let root = tempfile::tempdir().unwrap();
+            let (exe, _staged, backup, staging) = fixture(root.path());
+            preserve_backup(&exe, &backup, &staging).unwrap();
+            assert_eq!(fs::read_to_string(&exe).unwrap(), "old");
+            assert_eq!(fs::read_to_string(&backup).unwrap(), "old");
+        }
+
+        #[test]
+        fn concurrent_updates_are_serialized_by_the_install_lock() {
+            let root = tempfile::tempdir().unwrap();
+            let first = lock_install_dir(root.path()).unwrap();
+            assert!(
+                lock_install_dir(root.path()).is_err(),
+                "a second updater must not enter while the first holds the lease"
+            );
+            drop(first);
+            assert!(lock_install_dir(root.path()).is_ok());
+        }
     }
 }

@@ -1111,26 +1111,39 @@ fn balance(candidates: Vec<Candidate>) -> Vec<Candidate> {
         .collect()
 }
 
+/// Byte-level JSONL recovery shared by digest scanning and append. Returns where the
+/// unterminated final fragment starts, and whether it is torn (not a complete JSON record).
+/// `None` when the bytes are empty or already end with a newline.
+fn unterminated_tail(bytes: &[u8]) -> Option<(usize, bool)> {
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return None;
+    }
+    let start = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let complete = serde_json::from_slice::<Value>(&bytes[start..]).is_ok();
+    Some((start, !complete))
+}
+
 fn digests(path: &Path) -> Result<(HashSet<String>, usize, HashSet<String>)> {
     let mut seen = HashSet::new();
     let mut groups = HashSet::new();
     let mut count = 0;
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((seen, 0, groups)),
         Err(error) => return Err(error).context("reading existing training data"),
     };
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    for (index, line) in lines.iter().enumerate() {
-        let record: Value = match serde_json::from_str(line) {
-            Ok(record) => record,
-            // An interrupted append leaves an unterminated final record. `append` truncates it before
-            // writing, so it is skipped here instead of blocking every future harvest.
-            Err(_) if index + 1 == lines.len() && !text.ends_with('\n') => break,
-            Err(error) => {
-                return Err(error).context("existing training data is not valid JSONL");
-            }
-        };
+    // An interrupted append leaves a torn final record. `append` truncates it before writing, so
+    // it is skipped here instead of blocking every future harvest. Interior records stay strict.
+    let end = match unterminated_tail(&bytes) {
+        Some((start, true)) => start,
+        _ => bytes.len(),
+    };
+    for line in bytes[..end].split(|&b| b == b'\n') {
+        if line.iter().all(|b| b.is_ascii_whitespace()) {
+            continue;
+        }
+        let record: Value =
+            serde_json::from_slice(line).context("existing training data is not valid JSONL")?;
         count += 1;
         if let Some(messages) = record.get("messages") {
             seen.insert(digest(messages));
@@ -1162,11 +1175,10 @@ fn append(path: &Path, lines: &str) -> Result<()> {
             // Either a complete record missing its newline, or a torn append from a crash. Keep the
             // former; truncate the latter so it never ends up mid-file where digests would reject it.
             let text = fs::read(path)?;
-            let start = text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-            if serde_json::from_slice::<Value>(&text[start..]).is_ok() {
-                file.write_all(b"\n")?;
-            } else {
-                file.set_len(start as u64)?;
+            match unterminated_tail(&text) {
+                Some((start, true)) => file.set_len(start as u64)?,
+                Some((_, false)) => file.write_all(b"\n")?,
+                None => {}
             }
         }
     }
@@ -2198,6 +2210,56 @@ mod tests {
         let path = f.dir.path().join("data.jsonl");
         fs::write(&path, "{bad\n{\"a\":1}\n").unwrap();
         assert!(digests(&path).is_err());
+    }
+
+    #[test]
+    fn torn_multibyte_tail_is_recovered_at_every_byte_cut() {
+        let f = Fixture::new();
+        let path = f.dir.path().join("data.jsonl");
+        let tail = "{\"messages\":\"é日🎉\"}".as_bytes();
+        let start = tail.iter().position(|&b| b == b'"').unwrap() + 1;
+        // Cut after every byte, including inside 2-, 3- and 4-byte characters.
+        for cut in start..tail.len() {
+            let mut bytes = b"{\"a\":1}\n".to_vec();
+            bytes.extend_from_slice(&tail[..cut]);
+            fs::write(&path, &bytes).unwrap();
+            let (_, count, _) = digests(&path).unwrap();
+            assert_eq!(count, 1, "cut at byte {cut}");
+            append(&path, "{\"a\":2}\n").unwrap();
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                b"{\"a\":1}\n{\"a\":2}\n",
+                "cut at byte {cut}"
+            );
+            assert_eq!(digests(&path).unwrap().1, 2, "cut at byte {cut}");
+        }
+    }
+
+    #[test]
+    fn complete_multibyte_record_missing_only_its_newline_is_kept() {
+        let f = Fixture::new();
+        let path = f.dir.path().join("data.jsonl");
+        fs::write(&path, "{\"a\":1}\n{\"a\":\"é日🎉\"}").unwrap();
+        assert_eq!(digests(&path).unwrap().1, 2);
+        append(&path, "{\"a\":3}\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"a\":1}\n{\"a\":\"é日🎉\"}\n{\"a\":3}\n"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_interior_or_complete_record_is_rejected_without_rewriting() {
+        let f = Fixture::new();
+        let path = f.dir.path().join("data.jsonl");
+        let interior = b"{\"a\":\"\xff\"}\n{\"a\":1}\n".to_vec();
+        fs::write(&path, &interior).unwrap();
+        assert!(digests(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), interior);
+        let complete_tail = b"{\"a\":1}\n{\"a\":\"\xff\"}".to_vec();
+        fs::write(&path, &complete_tail).unwrap();
+        // A malformed unterminated record is torn: it is skipped, never a reason to fail.
+        assert_eq!(digests(&path).unwrap().1, 1);
     }
 
     /// A sibling model database beside the fixture's own; its directory name is the origin.

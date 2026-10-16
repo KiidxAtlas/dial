@@ -515,7 +515,7 @@ struct Probe {
     token: Option<String>,
     blocked: Option<(&'static str, &'static str)>,
 }
-fn origin(uri: &ureq::http::Uri) -> (String, String, u16) {
+pub(crate) fn origin(uri: &ureq::http::Uri) -> (String, String, u16) {
     (
         uri.scheme_str().unwrap_or("").to_ascii_lowercase(),
         uri.host().unwrap_or("").to_ascii_lowercase(),
@@ -966,12 +966,7 @@ fn probe_models(probe: &Probe) -> (ProviderStatus, Vec<ModelEntry>) {
         Ok(response) => response,
         Err(_) => {
             return (
-                status(
-                    probe,
-                    "unavailable",
-                    UNREACHABLE_DETAIL,
-                    0,
-                ),
+                status(probe, "unavailable", UNREACHABLE_DETAIL, 0),
                 Vec::new(),
             );
         }
@@ -2156,7 +2151,9 @@ fn oauth_catalog(
         .filter_map(|flow| {
             let provider = builtin_provider(flow.id)?;
             let signed = super::oauth::signed_in(user_dir, flow.id);
-            let base = provider.base_url.clone();
+            // A grant that routes by its own identifiers names that route; the template stays otherwise.
+            let base = super::oauth::grant_route(user_dir, flow.id)
+                .unwrap_or_else(|| provider.base_url.clone());
             let models: Vec<ModelEntry> = if signed {
                 bundled_models(flow.id)
                     .into_iter()
@@ -3021,7 +3018,10 @@ mod tests {
     #[test]
     fn ollama_models_take_their_purpose_from_api_show_capabilities() {
         let url = routed(vec![
-            ("/api/tags", r#"{"models":[{"name":"embeddinggemma:latest"}]}"#.into()),
+            (
+                "/api/tags",
+                r#"{"models":[{"name":"embeddinggemma:latest"}]}"#.into(),
+            ),
             ("/api/show", r#"{"capabilities":["embedding"]}"#.into()),
         ]);
         let (status, models) = probe_models(&test_probe(url, "ollama"));
@@ -3030,7 +3030,10 @@ mod tests {
         assert!(models[0].available);
         let url = routed(vec![
             ("/api/tags", r#"{"models":[{"name":"qwen3:4b"}]}"#.into()),
-            ("/api/show", r#"{"capabilities":["completion","tools"]}"#.into()),
+            (
+                "/api/show",
+                r#"{"capabilities":["completion","tools"]}"#.into(),
+            ),
         ]);
         let (_, models) = probe_models(&test_probe(url, "ollama"));
         assert_eq!(models[0].metadata.kind, ModelKind::Chat);

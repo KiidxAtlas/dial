@@ -8,6 +8,7 @@ use ring::{
     aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
 };
+use std::collections::{HashMap, VecDeque};
 
 /// AES-256-GCM room key; the seal key for every collab frame.
 pub const ROOM_KEY_BYTES: usize = 32;
@@ -107,6 +108,94 @@ pub fn secrets_equal(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Anti-replay window for one sender epoch. Each sequence number is accepted at most once and only
+/// while it lies within [`REPLAY_WINDOW`] of the highest number seen; older numbers are rejected.
+#[derive(Debug, Default, Clone)]
+pub struct ReplayWindow {
+    started: bool,
+    highest: u64,
+    /// Bit `i` set means sequence `highest - i` was accepted.
+    seen: u64,
+}
+
+/// Sequence numbers tracked behind the highest accepted one.
+pub const REPLAY_WINDOW: u64 = 64;
+
+impl ReplayWindow {
+    /// Returns true exactly once per sequence number inside the window. Sequence 0 is never valid.
+    pub fn accept(&mut self, seq: u64) -> bool {
+        if seq == 0 {
+            return false;
+        }
+        if !self.started {
+            self.started = true;
+            self.highest = seq;
+            self.seen = 1;
+            return true;
+        }
+        if seq > self.highest {
+            let shift = seq - self.highest;
+            self.seen = if shift >= REPLAY_WINDOW {
+                0
+            } else {
+                self.seen << shift
+            };
+            self.seen |= 1;
+            self.highest = seq;
+            return true;
+        }
+        let back = self.highest - seq;
+        if back >= REPLAY_WINDOW {
+            return false;
+        }
+        let bit = 1u64 << back;
+        if self.seen & bit != 0 {
+            return false;
+        }
+        self.seen |= bit;
+        true
+    }
+}
+
+/// Most sender epochs tracked at once. The oldest epoch is forgotten first.
+pub const MAX_TRACKED_SENDERS: usize = 1024;
+
+/// Replay windows keyed by the sender's random epoch. Epochs persist for the lifetime of the
+/// socket owner, so a frame captured from an earlier epoch is still rejected after a newer one
+/// has been seen.
+#[derive(Debug, Default)]
+pub struct SenderWindows {
+    order: VecDeque<String>,
+    windows: HashMap<String, ReplayWindow>,
+}
+
+impl SenderWindows {
+    /// Accept `(epoch, seq)` once. Authentication must happen before this check.
+    pub fn accept(&mut self, epoch: &str, seq: u64) -> bool {
+        if !self.windows.contains_key(epoch) {
+            if self.windows.len() >= MAX_TRACKED_SENDERS
+                && let Some(old) = self.order.pop_front()
+            {
+                self.windows.remove(&old);
+            }
+            self.order.push_back(epoch.to_owned());
+            self.windows
+                .insert(epoch.to_owned(), ReplayWindow::default());
+        }
+        self.windows
+            .get_mut(epoch)
+            .is_some_and(|window| window.accept(seq))
+    }
+}
+
+/// Random per-socket epoch (base64url) stamped on every frame and checked by receivers.
+pub fn generate_epoch() -> Result<String> {
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        random_bytes::<12>()?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +244,46 @@ mod tests {
         assert!(secrets_equal(b"abc", b"abc"));
         assert!(!secrets_equal(b"abc", b"abd"));
         assert!(!secrets_equal(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn replay_window_accepts_each_sequence_once_within_window() {
+        let mut window = ReplayWindow::default();
+        assert!(!window.accept(0));
+        assert!(window.accept(5));
+        assert!(!window.accept(5), "identical sequence replayed");
+        assert!(window.accept(3), "late frame inside the window is fresh");
+        assert!(!window.accept(3));
+        assert!(window.accept(70));
+        assert!(!window.accept(5), "sequence fell out of the window");
+        assert!(window.accept(71));
+        assert!(!window.accept(71));
+    }
+
+    #[test]
+    fn sender_windows_reject_old_epoch_replays_after_newer_epoch() {
+        let mut senders = SenderWindows::default();
+        assert!(senders.accept("epoch-a", 1));
+        assert!(senders.accept("epoch-a", 2));
+        assert!(senders.accept("epoch-b", 1));
+        assert!(
+            !senders.accept("epoch-a", 1),
+            "captured old-epoch frame replayed"
+        );
+        assert!(!senders.accept("epoch-b", 1), "identical frame replayed");
+        assert!(senders.accept("epoch-a", 3));
+        assert!(!generate_epoch().unwrap().is_empty());
+    }
+
+    #[test]
+    fn identical_ciphertext_replay_is_caught_by_sequence_not_iv() {
+        let key = RoomKey::new(&[4u8; 32]).unwrap();
+        let sealed = key.seal(br#"{"t":"prompt","seq":9}"#).unwrap();
+        let mut windows = SenderWindows::default();
+        assert!(windows.accept("sender", 9));
+        // The relay can redeliver the same ciphertext; decryption still succeeds, so the
+        // sequence check is what rejects it.
+        assert_eq!(key.open(&sealed).unwrap(), br#"{"t":"prompt","seq":9}"#);
+        assert!(!windows.accept("sender", 9));
     }
 }

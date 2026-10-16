@@ -16,6 +16,45 @@ let reconnectDelay = RECONNECT_MIN_MS;
 let pingTimer = null;
 let lastError = null;
 
+// Tabs whose debugger this extension attached. The relay forgets its sessions when the socket
+// closes, so after a reconnect these attachments are stale: they are detached before Dial attaches
+// again, because Chrome refuses a second attach. Persisted so a restarted worker still reconciles.
+const OWNED_TABS_KEY = "dialOwnedTabs";
+const ownedTabs = new Set();
+let ownedLoaded = null;
+
+function loadOwnedTabs() {
+  if (!ownedLoaded) {
+    ownedLoaded = chrome.storage.session
+      .get(OWNED_TABS_KEY)
+      .then((stored) => {
+        for (const tabId of stored[OWNED_TABS_KEY] ?? []) ownedTabs.add(tabId);
+      })
+      .catch(() => {});
+  }
+  return ownedLoaded;
+}
+
+function rememberOwnedTab(tabId) {
+  ownedTabs.add(tabId);
+  chrome.storage.session.set({ [OWNED_TABS_KEY]: [...ownedTabs] }).catch(() => {});
+}
+
+function forgetOwnedTab(tabId) {
+  if (!ownedTabs.delete(tabId)) return;
+  chrome.storage.session.set({ [OWNED_TABS_KEY]: [...ownedTabs] }).catch(() => {});
+}
+
+// Detaches the debugger from tabs this extension attached on an earlier socket. Only those tabs
+// are touched: a DevTools session the user opened is not ours to close.
+async function reconcileDebugger() {
+  await loadOwnedTabs();
+  const stale = [...ownedTabs];
+  ownedTabs.clear();
+  chrome.storage.session.set({ [OWNED_TABS_KEY]: [] }).catch(() => {});
+  await Promise.all(stale.map((tabId) => chrome.debugger.detach({ tabId }).catch(() => {})));
+}
+
 function snapshot(tab, targetId) {
   if (tab.id === undefined || !targetId) return null;
   return {
@@ -49,7 +88,12 @@ async function waitForPageTargetId(tabId) {
   }
 }
 
+// Until the hello for this socket is sent, nothing else goes out: the relay rejects a socket whose
+// first message is not hello, and events from reconciling stale attachments belong to no session.
+let helloPending = false;
+
 function post(message) {
+  if (helloPending && message.t !== "hello") return;
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(message));
   }
@@ -81,9 +125,14 @@ async function runOperation(message) {
   switch (message.op) {
     case "attach":
       await chrome.debugger.attach({ tabId: message.tabId }, "1.3");
+      rememberOwnedTab(message.tabId);
       return {};
     case "detach":
-      await chrome.debugger.detach({ tabId: message.tabId });
+      try {
+        await chrome.debugger.detach({ tabId: message.tabId });
+      } finally {
+        forgetOwnedTab(message.tabId);
+      }
       return {};
     case "send":
       return await chrome.debugger.sendCommand(
@@ -155,7 +204,13 @@ function connect() {
     lastError = null;
     reconnectDelay = RECONNECT_MIN_MS;
     setBadge(true);
-    buildHello().then((hello) => post(hello));
+    helloPending = true;
+    reconcileDebugger()
+      .then(() => buildHello())
+      .then((hello) => post(hello))
+      .finally(() => {
+        helloPending = false;
+      });
     clearInterval(pingTimer);
     pingTimer = setInterval(() => post({ t: "ping" }), PING_INTERVAL_MS);
   };
@@ -181,6 +236,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId === undefined) return;
+  forgetOwnedTab(source.tabId);
   post({ t: "detached", tabId: source.tabId, reason });
 });
 
@@ -195,6 +251,7 @@ chrome.tabs.onUpdated.addListener(async (_tabId, _changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  forgetOwnedTab(tabId);
   post({ t: "tabRemoved", tabId });
 });
 

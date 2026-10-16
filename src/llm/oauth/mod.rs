@@ -15,6 +15,7 @@ use crate::storage::settings_store::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::AtomicBool},
@@ -262,7 +263,38 @@ pub fn enterprise_url(user_dir: &Path, id: &str) -> Option<String> {
     load(&path(user_dir, id)).ok().flatten()?.enterprise_url
 }
 
-/// Run `id`'s interactive login and store the grant.
+/// The endpoint a signed-in grant routes to by itself (a Cloudflare gateway or Snowflake account
+/// built from its identifiers, a regional plan URL). Catalog rows and request routing both read it,
+/// so they name the same route.
+pub fn grant_route(user_dir: &Path, id: &str) -> Option<String> {
+    let flow = flow(id)?;
+    let credentials = load(&path(user_dir, id)).ok().flatten()?;
+    (flow.access)(&credentials).ok()?.base_url
+}
+
+/// Sign-out generation per provider. A sign-out advances it while holding the grant lock, so a
+/// login that began earlier can no longer publish its grant.
+static SIGN_OUT_GENERATIONS: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
+
+fn sign_out_generation(id: &'static str) -> u64 {
+    SIGN_OUT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn advance_sign_out_generation(id: &'static str) {
+    *SIGN_OUT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(id)
+        .or_insert(0) += 1;
+}
+
+/// Run `id`'s interactive login and store the grant. The grant is not stored when the provider is
+/// signed out while the login runs, including after the flow returns and before it saves.
 pub fn login(
     user_dir: &Path,
     id: &str,
@@ -270,11 +302,27 @@ pub fn login(
     cancel: Arc<AtomicBool>,
 ) -> Result<String> {
     let flow = require(id)?;
+    let generation = sign_out_generation(flow.id);
     let credentials = (flow.login)(&Login { ui, cancel })?;
     credentials.validate()?;
-    let path = path(user_dir, id);
+    publish(user_dir, flow, generation, &credentials)
+}
+
+/// Store a finished login only if no sign-out happened since `generation` was read.
+fn publish(
+    user_dir: &Path,
+    flow: &'static Flow,
+    generation: u64,
+    credentials: &Credentials,
+) -> Result<String> {
+    let path = path(user_dir, flow.id);
     let _lock = locked(&path)?;
-    save(&path, &credentials)?;
+    ensure!(
+        sign_out_generation(flow.id) == generation,
+        "{} sign-in was cancelled by sign-out; the grant was not saved",
+        flow.name
+    );
+    save(&path, credentials)?;
     let who = credentials
         .email
         .as_deref()
@@ -290,6 +338,7 @@ pub fn sign_out(user_dir: &Path, id: &str) -> Result<String> {
     let flow = require(id)?;
     let path = path(user_dir, id);
     let _lock = locked_for(&path, None, std::time::Duration::from_secs(2))?;
+    advance_sign_out_generation(flow.id);
     if path.exists() {
         std::fs::remove_file(&path).context("could not remove the stored OAuth grant")?;
     }
@@ -379,6 +428,44 @@ impl Binding {
     }
     pub fn refreshed_access(&self, cancel: &Arc<AtomicBool>) -> Result<Access> {
         refreshed_access(&self.user_dir, self.id, cancel)
+    }
+
+    /// Refuse to attach this grant to a route it does not authorize. A route the grant supplies
+    /// itself (`grant_routed`) is trusted; any other route must stay on the flow's canonical origin.
+    /// The wire protocol must match the flow's in both cases.
+    pub fn ensure_route(
+        &self,
+        grant_routed: bool,
+        route: &str,
+        protocol: ApiProtocol,
+    ) -> Result<()> {
+        let flow = self.flow();
+        ensure!(
+            protocol == flow.protocol,
+            "{} sign-in is bound to its own protocol; this route uses another one",
+            flow.name
+        );
+        ensure!(
+            grant_routed || same_origin(route, flow.base_url),
+            "{} sign-in is bound to its own endpoint and is not sent to other servers; use the provider's base URL or remove the custom one",
+            flow.name
+        );
+        Ok(())
+    }
+}
+
+/// Whether `route` and `canonical` are absolute URLs with the same scheme, host and port.
+fn same_origin(route: &str, canonical: &str) -> bool {
+    match (
+        route.parse::<ureq::http::Uri>(),
+        canonical.parse::<ureq::http::Uri>(),
+    ) {
+        (Ok(a), Ok(b)) => {
+            a.host().is_some()
+                && b.host().is_some()
+                && crate::llm::catalog::origin(&a) == crate::llm::catalog::origin(&b)
+        }
+        _ => false,
     }
 }
 
@@ -488,5 +575,122 @@ mod tests {
         };
         let text = format!("{c:?}");
         assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn a_login_finished_after_sign_out_is_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        let flow = flow("kilo").unwrap();
+        let generation = sign_out_generation(flow.id);
+        // The sign-out lands while the login is still waiting for its callback.
+        sign_out(&user, "kilo").unwrap();
+        let grant = Credentials {
+            access: "tok".into(),
+            expires_at_ms: util::NEVER_EXPIRES,
+            ..Default::default()
+        };
+        assert!(publish(&user, flow, generation, &grant).is_err());
+        assert!(!signed_in(&user, "kilo"));
+    }
+
+    #[test]
+    fn a_login_without_a_sign_out_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        let flow = flow("devin").unwrap();
+        let generation = sign_out_generation(flow.id);
+        let grant = Credentials {
+            access: "tok".into(),
+            expires_at_ms: util::NEVER_EXPIRES,
+            ..Default::default()
+        };
+        publish(&user, flow, generation, &grant).unwrap();
+        assert!(signed_in(&user, "devin"));
+    }
+
+    #[test]
+    fn a_grant_reaches_only_its_canonical_origin_and_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        let grant = Credentials {
+            access: "tok".into(),
+            expires_at_ms: util::NEVER_EXPIRES,
+            ..Default::default()
+        };
+        {
+            let p = path(&user, "kimi-code");
+            let _lock = locked(&p).unwrap();
+            save(&p, &grant).unwrap();
+        }
+        let binding = Binding::for_provider(&user, "kimi-code").unwrap();
+        let chat = ApiProtocol::ChatCompletions;
+        assert!(
+            binding
+                .ensure_route(
+                    false,
+                    "https://api.kimi.com/coding/v1/chat/completions",
+                    chat
+                )
+                .is_ok()
+        );
+        assert!(
+            binding
+                .ensure_route(false, "https://attacker.example/v1/chat/completions", chat)
+                .is_err()
+        );
+        assert!(
+            binding
+                .ensure_route(
+                    false,
+                    "http://api.kimi.com/coding/v1/chat/completions",
+                    chat
+                )
+                .is_err()
+        );
+        assert!(
+            binding
+                .ensure_route(
+                    false,
+                    "https://api.kimi.com/coding/v1/chat/completions",
+                    ApiProtocol::Anthropic
+                )
+                .is_err()
+        );
+        // A route the grant supplies itself is trusted; the protocol still has to match.
+        assert!(
+            binding
+                .ensure_route(true, "https://gateway.example/v1/anthropic", chat)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_gateway_grant_supplies_its_own_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        let mut extra = serde_json::Map::new();
+        extra.insert("accountId".into(), serde_json::Value::String("acc".into()));
+        extra.insert("gatewayId".into(), serde_json::Value::String("gw".into()));
+        let grant = Credentials {
+            access: "tok".into(),
+            expires_at_ms: util::NEVER_EXPIRES,
+            extra,
+            ..Default::default()
+        };
+        {
+            let p = path(&user, "cloudflare-ai-gateway");
+            let _lock = locked(&p).unwrap();
+            save(&p, &grant).unwrap();
+        }
+        assert_eq!(
+            grant_route(&user, "cloudflare-ai-gateway").as_deref(),
+            Some("https://gateway.ai.cloudflare.com/v1/acc/gw/anthropic")
+        );
+        assert!(grant_route(&user, "kimi-code").is_none());
     }
 }

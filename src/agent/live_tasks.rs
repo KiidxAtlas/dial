@@ -174,13 +174,35 @@ struct CancelUi<'a> {
 }
 impl Ui for CancelUi<'_> {
     fn approve(&mut self, tool: &str, summary: &str) -> super::Decision {
+        self.gate(|inner, cancel| inner.approve_with_cancel(tool, summary, cancel))
+    }
+    fn approve_call(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        summary: &str,
+        _cancel: Option<&AtomicBool>,
+    ) -> super::Decision {
+        self.gate(|inner, cancel| inner.approve_call(call_id, tool, summary, Some(cancel)))
+    }
+    fn approval_reason(&mut self) -> Option<String> {
+        self.inner.approval_reason()
+    }
+}
+impl CancelUi<'_> {
+    /// Runs one approval on the inner surface under this operation's cancellation flag. Interrupts
+    /// cancel the flag first, so a stopped operation is never prompted.
+    fn gate(
+        &mut self,
+        decide: impl FnOnce(&mut dyn Ui, &AtomicBool) -> super::Decision,
+    ) -> super::Decision {
         if self.interrupt.load(Ordering::SeqCst) {
             self.cancel.store(true, Ordering::SeqCst);
         }
         if self.cancel.load(Ordering::SeqCst) {
             return super::Decision::Deny;
         }
-        let decision = self.inner.approve_with_cancel(tool, summary, self.cancel);
+        let decision = decide(&mut *self.inner, self.cancel);
         if self.interrupt.load(Ordering::SeqCst) {
             self.cancel.store(true, Ordering::SeqCst);
         }
@@ -189,9 +211,6 @@ impl Ui for CancelUi<'_> {
         } else {
             decision
         }
-    }
-    fn approval_reason(&mut self) -> Option<String> {
-        self.inner.approval_reason()
     }
 }
 /// Reports a worker that unwinds outside the `catch_unwind` boundary as failed, so its job never reads as running forever.
@@ -518,8 +537,37 @@ pub struct ApprovalGate<'a> {
 }
 
 impl LiveTasks {
-    pub fn take_completed(&mut self) -> Vec<Value> {
-        std::mem::take(&mut self.completed)
+    /// Finished worker results the model has not received yet. A result leaves this queue only when a
+    /// request persists it into the session or a `status`/`wait` reply returns it, so it is delivered once.
+    pub fn undelivered(&self) -> Vec<Value> {
+        self.completed.clone()
+    }
+    /// Records that one worker result reached the model; it is never queued again.
+    pub fn deliver(&mut self, id: &str) {
+        self.completed
+            .retain(|result| result["id"].as_str() != Some(id));
+    }
+    /// A model-facing `status` or `wait` reply carries finished jobs in full, so those results are delivered.
+    pub fn acknowledge(&mut self, reply: &Value) {
+        let jobs: Vec<&Value> = match reply.as_array() {
+            Some(jobs) => jobs.iter().collect(),
+            None => vec![reply],
+        };
+        for job in jobs {
+            if let (Some(id), Some(status)) = (job["id"].as_str(), job["status"].as_str())
+                && status != "running"
+            {
+                self.deliver(id);
+            }
+        }
+    }
+    /// Ids of workers that have not settled yet; a turn that tries to finish waits for them.
+    pub fn running_ids(&self) -> Vec<String> {
+        self.jobs
+            .iter()
+            .filter(|(_, job)| job.running())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
     /// Messages workers sent to the parent since the last call, in send order.
     pub fn take_parent_messages(&self) -> Vec<mailbox::Letter> {
@@ -1357,7 +1405,7 @@ mod tests {
             .completed
             .push(json!({"id":"previous-result","status":"done"}));
         tasks.bind(new.clone());
-        assert!(tasks.take_completed().is_empty());
+        assert!(tasks.undelivered().is_empty());
         assert!(cancel.load(Ordering::SeqCst));
         assert_eq!(
             old.read(|n| n.result.phase),
@@ -1384,12 +1432,35 @@ mod tests {
         );
         assert_eq!(view.results, 0);
         assert!(
-            tasks.take_completed().is_empty(),
+            tasks.undelivered().is_empty(),
             "old-session results cannot enter the new parent's request"
         );
         assert_eq!(
             current.read(|n| n.result.phase),
             crate::runtime::Phase::Running
         );
+    }
+
+    #[test]
+    fn finished_results_are_delivered_once_through_any_model_view() {
+        let mut tasks = LiveTasks::default();
+        tasks
+            .completed
+            .push(json!({"id":"task-1","status":"completed","result":"found it"}));
+        tasks
+            .completed
+            .push(json!({"id":"task-2","status":"completed","result":"also"}));
+        // A `wait` or `status` reply that already carries task-1 consumes its queued result.
+        tasks.acknowledge(&json!({"id":"task-1","status":"completed","result":"found it"}));
+        assert_eq!(tasks.undelivered().len(), 1);
+        assert_eq!(tasks.undelivered()[0]["id"], "task-2");
+        // A running job in a reply is not a delivered result.
+        tasks.acknowledge(&json!([{"id":"task-2","status":"running"}]));
+        assert_eq!(tasks.undelivered().len(), 1);
+        tasks.deliver("task-2");
+        assert!(tasks.undelivered().is_empty());
+        // Delivering again is a no-op: the result never re-enters a request.
+        tasks.deliver("task-2");
+        assert!(tasks.undelivered().is_empty());
     }
 }

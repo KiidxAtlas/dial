@@ -39,34 +39,16 @@ help:
 		'make test-mlx  Run optional local MLX checks; explicitly skip unsupported hosts, never download'
 
 update:
+	$(PYTHON) scripts/install-dev.py check --keep "$(KEEP_BACKUPS)"
 	$(CARGO) build --bin dial --profile $(PROFILE) --locked --timings $(CARGO_FEATURE_FLAGS)
 	mkdir -p bin "$(INSTALL_DIR)"
-	@stamp="$$(date +%Y%m%d-%H%M%S)"; \
-	for path in bin/dial "$(INSTALL_DIR)/dial"; do \
-		if [ -f "$$path" ]; then \
-			cp -p "$$path" "$$path.bak-$$stamp"; \
-			printf 'Preserved previous binary: %s.bak-%s\n' "$$path" "$$stamp"; \
-		fi; \
-	done
-	@if [ "$(INSTALL_DIR)" != "$(HOME)/.cargo/bin" ] && [ -f "$(HOME)/.cargo/bin/dial" ]; then \
-		stamp="$$(date +%Y%m%d-%H%M%S)"; \
-		cp -p "$(HOME)/.cargo/bin/dial" "$(HOME)/.cargo/bin/dial.bak-$$stamp"; \
-		printf 'Preserved previous binary: %s.bak-%s\n' "$(HOME)/.cargo/bin/dial" "$$stamp"; \
-	fi
-	@for path in bin/dial "$(INSTALL_DIR)/dial" "$(HOME)/.cargo/bin/dial"; do \
-		for old in "$$path".bak-*; do [ -f "$$old" ] && printf '%s\n' "$$old"; done \
-			| sort -r | awk 'NR > $(KEEP_BACKUPS)' | while IFS= read -r old; do \
-				rm -f -- "$$old" && printf 'Pruned old backup: %s\n' "$$old"; \
-			done; \
-	done
-	install -m 755 "$(BUILD_DIR)/dial" bin/dial
-	install -m 755 "$(BUILD_DIR)/dial" "$(INSTALL_DIR)/dial"
-	@if [ -f "$(HOME)/.cargo/bin/dial" ] && [ "$(INSTALL_DIR)" != "$(HOME)/.cargo/bin" ]; then install -m 755 "$(BUILD_DIR)/dial" "$(HOME)/.cargo/bin/dial"; fi
+	$(PYTHON) scripts/install-dev.py install --keep "$(KEEP_BACKUPS)" --build "$(BUILD_DIR)/dial" --bin-target bin/dial --install-dir "$(INSTALL_DIR)" --cargo-bin "$(HOME)/.cargo/bin/dial"
 	@active="$$(command -v dial 2>/dev/null)"; \
 	if [ -z "$$active" ] || ! cmp -s "$$active" "$(BUILD_DIR)/dial"; then \
 		printf 'ERROR: PATH selects %s, which differs from the installed worktree build.\n' "$$active" >&2; \
 		exit 1; \
 	fi
+	@$(PYTHON) scripts/install-dev.py prune --keep "$(KEEP_BACKUPS)" --bin-target bin/dial --install-dir "$(INSTALL_DIR)" --cargo-bin "$(HOME)/.cargo/bin/dial"
 	@printf 'Updated %s and %s\n' '$(CURDIR)/bin/dial' '$(INSTALL_DIR)/dial'
 	@printf '%s\n' 'If your shell cached another dial path, run: hash -r (bash) or rehash (zsh).'
 

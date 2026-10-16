@@ -319,14 +319,26 @@ pub(crate) fn exit_code(output: &str) -> Option<i32> {
 }
 
 /// Recognize explicit empty-suite outcomes. A successful exit alone does not prove tests executed.
+/// Whole-run aggregation: a runner reports testless packages one row each (`go test` prints
+/// `? pkg [no test files]`), so the run is empty only when no package executed a test.
 pub(super) fn zero_tests(output: &str) -> bool {
     if output.contains("Ran 0 tests")
         || output.contains("no tests ran")
-        || output
-            .lines()
-            .any(|line| line.trim().ends_with("[no test files]") || line.trim() == "No tests found")
+        || output.lines().any(|line| line.trim() == "No tests found")
     {
         return true;
+    }
+    let testless = output
+        .lines()
+        .any(|line| line.trim().ends_with("[no test files]"));
+    if testless {
+        let executed = output.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("ok ")
+                && !line.ends_with("[no test files]")
+                && !line.contains("[no tests to run]")
+        });
+        return !executed;
     }
     let mut counts = output
         .lines()
@@ -526,6 +538,11 @@ pub fn plan_with_runner(
         {
             continue;
         }
+        // A renamed or deleted file has no post-change content to parse, so it gets no syntax obligation.
+        // Only a confirmed absence counts: an unreadable path keeps its check so the failure stays explicit.
+        if removed_from(root, path) {
+            continue;
+        }
 
         let owner = python_owner(root, path);
         let relative = root
@@ -550,6 +567,23 @@ pub fn plan_with_runner(
     }
 
     checks
+}
+
+/// Whether `path` is confirmed absent from the post-change workspace (renamed away or deleted).
+/// Any other lookup failure, such as a permission error, is not absence and keeps its obligation.
+fn removed_from(root: &Path, path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(root.join(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// A retained Python AST obligation whose file is gone is obsolete: nothing remains to parse.
+pub fn obsolete_check(root: &Path, check: &FocusedCheck) -> bool {
+    check
+        .name
+        .strip_prefix("python AST: ")
+        .is_some_and(|path| removed_from(root, Path::new(path)))
 }
 
 /// Workspace-relative manifest of the nearest crate below `root` that owns `changed`.
@@ -924,6 +958,8 @@ mod tests {
     fn routes_and_deduplicates_supported_languages_in_stable_order() {
         let root = TempDir::new();
         fs::write(root.0.join("Cargo.toml"), "").unwrap();
+        fs::create_dir_all(root.0.join("scripts")).unwrap();
+        fs::write(root.0.join("scripts/check.py"), "value = 1\n").unwrap();
         let changed = [
             PathBuf::from("src/main.rs"),
             PathBuf::from("scripts/check.py"),
@@ -949,8 +985,36 @@ mod tests {
     }
 
     #[test]
+    fn renamed_or_deleted_python_files_get_no_impossible_syntax_check() {
+        let root = TempDir::new();
+        fs::create_dir_all(root.0.join("pkg")).unwrap();
+        fs::write(root.0.join("pkg/new_name.py"), "value = 1\n").unwrap();
+        let changed = [
+            PathBuf::from("pkg/old_name.py"),
+            PathBuf::from("pkg/new_name.py"),
+            PathBuf::from("pkg/deleted.py"),
+        ];
+        let checks = plan(&root.0, Path::new("/usr/bin/python3"), &changed);
+        // Only the destination of the rename is parsed; the removed paths are never read.
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "python AST: pkg/new_name.py");
+        assert!(checks[0].command.contains("'pkg/new_name.py'"));
+        assert!(obsolete_check(
+            &root.0,
+            &FocusedCheck {
+                name: "python AST: pkg/old_name.py".into(),
+                command: String::new(),
+                timeout_secs: 0,
+            }
+        ));
+        assert!(!obsolete_check(&root.0, &checks[0]));
+    }
+
+    #[test]
     fn shell_quotes_executable_and_path_with_spaces_and_single_quotes() {
         let root = TempDir::new();
+        fs::create_dir_all(root.0.join("dir with space")).unwrap();
+        fs::write(root.0.join("dir with space/a'b.py"), "value = 1\n").unwrap();
         let changed = [PathBuf::from("dir with space/a'b.py")];
 
         #[cfg(unix)]
@@ -991,6 +1055,7 @@ mod selection_tests {
         std::fs::write(root.path().join("tests/test_app.py"), "").unwrap();
         std::fs::write(root.path().join("pytest.ini"), "").unwrap();
         std::fs::write(root.path().join("uv.lock"), "version = 1").unwrap();
+        std::fs::write(root.path().join("app.py"), "").unwrap();
         let static_check =
             plan(root.path(), Path::new("wrong-python"), &["app.py".into()]).remove(0);
         let test_check =
@@ -1317,6 +1382,15 @@ mod selection_tests {
         assert!(zero_tests("? example/pkg [no test files]\n"));
         assert!(zero_tests("No tests found"));
         assert!(!zero_tests("build complete"));
+        // A mixed `go test ./...` run passes when some package ran tests; all-testless stays empty.
+        let mixed = "ok  \texample/tested\t0.012s\n?   \texample/helper\t[no test files]\n";
+        assert!(!zero_tests(mixed));
+        assert!(zero_tests(
+            "?   \texample/helper\t[no test files]\n?   \texample/other\t[no test files]\n"
+        ));
+        assert!(zero_tests(
+            "ok  \texample/tested\t0.01s [no tests to run]\n?   \texample/helper\t[no test files]\n"
+        ));
     }
 }
 

@@ -50,9 +50,8 @@ impl Agent<'_> {
         // After a failed blocking compaction, retry only once the request has grown by a real
         // amount (or would overflow): retrying every tool step re-ran the whole method chain.
         let mut compaction_retry_floor: Option<u64> = None;
-        let mut fallback_index = 0usize;
-        let mut fallback_cooldown: Option<Instant> = None;
         let mut max_tokens = backend.output_budget(h.max_tokens);
+        self.report_retained_fallback(ui);
         let mut recovering_output = false;
         let mut engine = engine::Engine::default();
         let turn_cancel = self.cancellation.turn(self.interrupt.clone());
@@ -192,7 +191,7 @@ impl Agent<'_> {
                 engine.recovery.reset();
                 rejected_edit_previews = 0;
                 recovering_output = false;
-                max_tokens = h.max_tokens;
+                max_tokens = backend.output_budget(h.max_tokens);
                 reasoning_budget = None;
                 planning_notice = false;
                 plan_after_gate = false;
@@ -210,6 +209,23 @@ impl Agent<'_> {
                     interrupted: true,
                     trajectory: None,
                 }).map(engine::Tick::Finished);
+            }
+            // Worker results are persisted before the request is built, so they stay in context and survive
+            // an overflow retry; each one is delivered exactly once.
+            self.deliver_worker_results()?;
+            // A plan approved inside this turn ends planner-model use at this boundary, so implementation
+            // runs on the main model. The loop owns the backend, so it is swapped in place.
+            if !self.plan_mode && self.plan_model_prior.is_some() {
+                self.plan_model_resume()?;
+                if let Some(mut main) = self.backend.take() {
+                    main.set_usage_scope(Some(self.usage_scope.clone()));
+                    let mut planner = std::mem::replace(backend, main);
+                    planner.release();
+                }
+            }
+            // A fallback whose cooldown elapsed returns to the primary before anything is sized for it.
+            if self.restore_primary_if_due(backend, ui)? {
+                max_tokens = backend.output_budget(h.max_tokens);
             }
             let prep_started = Instant::now();
             let budget_window = self.budget_window();
@@ -479,6 +495,8 @@ impl Agent<'_> {
                         if !outcome.continue_allowed {
                             return self.pause_after_compaction(ui, step).map(engine::Tick::Finished);
                         }
+                        // The compacted context no longer holds the results duplicate memory cited.
+                        engine.evidence_compacted();
                         // Re-check at the next request boundary; compaction may be needed again
                         // after subsequent tool results in this same autonomous turn.
                         compaction_failed = false;
@@ -604,17 +622,6 @@ impl Agent<'_> {
                 serde_json::to_value(&request_overhead)?,
             )?;
             let started = Instant::now();
-            if fallback_index > 0 && fallback_cooldown.is_some_and(|until| Instant::now() >= until)
-            {
-                fallback_cooldown = None;
-                fallback_index = 0;
-                *backend = make_backend(self.effective_config())?
-                    .with_session_id(self.session.id().to_owned());
-                join_turn_usage(&self.usage_scope, backend);
-                self.request_phase
-                    .recover("fallback cooldown elapsed; returning to the primary model");
-                ui.diagnostic("Fallback cooldown elapsed; returning to the primary model");
-            }
             let timeout = self.config.worker_timeout_secs;
             let mut reasoning_policy = self.config.reasoning_guard.clone();
             reasoning_policy.max_pre_action_secs = selection.pre_action_secs;
@@ -883,41 +890,8 @@ impl Agent<'_> {
                         && error.downcast_ref::<llm::errors::ThinkingLoop>().is_none()
                         && crate::llm::fallback::should_fallback(&error) =>
                 {
-                    let selected = self.effective_config().selection();
-                    let fallbacks = crate::llm::fallback::fallback_models(
-                        self.effective_config(),
-                        "default",
-                        &selected,
-                    );
-                    let mut switched = false;
-                    while let Some(next) = fallbacks.get(fallback_index) {
-                        fallback_index += 1;
-                        let next_config = self.effective_config().with_selection(next);
-                        match make_backend(&next_config) {
-                            Ok(next_backend) => {
-                                let cooldown = error
-                                    .downcast_ref::<llm::HttpError>()
-                                    .and_then(|http| http.retry_after)
-                                    .unwrap_or(Duration::from_secs(5 * 60));
-                                fallback_cooldown = Some(Instant::now() + cooldown);
-                                *backend = next_backend.with_session_id(self.session.id().to_owned());
-                                join_turn_usage(&self.usage_scope, backend);
-                                self.request_phase
-                                    .recover("switching to a configured fallback model");
-                                ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Model, &format!(
-                                    "Primary model failed; continuing with configured fallback {}/{}",
-                                    next.provider, next.model
-                                )));
-                                switched = true;
-                                break;
-                            }
-                            Err(build_error) => ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Model, &format!(
-                                "Configured fallback {}/{} could not be constructed ({build_error:#}); trying the next fallback",
-                                next.provider, next.model
-                            ))),
-                        }
-                    }
-                    if switched {
+                    if self.fail_over(backend, &error, ui) {
+                        max_tokens = backend.output_budget(h.max_tokens);
                         budget.give_back();
                         return Ok(engine::Tick::Again);
                     }
@@ -1944,8 +1918,13 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 if !output.is_error {
                     round_succeeded = true;
                 }
-                if !output.is_error
-                    && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve")
+                // Committed facts decide: any tool whose transaction committed paths (LSP rename, code
+                // actions, checkpointed edits) advances the mutation epoch, even when it failed after
+                // a partial commit. The name list covers writers that commit without reporting paths.
+                let committed = !output.execution.changed_paths.is_empty();
+                if committed
+                    || (!output.is_error
+                        && matches!(call.name.as_str(), "write" | "edit" | "ast_edit" | "solve"))
                 {
                     self.step_checks.mutations += 1;
                     self.behavioral_checks.clear();
@@ -2005,7 +1984,12 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     |id| self.holds_full_result(id),
                 );
                 let is_duplicate = duplicate.is_some();
-                if is_duplicate {
+                // A read pointer re-presents evidence the model already holds: it is neither a
+                // withheld call nor a new observation.
+                let is_pointer = duplicate
+                    .as_deref()
+                    .is_some_and(super::investigation::is_unchanged_read);
+                if is_duplicate && !is_pointer {
                     self.record(step, "investigation_gate", json!({"name":call.name}))?;
                     ui.diagnostic(&format!("Recovery checkpoint: unchanged observation in this `{}` call; it is withheld while corrected arguments and narrower evidence remain available.", call.name));
                 }
@@ -2096,8 +2080,8 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     output.is_error,
                     artifact.is_some(),
                 );
-                let mut body =
-                    duplicate.unwrap_or_else(|| guard::clip_evidence(&output.text, limit));
+                let (mut body, dropped) =
+                    efficiency::visible_result(&output.text, limit, duplicate);
                 if call.name == "bash"
                     && !output.is_error
                     && call.arguments["command"]
@@ -2108,12 +2092,8 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 {
                     body = compact;
                 }
-                if (output.text.len() > limit || body.starts_with("[Investigation check"))
-                    && let Some(uri) = &artifact
-                {
-                    body.push_str(&format!(
-                        "\n[Complete tool evidence: {uri}; retrieve with artifact_read]"
-                    ));
+                if let Some(uri) = &artifact {
+                    efficiency::evidence_link(&mut body, uri, dropped);
                 }
                 if let Some(notice) = &retain_notice {
                     body.push_str(notice);
@@ -2660,7 +2640,7 @@ pub(super) fn settle_reliability(
 
 /// A fallback or cooldown return is a new provider backend. It must join the turn's usage ledger
 /// before its first request, or its requests, tokens and prices bypass accounting.
-fn join_turn_usage(usage: &crate::llm::usage::Scope, backend: &mut Backend) {
+pub(super) fn join_turn_usage(usage: &crate::llm::usage::Scope, backend: &mut Backend) {
     backend.set_usage_scope(Some(usage.clone()));
 }
 

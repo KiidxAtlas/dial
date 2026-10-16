@@ -1,8 +1,8 @@
 //! File reads and guarded transactional whole-file writes.
 
 use super::select::{
-    self, DEFAULT_READ_LINES, MAX_READ_LINE, MAX_READ_LINES, MAX_READ_OUTPUT, Selector, empty_read,
-    plan_spans,
+    self, DEFAULT_READ_LINES, MAX_READ_LINE, MAX_READ_LINES, MAX_READ_OUTPUT, READ_FOOTER_RESERVE,
+    Selector, empty_read, plan_spans,
 };
 use super::{EditMode, Workspace, hashline, io_message, opt_u64, present, req_str};
 use anyhow::Result;
@@ -179,15 +179,21 @@ pub(super) fn list_dir(ws: &Workspace, dir: &Path) -> Result<String, String> {
 }
 
 pub(super) fn read_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
-    read_tool_streaming(ws, args, &std::sync::atomic::AtomicBool::new(false))
+    read_tool_streaming(
+        ws,
+        args,
+        &std::sync::atomic::AtomicBool::new(false),
+        MAX_READ_OUTPUT,
+    )
 }
 pub(super) fn read_tool_streaming(
     ws: &Workspace,
     args: &Value,
     cancel: &std::sync::atomic::AtomicBool,
+    budget: usize,
 ) -> Result<String, String> {
     if present(args, "paths") {
-        return read_paths(ws, args, &args["paths"], cancel);
+        return read_paths(ws, args, &args["paths"], cancel, budget);
     }
     let input = req_str(args, "path")?;
     let scheme = super::resources::scheme(input)?;
@@ -203,7 +209,7 @@ pub(super) fn read_tool_streaming(
             path.to_str()
                 .ok_or("read file URI must decode to a UTF-8 path")?
         );
-        return read_tool_streaming(ws, &args, cancel);
+        return read_tool_streaming(ws, &args, cancel, budget);
     }
     if scheme == super::resources::Scheme::Artifact {
         let store = ws
@@ -269,9 +275,9 @@ pub(super) fn read_tool_streaming(
     if super::edit_source::notebook_path(Path::new(path_text)) {
         let offset = offset.map_or(1, |value| value.min(usize::MAX as u64) as usize);
         return if sel.raw {
-            read_plain(ws, path_text, &sel, offset, limit)
+            read_plain(ws, path_text, &sel, offset, limit, budget)
         } else {
-            hashline::read(ws, path_text, &sel, offset, limit)
+            hashline::read(ws, path_text, &sel, offset, limit, budget)
         };
     }
     if crate::llm::images::is_image(Path::new(path_text)) {
@@ -290,17 +296,19 @@ pub(super) fn read_tool_streaming(
     }
     let offset = offset.map_or(1, |o| o.min(usize::MAX as u64) as usize);
     match ws.edit_mode {
-        EditMode::Hashline => hashline::read(ws, path_text, &sel, offset, limit),
-        _ => read_plain(ws, path_text, &sel, offset, limit),
+        EditMode::Hashline => hashline::read(ws, path_text, &sel, offset, limit, budget),
+        _ => read_plain(ws, path_text, &sel, offset, limit, budget),
     }
 }
 
 /// Several targets in one call. Each keeps its own selector; a failing target is reported inline.
+/// The targets share one byte budget: each read gets what the earlier ones left of it.
 fn read_paths(
     ws: &Workspace,
     args: &Value,
     paths: &Value,
     cancel: &std::sync::atomic::AtomicBool,
+    budget: usize,
 ) -> Result<String, String> {
     if present(args, "path") {
         return Err("pass either path or paths, not both".into());
@@ -314,24 +322,29 @@ fn read_paths(
             "paths accepts at most {MAX_READ_PATHS} targets; split the read"
         ));
     }
+    let total = budget.min(MAX_READ_PATHS_BYTES);
     let mut out = String::new();
     for (index, target) in targets.iter().enumerate() {
         let Some(path) = target.as_str() else {
             return Err("paths must contain only strings".into());
         };
-        if out.len() > MAX_READ_PATHS_BYTES {
+        // Room left for this target; too little to show a row is left for a separate call.
+        let Some(room) = total
+            .checked_sub(out.len())
+            .filter(|room| *room > READ_FOOTER_RESERVE)
+        else {
             out.push_str(&format!(
                 "[{} remaining paths omitted: output limit reached; read them in a separate call]",
                 targets.len() - index
             ));
             break;
-        }
+        };
         let mut single = args.clone();
         if let Some(object) = single.as_object_mut() {
             object.remove("paths");
             object.insert("path".into(), Value::String(path.to_string()));
         }
-        match read_tool_streaming(ws, &single, cancel) {
+        match read_tool_streaming(ws, &single, cancel, room) {
             Ok(text) => out.push_str(&text),
             Err(error) => out.push_str(&format!("[{path}] error: {error}")),
         }
@@ -371,6 +384,7 @@ pub(super) fn read_plain(
     sel: &Selector,
     offset: usize,
     limit: usize,
+    budget: usize,
 ) -> Result<String, String> {
     let path = ws.resolve(input)?;
     let meta = fs::metadata(&path).map_err(|e| io_message("reading", input, &e))?;
@@ -390,6 +404,7 @@ pub(super) fn read_plain(
     let mut reader = open()?;
     let mut buf = Vec::new();
     let mut consumed = 0usize; // lines pulled from the reader
+    let row_limit = budget.saturating_sub(READ_FOOTER_RESERVE);
     let mut out = String::new();
     let mut shown: Vec<(usize, usize)> = Vec::new();
     let mut witnessed: Vec<(usize, String)> = Vec::new();
@@ -430,7 +445,7 @@ pub(super) fn read_plain(
                 row.push_str(" …[line truncated]");
             }
             row.push('\n');
-            if out.len() + row.len() > MAX_READ_OUTPUT {
+            if out.len() + row.len() > row_limit {
                 stopped_at = Some(consumed);
                 break;
             }
@@ -672,6 +687,44 @@ mod tests {
         fs::write(dir.path().join("long.txt"), "y".repeat(5_000_000)).unwrap();
         let long = run(&ws, "read", json!({"path": "long.txt"}));
         assert!(long.text.len() < 4000 && long.text.contains("line truncated"));
+    }
+
+    #[test]
+    fn read_budget_bounds_the_rows_and_the_multi_path_total() {
+        let (dir, ws) = workspace();
+        let body: String = (1..=2000)
+            .map(|n| format!("line {n} with some padding text\n"))
+            .collect();
+        fs::write(dir.path().join("long.txt"), &body).unwrap();
+        fs::write(dir.path().join("short.txt"), "alpha\nbeta\n").unwrap();
+        fs::write(dir.path().join("other.txt"), &body).unwrap();
+        let budget = 4096;
+        let single = read_tool_streaming(
+            &ws,
+            &json!({"path": "long.txt"}),
+            &std::sync::atomic::AtomicBool::new(false),
+            budget,
+        )
+        .unwrap();
+        assert!(single.len() <= budget, "{}", single.len());
+        assert!(single.contains("of 2000"), "{single}");
+        assert!(!single.contains("line 2000 "), "{single}");
+        let several = read_tool_streaming(
+            &ws,
+            &json!({"paths": ["short.txt", "other.txt"]}),
+            &std::sync::atomic::AtomicBool::new(false),
+            budget,
+        )
+        .unwrap();
+        assert!(
+            several.len() <= budget + READ_FOOTER_RESERVE,
+            "{}",
+            several.len()
+        );
+        assert!(
+            several.contains("alpha") && several.contains("other.txt"),
+            "{several}"
+        );
     }
 
     fn numbered_file(dir: &tempfile::TempDir, name: &str, lines: usize) {

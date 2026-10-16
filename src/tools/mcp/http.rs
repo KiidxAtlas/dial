@@ -31,6 +31,12 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 /// Longest single line accepted from an event stream, including the unbounded GET stream.
 const MAX_EVENT_LINE: u64 = 16 * 1024 * 1024;
+/// Most data one event may carry, counted across its `data:` lines as they arrive.
+const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+/// How long a streamable-HTTP GET stream runs before it is reopened on the same session.
+const STREAMABLE_LISTEN_LIFETIME: Duration = Duration::from_secs(600);
+/// How long a legacy SSE stream runs; it carries every reply, so its end closes the session.
+const LEGACY_LISTEN_LIFETIME: Duration = Duration::from_secs(3600);
 
 /// The server dropped the session (HTTP 404 for a known session id); the connection must be redone.
 #[derive(Debug)]
@@ -43,6 +49,33 @@ impl std::fmt::Display for SessionEnded {
 }
 
 impl std::error::Error for SessionEnded {}
+
+/// A GET event stream reached its lifetime and was closed; the connection must be redone.
+#[derive(Debug)]
+pub struct StreamExpired(pub String);
+
+impl std::fmt::Display for StreamExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MCP server `{}` closed its event stream after its lifetime; reconnect to resume",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for StreamExpired {}
+
+/// Whether a read failed because a timeout elapsed (ureq reports body timeouts as `Error::Timeout`).
+fn is_timeout(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::TimedOut
+        || matches!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<ureq::Error>()),
+            Some(ureq::Error::Timeout(_))
+        )
+}
 
 /// The server wants authorization dial does not have (HTTP 401 without static credentials).
 #[derive(Debug)]
@@ -175,6 +208,8 @@ pub struct Http {
     stop: AtomicBool,
     sse: bool,
     endpoint: Mutex<Option<String>>,
+    /// How long one GET event stream may run before Dial closes it (see `read_stream`).
+    stream_lifetime: Duration,
 }
 
 impl Http {
@@ -195,6 +230,11 @@ impl Http {
             stop: AtomicBool::new(false),
             sse: config.transport == Some(McpTransport::Sse),
             endpoint: Mutex::default(),
+            stream_lifetime: if config.transport == Some(McpTransport::Sse) {
+                LEGACY_LISTEN_LIFETIME
+            } else {
+                STREAMABLE_LISTEN_LIFETIME
+            },
         })
     }
 
@@ -292,17 +332,21 @@ impl Http {
             );
         }
         if is_sse {
-            read_events(BufReader::new(reader), &mut |_, data| {
-                if self.stop.load(Ordering::Relaxed) {
-                    return false;
-                }
-                if let Ok(value) = serde_json::from_str::<Value>(data) {
-                    for message in flatten(value) {
-                        sink(message);
+            read_events(
+                BufReader::new(reader),
+                &|| !self.stop.load(Ordering::Relaxed),
+                &mut |_, data| {
+                    if self.stop.load(Ordering::Relaxed) {
+                        return false;
                     }
-                }
-                true
-            })
+                    if let Ok(value) = serde_json::from_str::<Value>(data) {
+                        for message in flatten(value) {
+                            sink(message);
+                        }
+                    }
+                    true
+                },
+            )
             .map_err(|e| {
                 anyhow!(
                     "MCP server `{}`: reading the event stream failed: {e}",
@@ -337,7 +381,17 @@ impl Http {
     /// POST endpoint and carries every reply, so its end is a lost connection.
     fn listen(self: Arc<Self>, shared: Arc<Shared>, ready: Option<mpsc::Sender<Result<()>>>) {
         let mut ready = ready;
-        let result = self.read_stream(&shared, &mut ready);
+        let result = loop {
+            let result = self.read_stream(&shared, &mut ready);
+            // A streamable GET stream that reaches its lifetime is reopened on the same session.
+            let expired = result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.downcast_ref::<StreamExpired>().is_some());
+            if self.sse || !expired || self.stop.load(Ordering::Relaxed) {
+                break result;
+            }
+        };
         if !self.sse {
             return;
         }
@@ -376,6 +430,9 @@ impl Http {
                 request = request.header("MCP-Protocol-Version", version.as_str());
             }
             let response = request
+                .config()
+                .timeout_recv_body(Some(self.stream_lifetime))
+                .build()
                 .call()
                 .map_err(|e| anyhow!("MCP server `{}` event stream failed: {e}", self.server))?;
             let status = response.status().as_u16();
@@ -412,39 +469,45 @@ impl Http {
             }
             break response;
         };
-        // Stop-observation limit: ureq 3.4.2 offers no idle timeout for a body read.
-        // `timeout_recv_body` is a total budget that ends the stream outright (reconnecting on it
-        // would change legacy session semantics), and there is no handle to shut the socket. So
-        // this read blocks until the server sends an event or closes; `stop` is checked on the
-        // next event and the thread then exits. `shutdown`, `Drop`, and the `connect_sse` timeout
-        // only set the flag and never join this thread, so the wait never blocks a caller.
+        // The stream lives at most `stream_lifetime`: the transport read fails with a timeout when
+        // that elapses, so a server that stalls cannot hold this thread and its socket forever.
+        // `shutdown` and `Drop` only set `stop`, which is checked before every line; nothing joins
+        // this thread, so no caller waits on it.
         let reader = BufReader::new(response.body_mut().with_config().limit(u64::MAX).reader());
-        read_events(reader, &mut |event, data| {
-            if self.stop.load(Ordering::Relaxed) {
-                return false;
-            }
-            if self.sse && event == "endpoint" {
-                let outcome = self.set_endpoint(data);
-                let stop_reading = outcome.is_err();
-                if let Some(tx) = ready.take() {
-                    let _ = tx.send(outcome);
+        read_events(
+            reader,
+            &|| !self.stop.load(Ordering::Relaxed),
+            &mut |event, data| {
+                if self.stop.load(Ordering::Relaxed) {
+                    return false;
                 }
-                return !stop_reading;
-            }
-            if let Ok(value) = serde_json::from_str::<Value>(data) {
-                for message in flatten(value) {
-                    if let Some(answer) = shared.handle(&message) {
-                        let _ = self.post(&answer, ANSWER_TIMEOUT, &mut |_| {});
+                if self.sse && event == "endpoint" {
+                    let outcome = self.set_endpoint(data);
+                    let stop_reading = outcome.is_err();
+                    if let Some(tx) = ready.take() {
+                        let _ = tx.send(outcome);
+                    }
+                    return !stop_reading;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(data) {
+                    for message in flatten(value) {
+                        if let Some(answer) = shared.handle(&message) {
+                            let _ = self.post(&answer, ANSWER_TIMEOUT, &mut |_| {});
+                        }
                     }
                 }
-            }
-            true
-        })
+                true
+            },
+        )
         .map_err(|e| {
-            anyhow!(
-                "MCP server `{}`: reading the event stream failed: {e}",
-                self.server
-            )
+            if is_timeout(&e) {
+                anyhow::Error::new(StreamExpired(self.server.clone()))
+            } else {
+                anyhow!(
+                    "MCP server `{}`: reading the event stream failed: {e}",
+                    self.server
+                )
+            }
         })?;
         Ok(())
     }
@@ -591,15 +654,22 @@ pub(super) fn flatten(value: Value) -> Vec<Value> {
 
 /// Reads server-sent events as they arrive, calling `on_event(event_name, data)` per event (the
 /// name defaults to `message`; multi-line data is joined with newlines). Stops when it returns
-/// false or the stream ends. Comments and fields other than `event`/`data` are ignored.
+/// false, when `keep_going` returns false (checked before every line), or when the stream ends.
+/// Comments and fields other than `event`/`data` are ignored. The data of one event may not exceed
+/// [`MAX_EVENT_BYTES`]; that is counted as the lines arrive, so an event that never ends is refused.
 pub(super) fn read_events(
     mut reader: impl BufRead,
+    keep_going: &dyn Fn() -> bool,
     on_event: &mut dyn FnMut(&str, &str) -> bool,
 ) -> std::io::Result<()> {
     let mut event = String::new();
     let mut data: Vec<String> = Vec::new();
+    let mut data_bytes = 0usize;
     let mut raw: Vec<u8> = Vec::new();
     loop {
+        if !keep_going() {
+            return Ok(());
+        }
         raw.clear();
         // Bounded: a server that never sends a newline cannot grow this buffer without limit.
         let read = (&mut reader)
@@ -622,12 +692,23 @@ pub(super) fn read_events(
                 }
             }
             data.clear();
+            data_bytes = 0;
             event.clear();
             if read == 0 {
                 return Ok(());
             }
         } else if let Some(rest) = text.strip_prefix("data:") {
-            data.push(rest.strip_prefix(' ').unwrap_or(rest).to_owned());
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            // The joined event gets one newline between lines; count it as it is added.
+            let added = rest.len() + usize::from(!data.is_empty());
+            if data_bytes + added > MAX_EVENT_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "server-sent event exceeds the size limit",
+                ));
+            }
+            data_bytes += added;
+            data.push(rest.to_owned());
         } else if let Some(rest) = text.strip_prefix("event:") {
             event = rest.trim().to_owned();
         }
@@ -638,7 +719,7 @@ pub(super) fn read_events(
 #[cfg(test)]
 pub fn parse_sse(body: &str) -> Vec<Value> {
     let mut out = Vec::new();
-    let _ = read_events(body.as_bytes(), &mut |_, data| {
+    let _ = read_events(body.as_bytes(), &|| true, &mut |_, data| {
         if let Ok(value) = serde_json::from_str::<Value>(data) {
             out.push(value);
         }
@@ -665,7 +746,7 @@ mod tests {
     fn sse_event_names_reach_the_callback_and_crlf_is_accepted() {
         let body = "event: endpoint\r\ndata: /messages?session=1\r\n\r\ndata: {\"a\":1}\r\n\r\n";
         let mut seen = Vec::new();
-        read_events(body.as_bytes(), &mut |event, data| {
+        read_events(body.as_bytes(), &|| true, &mut |event, data| {
             seen.push((event.to_owned(), data.to_owned()));
             true
         })
@@ -697,5 +778,100 @@ mod tests {
         ] {
             assert!(validate_url(bad).is_err(), "{bad}");
         }
+    }
+
+    /// An endless stream of `data:` lines with no blank line: the generator for budget tests.
+    struct EndlessData {
+        pattern: Vec<u8>,
+        served: usize,
+    }
+
+    impl EndlessData {
+        fn new(line: &str) -> Self {
+            Self {
+                pattern: line.as_bytes().to_vec(),
+                served: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for EndlessData {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            for byte in buf.iter_mut() {
+                *byte = self.pattern[self.served % self.pattern.len()];
+                self.served += 1;
+            }
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn event_data_over_budget_fails_without_a_blank_line() {
+        let mut delivered = 0;
+        let error = read_events(
+            BufReader::new(EndlessData::new(&format!("data: {}\n", "a".repeat(1000)))),
+            &|| true,
+            &mut |_, _| {
+                delivered += 1;
+                true
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(delivered, 0);
+    }
+
+    #[test]
+    fn cancellation_is_checked_between_lines_of_one_event() {
+        let lines = std::cell::Cell::new(0usize);
+        let keep_going = || {
+            lines.set(lines.get() + 1);
+            lines.get() <= 3
+        };
+        let mut delivered = 0;
+        read_events(
+            BufReader::new(EndlessData::new("data: x\n")),
+            &keep_going,
+            &mut |_, _| {
+                delivered += 1;
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(lines.get(), 4);
+        assert_eq!(delivered, 0);
+    }
+
+    #[test]
+    fn stalled_legacy_stream_is_closed_at_its_lifetime() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let _ = socket.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\r\ndata: /messages\r\n\r\n",
+                );
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        });
+        let config = McpServerConfig {
+            transport: Some(McpTransport::Sse),
+            ..McpServerConfig::default()
+        };
+        let mut http = Http::new("fake", &format!("http://{addr}/sse"), &config, None).unwrap();
+        http.stream_lifetime = Duration::from_millis(300);
+        let http = Arc::new(http);
+        let shared = Arc::new(Shared::new(Vec::new(), None));
+        let (done, finished) = mpsc::channel();
+        let listener_shared = shared.clone();
+        std::thread::spawn(move || {
+            http.listen(listener_shared, None);
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the listener releases a stalled stream at its lifetime");
+        assert!(shared.is_closed());
     }
 }

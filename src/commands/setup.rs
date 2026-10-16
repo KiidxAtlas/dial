@@ -7,8 +7,14 @@
 use super::extensions::spawn_job_streaming;
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step, Which};
+use crate::config::Config;
 use crate::setup::deps::{self, Env, plan, recipe, run};
 use crate::setup::embeddings;
+use crate::setup::memory::{
+    BACKENDS, backend_label, backend_missing, parse_backend, selected, status_summary,
+};
+use crate::storage::memory_backend::config::MemoryBackendId;
+use crate::storage::settings_store::{Change, Scope};
 use crate::ui::overlay::palette::{ChoiceItem, ChoiceSpec};
 use anyhow::Result;
 use std::sync::Arc;
@@ -16,13 +22,13 @@ use std::sync::atomic::AtomicBool;
 
 const TITLE: &str = "Setup";
 
-const USAGE: &str = "/setup                 guided setup: search, review, then confirm\n/setup list            list capabilities and their status as text\n/setup <id>            preview what would run and where it installs\n/setup <id> yes        set it up (prerequisites first), then save its settings\n/setup providers       connect a model provider\n/setup embeddings      list local embedding models (Ollama)\n/setup embeddings:<model> [yes]   preview, then pull the model and assign it to semantic memory";
+const USAGE: &str = "/setup                 guided setup: search, review, then confirm\n/setup list            list capabilities and their status as text\n/setup <id>            preview what would run and where it installs\n/setup <id> yes        set it up (prerequisites first), then save its settings\n/setup providers       connect a model provider\n/setup memory          choose a memory backend: what each needs and whether it is ready\n/setup memory <backend>   switch memory to off, provenance, local, hindsight, sharpshooter or semantic (all projects)\n/setup embeddings      list local embedding models (Ollama)\n/setup embeddings:<model> [yes]   preview, then pull the model and assign it to the embedding role (used by the semantic memory backend)";
 
 pub(super) const COMMANDS: &[super::CommandSpec] = &[super::CommandSpec {
     name: "setup",
-    description: "check optional capabilities, set one up, or sign in to providers",
+    description: "check optional capabilities, set one up, choose memory, or sign in to providers",
     args_hint: "[<id> [yes]]",
-    subcommands: &["providers", "embeddings", "list"],
+    subcommands: &["providers", "memory", "embeddings", "list"],
 }];
 
 pub(super) fn run_command(
@@ -43,12 +49,25 @@ pub(super) fn run_command(
         embedding_command(shell, app, &parts);
         return Some(Ok(Step::Done));
     }
+    if parts.first() == Some(&"memory") {
+        return Some(memory_command(shell, app, agent, &parts[1..]));
+    }
     let env = Env::current(&app.layout.user_dir);
     match parts.as_slice() {
         [] => {
             return Some(shell.open(app, agent, Which::Choice(Box::new(setup_choices(&env)))));
         }
-        ["list"] => shell.note(TITLE, run::list_text(&env)),
+        ["list"] => {
+            let config = app.reload().unwrap_or_else(|_| app.config.clone());
+            shell.note(
+                TITLE,
+                format!(
+                    "{}\n\n{}",
+                    run::list_text(&env),
+                    crate::setup::memory::doctor_text(&config)
+                ),
+            )
+        }
         ["help"] => shell.note(TITLE, USAGE),
         ["providers"] => return Some(shell.open(app, agent, Which::Providers)),
         [id] => shell.note(TITLE, run::preview_text(id, &env)),
@@ -65,6 +84,12 @@ fn setup_choices(env: &Env) -> ChoiceSpec {
             value: "providers".into(),
             label: "Connect a model provider".into(),
             detail: "Sign in or configure an API key or local endpoint; opens Providers".into(),
+            current: false,
+        },
+        ChoiceItem {
+            value: "memory".into(),
+            label: "Choose a memory backend".into(),
+            detail: "See what each backend needs and whether it is ready, then switch".into(),
             current: false,
         },
         ChoiceItem {
@@ -157,7 +182,11 @@ fn guided_command(
         "embeddings" => {
             return shell.open(app, agent, Which::Choice(Box::new(embedding_choices())));
         }
+        "memory" => return memory_command(shell, app, agent, &[]),
         _ => {}
+    }
+    if let Some(backend) = id.strip_prefix("memory:") {
+        return set_memory_backend(shell, app, agent, backend);
     }
     let env = Env::current(&app.layout.user_dir);
     let preview = match review_plan(id, &env) {
@@ -228,6 +257,158 @@ fn embedding_command(shell: &mut Shell, app: &App, parts: &[&str]) {
     }
 }
 
+/// The `/setup memory` picker: one row per backend with what it needs and whether it is ready.
+fn memory_choices(config: &Config) -> ChoiceSpec {
+    let current = selected(config);
+    choice_spec(
+        "Setup · choose a memory backend (saved for all projects)",
+        BACKENDS
+            .iter()
+            .map(|(id, label, needs)| {
+                let (blocking, optional) = backend_missing(config, *id);
+                let status = status_summary(&blocking, &optional);
+                ChoiceItem {
+                    value: format!("memory:{}", id.as_str()),
+                    label: if current == Some(*id) {
+                        format!("{label} (current)")
+                    } else {
+                        (*label).to_owned()
+                    },
+                    detail: format!("{needs} · {status}"),
+                    current: current == Some(*id),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// `/setup memory [<backend>|offer-semantic]`.
+fn memory_command(
+    shell: &mut Shell,
+    app: &App,
+    agent: &mut Agent<'_>,
+    args: &[&str],
+) -> Result<Step> {
+    match args {
+        [] => {
+            let config = app.reload().unwrap_or_else(|_| app.config.clone());
+            shell.open(app, agent, Which::Choice(Box::new(memory_choices(&config))))
+        }
+        [offer] if *offer == embeddings::OFFER_SEMANTIC_ARG => offer_semantic(shell, app, agent),
+        [backend] => set_memory_backend(shell, app, agent, backend),
+        _ => {
+            shell.note(TITLE, USAGE);
+            Ok(Step::Done)
+        }
+    }
+}
+
+/// Asks once, with a single key, whether to switch memory to semantic now that an embedding model
+/// is set up or assigned. Declining changes nothing.
+fn offer_semantic(shell: &mut Shell, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
+    let config = app.reload()?;
+    if config.memory.enabled && config.memory.backend == MemoryBackendId::Semantic {
+        return Ok(Step::Done);
+    }
+    let current = if config.memory.enabled {
+        backend_label(config.memory.backend)
+    } else {
+        "Off"
+    };
+    let body = format!(
+        "The embedding model is used only by the semantic memory backend; memory is currently {current}.\nSwitching selects semantic memory for all projects. Facts kept by {current} stay on disk but are no longer recalled."
+    );
+    let keep = format!("Keep {current}");
+    if shell.ask(
+        "Use semantic memory?",
+        &body,
+        &[("Switch to semantic memory", 's'), (keep.as_str(), 'k')],
+    ) == Some(0)
+    {
+        return set_memory_backend(shell, app, agent, MemoryBackendId::Semantic.as_str());
+    }
+    shell.note(
+        TITLE,
+        format!(
+            "Kept {current}. Switch later with /setup memory semantic or in /settings → Memory."
+        ),
+    );
+    Ok(Step::Done)
+}
+
+/// Saves `memory.backend` for all projects through the settings save path, then reports what the
+/// backend still needs. Hindsight without its URL is not saved: validation would reject it.
+fn set_memory_backend(
+    shell: &mut Shell,
+    app: &App,
+    agent: &mut Agent<'_>,
+    name: &str,
+) -> Result<Step> {
+    let Some(backend) = parse_backend(name) else {
+        shell.note(
+            TITLE,
+            format!("Unknown memory backend `{name}`. Use /setup memory to choose one."),
+        );
+        return Ok(Step::Done);
+    };
+    let config = app.reload()?;
+    if backend == MemoryBackendId::Hindsight && config.memory.hindsight.endpoint.trim().is_empty() {
+        shell.note(
+            TITLE,
+            "Hindsight needs its Service URL first: open /settings → Memory, choose Hindsight service, and fill the fields it asks for.",
+        );
+        return Ok(Step::Done);
+    }
+    let saved = app
+        .save_settings(
+            Scope::Global,
+            &[Change::Set {
+                path: "memory.backend".into(),
+                value: toml::Value::String(backend.as_str().into()),
+            }],
+            None,
+        )
+        .and_then(|()| app.reload());
+    let fresh = match saved {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            shell.note(TITLE, format!("Memory backend not changed: {error:#}"));
+            return Ok(Step::Done);
+        }
+    };
+    shell.note(TITLE, switch_report(&fresh, backend));
+    Ok(shell.config_changed(app, agent, fresh))
+}
+
+/// What a switch did and what is still missing, from the config after the save.
+fn switch_report(fresh: &Config, backend: MemoryBackendId) -> String {
+    let mut lines = vec![format!(
+        "Memory backend: {} (saved for all projects).",
+        backend_label(backend)
+    )];
+    if !fresh.memory.enabled || fresh.memory.backend != backend {
+        lines.push(format!(
+            "This project's settings still select {}; change it in /settings → Memory with \"This project\" scope.",
+            if fresh.memory.enabled {
+                backend_label(fresh.memory.backend)
+            } else {
+                "Off"
+            }
+        ));
+    }
+    let (blocking, optional) = backend_missing(fresh, backend);
+    if blocking.is_empty() && optional.is_empty() {
+        lines.push("Ready: nothing else to set up.".to_owned());
+    }
+    lines.extend(
+        blocking
+            .into_iter()
+            .map(|line| format!("Still needed: {line}")),
+    );
+    lines.extend(optional.into_iter().map(|line| format!("Optional: {line}")));
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,8 +427,8 @@ mod tests {
         assert_eq!(spec.command, "setup");
         assert_eq!(spec.verb, "choose");
         assert!(spec.remove.is_none());
-        assert_eq!(spec.items.len(), deps::RECIPES.len() + 2);
-        for id in ["providers", "embeddings"]
+        assert_eq!(spec.items.len(), deps::RECIPES.len() + 3);
+        for id in ["providers", "memory", "embeddings"]
             .into_iter()
             .chain(deps::RECIPES.iter().map(|r| r.id))
         {
@@ -332,6 +513,101 @@ mod tests {
             review_plan("bun", &env)
                 .unwrap_err()
                 .contains("already set up")
+        );
+    }
+
+    fn with_role(config: &mut Config, role: &str) {
+        let selection: crate::llm::model_config::ModelSelection =
+            toml::from_str("provider = \"ollama\"\nmodel = \"m\"").unwrap();
+        config.model_roles.insert(role.into(), selection);
+    }
+
+    #[test]
+    fn memory_choices_list_every_backend_with_status_and_mark_the_current_one() {
+        let config = Config::default();
+        let spec = memory_choices(&config);
+        assert_eq!(spec.command, "setup");
+        assert_eq!(spec.verb, "choose");
+        assert_eq!(spec.items.len(), BACKENDS.len());
+        for (id, _, _) in BACKENDS {
+            assert_eq!(
+                spec.items
+                    .iter()
+                    .filter(|item| item.value == format!("memory:{}", id.as_str()))
+                    .count(),
+                1
+            );
+        }
+        let current: Vec<_> = spec.items.iter().filter(|item| item.current).collect();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].value, "memory:provenance");
+        let local = spec
+            .items
+            .iter()
+            .find(|item| item.value == "memory:local")
+            .unwrap();
+        assert!(local.detail.contains("Not ready"), "{}", local.detail);
+        assert!(local.detail.contains("/roles (Alt+M)"), "{}", local.detail);
+        let hindsight = spec
+            .items
+            .iter()
+            .find(|item| item.value == "memory:hindsight")
+            .unwrap();
+        assert!(
+            hindsight.detail.contains("Service URL"),
+            "{}",
+            hindsight.detail
+        );
+    }
+
+    #[test]
+    fn backend_missing_separates_blocking_and_optional_steps() {
+        let mut config = Config::default();
+        let (blocking, optional) = backend_missing(&config, MemoryBackendId::Semantic);
+        assert!(blocking.is_empty(), "{blocking:?}");
+        assert!(optional.iter().any(|line| line.contains("embedding role")));
+        assert!(
+            optional
+                .iter()
+                .any(|line| line.contains("memory role (Alt+M)"))
+        );
+        with_role(&mut config, "embedding");
+        with_role(&mut config, "memory");
+        assert_eq!(
+            backend_missing(&config, MemoryBackendId::Semantic),
+            (Vec::new(), Vec::new())
+        );
+        assert!(
+            backend_missing(&config, MemoryBackendId::Local)
+                .0
+                .is_empty()
+        );
+        config.memory.semantic.embedding_model = "half".into();
+        assert!(
+            backend_missing(&config, MemoryBackendId::Semantic).0[0]
+                .contains("set both or clear both")
+        );
+        let mut sharp = Config::default();
+        assert!(
+            !backend_missing(&sharp, MemoryBackendId::Sharpshooter)
+                .0
+                .is_empty()
+        );
+        sharp.memory.sharpshooter.model = "ollama/qwen3".into();
+        assert!(
+            backend_missing(&sharp, MemoryBackendId::Sharpshooter)
+                .0
+                .is_empty()
+        );
+        let report = switch_report(&config, MemoryBackendId::Local);
+        assert!(
+            report.contains("This project's settings still select Provenance facts"),
+            "{report}"
+        );
+        let report = switch_report(&Config::default(), MemoryBackendId::Provenance);
+        assert!(
+            report.contains("Ready: nothing else to set up."),
+            "{report}"
         );
     }
 }

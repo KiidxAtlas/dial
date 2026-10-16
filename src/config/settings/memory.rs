@@ -16,7 +16,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             ("sharpshooter", "Project decisions"),
             ("semantic", "Semantic facts")
         ]),
-        true
+        false
     ),
     field!(
         "memory.autolearn",
@@ -26,7 +26,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Learn tool",
         "Enable native learning guidance when the selected backend offers learn; optional private managed skills cannot shadow authored skills.",
         Kind::Bool,
-        true
+        false
     ),
     field!(
         "memory.autolearn_auto_continue",
@@ -36,7 +36,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Automatic private capture",
         "After substantive normal turns, opt into a genuine owner-scoped learn-only capture turn. Never simulates a user reply or approval; aborted/plan/goal phases are excluded.",
         Kind::Bool,
-        true
+        false
     ),
     field!(
         "memory.autolearn_min_tool_calls",
@@ -50,7 +50,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 1000,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.context_limit",
@@ -64,7 +64,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 50,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.context_max_bytes",
@@ -78,7 +78,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 24000,
             step: 256
         },
-        true
+        false
     ),
     field!(
         "memory.request_max_bytes",
@@ -92,7 +92,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 16 * 1024 * 1024,
             step: 1024
         },
-        true
+        false
     ),
     field!(
         "memory.local.max_rollouts_per_startup",
@@ -106,7 +106,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 1024,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.max_rollout_age_days",
@@ -120,7 +120,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 3650,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.min_rollout_idle_hours",
@@ -134,7 +134,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 8760,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.thread_scan_limit",
@@ -148,7 +148,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 10000,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.max_raw_memories",
@@ -162,7 +162,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 2000,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.stage1_concurrency",
@@ -176,7 +176,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 32,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.stage1_lease_secs",
@@ -190,7 +190,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 86400,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.stage1_retry_delay_secs",
@@ -204,7 +204,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 86400,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.consolidation_lease_secs",
@@ -218,7 +218,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 86400,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.consolidation_retry_delay_secs",
@@ -232,7 +232,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 86400,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.consolidation_heartbeat_secs",
@@ -246,7 +246,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 86399,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.local.rollout_payload_percent",
@@ -260,7 +260,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 0.9,
             step: 0.05
         },
-        true
+        false
     ),
     field!(
         "memory.local.phase1_input_tokens",
@@ -274,7 +274,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 1000000,
             step: 256
         },
-        true
+        false
     ),
     field!(
         "memory.local.fallback_token_limit",
@@ -288,7 +288,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 1000000,
             step: 256
         },
-        true
+        false
     ),
     field!(
         "memory.local.summary_injection_tokens",
@@ -302,7 +302,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 1000000,
             step: 256
         },
-        true
+        false
     ),
     field!(
         "memory.local.extraction_role",
@@ -312,7 +312,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Extraction model role",
         "Which model role runs extraction. Calls go through Dial's own model setup and usage tracking.",
         Kind::Enum(MODEL_ROLES),
-        true
+        false
     ),
     field!(
         "memory.local.consolidation_role",
@@ -322,7 +322,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Consolidation model role",
         "Which model role runs consolidation.",
         Kind::Enum(MODEL_ROLES),
-        true
+        false
     ),
     field!(
         "memory.local.timeout_secs",
@@ -336,7 +336,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 3600,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.hindsight.endpoint",
@@ -346,7 +346,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Service URL",
         "Address of the memory service. Use https://, or http:// for a server on this machine. Don't put passwords in the URL.",
         Kind::Text,
-        true
+        false
     ),
     field!(
         "memory.hindsight.api_key_env",
@@ -356,7 +356,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "API key variable",
         "Name of an environment variable that holds the key, not the key itself. Required when the service is not on this machine.",
         Kind::Text,
-        true
+        false
     ),
     field!(
         "memory.hindsight.bank",
@@ -366,7 +366,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Memory bank",
         "Name of the bank that stores memories. Each project gets its own bank unless scope is set to global.",
         Kind::Text,
-        true
+        false
     ),
     field!(
         "memory.hindsight.scoping",
@@ -380,7 +380,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             ("per-project", "Per project"),
             ("per-project-tagged", "Project tagged")
         ]),
-        true
+        false
     ),
     field!(
         "memory.hindsight.recall_budget",
@@ -390,7 +390,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Remote recall budget",
         "Budget the service may spend on each recall. Dial counts the usage the service reports.",
         Kind::Enum(&[("low", "Low"), ("mid", "Mid"), ("high", "High")]),
-        true
+        false
     ),
     field!(
         "memory.hindsight.recall_max_tokens",
@@ -404,7 +404,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 100000,
             step: 256
         },
-        true
+        false
     ),
     field!(
         "memory.hindsight.request_timeout_secs",
@@ -418,7 +418,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 3600,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.hindsight.retain_every_turns",
@@ -432,7 +432,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 1000,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.hindsight.auto_recall",
@@ -442,7 +442,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Recall on first turn",
         "Prepare recall before the first message, and use it only if that message is actually sent.",
         Kind::Bool,
-        true
+        false
     ),
     field!(
         "memory.hindsight.retain_mission",
@@ -452,7 +452,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Retain focus",
         "Service-side instructions for what to keep. Set by the service operator, not the model.",
         Kind::Text,
-        true
+        false
     ),
     field!(
         "memory.hindsight.reflect_mission",
@@ -462,7 +462,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Reflection focus",
         "Service-side instructions for how memories are summarized. Set by the service operator.",
         Kind::Text,
-        true
+        false
     ),
     field!(
         "memory.hindsight.auto_retain",
@@ -472,7 +472,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Save conversations automatically",
         "Save each main conversation's transcript. Saving on demand still works when this is off.",
         Kind::Bool,
-        true
+        false
     ),
     field!(
         "memory.hindsight.retain_mode",
@@ -485,7 +485,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             ("full-session", "Full session"),
             ("last-turn", "Incremental last turns")
         ]),
-        true
+        false
     ),
     field!(
         "memory.hindsight.retain_overlap_turns",
@@ -499,7 +499,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 1000,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.hindsight.retain_context",
@@ -509,7 +509,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Transcript context",
         "Extra context from the operator sent with each saved transcript.",
         Kind::Text,
-        true
+        false
     ),
     field!(
         "memory.hindsight.recall_types",
@@ -519,7 +519,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Memory types to recall",
         "Which kinds of memory to recall. Defaults to world and experience.",
         Kind::StringList,
-        true
+        false
     ),
     field!(
         "memory.hindsight.recall_context_turns",
@@ -533,7 +533,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 32,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.hindsight.recall_max_query_chars",
@@ -547,7 +547,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 65536,
             step: 100
         },
-        true
+        false
     ),
     field!(
         "memory.hindsight.reflect_timeout_secs",
@@ -561,7 +561,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 3600,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.hindsight.recall_timeout_secs",
@@ -575,7 +575,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 3600,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.hindsight.retain_timeout_secs",
@@ -589,7 +589,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 3600,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.hindsight.mental_models_enabled",
@@ -599,7 +599,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Use mental models",
         "Use the service's saved summaries as extra context, filtered to this project. Treated as untrusted text.",
         Kind::Bool,
-        true
+        false
     ),
     field!(
         "memory.hindsight.mental_model_auto_seed",
@@ -609,7 +609,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Create missing starter models",
         "Create starter summaries for preferences, conventions and decisions when they are missing. Existing ones are never overwritten.",
         Kind::Bool,
-        true
+        false
     ),
     field!(
         "memory.hindsight.mental_model_max_render_chars",
@@ -623,7 +623,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 65536,
             step: 256
         },
-        true
+        false
     ),
     field!(
         "memory.sharpshooter.model",
@@ -631,9 +631,9 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         LE,
         "Decision memory",
         "Model override",
-        "Optional model to use for decisions. Leave empty to use the decision model role.",
+        "Optional model for decision notes, as `provider/model` or a name on the memory role's provider. Leave empty to use the model role below (memory by default); set, it replaces that role.",
         Kind::Text,
-        true
+        false
     ),
     field!(
         "memory.sharpshooter.model_role",
@@ -643,7 +643,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Memory model role",
         "Which model role reads sessions for decisions.",
         Kind::Enum(MODEL_ROLES),
-        true
+        false
     ),
     field!(
         "memory.sharpshooter.interval_minutes",
@@ -657,7 +657,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 1440,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.sharpshooter.injection_token_limit",
@@ -671,7 +671,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 1000000,
             step: 256
         },
-        true
+        false
     ),
     field!(
         "memory.sharpshooter.max_file_lines",
@@ -685,7 +685,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 120,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.sharpshooter.max_parallel",
@@ -699,7 +699,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 32,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.sharpshooter.lease_secs",
@@ -713,7 +713,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 86400,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.sharpshooter.timeout_secs",
@@ -727,7 +727,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 3600,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.semantic.embedding",
@@ -735,9 +735,9 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         LE,
         "Semantic memory",
         "Embeddings",
-        "Off keeps recall keyword-only. Automatic uses the assigned embedding role (Alt+M), or the URL and model below when both are set. On requires one of them.",
+        "Off keeps recall keyword-only. Automatic uses embeddings when a route is configured: the URL and model override below when both are set (the override wins), otherwise the embedding role (Alt+M). On requires one of them. A half-filled override is rejected.",
         Kind::Enum(&[("off", "Off"), ("auto", "Automatic"), ("on", "On")]),
-        true
+        false
     ),
     field!(
         "memory.semantic.embedding_base_url",
@@ -745,9 +745,9 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         LE,
         "Semantic memory",
         "Embedding service URL",
-        "OpenAI-compatible base address, for example https://api.example.com/v1; Ollama and Gemini roles use their native APIs. Plain http:// works only on this machine.",
+        "Advanced override, set together with the model override: an OpenAI-compatible base address, for example https://api.example.com/v1. When both are set they win over the embedding role. Plain http:// works only on this machine.",
         Kind::Text,
-        true
+        false
     ),
     field!(
         "memory.semantic.embedding_model",
@@ -755,9 +755,9 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         LE,
         "Semantic memory",
         "Embedding model",
-        "Model name sent to the embeddings endpoint. Suggestions are curated Ollama models; Ctrl+L pulls one through Ollama and assigns it to the embedding role.",
+        "Enter picks the embedding role (Alt+M): discovered embedding models, or a curated Ollama model to set up (Ctrl+L). A typed name here is an advanced OpenAI-compatible override that needs the Embedding service URL too.",
         Kind::Choice(crate::setup::embeddings::CHOICES),
-        true
+        false
     ),
     field!(
         "memory.semantic.embedding_api_key_env",
@@ -765,9 +765,9 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         LE,
         "Semantic memory",
         "API key variable",
-        "Name of the environment variable that holds the service key. Leave empty for a local server without authentication.",
+        "Name of the environment variable that holds the embedding service key, for the URL override. Leave empty for a local server without authentication.",
         Kind::Text,
-        true
+        false
     ),
     field!(
         "memory.semantic.embedding_timeout_secs",
@@ -781,7 +781,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 120,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.semantic.recall_limit",
@@ -795,7 +795,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 50,
             step: 1
         },
-        true
+        false
     ),
     field!(
         "memory.semantic.token_budget",
@@ -809,7 +809,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 16000,
             step: 64
         },
-        true
+        false
     ),
     field!(
         "memory.semantic.auto_retain",
@@ -817,9 +817,9 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         LE,
         "Semantic memory",
         "Retain facts automatically",
-        "After substantive turns, extract durable facts with the memory role and store them in the background. Each turn is extracted once. Turn text is redacted and treated as untrusted.",
+        "After substantive turns, extract durable facts with the memory role (Alt+M) and store them in the background. Pauses while the memory role is unassigned; it never falls back to the main model. Each turn is extracted once. Turn text is redacted and treated as untrusted.",
         Kind::Bool,
-        true
+        false
     ),
     field!(
         "memory.semantic.consolidate_interval_minutes",
@@ -833,6 +833,6 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             max: 10080,
             step: 5
         },
-        true
+        false
     ),
 ];

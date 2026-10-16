@@ -80,13 +80,18 @@ impl Tool for Find {
             Ok(text) => text,
             Err(e) => return ToolOutput::err(e),
         };
-        let mut error = false;
         if let Some(args) = supplemental {
             let metadata = self.lsp.call(ctx, &args);
-            error = metadata.is_error;
             text.push_str(
                 "\n[Supplementary real language-server metadata; not part of lexical ranking]\n",
             );
+            // Metadata is auxiliary: a failing server must not turn the successful lexical rows into
+            // an error, so the failure is stated inline and the find result stays successful.
+            if metadata.is_error {
+                text.push_str(
+                    "[language-server metadata failed; the lexical results above are unaffected]\n",
+                );
+            }
             let available = MAX_OUTPUT.saturating_sub(text.len());
             let mut end = metadata.text.len().min(available);
             while !metadata.text.is_char_boundary(end) {
@@ -113,7 +118,7 @@ impl Tool for Find {
             execution: Default::default(),
             data: None,
             text,
-            is_error: error,
+            is_error: false,
         }
     }
 }
@@ -809,5 +814,53 @@ mod tests {
         );
         fs::write(&path, "network timeout changed\n").unwrap();
         assert_ne!(identity(first), identity(find(&ws, &query).unwrap()));
+    }
+
+    /// A language server that fails every request, as one that exits during startup does.
+    struct FailingMetadata;
+
+    impl Tool for FailingMetadata {
+        fn name(&self) -> &str {
+            "lsp"
+        }
+        fn schema(&self) -> Value {
+            json!({})
+        }
+        fn needs_approval(&self, _args: &Value) -> bool {
+            false
+        }
+        fn call(&self, _ctx: &ToolContext, _args: &Value) -> ToolOutput {
+            ToolOutput::err("language server exited during startup")
+        }
+    }
+
+    #[test]
+    fn a_failing_language_server_leaves_the_lexical_find_successful() {
+        let (dir, ws) = crate::tools::testkit::workspace();
+        fs::write(
+            dir.path().join("retry.rs"),
+            "pub fn reconnect_network() {}\n",
+        )
+        .unwrap();
+        let config = Config::default();
+        let tool = Find {
+            lsp: Arc::new(FailingMetadata),
+        };
+        let out = tool.call(
+            &ToolContext {
+                workspace: &ws,
+                config: &config,
+                mutation_authorizer: None,
+                confirm: None,
+            },
+            &json!({"query":"reconnect_network","mode":"exact","lsp_path":"retry.rs"}),
+        );
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("retry.rs"), "{}", out.text);
+        assert!(
+            out.text.contains("language-server metadata failed"),
+            "{}",
+            out.text
+        );
     }
 }

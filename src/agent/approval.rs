@@ -1039,10 +1039,7 @@ fn authorize_inner(
             } else {
                 summary.to_owned()
             };
-            let decision = match cancel {
-                Some(flag) => ui.approve_with_cancel(&call.name, &summary, flag),
-                None => ui.approve(&call.name, &summary),
-            };
+            let decision = ui.approve_call(&call.id, &call.name, &summary, cancel);
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
                 return Err(Denial::User);
             }

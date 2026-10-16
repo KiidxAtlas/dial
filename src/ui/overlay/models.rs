@@ -114,6 +114,8 @@ pub struct ModelOverlay {
     roles: Vec<RoleStatus>,
     /// Memory backend needs the memory role (see `with_memory_required`).
     memory_required: bool,
+    /// Memory backend uses the memory role only for optional automatic saving (semantic auto-retain).
+    memory_optional: bool,
     favorites: Vec<FavoriteRoute>,
     favorite_entries: Vec<FavoriteEntry>,
     scope: Scope,
@@ -158,6 +160,37 @@ fn role_accepts(role: &str, entry: &ModelEntry) -> bool {
         "embedding" => is_embedding(entry),
         _ => entry.supports_chat(),
     }
+}
+
+/// [`role_accepts`] for the list picked from a role row. The embedding role picker also offers
+/// models whose server did not say what they are (unknown kind), labelled unclassified, so a pulled
+/// embedding model on a server that declares no type stays assignable. Classified chat models stay
+/// excluded, and the per-model role chooser keeps the strict rule.
+fn role_picker_accepts(role: &str, entry: &ModelEntry) -> bool {
+    role_accepts(role, entry)
+        || (role == "embedding"
+            && entry.selection.provider != crate::agent::laya::PROVIDER
+            && is_unclassified(entry))
+}
+
+fn is_unclassified(entry: &ModelEntry) -> bool {
+    entry.metadata.kind == ModelKind::Unknown
+}
+
+/// Label for an unclassified model in the embedding role picker.
+pub const UNCLASSIFIED_LABEL: &str = "unclassified — may not be an embedding model";
+
+/// Models the embedding role can take, classified embedding models first, then unclassified ones
+/// (`true` marks a classified embedding model). Unavailable models are left out.
+pub fn embedding_candidates(discovery: &Discovery) -> Vec<(ModelEntry, bool)> {
+    let mut out: Vec<(ModelEntry, bool)> = discovery
+        .models
+        .iter()
+        .filter(|entry| entry.available && role_picker_accepts("embedding", entry))
+        .map(|entry| (entry.clone(), is_embedding(entry)))
+        .collect();
+    out.sort_by_key(|(_, classified)| !*classified);
+    out
 }
 
 /// The Laya decision engine as a judge model. It shares the decision role's checkpoint (assigned or
@@ -451,6 +484,7 @@ impl ModelOverlay {
     pub fn new(discovery: Option<Discovery>, roles: Vec<RoleStatus>, scope: Scope) -> Self {
         ModelOverlay {
             memory_required: false,
+            memory_optional: false,
             laya_judge: laya_judge_entry(&roles),
             discovery,
             roles,
@@ -740,6 +774,11 @@ impl ModelOverlay {
         self.memory_required = required;
     }
 
+    /// Whether the memory backend uses the memory role only for optional automatic saving.
+    pub fn set_memory_optional(&mut self, optional: bool) {
+        self.memory_optional = optional;
+    }
+
     pub fn set_roles(&mut self, roles: Vec<RoleStatus>) {
         let anchor = self.highlighted().map(|e| e.selection.clone());
         self.laya_judge = laya_judge_entry(&roles);
@@ -862,7 +901,11 @@ impl ModelOverlay {
         // With a query the best match leads within a rank; without one the discovery order stands.
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
         if let Some(role) = &self.target_role {
-            rows.retain(|row| role_accepts(role, row.3));
+            rows.retain(|row| role_picker_accepts(role, row.3));
+            if role == "embedding" {
+                // Classified embedding models lead; unclassified ones follow (stable sort).
+                rows.sort_by_key(|row| !is_embedding(row.3));
+            }
         }
         rows.into_iter()
             .map(|(_, _, _, entry, positions)| (entry, positions))
@@ -1258,11 +1301,9 @@ impl ModelOverlay {
             self.target_role = Some(role.to_owned());
             self.group = Group::All;
             self.search.clear();
-            self.kind = if role == "embedding" {
-                KindFilter::Embedding
-            } else {
-                KindFilter::All
-            };
+            // The embedding role filter (role_accepts) also keeps unclassified models, which the
+            // Embedding kind filter would hide.
+            self.kind = KindFilter::All;
             self.cursor = 0;
             self.scroll = 0;
             return OverlayEvent::None;
@@ -1285,7 +1326,7 @@ impl ModelOverlay {
             } else {
                 "main"
             });
-        if !role_accepts(target, entry) {
+        if !role_picker_accepts(target, entry) {
             self.message = Some((
                 format!(
                     "Cannot assign {} to {target}: {} models need a compatible task endpoint, not chat",
@@ -1667,6 +1708,12 @@ impl ModelOverlay {
                 ),
                 theme.fg(Tok::Warning),
             ));
+            if role == "embedding" {
+                spans.push(Span::styled(
+                    format!("  · {UNCLASSIFIED_LABEL}"),
+                    theme.fg(Tok::Muted),
+                ));
+            }
         } else if self.group != Group::Roles {
             spans.push(Span::styled(
                 format!("  {}", self.rows().len()),
@@ -1909,7 +1956,11 @@ impl ModelOverlay {
             .selection
             .context_window
             .map_or_else(|| "-".to_owned(), fmt_context);
-        let state = state_of(entry);
+        let state = if self.target_role.as_deref() == Some("embedding") && is_unclassified(entry) {
+            "unclassified"
+        } else {
+            state_of(entry)
+        };
         let state_w = if w >= 60 { 20 } else { 0 };
         let lora_w = if self.learning && w >= 90 {
             19
@@ -2000,6 +2051,9 @@ impl ModelOverlay {
             None if role == "main" => ("not configured".to_owned(), Tok::Warning),
             None if role == "memory" && self.memory_required => {
                 ("required: assign a model".to_owned(), Tok::Warning)
+            }
+            None if role == "memory" && self.memory_optional => {
+                ("optional: assign to save facts".to_owned(), Tok::Muted)
             }
             None => ("not set".to_owned(), Tok::Dim),
         };
@@ -2611,6 +2665,74 @@ mod tests {
         );
         assert!(matches!(send(&mut o, &rig, key(KeyCode::Enter)),
             OverlayEvent::AssignModel { role, .. } if role == "embedding"));
+    }
+
+    #[test]
+    fn embedding_role_picker_offers_unclassified_models_but_not_classified_chat() {
+        let rig = Rig::new();
+        let mut d = discovery();
+        d.models[3].available = true;
+        d.models[1].metadata.kind = ModelKind::Chat;
+        let mut o = ModelOverlay::new(Some(d.clone()), roles_with_main(), Scope::Global);
+        o.show_roles();
+        o.cursor = ROLES
+            .iter()
+            .position(|(role, _)| *role == "embedding")
+            .unwrap();
+        send(&mut o, &rig, key(KeyCode::Enter));
+        assert_eq!(o.target_role.as_deref(), Some("embedding"));
+        let listed = names(&o);
+        assert_eq!(listed.first().map(String::as_str), Some("nomic-embed"));
+        assert!(listed.iter().any(|name| name == "llama3"), "{listed:?}");
+        assert!(!listed.iter().any(|name| name == "qwen-chat"), "{listed:?}");
+        let shown = draw(&mut o, &rig, 130, 30);
+        assert!(shown.contains("unclassified"), "{shown}");
+        o.cursor = listed.iter().position(|name| name == "llama3").unwrap();
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Enter)),
+            OverlayEvent::AssignModel { role, selection, .. }
+                if role == "embedding" && selection.model == "llama3"
+        ));
+        // The per-model chooser keeps the strict rule: an unclassified model is not an embedding.
+        assert!(!role_accepts("embedding", &d.models[0]));
+        let candidates = embedding_candidates(&d);
+        assert_eq!(candidates[0].0.label, "nomic-embed");
+        assert!(candidates[0].1);
+        assert!(
+            candidates
+                .iter()
+                .any(|(e, classified)| e.label == "llama3" && !classified)
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|(e, _)| e.label != "qwen-chat" && e.available)
+        );
+    }
+
+    #[test]
+    fn memory_role_row_is_not_set_then_required_or_optional_by_backend() {
+        let rig = Rig::new();
+        let config = crate::config::Config::default();
+        let mut o = ModelOverlay::new(Some(discovery()), config.role_statuses(), Scope::Global);
+        o.show_roles();
+        let memory = config
+            .role_statuses()
+            .into_iter()
+            .find(|status| status.role == "memory")
+            .unwrap();
+        assert_eq!(
+            memory.source,
+            RoleSource::NotSet,
+            "memory never follows main"
+        );
+        assert!(memory.effective.is_none());
+        assert!(draw(&mut o, &rig, 140, 30).contains("not set"));
+        o.set_memory_required(true);
+        assert!(draw(&mut o, &rig, 140, 30).contains("required: assign a model"));
+        o.set_memory_required(false);
+        o.set_memory_optional(true);
+        assert!(draw(&mut o, &rig, 140, 30).contains("optional: assign to save facts"));
     }
 
     #[test]

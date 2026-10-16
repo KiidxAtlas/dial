@@ -152,9 +152,22 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+  windows-contract:
+    name: Windows Rust contract (gates publication)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-contract
+      - name: Run focused Windows contract suite
+        run: python scripts/windows-contract.py --profile ci
+
   publish:
     name: Publish GitHub release
-    needs: [build, windows-build]
+    needs: [build, windows-build, windows-contract]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -276,15 +289,10 @@ jobs:
               if count != 1:
                   raise SystemExit(f'could not update formula checksum for {archive}')
           formula_path.write_text(formula)
-          flake_path = Path('flake.nix')
-          flake, count = re.subn(r'version = "[^"]+";', f'version = "{version}";', flake_path.read_text(), count=1)
-          if count != 1:
-              raise SystemExit('could not update flake version')
-          flake_path.write_text(flake)
           PY
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add Formula/dial.rb flake.nix
+          git add Formula/dial.rb
           git commit -m "release: update package metadata for $version"
           git push origin HEAD:main
       - uses: actions/checkout@v4

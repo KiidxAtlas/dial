@@ -205,6 +205,7 @@ pub trait Tool: Send + Sync {
     /// shared request-multiplexed services may return `None` to share this instance.
     /// Tools owning a process, REPL or workspace-rooted client must return a fresh
     /// instance so child cancellation cannot stop a parent or sibling operation.
+    /// Edit write-through (LSP) follows the forked owner, so a child's edits never reach its parent's servers.
     fn fork_session(&self) -> Option<Arc<dyn Tool>> {
         None
     }

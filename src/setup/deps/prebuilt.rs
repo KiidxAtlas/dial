@@ -284,8 +284,7 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn symlink(target: &Path, link: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, link)
-        .with_context(|| format!("creating {}", link.display()))
+    std::os::unix::fs::symlink(target, link).with_context(|| format!("creating {}", link.display()))
 }
 
 #[cfg(not(unix))]
@@ -312,7 +311,10 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
             .unix_mode()
             .is_some_and(|mode| mode & 0o170000 == 0o120000)
         {
-            bail!("symlinks are not allowed in this archive: {}", raw.display());
+            bail!(
+                "symlinks are not allowed in this archive: {}",
+                raw.display()
+            );
         }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
@@ -370,9 +372,18 @@ mod tests {
 
     #[test]
     fn symlinks_must_stay_inside_the_install_directory() {
-        assert!(link_stays_inside(Path::new("bin/npm"), Path::new("../lib/npm-cli.js")));
-        assert!(!link_stays_inside(Path::new("bin/npm"), Path::new("../../etc/passwd")));
-        assert!(!link_stays_inside(Path::new("bin/npm"), Path::new("/usr/bin/env")));
+        assert!(link_stays_inside(
+            Path::new("bin/npm"),
+            Path::new("../lib/npm-cli.js")
+        ));
+        assert!(!link_stays_inside(
+            Path::new("bin/npm"),
+            Path::new("../../etc/passwd")
+        ));
+        assert!(!link_stays_inside(
+            Path::new("bin/npm"),
+            Path::new("/usr/bin/env")
+        ));
         assert!(!link_stays_inside(Path::new("a"), Path::new("../x")));
     }
 
@@ -414,8 +425,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("runtime.zip");
         let mut writer = zip::ZipWriter::new(File::create(&path).unwrap());
-        let options = zip::write::SimpleFileOptions::default()
-            .unix_permissions(0o755);
+        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
         writer.start_file("bun-test/bun", options).unwrap();
         writer.write_all(b"#!/bin/sh\n").unwrap();
         writer.finish().unwrap();

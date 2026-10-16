@@ -1279,16 +1279,17 @@ mod tests {
     fn browsing_keeps_nuxt_without_details_and_follows_provider_pagination() {
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
-        let base = serve(Arc::new(move |target| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            if !target.starts_with("/servers?") {
-                return (404, "{}".into());
-            }
-            let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
-            let params: BTreeMap<_, _> = url.query_pairs().collect();
-            assert_eq!(params.get("q").map(|v| v.as_ref()), Some("nuxt"));
-            let second = params.get("page").is_some_and(|v| v == "2");
-            (200, json!({
+        let base =
+            serve(Arc::new(move |target| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if !target.starts_with("/servers?") {
+                    return (404, "{}".into());
+                }
+                let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+                let params: BTreeMap<_, _> = url.query_pairs().collect();
+                assert_eq!(params.get("q").map(|v| v.as_ref()), Some("nuxt"));
+                let second = params.get("page").is_some_and(|v| v == "2");
+                (200, json!({
                 "servers": if second {
                     json!([{"namespace":"nuxt", "slug":"docs", "displayName":"Nuxt docs"}])
                 } else {
@@ -1300,7 +1301,7 @@ mod tests {
                 },
                 "pagination": {"totalPages":2}
             }).to_string())
-        }));
+            }));
         let (first, more) = browse_page_at(&base, "nuxt", 1, None).expect("first page");
         assert!(more);
         assert_eq!(first.len(), 1);
@@ -1310,7 +1311,11 @@ mod tests {
         let (second, more) = browse_page_at(&base, "nuxt", 2, None).expect("second page");
         assert!(!more);
         assert_eq!(second[0].name, "@nuxt/docs");
-        assert_eq!(hits.load(Ordering::SeqCst), 2, "no detail requests while browsing");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "no detail requests while browsing"
+        );
     }
 
     #[test]

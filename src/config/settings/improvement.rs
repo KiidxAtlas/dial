@@ -507,7 +507,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         IM,
         "Activation steering",
         "Automatic vector creation",
-        "Automatically create and use passing vectors from verified repairs. Foreground coding has priority. Disable to opt out.",
+        "Automatically create passing vectors from verified repairs and use them. Foreground coding has priority. Enable manual vector also uses an admitted automatic vector.",
         Kind::Bool,
     ),
     field!(
@@ -516,7 +516,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         IM,
         "Activation steering",
         "Enable manual vector",
-        "Enable a manually created vector. Automatic vectors have their own switch; all require passing evaluation.",
+        "Use the selected vector, manual or automatic, once it passes evaluation. Automatic vectors are also used when Automatic vector creation is on, even if this is off.",
         Kind::Bool,
     ),
     field!(

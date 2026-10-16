@@ -98,6 +98,7 @@ impl PluginStore {
 
     pub fn install(&self, source: &str) -> Result<InstalledPlugin> {
         let staged = self.stage(source)?;
+        validate_staged_runtime(&staged)?;
         ensure!(
             !self.root.join(&staged.name).exists(),
             "plugin {} is already installed; use update to replace it",
@@ -109,29 +110,51 @@ impl PluginStore {
         Ok(installed)
     }
 
+    /// Every installed plugin with a readable record, sorted by name.
     pub fn list(&self) -> Result<Vec<InstalledPlugin>> {
+        let mut plugins: Vec<InstalledPlugin> = self
+            .scan()?
+            .into_iter()
+            .filter_map(|(_, record)| record.ok())
+            .collect();
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(plugins)
+    }
+
+    /// Each plugin directory that has an install manifest, with its record or the reason it cannot be
+    /// read. Directories without a manifest are not plugins and are skipped.
+    fn scan(&self) -> Result<Vec<(String, Result<InstalledPlugin>)>> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error).context("reading plugin directory"),
         };
-        let mut plugins = Vec::new();
+        let mut found = Vec::new();
         for entry in entries {
             let path = entry?.path();
             let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if dir_name.starts_with('.') || validate_name(dir_name).is_err() || !path.is_dir() {
+            if dir_name.starts_with('.')
+                || validate_name(dir_name).is_err()
+                || !path.is_dir()
+                || !path.join(MANIFEST_FILE).is_file()
+            {
                 continue;
             }
-            // Directories without a readable installer manifest are not plugins.
-            match read_record(&path) {
-                Ok(plugin) if plugin.name == dir_name => plugins.push(plugin),
-                _ => continue,
-            }
+            let record = read_record(&path).and_then(|plugin| {
+                ensure!(
+                    plugin.name == dir_name,
+                    "manifest in {} names plugin {:?}",
+                    path.display(),
+                    plugin.name
+                );
+                Ok(plugin)
+            });
+            found.push((dir_name.to_owned(), record));
         }
-        plugins.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(plugins)
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(found)
     }
 
     pub fn get(&self, name: &str) -> Result<InstalledPlugin> {
@@ -209,21 +232,32 @@ impl PluginStore {
         self.refresh(&old, source)
     }
 
+    /// Runtime specs of every enabled plugin, one outcome per plugin. A broken plugin yields an
+    /// error naming it, so healthy plugins are still returned. Only enumeration failures are `Err`.
     pub fn enabled_runtimes(
         &self,
     ) -> Result<
-        Vec<(
-            InstalledPlugin,
-            PathBuf,
-            Vec<String>,
-            BTreeMap<String, String>,
-        )>,
+        Vec<
+            Result<(
+                InstalledPlugin,
+                PathBuf,
+                Vec<String>,
+                BTreeMap<String, String>,
+            )>,
+        >,
     > {
         let mut runtimes = Vec::new();
-        for plugin in self.list()? {
-            let spec = runtime_spec(&plugin).with_context(|| format!("plugin {}", plugin.name))?;
-            if let Some((program, args, env)) = spec {
-                runtimes.push((plugin, program, args, env));
+        for (dir_name, record) in self.scan()? {
+            let outcome = record
+                .and_then(|plugin| {
+                    let spec = runtime_spec(&plugin)?;
+                    Ok(spec.map(|(program, args, env)| (plugin, program, args, env)))
+                })
+                .with_context(|| format!("plugin {dir_name}"));
+            match outcome {
+                Ok(Some(runtime)) => runtimes.push(Ok(runtime)),
+                Ok(None) => {}
+                Err(error) => runtimes.push(Err(error)),
             }
         }
         Ok(runtimes)
@@ -251,6 +285,7 @@ impl PluginStore {
                 changed: false,
             });
         }
+        validate_staged_runtime(&staged)?;
         let installed = self.finalize(&staged, old.enabled)?;
         swap_into_place(staged.dir, &staged.tree, &installed.path)?;
         Ok(PluginUpdate {
@@ -339,13 +374,21 @@ pub fn runtime_spec(
         return Ok(None);
     }
     let map = read_manifest(&plugin.path.join(MANIFEST_FILE))?;
+    runtime_from_manifest(&map, &plugin.path)
+}
+
+/// Parses the runtime fields of a manifest whose plugin tree is at `base`.
+fn runtime_from_manifest(
+    map: &Map<String, Value>,
+    base: &Path,
+) -> Result<Option<(PathBuf, Vec<String>, BTreeMap<String, String>)>> {
     let Some(program) = map.get("program") else {
         return Ok(None);
     };
     let program = program
         .as_str()
         .ok_or_else(|| anyhow!("{MANIFEST_FILE} field \"program\" must be a string"))?;
-    let program = resolve_inside(&plugin.path, program)?;
+    let program = resolve_inside(base, program)?;
     let args = match map.get("args") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(items)) => items
@@ -372,6 +415,14 @@ pub fn runtime_spec(
         Some(_) => bail!("{MANIFEST_FILE} field \"env\" must be an object"),
     };
     Ok(Some((program, args, env)))
+}
+
+/// Checks a staged plugin's runtime declaration before it can be enabled, so a broken declaration
+/// never becomes an installed, enabled record.
+fn validate_staged_runtime(staged: &Staged) -> Result<()> {
+    runtime_from_manifest(&staged.manifest, &staged.tree)
+        .with_context(|| format!("plugin {} has an invalid runtime declaration", staged.name))
+        .map(|_| ())
 }
 
 /// Validates a plugin or marketplace name: `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`.
@@ -997,7 +1048,7 @@ mod tests {
         assert!(store.get("rt").unwrap().enabled);
         let runtimes = store.enabled_runtimes().unwrap();
         assert_eq!(runtimes.len(), 1);
-        let (plugin, program, args, env) = &runtimes[0];
+        let (plugin, program, args, env) = runtimes[0].as_ref().unwrap();
         assert_eq!(plugin.name, "rt");
         assert!(program.ends_with("bin/run.sh"));
         assert_eq!(args, &vec!["--x".to_string()]);
@@ -1011,11 +1062,50 @@ mod tests {
         write_plugin(&source, r#"{"name":"esc","program":"../outside"}"#);
         fs::write(temp.path().join("outside"), "x").unwrap();
         let store = PluginStore::new(temp.path().join("store"));
-        store
+        // A failed fresh install must not leave an enabled record behind.
+        let error = store
             .install(&format!("file:{}", source.display()))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("esc"), "{error:#}");
+        assert!(store.get("esc").is_err());
+        assert!(store.list().unwrap().is_empty());
+        assert!(!store.root.join("esc").exists());
+    }
+
+    #[test]
+    fn broken_plugin_does_not_hide_healthy_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = PluginStore::new(temp.path().join("store"));
+        for name in ["alpha", "beta", "gamma"] {
+            let source = temp.path().join(name);
+            write_plugin(
+                &source,
+                &format!(r#"{{"name":"{name}","program":"bin/run.sh"}}"#),
+            );
+            fs::create_dir_all(source.join("bin")).unwrap();
+            fs::write(source.join("bin/run.sh"), "#!/bin/sh\n").unwrap();
+            store
+                .install(&format!("file:{}", source.display()))
+                .unwrap();
+        }
+        // The executable disappears after installation, so only beta is broken at startup.
+        fs::remove_file(store.get("beta").unwrap().path.join("bin/run.sh")).unwrap();
+        let outcomes = store.enabled_runtimes().unwrap();
+        assert_eq!(outcomes.len(), 3);
+        let healthy: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().ok())
+            .map(|(plugin, ..)| plugin.name.as_str())
+            .collect();
+        assert_eq!(healthy, vec!["alpha", "gamma"]);
+        let failure = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
             .unwrap();
-        let plugin = store.get("esc").unwrap();
-        assert!(runtime_spec(&plugin).is_err());
+        assert!(
+            format!("{failure:#}").contains("plugin beta"),
+            "{failure:#}"
+        );
     }
 
     #[test]

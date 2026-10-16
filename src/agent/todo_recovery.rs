@@ -50,7 +50,9 @@ impl TodoRecovery {
         // Repeated rejections escalate the same reminder; the turn is never ended for them.
         let attempts = self.failures.max(self.repeated.1);
         let escalation = if attempts >= FAILURE_LIMIT && attempts % FAILURE_LIMIT == 0 {
-            format!("\nEscalation: {attempts} todo updates have been rejected without a successful plan change. Resending or rewording them is not recovery. Send the single update the diagnostic describes with its operation and indices corrected, or block the step with a concrete reason. The turn continues.")
+            format!(
+                "\nEscalation: {attempts} todo updates have been rejected without a successful plan change. Resending or rewording them is not recovery. Send the single update the diagnostic describes with its operation and indices corrected, or block the step with a concrete reason. The turn continues."
+            )
         } else {
             String::new()
         };
@@ -82,7 +84,7 @@ pub(super) fn solo_update_note(
         && !calls.is_empty()
         && calls.iter().all(|call| call.name == "todo"))
     .then_some(
-        "[Dial] This response held only `todo`, which costs a full request. Send todo updates in the same response as real work: set with the first reads, done with the next step's first call. Skip closing updates before the final answer; it closes remaining tasks.",
+        "[Dial] This response held only `todo`, which costs a full request. Send todo updates in the same response as real work: set with the first reads, done with the next step's first call. Skip closing updates before the final answer; an accepted answer closes only the in-progress task and leaves pending tasks open.",
     )
 }
 

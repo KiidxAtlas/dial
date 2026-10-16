@@ -207,6 +207,7 @@ impl<'a> Agent<'a> {
         };
         // The loaded-window cap was probed for the outgoing session's model.
         self.context_cap = None;
+        self.route.reset();
         self.context_meter = context_meter::ContextMeter::default();
         self.reported_messages = 0;
         if let Err(error) = self.restore_control()
@@ -612,6 +613,7 @@ impl<'a> Agent<'a> {
         self.auth_config = auth;
         self.model_override = config;
         self.context_cap = None;
+        self.route.reset();
         Ok(())
     }
     pub fn permission_rules(&self) -> &[approval::PermissionRule] {

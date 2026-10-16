@@ -15,6 +15,26 @@ Evidence labels:
 
 Severity: **P1** security, data loss, or materially wrong completion; **P2** correctness/reliability or a significant assurance gap; **P3** maintainability/documentation. Priorities do not imply an exploit was executed. Source locations are working-tree references and can drift after later edits.
 
+## Implementation status (applied after the audits)
+
+All findings in this report were implemented in the working tree. The sections below are the original audit text; their "proposed, not applied" wording is historical. `cargo check --all-targets` succeeds after the changes. **No tests, clippy or hosted CI have been run yet**, as requested, so regression tests added alongside the fixes are unexecuted.
+
+Findings implemented with a qualification:
+
+- **A3-05** — `ureq` exposes no socket handle or idle read deadline, so idle MCP listeners are released at a finite stream lifetime (600 s streamable HTTP with reopen, 3600 s legacy SSE with explicit error), not immediately on cancel.
+- **A3-03** — write-through is owner-local; a session binds its workspace on its first `lsp` call, so edits by a session that never called `lsp` get no write-through.
+- **A2-04** — the tree already rebound usage at both replacement sites; the fix centralizes it in one installer rather than closing a confirmed gap. Compaction applied in the background or on overflow retry does not yet reset duplicate-observation state (A13-04).
+- **A5-R1** — wire protocol bumped (`COLLAB_PROTO` 1002); older peers are incompatible.
+- **A6-06** — reviewers still read the checked-out workspace; ref reviews and changed trees are published as `Partial` instead of pinning a snapshot.
+- **A1-03** — Unix activation is crash-safe; the Windows deferred path is unchanged and still needs its own design. **A1-02** — Windows contract filters are untested on a real Windows host.
+- **A13-02** — the document-reader (`documents::read_streaming`) path keeps its page limit and is not plumbed with the model budget.
+- **A8-04** — an endpoint with no environment variable still sends unauthenticated after its key is removed (existing no-key contract).
+- **A9-03/A9-04** — anonymization is now stricter by design: text content blocks and unknown keys become placeholders.
+- Product-decision items took the report's suggested defaults (A9-R1 branch-aware share with an explicit whole-journal mode; A4-D1 documentation aligned to the tested policy; A12-R1 call ids on approvals).
+- Not exercised for lack of a harness or runtime: A2 clock-injected end-to-end tests, A5-R3 browser viewer, A5-R2 real Chrome reconnect, A5-05 real stalled peer, A11 terminal interaction, A14-06/A14-08 scripted runs.
+
+Next step: `cargo fmt`, `make test-rust`, `make lint`, `make test-integration`, `python3 scripts/test-build.py`, `python3 scripts/test-packaging.py`, then the Python and offline benchmark suites.
+
 ## Audit completion ledger
 
 | Pass | Scope                                | Report status | Source changes |

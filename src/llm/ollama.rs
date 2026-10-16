@@ -900,7 +900,10 @@ mod tests {
         assert_eq!(options["repeat_penalty"], 1.05);
         assert_eq!(options["repeat_last_n"], 128);
         assert!(options.get("repetition_penalty").is_none());
-        assert!(body.get("top_k").is_none(), "Ollama reads sampling from options");
+        assert!(
+            body.get("top_k").is_none(),
+            "Ollama reads sampling from options"
+        );
 
         profile.local_sampling.as_mut().unwrap().xtc_probability = Some(0.1);
         assert!(profile.validate().is_err());
@@ -908,7 +911,11 @@ mod tests {
     }
 
     fn ndjson(lines: &[Value]) -> Vec<u8> {
-        lines.iter().map(|line| format!("{line}\n")).collect::<String>().into_bytes()
+        lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>()
+            .into_bytes()
     }
 
     /// One native `/api/chat` exchange against a scripted server; returns the reply and the
@@ -991,7 +998,9 @@ mod tests {
         let mut pieces = Vec::new();
         let error = native_exchange(&server.url, None, &mut pieces).unwrap_err();
         assert!(
-            error.downcast_ref::<crate::llm::stream::IncompleteStream>().is_some(),
+            error
+                .downcast_ref::<crate::llm::stream::IncompleteStream>()
+                .is_some(),
             "{error:#}"
         );
     }

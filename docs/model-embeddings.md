@@ -6,11 +6,13 @@ keyword-only and nothing leaves the machine.
 
 ## Set up a local embedding model
 
-Dial can pull a local embedding model through Ollama and assign it to semantic memory in one step.
-Nothing downloads until you ask for it.
+Dial can pull a local embedding model through Ollama and assign it to the `embedding` role in one step.
+Nothing downloads until you ask for it. When `memory.backend` is not `semantic`, finishing the setup or
+assigning the role offers to switch to semantic memory (a single-key confirm); it never switches silently.
 
-- Settings → Semantic memory → Embedding model: press Ctrl+L to see the plan, then Ctrl+L again to
-  start. The row offers `nomic-embed-text` until an embedding model is configured.
+- Settings → Semantic memory → Embedding model: assigns the `embedding` role. Ctrl+L sets up the model
+  chosen in the row: it shows the plan, then Ctrl+L again starts it. The row offers `nomic-embed-text`
+  until an embedding model is configured.
 - `/models`, then **Get models** and its Embedding shelf (Tab to reach it): lists every embedding
   model discovery found (Enter assigns a served one to the `embedding` role), then the curated
   catalog. Enter on a curated model sets it up exactly as `/setup embeddings:<model> yes` does.

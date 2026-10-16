@@ -1684,19 +1684,52 @@ mod tests {
             models: 0,
             spec: configured.then(ProviderSpec::default),
         };
-        for base in ["http://127.0.0.1:11434", "http://localhost:1234/v1", "http://[::1]:8080"] {
-            assert!(expected_absent(&entry(base, "unavailable", UNREACHABLE_DETAIL, true)), "{base}");
+        for base in [
+            "http://127.0.0.1:11434",
+            "http://localhost:1234/v1",
+            "http://[::1]:8080",
+        ] {
+            assert!(
+                expected_absent(&entry(base, "unavailable", UNREACHABLE_DETAIL, true)),
+                "{base}"
+            );
         }
         // Not configured by the user: discovery found nothing, which is expected.
-        assert!(expected_absent(&entry("http://127.0.0.1:11434", "unavailable", UNREACHABLE_DETAIL, false)));
+        assert!(expected_absent(&entry(
+            "http://127.0.0.1:11434",
+            "unavailable",
+            UNREACHABLE_DETAIL,
+            false
+        )));
         // A configured remote endpoint that refused is a real failure.
-        assert!(!expected_absent(&entry("https://llm.example.com/v1", "unavailable", UNREACHABLE_DETAIL, true)));
+        assert!(!expected_absent(&entry(
+            "https://llm.example.com/v1",
+            "unavailable",
+            UNREACHABLE_DETAIL,
+            true
+        )));
         // A local server that answered with an error, or sent a bad reply, is a real failure.
-        for detail in ["Endpoint returned HTTP 500; redirects are not followed", "Endpoint returned malformed model metadata"] {
-            assert!(!expected_absent(&entry("http://127.0.0.1:11434", "unavailable", detail, true)), "{detail}");
+        for detail in [
+            "Endpoint returned HTTP 500; redirects are not followed",
+            "Endpoint returned malformed model metadata",
+        ] {
+            assert!(
+                !expected_absent(&entry(
+                    "http://127.0.0.1:11434",
+                    "unavailable",
+                    detail,
+                    true
+                )),
+                "{detail}"
+            );
         }
         // Credential failures are never neutral.
-        assert!(!expected_absent(&entry("http://127.0.0.1:11434", "auth-required", "Endpoint requires valid credentials", true)));
+        assert!(!expected_absent(&entry(
+            "http://127.0.0.1:11434",
+            "auth-required",
+            "Endpoint requires valid credentials",
+            true
+        )));
     }
 
     /// Put the cursor on the provider `id`; rows are ordered by readiness, not by fixture order.

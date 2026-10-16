@@ -1030,7 +1030,10 @@ impl Session {
     /// Sessions across every project, newest file first, pinned first.
     pub fn list_all(layout: &Layout, limit: usize) -> Result<Vec<SessionInfo>> {
         let pinned = session_pins::load(&layout.user_dir)?;
-        Self::list_paths(pinned_first(Self::all_session_files(layout)?, &pinned), limit)
+        Self::list_paths(
+            pinned_first(Self::all_session_files(layout)?, &pinned),
+            limit,
+        )
     }
 
     /// This project's sessions by activity (last accepted write first), ignoring pins. The first
@@ -1045,8 +1048,7 @@ impl Session {
     /// Whether another process holds this journal's writer lock. The shared probe is released
     /// immediately; the file is never claimed or changed.
     pub fn open_elsewhere(path: &Path) -> bool {
-        let Ok(file) =
-            platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path)
+        let Ok(file) = platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path)
         else {
             return false;
         };
@@ -1106,9 +1108,8 @@ impl Session {
 
     /// Notice for a listing that shows `shown` of `total` sessions; `None` when nothing is hidden.
     pub fn listing_notice(shown: usize, total: usize) -> Option<String> {
-        (shown < total).then(|| {
-            format!("Showing {shown} of {total} sessions; use --all for the full list")
-        })
+        (shown < total)
+            .then(|| format!("Showing {shown} of {total} sessions; use --all for the full list"))
     }
 
     /// Sessions whose id starts with `prefix`, newest first, pinned first. Only journals whose file
@@ -1415,6 +1416,28 @@ impl Session {
             })
             .collect();
         super::export::render(&self.title(), &messages, html)
+    }
+
+    /// The share snapshot for the default scope: a session header, then the active branch in order.
+    /// Abandoned branches, rewind markers and internal records (`dial_state` messages and session
+    /// meta) stay local. Only the explicit whole-journal diagnostic mode shares the raw journal.
+    pub fn share_records(&self) -> Vec<Value> {
+        let mut records = vec![json!({
+            "type": "session",
+            "id": self.id,
+            "started": self.started,
+            "model": self.model,
+            "version": env!("CARGO_PKG_VERSION"),
+        })];
+        for &i in self.branch() {
+            let entry = &self.entries[i];
+            match &entry.kind {
+                Kind::Meta { .. } => {}
+                Kind::Message(message) if role_of(message) == "dial_state" => {}
+                _ => records.push(entry_json(entry, false)),
+            }
+        }
+        records
     }
 
     /// Visible user messages that `rewind` can branch from, oldest first: (entry id, text).
@@ -4382,6 +4405,27 @@ mod tests {
         let reopened = Session::read(f.path().unwrap()).unwrap();
         assert_eq!(reopened.messages(), f.messages());
         assert_eq!(s.messages().len(), 3);
+    }
+
+    #[test]
+    fn share_records_are_the_active_branch_without_abandoned_or_internal_records() {
+        let e = env();
+        let mut s = new_session(&e);
+        s.append(user("u1")).unwrap();
+        s.append(assistant("a1")).unwrap();
+        s.append(user("abandoned")).unwrap();
+        s.rewind(1).unwrap();
+        s.append(user("kept")).unwrap();
+        let records = s.share_records();
+        assert_eq!(records[0]["type"], "session");
+        let text = serde_json::to_string(&records).unwrap();
+        assert!(
+            text.contains("\"kept\"") && text.contains("\"u1\""),
+            "{text}"
+        );
+        assert!(!text.contains("abandoned"), "{text}");
+        let journal = fs::read_to_string(s.path().unwrap()).unwrap();
+        assert!(journal.contains("abandoned"));
     }
 
     #[test]

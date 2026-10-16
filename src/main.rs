@@ -342,6 +342,10 @@ enum Command {
         endpoint: Option<String>,
         #[arg(long, conflicts_with = "endpoint")]
         gist: bool,
+        /// Diagnostic: share the whole journal, including abandoned branches and internal records,
+        /// instead of the active branch.
+        #[arg(long)]
+        whole_journal: bool,
     },
 }
 #[derive(Subcommand)]
@@ -628,7 +632,12 @@ fn real_main(mut cli: Cli) -> Result<()> {
             );
         }
         Some(Command::Relay { bind }) => return dial::collab::server::serve(*bind),
-        Some(Command::Share { id, endpoint, gist }) => {
+        Some(Command::Share {
+            id,
+            endpoint,
+            gist,
+            whole_journal,
+        }) => {
             let config = Config::load(&layout, Some(overlay(&cli)?))?;
             let sessions = Session::list_newest(&layout, usize::MAX)?;
             let selected = if let Some(id) = id {
@@ -645,15 +654,13 @@ fn real_main(mut cli: Cli) -> Result<()> {
                     .first()
                     .ok_or_else(|| anyhow::anyhow!("there are no sessions to share"))?
             };
-            let source = std::fs::read(&selected.path)?;
-            let mut entries = Vec::new();
-            for line in source
-                .split(|byte| *byte == b'\n')
-                .filter(|line| !line.is_empty())
-            {
-                entries.push(serde_json::from_slice::<serde_json::Value>(line)?);
-            }
-            let transcript = serde_json::to_vec(&entries)?;
+            // Default: the active branch. Abandoned branches and internal records stay local.
+            let scope = if *whole_journal {
+                dial::storage::share::Scope::WholeJournal
+            } else {
+                dial::storage::share::Scope::ActiveBranch
+            };
+            let transcript = dial::storage::share::transcript(&selected.path, scope)?;
             let encrypted = dial::storage::share::encrypt_transcript(&transcript)?;
             let link = if *gist {
                 dial::storage::share::upload_gist(&encrypted)?
@@ -987,7 +994,16 @@ fn real_main(mut cli: Cli) -> Result<()> {
         Some(Command::Doctor { fix, yes }) => {
             let env = dial::setup::deps::Env::current(&layout.user_dir);
             match fix {
-                None => println!("{}", dial::setup::deps::run::list_text(&env)),
+                None => {
+                    println!("{}", dial::setup::deps::run::list_text(&env));
+                    println!();
+                    match Config::load(&layout, Some(overlay(&cli)?)) {
+                        Ok(config) => println!("{}", dial::setup::memory::doctor_text(&config)),
+                        Err(error) => {
+                            println!("Memory: settings could not be read ({error:#}).")
+                        }
+                    }
+                }
                 Some(id) if id.starts_with("embeddings") => {
                     let model = dial::setup::embeddings::model_from_id(id)
                         .ok_or_else(|| anyhow::anyhow!("unknown embedding model in {id}"))?;

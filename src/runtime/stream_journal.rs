@@ -31,10 +31,14 @@ struct Writer {
     file: File,
     path: PathBuf,
     error: Option<String>,
+    /// Stream size below which reclamation is not retried after a deferred attempt.
+    reclaim_after: u64,
 }
 static WRITERS: LazyLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<Writer>>>>> =
     LazyLock::new(Default::default);
 const RECLAIM_AT: u64 = 4 * 1024 * 1024;
+/// Largest row replay reads. Publication refuses larger frames so every stored frame stays replayable.
+const MAX_FRAME: usize = 32 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub(crate) struct Journal(Arc<Mutex<Writer>>);
 pub(crate) fn path(session: &Path) -> std::path::PathBuf {
@@ -68,7 +72,12 @@ pub(crate) fn remove(session: &Path) -> std::io::Result<()> {
 /// reserves the destination, so reopening the session cannot adopt an unrelated stream journal.
 /// Failure removes only a destination this call created.
 pub(crate) fn copy(source: &Path, destination: &Path) -> anyhow::Result<()> {
-    let nodes = recover(source)?;
+    let (nodes, complete) = scan(source)?;
+    anyhow::ensure!(
+        complete,
+        "stream journal {} has an oversized row; source preserved, not copied",
+        path(source).display()
+    );
     let journal = Journal::create_new(destination).map_err(|error| {
         anyhow::anyhow!(
             "creating stream journal {}: {error}",
@@ -196,6 +205,7 @@ impl Journal {
             file,
             path: path.clone(),
             error: None,
+            reclaim_after: 0,
         }));
         writers.insert(path, Arc::downgrade(&writer));
         Ok(Self(writer))
@@ -208,6 +218,12 @@ impl Journal {
         let result = (|| {
             let mut bytes = serde_json::to_vec(&frame)?;
             bytes.push(b'\n');
+            // Replay reads at most MAX_FRAME bytes per row, so a larger frame could never be recovered.
+            if bytes.len() > MAX_FRAME {
+                return Err(std::io::Error::other(
+                    "stream frame exceeds the replay row limit",
+                ));
+            }
             writer.file.write_all(&bytes)
         })();
         if let Err(error) = result {
@@ -245,24 +261,28 @@ impl Journal {
             .sync_all()
     }
     pub fn needs_reclamation(&self) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        let writer = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        writer
             .file
             .metadata()
-            .is_ok_and(|metadata| metadata.len() >= RECLAIM_AT)
+            .is_ok_and(|metadata| metadata.len() >= RECLAIM_AT.max(writer.reclaim_after))
     }
     /// Caller must sync the main session before supplying its acknowledged runtime revisions.
     /// Unacknowledged observations from every branch survive, including an active partial reply.
+    /// Reclamation is deferred without latching the writer when the retained baselines exceed the
+    /// private-state limit or the scan skipped an oversized row: every frame stays in the stream.
     pub fn checkpoint(&self, acknowledged: &BTreeMap<String, u64>) -> anyhow::Result<()> {
         let mut writer = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         anyhow::ensure!(
             writer.error.is_none(),
             "stream journal has a latched write failure"
         );
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<bool> {
             let session = writer.path.with_extension("jsonl");
-            let nodes = recover(&session)?;
+            let (nodes, complete) = scan(&session)?;
+            if !complete {
+                return Ok(false);
+            }
             let mut bytes = Vec::new();
             for node in nodes {
                 // Live bodies still append delta frames. Keep their complete baseline even
@@ -283,29 +303,43 @@ impl Journal {
                 )?;
                 bytes.push(b'\n');
             }
+            if bytes.len() > crate::storage::atomic::PRIVATE_LIMIT {
+                return Ok(false);
+            }
             crate::storage::settings_store::write_private(&writer.path, &bytes)?;
             let file = crate::platform::fs::open_owner_only(
                 std::fs::OpenOptions::new().append(true),
                 &writer.path,
             )?;
             writer.file = file;
-            Ok(())
+            Ok(true)
         })();
-        if let Err(error) = &result {
-            writer.error = Some(format!("stream journal checkpoint failed: {error:#}"));
+        match &result {
+            Ok(true) => writer.reclaim_after = 0,
+            Ok(false) => {
+                let len = writer.file.metadata().map_or(0, |metadata| metadata.len());
+                writer.reclaim_after = len.saturating_add(RECLAIM_AT);
+            }
+            Err(error) => {
+                writer.error = Some(format!("stream journal checkpoint failed: {error:#}"));
+            }
         }
-        result
+        result.map(|_| ())
     }
 }
 
-pub(crate) fn recover(session: &Path) -> anyhow::Result<Vec<Node>> {
+/// Replays the stream. The flag is `false` when an oversized row was skipped, so the replay cannot
+/// prove that it saw every frame. Only a real end of file counts as a torn tail.
+fn scan(session: &Path) -> anyhow::Result<(Vec<Node>, bool)> {
     let path = path(session);
     let file = match crate::platform::fs::open_nofollow_nonblocking(
         std::fs::OpenOptions::new().read(true),
         &path,
     ) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), true));
+        }
         Err(error) => return Err(error.into()),
     };
     anyhow::ensure!(
@@ -317,15 +351,25 @@ pub(crate) fn recover(session: &Path) -> anyhow::Result<Vec<Node>> {
     let mut nodes = BTreeMap::<String, Node>::new();
     let mut reader = BufReader::new(file);
     let mut bytes = Vec::new();
+    let mut complete = true;
     loop {
         bytes.clear();
-        // Bound corrupt rows without allocating an unbounded line.
-        let n = std::io::Read::take(&mut reader, 32 * 1024 * 1024).read_until(b'\n', &mut bytes)?;
+        // Bound each row. Reaching the cap without a newline means an oversized row, not a torn tail.
+        let n = std::io::Read::take(&mut reader, MAX_FRAME as u64).read_until(b'\n', &mut bytes)?;
         if n == 0 {
             break;
         }
         if bytes.last() != Some(&b'\n') {
-            break;
+            if n < MAX_FRAME {
+                // End of file inside the final row: a torn append, safely ignored.
+                break;
+            }
+            // The row cannot be buffered. Skip it through its newline and mark the replay partial.
+            complete = false;
+            if !skip_row(&mut reader)? {
+                break;
+            }
+            continue;
         }
         #[derive(Deserialize)]
         struct Version {
@@ -358,7 +402,27 @@ pub(crate) fn recover(session: &Path) -> anyhow::Result<Vec<Node>> {
             }
         }
     }
-    Ok(nodes.into_values().collect())
+    Ok((nodes.into_values().collect(), complete))
+}
+
+/// Discards bytes through the next newline without buffering them. `false` means end of file.
+fn skip_row(reader: &mut impl BufRead) -> std::io::Result<bool> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(false);
+        }
+        if let Some(position) = available.iter().position(|&b| b == b'\n') {
+            reader.consume(position + 1);
+            return Ok(true);
+        }
+        let len = available.len();
+        reader.consume(len);
+    }
+}
+
+pub(crate) fn recover(session: &Path) -> anyhow::Result<Vec<Node>> {
+    scan(session).map(|(nodes, _)| nodes)
 }
 
 #[cfg(test)]
@@ -460,5 +524,101 @@ mod reclamation_tests {
         let before = std::fs::read(path(&destination)).unwrap();
         assert!(copy(&source, &destination).is_err());
         assert_eq!(std::fs::read(path(&destination)).unwrap(), before);
+    }
+
+    #[test]
+    fn aggregate_live_baselines_above_the_private_limit_defer_without_poisoning_the_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("session.jsonl");
+        let journal = Journal::open(&session).unwrap();
+        let tree = crate::runtime::Tree::default();
+        tree.journal(journal.clone());
+        // Each body is valid alone; together their retained baselines exceed the private limit.
+        let chunk = "x".repeat(3 * 1024 * 1024);
+        let bodies: Vec<_> = (0..3)
+            .map(|index| {
+                let body = tree.start("assistant", &format!("live {index}"), None);
+                body.append(&chunk);
+                body
+            })
+            .collect();
+        let ids: Vec<String> = bodies.iter().map(|body| body.snapshot().id).collect();
+        journal.checkpoint(&BTreeMap::new()).unwrap();
+        journal.check().unwrap();
+        assert!(std::fs::metadata(path(&session)).unwrap().len() > RECLAIM_AT);
+        // Unrelated writes keep flowing after the deferred reclamation.
+        bodies[0].append(" tail");
+        journal.check().unwrap();
+        let revisions: Vec<u64> = bodies
+            .iter()
+            .map(|body| body.snapshot().result.revision)
+            .collect();
+        drop(bodies);
+        drop(tree);
+        drop(journal);
+        let reopened = Journal::open(&session).unwrap();
+        reopened.check().unwrap();
+        let recovered = recover(&session).unwrap();
+        assert_eq!(recovered.len(), 3);
+        for (index, (id, revision)) in ids.iter().zip(&revisions).enumerate() {
+            let node = recovered.iter().find(|node| &node.id == id).unwrap();
+            assert_eq!(node.result.revision, *revision);
+            if index == 0 {
+                assert!(node.result.text.ends_with(" tail"));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_row_is_skipped_and_never_compacted_away() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("session.jsonl");
+        let journal = Journal::open(&session).unwrap();
+        let tree = crate::runtime::Tree::default();
+        tree.journal(journal.clone());
+        let body = tree.start("assistant", "after", None);
+        body.append("kept");
+        drop(body);
+        drop(tree);
+        drop(journal);
+        let stream = path(&session);
+        let original = std::fs::read(&stream).unwrap();
+        // An unparseable row larger than the replay limit, followed by valid frames.
+        let mut bytes = vec![b'x'; MAX_FRAME];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&original);
+        std::fs::write(&stream, &bytes).unwrap();
+        let (nodes, complete) = scan(&session).unwrap();
+        assert!(!complete);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].result.text, "kept");
+        assert!(copy(&session, &root.path().join("copy.jsonl")).is_err());
+        let journal = Journal::open(&session).unwrap();
+        journal.checkpoint(&BTreeMap::new()).unwrap();
+        journal.check().unwrap();
+        assert!(std::fs::metadata(&stream).unwrap().len() >= MAX_FRAME as u64);
+        assert_eq!(recover(&session).unwrap()[0].result.text, "kept");
+    }
+
+    #[test]
+    fn torn_final_row_recovers_the_complete_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("session.jsonl");
+        let journal = Journal::open(&session).unwrap();
+        let tree = crate::runtime::Tree::default();
+        tree.journal(journal.clone());
+        let body = tree.start("assistant", "prefix", None);
+        body.append("kept");
+        drop(body);
+        drop(tree);
+        drop(journal);
+        let stream = path(&session);
+        let mut bytes = std::fs::read(&stream).unwrap();
+        bytes.extend_from_slice(b"{\"kind\":\"append\",\"id\":\"torn");
+        std::fs::write(&stream, &bytes).unwrap();
+        let (nodes, complete) = scan(&session).unwrap();
+        assert!(complete);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].result.text, "kept");
     }
 }

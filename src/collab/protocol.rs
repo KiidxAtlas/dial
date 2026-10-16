@@ -8,16 +8,19 @@
 //! - TEXT control frames (unencrypted, no session data): relay→host
 //!   `{"t":"peer-joined"|"peer-left","peer":N}`, relay→guest `{"t":"room-closed"}`.
 //!
-//! Sealed payloads are JSON frames (see [`Frame`] helpers). Dial frames carry Dial's own
-//! session records, so clients speaking other protocol versions are refused
+//! Sealed payloads are JSON frames (see [`frame`] helpers). Every sealed frame is stamped by its
+//! socket with `role` (`host`|`guest`), a random per-socket `epoch` and a monotonic `seq`, which
+//! receivers check with a replay window before acting (`super::crypto::SenderWindows`). Dial frames
+//! carry Dial's own session records, so clients speaking other protocol versions are refused
 //! at `hello` instead of silently misrendering.
 use super::crypto::{ROOM_ID_BYTES, ROOM_KEY_BYTES, WRITE_TOKEN_BYTES, random_bytes};
 use anyhow::{Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 /// Wire protocol version carried in `hello`/`welcome`; the host rejects mismatches.
-pub const COLLAB_PROTO: u64 = 1001;
+pub const COLLAB_PROTO: u64 = 1002;
 /// Plaintext envelope prefix length.
 pub const ENVELOPE_HEADER_LENGTH: usize = 4;
 /// Upper bound for one replicated entry/node payload before shrinking.
@@ -251,12 +254,13 @@ pub mod frame {
     pub fn bye(reason: &str) -> Value {
         json!({"t":"bye","reason":reason})
     }
-    /// `{"t":"entry","entry":…}` from the entry's JSON, without re-serializing it.
-    pub fn entry_json(entry_json: &str) -> String {
-        format!("{{\"t\":\"entry\",\"entry\":{entry_json}}}")
+    /// `{"t":"entry","seq":N,"entry":…}`: `seq` is the entry's index in the host log, so receivers
+    /// drop duplicates and detect gaps. The entry is embedded from its JSON without re-serializing.
+    pub fn entry_json(seq: usize, entry_json: &str) -> String {
+        format!("{{\"t\":\"entry\",\"seq\":{seq},\"entry\":{entry_json}}}")
     }
     /// `{"t":"snapshot-chunk","entries":[…],"final":…}` from each entry's JSON.
-    pub fn snapshot_chunk(entries: &[String], last: bool) -> String {
+    pub fn snapshot_chunk(entries: &[&str], last: bool) -> String {
         format!(
             "{{\"t\":\"snapshot-chunk\",\"entries\":[{}],\"final\":{last}}}",
             entries.join(",")
@@ -264,25 +268,28 @@ pub mod frame {
     }
 }
 
-/// Byte-bounded snapshot chunking. Every chunk carries at least one entry; an empty snapshot
-/// still yields one `final` chunk so guests never wait for a missing terminator.
-pub fn snapshot_chunks(entries: Vec<String>) -> impl Iterator<Item = String> + Send {
-    let mut entries = entries.into_iter().peekable();
+/// Byte-bounded snapshot chunking over shared, immutable log storage. Chunks are produced lazily
+/// from a cursor, so a queued snapshot holds one `Arc` instead of a copy of the history. Every chunk
+/// carries at least one entry; an empty snapshot still yields one `final` chunk so guests never
+/// wait for a missing terminator.
+pub fn snapshot_chunks(entries: Arc<Vec<Arc<str>>>) -> impl Iterator<Item = String> + Send {
+    let mut next = 0usize;
     let mut done = false;
     std::iter::from_fn(move || {
         if done {
             return None;
         }
-        let mut batch = Vec::new();
+        let mut batch: Vec<&str> = Vec::new();
         let mut bytes = 0usize;
-        while let Some(next) = entries.peek() {
-            if !batch.is_empty() && bytes + next.len() > SNAPSHOT_CHUNK_BYTES {
+        while let Some(entry) = entries.get(next) {
+            if !batch.is_empty() && bytes + entry.len() > SNAPSHOT_CHUNK_BYTES {
                 break;
             }
-            bytes += next.len();
-            batch.push(entries.next().expect("peeked"));
+            bytes += entry.len();
+            batch.push(&**entry);
+            next += 1;
         }
-        let last = entries.peek().is_none();
+        let last = next >= entries.len();
         done = last;
         Some(frame::snapshot_chunk(&batch, last))
     })
@@ -466,16 +473,17 @@ mod tests {
 
     #[test]
     fn snapshot_chunks_are_bounded_and_terminated() {
-        let empty: Vec<String> = snapshot_chunks(Vec::new()).collect();
+        let empty: Vec<String> = snapshot_chunks(Arc::new(Vec::new())).collect();
         assert_eq!(
             empty,
             vec!["{\"t\":\"snapshot-chunk\",\"entries\":[],\"final\":true}"]
         );
         let big = "x".repeat(SNAPSHOT_CHUNK_BYTES / 2 + 1);
         let entries = vec![format!("\"{big}\""), format!("\"{big}\""), "1".into()];
-        let chunks: Vec<Value> = snapshot_chunks(entries)
-            .map(|c| serde_json::from_str(&c).unwrap())
-            .collect();
+        let chunks: Vec<Value> =
+            snapshot_chunks(Arc::new(entries.into_iter().map(Arc::from).collect()))
+                .map(|c| serde_json::from_str(&c).unwrap())
+                .collect();
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0]["entries"].as_array().unwrap().len(), 1);
         assert_eq!(chunks[0]["final"], false);

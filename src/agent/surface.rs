@@ -129,6 +129,20 @@ pub trait Ui {
             self.approve(tool, summary)
         }
     }
+    /// Approval for one tool call. The default ignores call identity; surfaces that correlate
+    /// approvals with call cards override it.
+    fn approve_call(
+        &mut self,
+        _call_id: &str,
+        tool: &str,
+        summary: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Decision {
+        match cancel {
+            Some(flag) => self.approve_with_cancel(tool, summary, flag),
+            None => self.approve(tool, summary),
+        }
+    }
     /// Wait for an answer while the current agent turn remains active.
     fn ask_user(&mut self, _title: &str, _question: &str, _options: &[String]) -> Option<String> {
         None

@@ -29,6 +29,8 @@ struct ActiveTool {
     call_id: Option<String>,
     output: String,
     pending: bool,
+    /// Approval that created this placeholder; cleared when a call card adopts it, removed when decided.
+    approval: Option<String>,
 }
 pub(crate) struct Adapter {
     layout: Layout,
@@ -65,6 +67,59 @@ fn source_meta(event: &Value) -> Value {
         }
     }
     json!({"dial":dial})
+}
+/// ACP stop reason for a finished prompt. Interruption stays `cancelled` and an exhausted step budget
+/// is `max_turn_requests`. Other outcomes keep `end_turn`, with the authoritative Dial outcome and
+/// report in `_meta.dial`, so failed, blocked and incomplete turns remain distinguishable.
+fn prompt_stop(value: &Value) -> Value {
+    if value["interrupted"] == true {
+        return json!({"stopReason":"cancelled"});
+    }
+    let outcome = value["outcome"].as_str().unwrap_or_default();
+    let stop = if value["step_limit"] == true {
+        "max_turn_requests"
+    } else {
+        "end_turn"
+    };
+    if outcome == "completed" && stop == "end_turn" {
+        return json!({"stopReason":stop});
+    }
+    let mut dial = json!({"outcome":outcome});
+    if let Some(report) = value["text"].as_str() {
+        dial["report"] = json!(report);
+    }
+    json!({"stopReason":stop,"_meta":{"dial":dial}})
+}
+/// ACP plan entry for one todo task. The `Status` match is exhaustive, so a new status cannot
+/// silently render as pending. Abandoned and blocked tasks keep their state and note in `_meta.dial`.
+fn plan_entry(task: &Value) -> Value {
+    use crate::agent::todo::Status;
+    let raw = match task["status"].as_str() {
+        Some("done") => "completed",
+        Some("running") => "in_progress",
+        Some(status) => status,
+        None => "",
+    };
+    let status = serde_json::from_value::<Status>(json!(raw)).ok();
+    let (acp, dial_status) = match status {
+        Some(Status::Pending) => ("pending", None),
+        Some(Status::InProgress) => ("in_progress", None),
+        Some(Status::Completed) => ("completed", None),
+        // Abandoned work closes out the plan but is not completed work.
+        Some(Status::Abandoned) => ("completed", Some("abandoned")),
+        // Blocked work is still outstanding; its blocker is the note.
+        Some(Status::Blocked) => ("pending", Some("blocked")),
+        None => ("pending", Some(raw)),
+    };
+    let mut entry = json!({"content":task["content"],"priority":"medium","status":acp});
+    if let Some(dial_status) = dial_status {
+        let mut dial = json!({"status":dial_status});
+        if let Some(note) = task["note"].as_str() {
+            dial["note"] = json!(note);
+        }
+        entry["_meta"] = json!({"dial":dial});
+    }
+    entry
 }
 fn tool_kind(name: &str) -> &'static str {
     match name {
@@ -617,7 +672,7 @@ impl Adapter {
                             if let Some(update)=self.update(json!({"sessionUpdate":"config_option_update","configOptions":config_options(plan)})){updates.push(update);}
                         }
                     }
-                    json!({"stopReason":if value["interrupted"] == true {"cancelled"} else {"end_turn"}})
+                    prompt_stop(value)
                 }
                 "session/close" => {
                     if let Some(session) = pending.session {
@@ -678,36 +733,61 @@ impl Adapter {
                 let id = format!("dial-permission-{approval}");
                 self.permissions.insert(key(&json!(id)), approval.into());
                 let name = event["tool"].as_str().unwrap_or("tool");
-                let tool =
-                    if let Some(tool) = self.tools.iter().rev().find(|tool| tool.name == name) {
-                        tool.id.clone()
-                    } else {
+                let call_id = event["call_id"].as_str();
+                // Attach to the call card with this call ID. Without one, add a placeholder that the
+                // call's own tool_call adopts, or that `approval_resolved` removes once decided.
+                let existing = call_id.and_then(|call| {
+                    self.tools
+                        .iter()
+                        .rev()
+                        .find(|tool| tool.call_id.as_deref() == Some(call))
+                        .map(|tool| tool.id.clone())
+                });
+                let tool = match existing {
+                    Some(tool) => tool,
+                    None => {
                         self.tools.push(ActiveTool {
                             id: approval.into(),
                             name: name.into(),
-                            call_id: None,
+                            call_id: call_id.map(str::to_owned),
                             output: String::new(),
                             pending: true,
+                            approval: Some(approval.into()),
                         });
                         approval.into()
-                    };
+                    }
+                };
                 return vec![
                     json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{"sessionId":session,
                     "toolCall":{"toolCallId":tool,"title":event["summary"],"kind":tool_kind(name),"status":"pending"},
                     "options":[{"optionId":"allow","name":"Allow once","kind":"allow_once"},{"optionId":"always","name":"Allow always","kind":"allow_always"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}),
                 ];
             }
+            "approval_resolved" => {
+                if let Some(approval) = event["approval_id"].as_str() {
+                    // A decided request is no longer pending: drop its reply mapping and any placeholder.
+                    self.permissions
+                        .remove(&key(&json!(format!("dial-permission-{approval}"))));
+                    self.tools
+                        .retain(|tool| tool.approval.as_deref() != Some(approval));
+                }
+                return Vec::new();
+            }
             "tool_call" => {
                 let name = event["name"].as_str().unwrap_or("tool");
                 let call_id = event["call_id"].as_str().map(str::to_owned);
-                let id = if let Some(tool) = self
-                    .tools
-                    .iter_mut()
-                    .rev()
-                    .find(|tool| tool.name == name && tool.pending)
-                {
+                let id = if let Some(tool) = self.tools.iter_mut().rev().find(|tool| {
+                    tool.pending
+                        && tool.name == name
+                        && match (&tool.call_id, &call_id) {
+                            (Some(own), Some(new)) => own == new,
+                            (Some(_), None) => false,
+                            (None, _) => true,
+                        }
+                }) {
                     tool.pending = false;
                     tool.call_id = call_id;
+                    tool.approval = None;
                     tool.id.clone()
                 } else {
                     self.next_tool += 1;
@@ -718,6 +798,7 @@ impl Adapter {
                         call_id,
                         output: String::new(),
                         pending: false,
+                        approval: None,
                     });
                     id
                 };
@@ -755,7 +836,12 @@ impl Adapter {
                 json!({"sessionUpdate":"tool_call_update","toolCallId":id,"status":if partial {"in_progress"} else if event["is_error"]==true {"failed"} else {"completed"},"content":[{"type":"content","content":{"type":"text","text":text}}],"rawOutput":event.get("data")})
             }
             "todo" => {
-                let entries:Vec<_>=event["tasks"].as_array().into_iter().flatten().map(|task|json!({"content":task["content"],"priority":"medium","status":match task["status"].as_str() {Some("done"|"completed")=>"completed",Some("in_progress"|"running")=>"in_progress",_=>"pending"}})).collect();
+                let entries: Vec<_> = event["tasks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(plan_entry)
+                    .collect();
                 json!({"sessionUpdate":"plan","entries":entries})
             }
             "notice" | "background" | "fatal" => {
@@ -944,5 +1030,80 @@ mod tests {
             "method":"session/cancel","params":{"sessionId":"s2"}}));
         assert!(request.is_none());
         assert_eq!(replies, vec![response(&json!(3), json!({}))]);
+    }
+
+    #[test]
+    fn prompt_stop_reasons_distinguish_outcomes() {
+        assert_eq!(
+            prompt_stop(&json!({"outcome":"completed","text":"done"})),
+            json!({"stopReason":"end_turn"})
+        );
+        assert_eq!(
+            prompt_stop(&json!({"interrupted":true,"outcome":"interrupted"})),
+            json!({"stopReason":"cancelled"})
+        );
+        for outcome in ["failed", "blocked", "needs_input", "incomplete"] {
+            let stop = prompt_stop(&json!({"outcome":outcome,"text":"report"}));
+            assert_eq!(stop["stopReason"], "end_turn", "{outcome}");
+            assert_eq!(stop["_meta"]["dial"]["outcome"], outcome);
+            assert_eq!(stop["_meta"]["dial"]["report"], "report");
+        }
+        let limited =
+            prompt_stop(&json!({"outcome":"incomplete","step_limit":true,"text":"Stopped"}));
+        assert_eq!(limited["stopReason"], "max_turn_requests");
+        assert_eq!(limited["_meta"]["dial"]["outcome"], "incomplete");
+    }
+
+    #[test]
+    fn plan_entries_map_every_todo_status_without_silent_pending() {
+        let entry =
+            |status: &str| plan_entry(&json!({"content":"task","status":status,"note":"why"}));
+        assert_eq!(entry("pending")["status"], "pending");
+        assert_eq!(entry("in_progress")["status"], "in_progress");
+        assert_eq!(entry("completed")["status"], "completed");
+        assert_eq!(entry("completed")["_meta"], Value::Null);
+        assert_eq!(entry("abandoned")["status"], "completed");
+        assert_eq!(
+            entry("abandoned")["_meta"]["dial"],
+            json!({"status":"abandoned","note":"why"})
+        );
+        assert_eq!(entry("blocked")["status"], "pending");
+        assert_eq!(
+            entry("blocked")["_meta"]["dial"],
+            json!({"status":"blocked","note":"why"})
+        );
+    }
+
+    #[test]
+    fn approvals_attach_by_call_id_and_expire_when_decided() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+        let mut adapter = Adapter::new(layout);
+        adapter.emit(json!({"event":"active_session","session_id":"s1"}));
+        adapter.emit(json!({"event":"tool_call","call_id":"a","name":"bash"}));
+        adapter.emit(json!({"event":"tool_call","call_id":"b","name":"bash"}));
+        // Same-name calls: the approval for call "a" attaches to its own card, not the latest one.
+        let attached = adapter
+            .emit(json!({"event":"approval","approval_id":"p1","tool":"bash","call_id":"a"}));
+        assert_eq!(
+            attached[0]["params"]["toolCall"]["toolCallId"],
+            "dial-tool-1"
+        );
+        // An approval without a call card gets a placeholder, which a same-name call with another
+        // call ID must not adopt, and which the decision removes.
+        let orphan = adapter
+            .emit(json!({"event":"approval","approval_id":"p2","tool":"bash","call_id":"zz"}));
+        assert_eq!(orphan[0]["params"]["toolCall"]["toolCallId"], "p2");
+        let call = adapter.emit(json!({"event":"tool_call","call_id":"c","name":"bash"}));
+        assert_eq!(call[0]["params"]["update"]["toolCallId"], "dial-tool-3");
+        assert_eq!(adapter.tools.len(), 4);
+        adapter.emit(json!({"event":"approval_resolved","approval_id":"p2"}));
+        assert_eq!(adapter.tools.len(), 3);
+        assert!(
+            !adapter
+                .permissions
+                .contains_key(&key(&json!("dial-permission-p2")))
+        );
     }
 }

@@ -4,38 +4,98 @@
 <header><h1>Dial session</h1><div id="status">Connecting…</div></header><main id="transcript"></main>
 <script type="module">
 const status=document.querySelector('#status'), transcript=document.querySelector('#transcript');
+const PROTO=1002, RETRY_BASE_MS=1000, RETRY_MAX_MS=30000;
 const b64=s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');return Uint8Array.from(atob(s+'='.repeat((4-s.length%4)%4)),c=>c.charCodeAt(0))};
 function fail(message){status.textContent=message;status.className='error'}
+function setStatus(message){status.textContent=message;status.className=''}
+function randomEpoch(){const bytes=crypto.getRandomValues(new Uint8Array(12));let text='';for(const byte of bytes)text+=String.fromCharCode(byte);return btoa(text).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
 try {
   const fragment=decodeURIComponent(location.hash.slice(1)); if(!fragment) throw Error('Open a full Dial collaboration link.');
   let link=fragment; if(link.startsWith('http://')||link.startsWith('https://')){const parsed=new URL(link);link=decodeURIComponent(parsed.hash.slice(1));}
   if(!link.includes('://'))link='wss://'+link;
-  const u=new URL(link); if(!u.hash&&u.pathname.includes('.')){};
+  const u=new URL(link);
   const match=u.pathname.match(/^\/r\/([A-Za-z0-9_-]+)(?:\.([A-Za-z0-9_-]+))?$/); if(!match)throw Error('Invalid collaboration link.');
   let secret=match[2]||u.hash.slice(1); if(!secret)throw Error('Link is missing its key.');
   const secretBytes=b64(secret);if(secretBytes.length!==32&&secretBytes.length!==48)throw Error('Invalid room key.');
   const key=await crypto.subtle.importKey('raw',secretBytes.slice(0,32),{name:'AES-GCM'},false,['encrypt','decrypt']);
-  const socketUrl=`${u.protocol}//${u.host}/r/${match[1]}?role=guest`; const ws=new WebSocket(socketUrl);ws.binaryType='arraybuffer';
+  const socketUrl=`${u.protocol}//${u.host}/r/${match[1]}?role=guest`;
+  // Host epoch and sequence persist across reconnects: the host's numbers only move forward.
+  const wire={epoch:null,lastSeq:0};
+  let attempt=0, ended=false;
   const add=(kind,text)=>{const el=document.createElement('article');el.textContent=`${kind}: ${text}`;transcript.append(el)};
-  ws.onopen=async()=>{status.textContent='Connected · end-to-end encrypted';const iv=crypto.getRandomValues(new Uint8Array(12));const body=new TextEncoder().encode(JSON.stringify({t:'hello',proto:1001,name:'web viewer'}));const sealed=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv,tagLength:128},key,body));const out=new Uint8Array(16+sealed.length);out.set(iv,4);out.set(sealed,16);ws.send(out);};
-  ws.onclose=()=>{status.textContent='Disconnected';};ws.onerror=()=>fail('Relay connection failed.');
-  ws.onmessage=async event=>{
-    if(typeof event.data==='string'){try{const ctl=JSON.parse(event.data);if(ctl.t==='room-closed')status.textContent='Host ended this session';}catch{}return;}
-    try {
-      const bytes=new Uint8Array(event.data);if(bytes.length<20)throw Error('Short frame');
-      const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(4,16),tagLength:128},key,bytes.slice(16));
-      const frame=JSON.parse(new TextDecoder().decode(plain));
-      if(frame.t==='state')add('Session',JSON.stringify(frame.state));
-      else if(frame.t==='entry')add(frame.entry?.type||'Entry',JSON.stringify(frame.entry));
-      else if(frame.t==='node')add('Runtime',JSON.stringify(frame.node));
-      else if(frame.t==='snapshot-chunk')for(const entry of frame.entries||[])add(entry?.type||'Entry',JSON.stringify(entry));
-      else if(frame.t==='notice')add('Notice',frame.message||'');
-      else if(frame.t==='error')add('Error',frame.message||'Unknown error');
-      else if(frame.t==='welcome')status.textContent=`Connected · ${frame.name||'host'}`;
-      else if(frame.t==='reset')transcript.replaceChildren();
-      else if(frame.t==='bye')status.textContent=`Host ended this session${frame.reason?': '+frame.reason:''}`;
-      window.scrollTo(0,document.body.scrollHeight);
-    } catch(error){add('Frame unavailable',String(error));}
+  const describe=entry=>entry?.type||entry?.role||'Entry';
+  const renderAll=entries=>{transcript.replaceChildren();for(const entry of entries)add(describe(entry),JSON.stringify(entry))};
+  const seal=async frame=>{
+    const iv=crypto.getRandomValues(new Uint8Array(12));
+    const body=new TextEncoder().encode(JSON.stringify(frame));
+    const sealed=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv,tagLength:128},key,body));
+    const out=new Uint8Array(16+sealed.length);out.set(iv,4);out.set(sealed,16);return out;
   };
+  // Mirrors the Rust replica: welcome stages a snapshot, final replaces the log, entries apply by
+  // index (duplicates dropped, gaps reported), reset clears the log before the host replays it.
+  const apply=(frame,replica)=>{
+    switch(frame.t){
+      case 'welcome':
+        replica.staging=[];attempt=0;setStatus('Connected · end-to-end encrypted · synchronising');break;
+      case 'snapshot-chunk':
+        if(!replica.staging)break;
+        replica.staging.push(...(frame.entries||[]));
+        if(frame.final===true){
+          replica.entries=replica.staging;replica.staging=null;replica.live=true;
+          renderAll(replica.entries);
+          setStatus(`Connected · end-to-end encrypted · ${replica.entries.length} entries`);
+        }
+        break;
+      case 'entry':{
+        const log=replica.staging??(replica.live?replica.entries:null);
+        if(!log||!Number.isSafeInteger(frame.seq))break;
+        if(frame.seq<log.length)break;
+        if(frame.seq>log.length){add('Notice',`missing host entries ${log.length} to ${frame.seq}; reconnect to resync`);break;}
+        log.push(frame.entry);
+        if(log===replica.entries)add(describe(frame.entry),JSON.stringify(frame.entry));
+        break;}
+      case 'reset':
+        replica.entries=[];replica.staging=null;replica.live=true;transcript.replaceChildren();break;
+      case 'notice':add('Notice',frame.message||'');break;
+      case 'error':add('Error',frame.message||'Unknown error');break;
+      case 'bye':ended=true;setStatus(`Host ended this session${frame.reason?': '+frame.reason:''}`);break;
+      default:break;
+    }
+    window.scrollTo(0,document.body.scrollHeight);
+  };
+  const receive=async(data,replica)=>{
+    const bytes=new Uint8Array(data);if(bytes.length<20)throw Error('Short frame');
+    const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:bytes.slice(4,16),tagLength:128},key,bytes.slice(16));
+    const frame=JSON.parse(new TextDecoder().decode(plain));
+    // Only host frames, from one host epoch, in strictly increasing sequence, are applied.
+    if(!frame||frame.role!=='host'||typeof frame.epoch!=='string')return;
+    if(wire.epoch===null)wire.epoch=frame.epoch;
+    if(frame.epoch!==wire.epoch||!Number.isSafeInteger(frame.seq)||frame.seq<=wire.lastSeq)return;
+    wire.lastSeq=frame.seq;
+    apply(frame,replica);
+  };
+  const connect=()=>{
+    // Replica state is per connection; the next welcome always supplies a complete snapshot.
+    const replica={staging:null,live:false,entries:[]};
+    const ws=new WebSocket(socketUrl);ws.binaryType='arraybuffer';
+    // Decryption is asynchronous, so every frame joins one chain and is reduced in arrival order.
+    let chain=Promise.resolve();
+    ws.onopen=async()=>{
+      setStatus('Connected · end-to-end encrypted');
+      ws.send(await seal({t:'hello',proto:PROTO,name:'web viewer',role:'guest',epoch:randomEpoch(),seq:1}));
+    };
+    ws.onmessage=event=>{
+      if(typeof event.data==='string'){try{const control=JSON.parse(event.data);if(control.t==='room-closed'){ended=true;setStatus('Host ended this session')}}catch{}return;}
+      chain=chain.then(()=>receive(event.data,replica)).catch(error=>add('Frame unavailable',String(error)));
+    };
+    ws.onerror=()=>fail('Relay connection failed.');
+    ws.onclose=()=>{
+      if(ended)return;
+      const delay=Math.min(RETRY_MAX_MS,RETRY_BASE_MS*2**attempt);attempt+=1;
+      setStatus(`Disconnected; reconnecting in ${Math.round(delay/1000)}s`);
+      setTimeout(connect,delay);
+    };
+  };
+  connect();
 } catch(error){fail(error.message||String(error));}
 </script></html>

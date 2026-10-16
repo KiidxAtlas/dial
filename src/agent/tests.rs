@@ -1061,8 +1061,14 @@ fn repeated_successful_tools_escalate_and_the_turn_completes() {
     assert_eq!((text.as_str(), outcome), ("done", TurnOutcome::Completed));
     assert_eq!(requests.len(), 9);
     let last = sent_messages(&requests[8]);
-    assert!(last.contains("tool_call_loop_persisted"), "escalation guidance was not shown");
-    assert!(last.contains("[Not executed:"), "identical repeats were not short-circuited");
+    assert!(
+        last.contains("tool_call_loop_persisted"),
+        "escalation guidance was not shown"
+    );
+    assert!(
+        last.contains("[Not executed:"),
+        "identical repeats were not short-circuited"
+    );
 }
 
 #[test]
@@ -1071,7 +1077,13 @@ fn repeated_failures_escalate_and_never_stop_the_turn() {
     // the turn itself completes.
     let config = Config::default();
     let mut scripts: Vec<crate::llm::fake::Script> = (0..12)
-        .map(|n| sse_tool_call(&format!("call_missing_{n}"), "read", r#"{"path":"missing.txt"}"#))
+        .map(|n| {
+            sse_tool_call(
+                &format!("call_missing_{n}"),
+                "read",
+                r#"{"path":"missing.txt"}"#,
+            )
+        })
         .collect();
     scripts.push(sse_reply("done"));
     let (text, outcome, requests) = scripted_turn(&config, scripts, "hi");
@@ -1090,10 +1102,12 @@ fn repeated_failures_escalate_and_never_stop_the_turn() {
     );
     assert!(results.iter().any(|message| message["is_error"] == true));
     // Recovery withholds unchanged calls before ten executions; assert escalation, not old prose.
-    assert!(messages.iter().any(|message| message["role"] == "user"
-        && message["content"]
-            .as_str()
-            .is_some_and(|text| text.contains("tool_call_loop_persisted"))));
+    assert!(messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("tool_call_loop_persisted"))
+    }));
 }
 
 #[test]

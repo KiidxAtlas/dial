@@ -5,7 +5,27 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Added
+- `/setup memory` lists each memory backend with its prerequisite and status, and enables the one you pick. `/memory help` lists the commands of the selected backend, and `/memory` with the backend off explains how to choose one.
+- `dial doctor` and `/setup list` end with a Memory section: the selected backend with what it still needs, and every backend's readiness with the `dial config set memory.backend <id>` command that selects it. Headless setups no longer need the TUI to see why memory is inactive.
+- Semantic memory offers `memory_update` and `forget` tools, accepts `scope: "global"` on `retain`, and addresses user-wide facts as `user:<n>` in `/memory forget|update|history`. `/memory clear user` clears the user-wide bank.
+- Assigning the `embedding` role or finishing `/setup embeddings` offers to switch to semantic memory.
+- `dial -p` runs one bounded memory maintenance pass before exiting.
+
+### Changed
+- Automatic memory recall runs on every user message for the semantic and Hindsight backends and attaches only facts not already shown. Compaction recalls from the selected backend.
+- Semantic auto-retain pauses while the `memory` role is unassigned instead of using the main model. The Roles view shows the memory role as required (local, sharpshooter) or optional (semantic) rather than "follows main".
+- Settings → Semantic memory → Embedding model assigns the `embedding` role instead of writing half of an advanced override, and `validate` rejects a half-filled `embedding_base_url` / `embedding_model` pair. `/memory clear` on semantic memory clears only the project bank.
+- The embedding role picker also lists models whose kind the server does not declare, labelled "unclassified".
+- The system prompt now says when to use the memory tools the selected backend offers (`recall` for past decisions and preferences the repository does not show, `retain` for durable facts), for the root agent and for subagents that have them. Before, only auto-learn had guidance, so the default backend's tools were used rarely.
+
 ### Fixed
+- Memory recall no longer discards keyword results when the embedding service is slower than the recall deadline.
+- Hindsight writes queued by earlier sessions or history generations are now sent; sharpshooter envelopes and observations from turns finished while maintenance was busy are no longer stranded.
+- The memory-paused notice reappears after settings change the backend, with consistent next steps.
+- Memory tools remain available to lean/local models, and `learn`, `reflect` and the auto-learn guidance reach the root agent.
+- Semantic memory: consolidation no longer merges facts whose numbers differ ("limit is 1 rps" vs "limit is 2 rps"), which discarded the correction and kept the stale value. `/memory clear` also drops turns queued for extraction instead of re-extracting them into the cleared bank. An extraction reply wrapped in one Markdown code fence is accepted.
+- Semantic memory failed with "database is locked" when a second dial session, or a background thread, opened the store while another connection had it open: each open switched the file from WAL to rollback-journal mode and back, and that switch cannot wait for other connections. The store now stays in WAL mode.
 - Background compaction on ChatGPT plans no longer injects an unsupported output-token limit into the summary model profile. Other providers retain the summary budget, and explicitly configured unsupported overrides still report validation errors.
 - The `browser` tool failed with "Chromium is not installed" when `browser.playwright_module` pointed at a Playwright whose own Chromium revision was never downloaded, even though other Chromium builds were installed. It now falls back to the newest complete Playwright build (dial's private runtime, `PLAYWRIGHT_BROWSERS_PATH`, or Playwright's per-user cache such as `~/Library/Caches/ms-playwright`) and then to an installed Chrome, Chromium or Edge. The built-in runtime also uses this fallback when its Chromium download fails, for example offline. When no browser is found, the error gives the exact `node …/cli.js install chromium` command for the configured Playwright.
 

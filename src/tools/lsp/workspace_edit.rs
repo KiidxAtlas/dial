@@ -6,6 +6,7 @@
 //! crash journal. An external process changing directory permissions can prevent rollback; in
 //! that case the error preserves and names the original backup instead of claiming success.
 
+use super::WriteOrigin;
 use super::client::Client;
 use super::text::{path_from_uri, read_source};
 use crate::tools::Workspace;
@@ -486,7 +487,8 @@ impl Plan {
             }
             changes.push(restored);
         }
-        let warnings = super::super::edit_transaction::commit(ws, &changes)?;
+        let warnings =
+            super::super::edit_transaction::commit_as(ws, &changes, WriteOrigin::Restored)?;
         let mut store = ws.store();
         for change in &self.changes {
             store.forget(&change.abs);
@@ -495,6 +497,16 @@ impl Plan {
     }
 
     pub fn commit(&self, ws: &Workspace, snapshot: &Snapshot) -> Result<Vec<String>, String> {
+        self.commit_as(ws, snapshot, WriteOrigin::Edit)
+    }
+
+    /// Commits like [`Self::commit`], publishing to the language servers with `origin`.
+    pub fn commit_as(
+        &self,
+        ws: &Workspace,
+        snapshot: &Snapshot,
+        origin: WriteOrigin,
+    ) -> Result<Vec<String>, String> {
         let mut changes = Vec::with_capacity(self.changes.len());
         for change in &self.changes {
             if change.original.is_some() {
@@ -528,7 +540,7 @@ impl Plan {
             }
             changes.push(transaction);
         }
-        let warnings = super::super::edit_transaction::commit(ws, &changes)?;
+        let warnings = super::super::edit_transaction::commit_as(ws, &changes, origin)?;
         let mut store = ws.store();
         for change in &self.changes {
             store.forget(&change.abs);

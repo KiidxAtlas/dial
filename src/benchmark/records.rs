@@ -72,25 +72,50 @@ impl Contract {
         isolated_source: &Path,
         configuration: &serde_json::Value,
     ) -> Result<Self> {
-        // Omit sensitive fields entirely: their values must not affect a public digest.
+        // Omit credentials entirely, but keep every outcome-affecting limit (for example
+        // `max_tokens` or `history_token_cap`) so that changing it changes the contract.
+        fn credential_key(key: &str) -> bool {
+            let key = key.to_ascii_lowercase();
+            let segments: Vec<&str> = key
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            const CREDENTIAL_WORDS: [&str; 12] = [
+                "secret",
+                "secrets",
+                "password",
+                "passwd",
+                "credential",
+                "credentials",
+                "authorization",
+                "headers",
+                "env",
+                "environment",
+                "apikey",
+                "bearer",
+            ];
+            const BUDGET_WORDS: [&str; 8] = [
+                "cap", "budget", "limit", "max", "min", "count", "size", "window",
+            ];
+            if segments
+                .iter()
+                .any(|segment| CREDENTIAL_WORDS.contains(segment))
+            {
+                return true;
+            }
+            if segments
+                .windows(2)
+                .any(|pair| matches!(pair, ["api" | "access" | "private", "key"]))
+            {
+                return true;
+            }
+            // A singular `token` names a credential unless it is a budget (`max_token`, `token_cap`).
+            segments.contains(&"token") && !segments.iter().any(|s| BUDGET_WORDS.contains(s))
+        }
         fn scrub(value: &mut serde_json::Value) {
             match value {
                 serde_json::Value::Object(map) => {
-                    map.retain(|key, _| {
-                        let key = key.to_ascii_lowercase();
-                        ![
-                            "secret",
-                            "token",
-                            "password",
-                            "api_key",
-                            "authorization",
-                            "credential",
-                            "headers",
-                            "env",
-                        ]
-                        .iter()
-                        .any(|part| key.contains(part))
-                    });
+                    map.retain(|key, _| !credential_key(key));
                     for value in map.values_mut() {
                         scrub(value);
                     }
@@ -239,5 +264,39 @@ mod tests {
         assert!(a.matched_tasks(&b));
         let c = Contract::new(&suite, root.path(), &serde_json::json!({"model":"b"})).unwrap();
         assert_ne!(a.configuration_sha256, c.configuration_sha256);
+    }
+    #[test]
+    fn configuration_digest_keeps_token_budgets_and_drops_only_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let suite = BenchmarkSuite {
+            version: 1,
+            name: "fixture".into(),
+            cases: vec![],
+        };
+        let digest = |value: serde_json::Value| {
+            Contract::new(&suite, root.path(), &value)
+                .unwrap()
+                .configuration_sha256
+        };
+        let base = serde_json::json!({
+            "harness": {"max_tokens": 1000, "history_token_cap": 5000, "num_draft_tokens": 4},
+            "api_key_env": "DIAL_KEY",
+            "endpoint": {"api_key": "secret-a", "headers": {"authorization": "x"}, "env": {"A": "b"}}
+        });
+        let mut budget = base.clone();
+        budget["harness"]["max_tokens"] = serde_json::json!(2000);
+        assert_ne!(digest(base.clone()), digest(budget));
+        let mut nested_cap = base.clone();
+        nested_cap["harness"]["history_token_cap"] = serde_json::json!(6000);
+        assert_ne!(digest(base.clone()), digest(nested_cap));
+        let mut credential = base.clone();
+        credential["endpoint"]["api_key"] = serde_json::json!("secret-b");
+        credential["endpoint"]["env"] = serde_json::json!({"A": "other"});
+        assert_eq!(digest(base), digest(credential));
+        let mut access = serde_json::json!({"access_token": "one"});
+        let plain = digest(serde_json::json!({}));
+        assert_eq!(digest(access.clone()), plain);
+        access["max_token"] = serde_json::json!(3);
+        assert_ne!(digest(access), plain);
     }
 }

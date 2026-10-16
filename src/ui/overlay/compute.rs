@@ -913,13 +913,22 @@ mod tests {
         overlay.cursor = 3;
         overlay.handle(&key(KeyCode::Enter), &keys);
         overlay.handle(&key(KeyCode::Esc), &keys);
-        assert_eq!(overlay.cursor, 3, "Esc returns to the item it was opened from");
+        assert_eq!(
+            overlay.cursor, 3,
+            "Esc returns to the item it was opened from"
+        );
         overlay.handle(&key(KeyCode::Enter), &keys);
         overlay.handle(&key(KeyCode::Down), &keys);
         overlay.handle(&key(KeyCode::Down), &keys);
-        assert!(matches!(overlay.handle(&key(KeyCode::Enter), &keys), OverlayEvent::None));
+        assert!(matches!(
+            overlay.handle(&key(KeyCode::Enter), &keys),
+            OverlayEvent::None
+        ));
         assert!(overlay.confirm.is_some(), "stop now waits for Enter");
-        assert!(matches!(overlay.handle(&key(KeyCode::Esc), &keys), OverlayEvent::None));
+        assert!(matches!(
+            overlay.handle(&key(KeyCode::Esc), &keys),
+            OverlayEvent::None
+        ));
         assert!(overlay.confirm.is_none(), "Esc keeps the job running");
     }
 

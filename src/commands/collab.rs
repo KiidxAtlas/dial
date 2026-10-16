@@ -14,8 +14,8 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     super::CommandSpec {
         name: "collab",
         description: "host a live collab session; status and stop manage it",
-        args_hint: "[view|status|stop|list]",
-        subcommands: &["view", "status", "stop", "list"],
+        args_hint: "[view|status|stop|list|abort]",
+        subcommands: &["view", "status", "stop", "list", "abort"],
     },
     super::CommandSpec {
         name: "join",
@@ -32,8 +32,8 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     super::CommandSpec {
         name: "share",
         description: "upload this session encrypted and print the link",
-        args_hint: "[gist]",
-        subcommands: &["gist"],
+        args_hint: "[gist] [whole-journal]",
+        subcommands: &["gist", "whole-journal"],
     },
     super::CommandSpec {
         name: "dump",
@@ -75,6 +75,7 @@ pub(super) fn completions(_config: &crate::config::types::Config) -> Vec<String>
         "/collab status",
         "/collab stop",
         "/share gist",
+        "/share whole-journal",
     ]
     .iter()
     .map(|s| (*s).to_owned())
@@ -88,8 +89,9 @@ fn collab(shell: &mut Shell, app: &App, agent: &Agent<'_>, args: &str) -> Result
         "status" => status(shell),
         "list" => list(shell, app),
         "stop" => stop(shell),
+        "abort" => guest_abort(shell),
         _ => {
-            shell.note("Collab", "Usage: /collab [view|status|stop|list]");
+            shell.note("Collab", "Usage: /collab [view|status|stop|list|abort]");
             Ok(Step::Done)
         }
     }
@@ -195,10 +197,14 @@ fn status(shell: &mut Shell) -> Result<Step> {
         Some(Room::Guest(guest)) if guest.ended() => {
             "The collab session has ended (/leave to exit)".to_owned()
         }
-        Some(Room::Guest(guest)) if guest.is_read_only() => {
-            "In a collab session as a read-only guest (/leave to exit)".to_owned()
-        }
-        Some(Room::Guest(_)) => "In a collab session as a guest (/leave to exit)".to_owned(),
+        Some(Room::Guest(guest)) if guest.is_read_only() => format!(
+            "In a collab session as a read-only guest ({} entries replicated; prompts stay on the host, /leave to exit)",
+            guest.replicated_entries()
+        ),
+        Some(Room::Guest(guest)) => format!(
+            "In a collab session as a guest ({} entries replicated; prompts go to the host, /collab abort stops its turn, /leave to exit)",
+            guest.replicated_entries()
+        ),
     });
     let mut lines = vec![text];
     lines.extend(notes);
@@ -282,31 +288,39 @@ fn leave(shell: &mut Shell) -> Result<Step> {
     Ok(Step::Done)
 }
 
-fn share_session(shell: &mut Shell, app: &App, agent: &Agent<'_>, args: &str) -> Result<Step> {
-    let gist = match args.trim() {
-        "" => false,
-        "gist" => true,
-        _ => {
-            shell.note("Share", "Usage: /share [gist]");
-            return Ok(Step::Done);
-        }
+/// Ask the host to abort its running turn (`/collab abort`, guests only).
+fn guest_abort(shell: &mut Shell) -> Result<Step> {
+    let text = match room::send_guest_abort() {
+        None => "Not joined to a collab session as a guest".to_owned(),
+        Some(Ok(())) => "Abort sent to the host".to_owned(),
+        Some(Err(message)) => message.to_owned(),
     };
+    shell.note("Collab", text);
+    Ok(Step::Done)
+}
+
+fn share_session(shell: &mut Shell, app: &App, agent: &Agent<'_>, args: &str) -> Result<Step> {
+    let mut gist = false;
+    let mut scope = share::Scope::ActiveBranch;
+    for word in args.split_whitespace() {
+        match word {
+            "gist" => gist = true,
+            // Diagnostic: the whole journal, including abandoned branches and internal records.
+            "whole-journal" => scope = share::Scope::WholeJournal,
+            _ => {
+                shell.note("Share", "Usage: /share [gist] [whole-journal]");
+                return Ok(Step::Done);
+            }
+        }
+    }
     // Snapshot the inputs so reading, encrypting and uploading run off the UI thread.
     let path = agent.session().path().map(|path| path.to_path_buf());
     let endpoint = app.config.share.server_url.clone();
     super::extensions::spawn_job(shell, "Share", move |_cancel| {
         let result = (|| -> Result<String> {
             let path = path.context("No session file yet — send a message first.")?;
-            // Session files are JSONL; the share payload is the JSON array of its records.
-            let source = std::fs::read(path)?;
-            let mut entries = Vec::new();
-            for line in source
-                .split(|byte| *byte == b'\n')
-                .filter(|line| !line.is_empty())
-            {
-                entries.push(serde_json::from_slice::<serde_json::Value>(line)?);
-            }
-            let transcript = serde_json::to_vec(&entries)?;
+            // Same payload as `dial share`: the active branch unless the diagnostic scope is named.
+            let transcript = share::transcript(&path, scope)?;
             let encrypted = share::encrypt_transcript(&transcript)?;
             let link = if gist {
                 share::upload_gist(&encrypted)?

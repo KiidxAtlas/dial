@@ -105,7 +105,10 @@ impl<'a> Agent<'a> {
             if self.config.laya.enabled {
                 "enabled".to_owned()
             } else {
-                format!("disabled (enable Decision advice in {})", crate::learn::improve::SETTINGS_PATH)
+                format!(
+                    "disabled (enable Decision advice in {})",
+                    crate::learn::improve::SETTINGS_PATH
+                )
             },
             self.config.laya.endpoint,
             self.config.laya.timeout_secs

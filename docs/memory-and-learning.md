@@ -15,7 +15,7 @@ Reusable findings remain advisory, never proof that current behavior was verifie
 
 ### Semantic facts backend
 
-`memory.backend = "semantic"` keeps project facts in a private per-project SQLite store outside the repository, with the same retain, recall, forget and update tools as provenance memory. It needs no configuration: recall is keyword search (FTS5 BM25). Assigning an embedding-capable model to the `embedding` model role (Alt+M, or `[model_roles.embedding]`) adds meaning-based search through that role's OpenAI-compatible `/embeddings` endpoint, using its endpoint, model and key. The two rankings are fused with reciprocal-rank fusion, so recall degrades to keyword search when the service is unavailable and the result reports the failure. Alt+M lists only embedding-capable models for this role; unassigned means keyword search.
+`memory.backend = "semantic"` keeps facts in private SQLite stores outside the repository: one per project, plus a user-wide bank shared by every project. It offers the `retain`, `recall`, `memory_update` and `forget` tools, with the same names and arguments as provenance memory; `retain` takes `scope: "project" | "global"` to choose the bank. It needs no configuration: recall is keyword search (FTS5 BM25). Assigning an embedding-capable model to the `embedding` model role (Alt+M, `/setup embeddings`, or `[model_roles.embedding]`) adds meaning-based search through that role's endpoint, model and key. The two rankings are fused with reciprocal-rank fusion, so recall degrades to keyword search when the service is unavailable or slower than the recall deadline, and `/memory` reports why. Alt+M lists embedding-capable models for this role, and also models whose kind the server does not declare, labelled "unclassified". Assigning the role or finishing `/setup embeddings` while another backend is selected offers to switch to semantic; it never switches silently.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -26,13 +26,17 @@ Reusable findings remain advisory, never proof that current behavior was verifie
 | `memory.semantic.embedding_timeout_secs` | 20 | Per-request timeout, 1–120. |
 | `memory.semantic.recall_limit` | 8 | Most facts per query, 1–50. |
 | `memory.semantic.token_budget` | 1500 | Recall text budget in tokens, 64–16000. |
-| `memory.semantic.auto_retain` | `true` | Queue each completed turn and extract durable facts with the `memory` role between turns. Malformed model output drops the turn; an unreachable model keeps it queued. |
-| `memory.semantic.consolidate_interval_minutes` | 60 | How often near-duplicate facts are merged (token-overlap ≥ 0.8; the newer copy is forgotten). `0` disables consolidation. Range 0–10080. |
+| `memory.semantic.auto_retain` | `true` | Queue each completed turn and extract durable facts with the `memory` role between turns. It pauses while the `memory` role is unassigned (it never falls back to the main model); recall and the `retain` tool keep working. Assign the role with Alt+M to save facts automatically. Malformed model output drops the turn; an unreachable model keeps it queued. A failing extraction does not block duplicate merging. |
+| `memory.semantic.consolidate_interval_minutes` | 60 | How often near-duplicate facts are merged (token-overlap ≥ 0.8; the newer copy is forgotten). Facts whose numbers differ are never merged. `0` disables consolidation. Range 0–10080. |
 
 Privacy: with no endpoint configured, nothing leaves the machine. With an endpoint, fact content and recall queries are sent to that service for embedding. Embedding requests send only the URL, model and bearer key; custom provider headers and `allow_insecure` are not applied to them. Facts are re-embedded only when their content changes or after `/memory rebuild`. Recalled facts are advisory, untrusted text.
 Auto-retain sends the text of each queued turn to the model assigned to the `memory` role.
 
-Maintenance: `/memory rebuild` recomputes the index and missing embeddings. `/memory forget <id> <revision>` and `/memory update <id> <revision> <text>` require the current revision and reject stale ones. `/memory history <id>` lists its revisions.
+Automatic recall runs on every user message for the semantic and Hindsight backends. Only facts not already shown in the session are attached, and a cached block is never attached twice. Compaction also consults the selected backend's recall.
+
+Fact references: a project fact is `<n>` and a user-wide fact is `user:<n>`. `/memory forget <ref> <revision>`, `/memory update <ref> <revision> <text>` and `/memory history <ref>` take either form and require the current revision. `/memory rebuild` recomputes the index and missing embeddings in both banks. `/memory clear` clears only the project bank; `/memory clear user` clears the user-wide bank. `/memory help` lists the commands of the selected backend; text that is not a command searches memory. With the backend off, `/memory` says how to choose one. `/setup memory` lists each backend with its prerequisite and sets `memory.backend`.
+
+`dial -p` runs one bounded memory maintenance pass before it exits, so a one-shot turn is retained. Hindsight flushes every queued write for its endpoint, including writes from earlier sessions.
 
 Duplicate content is detected by a content hash and returns the existing fact.
 

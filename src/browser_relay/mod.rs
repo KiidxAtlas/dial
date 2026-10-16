@@ -10,6 +10,7 @@
 pub mod bridge;
 pub mod client;
 pub mod install;
+pub mod outbox;
 pub mod protocol;
 pub mod server;
 

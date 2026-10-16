@@ -19,6 +19,8 @@
 use super::Workspace;
 
 pub(super) const MAX_READ_OUTPUT: usize = 48 * 1024;
+/// Bytes kept free of rows for a read's header and footer when its rows are limited to a byte budget.
+pub(super) const READ_FOOTER_RESERVE: usize = 1024;
 pub(super) const MAX_READ_LINE: usize = 2000;
 pub(super) const DEFAULT_READ_LINES: usize = 2000;
 pub(super) const MAX_READ_LINES: usize = 10_000;
@@ -225,7 +227,7 @@ fn describe_spans(shown: &[(usize, usize)]) -> String {
 /// Trailing status line, or empty when nothing needs saying.
 ///
 /// `shown` are the line spans actually returned and `len` the file's total
-/// lines. `capped` is set when the 20 KiB output cap cut the read short;
+/// lines. `capped` is set when the byte budget (the model-facing output limit) cut the read short;
 /// `next` is the first line not returned that the model may want, if any.
 /// Anchored output states its range and the total whenever it is not the
 /// whole file read without a selector; raw output stays verbatim and only says
@@ -242,7 +244,7 @@ pub(super) fn footer(
     let last = shown.last().map_or(0, |s| s.1);
     if capped {
         parts.push(format!(
-            "output truncated at 20 KiB after line {last} of {len}"
+            "output truncated at the byte budget after line {last} of {len}"
         ));
     } else if !sel.raw && (sel.selects_lines() || shown != [(1, len)]) {
         parts.push(format!("lines {} of {len}", describe_spans(shown)));
@@ -406,7 +408,7 @@ mod tests {
         );
         assert_eq!(
             footer("f", &none, &[(1, 2)], 9, Some(3), true),
-            "[output truncated at 20 KiB after line 2 of 9; continue with `f:3-`]\n"
+            "[output truncated at the byte budget after line 2 of 9; continue with `f:3-`]\n"
         );
     }
 }

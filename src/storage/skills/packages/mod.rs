@@ -25,6 +25,7 @@ use source::Source;
 pub const PACKAGE_ORIGIN: &str = "Dial package";
 const LOCK_FILE: &str = "skill-packages.lock.json";
 const LOCK_VERSION: u32 = 1;
+const OWNERS_FILE: &str = "owners.json";
 const NO_REGISTRIES: &str = "No skill registries are configured, so search has nothing to query. Add one under Settings → Skills → Skill registries (name = index URL), or install directly with /skills install <git-url>[@ref][#path]. Search only covers configured registries.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,12 +125,24 @@ fn write_lock(path: &Path, lock: &LockFile) -> Result<()> {
     crate::storage::memory::atomic_write(path, &bytes, 0o644)
 }
 
+/// A package integrity is the lowercase hex SHA-256 of its manifest (`git::integrity`).
+fn valid_integrity(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Every installed package in both scopes, project first, then by name.
 pub fn list_packages(layout: &Layout) -> Result<Vec<Package>> {
     let mut out = Vec::new();
     for scope in [Scope::Project, Scope::User] {
         let lock = read_lock(&lock_path(layout, scope))?;
         for (name, entry) in lock.packages {
+            // A malformed digest cannot name a store entry; skip it rather than trusting the path.
+            if !valid_integrity(&entry.integrity) {
+                continue;
+            }
             out.push(Package {
                 name,
                 scope,
@@ -148,12 +161,32 @@ pub fn list_packages(layout: &Layout) -> Result<Vec<Package>> {
 }
 
 /// Stored skill roots of installed packages, for discovery. Each root's children are skill directories.
+/// Entries with a malformed digest or a store directory that is not a real directory inside the store
+/// are skipped, so a lock cannot point discovery at external content.
 pub fn roots(layout: &Layout) -> Vec<(Scope, PathBuf)> {
     list_packages(layout)
         .unwrap_or_default()
         .into_iter()
-        .map(|package| (package.scope, store_root(layout).join(package.integrity)))
+        .filter_map(|package| {
+            stored_dir(layout, &package.integrity).map(|dir| (package.scope, dir))
+        })
         .collect()
+}
+
+/// The store directory for `integrity`, only when the digest is well formed and the directory is a
+/// real directory (not a symlink) whose canonical path lies inside the canonical store.
+fn stored_dir(layout: &Layout, integrity: &str) -> Option<PathBuf> {
+    if !valid_integrity(integrity) {
+        return None;
+    }
+    let store = store_root(layout);
+    let dir = store.join(integrity);
+    if !fs::symlink_metadata(&dir).ok()?.is_dir() {
+        return None;
+    }
+    let canonical_store = fs::canonicalize(&store).ok()?;
+    let canonical_dir = fs::canonicalize(&dir).ok()?;
+    canonical_dir.starts_with(&canonical_store).then_some(dir)
 }
 
 /// Source resolved for an install, with the package name it will be recorded under.
@@ -285,12 +318,78 @@ fn store_checkout(layout: &Layout, checkout: &Path, path: Option<&str>) -> Resul
     })
 }
 
-/// Deletes store entries no lock references. Caller holds the mutation lock.
+/// Project lock files that have recorded packages in the shared user store. Every project uses the
+/// same store, so pruning must consult each of them and not only the current project's lock.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnersFile {
+    version: u32,
+    #[serde(default)]
+    project_locks: BTreeSet<PathBuf>,
+}
+
+fn owners_path(layout: &Layout) -> PathBuf {
+    state_dir(layout).join(OWNERS_FILE)
+}
+
+fn read_owners(layout: &Layout) -> Result<BTreeSet<PathBuf>> {
+    let path = owners_path(layout);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let owners: OwnersFile = serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "{} is not a valid skill package owner index; fix or remove it",
+                    path.display()
+                )
+            })?;
+            ensure!(
+                owners.version == LOCK_VERSION,
+                "{} uses owner index version {}; this Dial reads version {LOCK_VERSION}",
+                path.display(),
+                owners.version
+            );
+            Ok(owners.project_locks)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Every lock that can own store content: this project's, the user's, and each project recorded earlier.
+fn owner_locks(layout: &Layout) -> Result<BTreeSet<PathBuf>> {
+    let mut locks = read_owners(layout)?;
+    locks.insert(lock_path(layout, Scope::Project));
+    locks.insert(lock_path(layout, Scope::User));
+    Ok(locks)
+}
+
+/// Writes a lock file. A project lock is first recorded as a store owner, so other projects' pruning
+/// keeps its content. Caller holds the mutation lock.
+fn save_lock(layout: &Layout, scope: Scope, lock: &LockFile) -> Result<()> {
+    if matches!(scope, Scope::Project) {
+        let mut owners = read_owners(layout)?;
+        if owners.insert(lock_path(layout, Scope::Project)) {
+            fs::create_dir_all(state_dir(layout))?;
+            let index = OwnersFile {
+                version: LOCK_VERSION,
+                project_locks: owners,
+            };
+            let mut bytes = serde_json::to_vec_pretty(&index)?;
+            bytes.push(b'\n');
+            crate::storage::memory::atomic_write(&owners_path(layout), &bytes, 0o644)?;
+        }
+    }
+    write_lock(&lock_path(layout, scope), lock)
+}
+
+/// Deletes store entries that no owner lock references. Caller holds the mutation lock.
 fn prune_store(layout: &Layout) -> Result<()> {
-    let live: BTreeSet<String> = list_packages(layout)?
-        .into_iter()
-        .map(|package| package.integrity)
-        .collect();
+    let mut live: BTreeSet<String> = BTreeSet::new();
+    for path in owner_locks(layout)? {
+        for package in read_lock(&path)?.packages.into_values() {
+            live.insert(package.integrity);
+        }
+    }
     let store = store_root(layout);
     let entries = match fs::read_dir(&store) {
         Ok(entries) => entries,
@@ -345,7 +444,7 @@ pub fn install(
             skills: stored.skills.clone(),
         },
     );
-    write_lock(&path, &lock)?;
+    save_lock(layout, scope, &lock)?;
     Ok(format!(
         "Installed {} ({}) at {} into {} scope.\nSkills: {}\nNo install scripts were run.",
         plan.name,
@@ -396,33 +495,55 @@ fn describe_change(
     parts.join("; ")
 }
 
+/// True when the locked entry is still the one `package` was read from.
+fn same_entry(entry: &LockEntry, package: &Package) -> bool {
+    entry.url == package.source.url
+        && entry.reference == package.source.reference
+        && entry.path == package.source.path
+        && entry.commit == package.commit
+        && entry.integrity == package.integrity
+        && entry.skills == package.skills
+}
+
 fn update_one(
     layout: &Layout,
     package: &Package,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<String> {
+    // Fetch outside the lock; the entry is compared against the snapshot under the lock before publishing.
     let checkout = git::fetch(&package.source, &layout.project_root, cancel, progress)?;
-    if checkout.commit == package.commit {
+    check_cancel(cancel)?;
+    progress(&format!("Storing {}", package.name));
+    let _lock = mutation_lock(layout)?;
+    let path = lock_path(layout, package.scope);
+    let mut lock = read_lock(&path)?;
+    let current = lock
+        .packages
+        .get(&package.name)
+        .ok_or_else(|| anyhow!("{} was removed while updating", package.name))?;
+    ensure!(
+        same_entry(current, package),
+        "{} was changed or reinstalled while updating; run /skills update {} again",
+        package.name,
+        package.name
+    );
+    // Same commit with its content still stored is already current; otherwise store the checkout,
+    // which also restores content that went missing.
+    let old_dir = stored_dir(layout, &package.integrity);
+    if checkout.commit == package.commit && old_dir.is_some() {
         return Ok(format!(
             "{}: already up to date at {}",
             package.name,
             short(&package.commit)
         ));
     }
-    check_cancel(cancel)?;
-    progress(&format!("Storing {}", package.name));
-    let _lock = mutation_lock(layout)?;
-    let old_dir = store_root(layout).join(&package.integrity);
-    let old_manifest = if old_dir.is_dir() {
-        git::manifest(&old_dir)?
-    } else {
-        BTreeMap::new()
+    let old_manifest = match old_dir {
+        Some(dir) => git::manifest(&dir)?,
+        None => BTreeMap::new(),
     };
     let stored = store_checkout(layout, checkout.dir.path(), package.source.path.as_deref())?;
     ensure_no_skill_clash(layout, &package.name, &stored.skills)?;
-    let path = lock_path(layout, package.scope);
-    let mut lock = read_lock(&path)?;
     let entry = lock
         .packages
         .get_mut(&package.name)
@@ -430,8 +551,15 @@ fn update_one(
     entry.commit = checkout.commit.clone();
     entry.integrity = stored.integrity.clone();
     entry.skills = stored.skills.clone();
-    write_lock(&path, &lock)?;
+    save_lock(layout, package.scope, &lock)?;
     prune_store(layout)?;
+    if checkout.commit == package.commit {
+        return Ok(format!(
+            "{}: restored missing content at {}",
+            package.name,
+            short(&package.commit)
+        ));
+    }
     Ok(format!(
         "{}: {} → {} ({})",
         package.name,
@@ -492,7 +620,7 @@ pub fn remove(layout: &Layout, name: &str) -> Result<String> {
         let path = lock_path(layout, scope);
         let mut lock = read_lock(&path)?;
         if lock.packages.remove(name).is_some() {
-            write_lock(&path, &lock)?;
+            save_lock(layout, scope, &lock)?;
             prune_store(layout)?;
             return Ok(format!(
                 "Removed {name} from {} scope. Its skills are no longer loaded.",
@@ -704,6 +832,117 @@ mod tests {
         assert!(!store.join("dead").exists());
         assert!(store.join(".staging-1").is_dir());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removal_in_one_project_keeps_content_another_project_references() {
+        let root = scratch("shared");
+        let user = root.join("user");
+        let project_a = root.join("a");
+        let project_b = root.join("b");
+        fs::create_dir_all(&project_a).unwrap();
+        fs::create_dir_all(&project_b).unwrap();
+        let layout_a = Layout::with_user_dir(&project_a, user.clone()).unwrap();
+        let layout_b = Layout::with_user_dir(&project_b, user).unwrap();
+        let store = store_root(&layout_a);
+        let live_a = "1".repeat(64);
+        let live_b = "2".repeat(64);
+        let dead = "3".repeat(64);
+        for name in [&live_a, &live_b, &dead] {
+            fs::create_dir_all(store.join(name)).unwrap();
+        }
+        fs::create_dir_all(store.join(".staging-1")).unwrap();
+        let with = |integrity: &str| LockFile {
+            version: LOCK_VERSION,
+            packages: [(
+                "pdf".to_owned(),
+                LockEntry {
+                    integrity: integrity.to_owned(),
+                    ..entry("https://x/r.git", &["pdf"])
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        save_lock(&layout_a, Scope::Project, &with(&live_a)).unwrap();
+        save_lock(&layout_b, Scope::Project, &with(&live_b)).unwrap();
+        // B removes its package; A's content must survive and B's own content is unreferenced now.
+        save_lock(
+            &layout_b,
+            Scope::Project,
+            &LockFile {
+                version: LOCK_VERSION,
+                packages: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        prune_store(&layout_b).unwrap();
+        assert!(store.join(&live_a).is_dir());
+        assert!(!store.join(&live_b).exists());
+        assert!(!store.join(&dead).exists());
+        assert!(store.join(".staging-1").is_dir());
+        assert_eq!(roots(&layout_a).len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lock_integrity_cannot_expose_external_or_malformed_roots() {
+        let root = scratch("roots");
+        let layout = layout(&root);
+        let store = store_root(&layout);
+        let good = "4".repeat(64);
+        let link = "5".repeat(64);
+        let outside = root.join("outside");
+        fs::create_dir_all(store.join(&good)).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, store.join(&link)).unwrap();
+        let mut lock = LockFile {
+            version: LOCK_VERSION,
+            packages: BTreeMap::new(),
+        };
+        for (name, integrity) in [
+            ("good", good.clone()),
+            ("link", link.clone()),
+            ("absolute", outside.display().to_string()),
+            ("traversal", "../../outside".to_owned()),
+            ("uppercase", "A".repeat(64)),
+        ] {
+            lock.packages.insert(
+                name.to_owned(),
+                LockEntry {
+                    integrity,
+                    ..entry("https://x/r.git", &["pdf"])
+                },
+            );
+        }
+        write_lock(&lock_path(&layout, Scope::Project), &lock).unwrap();
+        let found = roots(&layout);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].1, store.join(&good));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replaced_entry_is_detected_against_snapshot() {
+        let package = Package {
+            name: "pdf".into(),
+            scope: Scope::Project,
+            source: Source {
+                url: "https://x/r.git".into(),
+                reference: Some("main".into()),
+                path: Some("skills".into()),
+            },
+            commit: "a".repeat(40),
+            integrity: "b".repeat(64),
+            skills: vec!["pdf".into()],
+        };
+        assert!(same_entry(&entry("https://x/r.git", &["pdf"]), &package));
+        let replaced = LockEntry {
+            url: "https://y/other.git".into(),
+            ..entry("https://x/r.git", &["pdf"])
+        };
+        assert!(!same_entry(&replaced, &package));
     }
 
     #[test]

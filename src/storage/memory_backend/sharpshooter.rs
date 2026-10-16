@@ -12,6 +12,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 const FILES: [&str; 3] = ["architecture.md", "product.md", "style.md"];
+/// Envelopes one background pass extracts; `/memory enqueue` drains up to `ENQUEUE_EXTRACT_MAX`.
+const EXTRACT_PER_PASS: usize = 4;
+const ENQUEUE_EXTRACT_MAX: usize = 64;
 struct Sharpshooter {
     layout: Layout,
     config: SharpshooterConfig,
@@ -67,7 +70,10 @@ impl Sharpshooter {
             operation: op.clone(),
         }
     }
-    fn extract(&mut self, op: &Operation, model: &mut dyn MemoryModelRunner) -> Result<()> {
+    /// Extracts one unprocessed envelope, oldest first, from any session or history generation of
+    /// this project, so prompts left behind when a session ended are still processed. Returns
+    /// whether an envelope was taken.
+    fn extract(&mut self, op: &Operation, model: &mut dyn MemoryModelRunner) -> Result<bool> {
         op.check()?;
         let at = now();
         let token = format!("{:016x}", rand::random::<u64>());
@@ -80,11 +86,11 @@ impl Sharpshooter {
             |row| row.get(0),
         )?;
         if active >= self.config.max_parallel as i64 {
-            return Ok(());
+            return Ok(false);
         }
-        let row:Option<(String,String,String,String,Option<String>,Option<String>)>=tx.query_row("SELECT id,session,revision,prompt,previous_human,assistant_context FROM envelopes WHERE session=?1 AND branch=?2 AND processed=0 AND lease_until<=?3 ORDER BY created LIMIT 1",params![op.authority.session_id,op.authority.branch_id,at],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
-        let Some((id, session, revision, prompt, previous, assistant)) = row else {
-            return Ok(());
+        let row:Option<(String,String,String,String,String,Option<String>,Option<String>)>=tx.query_row("SELECT id,session,branch,revision,prompt,previous_human,assistant_context FROM envelopes WHERE processed=0 AND lease_until<=?1 ORDER BY created,id LIMIT 1",params![at],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).optional()?;
+        let Some((id, session, branch, revision, prompt, previous, assistant)) = row else {
+            return Ok(false);
         };
         tx.execute(
             "UPDATE envelopes SET lease=?1,lease_until=?2 WHERE id=?3",
@@ -159,7 +165,7 @@ impl Sharpshooter {
             delta["ts"] = json!(now() * 1000);
             let delta_id = format!("{:016x}", rand::random::<u64>());
             op.check()?;
-            tx.execute("INSERT INTO deltas(id,session,branch,revision,payload,created)VALUES(?1,?2,?3,?4,?5,?6)",params![delta_id,session,op.authority.branch_id,revision,serde_json::to_string(&delta)?,now()])?;
+            tx.execute("INSERT INTO deltas(id,session,branch,revision,payload,created)VALUES(?1,?2,?3,?4,?5,?6)",params![delta_id,session,branch,revision,serde_json::to_string(&delta)?,now()])?;
         }
         op.check()?;
         tx.execute(
@@ -167,7 +173,7 @@ impl Sharpshooter {
             params![id, token],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
     fn consolidate(
         &mut self,
@@ -336,6 +342,7 @@ impl Driver for Sharpshooter {
             json!({"backend":"sharpshooter","active":true,"writable":false,"searchable":true,"scope":op.scope.project,"pending":count,"lastConsolidated":last,"message":"Friction-gated project decisions, not a manual memory save backend"}),
         )
     }
+    /// Lines of the decision files that share words with the query, most shared words first.
     fn search(
         &mut self,
         op: &Operation,
@@ -344,9 +351,13 @@ impl Driver for Sharpshooter {
         _: &mut dyn MemoryModelRunner,
     ) -> Result<Value> {
         op.check()?;
-        let mut items = Vec::new();
-        if !query.is_empty() {
-            let needle = query.to_lowercase();
+        let needle = query.trim().to_lowercase();
+        let words: Vec<&str> = needle
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|word| word.chars().count() >= 3)
+            .collect();
+        let mut scored = Vec::new();
+        if !needle.is_empty() {
             for name in FILES {
                 let content: Option<String> = self
                     .db
@@ -355,13 +366,25 @@ impl Driver for Sharpshooter {
                     })
                     .optional()?;
                 for line in content.unwrap_or_default().lines() {
-                    if line.to_lowercase().contains(&needle) {
-                        items.push(json!({"content":line,"source":name}));
+                    let lower = line.to_lowercase();
+                    let score = if lower.contains(&needle) {
+                        words.len() + 1
+                    } else {
+                        words.iter().filter(|word| lower.contains(*word)).count()
+                    };
+                    if score > 0 {
+                        scored.push((score, json!({"content":line,"source":name})));
                     }
                 }
             }
         }
-        items.truncate(limit.min(50));
+        // Stable: equal scores keep file and line order.
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        let items: Vec<Value> = scored
+            .into_iter()
+            .take(limit.min(50))
+            .map(|(_, item)| item)
+            .collect();
         Ok(json!({"backend":"sharpshooter","query":query,"count":items.len(),"items":items}))
     }
     fn observe(&mut self, op: &Operation, messages: &[Value]) -> Result<()> {
@@ -414,7 +437,11 @@ impl Driver for Sharpshooter {
             return Ok(());
         }
         let result = (|| -> Result<()> {
-            self.extract(op, model)?;
+            for _ in 0..EXTRACT_PER_PASS {
+                if !self.extract(op, model)? {
+                    break;
+                }
+            }
             self.consolidate(op, model, false)?;
             Ok(())
         })();
@@ -433,8 +460,13 @@ impl Driver for Sharpshooter {
             op.authority.task_depth == 0,
             "decision maintenance is root-only"
         );
-        self.extract(op, model)?;
-        Ok(json!({"backend":"sharpshooter","consolidated":self.consolidate(op,model,true)?}))
+        let mut extracted = 0;
+        while extracted < ENQUEUE_EXTRACT_MAX && self.extract(op, model)? {
+            extracted += 1;
+        }
+        Ok(
+            json!({"backend":"sharpshooter","extracted":extracted,"consolidated":self.consolidate(op,model,true)?}),
+        )
     }
     fn clear(&mut self, op: &Operation, _: &mut dyn MemoryModelRunner) -> Result<Value> {
         op.check()?;
@@ -538,5 +570,82 @@ impl Driver for Sharpshooter {
             &json!({"items":items}),
             max.min(self.config.injection_token_limit as usize * 4),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::memory_backend::test_support::{FakeRunner, authority, scope};
+
+    fn layout(dir: &std::path::Path) -> Layout {
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        Layout::with_user_dir(&project, dir.join("home")).unwrap()
+    }
+
+    fn extractions(runner: &FakeRunner) -> usize {
+        runner
+            .systems
+            .iter()
+            .filter(|system| system.starts_with("Extract durable PROJECT DECISIONS"))
+            .count()
+    }
+
+    #[test]
+    fn envelopes_left_by_earlier_sessions_are_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driver = open(&layout(dir.path()), &SharpshooterConfig::default()).unwrap();
+        let earlier = Operation::for_test(authority("session-a"), scope(), None);
+        let messages = vec![
+            json!({"role":"user","content":"we always keep the parser free of allocation in hot loops"}),
+        ];
+        driver.observe(&earlier, &messages).unwrap();
+        // The session ended before maintenance ran; a later session picks the envelope up.
+        let later = Operation::for_test(authority("session-b"), scope(), None);
+        let mut runner = FakeRunner::new(r#"{"deltas":[]}"#);
+        driver.maintain(&later, &mut runner).unwrap();
+        assert_eq!(extractions(&runner), 1);
+        driver.maintain(&later, &mut runner).unwrap();
+        assert_eq!(
+            extractions(&runner),
+            1,
+            "a processed envelope is not extracted again"
+        );
+    }
+
+    #[test]
+    fn recall_matches_query_words_not_only_the_exact_phrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let mut driver = open(&layout, &SharpshooterConfig::default()).unwrap();
+        // Seed a decision file through a second connection to the driver's own store.
+        let key = format!(
+            "{:x}",
+            Sha256::digest(layout.project_root.as_os_str().as_encoded_bytes())
+        );
+        PrivateDirectory::open(&layout, "sharpshooter")
+            .unwrap()
+            .child(&key)
+            .unwrap()
+            .database("decisions.sqlite3")
+            .unwrap()
+            .execute(
+                "INSERT INTO files(name,content)VALUES('architecture.md',?1)",
+                ["- Keep the parser allocation-free in hot loops\n- Tabs for indentation"],
+            )
+            .unwrap();
+        let op = Operation::for_test(authority("session-a"), scope(), None);
+        let mut runner = FakeRunner::new("{}");
+        let found = driver
+            .search(&op, "parser allocations", 8, &mut runner)
+            .unwrap();
+        assert_eq!(found["count"], 1, "{found}");
+        assert!(
+            found["items"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("parser")
+        );
     }
 }

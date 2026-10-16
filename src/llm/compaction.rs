@@ -113,6 +113,7 @@ impl Backend {
         };
         let headers = llm::model_config::resolve_validated_headers(&self.headers)?;
         let pairs: Vec<_> = headers.pairs().collect();
+        let endpoint_key = self.endpoint_api_key()?;
         let (url, model, token, account, anthropic) = match &self.kind {
             ProviderKind::ChatGpt { model, .. } => (
                 format!("{}/codex/responses", llm::chatgpt::BASE_URL),
@@ -129,14 +130,10 @@ impl Backend {
                 true,
             ),
             ProviderKind::Endpoint {
-                base_url,
-                model,
-                api_key,
+                base_url, model, ..
             }
             | ProviderKind::AnthropicEndpoint {
-                base_url,
-                model,
-                api_key,
+                base_url, model, ..
             } => {
                 let protocol = self.protocol.unwrap_or(
                     if matches!(self.kind, ProviderKind::AnthropicEndpoint { .. }) {
@@ -162,7 +159,13 @@ impl Backend {
                         .to_owned()
                         + "/responses"
                 };
-                (url, model.as_str(), api_key.as_deref(), None, anthropic)
+                (
+                    url,
+                    model.as_str(),
+                    endpoint_key.as_deref(),
+                    None,
+                    anthropic,
+                )
             }
             ProviderKind::Local { .. } => {
                 bail!("native history cannot be replayed through a local provider")
@@ -345,6 +348,7 @@ impl Backend {
         );
         let request = prepared.as_ref().unwrap_or(request);
         let pairs: Vec<_> = headers.pairs().collect();
+        let endpoint_key = self.endpoint_api_key()?;
         let (url, model, token, account, anthropic) = match &self.kind {
             ProviderKind::ChatGpt { model, .. } => (
                 format!("{}/codex/responses", llm::chatgpt::BASE_URL),
@@ -361,14 +365,10 @@ impl Backend {
                 true,
             ),
             ProviderKind::Endpoint {
-                base_url,
-                model,
-                api_key,
+                base_url, model, ..
             }
             | ProviderKind::AnthropicEndpoint {
-                base_url,
-                model,
-                api_key,
+                base_url, model, ..
             } => {
                 let anthropic = self.protocol == Some(llm::model_config::ApiProtocol::Anthropic)
                     || (self.protocol.is_none()
@@ -381,7 +381,13 @@ impl Backend {
                         .to_owned()
                         + "/responses"
                 };
-                (url, model.as_str(), api_key.as_deref(), None, anthropic)
+                (
+                    url,
+                    model.as_str(),
+                    endpoint_key.as_deref(),
+                    None,
+                    anthropic,
+                )
             }
             ProviderKind::Local { .. } => bail!("local providers have no native compaction route"),
         };

@@ -183,6 +183,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         let config = Config::default();
+        let never_cancelled = std::sync::atomic::AtomicBool::new(false);
         let mut env = ToolEnv {
             root: std::path::Path::new("."),
             config: &config,
@@ -190,6 +191,8 @@ mod tests {
             staged: vec!["a.rs".to_owned()],
             numstat: Vec::new(),
             changelog_targets: Vec::new(),
+            index: None,
+            cancel: &never_cancelled,
             state: Default::default(),
         };
         run_agent(&mut env, None, &[]).expect("loop ends without error");

@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Evidence references shown in regenerated compaction notes. The complete index is kept in session
+/// state (`evidence_index`), so the prompt stays bounded however many artifacts a long session retains.
+const MAX_PROMPT_EVIDENCE_REFERENCES: usize = 24;
+
 impl<'a> Agent<'a> {
     /// Manual/idle maintenance owns the resident backend only for the duration of preparation.
     pub fn compact(&mut self, ui: &mut dyn Ui) -> Result<()> {
@@ -125,8 +129,16 @@ impl<'a> Agent<'a> {
                 summary_window = summary_window.min(loaded);
             }
         }
+        let evidence_notes = self.compaction_evidence_notes("", &source.messages);
+        // The regenerated notes are part of every committed projection. Refuse a notes block that cannot
+        // fit the window before any summary request is spent on a projection that cannot commit.
+        let notes_tokens = compaction::estimate(&json!({"role":"user","content":evidence_notes}));
+        ensure!(
+            notes_tokens < u64::from(self.budget_window()) / 2,
+            "regenerated compaction notes need about {notes_tokens} tokens, too large for the context window; no summary was requested. Reduce retained instructions or select a larger-window model"
+        );
         Ok(compaction::CompactionSnapshot {
-            evidence_notes: self.compaction_evidence_notes("", &source.messages),
+            evidence_notes,
             source,
             native_request,
             visible_history,
@@ -405,6 +417,11 @@ impl<'a> Agent<'a> {
             .session
             .compact_with_prefix(prepared.summary, Some(prefix), keep)?;
         prepared.outcome.journal_warning = committed.durability_error;
+        // The complete evidence index is durable session state; prompts show only its bounded tail.
+        let index = self.evidence_index(&snapshot.source.messages);
+        let mut control = self.session.control_state();
+        control["evidence_index"] = json!(index);
+        self.session.set_control_state(control)?;
         let generation = self.session.control_state()["provider_identity"]["history_generation"]
             .as_u64()
             .unwrap_or(0);
@@ -512,6 +529,46 @@ impl<'a> Agent<'a> {
         Ok(prepared.outcome)
     }
 
+    /// Every evidence reference this session retains, in arrival order. The complete index is durable
+    /// session state merged with references found in the messages being compacted; prompts show a
+    /// bounded tail of it, so older notes never pile up in the regenerated text.
+    pub(super) fn evidence_index(&self, messages: &[Value]) -> Vec<String> {
+        let mut index: Vec<String> = self.session.control_state()["evidence_index"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| reference.as_str().map(str::to_owned))
+            .collect();
+        let mut seen: std::collections::HashSet<String> = index.iter().cloned().collect();
+        for message in messages {
+            let mut references = Vec::new();
+            if let Some(reference) = message["dial_evidence"]["artifact"].as_str() {
+                references.push(reference.to_owned());
+            }
+            if message["role"] == "user"
+                && let Some(text) = message["content"].as_str()
+                && let Some((_, listed)) =
+                    text.rsplit_once("\nRetained evidence (read and mutation results): ")
+            {
+                references.extend(
+                    listed
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split(", ")
+                        .filter(|r| !r.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+            for reference in references {
+                if seen.insert(reference.clone()) {
+                    index.push(reference);
+                }
+            }
+        }
+        index
+    }
+
     pub(super) fn compaction_evidence_notes(&self, summary: &str, messages: &[Value]) -> String {
         let control = self.session.control_state();
         let goal = if control["original_goal"].is_null() {
@@ -529,27 +586,18 @@ impl<'a> Agent<'a> {
         } else {
             control["original_goal"].clone()
         };
-        let mut evidence = std::collections::BTreeSet::new();
-        for message in messages {
-            if let Some(reference) = message["dial_evidence"]["artifact"].as_str() {
-                evidence.insert(reference.to_owned());
-            }
-            if message["role"] == "user"
-                && let Some(text) = message["content"].as_str()
-                && let Some((_, references)) =
-                    text.rsplit_once("\nRetained evidence (read and mutation results): ")
-            {
-                for reference in references
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .split(", ")
-                    .filter(|r| !r.is_empty())
-                {
-                    evidence.insert(reference.to_owned());
-                }
-            }
-        }
+        let evidence = self.evidence_index(messages);
+        let omitted = evidence
+            .len()
+            .saturating_sub(MAX_PROMPT_EVIDENCE_REFERENCES);
+        let shown = evidence[omitted..].join(", ");
+        let archived_note = if omitted == 0 {
+            String::new()
+        } else {
+            format!(
+                "{omitted} earlier evidence references remain in the session evidence index (`evidence_index`); "
+            )
+        };
         let tasks = if self.todo.is_empty() {
             String::new()
         } else {
@@ -563,12 +611,12 @@ impl<'a> Agent<'a> {
             .path()
             .map(|path| path.to_string_lossy().into_owned());
         format!(
-            "{}\n\nOriginal user goal: {}\nCurrent user instruction (authoritative runtime record): {}\nDurable decisions/open work: {}{tasks}\nRetained evidence (read and mutation results): {}\nFull conversation archive: session {} ({}); retrieve omitted details with session_search; retrieve evidence with artifact_read. Latest user instructions take precedence over conflicting older goals and plans.",
+            "{}\n\nOriginal user goal: {}\nCurrent user instruction (authoritative runtime record): {}\nDurable decisions/open work: {}{tasks}\nRetained evidence (read and mutation results): {}\nFull conversation archive: session {} ({}); {archived_note}retrieve omitted details with session_search; retrieve evidence with artifact_read. Latest user instructions take precedence over conflicting older goals and plans.",
             summary.trim(),
             goal,
             control["current_instruction"],
             control["working_state"],
-            evidence.into_iter().collect::<Vec<_>>().join(", "),
+            shown,
             self.session.id(),
             history.as_deref().unwrap_or("in-memory session")
         )

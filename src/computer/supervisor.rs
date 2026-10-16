@@ -106,6 +106,8 @@ struct Run {
     reply: flume::Sender<ComputerResult<Value>>,
     host: Arc<dyn ComputerHost>,
     tool_signals: HashMap<String, AbortSignal>,
+    /// Generation of the worker that admitted this run; replies bind to it.
+    generation: u64,
 }
 
 struct State {
@@ -173,9 +175,9 @@ impl ComputerSupervisor {
             if st.status == Status::Closed {
                 return Err(closed_error());
             }
-            if st.worker.is_none() {
+            let Some(generation) = st.worker.as_ref().map(|w| w.generation) else {
                 return Err(not_running());
-            }
+            };
             ensure_session_locked(st, &request.session)?;
             st.next_id += 1;
             let id = st.next_id;
@@ -185,6 +187,7 @@ impl ComputerSupervisor {
                     reply,
                     host,
                     tool_signals: HashMap::new(),
+                    generation,
                 },
             );
             id
@@ -630,9 +633,9 @@ fn handle_message(inner: &Arc<Inner>, generation: u64, message: Value) {
             resolve_pending(inner, generation, &message, result);
         }
         Some("result") => resolve_run(inner, &message, ok),
-        Some("tool-call") => spawn_tool_call(inner, &message),
-        Some("control-request") => spawn_control_request(inner, &message),
-        Some("native") => spawn_native(inner, &message),
+        Some("tool-call") => spawn_tool_call(inner, generation, &message),
+        Some("control-request") => spawn_control_request(inner, generation, &message),
+        Some("native") => spawn_native(inner, generation, &message),
         _ => {}
     }
 }
@@ -690,9 +693,16 @@ struct Claim {
     signal: AbortSignal,
 }
 
-fn claim_signal(inner: &Arc<Inner>, run_id: Option<u64>, key: &str) -> Option<Claim> {
+fn claim_signal(
+    inner: &Arc<Inner>,
+    generation: u64,
+    run_id: Option<u64>,
+    key: &str,
+) -> Option<Claim> {
     let mut guard = inner.state.lock();
-    let run = run_id.and_then(|rid| guard.runs.get_mut(&rid))?;
+    let run = run_id
+        .and_then(|rid| guard.runs.get_mut(&rid))
+        .filter(|run| run.generation == generation)?;
     let signal = AbortSignal::new();
     run.tool_signals.insert(key.to_owned(), signal.clone());
     Some(Claim {
@@ -701,9 +711,12 @@ fn claim_signal(inner: &Arc<Inner>, run_id: Option<u64>, key: &str) -> Option<Cl
     })
 }
 
-fn release_signal(inner: &Arc<Inner>, run_id: Option<u64>, key: &str) {
+fn release_signal(inner: &Arc<Inner>, generation: u64, run_id: Option<u64>, key: &str) {
     let mut guard = inner.state.lock();
-    if let Some(run) = run_id.and_then(|rid| guard.runs.get_mut(&rid)) {
+    if let Some(run) = run_id
+        .and_then(|rid| guard.runs.get_mut(&rid))
+        .filter(|run| run.generation == generation)
+    {
         run.tool_signals.remove(key);
     }
 }
@@ -715,7 +728,8 @@ fn reply_envelope(result: ComputerResult<Value>) -> Value {
     }
 }
 
-fn spawn_tool_call(inner: &Arc<Inner>, message: &Value) {
+/// Tool and control requests are answered only by the worker generation that issued them.
+fn spawn_tool_call(inner: &Arc<Inner>, generation: u64, message: &Value) {
     let Some(id) = message.get("id").cloned() else {
         return;
     };
@@ -729,24 +743,26 @@ fn spawn_tool_call(inner: &Arc<Inner>, message: &Value) {
     let inner = Arc::clone(inner);
     std::thread::spawn(move || {
         let key = id.to_string();
-        let Some(claim) = claim_signal(&inner, run_id, &key) else {
+        let Some(claim) = claim_signal(&inner, generation, run_id, &key) else {
             let reply = reply_envelope(Err(ComputerError::tool("No active run for tool call")));
-            let _ = send(
+            let _ = send_reply(
                 &inner,
+                generation,
                 &json!({"type": "tool-reply", "id": id, "reply": reply}),
             );
             return;
         };
         let result = claim.host.call_tool(&name, args, &claim.signal);
-        release_signal(&inner, run_id, &key);
-        let _ = send(
+        release_signal(&inner, generation, run_id, &key);
+        let _ = send_reply(
             &inner,
+            generation,
             &json!({"type": "tool-reply", "id": id, "reply": reply_envelope(result)}),
         );
     });
 }
 
-fn spawn_control_request(inner: &Arc<Inner>, message: &Value) {
+fn spawn_control_request(inner: &Arc<Inner>, generation: u64, message: &Value) {
     let Some(id) = message.get("id").cloned() else {
         return;
     };
@@ -759,7 +775,7 @@ fn spawn_control_request(inner: &Arc<Inner>, message: &Value) {
     let inner = Arc::clone(inner);
     std::thread::spawn(move || {
         let key = id.to_string();
-        let result = match claim_signal(&inner, run_id, &key) {
+        let result = match claim_signal(&inner, generation, run_id, &key) {
             None => Err(ComputerError::tool("No active run for control request")),
             Some(claim) => {
                 let body = format!(
@@ -768,18 +784,21 @@ fn spawn_control_request(inner: &Arc<Inner>, message: &Value) {
                 let granted = claim
                     .host
                     .confirm_control(CONTROL_TITLE, &body, &claim.signal);
-                release_signal(&inner, run_id, &key);
+                release_signal(&inner, generation, run_id, &key);
                 granted.map(|granted| Value::Bool(granted && !claim.signal.is_aborted()))
             }
         };
-        let _ = send(
+        let _ = send_reply(
             &inner,
+            generation,
             &json!({"type": "tool-reply", "id": id, "reply": reply_envelope(result)}),
         );
     });
 }
 
-fn spawn_native(inner: &Arc<Inner>, message: &Value) {
+/// Native requests bind to the session and worker generation at admission. A replacement
+/// worker never serves them, and a reply produced after restart is discarded.
+fn spawn_native(inner: &Arc<Inner>, generation: u64, message: &Value) {
     let Some(id) = message.get("id").cloned() else {
         return;
     };
@@ -789,10 +808,20 @@ fn spawn_native(inner: &Arc<Inner>, message: &Value) {
         .unwrap_or_default()
         .to_owned();
     let args = message.get("args").cloned().unwrap_or(Value::Null);
+    let (session, stopped) = {
+        let st = inner.state.lock();
+        let Some(worker) = st.worker.as_ref().filter(|w| w.generation == generation) else {
+            return;
+        };
+        (st.session.clone(), worker.stopped.clone())
+    };
     let inner = Arc::clone(inner);
     std::thread::spawn(move || {
-        let session = inner.state.lock().session.clone();
+        if stopped.is_aborted() {
+            return;
+        }
         let result = match session {
+            // Cancelling the captured session stops operations already in flight.
             Some(session) => dispatch(&session, &method, args),
             None => Err(ComputerError::tool(NO_SESSION)),
         };
@@ -805,16 +834,33 @@ fn spawn_native(inner: &Arc<Inner>, message: &Value) {
                 "error": error.to_payload(),
             }),
         };
-        let _ = send(&inner, &reply);
+        let _ = send_reply(&inner, generation, &reply);
     });
 }
 
-fn send(inner: &Arc<Inner>, message: &Value) -> ComputerResult<()> {
-    send_guarded(inner, message, Instant::now() + START_TIMEOUT, None)
+/// Writes a reply to the issuing generation only; fails once that worker is no longer current.
+fn send_reply(inner: &Arc<Inner>, generation: u64, message: &Value) -> ComputerResult<()> {
+    send_scoped(
+        inner,
+        Some(generation),
+        message,
+        Instant::now() + START_TIMEOUT,
+        None,
+    )
 }
 
 fn send_guarded(
     inner: &Arc<Inner>,
+    message: &Value,
+    deadline: Instant,
+    signal: Option<&AbortSignal>,
+) -> ComputerResult<()> {
+    send_scoped(inner, None, message, deadline, signal)
+}
+
+fn send_scoped(
+    inner: &Arc<Inner>,
+    only: Option<u64>,
     message: &Value,
     deadline: Instant,
     signal: Option<&AbortSignal>,
@@ -824,6 +870,7 @@ fn send_guarded(
         .lock()
         .worker
         .as_ref()
+        .filter(|w| only.is_none_or(|generation| generation == w.generation))
         .map(|w| (Arc::clone(&w.stdin), w.stopped.clone(), w.generation))
         .ok_or_else(not_running)?;
     let mut line =
@@ -1101,7 +1148,13 @@ mod computer_supervisor_tests {
         let second = fake_worker(ECHO);
         first.close().unwrap();
         let (id, reply) = register_pending(&second.inner).unwrap();
-        send(&second.inner, &json!({"type":"capabilities", "id":id})).unwrap();
+        send_guarded(
+            &second.inner,
+            &json!({"type":"capabilities", "id":id}),
+            Instant::now() + START_TIMEOUT,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             reply.recv_timeout(Duration::from_secs(2)).unwrap().unwrap()["fake"],
             true
@@ -1137,5 +1190,27 @@ mod computer_supervisor_tests {
         });
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(supervisor.inner.state.lock().worker.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn computer_stale_generation_replies_are_discarded() {
+        let supervisor = fake_worker("import time; time.sleep(30)");
+        // Generation 7 never admitted a request; its reply must not reach generation 1.
+        let error = send_reply(&supervisor.inner, 7, &json!({"type":"native-result"})).unwrap_err();
+        assert_eq!(error.message, NOT_RUNNING);
+        assert!(supervisor.inner.state.lock().worker.is_some());
+
+        // A reply for the same request ID from an older generation must not settle the new one.
+        let (id, reply) = register_pending(&supervisor.inner).unwrap();
+        resolve_pending(&supervisor.inner, 2, &json!({"id": id}), Ok(json!("stale")));
+        assert!(reply.try_recv().is_err());
+        resolve_pending(
+            &supervisor.inner,
+            1,
+            &json!({"id": id}),
+            Ok(json!("current")),
+        );
+        assert_eq!(reply.try_recv().unwrap().unwrap(), json!("current"));
     }
 }

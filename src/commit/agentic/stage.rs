@@ -1,5 +1,12 @@
-//! Split-commit execution: unstage, then stage and commit each group in order.
+//! Split-commit execution. The staged state is captured once when the commit run starts
+//! ([`StagedSnapshot`]). Every group is built from those captured identities: whole-file groups
+//! take the captured blob and mode, and hunk or line groups take the captured staged diff. All
+//! group trees are prepared in a private index before the repository index is touched, so a
+//! failed preparation leaves git unchanged. Each commit then points the real index at its prepared
+//! tree; when a commit fails, the captured staging is restored and the report says what was
+//! committed.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -9,7 +16,7 @@ use super::state::{
 };
 use crate::commit::commit_types::format_conventional_commit;
 use crate::commit::diff::parse_file_diffs;
-use crate::commit::execute::{commit_with_message, git_output};
+use crate::commit::execute::{commit_with_message, git_output, git_output_indexed};
 use crate::commit::run::CommitError;
 use crate::tools::git_patch::{file_header_and_hunks, line_patch};
 
@@ -19,15 +26,18 @@ fn text(error: CommitError) -> String {
     }
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    git_output(root, args, "Git command failed").map_err(text)
+/// `git <args>` with an optional private index, errors as text.
+fn git_in(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<String, String> {
+    git_output_indexed(root, index, args, "Git command failed").map_err(text)
 }
 
-/// Run `git <args>` in `root` with `stdin` piped in. A non-zero exit becomes the error text.
-fn git_with_stdin(root: &Path, args: &[&str], stdin: &str) -> Result<(), String> {
+/// Run `git <args>` in `root` with `stdin` piped in and `index` as its index. A non-zero exit
+/// becomes the error text.
+fn git_with_stdin(root: &Path, index: &Path, args: &[&str], stdin: &str) -> Result<(), String> {
     let mut child = Command::new("git")
         .args(args)
         .current_dir(root)
+        .env("GIT_INDEX_FILE", index)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -46,6 +56,18 @@ fn git_with_stdin(root: &Path, args: &[&str], stdin: &str) -> Result<(), String>
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
     }
+}
+
+/// The commit `HEAD` names, or `None` on an unborn branch.
+fn head_commit(root: &Path) -> Result<Option<String>, CommitError> {
+    Ok(git_output(
+        root,
+        &["rev-parse", "--verify", "-q", "HEAD"],
+        "Failed to read HEAD",
+    )
+    .ok()
+    .map(|head| head.trim().to_owned())
+    .filter(|head| !head.is_empty()))
 }
 
 /// Ensure a patch fragment ends with a newline.
@@ -122,7 +144,8 @@ fn lines_patch(file_text: &str, path: &str, start: u64, end: u64) -> Result<Stri
     Ok(assemble(&header_out.unwrap_or(header), &selected_hunks))
 }
 
-/// Build the patch for one change of a group. `All` is handled by the caller with `git add`.
+/// Build the patch for one hunk or line selection, taken from the captured staged diff. Binary
+/// files have no hunks, so a partial selection of one is refused; they are committed whole.
 fn change_patch(diff_text: &str, change: &FileChange) -> Result<String, String> {
     let path = change.path();
     let file = parse_file_diffs(diff_text)
@@ -133,7 +156,7 @@ fn change_patch(diff_text: &str, change: &FileChange) -> Result<String, String> 
         FileChange::All { .. } => Err(format!("{path} is staged as a whole file")),
         FileChange::Indices { indices, .. } => {
             let (header, hunks) = file_header_and_hunks(&file.content)
-                .ok_or_else(|| format!("no hunks for {path}"))?;
+                .ok_or_else(|| format!("no hunks for {path}; commit it whole"))?;
             let mut selected = Vec::new();
             for index in indices {
                 let hunk = hunks
@@ -147,28 +170,201 @@ fn change_patch(diff_text: &str, change: &FileChange) -> Result<String, String> 
     }
 }
 
-/// Stage and commit one group. Changes are staged in plan order; the commit message comes from the group.
-fn commit_group(
+/// One staged entry of the captured index: file mode and blob id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedEntry {
+    mode: String,
+    blob: String,
+}
+
+/// The staged state captured when a commit run starts. Groups are built only from these identities.
+/// `index_tree` lets execution detect a change made after the capture.
+pub(crate) struct StagedSnapshot {
+    head: Option<String>,
+    index_tree: String,
+    full_diff: String,
+    /// Captured staged entries keyed by path; `None` marks a staged deletion.
+    entries: BTreeMap<String, Option<StagedEntry>>,
+}
+
+/// Parses `git diff --cached --raw -z --no-renames --no-abbrev` into captured entries. Each record
+/// is `:<old mode> <new mode> <old blob> <new blob> <status>` followed by the path.
+fn parse_raw(raw: &str) -> BTreeMap<String, Option<StagedEntry>> {
+    let mut entries = BTreeMap::new();
+    let mut fields = raw.split('\0');
+    while let Some(meta) = fields.next() {
+        let Some(meta) = meta.strip_prefix(':') else {
+            continue;
+        };
+        let Some(path) = fields.next() else {
+            break;
+        };
+        let parts: Vec<&str> = meta.split_whitespace().collect();
+        if parts.len() != 5 || path.is_empty() {
+            continue;
+        }
+        let entry = if parts[4].starts_with('D') {
+            None
+        } else {
+            Some(StagedEntry {
+                mode: parts[1].to_owned(),
+                blob: parts[3].to_owned(),
+            })
+        };
+        entries.insert(path.to_owned(), entry);
+    }
+    entries
+}
+
+impl StagedSnapshot {
+    /// Captures HEAD, the index tree, the staged diff and the staged entries. `index` is the
+    /// private preview index for a dry run, or `None` for the repository's own index.
+    pub(crate) fn capture(
+        root: &Path,
+        index: Option<&Path>,
+        full_diff: &str,
+    ) -> Result<Self, CommitError> {
+        let head = head_commit(root)?;
+        let index_tree =
+            git_output_indexed(root, index, &["write-tree"], "Failed to read the index")?
+                .trim()
+                .to_owned();
+        let raw = git_output_indexed(
+            root,
+            index,
+            &[
+                "diff",
+                "--cached",
+                "--raw",
+                "-z",
+                "--no-renames",
+                "--no-abbrev",
+            ],
+            "Failed to read staged entries",
+        )?;
+        Ok(Self {
+            head,
+            index_tree,
+            full_diff: full_diff.to_owned(),
+            entries: parse_raw(&raw),
+        })
+    }
+
+    /// Records a file that Dial wrote during this run (a changelog update), so the plan commits
+    /// exactly the bytes written. The mode follows any captured entry, otherwise a regular file.
+    pub(crate) fn add_written_file(&mut self, root: &Path, path: &str) -> Result<(), CommitError> {
+        let path_arg = format!("--path={path}");
+        let blob = git_output(
+            root,
+            &["hash-object", "-w", path_arg.as_str(), "--", path],
+            "Failed to record changelog update",
+        )?
+        .trim()
+        .to_owned();
+        let mode = match self.entries.get(path) {
+            Some(Some(entry)) => entry.mode.clone(),
+            _ => "100644".to_owned(),
+        };
+        self.entries
+            .insert(path.to_owned(), Some(StagedEntry { mode, blob }));
+        Ok(())
+    }
+
+    /// The captured entry for a whole-file change: `Some` to stage the blob, `None` for a deletion.
+    fn entry(&self, path: &str) -> Result<Option<&StagedEntry>, String> {
+        match self.entries.get(path) {
+            Some(entry) => Ok(entry.as_ref()),
+            None => Err(format!("{path} is not staged")),
+        }
+    }
+}
+
+/// Stages one group's changes into `index`, which already holds the groups before it.
+fn stage_group(
     root: &Path,
+    index: &Path,
+    snapshot: &StagedSnapshot,
     group: &SplitCommitGroup,
-    diff_text: &str,
-    bypass_hooks: bool,
 ) -> Result<(), String> {
     for change in &group.changes {
         match change {
-            FileChange::All { path } => {
-                git(root, &["add", "-A", "--", path])?;
-            }
+            FileChange::All { path } => match snapshot.entry(path)? {
+                Some(entry) => {
+                    git_in(
+                        root,
+                        Some(index),
+                        &[
+                            "update-index",
+                            "--add",
+                            "--cacheinfo",
+                            entry.mode.as_str(),
+                            entry.blob.as_str(),
+                            path.as_str(),
+                        ],
+                    )?;
+                }
+                None => {
+                    git_in(
+                        root,
+                        Some(index),
+                        &["update-index", "--force-remove", "--", path.as_str()],
+                    )?;
+                }
+            },
             other => {
-                let patch = change_patch(diff_text, other)?;
-                git_with_stdin(root, &["apply", "--cached", "--recount", "-"], &patch)?;
+                let patch = change_patch(&snapshot.full_diff, other)?;
+                git_with_stdin(
+                    root,
+                    index,
+                    &["apply", "--cached", "--recount", "-"],
+                    &patch,
+                )?;
             }
         }
     }
-    let message = group_message(group);
-    commit_with_message(root, &format_conventional_commit(&message), bypass_hooks).map_err(text)
+    Ok(())
 }
 
+/// Cumulative tree after each group, in `order`, built in a private index under `scratch`. Nothing
+/// in the repository index or history changes. Group `k`'s tree holds HEAD plus groups `0..=k`.
+fn prepare_trees(
+    root: &Path,
+    snapshot: &StagedSnapshot,
+    plan: &SplitCommitPlan,
+    order: &[usize],
+    scratch: &Path,
+) -> Result<Vec<String>, String> {
+    let index = scratch.join("index");
+    let base = match &snapshot.head {
+        Some(head) => vec!["read-tree", head.as_str()],
+        None => vec!["read-tree", "--empty"],
+    };
+    git_in(root, Some(index.as_path()), &base)?;
+    let mut trees = Vec::with_capacity(order.len());
+    for group_index in order {
+        stage_group(root, &index, snapshot, &plan.commits[*group_index])?;
+        let tree = git_in(root, Some(index.as_path()), &["write-tree"])?;
+        trees.push(tree.trim().to_owned());
+    }
+    Ok(trees)
+}
+
+/// Verifies that HEAD and the staged content still match the captured state.
+fn verify_unchanged(root: &Path, snapshot: &StagedSnapshot) -> Result<(), CommitError> {
+    let head = head_commit(root)?;
+    let index_tree = git_output(root, &["write-tree"], "Failed to read the index")?
+        .trim()
+        .to_owned();
+    if head != snapshot.head || index_tree != snapshot.index_tree {
+        return Err(CommitError::Git(
+            "HEAD or the staged changes changed after the split plan was made; nothing was committed. Run the commit again."
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Commit message of one group, as the commit will record it.
 fn group_message(group: &SplitCommitGroup) -> crate::commit::commit_types::CommitMessage {
     CommitProposal {
         analysis: ConventionalAnalysis {
@@ -183,7 +379,7 @@ fn group_message(group: &SplitCommitGroup) -> crate::commit::commit_types::Commi
     .to_message()
 }
 
-/// Files still staged from `order[from..]`, counted once per path.
+/// Files of `order[from..]`, counted once per path.
 fn remaining_files(plan: &SplitCommitPlan, order: &[usize], from: usize) -> usize {
     let mut paths: Vec<&str> = order[from..]
         .iter()
@@ -194,52 +390,80 @@ fn remaining_files(plan: &SplitCommitPlan, order: &[usize], from: usize) -> usiz
     paths.len()
 }
 
-/// Execute a validated split plan in dependency order.
+/// Subject lines of `groups`, one per line, for the failure report.
+fn subjects(plan: &SplitCommitPlan, groups: &[usize]) -> String {
+    groups
+        .iter()
+        .map(|index| {
+            let message = format_conventional_commit(&group_message(&plan.commits[*index]));
+            format!("  - {}", message.lines().next().unwrap_or_default())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Returns the commit messages a split would create, without touching git.
+pub(crate) fn preview_split(plan: &SplitCommitPlan, order: &[usize]) -> Vec<String> {
+    order
+        .iter()
+        .map(|index| format_conventional_commit(&group_message(&plan.commits[*index])))
+        .collect()
+}
+
+/// Execute a validated split plan in dependency order against the captured staged state.
 ///
-/// `full_diff` is the staged diff captured before any unstaging; hunk and line selections are read from it.
-/// Dry runs return the commit messages without touching git. A failed group is reported with how many
-/// commits were already created; no staged content is discarded.
+/// Every group tree is prepared first, so a bad selection fails before the first commit. Each
+/// commit then sets the real index to its prepared tree and commits it. If a group fails, the
+/// captured staging is restored, so the remaining groups stay staged exactly as captured, and the
+/// error reports which groups were committed and which remain.
 pub(crate) fn execute_split(
     root: &Path,
     plan: &SplitCommitPlan,
     order: &[usize],
-    full_diff: &str,
-    dry_run: bool,
+    snapshot: &StagedSnapshot,
     bypass_hooks: bool,
 ) -> Result<Vec<String>, CommitError> {
     let total = order.len();
-    if dry_run {
-        return Ok(order
-            .iter()
-            .map(|index| format_conventional_commit(&group_message(&plan.commits[*index])))
-            .collect());
-    }
-
-    let has_head = git_output(
-        root,
-        &["rev-parse", "--verify", "-q", "HEAD"],
-        "Git command failed",
-    )
-    .is_ok();
-    let unstage = if has_head {
-        git(root, &["reset", "-q"])
-    } else {
-        git(
-            root,
-            &["rm", "-r", "--cached", "-q", "--ignore-unmatch", "."],
-        )
-    };
-    unstage.map_err(CommitError::Git)?;
+    verify_unchanged(root, snapshot)?;
+    let scratch = tempfile::tempdir()
+        .map_err(|error| CommitError::Git(format!("Failed to prepare the split: {error}")))?;
+    let trees =
+        prepare_trees(root, snapshot, plan, order, scratch.path()).map_err(CommitError::Git)?;
 
     let mut messages = Vec::with_capacity(total);
-    for (position, index) in order.iter().enumerate() {
-        let group = &plan.commits[*index];
-        if let Err(error) = commit_group(root, group, full_diff, bypass_hooks) {
-            let done = position;
-            let remaining = remaining_files(plan, order, position);
+    for (position, group_index) in order.iter().enumerate() {
+        let group = &plan.commits[*group_index];
+        let result = git_in(root, None, &["read-tree", trees[position].as_str()]).and_then(|_| {
+            commit_with_message(
+                root,
+                &format_conventional_commit(&group_message(group)),
+                bypass_hooks,
+            )
+            .map_err(text)
+        });
+        if let Err(error) = result {
+            let restored = git_in(root, None, &["read-tree", snapshot.index_tree.as_str()]);
+            let staging = match restored {
+                Ok(_) => format!(
+                    "The captured staging of the {} file(s) in the remaining groups was restored; unstaged changes were not modified.",
+                    remaining_files(plan, order, position)
+                ),
+                Err(restore_error) => format!(
+                    "Restoring the captured staging failed ({restore_error}). Recover it with `git read-tree {}`.",
+                    snapshot.index_tree
+                ),
+            };
+            let completed = &order[..position];
+            let pending = &order[position..];
+            let committed = if completed.is_empty() {
+                "No commits were created.".to_owned()
+            } else {
+                format!("Created commits:\n{}", subjects(plan, completed))
+            };
             return Err(CommitError::Git(format!(
-                "Commit {} of {total} failed: {error}\n{done} of {total} commits created; {remaining} file(s) remain staged. No changes were lost.",
-                position + 1
+                "Commit {} of {total} failed: {error}\n{position} of {total} commits created. {committed}\nNot committed:\n{}\n{staging}",
+                position + 1,
+                subjects(plan, pending),
             )));
         }
         messages.push(format_conventional_commit(&group_message(group)));
@@ -263,6 +487,29 @@ mod tests {
             .expect("run git");
         assert!(output.status.success(), "git {args:?} failed");
         String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn init_repo(root: &Path) {
+        run(root, &["init", "-q"]);
+        run(root, &["config", "user.email", "test@example.com"]);
+        run(root, &["config", "user.name", "Test"]);
+        run(root, &["config", "commit.gpgsign", "false"]);
+        fs::write(root.join("base.txt"), "base\n").expect("write base");
+        run(root, &["add", "base.txt"]);
+        run(root, &["commit", "-q", "-m", "init"]);
+    }
+
+    fn cached_diff(root: &Path) -> String {
+        run(
+            root,
+            &[
+                "diff",
+                "--cached",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-renames",
+            ],
+        )
     }
 
     fn group(path: &str, summary: &str) -> SplitCommitGroup {
@@ -289,57 +536,98 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_returns_messages_without_git() {
+    fn preview_returns_messages_without_git() {
         let plan = SplitCommitPlan {
             commits: vec![group("a.txt", "add a")],
             warnings: Vec::new(),
         };
-        let messages = execute_split(
-            Path::new("/nonexistent-dial-root"),
-            &plan,
-            &[0],
-            "",
-            true,
-            false,
-        )
-        .expect("dry run");
+        let messages = preview_split(&plan, &[0]);
         assert_eq!(messages.len(), 1);
         assert!(messages[0].starts_with("feat: add a"));
     }
 
     #[test]
-    fn split_creates_one_commit_per_group_in_order() {
+    fn split_commits_captured_content_and_keeps_unstaged_edits_out() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        run(root, &["init", "-q"]);
-        run(root, &["config", "user.email", "test@example.com"]);
-        run(root, &["config", "user.name", "Test"]);
-        run(root, &["config", "commit.gpgsign", "false"]);
-        fs::write(root.join("base.txt"), "base\n").expect("write base");
-        run(root, &["add", "base.txt"]);
-        run(root, &["commit", "-q", "-m", "init"]);
-        fs::write(root.join("a.txt"), "a\n").expect("write a");
-        fs::write(root.join("b.txt"), "b\n").expect("write b");
-        run(root, &["add", "a.txt", "b.txt"]);
-        let full_diff = run(
-            root,
-            &[
-                "diff",
-                "--cached",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-renames",
-            ],
-        );
+        init_repo(root);
+        // Staged bytes differ from the working tree; the binary file is committed whole.
+        fs::write(root.join("a.txt"), "staged\n").expect("write a");
+        run(root, &["add", "a.txt"]);
+        fs::write(root.join("a.txt"), "unfinished scratch\n").expect("edit a");
+        fs::write(root.join("b.bin"), b"\0\x01binary\0").expect("write b");
+        run(root, &["add", "b.bin"]);
+        let full_diff = cached_diff(root);
+        let snapshot = StagedSnapshot::capture(root, None, &full_diff).expect("capture");
 
         let plan = SplitCommitPlan {
-            commits: vec![group("a.txt", "add a"), group("b.txt", "add b")],
+            commits: vec![group("a.txt", "add a"), group("b.bin", "add b")],
             warnings: Vec::new(),
         };
-        execute_split(root, &plan, &[0, 1], &full_diff, false, false).expect("split");
+        execute_split(root, &plan, &[0, 1], &snapshot, false).expect("split");
 
         let log = run(root, &["log", "--format=%s"]);
         let subjects: Vec<&str> = log.lines().collect();
         assert_eq!(subjects, vec!["feat: add b", "feat: add a", "init"]);
+        assert_eq!(run(root, &["show", "HEAD~1:a.txt"]), "staged\n");
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "unfinished scratch\n"
+        );
+        assert_eq!(run(root, &["status", "--porcelain"]), " M a.txt\n");
+        assert!(run(root, &["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[test]
+    fn split_refuses_to_run_when_staging_changed_after_capture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        fs::write(root.join("a.txt"), "a\n").expect("write a");
+        run(root, &["add", "a.txt"]);
+        let snapshot = StagedSnapshot::capture(root, None, &cached_diff(root)).expect("capture");
+        fs::write(root.join("b.txt"), "b\n").expect("write b");
+        run(root, &["add", "b.txt"]);
+        let plan = SplitCommitPlan {
+            commits: vec![group("a.txt", "add a")],
+            warnings: Vec::new(),
+        };
+        assert!(execute_split(root, &plan, &[0], &snapshot, false).is_err());
+        assert_eq!(run(root, &["log", "--format=%s"]).lines().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_group_restores_remaining_staging_and_reports_progress() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        let hook = root.join(".git/hooks/pre-commit");
+        fs::write(
+            &hook,
+            "#!/bin/sh\ngit diff --cached | grep -q REJECT && exit 1\nexit 0\n",
+        )
+        .expect("write hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
+        fs::write(root.join("a.txt"), "ok\n").expect("write a");
+        fs::write(root.join("b.txt"), "REJECT\n").expect("write b");
+        run(root, &["add", "a.txt", "b.txt"]);
+        let full_diff = cached_diff(root);
+        let snapshot = StagedSnapshot::capture(root, None, &full_diff).expect("capture");
+        let plan = SplitCommitPlan {
+            commits: vec![group("a.txt", "add a"), group("b.txt", "add b")],
+            warnings: Vec::new(),
+        };
+
+        let error = execute_split(root, &plan, &[0, 1], &snapshot, false)
+            .expect_err("second commit is rejected by the hook");
+        let text = error.to_string();
+        assert!(text.contains("1 of 2 commits created"), "{text}");
+        assert!(text.contains("add b"), "{text}");
+        assert_eq!(run(root, &["log", "--format=%s"]).lines().count(), 2);
+        assert_eq!(run(root, &["diff", "--cached", "--name-only"]), "b.txt\n");
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "REJECT\n");
     }
 }

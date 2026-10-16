@@ -3,7 +3,7 @@
 //! checked against a "none of these" option that can veto the whole selection.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use serde_json::json;
@@ -139,28 +139,43 @@ fn judge_all(
     paths: &[String],
     units: &[StageUnit],
 ) -> Vec<Result<f64, String>> {
+    let never_cancelled = AtomicBool::new(false);
+    map_bounded(units, &never_cancelled, |unit| {
+        judge_unit(inference, instruction, paths, unit)
+    })
+    .into_iter()
+    .map(|slot| slot.unwrap_or_else(|| Err("AI staging judgment did not run".to_owned())))
+    .collect()
+}
+
+/// Runs `work` over `items` on at most [`WORKERS`] threads and returns the results in input order.
+/// Once `cancel` is set no further item is admitted; its slot stays `None`. Items already running
+/// finish normally.
+pub(crate) fn map_bounded<T: Sync, R: Send>(
+    items: &[T],
+    cancel: &AtomicBool,
+    work: impl Fn(&T) -> R + Sync,
+) -> Vec<Option<R>> {
     let next = AtomicUsize::new(0);
-    let slots: Mutex<Vec<Option<Result<f64, String>>>> =
-        Mutex::new((0..units.len()).map(|_| None).collect());
+    let slots: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
     std::thread::scope(|scope| {
-        for _ in 0..WORKERS.min(units.len()) {
+        for _ in 0..WORKERS.min(items.len()) {
             scope.spawn(|| {
                 loop {
+                    if cancel.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(unit) = units.get(index) else {
+                    let Some(item) = items.get(index) else {
                         break;
                     };
-                    let result = judge_unit(inference, instruction, paths, unit);
+                    let result = work(item);
                     slots.lock()[index] = Some(result);
                 }
             });
         }
     });
-    slots
-        .into_inner()
-        .into_iter()
-        .map(|slot| slot.unwrap_or_else(|| Err("AI staging judgment did not run".to_owned())))
-        .collect()
+    slots.into_inner()
 }
 
 fn judge_unit(
@@ -383,5 +398,37 @@ mod tests {
     fn bound_marks_truncation() {
         assert_eq!(bound("abcdef", 10), "abcdef");
         assert_eq!(bound("abcdef", 3), "abc\n…");
+    }
+
+    #[test]
+    fn map_bounded_caps_concurrency_keeps_order_and_stops_on_cancel() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let items: Vec<usize> = (0..120).collect();
+        let running = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        let results = map_bounded(&items, &cancel, |item| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(2));
+            running.fetch_sub(1, Ordering::SeqCst);
+            *item * 2
+        });
+        assert!(peak.load(Ordering::SeqCst) <= WORKERS);
+        let values: Vec<usize> = results
+            .into_iter()
+            .map(|slot| slot.expect("every item runs before cancellation"))
+            .collect();
+        assert_eq!(
+            values,
+            items.iter().map(|item| item * 2).collect::<Vec<_>>()
+        );
+
+        // Once cancelled, no further item is admitted.
+        cancel.store(true, Ordering::SeqCst);
+        let results = map_bounded(&items, &cancel, |item| *item);
+        assert!(results.iter().all(Option::is_none));
     }
 }
