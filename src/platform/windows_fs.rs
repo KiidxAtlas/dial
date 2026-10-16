@@ -516,7 +516,7 @@ pub(in crate::platform) fn remove_beneath(root: &File, relative: &Path) -> io::R
     let result = unsafe {
         NtCreateFile(
             &mut handle,
-            DELETE | FILE_READ_ATTRIBUTES,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             &attrs,
             &mut status,
             ptr::null(),
@@ -537,7 +537,13 @@ pub(in crate::platform) fn remove_beneath(root: &File, relative: &Path) -> io::R
     set_name(&file, root, relative, 13, true, false)
 }
 pub(in crate::platform) fn remove_dir_beneath(root: &File, relative: &Path) -> io::Result<()> {
-    let file = relative_name(root, relative, DELETE | FILE_READ_ATTRIBUTES, 1, 1)?;
+    let file = relative_name(
+        root,
+        relative,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        1,
+        1,
+    )?;
     set_name(&file, root, relative, 13, true, false)
 }
 pub(in crate::platform) fn read_dir_beneath(root: &File) -> io::Result<Vec<std::ffi::OsString>> {
