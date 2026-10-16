@@ -447,6 +447,50 @@ fn workspace_lock<'a>(
     }
 }
 
+/// Installs a missing built-in language server for `abs` the first time it is needed.
+impl LspTool {
+    /// `select_all`, and when no server for the file is installed, installs the first built-in one
+    /// that has a Dial recipe (into Dial's tools directory, never with sudo) and selects again.
+    /// The install is gated like a server start; failures are folded into the original error.
+    fn select_all_installing(
+        &self,
+        ctx: &ToolContext,
+        abs: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Resolved>, String> {
+        let root = ctx.workspace.root();
+        let error = match self.servers.select_all(root, abs, &servers::path_dirs()) {
+            Ok(found) => return Ok(found),
+            Err(error) => error,
+        };
+        let wanted = self.servers.installable(root, abs, &servers::path_dirs());
+        if wanted.is_empty() {
+            return Err(error);
+        }
+        ctx.authorize_mutation("lsp", &[], true)?;
+        let env = crate::setup::deps::Env::current(&crate::config::types::default_user_dir());
+        let mut failures = Vec::new();
+        for program in &wanted {
+            check_cancel(cancel)?;
+            match crate::setup::deps::run::install_with_requirements(
+                program,
+                &env,
+                cancel,
+                &mut |_| {},
+            ) {
+                Ok(_) => {
+                    return self.servers.select_all(root, abs, &servers::path_dirs());
+                }
+                Err(failure) => failures.push(format!("{program}: {failure:#}")),
+            }
+        }
+        Err(format!(
+            "{error}; automatic install failed ({})",
+            failures.join("; ")
+        ))
+    }
+}
+
 impl LspTool {
     pub fn new(config: &LspConfig) -> Self {
         let mut tool = Self::with_launcher(
@@ -740,9 +784,7 @@ impl LspTool {
             _ => None,
         };
 
-        let selected = self
-            .servers
-            .select_all(ws.root(), &abs, &servers::path_dirs())?;
+        let selected = self.select_all_installing(ctx, &abs, cancel)?;
         let language = selected
             .first()
             .map(|server| server.language.as_str())

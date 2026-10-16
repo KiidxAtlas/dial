@@ -88,6 +88,14 @@ pub fn plan(recipe: &Recipe, env: &Env) -> Result<Plan, Blocked> {
                 Some(brew) => return Ok(brew_plan(recipe, formula, &brew)),
                 None => missing.push("brew"),
             },
+            Method::Go(package) => match env.find("go") {
+                Some(go) => return Ok(go_plan(recipe, &destination, package, &go)),
+                None => missing.push("go"),
+            },
+            Method::Rustup(component) => match env.find("rustup") {
+                Some(rustup) => return Ok(rustup_plan(recipe, component, &rustup)),
+                None => missing.push("rustup"),
+            },
             Method::Download(prebuilt) => {
                 if let Some(asset) = super::prebuilt::current_platform()
                     .and_then(|platform| prebuilt.asset(platform))
@@ -190,6 +198,37 @@ fn brew_plan(recipe: &Recipe, formula: &str, brew: &Path) -> Plan {
         steps: vec![Step {
             program: program_text(brew),
             args: vec!["install".into(), formula.into()],
+            env: Vec::new(),
+        }],
+        expected: PathBuf::new(),
+    }
+}
+
+fn go_plan(recipe: &Recipe, destination: &Path, package: &str, go: &Path) -> Plan {
+    let bin = destination.join("bin");
+    Plan {
+        id: recipe.id,
+        method: format!("go install into {}", bin.display()),
+        destination: destination.to_path_buf(),
+        fetch: None,
+        steps: vec![Step {
+            program: program_text(go),
+            args: vec!["install".into(), package.into()],
+            env: vec![("GOBIN".into(), program_text(&bin))],
+        }],
+        expected: bin.join(recipe.program),
+    }
+}
+
+fn rustup_plan(recipe: &Recipe, component: &str, rustup: &Path) -> Plan {
+    Plan {
+        id: recipe.id,
+        method: "rustup component (installs into the Rust toolchain, no sudo)".into(),
+        destination: PathBuf::from("Rust toolchain"),
+        fetch: None,
+        steps: vec![Step {
+            program: program_text(rustup),
+            args: vec!["component".into(), "add".into(), component.into()],
             env: Vec::new(),
         }],
         expected: PathBuf::new(),
@@ -310,10 +349,29 @@ pub(crate) mod tests {
         // Bun can be downloaded on supported platforms, so only the package managers that
         // remain are named when nothing is on PATH.
         let blocked = plan(recipe("gopls").unwrap(), &env);
-        assert_eq!(blocked, Err(Blocked::NoPackageManager(vec!["brew"])));
+        assert_eq!(blocked, Err(Blocked::NoPackageManager(vec!["brew", "go"])));
         if prebuilt::current_platform().is_some() {
             assert!(plan(recipe("bun").unwrap(), &env).is_ok());
         }
+    }
+
+    #[test]
+    fn go_and_rustup_recipes_plan_into_the_expected_places() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = fake_tools(tmp.path(), &["go", "rustup"]);
+        let gopls = plan(recipe("gopls").unwrap(), &env).unwrap();
+        assert_eq!(gopls.steps[0].args[0], "install");
+        assert_eq!(
+            gopls.steps[0].env,
+            vec![(
+                "GOBIN".to_owned(),
+                env.user_dir.join("tools/gopls/bin").display().to_string()
+            )]
+        );
+        assert_eq!(gopls.expected, env.user_dir.join("tools/gopls/bin/gopls"));
+        let ra = plan(recipe("rust-analyzer").unwrap(), &env).unwrap();
+        assert_eq!(ra.steps[0].args, vec!["component", "add", "rust-analyzer"]);
+        assert!(ra.expected.as_os_str().is_empty());
     }
 
     #[test]

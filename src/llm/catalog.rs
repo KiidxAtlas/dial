@@ -329,7 +329,13 @@ pub fn local_model_metadata(model: &Path) -> ModelMetadata {
             vision: Some(crate::llm::local_format::gguf_projector(model).is_some()),
             ..Default::default()
         };
-        if let Some(template) = &info.chat_template {
+        if info
+            .architecture
+            .as_deref()
+            .is_some_and(|arch| GGUF_EMBEDDING_ARCHITECTURES.contains(&arch))
+        {
+            metadata.kind = ModelKind::Embedding;
+        } else if let Some(template) = &info.chat_template {
             classify_template(&mut metadata, template);
         }
         return metadata;
@@ -1530,6 +1536,18 @@ fn annotate_lmstudio(models: &mut [ModelEntry], info: &[LmStudioModel]) {
         }
     }
 }
+
+/// GGUF `general.architecture` values of encoder-only embedding models (llama.cpp names).
+const GGUF_EMBEDDING_ARCHITECTURES: [&str; 8] = [
+    "bert",
+    "nomic-bert",
+    "nomic-bert-moe",
+    "jina-bert-v2",
+    "modern-bert",
+    "neo-bert",
+    "eurobert",
+    "t5encoder",
+];
 
 /// Encoder architectures and model types that embed text without a language-model head.
 const EMBEDDING_ARCHITECTURES: [&str; 11] = [

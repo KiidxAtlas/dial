@@ -57,16 +57,22 @@ struct Source {
     python: PathBuf,
 }
 
-/// The shelves of the group: one Hugging Face weight format, or the curated embedding models.
+/// The shelves of the group: one Hugging Face weight format, a Hugging Face browse shelf for
+/// embedding models, or the curated embedding models.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shelf {
     Hub(Family),
+    /// Browse Hugging Face for embedding models (pipeline tag `feature-extraction`); downloads are
+    /// GGUF embedders, which Dial then serves through `llama-server` and assigns to the embedding
+    /// role. Reuses the Hub download flow but searches embeddings instead of weight formats.
+    EmbeddingHub,
     Embedding,
 }
 
-const SHELVES: [Shelf; 3] = [
+const SHELVES: [Shelf; 4] = [
     Shelf::Hub(Family::Mlx),
     Shelf::Hub(Family::Gguf),
+    Shelf::EmbeddingHub,
     Shelf::Embedding,
 ];
 
@@ -74,14 +80,16 @@ impl Shelf {
     fn label(self) -> &'static str {
         match self {
             Shelf::Hub(family) => family.label(),
-            Shelf::Embedding => "Embedding",
+            Shelf::EmbeddingHub => "Embeddings",
+            Shelf::Embedding => "Curated",
         }
     }
 
     fn next(self) -> Self {
         match self {
             Shelf::Hub(Family::Mlx) => Shelf::Hub(Family::Gguf),
-            Shelf::Hub(Family::Gguf) => Shelf::Embedding,
+            Shelf::Hub(Family::Gguf) => Shelf::EmbeddingHub,
+            Shelf::EmbeddingHub => Shelf::Embedding,
             Shelf::Embedding => Shelf::Hub(Family::Mlx),
         }
     }
@@ -90,15 +98,22 @@ impl Shelf {
         match self {
             Shelf::Hub(Family::Mlx) => Shelf::Embedding,
             Shelf::Hub(Family::Gguf) => Shelf::Hub(Family::Mlx),
-            Shelf::Embedding => Shelf::Hub(Family::Gguf),
+            Shelf::EmbeddingHub => Shelf::Hub(Family::Gguf),
+            Shelf::Embedding => Shelf::EmbeddingHub,
         }
     }
 
     fn family(self) -> Option<Family> {
         match self {
             Shelf::Hub(family) => Some(family),
+            Shelf::EmbeddingHub => Some(Family::Gguf),
             Shelf::Embedding => None,
         }
+    }
+
+    /// Whether this shelf searches Hugging Face for embedding models rather than weight formats.
+    fn embeddable(self) -> bool {
+        matches!(self, Shelf::EmbeddingHub)
     }
 }
 
@@ -397,7 +412,7 @@ impl ModelDownloads {
         }
         let enter = if self.focus == Focus::Query {
             match self.shelf {
-                Shelf::Hub(_) => "search",
+                Shelf::Hub(_) | Shelf::EmbeddingHub => "search",
                 Shelf::Embedding => "list",
             }
         } else {
@@ -508,6 +523,10 @@ impl ModelDownloads {
             match self.shelf {
                 Shelf::Hub(_) => {
                     " Enter searches Hugging Face; an empty query browses suggested models."
+                        .to_owned()
+                }
+                Shelf::EmbeddingHub => {
+                    " Enter searches Hugging Face for embedding models; an empty query browses popular embedders."
                         .to_owned()
                 }
                 Shelf::Embedding => {
@@ -664,7 +683,10 @@ impl ModelDownloads {
         self.metadata = None;
         self.metadata_attempted.clear();
         self.message.clear();
-        if self.shelf.family().is_some() && self.query.trim().is_empty() {
+        if self.shelf.embeddable() {
+            // Browse popular embedders (or re-run the query) rather than chat-model suggestions.
+            self.run_embedding_search();
+        } else if self.shelf.family().is_some() && self.query.trim().is_empty() {
             self.show_curated();
         }
     }
@@ -693,7 +715,7 @@ impl ModelDownloads {
     /// Every selectable row, in display order: available downloads, then installed models.
     fn picks(&self) -> Vec<Pick> {
         match self.shelf {
-            Shelf::Hub(_) => self
+            Shelf::Hub(_) | Shelf::EmbeddingHub => self
                 .available_hits()
                 .into_iter()
                 .map(Pick::Hit)
@@ -740,6 +762,12 @@ impl ModelDownloads {
             match self.shelf {
                 Shelf::Hub(_) => {
                     self.run_search();
+                    if self.query.trim().is_empty() {
+                        self.focus = Focus::Results;
+                    }
+                }
+                Shelf::EmbeddingHub => {
+                    self.run_embedding_search();
                     if self.query.trim().is_empty() {
                         self.focus = Focus::Results;
                     }
@@ -841,6 +869,19 @@ impl ModelDownloads {
                 self.focus = Focus::Results;
             }
             Shelf::Hub(_) => self.run_search(),
+            Shelf::EmbeddingHub if self.query.trim().is_empty() => {
+                // Browse popular embedders; keep the query so switching back re-searches.
+                self.curated = false;
+                self.hits.clear();
+                self.browse_attempted = true;
+                self.metadata = None;
+                self.metadata_attempted.clear();
+                self.search = None;
+                self.cursor = 0;
+                self.start_embedding_search();
+                self.focus = Focus::Results;
+            }
+            Shelf::EmbeddingHub => self.run_embedding_search(),
             Shelf::Embedding => {
                 self.search = None;
                 self.focus = Focus::Results;
@@ -891,6 +932,39 @@ impl ModelDownloads {
         });
         self.search = Some(rx);
         self.status = format!("loading {} catalog from Hugging Face…", family.label());
+    }
+
+    /// Starts a Hugging Face search for embedding models (pipeline tag `feature-extraction`).
+    /// Mirrors [`start_search`] but calls the embedder search and tags results as GGUF, which is
+    /// what `llama-server` serves. Network only; no weights are fetched here.
+    fn start_embedding_search(&mut self) {
+        let query = self.query.trim().to_owned();
+        self.browse_attempted = true;
+        self.metadata = None;
+        self.metadata_attempted.clear();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                download::search_embedding(&query).map_err(|error| format!("{error:#}")),
+            );
+        });
+        self.search = Some(rx);
+        self.status = "loading embedding models from Hugging Face…".into();
+    }
+
+    /// Runs the embedding search for the current query. Empty query browses popular embedders; a
+    /// non-empty query clears the list first. Mirrors [`run_search`] but uses the embedder search.
+    fn run_embedding_search(&mut self) {
+        if self.query.trim().is_empty() {
+            if self.source.is_none() {
+                return;
+            }
+        } else {
+            self.hits.clear();
+            self.curated = false;
+            self.cursor = 0;
+        }
+        self.start_embedding_search();
     }
 
     /// Enter on a result: list its files (sizes, and quantizations for GGUF). Nothing is downloaded yet.
@@ -1236,7 +1310,8 @@ impl ModelDownloads {
 
     fn facts_line(&self, width: usize, theme: &Theme) -> Line<'static> {
         let facts = match self.shelf {
-            Shelf::Hub(family) => {
+            Shelf::Hub(_) | Shelf::EmbeddingHub => {
+                let family = self.shelf.family().unwrap_or(Family::Gguf);
                 let memory = match self.dashboard.memory_bytes {
                     Some(bytes) => format!(
                         "{:.1} GiB {}",
@@ -1276,6 +1351,7 @@ impl ModelDownloads {
         if focused && self.query.is_empty() {
             let placeholder = match self.shelf {
                 Shelf::Hub(_) => "  type a name, Enter searches Hugging Face",
+                Shelf::EmbeddingHub => "  type to search embedders, Enter searches Hugging Face",
                 Shelf::Embedding => "  type to filter the catalog",
             };
             spans.push(Span::styled(placeholder, theme.fg(Tok::Dim)));
@@ -1310,7 +1386,8 @@ impl ModelDownloads {
         };
         let mut rows = Vec::new();
         match self.shelf {
-            Shelf::Hub(family) => {
+            Shelf::Hub(_) | Shelf::EmbeddingHub => {
+                let family = self.shelf.family().unwrap_or(Family::Gguf);
                 let available = self.available_hits();
                 rows.push(heading(if available.is_empty() {
                     "No new models match · try a search"
@@ -2243,4 +2320,4 @@ mod tests {
         assert!(shown.contains("repo unknown"));
         assert!(shown.contains("published unknown"));
     }
-}
+}   
