@@ -81,6 +81,11 @@ pub(crate) fn detect(
 }
 
 fn inspect(prefix: &Path, source: String) -> Option<PythonEnv> {
+    inspect_layout(prefix, source, cfg!(windows))
+}
+
+// An explicit layout keeps both platforms covered by filesystem fixtures on every test host.
+fn inspect_layout(prefix: &Path, source: String, windows: bool) -> Option<PythonEnv> {
     let config = prefix.join("pyvenv.cfg");
     if config.is_file() {
         let text = std::fs::read_to_string(&config).ok()?;
@@ -92,21 +97,36 @@ fn inspect(prefix: &Path, source: String) -> Option<PythonEnv> {
                 .map(|(_, value)| value.as_str())
         };
         let mut launchers = Vec::new();
-        // The venv's own link usually points at the base interpreter; a copied binary inside the
-        // workspace is rejected later by resolve_operator_executable, so `home` remains the fallback.
-        launchers.push(prefix.join("bin").join("python"));
+        // Windows venv executables are redirectors, not the base interpreter. Use the absolute
+        // configured base; every candidate still passes resolve_operator_executable/preflight.
+        if windows {
+            if let Some(executable) = value("executable")
+                .or(value("base-executable"))
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+            {
+                launchers.push(executable);
+            }
+        } else {
+            // POSIX venv links normally resolve to the base; workspace copies are rejected later.
+            launchers.push(prefix.join("bin").join("python"));
+        }
         if let Some(home) = value("home")
             .map(PathBuf::from)
             .filter(|home| home.is_absolute())
         {
-            if let Some(minor) = value("version_info")
-                .or(value("version"))
-                .and_then(major_minor)
-            {
-                launchers.push(home.join(format!("python{}.{}", minor.0, minor.1)));
+            if windows {
+                launchers.push(home.join("python.exe"));
+            } else {
+                if let Some(minor) = value("version_info")
+                    .or(value("version"))
+                    .and_then(major_minor)
+                {
+                    launchers.push(home.join(format!("python{}.{}", minor.0, minor.1)));
+                }
+                launchers.push(home.join("python3"));
+                launchers.push(home.join("python"));
             }
-            launchers.push(home.join("python3"));
-            launchers.push(home.join("python"));
         }
         return Some(PythonEnv {
             kind: EnvKind::Venv,
@@ -122,7 +142,11 @@ fn inspect(prefix: &Path, source: String) -> Option<PythonEnv> {
         return Some(PythonEnv {
             kind: EnvKind::Conda,
             prefix: prefix.to_path_buf(),
-            launchers: vec![bin.join("python3"), bin.join("python")],
+            launchers: if windows {
+                vec![prefix.join("python.exe")]
+            } else {
+                vec![bin.join("python3"), bin.join("python")]
+            },
             include_system_site: true,
             source,
         });
@@ -148,6 +172,23 @@ fn major_minor(version: &str) -> Option<(u64, u64)> {
 
 /// The venv's `site-packages` for the interpreter version that will actually run it.
 pub(crate) fn site_packages(prefix: &Path, version: (u64, u64)) -> Result<PathBuf, String> {
+    site_packages_layout(prefix, version, cfg!(windows))
+}
+
+fn site_packages_layout(
+    prefix: &Path,
+    version: (u64, u64),
+    windows: bool,
+) -> Result<PathBuf, String> {
+    if windows {
+        let wanted = prefix.join("Lib").join("site-packages");
+        return wanted.is_dir().then_some(wanted).ok_or_else(|| {
+            format!(
+                "virtualenv {} has no Lib/site-packages; recreate it with the base interpreter or set kernel.venv = \"off\"",
+                prefix.display()
+            )
+        });
+    }
     let wanted = prefix
         .join("lib")
         .join(format!("python{}.{}", version.0, version.1))
@@ -194,11 +235,12 @@ mod tests {
         let prefix = venv(
             dir.path(),
             ".venv",
-            "home = /opt/py/bin\n# note\ninclude-system-site-packages = false\nversion = 3.12.4\n",
+            &format!(
+                "home = {}\n# note\ninclude-system-site-packages = false\nversion = 3.12.4\n",
+                dir.path().join("base/bin").display()
+            ),
         );
-        let found = detect(dir.path(), "auto", "python3", &|_| None)
-            .unwrap()
-            .unwrap();
+        let found = inspect_layout(&prefix, "workspace .venv".into(), false).unwrap();
         assert_eq!(found.kind, EnvKind::Venv);
         assert_eq!(found.prefix, prefix);
         assert!(!found.include_system_site);
@@ -206,9 +248,9 @@ mod tests {
             found.launchers,
             vec![
                 prefix.join("bin/python"),
-                PathBuf::from("/opt/py/bin/python3.12"),
-                PathBuf::from("/opt/py/bin/python3"),
-                PathBuf::from("/opt/py/bin/python"),
+                dir.path().join("base/bin/python3.12"),
+                dir.path().join("base/bin/python3"),
+                dir.path().join("base/bin/python"),
             ]
         );
         assert_eq!(found.source, "workspace .venv");
@@ -279,13 +321,82 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prefix = venv(dir.path(), ".venv", "home = /usr/bin\n");
         assert_eq!(
-            site_packages(&prefix, (3, 12)).unwrap(),
+            site_packages_layout(&prefix, (3, 12), false).unwrap(),
             prefix.join("lib/python3.12/site-packages")
         );
-        let error = site_packages(&prefix, (3, 11)).unwrap_err();
+        let error = site_packages_layout(&prefix, (3, 11), false).unwrap_err();
         assert!(
             error.contains("python3.12") && error.contains("3.11"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn windows_venv_uses_base_interpreter_and_unversioned_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("Python312");
+        let executable = base.join("python.exe");
+        let prefix = venv(
+            dir.path(),
+            ".venv",
+            &format!(
+                "home = {}\nexecutable = {}\nversion = 3.12.4\ninclude-system-site-packages = true\n",
+                base.display(),
+                executable.display()
+            ),
+        );
+        std::fs::create_dir_all(prefix.join("Scripts")).unwrap();
+        std::fs::write(prefix.join("Scripts/python.exe"), "redirector").unwrap();
+        std::fs::create_dir_all(prefix.join("Lib/site-packages")).unwrap();
+        let found = inspect_layout(&prefix, "fixture".into(), true).unwrap();
+        assert_eq!(found.launchers, vec![executable.clone(), executable]);
+        assert!(found.include_system_site);
+        assert_eq!(
+            site_packages_layout(&prefix, (3, 12), true).unwrap(),
+            prefix.join("Lib/site-packages")
+        );
+        std::fs::remove_dir(prefix.join("Lib/site-packages")).unwrap();
+        assert!(site_packages_layout(&prefix, (3, 12), true).is_err());
+    }
+
+    #[test]
+    fn windows_venv_home_fallback_and_relative_base_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("Python312");
+        let prefix = venv(dir.path(), ".venv", &format!("home = {}\n", base.display()));
+        let found = inspect_layout(&prefix, "fixture".into(), true).unwrap();
+        assert_eq!(found.launchers, vec![base.join("python.exe")]);
+        std::fs::write(
+            prefix.join("pyvenv.cfg"),
+            "home = relative\nexecutable = python.exe\n",
+        )
+        .unwrap();
+        assert!(
+            inspect_layout(&prefix, "fixture".into(), true)
+                .unwrap()
+                .launchers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn conda_interpreter_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("conda-meta")).unwrap();
+        for windows in [false, true] {
+            let found = inspect_layout(dir.path(), "fixture".into(), windows).unwrap();
+            assert_eq!(found.kind, EnvKind::Conda);
+            assert_eq!(
+                found.launchers,
+                if windows {
+                    vec![dir.path().join("python.exe")]
+                } else {
+                    vec![
+                        dir.path().join("bin/python3"),
+                        dir.path().join("bin/python"),
+                    ]
+                }
+            );
+        }
     }
 }

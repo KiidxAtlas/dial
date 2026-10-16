@@ -829,6 +829,9 @@ fn parse_models(value: &Value, probe: &Probe) -> Result<Vec<ModelEntry>> {
         .take(MAX_MODELS)
         .collect())
 }
+/// Detail of the status for an endpoint that refused the connection or did not answer in time. The
+/// settings panel shows it as "not running" for a local server, rather than as a failure.
+pub const UNREACHABLE_DETAIL: &str = "Connection failed or metadata probe timed out";
 fn probe_models(probe: &Probe) -> (ProviderStatus, Vec<ModelEntry>) {
     if super::model_config::validate_headers(probe.spec.headers.as_deref().unwrap_or_default())
         .is_err()
@@ -966,7 +969,7 @@ fn probe_models(probe: &Probe) -> (ProviderStatus, Vec<ModelEntry>) {
                 status(
                     probe,
                     "unavailable",
-                    "Connection failed or metadata probe timed out",
+                    UNREACHABLE_DETAIL,
                     0,
                 ),
                 Vec::new(),
@@ -1671,7 +1674,7 @@ fn resolve_local_model_in(
     )
 }
 
-fn hf_cache() -> Option<PathBuf> {
+pub(crate) fn hf_cache() -> Option<PathBuf> {
     std::env::var_os("HF_HUB_CACHE")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -3486,8 +3489,15 @@ mod tests {
         )]);
         assert!(is_llama_server(&llama, None, &[]));
         let other = routed(vec![]);
-        assert!(!is_llama_server(&other, None, &[]), "/props 404 is not llama.cpp");
-        assert!(!is_llama_server("https://api.example.invalid/v1", Some("secret"), &[]));
+        assert!(
+            !is_llama_server(&other, None, &[]),
+            "/props 404 is not llama.cpp"
+        );
+        assert!(!is_llama_server(
+            "https://api.example.invalid/v1",
+            Some("secret"),
+            &[]
+        ));
     }
     #[test]
     fn servers_without_the_native_api_are_listed_unchanged() {

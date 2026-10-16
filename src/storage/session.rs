@@ -185,7 +185,25 @@ pub struct SessionInfo {
     pub last_answer: String,
     /// Real user requests on the active branch, including compacted history.
     pub user_messages: usize,
+    /// Working directory recorded in the header (the project root), or the project directory name.
     pub project: String,
+}
+
+impl SessionInfo {
+    /// A conversation has at least one user request on its active branch. Empty sessions do not
+    /// count for resume, `-c`, or the picker's default view.
+    pub fn is_conversation(&self) -> bool {
+        self.user_messages > 0
+    }
+}
+
+/// The most recently active conversation. Callers pass a catalogue in any order; `-c` and the
+/// resume picker share this single selection.
+pub fn latest_conversation(sessions: &[SessionInfo]) -> Option<&SessionInfo> {
+    sessions
+        .iter()
+        .filter(|s| s.is_conversation())
+        .max_by(|a, b| a.updated.cmp(&b.updated).then_with(|| a.id.cmp(&b.id)))
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +383,13 @@ fn file_id(name: &str) -> Option<&str> {
 }
 
 // ---------------------------------------------------------------- file helpers
+
+/// Removes a partially moved session: its stream journal first, then the main file. Source files
+/// are never touched. Best effort; the caller already has the error to report.
+fn discard_moved_copy(dst: &Path) {
+    let _ = crate::runtime::stream_journal::remove(dst);
+    let _ = fs::remove_file(dst);
+}
 
 fn private_dir(dir: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
@@ -922,25 +947,47 @@ impl Session {
         Self::list_paths(session_files(&layout.sessions_dir())?, limit)
     }
 
-    /// Activity-ordered picker snapshot, pinned first. Reads journals once without mutating them.
-    /// `limit` budgets conversations and empty sessions separately (at most `2 * limit` rows),
-    /// so recent empty journals cannot displace conversations and callers can toggle empties.
+    /// Activity-ordered picker snapshot of this project, pinned first. Reads journals once without
+    /// mutating them. `limit` budgets conversations and empty sessions separately (at most `2 * limit`
+    /// rows), so recent empty journals cannot displace conversations and callers can toggle empties.
     /// Original active-branch records supply previews; bootstrap/compaction prefixes do not.
     pub fn list_for_picker(layout: &Layout, limit: usize) -> Result<Vec<SessionInfo>> {
+        Self::picker_snapshot(session_files(&layout.sessions_dir())?, layout, limit)
+    }
+
+    /// The picker's "all projects" scope: the same snapshot over every project's journals.
+    pub fn list_for_picker_all(layout: &Layout, limit: usize) -> Result<Vec<SessionInfo>> {
+        Self::picker_snapshot(Self::all_session_files(layout)?, layout, limit)
+    }
+
+    /// Journal count for the picker scope, "M" in "showing N of M". Parses nothing.
+    pub fn count_for_picker(layout: &Layout, all: bool) -> Result<usize> {
+        Ok(if all {
+            Self::all_session_files(layout)?.len()
+        } else {
+            session_files(&layout.sessions_dir())?.len()
+        })
+    }
+
+    fn picker_snapshot(
+        paths: Vec<PathBuf>,
+        layout: &Layout,
+        limit: usize,
+    ) -> Result<Vec<SessionInfo>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let pinned = session_pins::load(&layout.user_dir)?;
-        let mut sessions = Self::list_paths(session_files(&layout.sessions_dir())?, usize::MAX)?;
+        let mut sessions = Self::list_paths(paths, usize::MAX)?;
         // Stable sorting preserves newest-created order for equal activity timestamps.
         sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
         let mut sessions = session_pins::sort_pinned_first(sessions, &pinned, |s| &s.id);
         let (mut conversations, mut empty) = (0usize, 0usize);
         sessions.retain(|session| {
-            let count = if session.user_messages == 0 {
-                &mut empty
-            } else {
+            let count = if session.is_conversation() {
                 &mut conversations
+            } else {
+                &mut empty
             };
             if *count >= limit {
                 return false;
@@ -951,8 +998,8 @@ impl Session {
         Ok(sessions)
     }
 
-    /// Sessions across every project, newest first.
-    pub fn list_all(layout: &Layout, limit: usize) -> Result<Vec<SessionInfo>> {
+    /// Journals of every project under the user dir, newest file first.
+    fn all_session_files(layout: &Layout) -> Result<Vec<PathBuf>> {
         let mut paths = Vec::new();
         let projects = layout.user_dir.join("projects");
         if projects.is_dir() {
@@ -964,8 +1011,91 @@ impl Session {
             }
         }
         paths.sort_unstable_by(|a, b| b.file_name().cmp(&a.file_name()));
+        Ok(paths)
+    }
+
+    /// Sessions across every project, newest file first, pinned first.
+    pub fn list_all(layout: &Layout, limit: usize) -> Result<Vec<SessionInfo>> {
         let pinned = session_pins::load(&layout.user_dir)?;
-        Self::list_paths(pinned_first(paths, &pinned), limit)
+        Self::list_paths(pinned_first(Self::all_session_files(layout)?, &pinned), limit)
+    }
+
+    /// This project's sessions by activity (last accepted write first), ignoring pins. The first
+    /// entry of `latest_conversation` over this list is the session `-c` resumes.
+    pub fn list_by_activity(layout: &Layout, limit: usize) -> Result<Vec<SessionInfo>> {
+        let mut sessions = Self::list_paths(session_files(&layout.sessions_dir())?, usize::MAX)?;
+        sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
+        sessions.truncate(limit);
+        Ok(sessions)
+    }
+
+    /// Whether another process holds this journal's writer lock. The shared probe is released
+    /// immediately; the file is never claimed or changed.
+    pub fn open_elsewhere(path: &Path) -> bool {
+        let Ok(file) =
+            platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path)
+        else {
+            return false;
+        };
+        matches!(
+            FileExt::try_lock_shared(&file),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        )
+    }
+
+    /// Model recorded in the session header.
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    /// Timestamp of the last accepted journal entry, falling back to the start time.
+    pub fn updated_at(&self) -> String {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| !e.ts.is_empty())
+            .map_or_else(|| self.started.clone(), |e| e.ts.clone())
+    }
+
+    /// Active-branch conversation turns as `(role, text)`, for the picker's preview pane.
+    pub fn preview_turns(path: &Path) -> Result<Vec<(String, String)>> {
+        let s = Self::read(path)?;
+        let mut turns = Vec::new();
+        for &i in &s.active.branch {
+            let Kind::Message(message) = &s.entries[i].kind else {
+                continue;
+            };
+            if is_conversation_message(message) {
+                turns.push((
+                    role_of(message).to_owned(),
+                    truncate_chars(&content_text(message), PICKER_PREVIEW_CHARS),
+                ));
+            }
+        }
+        Ok(turns)
+    }
+
+    /// Project root recorded in a journal's header `cwd`, read from the header line only.
+    pub fn project_root(path: &Path) -> Option<PathBuf> {
+        let file =
+            platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path).ok()?;
+        let mut reader = BufReader::new(file);
+        let mut buf = Vec::new();
+        let line = read_bounded_line(&mut reader, &mut buf).ok()??;
+        if line.oversized {
+            return None;
+        }
+        let header: Value = serde_json::from_slice(&buf).ok()?;
+        (header["type"] == "session")
+            .then(|| header["cwd"].as_str().map(PathBuf::from))
+            .flatten()
+    }
+
+    /// Notice for a listing that shows `shown` of `total` sessions; `None` when nothing is hidden.
+    pub fn listing_notice(shown: usize, total: usize) -> Option<String> {
+        (shown < total).then(|| {
+            format!("Showing {shown} of {total} sessions; use --all for the full list")
+        })
     }
 
     /// Sessions whose id starts with `prefix`, newest first, pinned first. Only journals whose file
@@ -1005,8 +1135,18 @@ impl Session {
 
     /// Copies this journal into `target`'s sessions directory with the header cwd rewritten,
     /// then opens the copy as its writer. The caller swaps the copy in and calls `remove_file`
-    /// on the old session. On failure the copy is removed and `self` is untouched.
+    /// on the old session. On failure the copy and its stream journal are removed and `self` is
+    /// untouched.
     pub fn relocate_to(&self, target: &Layout) -> Result<Session> {
+        self.relocate_with(target, Session::open)
+    }
+
+    /// `relocate_to` with the reopen step injected so tests can fail it after the copy succeeds.
+    fn relocate_with(
+        &self,
+        target: &Layout,
+        reopen: impl FnOnce(&Path) -> Result<Session>,
+    ) -> Result<Session> {
         let src = self
             .path
             .as_ref()
@@ -1045,21 +1185,14 @@ impl Session {
         })();
         drop(out);
         if let Err(err) = written {
-            let _ = fs::remove_file(&dst);
+            discard_moved_copy(&dst);
             return Err(err).context("writing moved session");
         }
         if let Err(error) = crate::runtime::stream_journal::copy(src, &dst) {
-            let _ = fs::remove_file(&dst);
-            let _ = crate::runtime::stream_journal::remove(&dst);
+            discard_moved_copy(&dst);
             return Err(error);
         }
-        match Session::open(&dst) {
-            Ok(moved) => Ok(moved),
-            Err(err) => {
-                let _ = fs::remove_file(&dst);
-                Err(err)
-            }
-        }
+        reopen(dst.as_path()).inspect_err(|_| discard_moved_copy(&dst))
     }
 
     /// Workspace roots added beyond the project root, as recorded in the session header.
@@ -1149,12 +1282,7 @@ impl Session {
             }
             let Ok(s) = Self::load(&path) else { continue };
             let first_message = s.first_message();
-            let updated = s
-                .entries
-                .iter()
-                .rev()
-                .find(|e| !e.ts.is_empty())
-                .map_or_else(|| s.started.clone(), |e| e.ts.clone());
+            let updated = s.updated_at();
             let (mut last_message, mut last_answer, mut user_messages) =
                 (String::new(), String::new(), 0usize);
             for &i in &s.active.branch {
@@ -1178,12 +1306,18 @@ impl Session {
                     }
                 }
             }
-            let project = path
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            // The header's working directory names the project for display; the directory name is
+            // the fallback for headers that lack one.
+            let project = Self::project_root(&path).map_or_else(
+                || {
+                    path.parent()
+                        .and_then(Path::parent)
+                        .and_then(Path::file_name)
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                },
+                |root| root.display().to_string(),
+            );
             out.push(SessionInfo {
                 title: s.title(),
                 messages: s.message_count(),
@@ -3394,6 +3528,50 @@ mod tests {
         assert_eq!(body.result.phase, crate::runtime::Phase::Interrupted);
         assert!(!reopened.messages().iter().any(|m| m["role"] == "assistant"));
     }
+
+    #[test]
+    fn failed_reopen_after_stream_copy_removes_destination_and_keeps_source() {
+        let e = env();
+        let mut session = new_session(&e);
+        session.append(user("stream until interrupted")).unwrap();
+        let tree = session.runtime();
+        let answer = tree.start("assistant", "answer", None);
+        answer.append("visible prefix");
+        let src = session.path().unwrap().to_owned();
+        let src_streams = crate::runtime::stream_journal::path(&src);
+        let src_bytes = fs::read(&src).unwrap();
+        let streams_bytes = fs::read(&src_streams).unwrap();
+        assert!(
+            !streams_bytes.is_empty(),
+            "the live runtime must be journaled"
+        );
+        let target_project = tempfile::tempdir().unwrap();
+        let target =
+            Layout::with_user_dir(target_project.path(), e._home.path().join("dial")).unwrap();
+        let dst = target.sessions_dir().join(src.file_name().unwrap());
+        let dst_streams = crate::runtime::stream_journal::path(&dst);
+        // A second hard link makes the copied stream journal invalid, so the reopen fails only
+        // after `stream_journal::copy` has already written it.
+        let extra_link = e._home.path().join("extra-link.streams");
+        let reopen = |moved: &Path| {
+            fs::hard_link(crate::runtime::stream_journal::path(moved), &extra_link).unwrap();
+            Session::open(moved)
+        };
+        assert!(session.relocate_with(&target, reopen).is_err());
+        fs::remove_file(&extra_link).unwrap();
+        assert!(!dst.exists(), "moved main file must be removed");
+        assert!(
+            !dst_streams.exists(),
+            "moved stream journal must be removed"
+        );
+        assert_eq!(fs::read(&src).unwrap(), src_bytes);
+        assert_eq!(fs::read(&src_streams).unwrap(), streams_bytes);
+        let body = session.runtime().bodies("assistant")[0].snapshot();
+        assert_eq!(body.result.text, "visible prefix");
+        drop(answer);
+        drop(tree);
+    }
+
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -4176,6 +4354,44 @@ mod tests {
         assert_eq!(rows[1].id, newer.id());
         assert_eq!(rows.len(), 4);
         assert!(Session::list_for_picker(&e.layout, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn listing_helpers_pick_latest_conversation_report_project_and_lock_state() {
+        let e = env();
+        let mut old = new_session(&e);
+        old.append(user("older conversation")).unwrap();
+        old.append(assistant("the answer")).unwrap();
+        let mut empty = new_session(&e);
+        empty
+            .append(json!({"role":"user","content":"bootstrap","dial_transient":true}))
+            .unwrap();
+        let rows = Session::list_by_activity(&e.layout, usize::MAX).unwrap();
+        assert_eq!(rows.len(), 2);
+        let empty_row = rows.iter().find(|s| s.id == empty.id()).unwrap();
+        assert!(!empty_row.is_conversation());
+        let old_row = rows.iter().find(|s| s.id == old.id()).unwrap();
+        assert!(old_row.is_conversation());
+        assert_eq!(latest_conversation(&rows).unwrap().id, old.id());
+        assert_eq!(old_row.project, e.layout.project_root.display().to_string());
+        assert_eq!(Session::count_for_picker(&e.layout, false).unwrap(), 2);
+        let path = old.path().unwrap().to_owned();
+        assert_eq!(
+            Session::preview_turns(&path).unwrap(),
+            [
+                ("user".to_owned(), "older conversation".to_owned()),
+                ("assistant".to_owned(), "the answer".to_owned())
+            ]
+        );
+        // A live writer in this process holds the journal's lock, so another opener sees it busy.
+        assert!(Session::open_elsewhere(&path));
+        drop(old);
+        assert!(!Session::open_elsewhere(&path));
+        assert_eq!(
+            Session::listing_notice(30, 45).as_deref(),
+            Some("Showing 30 of 45 sessions; use --all for the full list")
+        );
+        assert!(Session::listing_notice(3, 3).is_none());
     }
 
     #[test]

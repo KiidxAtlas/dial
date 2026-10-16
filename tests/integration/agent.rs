@@ -54,6 +54,196 @@ enum Reply {
     Think { reasoning: String, pause: Duration },
 }
 
+#[test]
+fn parent_schedules_nohook_reads_concurrently() {
+    struct ConcurrentRead(AtomicUsize);
+    impl dial::tools::ext::Tool for ConcurrentRead {
+        fn name(&self) -> &str {
+            "harness_probe"
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"function","function":{"name":"harness_probe","description":"fixture","parameters":{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"]}}})
+        }
+        fn needs_approval(&self, _: &Value) -> bool {
+            false
+        }
+        fn concurrency(&self, _: &Value) -> dial::tools::ext::Concurrency {
+            dial::tools::ext::Concurrency::Shared
+        }
+        fn call(&self, _: &dial::tools::ext::ToolContext, args: &Value) -> ToolOutput {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.0.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            if self.0.load(Ordering::SeqCst) < 2 {
+                ToolOutput::err("reads did not overlap")
+            } else {
+                ToolOutput::ok(format!("overlapped read {}", args["index"]))
+            }
+        }
+    }
+    let server = serve(vec![
+        Reply::Call("tool_load", json!({"names":["harness_probe"]})),
+        Reply::Calls(vec![
+            ("harness_probe", json!({"index":0})),
+            ("harness_probe", json!({"index":1})),
+        ]),
+        Reply::Text("Done."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.task.max_concurrency = 2;
+    let probe = Arc::new(ConcurrentRead(AtomicUsize::new(0)));
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    a.register_tool(probe.clone()).unwrap();
+    let mut ui = Recorder::default();
+    a.turn("Inspect both values", &mut ui).unwrap();
+    assert_eq!(probe.0.load(Ordering::SeqCst), 2);
+    assert_eq!(server.requests.lock().len(), 3);
+    for index in 0..2 {
+        assert!(ui.results.iter().any(|(name, text, failed)| {
+            name == "harness_probe" && !failed && text == &format!("overlapped read {index}")
+        }));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn batched_read_hook_rewrites_are_validated_and_authorized_without_a_model_retry() {
+    for (replacement, denied, expected) in [
+        (json!({"path":"rewritten.txt"}), false, "rewritten evidence"),
+        (
+            json!({"path":"rewritten.txt", "offset":"invalid"}),
+            false,
+            "invalid tool call:",
+        ),
+        (json!({"path":"rewritten.txt"}), true, "denied"),
+    ] {
+        let server = serve(vec![
+            Reply::Calls(vec![
+                ("read", json!({"path":"first.txt"})),
+                ("read", json!({"path":"second.txt"})),
+            ]),
+            Reply::Text("Done."),
+        ]);
+        let mut e = env(&server.url, "auto");
+        e.config.task.max_concurrency = 2;
+        std::fs::write(
+            e.project.path().join("rewritten.txt"),
+            "rewritten evidence\n",
+        )
+        .unwrap();
+        e.config.hooks.push(dial::config::types::HookConfig {
+            event: "pre_tool_use".into(),
+            matcher: Some("read".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "cat >/dev/null; printf x >> pre-count; printf '%s' '{}'",
+                    json!({"input":replacement})
+                ),
+            ],
+            timeout_secs: 5,
+            fail_closed: None,
+        });
+        e.config.hooks.push(dial::config::types::HookConfig {
+            event: "post_tool_use".into(),
+            matcher: Some("read".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "cat >/dev/null; printf x >> post-count".into(),
+            ],
+            timeout_secs: 5,
+            fail_closed: None,
+        });
+        let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+        if denied {
+            a.set_permission_rules(vec![dial::agent::approval::PermissionRule {
+                effect: dial::agent::approval::Effect::Deny,
+                tool: "read".into(),
+                command_prefix: vec![],
+                paths: vec!["rewritten.txt".into()],
+            }]);
+        }
+        let mut ui = Recorder::default();
+        a.turn("Inspect the two files", &mut ui).unwrap();
+        assert_eq!(server.requests.lock().len(), 2, "no rewrite retry round");
+        let results: Vec<_> = ui
+            .results
+            .iter()
+            .filter(|(name, _, _)| name == "read")
+            .collect();
+        assert_eq!(results.len(), 2);
+        for (_, text, failed) in results {
+            assert!(text.contains(expected), "{text}");
+            assert_eq!(*failed, expected != "rewritten evidence", "{text}");
+            if *failed {
+                assert!(
+                    !text.contains("rewritten evidence"),
+                    "refused arguments executed"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(e.project.path().join("pre-count")).unwrap(),
+            "xx"
+        );
+        if denied {
+            assert!(!e.project.path().join("post-count").exists());
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(e.project.path().join("post-count")).unwrap(),
+                "xx"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn read_batch_lookahead_does_not_execute_a_later_withheld_read() {
+    let read = || Reply::Call("read", json!({"path":"repeated.txt"}));
+    let server = serve(vec![
+        read(),
+        read(),
+        Reply::Calls(vec![
+            ("read", json!({"path":"fresh.txt"})),
+            ("read", json!({"path":"repeated.txt"})),
+        ]),
+        Reply::Text("Done."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.task.max_concurrency = 2;
+    for path in ["repeated.txt", "fresh.txt"] {
+        std::fs::write(e.project.path().join(path), format!("{path} evidence\n")).unwrap();
+    }
+    // Post-only hooks preserve parallel admission and count actual executions, not displayed results.
+    e.config.hooks.push(dial::config::types::HookConfig {
+        event: "post_tool_use".into(),
+        matcher: Some("read".into()),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "cat >/dev/null; printf x >> read-count".into(),
+        ],
+        timeout_secs: 5,
+        fail_closed: None,
+    });
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let mut ui = Recorder::default();
+    a.turn("Inspect the files", &mut ui).unwrap();
+    assert_eq!(server.requests.lock().len(), 4);
+    assert_eq!(
+        std::fs::read_to_string(e.project.path().join("read-count")).unwrap(),
+        "xxx"
+    );
+    assert!(ui.results.iter().any(|(_, text, failed)| *failed
+        && text.contains("Recovery checkpoint:")
+        && text.contains("This call was not executed")));
+}
+
 #[cfg(unix)]
 #[test]
 fn coherent_runtime_stop_hooks_keep_blockers_and_input_waits_truthful() {
@@ -73,6 +263,8 @@ fn coherent_runtime_stop_hooks_keep_blockers_and_input_waits_truthful() {
         .unwrap();
     assert_eq!(report.outcome, TurnOutcome::Blocked);
     assert!(report.text.contains("Missing acceptance condition"));
+    assert!(report.text.contains("Candidate work summary"));
+    assert!(report.text.contains("Report complete."));
     assert_eq!(server.requests.lock().len(), 4);
     assert_eq!(agent.metrics().turns_completed, 0);
     assert!(agent.session().runtime().snapshots().iter().any(
@@ -95,6 +287,49 @@ fn coherent_runtime_stop_hooks_keep_blockers_and_input_waits_truthful() {
         1,
         "A stop hook cannot resume a turn waiting for the user"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_during_stop_hook_keeps_candidate_summary_without_resuming() {
+    struct CancellingHookUi {
+        cancel: Arc<AtomicBool>,
+        started: std::path::PathBuf,
+    }
+    impl Ui for CancellingHookUi {
+        fn heartbeat(&mut self) {
+            if self.started.exists() {
+                self.cancel.store(true, Ordering::SeqCst);
+                dial::platform::wake::signal();
+            }
+        }
+    }
+    let server = serve(vec![Reply::Text("Report complete.")]);
+    let mut e = env(&server.url, "auto");
+    e.config.hooks.push(dial::config::types::HookConfig {
+        event: "stop".into(),
+        matcher: None,
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "cat >/dev/null; touch hook-started; sleep 5".into(),
+        ],
+        timeout_secs: 10,
+        fail_closed: None,
+    });
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut agent = agent_with(&e, None, cancel.clone());
+    let mut ui = CancellingHookUi {
+        cancel,
+        started: e.project.path().join("hook-started"),
+    };
+    let report = agent.turn("Produce a report", &mut ui).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Interrupted);
+    assert!(report.interrupted);
+    assert!(report.text.contains("Candidate work summary"));
+    assert!(report.text.contains("Report complete."));
+    assert_eq!(server.requests.lock().len(), 1);
+    assert_eq!(agent.metrics().turns_completed, 0);
 }
 
 #[test]
@@ -3187,6 +3422,10 @@ fn compaction_keeps_recent_turns_and_replaces_older_ones_with_a_summary() {
         a.turn(q, &mut ui).unwrap();
     }
     a.compact(&mut ui).unwrap();
+    let usage = a.usage().0;
+    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests, 3);
+    assert!(usage.by_purpose[&dial::llm::usage::Purpose::Compaction].requests > 0);
+    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Compaction].requests, usage.workers.requests);
     let messages = a.session().messages();
     assert!(
         messages[0]["content"].as_str().unwrap().contains("SUMMARY"),
@@ -3363,6 +3602,7 @@ fn manual_compaction_with_nothing_to_cut_is_a_successful_no_op() {
     );
     assert_eq!(a.session().messages(), before, "history is untouched");
     assert_eq!(a.metrics().compactions, 0);
+    assert!(!a.usage().0.by_purpose.contains_key(&dial::llm::usage::Purpose::Compaction));
     assert!(
         ui.notices
             .iter()
@@ -3763,6 +4003,9 @@ fn automatic_compaction_uses_the_selected_role_during_a_live_turn() {
     a.turn("two?", &mut ui).unwrap();
     assert_eq!(a.turn("three?", &mut ui).unwrap().text, "third");
     assert_eq!(side.requests.lock()[0]["model"], "summary-model");
+    let usage = a.usage().0;
+    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests, 3);
+    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Compaction].requests, side.requests.lock().len() as u64);
     assert!(
         a.session().messages()[0]["content"]
             .as_str()
@@ -5747,6 +5990,9 @@ fn cancellation_during_automatic_checks_stops_without_a_repair_turn() {
     let start = std::time::Instant::now();
     let report = a.turn("create marker", &mut ui).unwrap();
     assert!(report.interrupted);
+    assert_eq!(report.outcome, TurnOutcome::Interrupted);
+    assert!(report.text.contains("Candidate work summary"));
+    assert!(report.text.ends_with("done"));
     assert!(
         start.elapsed() < Duration::from_secs(3),
         "cancelled checks must end promptly"
@@ -6584,9 +6830,11 @@ fn failed_focused_check_repairs_boundedly_and_never_reports_success() {
     });
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
-    let result = a.turn("create marker", &mut ui);
+    let report = a.turn("create marker", &mut ui).unwrap();
+    assert!(report.text.contains("Candidate work summary"));
+    assert!(report.text.ends_with("fixed"));
     assert_eq!(
-        result.unwrap().outcome,
+        report.outcome,
         TurnOutcome::Failed,
         "A failed final check must not become a successful turn"
     );
@@ -6642,6 +6890,8 @@ fn automatic_verification_prerequisite_failures_do_not_request_code_repairs() {
             .turn("Create marker", &mut Recorder::default())
             .unwrap();
         assert_eq!(report.outcome, TurnOutcome::Failed);
+        assert!(report.text.contains("Candidate work summary"));
+        assert!(report.text.contains("Marker written."));
         assert_eq!(
             server.requests.lock().len(),
             2,
@@ -6725,6 +6975,82 @@ fn stop_hook_reentry_cannot_reset_an_exhausted_turn_budget() {
     assert_eq!(report.steps, 1);
     assert_eq!(server.requests.lock().len(), 1);
     assert_eq!(agent.metrics().turns_completed, 0);
+    assert!(report.text.contains("Candidate work summary"));
+    assert!(report.text.contains("Report complete."));
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_hook_edits_reenter_verification_and_keep_the_turn_repair_bound() {
+    if skip_without_sandbox() {
+        return;
+    }
+    for fails_again in [false, true] {
+        let mut replies = vec![
+            Reply::Call("write", json!({"path":"marker.txt","content":"bad"})),
+            Reply::Text("Initial marker written."),
+            Reply::Call("write", json!({"path":"marker.txt","content":"fixed"})),
+            Reply::Text("Initial marker repaired."),
+            Reply::Call(
+                "write",
+                json!({"path":"marker.txt","content":if fails_again { "bad again" } else { "fixed again" }}),
+            ),
+            Reply::Text("Hook-requested marker update written."),
+        ];
+        // This request must never run: a hook cannot replenish the repair allowance.
+        replies.push(Reply::Text("Unexpected extra repair."));
+        let server = serve(replies);
+        let mut e = env(&server.url, "auto");
+        e.config.harness.max_steps = 8;
+        e.config.verification.automatic_checks = true;
+        e.config.verification.repair_attempts = 1;
+        e.config.verification.commands.push(VerificationCommand {
+            name: "marker-fixed".into(),
+            command: "grep -q fixed marker.txt".into(),
+            file_extensions: vec![],
+            timeout_secs: 5,
+        });
+        e.config.hooks.push(dial::config::types::HookConfig {
+            event: "stop".into(),
+            matcher: None,
+            command: vec!["sh".into(), "-c".into(), r#"payload=$(cat); case "$payload" in *'"stop_hook_active":false'*) printf '{"decision":"block","reason":"Update marker once more."}';; *) printf '{}';; esac"#.into()],
+            timeout_secs: 5,
+            fail_closed: None,
+        });
+        let mut agent = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+        let mut ui = Recorder::default();
+        let report = agent.turn("Create marker", &mut ui).unwrap();
+        assert_eq!(
+            report.outcome,
+            if fails_again {
+                TurnOutcome::Failed
+            } else {
+                TurnOutcome::Completed
+            }
+        );
+        assert_eq!(report.steps, 6);
+        assert_eq!(server.requests.lock().len(), 6);
+        assert_eq!(agent.metrics().repair_attempts, 1);
+        assert_eq!(
+            ui.calls.iter().filter(|name| *name == "bash").count(),
+            3,
+            "initial candidate, repair and hook update must each be checked"
+        );
+        let state = agent.session().control_state();
+        assert_eq!(
+            state["reliability"]["verification_results"][0]["status"],
+            if fails_again { "code_failed" } else { "passed" }
+        );
+        if fails_again {
+            assert!(report.text.contains("verification still fails"));
+            assert!(report.text.contains("Candidate work summary"));
+            assert!(
+                report
+                    .text
+                    .contains("Hook-requested marker update written.")
+            );
+        }
+    }
 }
 
 #[test]
@@ -7918,6 +8244,10 @@ fn semantic_find_uses_current_model_and_preserves_native_tool_pairs() {
     let report = a.turn("locate reusable value behavior", &mut ui).unwrap();
     assert_eq!(report.text, "cache implementation located");
     assert_eq!(ui.calls, ["find"]);
+    let usage = a.usage().0;
+    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Retrieval].requests, 1);
+    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests, 2);
+    assert_eq!(usage.workers.requests, 1);
     let requests = server.requests.lock();
     assert_eq!(
         requests.len(),
@@ -7975,6 +8305,9 @@ fn semantic_find_rejects_fabricated_ranking_and_exact_mode_bypasses_inference() 
         .unwrap();
     assert!(error.contains("outside captured evidence") && !error.contains("cache.rs:"));
     drop(requests);
+    let usage = a.usage().0;
+    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Retrieval].requests, 1);
+    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests, 2);
     let exact = serve(vec![
         Reply::Call("find", json!({"query":"memo.get","mode":"exact"})),
         Reply::Text("exact located"),
@@ -7987,6 +8320,7 @@ fn semantic_find_rejects_fabricated_ranking_and_exact_mode_bypasses_inference() 
     let requests = exact.requests.lock();
     assert_eq!(requests.len(), 2, "exact retrieval has no ranking request");
     assert!(requests[1]["messages"].to_string().contains("cache.rs:2-2"));
+    assert!(!a.usage().0.by_purpose.contains_key(&dial::llm::usage::Purpose::Retrieval));
 }
 
 #[test]
@@ -8027,6 +8361,10 @@ fn delegated_semantic_find_reuses_the_child_backend_and_request_budget() {
             .text,
         "delegated evidence received"
     );
+    let usage = a.usage().0;
+    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Retrieval].requests, 1);
+    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests, 4);
+    assert_eq!(usage.workers.requests, 3);
     let requests = side.requests.lock();
     assert_eq!(requests.len(), 3);
     assert!(requests.iter().all(|r| r["model"] == "side-model"));

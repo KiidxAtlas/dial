@@ -315,7 +315,7 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
         )
         .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
     }
-    let baseline = crate::benchmark::clone_project(env.workspace.root())?;
+    let baseline = crate::workspace_copy::clone_project(env.workspace.root())?;
     let before = tree(baseline.path(), env.config.solve.max_snapshot_bytes)?;
     for path in &request.allowed_paths {
         confined_destination(env.workspace.root(), path)?;
@@ -343,7 +343,7 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
             !env.interrupt.load(Ordering::SeqCst),
             "solve interrupted; source unchanged"
         );
-        let candidate = crate::benchmark::clone_project(baseline.path())?;
+        let candidate = crate::workspace_copy::clone_project(baseline.path())?;
         let workspace = Workspace::new(candidate.path())?.with_edit_mode(env.workspace.edit_mode());
         let candidate_env = subagents::Env {
             config: &child_config,
@@ -451,7 +451,7 @@ fn verify(
     let mut passed = true;
     for check in checks {
         // Each check sees the exact frozen candidate, not mutations made by another check.
-        let validation = crate::benchmark::clone_project(candidate)?;
+        let validation = crate::workspace_copy::clone_project(candidate)?;
         ensure!(
             tree(validation.path(), max_bytes)? == *expected,
             "candidate includes excluded files that cannot be verified"
@@ -513,7 +513,7 @@ pub(super) fn confined_destination(root: &Path, relative: &Path) -> Result<PathB
 }
 
 fn unchanged(root: &Path, before: &Tree, max_bytes: usize) -> Result<()> {
-    let current = crate::benchmark::clone_project(root)?;
+    let current = crate::workspace_copy::clone_project(root)?;
     ensure!(
         tree(current.path(), max_bytes)? == *before,
         "source changed during candidate search; refusing to apply any patch"
@@ -832,7 +832,7 @@ mod tests {
         }
         let source = tempfile::tempdir().unwrap();
         fs::write(source.path().join("file"), "user work").unwrap();
-        let candidate = crate::benchmark::clone_project(source.path()).unwrap();
+        let candidate = crate::workspace_copy::clone_project(source.path()).unwrap();
         fs::write(candidate.path().join("file"), "candidate").unwrap();
         let expected = tree(candidate.path(), 1000).unwrap();
         let interrupt = std::sync::atomic::AtomicBool::new(false);
@@ -957,8 +957,8 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         fs::write(source.path().join("file"), "dirty user work").unwrap();
         fs::write(source.path().join("untracked"), "keep").unwrap();
-        let first = crate::benchmark::clone_project(source.path()).unwrap();
-        let second = crate::benchmark::clone_project(source.path()).unwrap();
+        let first = crate::workspace_copy::clone_project(source.path()).unwrap();
+        let second = crate::workspace_copy::clone_project(source.path()).unwrap();
         fs::write(first.path().join("file"), "candidate").unwrap();
         assert_eq!(
             fs::read_to_string(second.path().join("file")).unwrap(),

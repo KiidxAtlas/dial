@@ -47,7 +47,16 @@ impl<'a> Agent<'a> {
         for name in self.ext.names() {
             if let Some(tool) = self.ext.get(name) {
                 for event in tool.drain_notifications() {
-                    if event.kind == "output" {
+                    if matches!(
+                        event.kind.as_str(),
+                        "background_output" | "background_progress"
+                    ) {
+                        ui.background_output(
+                            &event.name,
+                            &event.text,
+                            event.kind == "background_progress",
+                        );
+                    } else if event.kind == "output" {
                         ui.tool_output(&event.name, &event.text);
                     } else if event.kind == "progress" {
                         ui.tool_progress(&event.name, &event.text);
@@ -117,6 +126,10 @@ impl<'a> Agent<'a> {
                     memory: self.memory_runtime.as_ref(),
                     agents_messages: &self.agents_messages,
                     plan_mode: self.plan_mode,
+                    handoff: subagents::Handoff::capture(
+                        &self.session.control_state(),
+                        self.todo.tasks(),
+                    ),
                 },
                 args,
             )
@@ -187,6 +200,10 @@ impl<'a> Agent<'a> {
                         memory: self.memory_runtime.as_ref(),
                         agents_messages: &self.agents_messages,
                         plan_mode: self.plan_mode,
+                        handoff: subagents::Handoff::capture(
+                            &self.session.control_state(),
+                            self.todo.tasks(),
+                        ),
                     },
                     args,
                 ));

@@ -1,5 +1,8 @@
+#[path = "cli/benchmark/mod.rs"]
 mod benchmark_cli;
+#[path = "cli/improve.rs"]
 mod improve_cli;
+#[path = "cli/update.rs"]
 mod update;
 
 use anyhow::{Result, bail};
@@ -76,14 +79,14 @@ struct Cli {
     /// Environment variable holding the endpoint's API key.
     #[arg(long, global = true)]
     api_key_env: Option<String>,
-    /// ask | auto | readonly
-    #[arg(long, global = true)]
+    /// Tool approval policy (default: write).
+    #[arg(long, global = true, value_parser = clap::builder::PossibleValuesParser::new(dial::config::types::Approval::NAMES.iter().copied()))]
     approval: Option<String>,
     /// Approve every tool call (same as --approval auto; also accepted as --yolo / --auto-approve).
     #[arg(short = 'y', long, global = true, aliases = ["auto-approve", "yolo"])]
     yes: bool,
-    /// Approval mode: always-ask | yolo (write is not supported by Dial's policies).
-    #[arg(long = "approval-mode", global = true, value_name = "MODE")]
+    /// Compatibility alias for --approval.
+    #[arg(long = "approval-mode", global = true, value_name = "MODE", value_parser = clap::builder::PossibleValuesParser::new(dial::cli::cli_modes::APPROVAL_ALIASES.iter().map(|&(alias, _)| alias)))]
     approval_mode: Option<String>,
     /// Protocol mode: text | json | rpc | rpc-ui | acp (overrides --output-format and the default path).
     #[arg(long, global = true, value_name = "MODE")]
@@ -940,19 +943,14 @@ fn real_main(mut cli: Cli) -> Result<()> {
                     allow,
                     id,
                 } => {
-                    let entry = Entry {
-                        id: id.clone().unwrap_or_default(),
-                        prompt: prompt.clone(),
-                        every_secs: every.as_deref().map(schedule::parse_duration).transpose()?,
-                        watch: watch.clone(),
-                        allow: allow.clone(),
-                        approval: if cli.yes {
-                            "auto".into()
-                        } else {
-                            "readonly".into()
-                        },
-                        created: schedule::now(),
-                    };
+                    let entry = Entry::new(
+                        id.clone(),
+                        prompt.clone(),
+                        every.as_deref(),
+                        watch.clone(),
+                        allow.clone(),
+                        cli.yes,
+                    )?;
                     println!("added schedule {}", store.add(entry)?);
                 }
                 ScheduleCommand::List => {
@@ -990,6 +988,23 @@ fn real_main(mut cli: Cli) -> Result<()> {
             let env = dial::setup::deps::Env::current(&layout.user_dir);
             match fix {
                 None => println!("{}", dial::setup::deps::run::list_text(&env)),
+                Some(id) if id.starts_with("embeddings") => {
+                    let model = dial::setup::embeddings::model_from_id(id)
+                        .ok_or_else(|| anyhow::anyhow!("unknown embedding model in {id}"))?;
+                    if *yes {
+                        let cancel = std::sync::atomic::AtomicBool::new(false);
+                        let summary =
+                            dial::setup::embeddings::setup(&layout, model, &cancel, &mut |line| {
+                                println!("{line}")
+                            })?;
+                        println!("{summary}");
+                    } else {
+                        println!(
+                            "{}\n\nRe-run with --yes to set it up.",
+                            dial::setup::embeddings::preview_text(model, &layout.user_dir)
+                        );
+                    }
+                }
                 Some(id) if !*yes => println!(
                     "{}\n\nRe-run with --yes to set it up.",
                     dial::setup::deps::run::preview_text(id, &env)
@@ -1008,11 +1023,13 @@ fn real_main(mut cli: Cli) -> Result<()> {
             return Ok(());
         }
         Some(Command::Sessions { all, action }) => {
-            let sessions = if *all {
+            let mut sessions = if *all {
                 Session::list_all(&layout, usize::MAX)?
             } else {
-                Session::list(&layout, usize::MAX)?
+                Session::list_by_activity(&layout, usize::MAX)?
             };
+            // Activity order in both views: the most recently written session first.
+            sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
             if let Some(action) = action {
                 let id = match action {
                     SessionCommand::Export { id, .. } | SessionCommand::Rename { id, .. } => id,
@@ -1051,7 +1068,12 @@ fn real_main(mut cli: Cli) -> Result<()> {
                     }
                 }
             } else {
-                for s in sessions.iter().take(if *all { usize::MAX } else { 30 }) {
+                let shown = if *all {
+                    sessions.len()
+                } else {
+                    sessions.len().min(30)
+                };
+                for s in sessions.iter().take(shown) {
                     println!(
                         "{}  {}  {:>4} msgs  {}{}",
                         &s.id[..s.id.len().min(8)],
@@ -1059,11 +1081,14 @@ fn real_main(mut cli: Cli) -> Result<()> {
                         s.messages,
                         s.title,
                         if *all {
-                            format!("  {}", s.path.display())
+                            format!("  {}", s.project)
                         } else {
                             String::new()
                         }
                     );
+                }
+                if let Some(notice) = Session::listing_notice(shown, sessions.len()) {
+                    eprintln!("{notice}");
                 }
             }
             return Ok(());
@@ -1072,7 +1097,11 @@ fn real_main(mut cli: Cli) -> Result<()> {
             return dial::cli::annotate::run(&layout, args);
         }
         Some(Command::Config(args)) => {
-            return exit_with(dial::cli::config_models::run_config(&cwd, args)?);
+            return exit_with(dial::cli::config_models::run_config_with_overlay(
+                &cwd,
+                args,
+                Some(overlay(&cli)?),
+            )?);
         }
         Some(Command::Commit { args }) => {
             let config = Config::load(&layout, Some(overlay(&cli)?))?;
@@ -1251,22 +1280,27 @@ fn chat(
         Some(Session::ephemeral())
     } else if cli.continue_session || resume_prefix.is_some() {
         let wanted = resume_prefix.unwrap_or_default();
-        let matches: Vec<_> = Session::list_newest(&layout, usize::MAX)?
-            .into_iter()
-            .filter(|s| {
-                if wanted.is_empty() {
-                    s.messages > 0
-                } else {
-                    s.id.starts_with(&wanted)
-                }
-            })
-            .collect();
-        if !wanted.is_empty() && matches.len() > 1 {
-            bail!("session prefix {wanted:?} is ambiguous; use a longer id");
-        }
-        let found = matches.into_iter().next();
+        let catalogue = Session::list_by_activity(&layout, usize::MAX)?;
+        let found = if wanted.is_empty() {
+            // `-c` resumes the most recently active conversation; empty sessions never count.
+            let latest =
+                dial::storage::session::latest_conversation(&catalogue).map(|s| s.path.clone());
+            if latest.is_none() {
+                eprintln!("No earlier conversation in this project; starting a new session.");
+            }
+            latest
+        } else {
+            let matches: Vec<_> = catalogue
+                .iter()
+                .filter(|s| s.id.starts_with(&wanted))
+                .collect();
+            if matches.len() > 1 {
+                bail!("session prefix {wanted:?} is ambiguous; use a longer id");
+            }
+            matches.first().map(|s| s.path.clone())
+        };
         match found {
-            Some(info) => Some(Session::open(&info.path)?),
+            Some(path) => Some(Session::open(&path)?),
             None if wanted.is_empty() => None,
             None => bail!("no session to resume in this project"),
         }
@@ -1327,4 +1361,57 @@ fn longest_backtick_run(text: &str) -> usize {
         }
     }
     longest
+}
+
+#[cfg(test)]
+mod cli_contract_tests {
+    use super::*;
+
+    #[test]
+    fn approval_choices_and_aliases_are_accepted_by_the_cli() {
+        for &policy in dial::config::types::Approval::NAMES {
+            let cli = Cli::try_parse_from(["dial", "--approval", policy]).unwrap();
+            assert_eq!(cli.approval.as_deref(), Some(policy));
+        }
+        for &(alias, _) in dial::cli::cli_modes::APPROVAL_ALIASES {
+            let cli = Cli::try_parse_from(["dial", "--approval-mode", alias]).unwrap();
+            assert_eq!(cli.approval_mode.as_deref(), Some(alias));
+        }
+        assert!(Cli::try_parse_from(["dial", "--approval", "invalid"]).is_err());
+    }
+
+    #[test]
+    fn schedule_cli_accepts_comma_and_repeated_allow_lists() {
+        let cli = Cli::try_parse_from([
+            "dial",
+            "schedule",
+            "add",
+            "--every",
+            "1h",
+            "--allow",
+            "read,edit",
+            "--allow",
+            "bash",
+            "inspect the project",
+        ])
+        .unwrap();
+        let Some(Command::Schedule {
+            action:
+                ScheduleCommand::Add {
+                    prompt,
+                    every,
+                    watch,
+                    allow,
+                    id,
+                },
+        }) = cli.command
+        else {
+            panic!("expected schedule add");
+        };
+        let entry = dial::schedule::Entry::new(id, prompt, every.as_deref(), watch, allow, cli.yes)
+            .unwrap();
+        assert_eq!(entry.allow, ["read", "edit", "bash"]);
+        assert_eq!(entry.approval, "readonly");
+        assert_eq!(entry.prompt, "inspect the project");
+    }
 }

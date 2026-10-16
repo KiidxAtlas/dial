@@ -34,7 +34,7 @@ pub struct CheckRun {
     pub kind: CheckKind,
     pub tool_call_id: String,
     pub evidence_ref: String,
-    /// Missing exit status, timeouts and signal termination are not behavioral failures.
+    /// Typed exit status only for a classified pass/code failure; unknown runs invalidate baselines.
     pub exit_code: Option<i32>,
     /// Strictly increasing execution sequence within the current checkpoint turn.
     pub sequence: u64,
@@ -382,6 +382,20 @@ mod tests {
         let mut pass = run(6, 0, CheckKind::Behavioral);
         pass.evidence_ref.clear();
         assert!(tracker.observe(pass, vec![change('a', 'c')]).is_none());
+    }
+
+    #[test]
+    fn unknown_run_invalidates_an_earlier_failure_baseline() {
+        let mut tracker = Tracker::default();
+        tracker.observe(run(1, 1, CheckKind::Behavioral), vec![change('a', 'b')]);
+        let mut unknown = run(2, 0, CheckKind::Behavioral);
+        unknown.exit_code = None;
+        assert!(tracker.observe(unknown, vec![change('a', 'c')]).is_none());
+        assert!(
+            tracker
+                .observe(run(3, 0, CheckKind::Behavioral), vec![change('a', 'd')])
+                .is_none()
+        );
     }
 
     #[test]

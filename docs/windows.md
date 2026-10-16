@@ -26,6 +26,8 @@ Windows does not provide macOS Seatbelt or the Linux namespace sandbox used by D
 
 Windows shell commands are PowerShell source executed by Windows PowerShell; POSIX shell scripts are not translated. Process groups use Windows Job Objects, and background PTY jobs use ConPTY. The Python kernel is available only with `sandbox.mode = "off"`: its trusted driver installs the native `ProcessChildProcessPolicy` no-child-process mitigation before evaluating user code, but Windows filesystem/network isolation is unavailable.
 
+Python environment discovery uses Windows layouts: virtualenv packages come from `<venv>/Lib/site-packages`, while the trusted base interpreter comes from an absolute `executable`/`base-executable` or `home` in `pyvenv.cfg`, not the `Scripts/python.exe` redirector. Conda uses `<prefix>/python.exe`. Base interpreters and conda installations must still resolve outside the workspace and pass the normal interpreter preflight; environment discovery does not relax those checks.
+
 ## Known limitations
 
 - MLX/local Apple Silicon inference is unavailable; configure a hosted provider.

@@ -30,6 +30,8 @@ state, requests report `registry_default` routing.
 - `remote_model_idle_timeout_secs` defaults to 300 seconds for remote routes (ChatGPT, Anthropic, and OpenAI-compatible hosts that are not localhost or LAN). It bounds the wait for the first event and silence between events. Only actual stream progress resets it; keep-alives do not.
 - A stall maps to an incomplete stream, which is transient. It retries under `retry.max_attempts`, and the partial reply and its tool calls are discarded before the retry.
 - Local model servers (localhost or LAN) keep an unlimited first-event wait. `worker_timeout_secs` (default `0`) still governs local workers. `0` on `remote_model_idle_timeout_secs` is an explicit opt-out.
+- The agent's silence-recovery watchdog does not interrupt local model loading or prompt processing before generation begins. It still bounds silent generation and remote requests. Loading/prefill may remain silent when an engine cannot report measured progress; user cancellation and configured transport/startup limits remain active.
+- A failed or cancelled request to a Dial-managed server stops that server and its descendants before reuse. The next request starts a fresh process rather than queueing behind abandoned inference. External servers are never killed. Non-cancellation failures include a bounded stderr tail from the failed request, preserving the original error classification.
 - ChatGPT/Codex Responses requests (HTTP and websocket) send `prompt_cache_key` whenever the session has one, unless the profile sets `prompt_cache = false`. The key is derived from the session identity, account, and history generation, so it is stable within a session. API-key Responses requests keep the declared `capabilities.prompt_cache` gate and `prompt_cache` breakpoint policy.
 - The Codex backend routes prompt-cache affinity by the `session_id`/`conversation_id` headers, not by `prompt_cache_key`. The websocket handshake and HTTP SSE requests both send them (the dial session id), so a websocket-to-SSE fallback keeps its cache. A cached websocket idle for more than 30 seconds is replaced before use, because the backend evicts idle sockets without a close frame. A reused socket that fails before any event (a broken-pipe write, or a close with nothing received) is replaced inline and the request replayed in full. Only a fresh socket's failure moves that session/account/model to SSE for the process.
 
@@ -40,6 +42,22 @@ System assembly separates frozen guidance, stable project/tool context, and dyna
 New image-bearing history owns verified pixels before inference. Persistent sessions store content-addressed artifact references with source-path provenance; no-session conversations retain bytes in memory. Deleting or overwriting the original file does not alter the historical image. Legacy path-only references still verify their recorded digest, fail safely when stale, and produce bounded per-conversation notices. The harness records capture failures instead of substituting newer pixels. Ordinary artifact GC recognizes the retained image references.
 
 `Backend::wire_observation()` reports hashes and byte counts after provider transformations and image encoding, at HTTP serialization or the outgoing WebSocket request. Signed requests are measured without reserialization. Parent journals retain `provider_wire` observations. Fingerprints retain no prompt text, media, credentials or URLs; common prompt bytes are not token counts or proof of provider cache hits. Actual provider usage remains the authority for cache accounting. HTTP retries are transport attempts. A WebSocket continuation (`chained`) hashes the transmitted delta for `payload_*` but compares the full logical prompt, so an append still reads as `invalidation = none`; a prompt that held across an HTTP/WebSocket switch reads as `transport_changed`. Each accepted request's `transport`, `invalidation`, `common_prompt_bytes` and `prompt_bytes` are also stored in the stats ledger's `requests` table. A low `cache_read` with `invalidation` `none` or `transport_changed` is a provider-side miss (routing or eviction); `prompt_changed` means dial changed the prompt.
+
+## Runtime usage attribution
+
+The runtime usage ledger keeps independent main/worker and model breakdowns, plus `by_purpose`:
+`agent` (ordinary main or delegated inference), `retrieval` (semantic source ranking),
+`compaction` (foreground/background summarization, including native and remote routes), `memory`
+(recall, capture and maintenance inference), `repair` (constrained or coach repair), `judgment`
+(model-backed judgments), and `auxiliary` (side questions/rule generation). Purpose follows the
+operation, not the configured model role: the same `small` model can rank source or compact history.
+Each breakdown partitions `all`; adding breakdowns together double-counts usage. Retries, failed
+requests, cache counts and observed prices retain the request's original purpose and turn, including
+late worker results. Purpose attribution does not alter shared worker budgets or permissions.
+
+Missing provider usage and missing prices remain unknown, not zero-cost success. The ledger covers
+the current runtime, not restored historical usage or an invoice. Cache/reasoning counters have their
+own coverage fields and must not be interpreted as fully reported when those fields are absent.
 
 ## Retries and image input
 
@@ -64,8 +82,14 @@ inspection remains unavailable, the final result explicitly reports that it was 
 Known non-vision models skip images with a notice to both the user and model. Downloaded local models
 with a vision encoder in `config.json` use MLX-VLM and receive the image pixels; text-only models use
 MLX-LM. `dial setup` installs both runners in Dial's private runtime. The vision runner retains at most
-one image-feature cache and disables persistent prefix caching. External endpoints with unknown
-capabilities are attempted and may be rejected by the provider; use a vision-capable model for visual work.
+one image-feature cache and uses process-local prefix caching: at most 256 blocks and one exact
+checkpoint, with a 1 GiB cache-admission budget and 256 MiB free-memory reserve. Disk caching is
+disabled, so caches cannot cross server/profile/steering restarts. The runner checks cache compatibility
+before use and falls back to uncached inference when it cannot validate it. These are cache admission
+bounds, not a cap on the model's total or peak memory. Vision prefill reports measured token counts
+where the pinned runner exposes them, otherwise remaining in the coarse processing phase with a
+compatibility warning. External endpoints with unknown capabilities are attempted and may be rejected
+by the provider; use a vision-capable model for visual work.
 
 ## Model profiles, prompt caching and request headers
 

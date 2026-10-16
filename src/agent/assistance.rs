@@ -182,7 +182,15 @@ impl Agent<'_> {
         !self.plan_mode
             || matches!(
                 name,
-                "task" | "bg" | "lsp" | "ast_edit" | "working_state" | "tool_search" | "tool_load"
+                "task"
+                    | "message"
+                    | "exit_plan"
+                    | "bg"
+                    | "lsp"
+                    | "ast_edit"
+                    | "working_state"
+                    | "tool_search"
+                    | "tool_load"
             )
             || approval::is_read_only(&self.ext, name, &json!({}))
     }

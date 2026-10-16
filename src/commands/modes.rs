@@ -26,12 +26,12 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     super::CommandSpec {
         name: "effort",
         description: "Show or set the thinking effort for the current model",
-        args_hint: "[level]",
+        args_hint: "[level|auto]",
         subcommands: &[],
     },
     super::CommandSpec {
         name: "loop",
-        description: "Repeat a prompt after each turn, bounded by a count or duration (--while/--until gates)",
+        description: "Repeat a prompt after each turn, bounded by a count or duration",
         args_hint: "[count|duration] [--while|--until '<command>'] [prompt]",
         subcommands: &[],
     },

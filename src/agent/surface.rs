@@ -133,6 +133,10 @@ pub trait Ui {
     fn ask_user(&mut self, _title: &str, _question: &str, _options: &[String]) -> Option<String> {
         None
     }
+    /// Job identity is separate from the pending foreground tool; replace denotes a PTY snapshot.
+    fn background_output(&mut self, name: &str, text: &str, _replace: bool) {
+        self.background_notice(&format!("{name}: {text}"));
+    }
     /// Typed actual human input; cancellation is not a selected recommendation.
     fn ask_questions(
         &mut self,

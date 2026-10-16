@@ -10,11 +10,17 @@ use crate::{
     storage::{
         paths::Layout,
         settings_store::{Change, Scope},
-        skills::packages,
+        skills::packages::{self, registry::Entry as SkillEntry},
     },
     tools::{
-        mcp::{self, smithery},
-        plugin::{installer::PluginStore, marketplace::Marketplaces},
+        mcp::{
+            catalog::{self, CURATED, Candidate, Endpoints, Source},
+            smithery,
+        },
+        plugin::{
+            installer::PluginStore,
+            marketplace::{Marketplaces, SkillListing},
+        },
     },
     ui::overlay::extensions::model::{
         CatalogUpdate, Field, Form, Intent, JobProgress, Origin, Row, SharedCatalog,
@@ -23,80 +29,14 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::mpsc::{Receiver, TryRecvError, channel},
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{Receiver, TryRecvError, channel},
+    },
     thread,
 };
-
-/// A built-in MCP server that needs no API key.
-pub(crate) struct Curated {
-    pub id: &'static str,
-    pub title: &'static str,
-    pub summary: &'static str,
-    /// Runtime that must be on PATH; also the program that runs the server.
-    pub runtime: &'static str,
-    pub args: &'static [&'static str],
-    /// Whether the project root is appended as the last argument (filesystem server).
-    pub takes_root: bool,
-    /// Tools the server exposes, for the details pane.
-    pub tools: &'static str,
-}
-
-pub(crate) const CURATED: &[Curated] = &[
-    Curated {
-        id: "memory",
-        title: "Memory",
-        summary: "persistent knowledge graph across sessions",
-        runtime: "npx",
-        args: &["-y", "@modelcontextprotocol/server-memory"],
-        takes_root: false,
-        tools: "create_entities, create_relations, search_nodes, read_graph",
-    },
-    Curated {
-        id: "filesystem",
-        title: "Filesystem",
-        summary: "read and write files under the project root",
-        runtime: "npx",
-        args: &["-y", "@modelcontextprotocol/server-filesystem"],
-        takes_root: true,
-        tools: "read_file, write_file, list_directory, search_files",
-    },
-    Curated {
-        id: "sequential-thinking",
-        title: "Sequential thinking",
-        summary: "structured step-by-step reasoning tool",
-        runtime: "npx",
-        args: &["-y", "@modelcontextprotocol/server-sequential-thinking"],
-        takes_root: false,
-        tools: "sequentialthinking",
-    },
-    Curated {
-        id: "fetch",
-        title: "Fetch",
-        summary: "download web pages as markdown",
-        runtime: "uvx",
-        args: &["mcp-server-fetch"],
-        takes_root: false,
-        tools: "fetch",
-    },
-    Curated {
-        id: "time",
-        title: "Time",
-        summary: "current time and timezone conversion",
-        runtime: "uvx",
-        args: &["mcp-server-time"],
-        takes_root: false,
-        tools: "get_current_time, convert_time",
-    },
-];
-
-fn curated(id: &str) -> Result<&'static Curated> {
-    CURATED
-        .iter()
-        .find(|c| c.id == id)
-        .ok_or_else(|| anyhow!("`{id}` is not in the curated MCP list"))
-}
 
 /// Rows for the three tabs, built from disk and config.
 #[derive(Default)]
@@ -104,13 +44,15 @@ pub(crate) struct Snapshot {
     pub mcp: Vec<Row>,
     pub plugins: Vec<Row>,
     pub skills: Vec<Row>,
+    pub marketplaces: Vec<Row>,
 }
 
 pub(crate) fn snapshot(layout: &Layout, config: &Config) -> Snapshot {
     Snapshot {
         mcp: mcp_rows(config),
         plugins: plugin_rows(config),
-        skills: skill_rows(layout),
+        skills: skill_rows(layout, config),
+        marketplaces: marketplace_rows(config),
     }
 }
 
@@ -140,13 +82,15 @@ pub(crate) fn refresh(panel: &mut ExtensionsOverlay, layout: &Layout, config: &C
         .filter(|row| row.origin == Origin::Remote)
         .cloned();
     rows.mcp.extend(found);
-    panel.set_snapshot(rows.mcp, rows.plugins, rows.skills);
-    for tab in [Tab::Mcp, Tab::Plugins] {
+    panel.set_snapshot(rows.mcp, rows.plugins, rows.skills, rows.marketplaces);
+    // Listings are fetched in the background; the rows above already show what is cached.
+    for tab in [Tab::Mcp, Tab::Plugins, Tab::Skills] {
         let listing = SharedCatalog::default();
         let config = config.clone();
+        let layout = layout.clone();
         let shared = listing.clone();
         thread::spawn(move || {
-            let update = catalog_update(&smithery::registry_url(), &config, tab, "", 1);
+            let update = catalog_update(&Endpoints::live(), &layout, &config, tab, "", 1);
             if let Ok(mut slot) = shared.lock() {
                 *slot = Some(update);
             }
@@ -155,9 +99,10 @@ pub(crate) fn refresh(panel: &mut ExtensionsOverlay, layout: &Layout, config: &C
     }
 }
 
-fn skill_rows(layout: &Layout) -> Vec<Row> {
-    packages::list_packages(layout)
-        .unwrap_or_default()
+fn skill_rows(layout: &Layout, config: &Config) -> Vec<Row> {
+    let installed = packages::list_packages(layout).unwrap_or_default();
+    let mut taken = installed_skill_names(&installed);
+    let mut rows: Vec<Row> = installed
         .into_iter()
         .map(|package| {
             let source = package.source.spec();
@@ -177,7 +122,61 @@ fn skill_rows(layout: &Layout) -> Vec<Row> {
                 ],
             }
         })
+        .collect();
+    let found = match Marketplaces::new(marketplaces_root(config)).skills(None) {
+        Ok(listed) => listed.into_iter().map(listing_entry).collect(),
+        Err(_) => Vec::new(),
+    };
+    rows.extend(available_skills(found, &mut taken));
+    rows
+}
+
+/// Installed skill package names and the skill names they provide. Available skills with these
+/// names are hidden, so an installed skill is never offered again.
+fn installed_skill_names(installed: &[packages::Package]) -> BTreeSet<String> {
+    installed
+        .iter()
+        .flat_map(|package| {
+            std::iter::once(package.name.clone()).chain(package.skills.iter().cloned())
+        })
         .collect()
+}
+
+fn listing_entry(skill: SkillListing) -> (String, SkillEntry) {
+    (
+        skill.marketplace,
+        SkillEntry {
+            name: skill.name,
+            description: skill.description,
+            url: skill.url,
+        },
+    )
+}
+
+/// Rows for skills that are not installed. `taken` starts with the installed names and grows, so
+/// a skill listed by several sources shows once.
+fn available_skills(found: Vec<(String, SkillEntry)>, taken: &mut BTreeSet<String>) -> Vec<Row> {
+    found
+        .into_iter()
+        .filter(|(_, entry)| taken.insert(entry.name.clone()))
+        .map(|(marketplace, entry)| skill_row(&marketplace, &entry))
+        .collect()
+}
+
+fn skill_row(marketplace: &str, entry: &SkillEntry) -> Row {
+    Row {
+        id: entry.url.clone(),
+        title: entry.name.clone(),
+        summary: entry.description.clone(),
+        tags: vec![marketplace.to_owned(), "skill".into()],
+        origin: Origin::Remote,
+        state: State::Available,
+        details: vec![
+            format!("source: {}", entry.url),
+            format!("listed by: {marketplace}"),
+            "installs as a user skill package; no install scripts run".into(),
+        ],
+    }
 }
 
 fn mcp_rows(config: &Config) -> Vec<Row> {
@@ -199,19 +198,33 @@ fn mcp_rows(config: &Config) -> Vec<Row> {
         })
         .collect();
     for item in CURATED.iter().filter(|c| !config.mcp.contains_key(c.id)) {
+        let needs = item.env.iter().any(|(_, _, required)| *required);
+        let mut details = vec![
+            format!("runs: {} {}", item.runtime, item.args.join(" ")),
+            format!("needs: {} on PATH", item.runtime),
+        ];
+        details.extend(item.env.iter().map(|(key, description, required)| {
+            format!(
+                "{} {key}: {description}",
+                if *required { "needs" } else { "optional" }
+            )
+        }));
+        details.push(format!(
+            "installs to: {}",
+            mcp_cache_dir(&config.user_dir).display()
+        ));
+        details.push(format!("tools: {}", item.tools));
         rows.push(Row {
             id: item.id.into(),
             title: item.title.into(),
             summary: item.summary.into(),
-            tags: vec!["curated".into(), "no key".into()],
+            tags: vec![
+                "curated".into(),
+                if needs { "needs values" } else { "no key" }.into(),
+            ],
             origin: Origin::Curated,
             state: State::Available,
-            details: vec![
-                format!("runs: {} {}", item.runtime, item.args.join(" ")),
-                format!("needs: {} on PATH", item.runtime),
-                format!("installs to: {}", mcp_cache_dir(&config.user_dir).display()),
-                format!("tools: {}", item.tools),
-            ],
+            details,
         });
     }
     rows
@@ -292,79 +305,57 @@ fn marketplaces_root(config: &Config) -> PathBuf {
     config.user_dir.join("marketplaces")
 }
 
+/// Rows for the Marketplaces tab: one per registered marketplace, with what it offers.
+fn marketplace_rows(config: &Config) -> Vec<Row> {
+    let markets = Marketplaces::new(marketplaces_root(config));
+    let Ok(infos) = markets.list() else {
+        return Vec::new();
+    };
+    infos
+        .into_iter()
+        .map(|info| {
+            let plugins = markets
+                .entries(Some(info.name.as_str()))
+                .map_or(0, |e| e.len());
+            let skills = markets
+                .skills(Some(info.name.as_str()))
+                .map_or(0, |s| s.len());
+            let refreshed = info
+                .refreshed_at
+                .map_or_else(|| "never".to_owned(), |time| time.to_string());
+            Row {
+                id: info.name.clone(),
+                title: info.name.clone(),
+                summary: format!("{plugins} plugins · {skills} skills"),
+                tags: if info.builtin {
+                    vec!["built-in".into()]
+                } else {
+                    Vec::new()
+                },
+                origin: Origin::Installed,
+                state: if info.enabled {
+                    State::Enabled
+                } else {
+                    State::Disabled
+                },
+                details: vec![
+                    format!(
+                        "index: {}",
+                        if info.builtin {
+                            "built into Dial".to_owned()
+                        } else {
+                            info.index.clone()
+                        }
+                    ),
+                    format!("refreshed: {refreshed}"),
+                ],
+            }
+        })
+        .collect()
+}
+
 fn mcp_cache_dir(user_dir: &Path) -> PathBuf {
     user_dir.join("mcp")
-}
-
-/// What an install will do, shown before the user confirms.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Plan {
-    pub command: String,
-    pub location: PathBuf,
-    /// Why the install cannot run yet (missing runtime, already configured).
-    pub blocked: Option<String>,
-}
-
-pub(crate) fn plan_curated(config: &Config, id: &str) -> Result<Plan> {
-    let item = curated(id)?;
-    let (_, server) = curated_server(config, id)?;
-    let command = std::iter::once(item.runtime.to_string())
-        .chain(server.args.iter().cloned())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let blocked = if config.mcp.contains_key(item.id) {
-        Some(format!("`{id}` is already configured"))
-    } else if which(item.runtime).is_none() {
-        Some(format!(
-            "{} is not on PATH. Install it, then try again.",
-            item.runtime
-        ))
-    } else {
-        None
-    };
-    Ok(Plan {
-        command,
-        location: mcp_cache_dir(&config.user_dir),
-        blocked,
-    })
-}
-
-/// The server entry that will be health-checked and then saved. Package caches are redirected under
-/// Dial's user directory so nothing lands in a global cache the user did not pick.
-pub(crate) fn curated_server(config: &Config, id: &str) -> Result<(String, McpServerConfig)> {
-    let item = curated(id)?;
-    let mut args: Vec<String> = item.args.iter().map(|s| s.to_string()).collect();
-    if item.takes_root {
-        args.push(config.project_root.display().to_string());
-    }
-    let cache = mcp_cache_dir(&config.user_dir);
-    let env = BTreeMap::from([
-        (
-            "npm_config_cache".to_string(),
-            cache.join("npm").display().to_string(),
-        ),
-        (
-            "UV_CACHE_DIR".to_string(),
-            cache.join("uv").display().to_string(),
-        ),
-    ]);
-    let server = McpServerConfig {
-        program: PathBuf::from(item.runtime),
-        args,
-        env,
-        enabled: true,
-        ..Default::default()
-    };
-    Ok((item.id.to_string(), server))
-}
-
-/// Finds an executable on PATH without running it.
-pub(crate) fn which(program: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(program))
-            .find(|candidate| candidate.is_file())
-    })
 }
 
 /// Result of an intent. `changes` are saved by [`poll`] only when `ok` is true.
@@ -548,19 +539,22 @@ fn run(
     intent: &Intent,
     progress: &SharedProgress,
 ) -> Result<Outcome> {
-    run_at(&smithery::registry_url(), layout, config, intent, progress)
+    run_at(&Endpoints::live(), layout, config, intent, progress)
 }
 
-/// [`run`] against a given Smithery registry, so tests can point it at a local fake.
+/// [`run`] against the given registries, so tests can point them at a local fake.
 fn run_at(
-    registry: &str,
+    endpoints: &Endpoints,
     layout: &Layout,
     config: &Config,
     intent: &Intent,
     progress: &SharedProgress,
 ) -> Result<Outcome> {
     match intent {
-        Intent::InstallCuratedMcp { id } => install_curated(config, id, progress),
+        Intent::InstallCuratedMcp { id } => {
+            install_mcp(endpoints, config, id, &BTreeMap::new(), progress)
+        }
+        Intent::InstallMcp { id, values } => install_mcp(endpoints, config, id, values, progress),
         Intent::TestMcp { id } => test_mcp(config, id, progress),
         Intent::ToggleMcp { id, enable } => Ok(Outcome {
             ok: true,
@@ -594,14 +588,17 @@ fn run_at(
                 changes: Vec::new(),
             })
         }
-        Intent::SmitheryInstall { name } => smithery_install(registry, config, name, progress),
-        Intent::SmitheryKey { name, key } => smithery_key(registry, config, name, key, progress),
-        Intent::SmitheryDeploy { name, values } => {
-            smithery_deploy(registry, config, name, values, progress)
+        Intent::SmitheryInstall { name } => {
+            smithery_install(&endpoints.smithery, config, name, progress)
         }
-        Intent::SmitheryDiscover { query } => smithery_discover(registry, config, query, progress),
+        Intent::SmitheryKey { name, key } => {
+            smithery_key(&endpoints.smithery, config, name, key, progress)
+        }
+        Intent::SmitheryDeploy { name, values } => {
+            smithery_deploy(&endpoints.smithery, config, name, values, progress)
+        }
         Intent::CatalogBrowse { tab, query, page } => {
-            let update = catalog_update(registry, config, *tab, query, *page);
+            let update = catalog_update(endpoints, layout, config, *tab, query, *page);
             let ok = update.error.is_none();
             let message = update
                 .error
@@ -618,22 +615,41 @@ fn run_at(
         }
         Intent::AddMarketplace { name, index } => {
             Marketplaces::new(marketplaces_root(config)).add(name, index)?;
-            let update = catalog_update(registry, config, Tab::Plugins, "", 1);
-            if let Ok(mut shown) = progress.lock() {
-                shown.catalog = Some(update);
-            }
             Ok(Outcome {
                 ok: true,
                 message: format!("Added marketplace {name}"),
                 changes: Vec::new(),
             })
         }
+        Intent::RemoveMarketplace { name } => {
+            Marketplaces::new(marketplaces_root(config)).remove(name)?;
+            Ok(Outcome {
+                ok: true,
+                message: format!(
+                    "Removed marketplace {name}. Plugins and skills it installed stay installed."
+                ),
+                changes: Vec::new(),
+            })
+        }
+        Intent::ToggleMarketplace { name, enable } => {
+            Marketplaces::new(marketplaces_root(config)).set_enabled(name, *enable)?;
+            Ok(Outcome {
+                ok: true,
+                message: format!(
+                    "{} marketplace {name}",
+                    if *enable { "Enabled" } else { "Disabled" }
+                ),
+                changes: Vec::new(),
+            })
+        }
+        Intent::InstallSkill { source } => install_skill(layout, source, progress),
     }
 }
 
 /// Provider IO belongs on the command worker, never in the overlay. Errors retain cached rows.
 fn catalog_update(
-    registry: &str,
+    endpoints: &Endpoints,
+    layout: &Layout,
     config: &Config,
     tab: Tab,
     query: &str,
@@ -643,27 +659,24 @@ fn catalog_update(
     let result = (|| -> Result<(Vec<Row>, bool, String)> {
         match tab {
             Tab::Mcp => {
-                let key = smithery::resolve_api_key(&config.user_dir)?;
-                let (found, more) = smithery::browse_page_at(registry, query, page, key.as_deref())
-                    .map_err(|error| anyhow!("{}", error.message))?;
-                let rows: Vec<_> = found.iter().map(remote_row).collect();
-                let message = format!(
-                    "Smithery page {page}: {} usable servers · {}",
+                let found = catalog::discover(endpoints, config, query, page);
+                let rows: Vec<_> = found.candidates.iter().map(candidate_row).collect();
+                let mut message = format!(
+                    "MCP page {page}: {} servers from the official registry, Smithery and curated · {}",
                     rows.len(),
-                    if more {
+                    if found.more {
                         "n loads more"
                     } else {
                         "end of results"
                     }
                 );
-                Ok((rows, more, message))
+                if !found.notices.is_empty() {
+                    message.push_str(&format!(" · unavailable: {}", found.notices.join("; ")));
+                }
+                Ok((rows, found.more, message))
             }
             Tab::Plugins => {
                 let markets = Marketplaces::new(marketplaces_root(config));
-                if markets.list()?.is_empty() {
-                    return Ok((Vec::new(), false,
-                        "No marketplaces registered. a adds a trusted JSON index; /marketplace add <name> <index> also works.".into()));
-                }
                 markets.refresh(None)?;
                 // Validate the cached listing here so a corrupt index is not silently shown as empty.
                 markets.entries(None)?;
@@ -671,18 +684,55 @@ fn catalog_update(
                     .into_iter()
                     .filter(|row| row.origin == Origin::Remote)
                     .collect();
-                let message = format!(
-                    "{} marketplace plugins · / filters by name, description or marketplace · a adds an index",
-                    rows.len()
-                );
+                let message = if rows.is_empty() {
+                    "No plugins listed by enabled marketplaces. The Marketplaces tab adds or enables one.".to_owned()
+                } else {
+                    format!(
+                        "{} marketplace plugins · / filters by name, description or marketplace",
+                        rows.len()
+                    )
+                };
                 Ok((rows, false, message))
             }
-            Tab::Skills => Ok((
-                Vec::new(),
-                false,
-                "Skill packages have no catalog; install one with /skills install <git-url>."
-                    .into(),
-            )),
+            Tab::Skills => {
+                let installed = packages::list_packages(layout).unwrap_or_default();
+                let mut taken = installed_skill_names(&installed);
+                let mut found = Vec::new();
+                let mut notices = Vec::new();
+                match Marketplaces::new(marketplaces_root(config)).skills(None) {
+                    Ok(listed) => found.extend(listed.into_iter().map(listing_entry)),
+                    Err(error) => notices.push(format!("marketplaces: {error:#}")),
+                }
+                for (name, url) in &config.skills.registries {
+                    match packages::registry::fetch_index(url) {
+                        Ok(entries) => {
+                            found.extend(entries.into_iter().map(|entry| (name.clone(), entry)))
+                        }
+                        Err(error) => notices.push(format!("{name}: {error:#}")),
+                    }
+                }
+                let rows = available_skills(found, &mut taken);
+                let mut message = format!(
+                    "{} skills from marketplaces and skill registries · installed skills are hidden",
+                    rows.len()
+                );
+                if !notices.is_empty() {
+                    message.push_str(&format!(" · unavailable: {}", notices.join("; ")));
+                }
+                Ok((rows, false, message))
+            }
+            Tab::Marketplaces => {
+                let markets = Marketplaces::new(marketplaces_root(config));
+                markets.refresh(None)?;
+                let count = markets.list()?.len();
+                Ok((
+                    Vec::new(),
+                    false,
+                    format!(
+                        "{count} marketplaces · a adds an index · e enables or disables · x removes"
+                    ),
+                ))
+            }
         }
     })();
     match result {
@@ -713,45 +763,86 @@ fn say(progress: &SharedProgress, line: impl Into<String>) {
     }
 }
 
-fn install_curated(config: &Config, id: &str, progress: &SharedProgress) -> Result<Outcome> {
-    let plan = plan_curated(config, id)?;
-    if let Some(reason) = plan.blocked {
-        return Ok(Outcome {
-            ok: false,
-            message: reason,
-            changes: Vec::new(),
-        });
+/// Installs a curated or official-registry server. Missing required values reopen the form first;
+/// a server that starts and lists tools is saved, anything else saves nothing.
+fn install_mcp(
+    endpoints: &Endpoints,
+    config: &Config,
+    id: &str,
+    values: &BTreeMap<String, String>,
+    progress: &SharedProgress,
+) -> Result<Outcome> {
+    let candidate = match catalog::resolve(endpoints, config, id) {
+        Ok(candidate) => candidate,
+        Err(error) => return Ok(failed(format!("{error:#}"))),
+    };
+    let local = catalog::config_name(&candidate.name);
+    if config.mcp.contains_key(&local) {
+        return Ok(failed(format!("`{local}` is already configured")));
     }
-    say(progress, format!("running: {}", plan.command));
+    if candidate.missing_required(values).is_some() {
+        put_form(progress, mcp_form(&candidate, None));
+        return Ok(waiting());
+    }
+    let server = match candidate.server(values) {
+        Ok(server) => server,
+        Err(error) => return Ok(failed(format!("{error:#}"))),
+    };
+    if server.url.is_none() && !catalog::on_path(&server.program.to_string_lossy()) {
+        return Ok(failed(format!(
+            "{} is not on PATH. Install it, then try again.",
+            server.program.display()
+        )));
+    }
     say(
         progress,
-        format!("caches under {}", plan.location.display()),
+        format!("running: {}", candidate.install_summary()),
+    );
+    say(
+        progress,
+        format!("caches under {}", mcp_cache_dir(&config.user_dir).display()),
     );
     say(
         progress,
         "starting the server to check it (first run downloads packages)",
     );
-    let (name, server) = curated_server(config, id)?;
-    let tools = health_check(config, &name, &server)?;
-    match tools {
+    match catalog::check(&config.project_root, &local, &server) {
         Ok(count) => {
             say(
                 progress,
                 format!("health check passed with {count} tool(s)"),
             );
-            let change = crate::tools::mcp::smithery::config_change(&name, &server)?;
             Ok(Outcome {
                 ok: true,
-                message: format!("`{name}` connected with {count} tool(s)"),
-                changes: vec![change],
+                message: format!("`{local}` connected with {count} tool(s)"),
+                changes: vec![smithery::config_change(&local, &server)?],
             })
         }
-        Err(why) => Ok(Outcome {
-            ok: false,
-            message: format!("health check failed, nothing saved: {why}"),
-            changes: Vec::new(),
-        }),
+        Err(why) => Ok(failed(format!("health check failed, nothing saved: {why}"))),
     }
+}
+
+/// The form that asks for a candidate's values. Secret values are masked as they are typed.
+fn mcp_form(candidate: &Candidate, error: Option<String>) -> Form {
+    let fields = candidate
+        .inputs
+        .iter()
+        .map(|input| Field {
+            key: input.key.clone(),
+            label: input.key.clone(),
+            hint: input.description.clone(),
+            required: input.required,
+            secret: input.secret,
+            value: String::new(),
+        })
+        .collect();
+    Form::mcp_inputs(
+        &candidate.name,
+        &format!("Set up {}", candidate.title),
+        "Values are saved in this server's config entry. Enter reviews the install; Esc cancels.",
+        fields,
+        error,
+    )
 }
 
 fn test_mcp(config: &Config, id: &str, progress: &SharedProgress) -> Result<Outcome> {
@@ -781,18 +872,7 @@ fn health_check(
     name: &str,
     server: &McpServerConfig,
 ) -> Result<std::result::Result<usize, String>> {
-    let specs = BTreeMap::from([(name.to_string(), server.clone())]);
-    let load = mcp::connect_extra(&specs, &config.project_root);
-    let count = load.tools.len();
-    if count == 0 {
-        let why = load
-            .notices
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "the server listed no tools".into());
-        return Ok(Err(why));
-    }
-    Ok(Ok(count))
+    Ok(catalog::check(&config.project_root, name, server))
 }
 
 fn smithery_install(
@@ -879,41 +959,6 @@ fn smithery_deploy(
     }
 }
 
-fn smithery_discover(
-    registry: &str,
-    config: &Config,
-    query: &str,
-    progress: &SharedProgress,
-) -> Result<Outcome> {
-    let opts = smithery::SearchOptions {
-        limit: smithery::DEFAULT_LIMIT,
-        api_key: smithery::resolve_api_key(&config.user_dir)?,
-        semantic: false,
-    };
-    let found = match smithery::search_at(registry, query, &opts) {
-        Ok(found) => found,
-        Err(error) => {
-            return Ok(failed(format!(
-                "Smithery search failed: {}. Try again in a moment.",
-                error.message
-            )));
-        }
-    };
-    let count = found.len();
-    let mut rows = mcp_rows(config);
-    rows.extend(found.iter().map(remote_row));
-    if let Ok(mut shown) = progress.lock() {
-        shown.rows = Some(rows);
-    }
-    Ok(Outcome {
-        ok: true,
-        message: format!(
-            "Found {count} Smithery servers for `{query}`. Press i on one to install."
-        ),
-        changes: Vec::new(),
-    })
-}
-
 fn resolve_smithery(
     registry: &str,
     name: &str,
@@ -959,28 +1004,64 @@ fn smithery_form(result: &smithery::SearchResult, name: &str, error: Option<Stri
 
 /// Setting names that hold credentials are masked while typing.
 fn is_secret_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    ["key", "token", "secret", "password"]
-        .iter()
-        .any(|word| key.contains(word))
+    catalog::looks_secret(key)
 }
 
-fn remote_row(found: &smithery::SearchResult) -> Row {
-    let mut tags = vec!["smithery".to_owned()];
-    if found.verified {
-        tags.push("verified".into());
-    }
+/// A catalog row for one merged candidate. Official rows install from `i`, curated rows by id,
+/// and Smithery rows open their settings form.
+fn candidate_row(candidate: &Candidate) -> Row {
+    let mut tags: Vec<String> = candidate
+        .sources
+        .iter()
+        .map(|source| source.label().to_owned())
+        .collect();
+    tags.extend(candidate.badges.iter().cloned());
+    tags.push(
+        if candidate.origin() == Source::Smithery {
+            "settings on install"
+        } else if candidate.inputs.iter().any(|input| input.required) {
+            "needs values"
+        } else {
+            "no key"
+        }
+        .into(),
+    );
+    let origin = if candidate.origin() == Source::Curated {
+        Origin::Curated
+    } else {
+        Origin::Remote
+    };
+    let install = if candidate.origin() == Source::Smithery {
+        "Smithery settings form (press i)".to_owned()
+    } else {
+        candidate.install_summary()
+    };
+    let mut details = vec![format!("install: {install}")];
+    details.extend(candidate.inputs.iter().map(|input| {
+        format!(
+            "{} {}: {}",
+            if input.required { "needs" } else { "optional" },
+            input.key,
+            input.description
+        )
+    }));
+    details.push(format!(
+        "listed by: {}",
+        candidate
+            .sources
+            .iter()
+            .map(|source| source.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
     Row {
-        id: found.qualified_name.clone(),
-        title: found.display_name.clone(),
-        summary: found.description.clone(),
+        id: candidate.name.clone(),
+        title: candidate.title.clone(),
+        summary: candidate.description.clone(),
         tags,
-        origin: Origin::Remote,
+        origin,
         state: State::Available,
-        details: vec![
-            format!("transport: {}", found.transport),
-            format!("tools: {}", found.tools.len()),
-        ],
+        details,
     }
 }
 
@@ -1021,78 +1102,29 @@ fn install_plugin(config: &Config, id: &str, progress: &SharedProgress) -> Resul
     })
 }
 
+/// Installs a skill package from its `repo[@ref][#path]` listing into the user scope. The
+/// skill-package code checks the path and refuses symlinks; no install scripts run.
+fn install_skill(layout: &Layout, source: &str, progress: &SharedProgress) -> Result<Outcome> {
+    let cancel = AtomicBool::new(false);
+    let message = packages::install(
+        layout,
+        &BTreeMap::new(),
+        crate::storage::skills::Scope::User,
+        source,
+        &cancel,
+        &mut |line: &str| say(progress, line),
+    )?;
+    Ok(Outcome {
+        ok: true,
+        message,
+        changes: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn curated_ids_are_unique_and_run_through_a_runtime() {
-        let mut ids: Vec<&str> = CURATED.iter().map(|c| c.id).collect();
-        let total = ids.len();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), total);
-        for item in CURATED {
-            assert!(matches!(item.runtime, "npx" | "uvx"), "{}", item.id);
-        }
-    }
-
-    #[test]
-    fn curated_server_caches_inside_the_user_dir() {
-        let config = Config {
-            user_dir: PathBuf::from("/tmp/home/.dial"),
-            project_root: PathBuf::from("/work/project"),
-            ..Default::default()
-        };
-        let (name, server) = curated_server(&config, "filesystem").unwrap();
-        assert_eq!(name, "filesystem");
-        assert_eq!(server.program, PathBuf::from("npx"));
-        assert_eq!(
-            server.args.last().map(String::as_str),
-            Some("/work/project")
-        );
-        assert_eq!(
-            server.env.get("npm_config_cache").map(String::as_str),
-            Some("/tmp/home/.dial/mcp/npm")
-        );
-        assert!(server.enabled);
-    }
-
-    #[test]
-    fn plan_blocks_an_already_configured_server() {
-        let mut config = Config {
-            user_dir: PathBuf::from("/tmp/x"),
-            ..Default::default()
-        };
-        config
-            .mcp
-            .insert("memory".into(), McpServerConfig::default());
-        let plan = plan_curated(&config, "memory").unwrap();
-        assert_eq!(
-            plan.blocked.as_deref(),
-            Some("`memory` is already configured")
-        );
-    }
-
-    #[test]
-    fn plan_names_the_exact_command_and_location() {
-        let config = Config {
-            user_dir: PathBuf::from("/tmp/x"),
-            project_root: PathBuf::from("/work/project"),
-            ..Default::default()
-        };
-        let plan = plan_curated(&config, "filesystem").unwrap();
-        assert_eq!(
-            plan.command,
-            "npx -y @modelcontextprotocol/server-filesystem /work/project"
-        );
-        assert_eq!(plan.location, PathBuf::from("/tmp/x/mcp"));
-    }
-
-    #[test]
-    fn unknown_curated_id_is_an_error() {
-        assert!(plan_curated(&Config::default(), "nope").is_err());
-    }
+    use crate::tools::mcp::catalog::Install;
 
     #[test]
     fn snapshot_offers_uninstalled_curated_servers_only() {
@@ -1115,6 +1147,32 @@ mod tests {
             rows.iter()
                 .any(|r| r.id == "memory" && r.origin == Origin::Curated)
         );
+    }
+
+    fn listed(name: &str, source: Source) -> Candidate {
+        Candidate {
+            name: name.into(),
+            title: name.into(),
+            description: "a listed server".into(),
+            sources: vec![source],
+            badges: Vec::new(),
+            install: Install::Blocked("test".into()),
+            inputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_server_listed_twice_is_one_row_tagged_with_both_listings() {
+        let found = catalog::merge(vec![
+            listed("io.github.acme/notes", Source::Official),
+            listed("@acme/notes", Source::Smithery),
+        ]);
+        let rows: Vec<Row> = found.iter().map(candidate_row).collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "io.github.acme/notes");
+        assert!(rows[0].tags.iter().any(|t| t == "official"));
+        assert!(rows[0].tags.iter().any(|t| t == "smithery"));
+        assert_eq!(rows[0].origin, Origin::Remote);
     }
 }
 
@@ -1274,7 +1332,11 @@ mod smithery_flow_tests {
     ) -> (Outcome, Option<Form>) {
         let layout =
             Layout::with_user_dir(&config.user_dir, config.user_dir.clone()).expect("layout");
-        let outcome = run_at(base, &layout, config, &intent, progress).expect("stage runs");
+        let endpoints = Endpoints {
+            official: base.to_owned(),
+            smithery: base.to_owned(),
+        };
+        let outcome = run_at(&endpoints, &layout, config, &intent, progress).expect("stage runs");
         let form = progress.lock().expect("progress").form.take();
         (outcome, form)
     }
@@ -1330,23 +1392,6 @@ mod smithery_flow_tests {
         assert!(out.ok);
         let error = form.expect("form again").error.expect("error");
         assert!(error.contains("apiKey"), "{error}");
-
-        // Discover lists the registry's servers as remote rows.
-        let (out, _) = go(Intent::SmitheryDiscover {
-            query: "notes".into(),
-        });
-        assert!(out.ok, "{}", out.message);
-        let rows = progress
-            .lock()
-            .expect("progress")
-            .rows
-            .take()
-            .expect("rows");
-        let found = rows
-            .iter()
-            .find(|row| row.id == "@acme/notes")
-            .expect("remote row");
-        assert_eq!(found.origin, Origin::Remote);
     }
 
     #[test]
@@ -1431,5 +1476,233 @@ mod smithery_flow_tests {
             out.message
         );
         assert!(out.changes.is_empty());
+    }
+
+    #[test]
+    fn mcp_catalog_search_keeps_nuxt_when_smithery_details_are_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            user_dir: dir.path().into(),
+            project_root: dir.path().into(),
+            ..Default::default()
+        };
+        let layout = Layout::with_user_dir(dir.path(), dir.path().into()).expect("layout");
+        let official = serve(Arc::new(|_, _| (503, "{}".into())));
+        let smithery = serve(Arc::new(|_, target| {
+            if target.starts_with("/servers?") {
+                (
+                    200,
+                    json!({
+                        "servers": [{"qualifiedName":"@nuxt/mcp", "displayName":"Nuxt"}],
+                        "pagination": {"totalPages":1}
+                    })
+                    .to_string(),
+                )
+            } else {
+                (404, "{}".into())
+            }
+        }));
+        let update = catalog_update(
+            &Endpoints { official, smithery },
+            &layout,
+            &config,
+            Tab::Mcp,
+            "nuxt",
+            1,
+        );
+        assert!(update.error.is_none());
+        assert!(update.rows.iter().any(|row| row.id == "nuxt"));
+        let remote = update
+            .rows
+            .iter()
+            .find(|row| row.id == "@nuxt/mcp")
+            .unwrap();
+        assert!(remote.tags.iter().any(|tag| tag == "settings on install"));
+        assert!(update.message.contains("unavailable: official registry"));
+        assert!(!update.more);
+    }
+
+    #[test]
+    fn curated_servers_that_need_values_open_a_form_before_anything_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            user_dir: dir.path().into(),
+            project_root: dir.path().into(),
+            ..Default::default()
+        };
+        let unused = "http://127.0.0.1:9".to_owned();
+        let endpoints = Endpoints {
+            official: unused.clone(),
+            smithery: unused,
+        };
+        let progress = SharedProgress::default();
+        let out =
+            install_mcp(&endpoints, &config, "github", &BTreeMap::new(), &progress).expect("runs");
+        assert!(out.ok && out.changes.is_empty());
+        let form = progress
+            .lock()
+            .expect("progress")
+            .form
+            .take()
+            .expect("values form");
+        assert_eq!(
+            form.kind,
+            FormKind::McpInputs {
+                id: "github".into()
+            }
+        );
+        assert!(form.fields[0].required && form.fields[0].secret);
+
+        // An id that no listing knows fails with the reason and saves nothing.
+        let missing = install_mcp(
+            &endpoints,
+            &config,
+            "io.example/none",
+            &BTreeMap::new(),
+            &progress,
+        )
+        .expect("runs");
+        assert!(!missing.ok && missing.changes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod marketplace_tests {
+    use super::*;
+    use crate::tools::plugin::marketplace::DEFAULT_NAME;
+
+    fn config_in(dir: &tempfile::TempDir) -> Config {
+        Config {
+            user_dir: dir.path().into(),
+            project_root: dir.path().into(),
+            ..Default::default()
+        }
+    }
+
+    fn layout_for(config: &Config) -> Layout {
+        Layout::with_user_dir(&config.user_dir, config.user_dir.clone()).expect("layout")
+    }
+
+    #[test]
+    fn default_config_offers_curated_mcp_and_default_marketplace_skills_offline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = config_in(&dir);
+        let rows = snapshot(&layout_for(&config), &config);
+        assert!(rows.mcp.iter().any(|row| row.origin == Origin::Curated));
+        assert!(
+            rows.marketplaces
+                .iter()
+                .any(|row| row.id == DEFAULT_NAME && row.state == State::Enabled)
+        );
+        assert!(
+            rows.skills
+                .iter()
+                .any(|row| row.title == "pdf" && row.origin == Origin::Remote)
+        );
+        assert!(rows.plugins.is_empty());
+    }
+
+    #[test]
+    fn installed_skills_hide_the_same_skill_from_the_available_list() {
+        let listed = |name: &str, marketplace: &str| {
+            (
+                marketplace.to_owned(),
+                SkillEntry {
+                    name: name.into(),
+                    description: String::new(),
+                    url: format!("https://example.com/{marketplace}.git#{name}"),
+                },
+            )
+        };
+        let mut taken = BTreeSet::from(["pdf".to_owned()]);
+        let rows = available_skills(
+            vec![listed("pdf", "a"), listed("docx", "a"), listed("docx", "b")],
+            &mut taken,
+        );
+        let titles: Vec<&str> = rows.iter().map(|row| row.title.as_str()).collect();
+        assert_eq!(titles, vec!["docx"]);
+        assert!(rows[0].tags.iter().any(|tag| tag == "a"));
+    }
+
+    #[test]
+    fn skill_install_rejects_path_traversal_before_fetching() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = config_in(&dir);
+        let progress = SharedProgress::default();
+        let result = install_skill(
+            &layout_for(&config),
+            "https://example.com/org/skills.git#../outside",
+            &progress,
+        );
+        assert!(result.is_err());
+        assert!(!dir.path().join("skill-packages").exists());
+    }
+
+    #[test]
+    fn adding_removing_and_disabling_marketplaces_persist_through_the_intents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = config_in(&dir);
+        let layout = layout_for(&config);
+        let index = dir.path().join("extra.json");
+        std::fs::write(
+            &index,
+            r#"{"skills":[{"name":"extra-skill","url":"https://example.com/org/skills.git#extra-skill"}]}"#,
+        )
+        .expect("write index");
+        let endpoints = Endpoints {
+            official: "http://127.0.0.1:9".into(),
+            smithery: "http://127.0.0.1:9".into(),
+        };
+        let progress = SharedProgress::default();
+        let names = |config: &Config| -> Vec<String> {
+            Marketplaces::new(marketplaces_root(config))
+                .list()
+                .expect("list")
+                .into_iter()
+                .map(|market| market.name)
+                .collect()
+        };
+        let go = |intent: Intent| {
+            run_at(&endpoints, &layout, &config, &intent, &progress).expect("runs")
+        };
+
+        let initial = names(&config);
+        assert!(
+            go(Intent::AddMarketplace {
+                name: "extra".into(),
+                index: index.display().to_string(),
+            })
+            .ok
+        );
+        let mut expected = initial.clone();
+        expected.push("extra".to_string());
+        expected.sort();
+        assert_eq!(names(&config), expected);
+
+        assert!(
+            go(Intent::RemoveMarketplace {
+                name: "extra".into()
+            })
+            .ok
+        );
+        assert_eq!(names(&config), initial);
+
+        assert!(
+            go(Intent::ToggleMarketplace {
+                name: DEFAULT_NAME.into(),
+                enable: false,
+            })
+            .ok
+        );
+        let info = Marketplaces::new(marketplaces_root(&config))
+            .list()
+            .expect("list");
+        assert!(
+            !info
+                .iter()
+                .find(|market| market.name == DEFAULT_NAME)
+                .unwrap()
+                .enabled
+        );
     }
 }

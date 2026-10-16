@@ -2,7 +2,7 @@
 use crate::{
     config::types::Config as AppConfig,
     learn::{compute, worker},
-    storage::settings_store,
+    storage::{atomic::write_private, settings_store},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -80,29 +80,40 @@ pub fn pending_path(config: &AppConfig, name: &str) -> Result<PathBuf> {
         .join("pending")
         .join(format!("{name}.json")))
 }
+
+/// Hold the vector's mutation lease before reading admission or replacement state.
+/// Import, evaluation, automatic creation and promotion share this lock identity.
+pub(crate) fn lock_vector(path: &Path) -> Result<fs::File> {
+    settings_store::private_dir(path.parent().context("steering directory")?)?;
+    let lock = crate::learn::auto::lock_file(&path.with_extension("job.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&lock)
+        .context("another steering job already owns this vector")?;
+    Ok(lock)
+}
+
 /// Make a pending vector active. Requires its own passing local evaluation; never runs unevaluated.
 pub fn promote(config: &AppConfig, name: &str, replace: bool) -> Result<Value> {
     let pending = pending_path(config, name)?;
+    // Lock both identities before admission checks: evaluation/import may replace pending bytes.
+    // Acquisition is nonblocking, so competing operations fail rather than deadlock.
+    let _pending_lock = lock_vector(&pending)?;
+    let active = vector_path(config);
+    let _active_lock = lock_vector(&active)?;
     let bundle = read(&pending).context("no pending steering vector with that name")?;
     ensure!(
         bundle["model_name"] == config.model.as_str(),
         "pending vector belongs to a different model"
     );
-    let evaluation = &bundle["evaluation"];
-    ensure!(
-        evaluation["passed"] == true && evaluation["artifact"] == bundle["id"],
-        "pending vector has no passing local evaluation; run `dial steering evaluate --pending {name}` first"
-    );
-    let active = vector_path(config);
+    check(&bundle, strength(config, &bundle)).with_context(|| {
+        format!(
+            "pending vector is not admitted; run `dial steering evaluate --pending {name}` first"
+        )
+    })?;
     ensure!(
         replace || !active.exists(),
         "an active steering vector exists at {}; pass --replace to promote over it",
         active.display()
     );
-    settings_store::private_dir(active.parent().context("steering directory")?)?;
-    let lock = crate::learn::auto::lock_file(&active.with_extension("job.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .context("another steering job already owns this vector")?;
     fs::rename(&pending, &active)?;
     Ok(json!({"promoted": name, "vector": config.steering.vector, "path": active}))
 }
@@ -378,8 +389,7 @@ fn automatic_with(
             }
         }
     }
-    let publish =
-        |value: &Value| settings_store::write_private(&status_path, &serde_json::to_vec(value)?);
+    let publish = |value: &Value| write_private(&status_path, &serde_json::to_vec(value)?);
     if pairs.len() < 8 {
         let state = json!({"phase":format!("collecting verified repairs: {}/8 distinct prompts",pairs.len()),"pairs":pairs.len()});
         publish(&state)?;
@@ -394,6 +404,7 @@ fn automatic_with(
             config.steering.strength
         ]))?)
     );
+    let _lock = lock_vector(&path)?;
     if path.exists() {
         let bundle =
             read(&path).context("existing vector is unreadable; preserved without replacement")?;
@@ -411,8 +422,6 @@ fn automatic_with(
     {
         return Ok(previous);
     }
-    let lock = crate::learn::auto::lock_file(&path.with_extension("job.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock).context("another steering job owns this vector")?;
     let mut state = json!({"phase":"extracting candidate; foreground coding has priority","fingerprint":fingerprint,"attempted_at":now,"pairs":pairs.len()});
     publish(&state)?;
     let candidate = path.with_extension("candidate.json");
@@ -445,7 +454,7 @@ fn automatic_with(
         {
             // Each vector competes at its own admitted strength.
             let incumbent_path = path.with_extension("incumbent.json");
-            settings_store::write_private(&incumbent_path, &serde_json::to_vec(&incumbent)?)?;
+            write_private(&incumbent_path, &serde_json::to_vec(&incumbent)?)?;
             let evaluation = call(
                 &json!({"op":"steering_evaluate","model":config.model,"adapter":adapter,"output":incumbent_path,"progress":path.with_extension("incumbent.progress.json"),"strength":incumbent_strength,"cases":automatic_cases(),"max_tokens":128}),
             )?;
@@ -461,7 +470,7 @@ fn automatic_with(
         bundle["origin"] = json!("automatic verified repairs");
         crate::learn::auto::check_stop(config)?;
         // Atomic publication keeps the last admitted vector intact on failure/cancellation.
-        settings_store::write_private(&path, &serde_json::to_vec(&bundle)?)?;
+        write_private(&path, &serde_json::to_vec(&bundle)?)?;
         Ok(())
     })();
     // Final state is published below even when the job was cancelled after admission.
@@ -577,13 +586,10 @@ pub fn run_at(
         adapter.as_ref().is_none_or(|p| p.is_dir()),
         "adapter must be a directory"
     );
-    settings_store::private_dir(path.parent().unwrap())?;
-    let lock = crate::learn::auto::lock_file(&path.with_extension("job.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .context("another steering job already owns this vector")?;
+    let _lock = lock_vector(path)?;
     let progress_path = path.with_extension("progress.json");
     if !progress_path.exists() && config.compute_locks {
-        settings_store::write_private(
+        write_private(
             &progress_path,
             b"{\"phase\":\"queued; waiting for idle compute\"}",
         )?;
@@ -673,7 +679,7 @@ pub fn render(value: &Value) -> String {
     if let Some(reason) = runtime["reason"].as_str() {
         out.push_str(&format!("\n{reason}"));
     }
-    out.push_str("\n/settings → Improvement → Activation steering: automatic creation, manual vector, strength.\nMaintenance: dial steering extract --pairs FILE --layer N; dial steering evaluate --cases FILE.\nExperimental response contracts; full coding accuracy has not been certified.");
+    out.push_str(&format!("\n{} → Activation steering: automatic creation, manual vector, strength.\nMaintenance: dial steering extract --pairs FILE --layer N; dial steering evaluate --cases FILE.\nExperimental response contracts; full coding accuracy has not been certified.", crate::learn::improve::SETTINGS_PATH));
     out
 }
 pub fn runtime(base_url: &str) -> Result<Value> {
@@ -696,6 +702,95 @@ mod tests {
     fn candidate() -> Value {
         json!({"version":1,"id":"a".repeat(64),"model_name":"test","dimension":2,"layer":0,"layer_count":2,"vector":[1.0,0.0],"pairs":8,"evaluation":{"passed":true,"artifact":"a".repeat(64),"strength":0.5,"cases":8,"baseline_passes":4,"steered_passes":7,"scope":"held-out response contracts","tool_nonregression":true,"repetition_nonregression":true,"latency_nonregression":true}})
     }
+    #[test]
+    fn promotion_uses_the_same_admission_gate_as_runtime_loading() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            model: "test".into(),
+            state_dir: root.path().into(),
+            ..Default::default()
+        };
+        let pending = pending_path(&config, "imported-test").unwrap();
+        let active = vector_path(&config);
+        settings_store::private_dir(pending.parent().unwrap()).unwrap();
+        write_private(&active, b"existing vector").unwrap();
+        for (pointer, value) in [
+            ("/id", Value::Null),
+            ("/evaluation/artifact", json!("another artifact")),
+            ("/evaluation/tool_nonregression", json!(false)),
+            ("/evaluation/strength", json!(0.25)),
+            ("/model_name", json!("another model")),
+        ] {
+            let mut bundle = candidate();
+            *bundle.pointer_mut(pointer).unwrap() = value;
+            let bytes = serde_json::to_vec(&bundle).unwrap();
+            write_private(&pending, &bytes).unwrap();
+            assert!(
+                promote(&config, "imported-test", true).is_err(),
+                "{pointer}"
+            );
+            assert_eq!(fs::read(&pending).unwrap(), bytes);
+            assert_eq!(fs::read(&active).unwrap(), b"existing vector");
+        }
+    }
+
+    #[test]
+    fn promotion_locks_both_vectors_and_preserves_pending_on_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            model: "test".into(),
+            state_dir: root.path().into(),
+            ..Default::default()
+        };
+        let pending = pending_path(&config, "imported-test").unwrap();
+        let active = vector_path(&config);
+        let bytes = serde_json::to_vec(&candidate()).unwrap();
+        {
+            let _lock = lock_vector(&pending).unwrap();
+            write_private(&pending, &bytes).unwrap();
+            assert!(promote(&config, "imported-test", false).is_err());
+            assert_eq!(fs::read(&pending).unwrap(), bytes);
+            assert!(!active.exists());
+        }
+        {
+            let _lock = lock_vector(&active).unwrap();
+            assert!(promote(&config, "imported-test", false).is_err());
+            assert_eq!(fs::read(&pending).unwrap(), bytes);
+            assert!(!active.exists());
+        }
+        // Existing active bytes require explicit replacement even once both locks are available.
+        write_private(&active, b"existing vector").unwrap();
+        assert!(promote(&config, "imported-test", false).is_err());
+        assert_eq!(fs::read(&active).unwrap(), b"existing vector");
+        assert_eq!(fs::read(&pending).unwrap(), bytes);
+        promote(&config, "imported-test", true).unwrap();
+        assert_eq!(fs::read(&active).unwrap(), bytes);
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn promotion_revalidates_pending_after_evaluation_releases_its_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            model: "test".into(),
+            state_dir: root.path().into(),
+            ..Default::default()
+        };
+        let pending = pending_path(&config, "imported-test").unwrap();
+        let mut bundle = candidate();
+        let lock = lock_vector(&pending).unwrap();
+        write_private(&pending, &serde_json::to_vec(&bundle).unwrap()).unwrap();
+        assert!(promote(&config, "imported-test", false).is_err());
+        bundle["evaluation"]["passed"] = json!(false);
+        let bytes = serde_json::to_vec(&bundle).unwrap();
+        write_private(&pending, &bytes).unwrap();
+        drop(lock);
+        assert!(promote(&config, "imported-test", false).is_err());
+        assert_eq!(fs::read(&pending).unwrap(), bytes);
+        assert!(!vector_path(&config).exists());
+        assert!(lock_vector(&pending).is_ok(), "refusal releases its leases");
+    }
+
     fn at(strength: f64) -> Value {
         let mut bundle = candidate();
         bundle["evaluation"]["strength"] = json!(strength);
@@ -789,7 +884,7 @@ mod tests {
         let mut vector = candidate();
         vector["model_name"] = json!(config.model);
         vector["origin"] = json!("automatic verified repairs");
-        settings_store::write_private(&path, &serde_json::to_vec(&vector).unwrap()).unwrap();
+        write_private(&path, &serde_json::to_vec(&vector).unwrap()).unwrap();
         assert_eq!(status(&config)["state"], "configured");
         assert!(specification(&config, &config.model).unwrap().is_some());
         // Eligible vision models still reject missing datasets before starting any worker.
@@ -804,7 +899,7 @@ mod tests {
             .is_err()
         );
         vector["evaluation"]["passed"] = json!(false);
-        settings_store::write_private(&path, &serde_json::to_vec(&vector).unwrap()).unwrap();
+        write_private(&path, &serde_json::to_vec(&vector).unwrap()).unwrap();
         assert!(specification(&config, &config.model).is_err());
     }
     #[test]
@@ -815,7 +910,7 @@ mod tests {
         let result = automatic_with(&config, &store, None, &mut |request| {
             calls += 1;
             let output = Path::new(request["output"].as_str().unwrap());
-            settings_store::write_private(output, &serde_json::to_vec(&at(37.5))?)?;
+            write_private(output, &serde_json::to_vec(&at(37.5))?)?;
             if request["op"] == "steering_extract" {
                 assert!(request["layer"].is_null() && request["sweep"] == true);
                 assert_eq!(request["pairs"].as_array().unwrap().len(), 8);
@@ -841,7 +936,7 @@ mod tests {
         let result = automatic_with(&config, &store, None, &mut |request| {
             let mut bad = candidate();
             bad["evaluation"]["passed"] = json!(false);
-            settings_store::write_private(
+            write_private(
                 Path::new(request["output"].as_str().unwrap()),
                 &serde_json::to_vec(&bad)?,
             )?;
@@ -863,7 +958,7 @@ mod tests {
         incumbent["origin"] = json!("automatic verified repairs");
         incumbent["automatic_adapter"] = Value::Null;
         incumbent["evaluation"]["steered_passes"] = json!(8);
-        settings_store::write_private(&path, &serde_json::to_vec(&incumbent).unwrap()).unwrap();
+        write_private(&path, &serde_json::to_vec(&incumbent).unwrap()).unwrap();
         let before = fs::read(&path).unwrap();
         let result = automatic_with(&config, &store, None, &mut |request| {
             let output = Path::new(request["output"].as_str().unwrap());
@@ -871,7 +966,7 @@ mod tests {
                 assert_eq!(request["strength"], 0.5);
                 return Ok(incumbent["evaluation"].clone());
             }
-            settings_store::write_private(output, &serde_json::to_vec(&at(3.0))?)?;
+            write_private(output, &serde_json::to_vec(&at(3.0))?)?;
             if request["op"] == "steering_extract" {
                 return Ok(swept(3.0));
             }
@@ -886,7 +981,7 @@ mod tests {
         let (_dir, mut config, store) = auto_fixture();
         seed_pairs(&mut config, &store);
         settings_store::private_dir(vector_path(&config).parent().unwrap()).unwrap();
-        settings_store::write_private(
+        write_private(
             &vector_path(&config),
             &serde_json::to_vec(&candidate()).unwrap(),
         )
@@ -1003,11 +1098,11 @@ mod tests {
         let path = vector_path(&config);
         settings_store::private_dir(path.parent().unwrap()).unwrap();
         let mut item = candidate();
-        settings_store::write_private(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
+        write_private(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
         let first = specification(&config, "test").unwrap().unwrap();
         assert!(specification(&config, "another").is_err());
         item["evaluation"]["baseline_passes"] = json!(3);
-        settings_store::write_private(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
+        write_private(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
         assert_ne!(first, specification(&config, "test").unwrap().unwrap());
     }
 }

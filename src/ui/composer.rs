@@ -1265,10 +1265,29 @@ impl Composer {
             (bar, theme.sym(Sym::BoxV), bar, bar, bar, bar)
         };
 
+        let activity = statusline::activity_row(ctx.ui, ctx.status, theme, width);
+        let mut status_ui;
+        let header_ui = if activity.is_some() {
+            status_ui = ctx.ui.clone();
+            let (left, right) = statusline::segments(ctx.ui);
+            let metadata = |names: Vec<String>| {
+                names
+                    .into_iter()
+                    .filter(|name| !name.trim().eq_ignore_ascii_case("spinner"))
+                    .collect()
+            };
+            status_ui.status = crate::llm::model_config::StatusPreset::Custom;
+            status_ui.status_left = metadata(left);
+            status_ui.status_right = metadata(right);
+            &status_ui
+        } else {
+            ctx.ui
+        };
         let top = statusline::border_line_with(
-            ctx.ui, ctx.status, theme, w as u16, border, bar, top_l, top_r,
+            header_ui, ctx.status, theme, w as u16, border, bar, top_l, top_r,
         );
-        let mut rows: Rows = vec![top];
+        let activity_rows = usize::from(activity.is_some());
+        let mut rows: Rows = activity.into_iter().chain([top]).collect();
         for row in laid.rows.iter().skip(start).take(MAX_INPUT_ROWS) {
             let mut spans = Vec::new();
             if boxed {
@@ -1295,7 +1314,7 @@ impl Composer {
             rows.push(Line::from(spans));
         }
         let cursor = (
-            (1 + laid.cursor.0 - start) as u16,
+            (activity_rows + 1 + laid.cursor.0 - start) as u16,
             (laid.cursor.1 + if boxed { 2 } else { 0 }) as u16,
         );
         let mut hints = self.hint_items(ctx);
@@ -1583,7 +1602,7 @@ impl Composer {
         let blank_pointer = " ".repeat(text::width(pointer));
         let accent = theme.fg(Tok::Accent);
         let hit = accent.add_modifier(Modifier::BOLD);
-        render_list(
+        let mut rows = render_list(
             theme,
             w,
             total,
@@ -1629,18 +1648,6 @@ impl Composer {
                 let used = prefix + name_col + 2;
                 let room = budget.saturating_sub(used);
                 if room > 0 {
-                    let args = command
-                        .args_hint
-                        .as_deref()
-                        .filter(|_| selected)
-                        .unwrap_or("");
-                    let args = text::ellipsize(args, room, theme.ascii());
-                    let args_cells = text::width(&args);
-                    if args_cells > 0 {
-                        spans.push(Span::styled(args, theme.fg(Tok::Accent)));
-                        spans.push(Span::raw("  "));
-                    }
-                    let room = room.saturating_sub(args_cells + if args_cells > 0 { 2 } else { 0 });
                     let description = text::ellipsize(&command.description, room, theme.ascii());
                     spans.extend(highlighted(
                         &description,
@@ -1651,7 +1658,39 @@ impl Composer {
                 }
                 spans
             },
-        )
+        );
+        if menu.file_start.is_none() && menu.arguments.is_none() {
+            if let Some(found) = menu.matches.get(menu.selected) {
+                rows.extend(Self::command_detail_rows(&entries[found.index], w, theme));
+            }
+        }
+        rows
+    }
+
+    /// Usage and the full description of the selected command, drawn under the menu. Both rows are
+    /// ellipsized to the width, so the detail never wraps into the composer.
+    fn command_detail_rows(command: &CommandEntry, w: usize, theme: &Theme) -> Rows {
+        let usage = match command.args_hint.as_deref() {
+            Some(hint) if !hint.is_empty() => format!("/{} {hint}", command.name),
+            _ => format!("/{}", command.name),
+        };
+        let room = w.saturating_sub(2);
+        vec![
+            finish_row(
+                vec![Span::styled(
+                    format!(" {}", text::ellipsize(&usage, room, theme.ascii())),
+                    theme.fg(Tok::Accent),
+                )],
+                w,
+            ),
+            finish_row(
+                vec![Span::styled(
+                    format!(" {}", text::ellipsize(&command.description, room, theme.ascii())),
+                    theme.fg(Tok::Muted),
+                )],
+                w,
+            ),
+        ]
     }
 
     /// The search prompt row, then the matching history entries (newest first). Returns the cursor
@@ -2071,23 +2110,9 @@ fn substring_hits(value: &str, query_lower: &str) -> Vec<usize> {
 /// about 15 ms for 50k paths and under 1 ms for 2k, so anything at or below this rank inline.
 const SYNC_RANK_LIMIT: usize = 2_000;
 
-/// Commands listed first when `/` is typed with nothing after it, in this order.
-const START_HERE: &[&str] = &[
-    "help",
-    "model",
-    "settings",
-    "providers",
-    "extensions",
-    "setup",
-    "resume",
-    "compact",
-    "review",
-    "changes",
-    "undo",
-    "memory",
-    "cost",
-    "theme",
-];
+/// Commands listed first when `/` is typed with nothing after it. Defined with the other starter
+/// lists in `command_surface`, so the menu and the palette cannot disagree.
+const START_HERE: &[&str] = crate::ui::command_surface::START_HERE;
 
 /// Name matches lead description-only matches; within either field, prefixes lead word starts,
 /// then subsequences. Fuzzy score breaks ties and supplies highlight positions.
@@ -2436,6 +2461,9 @@ mod tests {
         let mut env = Env::new();
         env.status.phase = Phase::Working;
         let mut composer = Composer::new(Vec::new(), 100);
+        composer.set_busy(true);
+        env.status.elapsed_secs = 24.0;
+        env.status.tick = 6;
         composer.set_draft("Keep this draft while the model runs");
         let mut terminal = Terminal::new(TestBackend::new(110, 15)).unwrap();
         let mut stages = Vec::new();
@@ -2462,6 +2490,11 @@ mod tests {
                 .map(|s| s.content.as_ref())
                 .collect::<String>();
             assert!(text.contains("Keep this draft"));
+            assert_eq!(view.cursor.0, 2);
+            assert!(view.rows[0].spans.iter().any(|s| s.content.contains("turn 24s")));
+            assert!(!view.rows[1].spans.iter().any(|s| {
+                s.content.contains("processing") || s.content.contains("generating")
+            }));
             stages.push(view.rows);
         }
         terminal
@@ -2484,6 +2517,28 @@ mod tests {
             .unwrap();
         }
     }
+    #[test]
+    fn activity_row_preserves_cursor_and_draft_across_widths_and_idle_transition() {
+        let mut env = Env::new();
+        let mut composer = Composer::new(Vec::new(), 100);
+        composer.set_draft("Keep my draft");
+        for width in [8, 20, 40, 80, 110] {
+            env.status.phase = Phase::Idle;
+            let idle = composer.view(width, &env.ctx());
+            env.status.phase = Phase::Working;
+            composer.set_busy(true);
+            let active = composer.view(width, &env.ctx());
+            assert_eq!(active.cursor, (idle.cursor.0 + 1, idle.cursor.1));
+            assert_eq!(active.rows.len(), idle.rows.len() + 1);
+            assert!(active.rows.iter().all(|r| r.width() <= usize::from(width)));
+            env.status.phase = Phase::Idle;
+            composer.set_busy(false);
+            let settled = composer.view(width, &env.ctx());
+            assert_eq!(settled.cursor, idle.cursor);
+            assert_eq!(settled.rows, idle.rows);
+        }
+    }
+
     fn key(c: &mut Composer, env: &Env, code: KeyCode, mods: KeyModifiers) -> ComposerEvent {
         c.handle_key(event(code, mods), &env.ctx())
     }
@@ -4535,26 +4590,46 @@ mod tests {
     }
 
     #[test]
-    fn args_hints_show_after_the_name_and_long_descriptions_are_ellipsized() {
+    fn menu_rows_stay_short_and_the_selected_command_shows_usage_and_description() {
         let env = Env::new();
+        let description = "Switch the active model to something else entirely, now and then for every project";
         let mut c = Composer::new(vec![], 10);
         c.set_commands(vec![
             CommandEntry {
                 name: "model".into(),
-                description: "Switch the active model to something else entirely, now".into(),
+                description: description.into(),
                 kind: CommandKind::Builtin,
-                args_hint: Some("<name>".into()),
+                args_hint: Some("[settings|defaults|local]".into()),
             },
             cmd("help", "Show help", CommandKind::Builtin),
         ]);
         typed(&mut c, &env, "/mod");
-        let rows = screen(&c, &env, 40);
-        assert!(
-            rows[3].contains("model  <name>  Switch") && rows[3].contains('…'),
-            "{:?}",
-            rows[3]
-        );
-        assert!(rows.iter().all(|r| text::width(r) <= 40));
+        let narrow = screen(&c, &env, 60);
+        let wide = screen(&c, &env, 110);
+        for (rows, width) in [(&narrow, 60), (&wide, 110)] {
+            assert!(rows.iter().all(|r| text::width(r) <= width), "{rows:?}");
+            let menu = rows.iter().find(|r| r.contains("model")).unwrap();
+            assert!(!menu.contains("[settings"), "usage stays out of the row: {menu}");
+            assert!(
+                rows.iter().any(|r| r.contains("/model [settings|defaults|local]")),
+                "{rows:?}"
+            );
+        }
+        assert!(narrow.iter().any(|r| r.contains('…')), "{narrow:?}");
+        assert!(wide.iter().any(|r| r.contains("something else entirely")), "{wide:?}");
+    }
+
+    #[test]
+    fn menu_detail_never_overflows_tiny_widths() {
+        let env = Env::new();
+        let mut c = Composer::new(vec![], 10);
+        c.set_commands(vec![CommandEntry {
+            name: "model".into(),
+            description: "Switch the active model to something else entirely".into(),
+            kind: CommandKind::Builtin,
+            args_hint: Some("[settings|defaults|local]".into()),
+        }]);
+        typed(&mut c, &env, "/mod");
         for width in [8u16, 9, 14, 20] {
             let view = c.view(width, &env.ctx());
             assert!(
@@ -4665,7 +4740,8 @@ mod tests {
         let t = &env.theme;
         let menu = |c: &Composer| screen(c, &env, 60)[3..].to_vec();
         let rows = menu(&c);
-        assert_eq!(rows.len(), 5);
+        // Five list rows plus the selected command's usage and description.
+        assert_eq!(rows.len(), 7);
         assert!(
             rows[0].contains("cmd00")
                 && rows[4].contains("cmd04")
@@ -4675,10 +4751,10 @@ mod tests {
             rows[4].contains("1/20"),
             "counter on the last row: {rows:?}"
         );
-        assert!(rows.iter().all(|r| text::width(r) == 60), "{rows:?}");
+        assert!(rows.iter().take(5).all(|r| text::width(r) == 60), "{rows:?}");
         assert!(
             rows[0].ends_with(t.sym(Sym::ScrollThumb))
-                && rows[1..]
+                && rows[1..5]
                     .iter()
                     .all(|r| r.ends_with(t.sym(Sym::ScrollTrack))),
             "thumb at the top, track below: {rows:?}"
@@ -4728,7 +4804,7 @@ mod tests {
         let rows = menu(&c);
         assert_eq!(
             rows.len(),
-            5,
+            7,
             "cmd10..cmd19 and more: still limited to five rows"
         );
         assert!(
@@ -4747,7 +4823,7 @@ mod tests {
         ]);
         typed(&mut c, &env, "/");
         let rows = screen(&c, &env, 40);
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 7);
         assert!(
             !rows[3..]
                 .iter()
@@ -4832,7 +4908,7 @@ mod tests {
         ]);
         typed(&mut c, &env, "/");
         let rows = screen(&c, &env, 80);
-        assert_eq!(rows.len(), 4, "only one command survives: {rows:?}");
+        assert_eq!(rows.len(), 6, "only one command survives: {rows:?}");
         assert!(
             rows[3].contains("review")
                 && rows[3].contains("check this diff")

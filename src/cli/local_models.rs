@@ -1,4 +1,4 @@
-//! `dial models status` and the `/models local` dashboard: one read-only snapshot per downloaded
+//! `dial models status` and the Get models group of `/models`: one read-only snapshot per downloaded
 //! local model (MLX or GGUF) with its format, decode speed from recorded requests, memory-fit
 //! estimate, learning-store adapter and last gate, and what improvement is waiting on.
 //!
@@ -477,7 +477,7 @@ pub fn duration(secs: u64) -> String {
 /// Speed line for humans: `34.1 tok/s median · recent 36.0 (up) · 12 samples`.
 pub fn speed_text(speed: &DecodeSpeed) -> String {
     let Some(samples) = speed.samples else {
-        return "unknown (no stats database)".into();
+        return "unknown (stats unavailable)".into();
     };
     let Some(median) = speed.median_tok_per_s else {
         return format!("unknown ({samples} recorded requests with output and timing)");
@@ -682,7 +682,7 @@ mod tests {
         assert_eq!(DecodeSpeed::default().samples, None);
         assert_eq!(
             speed_text(&DecodeSpeed::default()),
-            "unknown (no stats database)"
+            "unknown (stats unavailable)"
         );
     }
 
@@ -869,7 +869,7 @@ mod tests {
         assert_eq!(json["models"][0]["memory"]["fit"], "unknown");
         assert_eq!(json["models"][0]["improvement"]["store"], "no_store");
         let text = render_text(&dashboard);
-        assert!(text.contains("speed     unknown (no stats database)"));
+        assert!(text.contains("speed     unknown (stats unavailable)"));
         assert!(text.contains("[MLX]"));
     }
 

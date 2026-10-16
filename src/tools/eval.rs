@@ -1,7 +1,7 @@
 //! Owner-local persistent Node code execution. The OS sandbox is the security boundary.
 use super::ext::{Tool, ToolCallback, ToolContext, ToolEvent};
 use super::kernel::{
-    ActiveGuard, FORK_FENCE, JsonProcess, MAX_CODE, check_operation, code_output, deadline,
+    ActiveGuard, FORK_FENCE, MAX_CODE, NativeProcess, check_operation, code_output, deadline,
     execution_deadline, guarded_operation, lock_session, native_cell, require_fork_containment,
     resolve_operator_executable, shell_quote, strip_runtime_injection,
 };
@@ -41,7 +41,7 @@ pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
 
 struct EvalTool {
     config: EvalConfig,
-    session: Mutex<Option<JsonProcess>>,
+    session: Mutex<Option<NativeProcess>>,
     pid: Arc<AtomicI32>,
     interrupt: AtomicBool,
     active: AtomicUsize,
@@ -107,7 +107,8 @@ impl EvalTool {
                 }
                 if action == "status" {
                     return Ok(
-                        json!({"running":slot.as_mut().is_some_and(JsonProcess::alive),"language":"js"}),
+                        json!({"running":slot.as_mut().is_some_and(NativeProcess::alive),"language":"js",
+                            "platform":super::catalog::execution_platform("eval")}),
                     );
                 }
                 let code = args
@@ -142,7 +143,7 @@ impl EvalTool {
                         // Even the explicit filesystem-sandbox opt-out cannot inject code before the fence.
                         strip_runtime_injection(&mut command);
                         check_operation(end, &self.interrupt, cancel)?;
-                        *slot = Some(JsonProcess::start(command, self.pid.clone()).map_err(
+                        *slot = Some(NativeProcess::start(command, self.pid.clone()).map_err(
                             |error| {
                                 format!(
                                     "starting Node kernel (install/configure eval.node): {error}"
@@ -184,7 +185,10 @@ impl Tool for EvalTool {
     fn schema(&self) -> Value {
         tool_schema(
             "eval",
-            "Persistent operator-installed Node 22+ JavaScript namespace (not browser page evaluation). action defaults to eval; reset/cancel/status manage only this execution owner's session. Real top-level await and lexical declarations persist. tool.<name>({...}), tool.call(name,args), and tool.schemas use the current controller's direct-tool authorization, approval, validation and write observers; callbacks are synchronous, and denied/malformed calls throw ToolError retaining result metadata. Returns bounded stdout/stderr/value/error; callback results retain text/data/is_error. Requires approval, macOS OS sandbox and mandatory process-fork containment, including when filesystem sandboxing is disabled. Node runtime threads are permitted; subprocess creation and native addons are denied. Timeout/cancel destroys this owner's namespace; if a controller callback is pending its approval/nested operation is also cancelled. Use kernel for Python.",
+            &super::catalog::execution_description(
+                "eval",
+                "Persistent operator-installed Node 22+ JavaScript namespace (not browser page evaluation). action defaults to eval; reset/cancel/status manage only this execution owner's session. Real top-level await and lexical declarations persist. tool.<name>({...}), tool.call(name,args), and tool.schemas use the current controller's direct-tool authorization, approval, validation and write observers; callbacks are synchronous, and denied/malformed calls throw ToolError retaining result metadata. Returns bounded stdout/stderr/value/error; callback results retain text/data/is_error. Requires approval, macOS OS sandbox and mandatory process-fork containment, including when filesystem sandboxing is disabled. Node runtime threads are permitted; subprocess creation and native addons are denied. Timeout/cancel destroys this owner's namespace; if a controller callback is pending its approval/nested operation is also cancelled. Use kernel for Python.",
+            ),
             json!({
                 "language":{"type":"string","enum":["js"]},
                 "action":{"type":"string","enum":["eval","reset","cancel","status"]},

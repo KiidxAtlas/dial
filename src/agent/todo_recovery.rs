@@ -47,8 +47,15 @@ impl TodoRecovery {
         } else {
             "No task is active. Use a current 1-based index with start, or append necessary new tasks. done needs an active task or a valid explicit index.".to_owned()
         };
+        // Repeated rejections escalate the same reminder; the turn is never ended for them.
+        let attempts = self.failures.max(self.repeated.1);
+        let escalation = if attempts >= FAILURE_LIMIT && attempts % FAILURE_LIMIT == 0 {
+            format!("\nEscalation: {attempts} todo updates have been rejected without a successful plan change. Resending or rewording them is not recovery. Send the single update the diagnostic describes with its operation and indices corrected, or block the step with a concrete reason. The turn continues.")
+        } else {
+            String::new()
+        };
         let advice = format!(
-            "[Todo recovery from Dial]\nLast rejected update: {}\n{correction}\nTask numbers are assigned automatically; index belongs at the top level for start/done/drop/block, never inside tasks. Omit index for the current task; explicit indices are 1-based.\nThis correction takes precedence over generic todo planning examples. Changing the operation or wording and calling view do not reset the failure count. Stop and report the specific blocker if you cannot correct the update; the turn stops after {FAILURE_LIMIT} unsuccessful todo updates without a plan change.",
+            "[Todo recovery from Dial]\nLast rejected update: {}\n{correction}\nTask numbers are assigned automatically; index belongs at the top level for start/done/drop/block, never inside tasks. Omit index for the current task; explicit indices are 1-based.\nThis correction takes precedence over generic todo planning examples. Changing the operation or wording and calling view do not reset the failure count. If you cannot correct the update, block the step with a concrete reason instead of resending it.{escalation}",
             guard::clip_middle(diagnostic.lines().next().unwrap_or(diagnostic), 800)
         );
         self.reminder = Some(advice.clone());
@@ -59,12 +66,6 @@ impl TodoRecovery {
         if let Some(reminder) = &self.reminder {
             messages.push(json!({"role":"user","dial_transient":true,"content":reminder}));
         }
-    }
-
-    pub fn stop_message(&self) -> Option<String> {
-        (self.failures.max(self.repeated.1) >= FAILURE_LIMIT).then(|| format!(
-            "Stopped: todo updates failed {} times without a successful plan change. Switching operations, rewording claims, reading files, or viewing the plan is not recovery. The existing tasks are preserved; correct the reported arguments before continuing.", self.failures
-        ))
     }
 }
 
@@ -166,18 +167,19 @@ mod tests {
     }
 
     #[test]
-    fn identical_rejected_updates_stop_even_across_plan_changes() {
+    fn identical_rejected_updates_escalate_even_across_plan_changes() {
         let mut recovery = TodoRecovery::default();
         let todo = TodoList::new();
+        // A successful plan change resets the whole rejection history, so each run counts from zero.
         for _ in 0..FAILURE_LIMIT {
             recovery.observe(&call("done"), true, false, "no active task", &todo);
-            // A successful plan change in between resets the failure count, not the repeat count.
             recovery.observe(&call("set"), false, true, "", &todo);
         }
-        assert!(recovery.stop_message().is_none());
+        assert_eq!(recovery.failures, 0);
+        let mut last = None;
         for _ in 0..FAILURE_LIMIT {
-            recovery.observe(&call("done"), true, false, "no active task", &todo);
+            last = recovery.observe(&call("done"), true, false, "no active task", &todo);
         }
-        assert!(recovery.stop_message().is_some());
+        assert!(last.is_some_and(|text| text.contains("Escalation")));
     }
 }

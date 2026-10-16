@@ -14,7 +14,7 @@
 //! are tested on every platform.
 
 use super::{Snapshot, stamp};
-use crate::{agent::agent_defs::TaskConfig, benchmark::is_excluded_source_path};
+use crate::{agent::agent_defs::TaskConfig, workspace_copy::is_excluded_source_path};
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeSet,
@@ -172,7 +172,7 @@ fn change_set(
 #[cfg(windows)]
 mod native {
     use super::Journal;
-    use crate::benchmark::is_excluded_source_path;
+    use crate::workspace_copy::is_excluded_source_path;
     use std::{
         ffi::{OsStr, OsString, c_void},
         fs::{self, File},

@@ -422,10 +422,25 @@ fn child_policy(env: Env, job: &Job, schemas: &[Value], rules: &Value) -> Result
     ))
 }
 
+/// Run one child inference with its provider usage tagged by `purpose`. The previous scope is
+/// restored on every path, so the tag never leaks onto a later request of the same backend.
+fn with_usage_purpose<T>(
+    usage: Option<&llm::usage::Scope>,
+    backend: &mut Backend,
+    purpose: llm::usage::Purpose,
+    run: impl FnOnce(&mut Backend) -> Result<T>,
+) -> Result<T> {
+    let previous = backend.set_usage_scope(usage.map(|scope| scope.worker().for_purpose(purpose)));
+    let result = run(backend);
+    backend.set_usage_scope(previous);
+    result
+}
+
 fn with_child_role_backend<T>(
     env: Env,
     main: &mut Backend,
     role: &str,
+    purpose: llm::usage::Purpose,
     model_override: Option<&str>,
     children: &ChildBackends,
     complete: impl FnOnce(&mut Backend, &crate::config::types::Config, bool) -> Result<T>,
@@ -442,7 +457,9 @@ fn with_child_role_backend<T>(
         config = config.with_selection(&selection);
     }
     if config.selection() == env.config.selection() {
-        return complete(main, &config, true);
+        return with_usage_purpose(env.usage, main, purpose, |main| {
+            complete(main, &config, true)
+        });
     }
     if main.local_inference() {
         main.release();
@@ -463,7 +480,9 @@ fn with_child_role_backend<T>(
     let backend = roles
         .get_mut(&key)
         .expect("actual child role backend initialized");
-    let result = complete(backend, &config, false);
+    let result = with_usage_purpose(env.usage, backend, purpose, |backend| {
+        complete(backend, &config, false)
+    });
     backend.release();
     result
 }
@@ -475,21 +494,21 @@ fn child_provider_request(
     request: &Chat,
     observer: &std::cell::RefCell<&mut (dyn Approver + '_)>,
 ) -> Result<Option<Chat>> {
-    let mut projected = request.clone();
-    projected.messages =
-        tools::contracts::project_history(&request.messages, &request.tools, env.ext)?;
-    let changed = projected.messages != request.messages;
+    let projected = super::dispatch::projected_request(
+        request,
+        tools::contracts::project_history(&request.messages, &request.tools, env.ext)?,
+    );
     let plugin_host = env.ext.plugins();
     let plugins = plugin_host.as_deref().filter(|_| env.layout.is_some());
     let rewritten = super::hooks::provider_request(
         &env.config.hooks,
         plugins,
         env.workspace.root(),
-        &projected,
+        projected.as_ref().unwrap_or(request),
         env.interrupt,
         &mut |notice| observer.borrow_mut().notice(notice),
     )?;
-    Ok(rewritten.or_else(|| changed.then_some(projected)))
+    Ok(rewritten.or(projected))
 }
 
 /// Side inference remains a worker request, with its own role cap, account and
@@ -499,6 +518,7 @@ fn child_role_chat(
     main: &mut Backend,
     adapter: Option<&Path>,
     role: &str,
+    purpose: llm::usage::Purpose,
     request: &Chat,
     steps: &mut u32,
     budget: u32,
@@ -512,6 +532,7 @@ fn child_role_chat(
         env,
         main,
         role,
+        purpose,
         model_override,
         children,
         |backend, role_config, same| {
@@ -727,6 +748,7 @@ impl crate::storage::memory_backend::MemoryModelRunner for ChildMemoryRunner<'_,
             self.env,
             self.backend,
             role,
+            llm::usage::Purpose::Memory,
             model,
             self.children,
             |backend, config, _| {
@@ -812,6 +834,7 @@ impl crate::storage::memory_backend::MemoryModelRunner for ChildMemoryRunner<'_,
             self.backend,
             self.adapter,
             &request.role,
+            llm::usage::Purpose::Memory,
             &chat,
             self.steps,
             self.budget,
@@ -847,7 +870,8 @@ impl crate::storage::memory_backend::MemoryModelRunner for ChildMemoryRunner<'_,
             .env
             .usage
             .context("external memory requires the genuine child worker usage ledger")?
-            .worker();
+            .worker()
+            .for_purpose(llm::usage::Purpose::Memory);
         let receipt = scope.reserve_external(format!(
             "memory:{}",
             self.env.config.memory.backend.as_str()
@@ -1057,10 +1081,20 @@ fn rollover_child(
             env.interrupt,
         )
         .map_err(|denial| anyhow::anyhow!("{}", denial.message()))?;
-    let mut history = child_history(context_notes::rollover_history(
-        &journal.session,
-        u64::from(env.config.compaction.keep_recent_tokens),
-    )?);
+    let selection = env.config.selection();
+    let identity = compaction::CompactionIdentity {
+        provider: &selection.provider,
+        model: &selection.model,
+        agent: Some(job.kind),
+    };
+    let mut fixed = compaction::replacement_request(request, &[]);
+    children.project(&mut fixed, job, rules, true);
+    let keep_recent = env.config.compaction.keep_recent_budget(
+        identity,
+        child_window(env, backend),
+        compaction::request_tokens_with_policy(&fixed, &env.config.compaction, identity),
+    )?;
+    let mut history = child_history(context_notes::rollover_history(&journal.session, keep_recent)?);
     let original = journal.session.control_state()["original_goal_message"].clone();
     anyhow::ensure!(
         original["dial_context_request"] == true,
@@ -1076,12 +1110,6 @@ fn rollover_child(
     drop(journal);
     let mut candidate = compaction::replacement_request(request, &history);
     children.project(&mut candidate, job, rules, true);
-    let selection = env.config.selection();
-    let identity = compaction::CompactionIdentity {
-        provider: &selection.provider,
-        model: &selection.model,
-        agent: Some(job.kind),
-    };
     let policy = child_policy(env, job, &candidate.tools, &serde_json::to_value(rules)?)?;
     let budget = context_notes::RolloverBudget {
         identity: &policy,
@@ -1403,6 +1431,7 @@ fn compact_child(
                 backend,
                 adapter,
                 "small",
+                llm::usage::Purpose::Compaction,
                 chat,
                 &mut **steps.borrow_mut(),
                 budget,
@@ -2273,7 +2302,6 @@ fn run_inner(
                     }
                     messages.push(json!({"role":"user","content":message}));
                 }
-                LengthAction::GiveUp(why) => return Ok(super::engine::Tick::Finished(Outcome::failed(steps, why))),
             }
             return Ok(super::engine::Tick::Again);
         }
@@ -2613,7 +2641,13 @@ fn run_inner(
                 );
                 continue;
             }
-            if parallel.is_empty() {
+            if parallel.is_empty()
+                && !super::hooks::wanted(
+                    &env.config.hooks,
+                    env.ext.plugins().as_deref(),
+                    "pre_tool_use",
+                )
+            {
                 let count = reply.tool_calls[index..]
                     .iter()
                     .take(env.config.task.max_concurrency)
@@ -3084,6 +3118,9 @@ fn capture_child_memory(
     let provider_rewrite = child_provider_request(&env, &request, &observer)?;
     let provider_request = provider_rewrite.as_ref().unwrap_or(&request);
     let started = std::time::Instant::now();
+    let previous_scope = context.backend.set_usage_scope(env.usage.map(|scope| {
+        scope.worker().for_purpose(llm::usage::Purpose::Memory)
+    }));
     let result = super::chat_with_ui(
         context.backend,
         context.adapter,
@@ -3121,6 +3158,7 @@ fn capture_child_memory(
             }
         },
     );
+    context.backend.set_usage_scope(previous_scope);
     if let Ok(reply) = &result
         && let Some(cost) = context.backend.reply_cost(reply)
     {
@@ -3154,7 +3192,9 @@ fn capture_child_memory(
         .memory_capture_allowed(env.interrupt)
         .map_err(anyhow::Error::msg);
     if rejected || !matches!(admission, Ok(true)) {
-        context.backend.record_discarded_response()?;
+        with_usage_purpose(env.usage, context.backend, llm::usage::Purpose::Memory, |backend| {
+            backend.record_discarded_response()
+        })?;
     }
     let mut assistant = tools::contracts::assistant_message(&reply, &request.tools, env.ext);
     assistant["dial_child_autolearn"] = json!(true);
@@ -3622,8 +3662,8 @@ fn call_tool_inner(
         Err(reason) => return refuse(reason),
         Ok(None) => call,
         Ok(Some(arguments)) => {
-            // The child's approval already covered the original call; only read-only rewrites
-            // that still satisfy the schema may run without a fresh decision.
+            // Only schema-valid read-only rewrites are supported here. The original
+            // authorization does not cover a rewritten path or other policy inputs.
             rewritten = llm::ToolCall {
                 arguments,
                 ..call.clone()
@@ -3632,6 +3672,21 @@ fn call_tool_inner(
                 || call_form_error(&rewritten, schemas, names).is_some()
             {
                 return refuse("A pre_tool_use hook rewrote this call into one that needs approval or fails its schema; subagents only run rewritten read-only calls. Retry with arguments the hook accepts unchanged.".into());
+            }
+            if let Err(denial) = approver.borrow_mut().authorize_with_cancel(
+                &rewritten,
+                &summarize(&rewritten),
+                false,
+                env.interrupt,
+            ) {
+                return refuse(denial.message().into());
+            }
+            if let Some(reason) = callback_gate.and_then(|gate| {
+                gate.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .intercept(env.workspace.root(), &rewritten)
+            }) {
+                return refuse(reason);
             }
             &rewritten
         }
@@ -3798,6 +3853,7 @@ fn call_tool_inner(
                 context.backend,
                 context.adapter,
                 "coach",
+                llm::usage::Purpose::Repair,
                 &chat,
                 context.steps,
                 context.budget,
@@ -3814,6 +3870,7 @@ fn call_tool_inner(
                     env,
                     context.backend,
                     "coach",
+                    llm::usage::Purpose::Repair,
                     None,
                     context.children,
                     |backend, _, _| backend.record_discarded_response(),
@@ -4030,6 +4087,9 @@ fn semantic_find(
             let chat = super::semantic_chat(&request, env.harness.max_tokens);
             let mut keep_going = |_: &str| !env.interrupt.load(Ordering::SeqCst);
             let started = std::time::Instant::now();
+            let previous_scope = context.backend.set_usage_scope(env.usage.map(|scope| {
+                scope.worker().for_purpose(llm::usage::Purpose::Retrieval)
+            }));
             let result = context.backend.chat_with_control(
                 context.adapter,
                 &chat,
@@ -4038,6 +4098,7 @@ fn semantic_find(
                 &mut |notice| approver.borrow_mut().notice(notice),
                 std::sync::Arc::clone(env.interrupt),
             );
+            context.backend.set_usage_scope(previous_scope);
             record_child_request(
                 env,
                 &context.children.namespace,
@@ -4335,5 +4396,92 @@ mod tests {
             out.text
         );
         assert!(asked.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewritten_child_reads_recheck_schema_and_path_authority() {
+        struct PathReviewer(Vec<String>);
+        impl Approver for PathReviewer {
+            fn authorize(
+                &mut self,
+                call: &llm::ToolCall,
+                _: &str,
+                _: bool,
+            ) -> Result<(), approval::Denial> {
+                let path = call.arguments["path"].as_str().unwrap().to_owned();
+                self.0.push(path.clone());
+                if path == "denied.txt" {
+                    Err(Denial::Rule)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for (replacement, expected, authorized) in [
+            (json!({"path":"allowed.txt"}), "allowed evidence", 2),
+            (json!({"path":"denied.txt"}), "denied", 2),
+            (
+                json!({"path":"allowed.txt", "offset":"invalid"}),
+                "fails its schema",
+                1,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("allowed.txt"), "allowed evidence\n").unwrap();
+            std::fs::write(dir.path().join("denied.txt"), "secret evidence\n").unwrap();
+            let workspace = Workspace::new(dir.path()).unwrap();
+            let mut config = Config::default();
+            config.hooks.push(crate::config::types::HookConfig {
+                event: "pre_tool_use".into(),
+                matcher: Some("read".into()),
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "cat >/dev/null; printf '%s' '{}'",
+                        json!({"input":replacement})
+                    ),
+                ],
+                timeout_secs: 5,
+                fail_closed: None,
+            });
+            let harness = Harness::default();
+            let ext = Registry::new();
+            let interrupt = Arc::new(AtomicBool::new(false));
+            let env = Env {
+                config: &config,
+                workspace: &workspace,
+                ext: &ext,
+                layout: None,
+                harness: &harness,
+                interrupt: &interrupt,
+                usage: None,
+                context_cap: None,
+                memory: None,
+                agents_messages: &[],
+                plan_mode: false,
+            };
+            let request = subagents::parse(
+                &json!({"agent":"scout", "task":"inspect", "solution_space":"files"}),
+                &config,
+            )
+            .unwrap();
+            let job = &request.jobs[0];
+            let names = toolset(job.spec, &harness.tools, &ext);
+            let schemas = schemas(env, &names).unwrap();
+            let call = llm::ToolCall {
+                id: "read".into(),
+                name: "read".into(),
+                arguments: json!({"path":"original.txt"}),
+                malformed_arguments: false,
+            };
+            let mut reviewer = PathReviewer(Vec::new());
+            let output = call_tool(env, job, &schemas, &names, &call, &mut reviewer, None, None);
+            assert!(output.text.contains(expected), "{}", output.text);
+            assert_eq!(output.is_error, expected != "allowed evidence");
+            assert!(!output.text.contains("secret evidence"));
+            assert_eq!(reviewer.0.len(), authorized);
+        }
     }
 }

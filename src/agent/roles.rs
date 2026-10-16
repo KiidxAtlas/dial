@@ -14,7 +14,7 @@ impl<'a> Agent<'a> {
             let supplementary = tools::navigation::lsp_args(args).map_err(anyhow::Error::msg)?;
             let response = if request.has_candidates() {
                 let chat = semantic_chat(&request, self.version.harness.max_tokens);
-                self.role_chat(main, "small", &chat, ui)
+                self.role_chat(main, "small", llm::usage::Purpose::Retrieval, &chat, ui)
                     .context("semantic find ranking failed")?
             } else {
                 "{\"indices\":[]}".to_owned()
@@ -175,7 +175,7 @@ impl<'a> Agent<'a> {
         chat.max_tokens = output_budget
             .min(u32::try_from(u64::from(window) - estimate).unwrap_or(u32::MAX))
             .max(1);
-        let text = self.role_chat(main, "coach", &chat, ui)?;
+        let text = self.role_chat(main, "coach", llm::usage::Purpose::Repair, &chat, ui)?;
         ensure!(
             !self.interrupt.load(Ordering::SeqCst),
             "edit repair cancelled"
@@ -213,30 +213,24 @@ impl<'a> Agent<'a> {
         &mut self,
         main: &mut Backend,
         role: &str,
+        purpose: llm::usage::Purpose,
         request: &Chat,
         ui: &mut dyn Ui,
     ) -> Result<String> {
-        self.role_chat_timeout(main, role, request, self.config.worker_timeout_secs, ui)
-    }
-    pub(super) fn role_chat_timeout(
-        &mut self,
-        main: &mut Backend,
-        role: &str,
-        request: &Chat,
-        timeout_secs: u64,
-        ui: &mut dyn Ui,
-    ) -> Result<String> {
+        let timeout_secs = self.config.worker_timeout_secs;
         main.require_session_identity()?;
         let namespace = match &self.active_side_namespace {
             Some(namespace) => namespace.clone(),
             None => compaction_runtime::side_request_namespace(&self.session.id())?,
         };
         let previous_cache = main.swap_cache_namespace(&namespace, &self.auth_config)?;
-        let previous_scope = main.set_usage_scope(Some(self.usage_scope.worker()));
+        let previous_scope =
+            main.set_usage_scope(Some(self.usage_scope.worker().for_purpose(purpose)));
         let previous_profile = main.swap_request_profile(None);
         let result = self.role_chat_scoped(
             main,
             role,
+            purpose,
             request,
             ui,
             &namespace,
@@ -252,6 +246,7 @@ impl<'a> Agent<'a> {
         &mut self,
         main: &mut Backend,
         role: &str,
+        purpose: llm::usage::Purpose,
         request: &Chat,
         ui: &mut dyn Ui,
         namespace: &str,
@@ -261,16 +256,9 @@ impl<'a> Agent<'a> {
         let selection = self.role_selection(role).cloned();
         let Some(selection) = selection else {
             if (request.max_tokens > 0 || main_profile.is_some())
-                && let Some(mut profile) = main_profile.or(main.compaction_profile()).cloned()
+                && let Some(profile) =
+                    main.bounded_request_profile(main_profile, request.max_tokens)
             {
-                if request.max_tokens > 0 {
-                    profile.max_tokens = Some(
-                        profile
-                            .max_tokens
-                            .filter(|cap| *cap > 0)
-                            .map_or(request.max_tokens, |cap| cap.min(request.max_tokens)),
-                    );
-                }
                 main.next_request_profile(crate::llm::profiles::request_tiers_for(
                     Some(profile),
                     &self.auth_config.selection(),
@@ -335,22 +323,12 @@ impl<'a> Agent<'a> {
                 return Err(error);
             }
         };
-        backend.set_usage_scope(Some(self.usage_scope.worker()));
+        backend.set_usage_scope(Some(self.usage_scope.worker().for_purpose(purpose)));
         let previous_profile = backend.swap_request_profile(None);
         if (request.max_tokens > 0 || previous_profile.is_some())
-            && let Some(mut profile) = previous_profile
-                .as_ref()
-                .or(backend.compaction_profile())
-                .cloned()
+            && let Some(profile) =
+                backend.bounded_request_profile(previous_profile.as_ref(), request.max_tokens)
         {
-            if request.max_tokens > 0 {
-                profile.max_tokens = Some(
-                    profile
-                        .max_tokens
-                        .filter(|cap| *cap > 0)
-                        .map_or(request.max_tokens, |cap| cap.min(request.max_tokens)),
-                );
-            }
             backend.next_request_profile(crate::llm::profiles::request_tiers_for(
                 Some(profile),
                 &self.auth_config.selection(),
@@ -442,4 +420,144 @@ pub(super) fn append_find_supplement(
     }
     output.is_error |= metadata.is_error;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_summary_role_chatgpt_does_not_inject_output_limits() {
+        for assigned in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            llm::chatgpt::test_account(home.path(), false);
+            let output = json!({"type":"message","role":"assistant","status":"completed",
+                "content":[{"type":"output_text","text":"summary","annotations":[]}]});
+            let server = llm::fake::serve(vec![llm::fake::Script::Sse(format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"type":"response.output_text.delta","delta":"summary"}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[output],"usage":{"input_tokens":10,"output_tokens":2}}})
+            ))]);
+            let profile = llm::profiles::ModelProfile {
+                provider: "chatgpt".into(),
+                model: "account-model".into(),
+                ..Default::default()
+            };
+            let mut config = Config {
+                provider: Some("chatgpt".into()),
+                model: "account-model".into(),
+                user_dir: home.path().to_path_buf(),
+                model_profile: Some("plan".into()),
+                ..Default::default()
+            };
+            config.model_profiles.insert("plan".into(), profile.clone());
+            if assigned {
+                config
+                    .model_roles
+                    .insert("small".into(), config.selection());
+            }
+            let backend = || {
+                let mut backend = Backend::new(
+                    ProviderKind::ChatGpt {
+                        model: "account-model".into(),
+                        user_dir: home.path().to_path_buf(),
+                    },
+                    Default::default(),
+                    5,
+                )
+                .with_session_id("role-compaction")
+                .with_profile(profile.clone());
+                backend.chatgpt_url = Some(format!("{}/codex/responses", server.url));
+                backend
+            };
+            let version = Version {
+                id: 0,
+                parent: None,
+                kind: "config".into(),
+                harness: config.harness.clone(),
+                adapter: None,
+                status: "active".into(),
+            };
+            let mut agent =
+                Agent::hermetic(&config, backend(), &version, workspace.path(), None, None)
+                    .unwrap();
+            if assigned {
+                agent.role_backends.insert("small".into(), backend());
+            }
+            let mut main = agent.backend.take().unwrap();
+            let request = Chat {
+                messages: vec![json!({"role":"user","content":"Summarize."})],
+                tools: vec![],
+                temperature: 0.0,
+                max_tokens: 64,
+                seed: None,
+            };
+            assert_eq!(
+                agent
+                    .role_chat(
+                        &mut main,
+                        "small",
+                        llm::usage::Purpose::Compaction,
+                        &request,
+                        &mut NullUi,
+                    )
+                    .unwrap(),
+                "summary"
+            );
+            let requests = server.requests();
+            assert_eq!(requests.len(), 1);
+            let body = llm::fake::body(&requests[0]);
+            for field in ["max_tokens", "max_output_tokens", "temperature", "top_p"] {
+                assert!(
+                    body.get(field).is_none(),
+                    "assigned={assigned}, {field}: {body}"
+                );
+            }
+            assert!(main.model_profile().unwrap().max_tokens.is_none());
+            assert!(config.active_model_profile().unwrap().max_tokens.is_none());
+        }
+    }
+
+    #[test]
+    fn auxiliary_output_budget_preserves_endpoint_caps_and_selected_profiles() {
+        let backend = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                model: "test".into(),
+                api_key: None,
+            },
+            Default::default(),
+            5,
+        )
+        .with_profile(llm::profiles::ModelProfile {
+            provider: "openai".into(),
+            model: "test".into(),
+            max_tokens: Some(1024),
+            ..Default::default()
+        });
+        let selected = llm::profiles::ModelProfile {
+            max_tokens: Some(32),
+            ..backend.model_profile().unwrap().clone()
+        };
+        assert_eq!(
+            backend
+                .bounded_request_profile(None, 64)
+                .unwrap()
+                .max_tokens,
+            Some(64)
+        );
+        assert_eq!(
+            backend
+                .bounded_request_profile(Some(&selected), 64)
+                .unwrap()
+                .max_tokens,
+            Some(32)
+        );
+        assert_eq!(
+            backend.bounded_request_profile(None, 0).unwrap().max_tokens,
+            Some(1024)
+        );
+        assert_eq!(backend.model_profile().unwrap().max_tokens, Some(1024));
+    }
 }

@@ -239,7 +239,7 @@ impl Action {
             Action::HistorySearch => "Search prompt history",
             Action::EditExternal => "Edit the draft in $VISUAL/$EDITOR",
             Action::DisplayReset => "Clear the screen and repaint",
-            Action::CommandPalette => "Search application actions",
+            Action::CommandPalette => "Search slash commands",
             Action::ModelSelect => "Open the model selector",
             Action::ModelRoles => "Assign models to roles",
             Action::ModelFavoriteNext => "Switch to the next available favorite model",
@@ -248,7 +248,7 @@ impl Action {
             Action::ToolsExpand => "Expand or collapse tool output",
             Action::ToolsToggle => "Show or hide tool activity",
             Action::ThinkingToggle => "Show or hide reasoning text",
-            Action::ApprovalCycle => "Cycle approval mode (ask, auto, read-only)",
+            Action::ApprovalCycle => "Cycle approval mode (ask, write, auto, read-only)",
             Action::SubagentsHub => {
                 "Open the worker hub: every worker, its activity, steering and cancel (Left twice on an empty composer also opens it)"
             }

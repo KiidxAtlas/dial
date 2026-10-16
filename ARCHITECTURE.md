@@ -8,15 +8,18 @@ worker used only for MLX inference and LoRA training.
 | Module | Responsibility |
 |---|---|
 | `agent` | Agent loop, prompts, approvals, guards, subagents, todos, investigation/verification gates, harvesting of training data |
-| `llm` | Provider clients (OpenAI-compatible, Anthropic, ChatGPT, local MLX server), streaming, tool-call repair (`text_tool_calls`, `json_repair`) |
+| `llm` | Provider clients (OpenAI-compatible, Anthropic, ChatGPT, local MLX server), inference model acquisition, streaming, tool-call repair (`text_tool_calls`, `json_repair`) |
 | `tools` | Model-callable tools: files, hashline edits, search, shell + sandbox, LSP, AST, DAP, MCP, browser, documents, git, kernel |
 | `storage` | Sessions, checkpoints, memory, project understanding, skills, settings (outside the workspace) |
-| `config` | Configuration types, domain setting declarations, validated snapshots and loading |
+| `config` | Configuration types, domain setting declarations, validated snapshots, canonical layered views and explicit model-selection changes |
 | `learn` | Gated self-improvement: curriculum, verification, probes, LoRA training jobs, admission/rollback |
 | `ui` | Terminal interface: composer, transcript, overlays, themes |
 | `runtime` | Shared result bodies, typed execution facts, cancellation scopes, and streaming journal; snapshots for observers and the session journal |
 | `app`, `repl`, `rpc`, `setup`, `main` | Entry points and wiring |
-| `benchmark`, `benchmark_cli` | Benchmark definitions, isolation and reporting |
+| `cli` | Top-level subcommands, flag resolution and shared plain-text table rendering; `benchmark/`, `improve.rs` and `update.rs` are private binary modules mounted by `main` |
+| `commands` | Interactive slash commands, mounted privately by `app` |
+| `benchmark` | Benchmark definitions, isolated evaluation setup and reporting; binary command implementation lives in `cli/benchmark` |
+| `workspace_copy` | Shared source-copy, secret-exclusion and generated-output policy for benchmark and runtime isolation |
 | `steering`, `adaptive`, `schedule`, `reliability` | Runtime steering, adaptive controls, scheduling and reliability helpers |
 
 ## Dependency boundaries
@@ -28,6 +31,9 @@ Enforced by `tests/integration/architecture.rs` (production code only; `#[cfg(te
 - `tools` does not depend on `ui`, `learn` or `agent`; `config` does not depend on `ui` or `learn`.
 - `runtime` does not depend on `ui`, `learn`, `agent`, `tools` or `llm`. Shared argument/schema/template/structural engines and process execution have neutral owners. Journal reclamation uses private storage publication after the session fsync barrier.
 - `storage`, `agent` and `learn` do not depend on `ui`.
+- `workspace_copy` does not depend on `agent`, `benchmark`, `learn`, `config`, `llm` or `ui`.
+  Evaluation and worker isolation consume this shared policy; benchmark re-exports retain the
+  earlier public copy API. Private dependency materialization keeps its narrower allowlist.
 
 Changing a rule means editing that test and stating why here.
 
@@ -65,6 +71,7 @@ Changing a rule means editing that test and stating why here.
   macOS/Apple Silicon only; Linux/WSL2 uses hosted or OpenAI-compatible providers.
 - Every completed live edit turn, including text-only completion, surfaces a bounded checkpoint diff; shell and approval-requiring extension calls are tracked as uncheckpointed and require staged/unstaged Git review (`agent/mod.rs`, `storage/checkpoint.rs`).
 - Failed focused checks remain named repair obligations and are re-run alongside checks selected from new changed files; project-aware mappings use Python, Rust, Go and JavaScript test metadata (`agent/verification.rs`, `agent/mod.rs`).
+- Finalization is reentered after stop-hook continuations, so later edits cannot bypass focused verification. Repairs and hooks share the original turn budget and retain separate bounded retry counts. Rejected completion reports keep a clearly labeled candidate work summary alongside the actual failure, blocker or interruption.
 - A learned adapter is used only after it passes the evaluation gate; admission and rollback
   invalidate task routes (`learn/gate.rs`, `learn/profiles.rs`).
 - Weight candidates are likelihood-screened on validation targets before rollout evaluation;
@@ -95,6 +102,20 @@ make test-module MOD=llm::provider   # cargo test --locked --lib llm::provider
 make test-integration                # cargo test --locked --test integration
 ```
 
+Discoverable check tiers (portable checks never download models):
+
+```sh
+make test-rust              # Rust tests; TEST_PROFILE selects dev or ci
+make test-python            # Python contracts; reports optional MLX skips
+make test-bench-offline      # offline benchmark graders and reporting
+make test-smoke DIAL=target/debug/dial  # existing artifact and scripted recovery fixtures
+make test-mlx               # optional Apple-Silicon MLX checks; explicitly skips if unavailable
+```
+
+`test-smoke` does not build its binary. `PYTHON` selects an already-provisioned interpreter;
+the targets do not install packages. CI uses the same Python, grader and smoke entry points.
+Portable Python coverage is not evidence that hardware-dependent MLX paths passed.
+
 Lib tests report timings with `RUSTC_BOOTSTRAP=1 target/debug/deps/dial-<hash> -Z unstable-options --report-time`.
 
 ## Runtime ownership
@@ -105,4 +126,45 @@ Lib tests report timings with `RUSTC_BOOTSTRAP=1 target/debug/deps/dial-<hash> -
 - `runtime/cancellation.rs` separates session termination, turn interruption, inference/read/background scopes and mutation commitment. Atomic commits settle before interruption is reported; uncertain effects never imply rollback.
 - `runtime/stream_journal.rs` appends incremental runtime observations before publication. A body updates its observable state only after the journal accepts the change; write failure stops both callback publication and polling-visible changes. Session recovery overlays newer frames only on their active branch, marks open bodies interrupted, and never projects partial tool arguments as executable calls. Final snapshots live in the main journal. Session relocation, deletion and archiving handle both files.
 - `config/schema.rs` owns shared settings metadata. Defaults come from `Config::default`; model-dependent output bounds use the selected profile. UI and CLI consume the same declaration. Cross-field and provider constraints remain in configuration validation.
+- `config/selection.rs` owns model-selection setting changes shared by setup and interactive controllers. Preparation validates the explicit candidate before selection is published; presentation never reconstructs configuration precedence.
+- Embedding setup uses the same model-selection writer as other role pickers. Switching to a
+  local role clears stale remote endpoint/auth fields without clearing explicit embedding overrides.
+- `llm/download.rs` owns inference acquisition and quantization planning. The `learn/download.rs` re-export preserves the earlier Rust import path, not learning ownership. Callers supply cancellation and progress; cached discovery does not fetch weights.
+- `storage/atomic.rs` owns publication mechanics with distinct private-state, workspace-replacement and mode-preserving policies. Ownership/link checks and platform durability constraints are not interchangeable.
 - CI records runtime-journal overhead and markdown/terminal encoding p95 without imposing a host-dependent speed threshold.
+- RPC has one state projector for worker and cached queries. Typed notices expose their lane;
+  ACP preserves source metadata in `_meta.dial` without requiring clients to change text handling.
+- Session relocation treats the main journal and incremental stream journal as one cleanup unit:
+  failure to reopen the destination removes both destination artifacts and preserves the source.
+- Steering import, evaluation, automatic creation and promotion share per-vector mutation leases.
+  Promotion holds both pending and active leases before checking state and uses the same admission
+  gate as runtime loading; `--replace` never bypasses evaluation or a busy lease.
+
+## Cross-surface review scope
+
+The cross-system review follows ownership and shared contracts rather than requiring a rewrite
+of each feature. The reviewed areas and resulting decisions are:
+
+| Area | Design decision |
+| --- | --- |
+| Parent/child agent loop, recovery and tool dispatch | Retain shared lifecycle, execution-effect and cancellation owners; do not add a second orchestration pipeline. |
+| Model configuration, setup and settings surfaces | Route embedding-role changes through the canonical selection writer; preserve explicit overrides and open-choice settings. |
+| Benchmarks and worker isolation | Share source copying and exclusion policy outside benchmark ownership; keep private dependency materialization semantics separate. |
+| Terminal, print CLI, RPC and ACP | Keep presentation adapters over shared agent events; preserve typed event metadata and use one RPC state projector. No terminal visual redesign was performed. |
+| Session persistence and runtime streams | Clean up both destination journals when relocation fails, preserving the source and its live runtime. |
+| Steering, import and automatic improvement | Share mutation leases and admission checks rather than duplicating weaker promotion gates. |
+| Provider acquisition and optional learning | Retain existing acquisition ownership and compatibility exports; no model downloads, training runs or provider-policy changes were made for this review. |
+
+Verification covers focused library tests plus architecture, isolation, configuration, benchmark
+and RPC integration tests. It is not certification of every feature or platform. Native Windows
+ProjFS, Linux overlay mounts, real provider inference, training and third-party client rendering
+were not exercised. ACP metadata preservation does not establish client-side output replacement.
+The earlier full-suite failures remain unresolved except for the specifically corrected schema
+and MCP contract assertions; they have not all been established as pre-existing. Clippy's
+correctness/suspicious gate passed with warnings, not a warning-free result. Unrelated formatting
+differences were left intact.
+
+**[INFERENCE]** Removing full-history cloning from RPC state queries and giving shared behavior
+one owner should reduce avoidable work and future drift. No wall-clock, allocation or model-success
+improvement was measured. Streaming execution, pruning defaults and broader protocol precedence
+changes require separate evidence before changing their behavior.

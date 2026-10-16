@@ -378,7 +378,23 @@ fn inventory_reports_runtime_status_without_exposing_configuration_secrets() {
     let loaded = load(&config);
     let inventory = loaded.inventory_tool(&config);
     assert!(!inventory.needs_approval(&json!({})));
-    assert!(inventory.read_only_hint());
+    // Install mutates the global config, so the inventory is never read-only. Only list and
+    // search are reads; every action is scheduled exclusively because the hint is false.
+    assert!(!inventory.read_only_hint());
+    for action in ["list", "search"] {
+        let args = json!({"action": action});
+        assert!(!inventory.needs_approval(&args), "{action} only reads");
+        assert_eq!(
+            inventory.concurrency(&args),
+            crate::tools::ext::Concurrency::Exclusive
+        );
+    }
+    let install = json!({"action": "install", "id": "example"});
+    assert!(inventory.needs_approval(&install));
+    assert_eq!(
+        inventory.concurrency(&install),
+        crate::tools::ext::Concurrency::Exclusive
+    );
     let (_dir, workspace) = testkit::workspace();
     let ctx = ToolContext {
         workspace: &workspace,

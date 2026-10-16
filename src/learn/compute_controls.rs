@@ -162,15 +162,16 @@ pub fn action(user: &Path, state: Option<&str>, action: &str) -> Result<String> 
         state.parent().and_then(Path::parent) == Some(layout.state_dir.as_path()),
         "job project does not match its state"
     );
+    ensure!(
+        config.improve.enabled,
+        "automatic improvement is off for this model; turn on Enabled in {} first",
+        super::improve::SETTINGS_PATH
+    );
     super::auto::resume(&state)?;
     let _ = store; // The existing worker's control lock is the authority for whether it is running.
     let writable = Store::open(&state, &config.model, &config.use_case, &config.harness)?;
     writable.set_meta("auto_enabled", "true")?;
-    config.improve.enabled = true;
-    ensure!(
-        super::auto::start_cycle(&layout, &config, &writable)?,
-        "Job already running or queued"
-    );
+    super::auto::start_cycle(&layout, &config, &writable)?.ensure_started(&state)?;
     Ok("Improvement cycle started; it will yield to coding requests.".into())
 }
 

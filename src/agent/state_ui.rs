@@ -309,6 +309,9 @@ impl Ui for StateUi<'_> {
     fn background_notice(&mut self, v: &str) {
         self.inner.background_notice(v)
     }
+    fn background_output(&mut self, name: &str, text: &str, replace: bool) {
+        self.inner.background_output(name, text, replace)
+    }
     fn image(&mut self, v: &Value) {
         self.inner.image(v)
     }

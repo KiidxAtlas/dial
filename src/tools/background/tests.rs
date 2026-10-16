@@ -37,6 +37,64 @@ fn tool() -> Background {
 }
 
 #[test]
+fn default_wait_returns_control_while_the_job_keeps_running() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    assert!(!start(&tool, &ws, "bounded", "sleep 30").is_error);
+    let began = Instant::now();
+    let out = bg(&tool, &ws, json!({"action":"wait", "name":"bounded"}));
+    assert!(!out.is_error, "{}", out.text);
+    assert!(out.text.contains("still running"), "{}", out.text);
+    assert!(began.elapsed() < Duration::from_secs(15));
+    assert!(tool.has_live_work());
+    assert!(!bg(&tool, &ws, json!({"action":"kill", "name":"bounded"})).is_error);
+}
+
+#[test]
+fn waits_release_the_workspace_lock_and_readiness_is_steerable() {
+    let tool = tool();
+    for action in ["wait", "output", "list"] {
+        assert!(matches!(
+            tool.concurrency(&json!({"action":action})),
+            super::super::ext::Concurrency::Shared
+        ));
+    }
+    assert!(matches!(
+        tool.concurrency(&json!({"action":"start"})),
+        super::super::ext::Concurrency::Exclusive
+    ));
+    assert!(tool.interruptible(&json!({"action":"start", "ready":{"log":"ready"}})));
+    assert!(!tool.interruptible(&json!({"action":"start"})));
+}
+
+#[test]
+fn pty_notifications_use_job_identity_and_replace_semantics() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    let out = bg(
+        &tool,
+        &ws,
+        json!({"action":"start", "name":"terminal", "pty":true, "command":"printf 'screen-ready\\n'; sleep 30"}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    let out = bg(
+        &tool,
+        &ws,
+        json!({"action":"wait", "name":"terminal", "until":"screen-ready", "timeout":5}),
+    );
+    assert!(!out.is_error, "{}", out.text);
+    let events = tool.drain_notifications();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "background_progress"
+                && event.name == "terminal"
+                && event.text.contains("screen-ready"))
+    );
+    assert!(!bg(&tool, &ws, json!({"action":"kill", "name":"terminal"})).is_error);
+}
+
+#[test]
 fn pty_start_is_refused_when_no_pty_is_configured() {
     let (_dir, ws) = open_workspace();
     let tool = Background {
@@ -658,7 +716,7 @@ fn heartbeat_emits_start_live_deltas_then_completion_once() {
     }
     let output: String = events
         .iter()
-        .filter(|event| event.kind == "output")
+        .filter(|event| event.kind == "background_output")
         .map(|event| event.text.as_str())
         .collect();
     assert_eq!(output, "first\nlast\n");
@@ -725,7 +783,10 @@ fn background_complete_artifact_preserves_discarded_middle() {
     assert_eq!(bytes.len(), 2 * 1048576 + b"START\n\nMIDDLE\n\nEND\n".len());
     assert_eq!(&bytes[1048576 + 6..1048576 + 14], b"\nMIDDLE\n");
     assert!(bytes.starts_with(b"START\n") && bytes.ends_with(b"\nEND\n"));
-    let output = events.iter().find(|event| event.kind == "output").unwrap();
+    let output = events
+        .iter()
+        .find(|event| event.kind == "background_output")
+        .unwrap();
     assert!(
         output.text.len() < 16 * 1024 + 200,
         "unbounded heartbeat output"
@@ -749,7 +810,7 @@ fn kill_drains_final_output_before_one_completion_notification() {
     assert!(
         events
             .iter()
-            .any(|event| event.kind == "output" && event.text.contains("ready"))
+            .any(|event| event.kind == "background_output" && event.text.contains("ready"))
     );
     assert_eq!(events.last().unwrap().kind, "complete");
     assert!(tool.drain_notifications().is_empty());

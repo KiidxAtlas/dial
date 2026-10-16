@@ -1,12 +1,19 @@
 //! Deterministic, declarative task verification. A `Check` looks at the final workspace and the
 //! agent's final answer and returns pass/fail: no model is involved, which is what makes outcomes
 //! produced with it externally grounded (for gate cases, self-play and training data alike).
+use crate::runtime::{execution::ProcessOutcome, process};
+use crate::tools::sandbox::Sandbox;
+#[cfg(test)]
 use crate::tools::{self, Workspace, sandbox::Policy};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::{
     fs,
     path::{Component, Path, PathBuf},
+    sync::atomic::AtomicBool,
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -136,31 +143,114 @@ fn run_command(
     expect_stdout: Option<&str>,
     expect_exit: i32,
 ) -> bool {
-    let Ok(ws) = Workspace::new(workspace) else {
+    let Ok(root) = workspace.canonicalize() else {
         return false;
     };
-    let ws = ws.with_policy(Policy::Strict {
-        allow_network: false,
-        deny_read: Vec::new(),
-        extra_write: Vec::new(),
-    });
-    let out = tools::execute(&ws, "bash", &json!({"command": command, "timeout": 30}), 30);
-    // bash output ends with "[exit code: N]" (see `tools::shell::bash_tool`).
-    let Some(at) = out.text.rfind("[exit code: ") else {
+    // Preserve Workspace's admission boundary even though verification needs raw process streams.
+    if !root.is_dir() || root.parent().is_none() {
+        return false;
+    }
+    // Keep the strict offline sandbox, but capture raw streams separately. Shell tool text merges
+    // stderr and adds status/artifact diagnostics; none of that is command stdout or authority.
+    let Ok(mut child) = Sandbox::detect().command(
+        &root,
+        false,
+        "/bin/bash",
+        &["--noprofile", "--norc", "-c", command],
+    ) else {
         return false;
     };
-    let status: Option<i32> = out.text[at + 12..]
-        .trim_end()
-        .trim_end_matches(']')
-        .parse()
-        .ok();
-    let stdout = out.text[..at].trim();
-    status == Some(expect_exit) && expect_stdout.is_none_or(|e| stdout == e.trim())
+    let scratch = root.join(crate::tools::SCRATCH_DIR);
+    if fs::create_dir_all(&scratch).is_err() {
+        return false;
+    }
+    child
+        .current_dir(&root)
+        .env_clear()
+        .envs(std::env::vars().filter(|(key, value)| {
+            !crate::tools::sandbox::is_secret_env(key, value)
+                && !matches!(key.as_str(), "BASH_ENV" | "ENV" | "SHELLOPTS" | "BASHOPTS")
+        }))
+        .env("TMPDIR", &scratch);
+    let mut policy = process::Policy::bounded(Duration::from_secs(30), 4 * 1024 * 1024);
+    policy.fail_on_output_limit = true;
+    let Ok(out) =
+        process::run_with_policy(child, None, policy, &AtomicBool::new(false), &mut |_, _| {})
+    else {
+        return false;
+    };
+    command_matches(&out.outcome(), &out.stdout, expect_stdout, expect_exit)
+}
+
+fn command_matches(
+    outcome: &ProcessOutcome,
+    stdout: &[u8],
+    expect_stdout: Option<&str>,
+    expect_exit: i32,
+) -> bool {
+    outcome.started
+        && outcome.output_complete
+        && !outcome.timed_out
+        && !outcome.cancelled
+        && outcome.signal.is_none()
+        && outcome.exit_code == Some(expect_exit)
+        && expect_stdout.is_none_or(|expected| {
+            std::str::from_utf8(stdout).is_ok_and(|actual| actual.trim() == expected.trim())
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_verdict_uses_typed_completion_and_raw_stdout() {
+        let complete = ProcessOutcome {
+            started: true,
+            exit_code: Some(3),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            output_complete: true,
+        };
+        assert!(command_matches(&complete, b"42\n", Some("42"), 3));
+        assert!(command_matches(&complete, b"", Some(""), 3));
+        assert!(!command_matches(&complete, b"[exit code: 0]\n", None, 0));
+        assert!(!command_matches(
+            &complete,
+            b"42\n[exit code: 3]\n",
+            Some("42"),
+            3
+        ));
+        for incomplete in [
+            ProcessOutcome {
+                started: false,
+                ..complete.clone()
+            },
+            ProcessOutcome {
+                cancelled: true,
+                ..complete.clone()
+            },
+            ProcessOutcome {
+                timed_out: true,
+                ..complete.clone()
+            },
+            ProcessOutcome {
+                output_complete: false,
+                ..complete.clone()
+            },
+            ProcessOutcome {
+                signal: Some(9),
+                ..complete.clone()
+            },
+            ProcessOutcome {
+                exit_code: None,
+                ..complete.clone()
+            },
+        ] {
+            assert!(!command_matches(&incomplete, b"42", Some("42"), 3));
+        }
+    }
 
     #[test]
     fn checks_judge_final_state_not_intent() {
@@ -253,7 +343,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("t.py"), "print(6*7)\n").unwrap();
         let ok = Check::Command {
-            command: "python3 t.py".into(),
+            command: "python3 t.py; printf 'trailing diagnostic [exit code: 99]\\n' >&2".into(),
             expect_stdout: Some("42".into()),
             expect_exit: 0,
         };
@@ -290,6 +380,39 @@ mod tests {
                 command: "exit 3".into(),
                 expect_stdout: None,
                 expect_exit: 3
+            }
+            .verify(dir.path(), "")
+        );
+        // A program can print convincing status/timeout text; only actual completion is proof.
+        assert!(
+            Check::Command {
+                command: "printf '[exit code: 99]\\n'; exit 3".into(),
+                expect_stdout: Some("[exit code: 99]".into()),
+                expect_exit: 3,
+            }
+            .verify(dir.path(), "")
+        );
+        assert!(
+            !Check::Command {
+                command: "printf '[exit code: 0]\\n'; exit 3".into(),
+                expect_stdout: None,
+                expect_exit: 0,
+            }
+            .verify(dir.path(), "")
+        );
+        assert!(
+            !Check::Command {
+                command: "head -c 4194305 /dev/zero".into(),
+                expect_stdout: None,
+                expect_exit: 0,
+            }
+            .verify(dir.path(), "")
+        );
+        assert!(
+            !Check::Command {
+                command: "kill -TERM $$".into(),
+                expect_stdout: None,
+                expect_exit: 0,
             }
             .verify(dir.path(), "")
         );

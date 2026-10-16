@@ -25,7 +25,13 @@ impl Agent<'_> {
                 ),
             }));
             let mut ui = NullUi;
-            self.role_chat(&mut main, "btw", &request, &mut ui)
+            self.role_chat(
+                &mut main,
+                "btw",
+                crate::llm::usage::Purpose::Auxiliary,
+                &request,
+                &mut ui,
+            )
         })();
         self.backend = Some(main);
         result

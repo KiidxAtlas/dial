@@ -9,6 +9,91 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// Configuration metadata only; schemas and authorization remain in the existing tool contracts.
+pub struct Integration {
+    pub name: &'static str,
+    pub default_enabled: bool,
+    pub always_registered: bool,
+}
+macro_rules! integrations {
+    ($(($name:literal, $default:literal, $always:literal)),* $(,)?) => {
+        pub const INTEGRATION_TOOLS: &[&str] = &[$($name),*];
+        pub const INTEGRATIONS: &[Integration] = &[$(Integration {
+            name: $name, default_enabled: $default, always_registered: $always,
+        }),*];
+    };
+}
+integrations! {
+    ("bg", true, false),
+    ("web_fetch", true, false),
+    ("web_search", true, false),
+    ("lsp", true, false),
+    ("ast_search", true, false),
+    ("ast_edit", true, false),
+    ("dap", true, false),
+    ("git", true, false),
+    ("ssh", true, false),
+    ("browser", true, true),
+    ("kernel", true, true),
+    ("eval", true, true),
+    ("find", true, true),
+    ("autoresearch", true, true),
+    ("archive", true, true),
+    ("github", false, false),
+    ("notebook", false, false),
+    ("security_scan", false, false),
+    ("computer", false, false),
+}
+pub fn default_integrations() -> Vec<String> {
+    INTEGRATIONS
+        .iter()
+        .filter(|entry| entry.default_enabled)
+        .map(|entry| entry.name.to_owned())
+        .collect()
+}
+pub fn integration_enabled(name: &str, configured: &[String]) -> bool {
+    INTEGRATIONS
+        .iter()
+        .any(|entry| entry.name == name && entry.always_registered)
+        || configured.iter().any(|entry| entry == name)
+}
+
+/// Platform support is not an execution grant or a probe of the configured interpreter.
+#[derive(Clone, Debug, Serialize)]
+pub struct PlatformAvailability {
+    pub available: bool,
+    pub reason: Option<String>,
+}
+pub fn execution_platform(name: &str) -> PlatformAvailability {
+    let reason = if cfg!(target_os = "macos") {
+        super::sandbox::Sandbox::detect().available().err().map(|error|
+            format!("{name} requires OS process-fork containment even with filesystem sandboxing disabled: {error}"))
+    } else if cfg!(windows) && name == "kernel" {
+        None // The trusted Python bootstrap installs the native no-child-process mitigation.
+    } else {
+        Some(format!(
+            "{name} requires OS process-fork containment; {}",
+            if name == "eval" {
+                "only macOS is supported"
+            } else {
+                "no unsandboxed or Linux fallback is provided"
+            }
+        ))
+    };
+    PlatformAvailability {
+        available: reason.is_none(),
+        reason,
+    }
+}
+pub(crate) fn execution_description(name: &str, description: &str) -> String {
+    match execution_platform(name).reason {
+        Some(reason) => format!(
+            "{description} Unavailable on this host: {reason}. status/reset/cancel remain available."
+        ),
+        None => description.to_owned(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
@@ -24,6 +109,8 @@ pub struct Definition {
     pub origin: Origin,
     pub identity: Identity,
     pub schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<PlatformAvailability>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
@@ -59,6 +146,7 @@ impl Catalog {
                     origin,
                     identity,
                     schema: schema.clone(),
+                    platform: matches!(name, "kernel" | "eval").then(|| execution_platform(name)),
                 },
             );
         }
@@ -195,5 +283,70 @@ mod tests {
             validate_offered_call(&call, &[schema], &["grep".into()]),
             None
         );
+    }
+    #[test]
+    fn integration_defaults_and_legacy_registration_share_metadata() {
+        let config = crate::config::types::Config::default();
+        assert_eq!(config.integrations, default_integrations());
+        let names: std::collections::BTreeSet<_> =
+            INTEGRATIONS.iter().map(|entry| entry.name).collect();
+        assert_eq!(names.len(), INTEGRATIONS.len());
+        assert_eq!(names, INTEGRATION_TOOLS.iter().copied().collect());
+        for entry in INTEGRATIONS {
+            assert_eq!(
+                integration_enabled(entry.name, &[]),
+                entry.always_registered
+            );
+        }
+    }
+
+    #[test]
+    fn execution_platform_reason_matches_launch_gate() {
+        for name in ["kernel", "eval"] {
+            let platform = execution_platform(name);
+            assert_eq!(platform.available, platform.reason.is_none());
+            assert_eq!(
+                super::super::kernel::require_fork_containment(name).err(),
+                platform.reason
+            );
+            #[cfg(target_os = "linux")]
+            assert!(!platform.available);
+            #[cfg(windows)]
+            assert_eq!(platform.available, name == "kernel");
+        }
+    }
+    #[test]
+    fn status_and_discovery_report_the_same_execution_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = crate::tools::Workspace::new(dir.path()).unwrap();
+        let config = crate::config::types::Config::default();
+        let context = super::super::ext::ToolContext {
+            workspace: &workspace,
+            config: &config,
+            mutation_authorizer: None,
+            confirm: None,
+        };
+        let tools = super::super::kernel::tools(&config)
+            .into_iter()
+            .chain(super::super::eval::tools(&config));
+        for tool in tools {
+            let schema = tool.schema();
+            let catalog = Catalog::from_schemas(&[schema.clone()], &Registry::new()).unwrap();
+            let platform = catalog.get(tool.name()).unwrap().platform.as_ref().unwrap();
+            let status = tool.call(&context, &json!({"action":"status"}));
+            assert!(!status.is_error, "{}", status.text);
+            assert_eq!(
+                status.data.unwrap()["platform"],
+                serde_json::to_value(platform).unwrap()
+            );
+            if let Some(reason) = &platform.reason {
+                assert!(
+                    schema["function"]["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains(reason)
+                );
+            }
+        }
     }
 }

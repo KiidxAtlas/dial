@@ -65,16 +65,25 @@ pub fn resolve(mode: Option<&str>, no_ui: bool) -> Result<Option<Resolved>, Stri
     Ok(resolved)
 }
 
-/// Map the `--approval-mode` values onto Dial's `--approval` values (`ask|write|auto|readonly`).
+/// Compatibility spellings of approval policies, shared by parsing and CLI choices.
+pub const APPROVAL_ALIASES: &[(&str, &str)] =
+    &[("always-ask", "ask"), ("write", "write"), ("yolo", "auto")];
+
+/// Map the `--approval-mode` values onto canonical approval policy names.
 pub fn approval_alias(value: &str) -> Result<&'static str, String> {
-    match value {
-        "always-ask" => Ok("ask"),
-        "write" => Ok("write"),
-        "yolo" => Ok("auto"),
-        other => Err(format!(
-            "invalid --approval-mode {other:?}; expected one of: always-ask, write, yolo"
-        )),
-    }
+    APPROVAL_ALIASES
+        .iter()
+        .find_map(|&(alias, policy)| (alias == value).then_some(policy))
+        .ok_or_else(|| {
+            let names = APPROVAL_ALIASES
+                .iter()
+                .map(|&(alias, _)| alias)
+                .collect::<Vec<_>>();
+            format!(
+                "invalid --approval-mode {value:?}; expected one of: {}",
+                names.join(", ")
+            )
+        })
 }
 
 #[cfg(test)]
@@ -129,5 +138,14 @@ mod tests {
         assert_eq!(approval_alias("yolo").unwrap(), "auto");
         assert_eq!(approval_alias("write").unwrap(), "write");
         assert!(approval_alias("nope").is_err());
+        for &(_, policy) in APPROVAL_ALIASES {
+            assert!(crate::config::types::Approval::NAMES.contains(&policy));
+        }
+        for &policy in crate::config::types::Approval::NAMES {
+            let parsed: crate::config::types::Approval =
+                serde_json::from_value(serde_json::json!(policy)).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), policy);
+            assert!(!parsed.description().is_empty());
+        }
     }
 }

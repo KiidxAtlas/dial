@@ -1,5 +1,6 @@
 //! Configuration loading, layering and validation; the shared data types live in [`types`].
 
+pub mod selection;
 pub mod session_models;
 pub mod settings;
 pub mod types;
@@ -1194,8 +1195,8 @@ impl Config {
             .find(|role| self.role_selection(role).is_none())
             .map(|role| {
                 format!(
-                    "memory backend {:?} calls a model: assign the {role} role with /roles",
-                    self.memory.backend
+                    "the {} backend needs a model, so assign the {role} role in /roles",
+                    format!("{:?}", self.memory.backend).to_lowercase()
                 )
             })
     }

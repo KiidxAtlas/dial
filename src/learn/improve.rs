@@ -910,6 +910,19 @@ impl Drop for LoraPhase<'_> {
     }
 }
 
+/// Where the learning settings live in the TUI. Every message that points to them uses this one string.
+pub const SETTINGS_PATH: &str = "/improve settings";
+
+/// Verified examples needed before a LoRA training run starts. The single source for every status
+/// line, the `/improve session` nudge and the docs: the trainer refuses below this count, so it is
+/// the larger of the configured minimum and one batch.
+pub fn min_examples(config: &Config) -> usize {
+    config
+        .improve
+        .lora_min_examples
+        .max(config.training.batch_size) as usize
+}
+
 pub fn lora_phase(config: &Config, store: &Store) -> Option<String> {
     let lock = std::fs::File::open(config.state_dir.join("lora-progress.lock")).ok()?;
     lora_phase_from_lock(&lock, store)
@@ -1013,14 +1026,12 @@ fn lora_candidate(
     )?;
     let prefix_digest = training_prefix_digest(&train_path, watermark)?;
     let valid_lines = bounded_validation_records(&valid_path)?;
-    if train_lines.len() < config.improve.lora_min_examples.max(t.batch_size) as usize
-        || valid_lines.len() < t.batch_size as usize
-    {
+    let minimum = min_examples(config);
+    if train_lines.len() < minimum || valid_lines.len() < t.batch_size as usize {
         return Ok(Err(format!(
-            "not enough verified records in incremental window ({}, {} validation, need {})",
+            "not enough verified records in incremental window ({}, {} validation, need {minimum})",
             train_lines.len(),
             valid_lines.len(),
-            config.improve.lora_min_examples.max(t.batch_size)
         )));
     }
     let temp = tempfile::tempdir()?;

@@ -293,13 +293,16 @@ pub fn readiness(config: &Config, store: &Store) -> Result<String> {
         gates.push("background work paused by /compute (resume it to continue)".into());
     }
     if !config.improve.background {
-        gates.push("background improvement off ([improve] background = true runs it)".into());
+        gates.push(format!(
+            "background improvement is off (turn it on in {})",
+            improve::SETTINGS_PATH
+        ));
     }
     if !config.uses_local_compute() && config.improve.max_daily_usd <= 0.0 {
-        gates.push(
-            "cloud main model: background cycles need [improve] max_daily_usd > 0 (currently 0)"
-                .into(),
-        );
+        gates.push(format!(
+            "a cloud model needs a daily spend limit for background cycles (set it in {})",
+            improve::SETTINGS_PATH
+        ));
     }
     let wait = remaining(
         store,
@@ -332,13 +335,13 @@ pub fn readiness(config: &Config, store: &Store) -> Result<String> {
     }
 }
 
-pub fn maybe_spawn(layout: &Layout, config: &Config, store: &Store) -> Result<bool> {
+pub fn maybe_spawn(layout: &Layout, config: &Config, store: &Store) -> Result<Spawn> {
     spawn_job(layout, config, store, false, Operation::Cycle)
 }
-pub fn start_cycle(layout: &Layout, config: &Config, store: &Store) -> Result<bool> {
+pub fn start_cycle(layout: &Layout, config: &Config, store: &Store) -> Result<Spawn> {
     spawn_job(layout, config, store, true, Operation::Cycle)
 }
-pub fn start_training(layout: &Layout, config: &Config, store: &Store) -> Result<bool> {
+pub fn start_training(layout: &Layout, config: &Config, store: &Store) -> Result<Spawn> {
     ensure!(
         config.training.enabled,
         "training is disabled; enable it in settings"
@@ -362,31 +365,78 @@ pub fn start_training(layout: &Layout, config: &Config, store: &Store) -> Result
     spawn_job(layout, config, store, true, Operation::Train)
 }
 
+/// Why a background job was not started. The operator sees the cause, not a generic "busy".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// `/compute` paused background work.
+    Paused,
+    /// The control lock is held: a worker is running a cycle or training.
+    Running,
+    /// The launch lock is held, or a worker was launched in the last 30 seconds.
+    Launching,
+    /// A scheduled start found the cycle not due, the machine busy, or background work off.
+    NotDue,
+}
+
+impl Refusal {
+    /// Operator-facing explanation. `state` is the model's state directory holding the lock files.
+    pub fn message(self, state: &Path) -> String {
+        match self {
+            Self::Paused => "background work is paused by /compute; resume it first".into(),
+            Self::Running => "an improvement cycle or training run is already running (it holds the control lock). Check /improve jobs; /improve stop <id> ends it safely.".into(),
+            Self::Launching => format!(
+                "a worker was just launched and has not taken its lock yet; try again in about 30 seconds. If /improve jobs shows nothing active for a minute, no worker holds {}, so the lock is stale and retrying is safe.",
+                state.join("launch.lock").display()
+            ),
+            Self::NotDue => "no cycle is due yet (cooldown, too few new turns, background work off, or the machine is busy). /improve status shows which.".into(),
+        }
+    }
+}
+
+/// Outcome of asking for a background job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spawn {
+    Started,
+    Refused(Refusal),
+}
+
+impl Spawn {
+    /// Turns a refusal into an error that names its cause, for operator-initiated starts.
+    pub fn ensure_started(self, state: &Path) -> Result<()> {
+        match self {
+            Self::Started => Ok(()),
+            Self::Refused(reason) => anyhow::bail!("{}", reason.message(state)),
+        }
+    }
+}
+
 fn spawn_job(
     layout: &Layout,
     config: &Config,
     store: &Store,
     force: bool,
     operation: Operation,
-) -> Result<bool> {
-    if super::compute::paused(&layout.user_dir)
-        || (!force
-            && (!config.improve.background
-                || (!config.uses_local_compute() && config.improve.max_daily_usd <= 0.0)
-                || !due(config, store)?
-                || super::resources::describe(&config.improve, &layout.user_dir).is_some()))
+) -> Result<Spawn> {
+    if super::compute::paused(&layout.user_dir) {
+        return Ok(Spawn::Refused(Refusal::Paused));
+    }
+    if !force
+        && (!config.improve.background
+            || (!config.uses_local_compute() && config.improve.max_daily_usd <= 0.0)
+            || !due(config, store)?
+            || super::resources::describe(&config.improve, &layout.user_dir).is_some())
     {
-        return Ok(false);
+        return Ok(Spawn::Refused(Refusal::NotDue));
     }
     let control = lock_file(&config.state_dir.join("control.lock"))?;
     if control.try_lock_exclusive().is_err() {
-        return Ok(false);
+        return Ok(Spawn::Refused(Refusal::Running));
     }
     let launch = lock_file(&config.state_dir.join("launch.lock"))?;
     if launch.try_lock_exclusive().is_err()
         || (!force && !improve::due(store, "last_background_spawn", 30)?)
     {
-        return Ok(false);
+        return Ok(Spawn::Refused(Refusal::Launching));
     }
     let request_path = config.state_dir.join("background-request.json");
     let mut request_config = config.clone();
@@ -433,7 +483,7 @@ fn spawn_job(
         &json!({"state":"queued","stop_supported":true,"pid":pid,"proc":ProcId::of(pid as i32),"at":improve::now()})
             .to_string(),
     )?;
-    Ok(true)
+    Ok(Spawn::Started)
 }
 
 pub fn background(path: &Path) -> Result<()> {
@@ -695,7 +745,12 @@ mod tests {
         store.set_meta("auto_enabled", "true").unwrap();
         let control = lock_file(&state.join("control.lock")).unwrap();
         control.lock_exclusive().unwrap();
-        assert!(!start_training(&layout, &config, &store).unwrap());
+        assert_eq!(
+            start_training(&layout, &config, &store).unwrap(),
+            Spawn::Refused(Refusal::Running)
+        );
+        assert!(Refusal::Running.message(&state).contains("/improve jobs"));
+        assert!(Refusal::Launching.message(&state).contains("launch.lock"));
         assert!(!state.join("background-request.json").exists());
         drop(control);
         fs::write(state.join("improvement.stop"), b"stop").unwrap();
@@ -868,7 +923,7 @@ mod tests {
         assert!(
             readiness(&cfg, &store)
                 .unwrap()
-                .contains("background improvement off")
+                .contains("background improvement is off")
         );
         cfg.improve.background = true;
         // A cloud main model (no local model string) with no daily budget must say why it will not learn.
@@ -877,7 +932,7 @@ mod tests {
         assert!(
             readiness(&cfg, &store)
                 .unwrap()
-                .contains("max_daily_usd > 0")
+                .contains("daily spend limit")
         );
         store.set_meta("auto_enabled", "false").unwrap();
         assert_eq!(

@@ -34,7 +34,7 @@ fn discover(
         {
             fs::create_dir_all(target.parent().context("dependency has no parent")?)?;
             copy_tree(&path, &target, root, dest, remaining, files, 0)?;
-        } else if !crate::benchmark::is_excluded_source_path(root, &path)
+        } else if !crate::workspace_copy::is_excluded_source_path(root, &path)
             && entry.file_type()?.is_dir()
         {
             discover(root, &path, dest, remaining, files)?;
@@ -171,7 +171,7 @@ fn executable_interpreter(path: &Path) -> bool {
 }
 
 fn excluded(name: &str) -> bool {
-    crate::benchmark::is_secret_file(name)
+    crate::workspace_copy::is_secret_file(name)
         || [
             ".git",
             ".hg",

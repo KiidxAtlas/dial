@@ -36,10 +36,21 @@ pub(super) struct Runtime {
 /// Provision (or reuse) the pinned runtime. Install and download are bounded by their
 /// caps and abort promptly when `interrupt` is set.
 pub(super) fn provision(interrupt: &AtomicBool) -> Result<Runtime, String> {
-    preflight()?;
-    let root = cache_root()?.join(digest_dir());
-    std::fs::create_dir_all(&root).map_err(|e| format!("creating private browser runtime: {e}"))?;
-    crate::platform::fs::set_owner_only(&root)
+    provision_at(&cache_root()?.join(digest_dir()), interrupt, || {
+        hosts_reachable(&["registry.npmjs.org:443"])
+    })
+}
+
+// Keep cache selection and network probing injectable without changing process-wide environment.
+fn provision_at(
+    root: &Path,
+    interrupt: &AtomicBool,
+    reachable: impl FnOnce() -> bool,
+) -> Result<Runtime, String> {
+    let runtime = layout(root);
+    ensure_fetchable(dependencies_cached(&runtime), reachable)?;
+    std::fs::create_dir_all(root).map_err(|e| format!("creating private browser runtime: {e}"))?;
+    crate::platform::fs::set_owner_only(root)
         .map_err(|e| format!("restricting private browser runtime permissions: {e}"))?;
     for (name, body) in [("package.json", PACKAGE), ("bun.lock", LOCK)] {
         let path = root.join(name);
@@ -50,11 +61,10 @@ pub(super) fn provision(interrupt: &AtomicBool) -> Result<Runtime, String> {
         crate::platform::fs::set_owner_only(&path)
             .map_err(|e| format!("restricting private browser runtime file: {e}"))?;
     }
-    let runtime = layout(&root);
-    if !runtime.entry.is_file() || !runtime.readability.is_file() {
+    if !dependencies_cached(&runtime) {
         let mut command = Command::new(bun());
         command
-            .current_dir(&root)
+            .current_dir(root)
             .args(["install", "--frozen-lockfile", "--ignore-scripts"]);
         run_bounded(
             command,
@@ -62,7 +72,7 @@ pub(super) fn provision(interrupt: &AtomicBool) -> Result<Runtime, String> {
             interrupt,
             "browser dependency installation",
         )?;
-        if !runtime.entry.is_file() || !runtime.readability.is_file() {
+        if !dependencies_cached(&runtime) {
             return Err("browser dependency installation produced an incomplete runtime".into());
         }
     }
@@ -75,6 +85,9 @@ pub(super) fn install_chromium(
     runtime: &Runtime,
     interrupt: &AtomicBool,
 ) -> Result<(), String> {
+    if !hosts_reachable(&["cdn.playwright.dev:443"]) {
+        return Err("Chromium is not cached and its download host (cdn.playwright.dev) is unreachable; connect to the network once, configure browser.chromium_executable, or attach via CDP".into());
+    }
     let mut command = Command::new(node);
     command
         .arg(&runtime.cli)
@@ -114,8 +127,12 @@ fn digest_dir() -> String {
     hasher.update(LOCK.as_bytes());
     crate::hex(&hasher.finalize()[..8])
 }
+fn dependencies_cached(runtime: &Runtime) -> bool {
+    runtime.entry.is_file() && runtime.readability.is_file()
+}
 
 /// True when the private runtime and a Chromium build are already cached, so no network is needed.
+#[cfg(test)]
 pub(super) fn is_cached() -> bool {
     let Ok(root) = cache_root().map(|base| base.join(digest_dir())) else {
         return false;
@@ -126,37 +143,34 @@ pub(super) fn is_cached() -> bool {
             .flatten()
             .any(|entry| entry.file_name().to_string_lossy().starts_with("chromium-"))
     });
-    runtime.entry.is_file() && runtime.readability.is_file() && has_chromium
+    dependencies_cached(&runtime) && has_chromium
 }
 
-/// Refuses to provision an uncached runtime while its download hosts are unreachable, so an
-/// offline machine gets a clear error instead of a raw npm or Chromium failure. A cached
-/// runtime needs no network and never probes it.
+/// Refuse to fetch uncached JavaScript dependencies offline. Chromium availability is checked
+/// separately, only when startup actually needs to download a private browser.
 fn ensure_fetchable(cached: bool, reachable: impl FnOnce() -> bool) -> Result<(), String> {
     if cached || reachable() {
         return Ok(());
     }
-    Err("browser runtime is not cached and its download hosts (registry.npmjs.org, cdn.playwright.dev) are unreachable; connect to the network once to provision it".into())
-}
-
-/// Preflight for [`provision`]: fails fast offline when the runtime is not fully cached.
-fn preflight() -> Result<(), String> {
-    ensure_fetchable(is_cached(), network_reachable)
+    Err("browser JavaScript dependencies are not cached and their download host (registry.npmjs.org) is unreachable; connect to the network once to provision them".into())
 }
 
 /// Whether the hosts that provisioning downloads from accept a TCP connection promptly.
+#[cfg(test)]
 pub(super) fn network_reachable() -> bool {
+    hosts_reachable(&["registry.npmjs.org:443", "cdn.playwright.dev:443"])
+}
+
+fn hosts_reachable(hosts: &[&str]) -> bool {
     use std::net::{TcpStream, ToSocketAddrs};
-    ["registry.npmjs.org:443", "cdn.playwright.dev:443"]
-        .iter()
-        .all(|host| {
-            host.to_socket_addrs()
-                .ok()
-                .and_then(|mut addresses| addresses.next())
-                .is_some_and(|address| {
-                    TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_ok()
-                })
-        })
+    hosts.iter().all(|host| {
+        host.to_socket_addrs()
+            .ok()
+            .and_then(|mut addresses| addresses.next())
+            .is_some_and(|address| {
+                TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_ok()
+            })
+    })
 }
 
 fn cache_root() -> Result<PathBuf, String> {
@@ -257,6 +271,31 @@ mod tests {
             Path::new("/cache/r/node_modules/@mozilla/readability/Readability.js")
         );
         assert_eq!(runtime.browsers, Path::new("/cache/r/browsers"));
+    }
+
+    #[test]
+    fn provision_cached_dependencies_offline_without_private_chromium() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = layout(dir.path());
+        for path in [&runtime.entry, &runtime.readability] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "// cached dependency").unwrap();
+        }
+        assert!(!runtime.browsers.exists());
+        // Configured Chromium and CDP startup both provision these same dependencies only.
+        let provisioned = provision_at(dir.path(), &AtomicBool::new(false), || {
+            panic!("cached dependencies must not probe the network")
+        })
+        .unwrap();
+        assert_eq!(provisioned.entry, runtime.entry);
+        assert!(!runtime.browsers.exists());
+        std::fs::remove_file(&runtime.readability).unwrap();
+        let error = provision_at(dir.path(), &AtomicBool::new(false), || false).unwrap_err();
+        assert!(
+            error.contains("JavaScript dependencies are not cached"),
+            "{error}"
+        );
+        assert!(error.contains("registry.npmjs.org"), "{error}");
     }
 
     #[test]

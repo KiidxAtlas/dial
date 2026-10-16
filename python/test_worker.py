@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from dial_worker import (RequestError, PREFERENCE_PAIRS_PER_BATCH, collect_preference_pairs, completion_mask, layer_scores,
                          pack_preference_batch, preference_iterations, preference_objective, read_datasets, read_records,
-                         sensitivity_request, tokenize_preference_pairs)
+                         sensitivity_request, tokenize_preference_pairs, trajectory_group)
 
 
 class ProvenanceTests(unittest.TestCase):
@@ -90,6 +90,32 @@ class ProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(RequestError, "trajectories overlap"):
             read_datasets(self.dataset("train.jsonl", [first]),
                           self.dataset("valid.jsonl", [later]))
+
+    def test_shared_trajectory_provenance_golden_cases(self):
+        fixture = Path(__file__).resolve().parents[1] / "tests/fixtures/trajectory_provenance.json"
+        for case in json.loads(fixture.read_text()):
+            with self.subTest(source=case["source"]):
+                self.assertEqual(trajectory_group(case["source"]), case["group"])
+
+    def test_oversized_trajectory_id_does_not_raise_or_lose_leading_zeroes(self):
+        self.assertIsNone(trajectory_group("dial:verified:" + "9" * 5000))
+        self.assertEqual(trajectory_group("dial:verified:" + "0" * 5000 + "7"), "trajectory:7")
+
+    def test_learned_trajectories_are_origin_qualified_across_splits(self):
+        first, later = self.record(), self.record("5")
+        first["source"] = "dial:learned:aaaa:12:tool-recovery"
+        later["messages"][0]["content"] = "And 2 + 3?"
+        for source, overlaps in [("dial:learned:aaaa:12:verifier:test", True),
+                                 ("dial:learned:bbbb:12:verifier:test", False),
+                                 ("dial:verified:12:verifier:test", False)]:
+            later["source"] = source
+            paths = (self.dataset("train.jsonl", [first]), self.dataset("valid.jsonl", [later]))
+            with self.subTest(source=source):
+                if overlaps:
+                    with self.assertRaisesRegex(RequestError, "trajectories overlap"):
+                        read_datasets(*paths)
+                else:
+                    read_datasets(*paths)
 
     def test_empty_and_unanswered_data_are_rejected(self):
         with self.assertRaises(RequestError):

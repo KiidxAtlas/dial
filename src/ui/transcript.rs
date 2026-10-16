@@ -1167,6 +1167,30 @@ impl Transcript {
         );
     }
 
+    /// Bounded live output keyed by job, independent of foreground tool-card lifetimes.
+    /// PTY snapshots replace previous content; pipe deltas append without deduplication.
+    pub fn background_output(&mut self, name: &str, text: &str, replace: bool) {
+        const LIMIT: usize = 16 * 1024;
+        let title = format!("Background {name}");
+        self.invalidate_tail();
+        if let Some(block) = self.blocks[self.cursor..].iter_mut().rev().find(|block| {
+            matches!(&block.kind, Kind::Notice { title: previous, .. } if previous == &title)
+        }) {
+            if let Kind::Notice { text: body, .. } = &mut block.kind {
+                if replace {
+                    body.clear();
+                }
+                body.push_str(text);
+                let cut = body.ceil_char_boundary(body.len().saturating_sub(LIMIT));
+                body.drain(..cut);
+                block.revision.set(block.revision.get().saturating_add(1));
+            }
+        } else {
+            let cut = text.ceil_char_boundary(text.len().saturating_sub(LIMIT));
+            self.push(Kind::Notice { title, text: text[cut..].to_owned() }, false);
+        }
+    }
+
     /// Placeholder a background job shows until its first output arrives.
     pub const JOB_STARTED: &'static str = "Started; the result appears here when it finishes.";
 
@@ -1996,6 +2020,46 @@ mod tests {
             "separators occur between settled blocks"
         );
         assert!(t.take_settled(40, &ctx).is_empty());
+    }
+
+    #[test]
+    fn background_output_renders_without_pending_tool_and_pty_replaces() {
+        let env = Env::new();
+        let ctx = env.ctx();
+        let mut t = Transcript::new();
+        t.background_output("pipe-job", "repeated\n", false);
+        t.background_output("pipe-job", "repeated\n", false);
+        t.background_output("pty-job", "old-screen", true);
+        t.background_output("pty-job", "new-screen", true);
+        let text = text_of(&t.take_settled(70, &ctx));
+        assert!(
+            text.contains("PIPE-JOB") && text.contains("PTY-JOB"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("repeated").count(),
+            2,
+            "pipe deltas must not be deduplicated: {text}"
+        );
+        assert!(
+            text.contains("new-screen") && !text.contains("old-screen"),
+            "{text}"
+        );
+        t.background_output("pipe-job", "after scrollback", false);
+        assert!(text_of(&t.take_settled(70, &ctx)).contains("after scrollback"));
+    }
+
+    #[test]
+    fn background_live_panel_is_utf8_bounded_while_full_output_stays_in_artifacts() {
+        let mut t = Transcript::new();
+        t.background_output("unicode", &"😀".repeat(5000), false);
+        t.background_output("unicode", "done", false);
+        let Kind::Notice { text, .. } = &t.blocks[0].kind else {
+            panic!("missing job panel")
+        };
+        assert!(text.len() <= 16 * 1024);
+        assert!(text.ends_with("done"));
+        assert!(text.starts_with('😀'));
     }
 
     #[test]

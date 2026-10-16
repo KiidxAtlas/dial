@@ -41,10 +41,28 @@ impl<'a> Agent<'a> {
         } else {
             repair_evidence::CheckKind::SyntaxOnly
         };
-        let exit = verification::exit_code(&output.text);
-        // The same verdict `run_checks` records, so cache, assistance and behavior credit cannot disagree with it.
-        let verdict =
-            verification::classify_output(None, output, self.interrupt.load(Ordering::SeqCst));
+        let check = configured
+            .map(|check| verification::FocusedCheck {
+                name: check.name.clone(),
+                command: check.command.clone(),
+                timeout_secs: check.timeout_secs,
+            })
+            .or_else(|| {
+                call.id
+                    .strip_prefix("focused-check:")
+                    .map(|name| verification::FocusedCheck {
+                        name: name.to_owned(),
+                        command: command.to_owned(),
+                        timeout_secs: 0,
+                    })
+            });
+        // Share the verdict and runner context used by focused-check diagnostics.
+        let verdict = verification::classify_output(
+            check.as_ref(),
+            output,
+            self.interrupt.load(Ordering::SeqCst),
+        );
+        let exit = verdict.repair_exit_code(output);
         let passed = verdict == verification::CheckStatus::Passed;
         if !self.hermetic
             && matches!(kind, repair_evidence::CheckKind::Behavioral)
@@ -112,11 +130,7 @@ impl<'a> Agent<'a> {
                 kind,
                 tool_call_id: format!("{}:{}:{}", self.session.id(), call.id, self.repair_sequence),
                 evidence_ref,
-                exit_code: if output.is_error && exit == Some(0) {
-                    None
-                } else {
-                    exit
-                },
+                exit_code: exit,
                 sequence: self.repair_sequence,
             };
             if let Some(record) = self.repair_tracker.observe(run, changes) {

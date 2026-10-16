@@ -83,6 +83,11 @@ impl RecoveryCheckpoint {
         } else {
             investigation.observe_output(call, output)
         };
+        // Escalation is stated with the withheld observation it concerns and never ends the turn.
+        let duplicate = match (duplicate, investigation.escalation()) {
+            (Some(advice), Some(escalation)) => Some(format!("{advice}\n{escalation}")),
+            (advice, _) => advice,
+        };
         if duplicate.is_some() && !output.is_error {
             self.cached_observations.insert(
                 key,
@@ -102,10 +107,8 @@ impl RecoveryCheckpoint {
         {
             self.arm(call, advice);
         }
-        let stop = investigation
-            .stop_message()
-            .or_else(|| repeats.stop_message(call));
-        (duplicate, repeat, stop)
+        // Repetition escalates inside the advice above and never ends the turn, so no stop is produced.
+        (duplicate, repeat, None)
     }
 
     pub fn arm(&mut self, call: &ToolCall, advice: &str) {

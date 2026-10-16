@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow};
 
 pub(super) const COMMANDS: &[super::CommandSpec] = &[super::CommandSpec {
     name: "commit",
-    description: "Generate a commit message for the changes and commit them (--push, --dry-run, --legacy, --no-changelog, -c context, -m model)",
+    description: "generate a commit message and commit the changes",
     args_hint: "[--push] [--dry-run] [--legacy] [--no-changelog] [-c <context>] [-m <model>]",
     subcommands: &[],
 }];

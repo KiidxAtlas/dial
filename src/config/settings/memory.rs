@@ -755,8 +755,8 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         LE,
         "Semantic memory",
         "Embedding model",
-        "Model name sent to the embeddings endpoint.",
-        Kind::Text,
+        "Model name sent to the embeddings endpoint. Suggestions are curated Ollama models; Ctrl+L pulls one through Ollama and assigns it to the embedding role.",
+        Kind::Choice(crate::setup::embeddings::CHOICES),
         true
     ),
     field!(

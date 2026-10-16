@@ -143,7 +143,14 @@ mod tests {
         assert!(!enabled(&config, false, "lm-studio", "m", Some(&off), None));
         let mut disabled = config.clone();
         disabled.constrained_repair = false;
-        assert!(!enabled(&disabled, false, "lm-studio", "m", Some(&lm), None));
+        assert!(!enabled(
+            &disabled,
+            false,
+            "lm-studio",
+            "m",
+            Some(&lm),
+            None
+        ));
     }
 
     #[test]
@@ -151,18 +158,53 @@ mod tests {
         let config = Config::default().assistance;
         let json = Some(StructuredOutput::JsonSchema);
         // A generic OpenAI-compatible endpoint declares no mechanism; the detected one decides.
-        assert!(!enabled(&config, false, "openai-compatible", "m", None, None));
-        assert!(enabled(&config, false, "openai-compatible", "m", None, json));
+        assert!(!enabled(
+            &config,
+            false,
+            "openai-compatible",
+            "m",
+            None,
+            None
+        ));
+        assert!(enabled(
+            &config,
+            false,
+            "openai-compatible",
+            "m",
+            None,
+            json
+        ));
         let plain = ModelProfile::minimal("openai-compatible", "m");
-        assert!(enabled(&config, false, "openai-compatible", "m", Some(&plain), json));
+        assert!(enabled(
+            &config,
+            false,
+            "openai-compatible",
+            "m",
+            Some(&plain),
+            json
+        ));
         // A detection already recorded on the profile (set at the request boundary) counts the same.
         let mut recorded = plain.clone();
         recorded.endpoint_structured_output = json;
-        assert!(enabled(&config, false, "openai-compatible", "m", Some(&recorded), None));
+        assert!(enabled(
+            &config,
+            false,
+            "openai-compatible",
+            "m",
+            Some(&recorded),
+            None
+        ));
         // An explicit declaration still wins over detection.
         let mut declared_off = recorded.clone();
         declared_off.capabilities.structured_output = Some(StructuredOutput::Disabled);
-        assert!(!enabled(&config, false, "openai-compatible", "m", Some(&declared_off), json));
+        assert!(!enabled(
+            &config,
+            false,
+            "openai-compatible",
+            "m",
+            Some(&declared_off),
+            json
+        ));
     }
 
     #[test]

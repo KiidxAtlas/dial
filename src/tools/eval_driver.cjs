@@ -83,7 +83,14 @@ function readFrame() {
 }
 
 function sendFrame(value) {
-  const bytes = Buffer.from(JSON.stringify(value) + '\n', 'utf8');
+  // JSON.stringify escapes lone UTF-16 surrogates, but Rust's JSON receiver rejects them.
+  // Normalize at the wire boundary, including truncated strings, nested tool values and keys.
+  // Consume escaped backslashes and valid surrogate pairs intact ("\\ud800" is literal text).
+  const json = JSON.stringify(value).replace(
+    /\\(?:u[dD][89aAbB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}|u[dD][89a-fA-F][0-9a-fA-F]{2}|.)/g,
+    escape => /^\\u[dD][89a-fA-F][0-9a-fA-F]{2}$/.test(escape) ? '\\ufffd' : escape,
+  );
+  const bytes = Buffer.from(json + '\n', 'utf8');
   if (bytes.length > MAX_FRAME) throw new ToolError('eval frame exceeds the protocol limit');
   let offset = 0;
   while (offset < bytes.length) offset += fs.writeSync(protocol, bytes, offset, bytes.length - offset);
@@ -127,7 +134,7 @@ const sink = new Writable({ write(_chunk, _encoding, done) { done(); } });
 const input = new PassThrough();
 // Node's own REPL evaluator supplies real top-level await and persistent lexical declarations.
 // Its context is a real vm.Context, and remains the same for every cell.
-const kernel = repl.start({ input, output: sink, terminal: false, prompt: '', useGlobal: false, ignoreUndefined: true, historySize: 0 });
+const kernel = repl.start({ input, output: sink, terminal: false, prompt: '', useGlobal: false, ignoreUndefined: true, historySize: 0, handleError: handleEvaluationError });
 const context = kernel.context;
 if (!vm.isContext(context)) throw new Error('Node REPL did not create a vm context');
 for (const name of ['require', 'module', 'exports', 'process', '__filename', '__dirname']) delete context[name];
@@ -150,34 +157,41 @@ process.on('unhandledRejection', error => {
   if (operation?.active) operation.stderr.write(String(error?.stack || error).slice(-LIMIT) + '\n');
 });
 
-// Node's default REPL evaluator emits runtime failures to its domain instead of calling
-// its evaluation callback. Replace the display-only listener with framed cell completion.
+// Runtime failures bypass eval's callback. Node 26+ supplies the public handleError option;
+// Node 22–25 use the REPL domain instead. Keep the real evaluator in both cases.
 let pendingEvaluation = null;
-kernel._domain.removeAllListeners('error');
-kernel._domain.on('error', error => {
+if (kernel._domain) {
+  kernel._domain.removeAllListeners('error');
+  kernel._domain.on('error', handleEvaluationError);
+}
+function handleEvaluationError(error) {
   const operation = operationStorage.getStore();
   if (pendingEvaluation && operation === pendingEvaluation.operation) {
-    pendingEvaluation.finish(error);
+    pendingEvaluation.finish(error, undefined, true);
   } else if (operation?.active) {
     operation.stderr.write(String(error?.stack || error).slice(-LIMIT) + '\n');
+  } else {
+    // No active cell can own this failure; do not silently report success.
+    process.stderr.write(String(error?.stack || error).slice(-LIMIT).toWellFormed() + '\n');
   }
-});
+  return 'ignore'; // The error was framed above, not swallowed by the REPL's display sink.
+}
 
 function evaluate(code) {
   return new Promise(resolve => {
     // The REPL's default evaluator handles declarations, await and completion values without
     // wrapping cells in disposable async-function scopes or pretending page JS is Node code.
     const operation = operationStorage.getStore();
-    const finish = (error, value) => {
+    const finish = (error, value, failed = error !== null && error !== undefined) => {
       if (!pendingEvaluation || pendingEvaluation.finish !== finish) return;
       pendingEvaluation = null;
-      resolve({ error, value });
+      resolve({ error, value, failed });
     };
     pendingEvaluation = { operation, finish };
     try {
       kernel.eval(code + '\n', context, '<dial-eval>', finish);
     } catch (error) {
-      finish(error);
+      finish(error, undefined, true);
     }
   });
 }
@@ -200,7 +214,7 @@ function evaluate(code) {
       await operationStorage.run(operation, async () => {
         if (typeof request.code !== 'string') throw new TypeError('code must be a string');
         const outcome = await evaluate(request.code);
-        if (outcome.error) throw outcome.error;
+        if (outcome.failed) throw outcome.error;
         if (outcome.value !== undefined) {
           context._ = outcome.value;
           result.value = util.inspect(outcome.value, { depth: 4, maxArrayLength: 100, maxStringLength: LIMIT, customInspect: false, getters: false }).slice(0, LIMIT);
@@ -223,4 +237,4 @@ function evaluate(code) {
     }
   }
   kernel.close();
-})().catch(error => { process.stderr.write(String(error?.stack || error).slice(-LIMIT)); process.exitCode = 1; });
+})().catch(error => { process.stderr.write(String(error?.stack || error).slice(-LIMIT).toWellFormed()); process.exitCode = 1; });

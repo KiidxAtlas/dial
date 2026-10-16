@@ -122,6 +122,59 @@ fn observe(m: &mut RunMetrics, event: &Value) {
     }
 }
 
+/// Runtime-wide usage from the child's `state` snapshot (`usage.total.all`): the main agent,
+/// workers and every purpose. Counters are read by name, so additive snapshot fields are ignored.
+struct Ledger {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    reasoning: u64,
+    requests: u64,
+    reported: u64,
+    /// No unreported attempts, and every successful request carried usage.
+    complete: bool,
+    cost: Option<f64>,
+    cost_complete: bool,
+}
+
+fn read_ledger(state: &Value) -> Option<Ledger> {
+    let all = state.pointer("/usage/total/all")?;
+    let count = |name: &str| all.get(name).and_then(Value::as_u64);
+    let successful = count("successful_requests")?;
+    let settled = successful.checked_add(count("failed_requests")?)?;
+    let reported = count("reported_responses")?;
+    let unreported = count("unreported_attempts")?;
+    Some(Ledger {
+        input: count("input")?,
+        output: count("output")?,
+        cache_read: count("cache_read")?,
+        reasoning: count("reasoning")?,
+        requests: count("requests")?,
+        reported,
+        complete: unreported == 0 && reported >= successful && settled == count("requests")?,
+        cost: all.get("observed_cost_usd").and_then(Value::as_f64),
+        cost_complete: all.get("cost_coverage").and_then(Value::as_str) == Some("observed_priced"),
+    })
+}
+
+/// Replaces the per-case counters with the runtime ledger, so main-agent usage events are never
+/// added to it. A missing ledger leaves coverage unknown instead of keeping a main-only lower bound.
+fn apply_ledger(metrics: &mut RunMetrics, ledger: Option<Ledger>) {
+    let Some(ledger) = ledger else {
+        metrics.token_usage_incomplete = true;
+        return;
+    };
+    metrics.prompt_tokens = ledger.input;
+    metrics.output_tokens = ledger.output;
+    metrics.cached_tokens = ledger.cache_read;
+    metrics.reasoning_tokens = ledger.reasoning;
+    metrics.requests = ledger.requests;
+    metrics.observed_cost_usd = ledger.cost;
+    metrics.observed_cost_complete = ledger.cost_complete;
+    metrics.token_usage_observed = ledger.reported > 0;
+    metrics.token_usage_incomplete = !ledger.complete;
+}
+
 pub fn run(
     executable: &Path,
     user_home: &Path,
@@ -212,6 +265,7 @@ pub fn run_configured(
         }
     });
     let mut metrics = RunMetrics::default();
+    let mut ledger_read = false;
     let result = (|| -> Result<()> {
         loop {
             let event = receive(&rx, deadline)?;
@@ -321,6 +375,21 @@ pub fn run_configured(
                 metrics.repair_attempts = Some(n);
             }
         }
+        // Runtime-wide ledger (every purpose and worker), read once after the last turn. It
+        // replaces the main-agent usage events above, so the two are never summed.
+        let state = request(
+            &mut input,
+            &rx,
+            id,
+            "state",
+            json!({}),
+            deadline,
+            &mut metrics,
+        )
+        .context("benchmark runtime usage snapshot unavailable")?;
+        ledger_read = true;
+        apply_ledger(&mut metrics, read_ledger(&state));
+        id += 1;
         request(
             &mut input,
             &rx,
@@ -335,6 +404,14 @@ pub fn run_configured(
     metrics.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     metrics.agent_succeeded = result.is_ok();
     metrics.agent_error = result.is_err();
+    // A failure before the ledger read leaves runtime usage unknown once the model was active.
+    let active = metrics.token_usage_observed
+        || metrics.tool_calls > 0
+        || metrics.turns_completed > 0
+        || metrics.compactions > 0;
+    if result.is_err() && !ledger_read && active {
+        metrics.token_usage_incomplete = true;
+    }
     drop(input);
     drop(child);
     drop(rx);
@@ -400,5 +477,78 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let error = receive(&rx, Some(Instant::now())).unwrap_err();
         assert_eq!(error.to_string(), "benchmark RPC timed out");
+    }
+    #[test]
+    fn runtime_ledger_replaces_main_agent_events_across_turns() {
+        let mut metrics = RunMetrics::default();
+        // Two turns of main-agent usage events; compaction and worker calls emit none.
+        for (prompt, output) in [(100u64, 10u64), (120, 12)] {
+            observe(
+                &mut metrics,
+                &json!({"event":"usage","prompt_tokens":prompt,"output_tokens":output}),
+            );
+        }
+        assert_eq!((metrics.prompt_tokens, metrics.output_tokens), (220, 22));
+        // The runtime ledger already contains those events plus the other requests.
+        let ledger = json!({"usage":{"total":{"all":{
+            "input":400,"output":40,"cache_read":50,"reasoning":7,"requests":5,
+            "successful_requests":5,"reported_responses":5,"unreported_attempts":0,
+            "failed_requests":0,"cost_coverage":"observed_priced","observed_cost_usd":0.25}}}});
+        apply_ledger(&mut metrics, read_ledger(&ledger));
+        assert_eq!((metrics.prompt_tokens, metrics.output_tokens), (400, 40));
+        assert_eq!(
+            (
+                metrics.cached_tokens,
+                metrics.reasoning_tokens,
+                metrics.requests
+            ),
+            (50, 7, 5)
+        );
+        assert_eq!(metrics.observed_cost_usd, Some(0.25));
+        assert!(metrics.token_usage_observed && !metrics.token_usage_incomplete);
+        assert!(metrics.observed_cost_complete);
+        let mut partial_price = ledger.clone();
+        partial_price["usage"]["total"]["all"]["cost_coverage"] = json!("partial");
+        apply_ledger(&mut metrics, read_ledger(&partial_price));
+        assert!(!metrics.observed_cost_complete);
+        assert!(!metrics.token_usage_incomplete);
+    }
+
+    #[test]
+    fn partial_or_missing_ledger_keeps_coverage_unknown() {
+        let all = |requests: u64, successful: u64, reported: u64, unreported: u64| {
+            json!({"usage":{"total":{"all":{
+                "input":10,"output":1,"cache_read":0,"reasoning":0,"requests":requests,
+                "successful_requests":successful,"reported_responses":reported,
+                "failed_requests":0,"unreported_attempts":unreported}}}})
+        };
+        // An attempt whose usage never arrived.
+        let mut metrics = RunMetrics::default();
+        apply_ledger(&mut metrics, read_ledger(&all(3, 3, 2, 1)));
+        assert!(metrics.token_usage_incomplete);
+        assert_eq!(metrics.prompt_tokens, 10);
+        // A successful response without usage, with nothing marked unreported.
+        let mut metrics = RunMetrics::default();
+        apply_ledger(&mut metrics, read_ledger(&all(2, 2, 1, 0)));
+        assert!(metrics.token_usage_incomplete);
+        // A worker still in flight cannot be reported as settled, even with no send yet.
+        apply_ledger(&mut metrics, read_ledger(&all(2, 1, 1, 0)));
+        assert!(metrics.token_usage_incomplete);
+        // An older runtime without the counters, or no snapshot, is unknown, not zero.
+        let mut metrics = RunMetrics::default();
+        apply_ledger(&mut metrics, read_ledger(&json!({"state":{}})));
+        assert!(metrics.token_usage_incomplete);
+        // A complete ledger with no requests is a real zero, not missing coverage.
+        let mut metrics = RunMetrics::default();
+        apply_ledger(&mut metrics, read_ledger(&all(0, 0, 0, 0)));
+        assert!(!metrics.token_usage_incomplete && !metrics.token_usage_observed);
+    }
+
+    #[test]
+    fn snapshot_from_the_real_usage_type_parses() {
+        let state = json!({"usage":{"total":dial::llm::usage::Groups::default()}});
+        let ledger = read_ledger(&state).expect("real usage snapshot");
+        assert!(ledger.complete);
+        assert_eq!(ledger.requests, 0);
     }
 }

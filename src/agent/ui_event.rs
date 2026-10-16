@@ -42,7 +42,8 @@ pub enum EventKind {
 }
 
 /// Where a surface should place an event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Lane {
     /// One quiet line beside the work it describes.
     Context,
@@ -107,5 +108,25 @@ impl UiEvent {
     pub fn with_tokens(mut self, before: u64, after: u64) -> Self {
         self.tokens = Some((before, after));
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lanes_serialize_as_snake_case_names() {
+        assert_eq!(serde_json::to_value(Lane::Context).unwrap(), "context");
+        assert_eq!(serde_json::to_value(Lane::Divider).unwrap(), "divider");
+        assert_eq!(serde_json::to_value(Lane::Alert).unwrap(), "alert");
+        assert_eq!(
+            serde_json::to_value(EventKind::ContextReset.lane()).unwrap(),
+            "divider"
+        );
+        assert_eq!(
+            serde_json::to_value(EventKind::Recovery.lane()).unwrap(),
+            "alert"
+        );
     }
 }

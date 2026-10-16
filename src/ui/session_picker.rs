@@ -1,7 +1,8 @@
 //! Resume catalogue and terminal presentation. The controller alone opens journals or persists pins.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     style::Modifier,
     text::{Line, Span},
@@ -13,20 +14,51 @@ use super::{
 };
 use crate::storage::session::SessionInfo;
 
+/// Wide layouts put the selected session's preview beside the list.
+const PREVIEW_MIN_COLS: usize = 100;
+const PREVIEW_MIN_ROWS: usize = 18;
+/// Turns kept at each end of the preview.
+const PREVIEW_TURNS: usize = 2;
+
 pub enum Action {
     None,
     Cancel,
     Resume(usize),
     Pin(usize),
+    /// Index of the session and its new title.
+    Rename(usize, String),
+    Fork(usize),
+    Delete(usize),
+    /// Toggle between this project and every project.
+    Scope,
+    /// Load every journal, not just the first page.
+    LoadAll,
+}
+
+/// A list row: a non-selectable date group header, or a session by its position in `found`.
+#[derive(Debug, PartialEq)]
+enum Unit {
+    Header(&'static str),
+    Item(usize),
 }
 
 pub struct Picker {
     pub sessions: Vec<SessionInfo>,
+    /// Fork depth of each session (tree mode), aligned with `sessions`.
+    depth: Vec<usize>,
     pinned: HashSet<String>,
     current: String,
     tree: bool,
     show_empty: bool,
+    all_projects: bool,
+    /// Journals in scope; `sessions.len()` is how many are loaded ("showing N of M").
+    total: usize,
+    open_elsewhere: HashSet<String>,
     query: String,
+    /// Session id and draft title while renaming.
+    rename: Option<(String, String)>,
+    notice: Option<String>,
+    preview: HashMap<String, Vec<(String, String)>>,
     selected: usize,
     found: Vec<usize>,
     searchable: Vec<String>,
@@ -40,20 +72,107 @@ impl Picker {
         query: &str,
         tree: bool,
     ) -> Self {
+        let (sessions, depth) = if tree {
+            let order = tree_order(&sessions);
+            let depth = order.iter().map(|&(_, depth)| depth).collect();
+            let mut slots: Vec<Option<SessionInfo>> = sessions.into_iter().map(Some).collect();
+            let sessions = order
+                .iter()
+                .map(|&(index, _)| {
+                    slots[index]
+                        .take()
+                        .expect("tree order visits each session once")
+                })
+                .collect();
+            (sessions, depth)
+        } else {
+            let depth = vec![0; sessions.len()];
+            (sessions, depth)
+        };
         let searchable = sessions.iter().map(search_text).collect();
         let mut picker = Self {
+            total: sessions.len(),
             sessions,
+            depth,
             pinned: pinned.into_iter().collect(),
             current: current.into(),
             tree,
             show_empty: tree,
+            all_projects: false,
+            open_elsewhere: HashSet::new(),
             query: text::one_line(query),
+            rename: None,
+            notice: None,
+            preview: HashMap::new(),
             selected: 0,
             found: Vec::new(),
             searchable,
         };
         picker.refilter(None);
         picker
+    }
+
+    /// Sets the scope label and the journal count `total` behind "showing N of M".
+    pub fn scope(mut self, all_projects: bool, total: usize) -> Self {
+        self.all_projects = all_projects;
+        self.total = total.max(self.sessions.len());
+        self
+    }
+
+    /// Sessions another dial process holds open. They stay listed but cannot be resumed.
+    pub fn with_open_elsewhere(mut self, ids: HashSet<String>) -> Self {
+        self.open_elsewhere = ids;
+        self
+    }
+
+    /// Keeps the empty-session filter across a reload.
+    pub fn with_show_empty(mut self, show_empty: bool) -> Self {
+        self.show_empty = show_empty || self.tree;
+        self.refilter(None);
+        self
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn tree(&self) -> bool {
+        self.tree
+    }
+
+    pub fn show_empty(&self) -> bool {
+        self.show_empty
+    }
+
+    pub fn all_projects(&self) -> bool {
+        self.all_projects
+    }
+
+    /// Id of the highlighted session, used to keep the selection across a reload.
+    pub fn selected_id(&self) -> Option<&str> {
+        self.found
+            .get(self.selected)
+            .map(|&i| self.sessions[i].id.as_str())
+    }
+
+    /// Shows an error from the last action; it clears on the next key press.
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = Some(text::one_line(&notice.into()));
+    }
+
+    /// The selected session whose preview is still needed (wide layouts only).
+    pub fn wanted_preview(&self, cols: usize, height: usize) -> Option<(String, PathBuf)> {
+        if !wide(cols, height) {
+            return None;
+        }
+        let &index = self.found.get(self.selected)?;
+        let session = &self.sessions[index];
+        (!self.preview.contains_key(&session.id))
+            .then(|| (session.id.clone(), session.path.clone()))
+    }
+
+    pub fn set_preview(&mut self, id: String, turns: Vec<(String, String)>) {
+        self.preview.insert(id, turns);
     }
 
     fn refilter(&mut self, keep: Option<&str>) {
@@ -66,7 +185,7 @@ impl Picker {
         let tokens: Vec<_> = query.split_whitespace().collect();
         let mut ranked = Vec::new();
         for (index, session) in self.sessions.iter().enumerate() {
-            if !self.show_empty && session.user_messages == 0 && !self.pinned.contains(&session.id)
+            if !self.show_empty && !session.is_conversation() && !self.pinned.contains(&session.id)
             {
                 continue;
             }
@@ -104,6 +223,13 @@ impl Picker {
             .min(self.found.len().saturating_sub(1));
     }
 
+    /// Moves the highlight to the listed session with `id`, if it is still listed.
+    pub fn select_id(&mut self, id: &str) {
+        if let Some(position) = self.found.iter().position(|&i| self.sessions[i].id == id) {
+            self.selected = position;
+        }
+    }
+
     pub fn set_pinned(&mut self, index: usize, pinned: bool) {
         let id = self.sessions[index].id.clone();
         if pinned {
@@ -130,20 +256,52 @@ impl Picker {
         let page = self.page_size(height);
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if self.rename.is_some() {
+                    return self.handle_rename(key);
+                }
+                self.notice = None;
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let selected = self.found.get(self.selected).copied();
                 match key.code {
-                    KeyCode::Esc => return Action::Cancel,
+                    // Esc clears a query first; a second press on the empty search closes.
+                    KeyCode::Esc => {
+                        if self.query.is_empty() {
+                            return Action::Cancel;
+                        }
+                        self.query.clear();
+                        self.refilter(None);
+                    }
                     KeyCode::Char('c') if ctrl => return Action::Cancel,
                     KeyCode::Char('p') if ctrl => {
-                        if let Some(&index) = self.found.get(self.selected) {
+                        if let Some(index) = selected {
                             return Action::Pin(index);
                         }
                     }
+                    KeyCode::Char('r') if ctrl => {
+                        if let Some(index) = selected {
+                            let session = &self.sessions[index];
+                            self.rename =
+                                Some((session.id.clone(), text::one_line(&session.title)));
+                        }
+                    }
+                    KeyCode::Char('f') if ctrl => {
+                        if let Some(index) = selected {
+                            return Action::Fork(index);
+                        }
+                    }
+                    KeyCode::Char('d') if ctrl => {
+                        if let Some(index) = selected {
+                            return Action::Delete(index);
+                        }
+                    }
+                    KeyCode::Char('g') if ctrl => return Action::Scope,
+                    KeyCode::Char('a') if ctrl => {
+                        if self.sessions.len() < self.total {
+                            return Action::LoadAll;
+                        }
+                    }
                     KeyCode::Tab => {
-                        let id = self
-                            .found
-                            .get(self.selected)
-                            .map(|&i| self.sessions[i].id.clone());
+                        let id = self.selected_id().map(str::to_owned);
                         self.show_empty = !self.show_empty;
                         self.refilter(id.as_deref());
                     }
@@ -159,7 +317,7 @@ impl Picker {
                     KeyCode::Home => self.selected = 0,
                     KeyCode::End => self.selected = self.found.len().saturating_sub(1),
                     KeyCode::Enter => {
-                        if let Some(&index) = self.found.get(self.selected) {
+                        if let Some(index) = selected {
                             return Action::Resume(index);
                         }
                     }
@@ -183,8 +341,46 @@ impl Picker {
                 }
             }
             Event::Paste(value) => {
-                self.query.push_str(&text::one_line(value));
-                self.refilter(None);
+                if let Some((_, draft)) = self.rename.as_mut() {
+                    draft.push_str(&text::one_line(value));
+                } else {
+                    self.query.push_str(&text::one_line(value));
+                    self.refilter(None);
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Keys while renaming: the draft replaces the search line until Enter or Esc.
+    fn handle_rename(&mut self, key: &KeyEvent) -> Action {
+        if key.kind == KeyEventKind::Release {
+            return Action::None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some((id, draft)) = self.rename.as_mut() else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Esc => self.rename = None,
+            KeyCode::Char('c') if ctrl => self.rename = None,
+            KeyCode::Enter => {
+                let title = draft.trim().to_owned();
+                let id = id.clone();
+                self.rename = None;
+                if title.is_empty() {
+                    self.notice = Some("Title is empty; rename cancelled.".into());
+                } else if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
+                    return Action::Rename(index, title);
+                }
+            }
+            KeyCode::Char('u') if ctrl => draft.clear(),
+            KeyCode::Backspace => {
+                draft.pop();
+            }
+            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                draft.push(c)
             }
             _ => {}
         }
@@ -199,6 +395,29 @@ impl Picker {
         }
     }
 
+    /// The list in display order: date headers (outside tree and search views) and sessions.
+    fn units(&self, now: i64) -> Vec<Unit> {
+        let headers = !self.tree && self.query.trim().is_empty();
+        let mut units = Vec::with_capacity(self.found.len() * 2);
+        let mut last = None;
+        for (position, &index) in self.found.iter().enumerate() {
+            if headers {
+                let session = &self.sessions[index];
+                let group = if self.pinned.contains(&session.id) {
+                    "Pinned"
+                } else {
+                    day_group(&session.updated, now)
+                };
+                if last != Some(group) {
+                    units.push(Unit::Header(group));
+                    last = Some(group);
+                }
+            }
+            units.push(Unit::Item(position));
+        }
+        units
+    }
+
     pub fn rows(&self, cols: usize, height: usize, theme: &Theme) -> Rows {
         if height < 5 || cols < 12 {
             return vec![Line::from(Span::styled(
@@ -210,14 +429,22 @@ impl Picker {
                 theme.fg(Tok::Muted),
             ))];
         }
-        let width = cols.saturating_sub(4);
+        let wide = wide(cols, height);
+        let inner = cols.saturating_sub(4);
+        // Wide layouts split the inner width: the list on the left, the preview pane on the right.
+        let width = if wide { inner * 3 / 5 } else { inner };
+        let pane_width = inner.saturating_sub(width + 3);
         let compact = height < 18;
         let clip = |value: &str| text::ellipsize(&text::one_line(value), width, theme.ascii());
         let line = |value: String, tok| Line::from(Span::styled(clip(&value), theme.fg(tok)));
+        let (prompt, draft) = match &self.rename {
+            Some((_, draft)) => ("Rename  ", draft.as_str()),
+            None => ("Search  ", self.query.as_str()),
+        };
         let mut body = vec![Line::from(vec![
-            Span::styled("Search  ", theme.fg(Tok::Accent)),
+            Span::styled(prompt, theme.fg(Tok::Accent)),
             Span::styled(
-                text::ellipsize(&self.query, width.saturating_sub(9), theme.ascii()),
+                text::ellipsize(draft, width.saturating_sub(9), theme.ascii()),
                 theme.fg(Tok::Text),
             ),
             Span::styled(theme.sym(Sym::BoxV).to_owned(), theme.fg(Tok::Accent)),
@@ -225,118 +452,54 @@ impl Picker {
         let empty = self
             .sessions
             .iter()
-            .filter(|s| s.user_messages == 0 && !self.pinned.contains(&s.id))
+            .filter(|s| !s.is_conversation() && !self.pinned.contains(&s.id))
             .count();
+        let scope = if self.all_projects {
+            "all projects"
+        } else {
+            "this project"
+        };
         if height >= 7 {
-            body.push(line(
-                format!(
-                    "{} · Tab {} · {} empty hidden · this project",
-                    if self.show_empty {
-                        "All sessions"
-                    } else {
-                        "Conversations"
-                    },
-                    if self.show_empty {
-                        "conversations"
-                    } else {
-                        "show all"
-                    },
-                    if self.show_empty { 0 } else { empty }
-                ),
-                Tok::Muted,
-            ));
+            let status = if self.show_empty {
+                format!("All sessions · {scope}")
+            } else if empty > 0 {
+                format!("Conversations · {empty} empty hidden · Tab includes them · {scope}")
+            } else {
+                format!("Conversations · {scope}")
+            };
+            body.push(line(status, Tok::Muted));
         }
-        let visible = self.page_size(height);
-        let start = self.selected.saturating_sub(visible.saturating_sub(1));
+        let loaded = self.sessions.len();
         if self.found.is_empty() {
-            body.push(line(
-                if self.query.trim().is_empty() {
-                    "No conversations yet. Tab shows empty sessions.".into()
-                } else {
-                    "No matches. Ctrl+U clears search; Tab includes empty sessions.".into()
-                },
-                Tok::Muted,
-            ));
-        }
-        for (position, &index) in self.found.iter().enumerate().skip(start).take(visible) {
-            let s = &self.sessions[index];
-            let selected = position == self.selected;
-            let title = label(s);
-            let marker = if selected {
-                theme.sym(Sym::Pointer)
-            } else {
-                " "
-            };
-            let flags = if width >= 44 {
+            let message = if !self.query.trim().is_empty() && loaded < self.total {
                 format!(
-                    "{}{}",
-                    if self.pinned.contains(&s.id) {
-                        "[pin] "
-                    } else {
-                        ""
-                    },
-                    if s.id == self.current {
-                        "[current] "
-                    } else {
-                        ""
-                    }
+                    "No matches in the {loaded} loaded sessions. Ctrl+A searches all {}.",
+                    self.total
                 )
+            } else if !self.query.trim().is_empty() {
+                "No matches. Ctrl+U clears search; Tab includes empty sessions.".into()
+            } else if empty > 0 && !self.show_empty {
+                "No conversations yet. Tab shows empty sessions.".into()
             } else {
-                String::new()
+                "No sessions yet.".into()
             };
-            let age = if width >= 28 {
-                age(&s.updated)
-            } else {
-                String::new()
-            };
-            let room = width.saturating_sub(text::width(&flags) + text::width(&age) + 4);
-            let title = text::ellipsize(&title, room, theme.ascii());
-            let gap = width
-                .saturating_sub(text::width(&title) + text::width(&flags) + text::width(&age) + 2);
-            let fill = if selected {
-                theme.bg(Tok::SelectedBg)
-            } else {
-                Default::default()
-            };
-            body.push(
-                Line::from(vec![
-                    Span::styled(
-                        format!("{marker} {flags}"),
-                        theme.fg(Tok::Accent).patch(fill),
-                    ),
-                    Span::styled(
-                        title,
-                        theme
-                            .fg(if selected { Tok::Accent } else { Tok::Text })
-                            .add_modifier(if selected {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            })
-                            .patch(fill),
-                    ),
-                    Span::styled(" ".repeat(gap), fill),
-                    Span::styled(age, theme.fg(Tok::Muted).patch(fill)),
-                ])
-                .style(fill),
-            );
-            if !compact {
-                let preview = if !s.last_message.trim().is_empty() {
-                    &s.last_message
-                } else {
-                    &s.first_message
-                };
-                body.push(line(
-                    format!(
-                        "  {}",
-                        if preview.trim().is_empty() {
-                            "No conversation messages"
-                        } else {
-                            preview
-                        }
-                    ),
-                    Tok::Muted,
-                ));
+            body.push(line(message, Tok::Muted));
+        }
+        let now = now_secs();
+        let units = self.units(now);
+        let visible = self.page_size(height);
+        let selected_unit = units
+            .iter()
+            .position(|unit| *unit == Unit::Item(self.selected))
+            .unwrap_or(0);
+        let start = selected_unit.saturating_sub(visible.saturating_sub(1));
+        for unit in units.iter().skip(start).take(visible) {
+            match unit {
+                Unit::Header(group) => body.push(Line::from(Span::styled(
+                    clip(*group),
+                    theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+                ))),
+                Unit::Item(position) => self.item_rows(*position, width, compact, theme, &mut body),
             }
         }
         if !compact {
@@ -348,16 +511,22 @@ impl Picker {
                     .as_ref()
                     .map(|id| format!(" · fork of {}", short(id)))
                     .unwrap_or_default();
+                let project = if self.all_projects {
+                    format!(" · {}", s.project)
+                } else {
+                    String::new()
+                };
                 body.push(line(
                     format!(
-                        "{} request{} · {} message{} · {} · {}{}",
+                        "{} request{} · {} message{} · {} · {}{}{}",
                         s.user_messages,
                         if s.user_messages == 1 { "" } else { "s" },
                         s.messages,
                         if s.messages == 1 { "" } else { "s" },
                         s.model.rsplit('/').next().unwrap_or(&s.model),
                         short(&s.id),
-                        branch
+                        branch,
+                        project
                     ),
                     Tok::Muted,
                 ));
@@ -385,27 +554,335 @@ impl Picker {
                 ));
             }
         }
-        body.push(line(
+        if let Some(notice) = &self.notice {
+            body.push(line(notice.clone(), Tok::Warning));
+        }
+        let position = if self.found.is_empty() {
+            0
+        } else {
+            self.selected + 1
+        };
+        if self.rename.is_some() {
+            body.push(line(
+                "Enter saves the title · Esc cancels rename".into(),
+                Tok::Muted,
+            ));
+        } else if compact {
+            body.push(line(
+                format!(
+                    "{position}/{} · Enter resume · Ctrl+P pin · Esc clear or close",
+                    self.found.len()
+                ),
+                Tok::Muted,
+            ));
+        } else {
+            let load = if loaded < self.total {
+                " · Ctrl+A load all"
+            } else {
+                ""
+            };
+            body.push(line(
+                format!(
+                    "{position}/{} · ↑↓ move · Enter resume · Esc clear or close{load}",
+                    self.found.len()
+                ),
+                Tok::Muted,
+            ));
+            body.push(line(
+                "Ctrl+P pin · Ctrl+R rename · Ctrl+F fork · Ctrl+D delete · Ctrl+G scope · Tab empty · Ctrl+U clear"
+                    .into(),
+                Tok::Muted,
+            ));
+        }
+        let rows = if wide {
+            let pane = self.pane(pane_width, theme);
+            body.into_iter()
+                .enumerate()
+                .map(|(i, left)| beside(left, pane.get(i), width, theme))
+                .collect()
+        } else {
+            body
+        };
+        let extra = if loaded < self.total {
             format!(
-                "{}/{} · ↑↓ move · Enter resume · Ctrl+P pin · Esc cancel",
-                if self.found.is_empty() {
-                    0
-                } else {
-                    self.selected + 1
-                },
+                "showing {loaded} of {} · {} found",
+                self.total,
                 self.found.len()
-            ),
-            Tok::Muted,
-        ));
+            )
+        } else {
+            format!("{} found", self.found.len())
+        };
         chrome::framed_lines(
             theme,
             chrome::Section::Dial,
             if self.tree { "Session tree" } else { "Resume" },
-            &format!("{} found", self.found.len()),
-            body,
+            &extra,
+            rows,
             cols,
         )
     }
+
+    /// One session row (and its preview line outside compact layouts).
+    fn item_rows(
+        &self,
+        position: usize,
+        width: usize,
+        compact: bool,
+        theme: &Theme,
+        body: &mut Vec<Line<'static>>,
+    ) {
+        let index = self.found[position];
+        let s = &self.sessions[index];
+        let selected = position == self.selected;
+        let clip = |value: &str, tok| {
+            Line::from(Span::styled(
+                text::ellipsize(&text::one_line(value), width, theme.ascii()),
+                theme.fg(tok),
+            ))
+        };
+        let pinned = self.pinned.contains(&s.id);
+        let current = s.id == self.current;
+        let open = self.open_elsewhere.contains(&s.id);
+        let marker = if selected {
+            theme.sym(Sym::Pointer)
+        } else {
+            " "
+        };
+        // Wide rows spell the markers out; narrow rows keep one-character glyphs visible.
+        let flags = if width >= 44 {
+            let mut flags = String::new();
+            for (on, word) in [
+                (pinned, "[pin] "),
+                (current, "[current] "),
+                (open, "[open elsewhere] "),
+            ] {
+                if on {
+                    flags.push_str(word);
+                }
+            }
+            flags
+        } else {
+            let glyphs: String = [(pinned, '*'), (current, '@'), (open, '~')]
+                .into_iter()
+                .filter_map(|(on, glyph)| on.then_some(glyph))
+                .collect();
+            if glyphs.is_empty() {
+                glyphs
+            } else {
+                format!("{glyphs} ")
+            }
+        };
+        let age = if width >= 28 {
+            age(&s.updated)
+        } else {
+            String::new()
+        };
+        let indent = if self.tree {
+            "  ".repeat(self.depth[index].min(6))
+        } else {
+            String::new()
+        };
+        let title = format!("{indent}{}", label(s));
+        let room = width.saturating_sub(text::width(&flags) + text::width(&age) + 4);
+        let title = text::ellipsize(&title, room, theme.ascii());
+        let gap =
+            width.saturating_sub(text::width(&title) + text::width(&flags) + text::width(&age) + 2);
+        let fill = if selected {
+            theme.bg(Tok::SelectedBg)
+        } else {
+            Default::default()
+        };
+        body.push(
+            Line::from(vec![
+                Span::styled(
+                    format!("{marker} {flags}"),
+                    theme.fg(Tok::Accent).patch(fill),
+                ),
+                Span::styled(
+                    title,
+                    theme
+                        .fg(if selected { Tok::Accent } else { Tok::Text })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        })
+                        .patch(fill),
+                ),
+                Span::styled(" ".repeat(gap), fill),
+                Span::styled(age, theme.fg(Tok::Muted).patch(fill)),
+            ])
+            .style(fill),
+        );
+        if !compact {
+            let preview = if !s.last_message.trim().is_empty() {
+                &s.last_message
+            } else {
+                &s.first_message
+            };
+            body.push(clip(
+                &format!(
+                    "  {}",
+                    if preview.trim().is_empty() {
+                        "No conversation messages"
+                    } else {
+                        preview
+                    }
+                ),
+                Tok::Muted,
+            ));
+        }
+    }
+
+    /// Preview pane for the selected session: its first and last turns, loaded on demand.
+    fn pane(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let Some(&index) = self.found.get(self.selected) else {
+            return Vec::new();
+        };
+        let s = &self.sessions[index];
+        let clip = |value: String, tok| {
+            Line::from(Span::styled(
+                text::ellipsize(&text::one_line(&value), width, theme.ascii()),
+                theme.fg(tok),
+            ))
+        };
+        let mut lines = vec![
+            clip(label(s), Tok::Accent),
+            clip(
+                format!(
+                    "{} · {}{}",
+                    s.model.rsplit('/').next().unwrap_or(&s.model),
+                    age(&s.updated),
+                    if self.all_projects {
+                        format!(" · {}", s.project)
+                    } else {
+                        String::new()
+                    }
+                ),
+                Tok::Muted,
+            ),
+        ];
+        match self.preview.get(&s.id) {
+            None => lines.push(clip("Loading preview".into(), Tok::Muted)),
+            Some(turns) if turns.is_empty() => {
+                lines.push(clip("No conversation messages".into(), Tok::Muted))
+            }
+            Some(turns) => {
+                let count = turns.len();
+                let mut shown: Vec<Option<&(String, String)>> =
+                    turns.iter().take(PREVIEW_TURNS).map(Some).collect();
+                if count > 2 * PREVIEW_TURNS {
+                    shown.push(None);
+                }
+                let tail = count.saturating_sub(PREVIEW_TURNS).max(PREVIEW_TURNS);
+                shown.extend(turns.iter().skip(tail).map(Some));
+                for turn in shown {
+                    match turn {
+                        None => lines.push(clip("…".into(), Tok::Muted)),
+                        Some((role, body)) => {
+                            let user = role == "user";
+                            lines.push(clip(
+                                format!("{}  {body}", if user { "You" } else { "Dial" }),
+                                if user { Tok::Text } else { Tok::Muted },
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+        lines
+    }
+}
+
+/// Whether the preview pane has room beside the list.
+fn wide(cols: usize, height: usize) -> bool {
+    cols >= PREVIEW_MIN_COLS && height >= PREVIEW_MIN_ROWS
+}
+
+/// Joins a list row with the matching preview row, keeping a separator column in every row.
+fn beside(
+    left: Line<'static>,
+    right: Option<&Line<'static>>,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let used: usize = left.spans.iter().map(|s| text::width(&s.content)).sum();
+    let mut spans = left.spans;
+    spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(used)),
+        left.style,
+    ));
+    spans.push(Span::styled(
+        format!(" {} ", theme.sym(Sym::BoxV)),
+        theme.fg(Tok::BorderMuted),
+    ));
+    if let Some(right) = right {
+        spans.extend(right.spans.iter().cloned());
+    }
+    Line::from(spans)
+}
+
+/// Tree order: each root (no parent in the list) followed by its descendants depth-first, with
+/// siblings most recently active first. Returns `(index, depth)` for every session exactly once.
+pub fn tree_order(sessions: &[SessionInfo]) -> Vec<(usize, usize)> {
+    let index: HashMap<&str, usize> = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); sessions.len()];
+    let mut roots = Vec::new();
+    for (i, session) in sessions.iter().enumerate() {
+        match session.parent_id.as_deref().and_then(|p| index.get(p)) {
+            Some(&parent) if parent != i => children[parent].push(i),
+            _ => roots.push(i),
+        }
+    }
+    let recent_first = |a: &usize, b: &usize| {
+        sessions[*b]
+            .updated
+            .cmp(&sessions[*a].updated)
+            .then_with(|| sessions[*b].id.cmp(&sessions[*a].id))
+    };
+    roots.sort_by(recent_first);
+    for siblings in &mut children {
+        siblings.sort_by(recent_first);
+    }
+    let mut out = Vec::with_capacity(sessions.len());
+    let mut seen = vec![false; sessions.len()];
+    // Parent cycles reach no root; they are started from their own index so nothing is dropped.
+    for start in roots.into_iter().chain(0..sessions.len()) {
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, depth)) = stack.pop() {
+            if std::mem::replace(&mut seen[node], true) {
+                continue;
+            }
+            out.push((node, depth));
+            for &child in children[node].iter().rev() {
+                stack.push((child, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// Date group of an activity stamp relative to `now` (both Unix seconds, UTC days).
+fn day_group(stamp: &str, now: i64) -> &'static str {
+    let Some(then) = stamp.get(..19).and_then(crate::platform::time::parse_utc) else {
+        return "Older";
+    };
+    match now.div_euclid(86400) - then.div_euclid(86400) {
+        ..=0 => "Today",
+        1 => "Yesterday",
+        2..=6 => "This week",
+        _ => "Older",
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn search_text(s: &SessionInfo) -> String {
@@ -428,14 +905,11 @@ fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-fn age(stamp: &str) -> String {
+pub fn age(stamp: &str) -> String {
     let Some(then) = stamp.get(..19).and_then(crate::platform::time::parse_utc) else {
         return text::one_line(stamp);
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    match now.saturating_sub(then).max(0) {
+    match now_secs().saturating_sub(then).max(0) {
         0..=59 => "now".into(),
         s @ 60..=3599 => format!("{}m ago", s / 60),
         s @ 3600..=86399 => format!("{}h ago", s / 3600),
@@ -446,7 +920,6 @@ fn age(stamp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
     fn session(id: &str, title: &str, requests: usize) -> SessionInfo {
         SessionInfo {
             id: id.into(),
@@ -466,6 +939,17 @@ mod tests {
     }
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
+    }
+    fn text_of(rows: &Rows) -> String {
+        rows.iter()
+            .map(|row| {
+                row.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
     #[test]
     fn conversations_hide_empty_but_pins_and_all_view_keep_them_accessible() {
@@ -529,6 +1013,31 @@ mod tests {
     }
 
     #[test]
+    fn tree_orders_children_under_parents_by_recent_activity() {
+        let mut root = session("root", "Root", 1);
+        root.updated = "2026-01-01T00:00:00Z".into();
+        let mut old_child = session("old", "Old child", 1);
+        old_child.parent_id = Some("root".into());
+        old_child.updated = "2026-01-02T00:00:00Z".into();
+        let mut new_child = session("new", "New child", 1);
+        new_child.parent_id = Some("root".into());
+        new_child.updated = "2026-01-05T00:00:00Z".into();
+        let mut other = session("other", "Other", 1);
+        other.updated = "2026-02-01T00:00:00Z".into();
+        let p = Picker::new(
+            vec![root, old_child, new_child, other],
+            vec![],
+            "",
+            "",
+            true,
+        );
+        let ids: Vec<_> = p.found.iter().map(|&i| p.sessions[i].id.as_str()).collect();
+        assert_eq!(ids, ["other", "root", "new", "old"]);
+        let depths: Vec<_> = p.found.iter().map(|&i| p.depth[i]).collect();
+        assert_eq!(depths, [0, 0, 1, 1]);
+    }
+
+    #[test]
     fn search_ranks_titles_and_matches_words_in_any_order_without_path_noise() {
         let mut a = session("one", "Callback retry", 1);
         a.last_message = "Other topic".into();
@@ -562,6 +1071,110 @@ mod tests {
         assert!(!p.query.contains('\x1b'));
         assert!(!p.query.contains('\n'));
     }
+
+    #[test]
+    fn escape_clears_the_query_first_and_closes_on_the_second_press() {
+        let mut p = Picker::new(vec![session("one", "Title", 1)], vec![], "", "title", false);
+        assert!(matches!(
+            p.handle(&key(KeyCode::Esc, KeyModifiers::NONE), 24),
+            Action::None
+        ));
+        assert!(p.query.is_empty());
+        assert_eq!(p.found, [0]);
+        assert!(matches!(
+            p.handle(&key(KeyCode::Esc, KeyModifiers::NONE), 24),
+            Action::Cancel
+        ));
+    }
+
+    #[test]
+    fn date_group_headers_are_rows_that_navigation_skips() {
+        let now = crate::platform::time::parse_utc("2026-03-10T12:00:00").unwrap();
+        let mut today = session("today", "Today", 1);
+        today.updated = "2026-03-10T11:00:00".into();
+        let mut old = session("old", "Old", 1);
+        old.updated = "2025-01-01T00:00:00".into();
+        let mut p = Picker::new(vec![today, old], vec![], "", "", false);
+        assert_eq!(
+            p.units(now),
+            [
+                Unit::Header("Today"),
+                Unit::Item(0),
+                Unit::Header("Older"),
+                Unit::Item(1)
+            ]
+        );
+        p.handle(&key(KeyCode::Down, KeyModifiers::NONE), 24);
+        assert_eq!(p.selected_id(), Some("old"));
+        let rendered = text_of(&p.rows(80, 24, &Theme::dark()));
+        assert!(rendered.contains("Today"));
+        assert!(rendered.contains("Older"));
+        assert_eq!(day_group("2026-03-09T23:00:00", now), "Yesterday");
+        assert_eq!(day_group("2026-03-05T23:00:00", now), "This week");
+    }
+
+    #[test]
+    fn header_reports_loaded_of_total_and_ctrl_a_loads_only_when_more_exist() {
+        let theme = Theme::dark();
+        let mut p = Picker::new(
+            vec![session("a", "A", 1), session("b", "B", 1)],
+            vec![],
+            "",
+            "",
+            false,
+        )
+        .scope(false, 5);
+        assert!(text_of(&p.rows(100, 24, &theme)).contains("showing 2 of 5"));
+        assert!(matches!(
+            p.handle(&key(KeyCode::Char('a'), KeyModifiers::CONTROL), 24),
+            Action::LoadAll
+        ));
+        let mut full =
+            Picker::new(vec![session("a", "A", 1)], vec![], "", "", false).scope(false, 1);
+        assert!(matches!(
+            full.handle(&key(KeyCode::Char('a'), KeyModifiers::CONTROL), 24),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn rename_edits_a_draft_in_the_search_line_and_enter_returns_it() {
+        let mut p = Picker::new(
+            vec![session("one", "Old", 1), session("two", "Other", 1)],
+            vec![],
+            "",
+            "",
+            false,
+        );
+        p.handle(&key(KeyCode::Char('r'), KeyModifiers::CONTROL), 24);
+        p.handle(&key(KeyCode::Char('u'), KeyModifiers::CONTROL), 24);
+        for c in "New name".chars() {
+            p.handle(&key(KeyCode::Char(c), KeyModifiers::NONE), 24);
+        }
+        match p.handle(&key(KeyCode::Enter, KeyModifiers::NONE), 24) {
+            Action::Rename(index, title) => {
+                assert_eq!(p.sessions[index].id, "one");
+                assert_eq!(title, "New name");
+            }
+            _ => panic!("expected a rename"),
+        }
+    }
+
+    #[test]
+    fn wide_layout_previews_the_selected_session_once_loaded() {
+        let theme = Theme::dark();
+        let mut p = Picker::new(vec![session("one", "Preview me", 1)], vec![], "", "", false);
+        assert_eq!(
+            p.wanted_preview(110, 38).map(|(id, _)| id).as_deref(),
+            Some("one")
+        );
+        assert!(p.wanted_preview(80, 38).is_none());
+        p.set_preview("one".into(), vec![("user".into(), "first question".into())]);
+        assert!(p.wanted_preview(110, 38).is_none());
+        let rendered = text_of(&p.rows(110, 38, &theme));
+        assert!(rendered.contains("You  first question"));
+    }
+
     #[test]
     fn layout_fits_small_and_wide_terminals_without_losing_selection() {
         let theme = Theme::dark();

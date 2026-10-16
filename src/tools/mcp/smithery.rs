@@ -240,14 +240,14 @@ pub fn search_at(
     Ok(results)
 }
 
-/// One registry page for interactive browsing. Unlike identity search, an empty query lists
-/// the catalog and registry relevance ordering is retained. Entries still need a usable connection.
+/// One registry page for interactive browsing. Listing metadata is enough to show a server;
+/// connection details are resolved only when installing, so unavailable details cannot hide it.
 pub fn browse_page_at(
     registry: &str,
     keyword: &str,
     page: usize,
     api_key: Option<&str>,
-) -> Result<(Vec<SearchResult>, bool), SmitheryError> {
+) -> Result<(Vec<super::catalog::Candidate>, bool), SmitheryError> {
     let url =
         registry_search_url(registry, keyword.trim(), DEFAULT_LIMIT, page.max(1)).map_err(|e| {
             SmitheryError {
@@ -279,21 +279,45 @@ pub fn browse_page_at(
         .map(|total| (page.max(1) as u64) < total)
         .unwrap_or(entries.len() >= DEFAULT_LIMIT);
     let mut seen = HashSet::new();
-    let entries: Vec<_> = entries
+    let results = entries
         .iter()
-        .filter(|entry| identity_key(entry).is_some_and(|id| seen.insert(id)))
+        .filter_map(listing_candidate)
+        .filter(|candidate| seen.insert(candidate.name.clone()))
         .collect();
-    let results = std::thread::scope(|scope| {
-        let handles: Vec<_> = entries
-            .into_iter()
-            .map(|entry| scope.spawn(move || resolve_entry(registry, entry, api_key)))
-            .collect();
-        handles
-            .into_iter()
-            .filter_map(|handle| handle.join().ok().flatten())
-            .collect()
-    });
     Ok((results, more))
+}
+
+/// Discovery is not install validation. Reuse the common candidate shape without inventing a
+/// connection or fetching per-server details; the Smithery install flow resolves those later.
+fn listing_candidate(entry: &Value) -> Option<super::catalog::Candidate> {
+    use super::catalog::{Candidate, Install, Source};
+    let raw_name = safe_metadata(entry.get("qualifiedName")).or_else(|| {
+        Some(format!(
+            "{}/{}",
+            safe_metadata(entry.get("namespace"))?,
+            safe_metadata(entry.get("slug"))?
+        ))
+    })?;
+    if raw_name.trim_start_matches('@').is_empty() {
+        return None;
+    }
+    let name = normalize_qualified_name(&raw_name);
+    Some(Candidate {
+        title: safe_metadata(entry.get("displayName")).unwrap_or_else(|| name.clone()),
+        name,
+        description: safe_metadata(entry.get("description"))
+            .unwrap_or_else(|| "No description".into()),
+        sources: vec![Source::Smithery],
+        badges: if entry.get("verified").and_then(Value::as_bool) == Some(true) {
+            vec!["verified".into()]
+        } else {
+            Vec::new()
+        },
+        install: Install::Blocked(
+            "Smithery servers install from /extensions, which asks for their settings".into(),
+        ),
+        inputs: Vec::new(),
+    })
 }
 
 fn registry_search_url(base: &str, keyword: &str, page_size: usize, page: usize) -> Result<String> {
@@ -1249,6 +1273,44 @@ mod tests {
             Ok(_) => panic!("expected an error"),
             Err(error) => error.to_string(),
         }
+    }
+
+    #[test]
+    fn browsing_keeps_nuxt_without_details_and_follows_provider_pagination() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let base = serve(Arc::new(move |target| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if !target.starts_with("/servers?") {
+                return (404, "{}".into());
+            }
+            let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+            let params: BTreeMap<_, _> = url.query_pairs().collect();
+            assert_eq!(params.get("q").map(|v| v.as_ref()), Some("nuxt"));
+            let second = params.get("page").is_some_and(|v| v == "2");
+            (200, json!({
+                "servers": if second {
+                    json!([{"namespace":"nuxt", "slug":"docs", "displayName":"Nuxt docs"}])
+                } else {
+                    json!([
+                        {"qualifiedName":"@nuxt/mcp", "displayName":"Nuxt", "verified":true},
+                        {"qualifiedName":"nuxt/mcp", "displayName":"Duplicate"},
+                        {"id":"not-an-install-identity"}
+                    ])
+                },
+                "pagination": {"totalPages":2}
+            }).to_string())
+        }));
+        let (first, more) = browse_page_at(&base, "nuxt", 1, None).expect("first page");
+        assert!(more);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name, "@nuxt/mcp");
+        assert_eq!(first[0].badges, ["verified"]);
+        assert!(!first[0].installable());
+        let (second, more) = browse_page_at(&base, "nuxt", 2, None).expect("second page");
+        assert!(!more);
+        assert_eq!(second[0].name, "@nuxt/docs");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "no detail requests while browsing");
     }
 
     #[test]

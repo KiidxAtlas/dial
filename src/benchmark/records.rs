@@ -181,7 +181,7 @@ impl Recorder {
         &self.data.contract
     }
     fn flush(&self) -> Result<()> {
-        crate::storage::settings_store::write_private(&self.path, &serde_json::to_vec(&self.data)?)
+        crate::storage::atomic::write_private(&self.path, &serde_json::to_vec(&self.data)?)
     }
 }
 

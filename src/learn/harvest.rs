@@ -265,7 +265,7 @@ pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Re
     // Balance over everything eligible, not just what is new, so the result does not depend on how
     // much was harvested before: a re-run selects the same records and finds nothing new.
     let mut groups: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
-    let minimum = config.improve.lora_min_examples.max(t.batch_size) as usize;
+    let minimum = crate::learn::improve::min_examples(config);
     let eligible = cap_learned(
         balance(candidates.into_values().collect()),
         t.learn_from_max_percent,
@@ -464,14 +464,25 @@ fn prompt_group(messages: &Value) -> Option<String> {
 fn trajectory_group(source: &str) -> Option<String> {
     if let Some(rest) = source.strip_prefix("dial:learned:") {
         let (origin, rest) = rest.split_once(':')?;
-        let id = rest.split(':').next()?.parse::<i64>().ok()?;
+        if origin.is_empty() {
+            return None;
+        }
+        let id = trajectory_id(rest)?;
         return Some(trajectory_key(Some(origin), id));
     }
     let rest = source
         .strip_prefix("dial:verified:")
         .or_else(|| source.strip_prefix("dial:tool-recovery:"))?;
-    let id = rest.split(':').next()?.parse::<i64>().ok()?;
+    let id = trajectory_id(rest)?;
     Some(trajectory_key(None, id))
+}
+
+fn trajectory_id(rest: &str) -> Option<i64> {
+    let id = rest.split(':').next()?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    id.parse().ok()
 }
 
 /// Trajectory ids are unique only within one database, so a sibling's trajectories carry its origin.
@@ -2358,6 +2369,34 @@ mod tests {
         let record = foreign_repair(&payload, "aaaa", 7).unwrap();
         assert_eq!(record["source"], "dial:learned:aaaa:7:tool-recovery");
         assert!(record.get("preference_pairs").is_none());
+    }
+
+    #[test]
+    fn trajectory_provenance_matches_shared_golden_cases() {
+        let cases: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/trajectory_provenance.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            assert_eq!(
+                trajectory_group(case["source"].as_str().unwrap()).as_deref(),
+                case["group"].as_str(),
+                "{}",
+                case["source"]
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_trajectory_ids_reject_overflow_but_accept_leading_zeroes() {
+        assert_eq!(
+            trajectory_group(&format!("dial:verified:{}", "9".repeat(5000))),
+            None
+        );
+        assert_eq!(
+            trajectory_group(&format!("dial:verified:{}7", "0".repeat(5000))).as_deref(),
+            Some("trajectory:7")
+        );
     }
 
     #[test]

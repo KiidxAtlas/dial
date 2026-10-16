@@ -1,12 +1,11 @@
 //! Persistent Python execution with controller-owned tool callbacks and OS process containment.
 //!
 //! Cancellation and timeouts first deliver SIGINT, which the driver turns into `KeyboardInterrupt`
-//! inside the running cell while keeping the namespace; only a cell that ignores it for
-//! [`INTERRUPT_GRACE`] is killed together with its session.
+//! inside the running cell. The interrupted namespace is always discarded; a driver that does
+//! not unwind within [`INTERRUPT_GRACE`] is killed together with its session.
 use super::ext::{Tool, ToolCallback, ToolContext, ToolEvent};
 #[cfg(windows)]
 use super::sandbox::Sandbox;
-use super::shell::ProcessGroup;
 #[cfg(not(windows))]
 use super::shell::shell_command;
 use super::{ToolOutput, Workspace, preludes, tool_schema};
@@ -14,10 +13,8 @@ use crate::config::types::Config;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-#[cfg(unix)]
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
@@ -28,9 +25,7 @@ mod env;
 
 pub(crate) const PYTHON_DRIVER: &str = include_str!("kernel_driver.py");
 pub(crate) const MAX_CODE: usize = 64 * 1024;
-pub(crate) const MAX_FRAME: usize = 12 * 1024 * 1024;
-/// How long an interrupted cell may take to unwind before the session is killed.
-pub(crate) const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+pub(crate) use crate::runtime::json_transport::{INTERRUPT_GRACE, execution_deadline};
 const DEFAULT_PYTHON: &str = "python3";
 // No descendant can detach: even with the operator's filesystem sandbox opt-out, fork/spawn is denied.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -80,7 +75,7 @@ impl Drop for ActiveGuard<'_> {
 }
 struct KernelTool {
     config: KernelConfig,
-    session: Mutex<Option<JsonProcess>>,
+    session: Mutex<Option<NativeProcess>>,
     pid: Arc<AtomicI32>,
     interrupt: AtomicBool,
     active: AtomicUsize,
@@ -92,7 +87,10 @@ impl Tool for KernelTool {
     fn schema(&self) -> Value {
         tool_schema(
             "kernel",
-            "Persistent Python 3.8+ namespace with real top-level await. tool.<name>(**kwargs), tool.call(name,args), and tool.schemas return to the current controller for the same permissions, approvals, validation and observers as direct tools. Results retain text/data/is_error; denied or malformed calls raise ToolError. Each cell requires approval and runs under the workspace OS sandbox plus a mandatory process-creation fence, even when filesystem sandboxing is disabled. Windows requires explicit unsandboxed opt-in because filesystem/network isolation is unavailable; its trusted driver installs a native no-child-process mitigation before user code. stdout/stderr/final expression/tracebacks are bounded. Timeout/cancel destroys this owner's namespace; if a controller callback is pending its approval/nested operation is also cancelled. Reset starts fresh lazily. macOS containment or the Windows native fence and operator-installed Python are required.",
+            &super::catalog::execution_description(
+                "kernel",
+                "Persistent Python 3.8+ namespace with real top-level await. tool.<name>(**kwargs), tool.call(name,args), and tool.schemas return to the current controller for the same permissions, approvals, validation and observers as direct tools. Results retain text/data/is_error; denied or malformed calls raise ToolError. Each cell requires approval and runs under the workspace OS sandbox plus a mandatory process-creation fence, even when filesystem sandboxing is disabled. Windows requires explicit unsandboxed opt-in because filesystem/network isolation is unavailable; its trusted driver installs a native no-child-process mitigation before user code. stdout/stderr/final expression/tracebacks are bounded. Timeout/cancel destroys this owner's namespace; if a controller callback is pending its approval/nested operation is also cancelled. Reset starts fresh lazily. macOS containment or the Windows native fence and operator-installed Python are required.",
+            ),
             json!({
                 "action":{"type":"string","enum":["eval","reset","cancel","status"]},
                 "code":{"type":"string","description":"Python cell, at most 64 KiB UTF-8."},
@@ -204,8 +202,12 @@ impl KernelTool {
                     return Ok(json!({"reset":true}));
                 }
                 if action == "status" {
-                    return Ok(json!({"running":slot.as_mut().is_some_and(JsonProcess::alive)}));
+                    return Ok(
+                        json!({"running":slot.as_mut().is_some_and(NativeProcess::alive),
+                        "platform":super::catalog::execution_platform("kernel")}),
+                    );
                 }
+                require_fork_containment("kernel")?;
                 let code = args
                     .get("code")
                     .and_then(Value::as_str)
@@ -316,12 +318,13 @@ impl KernelTool {
                         strip_runtime_injection(&mut command);
                         require_fork_containment("kernel")?;
                         check_operation(end, &self.interrupt, cancel)?;
-                        *slot =
-                            Some(JsonProcess::start(command, self.pid.clone()).map_err(|e| {
+                        *slot = Some(NativeProcess::start(command, self.pid.clone()).map_err(
+                            |e| {
                                 format!(
                                     "starting Python kernel (install/configure kernel.python): {e}"
                                 )
-                            })?);
+                            },
+                        )?);
                     }
                     check_operation(end, &self.interrupt, cancel)?;
                     slot.as_mut().unwrap().prelude_language =
@@ -447,7 +450,7 @@ fn resolve_python(
     if interrupt.load(Ordering::Acquire) {
         return Err("kernel preflight cancelled".into());
     }
-    let mut process = JsonProcess::start(command, pid)?;
+    let mut process = NativeProcess::start(command, pid)?;
     // Cancellation before PID publication cannot kill the new process itself.
     // Recheck immediately after registration so startup never enters an uncancellable wait.
     if interrupt.load(Ordering::Acquire) {
@@ -536,9 +539,6 @@ pub(crate) fn deadline(args: &Value, configured: u64) -> Result<Duration, String
         (request, cap) => request.min(cap),
     }))
 }
-pub(crate) fn execution_deadline(timeout: Duration) -> Option<Instant> {
-    (!timeout.is_zero()).then(|| Instant::now() + timeout)
-}
 pub(crate) fn remaining_timeout(end: Option<Instant>) -> Result<Duration, String> {
     match end {
         None => Ok(Duration::ZERO),
@@ -586,23 +586,9 @@ pub(crate) fn code_output(result: Result<Value, String>) -> ToolOutput {
 }
 
 pub(crate) fn require_fork_containment(label: &str) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        // The trusted kernel bootstrap applies ProcessChildProcessPolicy before user code.
-        let _ = label;
-        Ok(())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        super::sandbox::Sandbox::detect().available().map_err(|error| {
-            format!("{label} requires the OS process-fork containment fence even when filesystem sandboxing is disabled: {error}")
-        })
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        Err(format!(
-            "{label} requires OS process-fork containment; no unsandboxed or Linux fallback is provided"
-        ))
+    match super::catalog::execution_platform(label).reason {
+        Some(reason) => Err(reason),
+        None => Ok(()),
     }
 }
 
@@ -693,11 +679,11 @@ fn deliver_interrupt(group: u32) -> bool {
 }
 
 pub(crate) fn lock_session<'a>(
-    session: &'a Mutex<Option<JsonProcess>>,
+    session: &'a Mutex<Option<NativeProcess>>,
     end: Option<Instant>,
     interrupt: &AtomicBool,
     cancel: &AtomicBool,
-) -> Result<parking_lot::MutexGuard<'a, Option<JsonProcess>>, String> {
+) -> Result<parking_lot::MutexGuard<'a, Option<NativeProcess>>, String> {
     loop {
         check_operation(end, interrupt, cancel)?;
         if let Some(slot) = session.try_lock_for(Duration::from_millis(10)) {
@@ -756,7 +742,7 @@ fn dispatch_guarded<'a>(
 }
 
 fn native_cell_once(
-    process: &mut JsonProcess,
+    process: &mut NativeProcess,
     workspace: &Workspace,
     code: &str,
     end: Option<Instant>,
@@ -828,7 +814,7 @@ fn native_cell_once(
 /// Runs one cell after installing eval preludes when the registry changed; `__dial_display__` text
 /// is prepended to the cell's stdout.
 pub(crate) fn native_cell(
-    process: &mut JsonProcess,
+    process: &mut NativeProcess,
     workspace: &Workspace,
     code: &str,
     end: Option<Instant>,
@@ -884,332 +870,33 @@ pub(crate) fn native_cell(
     Ok(value)
 }
 
-#[cfg(windows)]
-type KernelStdin = crate::platform::io::QueuedWriter<ChildStdin>;
-#[cfg(unix)]
-type KernelStdin = ChildStdin;
-/// Bounded JSON-lines protocol. Pipes are nonblocking so neither output nor input can defeat deadlines.
-pub(crate) struct JsonProcess {
-    group: ProcessGroup,
-    input: KernelStdin,
-    output: ChildStdout,
-    errors: ChildStderr,
-    pending: Vec<u8>,
-    stderr: Vec<u8>,
-    stderr_dropped: usize,
-    pid: Arc<AtomicI32>,
-    sequence: u64,
-    callback_sequence: u64,
-    /// A request frame was fully written and its reply has not been read yet.
-    in_flight: bool,
-    /// Language whose eval preludes are installed into this process; `None` disables installation.
+/// Tool-owned prelude state wraps the neutral transport; browser processes do not install preludes.
+pub(crate) struct NativeProcess {
+    transport: crate::runtime::json_transport::JsonProcess,
     pub(crate) prelude_language: Option<preludes::PreludeLanguage>,
-    /// Registry generation last installed into this process.
     prelude_generation: u64,
 }
-impl JsonProcess {
-    pub(crate) fn start(mut command: Command, pid: Arc<AtomicI32>) -> Result<Self, String> {
-        let child = crate::platform::process::spawn_group(
-            command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-        )
-        .map_err(|e| e.to_string())?;
-        // Owned from spawn onward: any later error terminates and reaps the group.
-        let mut group = ProcessGroup::new(child);
-        let input = group.child.stdin.take().ok_or("child stdin unavailable")?;
-        let output = group
-            .child
-            .stdout
-            .take()
-            .ok_or("child stdout unavailable")?;
-        let errors = group
-            .child
-            .stderr
-            .take()
-            .ok_or("child stderr unavailable")?;
-        crate::platform::io::set_nonblocking(&input).map_err(|e| e.to_string())?;
-        crate::platform::io::set_nonblocking(&output).map_err(|e| e.to_string())?;
-        crate::platform::io::set_nonblocking(&errors).map_err(|e| e.to_string())?;
-        #[cfg(windows)]
-        let input = crate::platform::io::QueuedWriter::new(input, 64 * 1024);
-        pid.store(group.child.id() as i32, Ordering::Release);
+impl NativeProcess {
+    pub(crate) fn start(command: Command, pid: Arc<AtomicI32>) -> Result<Self, String> {
         Ok(Self {
-            group,
-            input,
-            output,
-            errors,
-            pending: Vec::new(),
-            stderr: Vec::new(),
-            stderr_dropped: 0,
-            pid,
-            sequence: 0,
-            callback_sequence: 0,
-            in_flight: false,
+            transport: crate::runtime::json_transport::JsonProcess::start(command, pid)?,
             prelude_language: None,
             prelude_generation: 0,
         })
     }
     pub(crate) fn alive(&mut self) -> bool {
-        self.group.exited().is_ok_and(|exited| !exited)
-    }
-    fn write_frame(
-        &mut self,
-        value: &Value,
-        end: Option<Instant>,
-        check: &impl Fn() -> Result<(), String>,
-    ) -> Result<(), String> {
-        let mut bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
-        if bytes.len() > MAX_FRAME {
-            return Err("request frame too large".into());
-        }
-        bytes.push(b'\n');
-        let mut offset = 0;
-        while offset < bytes.len() {
-            check()?;
-            self.drain_stderr();
-            if end.is_some_and(|end| Instant::now() >= end) {
-                return Err("execution deadline exceeded; namespace/session discarded".into());
-            }
-            match self.write_input(&bytes[offset..]) {
-                Ok(0) => return Err("child stdin closed".into()),
-                Ok(n) => offset += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.poll_input(),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        loop {
-            check()?;
-            self.drain_stderr();
-            if end.is_some_and(|end| Instant::now() >= end) {
-                return Err("execution deadline exceeded; namespace/session discarded".into());
-            }
-            if self.input_drained().map_err(|error| error.to_string())? {
-                break;
-            }
-        }
-        Ok(())
-    }
-    fn write_input(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        #[cfg(windows)]
-        {
-            self.input.try_write(bytes)
-        }
-        #[cfg(unix)]
-        {
-            self.input.write(bytes)
-        }
-    }
-    fn input_drained(&self) -> std::io::Result<bool> {
-        #[cfg(windows)]
-        {
-            self.input.wait_until_drained(Duration::from_millis(10))
-        }
-        #[cfg(unix)]
-        {
-            Ok(true)
-        }
-    }
-    fn poll_input(&self) {
-        #[cfg(windows)]
-        {
-            let _ = self.input.wait_until_drained(Duration::from_millis(10));
-        }
-        #[cfg(unix)]
-        {
-            let _ = crate::platform::io::wait_writable(&self.input, Duration::from_millis(10));
-        }
-    }
-    fn poll_output(&self) {
-        let _ = crate::platform::io::wait_readable(&self.output, Duration::from_millis(10));
-    }
-    fn drain_stderr(&mut self) {
-        let mut buffer = [0u8; 16384];
-        for _ in 0..8 {
-            match crate::platform::io::read_nonblocking(&mut self.errors, &mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let remaining = (16 * 1024usize).saturating_sub(self.stderr.len());
-                    self.stderr.extend_from_slice(&buffer[..n.min(remaining)]);
-                    self.stderr_dropped = self
-                        .stderr_dropped
-                        .saturating_add(n.saturating_sub(remaining));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    }
-    pub(crate) fn request(
-        &mut self,
-        value: Value,
-        timeout: Duration,
-        callback: impl FnMut(&Value) -> Result<Value, String>,
-    ) -> Result<Value, String> {
-        self.request_guarded(
-            value,
-            execution_deadline(timeout),
-            || Ok(()),
-            usize::MAX,
-            callback,
-        )
-    }
-    /// Interrupt-aware request: a tripped check (cancel, deadline, interrupt) first gives the driver
-    /// [`INTERRUPT_GRACE`] to unwind the cell after SIGINT, then the caller discards the session.
-    pub(crate) fn request_guarded(
-        &mut self,
-        value: Value,
-        end: Option<Instant>,
-        check: impl Fn() -> Result<(), String>,
-        max_callbacks: usize,
-        callback: impl FnMut(&Value) -> Result<Value, String>,
-    ) -> Result<Value, String> {
-        let tripped = std::cell::Cell::new(false);
-        let watched = || check().inspect_err(|_| tripped.set(true));
-        let result = self.exchange(value, end, &watched, max_callbacks, callback);
-        if tripped.get() && self.in_flight {
-            self.settle_interrupted();
-        }
-        self.in_flight = false;
-        result
-    }
-    fn settle_interrupted(&mut self) {
-        let deadline = Instant::now() + INTERRUPT_GRACE;
-        let mut buffer = [0u8; 16384];
-        while !self.pending.contains(&b'\n') && Instant::now() < deadline && self.alive() {
-            self.drain_stderr();
-            match crate::platform::io::read_nonblocking(&mut self.output, &mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if self.pending.len() + n > MAX_FRAME {
-                        break;
-                    }
-                    self.pending.extend_from_slice(&buffer[..n]);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.poll_output(),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-    }
-    fn exchange(
-        &mut self,
-        mut value: Value,
-        end: Option<Instant>,
-        check: &impl Fn() -> Result<(), String>,
-        max_callbacks: usize,
-        mut callback: impl FnMut(&Value) -> Result<Value, String>,
-    ) -> Result<Value, String> {
-        check()?;
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or("operation sequence exhausted")?;
-        value["id"] = json!(self.sequence);
-        self.write_frame(&value, end, &check)?;
-        self.in_flight = true;
-        let mut callbacks = 0usize;
-        loop {
-            check()?;
-            self.drain_stderr();
-            let mut buffer = [0u8; 16384];
-            if end.is_some_and(|end| Instant::now() >= end) {
-                return Err("execution deadline exceeded; namespace/session discarded".into());
-            }
-            if let Some(index) = self.pending.iter().position(|b| *b == b'\n') {
-                let line = self.pending.drain(..=index).collect::<Vec<_>>();
-                let reply: Value = serde_json::from_slice(&line)
-                    .map_err(|e| format!("invalid adapter response: {e}"))?;
-                if reply.get("callback").is_some() {
-                    callbacks += 1;
-                    if callbacks > max_callbacks {
-                        return Err("operation callback limit exceeded".into());
-                    }
-                    let operation = reply.get("operation_id").and_then(Value::as_u64);
-                    let identity = reply.get("callback_id").and_then(Value::as_u64);
-                    let outcome = if operation != Some(self.sequence) {
-                        Err("callback belongs to an expired operation".into())
-                    } else if identity.is_none_or(|id| id <= self.callback_sequence) {
-                        Err("callback identity is malformed or repeated".into())
-                    } else {
-                        self.callback_sequence = identity.unwrap();
-                        check()?;
-                        callback(&reply)
-                    };
-                    // A deadline/cancel while approval or a nested tool was pending must never resume code.
-                    check()?;
-                    if end.is_some_and(|end| Instant::now() >= end) {
-                        return Err(
-                            "execution deadline exceeded; namespace/session discarded".into()
-                        );
-                    }
-                    let response = match outcome {
-                        Ok(value) => {
-                            json!({"callback_id":reply["callback_id"],"operation_id":self.sequence,"result":value})
-                        }
-                        Err(error) => {
-                            json!({"callback_id":reply["callback_id"],"operation_id":self.sequence,"error":error})
-                        }
-                    };
-                    self.write_frame(&response, end, &check)?;
-                    continue;
-                }
-                if reply.get("id").and_then(Value::as_u64) != Some(self.sequence) {
-                    return Err("adapter response sequence mismatch".into());
-                }
-                if let Some(error) = reply.get("error").and_then(Value::as_str) {
-                    return Err(error.into());
-                }
-                let mut result = reply.get("result").cloned().unwrap_or(Value::Null);
-                if !self.stderr.is_empty() {
-                    if let Some(object) = result.as_object_mut() {
-                        object.insert(
-                            "process_output".into(),
-                            json!(String::from_utf8_lossy(&self.stderr)),
-                        );
-                        if self.stderr_dropped > 0 {
-                            object.insert(
-                                "process_output_truncated_bytes".into(),
-                                json!(self.stderr_dropped),
-                            );
-                        }
-                    }
-                    self.stderr.clear();
-                    self.stderr_dropped = 0;
-                }
-                check()?;
-                if end.is_some_and(|end| Instant::now() >= end) {
-                    return Err("execution deadline exceeded; namespace/session discarded".into());
-                }
-                return Ok(result);
-            }
-            match crate::platform::io::read_nonblocking(&mut self.output, &mut buffer) {
-                Ok(0) => {
-                    return Err(format!(
-                        "execution process exited: {}",
-                        String::from_utf8_lossy(&self.stderr)
-                    ));
-                }
-                Ok(n) => {
-                    if self.pending.len() + n > MAX_FRAME {
-                        return Err("adapter output exceeded frame limit".into());
-                    }
-                    self.pending.extend_from_slice(&buffer[..n]);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.poll_output(),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.to_string()),
-            }
-        }
+        self.transport.alive()
     }
 }
-impl Drop for JsonProcess {
-    fn drop(&mut self) {
-        self.group.terminate();
-        self.pid.store(0, Ordering::Release);
+impl std::ops::Deref for NativeProcess {
+    type Target = crate::runtime::json_transport::JsonProcess;
+    fn deref(&self) -> &Self::Target {
+        &self.transport
+    }
+}
+impl std::ops::DerefMut for NativeProcess {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.transport
     }
 }
 
@@ -1248,15 +935,15 @@ mod tests {
             .unwrap();
         assert_eq!(result["stdout"], "done\n");
     }
-    fn process() -> JsonProcess {
+    fn process() -> NativeProcess {
         let mut command = Command::new("python3");
         command.args(["-u", "-c", PYTHON_DRIVER]);
-        JsonProcess::start(command, Arc::new(AtomicI32::new(0))).unwrap()
+        NativeProcess::start(command, Arc::new(AtomicI32::new(0))).unwrap()
     }
     #[test]
     fn python_state_stdout_tracebacks_and_reset() {
         let mut p = process();
-        let call = |p: &mut JsonProcess, code: &str| {
+        let call = |p: &mut NativeProcess, code: &str| {
             p.request(
                 json!({"code":code}),
                 Duration::from_secs(5),
@@ -1299,7 +986,7 @@ mod tests {
         std::fs::write(site.join("dialfixture").join("__init__.py"), "VALUE = 41\n").unwrap();
         let mut command = Command::new("python3");
         command.args(["-I", "-u", "-c", PYTHON_DRIVER]).arg(&site);
-        let mut p = JsonProcess::start(command, Arc::new(AtomicI32::new(0))).unwrap();
+        let mut p = NativeProcess::start(command, Arc::new(AtomicI32::new(0))).unwrap();
         let result = p
             .request(
                 json!({"code":"import dialfixture\ndialfixture.VALUE + 1"}),
@@ -1315,7 +1002,7 @@ mod tests {
     #[test]
     fn idle_sigint_keeps_the_namespace_and_the_session() {
         let pid = Arc::new(AtomicI32::new(0));
-        let mut p = JsonProcess::start(
+        let mut p = NativeProcess::start(
             {
                 let mut command = Command::new("python3");
                 command.args(["-u", "-c", PYTHON_DRIVER]);
@@ -1324,7 +1011,7 @@ mod tests {
             pid.clone(),
         )
         .unwrap();
-        let call = |p: &mut JsonProcess, code: &str| {
+        let call = |p: &mut NativeProcess, code: &str| {
             p.request(
                 json!({"code":code}),
                 Duration::from_secs(5),
@@ -1372,8 +1059,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn drop_kills_and_reaps_the_process_group_leader() {
-        let p = process();
-        let pid = p.group.child.id() as libc::pid_t;
+        let mut command = Command::new("python3");
+        command.args(["-u", "-c", PYTHON_DRIVER]);
+        let observed_pid = Arc::new(AtomicI32::new(0));
+        let p = NativeProcess::start(command, observed_pid.clone()).unwrap();
+        let pid = observed_pid.load(Ordering::Acquire) as libc::pid_t;
         drop(p);
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(
@@ -1401,7 +1091,9 @@ mod tests {
             &json!({"action":"eval","code":"open('escaped', 'w').write('no')"}),
         );
         assert!(
-            out.is_error && out.text.contains("test-denied"),
+            out.is_error
+                && (out.text.contains("test-denied")
+                    || out.text.contains("process-fork containment")),
             "{}",
             out.text
         );
@@ -1495,7 +1187,7 @@ mod tests {
         let driver = "import sys,json\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'callback':'http','callback_id':1,'operation_id':0}),flush=True)\nreply=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'result':reply}),flush=True)";
         let mut command = Command::new("python3");
         command.args(["-u", "-c", driver]);
-        let mut process = JsonProcess::start(command, Arc::new(AtomicI32::new(0))).unwrap();
+        let mut process = NativeProcess::start(command, Arc::new(AtomicI32::new(0))).unwrap();
         let value = process
             .request(json!({}), Duration::from_secs(5), |_| {
                 panic!("expired callback performed networking")

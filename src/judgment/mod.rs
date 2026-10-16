@@ -287,7 +287,11 @@ impl Backend for ProviderBackend<'_> {
         };
         let mut backend = crate::agent::make_backend(self.config)?;
         if let Some(scope) = self.usage {
-            backend.set_usage_scope(Some(scope.worker()));
+            backend.set_usage_scope(Some(
+                scope
+                    .worker()
+                    .for_purpose(crate::llm::usage::Purpose::Judgment),
+            ));
         }
         let result: Result<Reply> =
             backend.chat(None, &request, self.config.worker_timeout_secs, None);

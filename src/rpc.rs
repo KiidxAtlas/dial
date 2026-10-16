@@ -256,11 +256,9 @@ impl Ui for RpcUi {
     fn notice(&mut self, message: &str) {
         self.out.emit(json!({"event":"notice","message":message}));
     }
-    /// Same `notice` event clients already read, plus the typed kind for richer clients.
+    /// Same `notice` event clients already read, plus the typed kind and lane for richer clients.
     fn event(&mut self, event: &crate::agent::ui_event::UiEvent) {
-        self.out.emit(
-            json!({"event":"notice","message":event.text,"kind":event.kind,"tokens":event.tokens}),
-        );
+        self.out.emit(typed_notice(event));
     }
     fn model_progress(&mut self, progress: &crate::llm::ModelProgress) {
         self.out
@@ -287,6 +285,10 @@ impl Ui for RpcUi {
     fn background_notice(&mut self, message: &str) {
         self.out
             .emit(json!({"event":"background","message":message}));
+    }
+    fn background_output(&mut self, name: &str, text: &str, replace: bool) {
+        self.out
+            .emit(json!({"event":"background","name":name,"message":text,"replace":replace}));
     }
     fn reasoning_delta(&mut self, text: &str) {
         self.out.emit(json!({"event":"reasoning","delta":text}));
@@ -543,16 +545,53 @@ fn stop_owned_tasks(agent: &mut Agent<'_>, ui: &mut RpcUi) {
     agent.pump_subagents(ui);
 }
 
-fn query_snapshot(agent: &Agent<'_>) -> Value {
+/// Worker-owned query projection. `state` and `messages` are kept apart so a `state` query is
+/// answered without reading or cloning the message history.
+struct QueryProjection {
+    state: Value,
+    messages: Value,
+}
+
+impl Default for QueryProjection {
+    fn default() -> Self {
+        Self {
+            state: Value::Null,
+            messages: json!([]),
+        }
+    }
+}
+
+/// The single `state` projection, used by the worker's `state` arm and by the cached reader reply.
+fn state_projection(agent: &Agent<'_>) -> Value {
     let (usage_total, usage_turn) = agent.usage();
-    json!({
-        "state":{"session_id":agent.session().id(),"title":agent.session().title(),"tools":agent.tool_names(),
-            "plan_mode":agent.plan_mode(),"cost":agent.session_cost(),
-            "cost_note":"observed priced session spend, not an invoice total; usage has explicit unknown-cost coverage",
-            "observed_cost":usage_total.all.observed_cost_usd,"usage":{"total":usage_total,"turn":usage_turn},
-            "metrics":agent.metrics(),"efficiency":agent.efficiency_report(),"speculation":agent.speculation_stats(),"tree":agent.session().execution_tree()},
-        "messages":agent.session().messages()
-    })
+    json!({"session_id":agent.session().id(),"title":agent.session().title(),"tools":agent.tool_names(),
+        "plan_mode":agent.plan_mode(),"cost":agent.session_cost(),
+        "cost_note":"observed priced session spend, not an invoice total; usage has explicit unknown-cost coverage",
+        "observed_cost":usage_total.all.observed_cost_usd,"usage":{"total":usage_total,"turn":usage_turn},
+        "metrics":agent.metrics(),"efficiency":agent.efficiency_report(),"speculation":agent.speculation_stats(),"tree":agent.session().execution_tree()})
+}
+
+fn query_snapshot(agent: &Agent<'_>) -> QueryProjection {
+    QueryProjection {
+        state: state_projection(agent),
+        messages: json!(agent.session().messages()),
+    }
+}
+
+/// Reply to a `state` query: the cached projection plus the live busy flag. Never includes messages.
+fn state_reply(projection: &QueryProjection, busy: bool) -> Result<Value> {
+    anyhow::ensure!(
+        projection.state.is_object(),
+        "RPC state snapshot is unavailable"
+    );
+    let mut state = projection.state.clone();
+    state["busy"] = json!(busy);
+    Ok(state)
+}
+
+/// Typed `notice` event. `text` stays the authoritative plain notice; `kind`, `lane` and `tokens` are additive.
+pub(crate) fn typed_notice(event: &crate::agent::ui_event::UiEvent) -> Value {
+    json!({"event":"notice","message":event.text,"kind":event.kind,"lane":event.kind.lane(),"tokens":event.tokens})
 }
 /// Live voice state of one control connection. `speech` cancels the reply being read aloud.
 #[derive(Default)]
@@ -630,7 +669,7 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
     let worker_questions = pending_question.clone();
     let question_root = layout.project_root.clone();
     let input_disconnected = Arc::new(AtomicBool::new(false));
-    let query_cache = Arc::new(Mutex::new(Value::Null));
+    let query_cache = Arc::new(Mutex::new(QueryProjection::default()));
     let worker_query_cache = query_cache.clone();
     let worker_disconnected = input_disconnected.clone();
     let (control_tx, control_rx) = mpsc::sync_channel(1);
@@ -875,12 +914,7 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                             }
                             Ok(result)
                         }
-                        "state" => {
-                            let (usage_total, usage_turn) = agent.usage();
-                            Ok(
-                                json!({"session_id":agent.session().id(),"title":agent.session().title(),"tools":agent.tool_names(),"plan_mode":agent.plan_mode(),"cost":agent.session_cost(),"cost_note":"observed priced session spend, not an invoice total; usage has explicit unknown-cost coverage","observed_cost":usage_total.all.observed_cost_usd,"usage":{"total":usage_total,"turn":usage_turn},"metrics":agent.metrics(),"efficiency":agent.efficiency_report(),"speculation":agent.speculation_stats(),"tree":agent.session().execution_tree()}),
-                            )
-                        }
+                        "state" => Ok(state_projection(&agent)),
                         "plan" => {
                             agent.set_plan_mode(
                                 params["enabled"]
@@ -1240,27 +1274,15 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             match request["method"].as_str().unwrap_or("") {
                 "state" | "messages" | "messages_page" => {
-                    let snapshot = query_cache
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone();
                     let result = (|| -> Result<Value> {
+                        let projection = query_cache.lock().unwrap_or_else(|p| p.into_inner());
                         match request["method"].as_str().unwrap_or("") {
-                            "state" => {
-                                let mut state = snapshot
-                                    .get("state")
-                                    .cloned()
-                                    .context("RPC state snapshot is unavailable")?;
-                                state["busy"] = json!(busy.load(Ordering::SeqCst));
-                                Ok(state)
-                            }
-                            "messages" => Ok(
-                                json!({"messages":snapshot.get("messages").cloned().unwrap_or_else(||json!([]))}),
-                            ),
+                            "state" => state_reply(&projection, busy.load(Ordering::SeqCst)),
+                            "messages" => Ok(json!({"messages":projection.messages.clone()})),
                             _ => {
-                                let messages = snapshot
-                                    .get("messages")
-                                    .and_then(Value::as_array)
+                                let messages = projection
+                                    .messages
+                                    .as_array()
                                     .context("RPC message snapshot is unavailable")?;
                                 let offset = request["params"]["offset"]
                                     .as_u64()
@@ -1665,5 +1687,32 @@ mod tests {
         let mut input = std::io::Cursor::new(b"{\"id\":2,\"method\":\"state\"}");
         let next = read_request(&mut input).unwrap().unwrap().unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&next).unwrap()["id"], 2);
+    }
+    #[test]
+    fn state_reply_reads_only_the_state_projection() {
+        let projection = QueryProjection {
+            state: json!({"session_id":"s1","tree":[]}),
+            messages: json!([{"role":"user","content":"large history"}]),
+        };
+        let reply = state_reply(&projection, true).unwrap();
+        assert_eq!(reply, json!({"session_id":"s1","tree":[],"busy":true}));
+        assert!(reply.get("messages").is_none());
+        assert!(state_reply(&QueryProjection::default(), false).is_err());
+        assert_eq!(QueryProjection::default().messages, json!([]));
+    }
+    #[test]
+    fn typed_notice_adds_lane_and_keeps_plain_text_and_tokens() {
+        use crate::agent::ui_event::{EventKind, UiEvent};
+        let value = typed_notice(
+            &UiEvent::new(EventKind::Compaction, "History compacted").with_tokens(900, 120),
+        );
+        assert_eq!(value["event"], "notice");
+        assert_eq!(value["message"], "History compacted");
+        assert_eq!(value["kind"], "compaction");
+        assert_eq!(value["lane"], "divider");
+        assert_eq!(value["tokens"], json!([900, 120]));
+        let alert = typed_notice(&UiEvent::new(EventKind::Recovery, "retrying"));
+        assert_eq!(alert["lane"], "alert");
+        assert!(alert["tokens"].is_null());
     }
 }

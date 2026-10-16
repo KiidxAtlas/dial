@@ -1,4 +1,4 @@
-use super::settings::{editor_spans, filled, fit, is_ctrl, typed_char};
+use super::settings::{Axis, arrows, editor_spans, filled, fit, is_ctrl, typed_char};
 use crate::{
     llm::model_config::{HeaderValue, RequestHeader, RequestHeaders, validate_headers},
     ui::{
@@ -22,6 +22,7 @@ pub(super) struct HeaderEditor {
     row: usize,
     value_field: bool,
     inherit: bool,
+    title: String,
     error: Option<String>,
 }
 pub(super) enum Outcome {
@@ -53,7 +54,13 @@ impl HeaderEditor {
             value_field: false,
             inherit: headers.is_none(),
             error: None,
+            title: String::new(),
         }
+    }
+    /// Names the model and role being edited in the title line.
+    pub fn titled(mut self, title: String) -> Self {
+        self.title = title;
+        self
     }
     pub fn paste(&mut self, text: &str) {
         if text.len() > 4096 {
@@ -124,7 +131,8 @@ impl HeaderEditor {
             }
             self.row = self.row.min(self.rows.len().saturating_sub(1));
             self.inherit = false;
-        } else if is_ctrl(key, 'i') {
+        } else if key.code == KeyCode::F(9) {
+            // Ctrl+I is Tab on legacy terminals, so inherit lives on a function key.
             self.rows.clear();
             self.inherit = true;
         } else if is_ctrl(key, 'e') {
@@ -159,13 +167,14 @@ impl HeaderEditor {
         let compact = height < 10;
         let mut lines: Vec<Line<'static>> = Vec::new();
 
-        lines.push(Line::from(fit(
-            vec![
-                chrome::label(theme, " HTTP headers"),
-                Span::styled(format!("  {}/{MAX_ROWS}", self.rows.len()), muted),
-            ],
-            width,
-        )));
+        let mut title = vec![
+            chrome::label(theme, " HTTP headers"),
+            Span::styled(format!("  {}/{MAX_ROWS}", self.rows.len()), muted),
+        ];
+        if !self.title.is_empty() {
+            title.push(Span::styled(format!(" · {}", self.title), muted));
+        }
+        lines.push(Line::from(fit(title, width)));
 
         let literal = self.rows.iter().any(|row| !row.env);
         let (status, tone) = if self.inherit {
@@ -204,10 +213,11 @@ impl HeaderEditor {
                 "^N add · ^D delete · Tab field · F2 env/literal · F10 save · Esc cancel",
             ));
         } else {
-            lines.push(hint(
-                "^N add · ^D delete · Tab field · ↑↓ row · F2 env/literal",
-            ));
-            lines.push(hint("^I inherit · ^E clear all · F10 save · Esc cancel"));
+            let arrows = arrows(theme, Axis::Vertical);
+            lines.push(hint(&format!(
+                "^N add · ^D delete · Tab field · {arrows} row · F2 env/literal"
+            )));
+            lines.push(hint("F9 inherit · ^E clear all · F10 save · Esc cancel"));
         }
 
         let name_w = (width.saturating_sub(FIXED_COLUMNS) / 3).clamp(6, 28);
@@ -297,7 +307,12 @@ impl HeaderEditor {
         if overflow {
             lines.push(Line::from(fit(
                 vec![Span::styled(
-                    format!(" row {} of {}  ·  ↑↓ scroll", self.row + 1, self.rows.len()),
+                    format!(
+                        " row {} of {}  ·  {} scroll",
+                        self.row + 1,
+                        self.rows.len(),
+                        arrows(theme, Axis::Vertical)
+                    ),
                     dim,
                 )],
                 width,
@@ -497,5 +512,37 @@ mod tests {
             rows.iter().any(|row| row.contains("(value)")),
             "inactive empty field shows its placeholder: {rows:?}"
         );
+    }
+
+    #[test]
+    fn f9_inherits_and_tab_only_switches_fields() {
+        let theme = Theme::dark();
+        let keymap = Keymap::defaults();
+        let mut editor = HeaderEditor::new(&headers(2));
+        editor.key(&key(KeyCode::Tab, KeyModifiers::NONE), &keymap);
+        assert!(editor.value_field, "Tab moves between name and value");
+        assert_eq!(editor.rows.len(), 2, "Tab must not clear headers");
+        assert!(matches!(
+            editor.key(&key(KeyCode::F(9), KeyModifiers::NONE), &keymap),
+            Outcome::Pending
+        ));
+        assert!(editor.inherit && editor.rows.is_empty());
+        assert!(matches!(
+            editor.key(&key(KeyCode::F(10), KeyModifiers::NONE), &keymap),
+            Outcome::Save(None)
+        ));
+        assert!(
+            text(&HeaderEditor::new(&headers(1)).lines(&theme, 100, 20))
+                .iter()
+                .any(|row| row.contains("F9 inherit"))
+        );
+    }
+
+    #[test]
+    fn title_names_the_model_and_role_being_edited() {
+        let theme = Theme::dark();
+        let editor = HeaderEditor::new(&None).titled("qwen → role main".into());
+        let rows = text(&editor.lines(&theme, 100, 20));
+        assert!(rows[0].contains("qwen → role main"), "{rows:?}");
     }
 }

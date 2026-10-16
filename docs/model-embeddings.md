@@ -4,6 +4,52 @@ Semantic memory ranks facts by keyword search and, when embeddings are on, by co
 over stored vectors. Facts are fused with reciprocal-rank fusion. Without embeddings, recall is
 keyword-only and nothing leaves the machine.
 
+## Set up a local embedding model
+
+Dial can pull a local embedding model through Ollama and assign it to semantic memory in one step.
+Nothing downloads until you ask for it.
+
+- Settings → Semantic memory → Embedding model: press Ctrl+L to see the plan, then Ctrl+L again to
+  start. The row offers `nomic-embed-text` until an embedding model is configured.
+- `/models`, then **Get models** and its Embedding shelf (Tab to reach it): lists the same curated catalog,
+  marks the models Ollama already has, and Enter sets one up exactly as `/setup embeddings:<model> yes`
+  does. Nothing is pulled until Enter.
+- `/setup embeddings` lists the curated catalog. `/setup embeddings:<model>` previews the plan and
+  `/setup embeddings:<model> yes` runs it in the background. Any other Ollama embedding model name
+  also works.
+- `dial doctor --fix embeddings:<model>` previews and `--yes` runs the same setup from the shell.
+
+The setup starts Ollama if it is installed but not running. If Ollama is missing, it is installed
+through the dependency registry (Homebrew where available) when the registry knows how; otherwise the
+setup stops and shows the download page. It then pulls the model with Ollama's `/api/pull`, which
+streams progress and can be cancelled; Ollama checks each layer's digest. Only after the pull
+succeeds does Dial save the config:
+
+- `model_roles.embedding` is replaced as a whole with `provider = "ollama"`, `model = "<model>"`,
+  using the same selection writer as the main model. Endpoint and authentication settings come
+  from the selected Ollama provider, not the previous embedding role. Stale role-specific URL,
+  key variable, custom headers, account and protocol settings are cleared. With the default
+  Ollama provider this uses the local server and native `/api/embed`.
+- `memory.semantic.embedding` becomes `on` if it was `off`. `auto` and `on` are left as they are.
+- The explicit `embedding_base_url` / `embedding_model` overrides are not changed. They are
+  OpenAI-compatible and still win over the role when both are set; clear them to use the role.
+- `memory.backend` is not changed. Semantic recall needs `memory.backend = "semantic"`; select it
+  in settings when the setup reports that it is not selected.
+
+Curated models (Ollama library, sizes rounded; dimensions from each model card):
+
+| Model | Dims | Download | Notes |
+| --- | --- | --- | --- |
+| `nomic-embed-text` | 768 | 274 MB | General English, 8k context. Default. |
+| `all-minilm` | 384 | 46 MB | Smallest and fastest; English only. |
+| `mxbai-embed-large` | 1024 | 670 MB | Larger English embedder. |
+| `embeddinggemma` | 768 | 622 MB | About 300M multilingual, Gemma 3 based. |
+| `bge-m3` | 1024 | 1.2 GB | Multilingual, long inputs. |
+| `snowflake-arctic-embed2` | 1024 | 1.2 GB | Multilingual retrieval, about 568M. |
+
+Dial does not run embedding inference itself. Ollama serves the model; an MLX or LM Studio
+embedding checkpoint needs an embeddings endpoint and the override or role settings above.
+
 ## Choosing the endpoint
 
 `memory.semantic.embedding` is one of:

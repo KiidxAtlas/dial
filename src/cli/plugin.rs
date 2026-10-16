@@ -56,6 +56,10 @@ pub enum MarketplaceCmd {
     /// Unregister a marketplace.
     #[command(alias = "rm")]
     Remove { name: String },
+    /// Turn a registered marketplace on; its plugins and skills are offered again.
+    Enable { name: String },
+    /// Turn a registered marketplace off without removing it.
+    Disable { name: String },
     /// List registered marketplaces.
     List,
     /// Re-fetch one marketplace index, or all of them when no name is given.
@@ -150,6 +154,14 @@ fn marketplace(command: MarketplaceCmd, plugins_root: PathBuf, root: PathBuf) ->
             marketplaces.remove(&name)?;
             println!("Removed marketplace {name}");
         }
+        MarketplaceCmd::Enable { name } => {
+            marketplaces.set_enabled(&name, true)?;
+            println!("Enabled marketplace {name}");
+        }
+        MarketplaceCmd::Disable { name } => {
+            marketplaces.set_enabled(&name, false)?;
+            println!("Disabled marketplace {name}");
+        }
         MarketplaceCmd::List => print_marketplaces(&marketplaces.list()?),
         MarketplaceCmd::Refresh { name } => {
             marketplaces.refresh(name.as_deref())?;
@@ -232,7 +244,17 @@ fn print_marketplaces(marketplaces: &[MarketplaceInfo]) {
         return;
     }
     for marketplace in marketplaces {
-        println!("{}\t{}", marketplace.name, marketplace.index);
+        let state = if marketplace.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let index = if marketplace.builtin {
+            "built-in"
+        } else {
+            marketplace.index.as_str()
+        };
+        println!("{}\t{state}\t{index}", marketplace.name);
     }
 }
 
@@ -282,6 +304,26 @@ mod tests {
         match Cli::try_parse_from(argv).unwrap().command.unwrap() {
             Top::Plugin(p) => p.command,
         }
+    }
+
+    #[test]
+    fn parses_marketplace_enable_and_disable() {
+        let mp = |args: &[&str]| match parse(&[&["plugin", "marketplace"][..], args].concat()) {
+            Some(PluginCmd::Marketplace { command }) => command,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(
+            mp(&["enable", "anthropic-skills"]),
+            Some(MarketplaceCmd::Enable {
+                name: "anthropic-skills".into()
+            })
+        );
+        assert_eq!(
+            mp(&["disable", "anthropic-skills"]),
+            Some(MarketplaceCmd::Disable {
+                name: "anthropic-skills".into()
+            })
+        );
     }
 
     #[test]

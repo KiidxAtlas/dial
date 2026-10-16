@@ -10,16 +10,22 @@ pub enum Tab {
     Mcp,
     Plugins,
     Skills,
+    Marketplaces,
 }
 
+/// Number of tabs; sizes the per-tab arrays in [`Browser`].
+const TABS: usize = 4;
+const _: () = assert!(Tab::ALL.len() == TABS);
+
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Mcp, Tab::Plugins, Tab::Skills];
+    pub const ALL: [Tab; TABS] = [Tab::Mcp, Tab::Plugins, Tab::Skills, Tab::Marketplaces];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Mcp => "MCP servers",
             Tab::Plugins => "Plugins",
             Tab::Skills => "Skills",
+            Tab::Marketplaces => "Marketplaces",
         }
     }
 
@@ -94,6 +100,13 @@ pub enum Intent {
     InstallCuratedMcp {
         id: String,
     },
+    /// Install a server from the official registry or the curated list. `values` fill its
+    /// required environment variables; the controller asks for them when they are missing.
+    InstallMcp {
+        id: String,
+        #[serde(default)]
+        values: BTreeMap<String, String>,
+    },
     ToggleMcp {
         id: String,
         enable: bool,
@@ -128,10 +141,6 @@ pub enum Intent {
         name: String,
         values: BTreeMap<String, String>,
     },
-    /// Search the Smithery registry for servers.
-    SmitheryDiscover {
-        query: String,
-    },
     /// Read a catalog page; no package execution or installation.
     CatalogBrowse {
         tab: Tab,
@@ -143,6 +152,19 @@ pub enum Intent {
         name: String,
         index: String,
     },
+    /// Remove a registered marketplace. Plugins and skills it installed stay installed.
+    RemoveMarketplace {
+        name: String,
+    },
+    /// Turn a registered marketplace on or off without forgetting it.
+    ToggleMarketplace {
+        name: String,
+        enable: bool,
+    },
+    /// Install a skill package from a skill listing; `source` is `repo[@ref][#path]`.
+    InstallSkill {
+        source: String,
+    },
 }
 
 impl Intent {
@@ -150,6 +172,7 @@ impl Intent {
     pub fn describe(&self) -> String {
         match self {
             Intent::InstallCuratedMcp { id } => format!("Install MCP server `{id}`"),
+            Intent::InstallMcp { id, .. } => format!("Install MCP server `{id}`"),
             Intent::ToggleMcp { id, enable: true } => format!("Enable MCP server `{id}`"),
             Intent::ToggleMcp { id, enable: false } => format!("Disable MCP server `{id}`"),
             Intent::RemoveMcp { id } => format!("Remove MCP server `{id}`"),
@@ -162,11 +185,21 @@ impl Intent {
             Intent::SmitheryDeploy { name, .. } => {
                 format!("Install Smithery server `{name}` with these settings")
             }
-            Intent::SmitheryDiscover { query } => format!("Search Smithery for `{query}`"),
             Intent::CatalogBrowse { tab, query, page } => {
                 format!("Browse {}: `{query}` (page {page})", tab.label())
             }
             Intent::AddMarketplace { name, .. } => format!("Add marketplace `{name}`"),
+            Intent::RemoveMarketplace { name } => format!("Remove marketplace `{name}`"),
+            Intent::ToggleMarketplace { name, enable: true } => {
+                format!("Enable marketplace `{name}`")
+            }
+            Intent::ToggleMarketplace {
+                name,
+                enable: false,
+            } => {
+                format!("Disable marketplace `{name}`")
+            }
+            Intent::InstallSkill { source } => format!("Install skill package `{source}`"),
         }
     }
 
@@ -176,6 +209,7 @@ impl Intent {
         matches!(
             self,
             Intent::InstallCuratedMcp { .. }
+                | Intent::InstallMcp { .. }
                 | Intent::InstallPlugin { .. }
                 | Intent::RemoveMcp { .. }
                 | Intent::RemovePlugin { .. }
@@ -184,6 +218,9 @@ impl Intent {
                 | Intent::SmitheryInstall { .. }
                 | Intent::SmitheryDeploy { .. }
                 | Intent::AddMarketplace { .. }
+                | Intent::RemoveMarketplace { .. }
+                | Intent::ToggleMarketplace { enable: false, .. }
+                | Intent::InstallSkill { .. }
         )
     }
 }
@@ -198,8 +235,6 @@ pub struct JobProgress {
     pub result: Option<(bool, String)>,
     /// A form for the user to fill in. The overlay opens it on its next tick.
     pub form: Option<Form>,
-    /// Replacement MCP rows, for example Smithery search results.
-    pub rows: Option<Vec<Row>>,
     pub catalog: Option<CatalogUpdate>,
 }
 
@@ -226,8 +261,10 @@ pub enum FormKind {
     Config {
         name: String,
     },
-    /// Registry search text.
-    Discover,
+    /// Values for the curated or official-registry server `id`.
+    McpInputs {
+        id: String,
+    },
     Marketplace,
 }
 
@@ -284,21 +321,21 @@ impl Form {
         }
     }
 
-    pub fn discover() -> Self {
+    /// A form for the values an MCP server needs (environment variables), keyed by listing id.
+    pub fn mcp_inputs(
+        id: &str,
+        title: &str,
+        note: &str,
+        fields: Vec<Field>,
+        error: Option<String>,
+    ) -> Self {
         Self {
-            kind: FormKind::Discover,
-            title: "Search Smithery".to_owned(),
-            note: "Find MCP servers in the Smithery registry.".to_owned(),
-            fields: vec![Field {
-                key: "query".to_owned(),
-                label: "Search".to_owned(),
-                hint: String::new(),
-                required: true,
-                secret: false,
-                value: String::new(),
-            }],
+            kind: FormKind::McpInputs { id: id.to_owned() },
+            title: title.to_owned(),
+            note: note.to_owned(),
+            fields,
             focus: 0,
-            error: None,
+            error,
         }
     }
 
@@ -306,7 +343,7 @@ impl Form {
         Self {
             kind: FormKind::Marketplace,
             title: "Add plugin marketplace".into(),
-            note: "Supply a trusted marketplace JSON index (HTTPS URL or local file). Adding an index does not install plugins.".into(),
+            note: "Supply a trusted JSON index (HTTPS URL or local file). Adding one lists its plugins and skills; nothing is installed.".into(),
             fields: ["name", "index"].into_iter().map(|key| Field {
                 key: key.into(), label: key.into(), hint: String::new(), required: true,
                 secret: false, value: String::new(),
@@ -407,9 +444,9 @@ pub struct Browser {
     tab: Tab,
     query: String,
     searching: bool,
-    rows: [Vec<Row>; 3],
-    cursor: [usize; 3],
-    catalog: [CatalogState; 3],
+    rows: [Vec<Row>; TABS],
+    cursor: [usize; TABS],
+    catalog: [CatalogState; TABS],
     /// Intent waiting for the user's yes/no.
     pub confirm: Option<Intent>,
     pub job: Job,
@@ -425,8 +462,8 @@ impl Default for Browser {
             tab: Tab::Mcp,
             query: String::new(),
             searching: false,
-            rows: [Vec::new(), Vec::new(), Vec::new()],
-            cursor: [0; 3],
+            rows: std::array::from_fn(|_| Vec::new()),
+            cursor: [0; TABS],
             catalog: std::array::from_fn(|_| CatalogState::default()),
             confirm: None,
             job: Job::Idle,
@@ -507,12 +544,19 @@ impl Browser {
         self.set_rows(tab, rows);
     }
 
-    /// Rows of `tab` that match the current query, in their original order.
+    /// Locally filter cached rows, but preserve MCP results returned for this exact
+    /// search: registries may match metadata not included in the displayed row.
     pub fn visible(&self, tab: Tab) -> Vec<&Row> {
         let needle = self.query.trim().to_lowercase();
+        let remote_search =
+            tab == Tab::Mcp && self.catalog(tab).query.trim().to_lowercase() == needle;
         self.rows[tab.index()]
             .iter()
-            .filter(|row| needle.is_empty() || row.matches(&needle))
+            .filter(|row| {
+                needle.is_empty()
+                    || row.matches(&needle)
+                    || (remote_search && row.origin == Origin::Remote)
+            })
             .collect()
     }
 
@@ -693,9 +737,67 @@ mod tests {
     fn tabs_wrap_both_ways() {
         let mut b = Browser::new();
         b.prev_tab();
-        assert_eq!(b.tab(), Tab::Skills);
+        assert_eq!(b.tab(), Tab::Marketplaces);
         b.next_tab();
         assert_eq!(b.tab(), Tab::Mcp);
+    }
+
+    #[test]
+    fn catalog_lifecycle_covers_every_tab() {
+        let mut b = Browser::new();
+        for tab in Tab::ALL {
+            assert_eq!(b.catalog(tab), &CatalogState::default());
+            assert_eq!(
+                b.begin_catalog(tab, String::new(), 1),
+                Intent::CatalogBrowse {
+                    tab,
+                    query: String::new(),
+                    page: 1
+                }
+            );
+            assert!(b.catalog(tab).loading);
+            b.apply_catalog(CatalogUpdate {
+                tab,
+                query: String::new(),
+                page: 1,
+                rows: vec![row(tab.label(), tab.label(), "", &[])],
+                more: false,
+                error: None,
+                message: String::new(),
+            });
+            assert!(!b.catalog(tab).loading);
+            assert_eq!(b.catalog(tab).page, 1);
+            assert_eq!(b.rows(tab).len(), 1);
+        }
+    }
+
+    #[test]
+    fn registry_search_results_are_not_filtered_a_second_time() {
+        let mut b = sample();
+        for c in "nuxt".chars() {
+            b.push_query(c);
+        }
+        let mut remote = row("framework-docs", "Framework docs", "Documentation", &[]);
+        remote.origin = Origin::Remote;
+        b.apply_catalog(CatalogUpdate {
+            tab: Tab::Mcp,
+            query: "nuxt".into(),
+            page: 1,
+            rows: vec![remote.clone()],
+            more: false,
+            error: None,
+            message: String::new(),
+        });
+        assert_eq!(b.selected(), Some(&remote));
+        b.push_query('x');
+        assert!(b.visible(Tab::Mcp).is_empty());
+        b.pop_query();
+        assert_eq!(b.selected(), Some(&remote));
+        // A plugin listing is not a server-side search response.
+        b.set_rows(Tab::Plugins, vec![remote]);
+        assert!(b.visible(Tab::Plugins).is_empty());
+        b.clear_search();
+        assert_eq!(b.visible(Tab::Mcp).len(), 4);
     }
 
     #[test]
@@ -730,7 +832,10 @@ mod tests {
         for c in "web".chars() {
             b.push_query(c);
         }
-        assert_eq!(b.match_summary(), "MCP servers 1 · Plugins 1 · Skills 0");
+        assert_eq!(
+            b.match_summary(),
+            "MCP servers 1 · Plugins 1 · Skills 0 · Marketplaces 0"
+        );
     }
 
     #[test]
@@ -833,6 +938,32 @@ mod tests {
                 ok: true,
                 message: "Connected with 9 tools".into(),
             }
+        );
+    }
+
+    #[test]
+    fn marketplace_and_skill_changes_wait_for_confirmation() {
+        let mut b = Browser::new();
+        for intent in [
+            Intent::RemoveMarketplace { name: "x".into() },
+            Intent::ToggleMarketplace {
+                name: "x".into(),
+                enable: false,
+            },
+            Intent::InstallSkill {
+                source: "https://example.com/org/skills.git#pdf".into(),
+            },
+        ] {
+            assert!(b.request(intent).is_none());
+            b.decline();
+        }
+        // Enabling a marketplace is reversible and runs at once.
+        assert!(
+            b.request(Intent::ToggleMarketplace {
+                name: "x".into(),
+                enable: true,
+            })
+            .is_some()
         );
     }
 }

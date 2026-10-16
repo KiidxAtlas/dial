@@ -106,6 +106,49 @@ pub fn parse_duration(text: &str) -> Result<u64> {
 }
 
 impl Entry {
+    /// Build a schedule identically for CLI and interactive callers. Store::add assigns a
+    /// missing id and validates triggers before publishing it.
+    pub fn new(
+        id: Option<String>,
+        prompt: String,
+        every: Option<&str>,
+        watch: Vec<String>,
+        allow: Vec<String>,
+        approve_all: bool,
+    ) -> Result<Self> {
+        let mut tools = Vec::new();
+        for value in allow {
+            for tool in value.split(',').map(str::trim) {
+                ensure!(
+                    !tool.is_empty() && tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                    "invalid --allow tool name"
+                );
+                if !tools.iter().any(|existing| existing == tool) {
+                    tools.push(tool.to_owned());
+                }
+            }
+        }
+        Ok(Self {
+            id: id.unwrap_or_default(),
+            prompt,
+            every_secs: every.map(parse_duration).transpose()?,
+            watch,
+            allow: tools,
+            approval: if approve_all { "auto" } else { "readonly" }.into(),
+            created: now(),
+        })
+    }
+
+    pub fn access_description(&self) -> String {
+        if self.approval == "auto" {
+            "all tools approved".into()
+        } else if self.allow.is_empty() {
+            "read-only".into()
+        } else {
+            format!("read-only + {}", self.allow.join(","))
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.id.is_empty()
@@ -431,13 +474,7 @@ pub fn describe(entry: &Entry, last_run: Option<u64>) -> String {
     if !entry.watch.is_empty() {
         triggers.push(format!("on change of {}", entry.watch.join(", ")));
     }
-    let access = if entry.approval == "auto" {
-        "all tools approved".to_owned()
-    } else if entry.allow.is_empty() {
-        "read-only".to_owned()
-    } else {
-        format!("read-only + {}", entry.allow.join(","))
-    };
+    let access = entry.access_description();
     let last = last_run.map_or("never run".to_owned(), |t| {
         format!("last run {}s ago", now().saturating_sub(t))
     });
@@ -1727,6 +1764,45 @@ mod tests {
             allow: vec![],
             approval: "readonly".into(),
             created: 1000,
+        }
+    }
+
+    #[test]
+    fn creation_normalizes_allow_lists_without_broadening_permissions() {
+        let create = |allow: Vec<String>, yes| {
+            Entry::new(
+                Some("s1".into()),
+                "inspect".into(),
+                Some("1h"),
+                vec![],
+                allow,
+                yes,
+            )
+            .unwrap()
+        };
+        let repeated = create(vec!["read".into(), "edit".into()], false);
+        let comma = create(vec!["read, edit".into(), "read".into()], false);
+        assert_eq!(repeated.allow, comma.allow);
+        assert_eq!(comma.approval, "readonly");
+        assert_eq!(comma.every_secs, Some(3600));
+        assert_eq!(comma.access_description(), "read-only + read,edit");
+        assert_eq!(create(vec![], false).access_description(), "read-only");
+        assert_eq!(
+            create(vec!["edit".into()], true).access_description(),
+            "all tools approved"
+        );
+        for bad in ["", "read,", ",edit", "write,bash --yes"] {
+            assert!(
+                Entry::new(
+                    None,
+                    "inspect".into(),
+                    Some("1h"),
+                    vec![],
+                    vec![bad.into()],
+                    false
+                )
+                .is_err()
+            );
         }
     }
 

@@ -106,13 +106,25 @@ pub fn route(words: &[String]) -> Result<ModelsRoute> {
 
 /// Credential-bearing keys. `*_env` names an environment variable, not a secret.
 pub fn is_secret_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
+    let key = key.to_ascii_lowercase().replace('-', "_");
     if key.ends_with("_env") {
         return false;
     }
-    ["api_key", "apikey", "token", "secret", "password"]
+    key.split('.').any(|part| {
+        [
+            "api_key",
+            "apikey",
+            "secret",
+            "password",
+            "credential",
+            "authorization",
+        ]
         .iter()
-        .any(|needle| key.contains(needle))
+        .any(|needle| part.contains(needle))
+            || part == "token"
+            || part.ends_with("_token")
+            || matches!(part, "cookie" | "cookies")
+    })
 }
 
 /// Flattens nested tables to dotted keys. Arrays and scalars are leaves.
@@ -152,6 +164,7 @@ pub fn parse_value(raw: &str) -> toml::Value {
 
 /// Applies the same in-memory migrations `Config::load` applies to one layer (nothing is written),
 /// so legacy keys such as retired model roles are displayed in their current form.
+#[cfg(test)]
 fn migrate_for_display(mut table: toml::Table) -> toml::Table {
     crate::config::migrate_memory_tool_table(&mut table);
     crate::config::migrate_edit_configuration(&mut table);
@@ -160,16 +173,11 @@ fn migrate_for_display(mut table: toml::Table) -> toml::Table {
     table
 }
 
-fn migrated_layer(layout: &Layout, scope: Scope) -> Result<toml::Table> {
-    Ok(migrate_for_display(settings_store::load_layer(
-        layout, scope,
-    )?))
-}
-
-fn merged(layout: &Layout) -> Result<toml::Table> {
-    let mut table = migrated_layer(layout, Scope::Global)?;
-    crate::config::merge(&mut table, migrated_layer(layout, Scope::Project)?);
-    Ok(table)
+fn merged(layout: &Layout, overlay: &toml::Table) -> Result<toml::Table> {
+    // Use the runtime resolver: migrations, defaults and append/deduplicate hooks all match.
+    Ok(toml::Table::try_from(settings_store::load_config(
+        layout, overlay,
+    )?)?)
 }
 
 fn scope(project: bool) -> Scope {
@@ -180,16 +188,58 @@ fn scope(project: bool) -> Scope {
     }
 }
 
-fn display_value(key: &str, value: &toml::Value) -> String {
+/// Redact recursively, including `config get` of a whole table or an array of inline tables.
+fn redacted_value(key: &str, value: &toml::Value) -> toml::Value {
     if is_secret_key(key) {
-        "<redacted>".to_owned()
+        return "<redacted>".into();
+    }
+    match value {
+        toml::Value::Table(table) => {
+            let secret_header = table
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .is_some_and(is_secret_key);
+            toml::Value::Table(
+                table
+                    .iter()
+                    .map(|(name, value)| {
+                        let value = if secret_header && name == "value" {
+                            "<redacted>".into()
+                        } else {
+                            redacted_value(&format!("{key}.{name}"), value)
+                        };
+                        (name.clone(), value)
+                    })
+                    .collect(),
+            )
+        }
+        toml::Value::Array(values) => {
+            toml::Value::Array(values.iter().map(|v| redacted_value(key, v)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn display_value(key: &str, value: &toml::Value) -> String {
+    let shown = redacted_value(key, value);
+    if shown.as_str() == Some("<redacted>") {
+        "<redacted>".into()
     } else {
-        value.to_string()
+        shown.to_string()
     }
 }
 
 /// Runs `dial config` (list when no action is given).
 pub fn run_config(cwd: &Path, args: &ConfigArgs) -> Result<i32> {
+    run_config_with_overlay(cwd, args, None)
+}
+
+pub fn run_config_with_overlay(
+    cwd: &Path,
+    args: &ConfigArgs,
+    overlay: Option<toml::Table>,
+) -> Result<i32> {
+    let overlay = overlay.unwrap_or_default();
     if matches!(args.action, Some(ConfigAction::Reference)) {
         if args.json {
             println!(
@@ -204,22 +254,18 @@ pub fn run_config(cwd: &Path, args: &ConfigArgs) -> Result<i32> {
     let layout = Layout::discover(cwd)?;
     match args.action.clone().unwrap_or(ConfigAction::List) {
         ConfigAction::List => {
-            let entries = flatten(&merged(&layout)?);
+            let entries = flatten(&merged(&layout, &overlay)?);
             if args.json {
-                let settings: Vec<_> = entries
+                let settings = entries
                     .iter()
                     .map(|(key, value)| {
-                        serde_json::json!({
+                        Ok(serde_json::json!({
                             "key": key,
-                            "value": if is_secret_key(key) {
-                                serde_json::Value::String("<redacted>".into())
-                            } else {
-                                serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
-                            },
-                            "redacted": is_secret_key(key),
-                        })
+                            "value": serde_json::to_value(redacted_value(key, value))?,
+                            "redacted": redacted_value(key, value) != *value,
+                        }))
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({ "settings": settings }))?
@@ -231,15 +277,11 @@ pub fn run_config(cwd: &Path, args: &ConfigArgs) -> Result<i32> {
             }
         }
         ConfigAction::Get { key } => {
-            let table = merged(&layout)?;
+            let table = merged(&layout, &overlay)?;
             let value =
                 lookup(&table, &key).ok_or_else(|| anyhow::anyhow!("no setting at {key:?}"))?;
             if args.json {
-                let shown = if is_secret_key(&key) {
-                    serde_json::Value::String("<redacted>".into())
-                } else {
-                    serde_json::to_value(value)?
-                };
+                let shown = serde_json::to_value(redacted_value(&key, value))?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
@@ -257,7 +299,7 @@ pub fn run_config(cwd: &Path, args: &ConfigArgs) -> Result<i32> {
         } => {
             let scope = scope(project);
             let value = parse_value(&value);
-            crate::config::schema::check_value_for(&merged(&layout)?, &key, &value)
+            crate::config::schema::check_value_for(&merged(&layout, &overlay)?, &key, &value)
                 .map_err(anyhow::Error::msg)?;
             settings_store::save_config(
                 &layout,
@@ -332,10 +374,10 @@ pub fn format_table(entries: &[ModelEntry]) -> String {
         "REASONING",
         "MAX_OUT",
     ];
-    let rows: Vec<Vec<String>> = entries
+    let rows: Vec<[String; 8]> = entries
         .iter()
         .map(|e| {
-            vec![
+            [
                 e.selection.provider.clone(),
                 e.selection.model.clone(),
                 e.metadata.kind.label().to_owned(),
@@ -349,30 +391,7 @@ pub fn format_table(entries: &[ModelEntry]) -> String {
             ]
         })
         .collect();
-    let mut widths: Vec<usize> = HEADER.iter().map(|h| h.len()).collect();
-    for row in &rows {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
-        }
-    }
-    let push_row = |out: &mut String, cells: &[String]| {
-        let line: Vec<String> = cells
-            .iter()
-            .zip(&widths)
-            .map(|(cell, width)| format!("{cell:<width$}", width = *width))
-            .collect();
-        out.push_str(line.join("  ").trim_end());
-        out.push('\n');
-    };
-    let mut out = String::new();
-    push_row(
-        &mut out,
-        &HEADER.iter().map(|h| (*h).to_owned()).collect::<Vec<_>>(),
-    );
-    for row in &rows {
-        push_row(&mut out, row);
-    }
-    out
+    super::table::render(HEADER, &rows)
 }
 
 /// Runs `dial models`. `overlay` is the CLI config overlay (e.g. from `--model`).
@@ -461,6 +480,18 @@ mod tests {
         assert!(is_secret_key("auth.token"));
         assert!(!is_secret_key("endpoint.api_key_env"));
         assert!(!is_secret_key("model"));
+        assert!(is_secret_key("X-Api-Key"));
+        assert!(is_secret_key("refresh-token"));
+        for key in [
+            "harness.max_tokens",
+            "efficiency.history_token_cap",
+            "max_output_tokens",
+            "tokenizer",
+            "reasoning.token_budget",
+        ] {
+            assert!(!is_secret_key(key), "{key}");
+            assert_eq!(display_value(key, &4096.into()), "4096");
+        }
     }
 
     #[test]
@@ -539,5 +570,59 @@ mod tests {
             lookup(&shown, "model_roles.coach"),
             Some(&toml::Value::String("big".into()))
         );
+    }
+
+    #[test]
+    fn nested_credentials_are_redacted_in_text_and_json() {
+        let table: toml::Table = toml::from_str(
+            r#"
+            max_tokens = 4096
+            api_key_env = "KEY_NAME"
+            [auth]
+            access_token = "hidden-token"
+            password = "hidden-password"
+            [[headers]]
+            name = "Authorization"
+            value = { literal = "hidden-header" }
+        "#,
+        )
+        .unwrap();
+        let value = toml::Value::Table(table);
+        for output in [
+            display_value("endpoint", &value),
+            serde_json::to_string(&redacted_value("endpoint", &value)).unwrap(),
+        ] {
+            for secret in ["hidden-token", "hidden-password", "hidden-header"] {
+                assert!(!output.contains(secret), "{output}");
+            }
+            assert!(output.contains("4096") && output.contains("KEY_NAME"));
+            assert!(output.contains("<redacted>"));
+        }
+    }
+
+    #[test]
+    fn config_display_uses_runtime_defaults_overlay_and_hook_merging() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
+        let global = "[[hooks]]\nevent='pre_tool_use'\ncommand=['global-policy']\n";
+        let local = "[[hooks]]\nevent='post_tool_use'\ncommand=['fmt']\n";
+        for (path, content) in layout.config_files().iter().zip([global, local]) {
+            settings_store::private_dir(path.parent().unwrap()).unwrap();
+            settings_store::write_private(path, content.as_bytes()).unwrap();
+        }
+        let overlay: toml::Table = toml::from_str(
+            "model='launch-model'\n[[hooks]]\nevent='pre_tool_use'\ncommand=['global-policy']\n",
+        )
+        .unwrap();
+        let table = merged(&layout, &overlay).unwrap();
+        assert_eq!(
+            lookup(&table, "model").and_then(toml::Value::as_str),
+            Some("launch-model")
+        );
+        assert_eq!(table["hooks"].as_array().unwrap().len(), 2);
+        assert!(lookup(&table, "harness.max_tokens").is_some());
+        let runtime = settings_store::load_config(&layout, &overlay).unwrap();
+        assert_eq!(table, toml::Table::try_from(runtime).unwrap());
     }
 }

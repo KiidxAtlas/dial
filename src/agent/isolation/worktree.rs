@@ -5,7 +5,7 @@
 //! ignored-but-not-excluded file is copied from the project. The parent repository only gains a
 //! worktree administrative directory, which is removed when the isolated copy is released.
 
-use crate::benchmark::is_excluded_source_path;
+use crate::workspace_copy::is_excluded_source_path;
 use std::{
     fs, io,
     path::{Path, PathBuf},

@@ -64,10 +64,14 @@ impl InvestigationGuard {
         ))
     }
 
-    /// Several unchanged observations after corrective feedback are not further investigation.
-    /// Intervening reads, commands and failures cannot reset an observation's repeat count.
-    pub fn stop_message(&self) -> Option<String> {
-        (self.unchanged >= 4).then(|| "Stopped: the same observation was repeated four times without changing despite investigation feedback. The work remains incomplete; reuse the existing evidence and choose a different next action before continuing.".into())
+    /// Several unchanged observations are not further investigation. Intervening reads, commands and
+    /// failures cannot reset an observation's repeat count. Guidance escalates at each further multiple
+    /// of four and never ends the turn: the repeated observation is already withheld.
+    pub fn escalation(&self) -> Option<String> {
+        (self.unchanged >= 4 && self.unchanged % 4 == 0).then(|| format!(
+            "[Escalation from dial] This observation has now been repeated {} times unchanged and withheld each time. Its evidence is already in this conversation. Stop re-checking it: act on it, or run one check of a different kind.",
+            self.unchanged
+        ))
     }
 }
 
@@ -178,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_successful_shell_checks_stop_even_when_timeout_and_artifact_change() {
+    fn repeated_successful_shell_checks_escalate_even_when_timeout_and_artifact_change() {
         let mut guard = InvestigationGuard::default();
         let command = "cd project && grep '^version' pyproject.toml && grep '__version__' src/app/__init__.py";
         for attempt in 0..5 {
@@ -187,7 +191,7 @@ mod tests {
                 "version = \"0.3.31\"\n__version__ = \"0.3.31\"\n[exit code: 0]\n[complete output: artifact://{attempt}]\n"
             );
             assert_eq!(guard.observe(&check, &text, false).is_some(), attempt > 0);
-            assert_eq!(guard.stop_message().is_some(), attempt == 4);
+            assert_eq!(guard.escalation().is_some(), attempt == 4);
         }
     }
 
@@ -249,19 +253,19 @@ mod tests {
     }
 
     #[test]
-    fn repeated_evidence_stops_but_new_evidence_rearms() {
+    fn repeated_evidence_escalates_but_new_evidence_rearms() {
         let mut guard = InvestigationGuard::default();
         let read = call("read", json!({"path":"a.rs"}));
         guard.observe(&read, "original", false);
         for _ in 0..3 {
             guard.observe(&read, "original", false);
-            assert!(guard.stop_message().is_none());
+            assert!(guard.escalation().is_none());
             guard.observe(&call("todo", json!({"op":"view"})), "plan", false);
         }
         guard.observe(&read, "original", false);
-        assert!(guard.stop_message().is_some());
+        assert!(guard.escalation().is_some());
         guard.observe(&read, "changed externally", false);
-        assert!(guard.stop_message().is_none());
+        assert!(guard.escalation().is_none());
     }
 
     #[test]
@@ -291,9 +295,9 @@ mod tests {
                     .is_some()
             );
         }
-        assert!(guard.stop_message().is_some());
+        assert!(guard.escalation().is_some());
         assert!(guard.observe(&read, "changed externally", false).is_none());
-        assert!(guard.stop_message().is_none());
+        assert!(guard.escalation().is_none());
     }
 
     #[test]
@@ -310,7 +314,7 @@ mod tests {
         ] {
             assert!(guard.observe(&call("read", args), text, false).is_some());
         }
-        assert!(guard.stop_message().is_some());
+        assert!(guard.escalation().is_some());
         assert!(
             guard
                 .observe(
@@ -325,7 +329,7 @@ mod tests {
                 .observe(&original, "[a.rs#AB12]\n3:three\n[lines 3 of 3]\n", false)
                 .is_none()
         );
-        assert!(guard.stop_message().is_none());
+        assert!(guard.escalation().is_none());
         assert!(
             guard
                 .observe(
@@ -366,13 +370,13 @@ mod tests {
                 "change preview (+0 -0 lines)",
                 false,
             );
-            assert_eq!(guard.stop_message().is_some(), attempt == 4);
+            assert_eq!(guard.escalation().is_some(), attempt == 4);
         }
         guard.observe_output(
             &call("edit", json!({})),
             &crate::tools::ToolOutput::structured(json!({})).with_changes(["changed.rs".into()]),
         );
-        assert!(guard.stop_message().is_none());
+        assert!(guard.escalation().is_none());
         assert!(guard.observe(&check, "version = 0.3.31", false).is_none());
     }
 

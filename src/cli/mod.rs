@@ -2,6 +2,8 @@
 //!
 //! `src/commands/` is the slash-command module (mounted privately by `app.rs`); CLI
 //! subcommand and flag logic lives here instead.
+//! `benchmark/`, `improve.rs`, and `update.rs` are private binary modules mounted
+//! by `main.rs`, not part of this library module's public API.
 
 pub mod annotate;
 pub mod anonymize;
@@ -23,4 +25,5 @@ pub mod ps;
 pub mod search;
 pub mod session_flags;
 pub mod session_import;
+mod table;
 pub mod tool_flags;

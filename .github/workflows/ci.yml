@@ -55,20 +55,17 @@ jobs:
       - name: Test
         # Parallel: tests that change process HOME/PATH hold a shared lock; process fixtures set
         # their environment per child. Serial execution made the lib tests ~4x slower.
-        run: cargo test --locked --profile ci
+        run: make test-rust TEST_PROFILE=ci
       - name: Check slim build
         run: cargo check --locked --profile ci --no-default-features --bin dial
       - name: Install executable and verify artifact contracts
         timeout-minutes: 10
         run: |
           cargo install --locked --path . --profile ci --root target/installed
-          python3 scripts/check-artifact.py --dial target/installed/bin/dial
+          make test-smoke DIAL=target/installed/bin/dial
       - name: Real terminal and crash lifecycle
         timeout-minutes: 5
         run: python3 examples/benchmarks/interactive_smoke.py --dial target/installed/bin/dial --captures target/pty-captures
-      - name: Repeated scripted harness outcomes
-        timeout-minutes: 5
-        run: python3 examples/benchmarks/smoke.py --dial target/installed/bin/dial --suite recovery --machine-repetitions 2
       - name: Record runtime overhead
         continue-on-error: true
         run: cargo run --locked --profile ci --example runtime_baseline -- target/runtime-baseline.json
@@ -112,9 +109,9 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install pytest fastapi==0.141.1 pydantic uvicorn
-      - run: python -m pytest python/test_*.py
+      - run: make test-python PYTHON=python
       - name: Benchmark graders and repeated-trial reporting
-        run: python -m unittest discover -s examples/benchmarks -p 'test_*.py'
+        run: make test-bench-offline PYTHON=python
   installer-windows:
     name: Windows installer (${{ matrix.shell }})
     strategy:

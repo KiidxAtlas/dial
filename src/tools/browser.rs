@@ -2,14 +2,13 @@
 //! Chromium has no OS network permission: all HTTP requests cross the guarded Rust bridge.
 use super::background::procinfo::{ProcId, SIGKILL};
 use super::ext::{Tool, ToolContext};
-use super::kernel::{
-    JsonProcess, deadline, execution_deadline, remaining_timeout, resolve_operator_executable,
-};
+use super::kernel::{deadline, remaining_timeout, resolve_operator_executable};
 #[cfg(target_os = "macos")]
 use super::sandbox::{Sandbox, profile as sandbox_profile};
 use super::web::{fetch::parse_url, guard::blocked_reason};
 use super::{ToolOutput, tool_schema};
 use crate::config::types::{Config, SandboxMode};
+use crate::runtime::json_transport::{JsonProcess, execution_deadline};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -171,7 +170,7 @@ impl Tool for BrowserTool {
                 "tab":{"type":"integer","minimum":1,"description":"Open tab id returned by open/tabs; optional only when exactly one tab exists."}, "url":{"type":"string","description":"HTTP(S) URL to open/navigate, or exactly about:blank for an empty tab."},
                 "expression":{"type":"string","description":"JavaScript expression evaluated in the page, not Node"},
                 "selector":{"type":"string"},"text":{"type":"string"},"key":{"type":"string"},
-                "code":{"type":"string","description":"run: JavaScript statements executed in the page with the Playwright page in scope; CSP unsafe-eval may block it."},
+                "code":{"type":"string","description":"run: async JavaScript function body in the page realm with DOM globals, assert(condition, message), and sleep(ms). Use return for the result. No Playwright page or Node bindings; CSP unsafe-eval may block it."},
                 "fn":{"type":"string","description":"run: arrow-function source executed in the page instead of code."},
                 "args":{"type":"array","maxItems":32,"description":"run: arguments passed to fn."},
                 "chain":{"type":"array","minItems":1,"maxItems":8,"description":"call: ordered page-helper steps, each {method, args}."},
@@ -707,13 +706,8 @@ fn start(
         return Err("browser startup cancelled".into());
     }
     let builtin = config.playwright_module.trim().is_empty();
-    let module = if builtin {
-        runtime.entry.to_string_lossy().into_owned()
-    } else {
-        config.playwright_module.clone()
-    };
     let browsers = builtin.then_some(runtime.browsers.as_path());
-    let (mut entry, mut meta) = probe(ctx, &trusted, &module, browsers, &pid, interrupt, end)?;
+    let (entry, mut meta) = probe(ctx, &trusted, config, &runtime, &pid, interrupt, end)?;
     let node = PathBuf::from(meta["node"].as_str().ok_or("Node executable missing")?)
         .canonicalize()
         .map_err(|e| format!("Node executable: {e}"))?;
@@ -723,9 +717,7 @@ fn start(
         && !chromium_path(config, &meta)?.is_file()
     {
         match runtime::install_chromium(&node, &runtime, interrupt) {
-            Ok(()) => {
-                (entry, meta) = probe(ctx, &trusted, &module, browsers, &pid, interrupt, end)?
-            }
+            Ok(()) => (_, meta) = probe(ctx, &trusted, config, &runtime, &pid, interrupt, end)?,
             // Offline or a failed download still works when another Chromium is installed.
             Err(error)
                 if discover::installed_chromium(&discover::playwright_roots(&runtime.browsers))
@@ -739,13 +731,6 @@ fn start(
     if interrupt.load(Ordering::Acquire) {
         return Err("browser startup cancelled".into());
     }
-    let entry = if builtin {
-        entry
-            .canonicalize()
-            .map_err(|e| format!("browser runtime entry: {e}"))?
-    } else {
-        operator_dependency(ctx.workspace.root(), &entry)?
-    };
     let executable_path = chromium_path(config, &meta)?;
     // Attaching to an operator browser never launches Chromium, so a missing bundled binary must not block it.
     let executable = match executable_path.canonicalize() {
@@ -885,17 +870,23 @@ fn start(
     Ok(session)
 }
 
-/// Start-time dependency probe. The trusted Node runs PREFLIGHT, which resolves the Playwright entry
-/// and the Chromium executable (honoring PLAYWRIGHT_BROWSERS_PATH when set).
+/// Start-time dependency probe. Resolve without evaluating, validate the entry's trust boundary,
+/// then require it to discover Chromium (honoring PLAYWRIGHT_BROWSERS_PATH when set).
 fn probe(
     ctx: &ToolContext,
     trusted: &Path,
-    module: &str,
-    browsers: Option<&Path>,
+    config: &BrowserConfig,
+    runtime: &runtime::Runtime,
     pid: &Arc<AtomicI32>,
     interrupt: &AtomicBool,
     end: Option<Instant>,
 ) -> Result<(PathBuf, Value), String> {
+    let builtin = config.playwright_module.trim().is_empty();
+    let module = if builtin {
+        runtime.entry.as_os_str()
+    } else {
+        std::ffi::OsStr::new(&config.playwright_module)
+    };
     let mut command = Command::new(trusted);
     command
         .args(["-e", PREFLIGHT])
@@ -903,8 +894,8 @@ fn probe(
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("DIAL_PLAYWRIGHT", module)
         .current_dir(ctx.workspace.root());
-    if let Some(browsers) = browsers {
-        command.env("PLAYWRIGHT_BROWSERS_PATH", browsers);
+    if builtin {
+        command.env("PLAYWRIGHT_BROWSERS_PATH", &runtime.browsers);
     }
     let mut process = JsonProcess::start(command, pid.clone()).map_err(|e| {
         format!(
@@ -918,14 +909,18 @@ fn probe(
     let info = process.request(json!({}), remaining_timeout(end)?, |_| {
         Err("unexpected dependency callback".into())
     })?;
-    let entry = info["entry"]
-        .as_str()
-        .ok_or("Playwright entry missing")?
-        .to_owned();
+    let entry = PathBuf::from(info["entry"].as_str().ok_or("Playwright entry missing")?);
+    let entry = if builtin {
+        entry
+            .canonicalize()
+            .map_err(|e| format!("browser runtime entry: {e}"))?
+    } else {
+        operator_dependency(ctx.workspace.root(), &entry)?
+    };
     let meta = process.request(json!({"entry": entry}), remaining_timeout(end)?, |_| {
         Err("unexpected dependency callback".into())
     })?;
-    Ok((PathBuf::from(entry), meta))
+    Ok((entry, meta))
 }
 
 fn chromium_path(config: &BrowserConfig, meta: &Value) -> Result<PathBuf, String> {
@@ -1503,32 +1498,73 @@ mod tests {
             )
             .unwrap();
         }
-        let mut command = Command::new("node");
-        command
-            .args(["-e", PREFLIGHT])
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("DIAL_PLAYWRIGHT", &module)
-            .current_dir(dir.path());
-        let mut probe = JsonProcess::start(command, Arc::new(AtomicI32::new(0))).unwrap();
-        let result = probe
-            .request(json!({}), Duration::from_secs(5), |_| unreachable!())
-            .unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let workspace = super::super::Workspace::new(dir.path()).unwrap();
+        let config = Config::default();
+        let ctx = ToolContext {
+            workspace: &workspace,
+            config: &config,
+            mutation_authorizer: None,
+            confirm: None,
+        };
+        let root = workspace.root();
+        let node = resolve_operator_executable(root, "node", "browser.node").unwrap();
+        let trusted_module = outside.path().join("trusted.cjs");
+        std::fs::write(
+            &trusted_module,
+            "exports.chromium = { executablePath: () => (process.env.PLAYWRIGHT_BROWSERS_PATH || 'external') + '/chromium' };",
+        )
+        .unwrap();
+        let runtime = runtime::Runtime {
+            root: outside.path().to_path_buf(),
+            entry: trusted_module.clone(),
+            cli: outside.path().join("cli.js"),
+            readability: outside.path().join("Readability.js"),
+            browsers: outside.path().join("browsers"),
+        };
+        let check = |module: &str| {
+            let browser_config = BrowserConfig {
+                playwright_module: module.into(),
+                ..Default::default()
+            };
+            probe(
+                &ctx,
+                &node,
+                &browser_config,
+                &runtime,
+                &Arc::new(AtomicI32::new(0)),
+                &AtomicBool::new(false),
+                Some(Instant::now() + Duration::from_secs(5)),
+            )
+        };
         assert!(
-            operator_dependency(&root, Path::new(result["entry"].as_str().unwrap()))
+            check(module.to_str().unwrap())
                 .unwrap_err()
                 .contains("workspace-owned")
         );
         assert!(!escaped.exists());
+        // An operator-owned module completes both requests, proving this uses the production probe.
+        let (_, meta) = check(trusted_module.to_str().unwrap()).unwrap();
+        assert_eq!(meta["executable"], "external/chromium");
+        // The built-in cache still completes the second request with its private browser path.
+        let (entry, meta) = check("").unwrap();
+        assert_eq!(entry, trusted_module.canonicalize().unwrap());
+        assert_eq!(
+            meta["executable"],
+            format!("{}/chromium", runtime.browsers.display())
+        );
         #[cfg(unix)]
         {
             let symlink = outside.path().join("symlink.js");
             std::os::unix::fs::symlink(module.join("index.js"), &symlink).unwrap();
-            assert!(operator_dependency(&root, &symlink).is_err());
+            assert!(
+                check(symlink.to_str().unwrap())
+                    .unwrap_err()
+                    .contains("workspace-owned")
+            );
+            assert!(!escaped.exists());
             assert!(
                 resolve_operator_executable(
-                    &root,
+                    root,
                     module.join("index.js").to_str().unwrap(),
                     "browser.node"
                 )
@@ -1536,7 +1572,7 @@ mod tests {
                 .contains("outside")
             );
             assert!(
-                resolve_operator_executable(&root, symlink.to_str().unwrap(), "browser.node")
+                resolve_operator_executable(root, symlink.to_str().unwrap(), "browser.node")
                     .is_err()
             );
         }

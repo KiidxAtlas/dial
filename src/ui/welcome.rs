@@ -79,7 +79,7 @@ fn approval_meaning(mode: &str) -> &'static str {
     match mode {
         "write" => "edits and safe commands run; risky ones ask",
         "ask" => "asks before every edit and command",
-        "auto" => "runs everything without asking",
+        "auto" => "runs tools without asking",
         "readonly" => "reads only; no edits or commands",
         _ => "",
     }
@@ -154,11 +154,18 @@ fn facts(
         )];
         let meaning = approval_meaning(&approval);
         if !meaning.is_empty() {
-            spans.push(Span::styled(format!("  {meaning}"), muted));
+            spans.push(Span::styled(format!("{dot}{meaning}"), muted));
         }
         let sandbox = text::one_line(info.sandbox.trim());
         if !sandbox.is_empty() {
-            spans.push(Span::styled(format!("{dot}{sandbox} sandbox"), muted));
+            // Auto approval with the sandbox off is the unguarded pairing: flag it in the warning colour.
+            let unguarded = approval == "auto" && sandbox.eq_ignore_ascii_case("off");
+            let style = if unguarded {
+                theme.fg(Tok::Warning)
+            } else {
+                muted
+            };
+            spans.push(Span::styled(format!("{dot}sandbox {sandbox}"), style));
         }
         out.push(("mode", spans));
     }
@@ -308,16 +315,13 @@ pub fn rows(info: &WelcomeInfo, width: u16, theme: &Theme) -> Rows {
             width,
             &ellipsis,
         ));
-        for (i, starter) in STARTERS.iter().enumerate() {
-            let number = format!("{}", i + 1);
-            let mut spans = vec![pad(1)];
-            spans.extend(fx::gradient(
-                theme,
-                &number,
-                i as f32 * 0.2,
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(format!("  {starter}"), theme.fg(Tok::Text)));
+        for starter in STARTERS.iter() {
+            // Bullets, not numbers: digits typed into the composer are text, not a starter pick.
+            let spans = vec![
+                pad(1),
+                Span::styled(theme.sym(Sym::Bullet).to_owned(), theme.fg(Tok::Accent)),
+                Span::styled(format!("  {starter}"), theme.fg(Tok::Text)),
+            ];
             out.push(row(margin, spans, width, &ellipsis));
         }
     }
@@ -461,7 +465,7 @@ mod tests {
             "via lmstudio",
             "ask",
             "asks before every edit and command",
-            "dev sandbox",
+            "sandbox dev",
             "Ctrl+P",
             "actions",
             "RECENT",
@@ -525,8 +529,9 @@ mod tests {
         first.recent.clear();
         let text = plain(&rows(&first, 120, &Theme::dark())).join("\n");
         assert!(text.contains("START WITH"), "{text}");
-        for (i, starter) in STARTERS.iter().enumerate() {
-            assert!(text.contains(&format!("{}  {starter}", i + 1)), "{text}");
+        let bullet = Theme::dark().sym(Sym::Bullet).to_owned();
+        for starter in STARTERS.iter() {
+            assert!(text.contains(&format!("{bullet}  {starter}")), "{text}");
         }
         assert!(!text.contains("/resume"));
         let back = plain(&rows(&info(), 120, &Theme::dark())).join("\n");
@@ -551,6 +556,26 @@ mod tests {
             .expect("warning");
         assert_eq!(warn.style.fg, theme.fg(Tok::Warning).fg);
         assert!(plain(&rows).join("\n").contains("Ctrl+K to choose one"));
+    }
+
+    #[test]
+    fn auto_approval_with_the_sandbox_off_reads_as_a_sentence_and_is_flagged() {
+        let theme = Theme::dark();
+        let mut risky = info();
+        risky.approval = "auto".into();
+        risky.sandbox = "off".into();
+        let lines = rows(&risky, 120, &theme);
+        assert!(
+            plain(&lines)
+                .join("\n")
+                .contains("auto · runs tools without asking · sandbox off")
+        );
+        let spans: Vec<Span<'_>> = lines.iter().flat_map(|l| l.spans.iter().cloned()).collect();
+        let sandbox = spans
+            .iter()
+            .find(|span| span.content.contains("sandbox off"))
+            .expect("sandbox span");
+        assert_eq!(sandbox.style.fg, theme.fg(Tok::Warning).fg);
     }
 
     #[test]

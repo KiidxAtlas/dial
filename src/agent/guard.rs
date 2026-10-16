@@ -993,15 +993,13 @@ mod tests {
                 .unwrap()
                 .contains("Read recovery")
         );
-        assert!(guard.stop_message(&malformed).is_none());
+        // Failed reads get recovery guidance on every failure; they never escalate into a stop.
         let other = call("read", json!({"path":"src/b.rs:1-20"}));
         assert!(guard.observe(&other, false).is_none());
-        guard.observe(&malformed, true);
-        assert!(guard.stop_message(&malformed).is_none());
+        assert!(guard.observe(&malformed, true).unwrap().contains("Read recovery"));
         let corrected = call("read", json!({"path":"src/a.rs:25-50"}));
-        assert!(guard.stop_message(&corrected).is_none());
-        guard.observe(&malformed, false);
-        assert!(guard.stop_message(&malformed).is_none());
+        assert!(guard.observe(&corrected, true).unwrap().contains("Read recovery"));
+        assert!(guard.observe(&malformed, false).is_none());
     }
 
     #[test]

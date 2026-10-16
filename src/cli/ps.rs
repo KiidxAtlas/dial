@@ -163,13 +163,11 @@ fn label(row: &Value) -> String {
 
 /// Aligned plain-text table with one row per process. The last column is left unpadded.
 fn format_table(rows: &[Value]) -> String {
-    let header: Vec<String> = ["PID", "KIND", "PHASE", "MEMORY", "CPU", "LABEL"]
-        .map(str::to_owned)
-        .into();
-    let body: Vec<Vec<String>> = rows
+    let header = ["PID", "KIND", "PHASE", "MEMORY", "CPU", "LABEL"];
+    let body: Vec<[String; 6]> = rows
         .iter()
         .map(|row| {
-            vec![
+            [
                 row["pid"]
                     .as_i64()
                     .map_or_else(|| "-".to_owned(), |pid| pid.to_string()),
@@ -184,30 +182,7 @@ fn format_table(rows: &[Value]) -> String {
         })
         .collect();
 
-    let mut widths: Vec<usize> = header.iter().map(String::len).collect();
-    for cells in &body {
-        for (width, cell) in widths.iter_mut().zip(cells) {
-            *width = (*width).max(cell.chars().count());
-        }
-    }
-
-    let mut out = String::new();
-    for cells in std::iter::once(&header).chain(body.iter()) {
-        push_line(&mut out, cells, &widths);
-    }
-    out
-}
-
-fn push_line(out: &mut String, cells: &[String], widths: &[usize]) {
-    let last = cells.len() - 1;
-    for (index, (cell, width)) in cells.iter().zip(widths).enumerate() {
-        if index == last {
-            out.push_str(cell);
-        } else {
-            out.push_str(&format!("{cell:<width$}  ", width = width));
-        }
-    }
-    out.push('\n');
+    super::table::render(header, &body)
 }
 
 /// Key/value detail block for `ps info`.

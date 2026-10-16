@@ -226,7 +226,7 @@ fn plan_yolo(shell: &mut Shell, agent: &mut Agent<'_>, args: &str) -> Result<()>
 }
 
 fn schedule(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
-    use crate::schedule::{self, Entry, Store};
+    use crate::schedule::{self, Store};
     const TITLE: &str = "Schedule";
     const USAGE: &str = "/schedule list\n/schedule add --every 1h|--watch GLOB [--allow TOOL]... [--yes] [--id NAME] PROMPT\n/schedule remove ID\n/schedule log ID\n/schedule run   (runs due entries once, in the background)";
     let store = Store::new(&app.layout)?;
@@ -249,59 +249,17 @@ fn schedule(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
             shell.note(TITLE, text);
         }
         "add" => {
-            let words = shlex::split(rest).context("unbalanced quotes in /schedule add")?;
-            let mut every = None;
-            let mut watch = Vec::new();
-            let mut allow = Vec::new();
-            let mut id = None;
-            let mut yes = false;
-            let mut prompt = Vec::new();
-            let mut words = words.into_iter();
-            while let Some(word) = words.next() {
-                let mut value = |flag: &str| {
-                    words
-                        .next()
-                        .with_context(|| format!("{flag} needs a value"))
-                };
-                match word.as_str() {
-                    "--every" => every = Some(schedule::parse_duration(&value("--every")?)?),
-                    "--watch" => watch.push(value("--watch")?),
-                    "--allow" => allow.push(value("--allow")?),
-                    "--id" => id = Some(value("--id")?),
-                    "--yes" | "-y" => yes = true,
-                    _ => {
-                        prompt.push(word);
-                        prompt.extend(words.by_ref());
-                    }
-                }
-            }
-            if prompt.is_empty() || (every.is_none() && watch.is_empty()) {
+            let entry = parse_schedule_add(rest)?;
+            if entry.prompt.is_empty() || (entry.every_secs.is_none() && entry.watch.is_empty()) {
                 shell.note(TITLE, USAGE);
                 return Ok(());
             }
-            let entry = Entry {
-                id: id.unwrap_or_default(),
-                prompt: prompt.join(" "),
-                every_secs: every,
-                watch,
-                allow,
-                approval: if yes {
-                    "auto".into()
-                } else {
-                    "readonly".into()
-                },
-                created: schedule::now(),
-            };
+            let access = entry.access_description();
             let id = store.add(entry)?;
             shell.note(
                 TITLE,
                 format!(
-                    "Added {id}. Runs happen while `dial schedule run` (or /schedule run) is active.{}",
-                    if yes {
-                        ""
-                    } else {
-                        " It runs read-only; add --yes to allow changes."
-                    }
+                    "Added {id} ({access}). Runs happen while `dial schedule run` (or /schedule run) is active."
                 ),
             );
         }
@@ -324,6 +282,79 @@ fn schedule(shell: &mut Shell, app: &App, args: &str) -> Result<()> {
         _ => shell.note(TITLE, USAGE),
     }
     Ok(())
+}
+
+fn parse_schedule_add(args: &str) -> Result<crate::schedule::Entry> {
+    let words = shlex::split(args).context("unbalanced quotes in /schedule add")?;
+    let mut every = None;
+    let mut watch = Vec::new();
+    let mut allow = Vec::new();
+    let mut id = None;
+    let mut yes = false;
+    let mut prompt = Vec::new();
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        let mut value = |flag: &str| {
+            words
+                .next()
+                .with_context(|| format!("{flag} needs a value"))
+        };
+        match word.as_str() {
+            "--every" => every = Some(value("--every")?),
+            "--watch" => watch.push(value("--watch")?),
+            "--allow" => allow.push(value("--allow")?),
+            "--id" => id = Some(value("--id")?),
+            "--yes" | "-y" => yes = true,
+            "--" => {
+                prompt.extend(words.by_ref());
+                break;
+            }
+            _ => {
+                prompt.push(word);
+                prompt.extend(words.by_ref());
+            }
+        }
+    }
+    crate::schedule::Entry::new(id, prompt.join(" "), every.as_deref(), watch, allow, yes)
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::parse_schedule_add;
+
+    #[test]
+    fn slash_schedule_normalizes_permissions_and_preserves_quoted_prompt() {
+        let entry = parse_schedule_add(
+            r#"--every 1h --allow read,edit --allow bash --id review "review the project""#,
+        )
+        .unwrap();
+        entry.validate().unwrap();
+        assert_eq!(entry.id, "review");
+        assert_eq!(entry.prompt, "review the project");
+        assert_eq!(entry.allow, ["read", "edit", "bash"]);
+        assert_eq!(entry.approval, "readonly");
+        assert_eq!(entry.access_description(), "read-only + read,edit,bash");
+        let auto = parse_schedule_add("--every 1h --yes review").unwrap();
+        assert_eq!(auto.approval, "auto");
+        assert_eq!(
+            parse_schedule_add("--every 1h -- --yes is prompt text")
+                .unwrap()
+                .prompt,
+            "--yes is prompt text"
+        );
+    }
+
+    #[test]
+    fn slash_schedule_rejects_incomplete_or_invalid_arguments() {
+        for bad in [
+            "--allow",
+            "--every nope review",
+            "--allow edit, review",
+            "\"unterminated",
+        ] {
+            assert!(parse_schedule_add(bad).is_err(), "{bad}");
+        }
+    }
 }
 
 fn split_args(args: &str) -> Result<Vec<String>> {

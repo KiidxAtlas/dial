@@ -356,16 +356,11 @@ pub fn import_steering(config: &Config, pack: &Path, replace: bool) -> Result<Va
     ensure!(bundle.is_object(), "steering pack vector must be an object");
     let name = format!("imported-{}", &manifest.files[0].sha256[..12]);
     let pending = steering::pending_path(config, &name)?;
+    let _lock = steering::lock_vector(&pending)?;
     ensure!(
         replace || !pending.exists(),
         "a pending import named {name} already exists; pass --replace to overwrite that pending file"
     );
-    crate::storage::settings_store::private_dir(
-        pending.parent().context("pending steering directory")?,
-    )?;
-    let lock = crate::learn::auto::lock_file(&pending.with_extension("job.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .context("another steering job already owns this pending vector")?;
     let staged = pending.with_extension("staging.json");
     crate::storage::settings_store::write_private(&staged, &raw)?;
     let request = json!({"op":"steering_import","model":config.model,"model_name":config.model,"adapter":null,"output":staged});
@@ -623,6 +618,45 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn steering_import_respects_the_shared_pending_vector_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = root.path().join("checkpoint");
+        fs::create_dir_all(&checkpoint).unwrap();
+        fs::write(checkpoint.join("config.json"), b"{}").unwrap();
+        fs::write(checkpoint.join("model.safetensors"), b"w").unwrap();
+        let config = Config {
+            model: checkpoint.display().to_string(),
+            state_dir: root.path().join("state"),
+            ..Config::default()
+        };
+        let sources = write_sources(root.path(), &[(STEERING_FILE, b"{}".to_vec())]);
+        let manifest = sample_manifest(
+            "steering",
+            &pinned_base(&config).unwrap(),
+            entries(&sources).unwrap(),
+        );
+        let pack = root.path().join("steering.dialpack");
+        write_pack(&pack, &manifest, &sources).unwrap();
+        let name = format!("imported-{}", &manifest.files[0].sha256[..12]);
+        let pending = steering::pending_path(&config, &name).unwrap();
+        let lock = steering::lock_vector(&pending).unwrap();
+        crate::storage::settings_store::write_private(&pending, b"existing vector").unwrap();
+        for replace in [false, true] {
+            let error = import_steering(&config, &pack, replace).unwrap_err();
+            assert!(
+                error.to_string().contains("another steering job"),
+                "{error:#}"
+            );
+            assert_eq!(fs::read(&pending).unwrap(), b"existing vector");
+            assert!(!pending.with_extension("staging.json").exists());
+        }
+        drop(lock);
+        assert!(import_steering(&config, &pack, false).is_err());
+        assert_eq!(fs::read(&pending).unwrap(), b"existing vector");
+        assert!(!pending.with_extension("staging.json").exists());
     }
 
     #[test]

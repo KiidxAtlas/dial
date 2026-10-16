@@ -1,9 +1,18 @@
-//! Read-only runtime inventory. Configuration presence is not evidence of a live connection.
+//! MCP inventory and discovery for the agent. `list` reports what is configured and connected
+//! (configuration presence is not evidence of a live connection). `search` reads the official MCP
+//! registry, Smithery and the curated list. `install` adds one server to the global config after a
+//! health check, and needs the user's approval (see [`Tool::needs_approval`]).
+use super::catalog::{self, Endpoints, Input};
+use super::smithery;
 use super::{McpLoad, Session};
-use crate::config::types::Config;
+use crate::config::types::{Config, McpServerConfig};
+use crate::storage::paths::Layout;
+use crate::storage::settings_store::{self, Scope};
 use crate::tools::ToolOutput;
 use crate::tools::ext::{Tool, ToolContext};
+use anyhow::Result;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 struct Server {
@@ -87,6 +96,106 @@ impl Inventory {
     }
 }
 
+fn input_json(input: &Input) -> Value {
+    json!({
+        "name": input.key,
+        "required": input.required,
+        "secret": input.secret,
+        "description": input.description,
+    })
+}
+
+/// Registry search for the agent: every listing merged, with what each server needs.
+fn search(config: &Config, query: &str) -> ToolOutput {
+    let found = catalog::discover(&Endpoints::live(), config, query, 1);
+    let results: Vec<Value> = found
+        .candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "id": candidate.name,
+                "title": candidate.title,
+                "description": candidate.description,
+                "sources": candidate.sources.iter().map(|s| s.label()).collect::<Vec<_>>(),
+                "installable": candidate.installable(),
+                "install": candidate.install_summary(),
+                "inputs": candidate.inputs.iter().map(input_json).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    ToolOutput::structured(json!({
+        "results": results,
+        "more": found.more,
+        "notices": found.notices,
+        "note": "Search reads listings only; nothing was downloaded or started. Install a result with action install and its id. Environment values are never guessed: inputs marked required must be entered by the user in /extensions.",
+    }))
+}
+
+/// Approval-gated install: resolve, refuse anything that needs values, start once to check, save.
+fn install(config: &Config, id: &str) -> ToolOutput {
+    let id = id.trim();
+    if id.is_empty() {
+        return ToolOutput::err("install needs `id`: use the id of a search result");
+    }
+    let candidate = match catalog::resolve(&Endpoints::live(), config, id) {
+        Ok(candidate) => candidate,
+        Err(error) => return ToolOutput::err(format!("{error:#}")),
+    };
+    let local = catalog::config_name(&candidate.name);
+    if config.mcp.contains_key(&local) {
+        return ToolOutput::err(format!(
+            "`{local}` is already configured. Check it with action list."
+        ));
+    }
+    let required: Vec<&Input> = candidate.inputs.iter().filter(|input| input.required).collect();
+    if !required.is_empty() {
+        return ToolOutput::structured(json!({
+            "status": "needs_input",
+            "id": candidate.name,
+            "required": required.iter().copied().map(input_json).collect::<Vec<_>>(),
+            "message": format!(
+                "`{}` needs values the user must enter. Nothing was installed. Ask the user to open /extensions, select `{}` and press i to enter them.",
+                candidate.title, candidate.name
+            ),
+        }));
+    }
+    let server = match candidate.server(&BTreeMap::new()) {
+        Ok(server) => server,
+        Err(error) => return ToolOutput::err(format!("{error:#}")),
+    };
+    if server.url.is_none() && !catalog::on_path(&server.program.to_string_lossy()) {
+        return ToolOutput::err(format!(
+            "{} is not on PATH, so `{local}` cannot start. Install it first.",
+            server.program.display()
+        ));
+    }
+    let tools = match catalog::check(&config.project_root, &local, &server) {
+        Ok(count) => count,
+        Err(why) => return ToolOutput::err(format!("health check failed, nothing saved: {why}")),
+    };
+    match save(config, &local, &server) {
+        Ok(()) => ToolOutput::structured(json!({
+            "status": "installed",
+            "name": local,
+            "tools": tools,
+            "message": format!(
+                "Installed `{local}` with {tools} tool(s) in the global config. It takes effect when Dial starts its next session; /mcp shows its status."
+            ),
+        })),
+        Err(error) => ToolOutput::err(format!(
+            "health check passed, but saving the config failed: {error:#}"
+        )),
+    }
+}
+
+/// Writes the server into the global config, validated like any other settings change.
+fn save(config: &Config, name: &str, server: &McpServerConfig) -> Result<()> {
+    let layout = Layout::with_user_dir(&config.project_root, config.user_dir.clone())?;
+    let change = smithery::config_change(name, server)?;
+    settings_store::save_config(&layout, Scope::Global, &[change])?;
+    Ok(())
+}
+
 impl Tool for Inventory {
     fn name(&self) -> &str {
         "mcp_servers"
@@ -95,22 +204,89 @@ impl Tool for Inventory {
     fn schema(&self) -> Value {
         json!({"type":"function","function":{
             "name":self.name(),
-            "description":"List installed/configured MCP servers and their runtime connection status (connected, disconnected, failed or disabled), negotiated capabilities and registered tool names. Inspect MCP server inventory without starting servers, executing remote tools or granting approval. Discover exact listed tools with tool_search or tool_load to use them next round.",
-            "parameters":{"type":"object","properties":{},"additionalProperties":false}
+            "description":"Inspect and find MCP servers. action `list` (default): configured servers with runtime connection status (connected, disconnected, failed or disabled), negotiated capabilities and registered tool names; starts nothing. action `search` with optional `query`: find servers in the official MCP registry, Smithery and the curated list (read-only). action `install` with `id` from a search result: needs the user's approval, starts the server once to check it, then saves it to the global config; it takes effect in the next session. Servers that need environment values are not installed; the result names them for the user to enter in /extensions. Discover exact listed tools with tool_search or tool_load to use them next round.",
+            "parameters":{"type":"object","properties":{
+                "action":{"type":"string","enum":["list","search","install"]},
+                "query":{"type":"string","description":"Search text for action search; empty lists the catalog"},
+                "id":{"type":"string","description":"Result id from a search, for action install"}
+            },"additionalProperties":false}
         }})
     }
 
-    fn needs_approval(&self, _args: &Value) -> bool {
-        false
+    /// Only `install` changes anything; list and search are reads.
+    fn needs_approval(&self, args: &Value) -> bool {
+        args.get("action").and_then(Value::as_str) == Some("install")
     }
     fn read_only_hint(&self) -> bool {
-        true
+        false
     }
     fn may_modify_workspace(&self, _args: &Value) -> bool {
         false
     }
 
-    fn call(&self, _ctx: &ToolContext, _args: &Value) -> ToolOutput {
-        ToolOutput::structured(self.snapshot())
+    fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
+        match args.get("action").and_then(Value::as_str).unwrap_or("list") {
+            "list" => ToolOutput::structured(self.snapshot()),
+            "search" => search(ctx.config, args.get("query").and_then(Value::as_str).unwrap_or("")),
+            "install" => install(ctx.config, args.get("id").and_then(Value::as_str).unwrap_or("")),
+            other => ToolOutput::err(format!(
+                "unknown action `{other}`; use list, search or install"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inventory() -> Inventory {
+        Inventory::new(&Config::default(), &McpLoad::default())
+    }
+
+    #[test]
+    fn only_install_needs_approval() {
+        let tool = inventory();
+        assert!(!tool.needs_approval(&json!({"action": "list"})));
+        assert!(!tool.needs_approval(&json!({"action": "search", "query": "git"})));
+        assert!(!tool.needs_approval(&json!({})));
+        assert!(tool.needs_approval(&json!({"action": "install", "id": "memory"})));
+        assert!(!tool.may_modify_workspace(&json!({"action": "install"})));
+    }
+
+    #[test]
+    fn install_refuses_an_empty_id_and_unknown_ids_without_starting_anything() {
+        let config = Config::default();
+        let empty = install(&config, "  ");
+        assert!(empty.is_error);
+        assert!(empty.text.contains("needs `id`"), "{}", empty.text);
+    }
+
+    #[test]
+    fn install_asks_for_the_values_a_curated_server_needs_instead_of_guessing() {
+        let config = Config {
+            user_dir: std::path::PathBuf::from("/tmp/dial-test-home"),
+            project_root: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let out = install(&config, "github");
+        assert!(!out.is_error);
+        let data = out.data.expect("structured");
+        assert_eq!(data["status"], "needs_input");
+        assert_eq!(data["required"][0]["name"], "GITHUB_PERSONAL_ACCESS_TOKEN");
+        assert_eq!(data["required"][0]["secret"], true);
+    }
+
+    #[test]
+    fn install_refuses_a_server_that_is_already_configured() {
+        let mut config = Config {
+            user_dir: std::path::PathBuf::from("/tmp/dial-test-home"),
+            project_root: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        config.mcp.insert("time".into(), McpServerConfig::default());
+        let out = install(&config, "time");
+        assert!(out.is_error);
+        assert!(out.text.contains("already configured"), "{}", out.text);
     }
 }
