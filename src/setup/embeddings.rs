@@ -11,10 +11,13 @@
 //! `memory.semantic.embedding` mode becomes `on` when it was `off`. The explicit
 //! `embedding_base_url` / `embedding_model` overrides are OpenAI-compatible and are left alone;
 //! they still win over the role when set.
+//! Setup reaches the Ollama endpoint that `ollama` resolves to in config (a configured provider's
+//! URL, headers and key, or the local default), and the saved role points at that same endpoint.
+//! Only the built-in local default is started or installed by setup.
 
 use crate::config::selection;
 use crate::config::types::Config;
-use crate::llm::model_config::ModelSelection;
+use crate::llm::model_config::{HeaderValue, ModelSelection, RequestHeader, resolve_headers};
 use crate::setup::deps::{self, Env};
 use crate::storage::memory_backend::config::{EmbeddingMode, MemoryBackendId};
 use crate::storage::paths::Layout;
@@ -281,21 +284,101 @@ fn agent(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
-/// Whether an Ollama server answers at `base`. Bounded to two seconds.
-pub fn reachable(base: &str) -> bool {
-    agent(Duration::from_secs(2))
-        .get(format!("{}/api/version", base.trim_end_matches('/')))
-        .call()
-        .is_ok_and(|response| response.status().is_success())
+/// Ollama server that setup reaches: the endpoint `ollama` resolves to in config, with the headers
+/// and key the runtime sends to it, so the pull and the saved role point at one place.
+pub struct Server {
+    base_url: String,
+    headers: Vec<RequestHeader>,
+    token: Option<String>,
 }
 
-/// Names of the models Ollama has on disk.
-pub fn installed_models(base: &str) -> Result<Vec<String>> {
-    let url = format!("{}/api/tags", base.trim_end_matches('/'));
-    let mut response = agent(Duration::from_secs(5))
-        .get(&url)
-        .call()
-        .with_context(|| format!("GET {url}"))?;
+impl Server {
+    /// A server with no headers or key, for tests that only have a base URL.
+    #[cfg(test)]
+    fn bare(base_url: &str) -> Self {
+        Self {
+            base_url: base_url.to_owned(),
+            headers: Vec::new(),
+            token: None,
+        }
+    }
+
+    /// URL of a native Ollama API path. A trailing `/v1` (the OpenAI-compatible base some configs
+    /// use) is dropped, as the embedding route does.
+    fn api(&self, path: &str) -> String {
+        let root = self.base_url.trim_end_matches('/');
+        let root = root.strip_suffix("/v1").unwrap_or(root);
+        format!("{root}{path}")
+    }
+
+    /// Only the built-in local address is started and installed by setup; any other server is one
+    /// the user runs.
+    fn is_local_default(&self) -> bool {
+        self.base_url.trim_end_matches('/') == crate::llm::ollama::BASE_URL
+    }
+
+    /// Redacts the bearer key and env-sourced header values from server-controlled text.
+    /// Literal header values are not secret and are left alone.
+    fn redact_text(&self, mut text: String) -> String {
+        let mut secrets: Vec<String> = self.token.iter().cloned().collect();
+        if let Ok(resolved) = resolve_headers(&self.headers) {
+            secrets.extend(
+                resolved
+                    .pairs()
+                    .zip(&self.headers)
+                    .filter(|(_, row)| matches!(row.value, HeaderValue::Env(_)))
+                    .map(|((_, value), _)| value.to_owned()),
+            );
+        }
+        secrets.retain(|secret| !secret.is_empty());
+        for secret in secrets {
+            text = text.replace(&secret, "[redacted]");
+        }
+        text
+    }
+
+    fn redact(&self, error: anyhow::Error) -> anyhow::Error {
+        anyhow::anyhow!(self.redact_text(format!("{error:#}")))
+    }
+}
+
+/// Adds the server's configured headers and bearer key, as the runtime embedding request does.
+fn authorize<B>(
+    mut request: ureq::RequestBuilder<B>,
+    server: &Server,
+) -> Result<ureq::RequestBuilder<B>> {
+    let resolved = resolve_headers(&server.headers)?;
+    for (name, value) in resolved.pairs() {
+        request = request.header(name, value);
+    }
+    if let Some(token) = &server.token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    Ok(request)
+}
+
+/// Whether an Ollama server answers at `server`. Bounded to two seconds.
+fn reachable(server: &Server) -> bool {
+    authorize(
+        agent(Duration::from_secs(2)).get(server.api("/api/version")),
+        server,
+    )
+    .is_ok_and(|request| {
+        request
+            .call()
+            .is_ok_and(|response| response.status().is_success())
+    })
+}
+
+/// Model names the server has on disk. Errors never carry the key or env-sourced header values.
+fn list_models(server: &Server) -> Result<Vec<String>> {
+    fetch_models(server).map_err(|error| server.redact(error))
+}
+
+fn fetch_models(server: &Server) -> Result<Vec<String>> {
+    let url = server.api("/api/tags");
+    let request = authorize(agent(Duration::from_secs(5)).get(&url), server)?;
+    let mut response = request.call().with_context(|| format!("GET {url}"))?;
     ensure!(
         response.status().is_success(),
         "Ollama model list returned HTTP {}",
@@ -311,27 +394,47 @@ pub fn installed_models(base: &str) -> Result<Vec<String>> {
     parse_tags(&text)
 }
 
+/// Model names on the Ollama endpoint config resolves for `ollama`: the same server setup pulls from,
+/// with its configured headers and key. Only the model list is read.
+pub fn configured_models(layout: &Layout) -> Result<Vec<String>> {
+    let config = Config::load(layout, None)?;
+    let server = resolve_server(layout, &config)?;
+    list_models(&server)
+}
+
 /// Pulls `model` through Ollama's streaming `/api/pull`. Ollama checks each layer's digest
 /// itself. `cancel` is checked between progress frames; closing the stream stops the pull.
 pub fn pull(
-    base: &str,
+    server: &Server,
+    model: &str,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    pull_stream(server, model, cancel, &mut |line| {
+        progress(&server.redact_text(line.to_owned()));
+    })
+    .map_err(|error| server.redact(error))
+}
+
+fn pull_stream(
+    server: &Server,
     model: &str,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<()> {
     validate_name(model)?;
-    let url = format!("{}/api/pull", base.trim_end_matches('/'));
+    let url = server.api("/api/pull");
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_recv_response(Some(PULL_RESPONSE_TIMEOUT))
         .http_status_as_error(false)
         .build()
         .into();
     let body = json!({"model": model, "stream": true}).to_string();
-    let mut response = agent
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .send(body)
-        .with_context(|| format!("POST {url}"))?;
+    let request = authorize(
+        agent.post(&url).header("Content-Type", "application/json"),
+        server,
+    )?;
+    let mut response = request.send(body).with_context(|| format!("POST {url}"))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         let mut text = String::new();
@@ -359,7 +462,8 @@ pub fn pull(
         if cancel.load(Ordering::Relaxed) {
             bail!("cancelled while pulling {model}");
         }
-        let line = line.with_context(|| format!("reading the pull stream from {base}"))?;
+        let line =
+            line.with_context(|| format!("reading the pull stream from {}", server.base_url))?;
         match parse_pull_line(&line)? {
             None => {}
             Some(PullUpdate::Success) => {
@@ -395,16 +499,22 @@ pub fn wiring(config: &Config, model: &str, mode: EmbeddingMode) -> Result<Vec<C
     Ok(out)
 }
 
-/// Starts `ollama serve` when the program is installed but no server answers. Installs Ollama
-/// through the dependency registry first when the registry knows how.
+/// Ensures the server answers. Only the local default is started (installing Ollama through the
+/// dependency registry first when the registry knows how); other servers must already be running.
 fn ensure_ollama(
     layout: &Layout,
+    server: &Server,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<()> {
-    if reachable(crate::llm::ollama::BASE_URL) {
+    if reachable(server) {
         return Ok(());
     }
+    ensure!(
+        server.is_local_default(),
+        "Ollama is not reachable at {}; start it there and run the setup again",
+        server.base_url
+    );
     let program = match Env::current(&layout.user_dir).find("ollama") {
         Some(program) => program,
         None => {
@@ -425,7 +535,7 @@ fn ensure_ollama(
         .spawn()
         .with_context(|| format!("starting {} serve", program.display()))?;
     let started = Instant::now();
-    while !reachable(crate::llm::ollama::BASE_URL) {
+    while !reachable(server) {
         ensure!(
             !cancel.load(Ordering::Relaxed),
             "cancelled while starting Ollama"
@@ -440,6 +550,26 @@ fn ensure_ollama(
     Ok(())
 }
 
+/// The Ollama endpoint `ollama` resolves to in config: a configured provider's URL, headers and key,
+/// else the local default. The same resolution feeds `wiring`, so the pull and the role agree.
+fn resolve_server(layout: &Layout, config: &Config) -> Result<Server> {
+    let endpoint = config
+        .selection_endpoint(&ModelSelection::new("ollama", ""))
+        .context("Ollama has no endpoint configured")?;
+    crate::llm::provider::endpoint_url(&endpoint.base_url, endpoint.allow_insecure)
+        .context("Ollama endpoint")?;
+    let token = crate::llm::catalog::resolve_credential(
+        &layout.user_dir,
+        &endpoint.base_url,
+        endpoint.api_key_env.as_deref(),
+    )?;
+    Ok(Server {
+        base_url: endpoint.base_url,
+        headers: endpoint.headers.unwrap_or_default(),
+        token,
+    })
+}
+
 /// Ensures Ollama runs, pulls `model` if it is missing, then saves the embedding wiring.
 /// Settings are written only after the pull succeeds. Returns a summary for the user.
 pub fn setup(
@@ -450,37 +580,59 @@ pub fn setup(
 ) -> Result<String> {
     validate_name(model)?;
     let config = Config::load(layout, None)?;
-    ensure_ollama(layout, cancel, progress)?;
-    if has_model(&installed_models(crate::llm::ollama::BASE_URL)?, model) {
-        progress(&format!("{model} is already pulled"));
-    } else {
-        pull(crate::llm::ollama::BASE_URL, model, cancel, progress)?;
-        progress("pulled");
-    }
-    settings_store::save_model_config(
+    let server = resolve_server(layout, &config)?;
+    (|| -> Result<()> {
+        ensure_ollama(layout, &server, cancel, progress)?;
+        if has_model(&list_models(&server)?, model) {
+            progress(&format!("{model} is already pulled"));
+        } else {
+            pull(&server, model, cancel, progress)?;
+            progress("pulled");
+        }
+        Ok(())
+    })()
+    .map_err(|error| server.redact(error))?;
+    let saved = settings_store::save_model_config(
         layout,
         Scope::Global,
         &wiring(&config, model, config.memory.semantic.embedding)?,
         "embedding",
     )?;
+    Ok(summary(model, &config, &saved))
+}
+
+/// What setup reports. Mode and overrides are read from `saved`, the config after the write, so a
+/// project setting that still overrides the global change is reported instead of hidden.
+fn summary(model: &str, before: &Config, saved: &Config) -> String {
     let mut lines = vec![format!(
         "Embedding model: ollama / {model} (model_roles.embedding)"
     )];
-    if config.memory.semantic.embedding == EmbeddingMode::Off {
-        lines.push("memory.semantic.embedding is now on.".to_owned());
+    if before.memory.semantic.embedding == EmbeddingMode::Off {
+        if saved.memory.semantic.embedding == EmbeddingMode::On {
+            lines.push("memory.semantic.embedding is now on.".to_owned());
+        } else {
+            let mode = match saved.memory.semantic.embedding {
+                EmbeddingMode::Off => "off",
+                EmbeddingMode::Auto => "auto",
+                EmbeddingMode::On => "on",
+            };
+            lines.push(format!(
+                "memory.semantic.embedding is still {mode}: a project setting overrides the global change. Set it to on in the project settings."
+            ));
+        }
     }
-    let semantic = &config.memory.semantic;
+    let semantic = &saved.memory.semantic;
     if !semantic.embedding_base_url.trim().is_empty() || !semantic.embedding_model.trim().is_empty()
     {
         lines.push("The explicit embedding_base_url / embedding_model overrides still win over this role; clear them to use it.".to_owned());
     }
-    if config.memory.backend != MemoryBackendId::Semantic {
+    if saved.memory.backend != MemoryBackendId::Semantic {
         lines.push(format!(
             "Semantic recall needs the semantic memory backend; the current backend is {}. Select semantic in settings.",
-            config.memory.backend.as_str()
+            saved.memory.backend.as_str()
         ));
     }
-    Ok(lines.join("\n"))
+    lines.join("\n")
 }
 
 /// What `/setup embeddings:<name> yes` will do, shown before anything runs. Reads only local
@@ -495,15 +647,15 @@ pub fn preview_text(model: &str, user_dir: &Path) -> String {
     }];
     let env = Env::current(user_dir);
     if env.find("ollama").is_some() {
-        lines.push("Ollama is installed; it is started if it is not running.".to_owned());
+        lines.push("Ollama is installed. With no providers.ollama endpoint configured, it is started if it is not running; a configured endpoint must already be running.".to_owned());
     } else if deps::recipe("ollama").is_some() {
-        lines.push("Ollama is not installed. It is set up first:".to_owned());
+        lines.push("Ollama is not installed. With no providers.ollama endpoint configured, it is set up first:".to_owned());
         lines.push(deps::run::preview_text("ollama", &env));
     } else {
         lines.push(INSTALL_HINT.to_owned());
     }
     lines.push(format!(
-        "Pulls {model} through Ollama into its model store (skipped if already there). Ollama verifies each layer's digest."
+        "Pulls {model} through the Ollama endpoint (the configured providers.ollama, or the local default) into its model store, skipped if already there. Ollama verifies each layer's digest."
     ));
     lines.push(format!(
         "Then sets model_roles.embedding to ollama / {model}, and memory.semantic.embedding to on if it is off."
@@ -824,15 +976,217 @@ mod tests {
         });
         let cancel = AtomicBool::new(false);
         let mut seen = Vec::new();
-        pull(&base, "nomic-embed-text", &cancel, &mut |line| {
-            seen.push(line.to_owned())
-        })
+        pull(
+            &Server::bare(&base),
+            "nomic-embed-text",
+            &cancel,
+            &mut |line| seen.push(line.to_owned()),
+        )
         .unwrap();
         assert!(seen.iter().any(|line| line == "pulling manifest"));
         assert!(seen.iter().any(|line| line.starts_with("pulling abc: 50%")));
         let cancelled = AtomicBool::new(true);
-        let error = pull(&base, "nomic-embed-text", &cancelled, &mut |_| {}).unwrap_err();
+        let error = pull(
+            &Server::bare(&base),
+            "nomic-embed-text",
+            &cancelled,
+            &mut |_| {},
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("cancelled"));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn native_paths_drop_an_openai_v1_suffix() {
+        assert_eq!(
+            Server::bare("http://gpu:11434/v1/").api("/api/pull"),
+            "http://gpu:11434/api/pull"
+        );
+        assert_eq!(
+            Server::bare("http://127.0.0.1:11434").api("/api/tags"),
+            "http://127.0.0.1:11434/api/tags"
+        );
+    }
+
+    fn ollama_config(layout: &Layout, base: &str, scope: Scope, mode: &str) {
+        let headers: toml::Value = toml::from_str::<toml::Table>(
+            "rows = [{ name = \"X-Gateway\", value = { literal = \"edge\" } }]",
+        )
+        .unwrap()["rows"]
+            .clone();
+        let mut changes = vec![Change::Set {
+            path: "memory.semantic.embedding".into(),
+            value: mode.into(),
+        }];
+        if scope == Scope::Global {
+            changes.push(Change::Set {
+                path: "providers.ollama.base_url".into(),
+                value: base.into(),
+            });
+            changes.push(Change::Set {
+                path: "providers.ollama.headers".into(),
+                value: headers,
+            });
+        }
+        settings_store::save_config(layout, scope, &changes).unwrap();
+    }
+
+    #[test]
+    fn setup_pulls_from_and_wires_the_configured_ollama_provider() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+        let fake = crate::llm::fake::serve(vec![
+            crate::llm::fake::json(200, &json!({"version": "test"})),
+            crate::llm::fake::json(200, &json!({"models": []})),
+            crate::llm::fake::Script::Http {
+                status: 200,
+                content_type: "application/x-ndjson",
+                body: b"{\"status\":\"success\"}\n".to_vec(),
+            },
+        ]);
+        let url = fake.url.clone();
+        ollama_config(&layout, &url, Scope::Global, "off");
+        let mut lines = Vec::new();
+        let summary = setup(&layout, "bge-m3", &AtomicBool::new(false), &mut |line| {
+            lines.push(line.to_owned())
+        })
+        .unwrap();
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 3, "version, tags, pull");
+        for raw in &requests {
+            assert_eq!(
+                crate::llm::fake::header(raw, "x-gateway").as_deref(),
+                Some("edge"),
+                "configured provider headers reach every setup request"
+            );
+        }
+        assert!(crate::llm::fake::request_line(&requests[2]).starts_with("POST /api/pull "));
+        assert_eq!(crate::llm::fake::body(&requests[2])["model"], "bge-m3");
+        let saved = settings_store::load_config(&layout, &toml::Table::new()).unwrap();
+        let role = saved.role_selection("embedding").expect("role assigned");
+        assert_eq!(role.provider, "ollama");
+        assert_eq!(role.base_url.as_deref(), Some(url.as_str()));
+        assert_eq!(saved.memory.semantic.embedding, EmbeddingMode::On);
+        let endpoint = saved
+            .for_role("embedding")
+            .endpoint
+            .expect("effective route");
+        assert_eq!(endpoint.base_url, url);
+        assert!(summary.contains("now on"), "{summary}");
+    }
+
+    #[test]
+    fn setup_reports_a_project_mode_that_still_overrides_the_global_change() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+        let fake = crate::llm::fake::serve(vec![
+            crate::llm::fake::json(200, &json!({"version": "test"})),
+            crate::llm::fake::json(200, &json!({"models": [{"name": "bge-m3:latest"}]})),
+        ]);
+        let url = fake.url.clone();
+        ollama_config(&layout, &url, Scope::Global, "auto");
+        ollama_config(&layout, &url, Scope::Project, "off");
+        let summary = setup(&layout, "bge-m3", &AtomicBool::new(false), &mut |_| {}).unwrap();
+        fake.requests();
+        assert!(summary.contains("still off"), "{summary}");
+        let saved = settings_store::load_config(&layout, &toml::Table::new()).unwrap();
+        assert_eq!(saved.memory.semantic.embedding, EmbeddingMode::Off);
+        assert!(saved.role_selection("embedding").is_some());
+    }
+
+    #[test]
+    fn a_configured_remote_ollama_that_is_down_is_not_started_or_installed_locally() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        ollama_config(
+            &layout,
+            &format!("http://127.0.0.1:{port}"),
+            Scope::Global,
+            "auto",
+        );
+        let error = setup(&layout, "bge-m3", &AtomicBool::new(false), &mut |_| {}).unwrap_err();
+        assert!(error.to_string().contains("is not reachable"), "{error:#}");
+        let saved = settings_store::load_config(&layout, &toml::Table::new()).unwrap();
+        assert!(
+            saved.role_selection("embedding").is_none(),
+            "nothing saved on failure"
+        );
+    }
+
+    #[test]
+    fn configured_models_list_the_configured_endpoint_with_its_headers() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+        let fake = crate::llm::fake::serve(vec![crate::llm::fake::json(
+            200,
+            &json!({"models": [{"name": "bge-m3:latest"}]}),
+        )]);
+        ollama_config(&layout, &fake.url, Scope::Global, "auto");
+        let names = configured_models(&layout).unwrap();
+        let requests = fake.requests();
+        assert!(has_model(&names, "bge-m3"), "{names:?}");
+        assert!(crate::llm::fake::request_line(&requests[0]).starts_with("GET /api/tags "));
+        assert_eq!(
+            crate::llm::fake::header(&requests[0], "x-gateway").as_deref(),
+            Some("edge")
+        );
+    }
+
+    #[test]
+    fn pull_errors_never_echo_the_bearer_key() {
+        let fake = crate::llm::fake::serve(vec![crate::llm::fake::json(
+            401,
+            &json!({"error": "bad key sk-edge-secret-42"}),
+        )]);
+        let server = Server {
+            base_url: fake.url.clone(),
+            headers: Vec::new(),
+            token: Some("sk-edge-secret-42".into()),
+        };
+        let error = pull(&server, "bge-m3", &AtomicBool::new(false), &mut |_| {}).unwrap_err();
+        let requests = fake.requests();
+        assert_eq!(
+            crate::llm::fake::header(&requests[0], "authorization").as_deref(),
+            Some("Bearer sk-edge-secret-42")
+        );
+        let text = format!("{error:#}");
+        assert!(!text.contains("sk-edge-secret-42"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+    }
+
+    #[test]
+    fn pull_progress_never_echoes_the_bearer_key() {
+        let fake = crate::llm::fake::serve(vec![crate::llm::fake::Script::Http {
+            status: 200,
+            content_type: "application/x-ndjson",
+            body: b"{\"status\":\"downloading for sk-fixture-secret\"}\n{\"status\":\"success\"}\n"
+                .to_vec(),
+        }]);
+        let server = Server {
+            base_url: fake.url.clone(),
+            headers: Vec::new(),
+            token: Some("sk-fixture-secret".into()),
+        };
+        let mut progress = Vec::new();
+        pull(&server, "bge-m3", &AtomicBool::new(false), &mut |line| {
+            progress.push(line.to_owned())
+        })
+        .unwrap();
+        assert!(progress.iter().any(|line| line.contains("[redacted]")));
+        assert!(
+            progress
+                .iter()
+                .all(|line| !line.contains("sk-fixture-secret"))
+        );
     }
 }

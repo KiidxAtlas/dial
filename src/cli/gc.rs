@@ -652,9 +652,15 @@ fn sweep_archive(
             continue;
         }
         if let Err(error) = crate::runtime::stream_journal::relocate(&candidate.path, &dest) {
-            let _ = fs::rename(&dest, &candidate.path);
+            // The stream journal did not move, so only the main file needs to come back.
+            let note = match fs::rename(&dest, &candidate.path) {
+                Ok(()) => String::new(),
+                Err(re) => format!(
+                    "; rollback failed: the session stays archived while its stream journal stays live: {re}"
+                ),
+            };
             result.errors.push(format!(
-                "moving stream journal for {}: {error}",
+                "moving stream journal for {}: {error}{note}",
                 candidate.path.display()
             ));
             continue;
@@ -673,10 +679,8 @@ fn sweep_archive(
             ),
         };
         if let Err(e) = store.record_archive(run_id, &record) {
-            // Without the record the move cannot be reversed by name, so put the file back.
-            let rollback = fs::rename(&dest, &candidate.path);
-            let _ = crate::runtime::stream_journal::relocate(&dest, &candidate.path);
-            let note = match rollback {
+            // Without the record the move cannot be reversed by name, so put the pair back.
+            let note = match restore_archived(&dest, &candidate.path) {
                 Ok(()) => "rolled back".to_string(),
                 Err(re) => format!("rollback failed: {re}"),
             };
@@ -689,6 +693,19 @@ fn sweep_archive(
         result.archived += 1;
     }
     result
+}
+
+/// Moves an archived session and its stream journal back. The main file returns first and the
+/// stream journal only after that succeeds, so a failed main rename leaves the pair together in the
+/// archive instead of splitting it.
+fn restore_archived(dest: &Path, original: &Path) -> Result<(), String> {
+    fs::rename(dest, original).map_err(|e| format!("restoring {}: {e}", original.display()))?;
+    crate::runtime::stream_journal::relocate(dest, original).map_err(|e| {
+        format!(
+            "restoring stream journal of {}: {e}; the session file is back",
+            original.display()
+        )
+    })
 }
 
 /// Open the gc store, make sure the archive directory exists, and begin a run.
@@ -1053,6 +1070,41 @@ mod tests {
         assert_eq!(record.cwd, "/proj");
         assert_eq!(record.archived_path, dest.display().to_string());
         assert!(store.last_run_settings().unwrap().is_some());
+    }
+
+    #[test]
+    fn restore_archived_returns_the_pair_or_keeps_it_together_in_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = layout(dir.path());
+        let sessions = l.sessions_dir();
+        let archive = sessions.join(ARCHIVE_DIR);
+        fs::create_dir_all(&archive).unwrap();
+        let archived_pair = |name: &str| {
+            let original = sessions.join(name);
+            let dest = archive.join(name);
+            fs::write(&dest, "{}\n").unwrap();
+            let streams = crate::runtime::stream_journal::path(&dest);
+            fs::write(&streams, "stream\n").unwrap();
+            (original, dest, streams)
+        };
+        let (original, dest, streams) = archived_pair("20200101T000000000Z_back.jsonl");
+        restore_archived(&dest, &original).unwrap();
+        assert!(original.exists() && !dest.exists());
+        assert!(crate::runtime::stream_journal::path(&original).exists());
+        assert!(!streams.exists());
+
+        // A directory at the original path makes the main rename fail; the stream journal must
+        // then stay beside the archived main file rather than return alone.
+        let (blocked, dest, streams) = archived_pair("20200101T000000000Z_blocked.jsonl");
+        fs::create_dir(&blocked).unwrap();
+        let error = restore_archived(&dest, &blocked).unwrap_err();
+        assert!(error.starts_with("restoring"), "{error}");
+        assert!(dest.exists());
+        assert!(
+            streams.exists(),
+            "the stream journal must stay with its archived session"
+        );
+        assert!(!crate::runtime::stream_journal::path(&blocked).exists());
     }
 
     #[test]

@@ -22,6 +22,14 @@ struct Pending {
     method: String,
     session: Option<String>,
 }
+/// One live call owns its wire identity and output. Names alone cannot correlate overlapping calls.
+struct ActiveTool {
+    id: String,
+    name: String,
+    call_id: Option<String>,
+    output: String,
+    pending: bool,
+}
 pub(crate) struct Adapter {
     layout: Layout,
     initialized: bool,
@@ -30,9 +38,7 @@ pub(crate) struct Adapter {
     sessions: HashSet<String>,
     active: Option<String>,
     permissions: HashMap<String, String>,
-    tools: HashMap<String, String>,
-    tool_output: HashMap<String, String>,
-    pending_tools: HashSet<String>,
+    tools: Vec<ActiveTool>,
     next_tool: u64,
     modes: HashMap<String, bool>,
 }
@@ -93,9 +99,7 @@ impl Adapter {
             sessions: HashSet::new(),
             active: None,
             permissions: HashMap::new(),
-            tools: HashMap::new(),
-            tool_output: HashMap::new(),
-            pending_tools: HashSet::new(),
+            tools: Vec::new(),
             next_tool: 0,
             modes: HashMap::new(),
         }
@@ -147,6 +151,14 @@ impl Adapter {
             return (
                 None,
                 vec![error(&id, -32600, "request id must be a string or number")],
+            );
+        }
+        // Check correlation before preparation: prompt preparation can persist attachments, and
+        // cancellation must not consume an existing prompt's response slot.
+        if !notification && self.pending.contains_key(&key(&id)) {
+            return (
+                None,
+                vec![error(&id, -32602, "request id is already in flight")],
             );
         }
         let result = self.prepare(method, &wire["params"], &id);
@@ -265,13 +277,17 @@ impl Adapter {
                 ensure!(self.sessions.contains(session), "session is not open");
                 // The core has only one running turn. Never cancel another session's turn.
                 if self.active.as_deref() != Some(session) {
-                    return Ok((None, Vec::new()));
+                    return Ok((
+                        None,
+                        if id.is_null() {
+                            Vec::new()
+                        } else {
+                            vec![response(id, json!({}))]
+                        },
+                    ));
                 }
                 self.permissions.clear();
-                return Ok((
-                    Some(json!({"id":id,"method":"abort","params":{"_acp":true}})),
-                    Vec::new(),
-                ));
+                "abort"
             }
             "session/close" => {
                 actor_params["_active"] = json!(session.as_deref() == self.active.as_deref());
@@ -316,17 +332,15 @@ impl Adapter {
             }
             actor_params["session_id"] = json!(session);
         }
-        ensure!(
-            !self.pending.contains_key(&key(id)),
-            "request id is already in flight"
-        );
-        self.pending.insert(
-            key(id),
-            Pending {
-                method: method.into(),
-                session,
-            },
-        );
+        if !id.is_null() {
+            self.pending.insert(
+                key(id),
+                Pending {
+                    method: method.into(),
+                    session,
+                },
+            );
+        }
         Ok((
             Some(json!({"id":id,"method":actor_method,"params":actor_params})),
             Vec::new(),
@@ -584,8 +598,6 @@ impl Adapter {
                     self.sessions.insert(session.clone());
                     self.active = Some(session.clone());
                     self.tools.clear();
-                    self.tool_output.clear();
-                    self.pending_tools.clear();
                     let plan = value["plan_mode"].as_bool().unwrap_or(false);
                     self.modes.insert(session.clone(), plan);
                     let mut result =
@@ -648,8 +660,6 @@ impl Adapter {
             "active_session" => {
                 self.active = event["session_id"].as_str().map(str::to_owned);
                 self.tools.clear();
-                self.tool_output.clear();
-                self.pending_tools.clear();
                 return Vec::new();
             }
             "text" => {
@@ -668,13 +678,19 @@ impl Adapter {
                 let id = format!("dial-permission-{approval}");
                 self.permissions.insert(key(&json!(id)), approval.into());
                 let name = event["tool"].as_str().unwrap_or("tool");
-                let tool = if let Some(tool) = self.tools.get(name) {
-                    tool.clone()
-                } else {
-                    self.tools.insert(name.into(), approval.into());
-                    self.pending_tools.insert(name.into());
-                    approval.into()
-                };
+                let tool =
+                    if let Some(tool) = self.tools.iter().rev().find(|tool| tool.name == name) {
+                        tool.id.clone()
+                    } else {
+                        self.tools.push(ActiveTool {
+                            id: approval.into(),
+                            name: name.into(),
+                            call_id: None,
+                            output: String::new(),
+                            pending: true,
+                        });
+                        approval.into()
+                    };
                 return vec![
                     json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{"sessionId":session,
                     "toolCall":{"toolCallId":tool,"title":event["summary"],"kind":tool_kind(name),"status":"pending"},
@@ -683,25 +699,46 @@ impl Adapter {
             }
             "tool_call" => {
                 let name = event["name"].as_str().unwrap_or("tool");
-                let id = if self.pending_tools.remove(name) {
-                    self.tools.get(name).cloned().unwrap_or_default()
+                let call_id = event["call_id"].as_str().map(str::to_owned);
+                let id = if let Some(tool) = self
+                    .tools
+                    .iter_mut()
+                    .rev()
+                    .find(|tool| tool.name == name && tool.pending)
+                {
+                    tool.pending = false;
+                    tool.call_id = call_id;
+                    tool.id.clone()
                 } else {
                     self.next_tool += 1;
                     let id = format!("dial-tool-{}", self.next_tool);
-                    self.tools.insert(name.into(), id.clone());
+                    self.tools.push(ActiveTool {
+                        id: id.clone(),
+                        name: name.into(),
+                        call_id,
+                        output: String::new(),
+                        pending: false,
+                    });
                     id
                 };
-                self.tool_output.remove(name);
                 json!({"sessionUpdate":"tool_call","toolCallId":id,"title":event["summary"],"kind":tool_kind(name),"status":"in_progress","rawInput":{"tool":name,"summary":event["summary"]}})
             }
             "tool_result" | "tool_output" => {
                 let name = event["name"].as_str().unwrap_or("tool");
-                let Some(id) = self.tools.get(name).cloned() else {
+                let position =
+                    self.tools
+                        .iter()
+                        .rposition(|tool| match event["call_id"].as_str() {
+                            Some(id) => tool.call_id.as_deref() == Some(id),
+                            None => tool.name == name,
+                        });
+                let Some(position) = position else {
                     return Vec::new();
                 };
+                let id = self.tools[position].id.clone();
                 let partial = event["event"] == "tool_output";
                 let text = if partial {
-                    let text = self.tool_output.entry(name.into()).or_default();
+                    let text = &mut self.tools[position].output;
                     if let Some(delta) = event["delta"].as_str() {
                         text.push_str(delta);
                     }
@@ -713,9 +750,7 @@ impl Adapter {
                     event["text"].as_str().unwrap_or("").to_owned()
                 };
                 if !partial {
-                    self.tools.remove(name);
-                    self.tool_output.remove(name);
-                    self.pending_tools.remove(name);
+                    self.tools.remove(position);
                 }
                 json!({"sessionUpdate":"tool_call_update","toolCallId":id,"status":if partial {"in_progress"} else if event["is_error"]==true {"failed"} else {"completed"},"content":[{"type":"content","content":{"type":"text","text":text}}],"rawOutput":event.get("data")})
             }
@@ -753,6 +788,65 @@ mod tests {
                 message["params"]["update"].clone()
             })
             .collect()
+    }
+
+    #[test]
+    fn overlapping_same_name_calls_keep_their_own_results() {
+        let updates = session_updates(vec![
+            json!({"event":"tool_call","call_id":"a","name":"read","summary":"first"}),
+            json!({"event":"tool_call","call_id":"b","name":"read","summary":"second"}),
+            json!({"event":"tool_output","call_id":"a","name":"read","delta":"partial a"}),
+            json!({"event":"tool_output","call_id":"b","name":"read","delta":"partial b"}),
+            json!({"event":"tool_result","call_id":"b","name":"read","text":"second result","is_error":true}),
+            json!({"event":"tool_result","call_id":"a","name":"read","text":"first result","data":{"answer":1}}),
+        ]);
+        assert_eq!(updates.len(), 6);
+        let a = &updates[0]["toolCallId"];
+        let b = &updates[1]["toolCallId"];
+        assert_ne!(a, b);
+        for index in [2, 5] {
+            assert_eq!(&updates[index]["toolCallId"], a);
+        }
+        for index in [3, 4] {
+            assert_eq!(&updates[index]["toolCallId"], b);
+        }
+        assert_eq!(updates[2]["content"][0]["content"]["text"], "partial a");
+        assert_eq!(updates[3]["content"][0]["content"]["text"], "partial b");
+        assert_eq!(updates[4]["status"], "failed");
+        assert_eq!(updates[5]["status"], "completed");
+        assert_eq!(updates[5]["rawOutput"], json!({"answer":1}));
+    }
+
+    #[test]
+    fn approval_and_legacy_output_follow_the_call_and_session_lifetime() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+        let mut adapter = Adapter::new(layout);
+        adapter.emit(json!({"event":"active_session","session_id":"s1"}));
+        let approval = adapter.emit(json!({"event":"approval","approval_id":"p1","tool":"bash"}));
+        let id = approval[0]["params"]["toolCall"]["toolCallId"].clone();
+        let call = adapter.emit(json!({"event":"tool_call","call_id":"a","name":"bash"}));
+        assert_eq!(call[0]["params"]["update"]["toolCallId"], id);
+        let partial = adapter.emit(json!({"event":"tool_output","name":"bash","delta":"output"}));
+        assert_eq!(partial[0]["params"]["update"]["toolCallId"], id);
+        assert!(
+            adapter
+                .emit(json!({"event":"tool_result","call_id":"unknown","name":"bash"}))
+                .is_empty()
+        );
+        let result =
+            adapter.emit(json!({"event":"tool_result","call_id":"a","name":"bash","text":"done"}));
+        assert_eq!(result[0]["params"]["update"]["toolCallId"], id);
+        assert!(adapter.tools.is_empty());
+        adapter.emit(json!({"event":"tool_call","call_id":"old","name":"read"}));
+        adapter.emit(json!({"event":"active_session","session_id":"s2"}));
+        assert!(adapter.tools.is_empty());
+        assert!(
+            adapter
+                .emit(json!({"event":"tool_result","call_id":"old","name":"read"}))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -796,5 +890,59 @@ mod tests {
         );
         assert_eq!(updates[4]["content"]["text"], "boom");
         assert_eq!(updates[4]["_meta"]["dial"], json!({"event":"fatal"}));
+    }
+    #[test]
+    fn cancellation_cannot_steal_a_prompt_response_and_notifications_have_no_reply() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+        let mut adapter = Adapter::new(layout);
+        adapter.initialized = true;
+        adapter.sessions.extend(["s1".into(), "s2".into()]);
+        adapter.active = Some("s1".into());
+        let (prompt, replies) = adapter.receive(json!({"jsonrpc":"2.0","id":1,
+            "method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"hello"}]}}));
+        assert_eq!(prompt.unwrap()["method"], "send");
+        assert!(replies.is_empty());
+        adapter
+            .permissions
+            .insert("permission".into(), "approval".into());
+        let (request, replies) = adapter.receive(json!({"jsonrpc":"2.0","id":1,
+            "method":"session/cancel","params":{"sessionId":"s1"}}));
+        assert!(request.is_none());
+        assert!(replies[0].get("error").is_some());
+        assert_eq!(adapter.pending["1"].method, "session/prompt");
+        assert_eq!(adapter.permissions.len(), 1);
+
+        let (request, replies) = adapter.receive(json!({"jsonrpc":"2.0","id":2,
+            "method":"session/cancel","params":{"sessionId":"s1"}}));
+        assert_eq!(request.unwrap()["method"], "abort");
+        assert!(replies.is_empty());
+        assert!(adapter.permissions.is_empty());
+        assert_eq!(
+            adapter.emit(json!({"id":2,"result":{"requested":true}})),
+            vec![response(&json!(2), json!({}))]
+        );
+
+        let (request, replies) = adapter.receive(json!({"jsonrpc":"2.0",
+            "method":"session/cancel","params":{"sessionId":"s1"}}));
+        assert_eq!(request.unwrap()["method"], "abort");
+        assert!(replies.is_empty());
+        assert!(
+            adapter
+                .emit(json!({"id":null,"result":{"requested":true}}))
+                .is_empty()
+        );
+        let prompt_reply = adapter.emit(json!({"id":1,"result":{"interrupted":true}}));
+        assert_eq!(
+            prompt_reply.last().unwrap(),
+            &response(&json!(1), json!({"stopReason":"cancelled"}))
+        );
+        assert!(adapter.pending.is_empty());
+
+        let (request, replies) = adapter.receive(json!({"jsonrpc":"2.0","id":3,
+            "method":"session/cancel","params":{"sessionId":"s2"}}));
+        assert!(request.is_none());
+        assert_eq!(replies, vec![response(&json!(3), json!({}))]);
     }
 }

@@ -305,11 +305,7 @@ impl<'a> Agent<'a> {
             if let Some(cost) = main.reply_cost(&reply) {
                 self.session_cost = Some(self.session_cost.unwrap_or(0.0) + cost);
             }
-            ensure!(
-                reply.finish_reason != "length" && reply.tool_calls.is_empty(),
-                "{role} response was truncated or contained tool calls; no auxiliary result was accepted"
-            );
-            return Ok(reply.text);
+            return accept_auxiliary_reply(main, role, reply);
         };
         let role_config = self.auth_config.for_role(role);
         let mut backend = match self.role_backends.remove(role) {
@@ -370,19 +366,27 @@ impl<'a> Agent<'a> {
         {
             self.session_cost = Some(self.session_cost.unwrap_or(0.0) + cost);
         }
+        let result = result.and_then(|reply| accept_auxiliary_reply(&backend, role, reply));
         backend.release();
         backend.restore_cache_namespace(previous_cache);
         let _ = backend.swap_request_profile(previous_profile);
         self.role_backends.insert(role.to_owned(), backend);
         ui.role("main", &self.config.selection().display_name());
-        result.and_then(|reply| {
-            ensure!(
-                reply.finish_reason != "length" && reply.tool_calls.is_empty(),
-                "{role} response was truncated or contained tool calls; no auxiliary result was accepted"
-            );
-            Ok(reply.text)
-        })
+        result
     }
+}
+
+/// Auxiliary replies must be complete, tool-free text. A received reply that is rejected remains
+/// physical usage, so it is recorded as a discarded attempt under the purpose that requested it.
+fn accept_auxiliary_reply(backend: &Backend, role: &str, reply: llm::Reply) -> Result<String> {
+    if reply.finish_reason == "length" || !reply.tool_calls.is_empty() || reply.dropped_tool_call()
+    {
+        backend.record_discarded_response()?;
+        anyhow::bail!(
+            "{role} response was truncated or contained tool calls; no auxiliary result was accepted"
+        );
+    }
+    Ok(reply.text)
 }
 
 pub(super) fn semantic_chat(request: &tools::navigation::SemanticRequest, max_tokens: u32) -> Chat {
