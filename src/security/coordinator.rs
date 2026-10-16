@@ -6,6 +6,7 @@
 //! `completed`, `partial` (coverage gaps or failed batches), `cancelled`, or `failed`.
 
 use std::collections::{BTreeSet, HashSet};
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,13 +15,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::contracts::{self, Plan, Scan, ScanStatus, TargetKind};
-use super::preflight::{normalize_relative, path_in_scope};
+use super::preflight::{digest_working_tree, normalize_relative, path_in_scope};
 use super::review::Reviewer;
 use super::scan::{self, Phase, REVIEWER_PROMPT, SCAN_REQUEST_HEADER, list_or_none, render};
 use super::store::Store;
 
 /// Files per reviewer task.
 const BATCH_SIZE: usize = 20;
+
+/// Characters of ref-diff material sent with one prompt: the coordinator's summary and each
+/// reviewer batch's diff. Larger material is cut and marked, so prompt size stays bounded.
+const BATCH_DIFF_MAX_CHARS: usize = 120_000;
 
 /// Coordinator prompt body after the metadata comment (verbatim).
 pub const COORDINATOR_PROMPT: &str = r#"Coordinate a software-security scan with this session's native tools.
@@ -68,27 +73,84 @@ pub struct Run {
     pub deferred: Vec<String>,
 }
 
-/// In-scope repository files for a plan, sorted and unique, plus the ref diff when one applies.
+/// Whether a scope path names the whole repository.
+fn whole_tree(path: &str) -> bool {
+    path.is_empty() || path == "."
+}
+
+/// Git pathspecs for a scope: the include roots (or the whole tree), each excluded root as an
+/// exclude pathspec. Literal magic keeps names containing glob characters exact.
+fn scope_pathspecs(include: &[String], exclude: &[String]) -> Vec<String> {
+    let mut specs: Vec<String> =
+        if include.is_empty() || include.iter().any(|path| whole_tree(path)) {
+            vec![".".to_owned()]
+        } else {
+            include
+                .iter()
+                .map(|path| format!(":(literal){path}"))
+                .collect()
+        };
+    specs.extend(
+        exclude
+            .iter()
+            .filter(|path| !whole_tree(path))
+            .map(|path| format!(":(exclude,literal){path}")),
+    );
+    specs
+}
+
+/// Arguments of `git diff <flags> <base> <head> -- <specs>`.
+fn ref_diff_args<'a>(
+    flags: &[&'a str],
+    base: &'a str,
+    head: &'a str,
+    specs: &'a [String],
+) -> Vec<&'a str> {
+    let mut args: Vec<&'a str> = vec!["diff"];
+    args.extend_from_slice(flags);
+    args.extend([base, head, "--"]);
+    args.extend(specs.iter().map(String::as_str));
+    args
+}
+
+/// In-scope repository files for a plan, sorted and unique, plus the ref-diff summary when one
+/// applies. For a ref diff, the inventory and the summary come from the same pathspecs and the
+/// same base and head commit IDs.
 fn scope_files(plan: &Plan) -> Result<(Vec<String>, Option<String>)> {
     let target = &plan.target;
     let root = &plan.repository_root;
-    let (raw, diff) = match target.kind {
+    if target.exclude_paths.iter().any(|path| whole_tree(path)) {
+        return Ok((Vec::new(), None));
+    }
+    let (raw, summary) = match target.kind {
         TargetKind::RefDiff => {
             let base = target.base_revision.clone().unwrap_or_default();
             let head = target.head_revision.clone().unwrap_or_default();
+            let specs = scope_pathspecs(&target.include_paths, &target.exclude_paths);
             let names = git(
                 root,
-                &[
-                    "diff",
-                    "--name-only",
-                    "-z",
-                    "--diff-filter=d",
-                    base.as_str(),
-                    head.as_str(),
-                ],
+                &ref_diff_args(
+                    &["--name-only", "-z", "--no-renames", "--diff-filter=d"],
+                    &base,
+                    &head,
+                    &specs,
+                ),
             )?;
-            let diff = git(root, &["diff", base.as_str(), head.as_str()])?;
-            (names, Some(diff))
+            let summary = if names.is_empty() {
+                None
+            } else {
+                let stat = git(
+                    root,
+                    &ref_diff_args(
+                        &["--stat", "--no-color", "--no-renames"],
+                        &base,
+                        &head,
+                        &specs,
+                    ),
+                )?;
+                Some(bounded(&stat, BATCH_DIFF_MAX_CHARS))
+            };
+            (names, summary)
         }
         TargetKind::Repository | TargetKind::WorkingTree | TargetKind::ScopedPath => {
             let tracked = git(root, &["ls-files", "-z"])?;
@@ -105,7 +167,7 @@ fn scope_files(plan: &Plan) -> Result<(Vec<String>, Option<String>)> {
         .collect();
     files.sort();
     files.dedup();
-    Ok((files, diff))
+    Ok((files, summary))
 }
 
 fn git(root: &str, args: &[&str]) -> Result<String> {
@@ -122,6 +184,112 @@ fn git(root: &str, args: &[&str]) -> Result<String> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Diff material for one reviewer batch: the base-to-head diff of that batch's files, bounded.
+/// Repository-state targets carry no ref diff.
+fn batch_diff(plan: &Plan, batch: &[String]) -> Result<Option<String>> {
+    let target = &plan.target;
+    if !matches!(target.kind, TargetKind::RefDiff) {
+        return Ok(None);
+    }
+    let base = target.base_revision.clone().unwrap_or_default();
+    let head = target.head_revision.clone().unwrap_or_default();
+    let specs: Vec<String> = batch
+        .iter()
+        .map(|path| format!(":(literal){path}"))
+        .collect();
+    let diff = git(
+        &plan.repository_root,
+        &ref_diff_args(
+            &["--no-color", "--no-ext-diff", "--no-renames"],
+            &base,
+            &head,
+            &specs,
+        ),
+    )?;
+    Ok(Some(bounded(&diff, BATCH_DIFF_MAX_CHARS)))
+}
+
+/// `text` cut to `limit` characters, with a marker stating how much was omitted.
+fn bounded(text: &str, limit: usize) -> String {
+    let total = text.chars().count();
+    if total <= limit {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!(
+        "{kept}\n[diff truncated: {} characters omitted]",
+        total - limit
+    )
+}
+
+/// Digest of the in-scope working tree that the reviewers read. Results are attributed to it.
+fn source_witness(plan: &Plan) -> Result<String> {
+    digest_working_tree(
+        Path::new(&plan.repository_root),
+        &plan.target.include_paths,
+        &plan.target.exclude_paths,
+    )
+}
+
+/// Reasons a ref review does not describe its requested revision. Reviewers read the checked-out
+/// files, so the review is qualified unless the checkout is the requested head, the in-scope files
+/// match it, and every inventory file exists in it.
+fn source_qualifications(plan: &Plan, inventory: &[String]) -> Result<Vec<String>> {
+    let target = &plan.target;
+    if !matches!(target.kind, TargetKind::RefDiff) {
+        return Ok(Vec::new());
+    }
+    let root = plan.repository_root.as_str();
+    let head = target.head_revision.clone().unwrap_or_default();
+    let specs = scope_pathspecs(&target.include_paths, &target.exclude_paths);
+    let mut notes = Vec::new();
+    let checked_out = checkout_head(root);
+    if checked_out.as_deref() != Some(head.as_str()) {
+        notes.push(format!(
+            "checkout {} is not the requested head {head}; reviewers read the checked-out files",
+            checked_out.as_deref().unwrap_or("(unborn)")
+        ));
+    }
+    if differs_from(root, &head, &specs) {
+        notes.push(format!(
+            "in-scope working tree differs from the requested head {head}"
+        ));
+    }
+    for path in inventory {
+        if !Path::new(root).join(path).exists() {
+            notes.push(format!(
+                "{path}: absent from the checked-out tree; the requested revision was not read"
+            ));
+        }
+    }
+    Ok(notes)
+}
+
+/// The commit that the checkout's `HEAD` names; `None` when unborn or unreadable.
+fn checkout_head(root: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Whether the checkout's files under `specs` differ from `revision` (`git diff --quiet`).
+fn differs_from(root: &str, revision: &str, specs: &[String]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--quiet", "--no-ext-diff", revision, "--"])
+        .args(specs)
+        .output()
+        .is_ok_and(|output| output.status.code() == Some(1))
 }
 
 /// The scan request header rendered for `plan`.
@@ -263,10 +431,13 @@ fn execute(
 ) -> Result<(ScanStatus, Vec<String>)> {
     let id = scan.id.clone();
     scan::set_phase(&id, Phase::Preparing);
-    let (inventory, diff) = scope_files(plan)?;
+    let (inventory, summary) = scope_files(plan)?;
+    // The source the reviewers read is fingerprinted here and checked again before publishing.
+    let witness = source_witness(plan)?;
+    let mut deferred = source_qualifications(plan, &inventory)?;
 
     scan::set_phase(&id, Phase::Reviewing);
-    let prompt = coordinator_prompt(plan, &inventory, diff.as_deref());
+    let prompt = coordinator_prompt(plan, &inventory, summary.as_deref());
     let text = match reviewer.run_reviewer(&prompt, &plan_schema()) {
         Ok(text) => text,
         Err(_) if stopped(store, &id, cancel, reviewer) => {
@@ -276,19 +447,17 @@ fn execute(
     };
     let (batches, unassigned) = assign(&inventory, &text)?;
 
-    let mut deferred: Vec<String> = unassigned
-        .into_iter()
-        .map(|path| format!("{path}: not assigned by coordinator"))
-        .collect();
-    let mut status = if deferred.is_empty() {
-        ScanStatus::Completed
-    } else {
-        ScanStatus::Partial
-    };
+    deferred.extend(
+        unassigned
+            .into_iter()
+            .map(|path| format!("{path}: not assigned by coordinator")),
+    );
+    let mut partial = !deferred.is_empty();
     for batch in &batches {
         if stopped(store, &id, cancel, reviewer) {
             return Ok((ScanStatus::Cancelled, deferred));
         }
+        let diff = batch_diff(plan, batch)?;
         let prompt = batch_prompt(plan, batch, diff.as_deref());
         let report = reviewer
             .run_reviewer(&prompt, &scan::reviewer_schema())
@@ -300,7 +469,7 @@ fn execute(
                     .filter(|path| !report.reviewed.contains(*path))
                     .collect();
                 if !uncovered.is_empty() || report.has_deferred {
-                    status = ScanStatus::Partial;
+                    partial = true;
                 }
                 for path in uncovered {
                     deferred.push(format!("{path}: not reported as reviewed"));
@@ -319,14 +488,28 @@ fn execute(
                 if stopped(store, &id, cancel, reviewer) {
                     return Ok((ScanStatus::Cancelled, deferred));
                 }
-                status = ScanStatus::Partial;
+                partial = true;
                 for path in batch {
                     deferred.push(format!("{path}: review failed: {error:#}"));
                 }
             }
         }
     }
+    // Revalidate before publishing: a tree that changed while the reviewers read it must not be
+    // reported as complete under the fingerprint it was planned with.
+    if source_witness(plan)? != witness {
+        partial = true;
+        deferred.push(
+            "source changed during review: the findings describe files that are no longer current; run the scan again"
+                .to_owned(),
+        );
+    }
     scan::set_phase(&id, Phase::Publishing);
+    let status = if partial {
+        ScanStatus::Partial
+    } else {
+        ScanStatus::Completed
+    };
     Ok((status, deferred))
 }
 
@@ -427,12 +610,16 @@ mod tests {
 
     /// Scripted reviewer. Records each prompt and the phase of the running scan. `cancel_after`
     /// requests cancellation through the scan registry once that many prompts have run.
+    /// Scripted reviewer. Records each prompt and the phase of the running scan. `cancel_after`
+    /// requests cancellation through the scan registry once that many prompts have run.
+    /// `rewrite_after` overwrites a file once that many prompts have run, as if edited mid-scan.
     struct Fake<'s> {
         store: &'s Store,
         replies: VecDeque<Reply>,
         prompts: Vec<String>,
         phases: Vec<Option<Phase>>,
         cancel_after: Option<usize>,
+        rewrite_after: Option<(usize, std::path::PathBuf)>,
     }
 
     impl<'s> Fake<'s> {
@@ -443,6 +630,7 @@ mod tests {
                 prompts: Vec::new(),
                 phases: Vec::new(),
                 cancel_after: None,
+                rewrite_after: None,
             }
         }
     }
@@ -454,6 +642,11 @@ mod tests {
                 self.phases.push(scan::phase(&scan.id));
                 if self.cancel_after == Some(self.prompts.len()) {
                     scan::request_cancel(&scan.id);
+                }
+            }
+            if let Some((after, path)) = &self.rewrite_after {
+                if self.prompts.len() == *after {
+                    fs::write(path, "fn changed() {}\n").unwrap();
                 }
             }
             match self.replies.pop_front() {
@@ -629,5 +822,131 @@ mod tests {
     #[test]
     fn cancel_request_reaches_only_a_running_scan() {
         assert!(!scan::request_cancel("secscan_not_running"));
+    }
+
+    /// Commits everything staged in `repo` with a fixed identity.
+    fn commit_all(repo: &std::path::Path, message: &str) {
+        git_in(
+            repo,
+            &[
+                "-c",
+                "user.name=Dial Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ],
+        );
+    }
+
+    /// A ref-diff fixture: `base` and `head` commits where `head` changes an in-scope file, an
+    /// excluded file, and deletes an in-scope file. The scope is `src`.
+    fn ref_fixture() -> (tempfile::TempDir, Plan, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        for sub in ["src", "other", "docs"] {
+            fs::create_dir_all(repo.join(sub)).unwrap();
+        }
+        git_in(&repo, &["init", "-q"]);
+        fs::write(repo.join("src/keep.rs"), "fn keep() {}\n").unwrap();
+        fs::write(repo.join("src/gone.rs"), "fn gone() {}\n").unwrap();
+        fs::write(repo.join("other/secret.rs"), "fn secret() {}\n").unwrap();
+        fs::write(repo.join("docs/readme.md"), "docs\n").unwrap();
+        git_in(&repo, &["add", "-A"]);
+        commit_all(&repo, "base");
+        fs::write(repo.join("src/keep.rs"), "fn keep() { INCLUDED_CHANGE }\n").unwrap();
+        fs::remove_file(repo.join("src/gone.rs")).unwrap();
+        fs::write(
+            repo.join("other/secret.rs"),
+            "fn secret() { SECRET_EXCLUDED_MARKER }\n",
+        )
+        .unwrap();
+        git_in(&repo, &["add", "-A"]);
+        commit_all(&repo, "head");
+        let output = dir.path().join("outputs");
+        let request = PlanRequest {
+            cwd: &repo,
+            target: TargetRequest::RefDiff {
+                base: "HEAD~1".into(),
+                head: "HEAD".into(),
+                include: vec!["src".into()],
+                exclude: vec![],
+            },
+            knowledge_bases: vec![],
+            output_root: &output,
+            archive_existing: false,
+            model: ModelRef {
+                provider: "openai".into(),
+                model_id: "test-model".into(),
+                thinking_level: None,
+            },
+            account: AccountRef {
+                provider: "openai-codex".into(),
+                credential_id: "test-account".into(),
+            },
+            config_material: json!({"model": "test-model"}),
+            workflow_fingerprint: "test".into(),
+        };
+        let plan = preflight::create_plan(&request, "2024-01-01T00:00:00Z").unwrap();
+        let store = Store::open(&dir.path().join("user"), &plan.repository_root).unwrap();
+        (dir, plan, store)
+    }
+
+    #[test]
+    fn scoped_ref_review_sends_only_in_scope_diff_material() {
+        let (_dir, plan, store) = ref_fixture();
+        let inventory = scope_files(&plan).unwrap().0;
+        assert_eq!(inventory, vec!["src/keep.rs".to_owned()]);
+        let replies = vec![
+            ok(assignment(std::slice::from_ref(&inventory))),
+            ok(report(&inventory)),
+        ];
+        let mut reviewer = Fake::new(&store, replies);
+        let run = start(&store, &plan, &mut reviewer).unwrap();
+        assert_eq!(run.scan.status, ScanStatus::Completed);
+        assert_eq!(reviewer.prompts.len(), 2);
+        for prompt in &reviewer.prompts {
+            assert!(
+                !prompt.contains("SECRET_EXCLUDED_MARKER"),
+                "excluded bytes reached a prompt"
+            );
+            assert!(!prompt.contains("other/secret.rs"));
+        }
+        assert!(reviewer.prompts[1].contains("INCLUDED_CHANGE"));
+    }
+
+    #[test]
+    fn empty_ref_scope_has_no_inventory_or_summary() {
+        let (_dir, mut plan, _store) = ref_fixture();
+        plan.target.include_paths = vec!["docs".into()];
+        let (files, summary) = scope_files(&plan).unwrap();
+        assert!(files.is_empty());
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn source_changed_during_review_is_published_as_partial() {
+        let inventory = paths(3);
+        let (dir, plan, store) = fixture(&inventory);
+        let chunks = chunks_of(&inventory);
+        let replies = vec![ok(assignment(&chunks)), ok(report(&chunks[0]))];
+        let mut reviewer = Fake::new(&store, replies);
+        // Edit a reviewed file after the batch prompt has been handed to the reviewer.
+        reviewer.rewrite_after = Some((2, dir.path().join("repo").join(&inventory[0])));
+        let run = start(&store, &plan, &mut reviewer).unwrap();
+        assert_eq!(run.scan.status, ScanStatus::Partial);
+        assert!(
+            run.deferred
+                .iter()
+                .any(|item| item.contains("source changed during review"))
+        );
+        assert_eq!(
+            store.load_scan(&run.scan.id).unwrap().status,
+            ScanStatus::Partial
+        );
     }
 }

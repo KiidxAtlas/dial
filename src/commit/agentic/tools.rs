@@ -1,7 +1,8 @@
 //! Tool surface of the agentic commit loop: schemas, handlers, and per-run state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value as Json, json};
 
@@ -17,11 +18,12 @@ use super::validation::{
     MAX_DETAIL_ITEMS, SUMMARY_MAX_CHARS, cap_details, is_test_path, normalize_summary,
     parse_category, validate_analysis, validate_summary_rules, validate_type_consistency,
 };
+use crate::commit::ai_stage::map_bounded;
 use crate::commit::changelog::parse::normalize_items;
 use crate::commit::commit_types::{COMMIT_TYPE_ORDER, canonical_commit_type, coerce_commit_type};
 use crate::commit::config::GenerationConfig;
 use crate::commit::diff::{FileStatus, parse_file_diffs, parse_file_hunks, parse_prompt_diff};
-use crate::commit::execute::git_output;
+use crate::commit::execute::{git_output, git_output_indexed};
 use crate::commit::run::{CommitBackend, CommitError};
 use crate::commit::scope::extract_scope_candidates;
 use crate::config::types::Config;
@@ -85,6 +87,10 @@ pub(crate) struct ToolEnv<'a> {
     pub(crate) numstat: Vec<NumstatEntry>,
     /// Changelog files that the flow may update.
     pub(crate) changelog_targets: Vec<String>,
+    /// Index the run reads and writes: the repository's own, or a private copy for a preview.
+    pub(crate) index: Option<PathBuf>,
+    /// Set by the caller to stop `analyze_files` from admitting further model calls.
+    pub(crate) cancel: &'a AtomicBool,
     pub(crate) state: CommitAgentState,
 }
 
@@ -277,6 +283,12 @@ fn message(error: CommitError) -> String {
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     git_output(root, args, "Git command failed").map_err(message)
+}
+
+/// Git read of the run's staged state. It uses the run's index, so a preview never reads the
+/// user's own index.
+fn git_index(env: &ToolEnv<'_>, args: &[&str]) -> Result<String, String> {
+    git_output_indexed(env.root, env.index.as_deref(), args, "Git command failed").map_err(message)
 }
 
 /// `git diff [--cached] <extra>` arguments.
@@ -487,7 +499,7 @@ fn file_diff(env: &mut ToolEnv<'_>, file: &str, staged: bool) -> Result<String, 
             pathspec.as_str(),
         ],
     );
-    let diff = git(env.root, &args)?;
+    let diff = git_index(env, &args)?;
     env.state.diff_cache.insert(key, diff.clone());
     Ok(diff)
 }
@@ -495,13 +507,13 @@ fn file_diff(env: &mut ToolEnv<'_>, file: &str, staged: bool) -> Result<String, 
 fn git_overview(env: &mut ToolEnv<'_>, args: &Json) -> Result<String, String> {
     let staged = opt_bool(args, "staged", true);
     let include_untracked = opt_bool(args, "include_untracked", false);
-    let names = git(
-        env.root,
+    let names = git_index(
+        env,
         &diff_args(staged, &["--name-only", "--no-renames", "--no-color", "-z"]),
     )?;
-    let stat = git(env.root, &diff_args(staged, &["--stat", "--no-color"]))?;
-    let numstat_raw = git(
-        env.root,
+    let stat = git_index(env, &diff_args(staged, &["--stat", "--no-color"]))?;
+    let numstat_raw = git_index(
+        env,
         &diff_args(staged, &["--numstat", "--no-renames", "-z"]),
     )?;
 
@@ -530,14 +542,11 @@ fn git_overview(env: &mut ToolEnv<'_>, args: &Json) -> Result<String, String> {
         .join("\n");
     let scope = extract_scope_candidates(&kept_numstat_raw, &GenerationConfig::default());
     let untracked_files: Vec<String> = if include_untracked {
-        git(
-            env.root,
-            &["ls-files", "--others", "--exclude-standard", "-z"],
-        )?
-        .split('\0')
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect()
+        git_index(env, &["ls-files", "--others", "--exclude-standard", "-z"])?
+            .split('\0')
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
     } else {
         Vec::new()
     };
@@ -747,70 +756,112 @@ fn recent_commits(root: &Path, args: &Json) -> Result<String, String> {
     Ok(serde_json::to_string_pretty(&out).unwrap_or_default())
 }
 
+/// Largest number of files named in the shared overview of `analyze_files`.
+const ANALYZE_OVERVIEW_FILES: usize = 40;
+/// Character budget for all prompts of one `analyze_files` call. Files that do not fit are
+/// reported as skipped instead of being sent.
+const ANALYZE_PROMPT_BUDGET_CHARS: usize = 400_000;
+
+/// The change's file list, shared by every prompt of one call. It names at most
+/// `ANALYZE_OVERVIEW_FILES` files, so each prompt carries a bounded overview rather than the
+/// whole list.
+fn analysis_overview(env: &ToolEnv<'_>, files: &[String]) -> String {
+    let mut lines: Vec<String> = files
+        .iter()
+        .take(ANALYZE_OVERVIEW_FILES)
+        .map(|file| {
+            format!(
+                "- {file} ({} lines): {}",
+                lines_changed(env, file),
+                file_type(file)
+            )
+        })
+        .collect();
+    if files.len() > ANALYZE_OVERVIEW_FILES {
+        lines.push(format!(
+            "- … and {} more files",
+            files.len() - ANALYZE_OVERVIEW_FILES
+        ));
+    }
+    format!("FILES IN THIS CHANGE:\n{}", lines.join("\n"))
+}
+
 fn analyze_files(env: &ToolEnv<'_>, args: &Json) -> Result<String, String> {
-    let files = str_list(args, "files")?;
+    let requested = str_list(args, "files")?;
+    // A path requested twice is analysed once, at its first position.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let files: Vec<String> = requested
+        .into_iter()
+        .filter(|file| seen.insert(file.clone()))
+        .collect();
     if files.is_empty() {
         return Err("files must contain at least one path".to_owned());
     }
     let goal = trimmed_opt(args.get("goal").and_then(Json::as_str)).unwrap_or_default();
-    // Prompts read `env`, so they are built first. The model calls then run concurrently,
-    // and the results keep input order.
-    let mut prompts: Vec<(&str, String)> = Vec::with_capacity(files.len());
+    let overview = analysis_overview(env, &files);
+    // Prompts are rendered before any call, against one aggregate budget. Files that do not fit
+    // are reported as skipped; the rest run on the bounded pool and keep input order.
+    let mut used = 0usize;
+    let mut jobs: Vec<(&str, Result<String, String>)> = Vec::with_capacity(files.len());
     for file in &files {
-        let related: Vec<String> = files
-            .iter()
-            .filter(|other| *other != file)
-            .map(|other| {
-                format!(
-                    "- {other} ({} lines): {}",
-                    lines_changed(env, other),
-                    file_type(other)
-                )
-            })
-            .collect();
-        let related_text = if related.is_empty() {
-            String::new()
-        } else {
-            format!("OTHER FILES IN THIS CHANGE:\n{}", related.join("\n"))
-        };
         let prompt = render(
             ANALYZE_TEMPLATE,
             &Value::map([
                 ("file", Value::text(file)),
                 ("goal", Value::text(&goal)),
-                ("related_files", Value::text(related_text)),
+                ("related_files", Value::text(&overview)),
             ]),
         )?;
-        prompts.push((file.as_str(), prompt));
+        let size = prompt.chars().count();
+        if used + size > ANALYZE_PROMPT_BUDGET_CHARS {
+            jobs.push((
+                file.as_str(),
+                Err(format!(
+                    "Analysis skipped for {file}: the prompt budget for this call is used up"
+                )),
+            ));
+            continue;
+        }
+        used += size;
+        jobs.push((file.as_str(), Ok(prompt)));
     }
     let backend = env.backend;
     let config = env.config;
-    let entries: Vec<Option<String>> = std::thread::scope(|scope| {
-        let handles: Vec<(&str, _)> = prompts
-            .into_iter()
-            .map(|(file, prompt)| {
-                (
-                    file,
-                    scope.spawn(move || analyze_one(backend, config, file, prompt)),
-                )
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|(file, handle)| {
-                handle.join().unwrap_or_else(|_| {
-                    Some(format!(
-                        "Analysis failed for {file}: analysis thread panicked"
-                    ))
-                })
-            })
-            .collect()
+    let entries = map_bounded(&jobs, env.cancel, |(file, job)| match job {
+        Ok(prompt) => analyze_guarded(backend, config, file, prompt),
+        Err(skipped) => Some(skipped.clone()),
     });
-    let results: Vec<String> = entries.into_iter().flatten().collect();
+    // Items the pool never admitted (cancellation) keep their slot as `None`.
+    let results: Vec<String> = jobs
+        .iter()
+        .zip(entries)
+        .filter_map(|(job, entry)| match entry {
+            Some(text) => text,
+            None => Some(format!("Analysis cancelled for {}", job.0)),
+        })
+        .collect();
     if results.is_empty() {
         return Ok("(no output)".to_owned());
     }
     Ok(results.join("\n\n"))
+}
+
+/// One guarded model call for `analyze_files`. A panic inside the call becomes a failure note for
+/// that file instead of aborting the whole analysis.
+fn analyze_guarded(
+    backend: &dyn CommitBackend,
+    config: &Config,
+    file: &str,
+    prompt: &str,
+) -> Option<String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        analyze_one(backend, config, file, prompt)
+    }))
+    .unwrap_or_else(|_| {
+        Some(format!(
+            "Analysis failed for {file}: analysis thread panicked"
+        ))
+    })
 }
 
 /// One model call for `analyze_files`. `None` when the model returns no text.
@@ -818,7 +869,7 @@ fn analyze_one(
     backend: &dyn CommitBackend,
     config: &Config,
     file: &str,
-    prompt: String,
+    prompt: &str,
 ) -> Option<String> {
     let chat = Chat {
         messages: vec![json!({"role": "user", "content": prompt})],
@@ -989,9 +1040,9 @@ fn parse_change(value: &Json) -> Result<FileChange, String> {
 }
 
 /// Line count of the staged version of `path`, `None` when it cannot be read.
-fn staged_line_count(root: &Path, path: &str) -> Option<u64> {
+fn staged_line_count(env: &ToolEnv<'_>, path: &str) -> Option<u64> {
     let spec = format!(":{path}");
-    git(root, &["show", spec.as_str()])
+    git_index(env, &["show", spec.as_str()])
         .ok()
         .map(|content| content.lines().count() as u64)
 }
@@ -1145,7 +1196,7 @@ fn split_commit(env: &mut ToolEnv<'_>, args: &Json) -> Result<String, String> {
                 FileChange::Lines { path, start, end } => {
                     let valid = *start >= 1
                         && start <= end
-                        && staged_line_count(env.root, path).is_some_and(|lines| *end <= lines);
+                        && staged_line_count(env, path).is_some_and(|lines| *end <= lines);
                     if !valid {
                         errors.push(format!("{prefix}invalid line range for {path}"));
                     }

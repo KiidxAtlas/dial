@@ -1764,7 +1764,8 @@ fn final_report_reconciles_optional_progress_without_extra_requests() {
         .turn("Write both reports", &mut Recorder::default())
         .unwrap();
     assert_eq!(report.outcome, TurnOutcome::Completed);
-    assert!(!agent.todo().has_open());
+    // A14-01: a completed turn never marks work that was not started as done.
+    assert!(agent.todo().has_open());
     assert_eq!(server.requests.lock().len(), 2);
 }
 
@@ -3423,9 +3424,15 @@ fn compaction_keeps_recent_turns_and_replaces_older_ones_with_a_summary() {
     }
     a.compact(&mut ui).unwrap();
     let usage = a.usage().0;
-    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests, 3);
+    assert_eq!(
+        usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests,
+        3
+    );
     assert!(usage.by_purpose[&dial::llm::usage::Purpose::Compaction].requests > 0);
-    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Compaction].requests, usage.workers.requests);
+    assert_eq!(
+        usage.by_purpose[&dial::llm::usage::Purpose::Compaction].requests,
+        usage.workers.requests
+    );
     let messages = a.session().messages();
     assert!(
         messages[0]["content"].as_str().unwrap().contains("SUMMARY"),
@@ -3602,7 +3609,12 @@ fn manual_compaction_with_nothing_to_cut_is_a_successful_no_op() {
     );
     assert_eq!(a.session().messages(), before, "history is untouched");
     assert_eq!(a.metrics().compactions, 0);
-    assert!(!a.usage().0.by_purpose.contains_key(&dial::llm::usage::Purpose::Compaction));
+    assert!(
+        !a.usage()
+            .0
+            .by_purpose
+            .contains_key(&dial::llm::usage::Purpose::Compaction)
+    );
     assert!(
         ui.notices
             .iter()
@@ -4004,8 +4016,14 @@ fn automatic_compaction_uses_the_selected_role_during_a_live_turn() {
     assert_eq!(a.turn("three?", &mut ui).unwrap().text, "third");
     assert_eq!(side.requests.lock()[0]["model"], "summary-model");
     let usage = a.usage().0;
-    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests, 3);
-    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Compaction].requests, side.requests.lock().len() as u64);
+    assert_eq!(
+        usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests,
+        3
+    );
+    assert_eq!(
+        usage.by_purpose[&dial::llm::usage::Purpose::Compaction].requests,
+        side.requests.lock().len() as u64
+    );
     assert!(
         a.session().messages()[0]["content"]
             .as_str()
@@ -8245,8 +8263,14 @@ fn semantic_find_uses_current_model_and_preserves_native_tool_pairs() {
     assert_eq!(report.text, "cache implementation located");
     assert_eq!(ui.calls, ["find"]);
     let usage = a.usage().0;
-    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Retrieval].requests, 1);
-    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests, 2);
+    assert_eq!(
+        usage.by_purpose[&dial::llm::usage::Purpose::Retrieval].requests,
+        1
+    );
+    assert_eq!(
+        usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests,
+        2
+    );
     assert_eq!(usage.workers.requests, 1);
     let requests = server.requests.lock();
     assert_eq!(
@@ -8306,8 +8330,14 @@ fn semantic_find_rejects_fabricated_ranking_and_exact_mode_bypasses_inference() 
     assert!(error.contains("outside captured evidence") && !error.contains("cache.rs:"));
     drop(requests);
     let usage = a.usage().0;
-    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Retrieval].requests, 1);
-    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests, 2);
+    assert_eq!(
+        usage.by_purpose[&dial::llm::usage::Purpose::Retrieval].requests,
+        1
+    );
+    assert_eq!(
+        usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests,
+        2
+    );
     let exact = serve(vec![
         Reply::Call("find", json!({"query":"memo.get","mode":"exact"})),
         Reply::Text("exact located"),
@@ -8320,7 +8350,12 @@ fn semantic_find_rejects_fabricated_ranking_and_exact_mode_bypasses_inference() 
     let requests = exact.requests.lock();
     assert_eq!(requests.len(), 2, "exact retrieval has no ranking request");
     assert!(requests[1]["messages"].to_string().contains("cache.rs:2-2"));
-    assert!(!a.usage().0.by_purpose.contains_key(&dial::llm::usage::Purpose::Retrieval));
+    assert!(
+        !a.usage()
+            .0
+            .by_purpose
+            .contains_key(&dial::llm::usage::Purpose::Retrieval)
+    );
 }
 
 #[test]
@@ -8362,8 +8397,14 @@ fn delegated_semantic_find_reuses_the_child_backend_and_request_budget() {
         "delegated evidence received"
     );
     let usage = a.usage().0;
-    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Retrieval].requests, 1);
-    assert_eq!(usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests, 4);
+    assert_eq!(
+        usage.by_purpose[&dial::llm::usage::Purpose::Retrieval].requests,
+        1
+    );
+    assert_eq!(
+        usage.by_purpose[&dial::llm::usage::Purpose::Agent].requests,
+        4
+    );
     assert_eq!(usage.workers.requests, 3);
     let requests = side.requests.lock();
     assert_eq!(requests.len(), 3);

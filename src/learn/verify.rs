@@ -85,8 +85,12 @@ impl Check {
             Check::FileContains { path, needle } => {
                 read(workspace, path).is_some_and(|c| c.contains(needle.as_str()))
             }
+            // Only a definite NotFound proves absence; any other metadata error is unavailable.
             Check::FileAbsent { path } => match confine(workspace, path) {
-                Some(p) => fs::symlink_metadata(p).is_err(),
+                Some(p) => matches!(
+                    fs::symlink_metadata(p),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                ),
                 None => false,
             },
             Check::JsonFile {
@@ -122,8 +126,13 @@ fn confine(root: &Path, rel: &str) -> Option<PathBuf> {
     let mut probe = root.to_path_buf();
     for part in p.components() {
         probe.push(part);
-        if fs::symlink_metadata(&probe).is_ok_and(|m| m.file_type().is_symlink()) {
-            return None;
+        match fs::symlink_metadata(&probe) {
+            Ok(meta) if meta.file_type().is_symlink() => return None,
+            Ok(_) => {}
+            // A missing ancestor means the target is absent, not that the walk failed.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Unreadable or otherwise unknown components cannot be confined.
+            Err(_) => return None,
         }
     }
     Some(full)
@@ -302,6 +311,62 @@ mod tests {
             !Check::All { checks: vec![] }.verify(w, ""),
             "an empty All must not pass vacuously"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_definite_not_found_proves_file_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root reads through directories without search permission, so only the absence
+        // assertion is meaningful there.
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let privileged = unsafe { libc::geteuid() } == 0;
+        let dir = tempfile::tempdir().unwrap();
+        let w = dir.path();
+        fs::write(w.join("present.txt"), "x").unwrap();
+        assert!(
+            Check::FileAbsent {
+                path: "missing.txt".into()
+            }
+            .verify(w, "")
+        );
+        assert!(
+            Check::FileAbsent {
+                path: "missing/child.txt".into()
+            }
+            .verify(w, "")
+        );
+        assert!(
+            !Check::FileAbsent {
+                path: "present.txt".into()
+            }
+            .verify(w, "")
+        );
+        std::os::unix::fs::symlink(w.join("present.txt"), w.join("link")).unwrap();
+        assert!(
+            !Check::FileAbsent {
+                path: "link".into()
+            }
+            .verify(w, ""),
+            "symlink components are rejected rather than treated as absent"
+        );
+        // Metadata for a child of a non-searchable directory fails with PermissionDenied.
+        fs::create_dir(w.join("locked")).unwrap();
+        fs::write(w.join("locked/secret.txt"), "x").unwrap();
+        fs::set_permissions(w.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let absent = Check::FileAbsent {
+            path: "locked/secret.txt".into(),
+        }
+        .verify(w, "");
+        let readable = Check::FileContains {
+            path: "locked/secret.txt".into(),
+            needle: "x".into(),
+        }
+        .verify(w, "");
+        // Restore access before any assertion can fail, so the temporary directory cleans up.
+        fs::set_permissions(w.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!absent, "an inaccessible file must not count as deleted");
+        assert!(privileged || !readable);
     }
 
     #[cfg(unix)]

@@ -11,16 +11,17 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tungstenite::handshake::derive_accept_key;
-use tungstenite::protocol::Role;
+use tungstenite::protocol::{Role, WebSocketConfig};
 use tungstenite::{Message, WebSocket};
 
 use super::bridge::{Relay, Snapshot};
+use super::outbox::{self, OutboxReceiver};
 use super::protocol::{ExtMessage, PROTOCOL_VERSION, TOKEN_HEADER};
 
 /// Longest request head accepted before the connection is refused.
@@ -32,6 +33,14 @@ const POLL: Duration = Duration::from_millis(20);
 const EXTENSION_SILENCE: Duration = Duration::from_secs(60);
 const EXTENSION_ORIGIN_PREFIX: &str = "chrome-extension://";
 const NOT_CONNECTED_MESSAGE: &str = "Dial browser extension is not connected. Run `dial browser-relay install`, then load the printed folder in chrome://extensions.";
+/// Inbound limit per WebSocket message and per frame. Outbound limits live in `outbox`.
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// CDP requests one client may have running at once. Requests past the cap get an error reply.
+const MAX_IN_FLIGHT_PER_CLIENT: usize = 64;
+const BUSY_MESSAGE: &str =
+    "too many requests are running for this client; wait for earlier responses";
+/// A peer that stops reading for this long loses its connection instead of pinning its queue.
+const WRITE_STALL: Duration = Duration::from_secs(10);
 
 /// Everything a connection thread needs. Shared through `Arc`.
 pub struct Shared {
@@ -83,6 +92,7 @@ impl Head {
 
 fn handle_connection(mut stream: TcpStream, shared: &Shared) {
     let _ = stream.set_read_timeout(Some(HEAD_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(WRITE_STALL));
     let head = match read_head(&mut stream) {
         Ok(head) => head,
         Err(_) => {
@@ -300,11 +310,13 @@ fn upgrade(stream: &mut TcpStream, head: &Head) -> Option<WebSocket<TcpStream>> 
     );
     stream.write_all(response.as_bytes()).ok()?;
     stream.set_read_timeout(Some(POLL)).ok()?;
+    // Blocked writes return after one poll so queued output is measured rather than pinning the thread.
+    stream.set_write_timeout(Some(POLL)).ok()?;
     let _ = stream.set_nodelay(true);
     Some(WebSocket::from_raw_socket(
         stream.try_clone().ok()?,
         Role::Server,
-        None,
+        Some(socket_config()),
     ))
 }
 
@@ -339,36 +351,96 @@ fn send_text(ws: &mut WebSocket<TcpStream>, text: String) -> Result<(), tungsten
     }
 }
 
-fn flush(ws: &mut WebSocket<TcpStream>) -> Result<(), tungstenite::Error> {
+/// Pushes buffered output. `Ok(false)` means the peer is not reading yet.
+fn flush(ws: &mut WebSocket<TcpStream>) -> Result<bool, tungstenite::Error> {
     match ws.flush() {
-        Err(tungstenite::Error::Io(error)) if is_would_block(&error) => Ok(()),
-        other => other,
+        Ok(()) => Ok(true),
+        Err(tungstenite::Error::Io(error)) if is_would_block(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Inbound limits for one socket. Outbound limits are the bounded queue in `outbox`.
+fn socket_config() -> WebSocketConfig {
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(MAX_MESSAGE_BYTES);
+    config.max_frame_size = Some(MAX_MESSAGE_BYTES);
+    config.max_write_buffer_size = outbox::MAX_QUEUED_BYTES + 1024 * 1024;
+    config
+}
+
+/// Writes queued frames while the socket accepts them. Returns false when this connection must
+/// end: its queue overflowed, a write failed, or the peer stopped reading for `WRITE_STALL`.
+fn pump(ws: &mut WebSocket<TcpStream>, rx: &OutboxReceiver, stalled: &mut Option<Instant>) -> bool {
+    loop {
+        if rx.is_overloaded() {
+            return false;
+        }
+        match flush(ws) {
+            Ok(true) => *stalled = None,
+            Ok(false) => {
+                // Output the peer is not reading stays buffered; take nothing more until it drains.
+                let since = *stalled.get_or_insert_with(Instant::now);
+                return since.elapsed() < WRITE_STALL;
+            }
+            Err(_) => return false,
+        }
+        let Ok(frame) = rx.try_recv() else {
+            return true;
+        };
+        if send_text(ws, frame).is_err() {
+            return false;
+        }
+    }
+}
+
+/// One running CDP request. It counts against the client's cap until the request ends, including
+/// when its thread panics.
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn claim(counter: &Arc<AtomicUsize>) -> Option<Self> {
+        if counter.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT_PER_CLIENT {
+            counter.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self(Arc::clone(counter)))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 fn serve_cdp_client(ws: &mut WebSocket<TcpStream>, shared: &Shared) {
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = outbox::channel();
     let client = shared.relay.connect_client(tx.clone());
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let mut stalled = None;
     loop {
-        let mut broken = false;
-        while let Ok(frame) = rx.try_recv() {
-            if send_text(ws, frame).is_err() {
-                broken = true;
-                break;
-            }
-        }
-        if broken || flush(ws).is_err() {
+        if !pump(ws, &rx, &mut stalled) {
             break;
         }
         match poll(ws) {
             Incoming::Text(text) => match serde_json::from_str::<Value>(&text) {
                 Ok(request) => {
+                    let Some(slot) = InFlight::claim(&in_flight) else {
+                        // Explicit overload: the request never starts, and the caller learns why.
+                        if let Some(id) = request.get("id").cloned() {
+                            let error = json!({"code": -32000, "message": BUSY_MESSAGE});
+                            let _ = tx.send(json!({"id": id, "error": error}).to_string());
+                        }
+                        continue;
+                    };
                     // Runs on its own thread. A command such as `Page.navigate` waits for the
                     // extension, whose answer arrives on this same socket, so the reader must keep
-                    // reading. Replies share the event channel, which keeps them in order.
+                    // reading. Replies share the event queue, which keeps them in order.
                     let relay = Arc::clone(&shared.relay);
                     let reply = tx.clone();
                     thread::spawn(move || {
+                        let _slot = slot;
                         if let Some(response) = relay.handle_cdp(client, &request) {
                             let _ = reply.send(response);
                         }
@@ -394,18 +466,12 @@ fn serve_cdp_client(ws: &mut WebSocket<TcpStream>, shared: &Shared) {
 }
 
 fn serve_extension(ws: &mut WebSocket<TcpStream>, shared: &Shared) {
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = outbox::channel();
     let mut link: Option<u64> = None;
     let mut last_seen = Instant::now();
+    let mut stalled = None;
     loop {
-        let mut broken = false;
-        while let Ok(frame) = rx.try_recv() {
-            if send_text(ws, frame).is_err() {
-                broken = true;
-                break;
-            }
-        }
-        if broken || flush(ws).is_err() {
+        if !pump(ws, &rx, &mut stalled) {
             break;
         }
         match poll(ws) {

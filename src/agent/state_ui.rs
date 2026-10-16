@@ -352,6 +352,15 @@ impl Ui for StateUi<'_> {
     fn approve_with_cancel(&mut self, t: &str, s: &str, c: &AtomicBool) -> Decision {
         self.inner.approve_with_cancel(t, s, c)
     }
+    fn approve_call(
+        &mut self,
+        call_id: &str,
+        t: &str,
+        s: &str,
+        c: Option<&AtomicBool>,
+    ) -> Decision {
+        self.inner.approve_call(call_id, t, s, c)
+    }
     fn ask_user(&mut self, title: &str, question: &str, options: &[String]) -> Option<String> {
         self.inner.ask_user(title, question, options)
     }

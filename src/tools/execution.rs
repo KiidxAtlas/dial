@@ -165,7 +165,12 @@ pub(crate) fn native(
             )
             .unwrap_or_else(ToolOutput::err)
         }
-        "read" => super::read_tool_streaming(context.workspace, args, cancel),
+        "read" => super::read_tool_streaming(
+            context.workspace,
+            args,
+            cancel,
+            super::model_output_limit(context.config.context_window),
+        ),
         "artifact_read" => context
             .workspace
             .artifacts()

@@ -653,6 +653,15 @@ fn logout(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
         );
         return Ok(Step::Done);
     };
+    // A sign-in still waiting for its callback must not publish a grant after sign-out. Dropping
+    // the job cancels it.
+    if shell
+        .auth_job
+        .as_ref()
+        .is_some_and(|job| job.label == target.name)
+    {
+        shell.auth_job.take();
+    }
     let text = match oauth::sign_out(&user_dir, target.id) {
         Ok(message) => message,
         Err(error) => format!("error: {error:#}"),

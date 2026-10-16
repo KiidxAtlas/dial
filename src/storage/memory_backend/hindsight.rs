@@ -42,7 +42,10 @@ fn credential(config: &HindsightConfig) -> Result<Option<String>> {
         return Ok(None);
     }
     let token = std::env::var(&config.api_key_env).map_err(|_| {
-        anyhow::anyhow!("the environment variable named in API key variable is not set")
+        anyhow::anyhow!(
+            "the Hindsight API key variable {name} (memory.hindsight.api_key_env) is not set; export {name} in the shell before starting dial",
+            name = config.api_key_env
+        )
     })?;
     ensure!(
         !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_graphic()),
@@ -380,7 +383,9 @@ impl Hindsight {
         model: &mut dyn MemoryModelRunner,
         retry: bool,
     ) -> Result<usize> {
-        let rows:Vec<(String,String)>=self.db.prepare("SELECT id,payload FROM pending WHERE endpoint=?1 AND bank=?2 AND project=?3 AND session=?4 AND branch=?5 AND (state='queued' OR ?6) ORDER BY created LIMIT 16")?.query_map(params![self.config.endpoint,op.scope.retain_bank,op.scope.project,op.authority.session_id,op.authority.branch_id,retry],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        // Every queued write for this endpoint and bank is sent, including writes left by earlier
+        // sessions and earlier context-history generations, not only the current branch's.
+        let rows:Vec<(String,String)>=self.db.prepare("SELECT id,payload FROM pending WHERE endpoint=?1 AND bank=?2 AND (state='queued' OR ?3) ORDER BY created LIMIT 16")?.query_map(params![self.config.endpoint,op.scope.retain_bank,retry],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -427,7 +432,11 @@ impl Driver for Hindsight {
         MemoryBackendId::Hindsight
     }
     fn status(&mut self, op: &Operation) -> Result<Value> {
-        let pending:i64=self.db.query_row("SELECT count(*) FROM pending WHERE endpoint=?1 AND bank=?2 AND project=?3 AND session=?4 AND branch=?5",params![self.config.endpoint,op.scope.retain_bank,op.scope.project,op.authority.session_id,op.authority.branch_id],|row|row.get(0))?;
+        let pending: i64 = self.db.query_row(
+            "SELECT count(*) FROM pending WHERE endpoint=?1 AND bank=?2",
+            params![self.config.endpoint, op.scope.retain_bank],
+            |row| row.get(0),
+        )?;
         let waiting = if pending == 0 {
             "nothing waiting to send".to_owned()
         } else {
@@ -612,7 +621,66 @@ impl Driver for Hindsight {
         )
     }
     fn queue(&mut self, op: &Operation) -> Result<Value> {
-        let items:Vec<Value>=self.db.prepare("SELECT id,state,created FROM pending WHERE endpoint=?1 AND bank=?2 AND project=?3 AND session=?4 AND branch=?5 ORDER BY created LIMIT 50")?.query_map(params![self.config.endpoint,op.scope.retain_bank,op.scope.project,op.authority.session_id,op.authority.branch_id],|row|Ok(json!({"id":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?,"created":row.get::<_,i64>(2)?})))?.collect::<rusqlite::Result<_>>()?;
+        let items:Vec<Value>=self.db.prepare("SELECT id,state,created FROM pending WHERE endpoint=?1 AND bank=?2 ORDER BY created LIMIT 50")?.query_map(params![self.config.endpoint,op.scope.retain_bank],|row|Ok(json!({"id":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?,"created":row.get::<_,i64>(2)?})))?.collect::<rusqlite::Result<_>>()?;
         Ok(json!({"backend":"hindsight","items":items}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::memory_backend::test_support::{FakeRunner, authority, scope};
+
+    #[test]
+    fn flush_sends_writes_queued_by_earlier_sessions_and_generations() {
+        let server = crate::llm::fake::serve(vec![
+            crate::llm::fake::json(200, &json!({})),
+            crate::llm::fake::json(200, &json!({"success": true})),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let layout = Layout::with_user_dir(&project, dir.path().join("home")).unwrap();
+        let config = HindsightConfig {
+            endpoint: server.url.clone(),
+            mental_models_enabled: false,
+            ..HindsightConfig::default()
+        };
+        let mut driver = open(&layout, &config).unwrap();
+        let earlier = Operation::for_test(authority("session-a"), scope(), None);
+        let input = SaveInput {
+            content: "the retain queue survives a restart".into(),
+            context: None,
+            source: None,
+            global: false,
+        };
+        driver
+            .save(&earlier, &input, &mut FakeRunner::new(""))
+            .unwrap();
+        // A later session (or a later history generation) owns the maintenance pass.
+        let later = Operation::for_test(authority("session-b"), scope(), None);
+        assert_eq!(driver.status(&later).unwrap()["pending"], 1);
+        driver.maintain(&later, &mut FakeRunner::new("")).unwrap();
+        assert_eq!(driver.status(&later).unwrap()["pending"], 0);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            String::from_utf8_lossy(&requests[1]).contains("the retain queue survives a restart")
+        );
+    }
+
+    #[test]
+    fn missing_api_key_names_the_variable_to_export() {
+        let config = HindsightConfig {
+            endpoint: "https://hindsight.example".into(),
+            api_key_env: "DIAL_TEST_UNSET_HINDSIGHT_KEY".into(),
+            ..HindsightConfig::default()
+        };
+        let error = credential(&config).unwrap_err().to_string();
+        assert!(error.contains("DIAL_TEST_UNSET_HINDSIGHT_KEY"), "{error}");
+        assert!(
+            error.contains("export") && error.contains("before starting dial"),
+            "{error}"
+        );
     }
 }

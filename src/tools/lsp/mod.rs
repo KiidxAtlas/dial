@@ -41,25 +41,42 @@ pub(crate) use text::path_from_uri;
 use text::{locate, read_source, uri_from_path};
 use workspace_edit::{Plan, Snapshot};
 
-static WRITE_THROUGH: LazyLock<Mutex<HashMap<PathBuf, Weak<LspTool>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Post-commit owners, one binding per workspace instance (see [`bind_write_owner`]). Each edit is
+/// published only to the service of the session that executed it, never a sibling's.
+static WRITE_THROUGH: LazyLock<Mutex<Vec<(Weak<Mutex<()>>, Weak<LspTool>)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-/// The `lsp` tool, ready to register.
+/// The `lsp` tool, ready to register. Only this instance (and its forks) publishes write-through;
+/// the internal copy `find` builds for its metadata does not.
 pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
-    let tool = Arc::new(LspTool::new(&config.lsp));
-    let mut map = lock(&WRITE_THROUGH);
-    map.retain(|_, weak| weak.strong_count() > 0);
-    map.insert(config.project_root.clone(), Arc::downgrade(&tool));
+    let tool = Arc::new_cyclic(|owner| {
+        let mut tool = LspTool::new(&config.lsp);
+        tool.write_owner = Some(owner.clone());
+        tool
+    });
     vec![tool]
 }
+
+/// Why a committed transaction is published to the language servers. Only `Edit` formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOrigin {
+    /// A tool's own edit: watched-file notices, format-on-write when enabled, then diagnostics.
+    Edit,
+    /// Rollback of a failed multi-step operation: notices and diagnostics, never formatting.
+    Restored,
+    /// format-on-write's own commit. The enclosing edit formats once and publishes diagnostics for
+    /// the final text, so this origin sends notices and synchronization only.
+    Formatted,
+}
+
 /// Synchronizes committed files with already-running language servers and returns the notes to
 /// append to the edit result: watched-file notices, format-on-write status, and diagnostics.
 /// `kind` is the LSP `FileChangeType`: 1 created, 2 changed, 3 deleted. The write path starts project
 /// code only when `[lsp] start_on_write` opts in, and never holds a workspace lock while a server answers.
-pub fn writethrough(ws: &Workspace, paths: &[(PathBuf, u8)]) -> String {
-    let tool = lock(&WRITE_THROUGH).get(ws.root()).and_then(Weak::upgrade);
-    let Some(tool) = tool else {
+/// The servers are those of the tool bound to `ws` (see [`bind_write_owner`]); other sessions' are untouched.
+pub fn writethrough(ws: &Workspace, paths: &[(PathBuf, u8)], origin: WriteOrigin) -> String {
+    let Some(tool) = write_owner(ws) else {
         return String::new();
     };
     let mut clients: Vec<Arc<Client>> = lock(&tool.running)
@@ -87,7 +104,7 @@ pub fn writethrough(ws: &Workspace, paths: &[(PathBuf, u8)]) -> String {
         }
     }
 
-    if tool.format_on_write {
+    if tool.format_on_write && origin == WriteOrigin::Edit {
         for (path, kind) in paths {
             if *kind == 3 {
                 continue;
@@ -97,7 +114,8 @@ pub fn writethrough(ws: &Workspace, paths: &[(PathBuf, u8)]) -> String {
             }
         }
     }
-    if !tool.diagnostics_on_write {
+    // The formatted commit's own publish is skipped: the enclosing edit diagnoses the final text.
+    if !tool.diagnostics_on_write || origin == WriteOrigin::Formatted {
         return output;
     }
     for (path, kind) in paths {
@@ -150,6 +168,28 @@ pub fn writethrough(ws: &Workspace, paths: &[(PathBuf, u8)]) -> String {
         }
     }
     output
+}
+
+/// The tool bound to this workspace instance, if it is still alive.
+fn write_owner(ws: &Workspace) -> Option<Arc<LspTool>> {
+    let token = Arc::downgrade(&ws.operations);
+    lock(&WRITE_THROUGH)
+        .iter()
+        .find(|(bound, _)| Weak::ptr_eq(bound, &token))
+        .and_then(|(_, owner)| owner.upgrade())
+}
+
+/// Binds `owner` as the write-through owner of `ws`'s instance, replacing that instance's previous
+/// binding and dropping entries whose owner or workspace is gone. The key is the workspace's
+/// serialization domain: a `rebased` child copy gets its own, while clones of one session share it.
+/// Binding never stops another owner's servers; it only chooses who receives this instance's edits.
+fn bind_write_owner(ws: &Workspace, owner: &Weak<LspTool>) {
+    let token = Arc::downgrade(&ws.operations);
+    let mut bindings = lock(&WRITE_THROUGH);
+    bindings.retain(|(bound, live)| {
+        bound.strong_count() > 0 && live.strong_count() > 0 && !Weak::ptr_eq(bound, &token)
+    });
+    bindings.push((token, owner.clone()));
 }
 
 /// Starts the server that serves each changed file when `[lsp] start_on_write` opted in. A server
@@ -241,7 +281,9 @@ fn format_on_write(
         let snapshot = Snapshot::capture(ws)?;
         let value = json!({"changes": {text::uri_from_path(path): edits}});
         let plan = Plan::prepare(ws, client, &snapshot, &value)?;
-        let mut notes = plan.commit(ws, &snapshot)?.join("\n");
+        let mut notes = plan
+            .commit_as(ws, &snapshot, WriteOrigin::Formatted)?
+            .join("\n");
         notes.push_str(&synchronize_applied(tool, client, &plan, client.name()));
         return Ok(notes);
     }
@@ -251,7 +293,7 @@ fn format_on_write(
 const DESCRIPTION: &str = "Code intelligence and refactoring from real language servers; startup, edits and commands need approval. \
 `path` selects the server; position actions need 1-based `line` plus `column` or `symbol`. \
 `rename_preview` previews `new_name`; `rename` applies every validated server-provided text edit \
-as one observer/checkpoint-backed transaction. Resource create/rename/delete operations are refused. \
+as one observer/checkpoint-backed transaction. Server-provided resource create/rename/delete operations are applied only by these approved calls, in the same validated transaction as their text edits; directory resources are refused (use `rename_file`). \
 `rename_file` moves `path` (a file, or a directory of files) to workspace-relative `new_name`; each language server for `path` first answers `workspace/willRenameFiles` (starting it under this approved call), then those edits and the move commit as one checkpointed transaction. `apply:false` previews without writing. \
 `code_actions` lists actions at the cursor (optional end_line/end_column range and query kind); \
 use its session-local `action_id` with `code_action_resolve` to preview, or approved `code_action_apply` \
@@ -347,6 +389,8 @@ pub struct LspTool {
     diagnostics_on_write: bool,
     format_on_write: bool,
     start_on_write: bool,
+    /// Set on a registered instance and its forks: the owner that publishes committed edits.
+    write_owner: Option<Weak<LspTool>>,
 }
 
 #[derive(Clone)]
@@ -441,6 +485,7 @@ impl LspTool {
             diagnostics_on_write: config.diagnostics_on_write,
             format_on_write: config.format_on_write,
             start_on_write: config.start_on_write,
+            write_owner: None,
         }
     }
     fn is_running(&self, language: &str) -> bool {
@@ -637,6 +682,9 @@ impl LspTool {
 
     fn run(&self, ctx: &ToolContext, args: &Value, cancel: &AtomicBool) -> Result<String, String> {
         let ws = ctx.workspace;
+        if let Some(owner) = &self.write_owner {
+            bind_write_owner(ws, owner);
+        }
         let action = Action::parse(req_str(args, "action")?)?;
         if action == Action::Status {
             let sessions: Vec<Value> = lock(&self.running)
@@ -1368,7 +1416,7 @@ impl Tool for LspTool {
     }
 
     fn fork_session(&self) -> Option<Arc<dyn Tool>> {
-        Some(Arc::new(Self {
+        Some(Arc::new_cyclic(|owner| Self {
             servers: self.servers.clone(),
             launch: Arc::clone(&self.launch),
             running: Mutex::new(HashMap::new()),
@@ -1379,6 +1427,7 @@ impl Tool for LspTool {
             diagnostics_on_write: self.diagnostics_on_write,
             format_on_write: self.format_on_write,
             start_on_write: self.start_on_write,
+            write_owner: self.write_owner.as_ref().map(|_| owner.clone()),
         }))
     }
 

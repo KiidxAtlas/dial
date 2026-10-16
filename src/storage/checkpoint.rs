@@ -91,6 +91,18 @@ fn turn_dir(dir: &Path, turn: u64) -> PathBuf {
     dir.join(format!("{turn:010}"))
 }
 
+/// Remove a restored turn. The manifest goes last, so a failure partway leaves a checkpoint that
+/// is still listed and can be retried rather than orphaned saved files.
+fn discard_turn(dir: &Path, turn: u64) -> std::io::Result<()> {
+    let base = turn_dir(dir, turn);
+    match fs::remove_dir_all(base.join("files")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::remove_dir_all(base)
+}
+
 /// Turn numbers of the turn directories on disk, ascending.
 fn disk_turns(dir: &Path) -> Vec<u64> {
     let mut turns: Vec<u64> = fs::read_dir(dir)
@@ -505,8 +517,23 @@ impl Checkpoints {
                 }
             }
             // Only discard a checkpoint whose files all came back; otherwise keep it for a retry.
-            if !failed {
-                fs::remove_dir_all(turn_dir(&self.dir, manifest.turn)).ok();
+            // Older checkpoints are never reached past a failed newer one: a retry would replay
+            // this manifest's saved content after an older manifest had already been restored.
+            if failed {
+                report.warnings.push(format!(
+                    "turn {}: rollback stopped; older checkpoints were not restored",
+                    manifest.turn
+                ));
+                break;
+            }
+            if let Err(e) = discard_turn(&self.dir, manifest.turn)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                report.warnings.push(format!(
+                    "turn {}: checkpoint could not be discarded, rollback stopped: {e:#}",
+                    manifest.turn
+                ));
+                break;
             }
         }
         inner.current = None;
@@ -1053,5 +1080,74 @@ mod tests {
         let report = cp.rollback(1).unwrap();
         assert!(report.restored.is_empty() && !report.warnings.is_empty());
         assert!(!evil_root.join("f.txt").exists());
+    }
+
+    /// A failed newer manifest must stop the rollback: older manifests stay untouched, so a
+    /// retry after reattaching cannot replay the newer saved content over the older restore.
+    #[test]
+    fn failed_newer_manifest_stops_older_rollbacks_across_retries() {
+        let fx = Fixture::new();
+        fx.write("a.txt", "A0");
+        let extra = tempfile::tempdir().unwrap();
+        let extra_root = fs::canonicalize(extra.path()).unwrap();
+        fs::write(extra_root.join("b.txt"), "B0").unwrap();
+        let cp = fx.open();
+        cp.set_added_roots(std::slice::from_ref(&extra_root));
+        cp.begin_turn("one").unwrap();
+        modify(&cp, &fx, "a.txt", "A1");
+        cp.begin_turn("two").unwrap();
+        modify(&cp, &fx, "a.txt", "A2");
+        cp.before_write(&extra_root.join("b.txt")).unwrap();
+        fs::write(extra_root.join("b.txt"), "B1").unwrap();
+
+        cp.set_added_roots(&[]);
+        let report = cp.rollback(2).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("no longer attached"))
+        );
+        assert_eq!(fx.read("a.txt").as_deref(), Some("A1"));
+        assert_eq!(
+            cp.list().len(),
+            2,
+            "both checkpoints are retained for a retry"
+        );
+
+        cp.set_added_roots(std::slice::from_ref(&extra_root));
+        let retry = cp.rollback(2).unwrap();
+        assert!(retry.warnings.is_empty(), "{:?}", retry.warnings);
+        assert_eq!(fx.read("a.txt").as_deref(), Some("A0"));
+        assert_eq!(fs::read_to_string(extra_root.join("b.txt")).unwrap(), "B0");
+        assert!(cp.list().is_empty());
+    }
+
+    /// A checkpoint whose directory cannot be discarded after a full restore is reported and
+    /// stops the rollback instead of being silently replayed later.
+    #[cfg(unix)]
+    #[test]
+    fn undeletable_checkpoint_directory_stops_the_rollback() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = Fixture::new();
+        fx.write("a.txt", "A0");
+        let cp = fx.open();
+        cp.begin_turn("one").unwrap();
+        modify(&cp, &fx, "a.txt", "A1");
+        let files = turn_dir(&cp.dir, 1).join("files");
+        fs::set_permissions(&files, fs::Permissions::from_mode(0o500)).unwrap();
+        let report = cp.rollback(1);
+        fs::set_permissions(&files, fs::Permissions::from_mode(0o700)).unwrap();
+        let report = report.unwrap();
+        assert_eq!(fx.read("a.txt").as_deref(), Some("A0"));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not be discarded")),
+            "{:?}",
+            report.warnings
+        );
+        assert_eq!(cp.list().len(), 1, "the checkpoint is kept for a retry");
     }
 }

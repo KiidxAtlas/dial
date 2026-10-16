@@ -436,8 +436,10 @@ impl<'a> Agent<'a> {
         }
     }
 
-    /// One completion boundary for plain reports and explicit finish calls.
-    pub(super) fn validate_completion(&mut self, ui: &mut dyn Ui) -> Result<(), String> {
+    /// Side-effect-free completion blockers shared by `finish completed` and `goal complete`: explicit
+    /// blockers, running shell or worker jobs, unreadable worker state, and failed checks with no edit
+    /// awaiting a fresh check. Callers decide whether to pump workers or disclose changes.
+    pub(super) fn completion_blockers(&self) -> Result<(), String> {
         let blocked = self
             .todo
             .tasks()
@@ -449,16 +451,15 @@ impl<'a> Agent<'a> {
         let awaited = self.awaited_background_jobs();
         if !awaited.is_empty() {
             return Err(format!(
-                "cannot finish completed while background jobs are running:\n{}\nWait for them with `bg wait` or stop them with `bg kill`, then finish again.",
+                "cannot complete while background jobs are running:\n{}\nWait for them with `bg wait` or stop them with `bg kill`, then try again.",
                 awaited.join("\n")
             ));
         }
-        self.pump_subagents(ui);
         let jobs = match self.live_tasks.status(None) {
             Ok(jobs) => jobs,
             Err(error) => {
                 return Err(format!(
-                    "cannot finish completed: live task state is unreadable ({error}); inspect subagent status before finishing"
+                    "cannot complete: live task state is unreadable ({error}); inspect subagent status before finishing"
                 ));
             }
         };
@@ -466,19 +467,32 @@ impl<'a> Agent<'a> {
             .as_array()
             .is_some_and(|jobs| jobs.iter().any(|job| job["status"] == "running"))
         {
-            return Err("cannot finish completed while live tasks are running; wait for and inspect their results".into());
+            return Err("cannot complete while live tasks are running; wait with `task wait` or continue independent work, then try again".into());
         }
+        // Every effect generation counts: a shell or extension repair after a failure is new work that the
+        // outer verification pass rechecks, so only a failure with no newer effect is refused here.
+        let unchecked_effects = self.step_checks.mutations > self.step_checks.checked
+            || self.step_checks.uncheckpointed_shell_commands
+                > self.step_checks.checked_shell_commands
+            || self.step_checks.uncheckpointed_extension_calls
+                > self.step_checks.checked_extension_calls;
         if !self.hermetic
             && self.step_checks.failed
-            && (!self.config.verification.enabled
-                || self.step_checks.mutations <= self.step_checks.checked)
+            && (!self.config.verification.enabled || !unchecked_effects)
         {
-            return Err("Cannot finish completed: focused checks failed and no new edits are awaiting a fresh check. Repair, rerun the failed check, or report a blocker.".into());
+            return Err("Cannot complete: focused checks failed and no new edits are awaiting a fresh check. Repair, rerun the failed check, or report a blocker.".into());
         }
+        Ok(())
+    }
+
+    /// One completion boundary for plain reports and explicit finish calls. Pumps worker results
+    /// first, so a worker that already finished is not reported as running.
+    pub(super) fn validate_completion(&mut self, ui: &mut dyn Ui) -> Result<(), String> {
+        self.pump_subagents(ui);
+        self.completion_blockers()?;
         if !self.hermetic {
             self.disclose_turn_changes(ui);
         }
-
         Ok(())
     }
 }

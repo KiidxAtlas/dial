@@ -23,7 +23,10 @@ outside software. Dial sets it up on request, never at startup.
   `/setup embeddings` still prints the model catalog; `/setup embeddings:<model>` previews,
   and `/setup embeddings:<model> yes` pulls and assigns that model. Custom Ollama model names
   remain supported through these direct commands. `/setup providers` opens Providers directly.
-- **Shell**: `dial doctor` reports the same list; `dial doctor --fix <id>` previews and `--yes` runs.
+- **Shell**: `dial doctor` reports the same list, followed by a Memory section (the selected backend,
+  what it still needs, and each backend's readiness). Select a backend without the TUI with
+  `dial config set memory.backend <off|provenance|semantic|local|sharpshooter|hindsight>`.
+  `dial doctor --fix <id>` previews and `--yes` runs.
 
 ## What a setup may do
 

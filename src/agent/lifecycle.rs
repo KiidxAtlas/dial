@@ -266,7 +266,15 @@ impl<'a> Agent<'a> {
                 &config.foreign_sources,
             ),
             skills: skills::catalog_block(&skills),
-            memory: String::new(),
+            // Standing memory guidance and auto-learn guidance; children receive the same text in `child.rs`.
+            memory: [
+                crate::storage::memory_backend::memory_guidance(&config.memory),
+                crate::storage::memory_backend::autolearn_instructions(&config.memory),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n"),
             system_template: None,
             system_template_error: None,
         };
@@ -341,6 +349,7 @@ impl<'a> Agent<'a> {
             subagent_backend,
             role_backends: BTreeMap::new(),
             context_cap: None,
+            route: Default::default(),
             enabled_tools: HashSet::new(),
             lean_tools: false,
             metrics: AgentMetrics::default(),
@@ -491,6 +500,7 @@ impl<'a> Agent<'a> {
             subagent_backend: None,
             role_backends: BTreeMap::new(),
             context_cap: None,
+            route: Default::default(),
             enabled_tools: HashSet::new(),
             lean_tools: false,
             metrics: AgentMetrics::default(),

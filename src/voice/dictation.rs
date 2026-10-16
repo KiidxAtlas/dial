@@ -16,7 +16,7 @@ use std::{
 };
 
 /// When a recording ends on its own. Toggle and live modes end on trailing silence; a held key
-/// ends only when released (cancel) or at the hard cap.
+/// ends only when released (finish) or at the hard cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndRule {
     Silence,
@@ -24,13 +24,24 @@ pub enum EndRule {
 }
 
 /// Record until trailing silence or the configured hard cap, transcribing complete segments.
-pub fn record_and_transcribe(env: &VoiceEnv, cancel: &Arc<AtomicBool>) -> Result<String> {
-    record(env, cancel, EndRule::Silence)
+/// `finish` ends the recording early and transcribes what was heard; `abort` discards it.
+pub fn record_and_transcribe(
+    env: &VoiceEnv,
+    finish: &Arc<AtomicBool>,
+    abort: &Arc<AtomicBool>,
+) -> Result<String> {
+    record(env, finish, abort, EndRule::Silence)
 }
 
-/// Record until `cancel` is set (the key was released) or the hard cap, transcribing segments.
-pub fn record_held(env: &VoiceEnv, cancel: &Arc<AtomicBool>) -> Result<String> {
-    record(env, cancel, EndRule::Manual)
+/// Record until `finish` is set (the key was released) or the hard cap, transcribing segments.
+/// `abort` discards the recording: capture stops, transcription in flight is cancelled, and no
+/// partial text is returned.
+pub fn record_held(
+    env: &VoiceEnv,
+    finish: &Arc<AtomicBool>,
+    abort: &Arc<AtomicBool>,
+) -> Result<String> {
+    record(env, finish, abort, EndRule::Manual)
 }
 
 /// Collects segment transcriptions. A failed segment does not discard the others: it is kept as
@@ -47,16 +58,16 @@ impl Segments {
         env: &VoiceEnv,
         backend: &SttBackend,
         segment: &[f32],
-        cancel: &Arc<AtomicBool>,
+        abort: &Arc<AtomicBool>,
     ) -> Result<()> {
-        match stt::transcribe(env, backend, segment, cancel) {
+        match stt::transcribe(env, backend, segment, abort) {
             Ok(text) => {
                 if !text.trim().is_empty() {
                     self.texts.push(text.trim().to_owned());
                 }
                 Ok(())
             }
-            Err(error) if cancel.load(Ordering::SeqCst) => Err(error),
+            Err(error) if abort.load(Ordering::SeqCst) => Err(error),
             Err(error) => {
                 self.first_failure.get_or_insert(error);
                 Ok(())
@@ -75,14 +86,19 @@ impl Segments {
     }
 }
 
-fn record(env: &VoiceEnv, cancel: &Arc<AtomicBool>, end: EndRule) -> Result<String> {
+fn record(
+    env: &VoiceEnv,
+    finish: &Arc<AtomicBool>,
+    abort: &Arc<AtomicBool>,
+    end: EndRule,
+) -> Result<String> {
     let config = &env.voice.stt;
     ensure!(
         config.enabled,
         "speech recognition is disabled (set voice.stt.enabled = true)"
     );
     let backend = stt::resolve_backend(env)?;
-    let (capture, rx) = Capture::start(config, cancel)?;
+    let (capture, rx) = Capture::start(config, abort)?;
     let _source = capture.source().to_owned();
     let mut endpointer = Endpointer::new(EndpointerConfig {
         end_silence_ms: config.end_silence_ms.clamp(100, 5000),
@@ -91,10 +107,8 @@ fn record(env: &VoiceEnv, cancel: &Arc<AtomicBool>, end: EndRule) -> Result<Stri
     });
     let deadline = Instant::now() + Duration::from_secs(config.max_recording_secs.clamp(1, 600));
     let mut segments = Segments::default();
-    // Release only ends recording: an in-flight segment is still transcribed, not aborted.
-    let no_abort = Arc::new(AtomicBool::new(false));
     let mut completed = false;
-    while !completed && !cancel.load(Ordering::SeqCst) {
+    while !completed && !finish.load(Ordering::SeqCst) && !abort.load(Ordering::SeqCst) {
         if Instant::now() >= deadline {
             break;
         }
@@ -102,7 +116,7 @@ fn record(env: &VoiceEnv, cancel: &Arc<AtomicBool>, end: EndRule) -> Result<Stri
             Ok(Ok(samples)) => {
                 for event in endpointer.push(&samples) {
                     let EndpointerEvent::Segment(segment) = event;
-                    segments.add(env, &backend, &segment, &no_abort)?;
+                    segments.add(env, &backend, &segment, abort)?;
                     if end == EndRule::Silence && !endpointer.in_speech() {
                         completed = true;
                         break;
@@ -116,12 +130,45 @@ fn record(env: &VoiceEnv, cancel: &Arc<AtomicBool>, end: EndRule) -> Result<Stri
     }
     drop(rx);
     capture.stop();
+    ensure!(!abort.load(Ordering::SeqCst), "speech input was cancelled");
     if endpointer.in_speech() {
-        let not_cancelled = Arc::new(AtomicBool::new(false));
+        // Finishing only ends recording: trailing speech is still transcribed, not aborted.
         for event in endpointer.flush() {
             let EndpointerEvent::Segment(segment) = event;
-            segments.add(env, &backend, &segment, &not_cancelled)?;
+            segments.add(env, &backend, &segment, abort)?;
         }
     }
+    ensure!(!abort.load(Ordering::SeqCst), "speech input was cancelled");
     segments.finish()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn abort_stops_stalled_transcription_without_partial_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("stalled-stt");
+        std::fs::write(&program, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let backend = SttBackend::WhisperCpp {
+            program,
+            model: dir.path().join("model.bin"),
+        };
+        let env = VoiceEnv::default();
+        let abort = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&abort);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let mut segments = Segments::default();
+        let started = Instant::now();
+        let segment = vec![0.1_f32; 1600];
+        assert!(segments.add(&env, &backend, &segment, &abort).is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(segments.texts.is_empty());
+    }
 }

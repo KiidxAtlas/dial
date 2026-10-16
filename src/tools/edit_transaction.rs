@@ -16,6 +16,16 @@ pub(crate) use imp::{Change, MAX_BYTES, MAX_FILE, Original, inherit_permissions,
 /// diagnostics). LSP output is appended to the warnings. It never fails the commit, because the
 /// files are already written when it runs.
 pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, String> {
+    commit_as(ws, changes, lsp::WriteOrigin::Edit)
+}
+
+/// Commits like [`commit`]. `origin` says why the change is published: a format-on-write commit
+/// must not format again (see [`lsp::WriteOrigin`]). Checkpoint observation is the same for all.
+pub(crate) fn commit_as(
+    ws: &Workspace,
+    changes: &[Change],
+    origin: lsp::WriteOrigin,
+) -> Result<Vec<String>, String> {
     let _lease = super::document_transaction::Lease::acquire(
         changes.iter().map(|change| change.path.clone()),
     )?;
@@ -41,7 +51,7 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
         })
         .collect();
     if !paths.is_empty() {
-        let notes = lsp::writethrough(ws, &paths);
+        let notes = lsp::writethrough(ws, &paths, origin);
         if !notes.trim().is_empty() {
             warnings.push(notes.trim_end().to_owned());
         }

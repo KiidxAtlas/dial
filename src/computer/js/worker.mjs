@@ -90,12 +90,14 @@ function writeLine(message) {
 	protocolOut(`${JSON.stringify(message)}\n`);
 }
 
+// Native ids carry a per-process nonce so a reply can never settle a request from another worker.
+const nativeInstance = randomUUID();
 let nativeSeq = 0;
 const pendingNative = new Map();
 
 /** Requests one native desktop operation from the host and awaits its result. */
 function native(method, args = {}) {
-	const id = `native-${++nativeSeq}`;
+	const id = `native-${nativeInstance}-${++nativeSeq}`;
 	return new Promise((resolve, reject) => {
 		pendingNative.set(id, { resolve, reject });
 		writeLine({ type: "native", id, method, args });
@@ -104,7 +106,7 @@ function native(method, args = {}) {
 
 /** Sends a native operation the host applies without replying. */
 function nativeFireAndForget(method, args = {}) {
-	writeLine({ type: "native", id: `native-${++nativeSeq}`, method, args });
+	writeLine({ type: "native", id: `native-${nativeInstance}-${++nativeSeq}`, method, args });
 }
 
 function settleNative(message) {

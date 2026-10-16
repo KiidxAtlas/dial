@@ -187,6 +187,7 @@ impl Agent<'_> {
         self.backend = Some(backend);
         self.auth_config = auth;
         self.model_override = Some(config);
+        self.route.reset();
         // The loaded-size cap belonged to the previous server/model; the next probe re-reads it.
         self.context_cap = None;
         self.modes.switch = Some(Saved {

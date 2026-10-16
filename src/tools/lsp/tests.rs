@@ -65,7 +65,11 @@ fn serve(stream: UnixStream, log: Log) {
             continue;
         };
         match (method, id) {
-            ("initialize", Some(id)) => reply(&mut out, &id, json!({"capabilities": {}})),
+            ("initialize", Some(id)) => reply(
+                &mut out,
+                &id,
+                json!({"capabilities": {"documentFormattingProvider": true}}),
+            ),
             ("initialized", None) => {
                 let _ = write_message(
                     &mut out,
@@ -119,6 +123,14 @@ fn serve(stream: UnixStream, log: Log) {
                     &mut out,
                     &id,
                     json!({"changes": {uri.as_str().unwrap(): [edit]}}),
+                )
+            }
+            ("textDocument/formatting", Some(id)) => {
+                // Every pass inserts a line, so a formatter re-run on its own commit never converges.
+                reply(
+                    &mut out,
+                    &id,
+                    json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "// formatted\n"}]),
                 )
             }
             ("test/fail", Some(id)) => {
@@ -854,4 +866,166 @@ fn merged_workspace_edits_keep_every_server_edit_in_one_document_list() {
     assert_eq!(entries[1]["textDocument"]["version"], 3);
     assert!(merged.get("changes").is_none());
     assert!(merge_workspace_edits(&[json!({"changes": []})]).is_err());
+}
+
+// ---- write-through ownership and format-on-write ----
+
+type Launcher =
+    Box<dyn Fn(&super::servers::Resolved, &Path) -> anyhow::Result<Client> + Send + Sync>;
+
+/// Starts every server with a fake transport and keeps each server's transcript, in start order.
+fn recording_launcher(logs: &Arc<Mutex<Vec<Log>>>) -> Launcher {
+    let collected = Arc::clone(logs);
+    Box::new(move |_server, root| {
+        let (client, log) = fake_client(root, fast());
+        collected.lock().push(log);
+        Ok(client)
+    })
+}
+
+fn fake_config(format_on_write: bool) -> LspConfig {
+    LspConfig {
+        format_on_write,
+        servers: BTreeMap::from([(
+            "fake".to_string(),
+            LspServerConfig {
+                program: PathBuf::from("/bin/sh"),
+                args: Some(vec![]),
+                extensions: Some(vec!["fk".into()]),
+                ..LspServerConfig::default()
+            },
+        )]),
+        ..LspConfig::default()
+    }
+}
+
+/// A tool that registers itself as the write-through owner, as the registered `lsp` tool does.
+fn owner_tool(config: &LspConfig, logs: &Arc<Mutex<Vec<Log>>>) -> Arc<LspTool> {
+    Arc::new_cyclic(|owner| {
+        let mut tool = LspTool::with_launcher(config, recording_launcher(logs));
+        tool.write_owner = Some(owner.clone());
+        tool
+    })
+}
+
+/// Runs `tool` against `ws` with approval granted for every mutation it asks about.
+fn run_as(tool: &dyn Tool, ws: &Workspace, args: Value) -> ToolOutput {
+    let config = Config::default();
+    let authorize = |_: &str, _: &[PathBuf], _: bool| -> Result<(), String> { Ok(()) };
+    tool.call(
+        &ToolContext {
+            workspace: ws,
+            config: &config,
+            mutation_authorizer: Some(&authorize),
+            confirm: None,
+        },
+        &args,
+    )
+}
+
+fn notices(log: &Log) -> usize {
+    methods(log)
+        .iter()
+        .filter(|method| method.as_str() == "workspace/didChangeWatchedFiles")
+        .count()
+}
+
+#[test]
+fn write_through_reaches_only_the_session_that_executed_the_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent_ws = Workspace::new(dir.path()).unwrap();
+    // A forked session over the same project has its own workspace instance and its own server.
+    let child_ws = Workspace::new(dir.path()).unwrap();
+    let logs: Arc<Mutex<Vec<Log>>> = Arc::default();
+    let parent = owner_tool(&fake_config(false), &logs);
+    let child = parent.fork_session().unwrap();
+    let file = parent_ws.root().join("a.fk");
+    std::fs::write(&file, "one\n").unwrap();
+    let symbols = json!({"action": "document_symbols", "path": "a.fk"});
+    assert!(!run_as(&*parent, &parent_ws, symbols.clone()).is_error);
+    assert!(!run_as(&*child, &child_ws, symbols).is_error);
+    wait_until("both sessions started a server", || logs.lock().len() == 2);
+    let (parent_log, child_log) = {
+        let logs = logs.lock();
+        (Arc::clone(&logs[0]), Arc::clone(&logs[1]))
+    };
+
+    std::fs::write(&file, "one\ntwo\n").unwrap();
+    writethrough(&parent_ws, &[(file.clone(), 2)], WriteOrigin::Edit);
+    wait_until("parent notified of its edit", || notices(&parent_log) == 1);
+    assert_eq!(
+        notices(&child_log),
+        0,
+        "a parent edit reached the fork's server"
+    );
+
+    writethrough(&child_ws, &[(file.clone(), 2)], WriteOrigin::Edit);
+    wait_until("fork notified of its edit", || notices(&child_log) == 1);
+    assert_eq!(
+        notices(&parent_log),
+        1,
+        "a fork edit reached the parent's server"
+    );
+
+    // Dropping the fork releases only its own binding and server; the parent keeps receiving edits.
+    drop(child);
+    writethrough(&parent_ws, &[(file.clone(), 2)], WriteOrigin::Edit);
+    wait_until("parent still notified after the fork is dropped", || {
+        notices(&parent_log) == 2
+    });
+}
+
+#[test]
+fn format_on_write_formats_once_and_observes_its_own_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let logs: Arc<Mutex<Vec<Log>>> = Arc::default();
+    let tool = owner_tool(&fake_config(true), &logs);
+    let file = ws.root().join("a.fk");
+    std::fs::write(&file, "one\n").unwrap();
+    assert!(
+        !run_as(
+            &*tool,
+            &ws,
+            json!({"action": "document_symbols", "path": "a.fk"})
+        )
+        .is_error
+    );
+    std::fs::write(&file, "one\ntwo\n").unwrap();
+
+    let notes = writethrough(&ws, &[(file.clone(), 2)], WriteOrigin::Edit);
+    let log = Arc::clone(&logs.lock()[0]);
+    let formats = methods(&log)
+        .iter()
+        .filter(|method| method.as_str() == "textDocument/formatting")
+        .count();
+    assert_eq!(
+        formats, 1,
+        "the formatter's own commit formatted again: {notes}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "// formatted\none\ntwo\n"
+    );
+    assert!(!notes.contains("[LSP format"), "{notes}");
+    // The formatted commit was still observed: the server was synchronized to the final text.
+    wait_until("server sees the formatted text", || {
+        log.lock().iter().any(|m| {
+            m["method"] == "textDocument/didChange"
+                && m["params"]["contentChanges"][0]["text"] == "// formatted\none\ntwo\n"
+        })
+    });
+}
+
+#[test]
+fn resource_operation_description_matches_the_approved_transactions() {
+    let tool = LspTool::new(&LspConfig::default());
+    let schema = tool.schema();
+    let description = schema["function"]["description"].as_str().unwrap();
+    assert!(description.contains(
+        "Server-provided resource create/rename/delete operations are applied only by these approved calls"
+    ));
+    assert!(!description.contains("Resource create/rename/delete operations are refused"));
+    assert!(tool.needs_approval(&json!({"action": "rename"})));
+    assert!(tool.needs_approval(&json!({"action": "code_action_apply"})));
 }

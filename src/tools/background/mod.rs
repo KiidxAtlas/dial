@@ -10,8 +10,10 @@
 //! immediate display per process. `kill`, tool/session drop and observed leader exit kill the
 //! owned process group or Windows Job Object. POSIX descendants that make a new group/session can
 //! escape group cleanup; Linux's sandbox PID namespace additionally contains them. Abrupt host
-//! termination may prevent cleanup. Cleanup drains until EOF or a 300ms grace; an open pipe/PTY then
-//! makes the output artifact explicitly incomplete.
+//! termination may prevent cleanup. Kill and drop stop each reader, which drains for at most 300ms
+//! and then closes Dial's read side. An open pipe/PTY is therefore left behind only as an
+//! explicitly incomplete saved artifact: an escaped descendant keeps running, but it does not keep
+//! Dial's reader, spool or ring alive.
 //! Input is capped at 64 KiB per call, cancellable and optionally deadline-bound; partial bytes
 //! cannot be rolled back. Pipes close explicitly for EOF. Canonical PTYs receive VEOF while
 //! keeping output open; raw PTYs have no half-close. Port readiness is network-approved and

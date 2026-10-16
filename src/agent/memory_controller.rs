@@ -18,6 +18,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// `/memory` with no memory backend selected.
+const MEMORY_OFF: &str = "Memory is off: nothing is remembered or recalled. Choose a backend in /settings → Memory or with /setup memory.";
+const MEMORY_OFF_STATUS: &str = "Memory is off: nothing is remembered or recalled.";
+
+/// `/memory help` for the provenance backend.
+const PROVENANCE_HELP: &str =
+    "Provenance memory: facts with history and expiry, found again by keyword.
+/memory                    status and the newest remembered facts
+/memory search <words>     find remembered facts (any other words also search)
+/memory clear [project|global]   forget this project's facts, or the facts shared by every project
+/memory help               this help
+The agent saves and corrects facts with its retain, recall, forget and memory_update tools.
+Choose another backend in /settings → Memory or with /setup memory.";
+
 #[derive(Default)]
 pub(super) struct Receipts {
     next: u64,
@@ -625,6 +639,9 @@ impl Agent<'_> {
     }
     pub fn selected_memory_command(&mut self, input: &str, ui: &mut dyn Ui) -> Result<Value> {
         if let Some(memory) = self.memory.clone() {
+            if input.trim() == "help" {
+                return Ok(json!({"backend":"provenance","help":PROVENANCE_HELP}));
+            }
             if matches!(input.trim(), "" | "status") {
                 let recent = memory.recall("", None, 20, 24000)?;
                 let items: Vec<Value> = recent
@@ -691,10 +708,19 @@ impl Agent<'_> {
                 memory.recall(query, None, 20, 24000)?,
             )?);
         }
-        let memory = self
-            .memory_runtime
-            .clone()
-            .context("selected memory backend is not active")?;
+        let Some(memory) = self.memory_runtime.clone() else {
+            use crate::storage::memory_backend::config::MemoryBackendId;
+            let off =
+                !self.config.memory.enabled || self.config.memory.backend == MemoryBackendId::Off;
+            anyhow::ensure!(off, "selected memory backend is not active");
+            return match input.trim() {
+                "" | "status" => {
+                    Ok(json!({"backend":"off","active":false,"message":MEMORY_OFF_STATUS}))
+                }
+                "help" => Ok(json!({"backend":"off","help":MEMORY_OFF})),
+                _ => anyhow::bail!("{MEMORY_OFF}"),
+            };
+        };
         memory.stop_maintenance();
         let authority = memory_authority(&self.session, 0);
         memory.bind(authority.clone());
@@ -703,9 +729,11 @@ impl Agent<'_> {
             .usage_scope
             .worker()
             .for_purpose(llm::usage::Purpose::Memory);
+        // Semantic forget/update/rebuild change stored facts (C2), so they take the same approval
+        // and read-only checks as clear and save.
         let mutating = matches!(
             input.split_whitespace().next(),
-            Some("clear" | "save" | "enqueue")
+            Some("clear" | "save" | "enqueue" | "forget" | "update" | "rebuild")
         ) || input.starts_with("mm seed")
             || input.starts_with("mm delete")
             || input.starts_with("mm refresh");
@@ -795,14 +823,19 @@ impl Agent<'_> {
         if let Some(capture) = self.memory_controller.capture.take() {
             capture.retire();
         }
-        if self.hermetic || !matches!(self.config.memory.backend.as_str(), "hindsight") {
+        // Every selected runtime is consulted; backends without compaction recall return None.
+        if self.hermetic {
             return;
         }
         let Some(memory) = self.memory_runtime.clone() else {
             return;
         };
         memory.stop_maintenance();
-        if self.auth_config.memory_uses_local_compute() {
+        // Only Hindsight's compaction recall ever released the local model; semantic recall is a
+        // local index search that needs no chat model, so the loaded model stays resident.
+        if matches!(self.config.memory.backend.as_str(), "hindsight")
+            && self.auth_config.memory_uses_local_compute()
+        {
             if let Some(backend) = live_backend {
                 backend.release();
             }
@@ -1016,5 +1049,42 @@ impl Agent<'_> {
             }
         }
         self.memory_controller = controller;
+    }
+
+    /// One-shot runs (`dial -p`) have no idle loop, so before exit run one selected-memory
+    /// maintenance pass, bounded by `budget`, to retain the finished turn. Nothing is printed on
+    /// success; a pass still running at the deadline is cancelled. A pending automatic capture turn
+    /// is not started here (it is a full model turn) and is retired with the agent.
+    pub fn finish_memory_before_exit(&mut self, ui: &mut dyn Ui, budget: Duration) {
+        if self.memory_runtime.is_none() {
+            return;
+        }
+        if let Some(capture) = self.memory_controller.capture.take() {
+            capture.retire();
+        }
+        let deadline = Instant::now() + budget;
+        self.memory_controller.last_start = None;
+        self.memory_maintenance_tick(ui, false);
+        while self.memory_controller.worker.is_some() {
+            if Instant::now() >= deadline {
+                if let Some(mut worker) = self.memory_controller.worker.take() {
+                    worker.memory.cancel();
+                    worker.settle(crate::runtime::Phase::Interrupted);
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            // Drains the worker's model and authorization requests; a finished worker is joined.
+            let started = self.memory_controller.last_start;
+            self.memory_maintenance_tick(ui, false);
+            // Never start a second pass: one bounded pass is the whole budget.
+            if self.memory_controller.last_start != started {
+                if let Some(mut worker) = self.memory_controller.worker.take() {
+                    worker.memory.cancel();
+                    worker.settle(crate::runtime::Phase::Interrupted);
+                }
+                return;
+            }
+        }
     }
 }

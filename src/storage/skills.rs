@@ -264,6 +264,10 @@ fn load_named(dir: &Path, name: &str, scope: Scope) -> Option<Skill> {
         return None;
     }
     let path = dir.join(SKILL_FILE);
+    // A symlinked SKILL.md could read content from outside the skill root.
+    if !is_real_file(&path) {
+        return None;
+    }
     let (head, _) = read_head(&path, HEAD_BYTES).ok()?;
     let text = String::from_utf8_lossy(&head);
     let (frontmatter, _) = split_frontmatter(&text)?;

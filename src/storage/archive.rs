@@ -631,6 +631,18 @@ fn lines(bytes: &[u8], drop_head: bool, drop_tail: bool) -> Vec<Value> {
         .collect()
 }
 
+/// Whether the final record of `window` is complete JSON. A window that begins inside a record
+/// (`line_start` false) cannot prove its last record unless an earlier newline shows where it starts.
+fn terminal_record_parses(window: &[u8], line_start: bool) -> bool {
+    let body = window.trim_ascii_end();
+    let record = match body.iter().rposition(|&b| b == b'\n') {
+        Some(at) => &body[at + 1..],
+        None if line_start => body,
+        None => return false,
+    };
+    serde_json::from_slice::<Value>(record).is_ok()
+}
+
 #[derive(Default)]
 struct ScanState {
     id: Option<String>,
@@ -715,31 +727,43 @@ fn scan_session(path: &Path) -> Option<ArchiveSession> {
     let modified = meta.modified().map(unix_secs).unwrap_or(0);
     let mut state = ScanState::default();
     let exact = size <= HEAD_BYTES + TAIL_BYTES;
-    if exact {
+    let terminal_observed = if exact {
         let mut bytes = Vec::with_capacity(size as usize);
         file.read_to_end(&mut bytes).ok()?;
         state.absorb(&lines(&bytes, false, false), true);
+        terminal_record_parses(&bytes, true)
     } else {
         let mut head = vec![0; HEAD_BYTES as usize];
         file.read_exact(&mut head).ok()?;
         state.absorb(&lines(&head, false, true), true);
+        // One byte before the window shows whether the window starts on a line boundary.
         let start = size - TAIL_BYTES;
-        file.seek(SeekFrom::Start(start)).ok()?;
-        let mut tail = Vec::with_capacity(TAIL_BYTES as usize);
-        file.read_to_end(&mut tail).ok()?;
-        // The tail window starts mid-file; its first fragment belongs to an unseen line.
-        state.absorb(&lines(&tail, true, false), false);
-    }
+        file.seek(SeekFrom::Start(start - 1)).ok()?;
+        let mut window = Vec::with_capacity(TAIL_BYTES as usize + 1);
+        file.read_to_end(&mut window).ok()?;
+        let line_start = window.first() == Some(&b'\n');
+        let tail = &window[1..];
+        let messages_before = state.messages;
+        // The tail window starts mid-file; a partial first line belongs to an unseen record.
+        state.absorb(&lines(tail, !line_start, false), false);
+        // The last message is known only when this window holds a message and its final record
+        // is complete. Otherwise that message may sit in the unseen middle or be cut off.
+        state.messages > messages_before && terminal_record_parses(tail, line_start)
+    };
     let name_id = path
         .file_name()
         .and_then(|n| n.to_str())
         .and_then(file_id)
         .map(str::to_owned);
     let id = state.id.clone().or(name_id)?;
-    let status = match (state.last_role.as_deref(), state.last_has_calls) {
-        (None, _) => SessionStatus::Unknown,
-        (Some("user"), _) => SessionStatus::Pending,
-        (Some("assistant"), false) => SessionStatus::Complete,
+    let status = match (
+        terminal_observed,
+        state.last_role.as_deref(),
+        state.last_has_calls,
+    ) {
+        (false, _, _) | (_, None, _) => SessionStatus::Unknown,
+        (_, Some("user"), _) => SessionStatus::Pending,
+        (_, Some("assistant"), false) => SessionStatus::Complete,
         _ => SessionStatus::Interrupted,
     };
     let title = state
@@ -964,10 +988,7 @@ impl Archive {
                 facts.push(shorten_path(&session.project));
             }
             facts.push(message_count(session));
-            if !matches!(
-                session.status,
-                SessionStatus::Complete | SessionStatus::Unknown
-            ) {
+            if session.status != SessionStatus::Complete {
                 facts.push(session.status.label().to_owned());
             }
             facts.push(session.title.clone());
@@ -1652,6 +1673,74 @@ mod tests {
         );
         assert_eq!(session.status, SessionStatus::Interrupted);
         assert_eq!(session.project, "/work/big");
+    }
+
+    #[test]
+    fn unobserved_terminal_records_never_inherit_complete() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("projects/term-44444444/sessions");
+        let filler = "x".repeat(1024);
+        let mut base = vec![message("1", "user", "first prompt")];
+        for i in 0..60 {
+            base.push(message(&format!("a{i}"), "assistant", &filler));
+        }
+        // A short completed exchange, then a final record larger than the tail window.
+        let mut oversized = base.clone();
+        oversized.push(message("done", "assistant", "all done"));
+        oversized.push(message("big", "user", &"y".repeat(40 * 1024)));
+        let path = write_session(
+            &dir,
+            "20260101T000000000Z",
+            "dddd000011112222",
+            "/work/big",
+            &oversized,
+        );
+        let session = scan_session(&path).unwrap();
+        assert!(!session.messages_exact);
+        assert_eq!(session.status, SessionStatus::Unknown);
+
+        // A completed exchange whose final record was cut off mid-JSON.
+        let mut truncated = base.clone();
+        truncated.push(message("done", "assistant", "all done"));
+        let path = write_session(
+            &dir,
+            "20260101T000000001Z",
+            "eeee000011112222",
+            "/work/big",
+            &truncated,
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"type\":\"message\",\"message\":{\"role\":\"assistant\"")
+            .unwrap();
+        assert_eq!(scan_session(&path).unwrap().status, SessionStatus::Unknown);
+    }
+
+    #[test]
+    fn a_final_record_ending_exactly_at_the_window_boundary_is_observed() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("projects/edge-55555555/sessions");
+        let filler = "x".repeat(1024);
+        let mut lines = vec![message("1", "user", "first prompt")];
+        for i in 0..60 {
+            lines.push(message(&format!("a{i}"), "assistant", &filler));
+        }
+        // The final record is exactly one tail window long, so the window starts on its line.
+        let line_len = serde_json::to_string(&message("z", "assistant", ""))
+            .unwrap()
+            .len()
+            + 1;
+        let text = "y".repeat(TAIL_BYTES as usize - line_len);
+        lines.push(message("z", "assistant", &text));
+        let path = write_session(
+            &dir,
+            "20260101T000000002Z",
+            "ffff000011112222",
+            "/work/edge",
+            &lines,
+        );
+        let session = scan_session(&path).unwrap();
+        assert!(!session.messages_exact);
+        assert_eq!(session.status, SessionStatus::Complete);
     }
 
     #[test]

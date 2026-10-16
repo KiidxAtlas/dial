@@ -278,6 +278,38 @@ pub fn notify(kind: NotifyKind, title: &str, body: &str, session: &str) {
     let _ = stdout.flush();
 }
 
+/// The notification for a finished turn, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TurnEndNotice {
+    pub kind: NotifyKind,
+    pub body: &'static str,
+}
+
+/// Notification policy for a finished turn, keyed by the agent's authoritative outcome (the
+/// transcript's status) rather than by whether the request returned `Ok`.
+///
+/// - `Completed` → completion, subject to `notify`.
+/// - `NeedsInput` → question, subject to `notify`: the agent is waiting for the user.
+/// - `Failed`, `Blocked`, `Incomplete` → error, subject to `notify` and `notify_errors`. Blocked
+///   and incomplete work did not finish, so they count as failures for this policy.
+/// - `Interrupted` and `Running` → silent; the user stopped the turn or it has not ended.
+pub fn turn_end_notice(
+    outcome: crate::runtime::Phase,
+    notify: bool,
+    notify_errors: bool,
+) -> Option<TurnEndNotice> {
+    use crate::runtime::Phase;
+    let (kind, body, failure) = match outcome {
+        Phase::Completed => (NotifyKind::Completion, "Turn finished", false),
+        Phase::NeedsInput => (NotifyKind::Question, "Turn needs your input", false),
+        Phase::Failed => (NotifyKind::Error, "Turn failed", true),
+        Phase::Blocked => (NotifyKind::Error, "Turn blocked", true),
+        Phase::Incomplete => (NotifyKind::Error, "Turn incomplete", true),
+        Phase::Running | Phase::Interrupted => return None,
+    };
+    (notify && (!failure || notify_errors)).then_some(TurnEndNotice { kind, body })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +452,64 @@ mod tests {
         assert!(sequence.contains("\"event\":\"question_asked\""));
         assert!(sequence.contains("\"session_id\":\"abc\""));
         assert!(sequence.ends_with("\x07"));
+    }
+
+    #[test]
+    fn turn_notices_follow_the_authoritative_outcome() {
+        use crate::runtime::Phase;
+        // (outcome, notify, notify_errors) -> expected (kind, body), or None for silence.
+        let cases = [
+            (
+                Phase::Completed,
+                true,
+                true,
+                Some((NotifyKind::Completion, "Turn finished")),
+            ),
+            (
+                Phase::Completed,
+                true,
+                false,
+                Some((NotifyKind::Completion, "Turn finished")),
+            ),
+            (Phase::Completed, false, true, None),
+            (
+                Phase::NeedsInput,
+                true,
+                false,
+                Some((NotifyKind::Question, "Turn needs your input")),
+            ),
+            (
+                Phase::Failed,
+                true,
+                true,
+                Some((NotifyKind::Error, "Turn failed")),
+            ),
+            (Phase::Failed, true, false, None),
+            (Phase::Failed, false, true, None),
+            (
+                Phase::Blocked,
+                true,
+                true,
+                Some((NotifyKind::Error, "Turn blocked")),
+            ),
+            (Phase::Blocked, true, false, None),
+            (
+                Phase::Incomplete,
+                true,
+                true,
+                Some((NotifyKind::Error, "Turn incomplete")),
+            ),
+            (Phase::Incomplete, true, false, None),
+            (Phase::Interrupted, true, true, None),
+            (Phase::Running, true, true, None),
+        ];
+        for (outcome, notify, notify_errors, expected) in cases {
+            let actual = turn_end_notice(outcome, notify, notify_errors)
+                .map(|notice| (notice.kind, notice.body));
+            assert_eq!(
+                actual, expected,
+                "{outcome:?} notify={notify} errors={notify_errors}"
+            );
+        }
     }
 }

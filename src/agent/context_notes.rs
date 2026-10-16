@@ -639,7 +639,10 @@ impl super::Agent<'_> {
             agent: None,
         };
         let fixed_tokens = self.projected_tokens(&self.projected_request(&[], template)?);
-        let keep_recent = self.config.compaction.keep_recent_budget(identity, window, fixed_tokens)?;
+        let keep_recent =
+            self.config
+                .compaction
+                .keep_recent_budget(identity, window, fixed_tokens)?;
         let mut history = rollover_history(&self.session, keep_recent)?;
         if let Some((authority, advice)) = &self.memory_controller.compaction_advice
             && super::memory_authority_matches(&self.session, authority, 0)

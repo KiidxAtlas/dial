@@ -257,7 +257,11 @@ impl ImproveOverlay {
                     } else {
                         "Automatic improvement: off (Enabled is off in /improve settings)".into()
                     },
-                    if view.enabled { Tok::Success } else { Tok::Warning },
+                    if view.enabled {
+                        Tok::Success
+                    } else {
+                        Tok::Warning
+                    },
                 ));
                 rows.push((format!("Readiness: {}", view.readiness), Tok::Text));
                 rows.push((
@@ -368,32 +372,48 @@ impl ImproveOverlay {
                 let (rows, selected) = self.body(ctx.theme);
                 let mut output: Vec<Line<'static>> = vec![tab_line(ctx.theme, &TABS, self.tab, w)];
                 let available = h.saturating_sub(output.len() + 2);
-                let scroll = selected.map_or(0, |row| row.saturating_sub(available.saturating_sub(1)));
-                for (index, (row, token)) in rows.into_iter().enumerate().skip(scroll).take(available) {
+                let scroll =
+                    selected.map_or(0, |row| row.saturating_sub(available.saturating_sub(1)));
+                for (index, (row, token)) in
+                    rows.into_iter().enumerate().skip(scroll).take(available)
+                {
                     let fill = if self.ask.is_none() && selected == Some(index) {
                         selected_fill(ctx.theme)
                     } else {
                         Style::default()
                     };
                     output.push(filled(
-                        vec![Span::styled(format!(" {}", text::one_line(&row)), ctx.theme.fg(token))],
+                        vec![Span::styled(
+                            format!(" {}", text::one_line(&row)),
+                            ctx.theme.fg(token),
+                        )],
                         w,
                         fill,
                     ));
                 }
                 let notice = match (&self.ask, &self.notice) {
                     (Some(ask), _) => Some((ask.prompt(), Tok::Warning, None)),
-                    (None, Some(Notice::Done(message))) => Some((message.clone(), Tok::Success, Some(Sym::Check))),
-                    (None, Some(Notice::Failed(message))) => Some((message.clone(), Tok::Error, Some(Sym::Cross2))),
-                    (None, Some(Notice::Info(message))) => Some((message.clone(), Tok::Muted, None)),
+                    (None, Some(Notice::Done(message))) => {
+                        Some((message.clone(), Tok::Success, Some(Sym::Check)))
+                    }
+                    (None, Some(Notice::Failed(message))) => {
+                        Some((message.clone(), Tok::Error, Some(Sym::Cross2)))
+                    }
+                    (None, Some(Notice::Info(message))) => {
+                        Some((message.clone(), Tok::Muted, None))
+                    }
                     (None, None) => None,
                 };
                 if let Some((message, token, mark)) = notice
                     && output.len() < h
                 {
-                    let prefix = mark.map_or(String::new(), |sym| format!("{} ", ctx.theme.sym(sym)));
+                    let prefix =
+                        mark.map_or(String::new(), |sym| format!("{} ", ctx.theme.sym(sym)));
                     output.push(filled(
-                        vec![Span::styled(format!(" {prefix}{}", text::one_line(&message)), ctx.theme.fg(token))],
+                        vec![Span::styled(
+                            format!(" {prefix}{}", text::one_line(&message)),
+                            ctx.theme.fg(token),
+                        )],
                         w,
                         Style::default(),
                     ));
@@ -414,11 +434,19 @@ impl ImproveOverlay {
                         };
                         let mut hints = vec![
                             (
-                                format!("{}/{}", keys.label(Action::TabPrev), keys.label(Action::TabNext)),
+                                format!(
+                                    "{}/{}",
+                                    keys.label(Action::TabPrev),
+                                    keys.label(Action::TabNext)
+                                ),
                                 "tab".into(),
                             ),
                             (
-                                format!("{}/{}", keys.label(Action::SelectUp), keys.label(Action::SelectDown)),
+                                format!(
+                                    "{}/{}",
+                                    keys.label(Action::SelectUp),
+                                    keys.label(Action::SelectDown)
+                                ),
                                 "select".into(),
                             ),
                         ];
@@ -428,7 +456,10 @@ impl ImproveOverlay {
                         hints.push((keys.label(Action::SelectCancel), "close".into()));
                         hints
                     };
-                    let hints: Vec<(&str, &str)> = hints.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    let hints: Vec<(&str, &str)> = hints
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
                     let mut spans = vec![Span::raw(" ")];
                     spans.extend(chrome::key_hint_spans(ctx.theme, &hints));
                     output.push(Line::from(fit(spans, w)));
@@ -504,17 +535,29 @@ mod tests {
         press(&mut overlay, KeyCode::Left);
         press(&mut overlay, KeyCode::Left);
         assert_eq!(overlay.tab, 3);
-        assert!(matches!(press(&mut overlay, KeyCode::Esc), OverlayEvent::Close));
+        assert!(matches!(
+            press(&mut overlay, KeyCode::Esc),
+            OverlayEvent::Close
+        ));
     }
 
     #[test]
     fn stop_asks_for_enter_and_escape_keeps_the_job() {
         let mut overlay = ImproveOverlay::new(view());
         press(&mut overlay, KeyCode::Right);
-        assert!(matches!(press(&mut overlay, KeyCode::Enter), OverlayEvent::None));
+        assert!(matches!(
+            press(&mut overlay, KeyCode::Enter),
+            OverlayEvent::None
+        ));
         assert!(overlay.ask.is_some(), "Enter asks first");
-        assert!(matches!(press(&mut overlay, KeyCode::Esc), OverlayEvent::None));
-        assert!(overlay.ask.is_none(), "Esc drops the question without closing");
+        assert!(matches!(
+            press(&mut overlay, KeyCode::Esc),
+            OverlayEvent::None
+        ));
+        assert!(
+            overlay.ask.is_none(),
+            "Esc drops the question without closing"
+        );
         press(&mut overlay, KeyCode::Enter);
         let OverlayEvent::Action(action) = press(&mut overlay, KeyCode::Enter) else {
             panic!("confirmed stop sends a command");
@@ -538,7 +581,10 @@ mod tests {
         press(&mut overlay, KeyCode::Right);
         press(&mut overlay, KeyCode::Right);
         press(&mut overlay, KeyCode::Enter);
-        assert!(overlay.ask.is_none(), "the live version is not a rollback target");
+        assert!(
+            overlay.ask.is_none(),
+            "the live version is not a rollback target"
+        );
         press(&mut overlay, KeyCode::Down);
         press(&mut overlay, KeyCode::Enter);
         assert!(overlay.ask.is_some());
@@ -548,7 +594,10 @@ mod tests {
         assert_eq!(action, "command:/improve rollback 2 --yes");
         press(&mut overlay, KeyCode::Down);
         press(&mut overlay, KeyCode::Enter);
-        assert!(overlay.ask.is_none(), "an older version cannot be restored from here");
+        assert!(
+            overlay.ask.is_none(),
+            "an older version cannot be restored from here"
+        );
     }
 
     #[test]
@@ -579,15 +628,27 @@ mod tests {
             preview_status: &status_preview,
         };
         let status = screen(&render(100, 24, |frame| overlay.draw(frame, &ctx)));
-        assert!(status.contains("Approved examples: 18 of 24 needed for training"), "{status}");
+        assert!(
+            status.contains("Approved examples: 18 of 24 needed for training"),
+            "{status}"
+        );
         assert!(status.contains("Live version: v3"), "{status}");
         assert!(status.contains("self-play · 24 cases"), "{status}");
-        assert!(!status.contains("[improve]") && !status.contains('{'), "{status}");
+        assert!(
+            !status.contains("[improve]") && !status.contains('{'),
+            "{status}"
+        );
         press(&mut overlay, KeyCode::Right);
         press(&mut overlay, KeyCode::Right);
         let versions = screen(&render(100, 24, |frame| overlay.draw(frame, &ctx)));
-        assert!(versions.contains("v2 · retired · lora · from v1"), "{versions}");
-        let rows = versions.lines().filter(|line| line.contains("· retired ·")).count();
+        assert!(
+            versions.contains("v2 · retired · lora · from v1"),
+            "{versions}"
+        );
+        let rows = versions
+            .lines()
+            .filter(|line| line.contains("· retired ·"))
+            .count();
         assert_eq!(rows, 2, "one line per version: {versions}");
     }
 
@@ -596,7 +657,11 @@ mod tests {
         let mut overlay = ImproveOverlay::new(view());
         overlay.refreshed = Instant::now() - REFRESH;
         assert!(overlay.wants_refresh());
-        overlay.view.jobs.iter_mut().for_each(|job| job.active = false);
+        overlay
+            .view
+            .jobs
+            .iter_mut()
+            .for_each(|job| job.active = false);
         assert!(!overlay.wants_refresh());
     }
 

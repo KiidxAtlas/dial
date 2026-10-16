@@ -176,6 +176,15 @@ impl RecoveryCheckpoint {
             self.source_versions.clear();
         }
     }
+
+    /// Compaction removed or summarized the results these entries referred to. Withheld calls and
+    /// cached observations describe evidence the model may no longer see, so they are released.
+    /// The failure counters belong to the repeat guard and are not touched here.
+    pub fn forget_evidence(&mut self) {
+        self.withheld.clear();
+        self.cached_observations.clear();
+        self.source_versions.clear();
+    }
 }
 
 #[cfg(test)]

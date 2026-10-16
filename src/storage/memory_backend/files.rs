@@ -212,13 +212,22 @@ impl PrivateDirectory {
         Ok(path)
     }
     pub fn database(&self, name: &str) -> Result<Connection> {
+        self.database_with_journal(name, "DELETE")
+    }
+    /// Opens a database that stays in WAL mode. Unlike `database`, it never switches the file
+    /// back to rollback-journal mode, which fails with "database is locked" while any other
+    /// connection (another session, a maintenance thread) has the WAL database open.
+    pub fn database_wal(&self, name: &str) -> Result<Connection> {
+        self.database_with_journal(name, "WAL")
+    }
+    fn database_with_journal(&self, name: &str, journal: &str) -> Result<Connection> {
         let file = self.file(name, libc::O_RDWR | libc::O_CREAT)?;
         let connection = Connection::open(self.checked_database_path(name, &file)?)
             .context("open private backend database")?;
         connection.busy_timeout(std::time::Duration::from_secs(10))?;
-        connection.execute_batch(
-            "PRAGMA foreign_keys=ON;PRAGMA journal_mode=DELETE;PRAGMA synchronous=FULL;",
-        )?;
+        connection.execute_batch(&format!(
+            "PRAGMA foreign_keys=ON;PRAGMA journal_mode={journal};PRAGMA synchronous=FULL;"
+        ))?;
         Ok(connection)
     }
     pub fn database_readonly(&self, name: &str) -> Result<Option<Connection>> {

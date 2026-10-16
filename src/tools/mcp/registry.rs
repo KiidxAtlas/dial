@@ -125,19 +125,19 @@ pub fn find_at(base: &str, name: &str, user_dir: &Path) -> Result<Option<Candida
 pub fn from_entry(entry: &Value, user_dir: &Path) -> Option<Candidate> {
     let server = entry.get("server").unwrap_or(entry);
     let meta = entry.get("_meta").and_then(|meta| meta.get(LATEST_KEY));
-    if meta.and_then(|m| m.get("isLatest")).and_then(Value::as_bool) == Some(false) {
+    if meta
+        .and_then(|m| m.get("isLatest"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
         return None;
     }
     if meta.and_then(|m| m.get("status")).and_then(Value::as_str) == Some("deleted") {
         return None;
     }
     let name = safe_metadata(server.get("name"))?;
-    let title = safe_metadata(server.get("title")).unwrap_or_else(|| {
-        name.rsplit('/')
-            .next()
-            .unwrap_or(name.as_str())
-            .to_owned()
-    });
+    let title = safe_metadata(server.get("title"))
+        .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name.as_str()).to_owned());
     let description =
         safe_metadata(server.get("description")).unwrap_or_else(|| "No description".to_owned());
     let version = safe_metadata(server.get("version"));
@@ -265,8 +265,8 @@ fn env_inputs(package: &Value) -> Vec<Input> {
         .iter()
         .filter_map(|item| {
             let key = safe_metadata(item.get("name"))?;
-            let secret = item.get("isSecret").and_then(Value::as_bool) == Some(true)
-                || looks_secret(&key);
+            let secret =
+                item.get("isSecret").and_then(Value::as_bool) == Some(true) || looks_secret(&key);
             Some(Input {
                 description: safe_metadata(item.get("description")).unwrap_or_default(),
                 required: item.get("isRequired").and_then(Value::as_bool) == Some(true),
@@ -388,7 +388,14 @@ mod tests {
         assert_eq!(server.program, PathBuf::from("docker"));
         assert_eq!(
             server.args,
-            ["run", "-i", "--rm", "-e", "EXAMPLE_KEY", "ghcr.io/example/tool:2.0.0"]
+            [
+                "run",
+                "-i",
+                "--rm",
+                "-e",
+                "EXAMPLE_KEY",
+                "ghcr.io/example/tool:2.0.0"
+            ]
         );
         assert_eq!(found.inputs[0].key, "EXAMPLE_KEY");
     }
@@ -516,14 +523,26 @@ mod tests {
     fn paging_follows_cursors_and_reports_the_end() {
         let base = serve_pages(2, false);
         let (first, more) = search_page_at(&base, "", 1, user()).expect("page 1");
-        assert_eq!(first.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["io.example/page-1"]);
+        assert_eq!(
+            first.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["io.example/page-1"]
+        );
         assert!(more);
         let (second, more) = search_page_at(&base, "", 2, user()).expect("page 2");
-        assert_eq!(second.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["io.example/page-2"]);
+        assert_eq!(
+            second.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["io.example/page-2"]
+        );
         assert!(!more);
-        let found = find_at(&base, "io.example/page-2", user()).expect("find").expect("listed");
+        let found = find_at(&base, "io.example/page-2", user())
+            .expect("find")
+            .expect("listed");
         assert_eq!(found.description, "page 2");
-        assert!(find_at(&base, "io.example/missing", user()).expect("find").is_none());
+        assert!(
+            find_at(&base, "io.example/missing", user())
+                .expect("find")
+                .is_none()
+        );
     }
 
     #[test]

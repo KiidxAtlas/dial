@@ -183,7 +183,11 @@ fn validate_scope_paths(root: &Path, paths: &[String]) -> Result<()> {
 }
 
 /// `dial-security-tree/v1` digest over the in-scope files' names, modes and contents plus HEAD.
-fn digest_working_tree(root: &Path, include: &[String], exclude: &[String]) -> Result<String> {
+pub(super) fn digest_working_tree(
+    root: &Path,
+    include: &[String],
+    exclude: &[String],
+) -> Result<String> {
     let mut files: Vec<String> = list_files(root)?
         .iter()
         .map(|f| normalize_relative(f))

@@ -88,14 +88,21 @@ impl Host {
         // Installed plugins (`dial plugin install`) run alongside the configured ones.
         match installer::PluginStore::new(config.user_dir.join("plugins")).enabled_runtimes() {
             Ok(runtimes) => {
-                for (plugin, program, args, env) in runtimes {
-                    self.start_one(
-                        &plugin.name,
-                        &program,
-                        &args,
-                        &env,
-                        config.extensions.timeout_secs,
-                    );
+                // Each plugin starts on its own, so one broken install leaves its siblings running.
+                for runtime in runtimes {
+                    match runtime {
+                        Ok((plugin, program, args, env)) => self.start_one(
+                            &plugin.name,
+                            &program,
+                            &args,
+                            &env,
+                            config.extensions.timeout_secs,
+                        ),
+                        Err(error) => self
+                            .notices
+                            .lock()
+                            .push(format!("installed plugins: {error:#}")),
+                    }
                 }
             }
             Err(error) => self

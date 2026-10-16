@@ -95,6 +95,8 @@ pub struct BlobResult {
     pub would_delete: usize,
     pub deleted: usize,
     pub bytes: u64,
+    /// Referenced artifacts whose bodies are absent. They hold nothing to keep.
+    pub missing_references: usize,
     pub errors: Vec<String>,
 }
 
@@ -397,10 +399,19 @@ fn artifact_ref_regex() -> Regex {
     Regex::new(r"artifact://([0-9a-fA-F]{64})").expect("static regex")
 }
 
+/// Result of a complete reference scan. `missing` lists referenced artifacts whose bodies are
+/// absent: there is nothing to keep for them, so they are reported rather than treated as failures.
+#[derive(Debug, Default)]
+pub struct ReferenceScan {
+    pub refs: HashSet<String>,
+    pub missing: Vec<String>,
+}
+
 /// Collect every artifact hash referenced from state files and top-level user-dir files, then
 /// transitively from the bodies of referenced artifacts. Scanning raw bytes is deliberately
-/// conservative: a reference anywhere keeps the blob.
-pub fn collect_references(layout: &Layout) -> Result<HashSet<String>> {
+/// conservative: a reference anywhere keeps the blob. Any read failure other than a missing
+/// referenced body fails the whole scan, because a partial reference set is not safe to sweep.
+pub fn collect_references(layout: &Layout) -> Result<ReferenceScan> {
     let re = artifact_ref_regex();
     let artifacts = layout.state_dir.join(ARTIFACTS_DIR);
     let mut refs: HashSet<String> = HashSet::new();
@@ -441,13 +452,34 @@ pub fn collect_references(layout: &Layout) -> Result<HashSet<String>> {
         scan(&bytes, &mut refs, &mut pending);
     }
     // Bodies of referenced artifacts may themselves reference other artifacts.
+    let mut missing = Vec::new();
     while let Some(hash) = pending.pop() {
         let body = artifacts.join(&hash);
-        if let Ok(bytes) = fs::read(&body) {
-            scan(&bytes, &mut refs, &mut pending);
+        match fs::read(&body) {
+            Ok(bytes) => scan(&bytes, &mut refs, &mut pending),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(hash),
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "reading referenced artifact {hash} ({})",
+                    body.display()
+                )));
+            }
         }
     }
-    Ok(refs)
+    Ok(ReferenceScan { refs, missing })
+}
+
+/// Claim a spool for deletion without blocking. The owning spool holds an exclusive lock on its
+/// file and tail ring for its whole lifetime, so a lock that cannot be taken at once means the
+/// spool is live. Returns the held claim, or `None` when the spool is live or cannot be opened.
+fn claim_spool(path: &Path) -> Option<fs::File> {
+    let file = crate::platform::fs::open_nofollow_nonblocking(
+        &fs::OpenOptions::new().read(true).write(true),
+        path,
+    )
+    .ok()?;
+    FileExt::try_lock_exclusive(&file).ok()?;
+    Some(file)
 }
 
 fn sweep_blobs(layout: &Layout, apply: bool, now_ms: i64) -> BlobResult {
@@ -456,17 +488,19 @@ fn sweep_blobs(layout: &Layout, apply: bool, now_ms: i64) -> BlobResult {
     if !artifacts.is_dir() {
         return result;
     }
-    let refs = match collect_references(layout) {
-        Ok(r) => r,
+    let scan = match collect_references(layout) {
+        Ok(s) => s,
         Err(e) => {
             // Without a complete reference set nothing is safe to delete.
             result
                 .errors
-                .push(format!("reference scan failed, nothing deleted: {e:#}"));
+                .push(format!("reference scan incomplete, nothing deleted: {e:#}"));
             return result;
         }
     };
-    result.referenced = refs.len();
+    result.referenced = scan.refs.len();
+    result.missing_references = scan.missing.len();
+    let refs = scan.refs;
     let entries = match regular_file_entries(&artifacts) {
         Ok(e) => e,
         Err(e) => {
@@ -475,7 +509,8 @@ fn sweep_blobs(layout: &Layout, apply: bool, now_ms: i64) -> BlobResult {
         }
     };
     let cutoff = now_ms - retention::WRITE_GRACE_MS;
-    let mut doomed: Vec<(PathBuf, u64)> = Vec::new();
+    // Each doomed spool carries its claim until its file is removed.
+    let mut doomed: Vec<(PathBuf, u64, Option<fs::File>)> = Vec::new();
     for (path, meta) in entries {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -488,15 +523,24 @@ fn sweep_blobs(layout: &Layout, apply: bool, now_ms: i64) -> BlobResult {
         if is_blob && refs.contains(name) {
             continue;
         }
+        // A live spool is not a candidate at all, however old its head looks.
+        let claim = if is_spool {
+            match claim_spool(&path) {
+                Some(claim) => Some(claim),
+                None => continue,
+            }
+        } else {
+            None
+        };
         result.candidates += 1;
         if retention::modified_ms(&meta) < cutoff {
             result.would_delete += 1;
             result.bytes += meta.len();
-            doomed.push((path, meta.len()));
+            doomed.push((path, meta.len(), claim));
         }
     }
     if apply {
-        for (path, len) in doomed {
+        for (path, len, _claim) in doomed {
             match remove_file_counted(&path, len) {
                 Ok(_) => {
                     result.deleted += 1;
@@ -1185,6 +1229,124 @@ mod tests {
                 .join(format!("{orphan}.json"))
                 .exists()
         );
+    }
+
+    #[test]
+    fn live_spool_is_kept_until_its_owner_finishes() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let l = layout(dir.path());
+        let artifacts = l.state_dir.join(ARTIFACTS_DIR);
+        fs::create_dir_all(&artifacts).unwrap();
+        let store = crate::tools::artifact::ArtifactStore::new(&artifacts)
+            .unwrap()
+            .with_limits(&crate::tools::artifact::ArtifactConfig {
+                max_bytes: 64,
+                head_bytes: 16,
+            });
+        let mut spool = store.spool().unwrap();
+        // Past the head budget: the head stops changing while the tail keeps being written.
+        spool.write_all(&[b'x'; 1000]).unwrap();
+        let spool_files: Vec<PathBuf> = fs::read_dir(&artifacts)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(SPOOL_PREFIX))
+            })
+            .collect();
+        assert_eq!(spool_files.len(), 2, "head and tail: {spool_files:?}");
+        for path in &spool_files {
+            set_age(path, Duration::from_secs(3600));
+        }
+        let mut a = args();
+        a.apply = true;
+        a.blobs = true;
+        let blobs = execute(&l, &a, retention::now_ms()).unwrap().blobs.unwrap();
+        assert_eq!(blobs.deleted, 0, "errors: {:?}", blobs.errors);
+        for path in &spool_files {
+            assert!(path.exists(), "live spool file removed: {}", path.display());
+        }
+        spool.write_all(b"tail").unwrap();
+        let uri = spool.finish().unwrap();
+        let id = uri.trim_start_matches("artifact://");
+        assert!(artifacts.join(id).exists());
+    }
+
+    #[test]
+    fn abandoned_unclaimed_spool_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = layout(dir.path());
+        let artifacts = l.state_dir.join(ARTIFACTS_DIR);
+        fs::create_dir_all(&artifacts).unwrap();
+        let head = artifacts.join(format!("{SPOOL_PREFIX}999-0"));
+        let tail = head.with_extension("tail");
+        fs::write(&head, "head").unwrap();
+        fs::write(&tail, "tail").unwrap();
+        set_age(&head, Duration::from_secs(3600));
+        set_age(&tail, Duration::from_secs(3600));
+        let mut a = args();
+        a.apply = true;
+        a.blobs = true;
+        let blobs = execute(&l, &a, retention::now_ms()).unwrap().blobs.unwrap();
+        assert_eq!(blobs.deleted, 2, "errors: {:?}", blobs.errors);
+        assert!(!head.exists() && !tail.exists());
+    }
+
+    #[test]
+    fn failed_transitive_read_deletes_nothing_and_reports_incomplete_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = layout(dir.path());
+        let artifacts = l.state_dir.join(ARTIFACTS_DIR);
+        fs::create_dir_all(&artifacts).unwrap();
+        let unreadable = "a".repeat(64);
+        let orphan = "c".repeat(64);
+        // A directory where the referenced body should be: reading it fails with a real error,
+        // not NotFound, so the scan must fail closed.
+        fs::create_dir(artifacts.join(&unreadable)).unwrap();
+        fs::write(artifacts.join(&orphan), "body").unwrap();
+        set_age(&artifacts.join(&orphan), Duration::from_secs(3600));
+        let session_dir = l.sessions_dir();
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("20260101T000000000Z_s.jsonl"),
+            format!("artifact://{unreadable}\n"),
+        )
+        .unwrap();
+        let mut a = args();
+        a.apply = true;
+        a.blobs = true;
+        let blobs = execute(&l, &a, retention::now_ms()).unwrap().blobs.unwrap();
+        assert_eq!(blobs.deleted, 0);
+        assert!(
+            blobs
+                .errors
+                .iter()
+                .any(|e| e.contains("reference scan incomplete") && e.contains(&unreadable)),
+            "errors: {:?}",
+            blobs.errors
+        );
+        assert!(artifacts.join(&orphan).exists());
+    }
+
+    #[test]
+    fn referenced_body_that_is_absent_is_missing_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = layout(dir.path());
+        let artifacts = l.state_dir.join(ARTIFACTS_DIR);
+        fs::create_dir_all(&artifacts).unwrap();
+        let absent = "9".repeat(64);
+        let session_dir = l.sessions_dir();
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("20260101T000000000Z_m.jsonl"),
+            format!("artifact://{absent}\n"),
+        )
+        .unwrap();
+        let scan = collect_references(&l).unwrap();
+        assert!(scan.refs.contains(&absent));
+        assert_eq!(scan.missing, vec![absent]);
     }
 
     #[test]

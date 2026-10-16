@@ -2,8 +2,9 @@
 //!
 //! Protocol: a guest sends `hello` with an optional write token. The host answers `welcome`
 //! (carrying `readOnly`), streams the full log as `snapshot-chunk` frames to that peer, and then
-//! broadcasts each new log entry as an `entry` frame. Guest `prompt`/`abort` frames are queued for
-//! the host agent, and only from writable guests while `allow_guest_steering` is on.
+//! broadcasts each new log entry as a sequence-numbered `entry` frame. Guest `prompt`/`abort`
+//! frames are queued for the host agent, and only from writable guests while `allow_guest_steering`
+//! is on. That queue is bounded: excess prompts get an explicit `error` reply, and aborts coalesce.
 use super::crypto::{
     RoomKey, WRITE_TOKEN_BYTES, generate_room_key, generate_write_token, secrets_equal,
 };
@@ -12,15 +13,69 @@ use super::protocol::{
     normalize_relay_origin, snapshot_chunks,
 };
 use super::registry::{self, HostRecord};
-use super::socket::{Role, Socket, SocketEvent, SocketOptions};
+use super::socket::{Role, SnapshotCharge, Socket, SocketEvent, SocketOptions};
 use crate::storage::session::Session;
 use anyhow::{Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const NAME_MAX_CHARS: usize = 64;
+/// Guest prompts that may wait for the host agent at once.
+const MAX_QUEUED_PROMPTS: usize = 8;
+/// Prompt text bytes that may wait for the host agent at once.
+const MAX_QUEUED_PROMPT_BYTES: usize = 256 * 1024;
+/// Largest single guest prompt.
+const MAX_PROMPT_BYTES: usize = 64 * 1024;
+
+/// Why a guest request was not queued. The host replies to the guest with [`Refusal::message`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    PromptTooLarge,
+    Busy,
+}
+
+impl Refusal {
+    fn message(&self) -> String {
+        match self {
+            Refusal::PromptTooLarge => {
+                format!("prompt exceeds the {MAX_PROMPT_BYTES}-byte guest limit")
+            }
+            Refusal::Busy => "the host agent already has guest prompts queued; retry after the running turn finishes".into(),
+        }
+    }
+}
+
+/// Admit one guest request into the host's steering queue. Aborts coalesce into one pending abort
+/// and never count against the prompt budget. Prompts are bounded by count, bytes and size.
+fn queue_steer(queue: &mut Vec<Steer>, action: Steer) -> Result<(), Refusal> {
+    match action {
+        Steer::Abort => {
+            if !queue.contains(&Steer::Abort) {
+                queue.push(Steer::Abort);
+            }
+            Ok(())
+        }
+        Steer::Prompt(text) => {
+            if text.len() > MAX_PROMPT_BYTES {
+                return Err(Refusal::PromptTooLarge);
+            }
+            let (count, bytes) = queue
+                .iter()
+                .fold((0usize, 0usize), |(count, bytes), steer| match steer {
+                    Steer::Prompt(queued) => (count + 1, bytes + queued.len()),
+                    Steer::Abort => (count, bytes),
+                });
+            if count >= MAX_QUEUED_PROMPTS || bytes + text.len() > MAX_QUEUED_PROMPT_BYTES {
+                return Err(Refusal::Busy);
+            }
+            queue.push(Steer::Prompt(text));
+            Ok(())
+        }
+    }
+}
 
 /// Host-agent work requested by a guest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,8 +95,9 @@ pub struct Host {
     /// `None` for a read-only room: no link carries a write token, so no peer can be granted write.
     write_token: Option<[u8; WRITE_TOKEN_BYTES]>,
     allow_steering: bool,
-    /// Bounded JSON of every archived message, in order. This is the replicated log.
-    entries: Vec<String>,
+    /// Bounded JSON of every archived message, in order. This is the replicated log. Snapshot
+    /// streams share this allocation; appends copy it only while a stream still reads the old one.
+    entries: Arc<Vec<Arc<str>>>,
     guests: BTreeMap<u32, GuestPeer>,
     steering: Vec<Steer>,
     /// Local collab-directory record (user dir, record), kept current with the guest count.
@@ -90,13 +146,16 @@ impl Host {
             role: Role::Host,
             key: RoomKey::new(&key)?,
         })?;
-        let entries = messages.iter().map(bounded_json).collect();
+        let entries: Vec<Arc<str>> = messages
+            .iter()
+            .map(|message| Arc::from(bounded_json(message)))
+            .collect();
         Ok(Self {
             socket,
             link,
             write_token,
             allow_steering,
-            entries,
+            entries: Arc::new(entries),
             guests: BTreeMap::new(),
             steering: Vec::new(),
             published: None,
@@ -121,15 +180,16 @@ impl Host {
         let messages = session.archived_messages();
         if self.diverged(&messages) {
             self.socket.send(&frame::reset(), 0);
-            self.entries.clear();
+            self.entries = Arc::default();
         }
         if messages.len() <= self.entries.len() {
             return;
         }
         for message in &messages[self.entries.len()..] {
-            let json = bounded_json(message);
-            self.socket.send_text(frame::entry_json(&json), 0);
-            self.entries.push(json);
+            let json: Arc<str> = Arc::from(bounded_json(message));
+            self.socket
+                .send_text(frame::entry_json(self.entries.len(), &json), 0);
+            Arc::make_mut(&mut self.entries).push(json);
         }
     }
 
@@ -140,7 +200,7 @@ impl Host {
             None => false,
             Some(last) => messages
                 .get(last)
-                .is_none_or(|message| bounded_json(message) != self.entries[last]),
+                .is_none_or(|message| bounded_json(message).as_str() != &*self.entries[last]),
         }
     }
 
@@ -283,8 +343,21 @@ impl Host {
             }),
             peer,
         );
-        self.socket
-            .send_batch(snapshot_chunks(self.entries.clone()), peer);
+        let charge = SnapshotCharge {
+            id: Arc::as_ptr(&self.entries) as usize,
+            bytes: self.entries.iter().map(|entry| entry.len()).sum(),
+        };
+        if !self
+            .socket
+            .send_batch(snapshot_chunks(self.entries.clone()), charge, peer)
+        {
+            self.socket.send(
+                &frame::error(
+                    "the session history could not be queued for this guest; rejoin to retry",
+                ),
+                peer,
+            );
+        }
         let access = if writable { "" } else { " (read-only)" };
         let note = format!("{name} joined the collab session{access}");
         self.socket.send(&frame::notice(&note), 0);
@@ -296,22 +369,27 @@ impl Host {
         let Some(guest) = self.guests.get(&peer) else {
             return;
         };
+        let writable = guest.writable;
         let label = match action {
             Steer::Prompt(_) => "prompt",
             Steer::Abort => "abort",
         };
-        if !guest.writable {
+        if !writable {
             self.socket.send(
                 &frame::error(&format!("{label} is disabled on a read-only link")),
                 peer,
             );
-        } else if !self.allow_steering {
+            return;
+        }
+        if !self.allow_steering {
             self.socket.send(
                 &frame::error("guest steering is disabled on this host"),
                 peer,
             );
-        } else {
-            self.steering.push(action);
+            return;
+        }
+        if let Err(refusal) = queue_steer(&mut self.steering, action) {
+            self.socket.send(&frame::error(&refusal.message()), peer);
         }
     }
 }
@@ -342,8 +420,11 @@ mod tests {
     #[test]
     fn snapshot_splits_into_bounded_chunks_with_one_final_marker() {
         let big = format!("\"{}\"", "x".repeat(SNAPSHOT_CHUNK_BYTES / 2 + 1024));
-        let entries = vec![big.clone(), big.clone(), big];
-        let chunks: Vec<Value> = snapshot_chunks(entries.clone())
+        let entries: Vec<Arc<str>> = [big.clone(), big.clone(), big]
+            .into_iter()
+            .map(Arc::from)
+            .collect();
+        let chunks: Vec<Value> = snapshot_chunks(Arc::new(entries.clone()))
             .map(|text| serde_json::from_str(&text).unwrap())
             .collect();
         assert!(
@@ -368,5 +449,38 @@ mod tests {
         assert!(!write_grant(Some(&token), None));
         assert!(!write_grant(Some(&token), Some("bogus")));
         assert!(!write_grant(None, Some(&presented)));
+    }
+
+    #[test]
+    fn steering_queue_bounds_prompts_and_coalesces_aborts() {
+        let mut queue = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(queue_steer(&mut queue, Steer::Abort), Ok(()));
+        }
+        assert_eq!(queue, vec![Steer::Abort]);
+        for _ in 0..MAX_QUEUED_PROMPTS {
+            assert_eq!(queue_steer(&mut queue, Steer::Prompt("go".into())), Ok(()));
+        }
+        assert_eq!(
+            queue_steer(&mut queue, Steer::Prompt("go".into())),
+            Err(Refusal::Busy)
+        );
+        assert_eq!(queue_steer(&mut queue, Steer::Abort), Ok(()));
+        assert_eq!(queue.iter().filter(|s| **s == Steer::Abort).count(), 1);
+
+        let mut fresh = Vec::new();
+        let oversized = "x".repeat(MAX_PROMPT_BYTES + 1);
+        assert_eq!(
+            queue_steer(&mut fresh, Steer::Prompt(oversized)),
+            Err(Refusal::PromptTooLarge)
+        );
+        let full = "y".repeat(MAX_PROMPT_BYTES);
+        for _ in 0..MAX_QUEUED_PROMPT_BYTES / MAX_PROMPT_BYTES {
+            assert_eq!(queue_steer(&mut fresh, Steer::Prompt(full.clone())), Ok(()));
+        }
+        assert_eq!(
+            queue_steer(&mut fresh, Steer::Prompt("z".into())),
+            Err(Refusal::Busy)
+        );
     }
 }

@@ -111,7 +111,9 @@ impl Local {
             "rollout exceeds private memory input bound"
         );
         let digest = format!("{:x}", Sha256::digest(payload.as_bytes()));
-        let id = format!("{session}:{branch}");
+        // One row per session: the live observation and the later scan of the same session's
+        // file update the same thread, so a session is extracted once, not once per id scheme.
+        let id = session;
         self.db.execute("INSERT INTO threads(id,session,branch,updated,payload,digest) VALUES(?1,?2,?3,?4,?5,?6)
             ON CONFLICT(id) DO UPDATE SET updated=CASE WHEN digest!=excluded.digest THEN excluded.updated ELSE updated END,payload=excluded.payload,digest=excluded.digest", params![id,session,branch,updated,payload,digest])?;
         Ok(())
@@ -415,7 +417,7 @@ impl Driver for Local {
     fn id(&self) -> MemoryBackendId {
         MemoryBackendId::Local
     }
-    fn status(&mut self, _: &Operation) -> Result<Value> {
+    fn status(&mut self, op: &Operation) -> Result<Value> {
         let count: i64 = self
             .db
             .query_row("SELECT count(*) FROM lessons", [], |row| row.get(0))?;
@@ -424,8 +426,27 @@ impl Driver for Local {
             .prepare("SELECT content FROM lessons ORDER BY created DESC,id DESC LIMIT 5")?
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        let at = now();
+        let idle = self.config.min_rollout_idle_hours as i64 * 3600;
+        let (current, waiting): (i64, i64) = self.db.query_row(
+            "SELECT SUM(session=?1),SUM(session!=?1 AND updated>?2) FROM threads WHERE processed_digest IS NULL OR processed_digest!=digest",
+            params![op.authority.session_id, at - idle],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                ))
+            },
+        )?;
+        let mut notes = Vec::new();
+        if current > 0 || waiting > 0 {
+            notes.push(format!(
+                "Local memory learns from a session after it has been idle for {} hour(s) (memory.local.min_rollout_idle_hours), and never from the session in use; {} past session(s) are waiting. Run /memory enqueue to learn from past sessions now.",
+                self.config.min_rollout_idle_hours, waiting
+            ));
+        }
         Ok(
-            json!({"backend":"local","active":true,"writable":true,"searchable":false,"count":count,"recent":recent,"scope":"project","message":"Learns from past sessions for this project."}),
+            json!({"backend":"local","active":true,"writable":true,"searchable":false,"count":count,"recent":recent,"scope":"project","notes":notes,"message":"Learns from past sessions for this project."}),
         )
     }
     fn save(

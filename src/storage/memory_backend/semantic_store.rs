@@ -231,6 +231,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS pending_turns(
                 id INTEGER PRIMARY KEY, turn_key TEXT NOT NULL UNIQUE, session TEXT NOT NULL,
                 prompt TEXT NOT NULL, answer TEXT NOT NULL, created INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS observed_turns(turn_key TEXT PRIMARY KEY, created INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(content, tokenize='unicode61');",
         )?;
@@ -355,7 +356,8 @@ impl Store {
         Ok(())
     }
 
-    /// Forgets every live fact; returns how many were erased.
+    /// Forgets every live fact and drops queued turns, whose text must not be extracted into the
+    /// bank that was just cleared; returns how many facts were erased.
     pub fn clear_all(&mut self, at: i64) -> Result<usize> {
         let tx = self
             .conn
@@ -370,6 +372,7 @@ impl Store {
         for (id, revision) in &live {
             tombstone(&tx, *id, *revision, at)?;
         }
+        tx.execute("DELETE FROM pending_turns", [])?;
         tx.commit()?;
         Ok(live.len())
     }
@@ -493,20 +496,32 @@ impl Store {
         Ok(indexed)
     }
 
-    /// Queues one completed turn for automatic retain. Identical turns are queued once.
+    /// Queues one completed turn for automatic retain unless an identical turn was ever queued,
+    /// so re-observing a conversation never extracts the same exchange twice. Returns whether
+    /// the turn was new.
     pub fn enqueue_turn(
         &mut self,
         session: &str,
         prompt: &str,
         answer: &str,
         at: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let key = content_hash(&format!("{prompt}\n{answer}"));
-        self.conn.execute(
-            "INSERT OR IGNORE INTO pending_turns(turn_key,session,prompt,answer,created)VALUES(?1,?2,?3,?4,?5)",
-            params![key, session, prompt, answer, at],
-        )?;
-        Ok(())
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let new = tx.execute(
+            "INSERT OR IGNORE INTO observed_turns(turn_key,created)VALUES(?1,?2)",
+            params![key, at],
+        )? == 1;
+        if new {
+            tx.execute(
+                "INSERT OR IGNORE INTO pending_turns(turn_key,session,prompt,answer,created)VALUES(?1,?2,?3,?4,?5)",
+                params![key, session, prompt, answer, at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(new)
     }
 
     /// Oldest queued turns as (id, prompt, answer), bounded by `limit`.
@@ -640,6 +655,19 @@ mod tests {
         store.retain("two", "test", 2).unwrap();
         assert_eq!(store.clear_all(3).unwrap(), 2);
         assert!(store.recent(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_all_drops_queued_turns() {
+        let mut store = store();
+        store.retain("one", "test", 1).unwrap();
+        assert!(store.enqueue_turn("s", "prompt", "answer", 2).unwrap());
+        store.clear_all(3).unwrap();
+        assert!(store.next_turns(10).unwrap().is_empty());
+        assert!(
+            !store.enqueue_turn("s", "prompt", "answer", 4).unwrap(),
+            "a cleared turn is not queued again"
+        );
     }
 
     #[test]

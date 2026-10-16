@@ -23,8 +23,10 @@ Exit status: `0` completed, `1` error, `2` incomplete, blocked, needs input, no 
 Execution uses shared, revisioned result bodies backed by the session's branch-aware JSONL journal.
 RPC `state` exposes a `tree` containing session, conversation and execution nodes. Each execution
 node has an `id`, `parent`, `kind`, `label` and `result` (`text`, optional structured `data`, `phase`,
-`revision`). `state_reset` clears the current observer view; `state_node` replaces one node and
-`state_delta` appends text to an existing node at the supplied revision. Worker updates use bounded
+`revision`). `state_reset` clears the current observer view; `state_node` replaces one node whenever
+its metadata (label, kind, parent, call ID, presentation, phase, execution or structured data) changed,
+and `state_delta` appends text to a running node at the supplied revision only when the text alone
+grew. Worker updates use bounded
 replacement snapshots. Legacy events remain available; clients should choose one projection to
 avoid displaying a token twice. Tool-result events include original structured `data` when supplied.
 Snapshots are written at boundaries, not for every token. Resuming never restarts unfinished workers.
@@ -48,6 +50,7 @@ responses correlate by `id`, while unsolicited events have `event`. Methods incl
 `task_start`, `task_status`, `task_message`, `task_cancel`, `approve` and `shutdown`.
 Live voice (`docs/voice.md`): `live_start` (optional `voice`, `instructions`), `live_mute` (`muted`), `live_stop`, and `live_listen` (records one utterance and runs it as a turn; not available over ACP). While a live session is active, `send` text gets its instructions, and each finished answer is read aloud.
 Approval responses must name the currently pending `approval_id`; future/stale/replayed decisions fail.
+The `approval` event carries `approval_id`, `tool`, `summary` and, when the request belongs to a call card, the call's `call_id`. `approval_resolved` (`approval_id`) follows once the request is decided, so clients can retire it.
 Abort and task messaging/cancellation remain usable while inference or an approval wait is active.
 Consumers must handle out-of-order response IDs and asynchronous events.
 
@@ -60,8 +63,20 @@ or broken consumers instead of reporting partially delivered success.
 ACP renders `notice`, `background` and `fatal` events as unchanged `agent_message_chunk` text. Each chunk also carries standard `_meta.dial` with `event` and, only when present, `kind`, `lane`, `tokens`, `name` and `replace`, so clients can tell sources apart. This is metadata preservation only; ACP does not implement client-side replacement of background output.
 
 ACP correlates tool calls and final results by the RPC `call_id`, not the tool name, so overlapping
-calls to the same tool retain distinct output and completion status. Name-only legacy output is
-attached to the latest active call of that name; it does not override explicit call identities.
+calls to the same tool retain distinct output and completion status. An approval with a `call_id`
+attaches to that call's card; an approval without a matching card gets a placeholder that the call's
+own `tool_call` adopts or that `approval_resolved` removes. Name-only legacy output is attached to
+the latest active call of that name; it does not override explicit call identities.
+
+A prompt response maps the authoritative outcome. Completed turns return a plain `stopReason` of
+`end_turn`; interrupted turns return `cancelled`; a turn that used its whole step budget returns
+`max_turn_requests`. Failed, blocked, needs-input and incomplete turns return `end_turn` with
+`_meta.dial.outcome` (the Dial outcome) and `_meta.dial.report` (the final report text). The RPC prompt
+result carries the same information as `outcome` and a boolean `step_limit`.
+
+ACP plan entries map each todo status explicitly: `pending`, `in_progress` and `completed` map directly;
+abandoned tasks are `completed` with `_meta.dial.status` `abandoned`; blocked tasks are `pending` with
+`_meta.dial.status` `blocked` and the task note in `_meta.dial.note`.
 
 In-flight ACP request IDs are rejected before prompt preparation or cancellation has side effects.
 Cancellation requests with IDs receive their own replies; cancellation notifications never produce

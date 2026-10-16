@@ -91,6 +91,7 @@ mod lifecycle;
 mod projection;
 mod repair;
 mod roles;
+mod route;
 mod selfplay;
 mod steering;
 mod surface;
@@ -251,7 +252,10 @@ impl StepChecks {
     fn has_uncheckpointed_operations(&self) -> bool {
         self.uncheckpointed_shell_commands > 0 || self.uncheckpointed_extension_calls > 0
     }
-    fn include_failed_checks(&self, checks: &mut Vec<verification::FocusedCheck>) {
+    fn include_failed_checks(&mut self, root: &Path, checks: &mut Vec<verification::FocusedCheck>) {
+        // A Python syntax obligation for a file renamed or deleted since the failure is obsolete.
+        self.failed_checks
+            .retain(|failed| !verification::obsolete_check(root, failed));
         for failed in &self.failed_checks {
             if !checks.iter().any(|check| check.command == failed.command) {
                 checks.push(failed.clone());
@@ -301,6 +305,8 @@ pub struct Agent<'a> {
     role_backends: BTreeMap<String, Backend>,
     /// Context the serving endpoint reports as currently loaded; may be far below the configured window.
     context_cap: Option<u32>,
+    /// The configured route's backend-bound state: fallback cooldown and the primary's loaded cap.
+    route: route::ActiveRoute,
     layout: Option<Layout>,
     session: Session,
     workspace: Workspace,

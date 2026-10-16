@@ -137,13 +137,7 @@ fn path_with(program: &Path, env: &Env) -> String {
         .unwrap_or_default()
 }
 
-fn npm_plan(
-    recipe: &Recipe,
-    env: &Env,
-    destination: &Path,
-    packages: &[&str],
-    npm: &Path,
-) -> Plan {
+fn npm_plan(recipe: &Recipe, env: &Env, destination: &Path, packages: &[&str], npm: &Path) -> Plan {
     let mut args = vec![
         "install".to_owned(),
         "--prefix".to_owned(),

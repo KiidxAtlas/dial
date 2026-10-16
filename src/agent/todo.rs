@@ -324,10 +324,11 @@ impl TodoList {
         out.join("\n")
     }
 
-    /// Progress bookkeeping follows an accepted final report; explicit blockers are never erased.
+    /// Accepted final report closes only the in-progress entry: the work the model was doing. Pending
+    /// entries were never started, so they stay open; explicit blockers are never erased.
     pub fn complete_reported_work(&mut self) {
         for task in &mut self.tasks {
-            if matches!(task.status, Status::Pending | Status::InProgress) {
+            if task.status == Status::InProgress {
                 task.status = Status::Completed;
             }
         }
@@ -662,7 +663,7 @@ pub fn schema() -> Value {
         "type": "function",
         "function": {
             "name": "todo",
-            "description": "Track a numbered plan. Calls: {\"op\":\"set\",\"tasks\":[{\"content\":\"...\"}]} replaces the plan; {\"op\":\"append\",\"tasks\":[...]} adds tasks; {\"op\":\"start\"} or {\"op\":\"start\",\"index\":2} switches focus (no index: first pending task); {\"op\":\"done\"} closes the active task and starts the next pending one; {\"op\":\"drop\"} or {\"op\":\"block\",\"reason\":\"...\"} close without completing; {\"op\":\"view\"} shows the plan. Findings and evidence are optional notes. Do not resend set to mark tasks done. Explicit indices are 1-based and may change when old closed tasks are pruned. Skip for trivial requests. Never call todo alone: send it in parallel with the call that starts or continues the work, and skip a closing update before the final answer (it closes remaining tasks).",
+            "description": "Track a numbered plan. Calls: {\"op\":\"set\",\"tasks\":[{\"content\":\"...\"}]} replaces the plan; {\"op\":\"append\",\"tasks\":[...]} adds tasks; {\"op\":\"start\"} or {\"op\":\"start\",\"index\":2} switches focus (no index: first pending task); {\"op\":\"done\"} closes the active task and starts the next pending one; {\"op\":\"drop\"} or {\"op\":\"block\",\"reason\":\"...\"} close without completing; {\"op\":\"view\"} shows the plan. Findings and evidence are optional notes. Do not resend set to mark tasks done. Explicit indices are 1-based and may change when old closed tasks are pruned. Skip for trivial requests. Never call todo alone: send it in parallel with the call that starts or continues the work. Skip a closing update before the final answer: an accepted completed answer closes only the in-progress task, and pending tasks stay open.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -716,6 +717,27 @@ mod tests {
         );
         list.complete_reported_work();
         assert_eq!(list.tasks()[1].status, Status::Blocked);
+    }
+
+    #[test]
+    fn accepted_report_closes_only_the_started_task_and_leaves_later_work_open() {
+        let mut list = TodoList::new();
+        assert!(
+            !set(
+                &mut list,
+                json!([{"content":"One"},{"content":"Two"},{"content":"Three"}])
+            )
+            .is_error
+        );
+        list.complete_reported_work();
+        assert_eq!(
+            statuses(&list),
+            [Status::Completed, Status::Pending, Status::Pending]
+        );
+        let mut resumed = TodoList::new();
+        resumed.restore(&list.snapshot()).unwrap();
+        assert_eq!(resumed, list);
+        assert!(resumed.has_open());
     }
 
     #[test]

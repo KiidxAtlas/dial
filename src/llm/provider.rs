@@ -243,6 +243,24 @@ pub struct AdapterRuntime {
 
 pub type AdapterMonitor = Arc<parking_lot::Mutex<AdapterRuntime>>;
 
+/// The inputs `catalog::resolve_credential` needs to read an endpoint's key again at each dispatch.
+struct CredentialSource {
+    user_dir: PathBuf,
+    base_url: String,
+    api_key_env: Option<String>,
+}
+
+impl CredentialSource {
+    /// The key `resolve_credential` gives for this endpoint right now.
+    fn resolve(&self) -> Result<Option<String>> {
+        llm::catalog::resolve_credential(
+            &self.user_dir,
+            &self.base_url,
+            self.api_key_env.as_deref(),
+        )
+    }
+}
+
 pub struct Backend {
     #[cfg(test)]
     pub(crate) chatgpt_url: Option<String>,
@@ -268,6 +286,8 @@ pub struct Backend {
     session_identity_error: Option<String>,
     /// Provider OAuth grant resolved (and refreshed) before every endpoint attempt.
     oauth: Option<llm::oauth::Binding>,
+    /// Where a key-authenticated endpoint reads its key at each dispatch; `None` for other routes.
+    credential: Option<CredentialSource>,
     /// Stable conversation identity for provider proxy attribution and live steering.
     session_id: Option<String>,
     codex_websocket: bool,
@@ -316,6 +336,7 @@ impl Backend {
             prompt_cache_key: None,
             session_identity_error,
             oauth: None,
+            credential: None,
             codex_websocket: false,
             image_notices: Default::default(),
             wire: Default::default(),
@@ -554,6 +575,42 @@ impl Backend {
             self.oauth = binding;
         }
         self
+    }
+
+    /// Read a key-authenticated endpoint's key at every dispatch instead of the copy made when the
+    /// backend was built, so a saved, replaced or removed key applies to the next request. OAuth
+    /// routes and other provider kinds keep their own credentials.
+    pub fn with_credential_source(
+        mut self,
+        user_dir: &Path,
+        base_url: &str,
+        api_key_env: Option<&str>,
+    ) -> Self {
+        if matches!(
+            self.kind,
+            ProviderKind::Endpoint { .. } | ProviderKind::AnthropicEndpoint { .. }
+        ) && self.oauth.is_none()
+        {
+            self.credential = Some(CredentialSource {
+                user_dir: user_dir.to_path_buf(),
+                base_url: base_url.to_owned(),
+                api_key_env: api_key_env.map(str::to_owned),
+            });
+        }
+        self
+    }
+
+    /// The API key an endpoint request sends at this dispatch: re-read through the credential source
+    /// when the backend has one, otherwise the key it was built with.
+    pub(super) fn endpoint_api_key(&self) -> Result<Option<String>> {
+        if let Some(source) = &self.credential {
+            return source.resolve();
+        }
+        Ok(match &self.kind {
+            ProviderKind::Endpoint { api_key, .. }
+            | ProviderKind::AnthropicEndpoint { api_key, .. } => api_key.clone(),
+            _ => None,
+        })
     }
 
     pub fn with_headers(mut self, headers: llm::model_config::RequestHeaders) -> Result<Self> {
@@ -1027,6 +1084,20 @@ impl Backend {
             ),
             _ => None,
         };
+        // A grant that routes by its own identifiers (a Cloudflare gateway or Snowflake account) fixes
+        // the endpoint before the configured base URL is validated, so unset template placeholders do
+        // not fail a route the grant already completes.
+        let grant_route = match (&self.kind, &self.oauth) {
+            (
+                ProviderKind::Endpoint { .. } | ProviderKind::AnthropicEndpoint { .. },
+                Some(binding),
+            ) => binding.access(&interrupt)?.base_url,
+            _ => None,
+        };
+        // Key-authenticated endpoints read their key at dispatch, so a key saved, replaced or removed
+        // since the backend was built applies to this request. Precedence and origin checks stay in
+        // `resolve_credential`.
+        let endpoint_key = self.endpoint_api_key()?;
         let (url, auth, model, protocol, codex_account_id) = match &self.kind {
             ProviderKind::ChatGpt { model, .. } => {
                 ensure!(
@@ -1234,14 +1305,13 @@ impl Backend {
                 });
             }
             ProviderKind::Endpoint {
-                base_url,
-                model,
-                api_key,
+                base_url, model, ..
             } => {
                 ensure!(
                     adapter.is_none(),
                     "endpoint providers cannot load LoRA adapters"
                 );
+                let base_url = grant_route.as_deref().unwrap_or(base_url.as_str());
                 (
                     match self.protocol.unwrap_or(ApiProtocol::ChatCompletions) {
                         ApiProtocol::ChatCompletions => {
@@ -1259,7 +1329,7 @@ impl Backend {
                             base_url.trim_end_matches('/').to_owned()
                         }
                     },
-                    api_key.as_deref(),
+                    endpoint_key.as_deref(),
                     model,
                     match self.protocol.unwrap_or(ApiProtocol::ChatCompletions) {
                         ApiProtocol::ChatCompletions => 0,
@@ -1273,14 +1343,13 @@ impl Backend {
                 )
             }
             ProviderKind::AnthropicEndpoint {
-                base_url,
-                model,
-                api_key,
+                base_url, model, ..
             } => {
                 ensure!(
                     adapter.is_none(),
                     "endpoint providers cannot load LoRA adapters"
                 );
+                let base_url = grant_route.as_deref().unwrap_or(base_url.as_str());
                 (
                     match self.protocol {
                         None | Some(ApiProtocol::Anthropic) => {
@@ -1300,7 +1369,7 @@ impl Backend {
                             base_url.trim_end_matches('/').to_owned()
                         }
                     },
-                    api_key.as_deref(),
+                    endpoint_key.as_deref(),
                     model,
                     match self.protocol {
                         None | Some(ApiProtocol::Anthropic) => 1,
@@ -1386,6 +1455,13 @@ impl Backend {
                 None => None,
             };
             let url: &str = oauth_url.as_deref().unwrap_or(url.as_str());
+            if let Some(binding) = &self.oauth {
+                binding.ensure_route(
+                    oauth_url.is_some(),
+                    url,
+                    self.protocol.unwrap_or(ApiProtocol::ChatCompletions),
+                )?;
+            }
             let resolved_headers = llm::model_config::resolve_validated_headers(&self.headers)?;
             // The CoreWeave project header is attached only to CoreWeave's own endpoint.
             let coreweave_project = match &self.kind {
@@ -3320,6 +3396,87 @@ mod tests {
             Some("Bearer sk-secret")
         );
         assert_eq!(fake::body(&seen)["model"], "gpt-x");
+    }
+
+    /// Writes a synthetic, unexpired OAuth grant for `id` in the store's on-disk layout.
+    fn write_grant(user_dir: &Path, id: &str, extra: serde_json::Value) {
+        let grant = json!({
+            "access": "tok",
+            "refresh": "",
+            "expires_at_ms": 4_102_444_800_000u64,
+            "extra": extra,
+        });
+        crate::storage::settings_store::write_private(
+            &user_dir.join(format!("oauth-{id}.json")),
+            grant.to_string().as_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn oauth_grant_is_never_attached_to_a_non_canonical_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        write_grant(&user, "kimi-code", json!({}));
+        let binding = llm::oauth::Binding::for_provider(&user, "kimi-code").unwrap();
+        // The configured route is a different server than the grant's canonical origin. The refusal
+        // happens before dispatch, so this server is never sent a request or the bearer token.
+        let server = fake::serve(vec![ok("pong")]);
+        let mut remote = backend(endpoint(&format!("{}/v1", server.url))).with_oauth(Some(binding));
+        let error = remote
+            .chat(None, &request(), 5, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bound to its own endpoint"), "{error}");
+        assert!(!error.contains("tok"), "{error}");
+    }
+
+    #[test]
+    fn invalid_grant_identifiers_fail_before_any_request_and_not_as_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        write_grant(
+            &user,
+            "cloudflare-ai-gateway",
+            json!({"accountId": "bad/account", "gatewayId": "gw"}),
+        );
+        let binding = llm::oauth::Binding::for_provider(&user, "cloudflare-ai-gateway").unwrap();
+        let mut remote = backend(ProviderKind::AnthropicEndpoint {
+            base_url: "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic".into(),
+            model: "claude-x".into(),
+            api_key: None,
+        })
+        .with_oauth(Some(binding));
+        let error = remote
+            .chat(None, &request(), 5, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Cloudflare AI Gateway account or gateway ID is invalid"),
+            "{error}"
+        );
+        assert!(!error.contains("placeholder"), "{error}");
+    }
+
+    #[test]
+    fn endpoint_key_is_read_at_each_dispatch_not_at_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user");
+        std::fs::create_dir_all(&user).unwrap();
+        let base = "https://key-rotation.example/v1";
+        llm::catalog::save_credential(&user, base, "sk-first").unwrap();
+        let remote = backend(endpoint(base)).with_credential_source(&user, base, None);
+        let source = remote
+            .credential
+            .as_ref()
+            .expect("key-authenticated endpoints read their key at dispatch");
+        assert_eq!(source.resolve().unwrap().as_deref(), Some("sk-first"));
+        llm::catalog::save_credential(&user, base, "sk-second").unwrap();
+        assert_eq!(source.resolve().unwrap().as_deref(), Some("sk-second"));
+        llm::catalog::remove_credential(&user, base).unwrap();
+        assert_eq!(source.resolve().unwrap(), None);
     }
 
     #[test]

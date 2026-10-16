@@ -434,7 +434,8 @@ impl<'a> Agent<'a> {
         };
         let call = &effective;
         let mut approval_denied = false;
-        let mut out = self.dispatch_inner(backend, call, ui, &mut approval_denied, arguments_changed);
+        let mut out =
+            self.dispatch_inner(backend, call, ui, &mut approval_denied, arguments_changed);
         if call.name != "exit_plan"
             && !approval_denied
             && hooks::wanted(self.tool_hooks(), plugins.as_deref(), "post_tool_use")
@@ -1170,13 +1171,24 @@ impl<'a> Agent<'a> {
     pub(super) fn await_background_jobs(&mut self, ui: &mut dyn Ui) -> bool {
         self.pump_subagents(ui);
         let jobs = self.awaited_background_jobs();
-        if !jobs.is_empty() && !self.interrupt.load(Ordering::Relaxed) {
-            self.background_notices.push(format!(
-                "[Background work is still running]\n{}\nContinue independent work first. If nothing useful remains, tell the user what is pending and use a bounded `bg wait`. Do not report these jobs as completed; inspect their results or stop jobs you no longer need.",
-                jobs.join("\n")
-            ));
+        let workers = self.live_tasks.running_ids();
+        if !self.interrupt.load(Ordering::Relaxed) {
+            if !jobs.is_empty() {
+                self.background_notices.push(format!(
+                    "[Background work is still running]\n{}\nContinue independent work first. If nothing useful remains, tell the user what is pending and use a bounded `bg wait`. Do not report these jobs as completed; inspect their results or stop jobs you no longer need.",
+                    jobs.join("\n")
+                ));
+            }
+            // Live workers are awaited like background jobs: the turn waits for their results rather than ending.
+            if !workers.is_empty() {
+                self.background_notices.push(format!(
+                    "[Live workers are still running]\n{}\nWait for their results with `task wait`, or continue independent work first. Their findings arrive as they finish; do not report these workers as completed before their results are in.",
+                    workers.join("\n")
+                ));
+            }
         }
-        !self.background_notices.is_empty()
+        // Finished worker results are queued for the next request: the turn continues to incorporate them.
+        !self.background_notices.is_empty() || !self.live_tasks.undelivered().is_empty()
     }
 }
 

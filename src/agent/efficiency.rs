@@ -69,6 +69,31 @@ pub(super) fn preview_limit(
     }
 }
 
+/// Visible body of one tool result, shared by the parent and child controllers so each clips against
+/// the window of the model that reads it. A replacement body (investigation advice or a read pointer)
+/// stands for the result and is never clipped itself. Returns the body and whether the complete
+/// result had to be dropped to fit `limit`.
+pub(super) fn visible_result(
+    text: &str,
+    limit: usize,
+    replacement: Option<String>,
+) -> (String, bool) {
+    match replacement {
+        Some(body) => (body, false),
+        None => (super::guard::clip_evidence(text, limit), text.len() > limit),
+    }
+}
+
+/// Appends the complete-evidence link only when the visible body dropped content, or when it is
+/// investigation advice that refers to the retained result. An unclipped result carries no link.
+pub(super) fn evidence_link(body: &mut String, uri: &str, dropped: bool) {
+    if dropped || body.starts_with("[Investigation check") {
+        body.push_str(&format!(
+            "\n[Complete tool evidence: {uri}; retrieve with artifact_read]"
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +137,49 @@ mod tests {
         );
         assert_eq!(byte_limit(0).min(byte_limit(4096)), 4096);
         assert_eq!(byte_limit(4096).min(byte_limit(0)), 4096);
+    }
+
+    #[test]
+    fn a_small_window_child_shapes_results_to_its_own_window_and_links_only_clipped_ones() {
+        // A 32k child reads a result shaped for its window, not the 200k parent's cap.
+        let child_window = 32 * 1024;
+        let parent_limit = tools::model_output_limit(200 * 1024);
+        let child_limit = preview_limit(
+            &EfficiencyConfig::default(),
+            child_window,
+            "grep",
+            false,
+            true,
+        );
+        assert_eq!(child_limit, 16 * 1024);
+        assert!(child_limit < parent_limit);
+        let big = "line of evidence\n".repeat(2000);
+        let (body, dropped) = visible_result(&big, child_limit, None);
+        assert!(dropped && body.len() < big.len());
+        let mut clipped = body.clone();
+        evidence_link(&mut clipped, "artifact://big", dropped);
+        assert!(clipped.contains("[Complete tool evidence: artifact://big"));
+        // An unclipped result carries no link.
+        let small = "two matches\n";
+        let (body, dropped) = visible_result(small, child_limit, None);
+        assert!(!dropped);
+        let mut unclipped = body.clone();
+        evidence_link(&mut unclipped, "artifact://small", dropped);
+        assert_eq!(unclipped, small);
+    }
+
+    #[test]
+    fn replacement_bodies_are_never_clipped_and_pointers_carry_no_link() {
+        let text = "evidence ".repeat(10_000);
+        let pointer = format!(
+            "{} This read of the same range returned identical content.",
+            crate::agent::investigation::UNCHANGED_READ
+        );
+        let (body, dropped) = visible_result(&text, 64, Some(pointer.clone()));
+        assert_eq!(body, pointer);
+        assert!(!dropped);
+        let mut body = body;
+        evidence_link(&mut body, "artifact://full", dropped);
+        assert_eq!(body, pointer);
     }
 }

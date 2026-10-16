@@ -1,5 +1,6 @@
-//! Stop-time handling for open work. Text alone does not close a todo list; continuations are bounded
-//! and need new tool evidence or a changed task list before another reminder is allowed.
+//! Stop-time handling for open work. Text alone never closes pending todos: an accepted completed
+//! answer closes only the in-progress task (see `TodoList::complete_reported_work`), and not in goal
+//! mode. Continuations are bounded and need new tool evidence or a changed task list before another reminder is allowed.
 use super::todo::{Status, TodoList};
 use serde_json::{Value, json};
 
@@ -101,7 +102,7 @@ impl Finish {
 pub fn schema() -> Value {
     json!({"type":"function","function":{
         "name":"finish",
-        "description":"Optional structured outcome; ordinary work completes with a plain final answer and needs no finish call. completed reports finished work and requires no live tasks still running. Todos are optional progress bookkeeping; accepted completion closes pending entries. Explicitly blocked tasks must be resolved or reported blocked. A review-pending response continues the turn: inspect the supplied diff and requested evidence, then call finish again. blocked means a concrete missing prerequisite prevents further work. needs_input asks a specific question and waits for the user's response inside the tool call, then continues the same turn; optionally provide 1–8 choices in options, and the interactive UI always offers an Other typed response. Both blocked and needs_input require reason and leave todos open. Use as the last call in a batch. Never claim completed for promised or unverified work.",
+        "description":"Optional structured outcome; ordinary work completes with a plain final answer and needs no finish call. completed reports finished work and requires no live tasks still running. Todos are optional progress bookkeeping; an accepted completed report closes only the in-progress task and leaves pending entries open. Explicitly blocked tasks must be resolved or reported blocked. A review-pending response continues the turn: inspect the supplied diff and requested evidence, then call finish again. blocked means a concrete missing prerequisite prevents further work. needs_input asks a specific question and waits for the user's response inside the tool call, then continues the same turn; optionally provide 1–8 choices in options, and the interactive UI always offers an Other typed response. Both blocked and needs_input require reason and leave todos open. Use as the last call in a batch. Never claim completed for promised or unverified work.",
         "parameters":{"type":"object","properties":{
             "outcome":{"type":"string","enum":["completed","blocked","needs_input"]},
             "summary":{"type":"string","minLength":1,"maxLength":8192},

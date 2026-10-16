@@ -1892,7 +1892,10 @@ mod tests {
         assert!(shown.contains("not served"), "{shown}");
         assert!(!shown.contains("llama3"), "chat models stay off the shelf");
         assert!(
-            !group.catalog_rows().iter().any(|m| m.name == "embeddinggemma"),
+            !group
+                .catalog_rows()
+                .iter()
+                .any(|m| m.name == "embeddinggemma"),
             "a curated model already served by Ollama is listed once"
         );
         assert_eq!(

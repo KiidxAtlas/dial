@@ -7,7 +7,7 @@
 //! start-time checks but still honour the daily budget only if you set one.
 use crate::config::types::ImproveConfig;
 use crate::storage::settings_store;
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use std::{
     path::Path,
     process::Command,
@@ -30,6 +30,8 @@ pub struct Snapshot {
     /// Seconds since the last coding turn asked for compute; `None` if none ever did.
     pub idle_secs: Option<u64>,
     pub used_today_secs: u64,
+    /// The persisted daily usage record is corrupt; a budgeted machine must not start background work.
+    pub usage_unreadable: bool,
 }
 
 impl Snapshot {
@@ -40,6 +42,7 @@ impl Snapshot {
             throttled: false,
             idle_secs: None,
             used_today_secs: 0,
+            usage_unreadable: false,
         }
     }
 }
@@ -64,6 +67,12 @@ pub fn blocker(config: &ImproveConfig, snapshot: &Snapshot) -> Option<String> {
                 config.idle_minutes
             ));
         }
+    }
+    if snapshot.usage_unreadable && config.daily_compute_minutes > 0 {
+        return Some(
+            "compute-usage.json is unreadable; repair or remove it to resume background compute"
+                .into(),
+        );
     }
     if let Some(left) = budget_left(config, snapshot.used_today_secs)
         && left == 0
@@ -138,6 +147,7 @@ pub fn probe(user_dir: &Path) -> Snapshot {
         throttled: mac && parse_throttled(&pmset(&["-g", "therm"])),
         idle_secs: idle_secs(user_dir),
         used_today_secs: used_today(user_dir),
+        usage_unreadable: read_usage_checked(user_dir, now()).is_err(),
     }
 }
 
@@ -169,16 +179,32 @@ fn day(at: u64) -> u64 {
 }
 
 fn read_usage(user_dir: &Path, at: u64) -> u64 {
-    std::fs::read_to_string(usage_path(user_dir))
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .filter(|v| v["day"].as_u64() == Some(day(at)))
-        .and_then(|v| v["secs"].as_u64())
-        .unwrap_or(0)
+    read_usage_checked(user_dir, at).unwrap_or(0)
+}
+
+/// Today's recorded usage. A missing record or one for another day counts as zero; a corrupt or
+/// unreadable record is an error, so writers never overwrite it and admission can fail closed.
+fn read_usage_checked(user_dir: &Path, at: u64) -> Result<u64> {
+    let text = match std::fs::read_to_string(usage_path(user_dir)) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let record: serde_json::Value =
+        serde_json::from_str(&text).context("compute usage record is corrupt")?;
+    let (Some(recorded_day), Some(secs)) = (record["day"].as_u64(), record["secs"].as_u64()) else {
+        bail!("compute usage record is corrupt");
+    };
+    Ok(if recorded_day == day(at) { secs } else { 0 })
 }
 
 pub fn used_today(user_dir: &Path) -> u64 {
     read_usage(user_dir, now())
+}
+
+/// Today's usage, or an error when the record is corrupt or unreadable (admission fails closed).
+pub fn used_today_checked(user_dir: &Path) -> Result<u64> {
+    read_usage_checked(user_dir, now())
 }
 
 /// Add background compute time to today's total.
@@ -191,7 +217,9 @@ fn record_usage_at(user_dir: &Path, secs: u64, at: u64) -> Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(user_dir)?;
-    let total = read_usage(user_dir, at) + secs;
+    // The stable settings lock covers the whole read-modify-write, independent of compute_locks.
+    let _lock = settings_store::locked(&usage_path(user_dir))?;
+    let total = read_usage_checked(user_dir, at)? + secs;
     settings_store::write_private(
         &usage_path(user_dir),
         serde_json::json!({"day": day(at), "secs": total})
@@ -344,6 +372,47 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn concurrent_settlements_keep_every_increment_without_compute_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = 86_400 * 100 + 5;
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..25 {
+                        record_usage_at(dir.path(), 3, at).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(read_usage(dir.path(), at), 8 * 25 * 3);
+    }
+
+    #[test]
+    fn corrupt_usage_record_is_reported_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = 86_400 * 100 + 5;
+        let corrupt = b"{\"day\": 1e";
+        std::fs::write(usage_path(dir.path()), corrupt).unwrap();
+        assert!(record_usage_at(dir.path(), 60, at).is_err());
+        assert_eq!(std::fs::read(usage_path(dir.path())).unwrap(), corrupt);
+        let config = ImproveConfig {
+            daily_compute_minutes: 120,
+            ..ImproveConfig::default()
+        };
+        let snapshot = Snapshot {
+            usage_unreadable: read_usage_checked(dir.path(), at).is_err(),
+            ..Snapshot::permissive()
+        };
+        assert!(blocker(&config, &snapshot).unwrap().contains("unreadable"));
+        // A corrupt record is not a day's usage: an unbudgeted machine is unaffected.
+        let unbudgeted = ImproveConfig {
+            daily_compute_minutes: 0,
+            ..config
+        };
+        assert_eq!(blocker(&unbudgeted, &snapshot), None);
     }
 
     #[test]

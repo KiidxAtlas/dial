@@ -348,22 +348,25 @@ impl Marketplaces {
         };
         let mut planned = Vec::new();
         for plugin in installed {
-            let candidates: Vec<&MarketplaceEntry> = entries
+            // Only an entry that still points at the installed source is the same publisher. A removed
+            // or disabled catalog, a direct install, or another publisher's entry under the same name
+            // never replaces the plugin implicitly; that needs an explicit `plugin@marketplace` install.
+            let matched: Vec<&MarketplaceEntry> = entries
                 .iter()
-                .filter(|entry| entry.name == plugin.name)
+                .filter(|entry| entry.name == plugin.name && entry.source == plugin.source)
                 .collect();
-            // Prefer the marketplace entry that already points at the installed source.
-            let chosen = candidates
-                .iter()
-                .copied()
-                .find(|entry| entry.source == plugin.source)
-                .or_else(|| candidates.first().copied());
-            let Some(entry) = chosen else {
+            let Some(entry) = matched.first().copied() else {
+                if name.is_some() {
+                    bail!(
+                        "plugin {} is not listed by an enabled marketplace at its installed source {}; to change publisher, remove it and install {}@<marketplace> explicitly",
+                        plugin.name,
+                        plugin.source,
+                        plugin.name
+                    );
+                }
                 continue;
             };
-            let source_changed = entry.source != plugin.source;
-            let version_changed = entry.version.is_some() && entry.version != plugin.version;
-            if source_changed || version_changed {
+            if entry.version.is_some() && entry.version != plugin.version {
                 planned.push(Planned {
                     plugin,
                     entry: entry.clone(),
@@ -655,6 +658,48 @@ mod tests {
             store.get("alpha").unwrap().version.as_deref(),
             Some("2.0.0")
         );
+    }
+
+    #[test]
+    fn upgrade_never_substitutes_another_publisher() {
+        let fx = Fixture::new();
+        let publisher_a = fx.plugin_dir("alpha", "1.0.0");
+        let publisher_b = fx.base.join("plugins/alpha-b");
+        write_plugin(
+            &publisher_b,
+            &json!({"name": "alpha", "version": "2.0.0"}).to_string(),
+        );
+        let source_a = format!("file:{}", publisher_a.display());
+        let source_b = format!("file:{}", publisher_b.display());
+        let index_a = fx.write_index(
+            "a.json",
+            json!([{"name": "alpha", "version": "1.0.0", "source": source_a}]),
+        );
+        let index_b = fx.write_index(
+            "b.json",
+            json!([{"name": "alpha", "version": "2.0.0", "source": source_b}]),
+        );
+        let marketplaces = fx.marketplaces();
+        marketplaces
+            .add("mkt-a", index_a.to_str().unwrap())
+            .unwrap();
+        marketplaces
+            .add("mkt-b", index_b.to_str().unwrap())
+            .unwrap();
+        let store = fx.store();
+        marketplaces.install("alpha@mkt-a", &store).unwrap();
+
+        // Publisher A's catalog is removed; publisher B's same-name entry must not take over.
+        marketplaces.remove("mkt-a").unwrap();
+        let updates = marketplaces.upgrade(&store, None).unwrap();
+        assert!(updates.is_empty(), "{updates:?}");
+        let kept = store.get("alpha").unwrap();
+        assert_eq!(kept.source, source_a);
+        assert_eq!(kept.version.as_deref(), Some("1.0.0"));
+        assert!(kept.enabled);
+        let err = marketplaces.upgrade(&store, Some("alpha")).unwrap_err();
+        assert!(format!("{err:#}").contains("installed source"), "{err:#}");
+        assert_eq!(store.get("alpha").unwrap().source, source_a);
     }
 
     #[test]

@@ -361,7 +361,12 @@ mod tests {
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(root)
-            .args(["-c", "user.name=Dial", "-c", "user.email=dial@example.invalid"])
+            .args([
+                "-c",
+                "user.name=Dial",
+                "-c",
+                "user.email=dial@example.invalid",
+            ])
             .args(args)
             .status()
             .expect("git runs");

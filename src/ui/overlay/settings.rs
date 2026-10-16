@@ -6,7 +6,7 @@
 //! This file also holds the small drawing helpers shared by the model and provider panels.
 use super::{DrawCtx, OverlayEvent};
 use crate::{
-    llm::model_config::UiConfig,
+    llm::model_config::{ModelSelection, UiConfig},
     storage::settings_store::Scope,
     ui::{
         chrome::{self, Section, Status, status_chip},
@@ -473,10 +473,35 @@ enum Item {
 }
 
 /// A missing dependency that a setting path needs: what to install and the plan to show first.
+#[derive(Clone)]
 pub struct SetupOffer {
     pub id: String,
     pub title: String,
     pub preview: String,
+}
+
+/// A discovered model the `embedding` role can take, listed on the Embedding model row.
+pub struct EmbeddingModel {
+    pub selection: ModelSelection,
+    pub label: String,
+    /// False for a model whose server did not say what it is (it may not be an embedding model).
+    pub classified: bool,
+}
+
+/// The settings row that picks the `embedding` role (and holds the advanced model override).
+const EMBEDDING_MODEL_PATH: &str = crate::setup::embeddings::EMBEDDING_MODEL_PATH;
+const EMBEDDING_URL_PATH: &str = "memory.semantic.embedding_base_url";
+/// Override rows kept behind "Show advanced" while no override URL is set.
+const EMBEDDING_OVERRIDE_ROWS: [&str; 2] =
+    [EMBEDDING_URL_PATH, "memory.semantic.embedding_api_key_env"];
+
+/// The other half of the OpenAI-compatible embedding override, which is valid only as a pair.
+pub fn pair_partner(path: &str) -> Option<&'static str> {
+    match path {
+        EMBEDDING_URL_PATH => Some(EMBEDDING_MODEL_PATH),
+        EMBEDDING_MODEL_PATH => Some(EMBEDDING_URL_PATH),
+        _ => None,
+    }
 }
 
 pub struct SettingsOverlay {
@@ -514,6 +539,12 @@ pub struct SettingsOverlay {
     memory_intent: Option<String>,
     /// Sections whose advanced settings are expanded, by (tab, section).
     advanced_open: BTreeSet<(&'static str, &'static str)>,
+    /// Discovered models the embedding role can take (supplied by the controller).
+    embedding_models: Vec<EmbeddingModel>,
+    /// Setup offers for the curated embedding models, by model name.
+    embedding_setups: BTreeMap<String, SetupOffer>,
+    /// One half of the embedding override pair, held until its partner is set so both save together.
+    staged_pair: Option<(&'static str, Value)>,
 }
 
 /// Plain-language summary of a memory backend. `models` is the chord that opens the model selector
@@ -538,10 +569,9 @@ fn memory_summary(backend: &str, models: &str) -> String {
         "sharpshooter" => format!(
             "Keeps project decision notes, written by the model on the Memory role ({models}, Roles)."
         ),
-        "semantic" => {
-            "Recalls facts by keyword, and by meaning when an embedding service is set. Needs no setup; with no service, nothing leaves this machine."
-                .to_owned()
-        }
+        "semantic" => format!(
+            "Stores facts on this machine and recalls them by keyword, and by meaning once an embedding model is assigned (Embedding model below, or {models}, Roles). Facts are saved automatically only after you assign the memory role ({models}); that model receives turn text."
+        ),
         _ => String::new(),
     }
 }
@@ -571,24 +601,69 @@ fn is_loopback_url(endpoint: &str) -> bool {
     })
 }
 
-/// Required fields of `backend` that are still empty, as setting paths, in the order to fill them.
-/// Mirrors `memory_backend::config::validate`, which rejects saving the backend without them.
-fn memory_needs(backend: &str, get: impl Fn(&str) -> Value) -> Vec<&'static str> {
-    let empty = |path: &str| get(path).as_str().is_none_or(|v| v.trim().is_empty());
+/// Required fields of `backend` that are still empty or half set, as setting paths, in the order to
+/// fill them. Mirrors `memory_backend::config::validate` and the runtime routes: Hindsight's URL and
+/// key, Sharpshooter's model when the memory role is unassigned, and for semantic the missing half of
+/// the URL/model override, or an embedding model when embeddings are `on` with no route.
+fn memory_needs(
+    backend: &str,
+    get: impl Fn(&str) -> Value,
+    has_role: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    let text = |path: &str| get(path).as_str().unwrap_or("").trim().to_owned();
     let mut needs = Vec::new();
     match backend {
         "hindsight" => {
-            let endpoint = get("memory.hindsight.endpoint");
-            let endpoint = endpoint.as_str().unwrap_or("").trim();
+            let endpoint = text("memory.hindsight.endpoint");
             if endpoint.is_empty() {
                 needs.push("memory.hindsight.endpoint");
-            } else if empty("memory.hindsight.api_key_env") && !is_loopback_url(endpoint) {
+            } else if text("memory.hindsight.api_key_env").is_empty() && !is_loopback_url(&endpoint)
+            {
                 needs.push("memory.hindsight.api_key_env");
+            }
+        }
+        "sharpshooter" => {
+            if text("memory.sharpshooter.model").is_empty()
+                && !has_role(&text("memory.sharpshooter.model_role"))
+            {
+                needs.push("memory.sharpshooter.model");
+            }
+        }
+        "semantic" => {
+            let (url, model) = (text(EMBEDDING_URL_PATH), text(EMBEDDING_MODEL_PATH));
+            match (url.is_empty(), model.is_empty()) {
+                (false, true) => needs.push(EMBEDDING_MODEL_PATH),
+                (true, false) => needs.push(EMBEDDING_URL_PATH),
+                (true, true)
+                    if text("memory.semantic.embedding") == "on" && !has_role("embedding") =>
+                {
+                    needs.push(EMBEDDING_MODEL_PATH)
+                }
+                _ => {}
             }
         }
         _ => {}
     }
     needs
+}
+
+/// A model role the backend cannot work without and that only the Roles view can assign.
+fn memory_missing_role(
+    backend: &str,
+    get: impl Fn(&str) -> Value,
+    has_role: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let fields: &[&str] = match backend {
+        "local" => &[
+            "memory.local.extraction_role",
+            "memory.local.consolidation_role",
+        ],
+        _ => &[],
+    };
+    fields
+        .iter()
+        .filter_map(|path| get(path).as_str().map(str::to_owned))
+        .find(|role| !has_role(role))
 }
 
 /// The display name of a `memory.backend` choice (`Hindsight service`).
@@ -863,6 +938,9 @@ impl SettingsOverlay {
             setup_pending: false,
             memory_intent: None,
             advanced_open: BTreeSet::new(),
+            embedding_models: Vec::new(),
+            embedding_setups: BTreeMap::new(),
+            staged_pair: None,
             feedback: None,
             load_error: None,
         }
@@ -946,13 +1024,39 @@ impl SettingsOverlay {
         self.setup_pending = pending;
     }
 
+    /// Discovered models the embedding role can take, listed on the Embedding model row.
+    pub fn set_embedding_models(&mut self, models: Vec<EmbeddingModel>) {
+        self.embedding_models = models;
+    }
+
+    /// Setup offers for the curated embedding models, by model name; picking one on the Embedding
+    /// model row makes Ctrl+L set up that model.
+    pub fn set_embedding_setups(&mut self, offers: BTreeMap<String, SetupOffer>) {
+        self.embedding_setups = offers;
+    }
+
+    /// The held half of the embedding override pair, to save together with its partner. The pending
+    /// entry stays until the controller settles that path.
+    pub fn take_staged_pair(&mut self) -> Option<(String, Value)> {
+        self.staged_pair
+            .take()
+            .map(|(path, value)| (path.to_owned(), value))
+    }
+
     pub fn replace_values(&mut self, values: Table, project_values: Table, global_values: Table) {
         self.effective = values;
         self.project = project_values;
         self.global = global_values;
         self.pending.clear();
+        self.staged_pair = None;
         self.notes.clear();
         self.load_error = None;
+    }
+
+    /// A model role was assigned or cleared elsewhere (the Embedding model row, or a setup job):
+    /// re-check a backend switch that waits on it.
+    pub fn roles_changed(&mut self) {
+        self.recheck_memory_intent();
     }
 
     /// Report background setup and settings-layer failures without replacing last-good values.
@@ -994,24 +1098,220 @@ impl SettingsOverlay {
                     self.memory_intent = None;
                 }
                 self.notes.remove(path);
-                if let Some(intent) = self.memory_intent.clone()
-                    && path.starts_with(memory_section(&intent).unwrap_or("\0"))
+                if let Some(intent) = self.memory_intent.as_deref()
+                    && path.starts_with(memory_section(intent).unwrap_or("\0"))
                 {
-                    match memory_needs(&intent, |p| self.current_path(p)).first() {
-                        Some(next) => self.move_to_path(next),
-                        None => {
-                            self.move_to_path("memory.backend");
-                            self.feedback = Some(format!(
-                                "{} is ready: press Enter on Backend to switch to it.",
-                                label_for_choice(&intent)
-                            ));
-                        }
-                    }
+                    self.recheck_memory_intent();
                 }
             }
             Err(message) => {
                 self.notes.insert(path.to_owned(), text::one_line(&message));
             }
+        }
+    }
+
+    /// Whether a model role is assigned in the effective settings.
+    fn has_role(&self, role: &str) -> bool {
+        settings_schema::get(&self.effective, &format!("model_roles.{role}")).is_some()
+    }
+
+    /// While a backend switch waits for its fields, point at the next one or say it is ready.
+    fn recheck_memory_intent(&mut self) {
+        let Some(intent) = self.memory_intent.clone() else {
+            return;
+        };
+        match memory_needs(&intent, |p| self.current_path(p), |r| self.has_role(r)).first() {
+            Some(next) => self.move_to_path(next),
+            None => {
+                self.move_to_path("memory.backend");
+                self.feedback = Some(format!(
+                    "{} is ready: press Enter on Backend to switch to it.",
+                    label_for_choice(&intent)
+                ));
+            }
+        }
+    }
+
+    /// Whether a row hides behind its section's "Show advanced" toggle. The embedding URL override
+    /// rows do while no override URL is set.
+    fn advanced(&self, path: &str) -> bool {
+        settings_schema::is_advanced(path)
+            || (EMBEDDING_OVERRIDE_ROWS.contains(&path)
+                && self
+                    .current_path(EMBEDDING_URL_PATH)
+                    .as_str()
+                    .is_none_or(|url| url.trim().is_empty()))
+    }
+
+    /// The Embedding model row's value: the override when set, otherwise the embedding role.
+    fn embedding_row_text(&self, value: &Value) -> String {
+        let model = value.as_str().unwrap_or("").trim();
+        if !model.is_empty() {
+            return format!("{model} · URL override");
+        }
+        match self.embedding_role() {
+            Some(name) => format!("{name} · embedding role"),
+            None => "not set · Enter to choose".to_owned(),
+        }
+    }
+
+    /// `provider/model` of the assigned embedding role.
+    fn embedding_role(&self) -> Option<String> {
+        let role = settings_schema::get(&self.effective, "model_roles.embedding")?;
+        let field = |key: &str| role.get(key).and_then(Value::as_str).unwrap_or("");
+        Some(format!("{}/{}", field("provider"), field("model")))
+    }
+
+    /// Enter on the Embedding model row: discovered models for the embedding role, curated models to
+    /// set up, then the advanced override.
+    fn open_embedding_picker(&mut self, def: &'static SettingDef) -> OverlayEvent {
+        let assigned = self.embedding_role();
+        let mut choices: Vec<String> = (0..self.embedding_models.len())
+            .map(|i| format!("role:{i}"))
+            .collect();
+        let discovered = |name: &str| {
+            self.embedding_models.iter().any(|model| {
+                model.selection.provider == "ollama"
+                    && model.selection.model.trim_end_matches(":latest") == name
+            })
+        };
+        choices.extend(
+            crate::setup::embeddings::CATALOG
+                .iter()
+                .filter(|model| !discovered(model.name))
+                .map(|model| format!("setup:{}", model.name)),
+        );
+        choices.push("override".to_owned());
+        let has_override = self
+            .current(def)
+            .as_str()
+            .is_some_and(|model| !model.trim().is_empty());
+        if has_override {
+            choices.push("clear".to_owned());
+        }
+        // A URL override waiting for its model lands on typing the model name.
+        let url_set = self
+            .current_path(EMBEDDING_URL_PATH)
+            .as_str()
+            .is_some_and(|url| !url.trim().is_empty());
+        let assigned_choice = |choice: &String| {
+            choice
+                .strip_prefix("role:")
+                .and_then(|i| i.parse::<usize>().ok())
+                .and_then(|i| self.embedding_models.get(i))
+                .is_some_and(|model| {
+                    assigned.as_deref()
+                        == Some(&format!(
+                            "{}/{}",
+                            model.selection.provider, model.selection.model
+                        ))
+                })
+        };
+        let cursor = choices
+            .iter()
+            .position(|choice| {
+                if url_set {
+                    choice == "override"
+                } else {
+                    assigned_choice(choice)
+                }
+            })
+            .unwrap_or(0);
+        self.notes.remove(def.path);
+        self.mode = Mode::Pick {
+            def,
+            choices,
+            cursor,
+        };
+        OverlayEvent::None
+    }
+
+    fn embedding_choice_label(&self, choice: &str) -> String {
+        if let Some(model) = choice
+            .strip_prefix("role:")
+            .and_then(|i| i.parse::<usize>().ok())
+            .and_then(|i| self.embedding_models.get(i))
+        {
+            let name = format!("{}/{}", model.selection.provider, model.label);
+            return if model.classified {
+                format!("{name} · embedding role")
+            } else {
+                format!(
+                    "{name} · {}",
+                    crate::ui::overlay::models::UNCLASSIFIED_LABEL
+                )
+            };
+        }
+        if let Some(name) = choice.strip_prefix("setup:") {
+            let size = crate::setup::embeddings::find(name)
+                .map(|model| format!(", {} MB", model.size_mb))
+                .unwrap_or_default();
+            return format!("{name} · set up with Ollama{size}, then Ctrl+L");
+        }
+        match choice {
+            "override" => {
+                "Type a model name (advanced override; needs Embedding service URL)".into()
+            }
+            "clear" => "Clear the URL/model override (use the embedding role)".into(),
+            other => other.to_owned(),
+        }
+    }
+
+    /// A choice on the Embedding model row: assign the role, arm a curated setup for Ctrl+L, edit
+    /// the override, or clear it.
+    fn embedding_pick(&mut self, def: &'static SettingDef, choice: &str) -> OverlayEvent {
+        if let Some(model) = choice
+            .strip_prefix("role:")
+            .and_then(|i| i.parse::<usize>().ok())
+            .and_then(|i| self.embedding_models.get(i))
+        {
+            let overridden = self
+                .current(def)
+                .as_str()
+                .is_some_and(|model| !model.trim().is_empty());
+            self.feedback = overridden.then(|| {
+                "The URL/model override still wins over the embedding role; clear it to use the role"
+                    .to_owned()
+            });
+            return OverlayEvent::AssignModel {
+                role: "embedding".into(),
+                selection: model.selection.clone(),
+                scope: self.scope,
+            };
+        }
+        if let Some(name) = choice.strip_prefix("setup:") {
+            match self.embedding_setups.get(name).cloned() {
+                Some(offer) => {
+                    self.setup_armed = Some(offer.id.clone());
+                    self.feedback = Some(format!(
+                        "Review the plan below, then press Ctrl+L to set up {}",
+                        offer.title
+                    ));
+                    self.setup_offers.insert(def.path.to_owned(), offer);
+                }
+                None => {
+                    self.feedback = Some(format!("Run /setup embeddings:{name} to set it up"));
+                }
+            }
+            return OverlayEvent::None;
+        }
+        match choice {
+            "override" => {
+                let mut editor = Editor::default();
+                editor.set(&edit_text(&self.current(def)));
+                self.mode = Mode::Edit { def, editor };
+                OverlayEvent::None
+            }
+            "clear" => {
+                self.notes.remove(def.path);
+                self.pending
+                    .insert(def.path.to_owned(), Pending::Unset(self.scope));
+                OverlayEvent::Unset {
+                    path: def.path.to_owned(),
+                    scope: self.scope,
+                }
+            }
+            _ => OverlayEvent::None,
         }
     }
 
@@ -1080,9 +1380,20 @@ impl SettingsOverlay {
     }
 
     fn move_to_path(&mut self, path: &str) {
-        if let Some(at) = self.visible().iter().position(
-            |r| matches!(r, Row::Setting(i) if settings_schema::registry()[*i].path == path),
-        ) {
+        let find = |rows: Vec<Row>| {
+            rows.iter().position(
+                |r| matches!(r, Row::Setting(i) if settings_schema::registry()[*i].path == path),
+            )
+        };
+        let mut found = find(self.visible());
+        if found.is_none()
+            && let Some(def) = settings_schema::registry().iter().find(|d| d.path == path)
+        {
+            // A field to fill may sit behind its section's advanced toggle: open it.
+            self.advanced_open.insert((def.tab, def.section));
+            found = find(self.visible());
+        }
+        if let Some(at) = found {
             self.cursor = at;
         }
     }
@@ -1168,12 +1479,12 @@ impl SettingsOverlay {
                     let basic = defs
                         .iter()
                         .enumerate()
-                        .filter(|(_, d)| in_section(*d) && !settings_schema::is_advanced(d.path))
+                        .filter(|(_, d)| in_section(*d) && !self.advanced(d.path))
                         .map(|(i, _)| Row::Setting(i));
                     let advanced: Vec<usize> = defs
                         .iter()
                         .enumerate()
-                        .filter(|(_, d)| in_section(*d) && settings_schema::is_advanced(d.path))
+                        .filter(|(_, d)| in_section(*d) && self.advanced(d.path))
                         .map(|(i, _)| i)
                         .collect();
                     rows.extend(basic);
@@ -1363,9 +1674,29 @@ impl SettingsOverlay {
         OverlayEvent::None
     }
 
-    fn emit_set(&mut self, def: &SettingDef, value: Value) -> OverlayEvent {
+    fn emit_set(&mut self, def: &'static SettingDef, value: Value) -> OverlayEvent {
         self.feedback = None;
         self.notes.remove(def.path);
+        // One half of the embedding override alone is invalid: hold it until its partner is set,
+        // then the controller saves both together (see `take_staged_pair`).
+        if let Some(partner) = pair_partner(def.path)
+            && value.as_str().is_some_and(|v| !v.trim().is_empty())
+            && self
+                .current_path(partner)
+                .as_str()
+                .is_none_or(|v| v.trim().is_empty())
+        {
+            self.pending
+                .insert(def.path.to_owned(), Pending::Set(value.clone(), self.scope));
+            self.staged_pair = Some((def.path, value));
+            self.feedback = Some(format!(
+                "{} saves together with {}: set it next",
+                label_of(def.path),
+                label_of(partner)
+            ));
+            self.move_to_path(partner);
+            return OverlayEvent::None;
+        }
         self.pending
             .insert(def.path.to_owned(), Pending::Set(value.clone(), self.scope));
         OverlayEvent::Set {
@@ -1406,6 +1737,9 @@ impl SettingsOverlay {
                     cursor,
                 };
                 OverlayEvent::None
+            }
+            Kind::Enum(_) | Kind::Choice(_) if def.path == EMBEDDING_MODEL_PATH => {
+                self.open_embedding_picker(def)
             }
             Kind::Enum(options) | Kind::Choice(options) => {
                 let mut choices: Vec<String> = options
@@ -1562,14 +1896,34 @@ impl SettingsOverlay {
             let value = choice_value(def.kind_for(&self.effective), &chosen);
             let unchanged = self.current(def) == value;
             self.mode = Mode::Browse;
+            if def.path == EMBEDDING_MODEL_PATH {
+                return self.embedding_pick(def, &chosen);
+            }
             if def.path == "memory.backend" {
-                let needs = memory_needs(&chosen, |p| self.current_path(p));
+                if let Some(role) =
+                    memory_missing_role(&chosen, |p| self.current_path(p), |r| self.has_role(r))
+                {
+                    // Only the Roles view assigns a model role; switching now would leave memory paused.
+                    self.memory_intent = None;
+                    self.feedback = Some(format!(
+                        "{} needs the {role} role: assign it in /roles (Alt+M), then choose it here.",
+                        label_for_choice(&chosen)
+                    ));
+                    return OverlayEvent::None;
+                }
+                let needs = memory_needs(&chosen, |p| self.current_path(p), |r| self.has_role(r));
                 if let Some(first) = needs.first() {
-                    // Saving the backend now would fail validation: collect its fields first.
+                    // Saving the backend now would fail validation or leave it inactive: collect
+                    // its fields first.
                     let labels: Vec<_> = needs.iter().map(|p| label_of(p)).collect();
+                    let alternative = if chosen == "sharpshooter" {
+                        " (or assign the memory role in /roles, Alt+M)"
+                    } else {
+                        ""
+                    };
                     self.memory_intent = Some(chosen.clone());
                     self.feedback = Some(format!(
-                        "To switch, first fill: {}. You'll come back here when they're set.",
+                        "To switch, first fill: {}{alternative}. You'll come back here when they're set.",
                         labels.join(", ")
                     ));
                     self.move_to_path(first);
@@ -1717,6 +2071,9 @@ impl SettingsOverlay {
                                 (Kind::AutoBool, "auto") => "Auto (let Dial decide)".to_owned(),
                                 (Kind::AutoBool, "true") => "On (enabled)".to_owned(),
                                 (Kind::AutoBool, "false") => "Off (disabled)".to_owned(),
+                                _ if def.path == EMBEDDING_MODEL_PATH => {
+                                    self.embedding_choice_label(name)
+                                }
                                 _ => value_text(def, &Value::String(name.clone())),
                             },
                             on: n == *cursor,
@@ -2161,7 +2518,11 @@ impl SettingsOverlay {
                     s.push(Span::styled("]", base(Tok::Muted)));
                     s
                 } else {
-                    let text = value_text(def, &value);
+                    let text = if def.path == EMBEDDING_MODEL_PATH {
+                        self.embedding_row_text(&value)
+                    } else {
+                        value_text(def, &value)
+                    };
                     match def.kind_for(&self.effective) {
                         Kind::Bool => {
                             let on = value.as_bool().unwrap_or(false);

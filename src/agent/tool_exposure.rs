@@ -12,7 +12,8 @@ impl<'a> Agent<'a> {
         if self.hermetic {
             return;
         }
-        let config = self.effective_config();
+        // The active route's configuration: a retained fallback is probed, not the configured primary.
+        let config = &self.auth_config;
         let Some(endpoint) = &config.endpoint else {
             return;
         };
@@ -273,6 +274,13 @@ impl<'a> Agent<'a> {
             .filter(|n| catalog.contains(n))
             .cloned()
             .collect();
+        // The selected backend's memory tools are core: offered up front (including `reflect`
+        // and `learn`, which the default harness list does not name) and kept by the compact,
+        // lean and fallback budgets below. A pinned harness list still decides for itself.
+        let memory_core = self.memory_core_tools(&catalog);
+        if !pinned {
+            names.extend(memory_core.iter().cloned());
+        }
         if !(discovery || pinned || self.hermetic || self.lean_tools || selection_only) {
             names.extend(
                 Self::ESSENTIAL_INTEGRATIONS
@@ -344,9 +352,11 @@ impl<'a> Agent<'a> {
                 .active_model_profile()
                 .is_none_or(|p| p.tools.is_none())
         {
+            let mut required = loaded.clone();
+            required.extend(memory_core.iter().cloned());
             assistance::compact(
                 &mut names,
-                &loaded,
+                &required,
                 self.initial_tool_limit(),
                 &self.assistance.scores,
             );
@@ -401,7 +411,11 @@ impl<'a> Agent<'a> {
             names.retain(|name| name != "task" && name != "message");
         }
         if self.lean_tools {
-            names.retain(|name| Self::LEAN_TOOLS.contains(&name.as_str()) || loaded.contains(name));
+            names.retain(|name| {
+                Self::LEAN_TOOLS.contains(&name.as_str())
+                    || loaded.contains(name)
+                    || memory_core.contains(name)
+            });
         }
         // The plan exit is a control operation, not an optional schema-budget candidate.
         if self.plan_mode && self.tool_eligible("exit_plan") {
@@ -410,6 +424,25 @@ impl<'a> Agent<'a> {
             names.dedup();
         }
         names
+    }
+
+    /// The selected memory backend's canonical tools present in the catalog: the runtime's
+    /// `recall`/`retain`/`reflect`/`learn`, or provenance's registered `recall`/`retain`.
+    fn memory_core_tools(&self, catalog: &[String]) -> Vec<String> {
+        let names: Vec<&str> = match (&self.memory_runtime, &self.memory) {
+            (Some(runtime), _) => runtime
+                .offered_names()
+                .into_iter()
+                .filter(|name| crate::storage::memory_backend::TOOL_NAMES.contains(name))
+                .collect(),
+            (None, Some(_)) => vec!["recall", "retain"],
+            (None, None) => Vec::new(),
+        };
+        names
+            .into_iter()
+            .filter(|name| catalog.iter().any(|entry| entry == name))
+            .map(str::to_owned)
+            .collect()
     }
 
     pub(super) fn schemas(&self, names: &[String]) -> Result<Vec<Value>> {
@@ -805,6 +838,82 @@ mod default_offer_tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn selected_memory_tools_stay_in_compact_lean_and_fallback_offers() {
+        let memory = "[memory]\nbackend='semantic'\n[memory.semantic]\nembedding='off'\n";
+        for profile in [
+            "[assistance]\ncompact_tools=true",
+            "[assistance]\nlean_local=true",
+        ] {
+            with_agent(&format!("{memory}{profile}"), |agent| {
+                assert!(agent.tool_discovery(), "{profile}");
+                let offered = agent.offered();
+                for tool in ["recall", "retain"] {
+                    assert!(
+                        offered.iter().any(|name| name == tool),
+                        "{profile}: {offered:?}"
+                    );
+                }
+                // The fallback used when the full set does not fit the window keeps them too.
+                agent.lean_tools = true;
+                let offered = agent.offered();
+                for tool in ["recall", "retain"] {
+                    assert!(
+                        offered.iter().any(|name| name == tool),
+                        "{profile}: {offered:?}"
+                    );
+                }
+                // Corrections stay loadable, like provenance's.
+                assert!(!offered.iter().any(|name| name == "forget"));
+                assert!(agent.catalog().iter().any(|name| name == "forget"));
+                agent.schemas(&offered).unwrap();
+            });
+        }
+        // Provenance's own recall/retain are protected the same way.
+        with_agent("[assistance]\ncompact_tools=true", |agent| {
+            agent.lean_tools = true;
+            let offered = agent.offered();
+            for tool in ["recall", "retain"] {
+                assert!(offered.iter().any(|name| name == tool), "{offered:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn autolearn_offers_learn_up_front_and_guides_the_root_agent() {
+        with_agent(
+            "[memory]\nbackend='local'\nautolearn=true\n[assistance]\nlean_local=false",
+            |agent| {
+                let offered = agent.offered();
+                assert!(offered.iter().any(|name| name == "learn"), "{offered:?}");
+                assert!(system_text(agent).contains("Auto-learn is enabled"));
+            },
+        );
+        with_agent("[assistance]\nlean_local=false", |agent| {
+            assert!(!system_text(agent).contains("Auto-learn is enabled"));
+        });
+    }
+
+    #[test]
+    fn memory_guidance_follows_the_tools_the_backend_offers() {
+        with_agent("[assistance]\nlean_local=false", |agent| {
+            assert!(system_text(agent).contains("`recall` searches facts"));
+        });
+        with_agent("[memory]\nbackend='semantic'", |agent| {
+            assert!(system_text(agent).contains("`retain` saves a durable fact"));
+        });
+        with_agent("[memory]\nbackend='sharpshooter'", |agent| {
+            let text = system_text(agent);
+            assert!(text.contains("saved project decisions"), "{text}");
+            assert!(!text.contains("`retain` saves"));
+        });
+        for off in ["[memory]\nbackend='off'", "[memory]\nbackend='local'"] {
+            with_agent(off, |agent| {
+                assert!(!system_text(agent).contains("Memory: `recall`"), "{off}");
+            });
+        }
     }
 
     #[test]

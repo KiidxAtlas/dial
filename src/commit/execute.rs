@@ -1,6 +1,5 @@
 //! Git execution helpers shared by the agentic and legacy commit flows.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{sync::atomic::AtomicBool, time::Duration};
@@ -10,11 +9,25 @@ use super::run::CommitError;
 /// Run `git <args>` in `cwd` and return stdout. A failed command becomes [`CommitError::Git`]
 /// with `context` and the captured stderr (or stdout) so the cause is readable.
 pub(crate) fn git_output(cwd: &Path, args: &[&str], context: &str) -> Result<String, CommitError> {
+    git_output_indexed(cwd, None, args, context)
+}
+
+/// [`git_output`] with an optional private index. `index` sets `GIT_INDEX_FILE`, so the command
+/// reads and writes that index instead of the repository's own (see [`PreviewIndex`]).
+pub(crate) fn git_output_indexed(
+    cwd: &Path,
+    index: Option<&Path>,
+    args: &[&str],
+    context: &str,
+) -> Result<String, CommitError> {
     let mut command = Command::new("git");
     command
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
     let timeout = Duration::from_secs(if args.contains(&"push") { 1800 } else { 120 });
     let output = crate::runtime::process::run(
         command,
@@ -35,76 +48,41 @@ pub(crate) fn repo_top(cwd: &Path) -> Result<PathBuf, CommitError> {
     Ok(PathBuf::from(top.trim_end_matches(['\n', '\r'])))
 }
 
-/// Restores the git index to its captured bytes when dropped. A dry run builds its staged diff with
-/// `git add -A`, and this keeps the user's staging area unchanged afterwards.
-pub(crate) struct IndexSnapshot {
+/// A private copy of the repository's index for a dry run. Preview staging and diffs run with
+/// `GIT_INDEX_FILE` pointing at this copy, so the user's index is never written: a concurrent
+/// `git add` by another terminal or editor is never overwritten, and a crash leaves nothing staged.
+/// The copy lives in a temporary directory that is removed on drop.
+pub(crate) struct PreviewIndex {
+    _dir: tempfile::TempDir,
     path: PathBuf,
-    bytes: Option<Vec<u8>>,
-    restored: bool,
 }
 
-impl IndexSnapshot {
+impl PreviewIndex {
+    /// Copies the repository's current index bytes. An absent index (a fresh repository) yields an
+    /// absent copy, which git creates on first use.
     pub(crate) fn capture(cwd: &Path) -> Result<Self, CommitError> {
         const CONTEXT: &str = "Commit preview failed";
         let index = git_output(cwd, &["rev-parse", "--git-path", "index"], CONTEXT)?;
-        let path = cwd.join(index.trim_end_matches(['\n', '\r']));
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        let source = cwd.join(index.trim_end_matches(['\n', '\r']));
+        let dir =
+            tempfile::tempdir().map_err(|error| CommitError::Git(format!("{CONTEXT}: {error}")))?;
+        let path = dir.path().join("index");
+        match std::fs::copy(&source, &path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(CommitError::Git(format!(
                     "{CONTEXT}: {}: {error}",
-                    path.display()
+                    source.display()
                 )));
             }
-        };
-        Ok(Self {
-            path,
-            bytes,
-            restored: false,
-        })
-    }
-
-    /// Writes the captured index back and reports failure, so a dry run cannot silently leave the
-    /// user's staging area modified. Drop repeats the write only if this was never called.
-    pub(crate) fn restore(mut self) -> Result<(), CommitError> {
-        self.restored = true;
-        write_back(&self.path, self.bytes.as_deref()).map_err(|error| {
-            CommitError::Git(format!(
-                "Restoring the git index failed: {}: {error}",
-                self.path.display()
-            ))
-        })
-    }
-}
-
-fn write_back(path: &Path, bytes: Option<&[u8]>) -> std::io::Result<()> {
-    match bytes {
-        Some(bytes) => {
-            // Temp file in the index's own directory, synced, then renamed over it: a crash
-            // mid-restore must not leave a truncated `.git/index`. The original mode is kept.
-            let dir = path.parent().unwrap_or_else(|| Path::new("."));
-            let mode = std::fs::metadata(path).ok().map(|meta| meta.permissions());
-            let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-            tmp.write_all(bytes)?;
-            if let Some(mode) = mode {
-                tmp.as_file().set_permissions(mode)?;
-            }
-            tmp.as_file().sync_all()?;
-            tmp.persist(path).map(|_| ()).map_err(|error| error.error)
         }
-        None => match std::fs::remove_file(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            other => other,
-        },
+        Ok(Self { _dir: dir, path })
     }
-}
 
-impl Drop for IndexSnapshot {
-    fn drop(&mut self) {
-        if !self.restored {
-            let _ = write_back(&self.path, self.bytes.as_deref());
-        }
+    /// The private index file, for `GIT_INDEX_FILE`.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 }
 

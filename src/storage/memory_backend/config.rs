@@ -224,10 +224,24 @@ fn role(value: &str) -> Result<()> {
     );
     Ok(())
 }
-fn endpoint(value: &str, credential: &str) -> Result<()> {
+/// Wording for one endpoint field, so a rejected embedding URL is not described as the Hindsight service.
+struct EndpointLabels {
+    url: &'static str,
+    service: &'static str,
+}
+const HINDSIGHT_LABELS: EndpointLabels = EndpointLabels {
+    url: "Service URL",
+    service: "The memory service",
+};
+const EMBEDDING_LABELS: EndpointLabels = EndpointLabels {
+    url: "Embedding service URL",
+    service: "The embedding service",
+};
+fn endpoint(value: &str, credential: &str, labels: &EndpointLabels) -> Result<()> {
     let url = url::Url::parse(value).map_err(|_| {
         anyhow::anyhow!(
-            "Service URL must be a full https:// address (http:// is allowed only on this machine)"
+            "{} must be a full https:// address (http:// is allowed only on this machine)",
+            labels.url
         )
     })?;
     let host = url.host_str().unwrap_or("");
@@ -245,11 +259,13 @@ fn endpoint(value: &str, credential: &str) -> Result<()> {
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none(),
-        "Service URL must not contain a password, query string or fragment; put the key in the API key variable instead"
+        "{} must not contain a password, query string or fragment; put the key in the API key variable instead",
+        labels.url
     );
     ensure!(
         local || !credential.is_empty(),
-        "The memory service is not on this machine, so API key variable must name an environment variable that holds its key"
+        "{} is not on this machine, so API key variable must name an environment variable that holds its key",
+        labels.service
     );
     Ok(())
 }
@@ -277,13 +293,56 @@ fn bank(value: &str) -> Result<()> {
 
 /// Whether the enabled backend calls a chat model through a memory role: `memory` for local
 /// extraction/consolidation and sharpshooter work (`decision` is not used by these backends).
-/// Hindsight runs server-side and Provenance is deterministic, so neither needs a role.
+/// Hindsight runs server-side and Provenance is deterministic, so neither needs a role. Semantic
+/// calls the memory role only for automatic fact saving, which pauses (never falls back to the main
+/// model) while the role is unassigned; see [`auto_retain_uses_memory_role`].
 pub fn calls_model(config: &crate::config::types::MemoryConfig) -> bool {
     config.enabled
         && matches!(
             config.backend,
             MemoryBackendId::Local | MemoryBackendId::Sharpshooter
         )
+}
+
+/// Whether the enabled backend cannot work until the `memory` model role is assigned: local
+/// extraction or consolidation on that role, or sharpshooter on that role without a model override.
+pub fn requires_memory_role(config: &crate::config::types::MemoryConfig) -> bool {
+    calls_model(config)
+        && match config.backend {
+            MemoryBackendId::Local => [
+                config.local.extraction_role.as_str(),
+                config.local.consolidation_role.as_str(),
+            ]
+            .contains(&"memory"),
+            MemoryBackendId::Sharpshooter => {
+                config.sharpshooter.model.trim().is_empty()
+                    && config.sharpshooter.model_role == "memory"
+            }
+            _ => false,
+        }
+}
+
+/// Semantic memory saves facts automatically with the `memory` role when `auto_retain` is on. The
+/// role is optional: without it automatic saving pauses while recall and the retain tool still work.
+pub fn auto_retain_uses_memory_role(config: &crate::config::types::MemoryConfig) -> bool {
+    config.enabled && config.backend == MemoryBackendId::Semantic && config.semantic.auto_retain
+}
+
+/// The explicit OpenAI-compatible embedding override is only usable as a pair: `Some(message)` when
+/// exactly one of `embedding_base_url` and `embedding_model` is set.
+pub fn half_embedding_override(semantic: &SemanticConfig) -> Option<&'static str> {
+    match (
+        semantic.embedding_base_url.trim().is_empty(),
+        semantic.embedding_model.trim().is_empty(),
+    ) {
+        (true, false) => Some(
+            "Embedding model override is set without Embedding service URL; set both or clear both (to use the embedding role, Alt+M, clear both)",
+        ),
+        (false, true) => Some(
+            "Embedding service URL is set without Embedding model override; set both or clear both (to use the embedding role, Alt+M, clear both)",
+        ),
+        _ => None,
+    }
 }
 
 pub fn validate(config: &crate::config::types::MemoryConfig) -> Result<()> {
@@ -371,7 +430,11 @@ pub fn validate(config: &crate::config::types::MemoryConfig) -> Result<()> {
         "invalid hindsight context, deadline or synthesis bounds"
     );
     if !hindsight.endpoint.is_empty() {
-        endpoint(&hindsight.endpoint, &hindsight.api_key_env)?;
+        endpoint(
+            &hindsight.endpoint,
+            &hindsight.api_key_env,
+            &HINDSIGHT_LABELS,
+        )?;
     }
     if config.backend == MemoryBackendId::Hindsight {
         ensure!(
@@ -405,10 +468,16 @@ pub fn validate(config: &crate::config::types::MemoryConfig) -> Result<()> {
     // Overrides matter only to the semantic backend, and not at all when embeddings are off.
     let overrides_used =
         config.backend == MemoryBackendId::Semantic && semantic.embedding != EmbeddingMode::Off;
+    if overrides_used {
+        if let Some(message) = half_embedding_override(semantic) {
+            anyhow::bail!("{message}");
+        }
+    }
     if overrides_used && !semantic.embedding_base_url.trim().is_empty() {
         endpoint(
             semantic.embedding_base_url.trim(),
             &semantic.embedding_api_key_env,
+            &EMBEDDING_LABELS,
         )?;
     }
     if !semantic.embedding_api_key_env.is_empty() {
@@ -449,6 +518,7 @@ mod tests {
         memory.backend = MemoryBackendId::Semantic;
         memory.backend_explicit = true;
         memory.semantic.embedding_base_url = "http://remote.example/v1".into();
+        memory.semantic.embedding_model = "embedder".into();
         assert!(validate(&memory).is_err(), "auto still validates overrides");
         memory.semantic.embedding = EmbeddingMode::Off;
         assert!(validate(&memory).is_ok(), "off ignores the override");
@@ -458,5 +528,50 @@ mod tests {
             validate(&memory).is_ok(),
             "other backends ignore the override"
         );
+    }
+
+    #[test]
+    fn half_embedding_override_is_rejected_with_embedding_wording() {
+        let mut memory = crate::config::types::MemoryConfig::default();
+        memory.backend = MemoryBackendId::Semantic;
+        memory.backend_explicit = true;
+        memory.semantic.embedding_model = "nomic-embed-text".into();
+        let error = validate(&memory).unwrap_err().to_string();
+        assert!(error.contains("Embedding service URL"), "{error}");
+        assert!(error.contains("set both or clear both"), "{error}");
+        assert!(!error.contains("Service URL must"), "{error}");
+        memory.semantic.embedding_model.clear();
+        memory.semantic.embedding_base_url = "http://127.0.0.1:11434/v1".into();
+        let error = validate(&memory).unwrap_err().to_string();
+        assert!(error.contains("Embedding model override"), "{error}");
+        memory.semantic.embedding_model = "nomic-embed-text".into();
+        validate(&memory).unwrap();
+        // A remote URL without a key names the embedding service, not the Hindsight one.
+        memory.semantic.embedding_base_url = "https://remote.example/v1".into();
+        let error = validate(&memory).unwrap_err().to_string();
+        assert!(error.starts_with("The embedding service"), "{error}");
+        // Embeddings off or another backend: the half pair is never used, so it is not rejected.
+        memory.semantic.embedding_base_url.clear();
+        memory.semantic.embedding = EmbeddingMode::Off;
+        validate(&memory).unwrap();
+    }
+
+    #[test]
+    fn memory_role_requirement_follows_backend_and_overrides() {
+        let mut memory = crate::config::types::MemoryConfig::default();
+        memory.backend = MemoryBackendId::Sharpshooter;
+        assert!(requires_memory_role(&memory));
+        memory.sharpshooter.model = "ollama/qwen3".into();
+        assert!(
+            !requires_memory_role(&memory),
+            "the override replaces the role"
+        );
+        memory.backend = MemoryBackendId::Local;
+        assert!(requires_memory_role(&memory));
+        memory.backend = MemoryBackendId::Semantic;
+        assert!(!requires_memory_role(&memory));
+        assert!(auto_retain_uses_memory_role(&memory));
+        memory.semantic.auto_retain = false;
+        assert!(!auto_retain_uses_memory_role(&memory));
     }
 }

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::outbox::Outbox;
 use super::protocol::{
     BROWSER_TARGET_ID, DEFAULT_CONTEXT_ID, ExtMessage, PROTOCOL_VERSION, RelayOp, RpcFrame,
     TabSnapshot, pong_frame,
@@ -20,6 +21,9 @@ use super::protocol::{
 /// How long one relay-to-extension operation may take before the CDP caller gets an error.
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const NOT_CONNECTED: &str = "the Dial browser extension is not connected; run `dial browser-relay install`, load the printed folder in chrome://extensions, and keep Chrome open";
+/// Extension requests that may await answers at once. Further CDP calls are refused, not queued.
+pub const MAX_PENDING_RPCS: usize = 256;
+const EXTENSION_BUSY: &str = "the Dial browser extension is busy or not keeping up; retry shortly";
 /// URL prefixes that `chrome.debugger` refuses or that are not user content.
 const INTERNAL_PREFIXES: [&str; 6] = [
     "chrome://",
@@ -94,11 +98,11 @@ struct Session {
 
 struct Link {
     id: u64,
-    tx: Sender<String>,
+    tx: Outbox,
 }
 
 struct Client {
-    tx: Sender<String>,
+    tx: Outbox,
     discover: bool,
     auto_attach: bool,
 }
@@ -118,6 +122,8 @@ struct State {
     attached: HashMap<i64, usize>,
     /// (client, tab) pairs with a background auto-attach in flight.
     attaching: HashSet<(u64, i64)>,
+    /// Tabs whose first attach is in flight. Concurrent callers wait for it instead of attaching again.
+    attach_inflight: HashSet<i64>,
     last_error: Option<String>,
 }
 
@@ -148,6 +154,7 @@ impl Relay {
                 sessions: HashMap::new(),
                 attached: HashMap::new(),
                 attaching: HashSet::new(),
+                attach_inflight: HashSet::new(),
                 last_error: None,
             }),
         }
@@ -183,7 +190,7 @@ impl Relay {
 
     /// Registers an extension connection from its hello. Replaces any earlier connection and
     /// returns the link id the server uses for the rest of that connection.
-    pub fn extension_hello(&self, tx: Sender<String>, hello: ExtMessage) -> Result<u64, String> {
+    pub fn extension_hello(&self, tx: Outbox, hello: ExtMessage) -> Result<u64, String> {
         let ExtMessage::Hello {
             dial_protocol,
             extension_version,
@@ -284,7 +291,7 @@ impl Relay {
     }
 
     /// Registers a CDP client connection and returns its id. `tx` receives every frame for it.
-    pub fn connect_client(&self, tx: Sender<String>) -> u64 {
+    pub fn connect_client(&self, tx: Outbox) -> u64 {
         let mut st = self.lock();
         st.next_id += 1;
         let id = st.next_id;
@@ -547,25 +554,70 @@ impl Relay {
     }
 
     /// Opens a top-level page session for `client`, attaching the debugger if nothing has it yet.
+    ///
+    /// Concurrent first attachments to one tab share a single extension attach: the first caller
+    /// reserves the tab and the others wait for its answer. The session commits only while this
+    /// client and the extension connection that answered are still live. A successful attach that
+    /// cannot be committed is released, so no debugger stays attached without an owner.
     fn open_page_session(&self, client: u64, tab: i64) -> Result<String, CdpError> {
-        let needs_attach = {
-            let st = self.lock();
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let (link, reserved) = loop {
+            let mut st = self.lock();
+            if !st.clients.contains_key(&client) {
+                return Err(client_gone());
+            }
             let snapshot = st.tabs.get(&tab).ok_or_else(no_such_target)?;
             if !eligible(snapshot) {
                 return Err(CdpError::new(format!(
                     "tab {tab} cannot be attached: it is discarded or an internal page"
                 )));
             }
-            !is_attached(&st, tab)
+            let link = st.link.as_ref().map(|current| current.id);
+            if is_attached(&st, tab) {
+                break (link, false);
+            }
+            if st.attach_inflight.insert(tab) {
+                break (link, true);
+            }
+            drop(st);
+            if Instant::now() >= deadline {
+                return Err(CdpError::new(format!(
+                    "could not attach to tab {tab}: another attach is still in progress"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(5));
         };
-        if needs_attach {
-            self.rpc(RelayOp::Attach { tab_id: tab }).map_err(|error| {
-                CdpError::new(format!("could not attach to tab {tab}: {}", error.message))
-            })?;
-        }
+        let attach = if reserved {
+            let answer = self.rpc(RelayOp::Attach { tab_id: tab });
+            self.lock().attach_inflight.remove(&tab);
+            Some(answer)
+        } else {
+            None
+        };
         let mut st = self.lock();
-        if !st.tabs.contains_key(&tab) {
-            return Err(no_such_target());
+        let attached_now = match attach {
+            Some(Ok(_)) => true,
+            Some(Err(error)) => {
+                return Err(CdpError::new(format!(
+                    "could not attach to tab {tab}: {}",
+                    error.message
+                )));
+            }
+            None => false,
+        };
+        let live = st.clients.contains_key(&client)
+            && st.link.as_ref().map(|current| current.id) == link
+            && st.tabs.contains_key(&tab);
+        if !live {
+            // Release an attach this request made when nothing else holds the debugger.
+            if attached_now && st.link.is_some() && !is_attached(&st, tab) {
+                fire(&mut st, RelayOp::Detach { tab_id: tab });
+            }
+            return Err(if st.clients.contains_key(&client) {
+                no_such_target()
+            } else {
+                client_gone()
+            });
         }
         *st.attached.entry(tab).or_insert(0) += 1;
         let key = next_session_key(&mut st, "dial-session-");
@@ -701,7 +753,12 @@ impl Relay {
                         );
                     }
                 }
-                Err(error) => st.last_error = Some(error.message),
+                Err(error) => {
+                    // A client that left mid-attach has no status to report to.
+                    if st.clients.contains_key(&client) {
+                        st.last_error = Some(error.message);
+                    }
+                }
             }
         }
     }
@@ -815,6 +872,10 @@ fn no_such_target() -> CdpError {
 
 fn session_not_found() -> CdpError {
     CdpError::with_code(-32001, "Session with given id not found.")
+}
+
+fn client_gone() -> CdpError {
+    CdpError::new("the CDP client disconnected before its request completed")
 }
 
 fn next_session_key(st: &mut State, prefix: &str) -> String {
@@ -990,6 +1051,9 @@ fn queue_rpc(
         Some(link) => link.tx.clone(),
         None => return Err(CdpError::new(NOT_CONNECTED)),
     };
+    if st.pending.len() >= MAX_PENDING_RPCS {
+        return Err(CdpError::new(EXTENSION_BUSY));
+    }
     st.next_id += 1;
     let id = st.next_id;
     let frame = serde_json::to_string(&RpcFrame::new(id, op))
@@ -998,7 +1062,11 @@ fn queue_rpc(
     st.pending.insert(id, reply);
     if link_tx.send(frame).is_err() {
         st.pending.remove(&id);
-        return Err(CdpError::new(NOT_CONNECTED));
+        return Err(CdpError::new(if link_tx.is_overloaded() {
+            EXTENSION_BUSY
+        } else {
+            NOT_CONNECTED
+        }));
     }
     Ok((id, rx))
 }
@@ -1053,6 +1121,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::browser_relay::outbox::{self, OutboxReceiver};
 
     const WAIT: Duration = Duration::from_secs(5);
 
@@ -1083,7 +1152,7 @@ mod tests {
         tabs: Vec<TabSnapshot>,
         answer: fn(&Value) -> Result<Value, String>,
     ) -> u64 {
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = outbox::channel();
         let link = relay.extension_hello(tx, hello(tabs)).unwrap();
         let relay = Arc::clone(relay);
         thread::spawn(move || {
@@ -1121,12 +1190,12 @@ mod tests {
         }
     }
 
-    fn client(relay: &Relay) -> (u64, mpsc::Receiver<String>) {
-        let (tx, rx) = mpsc::channel();
+    fn client(relay: &Relay) -> (u64, OutboxReceiver) {
+        let (tx, rx) = outbox::channel();
         (relay.connect_client(tx), rx)
     }
 
-    fn next_frame(rx: &mpsc::Receiver<String>) -> Value {
+    fn next_frame(rx: &OutboxReceiver) -> Value {
         serde_json::from_str(&rx.recv_timeout(WAIT).expect("frame")).unwrap()
     }
 
@@ -1186,7 +1255,7 @@ mod tests {
         assert!(before.targets.is_empty());
         assert!(before.disconnected_for.is_none());
 
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = outbox::channel();
         let link = relay
             .extension_hello(tx, hello(vec![tab(1, "https://a.test/")]))
             .unwrap();
@@ -1206,7 +1275,7 @@ mod tests {
     #[test]
     fn hello_with_another_protocol_version_is_rejected_with_an_update_hint() {
         let relay = Relay::new();
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = outbox::channel();
         let stale = ExtMessage::Hello {
             dial_protocol: PROTOCOL_VERSION + 1,
             extension_version: "9".into(),
@@ -1222,11 +1291,11 @@ mod tests {
     #[test]
     fn a_newer_extension_connection_replaces_the_old_one() {
         let relay = Relay::new();
-        let (tx1, _rx1) = mpsc::channel();
+        let (tx1, _rx1) = outbox::channel();
         let first = relay
             .extension_hello(tx1, hello(vec![tab(1, "https://a.test/")]))
             .unwrap();
-        let (tx2, _rx2) = mpsc::channel();
+        let (tx2, _rx2) = outbox::channel();
         let second = relay
             .extension_hello(tx2, hello(vec![tab(2, "https://b.test/")]))
             .unwrap();
@@ -1244,7 +1313,7 @@ mod tests {
     #[test]
     fn browser_level_commands_answer_without_touching_the_extension() {
         let relay = Relay::new();
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = outbox::channel();
         relay.extension_hello(tx, hello(Vec::new())).unwrap();
         let (id, _client_rx) = client(&relay);
 
@@ -1466,7 +1535,7 @@ mod tests {
     fn last_top_level_session_detaches_the_debugger_when_the_client_leaves() {
         let relay = Arc::new(Relay::new());
         let (seen_tx, seen_rx) = mpsc::channel::<String>();
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = outbox::channel();
         let link = relay
             .extension_hello(tx, hello(vec![tab(5, "https://a.test/")]))
             .unwrap();
@@ -1638,5 +1707,109 @@ mod tests {
         let error = relay.snapshot().last_error.unwrap();
         assert!(error.contains("tab 12"), "{error}");
         assert!(error.contains("already attached"), "{error}");
+    }
+
+    #[test]
+    fn attach_answered_after_its_client_left_is_released_without_a_session() {
+        let relay = Arc::new(Relay::new());
+        let (tx, rx) = outbox::channel();
+        let link = relay
+            .extension_hello(tx, hello(vec![tab(15, "https://a.test/")]))
+            .unwrap();
+        let (seen_tx, seen_rx) = mpsc::channel::<String>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let answering = Arc::clone(&relay);
+        thread::spawn(move || {
+            while let Ok(frame) = rx.recv() {
+                let frame: Value = serde_json::from_str(&frame).unwrap();
+                let op = frame["op"].as_str().unwrap_or_default().to_owned();
+                seen_tx.send(op.clone()).unwrap();
+                if op == "attach" {
+                    release_rx.recv().unwrap();
+                }
+                if let Some(id) = frame.get("id").and_then(Value::as_u64) {
+                    answering.extension_message(
+                        link,
+                        ExtMessage::RpcResult {
+                            id,
+                            ok: true,
+                            result: json!({}),
+                            error: String::new(),
+                        },
+                    );
+                }
+            }
+        });
+        let (owner, _owner_rx) = client(&relay);
+        let opener = Arc::clone(&relay);
+        let open = thread::spawn(move || opener.open_page_session(owner, 15));
+        assert_eq!(seen_rx.recv_timeout(WAIT).unwrap(), "attach");
+        relay.disconnect_client(owner);
+        release_tx.send(()).unwrap();
+        assert!(open.join().unwrap().is_err());
+        assert_eq!(seen_rx.recv_timeout(WAIT).unwrap(), "detach");
+        let st = relay.lock();
+        assert!(!is_attached(&st, 15));
+        assert!(st.sessions.is_empty());
+    }
+
+    #[test]
+    fn simultaneous_first_attachments_share_one_extension_attach() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let relay = Arc::new(Relay::new());
+        let (tx, rx) = outbox::channel();
+        let link = relay
+            .extension_hello(tx, hello(vec![tab(16, "https://a.test/")]))
+            .unwrap();
+        let attaches = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attaches);
+        let answering = Arc::clone(&relay);
+        thread::spawn(move || {
+            while let Ok(frame) = rx.recv() {
+                let frame: Value = serde_json::from_str(&frame).unwrap();
+                if frame["op"] == "attach" {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if let Some(id) = frame.get("id").and_then(Value::as_u64) {
+                    answering.extension_message(
+                        link,
+                        ExtMessage::RpcResult {
+                            id,
+                            ok: true,
+                            result: json!({}),
+                            error: String::new(),
+                        },
+                    );
+                }
+            }
+        });
+        let (first, _first_rx) = client(&relay);
+        let (second, _second_rx) = client(&relay);
+        let (left, right) = thread::scope(|scope| {
+            let left = scope.spawn(|| relay.open_page_session(first, 16));
+            let right = scope.spawn(|| relay.open_page_session(second, 16));
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert!(left.is_ok() && right.is_ok(), "{left:?} {right:?}");
+        assert_eq!(attaches.load(Ordering::SeqCst), 1);
+        assert_eq!(relay.lock().attached.get(&16), Some(&2));
+    }
+
+    #[test]
+    fn extension_requests_are_refused_past_the_pending_budget() {
+        let relay = Relay::new();
+        let (tx, _rx) = outbox::channel();
+        relay
+            .extension_hello(tx, hello(vec![tab(17, "https://a.test/")]))
+            .unwrap();
+        let mut st = relay.lock();
+        for id in 0..MAX_PENDING_RPCS as u64 {
+            let (reply, _answer) = mpsc::channel();
+            st.pending.insert(id, reply);
+        }
+        let error = queue_rpc(&mut st, &RelayOp::Detach { tab_id: 17 }).unwrap_err();
+        assert_eq!(error.message, EXTENSION_BUSY);
     }
 }

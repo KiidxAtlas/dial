@@ -56,7 +56,10 @@ impl<'a> Agent<'a> {
             .as_ref()
             .is_ok_and(|report| report.outcome == TurnOutcome::Completed)
         {
-            self.todo.complete_reported_work();
+            // Goal mode keeps todos as the deliverable audit, so an accepted report never closes them there.
+            if !self.modes.goal.tool_offered() {
+                self.todo.complete_reported_work();
+            }
             let mut control = self.session.control_state();
             control["todo"] = self.todo.snapshot();
             self.session.set_control_state(control)?;
@@ -337,17 +340,14 @@ impl<'a> Agent<'a> {
                 None
             }
         };
+        // Recall attaches only facts not already shown on this branch; earlier ones stay in the
+        // history of the message they were attached to, so nothing is re-appended.
         if let Some(saved) = prepared_recall
             .as_ref()
             .and_then(|prepared| prepared.context.as_deref())
         {
             context.push_str("\n\n");
             context.push_str(saved);
-        } else if let Some(memory) = &self.memory_runtime
-            && let Ok(Some(saved)) = memory.prompt_context(&recall_authority)
-        {
-            context.push_str("\n\n");
-            context.push_str(&saved);
         }
         if let Some(memory) = &self.memory_runtime {
             let authority = memory_authority(&self.session, 0);
@@ -596,7 +596,8 @@ impl<'a> Agent<'a> {
                     || self.step_checks.has_uncheckpointed_operations())
             {
                 let mut checks = self.focused_checks(turn);
-                self.step_checks.include_failed_checks(&mut checks);
+                self.step_checks
+                    .include_failed_checks(self.workspace.root(), &mut checks);
                 self.step_checks.record_checked();
                 let mut run = self.run_checks(&checks, ui);
                 self.step_checks.failed = !run.failures.is_empty();
@@ -643,7 +644,8 @@ impl<'a> Agent<'a> {
                             run.failures.clear();
                         } else {
                             checks = self.focused_checks(turn);
-                            self.step_checks.include_failed_checks(&mut checks);
+                            self.step_checks
+                                .include_failed_checks(self.workspace.root(), &mut checks);
                             self.step_checks.record_checked();
                             run = self.run_checks(&checks, ui);
                             self.step_checks.failed = !run.failures.is_empty();

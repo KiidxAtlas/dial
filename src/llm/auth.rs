@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -58,8 +57,21 @@ impl Drop for SecretToken {
     }
 }
 
-/// Run the OpenRouter PKCE flow and return the minted durable API key.
-pub fn openrouter_login(cancel: Arc<AtomicBool>) -> Result<SecretToken> {
+/// Run the OpenRouter PKCE flow and return the minted durable API key. The sign-in URL is always
+/// reported through `progress`. A browser that cannot be opened (or `DIAL_NO_BROWSER`) does not end
+/// the flow: the callback listener and PKCE verifier stay alive for a manual visit to the URL.
+pub fn openrouter_login(
+    cancel: Arc<AtomicBool>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<SecretToken> {
+    openrouter_login_with(cancel, progress, super::oauth::util::open_browser)
+}
+
+fn openrouter_login_with(
+    cancel: Arc<AtomicBool>,
+    progress: &mut dyn FnMut(&str),
+    open: impl FnOnce(&str) -> bool,
+) -> Result<SecretToken> {
     let listener = TcpListener::bind(("localhost", CALLBACK_PORT))
         .map_err(|_| anyhow::anyhow!("could not start the OpenRouter sign-in callback listener"))?;
     listener
@@ -69,12 +81,8 @@ pub fn openrouter_login(cancel: Arc<AtomicBool>) -> Result<SecretToken> {
     let verifier = SecretToken::new(random_verifier());
     let challenge = pkce_challenge(verifier.as_str());
     let url = authorization_url(&challenge);
-    let mut command = Command::new("open");
-    command.arg(&url);
-    let opened = super::oauth::util::run_opener(&mut command);
-    if !opened {
-        bail!("could not open browser; open this URL to sign in to OpenRouter: {url}");
-    }
+    let opened = open(url.as_str());
+    progress(&sign_in_notice(opened, &url));
 
     let code = SecretToken::new(receive_callback(
         &listener,
@@ -82,6 +90,16 @@ pub fn openrouter_login(cancel: Arc<AtomicBool>) -> Result<SecretToken> {
         &cancel,
     )?);
     exchange_code(code.as_str(), verifier.as_str(), cancel)
+}
+
+fn sign_in_notice(opened: bool, url: &str) -> String {
+    if opened {
+        format!("Continue OpenRouter sign-in in your browser. If nothing opened, visit: {url}")
+    } else {
+        format!(
+            "Could not open a browser. Visit this URL to sign in to OpenRouter (waiting up to 3 minutes): {url}"
+        )
+    }
 }
 
 fn random_verifier() -> String {
@@ -421,6 +439,37 @@ mod tests {
                 .to_string()
                 .contains("timed out")
         );
+    }
+
+    #[test]
+    fn sign_in_notice_always_carries_the_url_for_manual_completion() {
+        let url = "https://openrouter.ai/auth?code_challenge=x&code_challenge_method=S256";
+        assert!(sign_in_notice(true, url).ends_with(url));
+        let manual = sign_in_notice(false, url);
+        assert!(manual.contains("Could not open a browser"));
+        assert!(manual.ends_with(url));
+    }
+
+    #[test]
+    fn manual_callback_is_received_after_the_browser_could_not_open() {
+        // The listener is the one `openrouter_login_with` keeps alive after an opener failure.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            receive_callback(
+                &listener,
+                Instant::now() + Duration::from_secs(10),
+                &AtomicBool::new(false),
+            )
+        });
+        let mut manual = TcpStream::connect(address).unwrap();
+        manual
+            .write_all(b"GET /callback?code=manual-code HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        manual.read_to_string(&mut response).unwrap();
+        assert_eq!(server.join().unwrap().unwrap(), "manual-code");
     }
 
     #[test]

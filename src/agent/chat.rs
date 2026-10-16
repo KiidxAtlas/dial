@@ -71,6 +71,21 @@ pub(super) fn silence_watch_armed(local_model: bool, generating: bool) -> bool {
     !local_model || generating
 }
 
+/// Whether generation silence has lasted past its limit. Provider backoff is an explicit wait, not
+/// a stall: it never arms the watchdog, and the clock restarts when the next attempt begins.
+pub(super) fn silence_exceeded(
+    limit_secs: u64,
+    local_model: bool,
+    generating: bool,
+    backing_off: bool,
+    idle: Duration,
+) -> bool {
+    limit_secs > 0
+        && !backing_off
+        && silence_watch_armed(local_model, generating)
+        && idle.as_secs() >= limit_secs
+}
+
 /// Guarded attempts for a detected thinking/response loop, including the first.
 pub(super) const THINKING_LOOP_MAX_ATTEMPTS: u32 = 3;
 /// Thinking-loop redirect notice, appended only to the re-sampled request.
@@ -306,6 +321,8 @@ pub(super) fn chat_attempt_with_ui(
         let mut last_tick = Instant::now();
         let mut last_progress = Instant::now();
         let mut generating = false;
+        // True while the provider waits out a retry delay (`Retry { waiting: true }`).
+        let mut backing_off = false;
         let mut stalled = None;
         let mut partial_text = String::new();
         let result = loop {
@@ -348,6 +365,7 @@ pub(super) fn chat_attempt_with_ui(
                     });
                     last_progress = Instant::now();
                     generating = false;
+                    backing_off = waiting;
                     if waiting {
                         partial_text.clear();
                         // A discarded attempt's output must not count toward the next one. A loop
@@ -558,9 +576,13 @@ pub(super) fn chat_attempt_with_ui(
                     ui.request_phase(RequestPhase::Cancelling);
                     cancel_request.store(true, Ordering::SeqCst);
                 } else if stalled.is_none()
-                    && silence_limit > 0
-                    && silence_watch_armed(local_model, generating)
-                    && last_progress.elapsed().as_secs() >= silence_limit
+                    && silence_exceeded(
+                        silence_limit,
+                        local_model,
+                        generating,
+                        backing_off,
+                        last_progress.elapsed(),
+                    )
                 {
                     stalled = Some(last_progress.elapsed().as_secs());
                     ui.request_phase(RequestPhase::Cancelling);
@@ -587,4 +609,30 @@ pub(super) fn chat_attempt_with_ui(
         }
         result
     })
+}
+
+#[cfg(test)]
+mod silence_tests {
+    use super::*;
+
+    #[test]
+    fn provider_backoff_is_not_a_silent_stall() {
+        let idle = Duration::from_secs(150);
+        // Genuine remote silence past the limit is still bounded.
+        assert!(silence_exceeded(120, false, false, false, idle));
+        // A retry delay longer than the limit is an explicit wait, not silence.
+        assert!(!silence_exceeded(120, false, false, true, idle));
+        // Local prefill stays unarmed until generation is observed.
+        assert!(!silence_exceeded(120, true, false, false, idle));
+        assert!(silence_exceeded(120, true, true, false, idle));
+        // Disabled limit, and idle time below the limit.
+        assert!(!silence_exceeded(0, false, true, false, idle));
+        assert!(!silence_exceeded(
+            120,
+            false,
+            true,
+            false,
+            Duration::from_secs(119)
+        ));
+    }
 }

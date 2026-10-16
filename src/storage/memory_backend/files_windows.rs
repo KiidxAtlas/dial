@@ -232,6 +232,15 @@ impl PrivateDirectory {
     }
 
     pub fn database(&self, name: &str) -> Result<Connection> {
+        self.database_with_journal(name, "DELETE")
+    }
+
+    /// Opens a database that stays in WAL mode; see the Unix implementation.
+    pub fn database_wal(&self, name: &str) -> Result<Connection> {
+        self.database_with_journal(name, "WAL")
+    }
+
+    fn database_with_journal(&self, name: &str, journal: &str) -> Result<Connection> {
         let file = match self.file(name, true, false) {
             Ok(file) => file,
             Err(error) if missing(&error) => match self.file(name, true, true) {
@@ -249,9 +258,9 @@ impl PrivateDirectory {
             "memory database path changed"
         );
         connection.busy_timeout(std::time::Duration::from_secs(10))?;
-        connection.execute_batch(
-            "PRAGMA foreign_keys=ON;PRAGMA journal_mode=DELETE;PRAGMA synchronous=FULL;",
-        )?;
+        connection.execute_batch(&format!(
+            "PRAGMA foreign_keys=ON;PRAGMA journal_mode={journal};PRAGMA synchronous=FULL;"
+        ))?;
         Ok(connection)
     }
 

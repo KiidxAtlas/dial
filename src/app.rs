@@ -185,6 +185,9 @@ fn run_plain(layout: Layout, config: Config, options: Options) -> Result<()> {
     Ok(())
 }
 
+/// How long `dial -p` waits, after its turn, for one selected-memory maintenance pass.
+const PRINT_MEMORY_BUDGET: Duration = Duration::from_secs(20);
+
 /// Run one turn without terminal control sequences; JSON modes reserve stdout for their protocol.
 pub fn run_print(
     layout: Layout,
@@ -248,7 +251,13 @@ pub fn run_print(
     ui.check_output()?;
     let completed_before = agent.metrics().turns_completed;
     let result = agent.turn(options.prompt.trim(), &mut ui);
-    ui.set_completed(agent.metrics().turns_completed > completed_before);
+    let completed = agent.metrics().turns_completed > completed_before;
+    ui.set_completed(completed);
+    // A one-shot run has no idle loop: give the selected memory one bounded pass to retain this
+    // turn before exit. Success prints nothing.
+    if completed && result.is_ok() {
+        agent.finish_memory_before_exit(&mut ui, PRINT_MEMORY_BUDGET);
+    }
     let (total, turn) = agent.usage();
     ui.set_usage_breakdown(total, turn);
     match result {
@@ -482,7 +491,7 @@ fn credential_sources(
 }
 
 /// The `/memory` status in plain words: what Dial remembers (newest first), then the backend, whether
-/// it is working, why not, and what to do.
+/// it is working, why not, notes from the backend, and what to do next.
 fn memory_status_text(value: &Value) -> String {
     let backend = value.get("backend").and_then(Value::as_str).unwrap_or("");
     let active = value.get("active").and_then(Value::as_bool).unwrap_or(true);
@@ -498,29 +507,115 @@ fn memory_status_text(value: &Value) -> String {
     let mut lines = Vec::new();
     if active && !noun.is_empty() {
         lines.extend(remembered_lines(value, noun));
+        if let Some(user) = value.get("userFacts").and_then(Value::as_u64) {
+            lines.push(format!("User-wide facts (all projects): {user}"));
+        }
         lines.push(String::new());
     }
     lines.push(format!("Backend: {label}"));
     lines.push(format!("Active: {}", if active { "yes" } else { "no" }));
-    if noun.is_empty()
+    let error = value.get("error").and_then(Value::as_str);
+    // An inactive backend's generic message repeats the reason below with a fixed next step.
+    if (noun.is_empty() || backend == "off")
+        && (active || error.is_none())
         && let Some(message) = value.get("message").and_then(Value::as_str)
     {
         lines.push(message.to_owned());
     }
+    if let Some(embedding) = value.get("embedding") {
+        let state = embedding.get("state").and_then(Value::as_str).unwrap_or("");
+        let line = match (state, embedding.get("model").and_then(Value::as_str)) {
+            ("on", Some(model)) => match embedding.get("embedded").and_then(Value::as_u64) {
+                Some(embedded) => format!("Embeddings: on ({model}, {embedded} facts embedded)"),
+                None => format!("Embeddings: on ({model})"),
+            },
+            _ => {
+                let reason = embedding
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("not configured");
+                format!("Embeddings: off — {reason}")
+            }
+        };
+        lines.push(line);
+        if state != "on" && !reason_names_next_step(embedding) {
+            lines.push(
+                "  Recall by meaning: assign the embedding role (Alt+M) or run /setup embeddings."
+                    .to_owned(),
+            );
+        }
+    }
     if let Some(probe) = value.get("reachability").and_then(Value::as_str) {
         lines.push(format!("Service probe: {probe}"));
     }
-    if let Some(error) = value.get("error").and_then(Value::as_str) {
+    if let Some(error) = error {
         lines.push(format!("Why: {error}"));
     }
-    if !active && backend != "off" {
-        lines.push("Next: /settings → Memory".to_owned());
-    } else if active && !noun.is_empty() {
-        lines.push(format!(
-            "Next: /memory clear forgets project {noun}s · /settings → Memory"
-        ));
+    for note in value
+        .get("notes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        lines.push(format!("Note: {note}"));
+    }
+    if backend == "off" {
+        lines.push("Next: choose a backend in /settings → Memory or with /setup memory".to_owned());
+    } else if !active {
+        lines.push(format!("Next: {}", memory_next_step(error.unwrap_or(""))));
+    } else if !noun.is_empty() {
+        let clear = if backend == "semantic" {
+            "/memory clear forgets project facts (/memory clear user: user-wide)"
+        } else {
+            "/memory clear forgets project facts"
+        };
+        lines.push(format!("Next: {clear} · /memory help · /settings → Memory"));
     }
     lines.join("\n")
+}
+
+/// Whether a backend's embedding reason already says what to do (it mentions a role or a command).
+fn reason_names_next_step(embedding: &Value) -> bool {
+    embedding
+        .get("reason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| reason.contains("Alt+M") || reason.contains("/setup"))
+}
+
+/// Where to fix an inactive memory backend: the Roles view when a model role is missing, settings
+/// otherwise.
+fn memory_next_step(reason: &str) -> &'static str {
+    if reason.contains("/roles") || reason.contains(" role") {
+        "assign the role in /roles (Alt+M)"
+    } else {
+        "/settings → Memory, or choose another backend with /setup memory"
+    }
+}
+
+/// The "memory is paused" notice, due after a startup or rebuild only when the backend or its open
+/// error differs from the last one reported (`last` remembers it).
+fn memory_notice_due(
+    last: &mut Option<(String, Option<String>)>,
+    backend: &str,
+    error: Option<String>,
+) -> Option<String> {
+    let state = (backend.to_owned(), error);
+    if last.as_ref() == Some(&state) {
+        return None;
+    }
+    let notice = state.1.as_deref().map(|reason| {
+        if reason.contains("/roles") || reason.contains("/settings") {
+            format!("Memory is paused: {reason}.")
+        } else {
+            format!(
+                "Memory is paused: {reason}. Next: {}.",
+                memory_next_step(reason)
+            )
+        }
+    });
+    *last = Some(state);
+    notice
 }
 
 /// The remembered items for a backend that stores facts or lessons: a count heading, then one row per
@@ -545,6 +640,12 @@ fn remembered_lines(value: &Value, noun: &str) -> Vec<String> {
         count.to_string()
     };
     let plural = if count == 1 && !truncated { "" } else { "s" };
+    if value.get("recent").is_none() {
+        // Backends that report only a count (semantic) list nothing, so make no "newest first" claim.
+        return vec![format!(
+            "{shown} remembered {noun}{plural} in this project."
+        )];
+    }
     let mut lines = vec![format!("{shown} remembered {noun}{plural}, newest first:")];
     for item in value
         .get("recent")
@@ -650,8 +751,9 @@ fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) -> Result<(
     let mut session_cost = None;
     let mut runtime_accounting = None;
     let mut plan_carry: (Option<String>, Option<String>) = Default::default();
-    let mut memory_checked = false;
     shell.begin(app, &session, resumed);
+    // The backend and its open error last reported, so the paused notice repeats only on change.
+    let mut memory_reported: Option<(String, Option<String>)> = None;
     // `session_end` is handed from one agent to the next across same-session rebuilds.
     let mut lifecycle_open = false;
     // A local model server survives a same-session rebuild; the new backend reuses it when the
@@ -668,16 +770,14 @@ fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) -> Result<(
             } else {
                 agent.begin_session_lifecycle();
             }
-            if !memory_checked {
-                memory_checked = true;
-                if let Some(reason) = agent.memory_open_error() {
-                    shell.transcript.notice(
-                        "Memory",
-                        &format!(
-                            "Memory is paused: {reason}. Fix it in /settings → Memory, or choose another backend there."
-                        ),
-                    );
-                }
+            // Re-checked after every rebuild: a settings change can switch to a backend that
+            // cannot open (a missing role, a half override), which must not go silent.
+            if let Some(notice) = memory_notice_due(
+                &mut memory_reported,
+                app.config.memory.backend.as_str(),
+                agent.memory_open_error(),
+            ) {
+                shell.transcript.notice("Memory", &notice);
             }
             if let Some(snapshot) = &todo {
                 agent.restore_todo(snapshot)?;
@@ -1632,6 +1732,52 @@ fn palette_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> 
     entries
 }
 
+/// `/memory` argument choices for the selected backend: each backend accepts different
+/// subcommands, and an unknown word is a search, so only real subcommands are offered.
+fn memory_argument_completions(config: &Config) -> Vec<String> {
+    use crate::storage::memory_backend::config::MemoryBackendId;
+    let backend = if config.memory.enabled {
+        config.memory.backend
+    } else {
+        MemoryBackendId::Off
+    };
+    let (words, nested): (&[&str], &[(&str, &[&str])]) = match backend {
+        MemoryBackendId::Off => (&["status", "help"], &[]),
+        MemoryBackendId::Provenance => (
+            &["status", "search", "clear", "help"],
+            &[("clear", &["project", "global"])],
+        ),
+        MemoryBackendId::Semantic => (
+            &[
+                "status", "search", "save", "forget", "update", "history", "rebuild", "clear",
+                "help",
+            ],
+            &[("clear", &["user"])],
+        ),
+        MemoryBackendId::Hindsight => (
+            &[
+                "status", "search", "save", "enqueue", "queue", "mm", "clear", "help",
+            ],
+            &[(
+                "mm",
+                &["list", "seed", "show", "history", "refresh", "delete"],
+            )],
+        ),
+        MemoryBackendId::Local => (&["status", "save", "enqueue", "clear", "help"], &[]),
+        MemoryBackendId::Sharpshooter => (
+            &[
+                "status", "search", "stats", "diagnose", "queue", "enqueue", "clear", "help",
+            ],
+            &[],
+        ),
+    };
+    let mut out: Vec<String> = words.iter().map(|word| format!("/memory {word}")).collect();
+    for (word, args) in nested {
+        out.extend(args.iter().map(|arg| format!("/memory {word} {arg}")));
+    }
+    out
+}
+
 /// Concrete argument choices, not usage placeholders. Keep these next to the command registry;
 /// the composer only matches/renders continuations and never knows command semantics.
 fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Vec<String> {
@@ -1644,8 +1790,6 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
             ][..],
         ),
         ("understanding", &["architecture", "build", "clear"][..]),
-        ("memory", &["clear"][..]),
-        ("memory clear", &["project", "global"][..]),
         ("checks", &["list", "add", "remove", "help"][..]),
         ("experience", &["ledger"]),
         ("laya", &["status", "check", "start", "on", "off"]),
@@ -1684,6 +1828,7 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
     ] {
         candidates.extend(args.iter().map(|arg| format!("/{name} {arg}")));
     }
+    candidates.extend(memory_argument_completions(config));
     for skill in skills {
         for action in ["enable", "disable"] {
             candidates.push(format!("/skills {action} {}", skill.name));
@@ -1791,6 +1936,13 @@ fn next_favorite(
         .position(|selection| same(selection, &current))
         .map_or(0, |index| (index + 1) % candidates.len());
     candidates.get(index).cloned()
+}
+
+/// The settings path a change writes.
+fn change_path(change: &Change) -> &str {
+    match change {
+        Change::Set { path, .. } | Change::Remove { path } => path,
+    }
 }
 
 /// Make `role` follow the main model again. In the project layer an explicit marker is needed so a
@@ -3206,6 +3358,23 @@ impl Shell {
                     Err(error) if provider == "Smithery" => {
                         commands::smithery::browser_failed(self, app, agent, &error)?
                     }
+                    // An embedding setup finished while memory is not semantic: report it, then
+                    // offer the switch with a single key (the offer does nothing when semantic).
+                    Ok(message)
+                        if provider == "Setup"
+                            && message.starts_with(crate::setup::embeddings::SUMMARY_PREFIX) =>
+                    {
+                        self.transcript.notice_merge(provider, &message);
+                        self.transcript.settle_job_notices();
+                        self.command(
+                            app,
+                            agent,
+                            &format!(
+                                "/setup memory {}",
+                                crate::setup::embeddings::OFFER_SEMANTIC_ARG
+                            ),
+                        )?
+                    }
                     Ok(message) if provider == "Smithery" => {
                         self.note(provider, message);
                         commands::smithery::resume(self, app, agent)?
@@ -3977,16 +4146,10 @@ impl Shell {
                             }
                             Ok(Err(output)) => break output,
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                // Nothing else reads input while the command runs; raw mode delivers Ctrl-C as a key.
-                                while poll(Duration::ZERO).unwrap_or(false) {
-                                    if let Ok(Event::Key(key)) = read()
-                                        && key.kind != KeyEventKind::Release
-                                        && key.code == KeyCode::Char('c')
-                                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                                    {
-                                        app.interrupt.store(true, Ordering::SeqCst);
-                                    }
-                                }
+                                // Quiet output still owns input: keys, paste and resize go through
+                                // the same dispatcher a noisy command uses in `repaint`, so the
+                                // draft, queue and configured interrupt behave identically.
+                                bridge.pump();
                                 bridge.heartbeat()
                             }
                             Err(_) => {
@@ -4541,6 +4704,16 @@ impl Shell {
     }
 
     fn run_turn(&mut self, app: &App, agent: &mut Agent<'_>, text: &str) -> Result<Step> {
+        // A joined guest's prompts belong to the host agent: send them there or refuse. The local
+        // agent never runs them.
+        if let Some(routed) = crate::collab::room::route_guest_prompt(text) {
+            let message = match routed {
+                Ok(()) => "Sent to the host agent; its replies arrive as collab entries.",
+                Err(message) => message,
+            };
+            self.note("Collab", message);
+            return Ok(Step::Done);
+        }
         self.loop_mode.turn_started(text);
         self.retry_noted = false;
         repl::clear_interrupt();
@@ -4618,18 +4791,17 @@ impl Shell {
             }
             Err(error) => self.transcript.error(&format!("{error:#}")),
         }
-        // A turn the user stopped is not a completion; failures still notify when enabled.
-        let notify = match &result {
-            Ok(report) => !report.interrupted,
-            Err(_) => self.ui.notify_errors,
+        // Notify from the agent's outcome, not from transport success: failed, blocked and
+        // incomplete turns are errors, and an interrupted turn is silent (see `turn_end_notice`).
+        let outcome = match &result {
+            Ok(report) if report.interrupted => crate::agent::TurnOutcome::Interrupted,
+            Ok(report) => report.outcome,
+            Err(_) => crate::agent::TurnOutcome::Failed,
         };
-        if self.ui.notify && notify {
-            let kind = if matches!(&result, Err(_)) {
-                crate::ui::termcaps::NotifyKind::Error
-            } else {
-                crate::ui::termcaps::NotifyKind::Completion
-            };
-            crate::ui::termcaps::notify(kind, "Dial", "Turn finished", &self.session_id);
+        if let Some(notice) =
+            crate::ui::termcaps::turn_end_notice(outcome, self.ui.notify, self.ui.notify_errors)
+        {
+            crate::ui::termcaps::notify(notice.kind, "Dial", notice.body, &self.session_id);
         }
         self.transcript.finish_turn();
         if matches!(&result, Ok(report) if !report.interrupted) {
@@ -4814,70 +4986,43 @@ impl Shell {
             self.status.phase = Phase::WaitingCompute;
             self.status.elapsed_secs = elapsed_before_wait + waiting_since.elapsed().as_secs_f64();
             self.status.activity = "waiting for compute · Ctrl+, or /compute opens controls".into();
-            self.paint(None)?;
+            self.paint_waiting(app)?;
             if poll(TICK)? {
-                match read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        match self.composer_key(key) {
-                            ComposerEvent::Interrupt | ComposerEvent::Exit => {
-                                self.note("Cancelled", "An improvement or training job holds local compute exclusively.");
-                                return Ok(false);
-                            }
-                            ComposerEvent::Submit(text) => {
-                                if self.route_busy_command(app, text) {
-                                    return Ok(false);
-                                }
-                            }
-                            ComposerEvent::Action(Action::CommandPalette) => {
-                                if self.route_busy_command(app, "/palette".into()) {
-                                    return Ok(false);
-                                }
-                            }
-                            ComposerEvent::Action(Action::ModelSelect) => {
-                                self.route_busy_command(app, "/model".into());
-                            }
-                            ComposerEvent::Action(Action::ModelRoles) => {
-                                self.route_busy_command(app, "/roles".into());
-                            }
-                            ComposerEvent::Action(Action::ModelFavoriteNext) => {
-                                self.route_busy_command(app, "/model next".into());
-                            }
-                            ComposerEvent::Action(Action::Settings) => {
-                                self.route_busy_command(app, "/settings".into());
-                            }
-                            ComposerEvent::Action(Action::SubagentsHub) => {
-                                self.route_busy_command(app, "/agents".into());
-                            }
-                            ComposerEvent::Action(Action::EditExternal) => self.edit_externally(),
-                            ComposerEvent::Action(Action::PasteImage) => {
-                                if let Err(error) = self.composer.paste_clipboard_image() {
-                                    self.note(
-                                        "Image",
-                                        format!("clipboard image unavailable: {error:#}"),
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
+                let event = read()?;
+                match self.wait_event(app, event)? {
+                    WaitFlow::Continue => {}
+                    WaitFlow::Cancel => {
+                        self.note(
+                            "Cancelled",
+                            "An improvement or training job holds local compute exclusively.",
+                        );
+                        return Ok(false);
                     }
-                    Event::Paste(text) => self.composer_paste(&text),
-                    Event::Resize(..) => self.term.on_resize(),
-                    _ => {}
+                    WaitFlow::Stop => return Ok(false),
                 }
             }
         }
     }
 
-    /// Keep painting and accepting cancellation while local preparation owns a subprocess.
+    /// Keep painting and accepting input while local preparation owns a subprocess. Typed text
+    /// queues in the composer (the busy composer), and the configured interrupt or Escape cancels.
     fn wait_local_preparation(
         &mut self,
+        app: &App,
         work: impl FnOnce(Arc<AtomicBool>, &mut dyn FnMut(&str)) -> Result<String> + Send + 'static,
     ) -> Result<bool> {
         let mut slot = None;
         start_streaming_job(&mut slot, "Local models", work);
         self.status.phase = Phase::Setup;
+        self.composer.set_busy(true);
+        let outcome = self.preparation_events(app, &mut slot);
+        self.composer.set_busy(false);
+        outcome
+    }
+
+    fn preparation_events(&mut self, app: &App, slot: &mut Option<AuthJob>) -> Result<bool> {
         loop {
-            for (label, line) in AuthJob::drain_lines(&mut slot) {
+            for (label, line) in AuthJob::drain_lines(slot) {
                 self.transcript.notice_merge(label, &line);
             }
             if let Some(job) = slot.as_ref() {
@@ -4894,21 +5039,123 @@ impl Shell {
                 }
             }
             self.status.activity = "preparing local model · Esc cancels".into();
-            self.paint(None)?;
+            self.paint_waiting(app)?;
             if poll(TICK)? {
-                match read()? {
-                    Event::Key(key)
-                        if self.keys.matches(Action::Interrupt, &key)
-                            || self.keys.matches(Action::SelectCancel, &key) =>
-                    {
-                        drop(slot);
+                let event = read()?;
+                // Escape and the configured interrupt cancel preparation, unless a panel is open
+                // (then Escape closes the panel first, as everywhere else).
+                let cancel_key = self.busy_overlay.is_none()
+                    && matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release
+                        && (self.keys.matches(Action::Interrupt, key)
+                            || self.keys.matches(Action::SelectCancel, key)));
+                let flow = if cancel_key {
+                    WaitFlow::Cancel
+                } else {
+                    self.wait_event(app, event)?
+                };
+                match flow {
+                    WaitFlow::Continue => {}
+                    WaitFlow::Cancel => {
+                        *slot = None;
                         self.note("Local models", "Preparation cancelled; settings unchanged. Cached downloads can be reused.");
                         return Ok(false);
                     }
-                    Event::Resize(..) => self.term.on_resize(),
-                    _ => {}
+                    // A message sent now is queued in `startup` and runs once preparation stops.
+                    WaitFlow::Stop => {
+                        *slot = None;
+                        return Ok(false);
+                    }
                 }
             }
+        }
+    }
+
+    /// One terminal event during a blocking wait. An open panel gets it first, as in the idle
+    /// loop: Escape closes the panel, while the configured interrupt cancels the wait. Otherwise
+    /// keys, paste and resize use the composer and command routing that turns use, so typed and
+    /// queued work is kept rather than discarded.
+    fn wait_event(&mut self, app: &App, event: Event) -> Result<WaitFlow> {
+        if self.busy_overlay.is_some() {
+            let interrupt = matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release
+                && self.keys.matches(Action::Interrupt, key)
+                && !self.keys.matches(Action::SelectCancel, key));
+            if interrupt {
+                if let Some(state) = &mut self.busy_overlay {
+                    state.next = None;
+                }
+                self.finish_busy_overlay(app)?;
+                return Ok(WaitFlow::Cancel);
+            }
+            return Ok(if self.step_busy_overlay(app, Some(event))? {
+                WaitFlow::Stop
+            } else {
+                WaitFlow::Continue
+            });
+        }
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => self.wait_key(app, key),
+            Event::Paste(text) => {
+                self.composer_paste(&text);
+                Ok(WaitFlow::Continue)
+            }
+            Event::Resize(..) => {
+                self.term.on_resize();
+                Ok(WaitFlow::Continue)
+            }
+            _ => Ok(WaitFlow::Continue),
+        }
+    }
+
+    fn wait_key(&mut self, app: &App, key: crossterm::event::KeyEvent) -> Result<WaitFlow> {
+        if self.keys.matches(Action::Interrupt, &key) {
+            return Ok(WaitFlow::Cancel);
+        }
+        Ok(match self.composer_key(key) {
+            ComposerEvent::Interrupt | ComposerEvent::Exit => WaitFlow::Cancel,
+            ComposerEvent::Submit(text) => {
+                if self.route_busy_command(app, text) {
+                    WaitFlow::Stop
+                } else {
+                    WaitFlow::Continue
+                }
+            }
+            ComposerEvent::Action(Action::CommandPalette) => self.wait_command(app, "/palette"),
+            ComposerEvent::Action(Action::ModelSelect) => self.wait_command(app, "/model"),
+            ComposerEvent::Action(Action::ModelRoles) => self.wait_command(app, "/roles"),
+            ComposerEvent::Action(Action::ModelFavoriteNext) => {
+                self.wait_command(app, "/model next")
+            }
+            ComposerEvent::Action(Action::Settings) => self.wait_command(app, "/settings"),
+            ComposerEvent::Action(Action::SubagentsHub) => self.wait_command(app, "/agents"),
+            ComposerEvent::Action(Action::EditExternal) => {
+                self.edit_externally();
+                WaitFlow::Continue
+            }
+            ComposerEvent::Action(Action::PasteImage) => {
+                if let Err(error) = self.composer.paste_clipboard_image() {
+                    self.note("Image", format!("clipboard image unavailable: {error:#}"));
+                }
+                WaitFlow::Continue
+            }
+            _ => WaitFlow::Continue,
+        })
+    }
+
+    fn wait_command(&mut self, app: &App, command: &str) -> WaitFlow {
+        if self.route_busy_command(app, command.to_owned()) {
+            WaitFlow::Stop
+        } else {
+            WaitFlow::Continue
+        }
+    }
+
+    /// Repaint during a blocking wait: an open panel draws itself, otherwise the transcript.
+    fn paint_waiting(&mut self, app: &App) -> Result<()> {
+        if self.busy_overlay.is_some() {
+            self.step_busy_overlay(app, None)?;
+            Ok(())
+        } else {
+            self.paint(None)
         }
     }
 
@@ -4925,7 +5172,7 @@ impl Shell {
             }
             self.note("Local models", "installing the local runtime…");
             let layout = app.layout.clone();
-            if !self.wait_local_preparation(move |cancel, progress| {
+            if !self.wait_local_preparation(app, move |cancel, progress| {
                 let progress = RefCell::new(progress);
                 crate::setup::ensure_runtime_with(&layout, &cancel, &|line| {
                     progress.borrow_mut()(line)
@@ -4952,7 +5199,7 @@ impl Shell {
                 let config = app.config.clone();
                 let capabilities = Arc::new(Mutex::new(None));
                 let prepared = capabilities.clone();
-                if !self.wait_local_preparation(move |cancel, progress| {
+                if !self.wait_local_preparation(app, move |cancel, progress| {
                     let progress = RefCell::new(progress);
                     crate::llm::download::ensure_local_model_with(
                         &config.python,
@@ -5306,15 +5553,25 @@ impl Shell {
                 }
                 apply_settings_hints(&mut overlay, &effective);
                 overlay.set_setup_offers(setting_setup_offers(&app.layout.user_dir, &effective));
+                // The Embedding model row lists discovered embedding models and curated setups.
+                if effective.memory.backend
+                    == crate::storage::memory_backend::config::MemoryBackendId::Semantic
+                {
+                    self.catalog.start(app);
+                }
+                overlay.set_embedding_models(settings_embedding_models(discovery.as_ref()));
+                overlay.set_embedding_setups(embedding_setup_offers(&app.layout.user_dir));
                 ActiveOverlay::Settings(Box::new(overlay))
             }
             Which::Models | Which::ModelRoles | Which::LearningModels | Which::ModelDownloads => {
                 let mut models =
                     ModelOverlay::new(discovery, effective.role_statuses(), self.scope)
                         .with_favorites(favorite_routes(&effective))
-                        .with_memory_required(crate::storage::memory_backend::config::calls_model(
-                            &effective.memory,
-                        ))
+                        .with_memory_required(
+                            crate::storage::memory_backend::config::requires_memory_role(
+                                &effective.memory,
+                            ),
+                        )
                         .with_main_lora(self.status.lora)
                         .with_learning(learning_models)
                         .with_downloads(
@@ -5322,6 +5579,11 @@ impl Shell {
                             crate::cli::local_models::Settings::from_config(&effective),
                             effective.python.clone(),
                         );
+                models.set_memory_optional(
+                    crate::storage::memory_backend::config::auto_retain_uses_memory_role(
+                        &effective.memory,
+                    ),
+                );
                 if matches!(which, Which::ModelRoles) {
                     models.show_roles();
                 }
@@ -7506,7 +7768,14 @@ impl Shell {
                     };
                     agent.selected_memory_command(args, &mut bridge)
                         .and_then(|value| {
-                            if matches!(args.trim(), "" | "status") && value.get("backend").is_some() {
+                            // `/memory help` answers with text (a `help` field or a bare string).
+                            if let Some(help) = value
+                                .get("help")
+                                .and_then(Value::as_str)
+                                .or_else(|| value.as_str())
+                            {
+                                Ok(help.to_owned())
+                            } else if matches!(args.trim(), "" | "status") && value.get("backend").is_some() {
                                 Ok(memory_status_text(&value))
                             } else {
                                 serde_json::to_string_pretty(&value).map_err(Into::into)
@@ -8251,6 +8520,44 @@ fn setting_setup_offers(
     offers
 }
 
+/// Discovered models the Settings Embedding model row offers for the `embedding` role.
+fn settings_embedding_models(
+    discovery: Option<&catalog::Discovery>,
+) -> Vec<crate::ui::overlay::settings::EmbeddingModel> {
+    discovery
+        .map(crate::ui::overlay::models::embedding_candidates)
+        .unwrap_or_default()
+        .into_iter()
+        .map(
+            |(entry, classified)| crate::ui::overlay::settings::EmbeddingModel {
+                selection: entry.selection,
+                label: entry.label,
+                classified,
+            },
+        )
+        .collect()
+}
+
+/// One setup offer per curated embedding model, so Ctrl+L sets up the model picked on the row.
+fn embedding_setup_offers(
+    user_dir: &std::path::Path,
+) -> std::collections::BTreeMap<String, crate::ui::overlay::settings::SetupOffer> {
+    crate::setup::embeddings::catalog_offers(user_dir)
+        .into_iter()
+        .zip(crate::setup::embeddings::CATALOG)
+        .map(|(offer, model)| {
+            (
+                model.name.to_owned(),
+                crate::ui::overlay::settings::SetupOffer {
+                    id: offer.id,
+                    title: offer.title,
+                    preview: offer.preview,
+                },
+            )
+        })
+        .collect()
+}
+
 struct PreparedModel {
     changes: Vec<Change>,
     role: String,
@@ -8569,11 +8876,53 @@ impl OverlayEnv<'_> {
             } else {
                 result
             };
+            // A finished embedding setup while memory is not semantic: offer the switch on close.
+            let result = match result {
+                Ok(message)
+                    if provider == "Setup"
+                        && message.starts_with(crate::setup::embeddings::SUMMARY_PREFIX) =>
+                {
+                    if let Ok(fresh) = self.app.reload() {
+                        self.latest = Some(fresh);
+                    }
+                    Ok(match self.queue_semantic_offer() {
+                        Some(note) => format!("{message}\n{note}"),
+                        None => message,
+                    })
+                }
+                other => other,
+            };
             self.refresh_roles(overlay);
             self.report(overlay, result);
             self.catalog.refresh(self.app);
         }
     }
+
+    /// After an embedding model is set up or assigned while memory is not semantic, queue the
+    /// single-key switch offer for when this panel closes (decision: never switch silently).
+    /// Returns the line that tells the user so.
+    fn queue_semantic_offer(&mut self) -> Option<String> {
+        use crate::storage::memory_backend::config::MemoryBackendId;
+        let config = self.latest.clone().or_else(|| self.app.reload().ok())?;
+        if config.memory.enabled && config.memory.backend == MemoryBackendId::Semantic {
+            return None;
+        }
+        if self.next.is_none() {
+            self.next = Some(format!(
+                "command:/setup memory {}",
+                crate::setup::embeddings::OFFER_SEMANTIC_ARG
+            ));
+        }
+        let current = if config.memory.enabled {
+            config.memory.backend.as_str()
+        } else {
+            "off"
+        };
+        Some(format!(
+            "Only semantic memory uses embeddings and memory is {current}: closing this panel asks whether to switch."
+        ))
+    }
+
     /// Persist, then reload the effective config (files plus command-line flags) and apply the UI part live.
     fn save(&mut self, changes: &[Change], scope: Scope) -> Result<Config> {
         self.app.save_settings(scope, changes, None)?;
@@ -8665,25 +9014,34 @@ impl OverlayEnv<'_> {
                         models.set_favorites(favorite_routes(config));
                     }
                 } else {
-                    self.setting(
-                        overlay,
-                        &path,
-                        &[Change::Set {
-                            path: path.clone(),
-                            value,
-                        }],
-                        scope,
-                    );
+                    let mut changes = vec![Change::Set {
+                        path: path.clone(),
+                        value,
+                    }];
+                    // The embedding override saves as a pair: add the half the panel held back.
+                    let partner = crate::ui::overlay::settings::pair_partner(&path);
+                    if let ActiveOverlay::Settings(settings) = &mut *overlay
+                        && let Some((staged, staged_value)) = settings.take_staged_pair()
+                        && Some(staged.as_str()) == partner
+                    {
+                        changes.push(Change::Set {
+                            path: staged,
+                            value: staged_value,
+                        });
+                    }
+                    self.setting(overlay, &path, &changes, scope);
                 }
             }
             OverlayEvent::Unset { path, scope } => {
                 *self.scope = scope;
-                self.setting(
-                    overlay,
-                    &path,
-                    &[Change::Remove { path: path.clone() }],
-                    scope,
-                );
+                let mut changes = vec![Change::Remove { path: path.clone() }];
+                // Clearing one half of the embedding override clears the pair.
+                if let Some(partner) = crate::ui::overlay::settings::pair_partner(&path) {
+                    changes.push(Change::Remove {
+                        path: partner.to_owned(),
+                    });
+                }
+                self.setting(overlay, &path, &changes, scope);
             }
             OverlayEvent::AssignModel {
                 role,
@@ -8695,6 +9053,7 @@ impl OverlayEnv<'_> {
                     .latest
                     .clone()
                     .unwrap_or_else(|| self.app.config.clone());
+                let embedding_role = role == "embedding";
                 let outcome = (|| -> Result<String> {
                     let changes = selection_changes(&config, &selection, &role)?;
                     settings_store::preview_model_config(&self.app.layout, scope, &changes, &role)?;
@@ -8745,8 +9104,28 @@ impl OverlayEnv<'_> {
                         Ok(message)
                     }
                 })();
+                let assigned =
+                    outcome.is_ok() && self.auth_job.as_ref().is_none_or(|job| job.model.is_none());
+                let outcome = match outcome {
+                    Ok(message) if assigned && embedding_role => {
+                        Ok(match self.queue_semantic_offer() {
+                            Some(note) => format!("{message}. {note}"),
+                            None => message,
+                        })
+                    }
+                    other => other,
+                };
                 self.report(overlay, outcome);
                 self.refresh_roles(overlay);
+                // The Settings Embedding model row shows the role and may complete a pending switch.
+                if assigned
+                    && let (ActiveOverlay::Settings(settings), Some(fresh)) =
+                        (&mut *overlay, &self.latest)
+                    && let Ok((values, global, project)) = settings_tables(self.app, fresh)
+                {
+                    settings.replace_values(values, project, global);
+                    settings.roles_changed();
+                }
             }
             OverlayEvent::ClearRole { role, scope } => {
                 *self.scope = scope;
@@ -8803,16 +9182,32 @@ impl OverlayEnv<'_> {
             }
             OverlayEvent::OpenRouterLogin => {
                 let dir = self.app.layout.user_dir.clone();
-                self.start_auth(overlay, "OpenRouter", move |cancel| {
-                    let mut key = crate::llm::auth::openrouter_login(cancel)?;
-                    catalog::verify_and_save_credential(
-                        &dir,
-                        "openrouter",
-                        catalog::OPENROUTER_BASE_URL,
-                        key.as_mut_string(),
-                    )?;
-                    Ok("OpenRouter sign-in verified; key saved locally".into())
-                });
+                // A streaming job: the sign-in URL is progress, so it reaches the transcript even
+                // when no browser opens and the user completes the callback by hand.
+                let started =
+                    start_streaming_job(self.auth_job, "OpenRouter", move |cancel, progress| {
+                        let mut key = crate::llm::auth::openrouter_login(cancel, progress)?;
+                        catalog::verify_and_save_credential(
+                            &dir,
+                            "openrouter",
+                            catalog::OPENROUTER_BASE_URL,
+                            key.as_mut_string(),
+                        )?;
+                        Ok("OpenRouter sign-in verified; key saved locally".into())
+                    });
+                if started {
+                    self.report(
+                        overlay,
+                        Ok("Waiting for OpenRouter sign-in in your browser; sign-in continues if you close this panel".into()),
+                    );
+                } else {
+                    self.report(
+                        overlay,
+                        Err(anyhow::anyhow!(
+                            "An authentication action is already running"
+                        )),
+                    );
+                }
             }
             OverlayEvent::ChatGptLogin { client_id } => {
                 let dir = self.app.layout.user_dir.clone();
@@ -9041,10 +9436,25 @@ impl OverlayEnv<'_> {
             .and_then(|fresh| settings_tables(self.app, &fresh).map(|tables| (fresh, tables)))
         {
             Ok((fresh, (values, global, project))) => {
+                // Paired changes (the embedding override) settle every path they wrote.
+                for other in changes
+                    .iter()
+                    .map(change_path)
+                    .filter(|other| *other != path)
+                {
+                    settings.settled(other, Ok(Self::effective_value(&fresh, other)));
+                }
                 settings.settled(path, Ok(Self::effective_value(&fresh, path)));
                 settings.replace_values(values, project, global);
             }
             Err(error) => {
+                for other in changes
+                    .iter()
+                    .map(change_path)
+                    .filter(|other| *other != path)
+                {
+                    settings.settled(other, Err(format!("{error:#}")));
+                }
                 settings.settled(path, Err(format!("{error:#}")));
                 settings.banner(format!("{error:#}"), true);
             }
@@ -9086,12 +9496,28 @@ impl OverlayEnv<'_> {
     fn refresh_roles(&mut self, overlay: &mut ActiveOverlay) {
         if let (ActiveOverlay::Models(models), Some(config)) = (overlay, &self.latest) {
             models.set_roles(config.role_statuses());
-            models.set_memory_required(crate::storage::memory_backend::config::calls_model(
-                &config.memory,
-            ));
+            models.set_memory_required(
+                crate::storage::memory_backend::config::requires_memory_role(&config.memory),
+            );
+            models.set_memory_optional(
+                crate::storage::memory_backend::config::auto_retain_uses_memory_role(
+                    &config.memory,
+                ),
+            );
             models.set_favorites(favorite_routes(config));
         }
     }
+}
+
+/// What a blocking wait (compute lock, local preparation) does after one terminal event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitFlow {
+    /// Keep waiting.
+    Continue,
+    /// The configured interrupt (or an explicit exit) abandons the wait.
+    Cancel,
+    /// A submitted message must run after the wait, so the wait ends without its work.
+    Stop,
 }
 
 /// Owned panel state lets agent callbacks keep draining while an overlay is visible.
@@ -9191,6 +9617,9 @@ fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut ActiveOverlay) {
             match overlay {
                 ActiveOverlay::Models(models) => models.set_discovery(discovery),
                 ActiveOverlay::Providers(providers) => providers.set_discovery(discovery),
+                ActiveOverlay::Settings(settings) => {
+                    settings.set_embedding_models(settings_embedding_models(Some(&discovery)))
+                }
                 _ => {}
             }
         }

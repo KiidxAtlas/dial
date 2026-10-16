@@ -19,14 +19,16 @@ impl PushToTalk {
         ensure!(env.voice.stt.enabled, "speech recognition is disabled");
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
+        // The terminal never aborts a recording: release/stop always finishes and transcribes.
+        let never_aborted = Arc::new(AtomicBool::new(false));
         let (tx, result) = mpsc::channel();
         thread::Builder::new()
             .name("dial-dictation".into())
             .spawn(move || {
                 let outcome = if hold {
-                    dictation::record_held(&env, &worker_stop)
+                    dictation::record_held(&env, &worker_stop, &never_aborted)
                 } else {
-                    dictation::record_and_transcribe(&env, &worker_stop)
+                    dictation::record_and_transcribe(&env, &worker_stop, &never_aborted)
                 };
                 let _ = tx.send(outcome);
             })?;

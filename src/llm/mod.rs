@@ -1947,7 +1947,11 @@ mod net_tests {
         let reply = reply.unwrap();
         assert_eq!(pieces.concat(), "Ok");
         assert_eq!(reply.text, "Ok");
-        assert!(reply.reasoning.starts_with("Look up"), "{}", reply.reasoning);
+        assert!(
+            reply.reasoning.starts_with("Look up"),
+            "{}",
+            reply.reasoning
+        );
         assert!(reply.reasoning.contains("ponder"), "{}", reply.reasoning);
         assert_eq!(reply.finish_reason, "tool_calls");
         assert_eq!(reply.tool_calls.len(), 1);
@@ -1955,8 +1959,15 @@ mod net_tests {
         assert_eq!(reply.tool_calls[0].arguments, json!({"path": "a"}));
         let replay = assistant_message(&reply);
         assert_eq!(replay["content"], "Ok");
-        assert!(replay["reasoning_content"].as_str().is_some_and(|r| r.starts_with("Look up")));
-        assert_eq!(replay["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a\"}");
+        assert!(
+            replay["reasoning_content"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("Look up"))
+        );
+        assert_eq!(
+            replay["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a\"}"
+        );
     }
 
     #[test]

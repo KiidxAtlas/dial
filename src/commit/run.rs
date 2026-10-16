@@ -7,7 +7,9 @@ use std::path::Path;
 use super::agentic::{AgenticOutcome, run_agentic_commit};
 use super::changelog::{ChangelogFlowArgs, run_changelog_flow};
 use super::config::GenerationConfig;
-use super::execute::{IndexSnapshot, commit_with_message, git_output, push_or_abort, repo_top};
+use super::execute::{
+    PreviewIndex, commit_with_message, git_output, git_output_indexed, push_or_abort, repo_top,
+};
 use super::model_selection::resolve_commit_config;
 use super::repo_context::generation_context;
 use super::types::CommitCommandArgs;
@@ -100,6 +102,9 @@ pub(crate) enum CommitRunOutcome {
         pushed: bool,
         used_fallback: bool,
     },
+    /// `--dry-run --push` with nothing staged: the existing commits that `--push` would publish
+    /// were not pushed.
+    WouldPush,
 }
 
 impl CommitRunOutcome {
@@ -123,6 +128,7 @@ impl CommitRunOutcome {
                 "No changes to commit; pushed existing commits.".to_owned()
             }
             Self::NothingToCommit { pushed: false } => "No changes to commit.".to_owned(),
+            Self::WouldPush => "Dry run. No changes to commit; nothing was pushed.".to_owned(),
             Self::DryRun {
                 message,
                 validation_error: None,
@@ -165,34 +171,33 @@ pub(crate) fn run_commit_command(
     // Paths from git are top-level relative, but pathspecs resolve from the working directory.
     let top = repo_top(cwd)?;
     let cwd = top.as_path();
-    // A dry run stages through `git add -A`, so the index is restored explicitly when the run ends.
+    // A dry run stages and diffs through a private copy of the index, so the repository's index is
+    // never written: a concurrent `git add` is never overwritten, and nothing needs restoring.
     let preview = args
         .dry_run
-        .then(|| IndexSnapshot::capture(cwd))
+        .then(|| PreviewIndex::capture(cwd))
         .transpose()?;
-    let outcome = run_commit_steps(args, cwd, config, backend, confirm);
-    if let Some(preview) = preview {
-        preview.restore()?;
-    }
-    outcome
+    let index = preview.as_ref().map(PreviewIndex::path);
+    run_commit_steps(args, cwd, index, config, backend, confirm)
 }
 
 fn run_commit_steps(
     args: &CommitCommandArgs,
     cwd: &Path,
+    index: Option<&Path>,
     config: &Config,
     backend: &dyn CommitBackend,
     confirm: &mut dyn FnMut(&str) -> bool,
 ) -> Result<CommitRunOutcome, CommitError> {
     if args.legacy {
-        return run_legacy_commit(args, cwd, config, backend, confirm);
+        return run_legacy_commit(args, cwd, index, config, backend, confirm);
     }
     let cfg = resolve_commit_config(config, args.model.as_deref());
     let AgenticOutcome {
         used_fallback,
         committed,
         message,
-    } = run_agentic_commit(args, cwd, &cfg, backend, confirm)?;
+    } = run_agentic_commit(args, cwd, index, &cfg, backend, confirm)?;
     if !committed {
         return Ok(if args.dry_run {
             CommitRunOutcome::DryRun {
@@ -203,7 +208,8 @@ fn run_commit_steps(
             CommitRunOutcome::NotCommitted { message }
         });
     }
-    let pushed = args.push;
+    // The single dry-run effect policy: a dry run never publishes.
+    let pushed = args.push && !args.dry_run;
     if pushed {
         push_or_abort(cwd, config.git.bypass_hooks)?;
     }
@@ -216,24 +222,30 @@ fn run_commit_steps(
 
 /// Deterministic legacy pipeline: stage everything if nothing is staged, generate one conventional
 /// message from the staged diff, then (after confirmation) update the changelog, commit, and push.
+/// `index` is the private preview index for a dry run, or `None` for the repository's own index.
 fn run_legacy_commit(
     args: &CommitCommandArgs,
     cwd: &Path,
+    index: Option<&Path>,
     config: &Config,
     backend: &dyn CommitBackend,
     confirm: &mut dyn FnMut(&str) -> bool,
 ) -> Result<CommitRunOutcome, CommitError> {
     const CONTEXT: &str = "Commit generation failed";
     let cfg = resolve_commit_config(config, args.model.as_deref());
+    // The single dry-run effect policy: nothing below publishes unless `publish` is set, and a
+    // dry run reports what it would push instead.
+    let publish = args.push && !args.dry_run;
 
-    if git_output(cwd, &["diff", "--cached", "--name-only"], CONTEXT)?
+    if git_output_indexed(cwd, index, &["diff", "--cached", "--name-only"], CONTEXT)?
         .trim()
         .is_empty()
     {
-        git_output(cwd, &["add", "-A"], CONTEXT)?;
+        git_output_indexed(cwd, index, &["add", "-A"], CONTEXT)?;
     }
-    let diff = git_output(
+    let diff = git_output_indexed(
         cwd,
+        index,
         &[
             "diff",
             "--cached",
@@ -244,19 +256,24 @@ fn run_legacy_commit(
         CONTEXT,
     )?;
     if diff.trim().is_empty() {
-        if args.push {
+        if args.dry_run && args.push {
+            return Ok(CommitRunOutcome::WouldPush);
+        }
+        if publish {
             push_or_abort(cwd, config.git.bypass_hooks)?;
             return Ok(CommitRunOutcome::NothingToCommit { pushed: true });
         }
         return Ok(CommitRunOutcome::NothingToCommit { pushed: false });
     }
-    let stat = git_output(
+    let stat = git_output_indexed(
         cwd,
+        index,
         &["diff", "--cached", "--no-color", "--stat", "--no-renames"],
         CONTEXT,
     )?;
-    let numstat = git_output(
+    let numstat = git_output_indexed(
         cwd,
+        index,
         &[
             "diff",
             "--cached",
@@ -301,13 +318,12 @@ fn run_legacy_commit(
         update_changelog(cwd, &cfg, backend)?;
     }
     commit_with_message(cwd, &message, config.git.bypass_hooks)?;
-    let pushed = args.push;
-    if pushed {
+    if publish {
         push_or_abort(cwd, config.git.bypass_hooks)?;
     }
     Ok(CommitRunOutcome::Committed {
         message,
-        pushed,
+        pushed: publish,
         used_fallback: false,
     })
 }
@@ -549,5 +565,73 @@ mod tests {
             .exit_code(),
             0
         );
+    }
+
+    /// A bare remote that receives `repo`'s current branch.
+    fn with_remote(repo: &Path) -> TempDir {
+        let remote = TempDir::new().expect("tempdir");
+        git(remote.path(), &["init", "-q", "--bare"]);
+        git(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.path().to_str().expect("utf-8 path"),
+            ],
+        );
+        git(repo, &["push", "-q", "origin", "HEAD"]);
+        remote
+    }
+
+    #[test]
+    fn dry_run_leaves_the_repository_index_untouched() {
+        let repo = repo();
+        let user = TempDir::new().expect("tempdir");
+        write_change(repo.path());
+        let index_before = std::fs::read(repo.path().join(".git/index")).expect("read index");
+        let backend = FakeBackend::new();
+        let args = CommitCommandArgs {
+            dry_run: true,
+            ..legacy_args()
+        };
+        run_legacy(&args, repo.path(), &user, &backend).expect("dry run succeeds");
+        assert_eq!(
+            std::fs::read(repo.path().join(".git/index")).expect("read index"),
+            index_before
+        );
+        assert!(git(repo.path(), &["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[test]
+    fn dry_run_push_never_publishes_existing_commits() {
+        let repo = repo();
+        let user = TempDir::new().expect("tempdir");
+        let remote = with_remote(repo.path());
+        git(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "local only"],
+        );
+        let before = git(remote.path(), &["rev-parse", "HEAD"]);
+        let backend = FakeBackend::new();
+
+        let args = CommitCommandArgs {
+            dry_run: true,
+            push: true,
+            ..legacy_args()
+        };
+        let outcome = run_legacy(&args, repo.path(), &user, &backend).expect("dry run succeeds");
+        assert_eq!(outcome, CommitRunOutcome::WouldPush);
+        assert_eq!(git(remote.path(), &["rev-parse", "HEAD"]), before);
+        assert_eq!(backend.calls(), 0);
+
+        // A real push of the same clean repository still publishes the outgoing commit.
+        let args = CommitCommandArgs {
+            push: true,
+            ..legacy_args()
+        };
+        let outcome = run_legacy(&args, repo.path(), &user, &backend).expect("push succeeds");
+        assert_eq!(outcome, CommitRunOutcome::NothingToCommit { pushed: true });
+        assert_ne!(git(remote.path(), &["rev-parse", "HEAD"]), before);
     }
 }

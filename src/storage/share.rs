@@ -1,5 +1,6 @@
 //! End-to-end encrypted session sharing. Uploads contain only a redacted, gzip-compressed
 //! transcript encrypted with a fresh AES-256-GCM key; the key is returned only in the URL fragment.
+use crate::storage::session::Session;
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::{
@@ -11,6 +12,7 @@ use serde_json::Value;
 #[cfg(test)]
 use std::io::Read;
 use std::io::Write;
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -30,6 +32,36 @@ const MAGIC: &[u8; 8] = b"DIALSHR1";
 pub struct EncryptedShare {
     pub bytes: Vec<u8>,
     pub key_fragment: String,
+}
+
+/// Which records a share uploads. `ActiveBranch` is the default: abandoned branches and internal
+/// records stay local. `WholeJournal` is an explicit diagnostic mode that uploads every record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Scope {
+    #[default]
+    ActiveBranch,
+    WholeJournal,
+}
+
+/// The plaintext transcript (a JSON array of records) for the session file at `path` under `scope`.
+/// `dial share` and `/share` both build their payload here, then seal it with `encrypt_transcript`.
+pub fn transcript(path: &Path, scope: Scope) -> Result<Vec<u8>> {
+    let records = match scope {
+        Scope::ActiveBranch => Session::read(path)?.share_records(),
+        Scope::WholeJournal => whole_journal_records(path)?,
+    };
+    Ok(serde_json::to_vec(&records)?)
+}
+
+fn whole_journal_records(path: &Path) -> Result<Vec<Value>> {
+    let source = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    source
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<Value>(line).context("session journal line is not JSON")
+        })
+        .collect()
 }
 
 pub fn encrypt_transcript(transcript: &[u8]) -> Result<EncryptedShare> {

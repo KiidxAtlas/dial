@@ -38,6 +38,8 @@ jobs:
         run: bash scripts/test-install.sh
       - name: Test local build and update commands
         run: python3 scripts/test-build.py
+      - name: Check packaging metadata consistency
+        run: python3 scripts/test-packaging.py && python3 scripts/check-packaging.py
       - name: Verify Linux sandbox enforcement
         if: runner.os == 'Linux'
         timeout-minutes: 10
@@ -129,3 +131,19 @@ jobs:
           python-version: '3.12'
       - name: Test install.ps1
         run: ./scripts/test-install.ps1
+  windows-rust:
+    name: Windows Rust contract
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned Rust
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-contract
+      # Focused native suite with a tracked exclusion list: scripts/windows-contract.txt.
+      - name: Run focused Windows contract suite
+        run: python scripts/windows-contract.py --profile ci

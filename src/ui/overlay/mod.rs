@@ -5,10 +5,10 @@
 pub mod compute;
 pub mod extensions;
 pub mod git;
-pub mod improve;
 mod headers;
-mod model_download;
+pub mod improve;
 pub mod jobs;
+mod model_download;
 pub mod model_settings;
 pub mod models;
 pub mod palette;

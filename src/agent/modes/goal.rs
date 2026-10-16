@@ -424,6 +424,7 @@ impl State {
             return Err("cannot complete goal because no goal is active");
         };
         match goal.status {
+            Status::Paused => return Err("cannot complete a paused goal; resume it first"),
             Status::Dropped => return Err("cannot complete a dropped goal"),
             Status::Complete => return Err("goal is already complete"),
             _ => {}
@@ -487,9 +488,8 @@ impl State {
         todo: &TodoList,
     ) -> Option<(String, Kind)> {
         let activity = self.take_activity();
-        if self.interview && activity.is_some() {
-            self.interview = false;
-        }
+        // The interview ends only when `goal create` succeeds (`start`) or the goal is dropped or
+        // completed. Tool calls made while interviewing (grounding reads, a failed create) keep `goal` offered.
         let stalled = continued && (activity.is_none() || *previous == activity);
         *previous = if continued { activity } else { None };
         if interrupted || stalled {
@@ -558,6 +558,11 @@ impl Agent<'_> {
 
     /// Runs one `goal` tool call against the session's goal state and persists the result.
     pub(crate) fn goal_tool(&mut self, args: &Value) -> std::result::Result<String, String> {
+        // `complete` ends the autonomous loop, so it must clear the same blockers as `finish completed`.
+        // A refusal returns before the goal state is touched, so the goal stays as it was.
+        if args["op"].as_str() == Some("complete") {
+            self.completion_blockers()?;
+        }
         let outcome = self.modes.goal.tool(args);
         self.save_modes().map_err(|error| error.to_string())?;
         outcome.map_err(str::to_owned)
@@ -967,5 +972,43 @@ mod tests {
         state.tool(&json!({"op": "complete"})).unwrap();
         state.account(500, 5);
         assert_eq!(state.goal.as_ref().unwrap().tokens_used, 10);
+    }
+
+    #[test]
+    fn interview_survives_grounding_tool_calls_and_ends_only_at_create() {
+        let mut state = State {
+            interview: true,
+            ..Default::default()
+        };
+        let todo = TodoList::new();
+        // A grounding read, then a user reply: the next request still offers `goal`.
+        state.record(
+            "read",
+            &json!({"path": "Cargo.toml"}),
+            &ToolOutput::ok("[package]".to_owned()),
+        );
+        assert!(state.follow_up(false, false, &mut None, &todo).is_none());
+        assert!(state.interview);
+        assert!(state.tool_offered());
+        // A failed create keeps the interview open too.
+        assert!(state.tool(&json!({"op": "create"})).is_err());
+        assert!(state.tool_offered());
+        // A successful create ends it.
+        state
+            .tool(&json!({"op": "create", "objective": "ship the parser"}))
+            .unwrap();
+        assert!(!state.interview);
+    }
+
+    #[test]
+    fn paused_goal_cannot_be_completed_without_resuming() {
+        let mut state = State::default();
+        state.start("ship the parser", None);
+        state.pause().unwrap();
+        assert!(state.tool(&json!({"op": "complete"})).is_err());
+        assert_eq!(state.goal.as_ref().unwrap().status, Status::Paused);
+        state.resume().unwrap();
+        state.tool(&json!({"op": "complete"})).unwrap();
+        assert_eq!(state.goal.as_ref().unwrap().status, Status::Complete);
     }
 }

@@ -62,11 +62,15 @@ pub(crate) fn validate_private_path(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Owner-private state larger than this is refused. Callers that can defer work (such as stream
+/// reclamation) check it before publishing, so a refusal never corrupts or latches their state.
+pub(crate) const PRIVATE_LIMIT: usize = 8 * 1024 * 1024;
+
 /// Owner-private publication rejects links and foreign owners. It never creates parent directories
 /// or acquires a lock: the transaction owner must prepare the private directory and hold its lock.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     ensure!(
-        bytes.len() <= 8 * 1024 * 1024,
+        bytes.len() <= PRIVATE_LIMIT,
         "private storage file exceeds size limit"
     );
     let dir = path.parent().context("storage path has no parent")?;

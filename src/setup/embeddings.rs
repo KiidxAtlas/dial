@@ -1,8 +1,9 @@
 //! Local embedding models for semantic memory, pulled through Ollama's native API.
 //!
-//! The curated catalog is what the settings picker and `/setup embeddings` offer. Any other
+//! The curated catalog is what the settings role picker and `/setup embeddings` offer. Any other
 //! Ollama model name is accepted when the user types it. Pulling is an explicit user action
-//! (Ctrl+L on the settings row, `/setup embeddings:<name> yes`, or `dial doctor --fix ... --yes`).
+//! (picking a curated model on the settings row and pressing Ctrl+L, `/setup embeddings:<name> yes`,
+//! or `dial doctor --fix ... --yes`).
 //! Discovery, previews and the settings overlay never fetch weights.
 //!
 //! Config is written only after the pull has finished. `model_roles.embedding` is replaced as a
@@ -34,6 +35,11 @@ use std::time::{Duration, Instant};
 pub const EMBEDDING_MODEL_PATH: &str = "memory.semantic.embedding_model";
 /// The model offered when nothing is configured.
 pub const DEFAULT_MODEL: &str = "nomic-embed-text";
+/// First words of a successful setup summary; the app recognizes a finished embedding setup by it.
+pub const SUMMARY_PREFIX: &str = "Embedding model: ";
+/// `/setup memory <this>`: the single-key offer to switch memory to semantic, run after an
+/// embedding model is set up or assigned while another backend is selected.
+pub const OFFER_SEMANTIC_ARG: &str = "offer-semantic";
 /// Prefix of the setup id that the settings overlay and `/setup` use for these models.
 const ID_PREFIX: &str = "embeddings";
 const INSTALL_HINT: &str = "Ollama is not installed. Install it from https://ollama.com/download (macOS: brew install ollama), then run this again.";
@@ -601,12 +607,20 @@ pub fn setup(
     Ok(summary(model, &config, &saved))
 }
 
-/// What setup reports. Mode and overrides are read from `saved`, the config after the write, so a
-/// project setting that still overrides the global change is reported instead of hidden.
+/// What setup reports. Mode, role and overrides are read from `saved`, the config after the write, so
+/// a project setting that still overrides the global change is reported instead of hidden.
 fn summary(model: &str, before: &Config, saved: &Config) -> String {
     let mut lines = vec![format!(
-        "Embedding model: ollama / {model} (model_roles.embedding)"
+        "{SUMMARY_PREFIX}ollama / {model} (model_roles.embedding, all projects)"
     )];
+    if let Some(role) = saved.role_selection("embedding")
+        && !(role.provider == "ollama" && role.model == model)
+    {
+        lines.push(format!(
+            "This project assigns its own embedding role ({}), which overrides the new global one. Clear it in /roles (Alt+M) with \"This project\" scope to use {model}.",
+            role.display_name()
+        ));
+    }
     if before.memory.semantic.embedding == EmbeddingMode::Off {
         if saved.memory.semantic.embedding == EmbeddingMode::On {
             lines.push("memory.semantic.embedding is now on.".to_owned());
@@ -628,7 +642,7 @@ fn summary(model: &str, before: &Config, saved: &Config) -> String {
     }
     if saved.memory.backend != MemoryBackendId::Semantic {
         lines.push(format!(
-            "Semantic recall needs the semantic memory backend; the current backend is {}. Select semantic in settings.",
+            "Only the semantic memory backend uses embeddings; memory is currently {}. Switch with /setup memory semantic or in /settings → Memory.",
             saved.memory.backend.as_str()
         ));
     }
@@ -638,6 +652,10 @@ fn summary(model: &str, before: &Config, saved: &Config) -> String {
 /// What `/setup embeddings:<name> yes` will do, shown before anything runs. Reads only local
 /// state; it never contacts Ollama.
 pub fn preview_text(model: &str, user_dir: &Path) -> String {
+    preview_with(model, &Env::current(user_dir))
+}
+
+fn preview_with(model: &str, env: &Env) -> String {
     let mut lines = vec![match find(model) {
         Some(info) => format!(
             "Local embeddings with {model} ({} dims, about {} MB):",
@@ -645,12 +663,11 @@ pub fn preview_text(model: &str, user_dir: &Path) -> String {
         ),
         None => format!("Local embeddings with {model}:"),
     }];
-    let env = Env::current(user_dir);
     if env.find("ollama").is_some() {
         lines.push("Ollama is installed. With no providers.ollama endpoint configured, it is started if it is not running; a configured endpoint must already be running.".to_owned());
     } else if deps::recipe("ollama").is_some() {
         lines.push("Ollama is not installed. With no providers.ollama endpoint configured, it is set up first:".to_owned());
-        lines.push(deps::run::preview_text("ollama", &env));
+        lines.push(deps::run::preview_text("ollama", env));
     } else {
         lines.push(INSTALL_HINT.to_owned());
     }
@@ -664,7 +681,7 @@ pub fn preview_text(model: &str, user_dir: &Path) -> String {
     lines.join("\n")
 }
 
-/// The embedding model row's setup offer, when no embedding model is configured.
+/// The embedding model row's setup offer for one model.
 pub struct EmbeddingOffer {
     pub path: &'static str,
     pub id: String,
@@ -672,17 +689,30 @@ pub struct EmbeddingOffer {
     pub preview: String,
 }
 
+fn offer(model: &str, env: &Env) -> EmbeddingOffer {
+    EmbeddingOffer {
+        path: EMBEDDING_MODEL_PATH,
+        id: setup_id(model),
+        title: format!("{model} (Ollama)"),
+        preview: preview_with(model, env),
+    }
+}
+
 /// Offers the default model on the embedding model row until one is configured.
 pub fn setting_offer(user_dir: &Path, config: &Config) -> Option<EmbeddingOffer> {
     if configured(config) {
         return None;
     }
-    Some(EmbeddingOffer {
-        path: EMBEDDING_MODEL_PATH,
-        id: setup_id(DEFAULT_MODEL),
-        title: format!("{DEFAULT_MODEL} (Ollama)"),
-        preview: preview_text(DEFAULT_MODEL, user_dir),
-    })
+    Some(offer(DEFAULT_MODEL, &Env::current(user_dir)))
+}
+
+/// One setup offer per curated model, so Ctrl+L sets up the model chosen on the settings row.
+pub fn catalog_offers(user_dir: &Path) -> Vec<EmbeddingOffer> {
+    let env = Env::current(user_dir);
+    CATALOG
+        .iter()
+        .map(|model| offer(model.name, &env))
+        .collect()
 }
 
 #[cfg(test)]
@@ -935,6 +965,40 @@ mod tests {
         configured_config.memory.semantic.embedding_base_url = "http://127.0.0.1:1/v1".into();
         configured_config.memory.semantic.embedding_model = "m".into();
         assert!(setting_offer(dir.path(), &configured_config).is_none());
+    }
+
+    #[test]
+    fn summary_names_a_shadowing_project_role_and_the_backend_switch() {
+        let before = Config::default();
+        let mut saved = Config::default();
+        let shadow: crate::llm::model_config::ModelSelection =
+            toml::from_str("provider = \"openai\"\nmodel = \"text-embedding-3-small\"").unwrap();
+        saved.model_roles.insert("embedding".into(), shadow);
+        let text = summary("nomic-embed-text", &before, &saved);
+        assert!(text.starts_with(SUMMARY_PREFIX), "{text}");
+        assert!(
+            text.contains("This project assigns its own embedding role"),
+            "{text}"
+        );
+        assert!(text.contains("/setup memory semantic"), "{text}");
+        let own: crate::llm::model_config::ModelSelection =
+            toml::from_str("provider = \"ollama\"\nmodel = \"nomic-embed-text\"").unwrap();
+        saved.model_roles.insert("embedding".into(), own);
+        saved.memory.backend = MemoryBackendId::Semantic;
+        let text = summary("nomic-embed-text", &before, &saved);
+        assert!(!text.contains("This project"), "{text}");
+        assert!(!text.contains("semantic memory backend"), "{text}");
+    }
+
+    #[test]
+    fn every_curated_model_has_its_own_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let offers = catalog_offers(dir.path());
+        assert_eq!(offers.len(), CATALOG.len());
+        for (offer, model) in offers.iter().zip(CATALOG) {
+            assert_eq!(offer.id, setup_id(model.name));
+            assert!(offer.preview.contains(model.name));
+        }
     }
 
     #[test]

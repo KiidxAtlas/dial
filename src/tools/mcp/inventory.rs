@@ -147,7 +147,11 @@ fn install(config: &Config, id: &str) -> ToolOutput {
             "`{local}` is already configured. Check it with action list."
         ));
     }
-    let required: Vec<&Input> = candidate.inputs.iter().filter(|input| input.required).collect();
+    let required: Vec<&Input> = candidate
+        .inputs
+        .iter()
+        .filter(|input| input.required)
+        .collect();
     if !required.is_empty() {
         return ToolOutput::structured(json!({
             "status": "needs_input",
@@ -227,8 +231,14 @@ impl Tool for Inventory {
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
         match args.get("action").and_then(Value::as_str).unwrap_or("list") {
             "list" => ToolOutput::structured(self.snapshot()),
-            "search" => search(ctx.config, args.get("query").and_then(Value::as_str).unwrap_or("")),
-            "install" => install(ctx.config, args.get("id").and_then(Value::as_str).unwrap_or("")),
+            "search" => search(
+                ctx.config,
+                args.get("query").and_then(Value::as_str).unwrap_or(""),
+            ),
+            "install" => install(
+                ctx.config,
+                args.get("id").and_then(Value::as_str).unwrap_or(""),
+            ),
             other => ToolOutput::err(format!(
                 "unknown action `{other}`; use list, search or install"
             )),

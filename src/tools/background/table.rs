@@ -34,6 +34,11 @@ pub(super) const MAX_BUFFER: usize = 256 * 1024;
 const MAX_NAME: usize = 32;
 /// How long after exit the reader may still be draining the pipe.
 const SETTLE: Duration = Duration::from_millis(300);
+/// How long a reader keeps draining after its owner asks it to stop. A group that has just died
+/// closes its output within this; an escaped descendant holding the pipe cannot extend it.
+const DRAIN_GRACE: Duration = Duration::from_millis(300);
+/// How long [`finish_reader`] waits for a stopped reader to report completion before detaching it.
+const JOIN_WAIT: Duration = Duration::from_millis(500);
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -159,12 +164,16 @@ impl Ring {
     }
 }
 
-/// Spool every byte before clipping. Pipes block; nonblocking PTYs retry after a short wait.
+/// Spool every byte before clipping. Readers poll nonblocking pipes and PTYs, so the owner's `stop`
+/// is observed even while an escaped descendant keeps the pipe open. Once stopped, a reader drains
+/// for at most [`DRAIN_GRACE`], closes its read side and finalizes the spool; a stream that never
+/// reached EOF is published as explicitly incomplete.
 fn spawn_reader<R: Read + Send + 'static>(
     mut pipe: R,
     terminal: bool,
     ring: Arc<Mutex<Ring>>,
     mut spool: Option<ArtifactSpool>,
+    stop: Arc<AtomicBool>,
 ) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("dial-bg-reader".into())
@@ -172,9 +181,19 @@ fn spawn_reader<R: Read + Send + 'static>(
             let mut buffer = [0u8; 16 * 1024];
             let mut error = None;
             let mut read_failed = false;
+            let mut reached_eof = false;
+            let mut stopped_at: Option<Instant> = None;
             loop {
+                if stop.load(Ordering::Acquire)
+                    && stopped_at.get_or_insert_with(Instant::now).elapsed() >= DRAIN_GRACE
+                {
+                    break;
+                }
                 match pipe.read(&mut buffer) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        reached_eof = true;
+                        break;
+                    }
                     Ok(count) => {
                         if let Some(writer) = &mut spool
                             && let Err(e) = writer.write_all(&buffer[..count])
@@ -188,16 +207,22 @@ fn spawn_reader<R: Read + Send + 'static>(
                         wake::notify();
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    // PTY input and output clones share O_NONBLOCK. No bytes available yet is
-                    // not a capture failure (and must not cause the process to be killed).
-                    Err(e) if terminal && e.kind() == io::ErrorKind::WouldBlock => {
+                    // Nonblocking readers report "no bytes yet" as WouldBlock. That is not a capture
+                    // failure (and must not kill the process); wait briefly and re-check `stop`.
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     // Linux PTY masters report EIO when the last slave is closed.
                     #[cfg(unix)]
-                    Err(e) if terminal && e.raw_os_error() == Some(libc::EIO) => break,
+                    Err(e) if terminal && e.raw_os_error() == Some(libc::EIO) => {
+                        reached_eof = true;
+                        break;
+                    }
                     #[cfg(windows)]
-                    Err(e) if terminal && e.kind() == io::ErrorKind::BrokenPipe => break,
+                    Err(e) if terminal && e.kind() == io::ErrorKind::BrokenPipe => {
+                        reached_eof = true;
+                        break;
+                    }
                     Err(e) => {
                         error = Some(format!("reading background output: {e}"));
                         read_failed = true;
@@ -206,6 +231,11 @@ fn spawn_reader<R: Read + Send + 'static>(
                 }
             }
             drop(pipe);
+            if !reached_eof && !read_failed {
+                error.get_or_insert_with(|| {
+                    "output capture stopped before EOF; saved output is incomplete".to_owned()
+                });
+            }
             if read_failed {
                 let mut ring = lock(&ring);
                 ring.read_failed = true;
@@ -225,10 +255,10 @@ fn spawn_reader<R: Read + Send + 'static>(
         })
 }
 
-/// Waits briefly for the reader to reach EOF. A descendant that escaped the process group can keep
-/// the pipe open forever; detach the reader then instead of blocking the table on it.
+/// Waits for a reader to report completion (its pipe closed, or it was stopped and drained), then
+/// joins it. A reader still blocked after [`JOIN_WAIT`] is detached rather than waited on.
 fn finish_reader(ring: &Mutex<Ring>, reader: JoinHandle<()>) {
-    let end = Instant::now() + SETTLE;
+    let end = Instant::now() + JOIN_WAIT;
     loop {
         let seen = wake::generation();
         if lock(ring).closed || Instant::now() >= end {
@@ -400,11 +430,13 @@ impl Proc {
                 .map_err(|e| format!("starting sandboxed PTY shell: {e}"))?;
             drop(spawn);
             let group = ManagedProcess::Group(ProcessGroup::new(child));
-            let reader = spawn_reader(master, true, ring.clone(), spool)
+            let reader = spawn_reader(master, true, ring.clone(), spool, stop.clone())
                 .map_err(|e| format!("starting PTY output reader: {e}"))?;
             (group, reader, Some(Arc::new(input)))
         } else {
             let (reader, writer) = io::pipe().map_err(|e| format!("creating output pipe: {e}"))?;
+            crate::platform::io::set_nonblocking(&reader)
+                .map_err(|e| format!("configuring output pipe: {e}"))?;
             let writer_err = writer
                 .try_clone()
                 .map_err(|e| format!("creating output pipe: {e}"))?;
@@ -421,7 +453,7 @@ impl Proc {
                 .map_err(|e| format!("starting sandboxed shell: {e}"))?;
             drop(spawn);
             let group = ManagedProcess::Group(ProcessGroup::new(child));
-            let reader = spawn_reader(reader, false, ring.clone(), spool)
+            let reader = spawn_reader(reader, false, ring.clone(), spool, stop.clone())
                 .map_err(|e| format!("starting output reader: {e}"))?;
             (group, reader, input)
         };
@@ -462,7 +494,7 @@ impl Proc {
                 child,
                 terminated: false,
             };
-            let reader = spawn_reader(output, true, ring.clone(), spool)
+            let reader = spawn_reader(output, true, ring.clone(), spool, stop.clone())
                 .map_err(|e| format!("starting ConPTY output reader: {e}"))?;
             (group, reader, input)
         } else {
@@ -483,7 +515,7 @@ impl Proc {
                 .map_err(|e| format!("starting shell: {e}"))?;
             drop(spawn);
             let group = ManagedProcess::Group(ProcessGroup::new(child));
-            let reader = spawn_reader(reader, false, ring.clone(), spool)
+            let reader = spawn_reader(reader, false, ring.clone(), spool, stop.clone())
                 .map_err(|e| format!("starting output reader: {e}"))?;
             (group, reader, input)
         };
@@ -869,7 +901,10 @@ impl Table {
         // Output read before adoption is part of this process's output and artifact.
         ring.push(&captured);
         let ring = Arc::new(Mutex::new(ring));
-        let reader = spawn_reader(reader, false, ring.clone(), spool)
+        crate::platform::io::set_nonblocking(&reader)
+            .map_err(|error| format!("configuring adopted output reader: {error}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = spawn_reader(reader, false, ring.clone(), spool, stop.clone())
             .map_err(|error| format!("starting adopted output reader: {error}"))?;
         let pid = group.id();
         wake::watch_exit(pid);
@@ -881,7 +916,7 @@ impl Table {
             ring,
             started: Instant::now(),
             state: State::Running,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
             reader: Some(reader),
             input: None,
             terminal: false,
@@ -1049,10 +1084,16 @@ mod reader_tests {
     #[test]
     fn terminal_reader_waits_for_nonblocking_output() {
         let ring = Arc::new(Mutex::new(Ring::terminal(1024, 24, 80)));
-        spawn_reader(DelayedOutput::new(), true, ring.clone(), None)
-            .unwrap()
-            .join()
-            .unwrap();
+        spawn_reader(
+            DelayedOutput::new(),
+            true,
+            ring.clone(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+        .join()
+        .unwrap();
         let ring = lock(&ring);
         assert_eq!(ring.text(), "ready\n");
         assert!(ring.closed);
@@ -1060,13 +1101,28 @@ mod reader_tests {
         assert!(ring.error.is_none());
     }
 
+    /// Fails with an error that is not "no data yet".
+    struct Broken;
+
+    impl Read for Broken {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("pipe broke"))
+        }
+    }
+
     #[test]
     fn pipe_reader_still_reports_unexpected_read_failures() {
         let ring = Arc::new(Mutex::new(Ring::new(1024)));
-        spawn_reader(DelayedOutput::new(), false, ring.clone(), None)
-            .unwrap()
-            .join()
-            .unwrap();
+        spawn_reader(
+            Broken,
+            false,
+            ring.clone(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+        .join()
+        .unwrap();
         let ring = lock(&ring);
         assert!(ring.closed);
         assert!(ring.read_failed);
@@ -1075,6 +1131,34 @@ mod reader_tests {
                 .as_ref()
                 .unwrap()
                 .contains("reading background output")
+        );
+    }
+
+    /// A pipe that never reaches EOF, as when an escaped descendant keeps it open.
+    struct OpenPipe;
+
+    impl Read for OpenPipe {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+    }
+
+    #[test]
+    fn stopped_reader_closes_an_open_pipe_as_incomplete() {
+        let ring = Arc::new(Mutex::new(Ring::new(1024)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = spawn_reader(OpenPipe, false, ring.clone(), None, stop.clone()).unwrap();
+        stop.store(true, Ordering::Release);
+        let began = Instant::now();
+        reader.join().unwrap();
+        assert!(began.elapsed() < DRAIN_GRACE + Duration::from_secs(5));
+        let ring = lock(&ring);
+        assert!(ring.closed);
+        assert!(!ring.read_failed);
+        assert!(
+            ring.error
+                .as_deref()
+                .is_some_and(|error| error.contains("incomplete"))
         );
     }
 }

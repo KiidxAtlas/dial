@@ -26,7 +26,7 @@
 
 use crate::tools::Workspace;
 use crate::tools::select::{
-    self, MAX_READ_LINE, MAX_READ_OUTPUT, Selector, empty_read, plan_spans,
+    self, MAX_READ_LINE, READ_FOOTER_RESERVE, Selector, empty_read, plan_spans,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -2378,6 +2378,7 @@ pub(crate) fn read(
     sel: &Selector,
     offset: usize,
     limit: usize,
+    budget: usize,
 ) -> Result<String, String> {
     let abs = ws.resolve(path_text)?;
     let meta = fs::metadata(&abs).map_err(|e| match e.kind() {
@@ -2389,12 +2390,12 @@ pub(crate) fn read(
         return super::files::list_dir(ws, &abs);
     }
     if sel.raw {
-        return super::files::read_plain(ws, path_text, sel, offset, limit);
+        return super::files::read_plain(ws, path_text, sel, offset, limit, budget);
     }
     let rel = super::edit_source::display_path(ws.rel(&abs));
     if meta.len() > MAX_FILE {
         return if sel.raw {
-            super::files::read_plain(ws, path_text, sel, offset, limit)
+            super::files::read_plain(ws, path_text, sel, offset, limit, budget)
         } else {
             Err(format!(
                 "{rel} is {} bytes, over the {MAX_FILE}-byte limit for anchored reads/edits; page it with `{rel}:raw:A-B` or use bash",
@@ -2415,6 +2416,7 @@ pub(crate) fn read(
     let len = lines.len();
     let spans = plan_spans(sel, offset, limit, len);
 
+    let row_limit = budget.saturating_sub(READ_FOOTER_RESERVE);
     let mut out = String::new();
     let mut shown: Vec<(usize, usize)> = Vec::new();
     let mut witnessed = Vec::new();
@@ -2429,7 +2431,7 @@ pub(crate) fn read(
             } else {
                 format!("{n}:{text}{suffix}\n")
             };
-            if out.len() + row.len() > MAX_READ_OUTPUT {
+            if out.len() + row.len() > row_limit {
                 stopped_at = Some(n);
                 break;
             }

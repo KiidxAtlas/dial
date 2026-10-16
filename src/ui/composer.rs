@@ -1685,7 +1685,10 @@ impl Composer {
             ),
             finish_row(
                 vec![Span::styled(
-                    format!(" {}", text::ellipsize(&command.description, room, theme.ascii())),
+                    format!(
+                        " {}",
+                        text::ellipsize(&command.description, room, theme.ascii())
+                    ),
                     theme.fg(Tok::Muted),
                 )],
                 w,
@@ -2491,10 +2494,17 @@ mod tests {
                 .collect::<String>();
             assert!(text.contains("Keep this draft"));
             assert_eq!(view.cursor.0, 2);
-            assert!(view.rows[0].spans.iter().any(|s| s.content.contains("turn 24s")));
-            assert!(!view.rows[1].spans.iter().any(|s| {
-                s.content.contains("processing") || s.content.contains("generating")
-            }));
+            assert!(
+                view.rows[0]
+                    .spans
+                    .iter()
+                    .any(|s| s.content.contains("turn 24s"))
+            );
+            assert!(
+                !view.rows[1].spans.iter().any(|s| {
+                    s.content.contains("processing") || s.content.contains("generating")
+                })
+            );
             stages.push(view.rows);
         }
         terminal
@@ -4592,7 +4602,8 @@ mod tests {
     #[test]
     fn menu_rows_stay_short_and_the_selected_command_shows_usage_and_description() {
         let env = Env::new();
-        let description = "Switch the active model to something else entirely, now and then for every project";
+        let description =
+            "Switch the active model to something else entirely, now and then for every project";
         let mut c = Composer::new(vec![], 10);
         c.set_commands(vec![
             CommandEntry {
@@ -4609,14 +4620,21 @@ mod tests {
         for (rows, width) in [(&narrow, 60), (&wide, 110)] {
             assert!(rows.iter().all(|r| text::width(r) <= width), "{rows:?}");
             let menu = rows.iter().find(|r| r.contains("model")).unwrap();
-            assert!(!menu.contains("[settings"), "usage stays out of the row: {menu}");
             assert!(
-                rows.iter().any(|r| r.contains("/model [settings|defaults|local]")),
+                !menu.contains("[settings"),
+                "usage stays out of the row: {menu}"
+            );
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains("/model [settings|defaults|local]")),
                 "{rows:?}"
             );
         }
         assert!(narrow.iter().any(|r| r.contains('…')), "{narrow:?}");
-        assert!(wide.iter().any(|r| r.contains("something else entirely")), "{wide:?}");
+        assert!(
+            wide.iter().any(|r| r.contains("something else entirely")),
+            "{wide:?}"
+        );
     }
 
     #[test]
@@ -4751,7 +4769,10 @@ mod tests {
             rows[4].contains("1/20"),
             "counter on the last row: {rows:?}"
         );
-        assert!(rows.iter().take(5).all(|r| text::width(r) == 60), "{rows:?}");
+        assert!(
+            rows.iter().take(5).all(|r| text::width(r) == 60),
+            "{rows:?}"
+        );
         assert!(
             rows[0].ends_with(t.sym(Sym::ScrollThumb))
                 && rows[1..5]
