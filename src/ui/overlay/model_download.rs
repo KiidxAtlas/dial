@@ -9,8 +9,10 @@
 //! assignment `/models` makes, and the same setup `/setup embeddings:<model> yes` runs.
 use super::settings::{filled, fit, hint, pair_label, selected_fill, typed_char};
 use crate::cli::local_models::{self, Dashboard, ModelRow, Settings};
+use crate::llm::catalog::ModelEntry;
 use crate::llm::download::{self, Choice, Family, Hit, Quant};
 use crate::llm::local_fit::Fit;
+use crate::llm::model_config::ModelSelection;
 use crate::setup::embeddings;
 use crate::storage::paths::Layout;
 use crate::ui::{
@@ -42,8 +44,10 @@ pub enum Step {
     UseModel(String),
     /// Set up this curated embedding model, as `/setup embeddings:<model> yes` does.
     SetupEmbedding(String),
-    /// Close the panel.
-    Close,
+    /// Assign this discovered, served embedding model to the embedding role.
+    UseEmbedding(ModelSelection),
+    /// Leave the group: the panel focuses its groups column (or closes when that column is hidden).
+    Back,
 }
 
 /// What the panel reads and downloads with, taken from the same layout and config as `/models`.
@@ -112,6 +116,8 @@ enum Pick {
     /// Index into the current Hugging Face hits.
     Hit(usize),
     Embedding(&'static embeddings::Model),
+    /// Index into the discovered embedding models.
+    Discovered(usize),
 }
 
 struct Picker {
@@ -173,6 +179,8 @@ pub struct ModelDownloads {
     /// unknown or when Ollama is not reachable.
     pulled: Option<Vec<String>>,
     pulled_rx: Option<Receiver<Result<Vec<String>, String>>>,
+    /// Embedding models discovery found on any provider, listed before the curated catalog.
+    discovered: Vec<ModelEntry>,
     /// Set after a download finishes; the panel takes it and asks the controller to rescan.
     rescan: bool,
 }
@@ -233,6 +241,7 @@ impl ModelDownloads {
             message: String::new(),
             pulled: None,
             pulled_rx: None,
+            discovered: Vec::new(),
             rescan: false,
         }
     }
@@ -252,6 +261,21 @@ impl ModelDownloads {
     /// Installed MLX and GGUF models, for the group's count.
     pub fn installed_count(&self) -> usize {
         self.dashboard.models.len()
+    }
+
+    /// Whether the GGUF quantization picker is open; it keeps its own keys.
+    pub fn has_picker(&self) -> bool {
+        self.picker.is_some()
+    }
+
+    /// The embedding models discovery found (Ollama, LM Studio, other servers and local checkpoints).
+    /// The Embedding shelf lists them before the curated catalog; Enter assigns a served one.
+    pub fn set_embedding_models(&mut self, models: &[ModelEntry]) {
+        self.discovered = models
+            .iter()
+            .filter(|entry| entry.is_embedding())
+            .cloned()
+            .collect();
     }
 
     /// Whether a download finished since the last call, so the controller should rescan.
@@ -381,20 +405,24 @@ impl ModelDownloads {
                 Some(Pick::Installed(_)) => "use as main",
                 Some(Pick::Hit(_)) => "list files",
                 Some(Pick::Embedding(_)) => "set up",
+                Some(Pick::Discovered(index)) if self.discovered[index].available => {
+                    "use for embeddings"
+                }
+                Some(Pick::Discovered(_)) => "",
                 None => "",
             }
         };
         let back = if self.is_downloading() {
             "cancel"
-        } else if self.focus == Focus::Results || !self.query.is_empty() {
-            "back"
+        } else if !self.query.is_empty() {
+            "clear"
         } else {
-            "close"
+            "back"
         };
         let mut hints = vec![
             format!(
                 "{} tabs",
-                pair_label(keys, Action::TabPrev, Action::TabNext)
+                pair_label(keys, Action::SectionPrev, Action::SectionNext)
             ),
             if enter.is_empty() {
                 String::new()
@@ -517,6 +545,14 @@ impl ModelDownloads {
                     model.size_mb,
                     text::one_line(model.description)
                 ),
+                Some(Pick::Discovered(index)) => {
+                    let entry = &self.discovered[index];
+                    format!(
+                        " {} · {}",
+                        entry.selection.provider,
+                        text::one_line(&entry.source)
+                    )
+                }
                 None => String::new(),
             }
         };
@@ -580,13 +616,41 @@ impl ModelDownloads {
             .collect()
     }
 
-    /// The curated embedding models, filtered by the query.
+    /// Discovered embedding models matching the query, as indexes into `discovered`.
+    fn discovered_rows(&self) -> Vec<usize> {
+        if self.shelf != Shelf::Embedding {
+            return Vec::new();
+        }
+        self.discovered
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                self.query_matches(&format!(
+                    "{}/{} {}",
+                    entry.selection.provider, entry.label, entry.source
+                ))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The curated embedding models, filtered by the query. A model the `ollama` provider already
+    /// serves is listed once, as a discovered model.
     fn catalog_rows(&self) -> Vec<&'static embeddings::Model> {
         if self.shelf != Shelf::Embedding {
             return Vec::new();
         }
         embeddings::CATALOG
             .iter()
+            .filter(|model| {
+                !self.discovered.iter().any(|entry| {
+                    entry.selection.provider == "ollama"
+                        && embeddings::has_model(
+                            std::slice::from_ref(&entry.selection.model),
+                            model.name,
+                        )
+                })
+            })
             .filter(|model| self.query_matches(&format!("{} {}", model.name, model.description)))
             .collect()
     }
@@ -636,9 +700,10 @@ impl ModelDownloads {
                 .chain(self.installed_rows().into_iter().map(Pick::Installed))
                 .collect(),
             Shelf::Embedding => self
-                .catalog_rows()
+                .discovered_rows()
                 .into_iter()
-                .map(Pick::Embedding)
+                .map(Pick::Discovered)
+                .chain(self.catalog_rows().into_iter().map(Pick::Embedding))
                 .collect(),
         }
     }
@@ -699,11 +764,24 @@ impl ModelDownloads {
                 );
                 Step::SetupEmbedding(model.name.to_owned())
             }
+            Some(Pick::Discovered(index)) => {
+                let entry = &self.discovered[index];
+                if entry.available {
+                    Step::UseEmbedding(entry.selection.clone())
+                } else {
+                    self.message = format!(
+                        "{} cannot be assigned yet: {}",
+                        entry.label,
+                        text::one_line(&entry.source)
+                    );
+                    Step::Handled
+                }
+            }
             None => Step::Handled,
         }
     }
 
-    /// Esc: cancel a running download, else back out one level, else close the panel.
+    /// Esc: cancel a running download, else close the picker or clear the query, else leave the group.
     fn escape(&mut self) -> Step {
         if let Some(Task::Download(download)) = &self.task {
             if !download.cancel.swap(true, Ordering::SeqCst) {
@@ -718,16 +796,13 @@ impl ModelDownloads {
         if self.picker.take().is_some() {
             return Step::Handled;
         }
-        if self.focus == Focus::Results {
-            self.focus = Focus::Query;
-            return Step::Handled;
-        }
         if !self.query.is_empty() {
             self.query.clear();
             self.query_changed();
+            self.focus = Focus::Results;
             return Step::Handled;
         }
-        Step::Close
+        Step::Back
     }
 
     fn picker_key(&mut self, key: &KeyEvent, keys: &Keymap) {
@@ -1182,8 +1257,8 @@ impl ModelDownloads {
                 )
             }
             Shelf::Embedding => match &self.pulled {
-                Some(_) => " Pulled models are marked. Enter pulls the others through Ollama, then assigns the embedding role.".to_owned(),
-                None => " Ollama's model list is not read yet. Enter still sets a model up; Ollama starts if needed.".to_owned(),
+                Some(_) => " Discovered embedding models first; Enter assigns one to the embedding role. Curated Ollama models below are pulled first.".to_owned(),
+                None => " Discovered embedding models first; Enter assigns one. Ollama's model list is not read yet; curated setup starts Ollama if needed.".to_owned(),
             },
         };
         Line::from(fit(
@@ -1286,14 +1361,32 @@ impl ModelDownloads {
                 }
             }
             Shelf::Embedding => {
+                let discovered = self.discovered_rows();
+                let mut at = 0;
+                if !discovered.is_empty() {
+                    rows.push(heading(
+                        "Discovered embedding models · Enter assigns the embedding role",
+                    ));
+                }
+                for index in discovered {
+                    rows.push((
+                        Some(at),
+                        filled(
+                            discovered_spans(&self.discovered[index], theme, width),
+                            width,
+                            fill(at),
+                        ),
+                    ));
+                    at += 1;
+                }
                 rows.push(heading(
                     "Curated Ollama embedding models · Enter sets one up",
                 ));
                 let models = self.catalog_rows();
                 if models.is_empty() {
-                    rows.push(heading("No embedding model matches the query."));
+                    rows.push(heading("No curated embedding model matches the query."));
                 }
-                for (at, model) in models.into_iter().enumerate() {
+                for model in models {
                     let pulled = self
                         .pulled
                         .as_ref()
@@ -1306,6 +1399,7 @@ impl ModelDownloads {
                             fill(at),
                         ),
                     ));
+                    at += 1;
                 }
             }
         }
@@ -1480,6 +1574,24 @@ fn embedding_spans(
     ]
 }
 
+/// One discovered embedding row: `provider/model`, whether it is served, then its source.
+fn discovered_spans(entry: &ModelEntry, theme: &Theme, width: usize) -> Vec<Span<'static>> {
+    const STATE_W: usize = 11;
+    let name_w = (width.saturating_sub(1 + STATE_W + 1) * 3 / 5).max(8);
+    let name = text::one_line(&format!("{}/{}", entry.selection.provider, entry.label));
+    let name = text::pad(&text::ellipsize(&name, name_w, theme.ascii()), name_w);
+    let (state, tok) = if entry.available {
+        ("ready", Tok::Success)
+    } else {
+        ("not served", Tok::Warning)
+    };
+    vec![
+        Span::styled(format!(" {name} "), theme.fg(Tok::Text)),
+        Span::styled(text::pad(state, STATE_W), theme.fg(tok)),
+        Span::styled(text::one_line(&entry.source), theme.fg(Tok::Muted)),
+    ]
+}
+
 /// One installed-model row: `label  [format]  median tok/s  fit  first waiting item`. The label gives way
 /// first (ellipsized); the format, speed and fit columns keep fixed widths so the verdict survives narrow
 /// panels, and the waiting item is what gets clipped last-resort at the far right.
@@ -1610,9 +1722,12 @@ mod tests {
         assert!(matches!(group.current(), Some(Pick::Hit(1))));
         group.key(&key(KeyCode::Up), &keys);
         assert_eq!(group.cursor, 0);
+        assert_eq!(group.key(&key(KeyCode::Esc), &keys), Step::Back);
+        group.paste("qwen");
         assert_eq!(group.key(&key(KeyCode::Esc), &keys), Step::Handled);
-        assert_eq!(group.focus, Focus::Query, "Esc leaves the list first");
-        assert_eq!(group.key(&key(KeyCode::Esc), &keys), Step::Close);
+        assert!(group.query.is_empty(), "Esc clears a query first");
+        assert_eq!(group.focus, Focus::Results);
+        assert_eq!(group.key(&key(KeyCode::Esc), &keys), Step::Back);
     }
 
     #[test]
@@ -1744,6 +1859,53 @@ mod tests {
         assert_eq!(embeddings::setup_id(first), format!("embeddings:{first}"));
     }
 
+    fn embedder(provider: &str, model: &str, available: bool) -> ModelEntry {
+        ModelEntry {
+            selection: ModelSelection::new(provider, model),
+            label: model.into(),
+            source: provider.into(),
+            available,
+            metadata: crate::llm::catalog::ModelMetadata {
+                kind: crate::llm::catalog::ModelKind::Embedding,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn discovered_embedding_models_lead_the_shelf_and_enter_assigns_them() {
+        let keys = Keymap::defaults();
+        let mut group = ModelDownloads::fixed(dashboard(Vec::new()));
+        group.shelf = Shelf::Embedding;
+        group.focus = Focus::Results;
+        let mut chat = embedder("ollama", "llama3:latest", true);
+        chat.metadata.kind = crate::llm::catalog::ModelKind::Chat;
+        group.set_embedding_models(&[
+            embedder("ollama", "embeddinggemma:latest", true),
+            chat,
+            embedder("lm-studio", "text-embedding-qwen3", true),
+            embedder("mlx", "/models/bge", false),
+        ]);
+        let shown = text_of(&group.body(120, 30, &Theme::dark()));
+        assert!(shown.contains("ollama/embeddinggemma:latest"), "{shown}");
+        assert!(shown.contains("lm-studio/text-embedding-qwen3"), "{shown}");
+        assert!(shown.contains("not served"), "{shown}");
+        assert!(!shown.contains("llama3"), "chat models stay off the shelf");
+        assert!(
+            !group.catalog_rows().iter().any(|m| m.name == "embeddinggemma"),
+            "a curated model already served by Ollama is listed once"
+        );
+        assert_eq!(
+            group.key(&key(KeyCode::Enter), &keys),
+            Step::UseEmbedding(ModelSelection::new("ollama", "embeddinggemma:latest"))
+        );
+        group.cursor = 2;
+        assert_eq!(group.key(&key(KeyCode::Enter), &keys), Step::Handled);
+        assert!(group.message.contains("cannot be assigned yet"));
+        group.cursor = 3;
+        assert!(matches!(group.current(), Some(Pick::Embedding(_))));
+    }
+
     #[test]
     fn escape_cancels_a_running_download_before_it_closes_the_panel() {
         let keys = Keymap::defaults();
@@ -1757,9 +1919,7 @@ mod tests {
             "the worker reports the outcome itself"
         );
         group.task = None;
-        assert_eq!(group.key(&key(KeyCode::Esc), &keys), Step::Handled);
-        assert_eq!(group.focus, Focus::Query);
-        assert_eq!(group.key(&key(KeyCode::Esc), &keys), Step::Close);
+        assert_eq!(group.key(&key(KeyCode::Esc), &keys), Step::Back);
     }
 
     #[test]

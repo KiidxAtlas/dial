@@ -28,7 +28,7 @@ access, with a message saying it is neither a local path nor a repository id.
 ## Finding and downloading in `/models`
 
 Open `/models` and choose **Get models** in the left column (`/models local` opens it directly). It has
-three shelves, **MLX**, **GGUF** and **Embedding**, switched with Left/Right (Tab also works).
+three shelves, **MLX**, **GGUF** and **Embedding**, switched with Right/Tab (Shift+Tab goes back).
 Suggested models that are not already installed appear **first**, with a selected row visible even
 in short panels. Offline starting points appear immediately; a background Hugging Face catalog
 request adds popular models without requiring a search. Network failures leave the starting points
@@ -49,14 +49,15 @@ refreshing the live catalog. F5 refreshes installed models and retries catalog m
 |---|---|
 | Type, Backspace | Edit the query. Typing never searches or downloads |
 | Enter (query) | Search and focus results; an empty query restores suggestions and refreshes the catalog |
-| Left / Right (or Shift+Tab / Tab) | Previous / next shelf (MLX is the default on Apple Silicon, GGUF elsewhere) |
+| Right / Tab, Shift+Tab | Next / previous shelf (MLX is the default on Apple Silicon, GGUF elsewhere) |
 | Up / Down | Move through rows; Up from the first row edits the query, Down returns to the rows |
 | Enter (installed model) | Make it the main model, through the same selection as `/models` |
 | Enter (result) | List the repository's files. MLX starts downloading; GGUF opens the quantization picker |
 | Enter (picker) | Download the chosen quantization (with its projector, when the repository has one) |
-| Enter (embedding model) | Set it up as `/setup embeddings:<model> yes` does; see [model-embeddings.md](model-embeddings.md) |
-| Esc | Cancel a running download; otherwise back to the query, then close |
-| Ctrl+Left | Move to the groups column. Downloads keep running |
+| Enter (discovered embedding model) | Assign it to the `embedding` role |
+| Enter (curated embedding model) | Set it up as `/setup embeddings:<model> yes` does; see [model-embeddings.md](model-embeddings.md) |
+| Esc | Cancel a running download, close the picker or clear the query; otherwise back to the groups column (closes `/models` when that column is hidden) |
+| Left (or Ctrl+Left) | Move to the groups column; Up/Down there switch groups. Downloads keep running |
 
 A download runs in the background. The status line shows the repository, the bytes fetched so far
 against the expected total, the elapsed time and the latest step. Downloads keep running while you
@@ -68,8 +69,11 @@ Selecting a GGUF quantization sends exactly its files to the download (`hf_hub_d
 other quantizations in the repository are neither listed for choice nor fetched. Check the file sizes
 in the picker before downloading.
 
-Chat models from the Ollama library are not pulled from this view. The Embedding shelf lists only the
-curated Ollama embedding models.
+Chat models from the Ollama library are not pulled from this view. The Embedding shelf first lists
+every embedding model discovery found (Ollama, LM Studio, other servers, local checkpoints), then the
+curated Ollama embedding models not already served. Ollama models are classified by the
+`capabilities` from `/api/show`. A local MLX embedding checkpoint is shown as **not served**: Dial
+does not run embedding inference itself, so serve it from LM Studio or another embeddings endpoint.
 
 ## Supported formats
 
