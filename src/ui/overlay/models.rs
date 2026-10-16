@@ -474,6 +474,15 @@ impl ModelOverlay {
             learning: false,
             downloads: ModelDownloads::idle(),
         }
+        .with_discovered_embeddings()
+    }
+
+    /// Hands the discovered embedding models to the Get models Embedding shelf.
+    fn with_discovered_embeddings(mut self) -> Self {
+        if let Some(discovery) = &self.discovery {
+            self.downloads.set_embedding_models(&discovery.models);
+        }
+        self
     }
 
     pub fn with_favorites(mut self, favorites: Vec<FavoriteRoute>) -> Self {
@@ -656,6 +665,9 @@ impl ModelOverlay {
     /// group lists nothing installed and downloads report unavailable.
     pub fn with_downloads(mut self, layout: &Layout, settings: Settings, python: PathBuf) -> Self {
         self.downloads = ModelDownloads::open(layout, settings, python);
+        if let Some(discovery) = &self.discovery {
+            self.downloads.set_embedding_models(&discovery.models);
+        }
         self
     }
 
@@ -696,6 +708,7 @@ impl ModelOverlay {
     /// Discovery arrives asynchronously: the search, filters and the highlighted model survive.
     pub fn set_discovery(&mut self, d: Discovery) {
         let anchor = self.highlighted().map(|e| e.selection.clone());
+        self.downloads.set_embedding_models(&d.models);
         self.discovery = Some(d);
         self.rebuild_favorite_entries();
         if let Group::Provider(id) = &self.group
@@ -960,8 +973,11 @@ impl ModelOverlay {
             return self.chooser_key(key, keys);
         }
         if self.group == Group::Download
-            && key.code == KeyCode::Left
-            && key.modifiers == crossterm::event::KeyModifiers::CONTROL
+            && self.focus == Focus::List
+            && !self.downloads.has_picker()
+            && (keys.matches(Action::TabPrev, key)
+                || (key.code == KeyCode::Left
+                    && key.modifiers == crossterm::event::KeyModifiers::CONTROL))
         {
             if !self.narrow {
                 self.focus = Focus::Groups;
@@ -977,7 +993,13 @@ impl ModelOverlay {
             match self.downloads.key(key, keys) {
                 Step::Ignored => {}
                 Step::Handled => return OverlayEvent::None,
-                Step::Close => return OverlayEvent::Close,
+                Step::Back => {
+                    if self.narrow {
+                        return OverlayEvent::Close;
+                    }
+                    self.focus = Focus::Groups;
+                    return OverlayEvent::None;
+                }
                 Step::UseModel(path) => {
                     return OverlayEvent::AssignModel {
                         role: "main".into(),
@@ -988,6 +1010,13 @@ impl ModelOverlay {
                 Step::SetupEmbedding(model) => {
                     return OverlayEvent::SetupDep {
                         id: embeddings::setup_id(&model),
+                    };
+                }
+                Step::UseEmbedding(selection) => {
+                    return OverlayEvent::AssignModel {
+                        role: "embedding".into(),
+                        selection,
+                        scope: self.scope,
                     };
                 }
             }
@@ -2218,7 +2247,15 @@ impl ModelOverlay {
                 ),
                 hint(keys, Action::SelectConfirm, "focus list"),
                 hint(keys, Action::TabNext, "focus list"),
-                hint(keys, Action::SelectCancel, "back"),
+                hint(
+                    keys,
+                    Action::SelectCancel,
+                    if self.group == Group::Download {
+                        "close"
+                    } else {
+                        "back"
+                    },
+                ),
             ];
         }
         if self.group == Group::Roles {
@@ -2242,8 +2279,8 @@ impl ModelOverlay {
         }
         if self.group == Group::Download {
             let mut hints = self.downloads.footer(keys);
-            if !self.narrow {
-                hints.push("Ctrl+Left groups".to_owned());
+            if !self.narrow && !self.downloads.has_picker() {
+                hints.push(self.groups_hint(keys));
             }
             hints.push("F5 rescan".to_owned());
             return hints;
@@ -3804,7 +3841,12 @@ mod tests {
         let mut o = overlay();
         o.show_downloads();
         o.downloads.show_embedding_for_test();
-        // The first catalog row is already selected; no search or Down key is required.
+        // Discovered embedders lead; the fixture's only one is not served, so Enter stays here.
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
+        send(&mut o, &rig, key(KeyCode::Down));
         match send(&mut o, &rig, key(KeyCode::Enter)) {
             OverlayEvent::SetupDep { id } => {
                 assert_eq!(
@@ -3822,15 +3864,12 @@ mod tests {
         let mut o = overlay();
         o.show_downloads();
         let (cancel, done) = o.downloads.fake_download("org/model");
-        // Up to the groups column, then to All: the download is not cancelled.
-        send(
-            &mut o,
-            &rig,
-            Event::Key(KeyEvent::new(
-                KeyCode::Left,
-                crossterm::event::KeyModifiers::CONTROL,
-            )),
-        );
+        // Left reaches the groups column without cancelling the download.
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Left)),
+            OverlayEvent::None
+        ));
+        assert_eq!(o.focus, Focus::Groups);
         send(&mut o, &rig, key(KeyCode::Up));
         assert_eq!(o.group, Group::Favorites);
         send(&mut o, &rig, key(KeyCode::Up));
@@ -3841,20 +3880,33 @@ mod tests {
     }
 
     #[test]
-    fn model_tabs_use_arrows_without_leaving_the_list() {
+    fn model_tabs_use_right_and_tab_while_left_returns_to_groups() {
         let rig = Rig::new();
         let mut o = overlay();
         o.show_downloads();
-        for code in [
-            KeyCode::Right,
-            KeyCode::Right,
-            KeyCode::Right,
-            KeyCode::Left,
-        ] {
+        for code in [KeyCode::Right, KeyCode::Right, KeyCode::Tab] {
             send(&mut o, &rig, key(code));
             assert_eq!(o.focus, Focus::List);
             assert_eq!(o.group, Group::Download);
         }
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Left)),
+            OverlayEvent::None
+        ));
+        assert_eq!(o.focus, Focus::Groups);
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Up)),
+            OverlayEvent::None
+        ));
+        assert_eq!(o.group, Group::Favorites);
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Down)),
+            OverlayEvent::None
+        ));
+        assert_eq!(o.group, Group::Download);
+        send(&mut o, &rig, key(KeyCode::Enter));
+        assert_eq!(o.focus, Focus::List);
+        // Keep the previous Ctrl+Left shortcut as an alias.
         send(
             &mut o,
             &rig,
@@ -3864,6 +3916,66 @@ mod tests {
             )),
         );
         assert_eq!(o.focus, Focus::Groups);
+    }
+
+    #[test]
+    fn get_models_escape_returns_to_groups_then_closes() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.show_downloads();
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Esc)),
+            OverlayEvent::None
+        ));
+        assert_eq!(o.focus, Focus::Groups);
+        assert_eq!(o.group, Group::Download);
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Up)),
+            OverlayEvent::None
+        ));
+        assert_eq!(o.group, Group::Favorites);
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Down)),
+            OverlayEvent::None
+        ));
+        assert_eq!(o.group, Group::Download);
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Esc)),
+            OverlayEvent::Close
+        ));
+    }
+
+    #[test]
+    fn get_models_escape_clears_query_before_returning_to_groups() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.show_downloads();
+        send(&mut o, &rig, ch('q'));
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Esc)),
+            OverlayEvent::None
+        ));
+        assert!(o.downloads.query_text().is_empty());
+        assert_eq!(o.focus, Focus::List);
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Esc)),
+            OverlayEvent::None
+        ));
+        assert_eq!(o.focus, Focus::Groups);
+    }
+
+    #[test]
+    fn get_models_escape_closes_when_groups_are_hidden() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.show_downloads();
+        draw(&mut o, &rig, 40, 20);
+        assert!(o.narrow);
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Esc)),
+            OverlayEvent::Close
+        ));
+        assert_eq!(o.focus, Focus::List);
     }
 
     #[test]

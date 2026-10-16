@@ -11,9 +11,10 @@ Nothing downloads until you ask for it.
 
 - Settings → Semantic memory → Embedding model: press Ctrl+L to see the plan, then Ctrl+L again to
   start. The row offers `nomic-embed-text` until an embedding model is configured.
-- `/models`, then **Get models** and its Embedding shelf (Tab to reach it): lists the same curated catalog,
-  marks the models Ollama already has, and Enter sets one up exactly as `/setup embeddings:<model> yes`
-  does. Nothing is pulled until Enter.
+- `/models`, then **Get models** and its Embedding shelf (Tab to reach it): lists every embedding
+  model discovery found (Enter assigns a served one to the `embedding` role), then the curated
+  catalog. Enter on a curated model sets it up exactly as `/setup embeddings:<model> yes` does.
+  Nothing is pulled until Enter.
 - `/setup embeddings` lists the curated catalog. `/setup embeddings:<model>` previews the plan and
   `/setup embeddings:<model> yes` runs it in the background. Any other Ollama embedding model name
   also works.

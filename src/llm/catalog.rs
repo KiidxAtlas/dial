@@ -1023,6 +1023,15 @@ fn probe_models(probe: &Probe) -> (ProviderStatus, Vec<ModelEntry>) {
         .and_then(|value| parse_models(&value, probe).ok())
     {
         Some(mut models) => {
+            if protocol == ApiProtocol::Ollama {
+                annotate_ollama(
+                    &mut models,
+                    &agent,
+                    url.strip_suffix("/api/tags").unwrap_or(&url),
+                    probe.token.as_deref(),
+                    &resolved_headers,
+                );
+            }
             if local
                 && probe.id != "ollama"
                 && let Some(info) = lmstudio_models_with_headers(
@@ -1418,6 +1427,92 @@ fn declared_kind(row: &Value) -> ModelKind {
         .map(kind_from_declared)
         .find(|kind| *kind != ModelKind::Unknown)
         .unwrap_or_default()
+}
+
+/// Ollama's `/api/tags` states no purpose; its `/api/show` reports `capabilities` (`embedding`,
+/// `completion`, ...). Asked only for rows still `Unknown`, at most `CONCURRENCY` at a time, through
+/// the probe's agent, headers and key. A failed request leaves the row `Unknown` (still listed).
+fn annotate_ollama(
+    models: &mut [ModelEntry],
+    agent: &ureq::Agent,
+    base: &str,
+    token: Option<&str>,
+    headers: &super::model_config::ResolvedHeaders<'_>,
+) {
+    let pending: Vec<(usize, String)> = models
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.metadata.kind == ModelKind::Unknown)
+        .map(|(index, entry)| (index, entry.selection.model.clone()))
+        .collect();
+    for chunk in pending.chunks(CONCURRENCY) {
+        let kinds: Vec<(usize, ModelKind)> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = chunk
+                .iter()
+                .map(|(index, model)| {
+                    scope.spawn(move || (*index, ollama_kind(agent, base, model, token, headers)))
+                })
+                .collect();
+            jobs.into_iter().filter_map(|job| job.join().ok()).collect()
+        });
+        for (index, kind) in kinds {
+            models[index].metadata.kind = kind;
+        }
+    }
+}
+
+fn ollama_kind(
+    agent: &ureq::Agent,
+    base: &str,
+    model: &str,
+    token: Option<&str>,
+    headers: &super::model_config::ResolvedHeaders<'_>,
+) -> ModelKind {
+    let mut request = agent
+        .post(format!("{base}/api/show"))
+        .header("Accept", "application/json");
+    for (name, value) in headers.pairs() {
+        let Ok(field) = super::model_config::private_header_value(value) else {
+            return ModelKind::Unknown;
+        };
+        request = request.header(name, field);
+    }
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let Ok(mut response) = request.send_json(serde_json::json!({ "model": model })) else {
+        return ModelKind::Unknown;
+    };
+    if !response.status().is_success() {
+        return ModelKind::Unknown;
+    }
+    let mut bytes = Vec::new();
+    if response
+        .body_mut()
+        .as_reader()
+        .take(MAX_RESPONSE + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_RESPONSE
+    {
+        return ModelKind::Unknown;
+    }
+    serde_json::from_slice::<Value>(&bytes)
+        .map(|shown| ollama_capability_kind(&shown))
+        .unwrap_or_default()
+}
+
+/// An `embedding` capability without `completion` is an embedder; `completion` is chat.
+fn ollama_capability_kind(shown: &Value) -> ModelKind {
+    let capabilities = shown["capabilities"].as_array();
+    let has = |name: &str| capabilities.is_some_and(|all| all.iter().any(|c| c == name));
+    if has("embedding") && !has("completion") {
+        ModelKind::Embedding
+    } else if has("completion") {
+        ModelKind::Chat
+    } else {
+        ModelKind::Unknown
+    }
 }
 
 /// LM Studio's native `type` is the purpose source for its served models. A served embedder keeps
@@ -2922,6 +3017,28 @@ mod tests {
         let (_, models) = probe_models(&test_probe(url, "ollama"));
         assert_eq!(models[0].selection.model, "llama:latest");
         assert!(job.join().unwrap().starts_with("GET /api/tags "));
+    }
+    #[test]
+    fn ollama_models_take_their_purpose_from_api_show_capabilities() {
+        let url = routed(vec![
+            ("/api/tags", r#"{"models":[{"name":"embeddinggemma:latest"}]}"#.into()),
+            ("/api/show", r#"{"capabilities":["embedding"]}"#.into()),
+        ]);
+        let (status, models) = probe_models(&test_probe(url, "ollama"));
+        assert_eq!(status.state, "reachable");
+        assert!(models[0].is_embedding(), "{:?}", models[0].metadata.kind);
+        assert!(models[0].available);
+        let url = routed(vec![
+            ("/api/tags", r#"{"models":[{"name":"qwen3:4b"}]}"#.into()),
+            ("/api/show", r#"{"capabilities":["completion","tools"]}"#.into()),
+        ]);
+        let (_, models) = probe_models(&test_probe(url, "ollama"));
+        assert_eq!(models[0].metadata.kind, ModelKind::Chat);
+        // No /api/show (404): the model is still listed, with an unknown purpose.
+        let url = routed(vec![("/api/tags", r#"{"models":[{"name":"m"}]}"#.into())]);
+        let (_, models) = probe_models(&test_probe(url, "ollama"));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].metadata.kind, ModelKind::Unknown);
     }
     #[test]
     fn auth_redirect_invalid_and_oversized_responses_are_explicit_failures() {
