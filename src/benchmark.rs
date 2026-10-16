@@ -502,6 +502,8 @@ pub struct AssistanceOverrides {
     pub reliability_gate: Option<bool>,
     /// Maps to `assistance.constrained_repair`: schema-constrained repair of malformed tool calls.
     pub constrained_repair: Option<bool>,
+    /// Maps to `assistance.lean_local`: the lean prompt and tool profile for locally served models.
+    pub lean_local: Option<bool>,
 }
 
 impl AssistanceOverrides {

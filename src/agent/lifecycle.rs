@@ -532,6 +532,7 @@ impl<'a> Agent<'a> {
             .clone()
             .with_bash_interceptor(self.config.bash_interceptor.clone(), offered.clone());
         let discoverable = self.discoverable_tools(&offered);
+        let lean = self.lean_local();
         let built = prompt::system_messages(prompt::Inputs {
             cwd: self.workspace.root(),
             harness: &self.version.harness,
@@ -539,7 +540,7 @@ impl<'a> Agent<'a> {
             soul: self.parts.soul.clone(),
             overrides: self.parts.overrides.clone(),
             context: &self.parts.context,
-            skills: if self.lean_tools && !offered.iter().any(|tool| tool == "skill") {
+            skills: if (self.lean_tools || lean) && !offered.iter().any(|tool| tool == "skill") {
                 String::new()
             } else {
                 self.parts.skills.clone()
@@ -548,6 +549,7 @@ impl<'a> Agent<'a> {
             tools: &offered,
             discoverable: &discoverable,
             template: self.parts.system_template.as_ref(),
+            lean,
         });
         let mut messages = match built {
             Ok(messages) => {

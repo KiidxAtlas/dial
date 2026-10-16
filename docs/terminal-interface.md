@@ -50,7 +50,8 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   without stopping the turn. `/model`, `/models`, and the model shortcut (`Ctrl+K` on macOS,
   `Alt+M` elsewhere) open the picker immediately; a selection
   applies after the current turn, without canceling it. Closing the picker without selecting changes
-  nothing. Other commands wait for the turn to finish, with a notice, except commands
+  nothing. A selection changes only this session and the saved default for new sessions; other
+  running Dial sessions keep their models. Other commands wait for the turn to finish, with a notice, except commands
   that replace or alter the active session/work: `/exit` (`/quit`, `/q`), `/new`, `/clear`, `/resume`, `/sessions`,
   `/tree`, `/fork`, `/undo`, `/rollback`, `/compact` and `/plan` stop it first.
   `/queue` inspection and queue edits also leave the current turn running. `/model restart` is refused
@@ -66,6 +67,27 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   On the first press, if discovery is needed, the switch is retained and applies when ready.
   Escape or `/model cancel` cancels that pending switch. Changes to the selected model, saved
   favorites, scope, or discovery request also cancel it rather than applying a stale choice.
+- `/model local` (also `/models local`; offered by slash completion) opens the **local models** dashboard: one row per downloaded MLX or GGUF model (and per local
+  model the recorded requests name), with its format, decode speed, memory fit, learning-store version and
+  adapter, last LoRA gate, and what improvement is waiting on. Highlight a row to see its details; `Esc` closes.
+  The dashboard is a read-only snapshot taken when it opens. It loads no model, starts no Python or MLX process,
+  makes no network call, and does not create a stats database or learning store that is missing. The same data is
+  printed by `dial models status` (`--json` for the machine-readable form, with identical field names).
+  - **Speed** is output tokens per second of request wall time from the recorded stats, the same measure as
+    `dial stats`. It uses the newest 40 successful requests with output and timing: a median, the median of the
+    newest 20, and a trend (`up` or `down` when that median moves more than 10% from the 20 before them, else
+    `flat`). It includes prompt processing time, so it is not a pure decode rate.
+  - **Fit** reuses the `dial models recommend` estimate (configured or default 32768-token context, detected
+    memory), with the layout from `config.json` for MLX and from the file header for GGUF.
+  - **Version, adapter, gate** come from the learning store for that model under the current project's state
+    directory, read with SELECT statements only. When several use cases share a model, the store changed most
+    recently is shown.
+  - **Waiting** lists the recorded blockers from the same rules as `/improve status`: verified turns since the
+    last cycle against `[improve] lora_min_examples`, new turns against `min_new_turns`, and the remaining cooldown.
+    Background-only gates (idle, AC power, `/compute` pause) are not read here, so an empty list means no recorded
+    blocker, not that a cycle will start.
+  - Anything unavailable is shown as `unknown` (JSON `null`): no stats database, no matching learning store, an
+    unreadable store, or no memory reading. It is never estimated from a neighbouring value.
 - `/sessions` and `/resume` open the current project's conversation picker. Pinned sessions lead,
   followed by recent journal activity rather than creation time. Empty sessions are hidden unless
   pinned; **Tab** includes them. Titles take priority over IDs and model details; the selected

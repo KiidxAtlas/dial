@@ -13,6 +13,7 @@ use crate::{
     config::types::{Admission, Config, Harness, Proposal, Version},
     learn::{
         curriculum::{self, Role, Task},
+        distill,
         gate::{self, Case, Rules, Suite},
         harvest, mutate, probe, worker, workflow,
     },
@@ -1875,7 +1876,7 @@ pub fn monitor_now(store: &Store, config: &Config) -> Result<Option<String>> {
 // ---------------------------------------------------------------------------------------------
 // The cycle.
 
-fn enforce_daily_cost(
+pub(super) fn enforce_daily_cost(
     runtime: &mut Runtime,
     config: &Config,
     store: &Store,
@@ -2063,6 +2064,18 @@ pub fn run_cycle(
         ),
     }
     super::auto::check_stop(config)?;
+    // Failure-driven distillation: a coach-assigned teacher practices the weak train families; only
+    // verifier-passed teacher runs reach harvest, through their own database and origin tag.
+    if distill::enabled(config) {
+        match distill::run(runtime, config, store, &active, &eval.held_out, progress) {
+            Ok(state) => note(&mut steps, "distill", state),
+            Err(error) => {
+                super::auto::check_stop(config)?;
+                note(&mut steps, "distill_error", json!(format!("{error:#}")));
+            }
+        }
+        super::auto::check_stop(config)?;
+    }
     let report = harvest::harvest(config, store, &eval.held_out)?;
     note(&mut steps, "harvest", serde_json::to_value(&report)?);
 

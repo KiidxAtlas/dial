@@ -973,6 +973,18 @@ fn scripted_turn_with(
     prompt: &str,
     configure: impl FnOnce(&mut Agent),
 ) -> (String, TurnOutcome, Vec<Vec<u8>>) {
+    let workspace = tempfile::tempdir().unwrap();
+    scripted_turn_at(config, scripts, prompt, workspace.path(), configure)
+}
+
+/// As [`scripted_turn_with`], in a caller-owned workspace whose files remain inspectable.
+fn scripted_turn_at(
+    config: &Config,
+    scripts: Vec<crate::llm::fake::Script>,
+    prompt: &str,
+    root: &std::path::Path,
+    configure: impl FnOnce(&mut Agent),
+) -> (String, TurnOutcome, Vec<Vec<u8>>) {
     let server = crate::llm::fake::serve(scripts);
     let backend = Backend::new(
         ProviderKind::Endpoint {
@@ -983,8 +995,7 @@ fn scripted_turn_with(
         PathBuf::new(),
         5,
     );
-    let workspace = tempfile::tempdir().unwrap();
-    std::fs::write(workspace.path().join("notes.txt"), "alpha\n").unwrap();
+    std::fs::write(root.join("notes.txt"), "alpha\n").unwrap();
     let version = Version {
         id: 0,
         parent: None,
@@ -993,8 +1004,7 @@ fn scripted_turn_with(
         adapter: None,
         status: "active".into(),
     };
-    let mut agent =
-        Agent::hermetic(config, backend, &version, workspace.path(), None, None).unwrap();
+    let mut agent = Agent::hermetic(config, backend, &version, root, None, None).unwrap();
     configure(&mut agent);
     let report = agent.turn(prompt, &mut NullUi).unwrap();
     let text = report.text.clone();
@@ -1392,4 +1402,116 @@ fn only_real_check_commands_count_as_verification() {
     ] {
         assert!(!is_check_command(no), "{no}");
     }
+}
+
+fn sse_tool_calls(calls: &[(&str, serde_json::Value)]) -> crate::llm::fake::Script {
+    let calls: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (name, arguments))| {
+            json!({"index":index,"id":format!("call_{index}"),"type":"function",
+                "function":{"name":name,"arguments":arguments.to_string()}})
+        })
+        .collect();
+    let event = json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+    crate::llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
+}
+
+fn replace_edits() -> Config {
+    let mut config = Config::default();
+    config.edit_mode_override = Some(crate::config::types::EditMode::Replace);
+    config
+}
+
+fn replace(path: &str, old: &str, new: &str) -> (&'static str, serde_json::Value) {
+    (
+        "edit",
+        json!({"path": path, "old_string": old, "new_string": new}),
+    )
+}
+
+#[test]
+fn edits_that_cycle_file_content_are_steered_and_the_turn_continues_to_completion() {
+    let workspace = tempfile::tempdir().unwrap();
+    // Committed versions: beta, alpha, beta, alpha, beta (third visit: the loop is reported).
+    let mut batch: Vec<_> = ["alpha", "beta", "alpha", "beta", "alpha", "beta"]
+        .windows(2)
+        .map(|pair| replace("notes.txt", pair[0], pair[1]))
+        .collect();
+    // Repeating a loop edit is refused; a different edit still runs in the same batch.
+    batch.push(replace("notes.txt", "beta", "alpha"));
+    batch.push(replace("notes.txt", "beta", "gamma"));
+    let (text, outcome, requests) = scripted_turn_at(
+        &replace_edits(),
+        vec![
+            sse_tool_calls(&[("read", json!({"path": "notes.txt"}))]),
+            sse_tool_calls(&batch),
+            sse_reply("Done."),
+        ],
+        "toggle the note",
+        workspace.path(),
+        |_| {},
+    );
+    assert_eq!(outcome, TurnOutcome::Completed, "{text}");
+    assert_eq!(requests.len(), 3, "the turn continued after the loop");
+    let followup = String::from_utf8_lossy(&requests[2]);
+    assert!(followup.contains("[Dial: edit loop]"), "{followup}");
+    assert!(
+        followup.contains("This call was not executed: it is one of the edits that kept returning"),
+        "{followup}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("notes.txt")).unwrap(),
+        "gamma\n"
+    );
+}
+
+#[test]
+fn native_edits_work_inside_an_added_root_but_not_an_undeclared_sibling() {
+    let base = tempfile::tempdir().unwrap();
+    let base_path = base.path().canonicalize().unwrap();
+    let (primary, added, sibling) = (
+        base_path.join("primary"),
+        base_path.join("added"),
+        base_path.join("sibling"),
+    );
+    for dir in [&primary, &added, &sibling] {
+        std::fs::create_dir(dir).unwrap();
+        std::fs::write(dir.join("lib.txt"), "old\n").unwrap();
+    }
+    let target = |dir: &std::path::Path| dir.join("lib.txt").to_string_lossy().into_owned();
+    let (added_file, sibling_file) = (target(&added), target(&sibling));
+    let (text, outcome, _) = scripted_turn_at(
+        &replace_edits(),
+        vec![
+            sse_tool_calls(&[
+                ("read", json!({"path": added_file})),
+                ("read", json!({"path": "lib.txt"})),
+            ]),
+            sse_tool_calls(&[
+                replace(&added_file, "old", "new"),
+                replace("lib.txt", "old", "new"),
+            ]),
+            sse_tool_calls(&[replace(&sibling_file, "old", "new")]),
+            sse_reply("Done."),
+        ],
+        "edit both",
+        &primary,
+        |agent| {
+            agent.workspace_mut().add_root(&added).unwrap();
+        },
+    );
+    assert_eq!(outcome, TurnOutcome::Completed, "{text}");
+    assert_eq!(
+        std::fs::read_to_string(added.join("lib.txt")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(primary.join("lib.txt")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sibling.join("lib.txt")).unwrap(),
+        "old\n"
+    );
 }

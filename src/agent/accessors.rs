@@ -91,6 +91,23 @@ impl<'a> Agent<'a> {
         self.backend.as_mut().unwrap().release();
         Ok(())
     }
+
+    /// Move the main backend's resident local server out so the agent rebuilt after a settings
+    /// change in this session can adopt it instead of reloading the weights.
+    pub fn take_resident_server(&mut self) -> Option<crate::llm::server::ModelServer> {
+        self.backend
+            .as_mut()
+            .and_then(Backend::take_resident_server)
+    }
+
+    /// Adopt a server from [`Self::take_resident_server`]. The next request reuses it only while
+    /// model, adapter, runtime, grammar and GGUF context still match; otherwise it is replaced.
+    /// A non-local backend drops it, which stops the process.
+    pub fn adopt_resident_server(&mut self, server: crate::llm::server::ModelServer) {
+        if let Some(backend) = self.backend.as_mut() {
+            backend.adopt_resident_server(server);
+        }
+    }
     pub fn todo(&self) -> &TodoList {
         &self.todo
     }

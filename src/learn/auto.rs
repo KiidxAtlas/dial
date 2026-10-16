@@ -45,14 +45,14 @@ pub fn lock_file(path: &Path) -> Result<File> {
     Ok(crate::platform::fs::open_owner_only(&options, path)?)
 }
 
+/// Foreground sessions hold `compute.lock` shared, so any number of local-model and Laya sessions
+/// run together. Only background training/maintenance takes it exclusively, and it yields first.
 pub fn compute_lock(layout: &Layout) -> Result<File> {
     let _request = super::compute::Request::foreground(&layout.user_dir)?;
     let file = lock_file(&layout.user_dir.join("compute.lock"))?;
-    if file.try_lock_exclusive().is_err() {
-        eprintln!(
-            "dial: waiting for local compute (another session or improvement cycle is active)"
-        );
-        file.lock_exclusive()?;
+    if fs2::FileExt::try_lock_shared(&file).is_err() {
+        eprintln!("dial: waiting for local compute (a background improvement job is yielding)");
+        fs2::FileExt::lock_shared(&file)?;
     }
     super::compute::register(
         &layout.user_dir,
@@ -345,8 +345,16 @@ pub fn start_training(layout: &Layout, config: &Config, store: &Store) -> Result
     );
     ensure!(
         config.endpoint.is_none() && !config.model.is_empty(),
-        "training requires Dial's local MLX runtime and a local checkpoint"
+        "training requires Dial's local model runtime and a local MLX checkpoint"
     );
+    if let Ok(resolved) = crate::llm::catalog::resolve_local_model(&config.model) {
+        let format = crate::llm::local_format::detect(std::path::Path::new(&resolved));
+        ensure!(
+            format.is_none() || format == Some(crate::llm::local_format::LocalFormat::Mlx),
+            "training needs MLX weights; {} models can be served and evaluated but not LoRA-trained",
+            format.map_or("this", |f| f.label())
+        );
+    }
     ensure!(
         runtime_enabled(config, store)?,
         "Improvement is paused; use /improve enable first"
@@ -674,7 +682,7 @@ mod tests {
             start_training(&layout, &config, &store)
                 .unwrap_err()
                 .to_string()
-                .contains("local MLX")
+                .contains("local MLX checkpoint")
         );
         config.endpoint = None;
         store.set_meta("auto_enabled", "false").unwrap();
@@ -702,6 +710,34 @@ mod tests {
             .is_err()
         );
         assert!(store.get_meta("last_cycle_attempt").unwrap().is_none());
+    }
+    #[test]
+    fn foreground_sessions_share_compute_but_exclude_background_work() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let layout = Layout::with_user_dir(&project, root.path().join("user")).unwrap();
+        let first = compute_lock(&layout).unwrap();
+        let second = compute_lock(&layout).unwrap();
+        let probe = lock_file(&layout.user_dir.join("compute.lock")).unwrap();
+        assert_eq!(
+            probe.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "background work cannot start while sessions hold compute"
+        );
+        drop(first);
+        assert!(probe.try_lock_exclusive().is_err());
+        drop(second);
+        // A process forked concurrently by another test can hold an inherited copy of the
+        // descriptor until its exec closes it, so wait briefly instead of asserting at once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while probe.try_lock_exclusive().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sessions released compute"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     #[test]
     fn project_jobs_distinguish_locks_from_stale_status_and_stop_pauses() {

@@ -1,5 +1,6 @@
 //! Configuration loading, layering and validation; the shared data types live in [`types`].
 
+pub mod session_models;
 pub mod settings;
 pub mod types;
 pub use crate::settings_schema as schema;
@@ -63,6 +64,19 @@ pub fn merge_overlay(base: &mut toml::Table, mut over: toml::Table) {
         }
     }
 }
+
+/// Global settings, then project settings, then the command-line overlay, before loading.
+pub fn merged_layers(
+    global: &toml::Table,
+    project: &toml::Table,
+    overlay: &toml::Table,
+) -> toml::Table {
+    let mut table = global.clone();
+    merge_overlay(&mut table, project.clone());
+    merge_overlay(&mut table, overlay.clone());
+    table
+}
+
 fn legacy_chatgpt_api_url(url: &str) -> bool {
     matches!(
         url,
@@ -415,13 +429,26 @@ impl Config {
         project: &toml::Table,
         overlay: &toml::Table,
     ) -> Result<Self> {
+        Self::from_session_layers(layout, global, project, overlay, None)
+    }
+
+    /// [`Self::from_layers`] with a running session's own model choices replacing the merged
+    /// model keys, so another process's model change never retargets this session.
+    pub fn from_session_layers(
+        layout: &Layout,
+        global: &toml::Table,
+        project: &toml::Table,
+        overlay: &toml::Table,
+        models: Option<&session_models::SessionModels>,
+    ) -> Result<Self> {
         ensure!(
             !project.contains_key("chatgpt_accounts") && !overlay.contains_key("chatgpt_accounts"),
             "chatgpt_accounts is a private global operator policy"
         );
-        let mut table = global.clone();
-        merge_overlay(&mut table, project.clone());
-        merge_overlay(&mut table, overlay.clone());
+        let mut table = merged_layers(global, project, overlay);
+        if let Some(models) = models {
+            models.apply(&mut table);
+        }
         let mut config = Self::from_table_with_policy(layout, table, global)?;
         if let Some(mode) = overlay
             .get("edit")
@@ -1412,7 +1439,10 @@ impl Config {
         self.improve.teach && !self.model.is_empty() && self.local_main_model()
     }
 
-    fn local_main_model(&self) -> bool {
+    /// The main model runs on this machine or the local network: Dial's MLX/GGUF runtime (no
+    /// endpoint), or an endpoint on a loopback, private-range or `.local` host (Ollama, LM Studio,
+    /// llama.cpp). The single classification every local-model policy uses.
+    pub(crate) fn local_main_model(&self) -> bool {
         self.endpoint.as_ref().is_none_or(|endpoint| {
             crate::llm::host_of(&endpoint.base_url)
                 .is_some_and(|host| crate::llm::is_local_host(&host))

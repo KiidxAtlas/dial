@@ -198,14 +198,15 @@ initial_tool_limit = 0
 ```
 
 Supported keys: `enabled`, `compact_tools`, `initial_tool_limit` (0 = unlimited, or 1..=64), `tool_grammar`,
-`repair_hints`, `syntax_guard`, `selective_verification`, `edit_mode`, `constrained_repair`, and `reliability_gate`
-(maps to `reliability.enabled`). Unknown keys are rejected.
+`repair_hints`, `syntax_guard`, `selective_verification`, `edit_mode`, `constrained_repair`, `lean_local`, and
+`reliability_gate` (maps to `reliability.enabled`). Unknown keys are rejected.
 
 ## Assistance ablation
 
 `dial benchmark --ablate-assistance [suite.toml] [-m model] [--report out.json] [--allow-remote]` runs an
 automatic matrix on one model: `raw` (assistance off), `dial` (the shipped defaults, independent of your
-config), and `ablate-<feature>` for each of `compact_tools`, `initial_tool_limit`, `tool_grammar`,
+config), `lean` (`dial` plus the `lean_local` profile, which only changes requests to a locally served model),
+and `ablate-<feature>` for each of `compact_tools`, `initial_tool_limit`, `tool_grammar`,
 `repair_hints`, `edit_mode` and `reliability_gate`. Each ablation changes exactly one feature from `dial`.
 The suite defaults to `examples/benchmarks/efficiency.toml`. The command prints a table with checked
 correctness, tool errors, malformed tool calls (tool contract errors), repair rounds, observed tokens and

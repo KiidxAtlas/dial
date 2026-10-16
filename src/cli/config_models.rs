@@ -2,7 +2,7 @@
 //! store (`storage::settings_store`) and model catalog (`llm::catalog`).
 //!
 //! Not implemented (no Dial subsystem): `config init-xdg` (Dial stores state under
-//! `DIAL_HOME`, not XDG), `models refresh` (the catalog is local discovery only), `models --kind`,
+//! `DIAL_HOME`, not XDG), `models refresh` (the catalog is local discovery only),
 //! and the `-e/--extensions`, `--no-extensions`, `--config` overlay flags (no extension model
 //! registry).
 
@@ -53,12 +53,16 @@ pub enum ConfigAction {
 
 #[derive(Args, Debug, Clone)]
 pub struct ModelsArgs {
-    /// `ls` (default), `list`, `find <pattern>`, `refresh`, or `recommend` (RAM-aware fit of
-    /// downloaded local MLX models). Any other first word is a provider/substring filter for `ls`.
+    /// `ls` (default), `list`, `find <pattern>`, `refresh`, `recommend` (RAM-aware fit of
+    /// downloaded local MLX models), or `status` (per-model speed, fit, adapter and gate; `--json`).
+    /// Any other first word is a provider/substring filter for `ls`.
     pub words: Vec<String>,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
+    /// Filter by the model's declared purpose (unknown means no type metadata was reported).
+    #[arg(long, value_parser = ["chat", "embedding", "rerank", "image", "audio", "unknown"])]
+    pub kind: Option<String>,
     /// `recommend` only: token context to estimate (default: configured context, else 32768).
     #[arg(long)]
     pub context: Option<u64>,
@@ -76,6 +80,7 @@ pub enum ModelsRoute {
     Find(String),
     Refresh,
     Recommend,
+    Status,
 }
 
 /// Routes positional words for the `models` command.
@@ -94,6 +99,7 @@ pub fn route(words: &[String]) -> Result<ModelsRoute> {
         }
         Some("refresh") => ModelsRoute::Refresh,
         Some("recommend") => ModelsRoute::Recommend,
+        Some("status") => ModelsRoute::Status,
         Some(_) => ModelsRoute::List(rest(0)),
     })
 }
@@ -316,9 +322,10 @@ fn tri(value: Option<bool>) -> String {
 
 /// Column-aligned table; cells are not truncated.
 pub fn format_table(entries: &[ModelEntry]) -> String {
-    const HEADER: [&str; 7] = [
+    const HEADER: [&str; 8] = [
         "PROVIDER",
         "MODEL",
+        "KIND",
         "AVAILABLE",
         "VISION",
         "TOOLS",
@@ -331,6 +338,7 @@ pub fn format_table(entries: &[ModelEntry]) -> String {
             vec![
                 e.selection.provider.clone(),
                 e.selection.model.clone(),
+                e.metadata.kind.label().to_owned(),
                 tri(Some(e.available)),
                 tri(e.metadata.vision),
                 tri(e.metadata.tools),
@@ -374,6 +382,9 @@ pub fn run_models(cwd: &Path, args: &ModelsArgs, overlay: Option<toml::Table>) -
         ModelsRoute::Refresh => {
             bail!("models refresh is not supported: Dial's model catalog is local discovery only")
         }
+        ModelsRoute::Status => {
+            return crate::cli::local_models::run_status(cwd, args.json, overlay);
+        }
         ModelsRoute::Recommend => {
             let options = models_recommend::RecommendOptions {
                 context: args.context,
@@ -393,6 +404,11 @@ pub fn run_models(cwd: &Path, args: &ModelsArgs, overlay: Option<toml::Table>) -
         .models
         .into_iter()
         .filter(|entry| needle.as_deref().is_none_or(|n| matches(entry, n)))
+        .filter(|entry| {
+            args.kind
+                .as_deref()
+                .is_none_or(|kind| entry.metadata.kind.label() == kind)
+        })
         .collect();
     if args.json {
         println!(
@@ -478,6 +494,40 @@ mod tests {
         let table = format_table(&[]);
         assert!(table.starts_with("PROVIDER"));
         assert_eq!(table.lines().count(), 1);
+    }
+
+    #[test]
+    fn model_list_exposes_declared_purpose_without_reading_source_prose() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "selection": {"provider":"custom", "model":"vectors"},
+            "label":"vectors", "source":"operator endpoint", "available":true,
+            "context_window":null, "metadata":{"kind":"embedding"}
+        }))
+        .unwrap();
+        let table = format_table(&[entry]);
+        assert!(table.lines().next().unwrap().contains("KIND"));
+        let cells: Vec<_> = table.lines().nth(1).unwrap().split_whitespace().collect();
+        assert_eq!(&cells[..4], &["custom", "vectors", "embedding", "yes"]);
+    }
+
+    #[test]
+    fn model_kind_cli_filter_accepts_declared_types_and_rejects_typos() {
+        for kind in ["chat", "embedding", "rerank", "image", "audio", "unknown"] {
+            let matches = <ModelsArgs as clap::Args>::augment_args(clap::Command::new("models"))
+                .try_get_matches_from(["models", "find", "custom", "--kind", kind])
+                .unwrap();
+            let args = <ModelsArgs as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+            assert_eq!(args.kind.as_deref(), Some(kind));
+            assert_eq!(
+                route(&args.words).unwrap(),
+                ModelsRoute::Find("custom".into())
+            );
+        }
+        assert!(
+            <ModelsArgs as clap::Args>::augment_args(clap::Command::new("models"))
+                .try_get_matches_from(["models", "--kind", "embeddng"])
+                .is_err()
+        );
     }
 
     #[test]

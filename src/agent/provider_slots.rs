@@ -6,7 +6,10 @@
 //! wider than the limit (parents waiting on children waiting on the parents' slots).
 //!
 //! Remote providers are unlimited unless `task.provider_concurrency.<provider>` sets a cap. A local
-//! model server is one shared resource and always takes one request at a time.
+//! model server (Dial's own runtime, or an endpoint on this machine or the LAN) is one shared
+//! resource: it takes one request at a time unless `task.provider_concurrency.<provider>` raises
+//! that, e.g. for a llama.cpp server started with several `--parallel` slots. Parallel requests on
+//! a single-slot server would also evict each other's prompt cache.
 use crate::config::types::Config;
 use std::{
     collections::HashMap,
@@ -54,17 +57,16 @@ impl Drop for Slot {
 
 /// The slot key and its limit (0 = unlimited) for requests made with `config`.
 fn route(config: &Config) -> (String, usize) {
-    if config.endpoint.is_none() {
+    let Some(endpoint) = &config.endpoint else {
         return (format!("local:{}", config.model), 1);
-    }
+    };
     let provider = config.selection().provider;
-    let limit = config
-        .task
-        .provider_concurrency
-        .get(&provider)
-        .copied()
-        .unwrap_or(0);
-    (provider, limit)
+    let configured = config.task.provider_concurrency.get(&provider).copied();
+    if config.local_main_model() {
+        let server = endpoint.base_url.trim_end_matches('/');
+        return (format!("local:{server}"), configured.unwrap_or(1));
+    }
+    (provider, configured.unwrap_or(0))
 }
 
 /// Wait for a request slot, or `None` once `interrupt` is set.
@@ -145,5 +147,40 @@ mod tests {
         assert!(acquire_key(key, 1, &interrupt).is_none());
         drop(held);
         assert!(acquire_key("unlimited".into(), 0, &AtomicBool::new(false)).is_some());
+    }
+
+    fn endpoint_config(base_url: &str) -> Config {
+        let mut config = Config {
+            provider: Some("ollama".into()),
+            model: "qwen3:8b".into(),
+            ..Default::default()
+        };
+        config.endpoint = Some(crate::config::types::EndpointConfig {
+            headers: None,
+            base_url: base_url.into(),
+            api_key_env: None,
+            allow_insecure: false,
+            protocol: None,
+            account_id: None,
+        });
+        config
+    }
+
+    #[test]
+    fn local_endpoints_take_one_request_at_a_time_unless_configured() {
+        for local in [
+            "http://127.0.0.1:11434",
+            "http://localhost:1234/v1",
+            "http://192.168.1.20:8080/",
+        ] {
+            let (key, limit) = route(&endpoint_config(local));
+            assert_eq!(limit, 1, "{local}");
+            assert!(key.starts_with("local:"), "{local}");
+        }
+        let mut raised = endpoint_config("http://127.0.0.1:8080");
+        raised.task.provider_concurrency.insert("ollama".into(), 4);
+        assert_eq!(route(&raised).1, 4);
+        let (key, limit) = route(&endpoint_config("https://api.example.com/v1"));
+        assert_eq!((key.as_str(), limit), ("ollama", 0));
     }
 }

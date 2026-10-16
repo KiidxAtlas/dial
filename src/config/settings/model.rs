@@ -385,7 +385,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Local worker",
         "Compute locks",
-        "Coordinate local models, training and maintenance across sessions. Turn off to run concurrently without waiting for compute; concurrent work may exhaust RAM/GPU memory. Pause and stop controls still apply. Laya never requires this lock.",
+        "Coordinate background training and maintenance with sessions. Sessions with local models share compute and never wait on each other; background work waits for them and yields to coding. Turn off to run background work concurrently; it may exhaust RAM/GPU memory. Pause and stop controls still apply. Laya never requires this lock.",
         Kind::Bool,
     ),
 ];

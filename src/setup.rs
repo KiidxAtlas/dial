@@ -100,6 +100,7 @@ pub fn run(layout: &Layout, model: Option<&str>) -> Result<()> {
         );
     }
     eprintln!("verifying {} (first run downloads weights)…", config.model);
+    crate::learn::download::ensure_local_model(&config.python, &config.model)?;
     let caps = worker::capabilities(&config)?;
     ensure!(
         caps["inference"] == true,

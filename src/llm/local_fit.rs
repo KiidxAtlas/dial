@@ -1,8 +1,8 @@
-//! Pure memory-fit estimates for local MLX checkpoints (`dial models recommend`).
+//! Pure memory-fit estimates for local models (`dial models recommend`, GGUF serving context).
 //!
-//! These are planning heuristics, not measurements: weights are the on-disk safetensors
-//! size, the KV cache follows the attention layout declared in `config.json`, and a fixed
-//! runtime overhead is added. Nothing here loads a model.
+//! These are planning heuristics, not measurements: weights are the on-disk safetensors or GGUF
+//! size, the KV cache follows the attention layout declared in `config.json` or the GGUF header,
+//! and a fixed runtime overhead is added. Nothing here loads a model.
 
 use std::fs;
 use std::path::Path;
@@ -142,6 +142,34 @@ impl Architecture {
             max_positions: uint(text, "max_position_embeddings"),
         })
     }
+
+    /// Reads the attention layout from GGUF header metadata. Sliding-window patterns are not
+    /// described there, so those layers count as full attention: an upper bound on the cache.
+    /// Hybrid models that declare `full_attention_interval` keep KV only on those layers.
+    pub fn from_gguf(info: &crate::llm::local_format::GgufInfo) -> Option<Self> {
+        let layers = info.block_count.filter(|layers| *layers > 0)?;
+        let values_per_token_per_layer = if let Some(rank) = info.kv_lora_rank {
+            rank + info.rope_dimension_count.unwrap_or(0)
+        } else {
+            let heads = info.head_count.filter(|heads| *heads > 0)?;
+            let kv_heads = info.head_count_kv.unwrap_or(heads);
+            let fallback = || Some(info.embedding_length? / heads);
+            let key = info.key_length.or_else(fallback)?;
+            let value = info.value_length.or_else(fallback)?;
+            kv_heads * (key + value)
+        };
+        let full_layers = match info.full_attention_interval.filter(|every| *every > 1) {
+            Some(every) => layers.div_ceil(every),
+            None => layers,
+        };
+        Some(Self {
+            full_layers,
+            windowed_layers: 0,
+            window: 0,
+            values_per_token_per_layer,
+            max_positions: info.context_length,
+        })
+    }
 }
 
 /// Quantization bits declared by `quantization` or `quantization_config`, if any.
@@ -192,6 +220,43 @@ pub fn resident_bytes(
     kv_bits: Option<u8>,
 ) -> u64 {
     weights_bytes + kv_bytes(arch, context, kv_bits) + overhead_bytes(weights_bytes)
+}
+
+/// Context to serve a GGUF model with. `llama-server` preallocates the whole KV cache, so the
+/// requested window (else the model's native one) is capped at the largest context that keeps
+/// weights plus cache within the comfortable memory budget, rounded down to 256 tokens. `None` when
+/// the header cannot be read; the native window when memory is unknown.
+pub fn gguf_serving_context(
+    path: &Path,
+    requested: Option<u64>,
+    kv_bits: Option<u8>,
+) -> Option<u64> {
+    static MEMORY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let info = crate::llm::local_format::gguf_info(path)?;
+    let arch = Architecture::from_gguf(&info)?;
+    let weights = crate::llm::local_format::gguf_weight_bytes(path)?;
+    let memory = *MEMORY.get_or_init(physical_memory_bytes);
+    serving_context(weights, &arch, requested, kv_bits, memory)
+}
+
+fn serving_context(
+    weights: u64,
+    arch: &Architecture,
+    requested: Option<u64>,
+    kv_bits: Option<u8>,
+    memory: Option<u64>,
+) -> Option<u64> {
+    let wanted = requested
+        .filter(|tokens| *tokens > 0)
+        .or(arch.max_positions)
+        .map(|tokens| effective_context(tokens, arch))?;
+    let affordable = max_context(weights, arch, kv_bits, memory);
+    let context = if affordable == 0 {
+        wanted
+    } else {
+        wanted.min(affordable)
+    };
+    Some((context / 256 * 256).max(256))
 }
 
 /// Context actually used: the requested length capped by the native maximum when known.
@@ -275,6 +340,62 @@ mod tests {
             values_per_token_per_layer: values,
             max_positions: None,
         }
+    }
+
+    #[test]
+    fn gguf_layout_counts_kv_heads_and_only_attention_layers_of_hybrids() {
+        let info = crate::llm::local_format::GgufInfo {
+            block_count: Some(48),
+            head_count: Some(32),
+            head_count_kv: Some(4),
+            key_length: Some(256),
+            value_length: Some(256),
+            context_length: Some(262_144),
+            ..Default::default()
+        };
+        let dense = Architecture::from_gguf(&info).unwrap();
+        assert_eq!(dense.full_layers, 48);
+        assert_eq!(dense.values_per_token_per_layer, 4 * 512);
+        assert_eq!(dense.max_positions, Some(262_144));
+        let hybrid = Architecture::from_gguf(&crate::llm::local_format::GgufInfo {
+            full_attention_interval: Some(4),
+            ..info.clone()
+        })
+        .unwrap();
+        assert_eq!(hybrid.full_layers, 12);
+        let derived = Architecture::from_gguf(&crate::llm::local_format::GgufInfo {
+            key_length: None,
+            value_length: None,
+            embedding_length: Some(4096),
+            ..info
+        })
+        .unwrap();
+        assert_eq!(derived.values_per_token_per_layer, 4 * 2 * 128);
+    }
+
+    #[test]
+    fn serving_context_caps_native_windows_to_memory_and_honors_requests() {
+        let layout = Architecture {
+            max_positions: Some(262_144),
+            ..arch(32, 2048)
+        };
+        let weights = 8 * GIB;
+        let memory = Some(32 * GIB);
+        let fitted = serving_context(weights, &layout, None, None, memory).unwrap();
+        assert!(fitted < 262_144 && fitted % 256 == 0, "{fitted}");
+        assert!(resident_bytes(weights, &layout, fitted, None) <= (32 * GIB) * 6 / 10);
+        assert_eq!(
+            serving_context(weights, &layout, Some(32_768), None, memory),
+            Some(32_768)
+        );
+        assert_eq!(
+            serving_context(weights, &layout, None, None, None),
+            Some(262_144)
+        );
+        assert_eq!(
+            serving_context(weights, &arch(32, 2048), None, None, memory),
+            None
+        );
     }
 
     #[test]

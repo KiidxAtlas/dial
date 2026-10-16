@@ -735,7 +735,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         LE,
         "Semantic memory",
         "Embeddings",
-        "Off keeps recall keyword-only. Automatic uses the embedding service when a URL and model are set. On requires them.",
+        "Off keeps recall keyword-only. Automatic uses the assigned embedding role (Alt+M), or the URL and model below when both are set. On requires one of them.",
         Kind::Enum(&[("off", "Off"), ("auto", "Automatic"), ("on", "On")]),
         true
     ),
@@ -745,7 +745,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         LE,
         "Semantic memory",
         "Embedding service URL",
-        "OpenAI-compatible base address, for example https://api.example.com/v1. Plain http:// works only on this machine.",
+        "OpenAI-compatible base address, for example https://api.example.com/v1; Ollama and Gemini roles use their native APIs. Plain http:// works only on this machine.",
         Kind::Text,
         true
     ),

@@ -604,7 +604,10 @@ fn value_text(def: &SettingDef, value: &Value) -> String {
         (Kind::AutoInt { .. } | Kind::AutoFloat { .. }, Value::String(s)) if s == "auto" => {
             "Auto".into()
         }
-        (Kind::Bool, Value::Boolean(b)) => if *b { "on" } else { "off" }.to_owned(),
+        (Kind::AutoBool, Value::String(s)) if s == "auto" => "auto".to_owned(),
+        (Kind::Bool | Kind::AutoBool, Value::Boolean(b)) => {
+            if *b { "on" } else { "off" }.to_owned()
+        }
         (Kind::Enum(options) | Kind::Choice(options), Value::String(s)) => options
             .iter()
             .find(|(v, _)| v == s)
@@ -1321,6 +1324,15 @@ impl SettingsOverlay {
             Kind::Bool => {
                 let next = !current.as_bool().unwrap_or(false);
                 self.emit_set(def, Value::Boolean(next))
+            }
+            Kind::AutoBool => {
+                // Cycles on -> off -> auto -> on; `auto` is the string form, not a boolean.
+                let next = match current {
+                    Value::Boolean(true) => Value::Boolean(false),
+                    Value::Boolean(false) => Value::String("auto".to_owned()),
+                    _ => Value::Boolean(true),
+                };
+                self.emit_set(def, next)
             }
             Kind::Enum(options) | Kind::Choice(options) => {
                 let mut choices: Vec<String> = options
@@ -2196,6 +2208,7 @@ impl SettingsOverlay {
                     }
                     Some(Row::Setting(i)) => match settings_schema::registry()[i].kind {
                         Kind::Bool => "toggle",
+                        Kind::AutoBool => "cycle",
                         Kind::Enum(_) | Kind::Choice(_) | Kind::Theme => "choose",
                         _ => "edit",
                     },
@@ -2542,6 +2555,24 @@ mod tests {
             "{welcome}"
         );
         assert!(screen.contains("Save to: This project"));
+    }
+
+    #[test]
+    fn auto_bool_cycles_true_false_auto_then_true() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        goto(&mut o, &rig.keys, "assistance.lean_local");
+        let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        assert_eq!(
+            (path.as_str(), value),
+            ("assistance.lean_local", Value::Boolean(true))
+        );
+        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        assert_eq!(value, Value::Boolean(false));
+        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        assert_eq!(value, Value::String("auto".to_owned()));
+        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+        assert_eq!(value, Value::Boolean(true));
     }
 
     #[test]

@@ -605,6 +605,45 @@ def adapter_combine(request):
     return result
 
 
+def fuse(request):
+    """Merge a validated adapter into its base and save a standalone MLX checkpoint.
+
+    The checkpoint keeps the base quantization unless `dequantize` asks for full-precision weights
+    (the input llama.cpp's converter expects). Output is published by one rename.
+    """
+    import shutil
+    import tempfile
+    from mlx.utils import tree_unflatten
+    from mlx_lm.utils import dequantize_model, save
+    model_name = resolve_model(string(request, "model"))
+    adapter = string(request, "adapter")
+    output = Path(string(request, "output"))
+    dequantize = request.get("dequantize", False)
+    require(type(dequantize) is bool, "dequantize must be a boolean")
+    require(output.is_absolute() and not output.exists(), "output must be a new absolute path")
+    require(output.parent.is_dir(), "output parent must exist")
+    model, tokenizer = load_base(model_name)
+    config = json.loads((Path(model_name) / "config.json").read_text())
+    apply_adapter(model, model_name, adapter)
+    fused = [(name, module.fuse(dequantize=dequantize)) for name, module in model.named_modules()
+             if hasattr(module, "fuse")]
+    require(bool(fused), "adapter has no LoRA layers to fuse")
+    model.update_modules(tree_unflatten(fused))
+    if dequantize:
+        model = dequantize_model(model)
+        config.pop("quantization", None)
+        config.pop("quantization_config", None)
+    staging = Path(tempfile.mkdtemp(prefix=".fuse-", dir=output.parent))
+    try:
+        save(staging, model_name, model, tokenizer, config, donate_model=False)
+        os.rename(staging, output)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return {"output": str(output), "model_type": config.get("model_type"), "layers": len(fused),
+            "dequantized": dequantize}
+
+
 def probe_adapter(model, tokens):
     """One small update and a serialized reload; never saves an admitted adapter."""
     import tempfile
@@ -1101,7 +1140,8 @@ def main():
         from dial_steering import operation as steering_operation
         operations = {"steering_extract":steering_operation,"steering_evaluate":steering_operation,"steering_import":steering_operation,
                       "steering_bake":steering_operation,"capabilities": capabilities, "generate": generate,
-                      "train": train, "sensitivity": sensitivity, "score": score, "adapter_combine": adapter_combine}
+                      "train": train, "sensitivity": sensitivity, "score": score, "adapter_combine": adapter_combine,
+                      "fuse": fuse}
         operation = request.get("op")
         require(isinstance(operation, str) and operation in operations, "unsupported operation")
         phase = operation

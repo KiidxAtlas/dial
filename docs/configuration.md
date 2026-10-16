@@ -11,6 +11,12 @@ unreadable, invalid UTF-8, oversized, linked or non-regular layers produce a pat
 than silently falling back to different settings. Files must be owned by the current user without
 hard links; symlinked files and user-owned symlink ancestors are refused. Valid files are owner-private.
 
+A running session reloads settings that change on disk, except its model choices. The main model
+(`model`, `provider`, `endpoint`, `model_profile`, `context_window`) and `[model_roles]` stay as
+they were when the session started, so picking a model in one terminal never switches another
+terminal's session. A model picked in a session applies there immediately and is saved as the
+default for sessions started later.
+
 Learning stores and adapters are additionally isolated under
 `~/.dial/projects/<name>-<hash>/models/<identity>/`, so switching providers/models does not reuse an
 incompatible adapter. Sessions, skills, memory and prompt history remain project-scoped.

@@ -64,6 +64,18 @@ pub enum Cmd {
     Import {
         pack: PathBuf,
     },
+    /// Merge an adapter version into its MLX base: a standalone checkpoint that Dial, LM Studio
+    /// and mlx_lm serve without the adapter.
+    Fuse {
+        /// Adapter version (default: the active version).
+        version: Option<i64>,
+        #[arg(long)]
+        out: PathBuf,
+        /// Write full-precision weights (input for llama.cpp's GGUF converter) instead of keeping
+        /// the base quantization.
+        #[arg(long)]
+        dequantize: bool,
+    },
     /// Run the local gate on a pending candidate, such as an imported pack.
     Evaluate {
         candidate: i64,
@@ -129,6 +141,16 @@ pub fn run(cmd: Cmd, layout: &Layout, mut config: Config) -> Result<()> {
         Cmd::Tasks => print_json(&dial::learn::repository::load(&config)?.iter().map(|t|json!({"id":t.spec.id,"split":t.spec.split,"digest":t.digest,"files":t.files.len()})).collect::<Vec<_>>())?,
         Cmd::Versions => print_json(&store.versions()?)?,
         Cmd::Export { version, out } => print_json(&dial::pack::export_adapter(&config, &store, version, &out)?)?,
+        Cmd::Fuse { version, out, dequantize } => {
+            let version = match version { Some(id) => store.version(id)?, None => store.active()? };
+            ensure!(version.kind == "lora", "only LoRA adapter versions can be fused; version {} is {}", version.id, version.kind);
+            improve::verify_adapter(&store, &version)?;
+            let adapter = version.adapter.as_ref().context("version has no adapter")?;
+            let out = std::path::absolute(&out)?;
+            let _compute = if config.uses_local_compute() { Some(dial::learn::compute::Background::acquire(&config)?) } else { None };
+            let fused = dial::learn::worker::fuse(&config, &config.model, adapter, &out, dequantize)?;
+            print_json(&json!({"version":version.id,"fused":fused}))?;
+        }
         Cmd::Import { pack } => {
             let control = auto::lock_file(&config.state_dir.join("control.lock"))?;
             control.try_lock_exclusive().context("an improvement cycle is using the version store")?;

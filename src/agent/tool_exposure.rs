@@ -1,6 +1,7 @@
 //! Tool exposure: offered tools, discovery, schemas and request records.
 
 use super::*;
+use crate::config::types::{LEAN_AUTO_MAX_WINDOW, LeanLocal};
 
 impl<'a> Agent<'a> {
     /// Local servers serve a context of their own choosing, often far below Dial's default: LM Studio
@@ -29,7 +30,12 @@ impl<'a> Agent<'a> {
             config.request_headers(),
         );
         if let Some(loaded) = loaded {
+            let lean = self.lean_local();
             self.context_cap = Some(loaded);
+            // The loaded window can switch the lean profile on or off; re-render the prompt once here.
+            if self.lean_local() != lean {
+                self.rebuild_system();
+            }
         }
     }
 
@@ -47,12 +53,57 @@ impl<'a> Agent<'a> {
         "tool_load",
     ];
 
+    /// Initial tool budget under the lean local profile. A configured 0 (unlimited) becomes this bound.
+    const LEAN_INITIAL_TOOL_LIMIT: usize = 8;
+
+    /// Lean local profile (`assistance.lean_local`): compact tool interface, a bounded initial tool
+    /// budget, omitted optional prompt sections and, on a single-request server, no up-front delegation.
+    /// It applies only when the main model is served locally (no endpoint, or a loopback or LAN host,
+    /// as `Config::local_main_model` classifies it); hosted routes and hermetic runs are unchanged.
+    ///
+    /// `auto` decides from the planned window (`context_window`). That window changes only when the
+    /// server probe reports a loaded size or the session switches; `probe_context` re-renders the system
+    /// prompt when such a change flips the profile, so the prefix stays byte-stable within a turn.
+    pub(super) fn lean_local(&self) -> bool {
+        if self.hermetic || !self.config.local_main_model() {
+            return false;
+        }
+        match self.config.assistance.lean_local {
+            LeanLocal::Off => false,
+            LeanLocal::On => true,
+            LeanLocal::Auto => self.context_window() <= LEAN_AUTO_MAX_WINDOW,
+        }
+    }
+
+    /// Whether the selected provider serves one request at a time: `task.provider_concurrency` is unset
+    /// or at most 1 (the slot limit `provider_slots` applies to a local server).
+    fn single_request_server(&self) -> bool {
+        self.config
+            .task
+            .provider_concurrency
+            .get(&self.config.selection().provider)
+            .copied()
+            .is_none_or(|limit| limit <= 1)
+    }
+
+    /// The configured initial tool budget, capped under the lean local profile.
+    fn initial_tool_limit(&self) -> usize {
+        let configured = self.config.assistance.initial_tool_limit;
+        match (self.lean_local(), configured) {
+            (true, 0) => Self::LEAN_INITIAL_TOOL_LIMIT,
+            (true, limit) => limit.min(Self::LEAN_INITIAL_TOOL_LIMIT),
+            (false, limit) => limit,
+        }
+    }
+
     /// Discovery mode: offer a bounded core and let the model load specialists with `tool_search`/
     /// `tool_load`. Meant for small local models whose schema budget is tight; off by default
     /// because every discovery costs a full extra request and the tool list change invalidates the
     /// provider's prompt cache.
     pub(super) fn tool_discovery(&self) -> bool {
-        !self.hermetic && self.config.efficiency.enabled && self.config.assistance.compact_tools
+        !self.hermetic
+            && self.config.efficiency.enabled
+            && (self.config.assistance.compact_tools || self.lean_local())
     }
 
     /// Most tools that discovery (`tool_search`, harness compatibility loads) keeps active at once in compact
@@ -290,9 +341,14 @@ impl<'a> Agent<'a> {
             assistance::compact(
                 &mut names,
                 &loaded,
-                self.config.assistance.initial_tool_limit,
+                self.initial_tool_limit(),
                 &self.assistance.scores,
             );
+        }
+        // The lean budget can trim `message` while `task` stays; peer messaging follows `task` (line 280).
+        if names.iter().any(|name| name == "task") && !names.iter().any(|name| name == "message") {
+            names.push("message".into());
+            names.sort();
         }
         for tool in context_notes::TOOL_NAMES {
             if catalog.iter().any(|name| name == tool) && self.plan_tool_available(tool) {
@@ -329,6 +385,12 @@ impl<'a> Agent<'a> {
         // Peer messaging follows the `task` offer after mode and profile filters have settled.
         if !names.iter().any(|name| name == "task") {
             names.retain(|name| name != "message");
+        }
+        // A single-request local server queues every fan-out behind the running request, so the lean
+        // profile does not offer `task` (and so `message`) up front; `tool_load` or the loadable list
+        // still reaches them, and an explicit load keeps them offered.
+        if self.lean_local() && self.single_request_server() && !loaded.contains("task") {
+            names.retain(|name| name != "task" && name != "message");
         }
         if self.lean_tools {
             names.retain(|name| Self::LEAN_TOOLS.contains(&name.as_str()) || loaded.contains(name));
@@ -384,10 +446,7 @@ impl<'a> Agent<'a> {
                     json!({"type":"function","function":{"name":other,"description":description,"parameters":parameters}})
                 }
             });
-            if !self.hermetic
-                && self.config.efficiency.enabled
-                && self.config.assistance.compact_tools
-            {
+            if self.tool_discovery() {
                 let description = match name.as_str() {
                     "write" => Some(
                         "Write complete UTF-8 source to a workspace path; guarded syntax and normal approvals apply.",
@@ -565,9 +624,69 @@ mod default_offer_tests {
             .len()
     }
 
+    /// System messages with the per-test project directory masked, so prompts built in different
+    /// temporary projects compare equal.
+    fn system_text(agent: &Agent<'_>) -> String {
+        let root = agent.workspace.root().display().to_string();
+        serde_json::to_string(&agent.system_messages())
+            .unwrap()
+            .replace(&root, "<project>")
+    }
+
+    #[test]
+    fn lean_local_profile_shrinks_the_request_and_stays_byte_stable_across_turns() {
+        // The bytes a local server prefills: the system messages and the offered tool schemas.
+        fn request(agent: &Agent<'_>) -> (String, String, Vec<String>) {
+            let offered = agent.offered();
+            let tools = serde_json::to_string(&agent.schemas(&offered).unwrap()).unwrap();
+            (system_text(agent), tools, offered)
+        }
+        let default = with_agent("[assistance]\nlean_local=false", |agent| request(agent));
+        let lean = with_agent("[assistance]\nlean_local=true", |agent| {
+            let first = request(agent);
+            // A following turn rebuilds the prefix from the same state and must not change a byte.
+            agent.rebuild_system();
+            assert_eq!(request(agent), first);
+            first
+        });
+        // Discovery lists the tools it does not offer, so the system text may grow slightly;
+        // the prefill as a whole must shrink.
+        let (lean_total, default_total) = (
+            lean.0.len() + lean.1.len(),
+            default.0.len() + default.1.len(),
+        );
+        assert!(
+            lean_total < default_total,
+            "prefill {lean_total} vs {default_total}"
+        );
+        assert!(
+            lean.1.len() < default.1.len(),
+            "schemas {} vs {}",
+            lean.1.len(),
+            default.1.len()
+        );
+        assert!(lean.2.len() < default.2.len(), "offered {:?}", lean.2);
+        assert!(!lean.0.contains("# Visual verification"));
+        assert!(default.0.contains("# Visual verification"));
+    }
+
+    #[test]
+    fn lean_local_profile_leaves_hosted_routes_unchanged() {
+        let overlay = "[endpoint]\nbase_url='https://api.example.com/v1'\n";
+        let default = with_agent(overlay, |agent| (system_text(agent), agent.offered()));
+        let lean = with_agent(
+            &format!("{overlay}[assistance]\nlean_local=true"),
+            |agent| {
+                assert!(!agent.lean_local());
+                (system_text(agent), agent.offered())
+            },
+        );
+        assert_eq!(lean, default);
+    }
+
     #[test]
     fn message_is_offered_with_task_whether_or_not_a_worker_is_live() {
-        with_agent("", |agent| {
+        with_agent("[assistance]\nlean_local=false", |agent| {
             // No worker runs here, so the offer must already include `message` with `task`; a live
             // worker cannot change it because the offer no longer reads worker state.
             assert!(!agent.live_task_control().any_running());
@@ -583,7 +702,7 @@ mod default_offer_tests {
 
     #[test]
     fn default_offer_defers_overlapping_specialists_but_lists_them_as_loadable() {
-        with_agent("", |agent| {
+        with_agent("[assistance]\nlean_local=false", |agent| {
             let offered = agent.offered();
             let catalog = agent.catalog();
             for core in [
@@ -663,7 +782,7 @@ mod default_offer_tests {
     #[test]
     fn pinned_harness_selection_keeps_deferred_tools_offered() {
         with_agent(
-            "[harness]\ntools=['read','edit','bash','recall','retain','memory_update']",
+            "[harness]\ntools=['read','edit','bash','recall','retain','memory_update']\n[assistance]\nlean_local=false",
             |agent| {
                 let offered = agent.offered();
                 assert!(
@@ -812,5 +931,79 @@ mod default_offer_tests {
                 );
             },
         );
+    }
+
+    /// `auto` follows the planned window on local routes only; an explicit value overrides the window, and
+    /// hosted routes never lean.
+    #[test]
+    fn lean_local_auto_follows_the_planned_window_and_explicit_values_override_it() {
+        let lean = |overlay: &str| with_agent(overlay, |agent| agent.lean_local());
+        // Auto is the default: a local route (no endpoint, or loopback) leans at or under 32k only.
+        assert!(lean("context_window=32768"));
+        assert!(!lean("context_window=32769"));
+        assert!(lean(
+            "context_window=8192\n[endpoint]\nbase_url='http://127.0.0.1:9/v1'"
+        ));
+        assert!(lean(
+            "context_window=32768\n[assistance]\nlean_local='auto'"
+        ));
+        assert!(!lean(
+            "context_window=65536\n[assistance]\nlean_local='auto'"
+        ));
+        // Explicit false opts out even on a small local window; explicit true forces a large one.
+        assert!(!lean("context_window=8192\n[assistance]\nlean_local=false"));
+        assert!(lean("context_window=65536\n[assistance]\nlean_local=true"));
+        // Hosted routes never lean, in any mode.
+        for mode in [
+            "",
+            "[assistance]\nlean_local=true",
+            "[assistance]\nlean_local='auto'",
+        ] {
+            let overlay = format!(
+                "context_window=8192\n[endpoint]\nbase_url='https://api.example.com/v1'\n{mode}"
+            );
+            assert!(!lean(&overlay), "{overlay}");
+        }
+    }
+
+    /// On a single-request local server the lean profile keeps `task` and `message` out of the first
+    /// request and the delegation section with them; loading `task` brings all three back.
+    #[test]
+    fn lean_single_slot_server_defers_delegation_until_loaded() {
+        let overlay = "[endpoint]\nbase_url='http://127.0.0.1:9/v1'\n[assistance]\nlean_local=true";
+        with_agent(overlay, |agent| {
+            assert!(agent.lean_local());
+            let offered = agent.offered();
+            assert!(!offered.iter().any(|name| name == "task"), "{offered:?}");
+            assert!(!offered.iter().any(|name| name == "message"), "{offered:?}");
+            assert!(
+                agent
+                    .discoverable_tools(&offered)
+                    .iter()
+                    .any(|(name, _)| name == "task")
+            );
+            let prompt = serde_json::to_string(&agent.system_messages()).unwrap();
+            assert!(!prompt.contains("# Delegation"), "{prompt}");
+            agent.activate_tools(&["task".to_owned()]).unwrap();
+            let offered = agent.offered();
+            assert!(offered.iter().any(|name| name == "task"), "{offered:?}");
+            assert!(offered.iter().any(|name| name == "message"), "{offered:?}");
+            let prompt = serde_json::to_string(&agent.system_messages()).unwrap();
+            assert!(prompt.contains("# Delegation"));
+        });
+    }
+
+    /// A server with a concurrency limit above one can run fan-out, so the lean profile offers it up front.
+    #[test]
+    fn lean_multi_slot_server_keeps_delegation_offered() {
+        let overlay = "[endpoint]\nbase_url='http://127.0.0.1:9/v1'\n[assistance]\nlean_local=true\n[task.provider_concurrency]\nendpoint=2";
+        with_agent(overlay, |agent| {
+            assert!(agent.lean_local());
+            let offered = agent.offered();
+            assert!(offered.iter().any(|name| name == "task"), "{offered:?}");
+            assert!(offered.iter().any(|name| name == "message"), "{offered:?}");
+            let prompt = serde_json::to_string(&agent.system_messages()).unwrap();
+            assert!(prompt.contains("# Delegation"));
+        });
     }
 }

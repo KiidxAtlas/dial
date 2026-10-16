@@ -413,7 +413,48 @@ pub fn current_lora_probe(caps: &Value) -> bool {
     caps["lora_probe_version"].as_u64() == Some(2)
 }
 
+/// Capabilities of GGUF and Splash models, answered without the MLX-only Python worker: GGUF serves
+/// inference through `llama-server` but cannot be LoRA-trained (training needs MLX weights), and a
+/// Splash bundle can only be run by LM Studio. `None` for MLX checkpoints and unresolved models.
+fn non_mlx_capabilities(model: &str) -> Option<Value> {
+    use crate::llm::local_format::{self, LocalFormat};
+    let resolved = crate::llm::catalog::resolve_local_model(model).ok();
+    let path = std::path::absolute(resolved.as_deref().unwrap_or(model)).ok()?;
+    let unsupported = [
+        "expert_growth",
+        "routing_calibration",
+        "attention_retrofit",
+        "learned_step_probe",
+    ];
+    let (inference, reason) = match local_format::detect(&path)? {
+        LocalFormat::Mlx => return None,
+        LocalFormat::Gguf if local_format::llama_server().is_some() => (
+            true,
+            "GGUF model served by llama.cpp: inference and evaluation are supported; LoRA training needs MLX weights".to_owned(),
+        ),
+        LocalFormat::Gguf => (
+            false,
+            "GGUF models need llama.cpp's `llama-server`: install llama.cpp or set DIAL_LLAMA_SERVER".to_owned(),
+        ),
+        LocalFormat::Splash => (
+            false,
+            "Splash bundles can only be run by LM Studio: select the model under the LM Studio provider".to_owned(),
+        ),
+    };
+    Some(json!({
+        "inference": inference,
+        "lora": false,
+        "lora_probe_version": 2,
+        "reason": reason,
+        "unsupported": unsupported,
+        "resolved_model": path,
+    }))
+}
+
 pub fn capabilities(config: &Config) -> Result<Value> {
+    if let Some(result) = non_mlx_capabilities(&config.model) {
+        return validate_capabilities(result);
+    }
     let result = call(
         config,
         &json!({"op": "capabilities", "model": config.model}),
@@ -425,6 +466,9 @@ pub fn capabilities_controlled(
     config: &Config,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Value> {
+    if let Some(result) = non_mlx_capabilities(&config.model) {
+        return validate_capabilities(result);
+    }
     crate::setup::refresh_worker(config)?;
     ensure!(
         config.python.is_absolute() && config.worker.is_absolute(),
@@ -466,8 +510,8 @@ fn validate_capabilities(result: Value) -> Result<Value> {
             parsed
                 .resolved_model
                 .as_ref()
-                .is_some_and(|path| path.is_absolute() && path.is_dir()),
-            "worker omitted resolved absolute model directory"
+                .is_some_and(|path| path.is_absolute() && (path.is_dir() || path.is_file())),
+            "worker omitted resolved absolute model path"
         );
     }
     for feature in [
@@ -806,6 +850,57 @@ pub fn adapter_combine(
     Ok(combined)
 }
 
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fused {
+    /// Standalone MLX checkpoint: the base with the adapter merged in.
+    pub output: PathBuf,
+    pub model_type: Option<String>,
+    pub layers: u32,
+    /// Full-precision weights (llama.cpp converter input) rather than the base quantization.
+    pub dequantized: bool,
+}
+
+/// Merge an MLX adapter into `model`, writing a standalone checkpoint that any MLX server (Dial,
+/// LM Studio, mlx_lm) loads without the adapter. `dequantize` writes full-precision weights, the
+/// input llama.cpp's `convert_hf_to_gguf.py` expects; otherwise the base quantization is kept.
+pub fn fuse(
+    config: &Config,
+    model: &str,
+    adapter: &Path,
+    output: &Path,
+    dequantize: bool,
+) -> Result<Fused> {
+    let model = crate::llm::catalog::resolve_local_model(model)?;
+    ensure!(
+        crate::llm::local_format::detect(Path::new(&model))
+            == Some(crate::llm::local_format::LocalFormat::Mlx),
+        "fusing needs a local MLX base checkpoint"
+    );
+    ensure!(adapter.is_absolute(), "adapter path must be absolute");
+    fresh_output(output)?;
+    let result = call(
+        config,
+        &json!({"op": "fuse", "model": model, "adapter": adapter, "output": output, "dequantize": dequantize}),
+    )?;
+    let fused: Fused = serde_json::from_value(result).context("invalid fuse response")?;
+    ensure!(
+        same_dir(&fused.output, output)
+            && fused.dequantized == dequantize
+            && crate::llm::local_format::detect(output)
+                == Some(crate::llm::local_format::LocalFormat::Mlx),
+        "worker did not produce the requested checkpoint"
+    );
+    Ok(fused)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Baked {
@@ -942,6 +1037,36 @@ pub fn choose_layers(scores: &[f64], coverage: f64, min: u32, max: u32) -> u32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn gguf_and_splash_models_answer_capabilities_without_the_mlx_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let gguf = root.path().join("m.gguf");
+        std::fs::write(&gguf, b"GGUF\x03\0\0\0rest").unwrap();
+        let caps = non_mlx_capabilities(gguf.to_str().unwrap()).unwrap();
+        assert_eq!(caps["lora"], false);
+        assert_eq!(
+            caps["inference"],
+            crate::llm::local_format::llama_server().is_some()
+        );
+        validate_capabilities(caps).unwrap();
+
+        let splash = root.path().join("splash");
+        for dir in ["target", "tokenizer"] {
+            std::fs::create_dir_all(splash.join(dir)).unwrap();
+        }
+        std::fs::write(splash.join("manifest.json"), "{}").unwrap();
+        let caps = non_mlx_capabilities(splash.to_str().unwrap()).unwrap();
+        assert_eq!(caps["inference"], false);
+        assert!(caps["reason"].as_str().unwrap().contains("LM Studio"));
+        validate_capabilities(caps).unwrap();
+
+        let mlx = root.path().join("mlx");
+        std::fs::create_dir(&mlx).unwrap();
+        std::fs::write(mlx.join("config.json"), "{}").unwrap();
+        std::fs::write(mlx.join("model.safetensors"), b"x").unwrap();
+        assert!(non_mlx_capabilities(mlx.to_str().unwrap()).is_none());
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_handoff_delivers_stdin_and_drains_output() {
@@ -965,6 +1090,92 @@ mod tests {
     fn unresponsive_training_is_preempted_and_retries_its_committed_checkpoint() {
         handoff_fixture(true);
     }
+    #[cfg(unix)]
+    #[test]
+    fn fuse_publishes_a_checkpoint_and_validates_the_worker_reply() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(base.join("config.json"), "{}").unwrap();
+        std::fs::write(base.join("model.safetensors"), "x").unwrap();
+        let adapter = root.path().join("adapter");
+        let request = root.path().join("request.json");
+        let config = Config {
+            state_dir: root.path().join("state"),
+            user_dir: root.path().join("user"),
+            python: PathBuf::from("/usr/bin/python3"),
+            worker: root.path().join("worker.py"),
+            model: "fixture".into(),
+            worker_timeout_secs: 60,
+            ..Config::default()
+        };
+        std::fs::write(
+            &config.worker,
+            format!(
+                r#"
+import json,sys
+from pathlib import Path
+r=json.load(sys.stdin)
+Path({request:?}).write_text(json.dumps(r))
+out=Path(r['output'])
+out.mkdir()
+(out/'config.json').write_text('{{}}')
+if out.name != 'empty':
+    (out/'model.safetensors').write_text('x')
+print(json.dumps({{'output':str(out),'model_type':'llama','layers':4,'dequantized':r['dequantize']}}))
+"#,
+                request = request.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let base_name = base.to_str().unwrap();
+
+        let output = root.path().join("twin");
+        let fused = fuse(&config, base_name, &adapter, &output, false).unwrap();
+        assert_eq!(
+            fused.output.canonicalize().unwrap(),
+            output.canonicalize().unwrap()
+        );
+        assert_eq!((fused.layers, fused.dequantized), (4, false));
+        let sent: Value =
+            serde_json::from_str(&std::fs::read_to_string(&request).unwrap()).unwrap();
+        assert_eq!(sent["op"], "fuse");
+        assert_eq!(sent["dequantize"], false);
+        assert_eq!(sent["adapter"], adapter.to_str().unwrap());
+        let full = fuse(
+            &config,
+            base_name,
+            &adapter,
+            &root.path().join("full"),
+            true,
+        )
+        .unwrap();
+        assert!(full.dequantized);
+
+        let error = fuse(&config, base_name, &adapter, &output, false).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        let error = fuse(
+            &config,
+            base_name,
+            &adapter,
+            &root.path().join("empty"),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("did not produce"), "{error}");
+        let gguf_base = root.path().join("m.gguf");
+        std::fs::write(&gguf_base, b"GGUF\x03\0\0\0").unwrap();
+        let error = fuse(
+            &config,
+            gguf_base.to_str().unwrap(),
+            &adapter,
+            &root.path().join("g"),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("MLX base"), "{error}");
+    }
+
     #[cfg(unix)]
     fn handoff_fixture(unresponsive: bool) {
         use fs2::FileExt;
@@ -1033,7 +1244,7 @@ else:
                 let request = super::super::compute::Request::foreground(&config.user_dir).unwrap();
                 let lock =
                     super::super::auto::lock_file(&config.user_dir.join("compute.lock")).unwrap();
-                while lock.try_lock_exclusive().is_err() {
+                while fs2::FileExt::try_lock_shared(&lock).is_err() {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
                 }

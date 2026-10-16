@@ -73,6 +73,34 @@ const KNOWN: &[(&str, &str, &str, &str)] = &[
         "DEEPSEEK_API_KEY",
     ),
 ];
+/// What a model is for, taken from structured provider or checkpoint metadata, never from its
+/// display name or source text. `Unknown` means no source said; it stays chat-eligible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    #[default]
+    Unknown,
+    Chat,
+    Embedding,
+    Rerank,
+    Image,
+    Audio,
+}
+impl ModelKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Chat => "chat",
+            Self::Embedding => "embedding",
+            Self::Rerank => "rerank",
+            Self::Image => "image",
+            Self::Audio => "audio",
+        }
+    }
+    pub fn supports_chat(self) -> bool {
+        matches!(self, Self::Chat | Self::Unknown)
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub selection: ModelSelection,
@@ -81,6 +109,14 @@ pub struct ModelEntry {
     pub available: bool,
     #[serde(default)]
     pub metadata: ModelMetadata,
+}
+impl ModelEntry {
+    pub fn is_embedding(&self) -> bool {
+        self.metadata.kind == ModelKind::Embedding
+    }
+    pub fn supports_chat(&self) -> bool {
+        self.metadata.kind.supports_chat()
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct ModelMetadata {
@@ -102,6 +138,9 @@ pub struct ModelMetadata {
     /// Automatic local verification progress; no model weights are loaded during discovery itself.
     #[serde(default)]
     pub lora_check: Option<LoraCheck>,
+    /// What the model is for. Set from structured provider or checkpoint metadata only.
+    #[serde(default)]
+    pub kind: ModelKind,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoraCheck {
@@ -270,6 +309,7 @@ fn metadata(row: &Value) -> ModelMetadata {
                 .filter(|n| *n > 0)
         }),
         pricing,
+        kind: declared_kind(row),
         ..Default::default()
     }
 }
@@ -279,11 +319,27 @@ pub fn local_lora_support(user_dir: &Path, model: &Path) -> Option<bool> {
     lora_support(mlx_architectures(user_dir).as_deref(), model)
 }
 
-/// Read local capabilities without importing Python or loading model weights.
+/// Read local capabilities without importing Python or loading model weights. GGUF models are read
+/// from their header (chat template) and a sibling `mmproj` projector, which `llama-server` loads.
 pub fn local_model_metadata(model: &Path) -> ModelMetadata {
+    if !model.join("config.json").is_file()
+        && let Some(info) = crate::llm::local_format::gguf_info(model)
+    {
+        let mut metadata = ModelMetadata {
+            vision: Some(crate::llm::local_format::gguf_projector(model).is_some()),
+            ..Default::default()
+        };
+        if let Some(template) = &info.chat_template {
+            classify_template(&mut metadata, template);
+        }
+        return metadata;
+    }
     read_json(&model.join("config.json"))
         .map(|value| {
             let mut info = metadata(&value);
+            if is_embedding_checkpoint(model) {
+                info.kind = ModelKind::Embedding;
+            }
             // A downloaded text-only configuration has no vision encoder.
             info.vision = Some(info.vision.unwrap_or(false));
             // These are template declarations, not inference or quality checks. Missing
@@ -312,23 +368,30 @@ pub fn local_model_metadata(model: &Path) -> ModelMetadata {
                     (template.len() as u64 <= MAX_RESPONSE).then_some(template)
                 });
             if let Some(template) = template {
-                info.tools = info.tools.or_else(|| {
-                    (template.contains("tools")
-                        && ["tool_call", "function_call", "[TOOL_CALLS]"]
-                            .iter()
-                            .any(|marker| template.contains(marker)))
-                    .then_some(true)
-                });
-                info.reasoning = info.reasoning.or_else(|| {
-                    (template.contains("enable_thinking")
-                        || (template.contains("<think>") && template.contains("</think>")))
-                    .then_some(true)
-                });
+                classify_template(&mut info, &template);
             }
             info
         })
         .unwrap_or_default()
 }
+
+/// Tool and reasoning support declared by a chat template. These are template declarations, not
+/// inference or quality checks; values already known are kept.
+fn classify_template(info: &mut ModelMetadata, template: &str) {
+    info.tools = info.tools.or_else(|| {
+        (template.contains("tools")
+            && ["tool_call", "function_call", "[TOOL_CALLS]"]
+                .iter()
+                .any(|marker| template.contains(marker)))
+        .then_some(true)
+    });
+    info.reasoning = info.reasoning.or_else(|| {
+        (template.contains("enable_thinking")
+            || (template.contains("<think>") && template.contains("</think>")))
+        .then_some(true)
+    });
+}
+
 /// Cache-only lookup: never make a metadata request in the inference hot path.
 pub fn model_metadata(layout: &Layout, selection: &ModelSelection) -> ModelMetadata {
     if selection.provider == super::chatgpt::PROVIDER {
@@ -698,18 +761,24 @@ fn parse_models(value: &Value, probe: &Probe) -> Result<Vec<ModelEntry>> {
                 .or_else(|| row.get("name"))?
                 .as_str()?
                 .trim();
-            let model = if probe
+            let gemini = probe
                 .spec
                 .protocol
                 .unwrap_or_else(|| ApiProtocol::builtin(&probe.id))
-                == ApiProtocol::Gemini
-            {
-                if !row["supportedGenerationMethods"]
-                    .as_array()
-                    .is_some_and(|methods| methods.iter().any(|m| m == "generateContent"))
-                {
-                    return None;
-                }
+                == ApiProtocol::Gemini;
+            let methods = row["supportedGenerationMethods"].as_array();
+            let declares = |method: &str| methods.is_some_and(|m| m.iter().any(|x| x == method));
+            // Gemini states purpose only through its generation methods; rows with neither are dropped.
+            let declared = if !gemini {
+                ModelKind::Unknown
+            } else if declares("generateContent") {
+                ModelKind::Chat
+            } else if declares("embedContent") {
+                ModelKind::Embedding
+            } else {
+                return None;
+            };
+            let model = if gemini {
                 model.strip_prefix("models/").unwrap_or(model)
             } else {
                 model
@@ -740,12 +809,21 @@ fn parse_models(value: &Value, probe: &Probe) -> Result<Vec<ModelEntry>> {
             selection.context_window = selection
                 .context_window
                 .or_else(|| documented_context_window(&selection));
+            let reported = if declared == ModelKind::Unknown {
+                declared_kind(row)
+            } else {
+                declared
+            };
+            let kind = bundled::known_kind(&selection, reported);
             Some(ModelEntry {
                 selection,
                 label: model.into(),
                 source: probe.spec.label.clone(),
                 available: true,
-                metadata: metadata(row),
+                metadata: ModelMetadata {
+                    kind,
+                    ..metadata(row)
+                },
             })
         })
         .take(MAX_MODELS)
@@ -1127,6 +1205,17 @@ fn local_get(
     token: Option<&str>,
     headers: &super::model_config::ResolvedHeaders<'_>,
 ) -> Option<Value> {
+    local_request(base_url, path, None, token, headers)
+}
+
+/// [`local_get`], or a JSON POST when `body` is set (Ollama's `/api/show` is POST-only).
+fn local_request(
+    base_url: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+    headers: &super::model_config::ResolvedHeaders<'_>,
+) -> Option<Value> {
     let uri = validated_url(base_url, true).ok()?;
     if !crate::llm::is_local_host(uri.host()?) {
         return None;
@@ -1138,14 +1227,31 @@ fn local_get(
         .max_redirects(0)
         .proxy(None);
     let agent = ureq::Agent::new_with_config(builder.build());
-    let mut request = agent.get(&format!("{origin}{path}"));
-    if let Some(token) = token {
-        request = request.header("Authorization", format!("Bearer {token}"));
-    }
-    for (name, value) in headers.pairs() {
-        request = request.header(name, super::model_config::private_header_value(value).ok()?);
-    }
-    let mut response = request.call().ok()?;
+    let url = format!("{origin}{path}");
+    let mut response = match body {
+        None => {
+            let mut request = agent.get(&url);
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            for (name, value) in headers.pairs() {
+                request =
+                    request.header(name, super::model_config::private_header_value(value).ok()?);
+            }
+            request.call().ok()?
+        }
+        Some(body) => {
+            let mut request = agent.post(&url);
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            for (name, value) in headers.pairs() {
+                request =
+                    request.header(name, super::model_config::private_header_value(value).ok()?);
+            }
+            request.send_json(body).ok()?
+        }
+    };
     if !response.status().is_success() {
         return None;
     }
@@ -1169,6 +1275,34 @@ fn lmstudio_models_with_headers(
 ) -> Option<Vec<LmStudioModel>> {
     let found = parse_lmstudio(&local_get(base_url, "/api/v0/models", token, headers)?);
     (!found.is_empty()).then_some(found)
+}
+
+/// Whether the OpenAI-compatible server at `base_url` is llama.cpp's `llama-server`, recognised by
+/// the `default_generation_settings` of its native `/props` document. Only loopback/private hosts
+/// are asked (`local_request` refuses others). An answer is cached per base URL; a transport
+/// failure is not, so a server that is still starting is probed again on the next request.
+pub fn is_llama_server(
+    base_url: &str,
+    token: Option<&str>,
+    headers: &[super::model_config::RequestHeader],
+) -> bool {
+    static KNOWN: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, bool>>> =
+        std::sync::LazyLock::new(Default::default);
+    let key = base_url.trim_end_matches('/').to_owned();
+    if let Some(known) = KNOWN.lock().ok().and_then(|known| known.get(&key).copied()) {
+        return known;
+    }
+    let Ok(resolved) = super::model_config::resolve_headers(headers) else {
+        return false;
+    };
+    let Some(props) = local_get(base_url, "/props", token, &resolved) else {
+        return false;
+    };
+    let llama = props.get("default_generation_settings").is_some();
+    if let Ok(mut known) = KNOWN.lock() {
+        known.insert(key, llama);
+    }
+    llama
 }
 
 /// Context window the local server is serving `model` with right now: LM Studio's loaded size,
@@ -1221,29 +1355,80 @@ pub fn loaded_context(
     if let Some(props) = local_get(base_url, "/props", token, &resolved) {
         return positive(props.pointer("/default_generation_settings/n_ctx"));
     }
-    let running = local_get(base_url, "/api/ps", token, &resolved)?;
-    let bare = |name: &str| name.strip_suffix(":latest").unwrap_or(name).to_owned();
-    running["models"]
-        .as_array()?
-        .iter()
-        .find(|m| {
-            ["name", "model"].iter().any(|key| {
-                m[*key]
-                    .as_str()
-                    .is_some_and(|name| bare(name) == bare(model))
-            })
-        })
-        .and_then(|m| positive(m.get("context_length")))
+    if let Some(running) = local_get(base_url, "/api/ps", token, &resolved) {
+        let bare = |name: &str| name.strip_suffix(":latest").unwrap_or(name).to_owned();
+        let loaded = running["models"].as_array().and_then(|models| {
+            models
+                .iter()
+                .find(|m| {
+                    ["name", "model"].iter().any(|key| {
+                        m[*key]
+                            .as_str()
+                            .is_some_and(|name| bare(name) == bare(model))
+                    })
+                })
+                .and_then(|m| positive(m.get("context_length")))
+        });
+        if loaded.is_some() {
+            return loaded;
+        }
+        // Not loaded yet: the model's trained context bounds the window it can usefully serve once
+        // Dial's first request loads it with the planned window as `num_ctx`.
+        let shown = local_request(
+            base_url,
+            "/api/show",
+            Some(&serde_json::json!({ "model": model })),
+            token,
+            &resolved,
+        )?;
+        return shown["model_info"].as_object().and_then(|info| {
+            info.iter()
+                .find(|(key, _)| key.ends_with(".context_length"))
+                .and_then(|(_, value)| positive(Some(value)))
+        });
+    }
+    None
 }
 
+/// Explicit purpose tokens a row declares (`type`, `pipeline_tag`, `task`). Matching is exact: an
+/// unfamiliar or differently spelled value stays `Unknown` rather than being guessed from its words.
+fn kind_from_declared(token: &str) -> ModelKind {
+    match token {
+        "llm" | "vlm" | "chat" | "text-generation" | "conversational" | "image-text-to-text" => {
+            ModelKind::Chat
+        }
+        "embeddings" | "embedding" | "feature-extraction" | "sentence-similarity" => {
+            ModelKind::Embedding
+        }
+        "reranker" | "rerank" | "text-ranking" => ModelKind::Rerank,
+        "image" | "text-to-image" => ModelKind::Image,
+        "audio" | "text-to-speech" | "automatic-speech-recognition" => ModelKind::Audio,
+        _ => ModelKind::Unknown,
+    }
+}
+
+/// The purpose a row declares through an explicit field; see [`kind_from_declared`].
+fn declared_kind(row: &Value) -> ModelKind {
+    ["type", "pipeline_tag", "task"]
+        .iter()
+        .filter_map(|key| row.get(*key).and_then(Value::as_str))
+        .map(kind_from_declared)
+        .find(|kind| *kind != ModelKind::Unknown)
+        .unwrap_or_default()
+}
+
+/// LM Studio's native `type` is the purpose source for its served models. A served embedder keeps
+/// its availability: it is selectable for embedding roles and excluded from chat by its kind.
 fn annotate_lmstudio(models: &mut [ModelEntry], info: &[LmStudioModel]) {
     for entry in models {
         let Some(known) = info.iter().find(|m| m.id == entry.selection.model) else {
             continue;
         };
-        if known.kind == "embeddings" {
-            entry.available = false;
-            entry.source = format!("{} · embedding model, not for chat", entry.source);
+        if entry.metadata.kind == ModelKind::Unknown {
+            entry.metadata.kind = kind_from_declared(&known.kind);
+        }
+        if entry.metadata.kind == ModelKind::Embedding {
+            entry.source = format!("{} · embedding model", entry.source);
         } else if known.loaded {
             entry.selection.context_window = known.loaded_context;
             entry.source = format!("{} · loaded", entry.source);
@@ -1314,19 +1499,19 @@ pub fn is_embedding_checkpoint(model: &Path) -> bool {
         .is_some_and(|kind| EMBEDDING_MODEL_TYPES.contains(&kind))
 }
 
-/// Local embedding checkpoints cannot chat, so they are unavailable for every model role.
-/// LM Studio's own `type` is handled in `annotate_lmstudio`.
+/// Local embedding checkpoints cannot chat and Dial cannot run them directly, so they stay
+/// unavailable until an embeddings endpoint serves them. Classified from checkpoint metadata only.
 fn annotate_embedding_checkpoints(models: &mut [ModelEntry]) {
     for entry in models {
-        if entry.source.contains("embedding model")
-            || entry.selection.provider != "mlx"
-            || entry.selection.base_url.is_some()
+        if entry.selection.provider == "mlx"
+            && entry.selection.base_url.is_none()
+            && entry.is_embedding()
         {
-            continue;
-        }
-        if is_embedding_checkpoint(Path::new(&entry.selection.model)) {
             entry.available = false;
-            entry.source = format!("{} · embedding model, not for chat", entry.source);
+            entry.source = format!(
+                "{} · embedding checkpoint, not served: serve it from LM Studio or an embeddings endpoint to use it",
+                entry.source
+            );
         }
     }
 }
@@ -1416,8 +1601,10 @@ fn local_models(cache: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
             candidates.extend(revisions.into_iter().map(|e| e.path()));
         }
         for path in candidates {
-            let Some(window) = snapshot(&path) else {
-                continue;
+            let (window, gguf) = match snapshot(&path) {
+                Some(window) => (window, false),
+                None if super::local_format::gguf_file(&path).is_some() => (None, true),
+                None => continue,
             };
             let label = repo
                 .file_name()
@@ -1431,7 +1618,12 @@ fn local_models(cache: &Path, trainable: Option<&Path>) -> Vec<ModelEntry> {
                     ..ModelSelection::default()
                 },
                 label,
-                source: "Hugging Face cache (MLX)".into(),
+                source: if gguf {
+                    "Hugging Face cache (GGUF)"
+                } else {
+                    "Hugging Face cache (MLX)"
+                }
+                .into(),
                 available: true,
                 metadata: ModelMetadata {
                     lora: lora_support(trainable, &path),
@@ -1454,14 +1646,20 @@ fn resolve_local_model_in(
     studio: Option<&Path>,
 ) -> Result<String> {
     let path = Path::new(model);
-    if snapshot(path).is_some() {
+    if snapshot(path).is_some() || super::local_format::gguf_file(path).is_some() {
         return Ok(fs::canonicalize(path)?.to_string_lossy().into_owned());
+    }
+    if super::local_format::detect(path) == Some(super::local_format::LocalFormat::Splash) {
+        anyhow::bail!(
+            "{model:?} is a Splash bundle, which only LM Studio can run: load it in LM Studio and select it under the LM Studio provider"
+        );
     }
     let mut entries = cache
         .map(|cache| local_models(cache, None))
         .unwrap_or_default();
     if let Some(studio) = studio {
         entries.extend(lmstudio_mlx_models(studio, None));
+        entries.extend(lmstudio_gguf_models(studio));
     }
     if let Some(entry) = entries.into_iter().find(|entry| entry.label == model) {
         return Ok(fs::canonicalize(entry.selection.model)?
@@ -1469,7 +1667,7 @@ fn resolve_local_model_in(
             .into_owned());
     }
     anyhow::bail!(
-        "local model {model:?} has no complete downloaded weights; inference is offline. Download this model first or select a downloaded local model in /models (for architecture maintenance, change the Architecture model in Settings → Model → Project understanding)"
+        "local model {model:?} has no complete downloaded weights (MLX safetensors or a GGUF file); inference is offline. Download this model first or select a downloaded local model in /models (for architecture maintenance, change the Architecture model in Settings → Model → Project understanding)"
     )
 }
 
@@ -1564,6 +1762,46 @@ fn lmstudio_mlx_models(folder: &Path, trainable: Option<&Path>) -> Vec<ModelEntr
                 metadata: ModelMetadata {
                     lora: lora_support(trainable, &path),
                     ..local_model_metadata(&path)
+                },
+            });
+        }
+    }
+    models
+}
+/// GGUF models LM Studio downloaded (`<folder>/<publisher>/<model>/*.gguf`), listed by the file
+/// `llama-server` would load. Labelled `publisher/model`.
+fn lmstudio_gguf_models(folder: &Path) -> Vec<ModelEntry> {
+    let sorted = |dir: &Path| -> Vec<fs::DirEntry> {
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .map(|it| it.filter_map(Result::ok).take(4096).collect())
+            .unwrap_or_default();
+        entries.sort_by_key(|entry| entry.file_name());
+        entries
+    };
+    let mut models = Vec::new();
+    for publisher in sorted(folder) {
+        for repo in sorted(&publisher.path()) {
+            if models.len() >= MAX_MODELS {
+                return models;
+            }
+            let Some(file) = super::local_format::gguf_file(&repo.path()) else {
+                continue;
+            };
+            models.push(ModelEntry {
+                selection: ModelSelection {
+                    model: file.to_string_lossy().into_owned(),
+                    ..ModelSelection::default()
+                },
+                label: format!(
+                    "{}/{}",
+                    publisher.file_name().to_string_lossy(),
+                    repo.file_name().to_string_lossy()
+                ),
+                source: "LM Studio download (GGUF)".into(),
+                available: true,
+                metadata: ModelMetadata {
+                    vision: Some(false),
+                    ..ModelMetadata::default()
                 },
             });
         }
@@ -1784,17 +2022,22 @@ fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
         && a.api_key_env == b.api_key_env
 }
 
-/// Downloaded MLX checkpoints from the Hugging Face cache and LM Studio. Makes no network
-/// calls and loads no models; `discover` and `dial models recommend` share this listing.
-pub fn downloaded_mlx_models(user_dir: &Path) -> Vec<ModelEntry> {
+/// Downloaded local models (MLX checkpoints and GGUF files) from the Hugging Face cache and LM
+/// Studio. Makes no network calls and loads no models; `discover` and `dial models recommend` share
+/// this listing.
+pub fn downloaded_local_models(user_dir: &Path) -> Vec<ModelEntry> {
     let trainable = mlx_architectures(user_dir);
     let mut models = Vec::new();
     if let Some(cache) = hf_cache() {
         models = local_models(&cache, trainable.as_deref());
     }
     if let Some(folder) = lmstudio_folder() {
+        let gguf = lmstudio_gguf_models(&folder);
         // The same repository downloaded by both keeps its Hugging Face entry.
-        for entry in lmstudio_mlx_models(&folder, trainable.as_deref()) {
+        for entry in lmstudio_mlx_models(&folder, trainable.as_deref())
+            .into_iter()
+            .chain(gguf)
+        {
             if models.len() < MAX_MODELS && !models.iter().any(|known| known.label == entry.label) {
                 models.push(entry);
             }
@@ -1861,12 +2104,12 @@ pub fn discover(
 ) -> Discovery {
     let trainable = mlx_architectures(&layout.user_dir);
     let mut discovery = Discovery {
-        models: downloaded_mlx_models(&layout.user_dir),
+        models: downloaded_local_models(&layout.user_dir),
         ..Discovery::default()
     };
     discovery.providers.push(ProviderStatus {
         id: "mlx".into(),
-        label: "Local MLX".into(),
+        label: "Local models".into(),
         base_url: None,
         state: if discovery.models.is_empty() {
             "unavailable"
@@ -1874,7 +2117,7 @@ pub fn discover(
             "cached"
         }
         .into(),
-        detail: "Downloaded config and weights only; no model loading or downloads".into(),
+        detail: "Downloaded MLX and GGUF models, loaded on demand; nothing is downloaded".into(),
         models: discovery.models.len(),
     });
     let mut endpoints = BTreeMap::new();
@@ -2232,7 +2475,9 @@ pub fn discover(
             selection.base_url = None;
         }
         let local = selection.provider == "mlx" && selection.base_url.is_none();
-        let available = local && snapshot(Path::new(&selection.model)).is_some();
+        let available = local
+            && (snapshot(Path::new(&selection.model)).is_some()
+                || super::local_format::gguf_file(Path::new(&selection.model)).is_some());
         let lora = if local {
             lora_support(trainable.as_deref(), Path::new(&selection.model))
         } else {
@@ -2317,6 +2562,160 @@ mod tests {
             metadata(&serde_json::json!({"id":"vision-reasoning-tools-model"})).tools,
             None
         );
+    }
+
+    #[test]
+    fn model_kind_policy_is_shared_and_serialized_snake_case() {
+        assert!(ModelKind::Chat.supports_chat());
+        assert!(ModelKind::Unknown.supports_chat());
+        for kind in [
+            ModelKind::Embedding,
+            ModelKind::Rerank,
+            ModelKind::Image,
+            ModelKind::Audio,
+        ] {
+            assert!(!kind.supports_chat(), "{}", kind.label());
+        }
+        assert_eq!(ModelKind::default(), ModelKind::Unknown);
+        assert_eq!(ModelKind::Embedding.label(), "embedding");
+        assert_eq!(
+            serde_json::to_string(&ModelKind::Rerank).unwrap(),
+            "\"rerank\""
+        );
+        let entry = |kind| ModelEntry {
+            selection: ModelSelection::default(),
+            label: "m".into(),
+            source: "s".into(),
+            available: true,
+            metadata: ModelMetadata {
+                kind,
+                ..Default::default()
+            },
+        };
+        assert!(entry(ModelKind::Embedding).is_embedding());
+        assert!(!entry(ModelKind::Embedding).supports_chat());
+        assert!(!entry(ModelKind::Chat).is_embedding());
+        assert!(entry(ModelKind::Unknown).supports_chat());
+        // Cache rows written before the field existed read back as Unknown.
+        let legacy: ModelMetadata = serde_json::from_str(r#"{"vision":true}"#).unwrap();
+        assert_eq!(legacy.kind, ModelKind::Unknown);
+    }
+
+    #[test]
+    fn declared_kinds_match_only_exact_documented_tokens() {
+        assert_eq!(kind_from_declared("embeddings"), ModelKind::Embedding);
+        assert_eq!(
+            kind_from_declared("feature-extraction"),
+            ModelKind::Embedding
+        );
+        assert_eq!(kind_from_declared("llm"), ModelKind::Chat);
+        assert_eq!(kind_from_declared("text-generation"), ModelKind::Chat);
+        assert_eq!(kind_from_declared("text-to-image"), ModelKind::Image);
+        assert_eq!(kind_from_declared("text-to-speech"), ModelKind::Audio);
+        assert_eq!(kind_from_declared("reranker"), ModelKind::Rerank);
+        // Names and near-misses are never classified by their words.
+        for token in [
+            "Embedding Model",
+            "my-embeddings-llm",
+            "text-embedding-3-small",
+            "",
+        ] {
+            assert_eq!(kind_from_declared(token), ModelKind::Unknown, "{token}");
+        }
+        let kind_of = |json: Value| metadata(&json).kind;
+        assert_eq!(
+            kind_of(serde_json::json!({"type": "embeddings"})),
+            ModelKind::Embedding
+        );
+        assert_eq!(
+            kind_of(serde_json::json!({"task": "feature-extraction"})),
+            ModelKind::Embedding
+        );
+        assert_eq!(
+            kind_of(serde_json::json!({"pipeline_tag": "text-generation"})),
+            ModelKind::Chat
+        );
+        assert_eq!(
+            kind_of(serde_json::json!({"id": "text-embedding-3-small"})),
+            ModelKind::Unknown
+        );
+    }
+
+    #[test]
+    fn lmstudio_served_embedders_stay_available_for_embedding_roles() {
+        let served = |id: &str, available: bool| ModelEntry {
+            selection: ModelSelection {
+                provider: "lm-studio".into(),
+                model: id.into(),
+                base_url: Some("http://127.0.0.1:1234/v1".into()),
+                ..Default::default()
+            },
+            label: id.into(),
+            source: "LM Studio".into(),
+            available,
+            metadata: ModelMetadata::default(),
+        };
+        let listed = |id: &str, kind: &str| LmStudioModel {
+            id: id.into(),
+            kind: kind.into(),
+            loaded: false,
+            loaded_context: None,
+        };
+        let mut models = vec![
+            served("nomic-embed", true),
+            served("qwen-chat", true),
+            served("cached-embed", false),
+        ];
+        annotate_lmstudio(
+            &mut models,
+            &[
+                listed("nomic-embed", "embeddings"),
+                listed("qwen-chat", "llm"),
+                listed("cached-embed", "embeddings"),
+            ],
+        );
+        assert!(models[0].available && models[0].is_embedding());
+        assert!(!models[0].supports_chat());
+        assert!(models[1].available && models[1].supports_chat());
+        // Annotation never changes availability: an unverified row stays unavailable.
+        assert!(!models[2].available && models[2].is_embedding());
+    }
+
+    #[test]
+    fn local_embedding_checkpoints_are_classified_and_unavailable_until_served() {
+        let root = tempfile::tempdir().unwrap();
+        let encoder = root.path().join("encoder");
+        fs::create_dir_all(&encoder).unwrap();
+        fs::write(
+            encoder.join("config.json"),
+            r#"{"architectures":["BertModel"],"model_type":"bert"}"#,
+        )
+        .unwrap();
+        let chat = root.path().join("chat");
+        fs::create_dir_all(&chat).unwrap();
+        fs::write(
+            chat.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+        assert_eq!(local_model_metadata(&encoder).kind, ModelKind::Embedding);
+        assert_eq!(local_model_metadata(&chat).kind, ModelKind::Unknown);
+        let checkpoint = |path: &Path| ModelEntry {
+            selection: ModelSelection {
+                provider: "mlx".into(),
+                model: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            label: "checkpoint".into(),
+            source: "Hugging Face cache (MLX)".into(),
+            available: true,
+            metadata: local_model_metadata(path),
+        };
+        let mut models = vec![checkpoint(&encoder), checkpoint(&chat)];
+        annotate_embedding_checkpoints(&mut models);
+        assert!(!models[0].available && models[0].is_embedding());
+        assert!(models[0].source.contains("not served"));
+        assert!(models[1].available && models[1].supports_chat());
     }
 
     #[test]
@@ -3049,7 +3448,7 @@ mod tests {
         ]
     }
     #[test]
-    fn lm_studio_discovery_hides_embedders_and_reports_only_the_loaded_context() {
+    fn lm_studio_discovery_keeps_embedders_available_and_reports_only_loaded_context() {
         let url = routed(lm_studio_routes());
         let (status, models) = probe_models(&test_probe(url, "lm-studio"));
         assert_eq!(status.state, "reachable");
@@ -3067,8 +3466,10 @@ mod tests {
         );
         assert!(by("cold").source.contains("loads on first use") && by("cold").available);
         assert!(
-            !by("embedder").available && by("embedder").source.contains("embedding"),
-            "embedders cannot chat"
+            by("embedder").available
+                && by("embedder").is_embedding()
+                && !by("embedder").supports_chat(),
+            "served embedders are available for embedding roles, not chat"
         );
         assert!(
             models
@@ -3076,6 +3477,17 @@ mod tests {
                 .all(|m| m.selection.context_window != Some(1_048_576)
                     && m.selection.context_window != Some(262_144))
         );
+    }
+    #[test]
+    fn llama_server_is_recognised_by_props_on_local_hosts_only() {
+        let llama = routed(vec![(
+            "/props",
+            r#"{"default_generation_settings":{"n_ctx":4096}}"#.into(),
+        )]);
+        assert!(is_llama_server(&llama, None, &[]));
+        let other = routed(vec![]);
+        assert!(!is_llama_server(&other, None, &[]), "/props 404 is not llama.cpp");
+        assert!(!is_llama_server("https://api.example.invalid/v1", Some("secret"), &[]));
     }
     #[test]
     fn servers_without_the_native_api_are_listed_unchanged() {
@@ -3134,6 +3546,19 @@ mod tests {
             loaded_context(&ollama, "mistral", None, &[]),
             None,
             "not loaded yet"
+        );
+        let cold = routed(vec![
+            ("/api/ps", r#"{"models":[]}"#.into()),
+            (
+                "/api/show",
+                r#"{"model_info":{"general.architecture":"qwen3","qwen3.context_length":40960}}"#
+                    .into(),
+            ),
+        ]);
+        assert_eq!(
+            loaded_context(&cold, "qwen3:8b", None, &[]),
+            Some(40960),
+            "an unloaded Ollama model is bounded by its trained context"
         );
         assert_eq!(
             loaded_context(&routed(vec![]), "anything", None, &[]),

@@ -38,11 +38,13 @@ it remains bounded retrieval, not an exhaustive or resolved call-graph guarantee
 
 ## Shared execution ownership
 
-`agent/engine.rs` owns the lifecycle driver used by parent and worker adapters, result settlement, output-length recovery, repetition checkpoints, unchanged-read reuse, narration progress, reply recovery, and the uncertain-effect stop boundary. `tools/execution.rs` owns native dispatch, pre-start cancellation, panic containment, and callback effect propagation. A callback tool cannot hide an uncertain nested result by catching its error or returning success; subsequent callbacks are refused.
+`agent/engine.rs` owns the lifecycle driver used by parent and worker adapters, result settlement, output-length recovery, repetition checkpoints, unchanged-read reuse, narration progress, reply recovery, committed-content edit-loop steering, and the uncertain-effect stop boundary. `tools/execution.rs` owns native dispatch, pre-start cancellation, panic containment, and callback effect propagation. A callback tool cannot hide an uncertain nested result by catching its error or returning success; subsequent callbacks are refused.
 
 `agent/turn.rs` is the parent adapter for durable session state, live steering and learning policy. `agent/child.rs` is the worker adapter for private history, assignment permissions and worker request budgets. Both adapters advance the same lifecycle driver and share inference transport, authorization helpers and the parallel scheduler. Their preparation and persistence callbacks retain explicit role responsibilities. New common execution policy belongs in the shared engine, not copied into both adapters. `agent/tool_runner.rs` handles foreground UI events and routes callbacks back to their owner.
 
 Unknown effects end the current turn as incomplete after saving results and skipping unstarted actions. They bypass automatic stall recovery, context transitions and memory maintenance. A refusal before execution records no effects. A timeout or interruption after execution starts does not imply rollback. Recovery from a missing durable tool result records an explicit unknown effect and never replays the call. Productive `max_steps = 0` remains unlimited.
+
+Successful edits can also loop: a model may keep inserting and removing the same lines, and each success used to clear repetition checkpoints. `agent/mutation_cycles.rs` hashes the actual committed content of each path the transaction owner reports in `Execution::changed_paths`, resolved and canonicalized through the workspace (including added roots). It never parses tool text or diffs. One return to an earlier version is an allowed revert. A version committed for the third time, with other versions in between, is an edit loop. An edit loop never ends the turn. The edit's result tells the model that its edits are undoing each other. The exact calls (normalized arguments) that produced the alternating versions are refused for the rest of the turn. Different edits, the same file through other arguments, other files and every other tool remain available, and the turn continues to completion. A mutation that only returns a file to content it already had is not progress, so it cannot clear other recovery restrictions. Consecutive identical versions count as one visit. Reads, todos and other files do not clear this history; only new steering resets it. History is bounded to 64 files, 16 recent versions per file and 64 refused calls, so novel edits remain unlimited. Uncertain effects keep their stop. Deleted, unreadable or files over 16 MiB are not tracked.
 
 ## Reviewed gaps
 
@@ -132,6 +134,13 @@ limits, reasoning budgets, approvals or verification requirements:
   so the provider's cached prefix survives ordinary rounds.
   `assistance.compact_tools=true` switches to discovery mode for small local models: a core set
   bounded by `assistance.initial_tool_limit` (default 16) plus `tool_search`/`tool_load`.
+  `assistance.lean_local=true` (default off) is a lean profile that applies only when the main
+  model is served locally (no endpoint, or a loopback or LAN host); hosted routes and hermetic
+  runs are unchanged. It turns on discovery mode, caps the initial tool budget at 8 (an unlimited
+  0 also becomes 8), and omits the visual-verification guidance unless `browser` or `computer` is
+  offered and the skills catalog unless `skill` is offered. The resulting prompt stays
+  byte-stable across turns. Measure it with `dial benchmark --ablate-assistance`'s `lean` row
+  before relying on it.
   Automatic search and compatibility activation retain at most eight discovered tools, oldest
   activation evicted first. Explicit `tool_load` names are pins and are never evicted by discovery;
   unloading clears both sets. Additive `discovered_tools` control state survives resume, and older

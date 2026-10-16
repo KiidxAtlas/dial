@@ -706,6 +706,24 @@ impl Backend {
         self.profile = Some(profile);
         self
     }
+    /// The structured-output mechanism the live endpoint enforces, detected rather than declared: a
+    /// loopback/private OpenAI-compatible endpoint that answers llama.cpp's `/props` enforces
+    /// `json_schema`. Hosted endpoints are never probed; `catalog::is_llama_server` caches per base URL.
+    pub fn endpoint_structured_output(&self) -> Option<llm::profiles::StructuredOutput> {
+        let ProviderKind::Endpoint {
+            base_url, api_key, ..
+        } = &self.kind
+        else {
+            return None;
+        };
+        if self.protocol.unwrap_or(ApiProtocol::ChatCompletions) != ApiProtocol::ChatCompletions
+            || !llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host))
+        {
+            return None;
+        }
+        llm::catalog::is_llama_server(base_url, api_key.as_deref(), &self.headers)
+            .then_some(llm::profiles::StructuredOutput::JsonSchema)
+    }
 
     pub fn reply_cost(&self, reply: &Reply) -> Option<f64> {
         let remote = match &self.kind {
@@ -810,6 +828,22 @@ impl Backend {
         *self.adapter_monitor.lock() = AdapterRuntime::default();
         if let Some(mut server) = self.server.take() {
             server.stop();
+        }
+    }
+
+    /// Move the resident local server out without stopping it, so a rebuilt backend for the same
+    /// session can adopt it instead of reloading the weights.
+    pub fn take_resident_server(&mut self) -> Option<ModelServer> {
+        self.server.take()
+    }
+
+    /// Adopt a server handed over by [`Self::take_resident_server`]. The next request reuses it
+    /// only if it still matches the model, adapter, runtime and context this backend asks for
+    /// (`ModelServer::ready_for`); otherwise it is stopped and replaced then. A backend that does
+    /// not run a local server stops it now.
+    pub fn adopt_resident_server(&mut self, server: ModelServer) {
+        if matches!(self.kind, ProviderKind::Local { .. }) && self.server.is_none() {
+            self.server = Some(server);
         }
     }
 
@@ -937,7 +971,17 @@ impl Backend {
             timeout_secs,
             interrupt,
         } = limits;
-        let profile = self.next_profile.take().or_else(|| self.profile.clone());
+        ensure!(
+            self.metadata.kind.supports_chat(),
+            "this is a {} model, not a chat model; select a chat model in /models or assign an embedding model to the embedding role",
+            self.metadata.kind.label()
+        );
+        let mut profile = self.next_profile.take().or_else(|| self.profile.clone());
+        if let Some(profile) = profile.as_mut()
+            && profile.endpoint_structured_output.is_none()
+        {
+            profile.endpoint_structured_output = self.endpoint_structured_output();
+        }
         ensure!(
             self.resolved_model(profile.as_ref()).tools != Some(false) || req.tools.is_empty(),
             "the resolved model declares tool calls unsupported; choose a tool-capable model"
@@ -1019,6 +1063,8 @@ impl Backend {
                 )
             }
             ProviderKind::Local { model_dir } => {
+                let mut req = req.clone();
+                req.messages = llm::messages::local(&req.messages)?;
                 if interrupted() {
                     return Err(llm::Interrupted.into());
                 }
@@ -1079,7 +1125,7 @@ impl Backend {
                         adapter,
                         steering.as_ref(),
                         &runtime,
-                        server::tool_grammar_enabled(self.steering_config.as_ref()),
+                        self.steering_config.as_ref(),
                     )
                 }) {
                     llm::InferencePhase::Processing
@@ -1121,7 +1167,7 @@ impl Backend {
                         auth: None,
                         model: server.request_model(),
                     },
-                    req,
+                    &req,
                     timeout_secs,
                     &mut on_text,
                     llm::Control {
@@ -1447,6 +1493,7 @@ impl Backend {
                         &mut on_text,
                         Arc::clone(&interrupt),
                         profile.as_ref(),
+                        Some(self.context_capacity()),
                         on_event,
                     )
                 }
@@ -2595,11 +2642,93 @@ mod tests {
         }
     }
 
+    #[test]
+    fn non_chat_model_kinds_are_rejected_before_any_request() {
+        use llm::catalog::ModelKind;
+        for kind in [
+            ModelKind::Embedding,
+            ModelKind::Rerank,
+            ModelKind::Image,
+            ModelKind::Audio,
+        ] {
+            let mut remote = backend(endpoint("https://must-not-connect.invalid")).with_metadata(
+                llm::catalog::ModelMetadata {
+                    kind,
+                    ..Default::default()
+                },
+            );
+            let error = remote
+                .chat(None, &request(), 1, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not a chat model"), "{error}");
+            assert!(!error.contains("SECRET-PROMPT"));
+        }
+    }
+
     fn ok(text: &str) -> Script {
         fake::json(
             200,
             &json!({"choices": [{"finish_reason": "stop", "message": {"content": text}}]}),
         )
+    }
+
+    /// A loopback llama-server is recognised by its `/props` once and the answer is reused; hosted
+    /// hosts are never probed; a server without the native API declares no mechanism.
+    #[test]
+    fn endpoint_structured_output_is_detected_on_local_llama_servers_only() {
+        let props = fake::json(
+            200,
+            &json!({"default_generation_settings": {"n_ctx": 4096}}),
+        );
+        let llama = fake::serve(vec![props]);
+        let remote = backend(endpoint(&format!("{}/v1", llama.url)));
+        assert_eq!(
+            remote.endpoint_structured_output(),
+            Some(llm::profiles::StructuredOutput::JsonSchema)
+        );
+        // Only one connection was scripted: a second probe would fail, so this proves the cache.
+        assert_eq!(
+            remote.endpoint_structured_output(),
+            Some(llm::profiles::StructuredOutput::JsonSchema)
+        );
+        let other = fake::serve(vec![fake::json(404, &json!({}))]);
+        assert_eq!(
+            backend(endpoint(&format!("{}/v1", other.url))).endpoint_structured_output(),
+            None
+        );
+        let hosted = backend(endpoint("https://api.example.invalid/v1"));
+        assert_eq!(hosted.endpoint_structured_output(), None);
+    }
+
+    /// The repair retry on a detected llama-server carries `json_schema`; without `/props` the same
+    /// retry is unchanged (no `response_format`, tools kept).
+    #[test]
+    fn repair_retry_carries_json_schema_only_on_a_detected_llama_server() {
+        let read = json!({"type": "function", "function": {"name": "read_file", "parameters": {
+            "type": "object", "properties": {"path": {"type": "string"}}}}});
+        let mut req = request();
+        req.tools = vec![read];
+        let mut repair = llm::profiles::ModelProfile::minimal("openai-compatible", "gpt-x");
+        repair.tool_repair = true;
+
+        let llama = fake::serve(vec![
+            fake::json(200, &json!({"default_generation_settings": {"n_ctx": 4096}})),
+            ok("{}"),
+        ]);
+        let mut remote = backend(endpoint(&format!("{}/v1", llama.url)))
+            .with_profile(repair.clone());
+        remote.chat(None, &req, 5, None).unwrap();
+        let body = fake::body(&llama.requests()[1]);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert!(body.get("tools").is_none());
+
+        let plain = fake::serve(vec![fake::json(404, &json!({})), ok("{}")]);
+        let mut remote = backend(endpoint(&format!("{}/v1", plain.url))).with_profile(repair);
+        remote.chat(None, &req, 5, None).unwrap();
+        let body = fake::body(&plain.requests()[1]);
+        assert!(body.get("response_format").is_none(), "{body}");
+        assert!(body.get("tools").is_some());
     }
 
     #[test]
@@ -3378,6 +3507,86 @@ mod tests {
             "inspect\n\n[Image unavailable: shot.png; changed; reattach]"
         );
         assert!(!fake::body(&requests[0]).to_string().contains("image_url"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_chat_projects_system_messages_without_rewriting_the_request() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model");
+        std::fs::create_dir(&model).unwrap();
+        let mut local = Backend::new(
+            ProviderKind::Local {
+                model_dir: model.to_string_lossy().into_owned(),
+            },
+            server::tests::fake_python(root.path()),
+            30,
+        );
+        let mut req = request();
+        req.messages = vec![
+            json!({"role":"system","content":"policy"}),
+            json!({"role":"system","content":"workspace"}),
+            json!({"role":"user","content":"hello"}),
+            json!({"role":"system","content":"guidance","dial_transient":true}),
+        ];
+        let original = req.messages.clone();
+        for streaming in [false, true] {
+            let mut on_text = |_: &str| true;
+            local
+                .chat(None, &req, 5, streaming.then_some(&mut on_text))
+                .unwrap();
+        }
+        let info: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(model.join("info.json")).unwrap()).unwrap();
+        let requests = info["requests"].as_array().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "warmup plus plain and streaming requests"
+        );
+        for wire in &requests[1..] {
+            assert_eq!(
+                wire["messages"],
+                json!([
+                    {"role":"system","content":"policy\n\nworkspace"},
+                    {"role":"user","content":"hello"},
+                    {"role":"user","content":"guidance"},
+                ])
+            );
+        }
+        assert_eq!(req.messages, original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rebuilt_backend_adopts_the_resident_server_without_reloading_the_model() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model");
+        std::fs::create_dir(&model).unwrap();
+        let python = server::tests::fake_python(root.path());
+        let kind = || ProviderKind::Local {
+            model_dir: model.to_string_lossy().into_owned(),
+        };
+        let info = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(model.join("info.json")).unwrap()).unwrap()
+        };
+        let mut before = Backend::new(kind(), python.clone(), 30);
+        before.chat(None, &request(), 5, None).unwrap();
+        let launched = info()["pid"].clone();
+        let server = before.take_resident_server().expect("a resident server");
+        drop(before);
+
+        let mut after = Backend::new(kind(), python, 30);
+        after.adopt_resident_server(server);
+        after.chat(None, &request(), 5, None).unwrap();
+        let info = info();
+        assert_eq!(info["pid"], launched, "the same server process answered");
+        assert_eq!(
+            info["requests"].as_array().unwrap().len(),
+            3,
+            "one warmup, then one request from each backend"
+        );
+        after.release();
     }
 
     #[cfg(unix)]

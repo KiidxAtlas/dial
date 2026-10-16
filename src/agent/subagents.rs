@@ -1309,6 +1309,7 @@ impl Approver for Direct<'_> {
             MutationScope::SourceRead => approval::authorize_source_read_paths(
                 self.always,
                 self.root,
+                self.extra_roots,
                 original,
                 tool,
                 paths,

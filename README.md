@@ -2,7 +2,7 @@
 
 A local-first coding agent harness for macOS, Linux and Windows (native or through WSL2). Run it in a project directory like any agent CLI. Learning is optional and separate: `dial improve` runs verified practice, harness proposals and local LoRA training behind an external evaluation gate. Ordinary coding sessions do not open a learning store, collect training trajectories, apply learned candidates or launch training/evaluation workers, unless you turn on **Teach this model** for a local model (`/settings` → Model → Learning). Local MLX inference and training require Apple Silicon; Intel Macs and Linux/WSL2 use hosted or OpenAI-compatible providers.
 
-Standalone: no dependency on any external agent harness or hosted service. Rust control plane and tools; Python for local MLX inference/training (`mlx-lm`, plus `mlx-vlm` for vision).
+Standalone: no dependency on any external agent harness or hosted service. Rust control plane and tools; Python for local MLX inference/training (`mlx-lm`, plus `mlx-vlm` for vision); GGUF models run through llama.cpp's `llama-server`.
 
 Inspect the executable you are actually running with `dial --version` (compiled revision and
 whether its compiled sources differed from that revision at build time) or `dial --build-info` (JSON including target, profile, build time and
@@ -39,8 +39,9 @@ Or use the Linux commands inside WSL2. See [docs/windows.md](docs/windows.md) fo
 - **Linux/WSL2** needs `bubblewrap` and `ca-certificates`, working unprivileged user namespaces, and
   a normal (non-root) user. Under WSL2, **Windows executable interop must be disabled** in
   `/etc/wsl.conf`; Dial refuses sandboxed commands while it is enabled.
-- **Local MLX inference and training** require macOS on Apple Silicon plus `uv`; hosted and
-  OpenAI-compatible providers work everywhere without Python.
+- **Local MLX inference and training** require macOS on Apple Silicon plus `uv`. **GGUF models** need
+  llama.cpp's `llama-server` on `PATH` (or `DIAL_LLAMA_SERVER`) and serve inference and evaluation only.
+  Hosted and OpenAI-compatible providers work everywhere without Python.
 - **From source:** `make update` builds and installs the faster, incremental `local` profile
   from a checkout; `make update SLIM=1` omits optional integrations. Use
   `cargo install --path . --locked` when you specifically want shipping optimization.
@@ -140,7 +141,7 @@ fallback chains are in [docs/model-routing.md](docs/model-routing.md).
 src/agent/    agent loop, system prompt, project context, todo, typed subagents, approvals
 src/tools/    Workspace + built-ins (files, search, shell, hashline, sandbox) and pluggable tools
               (ext.rs registry: bg, web, lsp, ast, mcp)
-src/llm/      backends, providers, catalog, auth, local MLX server, tool-call parsing
+src/llm/      backends, providers, catalog, auth, local model servers (MLX, GGUF), tool-call parsing
 src/learn/    self-improvement: curriculum, harvest, mutate, probe, gate, worker, verify
 src/storage/  sessions, memory, skills, checkpoints, SQLite store, paths, settings
 src/config/   configuration types and validation

@@ -35,6 +35,44 @@ pub(super) struct RepeatedToolCall {
     pub count: usize,
     pub arguments_summary: String,
     pub result_summary: String,
+    /// Identity of the streak's call set. A reply whose calls produce the same key repeats it.
+    key: String,
+    /// The streak's newest turn, with the result each of its calls received.
+    earlier: Vec<EarlierCall>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EarlierCall {
+    name: String,
+    arguments: serde_json::Value,
+    id: String,
+    result: String,
+}
+
+/// Sorted canonical `[name, arguments]` pairs: the identity of one assistant turn's call set.
+fn call_key(calls: &[(String, String, serde_json::Value)]) -> String {
+    let mut parts: Vec<String> = calls
+        .iter()
+        .map(|(_, name, args)| serde_json::json!([name, canonical_arguments(args)]).to_string())
+        .collect();
+    parts.sort();
+    serde_json::to_string(&parts).unwrap_or_default()
+}
+
+/// Summarized text of the tool result that answers `id`, or empty when none is in `messages`.
+fn result_text_for(messages: &[serde_json::Value], id: &str) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message["role"].as_str() == Some("tool") && message["tool_call_id"].as_str() == Some(id)
+        })
+        .map(|message| match &message["content"] {
+            serde_json::Value::String(text) => summarize_text(text, 200),
+            serde_json::Value::Null => String::new(),
+            other => summarize_text(&other.to_string(), 200),
+        })
+        .unwrap_or_default()
 }
 
 /// Argument identity stays stable by dropping the intent field (`i`, legacy `__intent`) at
@@ -113,14 +151,7 @@ impl RepeatedToolCall {
             {
                 break;
             }
-            let mut parts: Vec<String> = parsed
-                .iter()
-                .map(|(_, name, args)| {
-                    serde_json::json!([name, canonical_arguments(args)]).to_string()
-                })
-                .collect();
-            parts.sort();
-            let key = serde_json::to_string(&parts).unwrap_or_default();
+            let key = call_key(&parsed);
             match &streak_key {
                 Some(existing) if *existing != key => break,
                 Some(_) => count += 1,
@@ -139,25 +170,55 @@ impl RepeatedToolCall {
             .find(|(_, name, _)| !exempt.contains(&name.as_str()))
             .unwrap_or(&newest[0])
             .clone();
-        let result_summary = messages
+        let earlier = newest
             .iter()
-            .rev()
-            .find(|message| {
-                message["role"].as_str() == Some("tool")
-                    && message["tool_call_id"].as_str() == Some(id.as_str())
+            .map(|(id, name, args)| EarlierCall {
+                name: name.clone(),
+                arguments: canonical_arguments(args),
+                id: id.clone(),
+                result: result_text_for(messages, id),
             })
-            .map(|message| match &message["content"] {
-                serde_json::Value::String(text) => summarize_text(text, 200),
-                serde_json::Value::Null => String::new(),
-                other => summarize_text(&other.to_string(), 200),
-            })
-            .unwrap_or_default();
+            .collect();
         Some(Self {
             tool_name: name,
             count,
             arguments_summary: summarize_text(&canonical_arguments(&args).to_string(), 400),
-            result_summary,
+            result_summary: result_text_for(messages, &id),
+            key: streak_key.unwrap_or_default(),
+            earlier,
         })
+    }
+
+    /// When the reply's calls repeat this streak exactly (same call set, every call well formed),
+    /// returns one synthetic result per call, in order. Each names the earlier identical call and
+    /// its result, so the repeat is answered without running again. `None` lets the calls run.
+    pub(super) fn short_circuit(&self, calls: &[ToolCall]) -> Option<Vec<String>> {
+        if calls.is_empty() || calls.iter().any(|call| call.malformed_arguments) {
+            return None;
+        }
+        let parsed: Vec<(String, String, serde_json::Value)> = calls
+            .iter()
+            .map(|call| (call.id.clone(), call.name.clone(), call.arguments.clone()))
+            .collect();
+        if call_key(&parsed) != self.key {
+            return None;
+        }
+        let mut unmatched: Vec<&EarlierCall> = self.earlier.iter().collect();
+        parsed
+            .iter()
+            .map(|(_, name, args)| {
+                let canonical = canonical_arguments(args);
+                let at = unmatched
+                    .iter()
+                    .position(|earlier| earlier.name == *name && earlier.arguments == canonical)?;
+                let earlier = unmatched.remove(at);
+                Some(super::stream_guards::render_duplicate_call_result(
+                    name,
+                    &earlier.id,
+                    &earlier.result,
+                ))
+            })
+            .collect()
     }
 }
 
@@ -205,6 +266,90 @@ mod repeated_tool_call_tests {
             waits.extend(turn(&format!("w{n}"), "wait", "{}"));
         }
         assert!(RepeatedToolCall::detect(&waits, 5, &["wait"]).is_none());
+    }
+
+    fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args,
+            malformed_arguments: false,
+        }
+    }
+
+    #[test]
+    fn an_identical_repeat_gets_the_earlier_result_and_its_own_call_id() {
+        let mut messages = Vec::new();
+        for n in 0..6 {
+            messages.extend(turn(&format!("c{n}"), "read", "{\"path\":\"a\"}"));
+        }
+        let repeat = RepeatedToolCall::detect(&messages, 5, &["wait"]).expect("streak of six");
+        assert_eq!(repeat.count, 6);
+        let repeated = [call("new", "read", json!({"path": "a", "i": "again"}))];
+        let results = repeat.short_circuit(&repeated).expect("identical repeat");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].starts_with("[Not executed:"));
+        assert!(results[0].contains("tool_call_id `c5`"));
+        assert!(results[0].contains("`same result`"));
+    }
+
+    #[test]
+    fn a_different_call_resets_the_repeat_and_runs() {
+        let mut messages = Vec::new();
+        for n in 0..6 {
+            messages.extend(turn(&format!("c{n}"), "read", "{\"path\":\"a\"}"));
+        }
+        let repeat = RepeatedToolCall::detect(&messages, 5, &["wait"]).expect("streak of six");
+        assert!(repeat.short_circuit(&[call("x", "read", json!({"path": "b"}))]).is_none());
+        assert!(repeat.short_circuit(&[call("x", "grep", json!({"path": "a"}))]).is_none());
+        let mixed = [
+            call("x", "read", json!({"path": "a"})),
+            call("y", "read", json!({"path": "b"})),
+        ];
+        assert!(repeat.short_circuit(&mixed).is_none());
+        messages.extend(turn("x", "read", "{\"path\":\"b\"}"));
+        assert!(RepeatedToolCall::detect(&messages, 5, &["wait"]).is_none());
+    }
+
+    #[test]
+    fn malformed_or_empty_calls_are_never_short_circuited() {
+        let mut messages = Vec::new();
+        for n in 0..6 {
+            messages.extend(turn(&format!("c{n}"), "read", "{\"path\":\"a\"}"));
+        }
+        let repeat = RepeatedToolCall::detect(&messages, 5, &["wait"]).expect("streak of six");
+        let mut malformed = call("x", "read", json!({"path": "a"}));
+        malformed.malformed_arguments = true;
+        assert!(repeat.short_circuit(&[malformed]).is_none());
+        assert!(repeat.short_circuit(&[]).is_none());
+    }
+
+    #[test]
+    fn a_multi_call_repeat_pairs_each_call_with_its_own_earlier_result() {
+        let mut messages = Vec::new();
+        for n in 0..6 {
+            messages.extend(
+                json!([
+                    {"role":"assistant","content":null,"tool_calls":[
+                        {"id":format!("r{n}"),"type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}},
+                        {"id":format!("g{n}"),"type":"function","function":{"name":"grep","arguments":"{\"pattern\":\"x\"}"}}]},
+                    {"role":"tool","tool_call_id":format!("r{n}"),"content":"file text"},
+                    {"role":"tool","tool_call_id":format!("g{n}"),"content":"grep hits"}
+                ])
+                .as_array()
+                .unwrap()
+                .clone(),
+            );
+        }
+        let repeat = RepeatedToolCall::detect(&messages, 5, &["wait"]).expect("streak of six");
+        let reordered = [
+            call("g", "grep", json!({"pattern": "x"})),
+            call("r", "read", json!({"path": "a"})),
+        ];
+        let results = repeat.short_circuit(&reordered).expect("same call set");
+        assert!(results[0].contains("`grep`") && results[0].contains("tool_call_id `g5`"));
+        assert!(results[0].contains("`grep hits`"));
+        assert!(results[1].contains("tool_call_id `r5`") && results[1].contains("`file text`"));
     }
 }
 
@@ -283,7 +428,7 @@ impl NarrationGuard {
 /// A tool call that failed this many times with identical arguments earns a warning.
 const REPEAT_LIMIT: u32 = 3;
 const FAILURE_LIMIT: u32 = 4;
-/// Length stops answered with a nudge (after the budget cannot grow) before the turn gives up.
+/// Length stops that repeat past this many nudges get stronger guidance; they never end the turn.
 pub const MAX_LENGTH_NUDGES: u32 = 2;
 /// Hard ceiling for a raised per-call output budget.
 const MAX_RAISED_BUDGET: u32 = 32768;
@@ -389,6 +534,8 @@ impl RepeatGuard {
         format!("{}\u{0}{}", call.name, normalized_arguments(call))
     }
     /// Keep failures across intervening reads. Only success for this exact call resets its count.
+    /// Failures never end the turn: guidance is stated when the repeat starts and again at each
+    /// further multiple of `FAILURE_LIMIT`, in stronger words.
     pub fn observe(&mut self, call: &ToolCall, failed: bool) -> Option<String> {
         let key = Self::key(call);
         if !failed {
@@ -397,28 +544,35 @@ impl RepeatGuard {
         }
         let count = self.failures.entry(key).or_default();
         *count += 1;
+        let count = *count;
         if call.name == "read" {
             return Some(format!(
                 "[Read recovery: this exact call has now failed {count} times with the same arguments. Use the diagnostic to correct the path or numeric selector (offset/limit is also supported), or locate the file once with a scoped glob/grep. Reuse context already returned and request only missing lines. Do not retry unchanged, even after other reads; continue the task with the corrected call.]"
             ));
         }
-        (*count >= REPEAT_LIMIT).then(|| {
-            format!(
-                "[This exact call has now failed {count} times with the same arguments this turn. Do not issue it again unchanged: change the arguments or the approach. Reading another file does not reset this count; the turn stops after {FAILURE_LIMIT} identical failures.]"
-            )
-        })
+        if count < REPEAT_LIMIT {
+            return None;
+        }
+        if count % FAILURE_LIMIT == 0 {
+            return Some(Self::escalation(call, count));
+        }
+        Some(format!(
+            "[This exact call has now failed {count} times with the same arguments this turn. Do not issue it again unchanged: change the arguments or the approach. Reading another file does not reset this count.]"
+        ))
     }
 
-    pub fn stop_message(&self, call: &ToolCall) -> Option<String> {
-        let count = *self.failures.get(&Self::key(call))?;
-        if call.name == "todo" && call.arguments["op"] == "done" && count >= FAILURE_LIMIT {
-            return Some(format!(
-                "Stopped: `todo done` for the same target failed {count} times this turn. Rewording the completion claim is not recovery. Deliver the report, satisfy the reported check, or block the step with a concrete reason before retrying."
-            ));
+    /// Stronger guidance for an identical call that keeps failing. The identical retry is withheld
+    /// rather than run, so the model is told what to do instead. The turn itself is never ended.
+    fn escalation(call: &ToolCall, count: u32) -> String {
+        if call.name == "todo" && call.arguments["op"] == "done" {
+            return format!(
+                "[Escalation: `todo done` for the same target has failed {count} times this turn. Rewording the completion claim is not recovery. Deliver the report, satisfy the reported check, or block the step with a concrete reason. The turn continues.]"
+            );
         }
-        (count >= FAILURE_LIMIT).then(|| format!(
-            "Stopped: `{}` with the same arguments failed {count} times this turn. The model did not correct the call after feedback. Change the call or editing mode, or use a different model before retrying.", call.name
-        ))
+        format!(
+            "[Escalation: `{}` with the same arguments has failed {count} times this turn, and the feedback so far has not changed the call. Identical retries are withheld, not run. Choose a different tool or different arguments that the error text supports, or report the blocker in your answer. The turn continues.]",
+            call.name
+        )
     }
 }
 /// Steps a turn may spend. A step is a model call that did work; when a reply is unusable (cut off, unreadable
@@ -479,17 +633,16 @@ const CALL_TOOLS: &[&str] = &[
     "ast_search",
     "artifact_read",
 ];
-/// The same tool failing this many calls in a row, whatever its arguments, earns a warning and then a stop.
+/// The same tool failing this many calls in a row, whatever its arguments, earns a warning. The warning
+/// repeats with stronger wording at each further multiple of this count. Failures never end the turn.
 const STREAK_WARN: u32 = 5;
-const STREAK_STOP: u32 = 10;
-/// Rounds of tool calls in which every call failed.
+/// Rounds of tool calls in which every call failed. Warnings repeat at each further multiple of this count.
 const ROUND_WARN: u32 = 4;
-const ROUND_STOP: u32 = 8;
 
+/// Guidance from a stall check, delivered to the model in the same turn. No variant ends the turn.
 pub enum Stall {
     None,
     Warn(String),
-    Stop(String),
 }
 
 /// `RepeatGuard` only sees the same call failing again. A model that is lost changes its guess each time, so these
@@ -531,13 +684,13 @@ impl StallGuard {
             .causes
             .get(name)
             .map_or(String::new(), |cause| format!(" Last error: {cause}."));
-        if count >= STREAK_STOP {
-            Stall::Stop(format!(
-                "Stopped: `{name}` failed {count} times in a row without one success.{cause} The model is not recovering from the errors it is shown. Try a smaller request, a different edit mode, or a different model."
-            ))
-        } else if count == STREAK_WARN {
+        if count == STREAK_WARN {
             Stall::Warn(format!(
-                "[`{name}` has now failed {count} times in a row, with different arguments each time. Guessing again will not help: each error says what is wrong or what the file really contains. Re-read the file and quote it exactly, take a different approach, or tell the user you are blocked. The turn stops after {STREAK_STOP} in a row.]"
+                "[`{name}` has now failed {count} times in a row, with different arguments each time. Guessing again will not help: each error says what is wrong or what the file really contains. Re-read the file and quote it exactly, take a different approach, or report the blocker in your answer.]"
+            ))
+        } else if count > STREAK_WARN && count % STREAK_WARN == 0 {
+            Stall::Warn(format!(
+                "[Escalation: `{name}` has failed {count} times in a row without one success.{cause} Repeating the same kind of guess is not working. Before the next `{name}` call, read the exact current state it targets and make one call that copies it exactly, or switch to a different tool. The turn continues.]"
             ))
         } else {
             Stall::None
@@ -552,13 +705,13 @@ impl StallGuard {
         }
         self.failed_rounds += 1;
         let rounds = self.failed_rounds;
-        if rounds >= ROUND_STOP {
-            Stall::Stop(format!(
-                "Stopped: every tool call failed for {rounds} rounds in a row. The model is not making progress. Try a smaller request, check that the project and tools are reachable, or use a different model."
-            ))
-        } else if rounds == ROUND_WARN {
+        if rounds == ROUND_WARN {
             Stall::Warn(format!(
-                "{rounds} rounds of tool calls in a row have failed completely. Stop and reconsider: read the errors, check the current state of the files, and change your approach, or tell the user what is blocking you. The turn stops after {ROUND_STOP} such rounds."
+                "{rounds} rounds of tool calls in a row have failed completely. Stop and reconsider: read the errors, check the current state of the files, and change your approach, or report the blocker in your answer."
+            ))
+        } else if rounds > ROUND_WARN && rounds % ROUND_WARN == 0 {
+            Stall::Warn(format!(
+                "[Escalation: every tool call has failed for {rounds} rounds in a row. Retrying the same kind of call is not making progress. Run one small call known to work, confirm the project and tools respond, then change approach. The turn continues.]"
             ))
         } else {
             Stall::None
@@ -576,8 +729,6 @@ pub enum LengthAction {
         partial: Option<String>,
         message: String,
     },
-    /// Stop the turn and tell the user why.
-    GiveUp(String),
 }
 
 /// Double the output budget, bounded by what the context window can still spare for the answer.
@@ -601,28 +752,36 @@ pub fn recover_from_length(
     if let Some(max_tokens) = larger_budget(current, window, prompt_tokens) {
         return LengthAction::Retry { max_tokens };
     }
-    if nudges >= MAX_LENGTH_NUDGES {
-        return LengthAction::GiveUp(format!(
-            "Stopped: the model reached its output limit ({current} tokens) without finishing, repeatedly. Raise `harness.max_tokens`, or use a model or setting that spends fewer tokens on reasoning."
-        ));
-    }
+    // Past the nudge limit the nudge gets stronger instead of ending the turn. Nudged replies are
+    // refunded only a bounded number of times per turn (`StepBudget::FREE_RETRIES`); after that each
+    // one is charged to `harness.max_steps`, which remains the bound on this loop.
+    let escalated = nudges >= MAX_LENGTH_NUDGES;
+    let nudge = |partial: Option<String>, text: &str| LengthAction::Nudge {
+        partial,
+        message: if escalated {
+            format!(
+                "[Escalation: {nudges} replies in a row hit the output limit ({current} tokens) without finishing. Make the next reply short: take one concrete action, or give the answer in a few sentences, and put long content into a file written in parts.]\n{text}"
+            )
+        } else {
+            text.into()
+        },
+    };
     if !reply.tool_calls.is_empty() {
-        return LengthAction::Nudge {
-            partial: None,
-            message: "Your last tool call was cut off by the output limit, so nothing ran. Make smaller calls (for a large file, write a first part and extend it with edit) and keep your reasoning short.".into(),
-        };
+        return nudge(
+            None,
+            "Your last tool call was cut off by the output limit, so nothing ran. Make smaller calls (for a large file, write a first part and extend it with edit) and keep your reasoning short.",
+        );
     }
     if reply.text.trim().is_empty() {
-        return LengthAction::Nudge {
-            partial: None,
-            message: "You used the whole output limit on thinking and produced no answer. Think less: take the next action or answer directly.".into(),
-        };
+        return nudge(
+            None,
+            "You used the whole output limit on thinking and produced no answer. Think less: take the next action or answer directly.",
+        );
     }
-    LengthAction::Nudge {
-        partial: Some(reply.text.clone()),
-        message: "Your reply was cut off by the output limit. Continue exactly where you stopped."
-            .into(),
-    }
+    nudge(
+        Some(reply.text.clone()),
+        "Your reply was cut off by the output limit. Continue exactly where you stopped.",
+    )
 }
 
 #[cfg(test)]
@@ -723,8 +882,8 @@ mod tests {
                 "bash",
                 json!({"command":"false", "timeout":n+1, "i":n.to_string(), "_intent":n.to_string()}),
             );
-            guard.observe(&retry, true);
-            assert_eq!(guard.stop_message(&retry).is_some(), n + 1 == FAILURE_LIMIT);
+            let advice = guard.observe(&retry, true).unwrap_or_default();
+            assert_eq!(advice.contains("Escalation"), n + 1 == FAILURE_LIMIT);
         }
         let original = call("write", json!({"path":"a", "content":{"i":"first"}}));
         let changed = call("write", json!({"path":"a", "content":{"i":"different"}}));
@@ -733,7 +892,7 @@ mod tests {
             normalized_arguments(&changed)
         );
         let changed = call("bash", json!({"command":"true"}));
-        assert!(guard.stop_message(&changed).is_none());
+        assert!(guard.observe(&changed, false).is_none());
     }
 
     #[test]
@@ -803,9 +962,25 @@ mod tests {
         );
         assert!(guard.observe(&changed, true).is_none());
         assert!(guard.observe(&same, true).unwrap().contains("5 times"));
-        assert!(guard.stop_message(&same).is_some());
+        assert!(guard.observe(&same, true).unwrap().contains("6 times"));
         assert!(guard.observe(&same, false).is_none());
         assert!(guard.observe(&same, true).is_none() && guard.observe(&same, true).is_none());
+    }
+
+    #[test]
+    fn identical_failures_escalate_at_each_multiple_without_ending_the_turn() {
+        let mut guard = RepeatGuard::default();
+        let same = call("bash", json!({"command":"false"}));
+        let texts: Vec<String> = (0..12).filter_map(|_| guard.observe(&same, true)).collect();
+        // Guidance starts at the third failure; escalation comes at 4, 8 and 12 failures.
+        let escalated: Vec<usize> = texts
+            .iter()
+            .enumerate()
+            .filter(|(_, text)| text.contains("Escalation"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!((texts.len(), escalated), (10, vec![1, 5, 9]));
+        assert!(texts[9].contains("failed 12 times") && texts[9].contains("`bash`"));
     }
 
     #[test]
@@ -884,10 +1059,10 @@ mod tests {
     }
 
     #[test]
-    fn without_room_to_grow_the_model_is_nudged_then_the_turn_stops() {
+    fn without_room_to_grow_the_model_is_nudged_then_escalated_never_ended() {
         let spent = recover_from_length(8192, 8192, 6000, &reply("", vec![]), 0);
         assert!(
-            matches!(&spent, LengthAction::Nudge { partial: None, message } if message.contains("Think less")),
+            matches!(&spent, LengthAction::Nudge { partial: None, message } if message.contains("Think less") && !message.contains("Escalation")),
             "{spent:?}"
         );
         let partial = recover_from_length(8192, 8192, 6000, &reply("The answer is", vec![]), 0);
@@ -907,8 +1082,8 @@ mod tests {
             "{cut_call:?}"
         );
         match recover_from_length(8192, 8192, 6000, &reply("", vec![]), MAX_LENGTH_NUDGES) {
-            LengthAction::GiveUp(text) => {
-                assert!(text.contains("harness.max_tokens") && text.contains("8192"))
+            LengthAction::Nudge { message, .. } => {
+                assert!(message.contains("Escalation") && message.contains("8192 tokens") && message.contains("Think less"))
             }
             other => panic!("{other:?}"),
         }
@@ -966,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_that_keeps_failing_with_different_arguments_is_warned_then_stopped() {
+    fn a_tool_that_keeps_failing_with_different_arguments_is_warned_then_escalated() {
         let mut guard = StallGuard::default();
         let edit = |n: u32| {
             call(
@@ -994,14 +1169,14 @@ mod tests {
                 "warns once, not every time"
             );
         }
-        let Stall::Stop(text) = guard.call(&edit(10), true) else {
-            panic!("stops at the tenth")
+        let Stall::Warn(text) = guard.call(&edit(10), true) else {
+            panic!("escalates at the tenth")
         };
-        assert!(text.contains("`edit`") && text.contains("10 times"));
+        assert!(text.contains("`edit`") && text.contains("10 times") && text.contains("Escalation"));
     }
 
     #[test]
-    fn stop_text_names_the_last_error_of_the_failing_tool() {
+    fn escalation_text_names_the_last_error_of_the_failing_tool() {
         let mut guard = StallGuard::default();
         let edit = |n: u32| {
             call(
@@ -1017,8 +1192,8 @@ mod tests {
             guard.call(&edit(n), true);
         }
         guard.note_error("edit", "old_string not found in a.rs\nattempt 10");
-        let Stall::Stop(text) = guard.call(&edit(10), true) else {
-            panic!("stops at the tenth")
+        let Stall::Warn(text) = guard.call(&edit(10), true) else {
+            panic!("escalates at the tenth")
         };
         assert!(
             text.contains("`edit`") && text.contains("Last error: old_string not found in a.rs."),
@@ -1086,7 +1261,7 @@ mod tests {
             assert!(matches!(guard.round(true), Stall::None | Stall::Warn(_)));
         }
         assert!(
-            matches!(guard.round(true), Stall::Stop(_)),
+            matches!(guard.round(true), Stall::Warn(_)),
             "eight in a row"
         );
     }

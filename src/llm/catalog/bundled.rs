@@ -4,7 +4,9 @@
 //! `THIRD_PARTY_NOTICES`). Rows are
 //! published list prices and documented limits, not observations: callers label prices
 //! derived here as estimates and prefer live provider metadata or provider-reported costs.
-use super::{CacheWriteSplit, ModelMetadata, ONE_HOUR_WRITE_INPUT_MULTIPLIER, TokenPricing};
+use super::{
+    CacheWriteSplit, ModelKind, ModelMetadata, ONE_HOUR_WRITE_INPUT_MULTIPLIER, TokenPricing,
+};
 use crate::llm::{
     Reply,
     model_config::{ApiProtocol, ModelSelection},
@@ -554,6 +556,7 @@ pub(super) fn complete_metadata(
     selection: &ModelSelection,
     mut metadata: ModelMetadata,
 ) -> ModelMetadata {
+    metadata.kind = known_kind(selection, metadata.kind);
     if let Some(model) = selection_model(selection) {
         metadata.vision = metadata.vision.or(Some(model.vision));
         metadata.reasoning = metadata.reasoning.or(Some(model.reasoning));
@@ -565,10 +568,73 @@ pub(super) fn complete_metadata(
     metadata
 }
 
+/// Documented purpose of exact provider model ids whose model lists carry no purpose field. Only
+/// rows the provider documents by exact id belong here; family or name patterns never do.
+const EXACT_KINDS: &[(&str, &str, ModelKind)] = &[
+    ("openai", "text-embedding-3-small", ModelKind::Embedding),
+    ("openai", "text-embedding-3-large", ModelKind::Embedding),
+    ("openai", "text-embedding-ada-002", ModelKind::Embedding),
+];
+
+/// Purpose a live row reported, else the documented purpose of the exact provider id. An unknown
+/// purpose stays `Unknown`: custom and unlisted models are not assumed to be embedders or chat.
+pub(super) fn known_kind(selection: &ModelSelection, reported: ModelKind) -> ModelKind {
+    if reported != ModelKind::Unknown {
+        return reported;
+    }
+    let Some(provider) = selection_catalog_provider(selection) else {
+        return ModelKind::Unknown;
+    };
+    EXACT_KINDS
+        .iter()
+        .find(|(p, id, _)| *p == provider && *id == selection.model)
+        .map_or(ModelKind::Unknown, |(_, _, kind)| *kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn exact_kinds_come_from_documented_ids_and_never_from_families() {
+        let openai = |model: &str| ModelSelection {
+            provider: "openai".into(),
+            model: model.into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            ..Default::default()
+        };
+        for id in [
+            "text-embedding-3-small",
+            "text-embedding-3-large",
+            "text-embedding-ada-002",
+        ] {
+            assert_eq!(
+                known_kind(&openai(id), ModelKind::Unknown),
+                ModelKind::Embedding
+            );
+        }
+        // Family prefixes, unlisted ids and a live-reported purpose are not overridden by the table.
+        assert_eq!(
+            known_kind(&openai("text-embedding-9"), ModelKind::Unknown),
+            ModelKind::Unknown
+        );
+        assert_eq!(
+            known_kind(&openai("gpt-4o"), ModelKind::Unknown),
+            ModelKind::Unknown
+        );
+        assert_eq!(
+            known_kind(&openai("text-embedding-3-small"), ModelKind::Chat),
+            ModelKind::Chat
+        );
+        // The same id on a local or unrelated endpoint is not the documented OpenAI model.
+        let local = ModelSelection {
+            provider: "openai".into(),
+            model: "text-embedding-3-small".into(),
+            base_url: Some("http://127.0.0.1:8000/v1".into()),
+            ..Default::default()
+        };
+        assert_eq!(known_kind(&local, ModelKind::Unknown), ModelKind::Unknown);
+    }
     fn reply(prompt: u64, completion: u64, read: Option<u64>, write: Option<u64>) -> Reply {
         Reply {
             prompt_tokens: Some(prompt),

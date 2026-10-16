@@ -309,8 +309,8 @@ const ASSIST_FEATURES: [(&str, FeatureAblation); 6] = [
     ("reliability_gate", |o, _| o.reliability_gate = Some(false)),
 ];
 
-/// `raw` turns assistance off, `dial` is the shipped defaults (not the user's config), and each
-/// `ablate-<feature>` changes exactly one feature from `dial`.
+/// `raw` turns assistance off, `dial` is the shipped defaults (not the user's config), `lean` adds
+/// only the lean local profile to `dial`, and each `ablate-<feature>` changes exactly one feature from `dial`.
 fn assist_configurations(
     config: &Config,
     provider: &str,
@@ -328,6 +328,7 @@ fn assist_configurations(
         edit_mode: Some(default_edit),
         reliability_gate: Some(true),
         constrained_repair: Some(true),
+        lean_local: Some(false),
     };
     let raw = AssistanceOverrides {
         enabled: Some(false),
@@ -340,6 +341,7 @@ fn assist_configurations(
         edit_mode: Some(default_edit),
         reliability_gate: Some(false),
         constrained_repair: Some(false),
+        lean_local: Some(false),
     };
     let machine = |name: String, assistance: AssistanceOverrides| MachineConfiguration {
         name,
@@ -355,9 +357,14 @@ fn assist_configurations(
         kv_group_size: None,
         quantized_kv_start: None,
     };
+    let lean = AssistanceOverrides {
+        lean_local: Some(true),
+        ..dial.clone()
+    };
     let mut configurations = vec![
         machine("raw".into(), raw),
         machine("dial".into(), dial.clone()),
+        machine("lean".into(), lean),
     ];
     for (feature, ablate) in ASSIST_FEATURES {
         let mut overrides = dial.clone();
@@ -681,6 +688,9 @@ fn apply_assistance(config: &mut Config, overrides: &AssistanceOverrides) {
     if let Some(value) = overrides.constrained_repair {
         config.assistance.constrained_repair = value;
     }
+    if let Some(value) = overrides.lean_local {
+        config.assistance.lean_local = value.into();
+    }
 }
 
 /// Per-configuration MLX runtime overrides; unset fields keep the user's `local_runtime`.
@@ -729,6 +739,7 @@ fn assistance_settings(config: &Config) -> serde_json::Value {
         "edit_mode": config.edit.mode,
         "reliability_gate": config.reliability.enabled,
         "constrained_repair": config.assistance.constrained_repair,
+        "lean_local": config.assistance.lean_local,
     })
 }
 

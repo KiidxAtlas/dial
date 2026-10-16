@@ -86,7 +86,7 @@ pub fn apply(layout: &Layout, config: Config, flags: &ModelFlags) -> Result<Conf
     let available: Vec<ModelEntry> = discovery
         .models
         .into_iter()
-        .filter(|entry| entry.available && !entry.source.to_lowercase().contains("embedding"))
+        .filter(|entry| entry.available && entry.supports_chat())
         .collect();
     let resolved = resolve(&patterns.0, &available);
     for warning in &resolved.warnings {

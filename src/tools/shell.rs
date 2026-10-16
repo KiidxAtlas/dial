@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 300;
 
+/// The command's working directory: the primary root by default, or `cwd` / a leading simple
+/// `cd path && ...` resolved through [`Workspace::resolve`], so explicitly added roots work and
+/// symlink escapes, protected Dial storage and undeclared directories stay refused.
 fn working_directory(
     ws: &Workspace,
     args: &Value,
@@ -24,17 +27,9 @@ fn working_directory(
     let mut cwd = ws.root().to_path_buf();
     if let Some(value) = args.get("cwd") {
         let value = value.as_str().ok_or("cwd must be a string")?;
-        let path = Path::new(value);
-        cwd = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
-        };
-        cwd = cwd
-            .canonicalize()
-            .map_err(|e| format!("resolving cwd: {e}"))?;
-        if !cwd.starts_with(ws.root()) || !cwd.is_dir() {
-            return Err("cwd must be an existing directory inside the workspace".into());
+        cwd = ws.resolve(value)?;
+        if !cwd.is_dir() {
+            return Err("cwd must be an existing directory inside a workspace root".into());
         }
     }
     #[cfg(not(windows))]
@@ -46,15 +41,12 @@ fn working_directory(
             if let Some((target, script)) = rest.split_once(" && ") {
                 let target = target.trim();
                 if !target.is_empty() && !target.contains(['\'', '"', '`', '$', ';', '|']) {
-                    let path = Path::new(target);
-                    let candidate = if path.is_absolute() {
-                        path.to_path_buf()
-                    } else {
-                        cwd.join(path)
-                    };
-                    if let Ok(path) = candidate.canonicalize()
+                    // Relative targets are relative to the effective cwd, not the primary root.
+                    let candidate = cwd.join(target);
+                    if let Some(path) = candidate
+                        .to_str()
+                        .and_then(|candidate| ws.resolve(candidate).ok())
                         && path.is_dir()
-                        && path.starts_with(ws.root())
                     {
                         return Ok((path, script.to_owned()));
                     }
@@ -718,7 +710,7 @@ fn run_bash(
                     .cwd
                     .canonicalize()
                     .map_err(|error| error.to_string())?;
-                if !cwd.starts_with(ws.root()) || !cwd.is_dir() {
+                if cwd.to_str().is_none_or(|cwd| ws.resolve(cwd).is_err()) || !cwd.is_dir() {
                     return Err("shell state cwd is outside this workspace".into());
                 }
                 Ok(state)
@@ -1196,6 +1188,41 @@ mod tests {
         assert_eq!(cwd, ws.root().join("src"));
         assert_eq!(command, "pwd");
         assert!(working_directory(&ws, &json!({"cwd": "../"}), "pwd").is_err());
+    }
+
+    #[test]
+    fn cwd_may_be_an_added_root_but_not_an_undeclared_directory_or_a_file() {
+        let (dir, mut ws) = workspace();
+        let added = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(added.path().join("pkg")).unwrap();
+        fs::write(added.path().join("file.txt"), "x").unwrap();
+        let added_root = added.path().canonicalize().unwrap();
+        let added_text = added_root.to_string_lossy().into_owned();
+        // Not yet added: refused.
+        assert!(working_directory(&ws, &json!({"cwd": added_text}), "pwd").is_err());
+        ws.add_root(&added_root).unwrap();
+        let (cwd, _) = working_directory(&ws, &json!({"cwd": added_text}), "pwd").unwrap();
+        assert_eq!(cwd, added_root);
+        let (cwd, command) =
+            working_directory(&ws, &json!({}), &format!("cd {added_text}/pkg && pwd")).unwrap();
+        assert_eq!((cwd, command.as_str()), (added_root.join("pkg"), "pwd"));
+        // A leading relative `cd` resolves against the explicit added-root cwd.
+        let (cwd, _) = working_directory(&ws, &json!({"cwd": added_text}), "cd pkg && ls").unwrap();
+        assert_eq!(cwd, added_root.join("pkg"));
+        for denied in [
+            outside.path().to_string_lossy().into_owned(),
+            format!("{added_text}/file.txt"),
+            format!("{added_text}/missing"),
+            format!("{added_text}/../"),
+        ] {
+            assert!(
+                working_directory(&ws, &json!({"cwd": denied}), "pwd").is_err(),
+                "{denied}"
+            );
+        }
+        assert!(working_directory(&ws, &json!({"cwd": "."}), "pwd").is_ok());
+        drop(dir);
     }
     #[cfg(unix)]
     #[test]

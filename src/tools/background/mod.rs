@@ -694,7 +694,7 @@ impl Tool for Background {
                 "action": {"type": "string", "enum": ["start", "list", "output", "wait", "input", "close_stdin", "resize", "kill"]},
                 "command": {"type": "string", "description": "start: shell command to run"},
                 "name": {"type": "string", "description": "start: optional unique name (letters, digits, - _ .); output/wait/kill: which process"},
-                "cwd": {"type": "string", "description": "start: working directory inside the workspace (default: its root)"},
+                "cwd": {"type": "string", "description": "start: working directory relative to the primary workspace root, or absolute inside it or an added workspace root (default: primary root)"},
                 "pty": {"type": "boolean", "description": "start: allocate a private controlling terminal (default false); also enables input"},
                 "stdin": {"type": "boolean", "description": "start without PTY: keep a stdin pipe open (default false)"},
                 "rows": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY start/resize rows (default 24)"},

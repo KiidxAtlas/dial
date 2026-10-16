@@ -44,6 +44,8 @@ pub struct Report {
     pub from_repairs: usize,
     pub from_successes: usize,
     pub from_other_models: usize,
+    /// Verifier-passed teacher (`improve.distill`) trajectories; also counted in `from_other_models`.
+    pub from_teacher: usize,
     pub learned_from: BTreeMap<String, usize>,
     pub skipped_overlap: usize,
     pub skipped_oversize: usize,
@@ -204,6 +206,7 @@ pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Re
             max_tokens,
             &mut report,
             &mut links,
+            true,
         ) {
             Ok(found) => {
                 for candidate in found {
@@ -213,6 +216,36 @@ pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Re
                 }
             }
             Err(_) => report.skipped_siblings += 1,
+        }
+    }
+    // Failure-driven distillation: verifier-passed coach runs from their own database. Successes only;
+    // a teacher's tool repairs are not verified outcomes. Ignored unless distillation is enabled.
+    if super::distill::enabled(config) {
+        let dir = super::distill::teacher_dir(config);
+        let origin = super::distill::origin_tag(&config.for_role("coach").model);
+        if dir.join("state.sqlite3").is_file() {
+            match Store::open_read_only(&dir) {
+                Ok(teacher) => match sibling_candidates(
+                    config,
+                    &origin,
+                    &teacher,
+                    held_out,
+                    max_tokens,
+                    &mut report,
+                    &mut links,
+                    false,
+                ) {
+                    Ok(found) => {
+                        for candidate in found {
+                            candidates
+                                .entry(candidate.digest.clone())
+                                .or_insert(candidate);
+                        }
+                    }
+                    Err(_) => report.skipped_siblings += 1,
+                },
+                Err(_) => report.skipped_siblings += 1,
+            }
         }
     }
     let roots = connected_groups(&links);
@@ -316,6 +349,9 @@ pub fn harvest(config: &Config, store: &Store, held_out: &HashSet<String>) -> Re
             report.from_successes += 1
         }
         if let Some(origin) = &candidate.origin {
+            if origin.starts_with("teacher-") {
+                report.from_teacher += 1;
+            }
             report.from_other_models += 1;
             *report.learned_from.entry(origin.clone()).or_default() += 1;
         }
@@ -505,6 +541,7 @@ fn siblings(config: &Config, report: &mut Report) -> Vec<(String, Store)> {
 /// Verified repairs and successes from one sibling database, screened like local data. Targets lose
 /// their reasoning, and no preference pairs carry over: they were verified against the sibling's own
 /// model, not this one.
+#[allow(clippy::too_many_arguments)]
 fn sibling_candidates(
     config: &Config,
     origin: &str,
@@ -513,9 +550,15 @@ fn sibling_candidates(
     max_tokens: usize,
     report: &mut Report,
     links: &mut BTreeMap<String, HashSet<String>>,
+    repairs: bool,
 ) -> Result<Vec<Candidate>> {
     let mut found = Vec::new();
-    for (trajectory, payload) in sibling.tool_recoveries()? {
+    let repair_rows = if repairs {
+        sibling.tool_recoveries()?
+    } else {
+        Vec::new()
+    };
+    for (trajectory, payload) in repair_rows {
         if !config.improve.learn_from_sessions
             && !sibling
                 .trajectory_domain(trajectory)?
@@ -2327,5 +2370,75 @@ mod tests {
             trajectory_group("dial:learned:aaaa:7:verifier:test").as_deref(),
             Some("trajectory:aaaa:7")
         );
+    }
+
+    /// A coach-assigned teacher database holding one verified and one unverified run.
+    fn teacher_fixture(f: &mut Fixture, held_out_prompt: &str) -> Store {
+        f.config.state_dir = f.dir.path().join("own");
+        f.config.improve.distill = true;
+        f.config.model_roles.insert(
+            "coach".into(),
+            crate::llm::model_config::ModelSelection::new("mlx", "coach-model"),
+        );
+        let teacher = Store::open(
+            &super::super::distill::teacher_dir(&f.config),
+            "coach-model",
+            "case",
+            &Default::default(),
+        )
+        .unwrap();
+        let version = teacher.active().unwrap().id;
+        let add = |prompt: &str, score: f64| {
+            let id = teacher
+                .begin_trajectory(version, "selfplay:read_line", "task", prompt)
+                .unwrap();
+            teacher.finish_trajectory(id, Some("done"), None).unwrap();
+            teacher
+                .outcome(&Outcome {
+                    trajectory: id,
+                    score,
+                    source: "verifier:read_line".into(),
+                    reference: None,
+                })
+                .unwrap();
+            teacher
+                .save_messages(
+                    id,
+                    &json!({"messages":[system(), user(prompt), say("answer")],"tools":schemas()}),
+                )
+                .unwrap();
+        };
+        add("teach verified", 100.0);
+        add("teach unverified", 0.0);
+        add(held_out_prompt, 100.0);
+        teacher
+    }
+
+    #[test]
+    fn verified_teacher_runs_are_tagged_and_unverified_or_sealed_ones_stay_out() {
+        let mut f = Fixture::new();
+        teacher_fixture(&mut f, "teach sealed");
+        let held: HashSet<String> = ["teach sealed".to_owned()].into();
+        let report = f.run_with(&held);
+        assert_eq!(report.from_teacher, 1);
+        let records = f.records();
+        assert_eq!(records.len(), 1);
+        let source = records[0]["source"].as_str().unwrap();
+        assert!(
+            source.starts_with("dial:learned:teacher-coach-model:"),
+            "{source}"
+        );
+        assert!(records[0].to_string().contains("teach verified"));
+        assert!(!records[0].to_string().contains("teach unverified"));
+        assert!(!records[0].to_string().contains("teach sealed"));
+    }
+
+    #[test]
+    fn teacher_runs_are_ignored_unless_distillation_is_enabled() {
+        let mut f = Fixture::new();
+        teacher_fixture(&mut f, "teach sealed");
+        f.config.improve.distill = false;
+        let report = f.run();
+        assert_eq!((report.from_teacher, report.added()), (0, 0));
     }
 }
