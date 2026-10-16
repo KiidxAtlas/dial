@@ -1293,7 +1293,7 @@ impl Default for Config {
 
 /// Dial's user directory when no config is loaded: `DIAL_HOME`, else `$HOME/.dial`. Empty only when
 /// neither is set, so a relative `user_dir` never resolves against the current directory.
-fn default_user_dir() -> PathBuf {
+pub(crate) fn default_user_dir() -> PathBuf {
     match std::env::var_os("DIAL_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => std::env::var_os("HOME")

@@ -221,11 +221,32 @@ fn file_name_of(file: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Directories of the `PATH` environment variable.
+/// Directories of the `PATH` environment variable, then the bin directories of programs Dial
+/// installed itself (`<user_dir>/tools/*/bin` and `node_modules/.bin`), so an installed server is
+/// found without being on the user's `PATH`.
 pub fn path_dirs() -> Vec<PathBuf> {
-    std::env::var_os("PATH")
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    dirs.extend(installed_dirs(&crate::config::types::default_user_dir()));
+    dirs
+}
+
+/// Bin directories under Dial's install root for `user_dir`; empty when nothing is installed.
+fn installed_dirs(user_dir: &Path) -> Vec<PathBuf> {
+    if user_dir.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(user_dir.join("tools")) else {
+        return Vec::new();
+    };
+    let mut tools: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    tools.sort();
+    tools
+        .into_iter()
+        .flat_map(|tool| [tool.join("bin"), tool.join("node_modules/.bin")])
+        .filter(|dir| dir.is_dir())
+        .collect()
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -585,6 +606,25 @@ impl Servers {
     pub fn select(&self, ws_root: &Path, abs: &Path, dirs: &[PathBuf]) -> Result<Resolved, String> {
         Ok(self.select_all(ws_root, abs, dirs)?.remove(0))
     }
+
+    /// Built-in servers for `abs` that are missing but have a Dial install recipe, in preference
+    /// order. Configured servers are never replaced: a wrong `program` is the user's to fix.
+    pub fn installable(&self, ws_root: &Path, abs: &Path, dirs: &[PathBuf]) -> Vec<String> {
+        let Ok(candidates) = self.candidates(&abs.to_string_lossy()) else {
+            return Vec::new();
+        };
+        candidates
+            .into_iter()
+            .filter(|entry| !entry.configured && !entry.linter)
+            .filter_map(|entry| {
+                let root = project_root(ws_root, abs, &entry.root_markers)?;
+                find_program(&entry.program, &[&root, ws_root], ws_root, dirs)
+                    .is_none()
+                    .then(|| entry.program.to_string_lossy().into_owned())
+            })
+            .filter(|program| crate::setup::deps::recipe(program).is_some())
+            .collect()
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -628,6 +668,42 @@ mod tests {
             fs::write(dir.path().join(marker), "").unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn installed_dirs_lists_dial_tool_bins_only_when_present() {
+        let user = tempfile::tempdir().unwrap();
+        assert!(installed_dirs(user.path()).is_empty());
+        assert!(installed_dirs(Path::new("")).is_empty());
+        let bin = user.path().join("tools/gopls/bin");
+        let npm = user.path().join("tools/yaml-language-server/node_modules/.bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&npm).unwrap();
+        fs::create_dir_all(user.path().join("tools/empty")).unwrap();
+        assert_eq!(installed_dirs(user.path()), vec![bin, npm]);
+    }
+
+    #[test]
+    fn installable_names_missing_builtin_servers_with_recipes() {
+        let ws = project(&["Cargo.toml"]);
+        let root = fs::canonicalize(ws.path()).unwrap();
+        let servers = Servers::new(&LspConfig::default());
+        let file = root.join("src/lib.rs");
+        let empty = tempfile::tempdir().unwrap();
+        let dirs = [empty.path().to_path_buf()];
+        assert_eq!(servers.installable(&root, &file, &dirs), vec!["rust-analyzer"]);
+        fake_bin(empty.path(), "rust-analyzer");
+        assert!(servers.installable(&root, &file, &dirs).is_empty());
+    }
+
+    #[test]
+    fn installable_skips_configured_servers() {
+        let ws = project(&["Cargo.toml"]);
+        let root = fs::canonicalize(ws.path()).unwrap();
+        let missing = root.join("nope");
+        let servers = Servers::new(&config(&[("rust-analyzer", &missing, &["rs"])]));
+        let dirs = [root.clone()];
+        assert!(servers.installable(&root, &root.join("lib.rs"), &dirs).is_empty());
     }
 
     #[test]

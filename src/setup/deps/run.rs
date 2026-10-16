@@ -311,6 +311,26 @@ pub fn install(
     Ok(location)
 }
 
+/// Installs `id` after whatever it requires (Node.js for npm servers, uv for Python tools) is
+/// ready. Settings are not saved: callers find the result in Dial's install directory.
+pub fn install_with_requirements(
+    id: &str,
+    env: &Env,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<PathBuf> {
+    let target: &Recipe = recipe(id).with_context(|| format!("unknown dependency {id}"))?;
+    for required in target.requires {
+        let needed = recipe(required).with_context(|| format!("unknown dependency {required}"))?;
+        if locate(needed, env).is_none() {
+            progress(&format!("== {}", needed.title));
+            install(required, env, cancel, progress)?;
+        }
+    }
+    progress(&format!("== {}", target.title));
+    install(id, env, cancel, progress)
+}
+
 /// Downloads the whisper.cpp model if it is missing, then checks its SHA-256. Returns its path.
 /// A file that fails the checksum is deleted, never installed.
 pub fn ensure_whisper_model(

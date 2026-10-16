@@ -31,6 +31,10 @@ pub enum Method {
     /// A pinned release archive from the project's own download, verified by SHA-256 and unpacked
     /// into Dial's install directory. Used only when no package manager above is available.
     Download(prebuilt::Prebuilt),
+    /// A Go program installed with `go install <package>` into the install dir's `bin`.
+    Go(&'static str),
+    /// A rustup component (`rustup component add <name>`), which lands in the Rust toolchain.
+    Rustup(&'static str),
 }
 
 /// Where the artifact a recipe detects lives.
@@ -58,6 +62,52 @@ pub struct Recipe {
 }
 
 const LSP_TS: &[&str] = &["typescript", "typescript-language-server"];
+const LSP_VSCODE: &[&str] = &["vscode-langservers-extracted"];
+
+/// A language server installed from npm; the recipe id is the program name.
+macro_rules! npm_lsp {
+    ($program:literal, $title:literal, $packages:expr) => {
+        Recipe {
+            id: $program,
+            title: $title,
+            requires: &["node"],
+            program: $program,
+            base: Base::Install,
+            artifact: concat!("node_modules/.bin/", $program),
+            methods: &[Method::Npm($packages)],
+        }
+    };
+}
+
+/// A language server installed as a Python tool with uv.
+macro_rules! uv_lsp {
+    ($program:literal, $title:literal, $package:literal) => {
+        Recipe {
+            id: $program,
+            title: $title,
+            requires: &["uv"],
+            program: $program,
+            base: Base::Install,
+            artifact: concat!("bin/", $program),
+            methods: &[Method::Uv($package)],
+        }
+    };
+}
+
+/// A language server from a Homebrew formula.
+macro_rules! brew_lsp {
+    ($program:literal, $title:literal, $formula:literal) => {
+        Recipe {
+            id: $program,
+            title: $title,
+            requires: &[],
+            program: $program,
+            base: Base::Install,
+            artifact: "",
+            methods: &[Method::Brew($formula)],
+        }
+    };
+}
 
 pub const RECIPES: &[Recipe] = &[
     Recipe {
@@ -141,7 +191,7 @@ pub const RECIPES: &[Recipe] = &[
         program: "rust-analyzer",
         base: Base::Install,
         artifact: "",
-        methods: &[Method::Brew("rust-analyzer")],
+        methods: &[Method::Rustup("rust-analyzer"), Method::Brew("rust-analyzer")],
     },
     Recipe {
         id: "typescript-language-server",
@@ -168,7 +218,7 @@ pub const RECIPES: &[Recipe] = &[
         program: "gopls",
         base: Base::Install,
         artifact: "",
-        methods: &[Method::Brew("gopls")],
+        methods: &[Method::Go("golang.org/x/tools/gopls@latest"), Method::Brew("gopls")],
     },
     Recipe {
         id: "lua-language-server",
@@ -188,6 +238,34 @@ pub const RECIPES: &[Recipe] = &[
         artifact: "",
         methods: &[Method::Brew("zls")],
     },
+    npm_lsp!("bash-language-server", "bash-language-server", &["bash-language-server"]),
+    npm_lsp!("yaml-language-server", "yaml-language-server", &["yaml-language-server"]),
+    npm_lsp!("vscode-html-language-server", "HTML language server", LSP_VSCODE),
+    npm_lsp!("vscode-css-language-server", "CSS language server", LSP_VSCODE),
+    npm_lsp!("vscode-json-language-server", "JSON language server", LSP_VSCODE),
+    npm_lsp!("vscode-eslint-language-server", "ESLint language server", LSP_VSCODE),
+    npm_lsp!("svelteserver", "Svelte language server", &["svelte-language-server"]),
+    npm_lsp!("vue-language-server", "Vue language server", &["@vue/language-server"]),
+    npm_lsp!("astro-ls", "Astro language server", &["@astrojs/language-server"]),
+    npm_lsp!("intelephense", "Intelephense", &["intelephense"]),
+    npm_lsp!("docker-langserver", "Dockerfile language server", &["dockerfile-language-server-nodejs"]),
+    npm_lsp!("prisma-language-server", "Prisma language server", &["@prisma/language-server"]),
+    npm_lsp!("vim-language-server", "Vim language server", &["vim-language-server"]),
+    npm_lsp!("graphql-lsp", "GraphQL language server", &["graphql-language-service-cli"]),
+    npm_lsp!("tailwindcss-language-server", "Tailwind CSS language server", &["@tailwindcss/language-server"]),
+    npm_lsp!("emmet-language-server", "Emmet language server", &["emmet-language-server"]),
+    npm_lsp!("biome", "Biome", &["@biomejs/biome"]),
+    uv_lsp!("pylsp", "python-lsp-server", "python-lsp-server"),
+    uv_lsp!("basedpyright-langserver", "basedpyright", "basedpyright"),
+    uv_lsp!("ruff", "Ruff", "ruff"),
+    uv_lsp!("ty", "ty", "ty"),
+    brew_lsp!("marksman", "marksman", "marksman"),
+    brew_lsp!("texlab", "texlab", "texlab"),
+    brew_lsp!("jdtls", "Eclipse JDT language server", "jdtls"),
+    brew_lsp!("elixir-ls", "ElixirLS", "elixir-ls"),
+    brew_lsp!("gleam", "Gleam", "gleam"),
+    brew_lsp!("helm_ls", "helm-ls", "helm-ls"),
+    brew_lsp!("nixd", "nixd", "nixd"),
     Recipe {
         id: "node",
         title: "Node.js",

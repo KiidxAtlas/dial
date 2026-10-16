@@ -222,6 +222,27 @@ pub fn search(family: Family, query: &str) -> Result<Vec<Hit>> {
     parse_search(family, &text)
 }
 
+/// Embedding-model repositories matching `query`, most downloaded first. Network only; no weights.
+/// An empty query browses popular embedders. Uses the `feature-extraction` pipeline tag so results
+/// are embedders rather than chat models; [`search`] remains for the weight-family shelves.
+pub fn search_embedding(query: &str) -> Result<Vec<Hit>> {
+    let mut params = vec![
+        ("pipeline_tag", "feature-extraction"),
+        ("sort", "downloads"),
+        ("direction", "-1"),
+        ("limit", SEARCH_LIMIT),
+        ("expand", "downloads"),
+        ("expand", "likes"),
+        ("expand", "createdAt"),
+    ];
+    let query = query.trim();
+    if !query.is_empty() {
+        params.push(("search", query));
+    }
+    let text = get_text(API, &params)?;
+    parse_search(Family::Gguf, &text)
+}
+
 /// Metadata for one repository, including its whole-repository storage when reported.
 /// Network only; no file listing or weights are fetched.
 pub fn metadata(family: Family, repo: &str) -> Result<Hit> {
