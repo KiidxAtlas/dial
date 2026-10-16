@@ -580,7 +580,7 @@ mod tests {
                 remote.path().to_str().expect("utf-8 path"),
             ],
         );
-        git(repo, &["push", "-q", "origin", "HEAD"]);
+        git(repo, &["push", "-q", "-u", "origin", "HEAD"]);
         remote
     }
 

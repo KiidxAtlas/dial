@@ -179,7 +179,18 @@ mod tests {
         drop(held);
         let other = tempfile::tempdir().unwrap();
         assert!(load(&layout, "parent", other.path(), "task-1", "follow-up").is_err());
-        let saved = load(&layout, "parent", project.path(), "task-1", "follow-up").unwrap();
+        // A flock is shared with any child forked (not yet exec'd) by a concurrently running test, so
+        // the release after `drop` can lag by a few milliseconds.
+        let saved = (0..100)
+            .find_map(|_| {
+                load(&layout, "parent", project.path(), "task-1", "follow-up")
+                    .ok()
+                    .or_else(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        None
+                    })
+            })
+            .expect("lease is released once the holder is dropped");
         assert_eq!(saved.tools, ["read"]);
         assert_eq!(saved.messages.len(), 2);
         assert_eq!(saved.task["task"], "follow-up");
