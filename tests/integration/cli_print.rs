@@ -451,13 +451,14 @@ fn errors_and_empty_answers_have_distinct_exit_statuses_and_json_results() {
             .unwrap()
             .contains("no session")
     );
+    // `--approval` is validated by the argument parser, which exits 2 before any JSON event exists.
     let out = e.run(
         &server,
         &["--output-format", "json", "--approval", "invalid", "hello"],
         "",
     );
-    assert_eq!(out.status.code(), Some(1));
-    assert!(events(&out)[0]["error"].is_string());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid value 'invalid'"));
 }
 
 #[test]

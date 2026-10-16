@@ -5,7 +5,12 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-10-16
+
 ### Added
+- The `lsp` tool installs a missing language server the first time a file needs it, then continues the request. It looks on `PATH` and in Dial's own `~/.dial/tools/*/bin` and `node_modules/.bin` first, asks for the same approval as a server start, installs through npm, uv, `go install`, `rustup component add` or Homebrew (never sudo), and installs Node.js or uv first when the server needs them. A server you configured under `[lsp.<name>]` is never replaced. Install failures are appended to the original "no language server" error.
+- Install recipes for the bash, yaml, html, css, json, eslint, svelte, vue, astro, php (intelephense), docker, prisma, vim, graphql, tailwind, emmet and biome language servers (npm), pylsp, basedpyright, ruff and ty (uv), and marksman, texlab, jdtls, elixir-ls, gleam, helm-ls and nixd (Homebrew). rust-analyzer now installs with rustup and gopls with `go install`, each falling back to Homebrew.
+- `/models` download has an Embeddings shelf that searches Hugging Face for GGUF embedding models. A downloaded GGUF whose architecture is an embedder (bert, nomic-bert, jina-bert-v2, modern-bert and similar) is classified as an embedding model so it can be assigned to the `embedding` role.
 - `/setup memory` lists each memory backend with its prerequisite and status, and enables the one you pick. `/memory help` lists the commands of the selected backend, and `/memory` with the backend off explains how to choose one.
 - `dial doctor` and `/setup list` end with a Memory section: the selected backend with what it still needs, and every backend's readiness with the `dial config set memory.backend <id>` command that selects it. Headless setups no longer need the TUI to see why memory is inactive.
 - Semantic memory offers `memory_update` and `forget` tools, accepts `scope: "global"` on `retain`, and addresses user-wide facts as `user:<n>` in `/memory forget|update|history`. `/memory clear user` clears the user-wide bank.
@@ -18,6 +23,7 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Settings → Semantic memory → Embedding model assigns the `embedding` role instead of writing half of an advanced override, and `validate` rejects a half-filled `embedding_base_url` / `embedding_model` pair. `/memory clear` on semantic memory clears only the project bank.
 - The embedding role picker also lists models whose kind the server does not declare, labelled "unclassified".
 - The system prompt now says when to use the memory tools the selected backend offers (`recall` for past decisions and preferences the repository does not show, `retain` for durable facts), for the root agent and for subagents that have them. Before, only auto-learn had guidance, so the default backend's tools were used rarely.
+- The `zip` dependency moves to 9.x because every 4.x release was yanked; ZIP members whose names are not valid UTF-8 are now rejected in documents, archives and runtime downloads instead of being lossily decoded.
 
 ### Fixed
 - Memory recall no longer discards keyword results when the embedding service is slower than the recall deadline.
@@ -28,6 +34,8 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Semantic memory failed with "database is locked" when a second dial session, or a background thread, opened the store while another connection had it open: each open switched the file from WAL to rollback-journal mode and back, and that switch cannot wait for other connections. The store now stays in WAL mode.
 - Background compaction on ChatGPT plans no longer injects an unsupported output-token limit into the summary model profile. Other providers retain the summary budget, and explicitly configured unsupported overrides still report validation errors.
 - The `browser` tool failed with "Chromium is not installed" when `browser.playwright_module` pointed at a Playwright whose own Chromium revision was never downloaded, even though other Chromium builds were installed. It now falls back to the newest complete Playwright build (dial's private runtime, `PLAYWRIGHT_BROWSERS_PATH`, or Playwright's per-user cache such as `~/Library/Caches/ms-playwright`) and then to an installed Chrome, Chromium or Edge. The built-in runtime also uses this fallback when its Chromium download fails, for example offline. When no browser is found, the error gives the exact `node …/cli.js install chromium` command for the configured Playwright.
+- Scouts and other read-only subagents no longer get the `retain` and `learn` tools.
+- Windows: private-file verification accepts files owned by `BUILTIN\Administrators`, which an elevated token creates; the DACL still grants only the current user.
 
 ## [0.1.7] - 2026-10-15
 

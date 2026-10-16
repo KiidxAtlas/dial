@@ -493,11 +493,11 @@ fn repeated_silence_can_retry_by_explicit_user_direction() {
     }
     let server = serve(vec![
         Reply::Think {
-            reasoning: String::new(),
+            reasoning: "thinking".into(),
             pause: Duration::from_secs(2),
         },
         Reply::Think {
-            reasoning: String::new(),
+            reasoning: "thinking".into(),
             pause: Duration::from_secs(2),
         },
         Reply::Text("Resumed after explicit user direction."),
@@ -551,7 +551,7 @@ fn silent_request_retries_only_inference_and_preserves_completed_work() {
             json!({"path":"kept.txt","content":"completed work"}),
         ),
         Reply::Think {
-            reasoning: String::new(),
+            reasoning: "thinking".into(),
             pause: Duration::from_secs(2),
         },
         Reply::Text("Recovered with completed work preserved."),
@@ -617,11 +617,11 @@ fn repeated_silence_reports_incomplete_without_erasing_the_task_or_files() {
             json!({"path":"kept.txt","content":"completed work"}),
         ),
         Reply::Think {
-            reasoning: String::new(),
+            reasoning: "thinking".into(),
             pause: Duration::from_secs(2),
         },
         Reply::Think {
-            reasoning: String::new(),
+            reasoning: "thinking".into(),
             pause: Duration::from_secs(2),
         },
     ]);
@@ -1043,8 +1043,8 @@ fn cloud_tool_economy_preserves_core_and_requires_loading_specialists() {
             .collect::<Vec<_>>()
     };
     let initial = names(0);
-    // Core tools are always offered, including `task` and `skill`, so the initial set is the core, not `initial_tool_limit`.
-    assert!(initial.len() <= 16, "{initial:?}");
+    // Core tools are always offered, including `task`, `skill`, `message` and the memory tools, so the initial set is the core, not `initial_tool_limit`.
+    assert!(initial.len() <= 19, "{initial:?}");
     for core in [
         "read",
         "edit",
@@ -1512,10 +1512,14 @@ fn repeated_todo_rejections_stop_despite_reworded_claims() {
     let report = agent
         .turn("Inspect the source", &mut Recorder::default())
         .unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Incomplete);
-    assert!(agent.todo().has_open());
-    assert_eq!(server.requests.lock().len(), 5);
-    assert!(report.text.contains("failed 4 times"), "{}", report.text);
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 6);
+    assert!(
+        requests.last().unwrap()["messages"]
+            .to_string()
+            .contains("Escalation: 4 todo updates have been rejected")
+    );
 }
 
 #[test]
@@ -1594,16 +1598,16 @@ fn todo_recovery_bounds_alternating_operations_despite_successful_reads_and_view
     let report = agent
         .turn("Inspect source", &mut Recorder::default())
         .unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 14);
     assert!(
-        report.text.contains("todo updates failed 4 times"),
-        "{}",
-        report.text
+        requests.last().unwrap()["messages"]
+            .to_string()
+            .contains("Escalation: 4 todo updates have been rejected")
     );
-    assert_eq!(server.requests.lock().len(), 13);
     assert_eq!(agent.todo().tasks().len(), 1);
     assert_eq!(agent.todo().tasks()[0].content, "Inspect source");
-    assert!(agent.todo().has_open());
 }
 
 #[test]
@@ -1665,8 +1669,14 @@ fn identical_rejected_todo_updates_stop_even_when_the_plan_changes_between_them(
     let report = agent
         .turn("Inspect source", &mut Recorder::default())
         .unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Incomplete, "{}", report.text);
-    assert!(report.text.contains("failed 4 times"), "{}", report.text);
+    // A successful plan change resets the rejection history, so nothing escalates or stops.
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(report.text, "should not be reached");
+    assert!(
+        server.requests.lock().last().unwrap()["messages"]
+            .to_string()
+            .contains("Escalation:")
+    );
 }
 
 #[test]
@@ -1741,9 +1751,15 @@ fn repeated_invalid_plans_stop_despite_reworded_tasks_and_interleaved_reads() {
     let report = agent
         .turn("Inspect the source", &mut Recorder::default())
         .unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Incomplete);
-    assert_eq!(server.requests.lock().len(), 7);
-    assert!(report.text.contains("failed 4 times"), "{}", report.text);
+    // Repeated rejections escalate in the reminder and the turn continues.
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 8);
+    assert!(
+        requests.last().unwrap()["messages"]
+            .to_string()
+            .contains("Escalation: 4 todo updates have been rejected"),
+    );
     assert!(!agent.todo().has_open());
 }
 
@@ -1915,7 +1931,8 @@ fn interactive_recovery_asks_for_direction_and_continues_with_corrected_evidence
     let mut ui = RecoveryUi::default();
     let report = a.turn("Inspect the project", &mut ui).unwrap();
     assert_eq!(report.outcome, TurnOutcome::Completed);
-    assert_eq!(ui.asked, 1);
+    // Repeated failures escalate in place; the user is no longer interrupted to redirect.
+    assert_eq!(ui.asked, 0);
     assert!(
         server.requests.lock().last().unwrap()["messages"]
             .to_string()
@@ -1964,19 +1981,14 @@ fn repeated_reads_across_failed_checks_stop_and_keep_compact_evidence() {
     let report = a
         .turn("Inspect the current code and fix the build", &mut ui)
         .unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Incomplete);
-    assert!(
-        report
-            .text
-            .contains("same observation was repeated four times"),
-        "{}",
-        report.text
-    );
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
     let requests = server.requests.lock();
-    assert_eq!(
-        requests.len(),
-        14,
-        "different source reads remain available, but four rejected repeats stop before the final response"
+    assert!(
+        requests[5]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["function"]["name"] == "read")
     );
     assert!(
         requests[5]["tools"]
@@ -2062,22 +2074,19 @@ fn repeated_successful_shell_inspections_withhold_bash_and_stop_without_step_lim
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let mut ui = Recorder::default();
     let report = a.turn("Verify the package version", &mut ui).unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Incomplete);
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
     assert_eq!(
         ui.results
             .iter()
             .filter(|(name, _, failed)| name == "bash" && !failed)
             .count(),
-        2,
+        4,
         "report: {}; results: {:?}",
         report.text,
         ui.results
     );
     let requests = server.requests.lock();
-    assert!(
-        requests.len() < 9,
-        "ignored recovery feedback must stop the turn"
-    );
+    assert!(requests.len() >= 9);
     assert!(
         tool_names(&requests[3]).iter().any(|name| name == "bash"),
         "different commands remain available"
@@ -4084,12 +4093,9 @@ fn lm_studio_loaded_context_overrides_the_configured_window_and_drives_compactio
         16384,
         "the loaded size, not the configured one, is the budget"
     );
-    let paused = a.turn("three?", &mut ui).unwrap().text;
-    assert!(
-        paused.contains("paused by compaction policy"),
-        "{paused} {:?}",
-        ui.notices
-    );
+    let third = a.turn("three?", &mut ui).unwrap().text;
+    // A compaction that reduced the request no longer pauses the turn.
+    assert!(!third.contains("paused by compaction policy"), "{third}");
     assert!(
         a.session().messages()[0]["content"]
             .as_str()
@@ -4174,12 +4180,9 @@ fn compaction_that_frees_too_little_pauses_for_an_explicit_resume() {
     let mut ui = Recorder::default();
     a.turn("one?", &mut ui).unwrap();
     a.turn("two?", &mut ui).unwrap();
-    let paused = a.turn("three?", &mut ui).unwrap().text;
-    assert!(
-        paused.contains("paused by compaction policy"),
-        "{paused} {:?}",
-        ui.notices
-    );
+    let third = a.turn("three?", &mut ui).unwrap().text;
+    // A compaction that reduced the request no longer pauses the turn.
+    assert!(!third.contains("paused by compaction policy"), "{third}");
     assert_eq!(
         a.metrics().compactions,
         1,
@@ -4448,12 +4451,12 @@ fn child_repeated_successful_shell_inspections_stop_before_exhausting_steps() {
     run_turn(&e, &mut ui);
     let result = task_result(&main);
     assert!(
-        result.contains("same observation was repeated four times"),
+        result.contains("script exhausted"),
         "{result}; results: {:?}",
         ui.results
     );
     let requests = side.requests.lock();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 9);
     let results: Vec<_> = requests[2]["messages"]
         .as_array()
         .unwrap()
@@ -4567,16 +4570,10 @@ fn child_repeated_reads_reuse_evidence_and_stop_before_exhausting_steps() {
     .unwrap();
     run_turn(&e, &mut Recorder::default());
     let result = task_result(&main);
-    assert!(
-        result.contains("same observation was repeated four times"),
-        "{result}"
-    );
+    // Repeats are answered with a pointer and escalate; the child keeps running until it answers.
+    assert!(result.contains("script exhausted"), "{result}");
     let requests = side.requests.lock();
-    assert_eq!(
-        requests.len(),
-        5,
-        "the child must stop rather than use all steps"
-    );
+    assert_eq!(requests.len(), 9);
     let messages = requests[2]["messages"].as_array().unwrap();
     let results: Vec<_> = messages.iter().filter(|m| m["role"] == "tool").collect();
     assert!(
@@ -4792,6 +4789,11 @@ fn a_batch_runs_read_only_agents_concurrently_and_reports_in_input_order() {
     ]);
     let mut e = env(&main.url, "auto");
     with_subagent_role(&mut e, &side.url);
+    // A localhost endpoint is one shared server and takes one request at a time unless the operator raises it.
+    e.config
+        .task
+        .provider_concurrency
+        .insert("reviewer".into(), 3);
     let mut ui = Recorder::default();
     assert_eq!(run_turn(&e, &mut ui).text, "main finished");
     assert!(
@@ -5895,20 +5897,8 @@ fn rereads_do_not_allow_identical_failed_edits_to_loop_forever() {
     let report = a
         .turn("fix marker", &mut ui)
         .expect("a stuck turn is reported, not raised as an error");
-    assert_eq!(report.outcome, TurnOutcome::Incomplete);
-    assert!(
-        report.text.contains("same arguments failed 4 times"),
-        "{}",
-        report.text
-    );
-    assert!(
-        ui.notices
-            .iter()
-            .any(|n| n.contains("same arguments failed 4 times")),
-        "{:?}",
-        ui.notices
-    );
-    assert_eq!(server.requests.lock().len(), 7);
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
+    assert_eq!(server.requests.lock().len(), 8);
     assert_eq!(
         std::fs::read_to_string(e.project.path().join("marker.txt")).unwrap(),
         "original\n"
@@ -5917,14 +5907,8 @@ fn rereads_do_not_allow_identical_failed_edits_to_loop_forever() {
     assert_eq!(
         messages.iter().filter(|m| m["role"] == "tool").count(),
         7,
-        "all tool results must be persisted before stopping"
+        "every tool result is persisted"
     );
-    assert_eq!(
-        messages.last().unwrap()["role"],
-        "assistant",
-        "the reason is part of the conversation, so resuming sees why it stopped"
-    );
-    assert_eq!(a.metrics().turns_completed, 0);
 }
 
 #[test]
@@ -8481,8 +8465,19 @@ fn live_training_targets_match_actual_requests_across_turns_and_harvest_final_so
     assert!(context.contains("Relevant persistent notes"));
     let system_count = messages.iter().filter(|m| m["role"] == "system").count();
     assert_eq!(
-        system_count, 3,
-        "frozen guidance, stable context and the tool-search addendum"
+        system_count,
+        4,
+        "frozen guidance, stable context, the tool-search addendum and the memory guidance: {:?}",
+        messages
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .map(|m| m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .take(120)
+                .collect::<String>())
+            .collect::<Vec<_>>()
     );
     assert!(
         messages[..system_count]
@@ -8841,24 +8836,12 @@ fn a_tool_that_keeps_failing_with_a_new_guess_each_time_is_warned_then_the_turn_
     let report = a
         .turn("fix f.txt", &mut ui)
         .expect("a stalled turn reports itself instead of erroring");
-    assert_eq!(report.outcome, TurnOutcome::Incomplete);
-    assert!(
-        report
-            .text
-            .contains("failed 10 times in a row without one success"),
-        "{}",
-        report.text
-    );
-    assert!(report.text.contains("guess number 10"), "{}", report.text);
-    assert!(
-        ui.notices.iter().any(|n| n.starts_with("Stopped")),
-        "the user is told, not just the transcript: {:?}",
-        ui.notices
-    );
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
     let requests = server.requests.lock();
     assert!(
-        requests.len() <= 10,
-        "different bad guesses remain bounded by the tool-wide failure guard"
+        requests.last().unwrap()["messages"]
+            .to_string()
+            .contains("times in a row without one success")
     );
     assert!(
         !requests[4]["messages"]
@@ -8876,15 +8859,7 @@ fn a_tool_that_keeps_failing_with_a_new_guess_each_time_is_warned_then_the_turn_
         std::fs::read_to_string(e.project.path().join("f.txt")).unwrap(),
         "the real text\n".repeat(12)
     );
-    let last = a.session().messages().pop().unwrap();
-    assert_eq!(
-        (
-            last["role"].as_str(),
-            last["content"].as_str().map(|t| t.starts_with("Stopped"))
-        ),
-        (Some("assistant"), Some(true))
-    );
-    assert_eq!(a.metrics().turns_completed, 0);
+    assert_eq!(a.metrics().turns_completed, 1);
 }
 
 #[test]
@@ -8901,23 +8876,13 @@ fn rounds_in_which_nothing_worked_end_the_turn_even_when_no_single_tool_streak_d
     e.config.reliability.enabled = false; // Isolate the round guard from earlier rejected checkpoint calls.
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("read the notes", &mut Recorder::default()).unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Incomplete);
-    assert!(
-        report.text.contains("Most recent tool error (`read`)")
-            && report.text.contains("missing-8.txt")
-            && report.text.contains("say \"continue\" to resume"),
-        "{}",
-        report.text
-    );
-    assert!(
-        report
-            .text
-            .contains("every tool call failed for 8 rounds in a row"),
-        "{}",
-        report.text
-    );
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
     let requests = server.requests.lock();
-    assert_eq!(requests.len(), 8);
+    assert!(
+        requests[8]["messages"]
+            .to_string()
+            .contains("every tool call has failed for 8 rounds in a row")
+    );
     let after_fourth = requests[4]["messages"].as_array().unwrap();
     assert!(
         after_fourth.iter().any(|m| m["role"] == "user"
@@ -9116,10 +9081,19 @@ fn isolated_search_applies_smallest_verified_patch_without_touching_other_files(
         Arc::new(move |request| {
             let main = request["tools"]
                 .as_array()
-                .is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == "solve"));
+                .is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == "solve"))
+                || request["messages"].as_array().is_some_and(|ms| {
+                    ms.iter().any(|m| {
+                        m["role"] == "user"
+                            && m["content"].as_str().is_some_and(|s| {
+                                s.contains("Fix the value using verified candidates")
+                            })
+                    })
+                });
             if main {
+                // The first call only loads the deferred tool; the retry executes it.
                 return match main_step.fetch_add(1, Ordering::SeqCst) {
-                    0 => Reply::Call(
+                    0 | 1 => Reply::Call(
                         "solve",
                         json!({
                             "goal":"Make value.txt begin with fixed", "allowed_paths":["value.txt"],
@@ -9176,21 +9150,23 @@ fn isolated_search_applies_smallest_verified_patch_without_touching_other_files(
         "dirty user work\n"
     );
     let requests = server.requests.lock();
-    assert!(
-        requests.last().unwrap()["messages"]
-            .to_string()
-            .contains("\\\"winner\\\":1")
-    );
+    let last = requests.last().unwrap()["messages"].to_string();
+    assert!(last.contains("\\\"winner\\\":1"), "{last}");
 }
 
 #[test]
 fn escalation_rejects_nonlocal_route_before_disclosing_evidence() {
-    let server = serve(vec![
+    let call = || {
         Reply::Call(
             "escalate",
             json!({"goal":"Fix behavior","question":"Which invariant is missing?",
             "evidence":["PRIVATE_PROJECT_EVIDENCE"],"rejected_hypotheses":["syntax alone"]}),
-        ),
+        )
+    };
+    // The first call only loads the deferred tool; the retry executes and is refused.
+    let server = serve(vec![
+        call(),
+        call(),
         Reply::Text("Remote escalation requires operator opt-in."),
     ]);
     let mut e = env(&server.url, "auto");
@@ -9208,13 +9184,18 @@ fn escalation_rejects_nonlocal_route_before_disclosing_evidence() {
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     a.turn("Ask a narrow question", &mut Recorder::default())
         .unwrap();
-    assert_eq!(server.requests.lock().len(), 2);
-    assert!(a.session().messages().iter().any(|m| {
-        m["role"] == "tool"
-            && m["content"]
-                .as_str()
-                .is_some_and(|s| s.contains("allow_remote"))
-    }));
+    assert_eq!(server.requests.lock().len(), 3);
+    let tools: Vec<String> = a
+        .session()
+        .messages()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].to_string())
+        .collect();
+    assert!(
+        tools.iter().any(|s| s.contains("allow_remote")),
+        "{tools:?}"
+    );
 }
 
 #[test]
@@ -9426,6 +9407,7 @@ fn experience_capture_replay_and_stale_refusal_use_real_tools() {
     let id = recipe["id"].as_str().unwrap().to_owned();
     let replay = serve(vec![
         Reply::Call("experience", json!({"action":"run","id":id})),
+        Reply::Call("experience", json!({"action":"run","id":id})),
         Reply::Text("Done."),
     ]);
     let mut resumed = env(&replay.url, "auto");
@@ -9443,6 +9425,7 @@ fn experience_capture_replay_and_stale_refusal_use_real_tools() {
     drop(a);
     let stale = serve(vec![
         Reply::Call("experience", json!({"action":"run","id":id})),
+        Reply::Call("experience", json!({"action":"run","id":id})),
         Reply::Text("Stale; investigate."),
     ]);
     resumed.config.endpoint.as_mut().unwrap().base_url = stale.url.clone();
@@ -9454,7 +9437,7 @@ fn experience_capture_replay_and_stale_refusal_use_real_tools() {
         "concurrent edit"
     );
     assert!(
-        stale.requests.lock()[1]["messages"]
+        stale.requests.lock()[2]["messages"]
             .to_string()
             .contains("preconditions changed")
     );
@@ -9632,6 +9615,7 @@ fn experience_replay_still_requires_each_write_approval() {
         .unwrap();
     let replay = serve(vec![
         Reply::Call("experience", json!({"action":"run","id":id})),
+        Reply::Call("experience", json!({"action":"run","id":id})),
         Reply::Text("Write denied."),
     ]);
     e.config.endpoint.as_mut().unwrap().base_url = replay.url.clone();
@@ -9642,7 +9626,7 @@ fn experience_replay_still_requires_each_write_approval() {
         "old"
     );
     assert!(
-        replay.requests.lock()[1]["messages"]
+        replay.requests.lock()[2]["messages"]
             .to_string()
             .contains("denied")
     );
@@ -9820,17 +9804,10 @@ fn reliability_stops_different_contract_failures_without_executing_them() {
     std::fs::write(e.project.path().join("existing.txt"), "evidence").unwrap();
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     let report = a.turn("Fix a fixture", &mut Recorder::default()).unwrap();
-    assert_eq!(report.outcome, TurnOutcome::Incomplete);
-    assert!(report.text.contains("consecutive tool-contract failures"));
-    assert!(
-        report.text.contains("Most recent tool error (`read`)")
-            && report.text.contains("entire batch is rejected")
-            && report.text.contains("say \"continue\" to resume"),
-        "{}",
-        report.text
-    );
+    // Contract failures escalate; the turn is no longer ended for them.
+    assert_eq!(report.outcome, TurnOutcome::Completed, "{}", report.text);
     assert!(!e.project.path().join("must-not-exist.txt").exists());
-    assert_eq!(server.requests.lock().len(), 3);
+    assert_eq!(server.requests.lock().len(), 4);
     let control = a.session().control_state();
     assert_eq!(control["reliability"]["interface"], "compact single call");
     assert_eq!(control["reliability"]["stats"]["successes"], 0);

@@ -191,7 +191,10 @@ pub const RECIPES: &[Recipe] = &[
         program: "rust-analyzer",
         base: Base::Install,
         artifact: "",
-        methods: &[Method::Rustup("rust-analyzer"), Method::Brew("rust-analyzer")],
+        methods: &[
+            Method::Rustup("rust-analyzer"),
+            Method::Brew("rust-analyzer"),
+        ],
     },
     Recipe {
         id: "typescript-language-server",
@@ -218,7 +221,10 @@ pub const RECIPES: &[Recipe] = &[
         program: "gopls",
         base: Base::Install,
         artifact: "",
-        methods: &[Method::Go("golang.org/x/tools/gopls@latest"), Method::Brew("gopls")],
+        methods: &[
+            Method::Go("golang.org/x/tools/gopls@latest"),
+            Method::Brew("gopls"),
+        ],
     },
     Recipe {
         id: "lua-language-server",
@@ -238,22 +244,82 @@ pub const RECIPES: &[Recipe] = &[
         artifact: "",
         methods: &[Method::Brew("zls")],
     },
-    npm_lsp!("bash-language-server", "bash-language-server", &["bash-language-server"]),
-    npm_lsp!("yaml-language-server", "yaml-language-server", &["yaml-language-server"]),
-    npm_lsp!("vscode-html-language-server", "HTML language server", LSP_VSCODE),
-    npm_lsp!("vscode-css-language-server", "CSS language server", LSP_VSCODE),
-    npm_lsp!("vscode-json-language-server", "JSON language server", LSP_VSCODE),
-    npm_lsp!("vscode-eslint-language-server", "ESLint language server", LSP_VSCODE),
-    npm_lsp!("svelteserver", "Svelte language server", &["svelte-language-server"]),
-    npm_lsp!("vue-language-server", "Vue language server", &["@vue/language-server"]),
-    npm_lsp!("astro-ls", "Astro language server", &["@astrojs/language-server"]),
+    npm_lsp!(
+        "bash-language-server",
+        "bash-language-server",
+        &["bash-language-server"]
+    ),
+    npm_lsp!(
+        "yaml-language-server",
+        "yaml-language-server",
+        &["yaml-language-server"]
+    ),
+    npm_lsp!(
+        "vscode-html-language-server",
+        "HTML language server",
+        LSP_VSCODE
+    ),
+    npm_lsp!(
+        "vscode-css-language-server",
+        "CSS language server",
+        LSP_VSCODE
+    ),
+    npm_lsp!(
+        "vscode-json-language-server",
+        "JSON language server",
+        LSP_VSCODE
+    ),
+    npm_lsp!(
+        "vscode-eslint-language-server",
+        "ESLint language server",
+        LSP_VSCODE
+    ),
+    npm_lsp!(
+        "svelteserver",
+        "Svelte language server",
+        &["svelte-language-server"]
+    ),
+    npm_lsp!(
+        "vue-language-server",
+        "Vue language server",
+        &["@vue/language-server"]
+    ),
+    npm_lsp!(
+        "astro-ls",
+        "Astro language server",
+        &["@astrojs/language-server"]
+    ),
     npm_lsp!("intelephense", "Intelephense", &["intelephense"]),
-    npm_lsp!("docker-langserver", "Dockerfile language server", &["dockerfile-language-server-nodejs"]),
-    npm_lsp!("prisma-language-server", "Prisma language server", &["@prisma/language-server"]),
-    npm_lsp!("vim-language-server", "Vim language server", &["vim-language-server"]),
-    npm_lsp!("graphql-lsp", "GraphQL language server", &["graphql-language-service-cli"]),
-    npm_lsp!("tailwindcss-language-server", "Tailwind CSS language server", &["@tailwindcss/language-server"]),
-    npm_lsp!("emmet-language-server", "Emmet language server", &["emmet-language-server"]),
+    npm_lsp!(
+        "docker-langserver",
+        "Dockerfile language server",
+        &["dockerfile-language-server-nodejs"]
+    ),
+    npm_lsp!(
+        "prisma-language-server",
+        "Prisma language server",
+        &["@prisma/language-server"]
+    ),
+    npm_lsp!(
+        "vim-language-server",
+        "Vim language server",
+        &["vim-language-server"]
+    ),
+    npm_lsp!(
+        "graphql-lsp",
+        "GraphQL language server",
+        &["graphql-language-service-cli"]
+    ),
+    npm_lsp!(
+        "tailwindcss-language-server",
+        "Tailwind CSS language server",
+        &["@tailwindcss/language-server"]
+    ),
+    npm_lsp!(
+        "emmet-language-server",
+        "Emmet language server",
+        &["emmet-language-server"]
+    ),
     npm_lsp!("biome", "Biome", &["@biomejs/biome"]),
     uv_lsp!("pylsp", "python-lsp-server", "python-lsp-server"),
     uv_lsp!("basedpyright-langserver", "basedpyright", "basedpyright"),

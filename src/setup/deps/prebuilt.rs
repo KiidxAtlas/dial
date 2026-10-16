@@ -298,7 +298,12 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
     let mut total: u64 = 0;
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index).context("reading the runtime archive")?;
-        let raw = std::path::PathBuf::from(entry.name());
+        let raw = std::path::PathBuf::from(
+            entry
+                .name()
+                .context("the runtime archive has a member name that is not UTF-8")?
+                .as_ref(),
+        );
         let Some(rel) = inside_top(&raw)? else {
             continue;
         };

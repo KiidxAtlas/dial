@@ -26,11 +26,11 @@ impl Package {
             let member = zip
                 .by_index(i)
                 .map_err(|e| format!("reading document directory: {e}"))?;
-            if !super::archives::safe(member.name()) || !names.insert(member.name().to_string()) {
-                return Err(format!(
-                    "unsafe or duplicate document member {:?}",
-                    member.name()
-                ));
+            let name = member
+                .name()
+                .map_err(|e| format!("unreadable document member name: {e}"))?;
+            if !super::archives::safe(&name) || !names.insert(name.to_string()) {
+                return Err(format!("unsafe or duplicate document member {name:?}"));
             }
             if member.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
                 return Err("document symlink members are rejected".into());
@@ -45,7 +45,7 @@ impl Package {
         Ok(Self { zip, decoded: 0 })
     }
     pub(super) fn has(&self, name: &str) -> bool {
-        self.zip.file_names().any(|n| n == name)
+        self.zip.file_names().any(|n| n.is_ok_and(|n| n == name))
     }
     pub(super) fn xml(&mut self, name: &str) -> Result<String, String> {
         if !super::archives::safe(name) {
