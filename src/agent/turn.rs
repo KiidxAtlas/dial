@@ -304,16 +304,24 @@ impl Agent<'_> {
                     .map(|text| json!({"role":"user","content":text,"dial_transient":true})),
             );
             messages.extend(pending_nudges.iter().cloned());
-            if let Some(repeat) = guard::RepeatedToolCall::detect(
+            // The redirect is stated once; if the identical repeat continues, the stronger
+            // guidance replaces it. Neither stage ends the turn.
+            let repeat_streak = guard::RepeatedToolCall::detect(
                 &messages,
                 stream_guards::TOOL_CALL_LOOP_THRESHOLD,
                 stream_guards::TOOL_CALL_LOOP_EXEMPT_TOOLS,
-            ) {
+            );
+            if let Some(repeat) = &repeat_streak {
                 ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, &format!(
                     "Repeated tool call {}x; redirecting the model",
                     repeat.count
                 )));
-                messages.push(json!({"role":"user","dial_transient":true,"content":stream_guards::render_tool_call_loop_redirect(&repeat.tool_name, repeat.count, &repeat.arguments_summary, &repeat.result_summary)}));
+                let guidance = if repeat.count > stream_guards::TOOL_CALL_LOOP_THRESHOLD {
+                    stream_guards::render_tool_call_loop_escalation(&repeat.tool_name, repeat.count, &repeat.arguments_summary, &repeat.result_summary)
+                } else {
+                    stream_guards::render_tool_call_loop_redirect(&repeat.tool_name, repeat.count, &repeat.arguments_summary, &repeat.result_summary)
+                };
+                messages.push(json!({"role":"user","dial_transient":true,"content":guidance}));
             }
             coalesce_harness_notes(&mut messages, notes_start);
             if !self.experimental_context_owner()
@@ -1188,7 +1196,9 @@ impl Agent<'_> {
                         &self.config.assistance,
                         self.hermetic,
                         &model.provider,
+                        &model.model,
                         selection.profile.as_ref(),
+                        backend.endpoint_structured_output(),
                     ),
                 &reply,
                 schemas.as_slice(),
@@ -1410,7 +1420,9 @@ impl Agent<'_> {
                     &self.config.assistance,
                     self.hermetic,
                     &model.provider,
+                    &model.model,
                     selection.profile.as_ref(),
+                    backend.endpoint_structured_output(),
                 ),
                 &reply,
                 schemas.as_slice(),
@@ -1488,6 +1500,15 @@ impl Agent<'_> {
                     }
                 }
             }
+            // Past the stronger guidance, an identical repeat is answered with its earlier result
+            // instead of running again. Only the repeated call set qualifies; anything else runs.
+            let duplicates = repeat_streak
+                .as_ref()
+                .filter(|repeat| repeat.count > stream_guards::TOOL_CALL_LOOP_THRESHOLD)
+                .and_then(|repeat| repeat.short_circuit(&reply.tool_calls));
+            if duplicates.is_some() {
+                ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, "Repeated tool call not executed; the earlier identical result is already in context"));
+            }
             for (index, call) in reply.tool_calls.iter().enumerate() {
                 if parallel.is_empty()
                     && let Some(reason) = engine.pending_refusal()
@@ -1504,6 +1525,13 @@ impl Agent<'_> {
                         interrupted: true,
                         trajectory: None,
                     }).map(engine::Tick::Finished);
+                }
+                if let Some(results) = &duplicates {
+                    let output = ToolOutput::ok(results[index].clone());
+                    ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
+                    ui.tool_result_with_id(&call.id, &call.name, &output);
+                    self.push(tools::outcome::message(&call.id, &output))?;
+                    continue;
                 }
                 if self.edit_preview_intercepted && parallel.is_empty() {
                     let output = ToolOutput::err(
@@ -2227,7 +2255,9 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, advice.as_str()));
                 pending_nudges.push(json!({"role":"user","content":advice,"dial_transient":true}));
             }
-            let warning = match stall.round(!round_succeeded) {
+            // A short-circuited round neither failed nor succeeded, so it must not advance failure streaks.
+            let stall_round = if duplicates.is_some() { guard::Stall::None } else { stall.round(!round_succeeded) };
+            let warning = match stall_round {
                 guard::Stall::Stop(message) => {
                     stop.get_or_insert(message);
                     None

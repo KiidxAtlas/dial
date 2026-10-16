@@ -7,6 +7,7 @@ pub mod extensions;
 pub mod git;
 mod headers;
 pub mod jobs;
+pub mod local_models;
 pub mod model_settings;
 pub mod models;
 pub mod palette;

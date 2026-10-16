@@ -396,6 +396,7 @@ impl Agent<'_> {
                             return approval::authorize_source_read_paths(
                                 &self.always,
                                 self.workspace.root(),
+                                self.workspace.additional_roots(),
                                 original,
                                 &tool,
                                 &paths,

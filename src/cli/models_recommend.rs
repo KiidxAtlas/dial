@@ -1,7 +1,7 @@
-//! `dial models recommend`: RAM-aware fit estimates for downloaded local MLX checkpoints.
+//! `dial models recommend`: RAM-aware fit estimates for downloaded local MLX and GGUF models.
 //!
-//! Reads weights, `config.json` and recorded `dial reliability check` reports from disk. It
-//! loads no model and makes no network calls. Estimates come from `llm::local_fit`.
+//! Reads weights, `config.json` or the GGUF header, and recorded `dial reliability check` reports
+//! from disk. It loads no model and makes no network calls. Estimates come from `llm::local_fit`.
 
 use crate::config::types::Config;
 use crate::llm::catalog;
@@ -192,10 +192,17 @@ fn validate(options: &RecommendOptions) -> Result<()> {
     Ok(())
 }
 
-/// Downloaded MLX checkpoints plus favorite MLX paths that resolve to local snapshots.
+/// Downloaded MLX and GGUF models plus favorite local paths that resolve to them.
 fn candidates(layout: &Layout, config: &Config) -> Vec<Candidate> {
-    let mut out: Vec<Candidate> = catalog::downloaded_mlx_models(&layout.user_dir)
+    use crate::llm::local_format::{LocalFormat, detect};
+    let mut out: Vec<Candidate> = catalog::downloaded_local_models(&layout.user_dir)
         .into_iter()
+        .filter(|entry| {
+            matches!(
+                detect(Path::new(&entry.selection.model)),
+                Some(LocalFormat::Mlx | LocalFormat::Gguf)
+            )
+        })
         .map(|entry| Candidate {
             label: entry.label,
             source: entry.source,
@@ -237,11 +244,25 @@ fn row(
     memory_bytes: Option<u64>,
     reports: &[(String, Recorded)],
 ) -> Row {
+    let gguf = crate::llm::local_format::gguf_info(&candidate.path)
+        .filter(|_| !candidate.path.join("config.json").is_file());
     let config = fs::read_to_string(candidate.path.join("config.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    let architecture = config.as_ref().and_then(Architecture::from_config);
-    let weights_bytes = local_fit::safetensors_bytes(&candidate.path);
+    let (architecture, weights_bytes, missing_layout, missing_weights) = match &gguf {
+        Some(info) => (
+            Architecture::from_gguf(info),
+            crate::llm::local_format::gguf_weight_bytes(&candidate.path),
+            "the GGUF header has no transformer layout",
+            "no GGUF weights found",
+        ),
+        None => (
+            config.as_ref().and_then(Architecture::from_config),
+            local_fit::safetensors_bytes(&candidate.path),
+            "config.json has no transformer layout",
+            "no safetensors weights found",
+        ),
+    };
     let (estimate, max_context_tokens, note) = match (architecture, weights_bytes) {
         (Some(arch), Some(weights)) => (
             Some(local_fit::estimate(
@@ -254,12 +275,8 @@ fn row(
             local_fit::max_context(weights, &arch, kv_bits, memory_bytes),
             None,
         ),
-        (None, _) => (
-            None,
-            0,
-            Some("config.json has no transformer layout".to_owned()),
-        ),
-        (Some(_), None) => (None, 0, Some("no safetensors weights found".to_owned())),
+        (None, _) => (None, 0, Some(missing_layout.to_owned())),
+        (Some(_), None) => (None, 0, Some(missing_weights.to_owned())),
     };
     let path = candidate.path.to_string_lossy().into_owned();
     let recorded = reports
@@ -373,7 +390,7 @@ fn format_report(report: &Report) -> String {
     out.push('\n');
     if report.models.is_empty() {
         out.push_str(
-            "no downloaded local MLX models found; download one with `dial setup -m <repo>`\n",
+            "no downloaded local MLX or GGUF models found; download one with `dial setup -m <repo>`\n",
         );
     } else {
         let header = [
@@ -450,4 +467,45 @@ fn format_report(report: &Report) -> String {
          RELIABILITY shows recorded `dial reliability check` results only, not coding accuracy.\n",
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::local_format::gguf_metadata_tests::{header, string, uint32};
+
+    #[test]
+    fn gguf_models_are_sized_from_their_header_and_file() {
+        let root = tempfile::tempdir().unwrap();
+        let mut bytes = header(&[
+            ("general.architecture", string("llama")),
+            ("llama.block_count", uint32(32)),
+            ("llama.attention.head_count", uint32(32)),
+            ("llama.attention.head_count_kv", uint32(8)),
+            ("llama.embedding_length", uint32(4096)),
+            ("llama.context_length", uint32(131_072)),
+        ]);
+        bytes.resize(bytes.len() + 4096, 0);
+        let weights = bytes.len() as u64;
+        fs::write(root.path().join("model-Q4_K_M.gguf"), bytes).unwrap();
+        let row = row(
+            Candidate {
+                label: "llama-gguf".into(),
+                source: "test".into(),
+                path: root.path().to_path_buf(),
+                favorite: false,
+            },
+            8192,
+            None,
+            Some(64 * GIB),
+            &[],
+        );
+        assert_eq!(row.note, None);
+        assert_eq!(row.weights_bytes, Some(weights));
+        let estimate = row.estimate.unwrap();
+        // 32 layers x 8 KV heads x (128 + 128) values x 2 bytes per token.
+        assert_eq!(estimate.kv_bytes, 8192 * 32 * 8 * 256 * 2);
+        assert_eq!(row.fit, Fit::Fits);
+        assert!(row.max_context_tokens > 8192);
+    }
 }

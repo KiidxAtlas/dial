@@ -155,6 +155,8 @@ pub struct ModelServer {
     steering: Option<crate::steering::Specification>,
     runtime: llm::local_runtime::LocalRuntime,
     tool_grammar: bool,
+    /// The context window a GGUF server's `--ctx-size` was sized from; `None` for MLX.
+    gguf_context: Option<Option<u64>>,
     tracking: Option<crate::storage::process_record::Record>,
 }
 
@@ -254,6 +256,11 @@ impl ModelServer {
         self.model == model && self.adapter.as_deref() == adapter
     }
 
+    /// Whether this server loaded the weights of `model`, with any adapter.
+    pub fn serves(&self, model: &str) -> bool {
+        self.model == model
+    }
+
     /// False once the server process has exited (crash or external kill).
     pub fn is_running(&self) -> bool {
         !self.process.stopped && matches!(self.process.exited(), Ok(false))
@@ -265,12 +272,15 @@ impl ModelServer {
         adapter: Option<&Path>,
         steering: Option<&crate::steering::Specification>,
         runtime: &llm::local_runtime::LocalRuntime,
-        tool_grammar: bool,
+        context: Option<&crate::config::types::Config>,
     ) -> bool {
         self.matches(model, adapter)
             && self.steering.as_ref() == steering
             && self.runtime == *runtime
-            && self.tool_grammar == tool_grammar
+            && self.tool_grammar == tool_grammar_enabled(context)
+            && self
+                .gguf_context
+                .is_none_or(|launched| launched == requested_context(context))
             && self.is_running()
     }
 
@@ -374,15 +384,9 @@ pub fn ensure_profile_tracked<'a>(
         context,
         runtime,
     } = profile;
-    let reusable = slot.as_ref().is_some_and(|server| {
-        server.ready_for(
-            model,
-            adapter,
-            steering,
-            runtime,
-            tool_grammar_enabled(context),
-        )
-    });
+    let reusable = slot
+        .as_ref()
+        .is_some_and(|server| server.ready_for(model, adapter, steering, runtime, context));
     if !reusable {
         drop(slot.take());
         *slot = Some(ModelServer::start_profile(
@@ -403,6 +407,14 @@ pub fn ensure_profile_tracked<'a>(
 /// `DIAL_TOOL_GRAMMAR` handoff in `launch`; Python defaults to enabled.
 pub fn tool_grammar_enabled(context: Option<&crate::config::types::Config>) -> bool {
     context.is_none_or(|config| config.assistance.tool_grammar)
+}
+
+/// The context window a GGUF launch sizes `--ctx-size` from. MLX servers size their cache
+/// dynamically, so only GGUF servers relaunch when it changes.
+fn requested_context(context: Option<&crate::config::types::Config>) -> Option<u64> {
+    context
+        .and_then(|config| config.requested_context_window())
+        .map(u64::from)
 }
 
 /// Ask the OS for a free loopback port. The listener is dropped before the
@@ -471,6 +483,82 @@ fn spawn_spec(command: &Command) -> anyhow::Result<crate::storage::process_recor
     })
 }
 
+/// Command line for a Dial-supervised `llama-server` serving one GGUF model.
+struct LlamaLaunch<'a> {
+    model: &'a Path,
+    /// Multimodal projector (`mmproj*.gguf`) found next to the model.
+    projector: Option<&'a Path>,
+    /// A GGUF LoRA adapter (llama.cpp cannot load MLX adapters).
+    adapter: Option<&'a Path>,
+    /// Memory-fitted context; `None` leaves llama.cpp's own default.
+    context_tokens: Option<u64>,
+    port: u16,
+}
+
+impl LlamaLaunch<'_> {
+    /// Maps `[local_runtime]` onto llama.cpp. Settings without an exact llama.cpp equivalent are
+    /// refused rather than approximated, so a launch never silently ignores configuration.
+    fn args(
+        &self,
+        runtime: &llm::local_runtime::LocalRuntime,
+    ) -> anyhow::Result<Vec<std::ffi::OsString>> {
+        let mut args: Vec<std::ffi::OsString> = vec!["-m".into(), self.model.into()];
+        args.extend(
+            [
+                "--host=127.0.0.1".to_owned(),
+                format!("--port={}", self.port),
+                "--jinja".to_owned(),
+                // One slot keeps the whole context and prompt cache for the single session.
+                "--parallel=1".to_owned(),
+            ]
+            .map(Into::into),
+        );
+        if let Some(tokens) = self.context_tokens {
+            args.push(format!("--ctx-size={tokens}").into());
+        }
+        if let Some(projector) = self.projector {
+            args.extend(["--mmproj".into(), projector.into()]);
+        }
+        if let Some(adapter) = self.adapter {
+            let file = llm::local_format::gguf_file(adapter).ok_or_else(|| {
+                anyhow!(
+                    "{} is not a GGUF LoRA adapter; llama.cpp loads only GGUF adapters, so train on the model's MLX checkpoint or convert the adapter with llama.cpp's convert_lora_to_gguf.py",
+                    adapter.display()
+                )
+            })?;
+            args.extend(["--lora".into(), file.into()]);
+        }
+        if let Some(draft) = &runtime.draft_model {
+            let file = llm::local_format::gguf_file(Path::new(draft)).ok_or_else(|| {
+                anyhow!(
+                    "draft_model {draft} must be a local GGUF file (or a folder holding one) for a GGUF model; llama.cpp cannot load MLX drafts or download by id here"
+                )
+            })?;
+            args.extend(["--model-draft".into(), file.into()]);
+            let count = runtime
+                .num_draft_tokens
+                .unwrap_or(llm::local_runtime::DEFAULT_NUM_DRAFT_TOKENS);
+            args.push(format!("--spec-draft-n-max={count}").into());
+        }
+        if let Some(bits) = runtime.kv_bits {
+            let kind = match bits {
+                8 => "q8_0",
+                4 => "q4_0",
+                other => anyhow::bail!(
+                    "kv_bits = {other} has no llama.cpp KV-cache type; GGUF models accept 4 (q4_0) or 8 (q8_0)"
+                ),
+            };
+            anyhow::ensure!(
+                runtime.kv_group_size.is_none() && runtime.quantized_kv_start.is_none(),
+                "kv_group_size and quantized_kv_start are MLX-only; llama.cpp quantizes the whole KV cache with fixed blocks"
+            );
+            args.push(format!("--cache-type-k={kind}").into());
+            args.push(format!("--cache-type-v={kind}").into());
+        }
+        Ok(args)
+    }
+}
+
 fn launch(
     profile: ServerProfile<'_>,
     port: u16,
@@ -485,46 +573,82 @@ fn launch(
         context,
         runtime,
     } = profile;
-    let vision = llm::catalog::local_model_metadata(Path::new(model)).vision == Some(true);
+    let format = llm::local_format::detect(Path::new(model));
+    if format == Some(llm::local_format::LocalFormat::Splash) {
+        return Err(Failure::Fatal(anyhow!(
+            "{model} is a Splash bundle, which only LM Studio can run: load it in LM Studio and select it under the LM Studio provider (Dial lists LM Studio's loaded models automatically)"
+        )));
+    }
+    let gguf = if format == Some(llm::local_format::LocalFormat::Gguf) {
+        llm::local_format::gguf_file(Path::new(model))
+    } else {
+        None
+    };
+    let vision =
+        gguf.is_none() && llm::catalog::local_model_metadata(Path::new(model)).vision == Some(true);
     runtime.validate().map_err(Failure::Fatal)?;
-    if vision && !runtime.is_default() {
+    if gguf.is_none() && vision && !runtime.is_default() {
         return Err(Failure::Fatal(anyhow!(
             "draft-model and KV-cache settings apply to MLX-LM text models only; vision models run through MLX-VLM without them"
         )));
     }
-    let mut command = Command::new(python);
-    // `--opt=value` keeps a value that starts with `-` from being read as a flag.
-    command
-        .arg("-c")
-        .arg(launch_script())
-        .arg(format!("--model={model}"))
-        .arg("--host=127.0.0.1")
-        .arg(format!("--port={port}"))
-        .arg("--log-level=WARNING");
-    if vision {
-        command.arg("--vision-cache-size=1").arg("--max-num-seqs=1");
-        command.env("APC_ENABLED", "0");
-    } else if let Some(bytes) = prompt_cache_bytes() {
-        command.arg(format!("--prompt-cache-bytes={bytes}"));
-    }
-    if let Some(adapter) = adapter {
-        let mut flag = std::ffi::OsString::from("--adapter-path=");
-        flag.push(adapter);
-        command.arg(flag);
-    }
-    for arg in runtime.server_args() {
-        command.arg(arg);
-    }
-    if !tool_grammar_enabled(context) {
-        command.env("DIAL_TOOL_GRAMMAR", "0");
-    }
-    let steering_spec = steering
-        .map(serde_json::to_string)
-        .transpose()
-        .context("encoding steering specification")
-        .map_err(Failure::Fatal)?
-        .unwrap_or_default();
-    let mut child = crate::platform::process::spawn_group(
+    let mut command = if let Some(file) = &gguf {
+        if steering.is_some() {
+            return Err(Failure::Fatal(anyhow!(
+                "activation steering needs an MLX checkpoint; GGUF models run on llama.cpp without it"
+            )));
+        }
+        let program = llm::local_format::llama_server().ok_or_else(|| {
+            Failure::Fatal(anyhow!(
+                "GGUF models need llama.cpp's `llama-server`: install llama.cpp (for example `brew install llama.cpp`) or set DIAL_LLAMA_SERVER to its path"
+            ))
+        })?;
+        let requested = requested_context(context);
+        let context_tokens = llm::local_fit::gguf_serving_context(file, requested, runtime.kv_bits);
+        let projector = llm::local_format::gguf_projector(file);
+        let launch = LlamaLaunch {
+            model: file,
+            projector: projector.as_deref(),
+            adapter,
+            context_tokens,
+            port,
+        };
+        let mut command = Command::new(program);
+        command.args(launch.args(runtime).map_err(Failure::Fatal)?);
+        command
+    } else {
+        let mut command = Command::new(python);
+        // `--opt=value` keeps a value that starts with `-` from being read as a flag.
+        command
+            .arg("-c")
+            .arg(launch_script())
+            .arg(format!("--model={model}"))
+            .arg("--host=127.0.0.1")
+            .arg(format!("--port={port}"))
+            .arg("--log-level=WARNING");
+        if vision {
+            command.arg("--vision-cache-size=1").arg("--max-num-seqs=1");
+            command.env("APC_ENABLED", "0");
+        } else if let Some(bytes) = prompt_cache_bytes() {
+            command.arg(format!("--prompt-cache-bytes={bytes}"));
+        }
+        if let Some(adapter) = adapter {
+            let mut flag = std::ffi::OsString::from("--adapter-path=");
+            flag.push(adapter);
+            command.arg(flag);
+        }
+        for arg in runtime.server_args() {
+            command.arg(arg);
+        }
+        if !tool_grammar_enabled(context) {
+            command.env("DIAL_TOOL_GRAMMAR", "0");
+        }
+        let steering_spec = steering
+            .map(serde_json::to_string)
+            .transpose()
+            .context("encoding steering specification")
+            .map_err(Failure::Fatal)?
+            .unwrap_or_default();
         command
             .env(
                 "DIAL_MODEL_ENGINE",
@@ -533,12 +657,16 @@ fn launch(
             .env("DIAL_PARENT_PID", std::process::id().to_string())
             .env("DIAL_STEERING_SPEC", steering_spec)
             .env("HF_HUB_OFFLINE", "1")
-            .env("PYTHONUNBUFFERED", "1")
+            .env("PYTHONUNBUFFERED", "1");
+        command
+    };
+    let mut child = crate::platform::process::spawn_group(
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped()),
     )
-    .context("starting local MLX server")
+    .context("starting local model server")
     .map_err(Failure::Fatal)?;
     let stderr = child.stderr.take();
     let mut process = Supervised {
@@ -589,6 +717,7 @@ fn launch(
                 steering: steering.cloned(),
                 runtime: runtime.clone(),
                 tool_grammar: tool_grammar_enabled(context),
+                gguf_context: gguf.is_some().then(|| requested_context(context)),
                 tracking,
             })
         }
@@ -707,6 +836,124 @@ pub(crate) mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    fn strings(args: Vec<std::ffi::OsString>) -> Vec<String> {
+        args.into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn gguf_launch_maps_runtime_settings_onto_llama_cpp_flags() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("m.gguf");
+        let draft = root.path().join("draft.gguf");
+        let lora = root.path().join("lora.gguf");
+        for file in [&model, &draft, &lora] {
+            fs::write(file, b"GGUF\x03\0\0\0").unwrap();
+        }
+        let projector = root.path().join("mmproj-f16.gguf");
+        let launch = LlamaLaunch {
+            model: &model,
+            projector: Some(&projector),
+            adapter: Some(&lora),
+            context_tokens: Some(32768),
+            port: 4100,
+        };
+        let runtime = llm::local_runtime::LocalRuntime {
+            draft_model: Some(draft.to_string_lossy().into_owned()),
+            num_draft_tokens: Some(5),
+            kv_bits: Some(8),
+            ..Default::default()
+        };
+        let args = strings(launch.args(&runtime).unwrap());
+        let flag = |name: &str| {
+            let at = args.iter().position(|arg| arg == name).unwrap();
+            args[at + 1].clone()
+        };
+        assert_eq!(flag("-m"), model.to_string_lossy());
+        assert_eq!(flag("--mmproj"), projector.to_string_lossy());
+        assert_eq!(flag("--lora"), lora.to_string_lossy());
+        assert_eq!(flag("--model-draft"), draft.to_string_lossy());
+        for expected in [
+            "--ctx-size=32768",
+            "--spec-draft-n-max=5",
+            "--cache-type-k=q8_0",
+            "--cache-type-v=q8_0",
+            "--parallel=1",
+            "--jinja",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == expected),
+                "{expected} in {args:?}"
+            );
+        }
+
+        let plain = strings(
+            LlamaLaunch {
+                adapter: None,
+                projector: None,
+                context_tokens: None,
+                ..launch
+            }
+            .args(&Default::default())
+            .unwrap(),
+        );
+        assert!(!plain.iter().any(|arg| arg.starts_with("--ctx-size")
+            || arg.starts_with("--cache-type")
+            || arg == "--lora"));
+    }
+
+    #[test]
+    fn gguf_launch_refuses_settings_llama_cpp_cannot_honor() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("m.gguf");
+        fs::write(&model, b"GGUF\x03\0\0\0").unwrap();
+        let mlx_adapter = root.path().join("adapter");
+        fs::create_dir(&mlx_adapter).unwrap();
+        fs::write(mlx_adapter.join("adapters.safetensors"), b"x").unwrap();
+        let launch = |adapter| LlamaLaunch {
+            model: &model,
+            projector: None,
+            adapter,
+            context_tokens: None,
+            port: 1,
+        };
+        let error = launch(Some(&mlx_adapter))
+            .args(&Default::default())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not a GGUF LoRA adapter"),
+            "{error}"
+        );
+        for (runtime, message) in [
+            (
+                llm::local_runtime::LocalRuntime {
+                    kv_bits: Some(6),
+                    ..Default::default()
+                },
+                "no llama.cpp KV-cache type",
+            ),
+            (
+                llm::local_runtime::LocalRuntime {
+                    kv_bits: Some(4),
+                    kv_group_size: Some(64),
+                    ..Default::default()
+                },
+                "MLX-only",
+            ),
+            (
+                llm::local_runtime::LocalRuntime {
+                    draft_model: Some("mlx-community/draft".into()),
+                    ..Default::default()
+                },
+                "must be a local GGUF file",
+            ),
+        ] {
+            let error = launch(None).args(&runtime).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
 
     /// Stands in for `python -m mlx_lm.server`. The `--model` value selects a
     /// behaviour: `exit-early`, `never-ready`, `bad-model`, or a path that

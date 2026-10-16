@@ -44,6 +44,7 @@ pub(crate) mod mailbox;
 mod memory_capture;
 mod memory_controller;
 pub mod modes;
+mod mutation_cycles;
 pub mod output_schema;
 mod progress;
 pub mod prompt;

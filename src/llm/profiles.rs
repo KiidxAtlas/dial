@@ -179,17 +179,76 @@ impl ModelProfile {
             ..Default::default()
         }
     }
-    /// Effective structured-output mechanism: explicit capability, else the provider default.
+    /// Effective structured-output mechanism: explicit capability, else the detected endpoint, else
+    /// the provider default.
     pub fn structured_output(&self) -> StructuredOutput {
-        structured_output_for(&self.provider, &self.capabilities)
+        resolve_structured_output(
+            &self.provider,
+            &self.model,
+            &self.capabilities,
+            self.endpoint_structured_output,
+        )
     }
 }
 
-/// Effective structured-output mechanism for a provider and its declared capabilities.
-pub fn structured_output_for(provider: &str, capabilities: &ModelCapabilities) -> StructuredOutput {
+/// Explicit capability, else the mechanism detected on the live endpoint, else the provider default.
+pub fn resolve_structured_output(
+    provider: &str,
+    model: &str,
+    capabilities: &ModelCapabilities,
+    endpoint: Option<StructuredOutput>,
+) -> StructuredOutput {
     capabilities
         .structured_output
-        .unwrap_or_else(|| super::policy::structured_output(provider))
+        .or(endpoint)
+        .unwrap_or_else(|| structured_output_for(provider, model, capabilities))
+}
+
+/// Effective structured-output mechanism for a provider, model and its declared capabilities.
+/// A local GGUF model runs on a Dial-launched `llama-server`, which enforces `json_schema`.
+pub fn structured_output_for(
+    provider: &str,
+    model: &str,
+    capabilities: &ModelCapabilities,
+) -> StructuredOutput {
+    capabilities.structured_output.unwrap_or_else(|| {
+        if provider == "mlx" && super::local_format::serves_with_llama_cpp(model) {
+            StructuredOutput::JsonSchema
+        } else {
+            super::policy::structured_output(provider)
+        }
+    })
+}
+
+/// Ollama `keep_alive` values: a signed integer of seconds (negative keeps the model loaded) or a
+/// Go duration made of number+unit pairs (`ms`, `s`, `m`, `h`).
+fn valid_keep_alive(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 32 {
+        return false;
+    }
+    if value.parse::<i64>().is_ok() {
+        return true;
+    }
+    let mut rest = value.strip_prefix('-').unwrap_or(value);
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        if digits == 0 || rest[..digits].parse::<f64>().is_err() {
+            return false;
+        }
+        rest = &rest[digits..];
+        let unit = ["ms", "s", "m", "h"]
+            .into_iter()
+            .find(|unit| rest.starts_with(unit));
+        let Some(unit) = unit else { return false };
+        rest = &rest[unit.len()..];
+    }
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -216,12 +275,21 @@ pub struct ModelProfile {
     pub local_sampling: Option<super::local_sampling::LocalSampling>,
     /// Speculative-decoding and KV-cache overrides for this MLX model; replaces the global `local_runtime` when set.
     pub local_runtime: Option<super::local_runtime::LocalRuntime>,
+    /// Ollama only: how long the server keeps the model loaded after a request (`"30m"`, `"-1"` for
+    /// always). Unset leaves Ollama's own default, which unloads idle models after a few minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<String>,
     /// Request-scoped config tiers; applied by body builders, never persisted.
     #[serde(skip)]
     pub request_tiers: RequestTiers,
     /// Set only on the single constrained repair retry; never persisted.
     #[serde(skip)]
     pub tool_repair: bool,
+    /// Structured output detected from the live endpoint (a llama.cpp `llama-server` is recognised
+    /// by `catalog::is_llama_server`). Set at the request boundary; never persisted. An explicit
+    /// `capabilities.structured_output` still wins.
+    #[serde(skip)]
+    pub endpoint_structured_output: Option<StructuredOutput>,
 }
 impl ModelProfile {
     pub fn validate(&self) -> Result<()> {
@@ -231,14 +299,24 @@ impl ModelProfile {
         );
         if let Some(local) = &self.local_sampling {
             ensure!(
-                matches!(self.provider.as_str(), "mlx" | "lm-studio"),
-                "local sampling controls require the mlx or lm-studio provider"
+                matches!(self.provider.as_str(), "mlx" | "lm-studio" | "ollama"),
+                "local sampling controls require the mlx, lm-studio or ollama provider"
             );
-            if self.provider == "lm-studio" {
-                local.validate_lmstudio()?;
-            } else {
-                local.validate()?;
+            match self.provider.as_str() {
+                "lm-studio" => local.validate_lmstudio()?,
+                "ollama" => local.validate_ollama()?,
+                _ => local.validate()?,
             }
+        }
+        if let Some(keep_alive) = &self.keep_alive {
+            ensure!(
+                self.provider == "ollama",
+                "keep_alive requires the ollama provider"
+            );
+            ensure!(
+                valid_keep_alive(keep_alive),
+                "keep_alive must be a duration such as 30m, 2h or 300s, a number of seconds, or -1"
+            );
         }
         if let Some(runtime) = &self.local_runtime {
             ensure!(
@@ -512,6 +590,9 @@ impl ModelProfile {
         use serde_json::json;
         if let Some(local) = &self.local_sampling {
             match self.provider.as_str() {
+                "mlx" if super::local_format::serves_with_llama_cpp(&self.model) => {
+                    local.apply_llamacpp(body)
+                }
                 "mlx" => local.apply(body),
                 "lm-studio" => local.apply_lmstudio(body),
                 _ => {}
@@ -567,15 +648,15 @@ mod tests {
     fn structured_output_defaults_by_provider_and_explicit_none_disables() {
         let caps = ModelCapabilities::default();
         assert_eq!(
-            structured_output_for("lm-studio", &caps),
+            structured_output_for("lm-studio", "m", &caps),
             StructuredOutput::JsonSchema
         );
         assert_eq!(
-            structured_output_for("ollama", &caps),
+            structured_output_for("ollama", "m", &caps),
             StructuredOutput::OllamaFormat
         );
         assert_eq!(
-            structured_output_for("mlx", &caps),
+            structured_output_for("mlx", "m", &caps),
             StructuredOutput::Disabled
         );
         let off = ModelCapabilities {
@@ -583,9 +664,57 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            structured_output_for("lm-studio", &off),
+            structured_output_for("lm-studio", "m", &off),
             StructuredOutput::Disabled
         );
+    }
+
+    #[test]
+    fn detected_llama_server_defaults_to_json_schema_unless_the_profile_declares_otherwise() {
+        let mut profile = ModelProfile::minimal("openai", "qwen");
+        assert_eq!(profile.structured_output(), StructuredOutput::Disabled);
+        profile.endpoint_structured_output = Some(StructuredOutput::JsonSchema);
+        assert_eq!(profile.structured_output(), StructuredOutput::JsonSchema);
+        profile.capabilities.structured_output = Some(StructuredOutput::Disabled);
+        assert_eq!(profile.structured_output(), StructuredOutput::Disabled);
+
+        profile.capabilities.structured_output = None;
+        profile.tool_repair = true;
+        let mut body = serde_json::json!({"model": "qwen", "messages": [], "tools": [
+            {"type": "function", "function": {"name": "read_file", "parameters": {
+                "type": "object", "properties": {"path": {"type": "string"}}}}}
+        ]});
+        profile.apply_openai(&mut body);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn local_gguf_models_get_json_schema_repair_and_llama_cpp_sampling_names() {
+        let root = tempfile::tempdir().unwrap();
+        let gguf = root.path().join("model.gguf");
+        std::fs::write(&gguf, b"GGUF\x03\0\0\0").unwrap();
+        let model = gguf.to_string_lossy().into_owned();
+        let caps = ModelCapabilities::default();
+        assert_eq!(
+            structured_output_for("mlx", &model, &caps),
+            StructuredOutput::JsonSchema
+        );
+        let mut profile = ModelProfile::minimal("mlx", &model);
+        profile.local_sampling = Some(crate::llm::local_sampling::LocalSampling {
+            repetition_penalty: Some(1.1),
+            repetition_context_size: Some(64),
+            presence_context_size: Some(32),
+            top_k: Some(20),
+            ..Default::default()
+        });
+        let mut body = serde_json::json!({"messages": []});
+        profile.apply_openai(&mut body);
+        assert_eq!(body["repeat_penalty"], 1.1);
+        assert_eq!(body["repeat_last_n"], 64);
+        assert_eq!(body["top_k"], 20);
+        assert!(body.get("repetition_penalty").is_none());
+        assert!(body.get("presence_context_size").is_none());
     }
 
     #[test]

@@ -9,6 +9,8 @@ pub type EnumValues = &'static [(&'static str, &'static str)];
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
     Bool,
+    /// A boolean, or `auto`, which the configuration resolves from the model it serves.
+    AutoBool,
     /// `(stored value, label)` pairs, in cycling order.
     Enum(EnumValues),
     /// Suggested picker values for an open string domain (for example a model selector).
@@ -62,6 +64,7 @@ impl SettingDef {
         use serde_json::json;
         match self.kind {
             Kind::Bool => json!({"type":"boolean"}),
+            Kind::AutoBool => json!({"anyOf":[{"type":"boolean"},{"const":"auto"}]}),
             Kind::Enum(values) => {
                 json!({"type":"string","enum":values.iter().map(|(value,_)| *value).collect::<Vec<_>>(),"labels":values})
             }
@@ -115,7 +118,7 @@ impl SettingDef {
             .and_then(|get| get(&CONFIG))
             .or_else(|| get(&DEFAULTS, self.path).cloned())
             .or_else(|| match self.kind {
-                Kind::AutoInt { .. } | Kind::AutoFloat { .. } => Some(Value::String("auto".into())),
+                Kind::AutoInt { .. } | Kind::AutoFloat { .. } | Kind::AutoBool => Some(Value::String("auto".into())),
                 Kind::Text => Some(Value::String(String::new())),
                 _ => None,
             })
@@ -784,6 +787,7 @@ static REGISTRY: &[SettingDef] = &[
     improvement::DECLARATIONS[49],
     improvement::DECLARATIONS[50],
     improvement::DECLARATIONS[51],
+    improvement::DECLARATIONS[52],
     tools::DECLARATIONS[1],
     tools::DECLARATIONS[2],
     tools::DECLARATIONS[3],
@@ -848,7 +852,6 @@ static REGISTRY: &[SettingDef] = &[
     tools::DECLARATIONS[32],
     tools::DECLARATIONS[33],
     tools::DECLARATIONS[34],
-    improvement::DECLARATIONS[52],
     improvement::DECLARATIONS[53],
     improvement::DECLARATIONS[54],
     improvement::DECLARATIONS[55],
@@ -865,6 +868,9 @@ static REGISTRY: &[SettingDef] = &[
     improvement::DECLARATIONS[66],
     improvement::DECLARATIONS[67],
     improvement::DECLARATIONS[68],
+    improvement::DECLARATIONS[69],
+    improvement::DECLARATIONS[70],
+    improvement::DECLARATIONS[71],
     experimental::DECLARATIONS[0],
     experimental::DECLARATIONS[1],
     experimental::DECLARATIONS[2],
@@ -913,6 +919,7 @@ pub fn check_value_for(values: &Table, path: &str, value: &Value) -> Result<(), 
         .or_else(|| value.as_integer().map(|n| n as f64));
     let fits = match def.kind_for(values) {
         Kind::Bool => value.is_bool(),
+        Kind::AutoBool => value.is_bool() || value.as_str() == Some("auto"),
         Kind::Enum(options) => value
             .as_str()
             .is_some_and(|s| options.iter().any(|(stored, _)| *stored == s)),
@@ -987,6 +994,7 @@ const ADVANCED: &[&str] = &[
     "compaction.snapcompact.system_prompt",
     "compaction.snapcompact.tool_results",
     "assistance.initial_tool_limit",
+    "assistance.lean_local",
     "reliability.measured_interfaces",
     "reliability.examples",
     "reliability.max_contract_failures",
@@ -1318,6 +1326,9 @@ mod tests {
                         def.path
                     );
                     values.extend(options.iter().map(|(v, _)| Value::String((*v).into())));
+                }
+                Kind::AutoBool => {
+                    values.extend([Value::Boolean(true), Value::Boolean(false), Value::String("auto".into())]);
                 }
                 Kind::Int { min, max, step } | Kind::AutoInt { min, max, step } => {
                     assert!(

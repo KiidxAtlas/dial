@@ -334,6 +334,15 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         },
     ),
     field!(
+        "assistance.lean_local",
+        assistance.lean_local,
+        IM,
+        "Local model assistance",
+        "Lean local profile",
+        "Local servers only (no endpoint, or a loopback or LAN host). Auto turns on compact tool interface, an initial tool budget of at most 8, omitted optional prompt sections and no up-front delegation on a single-request server, when the context window is 32768 tokens or less. On forces it, Off opts out. Hosted models are unchanged.",
+        Kind::AutoBool,
+    ),
+    field!(
         "assistance.tool_grammar",
         assistance.tool_grammar,
         IM,
@@ -788,6 +797,28 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
             min: 256,
             max: 32768,
             step: 256
+        },
+    ),
+    field!(
+        "improve.distill",
+        improve.distill,
+        IM,
+        "Automatic improvement",
+        "Teacher distillation",
+        "Assigned coach model solves fresh tasks where this model's verified practice is weak; only verifier-passed runs train this model. Needs the coach role.",
+        Kind::Bool,
+    ),
+    field!(
+        "improve.distill_tasks",
+        improve.distill_tasks,
+        IM,
+        "Automatic improvement",
+        "Teacher tasks per cycle",
+        "Teacher self-play tasks per cycle when teacher distillation is on.",
+        Kind::Int {
+            min: 1,
+            max: 64,
+            step: 1
         },
     ),
 ];

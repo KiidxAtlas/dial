@@ -13,6 +13,7 @@ pub mod fuzzy_match;
 pub mod gc;
 pub mod images;
 pub mod launch;
+pub mod local_models;
 pub mod mode_flags;
 pub mod model_flags;
 pub mod model_scope;

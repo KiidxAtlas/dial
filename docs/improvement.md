@@ -31,6 +31,13 @@ checks or `/outcome` to count. Training still waits for `lora_min_examples` appr
 runs only when you ask (`/improve train` or `/improve cycle`); a new version serves only after it
 passes the evaluation gate. `/improve` shows how many approved turns are recorded.
 
+`/improve session` approves the current session for training, including a session reopened with
+`/resume` or `/sessions`. Every completed turn of that session that has a saved request and no
+existing verdict is recorded as approved (`user:session`, score 100). Failed or interrupted turns
+are skipped, and a turn you or a check scored lower keeps that score. Once the model has
+`lora_min_examples` verified turns, the command queues training and evaluation right away; until
+then it reports how many are still missing. Running it again approves only turns added since.
+
 Run `dial improve status` to inspect learning, `dial improve cycle` for an explicit gated cycle, or `dial improve train` for explicit training. Inside the terminal, `/improve settings` and `/improve models` expose the separate learning controls; `/improve jobs` and `/improve stop <state_id>` manage explicitly launched work. These operations retain compute, power, budget and evaluation gates. Learning workers yield to coding at their existing safe handoff boundaries.
 
 Existing verified trajectories remain available to the explicit learning pipeline. New ordinary coding chats stay in the session journal for resume, review and undo, without becoming training examples. To evaluate task/model performance, run the explicit benchmark and improvement tools.
@@ -43,7 +50,7 @@ subprocesses cancel promptly; inference/evaluation finishes its current case bef
 A stop also pauses future cycles until `dial improve enable` is run for that model. Workers
 started with older binaries cannot acknowledge stop requests; the result explicitly reports this.
 A recorded `running` state with `control_busy: false` is stale, not evidence of active training.
-Compute can be held by another model, project, interactive session, or capability verification.
+Compute is held shared by interactive sessions and exclusively by one background job or capability verification at a time.
 
 `/improve` shows the remaining cycle and LoRA cooldowns separately, new-turn prerequisites,
 the active stage and elapsed cycle time. The learning views show stage progress
@@ -260,6 +267,47 @@ activation.
 On an endpoint model, the skip reason now names an on-disk MLX checkpoint of the same model when one
 resolves, and says to train that checkpoint with `provider = "mlx"`.
 
+### Failure-driven distillation from the coach teacher
+
+Off by default. When this model's verified self-play is weak on some train families, a stronger
+teacher can practice the same families. Enable it with the `coach` role assigned (hosted or local)
+and the setting on:
+
+```toml
+[improve]
+distill = true        # /settings → Improvement → Teacher distillation
+distill_tasks = 4     # teacher self-play tasks per cycle, 1-64
+
+[model_roles.coach]   # any model; hosted teachers need their provider credentials
+provider = "anthropic"
+model = "claude-sonnet-5-5"
+```
+
+Each cycle (after self-play and before harvest):
+
+1. Families with a verified pass rate below 60% in this model's own self-play are selected, at most four,
+   weakest first. Only train families with tools qualify; gate-only and anchor families are never used.
+2. Fresh tasks are generated from those families by the same generator and sandbox as self-play.
+   Sealed gate prompts are dropped, and at most `distill_tasks` tasks run.
+3. The coach solves each task in a hermetic run. The same deterministic verifier judges it, and the
+   run gets the same single feedback retry as self-play.
+4. Teacher trajectories are stored in a separate database under this model's state directory
+   (`teacher/<coach model>/`). They do not change this model's self-play rates, live failures, or
+   tool-repair records.
+5. Harvest admits only teacher trajectories with a passing verifier score. Their training `source` is
+   `dial:learned:teacher-<model>:<id>:<verifier>`, where `<model>` is the coach model name with
+   characters outside `A-Z a-z 0-9 . -` replaced by `_`. They use the same split rules as other records and
+   share the foreign-record cap (`training.learn_from_max_percent`). The LoRA trainer reads them
+   through the usual 32 new and 16 replay records per batch.
+
+Budget and stop gates apply: `improve.max_daily_usd` counts coach spend, a budget stop ends the
+teacher phase early, and `dial improve stop` interrupts it. The coach is never used unless its role is
+assigned. A failed or disabled teacher does not block the rest of the cycle.
+
+The cycle report contains a `distill` step (`state`, `model`, `families`, `tasks`, `attempted`,
+`passed`, optional `error`), and `harvest.from_teacher` counts the admitted teacher records. The same
+report appears in `dial improve status` under `last_cycle`.
+
 ## Storage, hosted endpoints and unavailable capabilities
 
 `improvement.log`, datasets, adapter artifacts and the SQLite audit history live under the project's private state directory, outside the workspace. For custom use cases, an optional `[gate]` can point to your own independent JSONL suites; cases accept `expected`/`matcher` or a declarative `check`, and optional seeded `files`. Automatic generated tasks measure a bounded coding/tool-use curriculum, not arbitrary real-world correctness. Custom gates use their explicit point thresholds rather than the automatic curriculum's significance rule.
@@ -280,7 +328,7 @@ checks. `dial improve status` shows `waiting_for`, `compute_used_today_secs` and
 Evaluation stops early when a rejection is already certain (a suite over its regression bound, or a
 primary suite that cannot reach the required gain even if every remaining case went the candidate's
 way). This never changes whether a candidate is admitted, only how many cases run. Cloud main
-models never wait for local compute; only local models and explicit local roles take the compute lock.
+models never wait for local compute; local models and explicit local roles share it with other sessions.
 
 ## Measured harness improvement and repository exercises
 

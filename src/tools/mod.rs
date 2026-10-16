@@ -946,19 +946,28 @@ impl Workspace {
     /// Bounded, workspace-confined identity for a read observation, including selectors.
     /// Used only to expire recovery feedback; this is not verification evidence.
     pub(crate) fn read_identity(&self, input: &str) -> Option<[u8; 32]> {
+        let (path, _) = select::split_target(self, input).ok()?;
+        self.file_identity(Path::new(path))
+            .map(|(_, digest)| digest)
+    }
+
+    /// Canonical workspace path and SHA-256 of an exact file path (never a read selector, since
+    /// file names may contain `:`). `None` for paths outside every root, protected storage,
+    /// non-UTF-8 names, missing or unreadable targets, directories and files over 16 MiB.
+    /// Recovery bookkeeping only; this is not verification evidence.
+    pub(crate) fn file_identity(&self, input: &Path) -> Option<(PathBuf, [u8; 32])> {
         use sha2::{Digest, Sha256};
         use std::io::Read;
-        let (path, _) = select::split_target(self, input).ok()?;
-        let path = self.resolve(path).ok()?;
         const LIMIT: u64 = 16 * 1024 * 1024;
+        let path = self.resolve(input.to_str()?).ok()?;
         let metadata = fs::metadata(&path).ok()?;
         if !metadata.is_file() || metadata.len() > LIMIT {
             return None;
         }
-        let file = fs::File::open(path).ok()?;
+        let file = fs::File::open(&path).ok()?;
         let mut data = Vec::new();
         file.take(LIMIT + 1).read_to_end(&mut data).ok()?;
-        (data.len() as u64 <= LIMIT).then(|| Sha256::digest(&data).into())
+        (data.len() as u64 <= LIMIT).then(|| (path, Sha256::digest(&data).into()))
     }
 
     pub(crate) fn rel(&self, path: &Path) -> String {
@@ -1126,13 +1135,13 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         "bash" => tool_schema(
             "bash",
             if cfg!(windows) {
-                "Run a bash command in the workspace root, or the workspace-relative `cwd` when supplied. It runs in Git for Windows bash when installed, otherwise in Dial's built-in bash-compatible shell; only when `shell.backend = \"powershell\"` is it Windows PowerShell source. Windows filesystem/network isolation is unavailable; execution requires `sandbox.mode = \"off\"` and runs with the current user's privileges. stdout and stderr are merged; large output keeps its beginning and end. Commands run non-interactively without a controlling terminal. Use `background: true` for long-running work; check or stop it with the bg tool."
+                "Run a bash command in the workspace root, or in `cwd` when supplied. It runs in Git for Windows bash when installed, otherwise in Dial's built-in bash-compatible shell; only when `shell.backend = \"powershell\"` is it Windows PowerShell source. Windows filesystem/network isolation is unavailable; execution requires `sandbox.mode = \"off\"` and runs with the current user's privileges. stdout and stderr are merged; large output keeps its beginning and end. Commands run non-interactively without a controlling terminal. Use `background: true` for long-running work; check or stop it with the bg tool."
             } else {
-                "Run a shell command with `/bin/bash -c` in the workspace root, or the workspace-relative `cwd` when supplied. It may run inside a sandbox: writes are confined to the project, some paths outside it can be unreadable, and the network may be blocked. Temporary files belong in `$TMPDIR`. stdout and stderr are merged; large output keeps its beginning and end. Commands run non-interactively without a controlling terminal. Use `background: true` for long-running work; check or stop it with the bg tool."
+                "Run a shell command with `/bin/bash -c` in the workspace root, or in `cwd` when supplied. It may run inside a sandbox: writes are confined to the project and added directories, some paths outside them can be unreadable, and the network may be blocked. Temporary files belong in `$TMPDIR`. stdout and stderr are merged; large output keeps its beginning and end. Commands run non-interactively without a controlling terminal. Use `background: true` for long-running work; check or stop it with the bg tool."
             },
             json!({
                 "command": {"type": "string", "description": "Shell command to run."},
-                "cwd": {"type": "string", "description": "Workspace-relative working directory. Default is the project root: do not prefix commands with `cd <root> &&`."},
+                "cwd": {"type": "string", "description": "Working directory: relative to the primary workspace root, or absolute inside the primary root or an added workspace root. Default is the project root: do not prefix commands with `cd <root> &&`."},
                 "session": {"type":"string", "description":"With the embedded backend, retain cwd and exported string variables between completed foreground commands in this named workspace session. Does not retain functions, unexported variables or background jobs. Cancelled/timed-out exchanges invalidate the state."},
                 "timeout": {"type": "integer", "minimum": 1, "description": "Timeout in seconds, capped by the configured bash timeout."},
                 "background": {"type": "boolean", "description": "Start this command as a managed background job now (servers, watchers, long builds). Commands still running after ~15s move to background automatically. Check or stop jobs with the bg tool."},

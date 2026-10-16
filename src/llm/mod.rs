@@ -35,6 +35,7 @@ mod gitlab_duo;
 pub mod images;
 pub(crate) mod json_repair;
 pub mod local_fit;
+pub mod local_format;
 pub mod local_runtime;
 pub mod local_sampling;
 mod markup;
@@ -601,6 +602,11 @@ fn chat_at_controlled(
         "chat response exceeds {MAX_RESPONSE_BYTES} bytes"
     );
     let mut reply = parse_reply(&bytes.data).map_err(|error| response_error(error, auth))?;
+    // The streamed path heals leaked `<think>` blocks the same way: they become reasoning, never
+    // visible text that a later request would replay as the assistant's answer.
+    let (visible_text, leaked_reasoning) = markup::rewrite(&reply.text);
+    reply.text = visible_text;
+    reply.reasoning.push_str(&leaked_reasoning);
     if !reply.reasoning.is_empty() && !on_event(&StreamEvent::Reasoning(reply.reasoning.clone())) {
         return Err(Interrupted.into());
     }
@@ -1067,6 +1073,13 @@ fn http_error(
         excerpt.push_str(
             " — check this provider's API key/environment variable or sign in through /providers.",
         );
+    } else if matches!(status, 400 | 404 | 422)
+        && message.as_deref().is_some_and(|m| {
+            m.to_ascii_lowercase()
+                .contains("system message must be at the beginning")
+        })
+    {
+        excerpt.push_str(" — the model's chat template rejected the message layout, not the model selection; it requires a single system message at the beginning.");
     } else if status == 404 {
         excerpt.push_str(" — refresh /models and select an available model; check the provider endpoint in /providers.");
     }
@@ -1503,6 +1516,25 @@ mod tests {
     }
 
     #[test]
+    fn template_rejection_is_not_reported_as_a_missing_model() {
+        for (status, message, missing) in [
+            (404, "System message must be at the beginning.", false),
+            (400, "System message must be at the beginning.", false),
+            (404, "Model not found", true),
+        ] {
+            let body = json!({"error": {"message": message}}).to_string();
+            let (url, server) = serve_once(status, body.into_bytes());
+            let error = chat(&url, SERVER_MODEL, &request(vec![], None), 5)
+                .unwrap_err()
+                .to_string();
+            server.join().unwrap();
+            assert!(error.contains(message), "{error}");
+            assert_eq!(error.contains("refresh /models"), missing, "{error}");
+            assert_eq!(error.contains("chat template"), !missing, "{error}");
+        }
+    }
+
+    #[test]
     fn oversized_success_response_is_rejected() {
         let filler = "y".repeat(MAX_RESPONSE_BYTES + 10);
         let body = json!({"choices": [{"message": {"content": filler}}]}).to_string();
@@ -1882,6 +1914,48 @@ mod net_tests {
         let (reply, pieces) = collect(&server.url, None, &chat_request(vec![]), 10);
         assert_eq!(reply.unwrap().text, "whole");
         assert_eq!(pieces, ["whole"]);
+    }
+
+    #[test]
+    fn unstreamed_reply_routes_leaked_think_blocks_out_of_visible_text() {
+        let body = json!({"choices": [{"finish_reason": "stop", "message": {"content": "<think>plan it</think>Answer"}}],
+                          "usage": {"prompt_tokens": 1, "completion_tokens": 1}});
+        let server = fake::serve(vec![fake::json(200, &body)]);
+        let reply = chat_at(&server.url, None, SERVER_MODEL, &chat_request(vec![]), 10).unwrap();
+        assert_eq!(reply.text, "Answer");
+        assert_eq!(reply.reasoning, "plan it");
+        let replay = assistant_message(&reply);
+        assert_eq!(replay["content"], "Answer");
+        assert_eq!(replay["reasoning_content"], "plan it");
+    }
+
+    #[test]
+    fn llama_server_stream_keeps_think_blocks_out_of_text_and_replays_the_tool_call() {
+        let body = sse(&[
+            json!({"choices": [{"index": 0, "delta": {"reasoning_content": "Look"}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"reasoning_content": " up"}, "finish_reason": null}]}),
+            delta("<think>ponder</think>Ok"),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_0", "type": "function",
+                "function": {"name": "read_file", "arguments": ""}}]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"path\":"}}]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"a\"}"}}]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "timings": {"predicted_n": 9}}),
+        ]);
+        let server = fake::serve(vec![Script::Sse(body)]);
+        let (reply, pieces) = collect(&server.url, None, &chat_request(a_tool()), 10);
+        let reply = reply.unwrap();
+        assert_eq!(pieces.concat(), "Ok");
+        assert_eq!(reply.text, "Ok");
+        assert!(reply.reasoning.starts_with("Look up"), "{}", reply.reasoning);
+        assert!(reply.reasoning.contains("ponder"), "{}", reply.reasoning);
+        assert_eq!(reply.finish_reason, "tool_calls");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "read_file");
+        assert_eq!(reply.tool_calls[0].arguments, json!({"path": "a"}));
+        let replay = assistant_message(&reply);
+        assert_eq!(replay["content"], "Ok");
+        assert!(replay["reasoning_content"].as_str().is_some_and(|r| r.starts_with("Look up")));
+        assert_eq!(replay["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a\"}");
     }
 
     #[test]

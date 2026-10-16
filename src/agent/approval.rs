@@ -732,6 +732,7 @@ pub(crate) fn authorize_mutation_paths(
 pub(crate) fn authorize_source_read_paths(
     rules: &[PermissionRule],
     root: &Path,
+    extra_roots: &[PathBuf],
     original: &ToolCall,
     requested_name: &str,
     paths: &[PathBuf],
@@ -740,11 +741,13 @@ pub(crate) fn authorize_source_read_paths(
     if requested_name != "read" || !matches!(original.name.as_str(), "edit" | "write") {
         return Err("native source read authority does not match the executing tool".into());
     }
+    // Same containment as `authorize_mutation_paths`: the primary root or an explicitly added root.
     if unbounded_effects
         || paths.is_empty()
         || paths.iter().any(|path| {
             !path.is_absolute()
-                || !path.starts_with(root)
+                || !(path.starts_with(root)
+                    || extra_roots.iter().any(|extra| path.starts_with(extra)))
                 || path
                     .components()
                     .any(|part| matches!(part, Component::ParentDir | Component::CurDir))

@@ -1041,7 +1041,13 @@ impl LiveTasks {
                             }
                             subagents::MutationScope::SourceRead => {
                                 approval::authorize_source_read_paths(
-                                    rules, root, &original, &tool, &paths, unbounded,
+                                    rules,
+                                    root,
+                                    extra_roots,
+                                    &original,
+                                    &tool,
+                                    &paths,
+                                    unbounded,
                                 )
                             }
                             subagents::MutationScope::ManagedMemory => {

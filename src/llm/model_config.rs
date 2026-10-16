@@ -656,7 +656,7 @@ pub const ROLES: &[(&str, &str)] = &[
     ),
     (
         "embedding",
-        "Embedding model for semantic memory recall; embedding-capable models only, served by an OpenAI-compatible embeddings endpoint; unassigned uses lexical recall",
+        "Embedding model for semantic memory recall; use an OpenAI-compatible, Ollama or Gemini embedding endpoint; unassigned uses lexical recall",
     ),
 ];
 

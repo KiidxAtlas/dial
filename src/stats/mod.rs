@@ -202,6 +202,71 @@ pub struct SyncReport {
     pub removed: u64,
 }
 
+/// Decode speed of one model from recorded requests: output tokens per second of request time, the
+/// same measure as `Totals::tokens_per_second`. `None` is unknown; it is never estimated.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct DecodeSpeed {
+    /// `None` when the stats database could not be read; `Some(0)` when no request matched.
+    pub samples: Option<u64>,
+    /// Median of the newest `SAMPLE_LIMIT` successful requests.
+    pub median_tok_per_s: Option<f64>,
+    /// Median of the newest `TREND_WINDOW` of those samples.
+    pub recent_median_tok_per_s: Option<f64>,
+    /// Median of the `TREND_WINDOW` samples before those; needs at least three of them.
+    pub previous_median_tok_per_s: Option<f64>,
+    /// `up` or `down` when recent differs from previous by more than 10%, `flat` otherwise.
+    pub trend: Option<&'static str>,
+    /// The samples behind the medians, oldest first.
+    pub history: Vec<f64>,
+}
+
+/// Newest successful requests read per model for speed summaries.
+pub const SAMPLE_LIMIT: usize = 40;
+const TREND_WINDOW: usize = 20;
+
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    })
+}
+
+/// Summarizes tokens-per-second samples given oldest first.
+pub fn speed_summary(rates: &[f64]) -> DecodeSpeed {
+    let n = rates.len();
+    let recent = &rates[n.saturating_sub(TREND_WINDOW)..];
+    let previous =
+        (n > TREND_WINDOW).then(|| &rates[n.saturating_sub(2 * TREND_WINDOW)..n - TREND_WINDOW]);
+    let recent_median = median(recent);
+    let previous_median = previous.filter(|p| p.len() >= 3).and_then(median);
+    let trend = match (recent_median, previous_median) {
+        (Some(recent), Some(previous)) if previous > 0.0 => Some(if recent > previous * 1.1 {
+            "up"
+        } else if recent < previous * 0.9 {
+            "down"
+        } else {
+            "flat"
+        }),
+        _ => None,
+    };
+    DecodeSpeed {
+        samples: Some(n as u64),
+        median_tok_per_s: median(rates),
+        recent_median_tok_per_s: recent_median,
+        previous_median_tok_per_s: previous_median,
+        trend,
+        history: rates.to_vec(),
+    }
+}
+
+// ---------------------------------------------------------------- database
 // ---------------------------------------------------------------- database
 
 pub struct Db {
@@ -288,6 +353,51 @@ impl Db {
 
     pub fn open_default(user_dir: &Path) -> Result<Self> {
         Self::open(&db_path(user_dir))
+    }
+
+    /// Opens an existing database read-only: it is never created, migrated or synced.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(1))?;
+        Ok(Self { conn })
+    }
+
+    /// Every model name with recorded requests.
+    pub fn model_names(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT model FROM request_hourly ORDER BY model")?;
+        Ok(stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Output tokens per second of the newest successful requests to any of `models`, oldest first.
+    /// Failed requests and requests without output or duration are not speed evidence.
+    pub fn decode_speed(&self, models: &[&str]) -> Result<DecodeSpeed> {
+        if models.is_empty() {
+            return Ok(speed_summary(&[]));
+        }
+        let marks = vec!["?"; models.len()].join(",");
+        let sql = format!(
+            "SELECT output, duration_ms FROM (SELECT output, duration_ms, ts, id FROM requests
+               WHERE model IN ({marks}) AND error=0 AND output>0 AND duration_ms>0
+               ORDER BY ts DESC, id DESC LIMIT {SAMPLE_LIMIT}) ORDER BY ts, id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(models.iter().copied()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut rates = Vec::new();
+        for row in rows {
+            let (output, duration_ms) = row?;
+            rates.push(output as f64 / (duration_ms as f64 / 1000.0));
+        }
+        Ok(speed_summary(&rates))
     }
 
     pub fn record_request(&mut self, r: &RequestRecord) -> Result<()> {

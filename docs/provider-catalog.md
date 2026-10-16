@@ -6,6 +6,32 @@ Dial bundles the provider registry and model pricing/capability cards in `src/ll
 
 The bundled model catalog exposes `known_context_window` and `model_capabilities` for inference budgeting and thinking configuration. Runtime discovery/provider metadata takes precedence over the bundled card. List prices are estimates, not invoices; missing usage or unpriced cards remain unknown. A provider-reported cost takes precedence over calculated list pricing where available, and subscriptions are not reported as API invoices.
 
+## Model purpose and selection
+
+`/models` separates **chat**, **embedding**, and **other** models using structured provider
+metadata and exact catalog records, not words in a model's name or status. Unknown types remain
+visible and chat-selectable for compatibility with custom endpoints; their details say **kind unknown**.
+The CLI shows a **KIND** column; `dial models --kind embedding` filters by an exact declared type,
+and `dial models --json` includes `metadata.kind`.
+
+Enter on a chat model selects the main model. Enter on an embedding model assigns **embedding**,
+not main; `/roles` and Ctrl+A expose compatible assignments. Model cycling and scoped chat-model
+lists exclude known non-chat models. Reranking, image-generation and audio-only models can appear
+under **other**, but are not chat models and do not have a general-purpose Dial role. Vision-capable
+chat models remain chat models. The request layer rejects known non-chat types before making a
+chat request, including selections loaded from configuration.
+
+LM Studio embeddings can be assigned to the embedding role without being marked unavailable merely
+because they cannot chat. Downloaded embedding checkpoints are shown separately; Dial's supervised
+MLX chat server does not serve them. Run an embedding-capable server and configure its endpoint.
+See [embedding configuration](model-embeddings.md) and [local downloads](model-downloads.md).
+
+Use `/providers` for endpoint, protocol and credential configuration, `/model settings` for
+per-model controls, and [model routing](model-routing.md) for role assignments. Capability metadata
+can be incomplete: an unknown capability is not proof of support. Operator profiles override reported
+vision/tool support, context/output limits and supported request options; they do not install a new
+runtime or turn an embedding checkpoint into a chat model.
+
 ## Anthropic subscription sign-in
 
 Use Dial's browser OAuth flow for a Claude subscription: open `/providers`, select **Anthropic**,
@@ -19,13 +45,28 @@ so they can be configured.
 
 ## Providers and discovery
 
-The catalog finds cached Hugging Face MLX snapshots, MLX models downloaded by LM Studio (its
-`downloadsFolder`, default `~/.lmstudio/models`; listed under Local MLX and served by dial's own MLX
-server, so LoRA training applies), and running LM Studio, Ollama and llama.cpp
+The catalog finds cached Hugging Face snapshots and models downloaded by LM Studio (its
+`downloadsFolder`, default `~/.lmstudio/models`), listed under **Local models**: MLX checkpoints
+are served by dial's own MLX server (so LoRA training applies), and running LM Studio, Ollama and llama.cpp
 servers on their usual loopback ports. It also discovers OpenAI-compatible endpoints and Anthropic's
 Messages API. OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, Mistral and DeepSeek have setup presets.
 
-**Choosing a local MLX model.** `dial models recommend` estimates which downloaded MLX checkpoints fit this machine. It reads physical memory (`sysctl hw.memsize` on macOS, `MemTotal` on Linux; `--memory-gb` overrides), each checkpoint's safetensors size and `config.json`, and any `dial reliability check` reports recorded for it. It loads no model and makes no network calls, so it works before any runtime is installed. Flags: `--context <tokens>` (default: the configured context, else 32768; capped by the model's native maximum), `--kv-bits <2|3|4|6|8>` (estimate a quantized KV cache; default fp16), `--memory-gb <GiB>`, and `--json`. Each row shows weights, KV cache at the requested context, resident total, the largest context that stays within the comfortable budget, and recorded reliability. Estimated resident size is weights + KV cache + 1.5 GiB runtime allowance + 5% of weights. A model is `fits` at or below 60% of RAM, `tight` up to 75%, and `wont_fit` above that; `unknown` when memory cannot be read. Suggested downloads are listed by RAM tier and are not measured on this machine. Recorded reliability is shown only as `passed/total` with its age; reports older than seven days are marked stale, and the column never certifies coding accuracy. The JSON output (`models`, `suggestions`, `memory_bytes`, `memory_source`, `context_tokens`, `kv_bits`) is the same data as the table.
+**Local model formats.** Dial detects the format from the files in the model directory.
+- **MLX** (`config.json` + safetensors): served by `mlx_lm`/`mlx_vlm`; supports LoRA, steering and runtime tuning.
+- **GGUF** (a `.gguf` file, or a directory holding one; sharded files load from the first shard): served by llama.cpp's `llama-server` (found via `DIAL_LLAMA_SERVER`, `PATH`, `/opt/homebrew/bin` or `/usr/local/bin`) with `--jinja` and one slot. Tool and reasoning support come from the chat template in the GGUF header; a sibling `mmproj*.gguf` is passed as `--mmproj` and marks the model as vision-capable. `--ctx-size` is the configured context window, or else the largest window the memory estimate below allows (never the full native window by default). Constrained repair uses llama.cpp's JSON-schema grammar, and sampling names are translated (`repeat_penalty`, `repeat_last_n`). `[local_runtime]` maps `draft_model` (a local GGUF) and `num_draft_tokens` to `--model-draft`/`--spec-draft-n-max`, and `kv_bits` 8 or 4 to a `q8_0`/`q4_0` KV cache; the MLX-only `kv_group_size` and `quantized_kv_start` are rejected. An adapter must be a GGUF LoRA (`--lora`); steering and LoRA training need MLX weights.
+- **Splash** (`manifest.json` with `target/` and `tokenizer/`): only LM Studio can run these. Load the model in LM Studio and select it under the LM Studio provider; Dial's own launcher reports this instead of failing obscurely.
+
+The improvement pipeline probes capabilities per format: MLX runs the full gradient and adapter reload probe, GGUF is reported as inference-only (harness improvement and evaluation proceed, weight training is skipped), and Splash is reported unsupported with the LM Studio hint.
+
+**Local chat templates.** Dial combines leading system/developer instructions into one system
+message for its supervised local servers. Later instructions and request-local guidance stay at
+their original conversation boundary as user messages; tool calls, tool results and images keep
+their order. This wire-only projection leaves saved history and remote-provider requests unchanged.
+It supports templates such as Ornith's that reject system messages outside the first position.
+
+**Train once, serve anywhere.** `dial improve fuse [VERSION] --out <dir>` merges a LoRA version (default: the active one) into its MLX base and writes a standalone MLX checkpoint at the base quantization. Dial, LM Studio and `mlx_lm` then serve the improved model without loading an adapter. `--dequantize` writes full-precision weights instead, the input llama.cpp's `convert_hf_to_gguf.py` expects when you want a GGUF build. Dial does not write GGUF itself: `mlx_lm`'s exporter produces files current llama.cpp cannot load for BPE tokenizers (Llama 3, Qwen, SmolLM and similar), and llama.cpp's converter needs PyTorch, which Dial's runtime does not install.
+
+**Choosing a local model.** `dial models recommend` estimates which downloaded MLX checkpoints and GGUF files fit this machine (Splash bundles are not sized). It reads physical memory (`sysctl hw.memsize` on macOS, `MemTotal` on Linux; `--memory-gb` overrides), each model's weights (safetensors, or every GGUF shard) and its layout (`config.json`, or the GGUF header's block, head and key/value widths), and any `dial reliability check` reports recorded for it. It loads no model and makes no network calls, so it works before any runtime is installed. Flags: `--context <tokens>` (default: the configured context, else 32768; capped by the model's native maximum), `--kv-bits <2|3|4|6|8>` (estimate a quantized KV cache; default fp16; llama.cpp serves only 4 and 8), `--memory-gb <GiB>`, and `--json`. Each row shows weights, KV cache at the requested context, resident total, the largest context that stays within the comfortable budget, and recorded reliability. Estimated resident size is weights + KV cache + 1.5 GiB runtime allowance + 5% of weights. A model is `fits` at or below 60% of RAM, `tight` up to 75%, and `wont_fit` above that; `unknown` when memory cannot be read. The same estimate sizes `llama-server --ctx-size` when Dial launches a GGUF model without a configured context window, so llama.cpp does not preallocate a native window the machine cannot hold. Suggested downloads are listed by RAM tier and are not measured on this machine. Recorded reliability is shown only as `passed/total` with its age; reports older than seven days are marked stale, and the column never certifies coding accuracy. The JSON output (`models`, `suggestions`, `memory_bytes`, `memory_source`, `context_tokens`, `kv_bits`) is the same data as the table.
 
 Use `/model defaults` (or press `d` in `/model settings`) for direct access to shared context
 defaults. This opens in global scope; switch scope for a project-specific default.
@@ -76,9 +117,11 @@ models reload on their next use. Orphaned model servers from older Dial versions
 Pause/Resume background work and Start/Stop controls remain available. While waiting for compute,
 Ctrl+, opens these controls directly. Status refresh and job controls run off the terminal thread.
 
-**Compute locks** in **Settings → Model → Local worker** defaults to on. Turn it off
-(`compute_locks = false` in TOML) to run local models, training, verification and maintenance
-concurrently, without acquiring or waiting for the shared compute lock. This is a per-configuration
+**Compute locks** in **Settings → Model → Local worker** defaults to on. Foreground sessions share
+the lock, so local models and Laya run side by side across Dial instances and never wait on each
+other; only background training, verification and maintenance take it exclusively, and they yield
+to every foreground request. Turn it off (`compute_locks = false` in TOML) to run background work
+concurrently with sessions too, without acquiring or waiting for the lock. This is a per-configuration
 policy: other sessions and already-running workers retain their own settings; restart background
 workers to apply a change. Concurrent work can exhaust RAM/GPU memory. Explicit background pause,
 stop and cancellation controls remain active; data-integrity locks are not disabled.
@@ -92,6 +135,8 @@ resumes from its last committed step later. A checkpoint is committed at every s
 unfinished step may need repeating. **Stop job now** targets a verified detached background worker
 and its child processes, preserves the admitted adapter, and abandons that unfinished cycle; it
 never terminates a foreground chat. This also provides recovery for older workers without preemption.
+
+**Changing model settings mid-session.** Saving settings rebuilds the agent between turns, never during a request. The running local server is handed to the rebuilt agent and reused while the model, adapter, steering, `[local_runtime]`, tool grammar and (for GGUF) the context window that sized `--ctx-size` all still match; any difference relaunches it on the next request. Sampling and prompt settings therefore apply on the next turn without reloading weights.
 
 A failed capability probe overrides the static architecture check; only a successful probe can show
 awaiting training. Architecture support alone never claims LoRA compatibility.
@@ -158,9 +203,9 @@ For ChatGPT models, `/reasoning` shows the current and supported levels. Use `/r
 persist per model in this project's settings and are sent through the Responses reasoning field.
 
 **LM Studio.** Dial reads LM Studio's native model list (`/api/v0/models`, loopback or LAN hosts only) to show
-whether each model is `loaded` (with its real context length) or `loads on first use`, and greys out
-embedding models, which cannot chat. LM Studio loads a model on demand with a context length of its own
-choosing, often far below Dial's 32768 default (an 8192 load was seen in practice); Dial asks the server
+whether each model is `loaded` (with its real context length) or `loads on first use`, and identifies
+embedding models for the embedding role rather than chat. LM Studio loads a model on demand with a
+context length of its own choosing, often far below Dial's 32768 default (an 8192 load was seen in practice); Dial asks the server
 what is actually loaded and plans compaction and the context meter against the smaller number. A model
 LM Studio refuses to load (memory guardrail, unsupported architecture) is reported with the server's own
 message; load it in LM Studio first, with a smaller context, or choose another model. Larger models need
@@ -168,9 +213,22 @@ LM Studio's own resource limits to allow them; Dial cannot override those.
 
 **llama.cpp and Ollama.** The same runtime check covers them: llama.cpp's `/props` reports the per-slot
 context it serves (`-c` divided by `--parallel`; its `/v1/models` lists only the training context), and
-Ollama's `/api/ps` reports the context a running model was loaded with. Ollama's default is small and it
-truncates oversized prompts silently, so raise it with `OLLAMA_CONTEXT_LENGTH` (or `num_ctx` in a
-Modelfile) for agent work; Dial learns the size after the first reply that loads the model.
+Ollama's `/api/ps` reports the context a running model was loaded with. For a model Ollama has not loaded
+yet, `/api/show` supplies its trained context as the bound. Ollama's own default context is small and it
+truncates oversized prompts silently, so Dial always sends the window it plans against as `options.num_ctx`
+(a model profile's `context_window` takes precedence); `OLLAMA_CONTEXT_LENGTH` is no longer needed.
+
+**Ollama model profiles.** A `provider = "ollama"` profile accepts `local_sampling` keys `top_k`, `min_p`,
+`seed`, `repetition_penalty` (sent as `repeat_penalty`), `repetition_context_size` (`repeat_last_n`),
+`presence_penalty` and `frequency_penalty`, all sent in `options`; other local sampling keys are rejected.
+`keep_alive` (`"30m"`, `"2h"`, `300`, `-1` to keep the model loaded) controls how long Ollama keeps the model
+resident between requests, avoiding a reload after Ollama's default few idle minutes.
+
+**One request at a time.** A model server on this machine or the LAN (Dial's own runtime, or an endpoint on a
+loopback, private-range or `.local` host) receives one model request at a time across the main agent and
+workers, so parallel requests neither queue inside a single-slot server nor evict each other's prompt cache.
+For a server started with several slots (for example `llama-server --parallel 4`), raise it with
+`task.provider_concurrency.<provider> = 4`.
 
 Use any OpenAI-compatible server instead of the local MLX model (LM Studio, Ollama, llama.cpp, a hosted API): `dial --endpoint http://localhost:1234/v1 --api-key-env KEY -m <model-name>`. Weight updates need the local MLX model.
 

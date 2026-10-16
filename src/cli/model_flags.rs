@@ -670,14 +670,14 @@ mod tests {
         let mut overlay = toml::Table::new();
         capture_overlay(&mut overlay, &before, &selected).unwrap();
         let mut reload = SettingsReload::new(&layout, &overlay, &selected);
-        let (same, errors) = reload.reload(&layout, &overlay);
+        let (same, errors) = reload.reload(&layout, &overlay, None);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(same.service_tier, "priority");
         let mut wire = serde_json::json!({});
         same.active_model_profile().unwrap().apply_openai(&mut wire);
         assert_eq!(wire["reasoning_effort"], "none");
         std::fs::write(&path, "model = 'anthropic/claude-haiku-5.5'\nprovider = 'openrouter'\n[harness]\nmax_tokens = 8192\ntemperature = 0.4\n").unwrap();
-        let (changed, errors) = reload.reload(&layout, &overlay);
+        let (changed, errors) = reload.reload(&layout, &overlay, None);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(changed.harness.temperature, 0.4);
         assert_eq!(changed.service_tier, "priority");

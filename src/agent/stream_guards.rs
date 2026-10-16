@@ -24,6 +24,24 @@ Last result (truncated): `{{result_summary}}`
 NEVER call `{{tool_name}}` with those arguments again this turn. Use different arguments, choose another tool, or summarize findings and yield if complete.
 </system-interrupt>"#;
 
+/// Injected when the identical repeat continues after the redirect. It quotes the repeated call and
+/// the result already in context, and names the next step. It never ends the turn.
+const TOOL_CALL_LOOP_ESCALATION: &str = r#"<system-interrupt reason="tool_call_loop_persisted">
+You have called `{{tool_name}}` {{count}} consecutive times with identical arguments `{{arguments_summary}}`, after being redirected. Every one of those calls returned the same result, and that result is already in this conversation: `{{result_summary}}`
+
+Calling it again adds nothing. Do exactly one of these now:
+- Use the result you already have: act on it, or answer from it.
+- Call a different tool, or `{{tool_name}}` with arguments you have not tried.
+- If the task is complete, give the final answer.
+
+A further identical call will not run. It returns a reference to the earlier result instead.
+</system-interrupt>"#;
+
+/// Tool result for an identical repeat that was not executed. It keeps the call's tool_call_id
+/// pairing and points at the earlier identical call whose result is already in context.
+const DUPLICATE_CALL_RESULT: &str = r#"[Not executed: identical to your earlier `{{tool_name}}` call (tool_call_id `{{earlier_id}}`) with the same arguments in this turn. That call's result is already in this conversation: `{{result_summary}}`
+Use that result, change the arguments or the tool, or give the final answer. Harness note; no tool ran.]"#;
+
 /// Continues a turn whose stream dropped after partial text.
 pub(crate) const STREAM_STALL_CONTINUE: &str = r#"<system-injection>
 The provider connection dropped mid-response: your last turn was cut off after the text above, possibly mid-sentence. The user already saw that text.
@@ -194,16 +212,46 @@ pub(crate) fn render_tool_call_loop_redirect(
     arguments_summary: &str,
     result_summary: &str,
 ) -> String {
-    let result = if result_summary.is_empty() {
-        "(no text result)"
-    } else {
-        result_summary
-    };
     TOOL_CALL_LOOP_REDIRECT
         .replace("{{tool_name}}", tool_name)
         .replace("{{count}}", &count.to_string())
         .replace("{{arguments_summary}}", arguments_summary)
-        .replace("{{result_summary}}", result)
+        .replace("{{result_summary}}", result_or_placeholder(result_summary))
+}
+
+/// An empty result is shown as `(no text result)`.
+fn result_or_placeholder(result_summary: &str) -> &str {
+    if result_summary.is_empty() {
+        "(no text result)"
+    } else {
+        result_summary
+    }
+}
+
+/// Renders the stronger corrective for a repeat that continued after the redirect.
+pub(crate) fn render_tool_call_loop_escalation(
+    tool_name: &str,
+    count: usize,
+    arguments_summary: &str,
+    result_summary: &str,
+) -> String {
+    TOOL_CALL_LOOP_ESCALATION
+        .replace("{{tool_name}}", tool_name)
+        .replace("{{count}}", &count.to_string())
+        .replace("{{arguments_summary}}", arguments_summary)
+        .replace("{{result_summary}}", result_or_placeholder(result_summary))
+}
+
+/// Renders the synthetic result of an identical repeat that was not executed.
+pub(crate) fn render_duplicate_call_result(
+    tool_name: &str,
+    earlier_id: &str,
+    result_summary: &str,
+) -> String {
+    DUPLICATE_CALL_RESULT
+        .replace("{{tool_name}}", tool_name)
+        .replace("{{earlier_id}}", earlier_id)
+        .replace("{{result_summary}}", result_or_placeholder(result_summary))
 }
 
 /// Fills `{{retryCount}}` and `{{maxRetries}}` in a recovery prompt.
@@ -222,6 +270,21 @@ mod tests {
         let text = render_tool_call_loop_redirect("read", 5, "{\"path\":\"a\"}", "");
         assert!(text.contains("You called `read` 5 consecutive times"));
         assert!(text.contains("Last result (truncated): `(no text result)`"));
+    }
+
+    #[test]
+    fn escalation_and_duplicate_results_quote_the_repeated_call_without_stopping() {
+        let text = render_tool_call_loop_escalation("read", 6, "{\"path\":\"a\"}", "");
+        assert!(text.contains("You have called `read` 6 consecutive times"));
+        assert!(text.contains("`{\"path\":\"a\"}`"));
+        assert!(text.contains("`(no text result)`"));
+        assert!(text.contains("give the final answer"));
+        assert!(!text.contains("{{"));
+        let dup = render_duplicate_call_result("read", "call_5", "same result");
+        assert!(dup.starts_with("[Not executed:"));
+        assert!(dup.contains("tool_call_id `call_5`"));
+        assert!(dup.contains("`same result`"));
+        assert!(!dup.contains("{{"));
     }
 
     #[test]

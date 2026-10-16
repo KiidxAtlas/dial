@@ -10,7 +10,7 @@ use super::{
     },
 };
 use crate::{
-    llm::catalog::{Discovery, ModelEntry, ProviderStatus},
+    llm::catalog::{Discovery, ModelEntry, ModelKind, ProviderStatus},
     llm::model_config::{ModelSelection, ROLES, RoleSource, RoleStatus},
     storage::settings_store::Scope,
     ui::{
@@ -33,22 +33,30 @@ enum KindFilter {
     All,
     Chat,
     Embedding,
+    Other,
 }
 
 impl KindFilter {
-    const ALL: [KindFilter; 3] = [KindFilter::All, KindFilter::Chat, KindFilter::Embedding];
+    const ALL: [KindFilter; 4] = [
+        KindFilter::All,
+        KindFilter::Chat,
+        KindFilter::Embedding,
+        KindFilter::Other,
+    ];
     fn label(self) -> &'static str {
         match self {
             KindFilter::All => "all",
             KindFilter::Chat => "chat",
             KindFilter::Embedding => "embedding",
+            KindFilter::Other => "other",
         }
     }
     fn accepts(self, entry: &ModelEntry) -> bool {
         match self {
             KindFilter::All => true,
-            KindFilter::Chat => !is_embedding(entry),
-            KindFilter::Embedding => is_embedding(entry),
+            KindFilter::Chat => entry.supports_chat(),
+            KindFilter::Embedding => entry.is_embedding(),
+            KindFilter::Other => !entry.supports_chat() && !entry.is_embedding(),
         }
     }
 }
@@ -123,7 +131,7 @@ pub struct ModelOverlay {
 }
 
 fn is_embedding(entry: &ModelEntry) -> bool {
-    entry.source.to_lowercase().contains("embedding")
+    entry.is_embedding()
 }
 
 /// Whether a role can take this entry. Embedding models are offered only to the `embedding` role (they
@@ -136,7 +144,7 @@ fn role_accepts(role: &str, entry: &ModelEntry) -> bool {
     match role {
         "decision" => false,
         "embedding" => is_embedding(entry),
-        _ => !is_embedding(entry),
+        _ => entry.supports_chat(),
     }
 }
 
@@ -208,6 +216,9 @@ fn capabilities(entry: &ModelEntry) -> Vec<(Sym, &'static str, Option<bool>)> {
 }
 
 fn capability_badges(theme: &Theme, entry: &ModelEntry) -> String {
+    if !entry.supports_chat() && !entry.is_embedding() {
+        return entry.metadata.kind.label().to_owned();
+    }
     let capabilities = capabilities(entry);
     let mut badges = capabilities
         .iter()
@@ -228,7 +239,10 @@ fn capability_badges(theme: &Theme, entry: &ModelEntry) -> String {
 }
 
 fn capability_detail(theme: &Theme, entry: &ModelEntry) -> String {
-    capabilities(entry)
+    if !entry.supports_chat() && !entry.is_embedding() {
+        return format!("{} · no compatible Dial role", entry.metadata.kind.label());
+    }
+    let details = capabilities(entry)
         .iter()
         .map(|(icon, name, supported)| {
             format!(
@@ -242,7 +256,12 @@ fn capability_detail(theme: &Theme, entry: &ModelEntry) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("  ")
+        .join("  ");
+    if entry.metadata.kind == ModelKind::Unknown {
+        format!("kind unknown  {details}")
+    } else {
+        details
+    }
 }
 
 fn capability_cell(theme: &Theme, entry: &ModelEntry, width: usize) -> String {
@@ -264,10 +283,10 @@ fn capability_cell(theme: &Theme, entry: &ModelEntry, width: usize) -> String {
 /// `loaded`, `loads on first use`, `embedding`, `unavailable` or `available`, from what the catalog reported.
 fn state_of(entry: &ModelEntry) -> &'static str {
     let source = entry.source.to_lowercase();
-    if source.contains("embedding") {
-        "embedding"
-    } else if !entry.available {
+    if !entry.available {
         "unavailable"
+    } else if !entry.supports_chat() {
+        entry.metadata.kind.label()
     } else if source.contains("loads on first use") {
         "loads on first use"
     } else if source.contains("loaded") {
@@ -284,8 +303,8 @@ fn refusal(entry: &ModelEntry) -> String {
             .to_owned();
     }
     let source = entry.source.to_lowercase();
-    if source.contains("embedding") {
-        "embedding model, not for chat".to_owned()
+    if entry.is_embedding() && is_local_mlx(entry) {
+        "local embedding inference is not managed by Dial; serve it through an embeddings endpoint and assign the embedding role".to_owned()
     } else if source.contains("cached, unverified") {
         "its provider is not reachable; only cached metadata is shown".to_owned()
     } else if source.contains("unverified") {
@@ -1138,6 +1157,26 @@ impl ModelOverlay {
             ));
             return OverlayEvent::None;
         }
+        let target = self
+            .target_role
+            .as_deref()
+            .unwrap_or(if entry.is_embedding() {
+                "embedding"
+            } else {
+                "main"
+            });
+        if !role_accepts(target, entry) {
+            self.message = Some((
+                format!(
+                    "Cannot assign {} to {target}: {} models need a compatible task endpoint, not chat",
+                    display_name(entry),
+                    entry.metadata.kind.label()
+                ),
+                false,
+            ));
+            return OverlayEvent::None;
+        }
+        let target = target.to_owned();
         let selection = entry.selection.clone();
         let role = self.target_role.take();
         if let Some(role) = &role {
@@ -1145,7 +1184,7 @@ impl ModelOverlay {
             self.cursor = ROLES.iter().position(|(name, _)| name == role).unwrap_or(0);
         }
         OverlayEvent::AssignModel {
-            role: role.unwrap_or_else(|| "main".to_owned()),
+            role: target,
             selection,
             scope: self.scope,
         }
@@ -2073,6 +2112,8 @@ impl ModelOverlay {
                 Action::SelectConfirm,
                 if self.target_role.is_some() {
                     "assign"
+                } else if self.highlighted().is_some_and(ModelEntry::is_embedding) {
+                    "set embedding"
                 } else {
                     "set main"
                 },
@@ -2178,13 +2219,13 @@ mod tests {
                     true,
                     Some(32768),
                 ),
-                entry(
-                    "lm-studio",
-                    "nomic-embed",
-                    "LM Studio · embedding model, not for chat",
-                    false,
-                    Some(2048),
-                ),
+                ModelEntry {
+                    metadata: crate::llm::catalog::ModelMetadata {
+                        kind: ModelKind::Embedding,
+                        ..Default::default()
+                    },
+                    ..entry("lm-studio", "nomic-embed", "LM Studio", false, Some(2048))
+                },
                 entry(
                     "openai",
                     "gpt-cached",
@@ -2354,6 +2395,62 @@ mod tests {
         assert!(matches!(send(&mut o, &rig, key(KeyCode::Enter)),
             OverlayEvent::AssignModel { role, .. } if role == "embedding"));
         assert!(o.chooser.is_none());
+    }
+
+    #[test]
+    fn enter_routes_embeddings_to_the_embedding_role_not_main() {
+        let rig = Rig::new();
+        let mut d = discovery();
+        d.models[3].available = true;
+        let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+        o.type_text("nomic-embed");
+        assert!(
+            o.footer(&rig.keys)
+                .iter()
+                .any(|hint| hint.contains("set embedding"))
+        );
+        assert!(matches!(send(&mut o, &rig, key(KeyCode::Enter)),
+            OverlayEvent::AssignModel { role, .. } if role == "embedding"));
+    }
+
+    #[test]
+    fn non_chat_models_are_visible_but_cannot_be_assigned_to_chat_roles() {
+        let rig = Rig::new();
+        for kind in [ModelKind::Rerank, ModelKind::Image, ModelKind::Audio] {
+            let mut model = entry("custom", "specialized", "provider metadata", true, None);
+            model.metadata.kind = kind;
+            assert!(!KindFilter::Chat.accepts(&model));
+            assert!(KindFilter::Other.accepts(&model));
+            assert!(!ROLES.iter().any(|(role, _)| role_accepts(role, &model)));
+            let mut o = ModelOverlay::new(
+                Some(Discovery {
+                    models: vec![model],
+                    providers: vec![],
+                }),
+                roles_with_main(),
+                Scope::Global,
+            );
+            assert_eq!(names(&o), ["specialized"]);
+            assert!(matches!(
+                send(&mut o, &rig, key(KeyCode::Enter)),
+                OverlayEvent::None
+            ));
+            assert!(o.message.is_some());
+        }
+    }
+
+    #[test]
+    fn display_prose_does_not_determine_a_models_purpose() {
+        let model = entry(
+            "custom",
+            "chat",
+            "embedding examples in the documentation",
+            true,
+            None,
+        );
+        assert!(!is_embedding(&model));
+        assert!(role_accepts("main", &model));
+        assert!(!role_accepts("embedding", &model));
     }
 
     #[test]
@@ -2675,7 +2772,8 @@ mod tests {
             let detail = capability_detail(&rig.theme, &model);
             assert!(detail.contains("tools no") && detail.contains("reasoning unknown"));
             assert!(!capability_badges(&rig.theme, &model).contains(rig.theme.sym(Sym::IconTools)));
-            let embed = entry("ollama", "embed-model", "embedding", false, None);
+            let mut embed = entry("ollama", "embed-model", "Ollama", false, None);
+            embed.metadata.kind = ModelKind::Embedding;
             assert_eq!(
                 capability_badges(&rig.theme, &embed),
                 rig.theme.sym(Sym::IconEmbedding)
@@ -2898,7 +2996,10 @@ mod tests {
             "unknown context is '-': {row}"
         );
         let row = shown.lines().find(|l| l.contains("nomic-embed")).unwrap();
-        assert!(row.contains("embedding"), "{row}");
+        assert!(
+            row.contains("unavailable"),
+            "availability stays distinct from model purpose: {row}"
+        );
         assert!(
             shown
                 .lines()
@@ -2986,7 +3087,11 @@ mod tests {
         send(&mut o, &rig, key(KeyCode::Right));
         assert_eq!(names(&o), ["nomic-embed"]);
         send(&mut o, &rig, key(KeyCode::Right));
-        assert_eq!(o.kind, KindFilter::Embedding, "clamps at the last kind");
+        assert_eq!(o.kind, KindFilter::Other);
+        assert!(names(&o).is_empty());
+        send(&mut o, &rig, key(KeyCode::Right));
+        assert_eq!(o.kind, KindFilter::Other, "clamps at the last kind");
+        send(&mut o, &rig, key(KeyCode::Left));
         send(&mut o, &rig, key(KeyCode::Left));
         send(&mut o, &rig, key(KeyCode::Left));
         assert_eq!(o.kind, KindFilter::All);
@@ -3063,7 +3168,7 @@ mod tests {
         let shown = draw(&mut o, &rig, 130, 30);
         assert!(
             shown.contains("Cannot select lm-studio/nomic-embed")
-                && shown.contains("embedding model, not for chat"),
+                && shown.contains("provider reports it as unavailable"),
             "{shown}"
         );
         let style = style_of(

@@ -6,22 +6,33 @@ use super::{call_form_error, looks_like_text_call};
 use crate::config::types::AssistanceConfig;
 use crate::llm::Reply;
 use crate::llm::profiles::{
-    ModelCapabilities, ModelProfile, StructuredOutput, structured_output_for,
+    ModelCapabilities, ModelProfile, StructuredOutput, resolve_structured_output,
 };
 use crate::llm::tool_repair;
 use serde_json::Value;
 
 /// Whether a retry may be requested: the config is on, the session is not hermetic, and the
-/// effective endpoint enforces structured output.
+/// effective endpoint enforces structured output. `endpoint` is the mechanism detected on the live
+/// endpoint (`Backend::endpoint_structured_output`); a declared profile still wins.
 pub(super) fn enabled(
     config: &AssistanceConfig,
     hermetic: bool,
     provider: &str,
+    model: &str,
     profile: Option<&ModelProfile>,
+    endpoint: Option<StructuredOutput>,
 ) -> bool {
-    let mechanism = profile
-        .map(ModelProfile::structured_output)
-        .unwrap_or_else(|| structured_output_for(provider, &ModelCapabilities::default()));
+    let default = ModelCapabilities::default();
+    let (provider, model, capabilities) = match profile {
+        Some(profile) => (
+            profile.provider.as_str(),
+            profile.model.as_str(),
+            &profile.capabilities,
+        ),
+        None => (provider, model, &default),
+    };
+    let endpoint = endpoint.or(profile.and_then(|profile| profile.endpoint_structured_output));
+    let mechanism = resolve_structured_output(provider, model, capabilities, endpoint);
     config.constrained_repair && !hermetic && mechanism != StructuredOutput::Disabled
 }
 
@@ -123,16 +134,35 @@ mod tests {
         let config = Config::default().assistance;
         let lm = ModelProfile::minimal("lm-studio", "m");
         let mlx = ModelProfile::minimal("mlx", "m");
-        assert!(enabled(&config, false, "lm-studio", Some(&lm)));
-        assert!(enabled(&config, false, "ollama", None));
-        assert!(!enabled(&config, false, "mlx", Some(&mlx)));
-        assert!(!enabled(&config, true, "lm-studio", Some(&lm)));
+        assert!(enabled(&config, false, "lm-studio", "m", Some(&lm), None));
+        assert!(enabled(&config, false, "ollama", "m", None, None));
+        assert!(!enabled(&config, false, "mlx", "m", Some(&mlx), None));
+        assert!(!enabled(&config, true, "lm-studio", "m", Some(&lm), None));
         let mut off = ModelProfile::minimal("lm-studio", "m");
         off.capabilities.structured_output = Some(StructuredOutput::Disabled);
-        assert!(!enabled(&config, false, "lm-studio", Some(&off)));
+        assert!(!enabled(&config, false, "lm-studio", "m", Some(&off), None));
         let mut disabled = config.clone();
         disabled.constrained_repair = false;
-        assert!(!enabled(&disabled, false, "lm-studio", Some(&lm)));
+        assert!(!enabled(&disabled, false, "lm-studio", "m", Some(&lm), None));
+    }
+
+    #[test]
+    fn detected_llama_server_enables_repair_with_or_without_a_profile() {
+        let config = Config::default().assistance;
+        let json = Some(StructuredOutput::JsonSchema);
+        // A generic OpenAI-compatible endpoint declares no mechanism; the detected one decides.
+        assert!(!enabled(&config, false, "openai-compatible", "m", None, None));
+        assert!(enabled(&config, false, "openai-compatible", "m", None, json));
+        let plain = ModelProfile::minimal("openai-compatible", "m");
+        assert!(enabled(&config, false, "openai-compatible", "m", Some(&plain), json));
+        // A detection already recorded on the profile (set at the request boundary) counts the same.
+        let mut recorded = plain.clone();
+        recorded.endpoint_structured_output = json;
+        assert!(enabled(&config, false, "openai-compatible", "m", Some(&recorded), None));
+        // An explicit declaration still wins over detection.
+        let mut declared_off = recorded.clone();
+        declared_off.capabilities.structured_output = Some(StructuredOutput::Disabled);
+        assert!(!enabled(&config, false, "openai-compatible", "m", Some(&declared_off), json));
     }
 
     #[test]

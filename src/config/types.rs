@@ -919,6 +919,55 @@ impl Default for PortableRulesConfig {
     }
 }
 
+/// `assistance.lean_local`. `auto` (default) turns the lean profile on for local routes whose planned
+/// context window is at most [`LEAN_AUTO_MAX_WINDOW`]; TOML `true` forces it on for every local route
+/// and `false` opts out, so boolean configurations keep their meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LeanLocal {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// Largest planned context window at which `assistance.lean_local = "auto"` enables the lean profile.
+pub const LEAN_AUTO_MAX_WINDOW: u32 = 32_768;
+
+impl From<bool> for LeanLocal {
+    fn from(forced: bool) -> Self {
+        if forced { Self::On } else { Self::Off }
+    }
+}
+
+impl Serialize for LeanLocal {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::On => serializer.serialize_bool(true),
+            Self::Off => serializer.serialize_bool(false),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LeanLocal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Flag(bool),
+            Word(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Flag(forced) => Ok(forced.into()),
+            Raw::Word(word) if word == "auto" => Ok(Self::Auto),
+            Raw::Word(word) => Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(&word),
+                &"true, false or \"auto\"",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AssistanceConfig {
@@ -939,6 +988,12 @@ pub struct AssistanceConfig {
     /// After a malformed local tool call, retry once with output constrained to the offered tool schemas
     /// (LM Studio json_schema, Ollama format). Converted calls still pass runtime validation and approvals.
     pub constrained_repair: bool,
+    /// Lean profile for locally served models (no endpoint, or a loopback/LAN host): compact tool
+    /// interface, an initial tool budget of at most 8, optional prompt sections and the delegation
+    /// guidance omitted when the local server runs one request at a time. `auto` (default) enables it
+    /// only when the planned window is at most `LEAN_AUTO_MAX_WINDOW`; `true` forces it on, `false`
+    /// opts out. Hosted routes are unchanged. Measure with `dial benchmark --ablate-assistance`.
+    pub lean_local: LeanLocal,
 }
 impl Default for AssistanceConfig {
     fn default() -> Self {
@@ -954,6 +1009,7 @@ impl Default for AssistanceConfig {
             tool_grammar: true,
             repair_hints: false,
             constrained_repair: true,
+            lean_local: LeanLocal::Auto,
         }
     }
 }
@@ -1290,6 +1346,12 @@ pub struct ImproveConfig {
     pub daily_compute_minutes: u32,
     /// Maximum observed endpoint-model spend per background cycle/day in USD; zero disables background cloud work.
     pub max_daily_usd: f64,
+    /// Failure-driven distillation: the `coach` role solves fresh tasks from weak train families and
+    /// only verifier-passed teacher runs become training records (source `teacher-<model>`). Requires
+    /// an assigned coach role. Off by default.
+    pub distill: bool,
+    /// Teacher self-play tasks per cycle when `distill` is on (1..=64).
+    pub distill_tasks: u32,
 }
 
 impl Default for ImproveConfig {
@@ -1315,6 +1377,8 @@ impl Default for ImproveConfig {
             require_ac_power: true,
             daily_compute_minutes: 0,
             max_daily_usd: 0.0,
+            distill: false,
+            distill_tasks: 4,
         }
     }
 }
@@ -1383,4 +1447,34 @@ pub struct Proposal {
     /// "harness" or "lora". Other operations must be rejected.
     pub operation: String,
     pub harness: Option<Harness>,
+}
+
+#[cfg(test)]
+mod lean_local_tests {
+    use super::*;
+
+    #[test]
+    fn lean_local_accepts_true_false_and_auto_and_defaults_to_auto() {
+        let lean = |text: &str| toml::from_str::<AssistanceConfig>(text).map(|config| config.lean_local);
+        assert_eq!(AssistanceConfig::default().lean_local, LeanLocal::Auto);
+        assert_eq!(lean("").unwrap(), LeanLocal::Auto);
+        assert_eq!(lean("lean_local = \"auto\"").unwrap(), LeanLocal::Auto);
+        assert_eq!(lean("lean_local = true").unwrap(), LeanLocal::On);
+        assert_eq!(lean("lean_local = false").unwrap(), LeanLocal::Off);
+        assert!(lean("lean_local = \"maybe\"").is_err());
+        assert!(lean("lean_local = \"true\"").is_err());
+        // Serialized values keep the shape each one was written in.
+        let written = |value| {
+            toml::Table::try_from(AssistanceConfig {
+                lean_local: value,
+                ..AssistanceConfig::default()
+            })
+            .unwrap()["lean_local"]
+                .clone()
+        };
+        assert_eq!(written(LeanLocal::Auto), toml::Value::String("auto".into()));
+        assert_eq!(written(LeanLocal::On), toml::Value::Boolean(true));
+        assert_eq!(written(LeanLocal::Off), toml::Value::Boolean(false));
+        assert_eq!(LeanLocal::from(true), LeanLocal::On);
+    }
 }

@@ -30,6 +30,19 @@ pub struct TrainingState {
 /// A verified trajectory: (id, version, domain, score, source, payload).
 pub type VerifiedSuccess = (i64, i64, String, f64, String, Value);
 
+/// What [`Store::approve_session`] did with each completed turn of a session.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SessionApproval {
+    /// Newly approved for training.
+    pub approved: usize,
+    /// Already verified (a passing check, commit or earlier approval).
+    pub already: usize,
+    /// Kept as is: a person or verifier scored the turn below 100.
+    pub judged: usize,
+    /// Failed, or no saved request to learn from.
+    pub unusable: usize,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -965,6 +978,50 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// Record the user's approval (`user:session`, score 100) for every completed turn of one
+    /// session, so `/improve session` can train on it. Turns that failed, were interrupted (no saved
+    /// messages), or already carry a person's verdict or a lower external score are left unchanged.
+    pub fn approve_session(&self, session_id: &str) -> Result<SessionApproval> {
+        ensure!(!session_id.trim().is_empty(), "session id must be nonempty");
+        let mut statement = self.conn.prepare(
+            "SELECT t.id,t.error IS NOT NULL,
+                EXISTS(SELECT 1 FROM trajectory_messages m WHERE m.trajectory=t.id),
+                o.score,o.source
+            FROM trajectories t LEFT JOIN outcomes o ON o.trajectory=t.id
+            WHERE t.task=?1 AND t.finished_at IS NOT NULL AND t.domain NOT LIKE 'selfplay:%'
+            ORDER BY t.id",
+        )?;
+        let turns = statement
+            .query_map([format!("session:{session_id}")], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, bool>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut approval = SessionApproval::default();
+        for (trajectory, failed, saved, score, source) in turns {
+            match (score, source) {
+                _ if failed || !saved => approval.unusable += 1,
+                (Some(score), _) if score >= 100.0 => approval.already += 1,
+                (Some(_), Some(_)) => approval.judged += 1,
+                _ => {
+                    self.outcome(&Outcome {
+                        trajectory,
+                        score: 100.0,
+                        source: "user:session".into(),
+                        reference: Some("approved with /improve session".into()),
+                    })?;
+                    approval.approved += 1;
+                }
+            }
+        }
+        Ok(approval)
+    }
+
     /// Scored live trajectories of one version: (count, mean score). Self-play is excluded so the
     /// number reflects real use.
     pub fn live_score(&self, version: i64) -> Result<(usize, Option<f64>)> {
@@ -1498,6 +1555,79 @@ mod tests {
         outcome.source = " ".into();
         assert!(store.outcome(&outcome).is_err());
         assert!(store.finish_trajectory(id, Some("rewrite"), None).is_err());
+    }
+
+    #[test]
+    fn approving_a_session_credits_only_its_usable_unjudged_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), "model", "case", &harness()).unwrap();
+        let version = store.active().unwrap().id;
+        let turn = |task: &str, prompt: &str, failed: bool, saved: bool| {
+            let id = store
+                .begin_trajectory(version, "coding", task, prompt)
+                .unwrap();
+            if failed {
+                store.finish_trajectory(id, None, Some("boom")).unwrap();
+            } else {
+                store.finish_trajectory(id, Some("done"), None).unwrap();
+            }
+            if saved {
+                store.save_messages(id, &json!({"examples":[]})).unwrap();
+            }
+            id
+        };
+        let plain = turn("session:abc", "a", false, true);
+        let checked = turn("session:abc", "b", false, true);
+        let rejected = turn("session:abc", "c", false, true);
+        turn("session:abc", "d", true, true);
+        turn("session:abc", "e", false, false);
+        let other = turn("session:other", "f", false, true);
+        let unfinished = store
+            .begin_trajectory(version, "coding", "session:abc", "g")
+            .unwrap();
+        for (id, score, source) in [
+            (checked, 100.0, "checks:behavioral"),
+            (rejected, 20.0, "user"),
+        ] {
+            store
+                .outcome(&Outcome {
+                    trajectory: id,
+                    score,
+                    source: source.into(),
+                    reference: None,
+                })
+                .unwrap();
+        }
+
+        let approval = store.approve_session("abc").unwrap();
+        assert_eq!(
+            approval,
+            SessionApproval {
+                approved: 1,
+                already: 1,
+                judged: 1,
+                unusable: 2,
+            }
+        );
+        let score = |id: i64| -> Option<(f64, String)> {
+            store
+                .conn
+                .query_row(
+                    "SELECT score,source FROM outcomes WHERE trajectory=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .unwrap()
+        };
+        assert_eq!(score(plain), Some((100.0, "user:session".into())));
+        assert_eq!(score(rejected), Some((20.0, "user".into())));
+        assert_eq!(score(other), None);
+        assert_eq!(score(unfinished), None);
+        assert_eq!(store.verified_live_turns().unwrap(), 2);
+        // Approving again changes nothing.
+        assert_eq!(store.approve_session("abc").unwrap().approved, 0);
+        assert!(store.approve_session(" ").is_err());
     }
 
     #[test]

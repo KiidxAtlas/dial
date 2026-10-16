@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::config::session_models::SessionModels;
 use crate::platform::fs as platform_fs;
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -422,19 +423,40 @@ pub fn load_layer(layout: &Layout, scope: Scope) -> Result<toml::Table> {
 
 /// Resolve disk layers plus CLI overrides without migrating or rewriting disk configuration.
 pub fn load_config(layout: &Layout, overlay: &toml::Table) -> Result<crate::config::types::Config> {
+    load_session_config(layout, overlay, None)
+}
+
+/// [`load_config`] with a running session's own model choices kept over the files' model keys.
+pub fn load_session_config(
+    layout: &Layout,
+    overlay: &toml::Table,
+    models: Option<&SessionModels>,
+) -> Result<crate::config::types::Config> {
     let layers = [
         load_layer(layout, Scope::Global)?,
         load_layer(layout, Scope::Project)?,
     ];
-    resolve_layers(layout, &layers, overlay)
+    resolve_layers(layout, &layers, overlay, models)
+}
+
+/// The raw merged settings table (both files plus CLI overrides) that loading starts from.
+pub fn load_merged(layout: &Layout, overlay: &toml::Table) -> Result<toml::Table> {
+    Ok(crate::config::merged_layers(
+        &load_layer(layout, Scope::Global)?,
+        &load_layer(layout, Scope::Project)?,
+        overlay,
+    ))
 }
 
 fn resolve_layers(
     layout: &Layout,
     layers: &[toml::Table; 2],
     overlay: &toml::Table,
+    models: Option<&SessionModels>,
 ) -> Result<crate::config::types::Config> {
-    crate::config::types::Config::from_layers(layout, &layers[0], &layers[1], overlay)
+    crate::config::types::Config::from_session_layers(
+        layout, &layers[0], &layers[1], overlay, models,
+    )
 }
 
 /// Last validated external layers. Failed reads/parses retain that layer; a failed complete
@@ -455,7 +477,7 @@ impl SettingsReload {
                 load_layer(layout, Scope::Global)?,
                 load_layer(layout, Scope::Project)?,
             ];
-            resolve_layers(layout, &layers, overlay)?;
+            resolve_layers(layout, &layers, overlay, None)?;
             Ok(layers)
         })()
         .ok();
@@ -476,10 +498,12 @@ impl SettingsReload {
         self.settings.subscribe()
     }
 
+    /// Re-read both files. `models` keeps a running session's own model choices over the files'.
     pub fn reload(
         &mut self,
         layout: &Layout,
         overlay: &toml::Table,
+        models: Option<&SessionModels>,
     ) -> (crate::config::types::Config, Vec<String>) {
         let files = layout.config_files();
         let mut diagnostics = Vec::new();
@@ -501,7 +525,7 @@ impl SettingsReload {
         if self.layers.is_none() && !readable.iter().all(|value| *value) {
             return (self.settings.snapshot().config().clone(), diagnostics);
         }
-        match resolve_layers(layout, &candidate, overlay) {
+        match resolve_layers(layout, &candidate, overlay, models) {
             Ok(config) => {
                 self.layers = Some(candidate);
                 if let Err(error) = self.settings.publish(config) {
@@ -524,7 +548,7 @@ impl SettingsReload {
                         }
                         let mut trial = good.clone();
                         trial[index] = candidate[index].clone();
-                        if let Ok(config) = resolve_layers(layout, &trial, overlay) {
+                        if let Ok(config) = resolve_layers(layout, &trial, overlay, models) {
                             good = trial;
                             if let Err(error) = self.settings.publish(config) {
                                 diagnostics.push(format!("Settings publication failed: {error:#}; keeping last good settings"));
@@ -666,6 +690,42 @@ mod tests {
         );
         assert_eq!(fs::read(&layout.config_files()[0]).unwrap(), original);
     }
+
+    #[test]
+    fn another_sessions_model_write_does_not_retarget_a_pinned_session() {
+        let (_home, _project, layout) = fixture();
+        let set = |path: &str, value: &str| Change::Set {
+            path: path.into(),
+            value: value.into(),
+        };
+        save_config(
+            &layout,
+            Scope::Global,
+            &[set("model", "mine"), set("service_tier", "flex")],
+        )
+        .unwrap();
+        let overlay = toml::Table::new();
+        let mut pin = SessionModels::capture(&load_merged(&layout, &overlay).unwrap());
+        // Another terminal picks a model and edits an unrelated setting.
+        save_model_config(&layout, Scope::Global, &[set("model", "theirs")], "main").unwrap();
+        save_config(&layout, Scope::Global, &[set("service_tier", "priority")]).unwrap();
+        let config = load_session_config(&layout, &overlay, Some(&pin)).unwrap();
+        assert_eq!(config.model, "mine");
+        assert_eq!(config.service_tier, "priority");
+        let mut reload = SettingsReload::new(&layout, &overlay, &config);
+        assert_eq!(reload.reload(&layout, &overlay, Some(&pin)).0.model, "mine");
+        // This session's own choice applies here and becomes the saved default.
+        save_model_config(&layout, Scope::Global, &[set("model", "next")], "main").unwrap();
+        pin.adopt_role(&load_merged(&layout, &overlay).unwrap(), "main");
+        assert_eq!(
+            load_session_config(&layout, &overlay, Some(&pin))
+                .unwrap()
+                .model,
+            "next"
+        );
+        assert_eq!(load_config(&layout, &overlay).unwrap().model, "next");
+    }
+
     #[test]
     fn model_favorites_persist_and_project_empty_list_overrides_global() {
         use crate::llm::model_config::ModelSelection;

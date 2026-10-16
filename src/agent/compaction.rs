@@ -19,6 +19,13 @@ pub use summary::{BranchSummary, summarize_branch};
 
 pub const DEFAULT_RESERVE_TOKENS: u32 = 16_384;
 pub const MAX_SUMMARY_TOKENS: u32 = DEFAULT_RESERVE_TOKENS;
+/// Windows up to this size get a share-of-window default reserve (when `reserve_tokens` is unset).
+/// The fixed 16k default took half of a 32k local window before any history was kept.
+pub const SMALL_WINDOW_TOKENS: u32 = 65_536;
+const SMALL_WINDOW_RESERVE_PERCENT: u32 = 20;
+const SMALL_WINDOW_RESERVE_FLOOR: u32 = 2_048;
+/// Default verbatim tail; a configured value equal to this on a small window is scaled to fit the band.
+pub const DEFAULT_KEEP_RECENT_TOKENS: u32 = 20_000;
 /// Auto trigger as a percentage of the window left after the reserve.
 pub const DEFAULT_THRESHOLD_PERCENT: u64 = 80;
 
@@ -291,7 +298,7 @@ impl Default for CompactionConfig {
             threshold_percent: None,
             threshold_tokens: None,
             reserve_tokens: None,
-            keep_recent_tokens: 20_000,
+            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             mid_turn_enabled: true,
             auto_continue: true,
             remote_enabled: true,
@@ -401,6 +408,20 @@ impl CompactionConfig {
         Ok(())
     }
     pub fn reserve(&self, window: u32) -> u32 {
+        let reserve = self.fixed_or_proportional_reserve(window);
+        // Small default windows reserve at most 20% (never below a 2k floor), so the reserve no longer
+        // consumes half the window. Explicit `reserve_tokens` and large windows are unchanged, and the
+        // reserve never grows past the value the 16k/15% rule already gave.
+        if self.reserve_tokens.is_none() && window <= SMALL_WINDOW_TOKENS {
+            reserve.min(
+                (window.saturating_mul(SMALL_WINDOW_RESERVE_PERCENT) / 100)
+                    .max(SMALL_WINDOW_RESERVE_FLOOR),
+            )
+        } else {
+            reserve
+        }
+    }
+    fn fixed_or_proportional_reserve(&self, window: u32) -> u32 {
         let proportional = (window.saturating_mul(15) / 100).max(1);
         let reserve = proportional.max(self.reserve_tokens.unwrap_or(DEFAULT_RESERVE_TOKENS));
         if reserve >= window
@@ -415,6 +436,30 @@ impl CompactionConfig {
         (self.reserve(window).saturating_mul(4) / 5)
             .min(MAX_SUMMARY_TOKENS)
             .max(1)
+    }
+    /// Verbatim-tail budget for a cut without an explicit per-call value. The default is scaled only
+    /// on small windows so that the next request (`fixed_tokens` of system/tools, the summary budget,
+    /// and the kept tail) stays within `continue_band`; otherwise the turn pauses after compaction.
+    /// Worked example at 32k: reserve 6553, summary budget 5242, threshold 20972, band 16777, so the
+    /// tail is 0.9 * (16777 - 5242) = 10381 < 20000 when fixed overhead is zero. At 64k the band
+    /// (33751) already fits the default, so it is unchanged. Explicit values and windows above
+    /// SMALL_WINDOW_TOKENS are returned as configured.
+    pub fn keep_recent_budget(
+        &self,
+        identity: CompactionIdentity<'_>,
+        window: u32,
+        fixed_tokens: u64,
+    ) -> Result<u64> {
+        let configured = u64::from(self.keep_recent_tokens);
+        if window > SMALL_WINDOW_TOKENS || self.keep_recent_tokens != DEFAULT_KEEP_RECENT_TOKENS {
+            return Ok(configured);
+        }
+        let band = continue_band(self.effective_threshold(identity, window)?);
+        let room = band
+            .saturating_sub(fixed_tokens)
+            .saturating_sub(u64::from(self.summary_budget(window)));
+        // Keep 10% of the room free for estimate drift between the cut and the committed request.
+        Ok(configured.min(room / 10 * 9))
     }
     pub fn effective_threshold(
         &self,
@@ -976,15 +1021,15 @@ pub fn compact_history(
         backend.output_budget(request.max_tokens),
     );
     let fixed = replacement_request(request, &[]);
+    let fixed_tokens = request_tokens_with_policy(&fixed, policy, context.identity);
     ensure!(
-        request_tokens_with_policy(&fixed, policy, context.identity) < budget,
+        fixed_tokens < budget,
         "immutable system/tool/transient context and next response reserve cannot fit; history compaction cannot fix this"
     );
-    let keep_budget = u64::from(
-        options
-            .keep_recent_tokens
-            .unwrap_or(policy.keep_recent_tokens),
-    );
+    let keep_budget = match options.keep_recent_tokens {
+        Some(explicit) => u64::from(explicit),
+        None => policy.keep_recent_budget(context.identity, context.window, fixed_tokens)?,
+    };
     let original_cut =
         cut(&request.messages, keep_budget).ok_or_else(|| anyhow::Error::new(NothingToCompact))?;
     let non_summary = matches!(
@@ -1628,6 +1673,68 @@ mod tests {
     }
 
     #[test]
+    fn small_default_windows_reserve_a_share_of_the_window() {
+        let policy = CompactionConfig::default();
+        // (window, reserve): the 32k and 64k rows were 16384 before; 8k and 16k already used 15%.
+        for (window, reserve) in [
+            (8_192, 1_228),
+            (16_384, 2_457),
+            (32_768, 6_553),
+            (65_536, 13_107),
+            // Large windows keep the existing 15% / fixed 16k rule byte-for-byte.
+            (128_000, 19_200),
+            (200_000, 30_000),
+            (1_000_000, 150_000),
+        ] {
+            assert_eq!(policy.reserve(window), reserve, "window {window}");
+        }
+        // Explicit reserve_tokens is never rescaled for small windows.
+        let explicit = CompactionConfig {
+            reserve_tokens: Some(16_384),
+            ..CompactionConfig::default()
+        };
+        assert_eq!(explicit.reserve(32_768), 16_384);
+    }
+
+    #[test]
+    fn small_window_thresholds_sit_between_reserve_and_window() {
+        let policy = CompactionConfig::default();
+        let identity = CompactionIdentity {
+            provider: "p",
+            model: "m",
+            agent: None,
+        };
+        // Windows where the keep-recent budget fits under the trigger must trigger above it;
+        // the band is checked for every window in small_default_keep_recent_* tests.
+        for (window, keep_fits) in [
+            (8_192_u32, false),
+            (16_384, false),
+            (32_768, true),
+            (65_536, true),
+        ] {
+            let reserve = u64::from(policy.reserve(window));
+            let keep = policy.keep_recent_budget(identity, window, 0).unwrap();
+            let threshold = policy.effective_threshold(identity, window).unwrap();
+            assert!(
+                threshold > reserve,
+                "window {window}: threshold {threshold}"
+            );
+            assert!(
+                threshold < u64::from(window) - reserve,
+                "window {window}: threshold {threshold}"
+            );
+            let band = continue_band(threshold);
+            assert!(band > 0 && band < threshold, "window {window}: band {band}");
+            if keep_fits {
+                assert!(
+                    threshold > keep,
+                    "window {window}: threshold {threshold} must exceed keep-recent"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn oversized_single_turn_advances_to_a_harder_cut_before_summarizing() {
         // A single turn whose kept tail alone exceeds the keep budget must be cut further up front;
         // otherwise the summary pass runs twice against the turn's worker budget and fails.
@@ -1645,5 +1752,105 @@ mod tests {
             "harder cut {harder} must exceed keep cut {keep}"
         );
         assert_ne!(m[harder]["role"], "tool");
+    }
+
+    #[test]
+    fn small_window_default_keep_recent_keeps_the_next_request_in_band() {
+        // A cut of the default keep budget must leave summary + kept tail (+ fixed system/tool
+        // tokens) within continue_band, or continue_allowed is false and the turn pauses.
+        let policy = CompactionConfig::default();
+        let identity = CompactionIdentity {
+            provider: "p",
+            model: "m",
+            agent: None,
+        };
+        const FIXED: u64 = 1_000;
+        for (window, scaled) in [
+            (8_192_u32, true),
+            (16_384, true),
+            (32_768, true),
+            (65_536, false),
+        ] {
+            let threshold = policy.effective_threshold(identity, window).unwrap();
+            let band = continue_band(threshold);
+            let keep = policy.keep_recent_budget(identity, window, FIXED).unwrap();
+            assert_eq!(keep < 20_000, scaled, "window {window}: keep {keep}");
+            let system = json!({"role":"system","content":"s".repeat(4 * FIXED as usize)});
+            let mut messages = vec![system, json!({"role":"user","content":"do the task"})];
+            let mut call = 0;
+            let base = Chat {
+                messages: vec![],
+                tools: vec![],
+                temperature: 0.0,
+                max_tokens: 0,
+                seed: None,
+            };
+            loop {
+                let request = Chat {
+                    messages: messages.clone(),
+                    ..base.clone()
+                };
+                if request_tokens_with_policy(&request, &policy, identity) > threshold * 5 / 4 {
+                    break;
+                }
+                call += 1;
+                messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":format!("c{call}"),"function":{"name":"read","arguments":"{}"}}]}));
+                messages.push(json!({"role":"tool","tool_call_id":format!("c{call}"),"content":"x".repeat(1600)}));
+            }
+            let request = Chat {
+                messages,
+                ..base.clone()
+            };
+            let cut_index = cut(&request.messages, keep)
+                .unwrap_or_else(|| panic!("window {window}: default keep must cut"));
+            assert!(
+                cut_index > 2,
+                "window {window}: cut {cut_index} must summarize older history"
+            );
+            let summary = u64::from(policy.summary_budget(window));
+            let mut kept = vec![json!({"role":"user","content":"s".repeat(4 * summary as usize)})];
+            kept.extend(
+                request.messages[cut_index..]
+                    .iter()
+                    .filter(|m| is_history(m))
+                    .cloned(),
+            );
+            let candidate = replacement_request(&request, &kept);
+            let after = request_tokens_with_policy(&candidate, &policy, identity);
+            assert!(
+                after <= band,
+                "window {window}: post-compaction {after} exceeds continue band {band}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_and_large_window_keep_recent_is_unchanged() {
+        let identity = CompactionIdentity {
+            provider: "p",
+            model: "m",
+            agent: None,
+        };
+        let default = CompactionConfig::default();
+        for window in [65_537_u32, 200_000, 1_000_000] {
+            assert_eq!(
+                default.keep_recent_budget(identity, window, 1_000).unwrap(),
+                20_000,
+                "large window {window}"
+            );
+        }
+        for configured in [0_u32, 3_000, 12_000, 40_000] {
+            let policy = CompactionConfig {
+                keep_recent_tokens: configured,
+                ..CompactionConfig::default()
+            };
+            for window in [8_192_u32, 32_768, 65_536, 200_000] {
+                assert_eq!(
+                    policy.keep_recent_budget(identity, window, 1_000).unwrap(),
+                    u64::from(configured),
+                    "explicit {configured} at window {window}"
+                );
+            }
+        }
     }
 }

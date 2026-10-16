@@ -12,6 +12,10 @@ use super::{
     files::PrivateDirectory,
     now,
 };
+use crate::llm::model_config::{
+    ApiProtocol, HeaderValue, RequestHeader, resolve_headers, validate_headers,
+};
+use crate::llm::provider::endpoint_url;
 use crate::storage::{memory::screen, paths::Layout};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -45,10 +49,24 @@ pub trait Embedder: Send {
     fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>>;
 }
 
+/// The request and response shape a role or explicit endpoint speaks for embeddings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddingWire {
+    /// OpenAI-compatible `POST {base}/embeddings` (OpenAI, LM Studio, vLLM, Ollama `/v1`).
+    OpenAi,
+    /// Ollama native `POST {base}/api/embed`. `truncate` is false so overlong input is an error, not silently cut.
+    Ollama,
+    /// Gemini `POST {base}/models/{id}:batchEmbedContents`, one request entry per input.
+    Gemini,
+}
+
 struct HttpEmbedder {
     url: String,
+    wire: EmbeddingWire,
+    /// Wire model name: the bare model id for Gemini, the configured name otherwise.
     model: String,
     token: Option<String>,
+    headers: Vec<RequestHeader>,
     timeout_secs: u64,
 }
 
@@ -58,17 +76,40 @@ impl Embedder for HttpEmbedder {
     }
 
     fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        let body = json!({"model": self.model, "input": inputs});
-        let mut request = crate::llm::agent_with(self.timeout_secs, true, None, None)
-            .post(&self.url)
-            .header("Content-Type", "application/json");
-        if let Some(token) = &self.token {
-            request = request.header("Authorization", format!("Bearer {token}"));
+        if inputs.is_empty() {
+            return Ok(Vec::new());
         }
-        let mut response = request.send_json(&body).map_err(|_| {
-            anyhow::anyhow!(
-                "embedding request failed; check memory.semantic.embedding_base_url and that the endpoint is reachable"
-            )
+        let resolved = resolve_headers(&self.headers)?;
+        // Values a provider error excerpt must never echo back.
+        let mut secrets: Vec<String> = self.token.iter().cloned().collect();
+        secrets.extend(
+            resolved
+                .pairs()
+                .zip(&self.headers)
+                .filter(|(_, row)| matches!(row.value, HeaderValue::Env(_)))
+                .map(|((_, value), _)| value.to_owned()),
+        );
+        let body = request_body(self.wire, &self.model, inputs);
+        let mut request =
+            crate::llm::agent_with(self.timeout_secs, !is_local_url(&self.url), None, None)
+                .post(&self.url)
+                .header("Content-Type", "application/json");
+        for (name, value) in resolved.pairs() {
+            request = request.header(name, value);
+        }
+        if let Some(token) = &self.token {
+            request = match self.wire {
+                EmbeddingWire::Gemini => request.header("x-goog-api-key", token.as_str()),
+                _ => request.header("Authorization", format!("Bearer {token}")),
+            };
+        }
+        let mut response = request.send(&serde_json::to_vec(&body)?).map_err(|error| {
+            anyhow::anyhow!(redact(
+                &format!(
+                    "embedding request failed ({error}); check memory.semantic.embedding_base_url and that the endpoint is reachable"
+                ),
+                &secrets,
+            ))
         })?;
         let status = response.status().as_u16();
         let mut bytes = Vec::new();
@@ -77,95 +118,236 @@ impl Embedder for HttpEmbedder {
             .as_reader()
             .take(MAX_EMBED_RESPONSE + 1)
             .read_to_end(&mut bytes)?;
+        if !(200..300).contains(&status) {
+            let detail = provider_detail(&bytes, &secrets)
+                .map(|text| format!(": {text}"))
+                .unwrap_or_default();
+            anyhow::bail!("embedding endpoint returned HTTP {status}{detail}");
+        }
         ensure!(
             bytes.len() as u64 <= MAX_EMBED_RESPONSE,
             "embedding response exceeds the size limit"
         );
-        ensure!(
-            (200..300).contains(&status),
-            "embedding endpoint returned HTTP {status}"
-        );
-        parse_embeddings(&bytes, inputs.len())
+        parse_embeddings(self.wire, &bytes, inputs.len())
+            .map_err(|error| anyhow::anyhow!(redact(&format!("{error:#}"), &secrets)))
     }
 }
 
-/// Parses an OpenAI-style `{"data":[{"index":i,"embedding":[...]}]}` response, reordered by index.
-pub fn parse_embeddings(bytes: &[u8], expected: usize) -> Result<Vec<Vec<f32>>> {
-    let value: Value = serde_json::from_slice(bytes).context("embedding response is not JSON")?;
-    let data = value["data"]
-        .as_array()
-        .context("embedding response has no data array")?;
+fn is_local_url(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            let bare = host.trim_start_matches('[').trim_end_matches(']');
+            bare == "localhost"
+                || bare
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
+/// Gemini model ids are path segments; accept the bare id, with an optional `models/` prefix.
+fn gemini_model_id(model: &str) -> Result<&str> {
+    let id = model.strip_prefix("models/").unwrap_or(model);
     ensure!(
-        data.len() == expected,
-        "embedding response returned {} vectors for {expected} inputs",
-        data.len()
+        !id.is_empty()
+            && id.len() <= 128
+            && id != "."
+            && id != ".."
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "Gemini embedding model must be a model id of letters, digits, '-', '_' or '.'"
     );
-    let mut slots: Vec<Option<Vec<f32>>> = vec![None; expected];
-    let mut dimensions = None;
-    for (position, item) in data.iter().enumerate() {
-        let index = item["index"]
-            .as_u64()
-            .map(|value| value as usize)
-            .unwrap_or(position);
-        ensure!(
-            index < expected && slots[index].is_none(),
-            "embedding response has an invalid or duplicate index"
-        );
-        let values = item["embedding"]
-            .as_array()
-            .context("embedding item has no vector")?;
-        let vector = values
-            .iter()
-            .map(|value| {
-                value
-                    .as_f64()
-                    .filter(|number| number.is_finite())
-                    .map(|number| number as f32)
-                    .context("embedding value is not a finite number")
-            })
-            .collect::<Result<Vec<f32>>>()?;
-        ensure!(!vector.is_empty(), "embedding vector is empty");
-        match dimensions {
-            None => dimensions = Some(vector.len()),
-            Some(expected_dimensions) => ensure!(
-                expected_dimensions == vector.len(),
-                "embedding vectors have mixed dimensions"
-            ),
-        }
-        slots[index] = Some(vector);
+    Ok(id)
+}
+
+fn request_body(wire: EmbeddingWire, model: &str, inputs: &[String]) -> Value {
+    match wire {
+        EmbeddingWire::OpenAi => json!({"model": model, "input": inputs}),
+        EmbeddingWire::Ollama => json!({"model": model, "input": inputs, "truncate": false}),
+        EmbeddingWire::Gemini => json!({
+            "requests": inputs
+                .iter()
+                .map(|text| json!({
+                    "model": format!("models/{model}"),
+                    "content": {"parts": [{"text": text}]},
+                }))
+                .collect::<Vec<_>>()
+        }),
     }
-    slots
+}
+
+/// The provider's own error text, trimmed and bounded, for a non-2xx response.
+fn provider_detail(bytes: &[u8], secrets: &[String]) -> Option<String> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let text = value["error"]["message"]
+        .as_str()
+        .or_else(|| value["error"].as_str())
+        .or_else(|| value["message"].as_str())?;
+    // Redact before truncating: a bound must not expose the beginning of a credential.
+    let text = redact(text, secrets);
+    let text: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(300)
+        .collect();
+    Some(text.trim().to_owned()).filter(|text| !text.is_empty())
+}
+
+fn redact(text: &str, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(text.to_owned(), |text, secret| {
+            text.replace(secret.as_str(), "[redacted]")
+        })
+}
+
+/// Parses an embeddings response for `wire` into `expected` vectors in input order. Counts,
+/// indices and every number (a finite f32) are validated, and all vectors share one dimension.
+pub fn parse_embeddings(
+    wire: EmbeddingWire,
+    bytes: &[u8],
+    expected: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let value: Value = serde_json::from_slice(bytes).context("embedding response is not JSON")?;
+    let mut slots: Vec<Option<Vec<f32>>> = vec![None; expected];
+    match wire {
+        EmbeddingWire::OpenAi => {
+            let data = value["data"]
+                .as_array()
+                .context("embedding response has no data array")?;
+            ensure!(
+                data.len() == expected,
+                "embedding response returned {} vectors for {expected} inputs",
+                data.len()
+            );
+            for (position, item) in data.iter().enumerate() {
+                // Some compatible servers omit `index`; then array order is the input order.
+                let index = match item.get("index") {
+                    Some(index) => index_slot(index, expected)?,
+                    None => position,
+                };
+                place(&mut slots, index, parse_vector(&item["embedding"])?)?;
+            }
+        }
+        EmbeddingWire::Ollama | EmbeddingWire::Gemini => {
+            let items = value["embeddings"]
+                .as_array()
+                .context("embedding response has no embeddings array")?;
+            ensure!(
+                items.len() == expected,
+                "embedding response returned {} vectors for {expected} inputs",
+                items.len()
+            );
+            for (position, item) in items.iter().enumerate() {
+                let values = if wire == EmbeddingWire::Gemini {
+                    &item["values"]
+                } else {
+                    item
+                };
+                place(&mut slots, position, parse_vector(values)?)?;
+            }
+        }
+    }
+    let vectors: Vec<Vec<f32>> = slots
         .into_iter()
         .map(|slot| slot.context("embedding response is missing a vector"))
+        .collect::<Result<_>>()?;
+    let dimensions = vectors.first().map_or(0, Vec::len);
+    ensure!(
+        vectors.iter().all(|vector| vector.len() == dimensions),
+        "embedding vectors have mixed dimensions"
+    );
+    Ok(vectors)
+}
+
+fn index_slot(index: &Value, expected: usize) -> Result<usize> {
+    let number = index
+        .as_u64()
+        .context("embedding index must be a non-negative integer")?;
+    usize::try_from(number)
+        .ok()
+        .filter(|slot| *slot < expected)
+        .context("embedding index is outside the input range")
+}
+
+fn place(slots: &mut [Option<Vec<f32>>], index: usize, vector: Vec<f32>) -> Result<()> {
+    let slot = slots
+        .get_mut(index)
+        .context("embedding index is outside the input range")?;
+    ensure!(slot.is_none(), "embedding response has a duplicate index");
+    *slot = Some(vector);
+    Ok(())
+}
+
+fn parse_vector(values: &Value) -> Result<Vec<f32>> {
+    let values = values.as_array().context("embedding item has no vector")?;
+    ensure!(!values.is_empty(), "embedding vector is empty");
+    values
+        .iter()
+        .map(|value| -> Result<f32> {
+            let number = value.as_f64().context("embedding value is not a number")?;
+            let narrowed = number as f32;
+            ensure!(
+                narrowed.is_finite(),
+                "embedding value is outside the f32 range"
+            );
+            Ok(narrowed)
+        })
         .collect()
 }
 
-/// Validates the base URL with the same rules as the memory endpoints and appends `/embeddings`.
-pub fn embeddings_url(base: &str) -> Result<String> {
+/// The request URL for `wire`. OpenAI-compatible bases reuse the chat endpoint rules
+/// (`provider::endpoint_url`): a bare host gets `/v1`, and `/embeddings` replaces `/chat/completions`.
+pub fn embedding_url(
+    wire: EmbeddingWire,
+    base: &str,
+    allow_insecure: bool,
+    model: &str,
+) -> Result<String> {
     let base = base.trim();
-    let url = url::Url::parse(base).map_err(|_| {
-        anyhow::anyhow!(
-            "memory.semantic.embedding_base_url must be a full https:// address (http:// is allowed only on this machine)"
-        )
-    })?;
-    let host = url.host_str().unwrap_or("");
-    let bare_host = host.trim_start_matches('[').trim_end_matches(']');
-    let local = host == "localhost"
-        || bare_host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
     ensure!(
-        url.scheme() == "https" || (url.scheme() == "http" && local),
-        "embedding endpoints require HTTPS except loopback HTTP"
+        !base.contains('#'),
+        "embedding endpoint must not contain a fragment"
     );
-    ensure!(
-        url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none(),
-        "memory.semantic.embedding_base_url must not contain credentials, a query string or a fragment; put the key in memory.semantic.embedding_api_key_env"
-    );
-    Ok(format!("{}/embeddings", base.trim_end_matches('/')))
+    match wire {
+        EmbeddingWire::OpenAi => {
+            let completions = endpoint_url(base, allow_insecure)?;
+            let prefix = completions
+                .strip_suffix("/chat/completions")
+                .context("invalid embedding endpoint URL")?;
+            Ok(format!("{prefix}/embeddings"))
+        }
+        EmbeddingWire::Ollama => {
+            endpoint_url(base, allow_insecure)?;
+            let root = base.trim_end_matches('/');
+            let root = root.strip_suffix("/api/embed").unwrap_or(root);
+            let root = root.strip_suffix("/v1").unwrap_or(root);
+            Ok(format!("{root}/api/embed"))
+        }
+        EmbeddingWire::Gemini => {
+            endpoint_url(base, allow_insecure)?;
+            let id = gemini_model_id(model)?;
+            let root = base.trim_end_matches('/');
+            let path = url::Url::parse(root)
+                .map(|parsed| parsed.path().to_owned())
+                .context("invalid Gemini embedding endpoint")?;
+            let root = if path.is_empty() || path == "/" {
+                format!("{root}/v1beta")
+            } else {
+                root.to_owned()
+            };
+            Ok(format!("{root}/models/{id}:batchEmbedContents"))
+        }
+    }
 }
 
 fn api_key(env_name: &str) -> Result<Option<String>> {
@@ -193,12 +375,16 @@ pub struct EmbeddingRoute {
     /// True for the explicit overrides, whose key variable must be set; role keys come from the
     /// same credential store chat models use.
     pub explicit: bool,
+    pub wire: EmbeddingWire,
+    /// Role endpoints honour the chat endpoint's insecure-HTTP opt-in; overrides never do.
+    pub allow_insecure: bool,
+    /// The role endpoint's custom headers, validated before any request.
+    pub headers: Vec<RequestHeader>,
 }
 
-fn resolve_route(
-    config: &SemanticConfig,
-    role: Option<EmbeddingRoute>,
-) -> Result<Option<EmbeddingRoute>> {
+/// Overrides are checked before the role, so an unusable role never blocks them, and an
+/// unusable role is reported only when no complete override is set.
+fn resolve_route(config: &SemanticConfig, role: EmbeddingRole) -> Result<Option<EmbeddingRoute>> {
     let base = config.embedding_base_url.trim();
     let model = config.embedding_model.trim();
     match (base.is_empty(), model.is_empty()) {
@@ -208,8 +394,11 @@ fn resolve_route(
             api_key_env: Some(config.embedding_api_key_env.trim().to_owned())
                 .filter(|name| !name.is_empty()),
             explicit: true,
+            wire: EmbeddingWire::OpenAi,
+            allow_insecure: false,
+            headers: Vec::new(),
         })),
-        (true, true) => Ok(role),
+        (true, true) => role.map_err(anyhow::Error::msg),
         _ => anyhow::bail!(
             "set both memory.semantic.embedding_base_url and memory.semantic.embedding_model, or neither"
         ),
@@ -218,33 +407,43 @@ fn resolve_route(
 
 fn build_embedder(
     config: &SemanticConfig,
-    route: Option<EmbeddingRoute>,
+    role: EmbeddingRole,
     user_dir: &std::path::Path,
 ) -> Result<Option<Box<dyn Embedder>>> {
-    match config.embedding {
-        EmbeddingMode::Off => Ok(None),
-        EmbeddingMode::Auto if route.is_none() => Ok(None),
-        _ => {
-            let route = route.context(
-                "memory.semantic.embedding = \"on\" needs an assigned embedding model role (Alt+M) or embedding_base_url and embedding_model",
-            )?;
-            let token = if route.explicit {
-                api_key(route.api_key_env.as_deref().unwrap_or(""))?
-            } else {
-                crate::llm::catalog::resolve_credential(
-                    user_dir,
-                    &route.base_url,
-                    route.api_key_env.as_deref(),
-                )?
-            };
-            Ok(Some(Box::new(HttpEmbedder {
-                url: embeddings_url(&route.base_url)?,
-                model: route.model,
-                token,
-                timeout_secs: config.embedding_timeout_secs,
-            })))
-        }
+    // Off never resolves anything, so neither an unusable role nor a partial override can fail it.
+    if config.embedding == EmbeddingMode::Off {
+        return Ok(None);
     }
+    let Some(route) = resolve_route(config, role)? else {
+        if config.embedding == EmbeddingMode::Auto {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "memory.semantic.embedding = \"on\" needs an assigned embedding model role (Alt+M) or embedding_base_url and embedding_model"
+        );
+    };
+    validate_headers(&route.headers)?;
+    let model = match route.wire {
+        EmbeddingWire::Gemini => gemini_model_id(&route.model)?.to_owned(),
+        _ => route.model.clone(),
+    };
+    let token = if route.explicit {
+        api_key(route.api_key_env.as_deref().unwrap_or(""))?
+    } else {
+        crate::llm::catalog::resolve_credential(
+            user_dir,
+            &route.base_url,
+            route.api_key_env.as_deref(),
+        )?
+    };
+    Ok(Some(Box::new(HttpEmbedder {
+        url: embedding_url(route.wire, &route.base_url, route.allow_insecure, &model)?,
+        wire: route.wire,
+        model,
+        token,
+        headers: route.headers,
+        timeout_secs: config.embedding_timeout_secs,
+    })))
 }
 
 struct Semantic {
@@ -261,12 +460,12 @@ struct Semantic {
     consolidate_interval_secs: i64,
 }
 
-/// The assigned `embedding` model role as an embedding route. `Err` carries why the role cannot be
+/// The assigned `embedding` role as an embedding route. `Err` carries why the role cannot be
 /// used (for example its provider has no endpoint); under `auto` that degrades to lexical recall.
 pub type EmbeddingRole = std::result::Result<Option<EmbeddingRoute>, String>;
 
-/// Resolves the `embedding` role from the full config: its provider endpoint and model. Unassigned
-/// means `Ok(None)`.
+/// Resolves the `embedding` role from the full config. Unassigned means `Ok(None)`. The wire
+/// format follows the endpoint protocol; protocols without an embeddings route are reported.
 pub fn role_from_config(config: &crate::config::types::Config) -> EmbeddingRole {
     if config.role_selection("embedding").is_none() {
         return Ok(None);
@@ -274,15 +473,32 @@ pub fn role_from_config(config: &crate::config::types::Config) -> EmbeddingRole 
     let resolved = config.for_role("embedding");
     let Some(endpoint) = resolved.endpoint else {
         return Err(
-            "the embedding model role's provider has no endpoint; assign a model served over an OpenAI-compatible API in Alt+M"
+            "the embedding model role's provider has no endpoint; assign a model served over an OpenAI-compatible, Ollama or Gemini API in Alt+M"
                 .to_owned(),
         );
     };
+    let wire = match endpoint.protocol {
+        Some(ApiProtocol::ChatCompletions) => EmbeddingWire::OpenAi,
+        Some(ApiProtocol::Ollama) => EmbeddingWire::Ollama,
+        Some(ApiProtocol::Gemini) => EmbeddingWire::Gemini,
+        other => {
+            return Err(format!(
+                "the embedding model role uses the {} API, which Dial cannot call for embeddings; assign a model served over an OpenAI-compatible, Ollama or Gemini API in Alt+M",
+                other.map_or("unknown", |protocol| protocol.as_str())
+            ));
+        }
+    };
+    if resolved.model.trim().is_empty() {
+        return Err("the embedding model role has no model; assign one in Alt+M".to_owned());
+    }
     Ok(Some(EmbeddingRoute {
         base_url: endpoint.base_url,
         model: resolved.model,
         api_key_env: endpoint.api_key_env,
         explicit: false,
+        wire,
+        allow_insecure: endpoint.allow_insecure,
+        headers: endpoint.headers.unwrap_or_default(),
     }))
 }
 
@@ -299,11 +515,7 @@ pub fn open(
     let directory = PrivateDirectory::open(layout, "semantic")?.child(&key)?;
     let store = Store::new(directory.database("memory.sqlite3")?)?;
     let user = Store::new(PrivateDirectory::open(layout, "semantic")?.database("user.sqlite3")?)?;
-    let built = match role {
-        Ok(role) => resolve_route(config, role)
-            .and_then(|route| build_embedder(config, route, &layout.user_dir)),
-        Err(reason) => Err(anyhow::anyhow!(reason)),
-    };
+    let built = build_embedder(config, role, &layout.user_dir);
     let (embedder, embedding_note) = match built {
         Ok(embedder) => (embedder, None),
         Err(error) if config.embedding == EmbeddingMode::Auto => (None, Some(format!("{error:#}"))),
@@ -988,75 +1200,333 @@ mod tests {
     }
 
     #[test]
-    fn embeddings_url_accepts_https_and_loopback_only() {
+    fn embedding_urls_follow_each_wire_format() {
+        let openai = |base| embedding_url(EmbeddingWire::OpenAi, base, false, "m");
         assert_eq!(
-            embeddings_url("https://api.example.com/v1/").unwrap(),
+            openai("https://api.example.com/v1/").unwrap(),
             "https://api.example.com/v1/embeddings"
         );
         assert_eq!(
-            embeddings_url("http://127.0.0.1:8080/v1").unwrap(),
+            openai("http://127.0.0.1:8080/v1").unwrap(),
             "http://127.0.0.1:8080/v1/embeddings"
         );
-        assert!(embeddings_url("http://api.example.com/v1").is_err());
-        assert!(embeddings_url("https://user:pw@api.example.com").is_err());
-        assert!(embeddings_url("https://api.example.com/v1?key=1").is_err());
-        assert!(embeddings_url("not a url").is_err());
+        assert_eq!(
+            openai("http://localhost:1234").unwrap(),
+            "http://localhost:1234/v1/embeddings"
+        );
+        assert!(openai("http://api.example.com/v1").is_err());
+        assert!(openai("https://user:pw@api.example.com").is_err());
+        assert!(openai("https://api.example.com/v1?key=1").is_err());
+        for wire in [
+            EmbeddingWire::OpenAi,
+            EmbeddingWire::Ollama,
+            EmbeddingWire::Gemini,
+        ] {
+            assert!(embedding_url(wire, "https://api.example.com/v1#secret", false, "m").is_err());
+        }
+        assert!(openai("not a url").is_err());
+        assert_eq!(
+            embedding_url(
+                EmbeddingWire::OpenAi,
+                "http://api.example.com/v1",
+                true,
+                "m"
+            )
+            .unwrap(),
+            "http://api.example.com/v1/embeddings"
+        );
+        let ollama = |base| embedding_url(EmbeddingWire::Ollama, base, false, "m");
+        assert_eq!(
+            ollama("http://localhost:11434").unwrap(),
+            "http://localhost:11434/api/embed"
+        );
+        assert_eq!(
+            ollama("http://localhost:11434/v1/").unwrap(),
+            "http://localhost:11434/api/embed"
+        );
+        let gemini = |model| {
+            embedding_url(
+                EmbeddingWire::Gemini,
+                "https://generativelanguage.googleapis.com",
+                false,
+                model,
+            )
+        };
+        assert_eq!(
+            gemini("text-embedding-004").unwrap(),
+            "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents"
+        );
+        assert_eq!(
+            gemini("models/gemini-embedding-001").unwrap(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents"
+        );
+        for model in ["", "../x", "a/b", "a?b", ".."] {
+            assert!(gemini(model).is_err(), "{model:?} must not reach the path");
+        }
     }
 
     #[test]
-    fn parse_embeddings_reorders_by_index_and_rejects_bad_shapes() {
+    fn openai_responses_reorder_by_index_and_tolerate_missing_index() {
         let ordered = br#"{"data":[{"index":1,"embedding":[0,1]},{"index":0,"embedding":[1,0]}]}"#;
         assert_eq!(
-            parse_embeddings(ordered, 2).unwrap(),
+            parse_embeddings(EmbeddingWire::OpenAi, ordered, 2).unwrap(),
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]]
+        );
+        let unindexed = br#"{"data":[{"embedding":[1,0]},{"embedding":[0,1]}]}"#;
+        assert_eq!(
+            parse_embeddings(EmbeddingWire::OpenAi, unindexed, 2).unwrap(),
             vec![vec![1.0, 0.0], vec![0.0, 1.0]]
         );
         let short = br#"{"data":[{"index":0,"embedding":[1,0]}]}"#;
-        assert!(parse_embeddings(short, 2).is_err());
+        assert!(parse_embeddings(EmbeddingWire::OpenAi, short, 2).is_err());
         let mixed = br#"{"data":[{"index":0,"embedding":[1,0]},{"index":1,"embedding":[1]}]}"#;
-        assert!(parse_embeddings(mixed, 2).is_err());
+        assert!(parse_embeddings(EmbeddingWire::OpenAi, mixed, 2).is_err());
         let duplicate = br#"{"data":[{"index":0,"embedding":[1]},{"index":0,"embedding":[1]}]}"#;
-        assert!(parse_embeddings(duplicate, 2).is_err());
-        assert!(parse_embeddings(b"not json", 1).is_err());
+        assert!(parse_embeddings(EmbeddingWire::OpenAi, duplicate, 2).is_err());
+        assert!(parse_embeddings(EmbeddingWire::OpenAi, b"not json", 1).is_err());
     }
 
     #[test]
-    fn explicit_override_wins_over_role_and_needs_both_halves() {
-        let role = Some(EmbeddingRoute {
-            base_url: "https://role.example/v1".into(),
-            model: "role-model".into(),
-            api_key_env: None,
-            explicit: false,
-        });
+    fn index_and_number_boundaries_are_checked_before_use() {
+        for body in [
+            r#"{"data":[{"index":1,"embedding":[1]}]}"#,
+            r#"{"data":[{"index":-1,"embedding":[1]}]}"#,
+            r#"{"data":[{"index":0.5,"embedding":[1]}]}"#,
+            r#"{"data":[{"index":"0","embedding":[1]}]}"#,
+            r#"{"data":[{"index":null,"embedding":[1]}]}"#,
+            r#"{"data":[{"index":0,"embedding":[1e39]}]}"#,
+            r#"{"data":[{"index":0,"embedding":["1"]}]}"#,
+            r#"{"data":[{"index":0,"embedding":[]}]}"#,
+        ] {
+            assert!(
+                parse_embeddings(EmbeddingWire::OpenAi, body.as_bytes(), 1).is_err(),
+                "{body}"
+            );
+        }
+        let edge = br#"{"data":[{"index":0,"embedding":[3.4028234e38,-1]}]}"#;
+        assert_eq!(
+            parse_embeddings(EmbeddingWire::OpenAi, edge, 1).unwrap(),
+            vec![vec![f32::MAX, -1.0]]
+        );
+    }
+
+    #[test]
+    fn native_wires_parse_their_own_shapes_in_input_order() {
+        let ollama = br#"{"model":"m","embeddings":[[1,0],[0,1]]}"#;
+        assert_eq!(
+            parse_embeddings(EmbeddingWire::Ollama, ollama, 2).unwrap(),
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]]
+        );
+        assert!(parse_embeddings(EmbeddingWire::Ollama, ollama, 3).is_err());
+        let gemini = br#"{"embeddings":[{"values":[1,0]},{"values":[0,1]}]}"#;
+        assert_eq!(
+            parse_embeddings(EmbeddingWire::Gemini, gemini, 2).unwrap(),
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]]
+        );
+        assert!(parse_embeddings(EmbeddingWire::Gemini, ollama, 2).is_err());
+    }
+
+    fn serve_once(status: u16, body: &str) -> (String, crate::llm::fake::Fake) {
+        let server = crate::llm::fake::serve(vec![crate::llm::fake::json(
+            status,
+            &serde_json::from_str(body).unwrap(),
+        )]);
+        (server.url.clone(), server)
+    }
+
+    fn recorded_request(server: crate::llm::fake::Fake) -> String {
+        String::from_utf8(server.requests().remove(0))
+            .unwrap()
+            .to_ascii_lowercase()
+    }
+
+    fn http_embedder(
+        url: &str,
+        wire: EmbeddingWire,
+        token: Option<&str>,
+        headers: Vec<RequestHeader>,
+    ) -> HttpEmbedder {
+        HttpEmbedder {
+            url: url.into(),
+            wire,
+            model: "m".into(),
+            token: token.map(str::to_owned),
+            headers,
+            timeout_secs: 5,
+        }
+    }
+
+    #[test]
+    fn openai_wire_sends_bearer_and_custom_headers_and_reads_vectors() {
+        let (base, server) = serve_once(200, r#"{"data":[{"index":0,"embedding":[1,0]}]}"#);
+        let headers = vec![RequestHeader {
+            name: "X-Route-Pool".into(),
+            value: HeaderValue::Literal("eval".into()),
+        }];
+        let url = format!("{base}/v1/embeddings");
+        let mut embedder = http_embedder(&url, EmbeddingWire::OpenAi, Some("sk-test"), headers);
+        assert_eq!(
+            embedder.embed(&["hello".to_owned()]).unwrap(),
+            vec![vec![1.0, 0.0]]
+        );
+        let request = recorded_request(server);
+        assert!(request.starts_with("post /v1/embeddings "));
+        assert!(request.contains("authorization: bearer sk-test\r\n"));
+        assert!(request.contains("x-route-pool: eval\r\n"));
+        assert!(request.contains(r#""input":["hello"]"#));
+    }
+
+    #[test]
+    fn gemini_wire_posts_batch_request_with_key_header_and_no_bearer() {
+        let (base, server) = serve_once(200, r#"{"embeddings":[{"values":[0,1]}]}"#);
+        let url =
+            embedding_url(EmbeddingWire::Gemini, &base, false, "gemini-embedding-001").unwrap();
+        let mut embedder = http_embedder(&url, EmbeddingWire::Gemini, Some("sk-g"), Vec::new());
+        embedder.model = "gemini-embedding-001".into();
+        assert_eq!(
+            embedder.embed(&["hello".to_owned()]).unwrap(),
+            vec![vec![0.0, 1.0]]
+        );
+        let request = recorded_request(server);
+        assert!(
+            request.starts_with("post /v1beta/models/gemini-embedding-001:batchembedcontents ")
+        );
+        assert!(request.contains("x-goog-api-key: sk-g\r\n"));
+        assert!(!request.contains("authorization:"));
+        assert!(request.contains(r#""model":"models/gemini-embedding-001""#));
+        assert!(request.contains(r#""parts":[{"text":"hello"}]"#));
+    }
+
+    #[test]
+    fn ollama_wire_posts_native_request_without_truncation() {
+        let (base, server) = serve_once(200, r#"{"embeddings":[[1,0]]}"#);
+        let url = embedding_url(EmbeddingWire::Ollama, &base, false, "m").unwrap();
+        let mut embedder = http_embedder(&url, EmbeddingWire::Ollama, None, Vec::new());
+        assert_eq!(
+            embedder.embed(&["hello".to_owned()]).unwrap(),
+            vec![vec![1.0, 0.0]]
+        );
+        let request = recorded_request(server);
+        assert!(request.starts_with("post /api/embed "));
+        assert!(request.contains(r#""truncate":false"#));
+        assert!(!request.contains("authorization:"));
+    }
+
+    #[test]
+    fn provider_error_keeps_status_and_message_but_never_the_key() {
+        let (base, server) = serve_once(
+            429,
+            r#"{"error":{"message":"rate limited for key sk-secret-token"}}"#,
+        );
+        let url = format!("{base}/v1/embeddings");
+        let mut embedder = http_embedder(
+            &url,
+            EmbeddingWire::OpenAi,
+            Some("sk-secret-token"),
+            Vec::new(),
+        );
+        let error = format!("{:#}", embedder.embed(&["hi".to_owned()]).unwrap_err());
+        server.requests();
+        assert!(error.contains("HTTP 429"), "{error}");
+        assert!(error.contains("rate limited"), "{error}");
+        assert!(!error.contains("sk-secret-token"), "{error}");
+    }
+
+    #[test]
+    fn provider_error_redacts_credentials_before_bounding_the_excerpt() {
+        let secret = "private-credential".repeat(30);
+        let bytes =
+            serde_json::to_vec(&json!({"error":{"message":format!("denied {secret}")}})).unwrap();
+        let detail = provider_detail(&bytes, &[secret]).unwrap();
+        assert_eq!(detail, "denied [redacted]");
+    }
+
+    #[test]
+    fn off_ignores_unusable_role_and_partial_overrides() {
+        let dir = tempfile::tempdir().unwrap();
         let mut config = SemanticConfig::default();
-        assert_eq!(resolve_route(&config, role.clone()).unwrap(), role);
+        config.embedding = EmbeddingMode::Off;
         config.embedding_base_url = "https://override.example/v1".into();
-        assert!(resolve_route(&config, role.clone()).is_err());
-        config.embedding_model = "override-model".into();
-        let route = resolve_route(&config, role).unwrap().unwrap();
-        assert_eq!(route.base_url, "https://override.example/v1");
-        assert_eq!(route.model, "override-model");
-        assert!(route.explicit);
+        assert!(
+            build_embedder(&config, Err("role unusable".into()), dir.path())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
-    fn auto_without_route_is_lexical_and_on_without_route_is_an_error() {
+    fn complete_override_is_used_when_the_role_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = SemanticConfig::default();
+        config.embedding_base_url = "https://override.example/v1".into();
+        config.embedding_model = "override-model".into();
+        let embedder = build_embedder(&config, Err("role unusable".into()), dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(embedder.model(), "override-model");
+    }
+
+    #[test]
+    fn explicit_override_needs_both_halves_and_unusable_role_degrades_only_under_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = SemanticConfig::default();
+        assert!(
+            build_embedder(&config, Ok(None), dir.path())
+                .unwrap()
+                .is_none()
+        );
+        // Construction preserves the diagnostic; open() handles Auto's lexical fallback.
+        assert!(build_embedder(&config, Err("no endpoint".into()), dir.path()).is_err());
+        config.embedding = EmbeddingMode::On;
+        assert!(build_embedder(&config, Ok(None), dir.path()).is_err());
+        assert!(build_embedder(&config, Err("no endpoint".into()), dir.path()).is_err());
+        config.embedding = EmbeddingMode::Auto;
+        config.embedding_base_url = "https://override.example/v1".into();
+        assert!(build_embedder(&config, Err("no endpoint".into()), dir.path()).is_err());
+    }
+
+    #[test]
+    fn role_headers_are_validated_before_any_request() {
         let dir = tempfile::tempdir().unwrap();
         let route = EmbeddingRoute {
             base_url: "https://api.example.com/v1".into(),
             model: "m".into(),
             api_key_env: None,
             explicit: false,
+            wire: EmbeddingWire::OpenAi,
+            allow_insecure: false,
+            headers: vec![RequestHeader {
+                name: "Authorization".into(),
+                value: HeaderValue::Literal("Bearer x".into()),
+            }],
         };
-        let mut config = SemanticConfig::default();
-        assert!(build_embedder(&config, None, dir.path()).unwrap().is_none());
-        config.embedding = EmbeddingMode::On;
-        assert!(build_embedder(&config, None, dir.path()).is_err());
-        config.embedding = EmbeddingMode::Off;
-        assert!(
-            build_embedder(&config, Some(route), dir.path())
-                .unwrap()
-                .is_none()
+        assert!(build_embedder(&SemanticConfig::default(), Ok(Some(route)), dir.path()).is_err());
+    }
+
+    #[test]
+    fn role_wire_follows_the_endpoint_protocol() {
+        use crate::llm::model_config::{ApiProtocol, ModelSelection};
+        let mut config = crate::config::types::Config::default();
+        let mut selection = ModelSelection::new("custom-embed", "embed-model");
+        selection.base_url = Some("http://127.0.0.1:1234/v1".into());
+        config
+            .model_roles
+            .insert("embedding".into(), selection.clone());
+        let route = role_from_config(&config).unwrap().unwrap();
+        assert_eq!(route.wire, EmbeddingWire::OpenAi);
+        assert_eq!(route.model, "embed-model");
+        selection.protocol = Some(ApiProtocol::Ollama);
+        config
+            .model_roles
+            .insert("embedding".into(), selection.clone());
+        assert_eq!(
+            role_from_config(&config).unwrap().unwrap().wire,
+            EmbeddingWire::Ollama
         );
+        selection.protocol = Some(ApiProtocol::Anthropic);
+        config.model_roles.insert("embedding".into(), selection);
+        let reason = role_from_config(&config).unwrap_err();
+        assert!(reason.contains("anthropic"), "{reason}");
     }
 
     #[test]

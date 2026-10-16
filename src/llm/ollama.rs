@@ -116,10 +116,14 @@ fn arguments(raw: &Value) -> Result<Value> {
     Ok(value)
 }
 
+/// `context_window` is the window Dial plans against. Ollama loads a model with a small default
+/// context and silently truncates longer prompts, so the window is always requested explicitly
+/// (`num_ctx`); a profile's own `context_window` takes precedence.
 fn request(
     endpoint: &Endpoint<'_>,
     req: &Chat,
     profile: Option<&ModelProfile>,
+    context_window: Option<u32>,
     scope: &str,
 ) -> Result<Value> {
     ensure!(
@@ -139,10 +143,9 @@ fn request(
             profile.capabilities.output_limit == OutputLimit::MaxTokens,
             "Ollama profiles use max-tokens output limits"
         );
-        ensure!(
-            profile.local_sampling.is_none(),
-            "Ollama does not accept MLX/LM Studio local sampling controls"
-        );
+        if let Some(local) = &profile.local_sampling {
+            local.validate_ollama()?;
+        }
         ensure!(
             profile.prompt_cache != Some(true) && profile.cache_retention == CacheRetention::Auto,
             "Ollama does not support explicit prompt_cache/cache_retention request controls"
@@ -287,11 +290,21 @@ fn request(
         );
         options["seed"] = json!(seed);
     }
-    if let Some(context) = profile.and_then(|profile| profile.context_window) {
+    if let Some(context) = profile
+        .and_then(|profile| profile.context_window)
+        .or(context_window)
+        .filter(|context| *context > 0)
+    {
         options["num_ctx"] = json!(context);
+    }
+    if let Some(local) = profile.and_then(|profile| profile.local_sampling.as_ref()) {
+        local.apply_ollama(&mut options);
     }
     let mut body =
         json!({"model":endpoint.model,"messages":messages,"stream":true,"options":options});
+    if let Some(keep_alive) = profile.and_then(|profile| profile.keep_alive.as_deref()) {
+        body["keep_alive"] = json!(keep_alive);
+    }
     if let Some(profile) =
         profile.filter(|profile| profile.capabilities.reasoning == ReasoningApi::OllamaThink)
     {
@@ -703,6 +716,7 @@ fn read_ndjson(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn exchange(
     endpoint: Endpoint<'_>,
     req: &Chat,
@@ -710,6 +724,7 @@ pub(super) fn exchange(
     on_text: &mut Option<&mut dyn FnMut(&str) -> bool>,
     interrupt: Arc<AtomicBool>,
     profile: Option<&ModelProfile>,
+    context_window: Option<u32>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
 ) -> Result<Reply> {
     if interrupt.load(Ordering::SeqCst) {
@@ -724,7 +739,7 @@ pub(super) fn exchange(
         endpoint.auth,
         endpoint.headers,
     );
-    let body = request(&endpoint, req, profile, &scope)?;
+    let body = request(&endpoint, req, profile, context_window, &scope)?;
     let patience = Patience::for_stream(
         timeout_secs,
         super::host_of(&url).is_some_and(|host| super::is_local_host(&host)),
@@ -824,13 +839,160 @@ mod tests {
         };
         let mut profile = ModelProfile::minimal("ollama", "m");
         profile.capabilities.output_limit = OutputLimit::MaxTokens;
-        let plain = request(&endpoint, &req, Some(&profile), "main").unwrap();
+        let plain = request(&endpoint, &req, Some(&profile), None, "main").unwrap();
         assert!(plain.get("format").is_none());
         assert!(plain.get("tools").is_some());
 
         profile.tool_repair = true;
-        let repair = request(&endpoint, &req, Some(&profile), "main").unwrap();
+        let repair = request(&endpoint, &req, Some(&profile), None, "main").unwrap();
         assert_eq!(repair["format"]["oneOf"].as_array().map(Vec::len), Some(1));
         assert!(repair.get("tools").is_none());
+    }
+
+    fn chat() -> Chat {
+        Chat {
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            tools: vec![],
+            temperature: 0.2,
+            max_tokens: 64,
+            seed: None,
+        }
+    }
+
+    const ENDPOINT: Endpoint<'static> = Endpoint {
+        url: "http://localhost",
+        auth: None,
+        model: "m",
+        headers: &[],
+    };
+
+    #[test]
+    fn the_planned_window_is_requested_unless_a_profile_sets_its_own() {
+        let unprofiled = request(&ENDPOINT, &chat(), None, Some(32768), "main").unwrap();
+        assert_eq!(unprofiled["options"]["num_ctx"], 32768);
+        let unknown = request(&ENDPOINT, &chat(), None, None, "main").unwrap();
+        assert!(unknown["options"].get("num_ctx").is_none());
+        let mut profile = ModelProfile::minimal("ollama", "m");
+        profile.capabilities.output_limit = OutputLimit::MaxTokens;
+        profile.context_window = Some(8192);
+        let pinned = request(&ENDPOINT, &chat(), Some(&profile), Some(32768), "main").unwrap();
+        assert_eq!(pinned["options"]["num_ctx"], 8192);
+    }
+
+    #[test]
+    fn ollama_sampling_and_keep_alive_reach_options_with_native_names() {
+        let mut profile = ModelProfile::minimal("ollama", "m");
+        profile.capabilities.output_limit = OutputLimit::MaxTokens;
+        profile.keep_alive = Some("30m".into());
+        profile.local_sampling = Some(crate::llm::local_sampling::LocalSampling {
+            top_k: Some(20),
+            min_p: Some(0.05),
+            repetition_penalty: Some(1.05),
+            repetition_context_size: Some(128),
+            ..Default::default()
+        });
+        profile.validate().unwrap();
+        let body = request(&ENDPOINT, &chat(), Some(&profile), None, "main").unwrap();
+        assert_eq!(body["keep_alive"], "30m");
+        let options = &body["options"];
+        assert_eq!(options["top_k"], 20);
+        assert_eq!(options["min_p"], 0.05);
+        assert_eq!(options["repeat_penalty"], 1.05);
+        assert_eq!(options["repeat_last_n"], 128);
+        assert!(options.get("repetition_penalty").is_none());
+        assert!(body.get("top_k").is_none(), "Ollama reads sampling from options");
+
+        profile.local_sampling.as_mut().unwrap().xtc_probability = Some(0.1);
+        assert!(profile.validate().is_err());
+        assert!(request(&ENDPOINT, &chat(), Some(&profile), None, "main").is_err());
+    }
+
+    fn ndjson(lines: &[Value]) -> Vec<u8> {
+        lines.iter().map(|line| format!("{line}\n")).collect::<String>().into_bytes()
+    }
+
+    /// One native `/api/chat` exchange against a scripted server; returns the reply and the
+    /// visible text pieces delivered to the caller.
+    fn native_exchange(
+        url: &str,
+        context_window: Option<u32>,
+        pieces: &mut Vec<String>,
+    ) -> Result<Reply> {
+        let mut on_text_fn = |piece: &str| {
+            pieces.push(piece.to_owned());
+            true
+        };
+        let mut on_text: Option<&mut dyn FnMut(&str) -> bool> = Some(&mut on_text_fn);
+        exchange(
+            Endpoint {
+                url,
+                auth: None,
+                model: "m",
+                headers: &[],
+            },
+            &chat(),
+            10,
+            &mut on_text,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            context_window,
+            &mut |_| true,
+        )
+    }
+
+    #[test]
+    fn native_ndjson_stream_delivers_text_thinking_and_object_arguments_with_counts() {
+        let server = crate::llm::fake::serve(vec![crate::llm::fake::Script::Http {
+            status: 200,
+            content_type: "application/x-ndjson",
+            body: ndjson(&[
+                json!({"model": "m", "message": {"role": "assistant", "thinking": "plan"}, "done": false}),
+                json!({"model": "m", "message": {"role": "assistant", "content": "Hel"}, "done": false}),
+                json!({"model": "m", "message": {"role": "assistant", "content": "lo"}, "done": false}),
+                json!({"model": "m", "message": {"role": "assistant", "tool_calls": [
+                    {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}}
+                ]}, "done": false}),
+                json!({"model": "m", "message": {"role": "assistant", "content": ""}, "done": true,
+                    "done_reason": "stop", "prompt_eval_count": 12, "eval_count": 7,
+                    "eval_duration": 1_000_000_000u64}),
+            ]),
+        }]);
+        let mut pieces = Vec::new();
+        let reply = native_exchange(&server.url, Some(32768), &mut pieces).unwrap();
+        assert_eq!(pieces, ["Hel", "lo"]);
+        assert_eq!(reply.text, "Hello");
+        assert_eq!(reply.reasoning, "plan");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "read_file");
+        assert_eq!(reply.tool_calls[0].arguments, json!({"path": "a.txt"}));
+        assert!(!reply.tool_calls[0].malformed_arguments);
+        assert_eq!(reply.finish_reason, "tool_calls");
+        assert_eq!(
+            (reply.prompt_tokens, reply.completion_tokens),
+            (Some(12), Some(7))
+        );
+        let sent = crate::llm::fake::body(&server.requests().remove(0));
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["options"]["num_ctx"], 32768);
+    }
+
+    #[test]
+    fn native_stream_without_done_fails_and_releases_no_partial_tool_call() {
+        let server = crate::llm::fake::serve(vec![crate::llm::fake::Script::Http {
+            status: 200,
+            content_type: "application/x-ndjson",
+            body: ndjson(&[
+                json!({"message": {"role": "assistant", "content": "partial"}, "done": false}),
+                json!({"message": {"role": "assistant", "tool_calls": [
+                    {"function": {"name": "write_file", "arguments": {"path": "x"}}}
+                ]}, "done": false}),
+            ]),
+        }]);
+        let mut pieces = Vec::new();
+        let error = native_exchange(&server.url, None, &mut pieces).unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::llm::stream::IncompleteStream>().is_some(),
+            "{error:#}"
+        );
     }
 }

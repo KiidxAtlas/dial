@@ -12,6 +12,7 @@ mod commands;
 
 use crate::{
     agent::{self, Agent, Decision, Ui, context, make_backend, todo::TodoList},
+    config::session_models::SessionModels,
     config::types::{Approval, Config, Outcome},
     learn::auto,
     llm::{
@@ -54,7 +55,6 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read};
-use fs2::FileExt;
 use ratatui::text::{Line, Span};
 use serde_json::{Value, json};
 #[cfg(unix)]
@@ -269,6 +269,8 @@ struct App {
     layout: Layout,
     config: Config,
     overlay: toml::Table,
+    /// This session's own model choices: other processes' model writes never replace them.
+    models: RefCell<Option<SessionModels>>,
     store: Option<Store>,
     store_error: Option<String>,
     interrupt: Arc<AtomicBool>,
@@ -290,10 +292,15 @@ impl App {
         add_dirs: Vec<std::path::PathBuf>,
         mode_flags: crate::cli::mode_flags::ModeFlags,
     ) -> Result<Self> {
+        // Settings unreadable at this instant leave the session unpinned rather than failing launch.
+        let models = settings_store::load_merged(&layout, &overlay)
+            .ok()
+            .map(|merged| SessionModels::capture(&merged));
         let mut app = Self {
             layout,
             config: config.for_coding(),
             overlay,
+            models: RefCell::new(models),
             store: None,
             store_error: None,
             interrupt: repl::install_sigint(),
@@ -377,9 +384,42 @@ impl App {
         }
     }
 
-    /// The effective configuration as the files and the command-line flags define it right now.
+    /// The effective configuration as the files and the command-line flags define it right now,
+    /// keeping this session's own model choices.
     pub(crate) fn reload(&self) -> Result<Config> {
-        settings_store::load_config(&self.layout, &self.overlay)
+        settings_store::load_session_config(
+            &self.layout,
+            &self.overlay,
+            self.models.borrow().as_ref(),
+        )
+    }
+
+    /// Persist a settings write made in this session. Model keys it writes (or the model `role`
+    /// it assigns) become this session's model choice; other sessions keep their own.
+    pub(crate) fn save_settings(
+        &self,
+        scope: Scope,
+        changes: &[Change],
+        role: Option<&str>,
+    ) -> Result<()> {
+        match role {
+            Some(role) => settings_store::save_model_config(&self.layout, scope, changes, role)?,
+            None => settings_store::save_config(&self.layout, scope, changes)?,
+        };
+        if let Some(models) = self.models.borrow_mut().as_mut() {
+            let merged = settings_store::load_merged(&self.layout, &self.overlay)
+                .context("settings saved, but this session could not re-read them")?;
+            models.adopt_paths(
+                &merged,
+                changes.iter().map(|change| match change {
+                    Change::Set { path, .. } | Change::Remove { path } => path.as_str(),
+                }),
+            );
+            if let Some(role) = role {
+                models.adopt_role(&merged, role);
+            }
+        }
+        Ok(())
     }
 
     /// The directory layout this session runs in.
@@ -614,9 +654,15 @@ fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) -> Result<(
     shell.begin(app, &session, resumed);
     // `session_end` is handed from one agent to the next across same-session rebuilds.
     let mut lifecycle_open = false;
+    // A local model server survives a same-session rebuild; the new backend reuses it when the
+    // changed settings still match what it loaded.
+    let mut resident = None;
     loop {
         let step = {
             let mut agent = app.make_agent(session)?;
+            if let Some(server) = resident.take() {
+                agent.adopt_resident_server(server);
+            }
             if lifecycle_open {
                 agent.continue_session_lifecycle();
             } else {
@@ -659,6 +705,7 @@ fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) -> Result<(
             if matches!(step, Ok(Step::Rebuild(_))) {
                 agent.hand_off_session_lifecycle();
                 lifecycle_open = true;
+                resident = agent.take_resident_server();
             } else {
                 agent.end_session_lifecycle();
             }
@@ -1287,7 +1334,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "model",
-        "choose the main model and assign roles; /model settings tunes it; /model defaults sets context defaults",
+        "choose the main model and assign roles; /model settings tunes it; /model defaults sets context defaults; /model local opens the local models dashboard",
     ),
     ("providers", "set up providers, keys and endpoints"),
     ("settings", "appearance, tools and coding preferences"),
@@ -1554,7 +1601,9 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
     for (name, args) in [
         (
             "model",
-            &["settings", "defaults", "next", "prev", "cancel", "restart"][..],
+            &[
+                "settings", "defaults", "local", "next", "prev", "cancel", "restart",
+            ][..],
         ),
         ("understanding", &["architecture", "build", "clear"][..]),
         ("memory", &["clear"][..]),
@@ -1587,8 +1636,8 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
         (
             "improve",
             &[
-                "status", "jobs", "stop", "cycle", "train", "enable", "disable", "versions",
-                "tasks",
+                "status", "jobs", "stop", "cycle", "train", "session", "enable", "disable",
+                "versions", "tasks",
             ],
         ),
         ("theme", &["auto"]),
@@ -2476,6 +2525,7 @@ enum Which {
     Compute,
     Jobs,
     Subagents,
+    LocalModels,
     SubagentsActivity,
     SubagentViewer {
         id: String,
@@ -2523,6 +2573,7 @@ fn overlay_destination(action: &str) -> Option<Which> {
         "open:context-defaults" => Some(Which::ContextDefaults),
         "open:shortcuts" => Some(Which::Shortcuts),
         "open:compute" => Some(Which::Compute),
+        "open:local-models" => Some(Which::LocalModels),
         "open:extensions" => Some(Which::Extensions),
         "subagent-hub" => Some(Which::Subagents),
         "subagent-hub:activity" => Some(Which::SubagentsActivity),
@@ -2685,7 +2736,11 @@ impl Shell {
         match settings_fingerprint(&app.layout) {
             Ok(stamp) if force || self.resources.settings != Some(stamp) => {
                 self.resources.settings = Some(stamp);
-                let (config, errors) = self.resources.reload.reload(&app.layout, &app.overlay);
+                let (config, errors) = self.resources.reload.reload(
+                    &app.layout,
+                    &app.overlay,
+                    app.models.borrow().as_ref(),
+                );
                 diagnostics.extend(errors);
                 // Compare the same coding view used by App::new/adopt. Saved learning
                 // preferences differ intentionally and are not an external settings edit.
@@ -2903,7 +2958,7 @@ impl Shell {
                     self.keys.label(Action::CommandPalette)
                 ),
                 setup_hint: format!(
-                    "{} or /providers to sign in to a hosted model; /setup installs the local MLX runtime",
+                    "{} or /providers to sign in to a hosted model; /setup installs the local model runtime",
                     self.keys.label(Action::ModelSelect)
                 ),
                 branch,
@@ -4538,7 +4593,7 @@ impl Shell {
             {
                 return Ok(false);
             }
-            match lock.try_lock_exclusive() {
+            match fs2::FileExt::try_lock_shared(&lock) {
                 Ok(()) => {
                     crate::learn::compute::register(
                         &app.layout.user_dir,
@@ -4562,7 +4617,7 @@ impl Shell {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         match self.composer_key(key) {
                             ComposerEvent::Interrupt | ComposerEvent::Exit => {
-                                self.note("Cancelled", "Local compute is occupied by another session or an improvement cycle.");
+                                self.note("Cancelled", "An improvement or training job holds local compute exclusively.");
                                 return Ok(false);
                             }
                             ComposerEvent::Submit(text) => {
@@ -4615,14 +4670,14 @@ impl Shell {
             return Ok(true);
         }
         if !app.config.python.is_file() || !app.config.worker.is_file() {
-            let choice = self.ask("Set up local MLX",
+            let choice = self.ask("Set up local models",
                 "Installs a private Python environment with uv under your Dial home directory. Downloads need network access.",
-                &[("Install MLX runtime", 'y'), ("Cancel", 'n')]);
+                &[("Install runtime", 'y'), ("Cancel", 'n')]);
             if choice != Some(0) {
                 return Ok(false);
             }
             self.status.phase = Phase::Setup;
-            self.note("MLX", "installing the local runtime…");
+            self.note("Local models", "installing the local runtime…");
             self.paint(None)?;
             crate::setup::ensure_runtime(&app.layout)?;
             ensure!(
@@ -4641,14 +4696,14 @@ impl Shell {
             if needs_pin {
                 self.status.phase = Phase::Setup;
                 self.note(
-                    "MLX",
+                    "Local models",
                     "resolving the local model; the first use may download weights…",
                 );
                 self.paint(None)?;
                 let caps = crate::learn::worker::capabilities(&app.config)?;
                 ensure!(
                     caps["inference"] == true,
-                    "local model is not supported by this MLX runtime"
+                    "local model is not supported by this runtime"
                 );
                 if let Some(store) = &app.store {
                     store.set_meta("serving_capabilities", &caps.to_string())?;
@@ -4673,7 +4728,7 @@ impl Shell {
         {
             self.note(
                 "LoRA verification",
-                "Select a downloaded local MLX model. Remote endpoints cannot be probed here.",
+                "Select a downloaded local MLX checkpoint: LoRA verification needs MLX weights. Remote endpoints and GGUF files cannot be probed here.",
             );
             return Ok(());
         }
@@ -4686,8 +4741,8 @@ impl Shell {
         }
         let _lease = if app.config.compute_locks {
             let lock = auto::lock_file(&app.layout.user_dir.join("compute.lock"))?;
-            if let Err(error) = lock.try_lock_exclusive() {
-                self.note("LoRA verification", format!("Local compute is busy; retry F6 after the other session or improvement cycle finishes. {error}"));
+            if let Err(error) = fs2::FileExt::try_lock_shared(&lock) {
+                self.note("LoRA verification", format!("An improvement or training job holds local compute; retry F6 when it finishes. {error}"));
                 return Ok(());
             }
             Some(ProbeLease(lock))
@@ -4941,6 +4996,15 @@ impl Shell {
                 )))
             }
             Which::Shortcuts => ActiveOverlay::Shortcuts(ShortcutOverlay::new()),
+            Which::LocalModels => ActiveOverlay::LocalModels(Box::new(
+                crate::ui::overlay::local_models::LocalModelsOverlay::new(
+                    crate::cli::local_models::collect(
+                        app.layout(),
+                        &crate::cli::local_models::Settings::from_config(&effective),
+                        crate::stats::now_ms(),
+                    ),
+                ),
+            )),
             Which::Jobs => {
                 ActiveOverlay::Jobs(Box::new(crate::ui::overlay::jobs::JobsOverlay::new()))
             }
@@ -5288,7 +5352,7 @@ impl Shell {
         changes: &[Change],
         scope: Scope,
     ) -> Result<Step> {
-        settings_store::save_config(&app.layout, scope, changes)?;
+        app.save_settings(scope, changes, None)?;
         let fresh = app.reload()?;
         Ok(self.config_changed(app, agent, fresh))
     }
@@ -6081,14 +6145,14 @@ impl Shell {
                     .models
                     .iter()
                     .filter(|entry| {
-                        entry.available && !entry.source.to_lowercase().contains("embedding")
+                        entry.available && entry.supports_chat()
                     })
                     .map(|entry| entry.selection.clone())
                     .collect::<Vec<_>>();
                 match next_favorite(&effective, &favorites, &available) {
                     Some(selection) => {
                         let changes = selection_changes(&effective, &selection, "main")?;
-                        match settings_store::save_model_config(&app.layout, self.scope, &changes, "main")
+                        match app.save_settings(self.scope, &changes, Some("main"))
                             .and_then(|_| app.reload())
                             .map(|fresh| self.config_changed(app, agent, fresh)) {
                             Ok(step) => {
@@ -6117,10 +6181,13 @@ impl Shell {
             "model" if args == "defaults" => {
                 return self.open(app, agent, Which::ContextDefaults);
             }
+            "model" | "models" if args == "local" => {
+                return self.open(app, agent, Which::LocalModels);
+            }
             "model" if !args.is_empty() => {
                 self.note(
                     "Model",
-                    "Unknown option. Use /model to choose a model, /model settings to tune it, or /model defaults for shared context defaults.",
+                    "Unknown option. Use /model to choose a model, /model settings to tune it, /model defaults for shared context defaults, or /model local for the local models dashboard.",
                 );
             }
             "model" | "models" => return self.open(app, agent, Which::Models),
@@ -6208,13 +6275,36 @@ impl Shell {
                     result.unwrap_or_else(|error| format!("{error:#}")),
                 );
             }
-            "improve" if matches!(args, "cycle" | "train" | "enable" | "disable" | "versions" | "tasks") => {
+            "improve" if matches!(args, "cycle" | "train" | "session" | "enable" | "disable" | "versions" | "tasks") => {
                 let result = (|| -> Result<String> {
                     let mut learning = app.reload()?;
                     learning.improve.enabled = true;
                     learning.require_model()?;
                     let store = App::open_store(&learning)?;
                     match args {
+                        "session" => {
+                            let approval = store.approve_session(&self.session_id)?;
+                            let mut text = format!(
+                                "This session: {} turn(s) approved for training, {} already verified, {} kept with an existing lower score, {} not usable (failed or no saved request).",
+                                approval.approved, approval.already, approval.judged, approval.unusable
+                            );
+                            let verified = store.verified_live_turns()?;
+                            let needed = learning.improve.lora_min_examples as usize;
+                            if verified < needed {
+                                text.push_str(&format!("\n{verified}/{needed} verified turns recorded for this model; training starts once there are {needed} (improve.lora_min_examples). Run /improve session again after more turns."));
+                                return Ok(text);
+                            }
+                            ensure!(
+                                !crate::learn::compute::paused(&app.layout.user_dir),
+                                "{text}\nResume background work first"
+                            );
+                            let started = auto::start_training(&app.layout, &learning, &store)
+                                .map_err(|error| anyhow::anyhow!("{text}\nTraining not started: {error:#}"))?;
+                            ensure!(started, "{text}\nAn improvement job is already running or queued");
+                            self.yield_compute = app.config.uses_local_compute();
+                            text.push_str("\nTraining and evaluation queued in the background; coding keeps priority. Follow it with /improve jobs; cancel with /improve stop.");
+                            Ok(text)
+                        }
                         "cycle" | "train" => {
                             ensure!(
                                 !crate::learn::compute::paused(&app.layout.user_dir),
@@ -7283,6 +7373,7 @@ fn improve_summary(app: &App) -> String {
 enum ActiveOverlay {
     Palette(PaletteOverlay),
     Compute(ComputeOverlay),
+    LocalModels(Box<crate::ui::overlay::local_models::LocalModelsOverlay>),
     Extensions(Box<crate::ui::overlay::extensions::ExtensionsOverlay>),
     Settings(Box<SettingsOverlay>),
     ModelSettings(Box<crate::ui::overlay::model_settings::ModelSettingsOverlay>),
@@ -7310,6 +7401,7 @@ impl ActiveOverlay {
             Self::Subagents(o) => o.draw(frame, ctx),
             Self::SubagentViewer(o) => o.draw(frame, ctx),
             Self::Jobs(o) => o.draw(frame, ctx),
+            Self::LocalModels(o) => o.draw(frame, ctx),
         }
     }
     /// Native image placements for the frame just drawn. Only the git overlay previews images.
@@ -7338,6 +7430,7 @@ impl ActiveOverlay {
             Self::Git(o) => o.handle(event, keys),
             Self::SubagentViewer(o) => o.handle(event, keys, std::time::Instant::now()),
             Self::Jobs(o) => o.handle(event, keys),
+            Self::LocalModels(o) => o.handle(event, keys),
         }
     }
     /// Mouse input for panels without their own mouse handling (git has one). A left click selects
@@ -7382,6 +7475,7 @@ impl ActiveOverlay {
             Self::Subagents(o) => o.banner(message, is_error),
             Self::SubagentViewer(o) => o.set_notice(message),
             Self::Jobs(o) => o.banner(message, is_error),
+            Self::LocalModels(o) => o.banner(message),
             Self::Palette(_) | Self::Settings(_) | Self::Shortcuts(_) | Self::Git(_) => {}
         }
     }
@@ -7704,7 +7798,7 @@ impl OverlayEnv<'_> {
     }
     /// Persist, then reload the effective config (files plus command-line flags) and apply the UI part live.
     fn save(&mut self, changes: &[Change], scope: Scope) -> Result<Config> {
-        settings_store::save_config(&self.app.layout, scope, changes)?;
+        self.app.save_settings(scope, changes, None)?;
         self.reload_saved()
     }
 
@@ -7817,7 +7911,7 @@ impl OverlayEnv<'_> {
                             &selection.model,
                         )?;
                     }
-                    settings_store::save_model_config(&self.app.layout, scope, &changes, &role)?;
+                    self.app.save_settings(scope, &changes, Some(&role))?;
                     self.reload_saved()
                 });
                 self.report(
@@ -9315,6 +9409,7 @@ fn replay(transcript: &mut Transcript, messages: &[Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
 
     #[test]
     fn overlay_navigation_opens_roles_directly_in_every_lifecycle() {
@@ -10064,6 +10159,7 @@ mod tests {
             launch: Default::default(),
             add_dirs: Vec::new(),
             mode_flags: Default::default(),
+            models: RefCell::new(None),
             layout,
             config,
             overlay: toml::Table::new(),
@@ -10187,6 +10283,7 @@ mod tests {
             launch: Default::default(),
             add_dirs: Vec::new(),
             mode_flags: Default::default(),
+            models: RefCell::new(None),
             layout,
             config,
             overlay: toml::Table::new(),
@@ -10270,6 +10367,7 @@ mod tests {
             launch: Default::default(),
             add_dirs: Vec::new(),
             mode_flags: Default::default(),
+            models: RefCell::new(None),
             layout,
             config,
             overlay: toml::Table::new(),
@@ -10369,6 +10467,7 @@ mod tests {
             launch: Default::default(),
             add_dirs: Vec::new(),
             mode_flags: Default::default(),
+            models: RefCell::new(None),
             layout,
             config,
             overlay: toml::Table::new(),
@@ -10868,10 +10967,12 @@ mod tests {
             "/improve stop",
             "/improve cycle",
             "/improve train",
+            "/improve session",
             "/improve enable",
             "/improve disable",
             "/improve versions",
             "/improve tasks",
+            "/model local",
             "/experience ledger",
             "/theme auto",
         ] {

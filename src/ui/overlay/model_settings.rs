@@ -260,11 +260,16 @@ fn shown(field: &Field, profile: &ModelProfile) -> bool {
     let mlx = profile.provider == "mlx";
     match field.section {
         "Local sampling" | "Repetition" => {
-            mlx || (profile.provider == "lm-studio"
-                && field
-                    .path
-                    .strip_prefix("local_sampling.")
-                    .is_some_and(crate::llm::local_sampling::LocalSampling::lmstudio_field))
+            let field = field.path.strip_prefix("local_sampling.");
+            mlx || match profile.provider.as_str() {
+                "lm-studio" => {
+                    field.is_some_and(crate::llm::local_sampling::LocalSampling::lmstudio_field)
+                }
+                "ollama" => {
+                    field.is_some_and(crate::llm::local_sampling::LocalSampling::ollama_field)
+                }
+                _ => false,
+            }
         }
         "Chat template" => mlx,
         "Caching" => !mlx && profile.provider != "lm-studio",

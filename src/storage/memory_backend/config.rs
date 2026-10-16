@@ -402,7 +402,10 @@ pub fn validate(config: &crate::config::types::MemoryConfig) -> Result<()> {
             && semantic.embedding_model.len() <= 256,
         "invalid semantic memory bounds"
     );
-    if !semantic.embedding_base_url.trim().is_empty() {
+    // Overrides matter only to the semantic backend, and not at all when embeddings are off.
+    let overrides_used =
+        config.backend == MemoryBackendId::Semantic && semantic.embedding != EmbeddingMode::Off;
+    if overrides_used && !semantic.embedding_base_url.trim().is_empty() {
         endpoint(
             semantic.embedding_base_url.trim(),
             &semantic.embedding_api_key_env,
@@ -438,5 +441,22 @@ mod tests {
         for name in ["", "smol", "slow", "default", "bad role", "reranker"] {
             assert!(role(name).is_err(), "{name:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn off_and_non_semantic_backends_do_not_validate_embedding_overrides() {
+        let mut memory = crate::config::types::MemoryConfig::default();
+        memory.backend = MemoryBackendId::Semantic;
+        memory.backend_explicit = true;
+        memory.semantic.embedding_base_url = "http://remote.example/v1".into();
+        assert!(validate(&memory).is_err(), "auto still validates overrides");
+        memory.semantic.embedding = EmbeddingMode::Off;
+        assert!(validate(&memory).is_ok(), "off ignores the override");
+        memory.semantic.embedding = EmbeddingMode::Auto;
+        memory.backend = MemoryBackendId::Local;
+        assert!(
+            validate(&memory).is_ok(),
+            "other backends ignore the override"
+        );
     }
 }
