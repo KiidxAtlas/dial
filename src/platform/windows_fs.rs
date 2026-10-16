@@ -890,18 +890,57 @@ mod transaction_tests {
                 .len(),
             0
         );
-        assert!(create_new_beneath(&root, Path::new("one"), false).is_err());
-        assert!(create_new_beneath(&root, Path::new("name:stream"), false).is_err());
-        assert!(link_beneath(&root, Path::new("one"), Path::new("two")).is_ok());
+        let mut failures = Vec::new();
+        let mut expect = |label: &str, ok: bool, result: io::Result<()>| {
+            if result.is_ok() != ok {
+                failures.push(format!("{label}: expected ok={ok}, got {result:?}"));
+            }
+        };
+        expect(
+            "create existing",
+            false,
+            create_new_beneath(&root, Path::new("one"), false).map(drop),
+        );
+        expect(
+            "create stream name",
+            false,
+            create_new_beneath(&root, Path::new("name:stream"), false).map(drop),
+        );
+        expect(
+            "link",
+            true,
+            link_beneath(&root, Path::new("one"), Path::new("two")),
+        );
         // Same-file hard links are a no-op rename on newer Windows; collide with a distinct file instead.
-        create_new_beneath(&root, Path::new("other"), false).unwrap();
-        assert!(rename_beneath(&root, Path::new("one"), Path::new("other")).is_err());
-        assert!(remove_beneath(&root, Path::new("other")).is_ok());
-        assert!(rename_beneath(&root, Path::new("one"), Path::new("three")).is_ok());
-        assert!(remove_beneath(&root, Path::new("three")).is_ok());
-        assert!(remove_beneath(&root, Path::new("two")).is_ok());
+        expect(
+            "create other",
+            true,
+            create_new_beneath(&root, Path::new("other"), true).map(drop),
+        );
+        expect(
+            "rename onto existing",
+            false,
+            rename_beneath(&root, Path::new("one"), Path::new("other")),
+        );
+        expect(
+            "remove other",
+            true,
+            remove_beneath(&root, Path::new("other")),
+        );
+        expect(
+            "rename",
+            true,
+            rename_beneath(&root, Path::new("one"), Path::new("three")),
+        );
+        expect(
+            "remove three",
+            true,
+            remove_beneath(&root, Path::new("three")),
+        );
+        expect("remove two", true, remove_beneath(&root, Path::new("two")));
         drop(root);
-        std::fs::remove_dir(base).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]

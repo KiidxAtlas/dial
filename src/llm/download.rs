@@ -1235,7 +1235,10 @@ mod tests {
             fetch,
         )
         .unwrap();
-        assert_eq!(Path::new(&resolved), fs::canonicalize(&model).unwrap());
+        assert_eq!(
+            fs::canonicalize(&resolved).unwrap(),
+            fs::canonicalize(&model).unwrap()
+        );
         assert!(marker.exists());
 
         // Multi-quant repositories are rejected by the listing alone: no fetch marker is created.

@@ -3554,12 +3554,20 @@ mod tests {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut first = String::new();
                 reader.read_line(&mut first).ok();
+                let mut length = 0usize;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
                 }
+                // Drain a POST body so closing the socket cannot reset the connection before the reply is read.
+                std::io::Read::read_exact(&mut reader, &mut vec![0u8; length]).ok();
                 let path = first.split_whitespace().nth(1).unwrap_or("").to_owned();
                 let (code, body) = routes
                     .iter()
