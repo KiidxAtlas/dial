@@ -197,27 +197,42 @@ tool_grammar = false
 initial_tool_limit = 0
 ```
 
-Supported keys: `enabled`, `compact_tools`, `initial_tool_limit` (0 = unlimited, or 1..=64), `tool_grammar`,
-`repair_hints`, `syntax_guard`, `selective_verification`, `edit_mode`, `constrained_repair`, `lean_local`, and
-`reliability_gate` (maps to `reliability.enabled`). Unknown keys are rejected.
+Supported assistance keys: `enabled`, `compact_tools`, `initial_tool_limit` (0 = unlimited, or 1..=64), `tool_grammar`,
+`repair_hints`, `syntax_guard`, `selective_verification`, `edit_mode`, `constrained_repair`, `lean_local` (`true`,
+`false` or `"auto"`, matching the user config), and `reliability_gate` (maps to `reliability.enabled`). Unknown keys are rejected.
+
+Context-economy keys go under `[configurations.efficiency]` and are applied to the same isolated config: `tool_preview_bytes`
+(0 or 1024..=16384), `history_token_cap` (0 or 8192..=2000000), `compaction_enabled` and `keep_recent_tokens`. Operator
+config files are never modified. Each configuration records the resolved values under `settings.efficiency`, and
+`settings.assistance.lean_local_within_auto_window` shows whether `lean_local = "auto"` is within its window limit.
 
 ## Assistance ablation
 
 `dial benchmark --ablate-assistance [suite.toml] [-m model] [--report out.json] [--allow-remote]` runs an
-automatic matrix on one model: `raw` (assistance off), `dial` (the shipped defaults, independent of your
-config), `lean` (`dial` plus the `lean_local` profile, which only changes requests to a locally served model),
-and `ablate-<feature>` for each of `compact_tools`, `initial_tool_limit`, `tool_grammar`,
-`repair_hints`, `edit_mode` and `reliability_gate`. Each ablation changes exactly one feature from `dial`.
+automatic matrix on one model. `raw` turns assistance off. `dial` pins the assistance switches and
+listed context-economy levers to `Config::default()` rather than your config file. Other settings remain
+shared across the matrix and are subject to benchmark isolation. `lean` forces `lean_local = true`, which
+matters on local routes where shipped `auto` would not apply (windows above 32768 tokens). Each variant
+changes exactly one lever from `dial`:
+
+- `enable-compact_tools` and `enable-repair_hints` turn on features that ship off;
+- `ablate-initial_tool_limit`, `ablate-tool_grammar`, `ablate-edit_mode`, `ablate-reliability_gate` and
+  `ablate-lean_local` turn off or change features that ship on.
+
 The suite defaults to `examples/benchmarks/efficiency.toml`. The command prints a table with checked
 correctness, tool errors, malformed tool calls (tool contract errors), repair rounds, observed tokens and
 wall time, plus deltas against `dial`; the JSON report includes each configuration's effective settings.
-It does not gate on correctness, so a negative delta is measurement rather than failure. `--baseline` and
-`--profiles` cannot be combined with it.
+Token and cost totals come from the runtime usage ledger (main agent, workers and every purpose).
+Configuration-level tokens require complete usage in every case; cost additionally requires complete
+observed API pricing. Otherwise they stay null. Per-case `observed_cost_usd` is a lower bound unless
+`observed_cost_complete` is true; local, subscription and unpriced requests are not zero-cost evidence.
+The matrix does not gate on correctness, so a negative delta is measurement rather than failure.
+`--baseline` and `--profiles` cannot be combined with it.
 
 `tool_grammar` is also a user-level setting, `assistance.tool_grammar` (default `true`). It enables the
 MLX tool-call grammar only for tokenizers whose parser is one of the formats listed under *Schema-constrained tool calls* in [improvement.md](improvement.md#fast-weight-candidates-without-long-training-runs); disabling it sets `DIAL_TOOL_GRAMMAR=0`
-for the spawned server. `assistance.repair_hints` (default `true`) gates verified repair hints and verified
-examples from prior successful repairs.
+for the spawned server. `assistance.repair_hints` (default `false`) gates verified repair hints and verified
+examples from prior successful repairs. `assistance.compact_tools` ships `false`.
 
 `assistance.constrained_repair` (default `true`) allows one constrained retry for local endpoints after a
 malformed or schema-invalid tool call. The retry asks the endpoint for JSON that names one offered tool and

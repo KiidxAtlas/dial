@@ -275,6 +275,22 @@ pub enum Approval {
     Readonly,
 }
 
+impl Approval {
+    /// Canonical policy names for command-line choices, completion and settings views.
+    pub const NAMES: &'static [&'static str] = &["ask", "write", "auto", "readonly"];
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Ask => "asks before every edit and command",
+            Self::Write => {
+                "edits and safe commands run; destructive or outside-the-project actions ask"
+            }
+            Self::Auto => "runs everything without asking",
+            Self::Readonly => "read-only tools only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
@@ -1237,23 +1253,7 @@ impl Default for Config {
             tools: BTreeMap::new(),
             subagents: BTreeMap::new(),
             subagent_max_live_jobs: 32,
-            integrations: vec![
-                "bg".into(),
-                "web_fetch".into(),
-                "web_search".into(),
-                "lsp".into(),
-                "ast_search".into(),
-                "ast_edit".into(),
-                "dap".into(),
-                "git".into(),
-                "ssh".into(),
-                "browser".into(),
-                "kernel".into(),
-                "eval".into(),
-                "find".into(),
-                "autoresearch".into(),
-                "archive".into(),
-            ],
+            integrations: crate::tools::catalog::default_integrations(),
             bash_interceptor: Default::default(),
             ssh: Default::default(),
             ssh_hosts: BTreeMap::new(),

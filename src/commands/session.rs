@@ -17,13 +17,13 @@ use std::sync::atomic::AtomicBool;
 pub(super) const COMMANDS: &[super::CommandSpec] = &[
     super::CommandSpec {
         name: "branch",
-        description: "List user messages to branch from, or rewind to one (keeps the old path as a branch; alias: rewind)",
+        description: "Pick a user message to rewind to, after confirming (keeps the old path as a branch; alias: rewind)",
         args_hint: "[n]",
         subcommands: &[],
     },
     super::CommandSpec {
         name: "delete",
-        description: "Delete the current session and start a new one",
+        description: "Delete the current session after confirming, and start a new one",
         args_hint: "",
         subcommands: &[],
     },
@@ -128,13 +128,32 @@ fn restart(shell: &mut Shell) -> Result<Step> {
     Ok(Step::Quit)
 }
 
-/// Delete the current session file, start a fresh session, and drop its pin (`/delete`).
+/// Delete the current session file after confirmation, start a fresh session, and drop its pin
+/// (`/delete` and `/session delete`). Cancelling changes nothing.
 fn delete_current(shell: &mut Shell, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
     let Some(old_path) = agent.session().path().map(|p| p.to_path_buf()) else {
         shell.note("Delete", "No session file to delete (in-memory session).");
         return Ok(Step::Done);
     };
     let old_id = agent.session().id().to_owned();
+    let title = one_line(&agent.session().title());
+    let named = if title.trim().is_empty() {
+        format!("session {old_id}")
+    } else {
+        format!("\"{title}\" ({old_id})")
+    };
+    let body = format!(
+        "Delete {named}? Its file is removed and cannot be resumed. A fresh session starts in its place."
+    );
+    if shell.ask(
+        "Delete session?",
+        &body,
+        &[("Cancel", 'n'), ("Delete", 'd')],
+    ) != Some(1)
+    {
+        shell.note("Delete", "Delete cancelled; the session was kept.");
+        return Ok(Step::Done);
+    }
     let layout = agent
         .layout()
         .ok_or_else(|| anyhow::anyhow!("agent has no project layout"))?;
@@ -149,7 +168,16 @@ fn delete_current(shell: &mut Shell, app: &App, agent: &mut Agent<'_>) -> Result
     agent.set_plan_mode(false);
     shell.stop_loop_for_session_change();
     shell.session_id = fresh_id.clone();
-    old.remove_file()?;
+    // The pin is dropped only once the file is gone; a failed removal keeps both the file and pin.
+    if let Err(error) = old.remove_file() {
+        shell.note(
+            "Delete",
+            format!(
+                "Started new session {fresh_id}; the old file was kept because deleting it failed: {error:#}"
+            ),
+        );
+        return Ok(Step::Done);
+    }
     session_pins::unpin(&app.layout.user_dir, &old_id)?;
     shell.note(
         "Delete",
@@ -385,35 +413,64 @@ fn preview(text: &str) -> String {
     one_line(text).chars().take(80).collect()
 }
 
+/// How many recent user messages the bare `/branch` picker lists (keys 1-9).
+const BRANCH_CHOICES: usize = 9;
+
 fn branch(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
     let turns = agent.session().branchable_user_messages();
-    if args.is_empty() {
-        let body = if turns.is_empty() {
-            "No user messages to branch from.".to_owned()
-        } else {
-            let mut lines: Vec<String> = turns
-                .iter()
-                .rev()
-                .enumerate()
-                .map(|(index, (_, text))| format!("{}. {}", index + 1, preview(text)))
-                .collect();
-            lines.push("Usage: /branch <n> rewinds to message n (1 = most recent).".to_owned());
-            lines.join("\n")
-        };
-        shell.note("Branch", body);
+    if turns.is_empty() {
+        shell.note("Branch", "No user messages to branch from.");
         return Ok(Step::Done);
     }
-    let n: usize = match args.parse() {
-        Ok(n) if (1..=turns.len()).contains(&n) => n,
-        _ => {
-            shell.note(
-                "Branch",
-                format!("Expected a message number from 1 to {}.", turns.len()),
-            );
+    let n: usize = if args.is_empty() {
+        // Newest first, so choice 1 is the most recent message, as `/branch 1` means.
+        let labels: Vec<String> = turns
+            .iter()
+            .rev()
+            .take(BRANCH_CHOICES)
+            .enumerate()
+            .map(|(index, (_, text))| format!("{}  {}", index + 1, preview(text)))
+            .collect();
+        let options: Vec<(&str, char)> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let key = char::from_digit(index as u32 + 1, 10).unwrap_or(' ');
+                (label.as_str(), key)
+            })
+            .collect();
+        let mut body = "Choose the user message to rewind to (1 = most recent). Messages after it leave the conversation view; the old path is kept as a branch.".to_owned();
+        if turns.len() > BRANCH_CHOICES {
+            body.push_str(&format!(
+                " Only the {BRANCH_CHOICES} most recent are listed; use /branch <n> for older ones."
+            ));
+        }
+        let Some(choice) = shell.ask("Branch", &body, &options) else {
             return Ok(Step::Done);
+        };
+        choice + 1
+    } else {
+        match args.parse() {
+            Ok(n) if (1..=turns.len()).contains(&n) => n,
+            _ => {
+                shell.note(
+                    "Branch",
+                    format!("Expected a message number from 1 to {}.", turns.len()),
+                );
+                return Ok(Step::Done);
+            }
         }
     };
     let target = preview(&turns[turns.len() - n].1);
+    let dropped = dropped_on_rewind(agent, n);
+    let body = format!(
+        "Rewind to: {target}\n{dropped} message{} will leave the conversation view. The old path is kept as a branch.",
+        if dropped == 1 { "" } else { "s" }
+    );
+    if shell.ask("Branch", &body, &[("Cancel", 'n'), ("Rewind", 'r')]) != Some(1) {
+        shell.note("Branch", "Rewind cancelled; the conversation is unchanged.");
+        return Ok(Step::Done);
+    }
     agent.cancel_background_compaction();
     match super::branch::rewind(app, agent, n) {
         Ok(rewound) => {
@@ -431,6 +488,19 @@ fn branch(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Re
         Err(error) => shell.note("Branch", format!("rewind: {error:#}")),
     }
     Ok(Step::Done)
+}
+
+/// Messages that leave the view when `n` user turns are rewound: from the n-th latest user message
+/// to the end of the view.
+fn dropped_on_rewind(agent: &Agent<'_>, n: usize) -> usize {
+    let messages = agent.session().messages();
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, message)| message["role"].as_str() == Some("user"))
+        .nth(n.saturating_sub(1))
+        .map_or(0, |(index, _)| messages.len() - index)
 }
 
 fn retry(shell: &mut Shell, app: &App, agent: &mut Agent<'_>) -> Result<Step> {
@@ -549,6 +619,7 @@ fn login(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
         receiver,
         cancel,
         lines: None,
+        model: None,
     });
     shell.note(
         target.name,

@@ -270,7 +270,7 @@ pub fn settings_hints(config: &crate::config::types::Config) -> Vec<(&'static st
         if process::which(program).is_some() {
             "found"
         } else {
-            "not installed"
+            "not on PATH"
         }
     };
     let say = if cfg!(target_os = "macos") {
@@ -302,7 +302,7 @@ pub fn settings_hints(config: &crate::config::types::Config) -> Vec<(&'static st
             if tts_ready {
                 "A speech backend is available".to_owned()
             } else {
-                "No speech backend found: install one, or set an OpenAI key".to_owned()
+                "No speech backend yet: Ctrl+L can set one up, or set an OpenAI key".to_owned()
             },
         ),
         ("voice.stt.enabled", format!("Programs: {stt_list}")),

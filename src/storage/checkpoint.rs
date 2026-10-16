@@ -9,7 +9,7 @@
 //!
 //! Only turns that touched files are materialised: a read-only turn leaves no trace and does not
 //! count toward `rollback(n)`.
-use super::memory::atomic_write;
+use super::atomic::write_checkpoint as atomic_write;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;

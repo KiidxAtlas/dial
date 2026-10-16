@@ -211,6 +211,7 @@ impl Agent<'_> {
                     trajectory: None,
                 }).map(engine::Tick::Finished);
             }
+            let prep_started = Instant::now();
             let budget_window = self.budget_window();
             self.before_request(backend, &names, &mut pending_nudges, ui)?;
             let mut messages = self.system_messages();
@@ -271,14 +272,14 @@ impl Agent<'_> {
             engine.apply(schemas, &mut names, &mut messages);
             let single_call = !self.hermetic
                 && crate::reliability::single_call(self.config, measured.as_ref(), &reliability);
-            let contract = crate::reliability::Contract::new(schemas.clone())?;
-            let mut offered_schemas = contract.schemas;
+            let mut contract = crate::reliability::Contract::new(schemas.clone())?;
             if single_call {
                 let loaded = self.enabled_tools.iter().cloned().chain(self.discovered_tools()).collect();
-                crate::reliability::simplify(&mut offered_schemas, &loaded);
+                crate::reliability::simplify(&mut contract.schemas, &loaded);
+                // Simplification can drop offered schemas, so the offered contract is validated again.
+                contract = crate::reliability::Contract::new(contract.schemas)?;
             }
-            let snapshot = crate::reliability::Contract::new(offered_schemas.clone())?;
-            names = snapshot.names.clone();
+            names = contract.names.clone();
             let lightweight = self.config.efficiency.enabled
                 && !self.hermetic
                 && self.task_policy.lightweight
@@ -291,7 +292,7 @@ impl Agent<'_> {
                 && self.config.reliability.enabled
                 && (single_call || reliability.consecutive_contract_failures > 0)
             {
-                let guidance = snapshot.instruction(
+                let guidance = contract.instruction(
                     single_call,
                     self.config.reliability.examples && !lightweight,
                 );
@@ -332,7 +333,7 @@ impl Agent<'_> {
             rule_state.save(&mut request_control);
             let mut request = Chat {
                 messages,
-                tools: offered_schemas,
+                tools: contract.schemas,
                 temperature: selection.temperature.unwrap_or(h.temperature),
                 max_tokens: selection.max_tokens,
                 seed: if self.hermetic {
@@ -407,6 +408,11 @@ impl Agent<'_> {
                         identity: compaction_identity,
                         session_id: self.session.id(),
                         window: budget_window,
+                        fixed_tokens: compaction::request_tokens_with_policy(
+                            &compaction::replacement_request(&request, &[]),
+                            &self.config.compaction,
+                            compaction_identity,
+                        ),
                         tokens: request_context,
                         mid_turn: step != 0,
                         image_input: backend.accepts_image_input(),
@@ -628,10 +634,22 @@ impl Agent<'_> {
                 provider_request,
             );
             self.record(step, "request_prefix", serde_json::to_value(&prefix)?)?;
+            // Wall time before primary inference, including synchronous maintenance and waits.
+            self.record(
+                step,
+                "request_prep",
+                json!({"elapsed_ms": prep_started.elapsed().as_millis()}),
+            )?;
             ui.diagnostic(&format!(
                 "Request prefix: {}; {} stable message bytes",
                 prefix.invalidation, prefix.stable_message_bytes
             ));
+            // A constrained repair request is tagged as repair; the agent scope is restored after it.
+            let previous_usage = repairing.then(|| {
+                backend.set_usage_scope(Some(
+                    self.usage_scope.for_purpose(crate::llm::usage::Purpose::Repair),
+                ))
+            });
             let result = if self.hermetic {
                 crate::learn::compute::background_call(self.config, backend, |backend, cancel| {
                     chat_with_ui(
@@ -691,6 +709,9 @@ impl Agent<'_> {
                     Some(&mut rule_monitor),
                 )
             };
+            if let Some(previous) = previous_usage {
+                backend.set_usage_scope(previous);
+            }
             self.session.runtime().check_persistence().map_err(anyhow::Error::msg)?;
             // Also clear a profile if the model worker failed before entering the provider.
             if let Some(observation) = backend.wire_observation() {
@@ -1120,7 +1141,6 @@ impl Agent<'_> {
                         budget.refund();
                         return Ok(engine::Tick::Again);
                     }
-                    guard::LengthAction::GiveUp(text) => return self.stop_turn(ui, text, step + 1).map(engine::Tick::Finished),
                 }
             }
             if recovering_output {
@@ -1169,12 +1189,18 @@ impl Agent<'_> {
                 ui.inference_discarded(
                     "Completed edit preview failed; no tools from this generation were executed.",
                 );
-                if rejected_edit_previews >= 8 {
-                    return self.stop_turn(ui, "Stopped after eight rejected completed edit previews; no effects from the rejected generations. Correct the edit or choose a different grammar/model.".into(), step + 1).map(engine::Tick::Finished);
-                }
+                // From the eighth rejection on, generations are charged to the step budget instead of
+                // refunded, so `harness.max_steps` still bounds this loop. The guidance escalates; no turn end.
+                let escalation = if rejected_edit_previews >= 8 {
+                    format!("Escalation: {rejected_edit_previews} completed edit previews have been rejected this turn, and none of their edits ran. Stop regenerating the whole edit: read the target once, then make one smaller edit that quotes it exactly, using the offered grammar. ")
+                } else {
+                    String::new()
+                };
                 self.push(json!({"role":"user","dial_reminder":"edit-preview",
-                    "content":format!("The preceding generation was rejected before tool execution. Regenerate the complete edit using the offered grammar and observed source. Preview error (untrusted source data): {}", truncate(&error,4096))}))?;
-                budget.give_back();
+                    "content":format!("{escalation}The preceding generation was rejected before tool execution. Regenerate the complete edit using the offered grammar and observed source. Preview error (untrusted source data): {}", truncate(&error,4096))}))?;
+                if rejected_edit_previews < 8 {
+                    budget.give_back();
+                }
                 return Ok(engine::Tick::Again);
             }
             // Form failures bypass tool-result guards. Bound their recovery independently of
@@ -1192,6 +1218,7 @@ impl Agent<'_> {
             let model = self.auth_config.selection();
             if let Some(kind) = repair.trigger(
                 reply.tool_calls.is_empty()
+                    && !self.hermetic
                     && constrained_repair::enabled(
                         &self.config.assistance,
                         self.hermetic,
@@ -1416,14 +1443,16 @@ impl Agent<'_> {
             }
             let model = self.auth_config.selection();
             if let Some(kind) = repair.trigger(
-                constrained_repair::enabled(
-                    &self.config.assistance,
-                    self.hermetic,
-                    &model.provider,
-                    &model.model,
-                    selection.profile.as_ref(),
-                    backend.endpoint_structured_output(),
-                ),
+                // Hermetic turns disable repair; do not evaluate its live endpoint probe either.
+                !self.hermetic
+                    && constrained_repair::enabled(
+                        &self.config.assistance,
+                        self.hermetic,
+                        &model.provider,
+                        &model.model,
+                        selection.profile.as_ref(),
+                        backend.endpoint_structured_output(),
+                    ),
                 &reply,
                 schemas.as_slice(),
                 &names,
@@ -1735,6 +1764,12 @@ impl Agent<'_> {
                     }
                     if !single_call
                         && parallel.is_empty()
+                        // Rewrites must pass the serial controller's schema and approval checks.
+                        && !hooks::wanted(
+                            self.tool_hooks(),
+                            self.hook_plugins().as_deref(),
+                            "pre_tool_use",
+                        )
                         && approval::parallel_read(&self.ext, &call.name, &call.arguments)
                         && !approval::denied_by_rule(&self.always, call, self.workspace.root())
                     {
@@ -1750,6 +1785,7 @@ impl Agent<'_> {
                                     )
                                     && call_form_error(c, schemas, &names).is_none()
                                     && !self.speculative_pending(c)
+                                    && engine.rejection_at(&self.workspace, c).is_none()
                             })
                             .count();
                         if count > 1 {
@@ -2022,13 +2058,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                         output.text.push_str("\n\n");
                         output.text.push_str(&advice);
                     }
-                    guard::Stall::Stop(message) => {
-                        stop.get_or_insert(message);
-                    }
                     guard::Stall::None => {}
-                }
-                if stop.is_none() {
-                    stop = todo_recovery.stop_message();
                 }
                 self.record(
                     step,
@@ -2258,10 +2288,6 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             // A short-circuited round neither failed nor succeeded, so it must not advance failure streaks.
             let stall_round = if duplicates.is_some() { guard::Stall::None } else { stall.round(!round_succeeded) };
             let warning = match stall_round {
-                guard::Stall::Stop(message) => {
-                    stop.get_or_insert(message);
-                    None
-                }
                 guard::Stall::Warn(advice) => Some(advice),
                 guard::Stall::None => None,
             };
@@ -2287,14 +2313,14 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 );
                 self.session.set_control_state(control.clone())?;
                 ui.request_policy(&control);
-                if self.config.reliability.enabled
-                    && reliability.consecutive_contract_failures
-                        >= self.config.reliability.max_contract_failures
-                {
-                    stop = Some(format!(
-                        "Stopped after {} consecutive tool-contract failures without useful recovery. No rejected calls were executed. Inspect /reliability; run dial reliability check or select another model before retrying.",
-                        reliability.consecutive_contract_failures
-                    ));
+                // Repeated contract failures escalate the guidance instead of ending the turn; the step
+                // budget still bounds the retries.
+                let failures = reliability.consecutive_contract_failures;
+                let limit = self.config.reliability.max_contract_failures;
+                if self.config.reliability.enabled && limit > 0 && failures >= limit && failures % limit == 0 {
+                    pending_nudges.push(json!({"role":"user","dial_transient":true,"content":format!(
+                        "[Escalation from dial] {failures} tool calls in a row broke the tool contract, and none of the rejected calls ran. Call only the offered tools, with arguments that match their schemas exactly. Do not restate the rules or explain the failure at length: make the next call now."
+                    )}));
                 }
                 let mut result = control["adaptive_policy"]["result"].clone();
                 result["tool_round_failed"] = json!(tool_round_failed);

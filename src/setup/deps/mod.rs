@@ -5,12 +5,16 @@
 //! planning are pure over an [`Env`], so tests can fake the package managers on `PATH`.
 
 pub mod plan;
+pub mod prebuilt;
 pub mod run;
 
 use std::path::{Path, PathBuf};
 
 /// Minimum Bun version that the `bun` recipe accepts.
 pub const BUN_MIN: (u64, u64, u64) = (1, 3, 14);
+
+/// Minimum Node.js major.minor.patch for the `node` recipe (`eval.node` needs Node 22+).
+pub const NODE_MIN: (u64, u64, u64) = (22, 0, 0);
 
 /// One way to obtain a dependency. Every method installs only into Dial's user directory,
 /// or uses an existing package manager without elevated privileges. Nothing runs with sudo.
@@ -24,6 +28,9 @@ pub enum Method {
     Brew(&'static str),
     /// Needs the user: a service, a model file, or a privileged install. Dial shows the hint.
     Manual(&'static str),
+    /// A pinned release archive from the project's own download, verified by SHA-256 and unpacked
+    /// into Dial's install directory. Used only when no package manager above is available.
+    Download(prebuilt::Prebuilt),
 }
 
 /// Where the artifact a recipe detects lives.
@@ -60,7 +67,11 @@ pub const RECIPES: &[Recipe] = &[
         program: "bun",
         base: Base::Install,
         artifact: "node_modules/.bin/bun",
-        methods: &[Method::Npm(&["bun"]), Method::Brew("bun")],
+        methods: &[
+            Method::Npm(&["bun"]),
+            Method::Brew("bun"),
+            Method::Download(prebuilt::BUN),
+        ],
     },
     Recipe {
         id: "hindsight",
@@ -96,7 +107,7 @@ pub const RECIPES: &[Recipe] = &[
     Recipe {
         id: "piper",
         title: "Piper",
-        requires: &[],
+        requires: &["uv"],
         program: "piper",
         base: Base::Install,
         artifact: "bin/piper",
@@ -117,7 +128,7 @@ pub const RECIPES: &[Recipe] = &[
     Recipe {
         id: "mlx-whisper",
         title: "mlx-whisper",
-        requires: &[],
+        requires: &["uv"],
         program: "mlx_whisper",
         base: Base::Install,
         artifact: "bin/mlx_whisper",
@@ -135,7 +146,7 @@ pub const RECIPES: &[Recipe] = &[
     Recipe {
         id: "typescript-language-server",
         title: "typescript-language-server",
-        requires: &[],
+        requires: &["node"],
         program: "typescript-language-server",
         base: Base::Install,
         artifact: "node_modules/.bin/typescript-language-server",
@@ -144,7 +155,7 @@ pub const RECIPES: &[Recipe] = &[
     Recipe {
         id: "pyright-langserver",
         title: "pyright",
-        requires: &[],
+        requires: &["node"],
         program: "pyright-langserver",
         base: Base::Install,
         artifact: "node_modules/.bin/pyright-langserver",
@@ -184,7 +195,7 @@ pub const RECIPES: &[Recipe] = &[
         program: "node",
         base: Base::Install,
         artifact: "",
-        methods: &[Method::Brew("node")],
+        methods: &[Method::Brew("node"), Method::Download(prebuilt::NODE)],
     },
     Recipe {
         id: "uv",
@@ -193,7 +204,20 @@ pub const RECIPES: &[Recipe] = &[
         program: "uv",
         base: Base::Install,
         artifact: "",
-        methods: &[Method::Brew("uv")],
+        methods: &[Method::Brew("uv"), Method::Download(prebuilt::UV)],
+    },
+    Recipe {
+        id: "ollama",
+        title: "Ollama",
+        requires: &[],
+        program: "ollama",
+        base: Base::Install,
+        artifact: "",
+        // Homebrew first; otherwise the official installer page is the only hint Dial can give.
+        methods: &[
+            Method::Brew("ollama"),
+            Method::Manual("install Ollama from https://ollama.com/download"),
+        ],
     },
 ];
 
@@ -255,9 +279,15 @@ pub fn is_executable(path: &Path) -> bool {
 
 /// Where a recipe's artifact lives under `env`: a Dial install first, then `PATH`.
 pub fn locate(recipe: &Recipe, env: &Env) -> Option<PathBuf> {
+    installed(recipe, env).or_else(|| env.find(recipe.program))
+}
+
+/// What Dial itself installed for `recipe`: its artifact, or the binary of a direct download.
+fn installed(recipe: &Recipe, env: &Env) -> Option<PathBuf> {
+    let dir = install_dir(&env.user_dir, recipe.id);
     if !recipe.artifact.is_empty() {
         let base = match recipe.base {
-            Base::Install => install_dir(&env.user_dir, recipe.id),
+            Base::Install => dir.clone(),
             Base::UserDir => env.user_dir.clone(),
         };
         let path = base.join(recipe.artifact);
@@ -265,7 +295,11 @@ pub fn locate(recipe: &Recipe, env: &Env) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    env.find(recipe.program)
+    recipe.methods.iter().find_map(|method| match method {
+        Method::Download(prebuilt) => Some(dir.join(prebuilt.binary)),
+        _ => None,
+    })
+    .filter(|path| path.exists())
 }
 
 /// The default whisper.cpp model (`ggml-base.en.bin`) from whisper.cpp's own download source.
@@ -342,6 +376,7 @@ pub fn settings_for(id: &str, location: &Path) -> Vec<(String, String)> {
         "espeak-ng" => set("voice.tts.espeak_program"),
         "piper" => set("voice.tts.piper_program"),
         "whisper-cpp" => set("voice.stt.whisper_cpp_program"),
+        "node" => set("eval.node"),
         "mlx-whisper" => set("voice.stt.mlx_whisper_program"),
         "rust-analyzer" => lsp("rust-analyzer", &value),
         "typescript-language-server" => lsp("typescript-language-server", &value),
@@ -440,6 +475,9 @@ mod tests {
             settings_for("gopls", path),
             vec![("lsp.gopls.program".into(), "/x/bun".into())]
         );
-        assert!(settings_for("node", path).is_empty());
+        assert_eq!(
+            settings_for("node", path),
+            vec![("eval.node".into(), "/x/bun".into())]
+        );
     }
 }

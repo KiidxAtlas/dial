@@ -357,7 +357,13 @@ impl Agent<'_> {
                 .messages
                 .push(json!({"role": "user", "content": prompt}));
             let mut ui = NullUi;
-            self.role_chat(&mut main, "omfg", &request, &mut ui)
+            self.role_chat(
+                &mut main,
+                "omfg",
+                crate::llm::usage::Purpose::Auxiliary,
+                &request,
+                &mut ui,
+            )
         })();
         self.backend = Some(main);
         result

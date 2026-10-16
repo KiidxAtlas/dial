@@ -27,10 +27,14 @@
 	};
 	const invoke = async (action, options) => {
 		const response = await globalThis.__dial_prelude__("computer", { ...options, action });
-		if (response && typeof response.text === "string" && response.text.length > 0) {
+		if (!response || typeof response !== "object" || Array.isArray(response)) {
+			throw new TypeError("computer returned an invalid response");
+		}
+		if (typeof response.text === "string" && response.text.length > 0) {
 			globalThis.__dial_display__(response.text);
 		}
-		return response && typeof response.details === "object" && response.details !== null ? response.details : {};
+		// __dial_prelude__ returns raw ToolOutput.data, not a tool-result envelope.
+		return response;
 	};
 	const callValue = async chain => {
 		const details = await invoke("call", { chain });

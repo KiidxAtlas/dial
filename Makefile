@@ -12,10 +12,14 @@ CARGO_FEATURE_FLAGS = $(if $(filter 1,$(SLIM)),--no-default-features) $(if $(str
 INSTALL_DIR ?= $(shell path="$$(command -v dial 2>/dev/null)"; if [ -n "$$path" ]; then dirname "$$path"; else printf '%s' "$(HOME)/.local/bin"; fi)
 # Timestamped `dial.bak-*` copies kept per installed location by `make update` (newest first).
 KEEP_BACKUPS ?= 3
+# Checks never install dependencies or download models. Python tests report optional skips.
+PYTHON ?= python3
+TEST_PROFILE ?= dev
+DIAL ?= $(BUILD_DIR)/dial
 
 
 .DEFAULT_GOAL := help
-.PHONY: help update install build check test test-lib test-integration test-module lint
+.PHONY: help update install build check test test-lib test-integration test-module lint test-rust test-python test-bench-offline test-smoke test-mlx
 
 help:
 	@printf '%s\n' \
@@ -27,7 +31,12 @@ help:
 		'make test-lib Run library unit tests without building the CLI/integration targets' \
 		'make test-integration  Run the single integration test binary (tests/integration)' \
 		'make test-module MOD=llm::provider  Run lib tests under one module path' \
-		'make lint     Run clippy with the CI lint gate'
+		'make lint     Run clippy with the CI lint gate' \
+		'make test-rust TEST_PROFILE=dev  Run portable Rust tests (CI uses ci)' \
+		'make test-python  Run Python contracts; report unavailable optional MLX checks' \
+		'make test-bench-offline  Run benchmark grader/reporting tests, no model or binary needed' \
+		'make test-smoke DIAL=target/local/dial  Check an already-built binary and scripted recovery' \
+		'make test-mlx  Run optional local MLX checks; explicitly skip unsupported hosts, never download'
 
 update:
 	$(CARGO) build --bin dial --profile $(PROFILE) --locked --timings $(CARGO_FEATURE_FLAGS)
@@ -70,8 +79,10 @@ build:
 check:
 	$(CARGO) check --locked $(CARGO_FEATURE_FLAGS)
 
-test:
-	$(CARGO) test --locked $(CARGO_FEATURE_FLAGS)
+test: test-rust
+
+test-rust:
+	$(CARGO) test --locked --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 
 test-lib:
 	$(CARGO) test --locked --lib $(CARGO_FEATURE_FLAGS)
@@ -86,3 +97,17 @@ test-module:
 
 lint:
 	$(CARGO) clippy --locked --all-targets $(CARGO_FEATURE_FLAGS) -- -D clippy::correctness -D clippy::suspicious
+
+test-python:
+	HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m pytest -rs python/test_*.py
+
+test-bench-offline:
+	$(PYTHON) -m unittest discover -s examples/benchmarks -p 'test_*.py'
+
+# Deliberately no build prerequisite: test exactly the artifact selected by DIAL.
+test-smoke:
+	$(PYTHON) scripts/check-artifact.py --dial "$(DIAL)"
+	$(PYTHON) examples/benchmarks/smoke.py --dial "$(DIAL)" --suite recovery --machine-repetitions 2
+
+test-mlx:
+	HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) scripts/test-mlx.py

@@ -1,7 +1,10 @@
-//! The model selector: a left column (Roles, All models, providers with counts and a state glyph)
-//! and a right pane that is either the Roles view or a searchable list of models with a kind filter,
-//! a detail line and the roles that use the highlighted model. It only reports what the user chose;
-//! the controller saves it and answers with [`ModelOverlay::set_roles`].
+//! The model selector: a left column (Roles, All models, Favorites, Get models, providers with counts and
+//! a state glyph) and a right pane that is either the Roles view, a searchable list of models with a kind
+//! filter, a detail line and the roles that use the highlighted model, or the Get models group (installed
+//! local models, Hugging Face search, GGUF quantizations and curated embedding models; see
+//! `model_download`). It only reports what the user chose; the controller saves it and answers with
+//! [`ModelOverlay::set_roles`].
+use super::model_download::{ModelDownloads, Step};
 use super::{
     DrawCtx, OverlayEvent,
     settings::{
@@ -10,8 +13,11 @@ use super::{
     },
 };
 use crate::{
+    cli::local_models::Settings,
     llm::catalog::{Discovery, ModelEntry, ModelKind, ProviderStatus},
     llm::model_config::{ModelSelection, ROLES, RoleSource, RoleStatus},
+    setup::embeddings,
+    storage::paths::Layout,
     storage::settings_store::Scope,
     ui::{
         chrome::{self, Section},
@@ -27,6 +33,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KindFilter {
@@ -66,6 +73,7 @@ enum Group {
     Roles,
     All,
     Favorites,
+    Download,
     Provider(String),
 }
 
@@ -121,6 +129,8 @@ pub struct ModelOverlay {
     chooser: Option<Chooser>,
     prompt: Option<Prompt>,
     headers_editor: Option<(String, ModelSelection, super::headers::HeaderEditor)>,
+    /// The groups column is hidden at this width (set while drawing), so it cannot take focus.
+    narrow: bool,
     /// Banner near the footer: (text, is_ok). Cleared by the next key press.
     message: Option<(String, bool)>,
     /// LoRA state of the current main model, which the catalog alone cannot know (admitted adapters).
@@ -128,6 +138,8 @@ pub struct ModelOverlay {
     learning: bool,
     /// The judge role's Laya entry, offered only while choosing the judge model (see `laya_judge_entry`).
     laya_judge: ModelEntry,
+    /// The Get models group: installed local models, downloads and the embedding models.
+    downloads: ModelDownloads,
 }
 
 fn is_embedding(entry: &ModelEntry) -> bool {
@@ -456,9 +468,11 @@ impl ModelOverlay {
             chooser: None,
             prompt: None,
             headers_editor: None,
+            narrow: false,
             message: None,
             main_lora: Lora::Unknown,
             learning: false,
+            downloads: ModelDownloads::idle(),
         }
     }
 
@@ -638,6 +652,13 @@ impl ModelOverlay {
         self
     }
 
+    /// Reads the installed local models and enables downloads in the Get models group. Without it the
+    /// group lists nothing installed and downloads report unavailable.
+    pub fn with_downloads(mut self, layout: &Layout, settings: Settings, python: PathBuf) -> Self {
+        self.downloads = ModelDownloads::open(layout, settings, python);
+        self
+    }
+
     /// The main model's LoRA state when `entry` is the main model.
     fn main_lora_for(&self, entry: &ModelEntry) -> Option<Lora> {
         self.role_selection("main")
@@ -654,6 +675,22 @@ impl ModelOverlay {
         self.target_role = None;
         self.cursor = 0;
         self.scroll = 0;
+    }
+
+    /// Open on the Get models group (`/models local`).
+    pub fn show_downloads(&mut self) {
+        self.group = Group::Download;
+        self.focus = Focus::List;
+        self.search.clear();
+        self.kind = KindFilter::All;
+        self.target_role = None;
+        self.cursor = 0;
+        self.scroll = 0;
+    }
+
+    /// Whether a finished download asks for a rescan; the controller takes the request once per frame.
+    pub fn take_refresh(&mut self) -> bool {
+        self.downloads.take_rescan()
     }
 
     /// Discovery arrives asynchronously: the search, filters and the highlighted model survive.
@@ -731,13 +768,14 @@ impl ModelOverlay {
     }
 
     fn count_in(&self, group: &Group) -> usize {
-        if self.discovery.is_none() {
+        if self.discovery.is_none() && *group != Group::Download {
             return 0;
         }
         match group {
             Group::Roles => ROLES.len(),
             Group::All => self.all_entries().count(),
             Group::Favorites => self.favorite_entries.len(),
+            Group::Download => self.downloads.installed_count(),
             Group::Provider(id) => self
                 .all_entries()
                 .filter(|entry| &entry.selection.provider == id)
@@ -751,7 +789,7 @@ impl ModelOverlay {
         if self.discovery.is_none() {
             return Vec::new();
         }
-        if self.group == Group::Roles {
+        if matches!(self.group, Group::Roles | Group::Download) {
             return Vec::new();
         }
         let main = self.role_selection("main");
@@ -819,7 +857,7 @@ impl ModelOverlay {
     }
 
     fn highlighted(&self) -> Option<&ModelEntry> {
-        if self.group == Group::Roles {
+        if matches!(self.group, Group::Roles | Group::Download) {
             return None;
         }
         let rows = self.rows();
@@ -835,7 +873,7 @@ impl ModelOverlay {
     }
 
     fn groups(&self) -> Vec<Group> {
-        let mut groups = vec![Group::Roles, Group::All, Group::Favorites];
+        let mut groups = vec![Group::Roles, Group::All, Group::Favorites, Group::Download];
         groups.extend(self.providers().map(|p| Group::Provider(p.id.clone())));
         groups
     }
@@ -874,6 +912,11 @@ impl ModelOverlay {
     }
 
     fn type_text(&mut self, text: &str) {
+        if self.group == Group::Download {
+            self.focus = Focus::List;
+            self.downloads.paste(text);
+            return;
+        }
         if self.group == Group::Roles {
             self.group = Group::All;
             self.target_role = None;
@@ -916,11 +959,52 @@ impl ModelOverlay {
         if self.chooser.is_some() {
             return self.chooser_key(key, keys);
         }
+        if self.group == Group::Download
+            && key.code == KeyCode::Left
+            && key.modifiers == crossterm::event::KeyModifiers::CONTROL
+        {
+            if !self.narrow {
+                self.focus = Focus::Groups;
+            }
+            return OverlayEvent::None;
+        }
+        if self.group == Group::Download
+            && (self.focus == Focus::List
+                || typed_char(key).is_some()
+                || key.code == KeyCode::Backspace)
+        {
+            self.focus = Focus::List;
+            match self.downloads.key(key, keys) {
+                Step::Ignored => {}
+                Step::Handled => return OverlayEvent::None,
+                Step::Close => return OverlayEvent::Close,
+                Step::UseModel(path) => {
+                    return OverlayEvent::AssignModel {
+                        role: "main".into(),
+                        selection: ModelSelection::new("mlx", &path),
+                        scope: self.scope,
+                    };
+                }
+                Step::SetupEmbedding(model) => {
+                    return OverlayEvent::SetupDep {
+                        id: embeddings::setup_id(&model),
+                    };
+                }
+            }
+        }
         if key.code == KeyCode::F(8) {
+            // Headers belong to a role's assignment; outside Roles only a role being picked for has one.
+            if self.group != Group::Roles && self.target_role.is_none() {
+                self.set_status(
+                    "Choose a role first: Roles → Enter, then F8 sets that role's headers".into(),
+                    true,
+                );
+                return OverlayEvent::None;
+            }
             let role = if self.group == Group::Roles {
                 ROLES.get(self.cursor).map(|(role, _)| (*role).to_owned())
             } else {
-                self.target_role.clone().or_else(|| Some("main".into()))
+                self.target_role.clone()
             };
             let selection = if self.group == Group::Roles {
                 role.as_deref()
@@ -938,7 +1022,9 @@ impl ModelOverlay {
                         true,
                     );
                 } else {
-                    let editor = super::headers::HeaderEditor::new(&selection.headers);
+                    let title = format!("{} → role {role}", selection.model);
+                    let editor =
+                        super::headers::HeaderEditor::new(&selection.headers).titled(title);
                     self.headers_editor = Some((role, selection, editor));
                 }
             } else {
@@ -960,6 +1046,9 @@ impl ModelOverlay {
             return OverlayEvent::None;
         }
         if key.code == KeyCode::F(5) || is_ctrl(key, 'r') {
+            if self.group == Group::Download {
+                self.downloads.reload();
+            }
             return OverlayEvent::Refresh;
         }
         if key.code == KeyCode::F(6) && self.learning {
@@ -1012,7 +1101,7 @@ impl ModelOverlay {
             }
             return self.confirm();
         } else if keys.matches(Action::SectionNext, key) || keys.matches(Action::SectionPrev, key) {
-            self.focus = if self.focus == Focus::Groups {
+            self.focus = if self.focus == Focus::Groups || self.narrow {
                 Focus::List
             } else {
                 Focus::Groups
@@ -1020,17 +1109,19 @@ impl ModelOverlay {
         } else if keys.matches(Action::TabNext, key) {
             if self.focus == Focus::Groups {
                 self.focus = Focus::List;
-            } else if self.group != Group::Roles {
+            } else if !matches!(self.group, Group::Roles | Group::Download) {
                 self.shift_kind(1);
             }
         } else if keys.matches(Action::TabPrev, key) {
             if self.focus == Focus::List
-                && self.group != Group::Roles
+                && !matches!(self.group, Group::Roles | Group::Download)
                 && self.kind != KindFilter::All
             {
                 self.shift_kind(-1);
             } else {
-                self.focus = Focus::Groups;
+                if !self.narrow {
+                    self.focus = Focus::Groups;
+                }
             }
         } else if key.code == KeyCode::Delete
             || (self.group == Group::Roles && typed_char(key) == Some('x'))
@@ -1326,22 +1417,35 @@ impl ModelOverlay {
 
     fn compose(&mut self, w: u16, h: u16, ctx: &DrawCtx) -> Vec<Line<'static>> {
         let (w, h) = (usize::from(w), usize::from(h));
+        self.downloads.poll();
+        if self.group == Group::Download {
+            self.downloads.load_visible();
+        }
         let theme = ctx.theme;
         if let Some((_, _, editor)) = &self.headers_editor {
             return editor.lines(theme, w, h);
         }
         let body_min = h.min(3);
         let mut spare = h - body_min;
-        let mut grant = || {
-            if spare > 0 {
+        // The Get models group draws its own header, query and status, so it takes no kind, search or
+        // header rows of the list pane.
+        let download_view = self.group == Group::Download;
+        let mut grant = |wanted: bool| {
+            if wanted && spare > 0 {
                 spare -= 1;
                 true
             } else {
                 false
             }
         };
-        let (show_footer, show_kind, show_search, show_detail, show_header, show_used) =
-            (grant(), grant(), grant(), grant(), grant(), grant());
+        let (show_footer, show_kind, show_search, show_detail, show_header, show_used) = (
+            grant(true),
+            grant(!download_view),
+            grant(!download_view),
+            grant(true),
+            grant(!download_view),
+            grant(true),
+        );
         let flags = [
             show_footer,
             show_kind,
@@ -1353,6 +1457,11 @@ impl ModelOverlay {
         let body_rows = h - flags.iter().filter(|f| **f).count();
 
         let left_w = if w >= 56 { (w / 3).min(28) } else { 0 };
+        // Below 56 columns the groups column is hidden; its focus must not be reachable then.
+        self.narrow = left_w == 0;
+        if self.narrow && self.focus == Focus::Groups {
+            self.focus = Focus::List;
+        }
         let right_w = w - if left_w > 0 { left_w + 1 } else { 0 };
 
         let roles_view = self.group == Group::Roles;
@@ -1371,6 +1480,11 @@ impl ModelOverlay {
         }
         self.scroll = self.scroll.min(len.saturating_sub(body_rows));
         let rows = self.rows();
+        let download_lines = if download_view {
+            self.downloads.body(right_w, body_rows, theme)
+        } else {
+            Vec::new()
+        };
         let overflow = len > body_rows;
         let list_w = right_w.saturating_sub(usize::from(overflow));
 
@@ -1423,6 +1537,14 @@ impl ModelOverlay {
             }
             if let Some(top) = right_top.get(y) {
                 spans.extend(top.spans.clone());
+            } else if download_view {
+                if let Some(line) = download_lines.get(y) {
+                    // Flattening a styled Line must retain its inherited selection style.
+                    spans.extend(line.spans.iter().cloned().map(|mut span| {
+                        span.style = line.style.patch(span.style);
+                        span
+                    }));
+                }
             } else {
                 let i = y - top_rows;
                 let index = self.scroll + i;
@@ -1482,7 +1604,11 @@ impl ModelOverlay {
         match &self.discovery {
             None => " Scanning providers and models…".to_owned(),
             Some(d) if d.models.is_empty() => {
-                " No models yet. Press Enter to sign in to a provider or add an API key; a running LM Studio or Ollama server is found automatically."
+                " No models yet. Press Enter to set up a provider or add an API key, open Get models to download a local model, or start LM Studio or Ollama (found automatically)."
+                    .to_owned()
+            }
+            Some(_) if self.kind == KindFilter::Embedding && self.search.is_empty() => {
+                " No embedding models here. Open Get models and choose the Embedding shelf to set one up."
                     .to_owned()
             }
             Some(_) if !self.search.is_empty() => {
@@ -1497,6 +1623,7 @@ impl ModelOverlay {
             Group::Roles => "Roles".to_owned(),
             Group::All => "All models".to_owned(),
             Group::Favorites => "Favorites".to_owned(),
+            Group::Download => "Get models".to_owned(),
             Group::Provider(id) => self
                 .providers()
                 .find(|p| &p.id == id)
@@ -1534,6 +1661,7 @@ impl ModelOverlay {
         }
         // Legend entries are added whole while they fit, so a narrow pane never shows a clipped word.
         let legend = [
+            "* favorite".to_owned(),
             format!("{} vision", theme.sym(Sym::IconVision)),
             format!("{} tools", theme.sym(Sym::IconTools)),
             format!("{} reasoning", theme.sym(Sym::IconReasoning)),
@@ -1664,6 +1792,16 @@ impl ModelOverlay {
                 &Group::Favorites,
                 "Favorites".to_owned(),
                 self.count_in(&Group::Favorites).to_string(),
+                None,
+                self,
+            ),
+        ));
+        entries.push((
+            Some(Group::Download),
+            line(
+                &Group::Download,
+                "Get models".to_owned(),
+                self.downloads.installed_count().to_string(),
                 None,
                 self,
             ),
@@ -1960,6 +2098,9 @@ impl ModelOverlay {
                 Vec::new(),
             );
         }
+        if self.group == Group::Download {
+            return self.downloads.detail(theme);
+        }
         if self.group == Group::Roles {
             let (role, description) = ROLES[self.cursor.min(ROLES.len() - 1)];
             return (
@@ -2095,9 +2236,17 @@ impl ModelOverlay {
                 },
                 "F7 main model settings".to_owned(),
                 "F8 HTTP headers".to_owned(),
-                hint(keys, Action::TabPrev, "providers"),
+                self.groups_hint(keys),
                 hint(keys, Action::SelectCancel, "close"),
             ];
+        }
+        if self.group == Group::Download {
+            let mut hints = self.downloads.footer(keys);
+            if !self.narrow {
+                hints.push("Ctrl+Left groups".to_owned());
+            }
+            hints.push("F5 rescan".to_owned());
+            return hints;
         }
         if self.nothing_discovered() {
             return vec![
@@ -2106,7 +2255,7 @@ impl ModelOverlay {
             ];
         }
         vec![
-            "Ctrl-F favorite".to_owned(),
+            "Ctrl+F favorite".to_owned(),
             hint(
                 keys,
                 Action::SelectConfirm,
@@ -2122,7 +2271,7 @@ impl ModelOverlay {
                 "{} models",
                 pair_label(keys, Action::SelectUp, Action::SelectDown)
             ),
-            hint(keys, Action::TabPrev, "providers"),
+            self.groups_hint(keys),
             "type to search".to_owned(),
             format!(
                 "{} kind",
@@ -2136,7 +2285,11 @@ impl ModelOverlay {
             } else {
                 String::new()
             },
-            "F8 HTTP headers".to_owned(),
+            if self.target_role.is_some() {
+                "F8 HTTP headers".to_owned()
+            } else {
+                String::new()
+            },
             hint(
                 keys,
                 Action::SelectCancel,
@@ -2149,6 +2302,15 @@ impl ModelOverlay {
                 },
             ),
         ]
+    }
+
+    /// Footer hint for moving focus to the groups column; empty while that column is hidden.
+    fn groups_hint(&self, keys: &Keymap) -> String {
+        if self.narrow {
+            String::new()
+        } else {
+            hint(keys, Action::SectionPrev, "groups")
+        }
     }
 }
 
@@ -2358,7 +2520,8 @@ mod tests {
             send(&mut o, &rig, key(KeyCode::Down));
             send(&mut o, &rig, key(KeyCode::Enter));
             send(&mut o, &rig, key(KeyCode::Tab));
-            // All -> Favorites -> LM Studio.
+            // All -> Favorites -> Get models -> LM Studio.
+            send(&mut o, &rig, key(KeyCode::Down));
             send(&mut o, &rig, key(KeyCode::Down));
             send(&mut o, &rig, key(KeyCode::Down));
             assert_eq!(o.group, Group::Provider("lm-studio".into()));
@@ -2622,6 +2785,50 @@ mod tests {
         assert!(
             matches!(send(&mut o, &rig, key(KeyCode::Enter)), OverlayEvent::AssignModel { role, .. } if role == "small")
         );
+    }
+
+    #[test]
+    fn header_editing_needs_a_role_and_only_ever_assigns_that_role() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::F(8))),
+            OverlayEvent::None
+        ));
+        assert!(
+            o.headers_editor.is_none(),
+            "browsing alone must not edit main"
+        );
+        assert!(
+            o.message
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("Choose a role")),
+        );
+        o.show_roles();
+        o.cursor = ROLES.iter().position(|(role, _)| *role == "small").unwrap();
+        send(&mut o, &rig, key(KeyCode::Enter));
+        send(&mut o, &rig, key(KeyCode::F(8)));
+        assert!(o.headers_editor.is_some());
+        let OverlayEvent::AssignModel { role, .. } = send(&mut o, &rig, key(KeyCode::F(10))) else {
+            panic!("saving headers assigns the role being edited");
+        };
+        assert_eq!(role, "small");
+    }
+
+    #[test]
+    fn narrow_panes_do_not_focus_the_hidden_groups_and_the_legend_names_favorites() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        let narrow = draw(&mut o, &rig, 50, 24);
+        assert!(!narrow.contains("Shift+Tab groups"), "{narrow}");
+        send(&mut o, &rig, key(KeyCode::BackTab));
+        assert_eq!(o.focus, Focus::List, "hidden groups cannot take focus");
+        let wide = draw(&mut o, &rig, 100, 30);
+        assert!(wide.contains("* favorite"), "{wide}");
+        assert!(wide.contains("Ctrl+F favorite"), "{wide}");
+        assert!(wide.contains("Shift+Tab groups"), "{wide}");
+        send(&mut o, &rig, key(KeyCode::BackTab));
+        assert_eq!(o.focus, Focus::Groups);
     }
 
     #[test]
@@ -3112,11 +3319,16 @@ mod tests {
         send(&mut o, &rig, key(KeyCode::Down));
         assert_eq!(o.group, Group::Favorites);
         send(&mut o, &rig, key(KeyCode::Down));
+        assert_eq!(o.group, Group::Download);
+        assert!(draw(&mut o, &rig, 120, 30).contains("Get models"));
+        send(&mut o, &rig, key(KeyCode::Down));
         assert_eq!(o.group, Group::Provider("lm-studio".into()));
         assert_eq!(names(&o), ["qwen-warm", "qwen-chat", "nomic-embed"]);
         send(&mut o, &rig, key(KeyCode::Down));
         assert_eq!(names(&o), ["llama3"]);
         send(&mut o, &rig, key(KeyCode::Up));
+        send(&mut o, &rig, key(KeyCode::Up));
+        assert_eq!(o.group, Group::Download);
         send(&mut o, &rig, key(KeyCode::Up));
         assert_eq!(o.group, Group::Favorites);
         send(&mut o, &rig, key(KeyCode::Up));
@@ -3350,6 +3562,7 @@ mod tests {
         send(&mut o, &rig, key(KeyCode::Down));
         send(&mut o, &rig, key(KeyCode::Down));
         send(&mut o, &rig, key(KeyCode::Down));
+        send(&mut o, &rig, key(KeyCode::Down));
         assert_eq!(o.group, Group::Provider("openai".into()));
         let mut smaller = discovery();
         smaller.providers.retain(|p| p.id != "openai");
@@ -3399,6 +3612,20 @@ mod tests {
         send(&mut o, &rig, key(KeyCode::Down));
         send(&mut o, &rig, key(KeyCode::Down));
         send(&mut o, &rig, key(KeyCode::Tab));
+        assert_eq!(o.group, Group::Provider("ollama".into()));
+        assert_eq!(o.kind, KindFilter::Embedding);
+        assert!(names(&o).is_empty());
+        let shown = draw(&mut o, &rig, 120, 30);
+        assert!(
+            shown.contains("No embedding models here") && shown.contains("Get models"),
+            "{shown}"
+        );
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
+        send(&mut o, &rig, key(KeyCode::Right));
+        assert_eq!(o.kind, KindFilter::Other);
         assert!(draw(&mut o, &rig, 120, 30).contains("No models in this view"));
         assert!(matches!(
             send(&mut o, &rig, key(KeyCode::Enter)),
@@ -3486,5 +3713,165 @@ mod tests {
                 assert!(text::width(line) <= usize::from(w) * 2, "{line}");
             }
         }
+    }
+
+    #[test]
+    fn get_models_is_reachable_from_the_groups_column_by_keyboard() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        assert_eq!(o.group, Group::All);
+        // Left moves focus to the groups column; Down walks All -> Favorites -> Get models.
+        send(&mut o, &rig, key(KeyCode::Left));
+        assert_eq!(o.focus, Focus::Groups);
+        send(&mut o, &rig, key(KeyCode::Down));
+        send(&mut o, &rig, key(KeyCode::Down));
+        assert_eq!(o.group, Group::Download);
+        let shown = draw(&mut o, &rig, 120, 30);
+        assert!(shown.contains("Get models"), "{shown}");
+        assert!(shown.contains("Embedding"), "{shown}");
+    }
+
+    #[test]
+    fn get_models_short_panel_shows_recommendations_before_any_input() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.show_downloads();
+        let repo = crate::llm::download::recommended(crate::llm::download::default_family())[0]
+            .repo
+            .clone();
+        let shown = draw(&mut o, &rig, 120, 10);
+        assert!(shown.contains(&repo), "{shown}");
+        assert!(o.downloads.idle_now());
+        assert!(o.downloads.query_text().is_empty());
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
+        assert!(
+            o.downloads.idle_now(),
+            "idle fixture must not search on Enter"
+        );
+        assert!(draw(&mut o, &rig, 120, 10).contains("Downloads are unavailable"));
+    }
+
+    #[test]
+    fn get_models_selection_style_survives_column_composition() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.show_downloads();
+        let recommendations =
+            crate::llm::download::recommended(crate::llm::download::default_family());
+        for selected in 0..2 {
+            let buffer = render(160, 30, |frame| {
+                o.draw(
+                    frame,
+                    &DrawCtx {
+                        theme: &rig.theme,
+                        keys: &rig.keys,
+                        status: &rig.status,
+                        preview_status: &status_preview,
+                    },
+                );
+            });
+            let first = style_of(&buffer, &recommendations[selected].repo).unwrap();
+            let other = style_of(&buffer, &recommendations[1 - selected].repo).unwrap();
+            assert_eq!(first.bg, chrome::selected_style(&rig.theme).bg);
+            assert_ne!(
+                first.bg, other.bg,
+                "the selected model must be visibly distinct"
+            );
+            send(&mut o, &rig, key(KeyCode::Down));
+        }
+    }
+
+    #[test]
+    fn typing_in_get_models_edits_its_query_and_never_starts_a_download() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.show_downloads();
+        for c in "qwen".chars() {
+            assert!(matches!(send(&mut o, &rig, ch(c)), OverlayEvent::None));
+        }
+        assert_eq!(o.downloads.query_text(), "qwen");
+        assert!(o.downloads.idle_now());
+        assert!(o.search.is_empty(), "the models search is not touched");
+        assert!(!o.take_refresh());
+    }
+
+    #[test]
+    fn enter_on_an_embedding_catalog_row_asks_for_its_setup() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.show_downloads();
+        o.downloads.show_embedding_for_test();
+        // The first catalog row is already selected; no search or Down key is required.
+        match send(&mut o, &rig, key(KeyCode::Enter)) {
+            OverlayEvent::SetupDep { id } => {
+                assert_eq!(
+                    id,
+                    format!("embeddings:{}", crate::setup::embeddings::CATALOG[0].name)
+                );
+            }
+            other => panic!("expected the embeddings setup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn switching_groups_keeps_a_running_download() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.show_downloads();
+        let (cancel, done) = o.downloads.fake_download("org/model");
+        // Up to the groups column, then to All: the download is not cancelled.
+        send(
+            &mut o,
+            &rig,
+            Event::Key(KeyEvent::new(
+                KeyCode::Left,
+                crossterm::event::KeyModifiers::CONTROL,
+            )),
+        );
+        send(&mut o, &rig, key(KeyCode::Up));
+        assert_eq!(o.group, Group::Favorites);
+        send(&mut o, &rig, key(KeyCode::Up));
+        assert_eq!(o.group, Group::All);
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(o.downloads.is_running());
+        done.send(Ok("/no/such/path".into())).unwrap();
+    }
+
+    #[test]
+    fn model_tabs_use_arrows_without_leaving_the_list() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.show_downloads();
+        for code in [
+            KeyCode::Right,
+            KeyCode::Right,
+            KeyCode::Right,
+            KeyCode::Left,
+        ] {
+            send(&mut o, &rig, key(code));
+            assert_eq!(o.focus, Focus::List);
+            assert_eq!(o.group, Group::Download);
+        }
+        send(
+            &mut o,
+            &rig,
+            Event::Key(KeyEvent::new(
+                KeyCode::Left,
+                crossterm::event::KeyModifiers::CONTROL,
+            )),
+        );
+        assert_eq!(o.focus, Focus::Groups);
+    }
+
+    #[test]
+    fn show_downloads_opens_the_get_models_group_for_local_models_command() {
+        let mut o = overlay();
+        o.show_downloads();
+        assert_eq!(o.group, Group::Download);
+        assert_eq!(o.focus, Focus::List);
+        assert!(o.search.is_empty());
     }
 }

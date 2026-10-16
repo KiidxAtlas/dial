@@ -7,6 +7,45 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Kills the whole process group on drop so nothing outlives its owning operation.
+pub(crate) struct ProcessGroup {
+    pub(crate) child: Child,
+    terminated: bool,
+}
+impl ProcessGroup {
+    pub(crate) fn new(child: Child) -> Self {
+        Self {
+            child,
+            terminated: false,
+        }
+    }
+    pub(crate) fn terminate(&mut self) {
+        if !self.terminated {
+            let _ = crate::platform::process::terminate_group(self.child.id());
+            let _ = crate::platform::process::wait_exited(&self.child, Duration::from_millis(100));
+            let _ = crate::platform::process::kill_group(self.child.id());
+            self.terminated = true;
+        }
+    }
+    /// Transfers ownership without killing or forgetting the process group.
+    pub(crate) fn release(mut self) -> Child {
+        self.terminated = true;
+        let group = std::mem::ManuallyDrop::new(self);
+        unsafe { std::ptr::read(&group.child) }
+    }
+    /// The exited leader is not reaped, keeping its PID reserved until cleanup.
+    pub(crate) fn exited(&self) -> io::Result<bool> {
+        crate::platform::process::exited(&self.child)
+    }
+}
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.terminate();
+        let _ = self.child.wait();
+        crate::platform::process::forget_group(self.child.id());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
     Stdout,
@@ -154,6 +193,8 @@ impl Finished {
             cancelled: self.cancelled,
             output_complete: !self.output_incomplete
                 && !self.output_limited
+                && self.stdout_total == self.stdout.len()
+                && self.stderr_total == self.stderr.len()
                 && self.io_error.is_none(),
         }
     }
@@ -524,6 +565,7 @@ mod tests {
         .unwrap();
         assert_eq!(done.stdout, b"hello");
         assert_eq!(done.stdout_total, 11);
+        assert!(!done.outcome().output_complete);
         assert_eq!(done.stderr_text(100), "err");
         assert_eq!(done.code(), Some(3));
         assert!(!done.success());

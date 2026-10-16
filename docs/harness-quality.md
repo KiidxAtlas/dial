@@ -5,6 +5,9 @@ harness (isolated fixtures, graders, reports) have different responsibilities. F
 useful only when it preserves the requested result and the safety boundaries. A shorter transcript,
 a successful final sentence, or a scripted provider's output does not establish model quality.
 
+For the source-level comparison with Codex, Pi, and Anthropic, current loop ownership, implemented
+admission/verification optimizations, and deferred tradeoffs, see [Core harness review](harness-core-review.md).
+
 ## Research used for this design
 
 The following primary sources were fetched successfully during this work:

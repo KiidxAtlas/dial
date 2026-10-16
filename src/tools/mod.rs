@@ -124,27 +124,7 @@ pub const EXTRA_TOOLS: &[&str] = &[
 /// Integration tool names accepted in the config's `integrations` list (see [`ext`]). Most are
 /// offered only when listed; `find`, `browser`, `kernel`, `eval`, `autoresearch` and `archive` are
 /// always offered, so older saved lists keep them.
-pub const INTEGRATION_TOOLS: &[&str] = &[
-    "bg",
-    "web_fetch",
-    "web_search",
-    "lsp",
-    "ast_search",
-    "ast_edit",
-    "dap",
-    "git",
-    "find",
-    "browser",
-    "kernel",
-    "eval",
-    "github",
-    "notebook",
-    "ssh",
-    "security_scan",
-    "autoresearch",
-    "archive",
-    "computer",
-];
+pub use catalog::INTEGRATION_TOOLS;
 
 /// Tools dial enables by default: the built-ins plus the core dial tools below. The rest of
 /// [`EXTRA_TOOLS`] stays opt-in through the harness or tool flags.

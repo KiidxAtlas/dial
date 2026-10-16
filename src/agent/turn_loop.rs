@@ -553,136 +553,156 @@ impl<'a> Agent<'a> {
         if let Err(error) = self.flush_accepted_live_steering(ui) {
             result = Err(error);
         }
-        // One final verification pipeline serves plain reports and explicit finish calls.
-        let already_verified = self.step_checks.clean();
-        if self.config.verification.enabled
-            && self.config.verification.automatic_checks
-            && !already_verified
-            && let (Ok(report), Some(turn)) = (&result, checkpoint_turn)
-            && report.outcome == TurnOutcome::Completed
-            // A denied or failed edit leaves nothing to verify; running checks then fails on unrelated code.
-            && (self.step_checks.mutations > 0 || self.step_checks.has_uncheckpointed_operations())
-        {
-            let mut checks = self.focused_checks(turn);
-            self.step_checks.include_failed_checks(&mut checks);
-            self.step_checks.record_checked();
-            let mut run = self.run_checks(&checks, ui);
-            self.step_checks.failed = !run.failures.is_empty();
-            // `repair_attempts = 0` used to mean unlimited, so a check that can never pass re-prompted the
-            // model forever. Zero now selects this ceiling; an explicit count is used as configured.
-            const DEFAULT_REPAIR_ROUNDS: u64 = 3;
-            let limit = match self.config.verification.repair_attempts {
-                0 => DEFAULT_REPAIR_ROUNDS,
-                configured => u64::from(configured),
-            };
-            // Repairs draw from the same `turn_steps` as the initial run and stop-hook continuations.
-            let mut repair_attempts = 0u64;
-            let repair_outcome = (|| -> Result<()> {
-                while repair_attempts < limit {
-                    // Only confirmed code failures are repaired; infrastructure, permission, cancellation,
-                    // timeout and unverified problems stay visible in the final diagnostic.
-                    if run.actionable.is_empty() || self.interrupt.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let Some(repair_steps) = turn_steps.remaining() else {
-                        break;
-                    };
-                    self.metrics.repair_attempts += 1;
-                    self.record(0, "repair_round", json!({"attempt":repair_attempts+1}))?;
-                    self.push(json!({"role":"user","content":format!(
+        // Finalization is reentered after every stop-hook continuation. Repairs and hooks retain
+        // their turn-wide bounds, and only completed candidates may run checks or resume work.
+        const DEFAULT_REPAIR_ROUNDS: u64 = 3;
+        const STOP_HOOK_ROUNDS: u32 = 3;
+        let repair_limit = match self.config.verification.repair_attempts {
+            0 => DEFAULT_REPAIR_ROUNDS,
+            configured => u64::from(configured),
+        };
+        let mut repair_attempts = 0u64;
+        let mut stop_rounds = 0u32;
+        let plugins = self.hook_plugins();
+        let mut candidate_summary = String::new();
+        loop {
+            if let Ok(report) = &result
+                && report.outcome == TurnOutcome::Completed
+                && !report.text.trim().is_empty()
+            {
+                candidate_summary.clone_from(&report.text);
+            }
+            if let Ok(report) = &mut result
+                && report.outcome == TurnOutcome::Completed
+                && (report.interrupted || self.interrupt.load(Ordering::SeqCst))
+            {
+                report.outcome = TurnOutcome::Interrupted;
+                report.interrupted = true;
+                report.text = unsettled_report(
+                    &candidate_summary,
+                    "Interrupted before finalization; completion was not accepted.",
+                );
+            }
+            let already_verified = self.step_checks.clean();
+            // A denied or failed edit leaves nothing to verify; checks then fail on unrelated code.
+            if self.config.verification.enabled
+                && self.config.verification.automatic_checks
+                && !already_verified
+                && let (Ok(report), Some(turn)) = (&result, checkpoint_turn)
+                && report.outcome == TurnOutcome::Completed
+                && !report.interrupted
+                && !self.interrupt.load(Ordering::SeqCst)
+                && (self.step_checks.mutations > 0
+                    || self.step_checks.has_uncheckpointed_operations())
+            {
+                let mut checks = self.focused_checks(turn);
+                self.step_checks.include_failed_checks(&mut checks);
+                self.step_checks.record_checked();
+                let mut run = self.run_checks(&checks, ui);
+                self.step_checks.failed = !run.failures.is_empty();
+                // Zero selects a bounded default; hooks cannot reset the repair allowance.
+                let repair_outcome = (|| -> Result<()> {
+                    while repair_attempts < repair_limit {
+                        // Only confirmed code failures are repaired; infrastructure, permission, cancellation,
+                        // timeout and unverified problems stay visible in the final diagnostic.
+                        if run.actionable.is_empty() || self.interrupt.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let Some(repair_steps) = turn_steps.remaining() else {
+                            break;
+                        };
+                        self.metrics.repair_attempts += 1;
+                        self.record(0, "repair_round", json!({"attempt":repair_attempts+1}))?;
+                        self.push(json!({"role":"user","content":format!(
                                 "Automatic focused verification failed (repair attempt {}). Fix the diagnostics, then rerun the checks:\n{}",
                                 repair_attempts + 1, run.actionable.join("\n")
                             )}))?;
-                    repair_attempts = repair_attempts.saturating_add(1);
-                    let repaired = self.run_loop(
-                        &mut backend,
-                        &names,
-                        &mut schemas,
-                        repair_steps,
-                        user_text,
-                        ui,
-                    );
-                    self.flush_accepted_live_steering(ui)?;
-                    let mut repaired = repaired?;
-                    repaired.steps = turn_steps.charge(repaired.steps);
-                    if repaired.outcome != TurnOutcome::Completed {
+                        repair_attempts = repair_attempts.saturating_add(1);
+                        let repaired = self.run_loop(
+                            &mut backend,
+                            &names,
+                            &mut schemas,
+                            repair_steps,
+                            user_text,
+                            ui,
+                        );
+                        self.flush_accepted_live_steering(ui)?;
+                        let mut repaired = repaired?;
+                        repaired.steps = turn_steps.charge(repaired.steps);
+                        if repaired.outcome != TurnOutcome::Completed {
+                            repaired.text = unsettled_report(&candidate_summary, &repaired.text);
+                            result = Ok(repaired);
+                            break;
+                        }
+                        if !repaired.text.trim().is_empty() {
+                            candidate_summary.clone_from(&repaired.text);
+                        }
                         result = Ok(repaired);
-                        break;
+                        if self.step_checks.clean() {
+                            run.actionable.clear();
+                            run.failures.clear();
+                        } else {
+                            checks = self.focused_checks(turn);
+                            self.step_checks.include_failed_checks(&mut checks);
+                            self.step_checks.record_checked();
+                            run = self.run_checks(&checks, ui);
+                            self.step_checks.failed = !run.failures.is_empty();
+                        }
                     }
-                    result = Ok(repaired);
-                    if self.step_checks.clean() {
-                        run.actionable.clear();
-                        run.failures.clear();
-                    } else {
-                        checks = self.focused_checks(turn);
-                        self.step_checks.include_failed_checks(&mut checks);
-                        self.step_checks.record_checked();
-                        run = self.run_checks(&checks, ui);
-                        self.step_checks.failed = !run.failures.is_empty();
-                    }
+                    Ok(())
+                })();
+                // Errors from the repair rounds must still restore the backend and finish the turn.
+                if let Err(error) = repair_outcome {
+                    result = Err(error);
                 }
-                Ok(())
-            })();
-            // Errors from the repair rounds must still restore the backend and finish the turn.
-            if let Err(error) = repair_outcome {
-                result = Err(error);
+                if self.interrupt.load(Ordering::SeqCst)
+                    && result
+                        .as_ref()
+                        .is_ok_and(|report| report.outcome == TurnOutcome::Completed)
+                {
+                    let steps = result.as_ref().map_or(0, |report| report.steps);
+                    result = Ok(TurnReport {
+                        text: unsettled_report(
+                            &candidate_summary,
+                            "Interrupted during focused verification; completion was not accepted.",
+                        ),
+                        outcome: TurnOutcome::Interrupted,
+                        steps,
+                        interrupted: true,
+                        trajectory: None,
+                    });
+                } else if !run.failures.is_empty()
+                    && result.as_ref().is_ok_and(|report| {
+                        matches!(
+                            report.outcome,
+                            TurnOutcome::Completed | TurnOutcome::Incomplete
+                        )
+                    })
+                {
+                    let problems = run.failures.join("; ");
+                    let diagnostic = if repair_attempts > 0 {
+                        format!("Focused verification still fails after bounded repair: {problems}")
+                    } else if !run.actionable.is_empty() {
+                        format!(
+                            "Focused verification failed and the turn's step budget ran out before an automatic repair: {problems}"
+                        )
+                    } else {
+                        format!(
+                            "Focused verification failed without a repairable code diagnosis, so no automatic repair ran. Inspect the environment or permissions and rerun the check: {problems}"
+                        )
+                    };
+                    ui.notice(&diagnostic);
+                    let steps = result.as_ref().map_or(0, |report| report.steps);
+                    result = Ok(TurnReport {
+                        text: unsettled_report(&candidate_summary, &diagnostic),
+                        outcome: TurnOutcome::Failed,
+                        steps,
+                        interrupted: false,
+                        trajectory: None,
+                    });
+                }
             }
-            if self.interrupt.load(Ordering::SeqCst) {
-                let steps = result.as_ref().map_or(0, |report| report.steps);
-                result = Ok(TurnReport {
-                    text: String::new(),
-                    outcome: TurnOutcome::Interrupted,
-                    steps,
-                    interrupted: true,
-                    trajectory: None,
-                });
-            } else if !run.failures.is_empty()
-                && result.as_ref().is_ok_and(|report| {
-                    matches!(
-                        report.outcome,
-                        TurnOutcome::Completed | TurnOutcome::Incomplete
-                    )
-                })
-            {
-                let problems = run.failures.join("; ");
-                let diagnostic = if repair_attempts > 0 {
-                    format!("Focused verification still fails after bounded repair: {problems}")
-                } else if !run.actionable.is_empty() {
-                    format!(
-                        "Focused verification failed and the turn's step budget ran out before an automatic repair: {problems}"
-                    )
-                } else {
-                    format!(
-                        "Focused verification failed without a repairable code diagnosis, so no automatic repair ran. Inspect the environment or permissions and rerun the check: {problems}"
-                    )
-                };
-                ui.notice(&diagnostic);
-                let steps = result.as_ref().map_or(0, |report| report.steps);
-                result = Ok(TurnReport {
-                    text: diagnostic,
-                    outcome: TurnOutcome::Failed,
-                    steps,
-                    interrupted: false,
-                    trajectory: None,
-                });
-            }
-        }
-        // Without harness-run checks the per-step placeholder ("edits need verification") would
-        // outlive the turn; state plainly that nothing automatic verified the behavior.
-        if !self.hermetic
-            && !(self.config.verification.enabled && self.config.verification.automatic_checks)
-            && result
-                .as_ref()
-                .is_ok_and(|report| report.outcome == TurnOutcome::Completed)
-        {
-            self.publish_no_automatic_check(ui);
-        }
-        // A blocking stop hook feeds its reason back as a user message and resumes the turn.
-        // Bounded so a hook that never relents cannot loop forever.
-        const STOP_HOOK_ROUNDS: u32 = 3;
-        let plugins = self.hook_plugins();
-        let mut stop_rounds = 0u32;
-        loop {
+            // A blocking stop hook feeds its reason back and resumes through verification above.
             let payload = match &result {
                 Ok(report) => {
                     json!({"session_id":self.session.id(),"outcome":format!("{:?}", report.outcome),"answer":prompt::truncate_chars(&report.text, 4000),"stop_hook_active":stop_rounds > 0})
@@ -713,6 +733,18 @@ impl<'a> Agent<'a> {
                     n,
                 ))
             });
+            if self.interrupt.load(Ordering::SeqCst)
+                && let Ok(report) = &mut result
+                && report.outcome == TurnOutcome::Completed
+            {
+                report.outcome = TurnOutcome::Interrupted;
+                report.interrupted = true;
+                report.text = unsettled_report(
+                    &candidate_summary,
+                    "Interrupted during the stop hook; completion was not accepted.",
+                );
+                break;
+            }
             let reason = match verdict {
                 hooks::Verdict::Block { reason } => reason,
                 hooks::Verdict::Continue { .. } => break,
@@ -729,7 +761,7 @@ impl<'a> Agent<'a> {
                 ui.notice(&diagnostic);
                 if let Ok(report) = &mut result {
                     report.outcome = TurnOutcome::Blocked;
-                    report.text = diagnostic;
+                    report.text = unsettled_report(&candidate_summary, &diagnostic);
                 }
                 break;
             }
@@ -740,7 +772,7 @@ impl<'a> Agent<'a> {
                 ui.notice(&diagnostic);
                 if let Ok(report) = &mut result {
                     report.outcome = TurnOutcome::Incomplete;
-                    report.text = diagnostic;
+                    report.text = unsettled_report(&candidate_summary, &diagnostic);
                 }
                 break;
             };
@@ -765,8 +797,20 @@ impl<'a> Agent<'a> {
             })();
             if let Ok(report) = &mut resumed {
                 report.steps = turn_steps.charge(report.steps);
+                if report.outcome != TurnOutcome::Completed {
+                    report.text = unsettled_report(&candidate_summary, &report.text);
+                }
             }
             result = resumed;
+        }
+        // Publish only after all hook continuations settle, not for an intermediate candidate.
+        if !self.hermetic
+            && !(self.config.verification.enabled && self.config.verification.automatic_checks)
+            && result
+                .as_ref()
+                .is_ok_and(|report| report.outcome == TurnOutcome::Completed)
+        {
+            self.publish_no_automatic_check(ui);
         }
         self.ext.fire_lifecycle(&LifecycleEvent {
             event: "turn_finished".into(),
@@ -928,6 +972,15 @@ impl<'a> Agent<'a> {
     /// successful test invocation; only a separate verifier or user verdict supplies training labels.
     pub(super) fn persist_turn(&self, store: &Store, trajectory: i64) -> Result<()> {
         store.save_messages(trajectory, &self.training_capture.payload())
+    }
+}
+
+/// Keep the work visible without presenting a rejected candidate as an accepted completion.
+fn unsettled_report(summary: &str, diagnostic: &str) -> String {
+    if summary.trim().is_empty() || summary == diagnostic {
+        diagnostic.to_owned()
+    } else {
+        format!("{diagnostic}\n\nCandidate work summary (completion not accepted):\n{summary}")
     }
 }
 

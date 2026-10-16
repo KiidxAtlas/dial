@@ -118,7 +118,9 @@ impl SettingDef {
             .and_then(|get| get(&CONFIG))
             .or_else(|| get(&DEFAULTS, self.path).cloned())
             .or_else(|| match self.kind {
-                Kind::AutoInt { .. } | Kind::AutoFloat { .. } | Kind::AutoBool => Some(Value::String("auto".into())),
+                Kind::AutoInt { .. } | Kind::AutoFloat { .. } | Kind::AutoBool => {
+                    Some(Value::String("auto".into()))
+                }
                 Kind::Text => Some(Value::String(String::new())),
                 _ => None,
             })
@@ -1172,6 +1174,31 @@ mod tests {
     }
 
     #[test]
+    fn choice_settings_are_open_suggestions_not_closed_enums() {
+        let def = registry()
+            .iter()
+            .find(|def| def.path == "memory.semantic.embedding_model")
+            .expect("embedding model is a setting");
+        assert!(matches!(def.kind, Kind::Choice(_)));
+        assert_eq!(def.default_value(), Some(Value::String(String::new())));
+        let constraints = def.constraints();
+        assert!(constraints.get("enum").is_none());
+        assert!(
+            constraints["suggestions"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        for value in ["", "operator/custom-model:latest"] {
+            check_value(
+                "memory.semantic.embedding_model",
+                &Value::String(value.into()),
+            )
+            .unwrap();
+        }
+        assert!(check_value("memory.semantic.embedding_model", &Value::Integer(1)).is_err());
+    }
+
+    #[test]
     fn every_path_is_a_real_key_with_the_real_default() {
         let table = default_table();
         let ui = Table::try_from(UiConfig::default()).unwrap();
@@ -1317,7 +1344,7 @@ mod tests {
         for def in registry() {
             let mut values: Vec<Value> = Vec::new();
             match def.kind {
-                Kind::Enum(options) | Kind::Choice(options) => {
+                Kind::Enum(options) => {
                     assert!(
                         options
                             .iter()
@@ -1327,8 +1354,20 @@ mod tests {
                     );
                     values.extend(options.iter().map(|(v, _)| Value::String((*v).into())));
                 }
+                Kind::Choice(options) => {
+                    // Suggestions are not a closed set: the default may be blank and any text is valid.
+                    values.extend(options.iter().map(|(v, _)| Value::String((*v).into())));
+                    values.extend([
+                        Value::String(String::new()),
+                        Value::String("operator/custom-model".into()),
+                    ]);
+                }
                 Kind::AutoBool => {
-                    values.extend([Value::Boolean(true), Value::Boolean(false), Value::String("auto".into())]);
+                    values.extend([
+                        Value::Boolean(true),
+                        Value::Boolean(false),
+                        Value::String("auto".into()),
+                    ]);
                 }
                 Kind::Int { min, max, step } | Kind::AutoInt { min, max, step } => {
                     assert!(

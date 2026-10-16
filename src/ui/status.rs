@@ -129,6 +129,46 @@ pub struct StatusData {
 }
 
 impl StatusData {
+    /// Prefer lifecycle state over stale model telemetry, especially while stopping.
+    pub fn activity_label(&self) -> String {
+        let activity = crate::ui::text::one_line(&self.activity);
+        if self.stopping() {
+            return activity;
+        }
+        match self.phase {
+            Phase::Compacting => return "compacting context".into(),
+            Phase::WaitingCompute => {
+                return if activity.trim().is_empty() {
+                    "waiting for local compute".into()
+                } else {
+                    activity
+                };
+            }
+            _ => {}
+        }
+        self.model_activity().unwrap_or_else(|| {
+            if activity.trim().is_empty() {
+                "working".into()
+            } else {
+                activity
+            }
+        })
+    }
+
+    pub fn stopping(&self) -> bool {
+        self.activity.starts_with("stopping") || self.activity.starts_with("cancelling")
+    }
+
+    /// Engine-reported prompt progress only; an unknown total is not a percentage.
+    pub fn prompt_fraction(&self) -> Option<f64> {
+        let p = self.model_progress.as_ref()?;
+        if p.phase != crate::llm::InferencePhase::Processing || self.stopping() {
+            return None;
+        }
+        let (done, total) = (p.processed_tokens?, p.prompt_tokens?);
+        (total > 0).then(|| done.min(total) as f64 / total as f64)
+    }
+
     pub fn model_activity(&self) -> Option<String> {
         use crate::llm::InferencePhase;
         let p = self.model_progress.as_ref()?;
@@ -152,12 +192,18 @@ impl StatusData {
                 if let Some(rate) = p.tokens_per_second.filter(|r| r.is_finite() && *r > 0.0) {
                     label.push_str(&format!(" · {prefix}{rate:.1} tok/s"));
                 }
-                if self.model_silence_secs >= 15 {
-                    label.push_str(&format!(" · no output for {}s", self.model_silence_secs));
+                if self.activity == "reasoning"
+                    || self.activity == "writing"
+                    || self.activity.starts_with("preparing ")
+                {
+                    label = format!("{} · {label}", self.activity);
                 }
                 label
             }
         };
+        if self.model_silence_secs >= 15 {
+            label = format!("no progress for {}s · {label}", self.model_silence_secs);
+        }
         // Invalid telemetry cannot introduce terminal control sequences.
         label = crate::ui::text::one_line(&label);
         Some(label)
@@ -193,5 +239,73 @@ impl StatusData {
         let used = self.prompt_tokens?;
         (self.context_window > 0)
             .then(|| (used as f64 / f64::from(self.context_window)).clamp(0.0, 1.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::{InferencePhase, ModelProgress};
+
+    #[test]
+    fn silence_is_visible_in_every_model_phase_and_clears_on_progress() {
+        for phase in [
+            InferencePhase::Loading,
+            InferencePhase::Processing,
+            InferencePhase::Generating,
+        ] {
+            let mut status = StatusData {
+                phase: Phase::Working,
+                model_progress: Some(ModelProgress::new(phase)),
+                model_silence_secs: 14,
+                ..StatusData::default()
+            };
+            assert!(!status.activity_label().contains("no progress"));
+            status.model_silence_secs = 15;
+            assert!(status.activity_label().starts_with("no progress for 15s"));
+            status.model_silence_secs = 0;
+            assert!(!status.activity_label().contains("no progress"));
+            status.activity = "stopping after bash".into();
+            assert_eq!(status.activity_label(), "stopping after bash");
+        }
+    }
+
+    #[test]
+    fn prompt_fraction_needs_real_counts_and_clamps_to_the_total() {
+        let mut p = ModelProgress::new(InferencePhase::Processing);
+        let mut status = StatusData::default();
+        for (done, total, expected) in [
+            (None, None, None),
+            (Some(5), Some(0), None),
+            (Some(5), Some(10), Some(0.5)),
+            (Some(20), Some(10), Some(1.0)),
+        ] {
+            p.processed_tokens = done;
+            p.prompt_tokens = total;
+            status.model_progress = Some(p.clone());
+            assert_eq!(status.prompt_fraction(), expected);
+        }
+        status.activity = "stopping".into();
+        assert_eq!(status.prompt_fraction(), None);
+        status.activity.clear();
+        p.phase = InferencePhase::Generating;
+        status.model_progress = Some(p);
+        assert_eq!(status.prompt_fraction(), None);
+    }
+
+    #[test]
+    fn generation_keeps_the_current_operation_and_sanitizes_it() {
+        let mut status = StatusData {
+            model_progress: Some(ModelProgress::new(InferencePhase::Generating)),
+            ..StatusData::default()
+        };
+        for activity in ["reasoning", "writing", "preparing read"] {
+            status.activity = activity.into();
+            assert!(status.activity_label().starts_with(activity));
+            assert!(status.activity_label().contains("generating"));
+        }
+        status.activity = "preparing read\nfile\x1b[31m".into();
+        let label = status.activity_label();
+        assert!(!label.contains('\n') && !label.contains('\x1b'));
     }
 }

@@ -2,6 +2,18 @@
 
 use super::*;
 
+/// The request with its history replaced by a contract projection, or `None` when the projection
+/// changed nothing. Unchanged requests stay borrowed, so the common path copies no history.
+pub(super) fn projected_request(request: &Chat, projection: Option<Vec<Value>>) -> Option<Chat> {
+    projection.map(|messages| Chat {
+        messages,
+        tools: request.tools.clone(),
+        temperature: request.temperature,
+        max_tokens: request.max_tokens,
+        seed: request.seed,
+    })
+}
+
 pub(super) fn callback_image(
     workspace: &Workspace,
     call: &ToolCall,
@@ -320,23 +332,23 @@ impl<'a> Agent<'a> {
         request: &Chat,
         ui: &mut dyn Ui,
     ) -> Result<Option<Chat>> {
-        let mut projected = request.clone();
-        projected.messages =
-            tools::contracts::project_history(&request.messages, &request.tools, &self.ext)?;
-        let changed = projected.messages != request.messages;
+        let projected = projected_request(
+            request,
+            tools::contracts::project_history(&request.messages, &request.tools, &self.ext)?,
+        );
         let mut notices = Vec::new();
         let rewritten = hooks::provider_request(
             self.tool_hooks(),
             self.hook_plugins().as_deref(),
             self.workspace.root(),
-            &projected,
+            projected.as_ref().unwrap_or(request),
             self.interrupt.as_ref(),
             &mut |notice| notices.push(notice.to_owned()),
         )?;
         for notice in &notices {
             ui.notice(notice);
         }
-        Ok(rewritten.or_else(|| changed.then_some(projected)))
+        Ok(rewritten.or(projected))
     }
 
     pub(super) fn dispatch(
@@ -409,6 +421,9 @@ impl<'a> Agent<'a> {
                 Ok(arguments) => rewritten = arguments,
             }
         }
+        let arguments_changed = rewritten
+            .as_ref()
+            .is_some_and(|arguments| arguments != &call.arguments);
         // A rewritten call still runs through schemas and approvals inside `dispatch_inner`.
         let effective = match rewritten {
             Some(arguments) => ToolCall {
@@ -419,7 +434,7 @@ impl<'a> Agent<'a> {
         };
         let call = &effective;
         let mut approval_denied = false;
-        let mut out = self.dispatch_inner(backend, call, ui, &mut approval_denied);
+        let mut out = self.dispatch_inner(backend, call, ui, &mut approval_denied, arguments_changed);
         if call.name != "exit_plan"
             && !approval_denied
             && hooks::wanted(self.tool_hooks(), plugins.as_deref(), "post_tool_use")
@@ -456,6 +471,7 @@ impl<'a> Agent<'a> {
         call: &ToolCall,
         ui: &mut dyn Ui,
         approval_denied: &mut bool,
+        arguments_changed: bool,
     ) -> ToolOutput {
         let denied = |why: &str| {
             ToolOutput {
@@ -471,6 +487,18 @@ impl<'a> Agent<'a> {
             return denied(
                 "This callback was not executed: an earlier authorized edit preview failed in this assistant batch.",
             );
+        }
+        // Unchanged calls already passed the request contract at admission. Only a
+        // hook rewrite invalidates that evidence; authority is always checked below.
+        if arguments_changed {
+            let names = std::slice::from_ref(&call.name);
+            let schemas = match self.schemas(names) {
+                Ok(schemas) => schemas,
+                Err(error) => return denied(&format!("resolving tool schema: {error:#}")),
+            };
+            if let Some((_, why)) = call_form_error(call, &schemas, names) {
+                return denied(&format!("invalid tool call: {why}"));
+            }
         }
         if call.name == "exit_plan" && self.plan_mode {
             let Some(plan) = call.arguments["plan"]
@@ -772,7 +800,7 @@ impl<'a> Agent<'a> {
                     .catalog()
                     .into_iter()
                     .filter_map(|name| {
-                        if !self.plan_tool_available(&name) {
+                        if !self.tool_eligible(&name) {
                             return None;
                         }
                         let schema = self.schemas(std::slice::from_ref(&name)).ok()?.pop()?;
@@ -793,8 +821,8 @@ impl<'a> Agent<'a> {
                     return denied(&format!("persisting discovered tools: {error:#}"));
                 }
                 let offered = self.offered();
-                let matches: Vec<Value> = matches.into_iter().map(|(name, description, activate)| {
-                    json!({"enabled_next_round":activate || offered.contains(&name),"name":name,"description":description})
+                let matches: Vec<Value> = matches.into_iter().map(|(name, description, _)| {
+                    json!({"enabled_next_round":offered.contains(&name),"name":name,"description":description})
                 }).collect();
                 ToolOutput {
                     execution: Default::default(),
@@ -826,6 +854,11 @@ impl<'a> Agent<'a> {
                         .any(|n| !catalog.contains(n))
                 {
                     return denied("tool_load contains an unavailable tool; use tool_search first");
+                }
+                if let Some(name) = requested.iter().find(|name| !self.tool_eligible(name)) {
+                    return denied(&format!(
+                        "tool {name} is unavailable under the current mode or tool allowlist"
+                    ));
                 }
                 let mut enabled = self.enabled_tools.clone();
                 enabled.extend(requested.iter().cloned());
@@ -1122,7 +1155,7 @@ impl<'a> Agent<'a> {
         output
     }
 
-    /// `bash` jobs this session started and still runs; a turn waits for them.
+    /// Bash jobs owned by this session that must settle before completion can be accepted.
     pub(super) fn awaited_background_jobs(&self) -> Vec<String> {
         let mut jobs = Vec::new();
         for name in self.ext.names() {
@@ -1133,26 +1166,56 @@ impl<'a> Agent<'a> {
         jobs
     }
 
-    /// Text-only turn end with `bash` jobs still running: wait for them instead of ending. Returns true
-    /// as soon as a completion is queued for the model; false once nothing awaited remains, the wait
-    /// hits its cap, or the user interrupts.
+    /// Keep unfinished bash work visible without blocking the controller or user steering.
     pub(super) fn await_background_jobs(&mut self, ui: &mut dyn Ui) -> bool {
-        const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-        let started = std::time::Instant::now();
-        while !self.awaited_background_jobs().is_empty()
-            && !self.interrupt.load(Ordering::SeqCst)
-            && started.elapsed() < MAX_WAIT
-        {
-            for name in self.ext.names() {
-                if let Some(tool) = self.ext.get(name) {
-                    tool.await_work(std::time::Duration::from_secs(5));
-                }
-            }
-            self.pump_subagents(ui);
-            if !self.background_notices.is_empty() {
-                return true;
-            }
+        self.pump_subagents(ui);
+        let jobs = self.awaited_background_jobs();
+        if !jobs.is_empty() && !self.interrupt.load(Ordering::Relaxed) {
+            self.background_notices.push(format!(
+                "[Background work is still running]\n{}\nContinue independent work first. If nothing useful remains, tell the user what is pending and use a bounded `bg wait`. Do not report these jobs as completed; inspect their results or stop jobs you no longer need.",
+                jobs.join("\n")
+            ));
         }
-        false
+        !self.background_notices.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(messages: Vec<Value>) -> Chat {
+        Chat {
+            messages,
+            tools: vec![json!({"type":"function","function":{"name":"read"}})],
+            temperature: 0.2,
+            max_tokens: 64,
+            seed: Some(3),
+        }
+    }
+
+    #[test]
+    fn unchanged_projection_keeps_the_borrowed_request() {
+        let original = request(vec![json!({"role":"user","content":"hi"})]);
+        assert!(projected_request(&original, None).is_none());
+    }
+
+    #[test]
+    fn projected_history_replaces_only_messages() {
+        let original = request(vec![json!({"role":"user","content":"old"})]);
+        let projected = projected_request(
+            &original,
+            Some(vec![json!({"role":"user","content":"new"})]),
+        )
+        .expect("a changed projection produces a request");
+        assert_eq!(
+            projected.messages,
+            vec![json!({"role":"user","content":"new"})]
+        );
+        assert_eq!(projected.tools, original.tools);
+        assert_eq!(projected.temperature, original.temperature);
+        assert_eq!(projected.max_tokens, original.max_tokens);
+        assert_eq!(projected.seed, original.seed);
+        assert_eq!(original.messages[0]["content"], "old");
     }
 }

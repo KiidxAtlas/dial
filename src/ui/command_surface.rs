@@ -1,5 +1,7 @@
-//! One small everyday command surface shared by slash completion and the action palette.
+//! One small everyday command surface shared by slash completion, the palette and `/help`.
 //! Other registered commands remain callable and searchable under Advanced.
+
+/// Commands offered in the everyday menu and palette. Every starter list below is a subset.
 pub const EVERYDAY: &[&str] = &[
     "model",
     "providers",
@@ -22,6 +24,39 @@ pub const EVERYDAY: &[&str] = &[
     "cost",
     "help",
     "exit",
+    "setup",
+    "compact",
+    "theme",
+    "extensions",
+];
+
+/// Leading slash-menu entries when `/` is typed alone, in order.
+pub const START_HERE: &[&str] = &[
+    "help",
+    "model",
+    "settings",
+    "providers",
+    "extensions",
+    "setup",
+    "resume",
+    "compact",
+    "review",
+    "changes",
+    "undo",
+    "memory",
+    "cost",
+    "theme",
+];
+
+/// Palette entries that lead the unfiltered All list, in order.
+pub const STARTERS: &[&str] = &[
+    "model",
+    "providers",
+    "settings",
+    "help",
+    "setup",
+    "compact",
+    "theme",
 ];
 
 pub fn everyday(name: &str) -> bool {
@@ -175,6 +210,22 @@ mod category_tests {
         for c in Category::ALL {
             assert!(!c.title().is_empty() && !c.blurb().is_empty());
             assert!(titles.insert(c.title()), "duplicate {}", c.title());
+        }
+    }
+}
+
+#[cfg(test)]
+mod starter_tests {
+    use super::*;
+
+    #[test]
+    fn starter_lists_are_everyday_ordered_and_unique() {
+        for list in [START_HERE, STARTERS] {
+            let mut seen = std::collections::HashSet::new();
+            for name in list {
+                assert!(everyday(name), "/{name} starts a list but is not everyday");
+                assert!(seen.insert(name), "/{name} listed twice");
+            }
         }
     }
 }

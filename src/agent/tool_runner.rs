@@ -319,7 +319,16 @@ impl Agent<'_> {
 
             match rx.recv_timeout(Duration::from_millis(80)) {
                 Ok(Event::Output(event)) => {
-                    if event.kind == "output" {
+                    if matches!(
+                        event.kind.as_str(),
+                        "background_output" | "background_progress"
+                    ) {
+                        ui.background_output(
+                            &event.name,
+                            &event.text,
+                            event.kind == "background_progress",
+                        );
+                    } else if event.kind == "output" {
                         ui.tool_output(&event.name, &event.text);
                     } else if event.kind == "progress" {
                         ui.tool_progress(&event.name, &event.text);

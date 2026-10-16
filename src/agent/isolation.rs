@@ -199,7 +199,7 @@ fn snapshot(
                         .is_some_and(|(source, _)| source.starts_with(relative))
                 })
             });
-            if !preserved_source && crate::benchmark::is_excluded_source_path(root, &path)
+            if !preserved_source && crate::workspace_copy::is_excluded_source_path(root, &path)
                 || path
                     .file_name()
                     .is_some_and(|n| n == crate::tools::SCRATCH_DIR)
@@ -398,11 +398,11 @@ impl Isolated {
         let mut projection = None;
         match kind {
             Backend::Clone => {
-                dir = crate::benchmark::clone_project(project.root())?;
+                dir = crate::workspace_copy::clone_project(project.root())?;
                 root = dir.path().canonicalize()?;
             }
             Backend::Copy => {
-                dir = crate::benchmark::copy_project_plain(project.root())?;
+                dir = crate::workspace_copy::copy_project_plain(project.root())?;
                 root = dir.path().canonicalize()?;
             }
             Backend::Worktree => {

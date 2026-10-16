@@ -6,7 +6,7 @@ use fs2::FileExt;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         LazyLock, Mutex,
@@ -30,25 +30,8 @@ pub enum Change {
     Remove { path: String },
 }
 
-/// Validate ancestors without creating directories or changing permissions (also used for reads).
-pub(crate) fn validate_private_path(dir: &Path) -> Result<()> {
-    ensure!(
-        !dir.components()
-            .any(|part| part == std::path::Component::ParentDir),
-        "private storage path must not contain parent traversal"
-    );
-    // System-owned aliases such as macOS /var are trusted. User-owned symlink
-    // ancestors are not: they could redirect private state into the workspace.
-    for ancestor in dir.ancestors() {
-        if let Ok(meta) = fs::symlink_metadata(ancestor) {
-            ensure!(
-                !meta.file_type().is_symlink() || platform_fs::path_owned_by_system(ancestor)?,
-                "private storage path contains a user-owned symlink"
-            );
-        }
-    }
-    Ok(())
-}
+// Compatibility exports; publication mechanics and private path policy have a neutral owner.
+pub(crate) use super::atomic::{validate_private_path, write_private};
 
 pub(crate) fn private_dir(dir: &Path) -> Result<()> {
     validate_private_path(dir)?;
@@ -182,62 +165,6 @@ pub(crate) fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    ensure!(
-        bytes.len() as u64 <= MAX_FILE_BYTES,
-        "private storage file exceeds size limit"
-    );
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        ensure!(
-            meta.is_file()
-                && !meta.file_type().is_symlink()
-                && platform_fs::link_count(&platform_fs::open_nofollow_nonblocking(
-                    &OpenOptions::new().read(true),
-                    path
-                )?)? == 1
-                && platform_fs::path_owned_by_current_user(path)?,
-            "unsafe private storage target"
-        );
-    }
-    let dir = path.parent().context("storage path has no parent")?;
-    validate_private_path(dir)?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    platform_fs::set_owner_only(temp.path())?;
-    temp.write_all(bytes)?;
-    temp.as_file().sync_all()?;
-    #[cfg(unix)]
-    {
-        temp.persist(path).map_err(|e| e.error)?;
-        File::open(dir)?.sync_all()?;
-    }
-    #[cfg(windows)]
-    {
-        let temp_name = temp
-            .path()
-            .file_name()
-            .context("temporary file has no name")?
-            .to_os_string();
-        let target_name = path
-            .file_name()
-            .context("storage file has no name")?
-            .to_os_string();
-        let parent = platform_fs::open_dir_nofollow_write(dir)?;
-        let staged_file = temp.as_file().try_clone()?;
-        let staged_path = temp.into_temp_path();
-        platform_fs::replace_beneath_file(
-            &parent,
-            Path::new(&temp_name),
-            &staged_file,
-            Path::new(&target_name),
-        )?;
-        let _ = staged_path.keep().map_err(|error| error.error)?;
-        // Windows has no documented unprivileged directory flush/write-through rename; the staged
-        // file is flushed and publication is atomic for readers, but namespace crash durability is
-        // not guaranteed after a power loss.
-    }
-    Ok(())
-}
-
 fn patch(
     table: &mut toml::map::Map<String, toml::Value>,
     parts: &[&str],
@@ -321,6 +248,24 @@ pub fn save_model_config(
     changes: &[Change],
     role: &str,
 ) -> Result<crate::config::types::Config> {
+    let resets = model_project_resets(role)?;
+    save_config_with_project_resets(layout, scope, changes, &resets)
+}
+
+/// Validate the same future layers as `save_model_config`, without publishing or migrating files.
+/// Save re-reads under its locks; a preview is not a reservation against concurrent edits.
+pub fn preview_model_config(
+    layout: &Layout,
+    scope: Scope,
+    changes: &[Change],
+    role: &str,
+) -> Result<crate::config::types::Config> {
+    let resets = model_project_resets(role)?;
+    let (_, config) = prepare_config(layout, scope, changes, &resets)?;
+    Ok(config)
+}
+
+fn model_project_resets(role: &str) -> Result<Vec<Change>> {
     ensure!(
         crate::llm::model_config::ROLES
             .iter()
@@ -338,11 +283,10 @@ pub fn save_model_config(
     } else {
         vec![format!("model_roles.{role}")]
     };
-    let resets: Vec<_> = paths
+    Ok(paths
         .into_iter()
         .map(|path| Change::Remove { path })
-        .collect();
-    save_config_with_project_resets(layout, scope, changes, &resets)
+        .collect())
 }
 
 fn save_config_with_project_resets(
@@ -358,30 +302,7 @@ fn save_config_with_project_resets(
     let _lock = locked(&files[selected])?;
     let reset_project = scope == Scope::Global && !project_resets.is_empty();
     let _project_lock = reset_project.then(|| locked(&files[1])).transpose()?;
-    let mut layers: [toml::Table; 2] = Default::default();
-    for (index, path) in files.iter().enumerate() {
-        let edits = if index == selected { changes } else { &[] };
-        let mut layer = changed_document(path, edits)?;
-        crate::config::migrate_memory_tool_table(&mut layer);
-        crate::config::migrate_edit_configuration(&mut layer);
-        crate::config::migrate_model_role_table(&mut layer);
-        crate::config::migrate_removed_settings(&mut layer);
-        if reset_project && index == 1 {
-            // Clear canonical roles after migrating legacy assignments too.
-            for reset in project_resets {
-                if let Change::Remove { path } = reset {
-                    patch(&mut layer, &path.split('.').collect::<Vec<_>>(), None)?;
-                }
-            }
-        }
-        layers[index] = layer;
-    }
-    let config = crate::config::types::Config::from_layers(
-        layout,
-        &layers[0],
-        &layers[1],
-        &toml::Table::new(),
-    )?;
+    let (layers, config) = prepare_config(layout, scope, changes, project_resets)?;
     let selected_bytes = toml::to_string_pretty(&layers[selected])?;
     if reset_project {
         let project_bytes = toml::to_string_pretty(&layers[1])?;
@@ -406,6 +327,41 @@ fn save_config_with_project_resets(
         write_private(&files[selected], selected_bytes.as_bytes())?;
     }
     Ok(config)
+}
+
+fn prepare_config(
+    layout: &Layout,
+    scope: Scope,
+    changes: &[Change],
+    project_resets: &[Change],
+) -> Result<([toml::Table; 2], crate::config::types::Config)> {
+    layout.ensure_project_outside_storage()?;
+    let selected = if scope == Scope::Global { 0 } else { 1 };
+    let mut layers: [toml::Table; 2] = Default::default();
+    for (index, path) in layout.config_files().iter().enumerate() {
+        let edits = if index == selected { changes } else { &[] };
+        let mut layer = changed_document(path, edits)?;
+        crate::config::migrate_memory_tool_table(&mut layer);
+        crate::config::migrate_edit_configuration(&mut layer);
+        crate::config::migrate_model_role_table(&mut layer);
+        crate::config::migrate_removed_settings(&mut layer);
+        if scope == Scope::Global && index == 1 {
+            // Clear canonical roles after migrating legacy assignments too.
+            for reset in project_resets {
+                if let Change::Remove { path } = reset {
+                    patch(&mut layer, &path.split('.').collect::<Vec<_>>(), None)?;
+                }
+            }
+        }
+        layers[index] = layer;
+    }
+    let config = crate::config::types::Config::from_layers(
+        layout,
+        &layers[0],
+        &layers[1],
+        &toml::Table::new(),
+    )?;
+    Ok((layers, config))
 }
 
 /// One config layer as stored on disk (empty when the file does not exist). Used to show whether a

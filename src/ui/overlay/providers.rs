@@ -13,7 +13,7 @@ use super::{
     },
 };
 use crate::{
-    llm::catalog::{Discovery, ProviderStatus},
+    llm::catalog::{Discovery, ProviderStatus, UNREACHABLE_DETAIL},
     llm::model_config::ProviderSpec,
     storage::settings_store::Scope,
     ui::{
@@ -159,6 +159,24 @@ struct Menu {
     cursor: usize,
 }
 
+/// What a confirmed Confirm-mode action removes; nothing changes until the user confirms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    Provider,
+    SavedKey,
+    AnthropicSignOut,
+}
+
+impl Removal {
+    fn title(self) -> &'static str {
+        match self {
+            Removal::Provider => "Remove provider",
+            Removal::SavedKey => "Remove saved key",
+            Removal::AnthropicSignOut => "Sign out",
+        }
+    }
+}
+
 enum Mode {
     List,
     Menu(Menu),
@@ -167,7 +185,7 @@ enum Mode {
         secret: Secret,
         error: Option<String>,
     },
-    Confirm(Entry),
+    Confirm(Entry, Removal),
     Wizard(Wizard),
     Headers {
         entry: Entry,
@@ -184,6 +202,31 @@ struct Entry {
     detail: String,
     models: usize,
     spec: Option<ProviderSpec>,
+}
+
+/// Whether a base URL names this machine: a loopback address or `localhost`.
+fn is_loopback(base_url: &str) -> bool {
+    url::Url::parse(base_url).is_ok_and(|url| {
+        url.host_str().is_some_and(|host| {
+            let bare = host.trim_start_matches('[').trim_end_matches(']');
+            bare.eq_ignore_ascii_case("localhost")
+                || bare
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    })
+}
+
+/// Whether an unavailable row is an expected absence, not a failure: a configured local server
+/// that refused the connection is "not running", and so is a row Dial has not configured.
+/// Auth failures, HTTP errors and malformed replies from a configured provider stay red.
+fn expected_absent(entry: &Entry) -> bool {
+    if entry.state != "unavailable" {
+        return false;
+    }
+    entry.spec.is_none()
+        || (entry.detail == UNREACHABLE_DETAIL
+            && entry.base_url.as_deref().is_some_and(is_loopback))
 }
 
 /// Where a provider's API key comes from: the saved key in credentials.json and/or an
@@ -213,6 +256,8 @@ pub struct ProviderOverlay {
     page: usize,
     mode: Mode,
     message: Option<(String, bool)>,
+    /// A credential save awaits the controller's verdict; shown neutral until `set_status` answers.
+    saving: bool,
     credential_sources: BTreeMap<String, CredentialSource>,
 }
 
@@ -280,6 +325,7 @@ impl ProviderOverlay {
             page: 8,
             mode: Mode::List,
             message: None,
+            saving: false,
             credential_sources: BTreeMap::new(),
         }
     }
@@ -421,7 +467,7 @@ impl ProviderOverlay {
             Mode::List => self.list_key(key, keys),
             Mode::Menu(_) => self.menu_key(key, keys),
             Mode::Key { .. } => self.secret_key(key, keys),
-            Mode::Confirm(_) => self.confirm_key(key, keys),
+            Mode::Confirm(..) => self.confirm_key(key, keys),
             Mode::Wizard(_) => self.wizard_key(key, keys),
             Mode::Headers { .. } => self.headers_key(key, keys),
         }
@@ -430,10 +476,12 @@ impl ProviderOverlay {
     /// One-line banner near the footer (success or error); cleared by the next key press.
     pub fn set_status(&mut self, message: String, is_error: bool) {
         self.message = Some((message, !is_error));
+        self.saving = false;
     }
 
     fn list_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
         self.message = None;
+        self.saving = false;
         let count = self.row_count();
         let last = count - 1;
         if is_ctrl(key, 's') {
@@ -655,7 +703,9 @@ impl ProviderOverlay {
 
     fn begin_remove(&mut self) -> OverlayEvent {
         match self.selected() {
-            Some(entry) if entry.spec.is_some() => self.mode = Mode::Confirm(entry),
+            Some(entry) if entry.spec.is_some() => {
+                self.mode = Mode::Confirm(entry, Removal::Provider)
+            }
             Some(entry) => {
                 self.message = Some((
                     format!(
@@ -740,8 +790,8 @@ impl ProviderOverlay {
                 return OverlayEvent::AnthropicLogin;
             }
             ProviderAction::AnthropicSignOut => {
-                self.mode = Mode::List;
-                return OverlayEvent::AnthropicSignOut;
+                self.mode = Mode::Confirm(entry, Removal::AnthropicSignOut);
+                return OverlayEvent::None;
             }
             ProviderAction::OAuthLogin(id) => {
                 let id = id.clone();
@@ -781,15 +831,14 @@ impl ProviderOverlay {
                 return OverlayEvent::OpenRouterLogin;
             }
             ProviderAction::RemoveKey => {
-                self.mode = Mode::List;
-                self.message = Some(("API key removal requested".to_owned(), true));
-                return match entry.base_url {
-                    Some(base_url) => OverlayEvent::RemoveCredential { base_url },
-                    None => OverlayEvent::None,
-                };
+                if entry.base_url.is_none() {
+                    return OverlayEvent::None;
+                }
+                self.mode = Mode::Confirm(entry, Removal::SavedKey);
+                return OverlayEvent::None;
             }
             ProviderAction::Remove => {
-                self.mode = Mode::Confirm(entry);
+                self.mode = Mode::Confirm(entry, Removal::Provider);
                 return OverlayEvent::None;
             }
             ProviderAction::Toggle => entry,
@@ -864,12 +913,14 @@ impl ProviderOverlay {
             let provider = entry.id.clone();
             let label = text::one_line(&entry.label);
             let message = if matches!(provider.as_str(), "openai" | "anthropic") {
-                format!("Credential for {label} sent for verification")
+                format!("Verifying {label}…")
             } else {
-                format!("API key for {label} sent to the credential store")
+                format!("Saving {label} key…")
             };
             self.mode = Mode::List;
+            // Neutral until the controller's reply reaches `set_status`.
             self.message = Some((message, true));
+            self.saving = true;
             return OverlayEvent::SaveCredential {
                 provider,
                 base_url,
@@ -893,21 +944,71 @@ impl ProviderOverlay {
     }
 
     fn confirm_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
-        let Mode::Confirm(entry) = &self.mode else {
+        let Mode::Confirm(entry, removal) = &self.mode else {
             return OverlayEvent::None;
         };
         if keys.matches(Action::SelectConfirm, key) {
-            let id = entry.id.clone();
+            let (id, base_url, removal) = (entry.id.clone(), entry.base_url.clone(), *removal);
             self.mode = Mode::List;
-            return OverlayEvent::RemoveProvider {
-                id,
-                scope: self.scope,
+            return match removal {
+                Removal::Provider => OverlayEvent::RemoveProvider {
+                    id,
+                    scope: self.scope,
+                },
+                Removal::SavedKey => match base_url {
+                    Some(base_url) => {
+                        self.message = Some(("API key removal requested".to_owned(), true));
+                        OverlayEvent::RemoveCredential { base_url }
+                    }
+                    None => OverlayEvent::None,
+                },
+                Removal::AnthropicSignOut => OverlayEvent::AnthropicSignOut,
             };
         }
         if keys.matches(Action::SelectCancel, key) {
             self.mode = Mode::List;
         }
         OverlayEvent::None
+    }
+
+    /// Names what the confirmed action removes; nothing changes until Enter.
+    fn confirm_body(
+        &self,
+        theme: &Theme,
+        entry: &Entry,
+        removal: Removal,
+        w: usize,
+    ) -> Vec<Line<'static>> {
+        let label = text::one_line(&entry.label);
+        let (main, note) = match removal {
+            Removal::Provider => (
+                format!(
+                    "  Remove provider {} ({}) from the {} config?",
+                    label,
+                    text::one_line(&entry.id),
+                    scope_name(self.scope)
+                ),
+                "  Its saved API key, if any, is kept until you remove it.".to_owned(),
+            ),
+            Removal::SavedKey if entry.id == "anthropic" => (
+                "  Remove the saved credential and sign out of the Claude subscription?".to_owned(),
+                "  Dial stops using the saved key and the subscription login.".to_owned(),
+            ),
+            Removal::SavedKey => (
+                format!("  Remove the saved API key for {label}?"),
+                "  Dial stops using that key; an environment variable, if set, still applies."
+                    .to_owned(),
+            ),
+            Removal::AnthropicSignOut => (
+                "  Sign out of the Claude subscription?".to_owned(),
+                "  Dial stops using the subscription login; a saved API key is kept.".to_owned(),
+            ),
+        };
+        vec![
+            Line::default(),
+            Line::from(fit(vec![Span::styled(main, theme.fg(Tok::Warning))], w)),
+            Line::from(fit(vec![Span::styled(note, theme.fg(Tok::Muted))], w)),
+        ]
     }
 
     fn wizard_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
@@ -1029,7 +1130,7 @@ impl ProviderOverlay {
                     Mode::List => "Providers Dial can use. Enter opens the actions for the highlighted one.",
                     Mode::Menu(_) => "Actions",
                     Mode::Key { .. } => "API key",
-                    Mode::Confirm(_) => "Remove provider",
+                    Mode::Confirm(_, removal) => removal.title(),
                     Mode::Wizard(_) => "Add provider",
                     Mode::Headers { .. } => "HTTP header rows",
                 }),
@@ -1044,28 +1145,7 @@ impl ProviderOverlay {
                 secret,
                 error,
             } => self.key_body(theme, entry, secret, error.as_deref(), w),
-            Mode::Confirm(entry) => vec![
-                Line::default(),
-                Line::from(fit(
-                    vec![Span::styled(
-                        format!(
-                            "  Remove provider {} ({}) from the {} config?",
-                            text::one_line(&entry.label),
-                            text::one_line(&entry.id),
-                            scope_name(self.scope)
-                        ),
-                        theme.fg(Tok::Warning),
-                    )],
-                    w,
-                )),
-                Line::from(fit(
-                    vec![Span::styled(
-                        "  Its saved API key, if any, is kept until you remove it.".to_owned(),
-                        theme.fg(Tok::Muted),
-                    )],
-                    w,
-                )),
-            ],
+            Mode::Confirm(entry, removal) => self.confirm_body(theme, entry, *removal, w),
             Mode::Wizard(wizard) => self.wizard_body(theme, wizard, w),
             Mode::Headers { editor, .. } => editor.lines(theme, w, body_rows),
         };
@@ -1074,17 +1154,22 @@ impl ProviderOverlay {
         }
         if show_message {
             out.push(match &self.message {
-                Some((message, ok)) => Line::from(fit(
-                    vec![Span::styled(
-                        format!(
-                            " {} {}",
-                            theme.sym(if *ok { Sym::Check } else { Sym::Cross2 }),
-                            text::one_line(message)
-                        ),
-                        theme.fg(if *ok { Tok::Success } else { Tok::Error }),
-                    )],
-                    w,
-                )),
+                Some((message, ok)) => {
+                    let (glyph, tone) = if self.saving {
+                        (Sym::Working, Tok::Muted)
+                    } else if *ok {
+                        (Sym::Check, Tok::Success)
+                    } else {
+                        (Sym::Cross2, Tok::Error)
+                    };
+                    Line::from(fit(
+                        vec![Span::styled(
+                            format!(" {} {}", theme.sym(glyph), text::one_line(message)),
+                            theme.fg(tone),
+                        )],
+                        w,
+                    ))
+                }
                 None => Line::default(),
             });
         }
@@ -1154,8 +1239,8 @@ impl ProviderOverlay {
                 theme.fg(Tok::Accent).patch(fill),
             )];
             if let Some(entry) = entries.get(index) {
-                // A local server you never set up that is not running is not an error.
-                let chip = if entry.state == "unavailable" && entry.spec.is_none() {
+                // An unavailable row whose absence is expected is muted, not an error.
+                let chip = if expected_absent(entry) {
                     chrome::status_chip(theme, Status::Missing, "not running")
                 } else {
                     self.chip(theme, &entry.state)
@@ -1531,7 +1616,15 @@ impl ProviderOverlay {
                 ("F10".to_owned(), "save".to_owned()),
                 ("Esc".to_owned(), "cancel".to_owned()),
             ],
-            Mode::Confirm(_) => vec![
+            Mode::Confirm(_, removal) => vec![
+                hint(
+                    Action::SelectConfirm,
+                    if matches!(removal, Removal::AnthropicSignOut) {
+                        "sign out"
+                    } else {
+                        "remove"
+                    },
+                ),
                 hint(Action::SelectConfirm, "remove"),
                 hint(Action::SelectCancel, "cancel"),
             ],
@@ -1579,6 +1672,32 @@ pub(super) fn key_footer(theme: &Theme, hints: &[(String, String)], width: usize
 mod tests {
     use super::super::settings::testkit::*;
     use super::*;
+
+    #[test]
+    fn a_local_server_that_is_not_running_is_expected_but_real_failures_stay_red() {
+        let entry = |base: &str, state: &str, detail: &str, configured: bool| Entry {
+            id: "ollama".into(),
+            label: "Ollama".into(),
+            base_url: Some(base.into()),
+            state: state.into(),
+            detail: detail.into(),
+            models: 0,
+            spec: configured.then(ProviderSpec::default),
+        };
+        for base in ["http://127.0.0.1:11434", "http://localhost:1234/v1", "http://[::1]:8080"] {
+            assert!(expected_absent(&entry(base, "unavailable", UNREACHABLE_DETAIL, true)), "{base}");
+        }
+        // Not configured by the user: discovery found nothing, which is expected.
+        assert!(expected_absent(&entry("http://127.0.0.1:11434", "unavailable", UNREACHABLE_DETAIL, false)));
+        // A configured remote endpoint that refused is a real failure.
+        assert!(!expected_absent(&entry("https://llm.example.com/v1", "unavailable", UNREACHABLE_DETAIL, true)));
+        // A local server that answered with an error, or sent a bad reply, is a real failure.
+        for detail in ["Endpoint returned HTTP 500; redirects are not followed", "Endpoint returned malformed model metadata"] {
+            assert!(!expected_absent(&entry("http://127.0.0.1:11434", "unavailable", detail, true)), "{detail}");
+        }
+        // Credential failures are never neutral.
+        assert!(!expected_absent(&entry("http://127.0.0.1:11434", "auth-required", "Endpoint requires valid credentials", true)));
+    }
 
     /// Put the cursor on the provider `id`; rows are ordered by readiness, not by fixture order.
     fn select(o: &mut ProviderOverlay, id: &str) {
@@ -1912,7 +2031,7 @@ mod tests {
         }
         assert!(matches!(o.mode, Mode::List));
         let after = draw(&mut o, &rig, 100, 24);
-        assert!(!after.contains("SECRET") && after.contains("sent for verification"));
+        assert!(!after.contains("SECRET") && after.contains("Verifying"));
     }
     #[test]
     fn openrouter_login_is_offered_only_for_its_canonical_endpoint() {
@@ -2085,9 +2204,14 @@ mod tests {
             OverlayEvent::Action(a) => assert!(a.starts_with("test:"), "{a}"),
             other => panic!("{other:?}"),
         }
-        // Remove key.
+        // Remove key asks first, naming the key; Enter confirms.
         send(&mut o, &rig, key(KeyCode::Enter));
         pick(&mut o, "Remove API key");
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Enter)),
+            OverlayEvent::None
+        ));
+        assert!(draw(&mut o, &rig, 110, 24).contains("Remove the saved API key for"));
         match send(&mut o, &rig, key(KeyCode::Enter)) {
             OverlayEvent::RemoveCredential { base_url } => {
                 assert_eq!(base_url, "http://127.0.0.1:1234/v1")
@@ -2159,6 +2283,28 @@ mod tests {
         send(&mut o, &rig, ch('x'));
         assert!(matches!(o.mode, Mode::List));
         assert!(draw(&mut o, &rig, 120, 24).contains("built in and is not in your config"));
+    }
+
+    #[test]
+    fn saving_a_key_reads_as_in_progress_until_the_controller_replies() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        select(&mut o, "lm-studio");
+        send(&mut o, &rig, key(KeyCode::Enter));
+        pick(&mut o, "Replace API key");
+        send(&mut o, &rig, key(KeyCode::Enter));
+        for c in "sk-x".chars() {
+            send(&mut o, &rig, ch(c));
+        }
+        assert!(matches!(
+            send(&mut o, &rig, key(KeyCode::Enter)),
+            OverlayEvent::SaveCredential { .. }
+        ));
+        assert!(o.saving);
+        assert!(draw(&mut o, &rig, 100, 24).contains("Saving LM Studio key"));
+        o.set_status("API key saved (owner-only file)".into(), false);
+        assert!(!o.saving);
+        assert!(draw(&mut o, &rig, 100, 24).contains("API key saved"));
     }
 
     #[test]

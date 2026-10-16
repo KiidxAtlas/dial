@@ -6,8 +6,8 @@
 use super::{
     DrawCtx, OverlayEvent,
     settings::{
-        editor_spans, filled, fit, hint, hint_line, other_scope, pair_label, panel, pressed,
-        scope_name,
+        Axis, arrows, editor_spans, filled, fit, hint, hint_line, other_scope, pair_label, panel,
+        pressed, scope_name,
     },
 };
 use crate::{
@@ -880,9 +880,19 @@ impl ModelSettingsOverlay {
                 vec![chrome::label(theme, &format!(" {}", field.label))],
                 w,
             ))];
-            for row in text::wrap_words(field.help, w.saturating_sub(2).max(8)) {
+            // The title and the range (or the unsupported reason) always keep their rows; help gets the rest.
+            let help = text::wrap_words(field.help, w.saturating_sub(2).max(8));
+            let help_rows = detail_h.saturating_sub(2);
+            for (index, row) in help.iter().take(help_rows).enumerate() {
+                let mut shown = format!(" {row}");
+                if index + 1 == help_rows && help.len() > help_rows {
+                    shown.push_str(&format!(" {}", theme.sym(Sym::Ellipsis)));
+                }
                 lines.push(Line::from(fit(
-                    vec![Span::styled(format!(" {row}"), theme.fg(Tok::Muted))],
+                    vec![Span::styled(
+                        text::ellipsize(&shown, w, theme.ascii()),
+                        theme.fg(Tok::Muted),
+                    )],
                     w,
                 )));
             }
@@ -953,7 +963,7 @@ impl ModelSettingsOverlay {
                     "{} move",
                     pair_label(keys, Action::SelectUp, Action::SelectDown)
                 ),
-                "←/→ change".to_owned(),
+                format!("{} change", arrows(theme, Axis::Horizontal)),
                 hint(keys, Action::SelectConfirm, "edit"),
                 "r reset".to_owned(),
                 format!("s save to {}", scope_name(other_scope(self.scope))),
@@ -1201,6 +1211,32 @@ mod tests {
             let buffer = render(width, height, |frame| overlay.draw(frame, &ctx));
             assert_eq!(buffer.area.width, width);
         }
+    }
+
+    #[test]
+    fn detail_box_keeps_the_range_line_when_help_wraps() {
+        let rig = Rig::new();
+        let ctx = DrawCtx {
+            theme: &rig.theme,
+            keys: &rig.keys,
+            status: &rig.status,
+            preview_status: &status_preview,
+        };
+        let mut overlay = ModelSettingsOverlay::new("local".into(), mlx());
+        go(&mut overlay, &rig, "context_window");
+        for (width, height) in [(100, 32), (60, 32)] {
+            let text = screen(&render(width, height, |frame| overlay.draw(frame, &ctx)));
+            assert!(text.contains("Accepts 2048 to"), "{width}x{height}: {text}");
+        }
+        let ascii = crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+        let ascii_ctx = DrawCtx {
+            theme: &ascii,
+            keys: &rig.keys,
+            status: &rig.status,
+            preview_status: &status_preview,
+        };
+        let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ascii_ctx)));
+        assert!(text.contains("<-/->") && !text.contains('←'), "{text}");
     }
 
     #[test]

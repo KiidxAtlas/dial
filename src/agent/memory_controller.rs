@@ -2,7 +2,7 @@
 use super::{Agent, Ui, approval, compaction, compaction_runtime, make_backend, memory_authority};
 use crate::{
     llm::{
-        Chat, ToolCall,
+        self, Chat, ToolCall,
         usage::{ExternalUsageReceipt, Scope},
     },
     storage::memory_backend::{
@@ -699,7 +699,10 @@ impl Agent<'_> {
         let authority = memory_authority(&self.session, 0);
         memory.bind(authority.clone());
         let mut receipts = Receipts::default();
-        let scope = self.usage_scope.worker();
+        let scope = self
+            .usage_scope
+            .worker()
+            .for_purpose(llm::usage::Purpose::Memory);
         let mutating = matches!(
             input.split_whitespace().next(),
             Some("clear" | "save" | "enqueue")
@@ -765,7 +768,10 @@ impl Agent<'_> {
         let authority = memory_authority(&self.session, 0);
         memory.bind(authority.clone());
         let mut receipts = Receipts::default();
-        let scope = self.usage_scope.worker();
+        let scope = self
+            .usage_scope
+            .worker()
+            .for_purpose(llm::usage::Purpose::Memory);
         memory.execute_tool(
             &authority,
             &call.name,
@@ -814,7 +820,10 @@ impl Agent<'_> {
             malformed_arguments: false,
         };
         let mut receipts = Receipts::default();
-        let scope = self.usage_scope.worker();
+        let scope = self
+            .usage_scope
+            .worker()
+            .for_purpose(llm::usage::Purpose::Memory);
         let result = memory.compaction_context(
             &authority,
             &messages,
@@ -849,7 +858,10 @@ impl Agent<'_> {
         memory.bind(authority.clone());
         memory.observe_owned(&authority, self.session.archived_user_assistant_messages())?;
         let mut receipts = Receipts::default();
-        let scope = self.usage_scope.worker();
+        let scope = self
+            .usage_scope
+            .worker()
+            .for_purpose(llm::usage::Purpose::Memory);
         let origin = ToolCall {
             id: String::new(),
             name: "recall".into(),
@@ -970,7 +982,10 @@ impl Agent<'_> {
         {
             let authority = memory_authority(&self.session, 0);
             memory.bind(authority.clone());
-            let scope = self.usage_scope.worker();
+            let scope = self
+                .usage_scope
+                .worker()
+                .for_purpose(llm::usage::Purpose::Memory);
             let body = self.session.runtime().start(
                 "memory-maintenance",
                 "Selected memory maintenance",

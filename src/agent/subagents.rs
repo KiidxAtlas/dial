@@ -78,7 +78,7 @@ pub const AGENTS: &[AgentSpec] = &[
     AgentSpec {
         name: "reviewer",
         description: "read-only code review of a change or area, with findings ranked by severity",
-        prompt: "Review the captured change you are asked about. Report only concrete introduced defects, never invent issues or verification. Return the caller's structured schema with numeric priority (0 critical, 1 high, 2 normal, 3 low), confidence between 0 and 1, target-relative paths and inclusive line ranges, and an explicit findings/no_findings/inconclusive verdict. Read-only contextual inspection is permitted; no checks, commands, modifications, commits or pushes.",
+        prompt: "Review the requested change or code area. For change reviews, report concrete defects introduced by the supplied change; for area audits, report concrete existing defects within the requested scope. Do not invent a diff, issues or verification. Cite target-relative paths and inclusive line ranges, explain the trigger and consequence, rank findings by severity, and state findings, no findings, or inconclusive with any evidence gaps. If the caller supplies an output schema, follow that schema exactly; otherwise return a concise prose review. Read-only contextual inspection is permitted; no checks, commands, modifications, commits or pushes.",
         tools: &["read", "glob", "grep", "skill"],
         spawns: &[],
         max_steps: 0,
@@ -269,7 +269,7 @@ pub fn schema(config: &Config) -> Value {
         format!("{presets}\nCustom agents:{custom}")
     };
     let description = format!(
-        "Delegate self-contained slices to subagents. Batch independent slices in one call: `context` is shared; each item gives `task`, `solution_space`, and optionally `skills` and `agent`. Agent types:{types}{presets}"
+        "Delegate self-contained slices to subagents. Batch independent slices in one call: `context` is shared; each item gives `task`, `solution_space`, and optionally `skills` and `agent`. Default model-role preference chains (first configured role, otherwise the conversation model): worker task → coach → small; scout small → task; reviewer and test-runner tester → coach → task → small; planner planner → coach → task → small. Custom agents inherit their base role unless explicitly overridden. Agent types:{types}{presets}"
     );
     let mut entry_properties = json!({
         "agent":{"type":"string","description":"Agent type or preset (default scout)."},
@@ -436,6 +436,15 @@ impl Handoff {
             todos,
             working_state: (!state.is_null())
                 .then(|| prompt::truncate_chars(&state.to_string(), MAX_HANDOFF_STATE)),
+        }
+    }
+
+    /// Fresh runs receive current parent background; resumed conversations keep their saved brief.
+    pub(super) fn apply(&self, jobs: &mut [Job<'_>]) {
+        for job in jobs {
+            if job.resume_tools.is_none() && job.resume_messages.is_empty() {
+                job.handoff = self.clone();
+            }
         }
     }
 }
@@ -1635,9 +1644,7 @@ pub(super) fn run(parent: Parent<'_>, args: &Value, ui: &mut dyn Ui) -> ToolOutp
             };
         }
     };
-    for job in &mut request.jobs {
-        job.handoff = handoff.clone();
-    }
+    handoff.apply(&mut request.jobs);
     if let Err(why) = preload_skills(&mut request.jobs, env.layout) {
         return ToolOutput {
             execution: Default::default(),
@@ -1761,7 +1768,7 @@ pub(super) fn run(parent: Parent<'_>, args: &Value, ui: &mut dyn Ui) -> ToolOutp
             )
         })
         .collect();
-    render(&request, outcomes, &models)
+    render(&request, outcomes, &models, env.workspace.artifacts())
 }
 
 pub(super) fn nested_schema(config: &Config) -> Value {
@@ -1863,7 +1870,7 @@ pub(super) fn nested(
             &mut descendant,
         )));
     }
-    render(&request, outcomes, &models)
+    render(&request, outcomes, &models, env.workspace.artifacts())
 }
 
 /// Loads each job's autoloaded skills through the same `skill` body loader the model uses, so a
@@ -2720,15 +2727,16 @@ fn render(
     request: &Request,
     outcomes: Vec<Option<Outcome>>,
     models: &std::collections::BTreeMap<usize, String>,
+    artifacts: Option<&crate::tools::artifact::ArtifactStore>,
 ) -> ToolOutput {
     let outcomes: Vec<Outcome> = outcomes
         .into_iter()
         .map(|o| o.unwrap_or_else(|| Outcome::failed(0, "subagent produced no result")))
         .collect();
-    let data = json!({"jobs": request.jobs.iter().zip(&outcomes).map(|(job,outcome)| {
+    let mut data = json!({"jobs": request.jobs.iter().zip(&outcomes).map(|(job,outcome)| {
         let status = outcome.status.wire();
         let text = outcome.status.text.as_str();
-        let mut result = json!({"name":job.label,"agent":job.kind,"status":status,"steps":outcome.steps,"result":outcome.data.clone().unwrap_or_else(|| json!(clip(text, job.limit)))});
+        let mut result = json!({"name":job.label,"agent":job.kind,"status":status,"steps":outcome.steps,"result":outcome.data.clone().unwrap_or_else(|| json!(text))});
         result["role"] = json!(job.role);
         result["model"] = json!(models.get(&job.index));
         if let Some(route) = &outcome.model_route {
@@ -2740,6 +2748,41 @@ fn render(
         }
         result
     }).collect::<Vec<_>>()});
+    // Retain the complete typed report before any presentation clipping, as live tasks do.
+    // Without storage (or on failure), keep the full typed outcome rather than lose evidence.
+    let artifact = artifacts.map(|store| -> anyhow::Result<String> {
+        use std::io::Write;
+        let mut spool = store.spool()?;
+        serde_json::to_writer_pretty(&mut spool, &data)?;
+        spool.flush()?;
+        anyhow::ensure!(
+            spool.elided_bytes() == 0,
+            "complete task report exceeds artifact retention limit"
+        );
+        spool.finish()
+    });
+    match &artifact {
+        Some(Ok(uri)) => {
+            data["artifact"] = json!(uri);
+            for ((job, outcome), result) in request
+                .jobs
+                .iter()
+                .zip(&outcomes)
+                .zip(data["jobs"].as_array_mut().expect("job results"))
+            {
+                if job.schema.is_none()
+                    && outcome.data.is_none()
+                    && outcome.status.text.len() > job.limit
+                {
+                    result["result"] = json!(clip(&outcome.status.text, job.limit));
+                    result["preview"] = json!(true);
+                    result["artifact"] = json!(uri);
+                }
+            }
+        }
+        Some(Err(error)) => data["artifact_error"] = json!(format!("{error:#}")),
+        None => {}
+    }
     let answer = |job: &Job, outcome: &Outcome| {
         let text = &outcome.status.text;
         let mut answer = if outcome.status.phase == crate::runtime::Phase::Completed {
@@ -2749,11 +2792,28 @@ fn render(
             if text.trim().is_empty() {
                 Err("subagent incomplete: no report returned".into())
             } else {
-                Ok(clip(text, job.limit))
+                Ok(text.clone())
             }
         } else {
             Err(format!("subagent {}: {text}", outcome.status.phase.label()))
         };
+        if text.len() > job.limit {
+            let body = match &mut answer {
+                Ok(body) | Err(body) => body,
+            };
+            match &artifact {
+                Some(Ok(uri)) => {
+                    *body = clip(body, job.limit);
+                    body.push_str(&format!(
+                        "\n\n[Preview only; complete task report: {uri}. Read with artifact_read.]"
+                    ));
+                }
+                Some(Err(error)) => body.push_str(&format!(
+                    "\n\n[Artifact retention failed: {error:#}. Report above is unabridged.]"
+                )),
+                None => {}
+            }
+        }
         if let Some(isolation) = &outcome.isolation {
             let text = match &mut answer {
                 Ok(text) | Err(text) => text,
@@ -2822,6 +2882,194 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_run_and_start_handoffs_match_without_replacing_explicit_context() {
+        let config = config(&[]);
+        let args = json!({"task":"inspect parser","solution_space":"area audit","context":"explicit background"});
+        let control =
+            json!({"original_goal":"repair parser", "working_state":{"claim":"unverified"}});
+        let todos: Vec<super::super::todo::Task> = serde_json::from_value(json!([
+            {"content":"closed", "status":"completed"},
+            {"content":"next", "status":"pending"},
+            {"content":"active", "status":"in_progress"}
+        ]))
+        .unwrap();
+        let handoff = Handoff::capture(&control, &todos);
+        let mut run = parse(&args, &config).unwrap();
+        let mut start_args = args.clone();
+        start_args["action"] = json!("start");
+        let mut start = parse(&start_args, &config).unwrap();
+        handoff.apply(&mut run.jobs);
+        handoff.apply(&mut start.jobs);
+        let brief = start.jobs[0].brief();
+        assert_eq!(run.jobs[0].brief(), brief);
+        assert!(brief.contains("repair parser"));
+        assert!(brief.contains("recorded claims, not verified"));
+        assert!(brief.contains("explicit background"));
+        assert!(brief.contains("inspect parser"));
+        assert!(!brief.contains("closed"));
+        assert!(brief.find("active").unwrap() < brief.find("next").unwrap());
+
+        let long = Handoff::capture(
+            &json!({"original_goal":"x".repeat(100_000), "working_state":"y".repeat(100_000)}),
+            &todos,
+        );
+        assert!(long.goal.unwrap().len() < 5000);
+        assert!(long.working_state.unwrap().len() < 3000);
+    }
+
+    #[test]
+    fn resumed_jobs_keep_saved_background_and_conversation() {
+        let config = config(&[]);
+        let mut request = parse(
+            &json!({"task":"follow up", "solution_space":"s", "context":"saved context"}),
+            &config,
+        )
+        .unwrap();
+        let saved = json!({"role":"user", "content":"saved brief"});
+        request.jobs[0].resume_messages = vec![saved.clone()];
+        request.jobs[0].resume_tools = Some(vec!["read".into()]);
+        Handoff::capture(&json!({"original_goal":"new parent goal"}), &[]).apply(&mut request.jobs);
+        assert_eq!(request.jobs[0].resume_messages, [saved]);
+        assert_eq!(request.jobs[0].resume_tools, Some(vec!["read".into()]));
+        assert!(request.jobs[0].handoff.goal.is_none());
+        assert!(request.jobs[0].brief().contains("saved context"));
+        assert!(!request.jobs[0].brief().contains("new parent goal"));
+    }
+
+    #[test]
+    fn reviewer_preserves_read_only_permissions_and_optional_schema() {
+        let config = config(&[]);
+        let mut args =
+            json!({"agent":"reviewer", "task":"audit parser", "solution_space":"area audit"});
+        let request = parse(&args, &config).unwrap();
+        let job = &request.jobs[0];
+        assert!(job.schema.is_none());
+        assert!(!job.spec.mutates);
+        assert_eq!(job.spec.tools, ["read", "glob", "grep", "skill"]);
+        args["output_schema"] = json!({"type":"object", "required":["verdict"], "properties":{"verdict":{"type":"string"}}});
+        let request = parse(&args, &config).unwrap();
+        assert_eq!(
+            request.jobs[0].schema.as_ref(),
+            Some(&args["output_schema"])
+        );
+    }
+
+    #[test]
+    fn synchronous_previews_retain_complete_single_and_batch_reports() {
+        use base64::Engine;
+        let config = config(&[]);
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::tools::artifact::ArtifactStore::new(root.path()).unwrap();
+        let report = format!("{}FINAL-EVIDENCE", "évidence ".repeat(4000));
+        for batch in [false, true] {
+            let args = if batch {
+                json!({"tasks":[{"task":"audit", "solution_space":"s"}, {"task":"second", "solution_space":"s"}]})
+            } else {
+                json!({"task":"audit", "solution_space":"s"})
+            };
+            let request = parse(&args, &config).unwrap();
+            let outcomes = request
+                .jobs
+                .iter()
+                .map(|_| {
+                    let mut outcome = Outcome::failed(2, "");
+                    outcome.status = Status::done(report.clone());
+                    Some(outcome)
+                })
+                .collect();
+            let output = render(&request, outcomes, &BTreeMap::new(), Some(&store));
+            assert!(!output.is_error);
+            assert!(
+                output
+                    .text
+                    .contains("Preview only; complete task report: artifact://")
+            );
+            assert!(!output.text.contains("FINAL-EVIDENCE"));
+            let data = output.data.unwrap();
+            assert_eq!(data["jobs"][0]["preview"], true);
+            let uri = data["artifact"].as_str().unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let chunk: Value = serde_json::from_str(
+                    &store
+                        .retrieve_bytes(uri, bytes.len() as u64, 16384)
+                        .unwrap(),
+                )
+                .unwrap();
+                bytes.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(chunk["data"].as_str().unwrap())
+                        .unwrap(),
+                );
+                if chunk["next_offset"] == chunk["total_bytes"] {
+                    break;
+                }
+            }
+            let retained: Value = serde_json::from_slice(&bytes).unwrap();
+            for job in retained["jobs"].as_array().unwrap() {
+                assert_eq!(job["result"], report);
+                assert!(job.get("preview").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn synchronous_retention_failure_and_absence_preserve_full_typed_report() {
+        let config = config(&[]);
+        let request = parse(&json!({"task":"audit", "solution_space":"s"}), &config).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::tools::artifact::ArtifactStore::new(root.path())
+            .unwrap()
+            .with_limits(&crate::tools::artifact::ArtifactConfig {
+                max_bytes: 128,
+                head_bytes: 64,
+            });
+        let report = "é".repeat(20_000);
+        for artifacts in [None, Some(&store)] {
+            let output = render(
+                &request,
+                vec![Some(Outcome::failed(2, report.clone()))],
+                &BTreeMap::new(),
+                artifacts,
+            );
+            assert!(output.is_error);
+            assert!(output.text.contains(&report));
+            let data = output.data.unwrap();
+            assert_eq!(data["jobs"][0]["result"], report);
+            assert!(data.get("artifact").is_none());
+            assert!(data["jobs"][0].get("preview").is_none());
+            if artifacts.is_some() {
+                assert!(
+                    data["artifact_error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("retention limit")
+                );
+                assert!(output.text.contains("Artifact retention failed"));
+            }
+        }
+    }
+
+    #[test]
+    fn synchronous_structured_results_remain_intact() {
+        let config = config(&[]);
+        let request = parse(
+            &json!({"task":"audit", "solution_space":"s", "output_schema":{"type":"object"}}),
+            &config,
+        )
+        .unwrap();
+        let value = json!({"evidence":"x".repeat(30_000)});
+        let text = value.to_string();
+        let mut outcome = Outcome::failed(2, "");
+        outcome.status = Status::done(text.clone());
+        outcome.data = Some(value.clone());
+        let output = render(&request, vec![Some(outcome)], &BTreeMap::new(), None);
+        assert!(!output.is_error);
+        assert_eq!(output.text, text);
+        assert_eq!(output.data.unwrap()["jobs"][0]["result"], value);
+    }
 
     fn config(presets: &[(&str, &str)]) -> Config {
         Config {

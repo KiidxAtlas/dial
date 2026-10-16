@@ -212,7 +212,15 @@ impl<'a> Agent<'a> {
             options,
             cancel,
             ui,
-            &mut |backend, request, ui| self.role_chat(backend, "small", request, ui),
+            &mut |backend, request, ui| {
+                self.role_chat(
+                    backend,
+                    "small",
+                    llm::usage::Purpose::Compaction,
+                    request,
+                    ui,
+                )
+            },
             None,
         );
         self.active_side_namespace = previous_namespace;

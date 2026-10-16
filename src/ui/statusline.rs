@@ -109,6 +109,74 @@ pub fn preview_row(cfg: &UiConfig, data: &StatusData, theme: &Theme, width: u16)
     )
 }
 
+/// Live activity gets its own row in the composer, so metadata cannot crowd it out.
+/// Custom layouts opt in with `spinner`; built-in layouts always expose active work.
+pub fn activity_row(
+    cfg: &UiConfig,
+    data: &StatusData,
+    theme: &Theme,
+    width: u16,
+) -> Option<Line<'static>> {
+    if !data.busy() || width < 8 {
+        return None;
+    }
+    if cfg.status == StatusPreset::Custom {
+        let (left, right) = segments(cfg);
+        if !left
+            .iter()
+            .chain(&right)
+            .any(|n| canonical(n).is_some_and(|(n, _)| n == "spinner"))
+        {
+            return None;
+        }
+    }
+    let w = usize::from(width);
+    let waiting = data.stopping() || data.phase == super::status::Phase::WaitingCompute;
+    let stale = data.model_progress.is_some() && data.model_silence_secs >= 15;
+    let tone = if waiting || stale {
+        Tok::Warning
+    } else {
+        Tok::Text
+    };
+    let marker = if waiting || stale {
+        "!"
+    } else {
+        theme.spinner(data.tick)
+    };
+    let prefix = text::clip(&format!(" {marker} "), w);
+    let mut spans = vec![Span::styled(prefix.clone(), theme.fg(tone))];
+    let clock = if w >= 40 && data.elapsed_secs.is_finite() && data.elapsed_secs >= 0.0 {
+        format!("  turn {} ", elapsed(data.elapsed_secs))
+    } else {
+        String::new()
+    };
+    // The silence warning is more useful than an animated track during a stalled request.
+    let track = w >= 72 && !waiting && !stale;
+    let reserved = text::width(&prefix) + text::width(&clock) + if track { 10 } else { 0 };
+    let label = text::ellipsize(
+        &data.activity_label(),
+        w.saturating_sub(reserved),
+        theme.ascii(),
+    );
+    spans.push(Span::styled(
+        label.clone(),
+        theme.fg(tone).add_modifier(ratatui::style::Modifier::BOLD),
+    ));
+    spans.push(Span::raw(
+        " ".repeat(w.saturating_sub(reserved + text::width(&label))),
+    ));
+    if track {
+        spans.push(Span::raw("  "));
+        spans.extend(super::fx::activity_track(
+            theme,
+            data.tick,
+            data.prompt_fraction(),
+        ));
+    }
+    spans.push(Span::styled(clock, theme.fg(Tok::Muted)));
+    Some(Line::from(spans))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Segments
 // ---------------------------------------------------------------------------------------------
@@ -274,9 +342,7 @@ impl Env<'_> {
                     return None;
                 }
                 let frame = self.theme.spinner(data.tick);
-                let activity = data
-                    .model_activity()
-                    .unwrap_or_else(|| text::one_line(&data.activity));
+                let activity = data.activity_label();
                 // The spinner glyph breathes through the brand colors; the activity label
                 // carries a slow shimmer so a long wait still reads as live.
                 let mut glyph = self.part(format!("{frame} "), Tok::Success);
@@ -1005,6 +1071,49 @@ mod tests {
     ];
 
     #[test]
+    fn activity_row_fits_all_widths_and_preserves_silence_and_custom_preferences() {
+        let mut status = StatusData {
+            phase: Phase::Working,
+            activity: "running 日本語 tool".into(),
+            elapsed_secs: 65.0,
+            ..data()
+        };
+        for theme in [
+            Theme::dark(),
+            Theme::light(),
+            Theme::mono(),
+            Theme::dark().with_glyphs(Glyphs::Ascii),
+        ] {
+            for preset in ALL_PRESETS {
+                let cfg = cfg_with(preset);
+                for width in 8..160 {
+                    if let Some(row) = activity_row(&cfg, &status, &theme, width) {
+                        assert_eq!(row.width(), usize::from(width));
+                    }
+                }
+            }
+        }
+        status.model_progress = Some(crate::llm::ModelProgress::new(
+            crate::llm::InferencePhase::Processing,
+        ));
+        status.model_silence_secs = 27;
+        let row = activity_row(&UiConfig::default(), &status, &Theme::dark(), 40).unwrap();
+        assert!(plain(&row).contains("no progress for 27s"));
+        status.activity = "stopping".into();
+        let row = activity_row(&UiConfig::default(), &status, &Theme::dark(), 40).unwrap();
+        assert!(plain(&row).contains("stopping"));
+        assert!(!plain(&row).contains("processing"));
+        let custom = UiConfig {
+            status_left: vec!["model".into()],
+            status_right: vec![],
+            ..cfg_with(StatusPreset::Custom)
+        };
+        assert!(activity_row(&custom, &status, &Theme::dark(), 80).is_none());
+        status.phase = Phase::Idle;
+        assert!(activity_row(&UiConfig::default(), &status, &Theme::dark(), 80).is_none());
+    }
+
+    #[test]
     fn local_progress_shows_stages_live_tokens_and_rates_in_the_default_composer() {
         use crate::llm::{InferencePhase, ModelProgress};
         let mut progress = ModelProgress::new(InferencePhase::Loading);
@@ -1638,8 +1747,10 @@ mod tests {
         };
         let (a, b) = (at(0, Phase::Working), at(1, Phase::Working));
         assert!(
-            a.contains(&format!("{} 12s", theme.spinner(0)))
-                && b.contains(&format!("{} 12s", theme.spinner(1))),
+            a.contains(theme.spinner(0))
+                && b.contains(theme.spinner(1))
+                && a.contains("12s")
+                && b.contains("12s"),
             "{a:?} {b:?}"
         );
         assert_ne!(a, b);

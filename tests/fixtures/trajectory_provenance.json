@@ -1,0 +1,21 @@
+[
+  {"source":"dial:verified:7:verifier:test","group":"trajectory:7"},
+  {"source":"dial:tool-recovery:7","group":"trajectory:7"},
+  {"source":"dial:learned:aaaa:7:tool-recovery","group":"trajectory:aaaa:7"},
+  {"source":"dial:learned:aaaa:7:verifier:test","group":"trajectory:aaaa:7"},
+  {"source":"dial:learned:bbbb:7:verifier:test","group":"trajectory:bbbb:7"},
+  {"source":"dial:learned:teacher-abcd:007:verifier:test","group":"trajectory:teacher-abcd:7"},
+  {"source":"dial:verified:0","group":"trajectory:0"},
+  {"source":"dial:verified:9223372036854775807","group":"trajectory:9223372036854775807"},
+  {"source":"dial:verified:9223372036854775808","group":null},
+  {"source":"dial:verified:-7","group":null},
+  {"source":"dial:verified:+7","group":null},
+  {"source":"dial:verified:７","group":null},
+  {"source":"dial:verified:","group":null},
+  {"source":"dial:learned::7:verifier:test","group":null},
+  {"source":"dial:learned:aaaa:not-a-number","group":null},
+  {"source":"dial:verified:007:verifier:line\nbreak","group":"trajectory:7"},
+  {"source":"dial:learned:aaaa:7:verifier:line\nbreak","group":"trajectory:aaaa:7"},
+  {"source":"dial:tool-recovery:7:","group":"trajectory:7"},
+  {"source":"external arithmetic reference","group":null}
+]

@@ -329,14 +329,14 @@ fn excluded_entries(root: &Path, max_entries: usize) -> Result<Vec<PathBuf>, Sca
                 return Err(ScanError::TooMany(max_entries));
             }
             let path = entry.path();
-            if crate::benchmark::is_secret_source_path(root, &path) {
+            if crate::workspace_copy::is_secret_source_path(root, &path) {
                 let relative = path.strip_prefix(root).map_err(|_| {
                     ScanError::Failed("project entry outside the project root".to_owned())
                 })?;
                 found.push(relative.to_path_buf());
                 continue;
             }
-            if crate::benchmark::is_dependency_source_path(root, &path) {
+            if crate::workspace_copy::is_dependency_source_path(root, &path) {
                 continue;
             }
             let file_type = entry.file_type().map_err(|error| {
@@ -460,7 +460,7 @@ pub(super) fn changed_snapshot(
                 limits.isolation_source_files
             );
             let path = entry.path();
-            if crate::benchmark::is_excluded_source_path(upper, &path) {
+            if crate::workspace_copy::is_excluded_source_path(upper, &path) {
                 continue;
             }
             let relative = path
@@ -480,7 +480,8 @@ pub(super) fn changed_snapshot(
                 if let Some(hidden) = fuse_whiteout_target(&name) {
                     let hidden = relative.with_file_name(hidden);
                     // Masks hide excluded entries before the mount; they never delete anything.
-                    if !crate::benchmark::is_excluded_source_path(upper, &upper.join(&hidden)) {
+                    if !crate::workspace_copy::is_excluded_source_path(upper, &upper.join(&hidden))
+                    {
                         remove_subtree(&mut after, &hidden);
                     }
                 } else if name.as_os_str() != FUSE_OPAQUE_MARKER {

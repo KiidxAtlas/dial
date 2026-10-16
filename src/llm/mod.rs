@@ -27,6 +27,7 @@ mod copilot;
 mod coreweave;
 mod cursor;
 mod devin;
+pub mod download;
 pub mod errors;
 mod factory_droid;
 pub mod fallback;

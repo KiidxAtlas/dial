@@ -87,6 +87,17 @@ pub fn run_command(
     run_command_controlled(program, args, input, timeout_secs, None, None)
 }
 
+/// [`run_command`] that also stops early when `cancel` is set (the process group is killed).
+pub fn run_command_cancellable(
+    program: &Path,
+    args: &[String],
+    input: &str,
+    timeout_secs: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<String> {
+    run_command_controlled(program, args, input, timeout_secs, Some(cancel), None)
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("configured tool process ended after execution started; effects require inspection")]
 pub struct ToolEffectsUnknown;

@@ -26,6 +26,8 @@
 mod client;
 mod http;
 mod inventory;
+pub mod catalog;
+pub mod registry;
 pub mod smithery;
 pub use http::validate_url;
 mod names;

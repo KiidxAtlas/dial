@@ -1,4 +1,4 @@
-//! `/extensions`: one browser for MCP servers and plugins.
+//! `/extensions`: one browser for MCP servers, plugins, skills and marketplaces.
 //!
 //! The overlay only shows rows and emits [`Intent`]s as `extensions:<json>` actions. Detection,
 //! installs and config writes happen in `commands::extensions_browser`.
@@ -89,20 +89,16 @@ impl ExtensionsOverlay {
         let Some(shared) = &self.progress else {
             return;
         };
-        let (snapshot, form, rows, catalog) = match shared.lock() {
+        let (snapshot, form, catalog) = match shared.lock() {
             Ok(mut guard) => {
                 let form = guard.form.take();
-                let rows = guard.rows.take();
                 let catalog = guard.catalog.take();
-                (guard.clone(), form, rows, catalog)
+                (guard.clone(), form, catalog)
             }
             Err(_) => return,
         };
         if let Some(form) = form {
             self.browser.form = Some(form);
-        }
-        if let Some(rows) = rows {
-            self.browser.set_rows(Tab::Mcp, rows);
         }
         if let Some(update) = catalog {
             self.catalog_job = true;
@@ -145,10 +141,17 @@ impl ExtensionsOverlay {
     }
 
     /// Replace every tab with freshly built rows.
-    pub fn set_snapshot(&mut self, mcp: Vec<Row>, plugins: Vec<Row>, skills: Vec<Row>) {
+    pub fn set_snapshot(
+        &mut self,
+        mcp: Vec<Row>,
+        plugins: Vec<Row>,
+        skills: Vec<Row>,
+        marketplaces: Vec<Row>,
+    ) {
         self.browser.set_rows(Tab::Mcp, mcp);
         self.browser.set_rows(Tab::Plugins, plugins);
         self.browser.set_rows(Tab::Skills, skills);
+        self.browser.set_rows(Tab::Marketplaces, marketplaces);
     }
 
     /// Route one key. Returns an action for the app or the controller to run.
@@ -185,7 +188,7 @@ impl ExtensionsOverlay {
             } else if keys.matches(Action::SelectConfirm, key) {
                 b.end_search();
                 let tab = b.tab();
-                if !matches!(tab, Tab::Plugins | Tab::Skills) {
+                if !matches!(tab, Tab::Plugins | Tab::Marketplaces) {
                     let query = b.query().to_owned();
                     self.catalogs.retain(|(pending, _)| *pending != tab);
                     self.catalog_job = true;
@@ -243,6 +246,12 @@ impl ExtensionsOverlay {
             return OverlayEvent::None;
         }
         if keys.matches(Action::SelectConfirm, key) {
+            if let Some(intent) = enter_install(b) {
+                return match b.request(intent) {
+                    Some(now) => action(&now),
+                    None => OverlayEvent::None,
+                };
+            }
             b.toggle_details();
             return OverlayEvent::None;
         }
@@ -268,12 +277,12 @@ impl ExtensionsOverlay {
                 self.catalog_job = true;
                 action(&b.begin_catalog(tab, query, page))
             }
-            Some('a') if b.tab() == Tab::Plugins => {
+            Some('a') if b.tab() == Tab::Marketplaces => {
                 b.form = Some(Form::marketplace());
                 OverlayEvent::None
             }
-            Some('d') if b.tab() == Tab::Mcp => {
-                b.form = Some(Form::discover());
+            Some('v') => {
+                b.toggle_details();
                 OverlayEvent::None
             }
             Some(c) => match primary_intent(b, c) {
@@ -363,7 +372,7 @@ impl ExtensionsOverlay {
                     }
                 } else if rows.is_empty() {
                     let empty = if browser.query().is_empty() {
-                        "No catalog entries. r refreshes; / then Enter searches MCP servers; a adds a plugin marketplace."
+                        "No catalog entries. r refreshes; / then Enter searches; Marketplaces tab: a adds an index."
                     } else {
                         "No matches on this tab. Left/Right checks the other tabs; Esc clears the filter."
                     };
@@ -383,7 +392,7 @@ impl ExtensionsOverlay {
                     (ctx.keys.label(Action::SelectCancel), "cancel".to_owned()),
                 ]
             } else {
-                vec![
+                let mut items = vec![
                     (
                         pair_label(ctx.keys, Action::TabPrev, Action::TabNext),
                         "switch".to_owned(),
@@ -391,19 +400,21 @@ impl ExtensionsOverlay {
                     ("/".to_owned(), "search".to_owned()),
                     ("r".to_owned(), "refresh".to_owned()),
                     ("n".to_owned(), "more".to_owned()),
-                    ("a".to_owned(), "marketplace".to_owned()),
+                    (ctx.keys.label(Action::SelectConfirm), enter_label(browser)),
+                    ("v".to_owned(), "details".to_owned()),
                     (
                         pair_label(ctx.keys, Action::SelectUp, Action::SelectDown),
                         "move".to_owned(),
                     ),
-                    (ctx.keys.label(Action::SelectConfirm), "details".to_owned()),
-                    ("i".to_owned(), "install".to_owned()),
-                    ("d".to_owned(), "discover".to_owned()),
                     ("t".to_owned(), "test".to_owned()),
                     ("e".to_owned(), "enable".to_owned()),
                     ("x".to_owned(), "remove".to_owned()),
                     (ctx.keys.label(Action::SelectCancel), "close".to_owned()),
-                ]
+                ];
+                if browser.tab() == Tab::Marketplaces {
+                    items.insert(5, ("a".to_owned(), "add".to_owned()));
+                }
+                items
             };
             lines.push(key_footer(ctx.theme, &hints, w));
             lines
@@ -451,6 +462,14 @@ fn primary_intent(b: &Browser, key: char) -> Option<Intent> {
         (Tab::Mcp, 'i', false) if row.origin == Origin::Curated => {
             Some(Intent::InstallCuratedMcp { id: row.id.clone() })
         }
+        (Tab::Mcp, 'i', false)
+            if row.origin == Origin::Remote && row.tags.iter().any(|tag| tag == "official") =>
+        {
+            Some(Intent::InstallMcp {
+                id: row.id.clone(),
+                values: Default::default(),
+            })
+        }
         (Tab::Mcp, 'i', false) if row.origin == Origin::Remote => Some(Intent::SmitheryInstall {
             name: row.id.clone(),
         }),
@@ -463,7 +482,36 @@ fn primary_intent(b: &Browser, key: char) -> Option<Intent> {
         (Tab::Plugins, 'i', false) => Some(Intent::InstallPlugin { id: row.id.clone() }),
         (Tab::Plugins, 'x', true) => Some(Intent::RemovePlugin { id: row.id.clone() }),
         (Tab::Skills, 'x', true) => Some(Intent::RemoveSkill { id: row.id.clone() }),
+        (Tab::Skills, 'i', false) if row.origin == Origin::Remote => Some(Intent::InstallSkill {
+            source: row.id.clone(),
+        }),
+        (Tab::Marketplaces, 'x', true) => Some(Intent::RemoveMarketplace {
+            name: row.id.clone(),
+        }),
+        (Tab::Marketplaces, 'e', true) => Some(Intent::ToggleMarketplace {
+            name: row.id.clone(),
+            enable: row.state == State::Disabled,
+        }),
         _ => None,
+    }
+}
+
+/// The install that Enter starts on an available row. `None` for installed rows, and for rows
+/// with nothing to install, where Enter shows details instead.
+fn enter_install(b: &Browser) -> Option<Intent> {
+    let row = b.selected()?;
+    if row.origin == Origin::Installed {
+        return None;
+    }
+    primary_intent(b, 'i')
+}
+
+/// Footer label for Enter on the selected row.
+fn enter_label(b: &Browser) -> String {
+    if enter_install(b).is_some() {
+        "install".to_owned()
+    } else {
+        "details".to_owned()
     }
 }
 
@@ -562,9 +610,7 @@ fn submit_form(b: &mut Browser) -> OverlayEvent {
             key: values.get("api_key").cloned().unwrap_or_default(),
         },
         FormKind::Config { name } => Intent::SmitheryDeploy { name, values },
-        FormKind::Discover => Intent::SmitheryDiscover {
-            query: values.get("query").cloned().unwrap_or_default(),
-        },
+        FormKind::McpInputs { id } => Intent::InstallMcp { id, values },
         FormKind::Marketplace => Intent::AddMarketplace {
             name: values.get("name").cloned().unwrap_or_default(),
             index: values.get("index").cloned().unwrap_or_default(),
@@ -680,8 +726,43 @@ mod tests {
     }
 
     #[test]
+    fn arrow_navigation_renders_every_tab_and_wraps() {
+        use crate::ui::overlay::settings::testkit::{Rig, key, render, screen, status_preview};
+        use crossterm::event::KeyCode;
+
+        let rig = Rig::new();
+        let ctx = DrawCtx {
+            theme: &rig.theme,
+            keys: &rig.keys,
+            status: &rig.status,
+            preview_status: &status_preview,
+        };
+        for (width, height) in [(120, 30), (40, 12), (4, 4)] {
+            let mut overlay = ExtensionsOverlay::new();
+            for tab in Tab::ALL {
+                overlay
+                    .browser
+                    .set_rows(tab, vec![row("fixture", Origin::Installed, State::Enabled)]);
+            }
+            for direction in [KeyCode::Right, KeyCode::Left] {
+                for _ in Tab::ALL {
+                    assert!(matches!(
+                        overlay.handle(&key(direction), &rig.keys),
+                        OverlayEvent::None
+                    ));
+                    let buffer = render(width, height, |frame| overlay.draw(frame, &ctx));
+                    if width == 120 {
+                        assert!(screen(&buffer).contains("fixture"));
+                    }
+                }
+                assert_eq!(overlay.browser.tab(), Tab::Mcp);
+            }
+        }
+    }
+
+    #[test]
     fn letter_keys_never_remove_without_confirmation() {
-        for tab in [Tab::Mcp, Tab::Plugins, Tab::Skills] {
+        for tab in Tab::ALL {
             let mut b = Browser::new();
             while b.tab() != tab {
                 b.next_tab();
@@ -719,5 +800,28 @@ mod tests {
         assert!(b.confirm.is_some());
         b.decline();
         assert!(b.confirm.is_none());
+    }
+
+    #[test]
+    fn enter_installs_available_rows_and_shows_details_for_installed_ones() {
+        let mut b = Browser::new();
+        b.set_rows(
+            Tab::Plugins,
+            vec![
+                row("alpha@market", Origin::Remote, State::Available),
+                row("beta", Origin::Installed, State::Enabled),
+            ],
+        );
+        b.next_tab();
+        assert_eq!(
+            enter_install(&b),
+            Some(Intent::InstallPlugin {
+                id: "alpha@market".into()
+            })
+        );
+        assert_eq!(enter_label(&b), "install");
+        b.move_cursor(1);
+        assert!(enter_install(&b).is_none());
+        assert_eq!(enter_label(&b), "details");
     }
 }

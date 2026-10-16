@@ -2,9 +2,10 @@
 //! writes config; the caller saves settings only after [`install`] returns `Ok`.
 
 use super::plan::{Plan, Step, plan};
+use super::prebuilt;
 use super::{
-    BUN_MIN, Env, Recipe, Status, WHISPER_MODEL_BYTES, WHISPER_MODEL_SHA256, WHISPER_MODEL_URL,
-    is_ready, locate, recipe, report, settings_for, whisper_model_path,
+    BUN_MIN, Env, NODE_MIN, Recipe, Status, WHISPER_MODEL_BYTES, WHISPER_MODEL_SHA256,
+    WHISPER_MODEL_URL, is_ready, locate, recipe, report, settings_for, whisper_model_path,
 };
 use crate::voice::{SttBackendChoice, TtsBackendChoice};
 use anyhow::ensure;
@@ -123,6 +124,9 @@ pub fn run_plan(plan: &Plan, cancel: &AtomicBool, progress: &mut dyn FnMut(&str)
         std::fs::create_dir_all(&plan.destination)
             .with_context(|| format!("creating {}", plan.destination.display()))?;
     }
+    if let Some(fetch) = &plan.fetch {
+        prebuilt::fetch(&fetch.asset, &fetch.dest, cancel, progress)?;
+    }
     for step in &plan.steps {
         run_step(step, cancel, progress)?;
     }
@@ -231,6 +235,23 @@ pub fn health(id: &str, location: &Path, model: Option<&Path>) -> Result<String>
             }
             Ok(format!("Bun {}.{}.{}", version.0, version.1, version.2))
         }
+        "node" => {
+            let out = probe(location, &["--version"])?;
+            let version = parse_version(out.trim_start_matches('v'))
+                .context("could not read the Node.js version")?;
+            if version < NODE_MIN {
+                bail!(
+                    "Node.js {}.{}.{} is older than the required {}.{}.{}",
+                    version.0,
+                    version.1,
+                    version.2,
+                    NODE_MIN.0,
+                    NODE_MIN.1,
+                    NODE_MIN.2
+                );
+            }
+            Ok(format!("Node.js {}.{}.{}", version.0, version.1, version.2))
+        }
         "mlx-runtime" => probe(location, &["-c", "import mlx"]).map(|_| "MLX imports".into()),
         "whisper-cpp" => {
             let model = model.context("whisper.cpp needs its model; run setup again")?;
@@ -309,7 +330,7 @@ pub fn ensure_whisper_model(
         "downloading ggml-base.en.bin (about {} MB) from {WHISPER_MODEL_URL}",
         WHISPER_MODEL_BYTES / 1_000_000
     ));
-    download_to(WHISPER_MODEL_URL, &partial, cancel, progress)?;
+    download_to(WHISPER_MODEL_URL, &partial, WHISPER_MODEL_BYTES, cancel, progress)?;
     let got = sha256_file(&partial)?;
     if got != WHISPER_MODEL_SHA256 {
         let _ = fs::remove_file(&partial);
@@ -320,9 +341,10 @@ pub fn ensure_whisper_model(
     Ok(path)
 }
 
-fn download_to(
+pub(super) fn download_to(
     url: &str,
     dest: &Path,
+    expected: u64,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str),
 ) -> Result<()> {
@@ -339,10 +361,11 @@ fn download_to(
         fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
-    let mut next_report = WHISPER_MODEL_BYTES / 10;
+    let step = if expected > 0 { expected / 10 } else { 10_000_000 };
+    let mut next_report = step;
     loop {
         if cancel.load(Ordering::Relaxed) {
-            bail!("cancelled while downloading the whisper model");
+            bail!("cancelled while downloading {url}");
         }
         let n = reader
             .read(&mut buf)
@@ -353,19 +376,23 @@ fn download_to(
         file.write_all(&buf[..n])?;
         total += n as u64;
         if total >= next_report {
-            progress(&format!(
-                "downloaded {} of {} MB",
-                total / 1_000_000,
-                WHISPER_MODEL_BYTES / 1_000_000
-            ));
-            next_report += WHISPER_MODEL_BYTES / 10;
+            progress(&if expected > 0 {
+                format!(
+                    "downloaded {} of {} MB",
+                    total / 1_000_000,
+                    expected / 1_000_000
+                )
+            } else {
+                format!("downloaded {} MB", total / 1_000_000)
+            });
+            next_report += step;
         }
     }
     file.sync_all()?;
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(super) fn sha256_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -538,6 +565,12 @@ pub fn preview_text(id: &str, env: &Env) -> String {
                     whisper_model_path(&env.user_dir).display()
                 ));
             }
+            if let Some(fetch) = &planned.fetch {
+                lines.push(format!(
+                    "Downloads: {} (sha256 {})",
+                    fetch.asset.url, fetch.asset.sha256
+                ));
+            }
             for step in &planned.steps {
                 lines.push(format!("Runs: {}", step.display()));
             }
@@ -617,7 +650,7 @@ mod fake_pm_tests {
     fn fake_npm(root: &Path, version: &str) {
         let bin = root.join("fakebin/npm");
         let script = format!(
-            "#!/bin/sh\nprefix=\"\"\nwhile [ $# -gt 0 ]; do case \"$1\" in --prefix) prefix=\"$2\"; shift 2;; install|--no-audit|--no-fund) shift;; *) break;; esac; done\nmkdir -p \"$prefix/node_modules/.bin\"\nprintf '#!/bin/sh\\necho {version}\\n' > \"$prefix/node_modules/.bin/bun\"\nchmod +x \"$prefix/node_modules/.bin/bun\"\necho \"added 1 package: $*\"\n"
+            "#!/bin/sh\nset -eu\nprefix=\"\"\nwhile [ $# -gt 0 ]; do case \"$1\" in --prefix) prefix=\"$2\"; shift 2;; install|--no-audit|--no-fund) shift;; *) break;; esac; done\n/bin/mkdir -p \"$prefix/node_modules/.bin\"\nprintf '#!/bin/sh\\necho {version}\\n' > \"$prefix/node_modules/.bin/bun\"\n/bin/chmod +x \"$prefix/node_modules/.bin/bun\"\necho \"added 1 package: $*\"\n"
         );
         std::fs::write(&bin, script).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();

@@ -503,6 +503,7 @@ pub struct StartContext<'a> {
     pub memory: Option<&'a Arc<crate::storage::memory_backend::MemoryRuntime>>,
     pub plan_mode: bool,
     pub agents_messages: &'a [Value],
+    pub handoff: subagents::Handoff,
 }
 
 /// Approval state lent to child tasks while the parent waits on them.
@@ -551,6 +552,7 @@ impl LiveTasks {
             memory,
             plan_mode,
             agents_messages,
+            handoff,
         } = ctx;
         let session_id = session_id.to_owned();
         if !config.task.can_spawn_at(0) {
@@ -704,6 +706,7 @@ impl LiveTasks {
             let usage = usage.cloned();
             let memory = memory.cloned();
             let agents_messages = agents_messages.to_vec();
+            let handoff = handoff.clone();
             let workspace = workspace.clone();
             let ext = ext.clone();
             let layout = layout.cloned();
@@ -799,6 +802,7 @@ impl LiveTasks {
                         };
                         request.jobs[0].resume_messages = resume_messages;
                         request.jobs[0].resume_tools = resume_tools;
+                        handoff.apply(&mut request.jobs);
                         if let Err(why) =
                             subagents::preload_skills(&mut request.jobs, layout.as_ref())
                         {

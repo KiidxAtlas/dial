@@ -1,6 +1,8 @@
 //! Reproducible, local benchmark suite parsing, workspace isolation, and scoring.
 pub mod records;
 pub mod runtime;
+use crate::config::types::LeanLocal;
+pub use crate::workspace_copy::clone_project;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,51 +17,6 @@ pub const MAX_CHECKS_PER_CASE: usize = 100;
 pub const MAX_TURNS_PER_CASE: usize = 100;
 pub const MAX_CONTEXT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PROFILES: usize = 64;
-/// Directories that hold a project's private state or credentials. Overlay hides them from the
-/// worker, and the copy backends never copy them.
-const SECRET_DIRS: &[&str] = &[
-    ".git",
-    ".dial",
-    ".codegraph",
-    ".ssh",
-    ".aws",
-    ".gnupg",
-    ".kube",
-    "secrets",
-    ".secrets",
-    "credentials",
-];
-/// Build outputs, caches, and installed dependencies. The copy backends exclude them from their
-/// change sets; overlay leaves them visible and ignores changes made under them.
-const DEPENDENCY_DIRS: &[&str] = &[
-    "target",
-    "build",
-    "dist",
-    ".cache",
-    ".venv",
-    "venv",
-    ".tox",
-    "__pycache__",
-    "node_modules",
-    "vendor",
-];
-/// Root-only build caches and tool scratch; unlike these, `bin/` often contains real source.
-const ROOT_GENERATED_DIRS: &[&str] = &[".cargo-work", crate::tools::SCRATCH_DIR];
-const EXCLUDED_FILES: &[&str] = &[
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    ".git-credentials",
-    "credentials.json",
-    "secrets.json",
-    "secrets.yaml",
-    "secrets.yml",
-    "id_rsa",
-    "id_ed25519",
-];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -141,7 +98,7 @@ pub enum Assertion {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunMetrics {
     pub prompt_tokens: u64,
     pub output_tokens: u64,
@@ -184,6 +141,15 @@ pub struct RunMetrics {
     /// Actual repair attempts, when supplied by the agent instrumentation.
     #[serde(default)]
     pub repair_attempts: Option<u64>,
+    /// Observed API cost: a lower bound unless `observed_cost_complete` is true.
+    /// Missing usage or prices and local/subscription routes are not zero-cost evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub observed_cost_complete: bool,
+    /// Logical backend requests from the runtime ledger (all purposes); 0 when the ledger was unread.
+    #[serde(default)]
+    pub requests: u64,
 }
 
 /// Verification metadata, not prompt contents or a model's claim of success.
@@ -483,6 +449,9 @@ pub struct MachineConfiguration {
     pub kv_group_size: Option<u32>,
     #[serde(default)]
     pub quantized_kv_start: Option<u32>,
+    /// Context-economy overrides (`efficiency.*`, `compaction.*`); unset keeps the configured value.
+    #[serde(default)]
+    pub efficiency: EfficiencyOverrides,
 }
 
 /// Per-configuration assistance feature switches for ablation. `None` keeps the configured value.
@@ -503,7 +472,7 @@ pub struct AssistanceOverrides {
     /// Maps to `assistance.constrained_repair`: schema-constrained repair of malformed tool calls.
     pub constrained_repair: Option<bool>,
     /// Maps to `assistance.lean_local`: the lean prompt and tool profile for locally served models.
-    pub lean_local: Option<bool>,
+    pub lean_local: Option<LeanLocal>,
 }
 
 impl AssistanceOverrides {
@@ -513,6 +482,39 @@ impl AssistanceOverrides {
             ensure!(
                 limit <= 64,
                 "configuration assistance.initial_tool_limit must be 0 or 1..=64"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Per-configuration context-economy levers for comparison runs. `None` keeps the configured value;
+/// bounds match `Config::validate`, and overrides apply only to the run's isolated config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EfficiencyOverrides {
+    /// Maps to `efficiency.tool_preview_bytes`: 0 or 1024..=16384.
+    pub tool_preview_bytes: Option<usize>,
+    /// Maps to `efficiency.history_token_cap`: 0 or 8192..=2_000_000.
+    pub history_token_cap: Option<u32>,
+    /// Maps to `compaction.enabled`.
+    pub compaction_enabled: Option<bool>,
+    /// Maps to `compaction.keep_recent_tokens`.
+    pub keep_recent_tokens: Option<u32>,
+}
+
+impl EfficiencyOverrides {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(bytes) = self.tool_preview_bytes {
+            ensure!(
+                bytes == 0 || (1024..=16384).contains(&bytes),
+                "configuration efficiency.tool_preview_bytes must be 0 or 1024..=16384"
+            );
+        }
+        if let Some(cap) = self.history_token_cap {
+            ensure!(
+                cap == 0 || (8192..=2_000_000).contains(&cap),
+                "configuration efficiency.history_token_cap must be 0 or 8192..=2000000"
             );
         }
         Ok(())
@@ -595,6 +597,7 @@ impl MachineBenchmarkPolicy {
                 "quantization_bits must be 1..=16"
             );
             configuration.assistance.validate()?;
+            configuration.efficiency.validate()?;
         }
         Ok(())
     }
@@ -619,6 +622,9 @@ pub struct MachineConfigurationReport {
     pub wall_time_ms: u64,
     pub observed_prompt_tokens: Option<u64>,
     pub observed_output_tokens: Option<u64>,
+    /// Observed API cost; absent unless every case has complete tokens and observed pricing.
+    #[serde(default)]
+    pub observed_cost_usd: Option<f64>,
     pub repair_attempts: Option<u64>,
     pub correct_cases_per_second: Option<f64>,
     pub eligible: bool,
@@ -646,6 +652,20 @@ impl MachineConfigurationReport {
             wall_time_ms,
             observed_prompt_tokens: all_usage.then(|| total_prompt_tokens(&report)),
             observed_output_tokens: all_usage.then(|| total_output_tokens(&report)),
+            observed_cost_usd: if all_usage
+                && report
+                    .cases
+                    .iter()
+                    .all(|case| case.metrics.observed_cost_complete)
+            {
+                report
+                    .cases
+                    .iter()
+                    .map(|case| case.metrics.observed_cost_usd)
+                    .sum()
+            } else {
+                None
+            },
             repair_attempts: repairs,
             correct_cases_per_second: (wall_time_ms > 0)
                 .then(|| successes as f64 * 1000.0 / wall_time_ms as f64),
@@ -1076,171 +1096,6 @@ pub struct CommandCheck<'a> {
     pub expect_exit: i32,
 }
 
-/// Copy a source tree into a unique temporary directory, omitting generated/state directories.
-/// Symlinks are materialized only when their canonical targets remain inside the source root.
-pub fn clone_project(source: &Path) -> Result<tempfile::TempDir> {
-    copy_project_with(source, crate::platform::fs::copy_on_write)
-}
-
-/// Copy the project file by file with plain reads and writes, never reflinks. The `copy`
-/// isolation backend uses it so its behavior does not depend on the filesystem.
-pub(crate) fn copy_project_plain(source: &Path) -> Result<tempfile::TempDir> {
-    copy_project_with(source, plain_copy_file)
-}
-
-/// Copies one regular file. Returns the standard library's error unchanged.
-type CopyFile = fn(&Path, &Path) -> std::io::Result<()>;
-
-fn plain_copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    fs::copy(from, to).map(|_| ())
-}
-
-fn copy_project_with(source: &Path, copy_file: CopyFile) -> Result<tempfile::TempDir> {
-    let source = fs::canonicalize(source)
-        .with_context(|| format!("resolving benchmark source {}", source.display()))?;
-    ensure!(source.is_dir(), "benchmark source must be a directory");
-    let destination = tempfile::tempdir().context("creating benchmark workspace")?;
-    let mut visited = std::collections::BTreeSet::new();
-    copy_directory(
-        &source,
-        destination.path(),
-        &source,
-        &mut visited,
-        copy_file,
-    )?;
-    Ok(destination)
-}
-
-fn copy_directory(
-    source: &Path,
-    dest: &Path,
-    root: &Path,
-    visited: &mut std::collections::BTreeSet<PathBuf>,
-    copy_file: CopyFile,
-) -> Result<()> {
-    let canonical = fs::canonicalize(source)?;
-    ensure!(
-        canonical.starts_with(root),
-        "source symlink escapes project root"
-    );
-    if !visited.insert(canonical) {
-        return Ok(());
-    }
-    for entry in fs::read_dir(source).with_context(|| format!("reading {}", source.display()))? {
-        let entry = entry?;
-        let from = entry.path();
-        if is_excluded_source_path(root, &from) {
-            continue;
-        }
-        let name = entry.file_name();
-        let to = dest.join(&name);
-        let metadata = fs::symlink_metadata(&from)?;
-        if metadata.file_type().is_symlink() {
-            let target = fs::canonicalize(&from)
-                .with_context(|| format!("resolving symlink {}", from.display()))?;
-            ensure!(
-                target.starts_with(root),
-                "source symlink escapes project root: {}",
-                from.display()
-            );
-            if is_excluded_source_path(root, &target) {
-                continue;
-            }
-            if target.is_dir() {
-                fs::create_dir_all(&to)?;
-                copy_directory(&target, &to, root, visited, copy_file)?;
-            } else {
-                copy_file(&target, &to).with_context(|| format!("copying {}", from.display()))?;
-            }
-        } else if metadata.is_dir() {
-            fs::create_dir(&to)?;
-            copy_directory(&from, &to, root, visited, copy_file)?;
-        } else if metadata.is_file() {
-            copy_file(&from, &to).with_context(|| format!("copying {}", from.display()))?;
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn is_secret_file(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if EXCLUDED_FILES.contains(&lower.as_str()) {
-        return true;
-    }
-    if lower.starts_with(".env.")
-        && !matches!(
-            lower.as_str(),
-            ".env.example" | ".env.sample" | ".env.template"
-        )
-    {
-        return true;
-    }
-    [".pem", ".p12", ".pfx"]
-        .iter()
-        .any(|extension| lower.ends_with(extension))
-}
-
-/// Whether `path` is a secret or private entry under `root`: a secret directory, a secret file, or
-/// anything outside `root` (which fails closed). Overlay masks these entries.
-pub(crate) fn is_secret_source_path(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return true;
-    };
-    relative.components().any(|component| {
-        let Component::Normal(name) = component else {
-            return true;
-        };
-        let name = name.to_string_lossy();
-        SECRET_DIRS.contains(&name.as_ref()) || is_secret_file(&name)
-    })
-}
-
-/// Whether `path` lies in a build output, cache, or installed-dependency directory under `root`,
-/// or is one of the root-level generated directories. Overlay leaves these visible and ignores
-/// changes made under them.
-pub(crate) fn is_dependency_source_path(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
-    };
-    relative.components().any(|component| {
-        matches!(component, Component::Normal(name) if DEPENDENCY_DIRS.contains(&name.to_string_lossy().as_ref()))
-    }) || matches!(
-        relative.components().next(),
-        Some(Component::Normal(name)) if ROOT_GENERATED_DIRS.contains(&name.to_string_lossy().as_ref())
-    ) || ignored_bin_output(root, &relative)
-}
-
-/// Require the project's own ignore rule for `/bin/` and preserve tracked source scripts.
-fn ignored_bin_output(root: &Path, relative: &Path) -> bool {
-    if !relative.starts_with("bin") {
-        return false;
-    }
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    builder.add(root.join(".gitignore"));
-    let Ok(ignore) = builder.build() else {
-        return false;
-    };
-    if !ignore.matched(root.join("bin"), true).is_ignore() {
-        return false;
-    }
-    // A tracked descendant keeps the directory visible; individual ignored outputs below it
-    // can still be excluded. This local query runs no hooks and reads no file contents.
-    let tracked = std::process::Command::new("git")
-        .args(["ls-files", "--error-unmatch", "--"])
-        .arg(format!(":(literal){}", relative.display()))
-        .current_dir(root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    !tracked.is_ok_and(|status| status.success())
-}
-
-/// Whether the copy backends leave `path` out of their copies and change sets: a secret entry or
-/// a dependency directory.
-pub(crate) fn is_excluded_source_path(root: &Path, path: &Path) -> bool {
-    is_secret_source_path(root, path) || is_dependency_source_path(root, path)
-}
-
 fn validate_relative(path: &Path) -> Result<()> {
     ensure!(
         !path.as_os_str().is_empty()
@@ -1509,43 +1364,12 @@ fn category_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_copy::{DEPENDENCY_DIRS, SECRET_DIRS};
     use serde_json::json;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     #[cfg(windows)]
     use std::os::windows::fs::symlink_file as symlink;
-
-    #[test]
-    fn root_build_outputs_are_excluded_but_nested_sources_are_not() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        assert!(!is_excluded_source_path(root, &root.join("bin/script")));
-        fs::write(root.join(".gitignore"), "/bin/\n").unwrap();
-        for excluded in [
-            "bin",
-            "bin/dial",
-            "bin/dial.bak-20261015-131809",
-            ".cargo-work/windows/rustc/lib/librustc_driver.dylib",
-            ".tmp/dial-debug-dump-1",
-        ] {
-            assert!(
-                is_excluded_source_path(root, &root.join(excluded)),
-                "{excluded}"
-            );
-        }
-        for kept in [
-            "src/bin/tool.rs",
-            "src/main.rs",
-            "docs/bin/readme.md",
-            "binary.txt",
-            ".cargo/config.toml",
-        ] {
-            assert!(
-                !is_excluded_source_path(root, &root.join(kept)),
-                "{kept} is source and must be copied"
-            );
-        }
-    }
 
     #[test]
     fn efficiency_suite_and_fixture_are_valid() {
@@ -2005,30 +1829,12 @@ prompt = "do work"
             .regressed
         );
     }
-    #[test]
-    fn benchmark_copy_omits_common_credentials_but_keeps_templates() {
-        let source = tempfile::tempdir().unwrap();
-        fs::write(source.path().join(".env"), "OPENAI_API_KEY=secret").unwrap();
-        fs::write(
-            source.path().join(".env.example"),
-            "OPENAI_API_KEY=replace-me",
-        )
-        .unwrap();
-        fs::write(source.path().join("private.pem"), "private key").unwrap();
-        symlink(source.path().join(".env"), source.path().join("env_alias")).unwrap();
-        fs::write(source.path().join("main.rs"), "fn main() {}").unwrap();
-        let copied = clone_project(source.path()).unwrap();
-        assert!(!copied.path().join(".env").exists());
-        assert!(!copied.path().join("env_alias").exists());
-        assert!(!copied.path().join("private.pem").exists());
-        assert!(copied.path().join(".env.example").is_file());
-        assert!(copied.path().join("main.rs").is_file());
-    }
 }
 
 #[cfg(test)]
 mod machine_tests {
     use super::*;
+    use serde_json::json;
 
     fn measured(name: &str, outcomes: &[bool], wall_time_ms: u64) -> MachineConfigurationReport {
         let configuration = MachineConfiguration {
@@ -2044,6 +1850,7 @@ mod machine_tests {
             kv_bits: None,
             kv_group_size: None,
             quantized_kv_start: None,
+            efficiency: Default::default(),
         };
         let cases = outcomes
             .iter()
@@ -2205,6 +2012,79 @@ mod machine_tests {
         );
         assert_eq!(names.len(), 1);
         assert!(names[0].starts_with("baseline: invalid run: all 1 cases"));
+    }
+
+    #[test]
+    fn legacy_configurations_and_reports_remain_readable() {
+        // Pre-LeanLocal boolean configs and pre-efficiency configurations keep their meaning.
+        let legacy: AssistanceOverrides =
+            serde_json::from_value(json!({"lean_local": true})).unwrap();
+        assert_eq!(legacy.lean_local, Some(LeanLocal::On));
+        let auto: AssistanceOverrides =
+            serde_json::from_value(json!({"lean_local": "auto"})).unwrap();
+        assert_eq!(auto.lean_local, Some(LeanLocal::Auto));
+        let configuration: MachineConfiguration = serde_json::from_value(json!({
+            "name": "old", "provider": "mlx", "model": "m", "context_window": 8192
+        }))
+        .unwrap();
+        assert_eq!(configuration.efficiency, EfficiencyOverrides::default());
+        // Reports written before the ledger fields have no cost and no request count.
+        let metrics: RunMetrics = serde_json::from_value(json!({
+            "prompt_tokens": 3, "output_tokens": 4, "elapsed_ms": 5,
+            "tool_calls": 0, "tool_errors": 0
+        }))
+        .unwrap();
+        assert_eq!((metrics.observed_cost_usd, metrics.requests), (None, 0));
+        // Absent cost is not serialized, so legacy consumers see the same shape.
+        let value = serde_json::to_value(metrics).unwrap();
+        assert!(value.get("observed_cost_usd").is_none());
+    }
+
+    #[test]
+    fn cumulative_cost_needs_complete_usage_in_every_case() {
+        let mut complete = measured("priced", &[true, true], 1000);
+        for case in &mut complete.report.cases {
+            case.metrics.observed_cost_usd = Some(0.5);
+            case.metrics.observed_cost_complete = true;
+        }
+        let report = MachineConfigurationReport::measured(
+            complete.configuration.clone(),
+            complete.settings.clone(),
+            complete.report.clone(),
+            1000,
+        );
+        assert_eq!(report.observed_cost_usd, Some(1.0));
+        // One case with incomplete usage makes the whole configuration's cost unknown.
+        let mut partial = complete.report.clone();
+        partial.cases[1].metrics.token_usage_incomplete = true;
+        let report = MachineConfigurationReport::measured(
+            complete.configuration.clone(),
+            complete.settings.clone(),
+            partial,
+            1000,
+        );
+        assert_eq!(report.observed_cost_usd, None);
+        assert_eq!(report.observed_prompt_tokens, None);
+        // Complete token counts do not imply complete prices.
+        let mut unpriced = complete.report.clone();
+        unpriced.cases[1].metrics.observed_cost_complete = false;
+        let report = MachineConfigurationReport::measured(
+            complete.configuration.clone(),
+            complete.settings.clone(),
+            unpriced,
+            1000,
+        );
+        assert_eq!(report.observed_cost_usd, None);
+        assert!(report.observed_prompt_tokens.is_some());
+        // Local routes with complete usage carry no priced cost, which stays absent, not zero.
+        let local = measured("local", &[true], 1000);
+        let report = MachineConfigurationReport::measured(
+            local.configuration,
+            local.settings,
+            local.report,
+            1000,
+        );
+        assert_eq!(report.observed_cost_usd, None);
     }
 
     #[test]

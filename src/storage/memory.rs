@@ -1,50 +1,14 @@
-//! Shared memory security screening and atomic private-file persistence.
+//! Shared memory security screening. Persistence is owned by [`super::atomic`].
 //! Durable provenance/retrieval lives in [`super::provenance`].
-use anyhow::{Context, Result};
-use std::{fs, io::Write, path::Path};
-
+#[cfg(test)]
 use crate::platform::fs as platform_fs;
+#[cfg(test)]
+use std::fs;
 
 const DELIMITER: &str = "§";
 
-/// Write `bytes` to `path` so readers see either the old or the new content, never a partial file:
-/// a temp file in the same directory is synced, given `mode`, then renamed over the target.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let dir = path.parent().context("path has no parent directory")?;
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)
-        .with_context(|| format!("creating temp file in {}", dir.display()))?;
-    tmp.write_all(bytes)?;
-    platform_fs::set_mode(tmp.path(), mode)?;
-    tmp.as_file().sync_all()?;
-    #[cfg(unix)]
-    tmp.persist(path)
-        .map_err(|e| e.error)
-        .with_context(|| format!("replacing {}", path.display()))?;
-    #[cfg(windows)]
-    {
-        let temporary_name = tmp
-            .path()
-            .file_name()
-            .context("temporary file has no name")?
-            .to_os_string();
-        let target_name = path
-            .file_name()
-            .context("storage file has no name")?
-            .to_os_string();
-        let parent = platform_fs::open_dir_nofollow_write(dir)?;
-        let staged = tmp.as_file().try_clone()?;
-        let staged_path = tmp.into_temp_path();
-        platform_fs::replace_beneath_file(
-            &parent,
-            Path::new(&temporary_name),
-            &staged,
-            Path::new(&target_name),
-        )?;
-        let _ = staged_path.keep().map_err(|error| error.error)?;
-    }
-    Ok(())
-}
+// Compatibility for skill package publication; new callers name the neutral owner.
+pub(crate) use super::atomic::write_checkpoint as atomic_write;
 
 pub(crate) fn screen(entry: &str) -> Result<(), String> {
     if entry.contains(DELIMITER) {

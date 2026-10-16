@@ -4,11 +4,11 @@ use anyhow::{Context, Result, bail, ensure};
 use dial::{
     benchmark::{
         AssistanceOverrides, BenchmarkProfile, BenchmarkReport, BenchmarkSuite, CommandCheck,
-        MachineBenchmarkPolicy, MachineBenchmarkReport, MachineConfiguration,
+        EfficiencyOverrides, MachineBenchmarkPolicy, MachineBenchmarkReport, MachineConfiguration,
         MachineConfigurationReport, MachineIdentity, RunMetrics, clone_project, compare_baseline,
         named_invalid_runs, rank_machine_configurations, score_report,
     },
-    config::types::{Approval, Config, EditMode, SandboxMode},
+    config::types::{Approval, Config, EditMode, LEAN_AUTO_MAX_WINDOW, LeanLocal, SandboxMode},
     storage::paths::Layout,
     tools::{self, ToolOutput, Workspace},
 };
@@ -291,45 +291,70 @@ fn isolated_config(config: &Config) -> Config {
 
 const ASSIST_CASE_TIMEOUT_SECS: u64 = 600;
 
-/// Each ablation applies one switch to the shipped-defaults `dial` overrides.
-type FeatureAblation = fn(&mut AssistanceOverrides, EditMode);
-const ASSIST_FEATURES: [(&str, FeatureAblation); 6] = [
-    ("compact_tools", |o, _| o.compact_tools = Some(false)),
+/// One single-feature variant of the shipped `dial` baseline. `enable-*` turns on a feature that
+/// ships off; `ablate-*` turns off or changes a feature that ships on. Either way exactly one
+/// lever differs from `dial`.
+type FeatureVariant = fn(&mut AssistanceOverrides, EditMode);
+const ASSIST_VARIANTS: [(&str, FeatureVariant); 7] = [
+    ("enable-compact_tools", |o, _| o.compact_tools = Some(true)),
+    ("enable-repair_hints", |o, _| o.repair_hints = Some(true)),
     // 0 means unlimited: the initial tool budget is removed.
-    ("initial_tool_limit", |o, _| o.initial_tool_limit = Some(0)),
-    ("tool_grammar", |o, _| o.tool_grammar = Some(false)),
-    ("repair_hints", |o, _| o.repair_hints = Some(false)),
-    ("edit_mode", |o, default| {
-        o.edit_mode = Some(if default == EditMode::Replace {
+    ("ablate-initial_tool_limit", |o, _| {
+        o.initial_tool_limit = Some(0)
+    }),
+    ("ablate-tool_grammar", |o, _| o.tool_grammar = Some(false)),
+    ("ablate-edit_mode", |o, shipped| {
+        o.edit_mode = Some(if shipped == EditMode::Replace {
             EditMode::Hashline
         } else {
             EditMode::Replace
         })
     }),
-    ("reliability_gate", |o, _| o.reliability_gate = Some(false)),
+    ("ablate-reliability_gate", |o, _| {
+        o.reliability_gate = Some(false)
+    }),
+    ("ablate-lean_local", |o, _| {
+        o.lean_local = Some(LeanLocal::Off)
+    }),
 ];
 
-/// `raw` turns assistance off, `dial` is the shipped defaults (not the user's config), `lean` adds
-/// only the lean local profile to `dial`, and each `ablate-<feature>` changes exactly one feature from `dial`.
+/// The shipped assistance and context-economy values, read from `Config` rather than restated, so
+/// the `dial` baseline cannot drift from what an untouched config runs.
+fn shipped_overrides(shipped: &Config) -> (AssistanceOverrides, EfficiencyOverrides) {
+    let assistance = &shipped.assistance;
+    (
+        AssistanceOverrides {
+            enabled: Some(assistance.enabled),
+            compact_tools: Some(assistance.compact_tools),
+            initial_tool_limit: Some(assistance.initial_tool_limit),
+            tool_grammar: Some(assistance.tool_grammar),
+            repair_hints: Some(assistance.repair_hints),
+            syntax_guard: Some(assistance.syntax_guard),
+            selective_verification: Some(assistance.selective_verification),
+            edit_mode: Some(shipped.edit.mode),
+            reliability_gate: Some(shipped.reliability.enabled),
+            constrained_repair: Some(assistance.constrained_repair),
+            lean_local: Some(assistance.lean_local),
+        },
+        EfficiencyOverrides {
+            tool_preview_bytes: Some(shipped.efficiency.tool_preview_bytes),
+            history_token_cap: Some(shipped.efficiency.history_token_cap),
+            compaction_enabled: Some(shipped.compaction.enabled),
+            keep_recent_tokens: Some(shipped.compaction.keep_recent_tokens),
+        },
+    )
+}
+
+/// `raw` turns assistance off, `dial` is the shipped defaults (not the user's config), `lean` turns on
+/// the lean local profile that ships on `auto`, and each variant changes exactly one lever from `dial`.
 fn assist_configurations(
     config: &Config,
     provider: &str,
     model: &str,
 ) -> Vec<MachineConfiguration> {
-    let default_edit = tools::EditSettings::default().mode;
-    let dial = AssistanceOverrides {
-        enabled: Some(true),
-        compact_tools: Some(true),
-        initial_tool_limit: Some(16),
-        tool_grammar: Some(true),
-        repair_hints: Some(true),
-        syntax_guard: Some(true),
-        selective_verification: Some(true),
-        edit_mode: Some(default_edit),
-        reliability_gate: Some(true),
-        constrained_repair: Some(true),
-        lean_local: Some(false),
-    };
+    let shipped = Config::default();
+    let default_edit = shipped.edit.mode;
+    let (dial, efficiency) = shipped_overrides(&shipped);
     let raw = AssistanceOverrides {
         enabled: Some(false),
         compact_tools: Some(false),
@@ -341,7 +366,7 @@ fn assist_configurations(
         edit_mode: Some(default_edit),
         reliability_gate: Some(false),
         constrained_repair: Some(false),
-        lean_local: Some(false),
+        lean_local: Some(LeanLocal::Off),
     };
     let machine = |name: String, assistance: AssistanceOverrides| MachineConfiguration {
         name,
@@ -351,6 +376,7 @@ fn assist_configurations(
         quantization_bits: None,
         adapter: None,
         assistance,
+        efficiency: efficiency.clone(),
         draft_model: None,
         num_draft_tokens: None,
         kv_bits: None,
@@ -358,7 +384,7 @@ fn assist_configurations(
         quantized_kv_start: None,
     };
     let lean = AssistanceOverrides {
-        lean_local: Some(true),
+        lean_local: Some(LeanLocal::On),
         ..dial.clone()
     };
     let mut configurations = vec![
@@ -366,15 +392,15 @@ fn assist_configurations(
         machine("dial".into(), dial.clone()),
         machine("lean".into(), lean),
     ];
-    for (feature, ablate) in ASSIST_FEATURES {
+    for (name, variant) in ASSIST_VARIANTS {
         let mut overrides = dial.clone();
-        ablate(&mut overrides, default_edit);
-        configurations.push(machine(format!("ablate-{feature}"), overrides));
+        variant(&mut overrides, default_edit);
+        configurations.push(machine(name.into(), overrides));
     }
     configurations
 }
 
-/// Machine benchmark over `raw`, `dial` and one ablation per assistance feature.
+/// Machine benchmark over `raw`, `dial`, `lean` and one ablation per assistance feature.
 pub fn run_assist(
     layout: &Layout,
     config: &Config,
@@ -689,7 +715,23 @@ fn apply_assistance(config: &mut Config, overrides: &AssistanceOverrides) {
         config.assistance.constrained_repair = value;
     }
     if let Some(value) = overrides.lean_local {
-        config.assistance.lean_local = value.into();
+        config.assistance.lean_local = value;
+    }
+}
+
+/// Applies per-configuration context-economy overrides on top of the user's config; unset fields keep it.
+fn apply_efficiency(config: &mut Config, overrides: &EfficiencyOverrides) {
+    if let Some(bytes) = overrides.tool_preview_bytes {
+        config.efficiency.tool_preview_bytes = bytes;
+    }
+    if let Some(cap) = overrides.history_token_cap {
+        config.efficiency.history_token_cap = cap;
+    }
+    if let Some(enabled) = overrides.compaction_enabled {
+        config.compaction.enabled = enabled;
+    }
+    if let Some(tokens) = overrides.keep_recent_tokens {
+        config.compaction.keep_recent_tokens = tokens;
     }
 }
 
@@ -740,6 +782,17 @@ fn assistance_settings(config: &Config) -> serde_json::Value {
         "reliability_gate": config.reliability.enabled,
         "constrained_repair": config.assistance.constrained_repair,
         "lean_local": config.assistance.lean_local,
+        "lean_local_within_auto_window": config.context_window <= LEAN_AUTO_MAX_WINDOW,
+    })
+}
+
+/// Effective context-economy values recorded per configuration, after overrides and defaults.
+fn efficiency_settings(config: &Config) -> serde_json::Value {
+    json!({
+        "tool_preview_bytes": config.efficiency.tool_preview_bytes,
+        "history_token_cap": config.efficiency.history_token_cap,
+        "compaction_enabled": config.compaction.enabled,
+        "keep_recent_tokens": config.compaction.keep_recent_tokens,
     })
 }
 
@@ -759,6 +812,7 @@ fn select_configuration(
     selected.worker_timeout_secs = policy.case_timeout_secs;
     selected.harness.max_steps = selected.harness.capped_steps(24);
     apply_assistance(&mut selected, &requested.assistance);
+    apply_efficiency(&mut selected, &requested.efficiency);
     apply_local_runtime(&mut selected, requested)?;
     let mut quantization = serde_json::Value::Null;
     let mut adapter_metadata = serde_json::Value::Null;
@@ -858,6 +912,7 @@ fn select_configuration(
         "automatic_improvement": false,
         "model_roles": "disabled",
         "assistance": assistance_settings(&selected),
+        "efficiency": efficiency_settings(&selected),
         "local_runtime": selected.local_runtime,
     });
     Ok((selected, settings))
@@ -965,6 +1020,7 @@ mod tests {
             kv_bits: None,
             kv_group_size: None,
             quantized_kv_start: None,
+            efficiency: Default::default(),
         }
     }
 
@@ -1059,6 +1115,7 @@ mod tests {
             kv_bits: None,
             kv_group_size: None,
             quantized_kv_start: None,
+            efficiency: Default::default(),
         };
         let policy = MachineBenchmarkPolicy::default();
         assert!(
@@ -1077,14 +1134,19 @@ mod tests {
     }
 
     #[test]
-    fn assist_ablations_change_exactly_one_feature_from_dial() {
+    fn assist_variants_change_exactly_one_feature_from_dial() {
         let configurations = assist_configurations(&Config::default(), "openai", "model");
         let names: Vec<_> = configurations.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names[..2], ["raw", "dial"]);
-        assert_eq!(names.len(), 2 + ASSIST_FEATURES.len());
+        assert_eq!(names[..3], ["raw", "dial", "lean"]);
+        assert_eq!(names.len(), 3 + ASSIST_VARIANTS.len());
+        assert_eq!(
+            configurations[1].assistance.lean_local,
+            Some(LeanLocal::Auto)
+        );
+        assert_eq!(configurations[2].assistance.lean_local, Some(LeanLocal::On));
         let dial = serde_json::to_value(&configurations[1].assistance).unwrap();
-        for ablation in &configurations[2..] {
-            let value = serde_json::to_value(&ablation.assistance).unwrap();
+        for variant in &configurations[2..] {
+            let value = serde_json::to_value(&variant.assistance).unwrap();
             let changed = dial
                 .as_object()
                 .unwrap()
@@ -1093,9 +1155,111 @@ mod tests {
                 .count();
             assert_eq!(
                 changed, 1,
-                "{} must ablate exactly one feature",
-                ablation.name
+                "{} must change exactly one feature",
+                variant.name
             );
         }
+    }
+
+    #[test]
+    fn dial_baseline_tracks_shipped_defaults_and_ignores_user_config() {
+        let shipped = Config::default();
+        let mut user = Config::default();
+        user.assistance.compact_tools = true;
+        user.assistance.repair_hints = true;
+        user.assistance.lean_local = LeanLocal::Off;
+        user.efficiency.history_token_cap = 8192;
+        let configurations = assist_configurations(&user, "openai", "model");
+        let dial = &configurations[1];
+        // Shipped: compact_tools and repair_hints are off, lean_local is auto.
+        assert_eq!(dial.assistance.compact_tools, Some(false));
+        assert_eq!(dial.assistance.repair_hints, Some(false));
+        assert_eq!(dial.assistance.lean_local, Some(LeanLocal::Auto));
+        assert_eq!(
+            dial.assistance.initial_tool_limit,
+            Some(shipped.assistance.initial_tool_limit)
+        );
+        assert_eq!(
+            dial.assistance.reliability_gate,
+            Some(shipped.reliability.enabled)
+        );
+        assert_eq!(
+            dial.efficiency.history_token_cap,
+            Some(shipped.efficiency.history_token_cap)
+        );
+        // Default-off features are enabled by variants, not reported as ablations of dial.
+        let enable = configurations
+            .iter()
+            .find(|c| c.name == "enable-compact_tools")
+            .unwrap();
+        assert_eq!(enable.assistance.compact_tools, Some(true));
+        assert_eq!(configurations[2].assistance.lean_local, Some(LeanLocal::On));
+        assert!(
+            configurations
+                .iter()
+                .all(|c| c.efficiency == dial.efficiency)
+        );
+    }
+
+    #[test]
+    fn efficiency_overrides_stay_in_the_isolated_config_and_are_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(root.path(), home.path().to_owned()).unwrap();
+        let base: Config = toml::from_str(
+            r#"
+            [providers.local]
+            base_url = "https://127.0.0.1:8443/v1"
+        "#,
+        )
+        .unwrap();
+        let mut configuration = MachineConfiguration {
+            name: "context".into(),
+            provider: "local".into(),
+            model: "operator-model".into(),
+            context_window: 8192,
+            quantization_bits: None,
+            adapter: None,
+            assistance: Default::default(),
+            efficiency: EfficiencyOverrides {
+                tool_preview_bytes: Some(2048),
+                history_token_cap: Some(65_536),
+                compaction_enabled: Some(false),
+                keep_recent_tokens: Some(4096),
+            },
+            draft_model: None,
+            num_draft_tokens: None,
+            kv_bits: None,
+            kv_group_size: None,
+            quantized_kv_start: None,
+        };
+        let policy = MachineBenchmarkPolicy::default();
+        let (selected, settings) =
+            select_configuration(&layout, &base, &mut configuration, &policy).unwrap();
+        assert_eq!(selected.efficiency.tool_preview_bytes, 2048);
+        assert_eq!(selected.efficiency.history_token_cap, 65_536);
+        assert!(!selected.compaction.enabled);
+        assert_eq!(selected.compaction.keep_recent_tokens, 4096);
+        assert_eq!(settings["efficiency"]["history_token_cap"], 65_536);
+        assert_eq!(settings["efficiency"]["tool_preview_bytes"], 2048);
+        // The operator's base config is never mutated by an experiment override.
+        let defaults = Config::default();
+        assert_eq!(
+            base.efficiency.history_token_cap,
+            defaults.efficiency.history_token_cap
+        );
+        assert_eq!(
+            base.efficiency.tool_preview_bytes,
+            defaults.efficiency.tool_preview_bytes
+        );
+        assert_eq!(base.compaction.enabled, defaults.compaction.enabled);
+        // Out-of-bounds values fail before any inference.
+        configuration.efficiency.history_token_cap = Some(1);
+        assert!(select_configuration(&layout, &base, &mut configuration, &policy).is_err());
+        configuration.efficiency = EfficiencyOverrides {
+            tool_preview_bytes: Some(10),
+            ..Default::default()
+        };
+        assert!(select_configuration(&layout, &base, &mut configuration, &policy).is_err());
     }
 }

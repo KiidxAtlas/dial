@@ -32,11 +32,14 @@ The built-in tool roster, specialist integrations, safety model, context sources
 - **Silent inference recovery.** Requests managed by the model event pump have a separate
   silence watchdog: by default, 120 seconds without a worker event cancels only that inference
   attempt, discards its partial reply/tool arguments, then retries the same context once.
-  Completed tools, files, conversation and todos are not rolled back or replayed. After repeated
-  silence, interactive main-model requests ask for retry/direction or pause; noninteractive
-  exhaustion reports incomplete while keeping work. Cancellation is cooperative: the old worker
-  must finish before a new attempt can start. This is independent of unlimited task/step budgets
-  and does not override positive transport or reasoning limits. Configure it outside the project:
+  Local loading and prompt processing are exempt until generation starts, so a slow cold load or
+  prefill is not repeatedly cancelled by the generation-silence limit. Explicit cancellation and
+  configured startup/transport limits still apply. Completed tools, files, conversation and todos
+  are not rolled back or replayed. After repeated silence, interactive main-model requests ask for
+  retry/direction or pause; noninteractive exhaustion reports incomplete while keeping work. The
+  old worker must finish before a new attempt can start. Failed/cancelled Dial-managed model servers
+  are stopped before retry, ensuring abandoned GPU work cannot block a new request; external servers
+  are never killed. This is independent of task/step budgets. Configure it outside the project:
 
   ```toml
   [request_recovery]
@@ -73,7 +76,7 @@ The built-in tool roster, specialist integrations, safety model, context sources
   - `notebook`: revision-checked cell listing/read/source edits/insert/delete/move with immutable fresh source witnesses, JSON metadata preservation, stale-output handling and atomic rollback. It never executes cells.
   - Rich `read`: bounded JSON/JSONL selection, PDF pages, notebook cells, OOXML DOCX/PPTX/XLSX extraction, ZIP/TAR/gzip members and read-only SQLite. Archives never extract to disk; PDF requires Poppler. JSON selection is a documented bounded subset, not a claim of full jq semantics.
   - Shell/background output is streamed to the UI and fully spooled before clipping. `artifact://<sha256>` references survive compaction; `artifact_read` retrieves line ranges or exact byte pages. Abandoned temporary spools are removed.
-  - `bash` runs in the project root (`cwd` selects a subdirectory; no `cd <root> &&` prefix needed). `background: true` starts a job at once; a command still running after `[shell] auto_background_secs` (default 15) becomes a background job. Its completion is delivered to the model in the next request, a turn waits for running `bash` jobs instead of ending, and `bg` (output/wait/kill) is always available.
+  - `bash` runs in the project root (`cwd` selects a subdirectory; no `cd <root> &&` prefix needed). `background: true` starts a job at once; a command still running after `[shell] auto_background_secs` (default 15) becomes a background job. Completion is delivered to the model in the next request. Pending bash jobs return control to the model rather than silently blocking completion; continue independent work or explain what is pending and use a bounded `bg wait`. Waits and readiness checks default to 5 seconds (explicit `timeout: 0` remains unlimited). Job output has its own live transcript panel; `bg output` and artifacts retain the captured output. Read-only job waits do not hold the workspace mutation lock. `bg` remains available subject to the session's mode and tool allowlist.
   - Bash interceptor (`[bash_interceptor]`, on by default in `hint` mode): a command that is only a duplicate of a dedicated tool (`cat`/`head`/`tail` or `sed -n 'A,Bp'` → `read`, `grep`/`rg` → `grep`, `find -name` → `glob`, `sed -i`/`perl -i` → `edit`, `echo >` → `write`, `nohup`/`&`/dev servers/watch mode → `bg`) still runs, and its result gains one `[hint]` line naming the tool. A leading `cd DIR &&` and trailing `| head`/`| tail` count as part of the duplicate; batched compound commands, pipes into other programs, heredocs and `find` with `-exec`/`-delete`/time or size predicates are left alone, since one batched call saves model round trips. A hint names a tool only when the current request offers it. `gh run view|list` or `gh pr checks` output that still shows an unfinished run (or a `sleep` loop around them) gains a hint to wait once with `github` op `run_watch`, or `gh run watch <id> --exit-status` plus `bg` `wait`, instead of polling. `mode = "block"` refuses any command with a matching segment; `enabled = false` turns it off; `patterns` replaces the built-in rules. User `!` commands are never intercepted.
 - Native tool calling over streaming. When a local server does not parse tool calls itself, Dial reads the text formats local models emit: `<tool_call>` JSON (Qwen/Hermes), Qwen3-Coder `<function=…><parameter=…>` XML, Mistral `[TOOL_CALLS]`, Llama 3 `<|python_tag|>` and gpt-oss harmony `to=functions.…` messages. An unreadable block becomes a malformed call that is reported to the model and never executed.
 

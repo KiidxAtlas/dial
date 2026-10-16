@@ -122,10 +122,20 @@ impl<'a> Agent<'a> {
             .collect()
     }
 
+    /// Capability eligibility is independent of whether a tool's schema is loaded yet.
+    pub(super) fn tool_eligible(&self, name: &str) -> bool {
+        self.plan_tool_available(name)
+            && self.modes.vibe_allows(name)
+            && self.modes.launch.allows_tool(name)
+    }
+
     /// Activate tools chosen by discovery. In compact discovery mode they join the bounded working set and the
     /// oldest entries are evicted; otherwise they keep the legacy `enabled_tools` behaviour. Pinned tools are not
     /// recorded as discovered.
     pub(super) fn activate_tools(&mut self, names: &[String]) -> Result<()> {
+        if let Some(name) = names.iter().find(|name| !self.tool_eligible(name)) {
+            anyhow::bail!("tool {name} is unavailable under the current mode or tool allowlist");
+        }
         let mut state = self.session.control_state();
         if self.tool_discovery() {
             let before = self.discovered_tools();
@@ -195,6 +205,7 @@ impl<'a> Agent<'a> {
             if offered.iter().any(|tool| *tool == name)
                 || name == "tool_search"
                 || name == "tool_load"
+                || !self.tool_eligible(&name)
             {
                 continue;
             }
@@ -311,7 +322,7 @@ impl<'a> Agent<'a> {
         let hidden = catalog.iter().any(|name| {
             !names.iter().any(|offered| offered == name)
                 && !matches!(name.as_str(), "tool_search" | "tool_load")
-                && self.plan_tool_available(name)
+                && self.tool_eligible(name)
         });
         let loaders = discovery || pinned || self.lean_tools || selection_only || hidden;
         for tool in ["tool_search", "tool_load"] {
@@ -321,14 +332,9 @@ impl<'a> Agent<'a> {
                 names.retain(|name| name != tool);
             }
         }
-        names.retain(|name| self.plan_tool_available(name));
-        names.retain(|name| self.modes.vibe_allows(name));
-        names.retain(|name| self.modes.launch.allows_tool(name));
+        names.retain(|name| self.tool_eligible(name));
         if self.modes.goal.tool_offered() {
             names.push("goal".into());
-        }
-        if self.plan_mode {
-            names.push("exit_plan".into());
         }
         names.sort();
         names.dedup();
@@ -382,6 +388,8 @@ impl<'a> Agent<'a> {
             names.push("bg".into());
             names.sort();
         }
+        // Late additions must obey the same restrictions as discovery and explicit loads.
+        names.retain(|name| self.tool_eligible(name));
         // Peer messaging follows the `task` offer after mode and profile filters have settled.
         if !names.iter().any(|name| name == "task") {
             names.retain(|name| name != "message");
@@ -394,6 +402,12 @@ impl<'a> Agent<'a> {
         }
         if self.lean_tools {
             names.retain(|name| Self::LEAN_TOOLS.contains(&name.as_str()) || loaded.contains(name));
+        }
+        // The plan exit is a control operation, not an optional schema-budget candidate.
+        if self.plan_mode && self.tool_eligible("exit_plan") {
+            names.push("exit_plan".into());
+            names.sort();
+            names.dedup();
         }
         names
     }
@@ -1004,6 +1018,183 @@ mod default_offer_tests {
             assert!(offered.iter().any(|name| name == "message"), "{offered:?}");
             let prompt = serde_json::to_string(&agent.system_messages()).unwrap();
             assert!(prompt.contains("# Delegation"));
+        });
+    }
+
+    #[test]
+    fn restrictions_apply_to_discovery_loading_and_late_offers() {
+        for mode in ["plan", "vibe", "allowlist"] {
+            with_agent("", |agent| {
+                match mode {
+                    "plan" => agent.plan_mode = true,
+                    "vibe" => agent.modes.vibe = true,
+                    _ => {
+                        agent.modes.launch.tools = Some(
+                            [
+                                "read".to_owned(),
+                                "tool_load".to_owned(),
+                                "tool_search".to_owned(),
+                            ]
+                            .into(),
+                        )
+                    }
+                }
+                let offered = agent.offered();
+                if mode == "plan" {
+                    assert!(
+                        offered.iter().any(|name| name == "exit_plan"),
+                        "{offered:?}"
+                    );
+                    if offered.iter().any(|name| name == "task") {
+                        assert!(offered.iter().any(|name| name == "message"), "{offered:?}");
+                    }
+                }
+                assert!(
+                    !offered.iter().any(|name| name == "bash"),
+                    "{mode}: {offered:?}"
+                );
+                assert!(
+                    !agent
+                        .discoverable_tools(&offered)
+                        .iter()
+                        .any(|(name, _)| name == "bash")
+                );
+                if mode != "plan" {
+                    assert!(
+                        !offered.iter().any(|name| name == "bg"),
+                        "{mode}: {offered:?}"
+                    );
+                }
+                assert!(agent.activate_tools(&["bash".into()]).is_err());
+                struct Quiet;
+                impl Ui for Quiet {}
+                let mut backend = agent.backend.take().unwrap();
+                let out = agent.dispatch(
+                    &mut backend,
+                    &ToolCall {
+                        id: "restricted-load".into(),
+                        name: "tool_load".into(),
+                        arguments: json!({"names":["bash"]}),
+                        malformed_arguments: false,
+                    },
+                    &mut Quiet,
+                );
+                assert!(out.is_error, "{mode}: {}", out.text);
+                assert!(!agent.enabled_tools.contains("bash"));
+            });
+        }
+    }
+
+    #[test]
+    fn pending_background_work_returns_to_the_model_without_a_hidden_wait() {
+        struct Job(std::sync::atomic::AtomicUsize);
+        impl tools::ext::Tool for Job {
+            fn name(&self) -> &str {
+                "pending_probe"
+            }
+            fn schema(&self) -> Value {
+                json!({"type":"function","function":{"name":"pending_probe","description":"pending job fixture","parameters":{"type":"object","properties":{}}}})
+            }
+            fn needs_approval(&self, _: &Value) -> bool {
+                false
+            }
+            fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+                ToolOutput::ok("unused".into())
+            }
+            fn awaited_work(&self) -> Vec<String> {
+                // A legacy spin/wait would consume the second observation and incorrectly finish.
+                if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                    vec!["pending-probe still running".into()]
+                } else {
+                    vec![]
+                }
+            }
+        }
+        with_agent("", |agent| {
+            struct Quiet;
+            impl Ui for Quiet {}
+            agent
+                .ext
+                .try_register(Arc::new(Job(std::sync::atomic::AtomicUsize::new(0))))
+                .unwrap();
+            assert!(agent.await_background_jobs(&mut Quiet));
+            assert!(
+                agent
+                    .background_notices
+                    .iter()
+                    .any(|notice| notice.contains("pending-probe"))
+            );
+        });
+    }
+
+    #[test]
+    fn live_job_output_reaches_the_ui_without_a_matching_foreground_tool() {
+        struct Job;
+        impl tools::ext::Tool for Job {
+            fn name(&self) -> &str {
+                "output_probe"
+            }
+            fn schema(&self) -> Value {
+                json!({"type":"function","function":{"name":"output_probe","description":"job output fixture","parameters":{"type":"object","properties":{}}}})
+            }
+            fn needs_approval(&self, _: &Value) -> bool {
+                false
+            }
+            fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
+                ToolOutput::ok("done".into())
+            }
+            fn drain_notifications(&self) -> Vec<tools::ext::ToolEvent> {
+                vec![
+                    tools::ext::ToolEvent {
+                        kind: "background_output".into(),
+                        name: "job-identity".into(),
+                        text: "pipe delta".into(),
+                        artifact: None,
+                    },
+                    tools::ext::ToolEvent {
+                        kind: "background_progress".into(),
+                        name: "pty-identity".into(),
+                        text: "screen".into(),
+                        artifact: None,
+                    },
+                ]
+            }
+            fn call_streaming(
+                &self,
+                ctx: &ToolContext,
+                args: &Value,
+                on_event: &(dyn Fn(tools::ext::ToolEvent) + Sync),
+                _: &AtomicBool,
+            ) -> ToolOutput {
+                for event in self.drain_notifications() {
+                    on_event(event);
+                }
+                self.call(ctx, args)
+            }
+        }
+        #[derive(Default)]
+        struct Recording(Vec<(String, String, bool)>);
+        impl Ui for Recording {
+            fn background_output(&mut self, name: &str, text: &str, replace: bool) {
+                self.0.push((name.into(), text.into(), replace));
+            }
+            fn tool_output(&mut self, _: &str, _: &str) {
+                panic!("job output must not route to a foreground tool");
+            }
+        }
+        with_agent("", |agent| {
+            agent.ext.try_register(Arc::new(Job)).unwrap();
+            let mut ui = Recording::default();
+            agent.pump_subagents(&mut ui);
+            assert!(ui.0.contains(&("job-identity".into(), "pipe delta".into(), false)));
+            assert!(ui.0.contains(&("pty-identity".into(), "screen".into(), true)));
+            ui.0.clear();
+            let out = agent
+                .run_background_tool("output_probe", &json!({}), &mut ui, None)
+                .unwrap();
+            assert!(!out.is_error, "{}", out.text);
+            assert!(ui.0.contains(&("job-identity".into(), "pipe delta".into(), false)));
+            assert!(ui.0.contains(&("pty-identity".into(), "screen".into(), true)));
         });
     }
 }

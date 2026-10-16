@@ -63,6 +63,14 @@ impl std::fmt::Display for SilentRequest {
 }
 impl std::error::Error for SilentRequest {}
 
+/// Whether the generation-silence watchdog may cancel a request. Remote streams are always
+/// watched. A local engine's model load and prompt prefill are long, silent, and bounded only by
+/// the transport timeout, so only observed generation (text, reasoning, tool deltas, or a
+/// `Generating` progress report) arms it. Any retry disarms it until generation resumes.
+pub(super) fn silence_watch_armed(local_model: bool, generating: bool) -> bool {
+    !local_model || generating
+}
+
 /// Guarded attempts for a detected thinking/response loop, including the first.
 pub(super) const THINKING_LOOP_MAX_ATTEMPTS: u32 = 3;
 /// Thinking-loop redirect notice, appended only to the re-sampled request.
@@ -199,6 +207,7 @@ pub(super) fn chat_attempt_with_ui(
     let interrupt = Arc::new(AtomicBool::new(false));
     let cancel_request = interrupt.clone();
     let silence_limit = recovery.map_or(0, |policy| policy.silence_secs);
+    let local_model = backend.local_inference();
     let mut context = context_tokens.map(context_meter::StreamingContext::new);
     if let Some(tokens) = context_tokens {
         ui.context_usage(tokens, true);
@@ -296,6 +305,7 @@ pub(super) fn chat_attempt_with_ui(
         let mut thinking_loop_reason = None;
         let mut last_tick = Instant::now();
         let mut last_progress = Instant::now();
+        let mut generating = false;
         let mut stalled = None;
         let mut partial_text = String::new();
         let result = loop {
@@ -337,6 +347,7 @@ pub(super) fn chat_attempt_with_ui(
                         RequestPhase::Retrying
                     });
                     last_progress = Instant::now();
+                    generating = false;
                     if waiting {
                         partial_text.clear();
                         // A discarded attempt's output must not count toward the next one. A loop
@@ -364,6 +375,7 @@ pub(super) fn chat_attempt_with_ui(
                         llm::InferencePhase::Processing => RequestPhase::Processing,
                         llm::InferencePhase::Generating => RequestPhase::Generating,
                     });
+                    generating = value.phase == llm::InferencePhase::Generating;
                     last_progress = Instant::now();
                     if let Some(context) = &mut context {
                         let (tokens, estimated) = context.telemetry(&value);
@@ -404,6 +416,7 @@ pub(super) fn chat_attempt_with_ui(
                         }
                     }
                     if !text.is_empty() {
+                        generating = true;
                         ui.request_phase(RequestPhase::Generating);
                     }
                     last_progress = Instant::now();
@@ -444,6 +457,7 @@ pub(super) fn chat_attempt_with_ui(
                         cancel_request.store(true, Ordering::SeqCst);
                     }
                     if !text.is_empty() {
+                        generating = true;
                         ui.request_phase(RequestPhase::Generating);
                     }
                     last_progress = Instant::now();
@@ -481,6 +495,7 @@ pub(super) fn chat_attempt_with_ui(
                     }
                     last_progress = Instant::now();
                     if !delta.is_empty() {
+                        generating = true;
                         ui.request_phase(RequestPhase::Generating);
                     }
                     if let Some(progress) = &mut progress {
@@ -544,6 +559,7 @@ pub(super) fn chat_attempt_with_ui(
                     cancel_request.store(true, Ordering::SeqCst);
                 } else if stalled.is_none()
                     && silence_limit > 0
+                    && silence_watch_armed(local_model, generating)
                     && last_progress.elapsed().as_secs() >= silence_limit
                 {
                     stalled = Some(last_progress.elapsed().as_secs());

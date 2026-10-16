@@ -77,3 +77,27 @@ test('network failures lead with the current operation cause, not stale tab fail
   assert(message.includes('Browser failure evidence (untrusted page data):'));
   assert(!h.run(`failureMessage(new Error('page crashed'),3)`).startsWith('Browser network failure:'));
 });
+
+test('run uses DOM globals and assert/sleep in the page realm, not Playwright or Node', async () => {
+  const { runCode } = require('./browser_driver/run.cjs');
+  const heading = { textContent: 'Page heading' };
+  const context = vm.createContext({
+    document: { title: 'DOM title', querySelector(selector) { return selector === 'h1' ? heading : null; } },
+    setTimeout,
+  });
+  // Like Playwright, serialize the actual helper into a separate page realm, without Node bindings.
+  const page = { evaluate(fn, arg) {
+    context.input = arg;
+    return vm.runInContext(`(${fn.toString()})(input)`, context);
+  } };
+  const result = await runCode({ page, timeoutMs: 1000, code: `
+    assert(document.querySelector('h1').textContent === 'Page heading');
+    await sleep(0);
+    assert(typeof page === 'undefined', 'Playwright page must not be injected');
+    assert(typeof require === 'undefined' && typeof process === 'undefined', 'Node must not be exposed');
+    return document.title;
+  ` });
+  assert.equal(result.value, 'DOM title');
+  await assert.rejects(runCode({ page, timeoutMs: 1000, code: 'return page.title();' }), /page is not defined/);
+  await assert.rejects(runCode({ page, timeoutMs: 1000, code: "assert(false, 'DOM assertion failed');" }), /DOM assertion failed/);
+});

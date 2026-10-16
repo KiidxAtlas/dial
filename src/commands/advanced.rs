@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 pub(super) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "computer",
-        description: "host desktop screenshots and input (on, off, status)",
+        description: "control the desktop: screenshots and input",
         args_hint: "on|off|status",
         subcommands: &["on", "off", "status"],
     },

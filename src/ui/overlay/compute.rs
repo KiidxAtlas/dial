@@ -37,9 +37,9 @@ enum ListRow {
 }
 
 /// The tab strip: the active tab is amber, bold and underlined; the others are secondary. ASCII keeps `[tab]`.
-fn tab_line(theme: &Theme, active: usize, width: usize) -> Line<'static> {
+pub(super) fn tab_line(theme: &Theme, tabs: &[&str], active: usize, width: usize) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
-    for (i, tab) in TABS.iter().enumerate() {
+    for (i, tab) in tabs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
@@ -63,7 +63,7 @@ fn tab_line(theme: &Theme, active: usize, width: usize) -> Line<'static> {
 }
 
 /// Section heading of the item list: ` ── TOOLS ───────`, label in secondary, rule muted.
-fn section_heading(theme: &Theme, name: &str, width: usize) -> Line<'static> {
+pub(super) fn section_heading(theme: &Theme, name: &str, width: usize) -> Line<'static> {
     let rule = theme.sym(Sym::BoxH);
     let head = format!(" {rule}{rule} ");
     let title = chrome::label(theme, name);
@@ -109,12 +109,21 @@ struct Item {
     active: bool,
     target: Target,
 }
+/// A destructive request waiting for Enter: the control to send and the consequence to name.
+struct Pending {
+    action: String,
+    prompt: String,
+}
 pub struct ComputeOverlay {
     snapshot: Value,
     tab: usize,
     cursor: usize,
+    /// Cursor of the list the item menu was opened from; Esc returns to it.
+    saved_cursor: usize,
     menu: Option<Target>,
-    message: String,
+    confirm: Option<Pending>,
+    /// Result of the last control: text and whether it failed.
+    message: Option<(String, bool)>,
 }
 impl ComputeOverlay {
     pub fn new() -> Self {
@@ -122,8 +131,10 @@ impl ComputeOverlay {
             snapshot: Value::Null,
             tab: 0,
             cursor: 0,
+            saved_cursor: 0,
             menu: None,
-            message: "Loading live compute status…".into(),
+            confirm: None,
+            message: None,
         }
     }
     pub fn update(&mut self, snapshot: Value) {
@@ -138,12 +149,9 @@ impl ComputeOverlay {
                 .and_then(|id| items.iter().position(|item| item.target.identity() == id))
                 .unwrap_or(self.cursor.min(items.len().saturating_sub(1)));
         }
-        if self.message.starts_with("Loading") {
-            self.message.clear();
-        }
     }
-    pub fn banner(&mut self, message: String) {
-        self.message = text::one_line(&message);
+    pub fn banner(&mut self, message: String, is_error: bool) {
+        self.message = Some((text::one_line(&message), is_error));
     }
     fn jobs(&self) -> &[Value] {
         self.snapshot["jobs"]
@@ -262,15 +270,21 @@ impl ComputeOverlay {
             json!({"action":action,"state":state})
         ))
     }
-    fn remove(target: &Target) -> OverlayEvent {
+    /// Removing a job or stopping a process waits for Enter: both end work in progress.
+    fn request(target: &Target) -> Option<Pending> {
         match target {
-            Target::Job(state) => Self::event("remove", Some(state)),
-            Target::Process(process) => OverlayEvent::Action(format!(
-                "compute:{}",
-                json!({"action":"stop_process","pid":process["pid"],"identity":process["identity"]})
-            )),
-            Target::Control(_) => OverlayEvent::None,
-            Target::Summary => OverlayEvent::None,
+            Target::Job(state) => Some(Pending {
+                action: format!("compute:{}", json!({"action":"remove","state":state})),
+                prompt: "Remove this job? Automatic scheduling for it stops; its saved model data is kept.".into(),
+            }),
+            Target::Process(process) => Some(Pending {
+                action: format!(
+                    "compute:{}",
+                    json!({"action":"stop_process","pid":process["pid"],"identity":process["identity"]})
+                ),
+                prompt: "Stop this process? Work it is doing is lost; saved models reload on next use.".into(),
+            }),
+            Target::Control(_) | Target::Summary => None,
         }
     }
     pub fn handle(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
@@ -280,9 +294,19 @@ impl ComputeOverlay {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return OverlayEvent::None;
         }
+        if let Some(pending) = self.confirm.take() {
+            if keys.matches(Action::SelectConfirm, key) {
+                return OverlayEvent::Action(pending.action);
+            }
+            // Esc drops the question and keeps the job running; other keys leave it open.
+            if !keys.matches(Action::SelectCancel, key) {
+                self.confirm = Some(pending);
+            }
+            return OverlayEvent::None;
+        }
         if keys.matches(Action::SelectCancel, key) {
             if self.menu.take().is_some() {
-                self.cursor = 0;
+                self.cursor = self.saved_cursor;
                 return OverlayEvent::None;
             }
             return OverlayEvent::Close;
@@ -308,26 +332,33 @@ impl ComputeOverlay {
             if key.kind == crossterm::event::KeyEventKind::Repeat {
                 return OverlayEvent::None;
             }
-            if let Some(target) = self
+            let target = self
                 .menu
-                .as_ref()
-                .or_else(|| items.get(self.cursor).map(|item| &item.target))
-            {
-                return Self::remove(target);
-            }
+                .clone()
+                .or_else(|| items.get(self.cursor).map(|item| item.target.clone()));
+            self.confirm = target.as_ref().and_then(Self::request);
         } else if keys.matches(Action::SelectUp, key) {
             self.cursor = self.cursor.saturating_sub(1);
         } else if keys.matches(Action::SelectDown, key) {
             self.cursor = (self.cursor + 1).min(count.saturating_sub(1));
         } else if keys.matches(Action::SelectConfirm, key) {
-            if let Some(target) = &self.menu {
-                return match target {
-                    Target::Job(state) => Self::event(
-                        ["start", "stop", "stop_now"][self.cursor.min(2)],
-                        Some(state),
-                    ),
-                    _ => Self::remove(target),
-                };
+            if let Some(target) = self.menu.clone() {
+                if let Target::Job(state) = &target {
+                    // Index 2 discards an unfinished cycle, so it asks first.
+                    if self.cursor == 2 {
+                        self.confirm = Some(Pending {
+                            action: format!(
+                                "compute:{}",
+                                json!({"action":"stop_now","state":state})
+                            ),
+                            prompt: "Stop now? The unfinished cycle is discarded and starts over next time.".into(),
+                        });
+                        return OverlayEvent::None;
+                    }
+                    return Self::event(["start", "stop"][self.cursor.min(1)], Some(state));
+                }
+                self.confirm = Self::request(&target);
+                return OverlayEvent::None;
             }
             if let Some(item) = items
                 .get(self.cursor)
@@ -336,6 +367,7 @@ impl ComputeOverlay {
                 if let Target::Control(action) = item.target {
                     return Self::event(action, None);
                 }
+                self.saved_cursor = self.cursor;
                 self.menu = Some(item.target.clone());
                 self.cursor = 0;
             }
@@ -584,7 +616,7 @@ impl ComputeOverlay {
                     }
                 }
                 let header_limit = h.saturating_sub(5);
-                let mut output: Vec<Line<'static>> = vec![tab_line(ctx.theme, self.tab, w)];
+                let mut output: Vec<Line<'static>> = vec![tab_line(ctx.theme, &TABS, self.tab, w)];
                 output.extend(header.into_iter().take(header_limit).map(|(line, token)| {
                     filled(
                         vec![Span::styled(
@@ -615,25 +647,50 @@ impl ComputeOverlay {
                         ),
                     });
                 }
-                if output.len() < h {
-                    output.push(filled(
-                        vec![Span::styled(self.message.clone(), ctx.theme.fg(Tok::Muted))],
+                let notice = match (&self.confirm, &self.message) {
+                    (Some(pending), _) => Some(filled(
+                        vec![Span::styled(
+                            format!(" {}", text::one_line(&pending.prompt)),
+                            ctx.theme.fg(Tok::Warning),
+                        )],
                         w,
                         Style::default(),
-                    ));
+                    )),
+                    (None, Some((message, true))) => Some(filled(
+                        vec![Span::styled(
+                            format!(" {} {message}", ctx.theme.sym(Sym::Cross2)),
+                            ctx.theme.fg(Tok::Error),
+                        )],
+                        w,
+                        Style::default(),
+                    )),
+                    (None, Some((message, false))) => Some(filled(
+                        vec![Span::styled(
+                            format!(" {} {message}", ctx.theme.sym(Sym::Check)),
+                            ctx.theme.fg(Tok::Success),
+                        )],
+                        w,
+                        Style::default(),
+                    )),
+                    (None, None) => None,
+                };
+                if let Some(line) = notice.filter(|_| output.len() < h) {
+                    output.push(line);
                 }
                 if output.len() < h {
-                    let mut spans = vec![Span::raw(" ")];
-                    spans.extend(chrome::key_hint_spans(
-                        ctx.theme,
+                    let hints: &[(&str, &str)] = if self.confirm.is_some() {
+                        &[("Enter", "confirm"), ("Esc", "keep running")]
+                    } else {
                         &[
                             ("←→/Tab", "section"),
                             ("↑↓", "select"),
                             ("Enter", "details"),
                             ("x", "remove/stop"),
                             ("Esc", "back"),
-                        ],
-                    ));
+                        ]
+                    };
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(chrome::key_hint_spans(ctx.theme, hints));
                     output.push(Line::from(fit(spans, w)));
                 }
                 output
@@ -667,7 +724,11 @@ mod tests {
         overlay.handle(&key(KeyCode::Right), &keys);
         assert_eq!(overlay.tab, 1);
         assert_eq!(overlay.items().len(), 1);
-        let OverlayEvent::Action(action) = overlay.handle(&key(KeyCode::Char('x')), &keys) else {
+        assert!(matches!(
+            overlay.handle(&key(KeyCode::Char('x')), &keys),
+            OverlayEvent::None
+        ));
+        let OverlayEvent::Action(action) = overlay.handle(&key(KeyCode::Enter), &keys) else {
             panic!("missing stop");
         };
         let payload: Value =
@@ -678,7 +739,11 @@ mod tests {
         overlay.handle(&key(KeyCode::Right), &keys);
         assert_eq!(overlay.items().len(), 4);
         overlay.cursor = 3;
-        let OverlayEvent::Action(action) = overlay.handle(&key(KeyCode::Char('x')), &keys) else {
+        assert!(matches!(
+            overlay.handle(&key(KeyCode::Char('x')), &keys),
+            OverlayEvent::None
+        ));
+        let OverlayEvent::Action(action) = overlay.handle(&key(KeyCode::Enter), &keys) else {
             panic!("missing remove");
         };
         assert!(action.contains("remove") && action.contains("/job"));
@@ -722,7 +787,11 @@ mod tests {
         overlay.cursor = 1;
         status["processes"].as_array_mut().unwrap().reverse();
         overlay.update(status);
-        let OverlayEvent::Action(action) = overlay.handle(&key(KeyCode::Char('x')), &keys) else {
+        assert!(matches!(
+            overlay.handle(&key(KeyCode::Char('x')), &keys),
+            OverlayEvent::None
+        ));
+        let OverlayEvent::Action(action) = overlay.handle(&key(KeyCode::Enter), &keys) else {
             panic!("missing stop");
         };
         assert!(action.contains("model80"));
@@ -833,5 +902,43 @@ mod tests {
                 render(width, height, |frame| overlay.draw(frame, &ctx));
             }
         }
+    }
+
+    #[test]
+    fn esc_from_an_item_menu_restores_the_list_cursor_and_stop_now_asks_first() {
+        let keys = Keymap::defaults();
+        let mut overlay = ComputeOverlay::new();
+        overlay.update(fixture());
+        overlay.tab = 2;
+        overlay.cursor = 3;
+        overlay.handle(&key(KeyCode::Enter), &keys);
+        overlay.handle(&key(KeyCode::Esc), &keys);
+        assert_eq!(overlay.cursor, 3, "Esc returns to the item it was opened from");
+        overlay.handle(&key(KeyCode::Enter), &keys);
+        overlay.handle(&key(KeyCode::Down), &keys);
+        overlay.handle(&key(KeyCode::Down), &keys);
+        assert!(matches!(overlay.handle(&key(KeyCode::Enter), &keys), OverlayEvent::None));
+        assert!(overlay.confirm.is_some(), "stop now waits for Enter");
+        assert!(matches!(overlay.handle(&key(KeyCode::Esc), &keys), OverlayEvent::None));
+        assert!(overlay.confirm.is_none(), "Esc keeps the job running");
+    }
+
+    #[test]
+    fn banners_carry_success_or_error_tone() {
+        let rig = Rig::new();
+        let mut overlay = ComputeOverlay::new();
+        overlay.update(fixture());
+        overlay.banner("stop failed".into(), true);
+        let ctx = DrawCtx {
+            theme: &rig.theme,
+            keys: &rig.keys,
+            status: &rig.status,
+            preview_status: &status_preview,
+        };
+        let buffer = render(100, 30, |frame| overlay.draw(frame, &ctx));
+        assert_eq!(
+            style_of(&buffer, "stop failed").and_then(|style| style.fg),
+            rig.theme.fg(Tok::Error).fg
+        );
     }
 }

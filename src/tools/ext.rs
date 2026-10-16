@@ -198,8 +198,6 @@ pub trait Tool: Send + Sync {
     fn awaited_work(&self) -> Vec<String> {
         Vec::new()
     }
-    /// Block up to `timeout` until awaited work finishes or changes state.
-    fn await_work(&self, _timeout: std::time::Duration) {}
     /// Interrupt an active blocking operation without acquiring its session mutex.
     fn cancel_operation(&self) {}
 
@@ -355,6 +353,12 @@ impl Registry {
             super::gh::tools(config),
             crate::computer::tools(config),
             crate::security::tools(config),
+            super::browser::tools(config),
+            super::kernel::tools(config),
+            super::eval::tools(config),
+            super::navigation::tools(config),
+            super::autoresearch::tools(config),
+            super::archive::tools(config),
         ];
         for tool in super::dap::tools(&config.dap) {
             if config
@@ -366,21 +370,9 @@ impl Registry {
             }
         }
         for tool in groups.into_iter().flatten() {
-            if config.integrations.iter().any(|name| name == tool.name()) {
+            if super::catalog::integration_enabled(tool.name(), &config.integrations) {
                 registry.register_native(tool);
             }
-        }
-        // Always registered: saved `integrations` lists (for example one written by `/computer on`)
-        // predate these names, so gating them by name would silently drop them for those users.
-        let standalone = super::browser::tools(config)
-            .into_iter()
-            .chain(super::kernel::tools(config))
-            .chain(super::eval::tools(config))
-            .chain(super::navigation::tools(config))
-            .chain(super::autoresearch::tools(config))
-            .chain(super::archive::tools(config));
-        for tool in standalone {
-            registry.register_native(tool);
         }
         let mcp = super::mcp::load(config);
         registry.register_native(mcp.inventory_tool(config));
@@ -526,5 +518,23 @@ mod tests {
 
         config.integrations.clear();
         assert!(!Registry::standard(&config).contains("notebook"));
+    }
+    #[test]
+    fn legacy_integration_lists_keep_always_registered_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.project_root = dir.path().to_path_buf();
+        config.user_dir = dir.path().join("user");
+        config.state_dir = dir.path().join("state");
+        config.integrations.clear();
+        config.extensions.enabled = false;
+        let registry = Registry::standard(&config);
+        for entry in super::super::catalog::INTEGRATIONS {
+            if entry.always_registered {
+                assert!(registry.contains(entry.name), "{}", entry.name);
+            }
+        }
+        assert!(!registry.contains("computer"));
+        assert!(!registry.contains("notebook"));
     }
 }

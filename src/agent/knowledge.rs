@@ -103,9 +103,9 @@ impl<'a> Agent<'a> {
         let mut text = format!(
             "Laya: {} · advisory decisions\nService: {}\nRequest timeout: {}s\n",
             if self.config.laya.enabled {
-                "enabled"
+                "enabled".to_owned()
             } else {
-                "disabled (enable Decision advice in /settings → Laya)"
+                format!("disabled (enable Decision advice in {})", crate::learn::improve::SETTINGS_PATH)
             },
             self.config.laya.endpoint,
             self.config.laya.timeout_secs

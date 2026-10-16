@@ -122,7 +122,7 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
             }
         }
         (_, None) => ProviderKind::Local {
-            model_dir: crate::learn::download::ensure_local_model(&config.python, &config.model)?,
+            model_dir: crate::llm::download::ensure_local_model(&config.python, &config.model)?,
         },
         (_, Some(endpoint)) => ProviderKind::Endpoint {
             base_url: endpoint.base_url.clone(),

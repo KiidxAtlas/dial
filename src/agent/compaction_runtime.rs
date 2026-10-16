@@ -63,10 +63,7 @@ pub fn portable_summary_completion(
             .checked_add(Duration::from_secs(timeout))
             .ok_or_else(|| anyhow::anyhow!("compaction summary deadline overflow"))?;
         let mut request = source.clone();
-        let mut profile = backend.compaction_profile().cloned();
-        if let Some(profile) = &mut profile {
-            profile.max_tokens = Some(request.max_tokens);
-        }
+        let profile = backend.compaction_summary_profile(request.max_tokens);
         loop {
             if cancel.load(Ordering::SeqCst) {
                 return Err(llm::Interrupted.into());
@@ -469,6 +466,8 @@ pub struct SpeculationContext<'a> {
     pub tokens: u64,
     pub mid_turn: bool,
     pub image_input: bool,
+    /// Immutable prefix (system, developer, tools, transient guidance) of the next request.
+    pub fixed_tokens: u64,
     /// False for local/shared compute or a hook that requires exact blocking ownership.
     pub parallel_supported: bool,
 }
@@ -813,9 +812,12 @@ impl CompactionRuntime {
                         .iter()
                         .any(|message| message["dial_anthropic_compaction"].is_object())
                 });
-                if growth > u64::from(policy.keep_recent_tokens).max(SPECULATION_LEAD_MIN_TOKENS)
-                    && !native_anthropic
-                {
+                let keep_recent = policy.keep_recent_budget(
+                    context.identity,
+                    context.window,
+                    context.fixed_tokens,
+                )?;
+                if growth > keep_recent.max(SPECULATION_LEAD_MIN_TOKENS) && !native_anthropic {
                     return Ok(SpeculationAction::Refresh(method));
                 }
                 return Ok(SpeculationAction::None);
@@ -933,7 +935,9 @@ impl CompactionRuntime {
         let worker_snapshot = snapshot.clone();
         let worker_options = options.clone();
         let worker_cancel = cancel.clone();
-        let ledger_scope = usage_scope.worker();
+        let ledger_scope = usage_scope
+            .worker()
+            .for_purpose(llm::usage::Purpose::Compaction);
         backends.main.set_usage_scope(Some(ledger_scope.clone()));
         if let Some(summary) = &mut backends.summary {
             summary.set_usage_scope(Some(ledger_scope.clone()));
@@ -1491,7 +1495,11 @@ impl super::Agent<'_> {
         let guard = self
             .compaction_runtime
             .foreground_idle(maintenance_timeout(self.config.worker_timeout_secs))?;
-        let scope = self.usage_scope.next_turn(0)?.worker();
+        let scope = self
+            .usage_scope
+            .next_turn(0)?
+            .worker()
+            .for_purpose(llm::usage::Purpose::Compaction);
         let original_scope = std::mem::replace(&mut self.usage_scope, scope.clone());
         let original_interrupt = std::mem::replace(&mut self.interrupt, guard.cancel.clone());
         self.bind_maintenance_scope();
@@ -1576,7 +1584,13 @@ mod tests {
             std::path::PathBuf::new(),
             5,
         )
-        .with_session_id("compaction-test");
+        .with_session_id("compaction-test")
+        .with_profile(llm::profiles::ModelProfile {
+            provider: "openai".into(),
+            model: "test".into(),
+            max_tokens: Some(1024),
+            ..Default::default()
+        });
         let rewrite = HookConfig {
             event: "before_provider_request".into(),
             matcher: None,
@@ -1617,6 +1631,8 @@ mod tests {
         assert_eq!(summary, "summary");
         let requests = server.requests();
         assert_eq!(requests.len(), 1);
+        assert_eq!(fake::body(&requests[0])["max_tokens"], 64);
+        assert_eq!(backend.model_profile().unwrap().max_tokens, Some(1024));
         let sent = fake::body(&requests[0])["messages"].to_string();
         assert!(
             sent.contains("rewritten") && !sent.contains("original"),

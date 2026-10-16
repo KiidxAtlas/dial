@@ -27,25 +27,32 @@ Your own verdict always wins: a commit never overwrites a rating, `/undo` or `/o
 later rating replaces anything. Files you edit by hand before committing change the content, so a
 corrected turn is not credited. Dial watches the last eight turns that changed files in the project
 root; changes in added directories are not tracked. Turns that do not change files need Alt+Up,
-checks or `/outcome` to count. Training still waits for `lora_min_examples` approved examples and
+checks or `/outcome` to count. Training still waits for the training threshold, the larger of
+`improve.lora_min_examples` and `training.batch_size` (24 by default), approved examples and
 runs only when you ask (`/improve train` or `/improve cycle`); a new version serves only after it
-passes the evaluation gate. `/improve` shows how many approved turns are recorded.
+passes the evaluation gate. `/improve` shows how many approved turns are recorded. After a local-model
+turn, Dial posts a short note at three quarters of the threshold and again when it is reached, at
+most twice per session.
 
 `/improve session` approves the current session for training, including a session reopened with
 `/resume` or `/sessions`. Every completed turn of that session that has a saved request and no
 existing verdict is recorded as approved (`user:session`, score 100). Failed or interrupted turns
 are skipped, and a turn you or a check scored lower keeps that score. Once the model has
-`lora_min_examples` verified turns, the command queues training and evaluation right away; until
-then it reports how many are still missing. Running it again approves only turns added since.
+threshold of verified turns, the command queues training and evaluation right away; until then it
+reports how many are still missing. It needs Enabled on (see below). Running it again approves only turns added since.
 
-Run `dial improve status` to inspect learning, `dial improve cycle` for an explicit gated cycle, or `dial improve train` for explicit training. Inside the terminal, `/improve settings` and `/improve models` expose the separate learning controls; `/improve jobs` and `/improve stop <state_id>` manage explicitly launched work. These operations retain compute, power, budget and evaluation gates. Learning workers yield to coding at their existing safe handoff boundaries.
+Run `dial improve status` to inspect learning, `dial improve cycle` for an explicit gated cycle, or `dial improve train` for explicit training. Inside the terminal, bare `/improve` opens a panel with Status, Jobs, Versions and Setup tabs: Tab and Shift+Tab switch tabs, Up and Down select, Enter acts and Esc closes. Stopping a job and rolling back a version ask for Enter first. `/improve status` prints the same facts as text. `/improve settings` and `/improve models` open the learning controls.
+
+`/improve jobs`, `/improve status` and `/improve stop <state_id>` run at once even while a turn is running. A bare `/improve stop` lists the running job ids instead of guessing one. `/improve versions` and `/improve tasks` print one line per item; `/improve versions` marks the live version. `/improve rollback [version]` makes the previous version (the parent of the live one) live again after a confirmation, with the same checks as `dial improve rollback`; a version other than that parent is refused. `/improve cycle` and `/improve train` start in the background and post one note when they finish. These operations retain compute, power, budget and evaluation gates. Learning workers yield to coding at their existing safe handoff boundaries.
+
+**Enabled is the switch that gates starting work.** `/improve cycle`, `/improve train`, `/improve session` (when it would train) and the panel's start action refuse while Enabled (`[improve] enabled`, in `/improve settings`) is off, and say so. `/improve enable` and `/improve disable` pause or resume a model's scheduling but do not change Enabled.
 
 Existing verified trajectories remain available to the explicit learning pipeline. New ordinary coding chats stay in the session journal for resume, review and undo, without becoming training examples. To evaluate task/model performance, run the explicit benchmark and improvement tools.
 
 ## What a cycle does
 
 `/improve jobs` shows each model's worker status and log alongside the shared compute lock.
-`/improve stop <state_id>` requests a safe stop for the model ID shown there. Updated training
+`/improve stop <state_id>` requests a safe stop for the model ID shown there (the panel asks for Enter first). Updated training
 subprocesses cancel promptly; inference/evaluation finishes its current case before stopping.
 A stop also pauses future cycles until `dial improve enable` is run for that model. Workers
 started with older binaries cannot acknowledge stop requests; the result explicitly reports this.
@@ -226,7 +233,7 @@ tool observations and asks for an alternative approach plus a discriminating loc
 ## Learning from other models in this project
 
 A local MLX model can train on work that other models (hosted or local) did in the same project.
-It is opt-in and off by default. Enable it in `/settings` → Improvement → Learn from other models,
+It is opt-in and off by default. Enable it in `/improve settings` → Learn from other models,
 or in configuration:
 
 ```toml
@@ -250,7 +257,7 @@ learn_from = ["claude-sonnet-5-5"]   # or learn_from_all_verified = true
 - `training.learn_from_all_verified = true` admits verified data from every other model in the
   project without listing them.
 - `training.learn_from_max_percent` (0–50, default 25, validated at config load) caps the foreign share
-  of each batch. When local records are below `lora_min_examples` (or `batch_size`, if larger), foreign
+  of each batch. When local records are below the training threshold (`max(lora_min_examples, batch_size)`), foreign
   records fill the batch up to that minimum. Above it, foreign records are limited to
   `local * pct / (100 - pct)`.
 - `improve.learn_from_sessions = false` excludes live sessions from every model, leaving only
@@ -275,7 +282,7 @@ and the setting on:
 
 ```toml
 [improve]
-distill = true        # /settings → Improvement → Teacher distillation
+distill = true        # /improve settings → Teacher distillation
 distill_tasks = 4     # teacher self-play tasks per cycle, 1-64
 
 [model_roles.coach]   # any model; hosted teachers need their provider credentials
@@ -322,8 +329,8 @@ Background cycles start only when the machine is free (`[improve]`):
 `idle_minutes` (default 10) since your last coding turn, `require_ac_power` (default true; macOS
 `pmset`), not in Low Power Mode, not thermally throttled, and under `daily_compute_minutes`
 (default `0` = unlimited), which is also enforced while a cycle runs: it pauses with state
-`paused` and resumes when next due. `dial improve cycle` and `/improve start` bypass the start-time
-checks. `dial improve status` shows `waiting_for`, `compute_used_today_secs` and
+`paused` and resumes when next due. `dial improve cycle` and `/improve cycle` bypass the start-time
+checks, but not Enabled. `dial improve status` shows `waiting_for`, `compute_used_today_secs` and
 `last_cycle_seconds_by_phase` so you can see whether generation, training or evaluation holds the machine.
 Evaluation stops early when a rejection is already certain (a suite over its regression bound, or a
 primary suite that cannot reach the required gain even if every remaining case went the candidate's
@@ -410,7 +417,7 @@ reducing the incumbent vector's held-out score. Failed candidates preserve the a
 These are response-contract checks, not proof of overall coding improvement. Manual vectors are
 preserved. Unchanged completed attempts have a 24-hour cooldown; new evidence can trigger a new attempt.
 
-`/settings` → Improvement → Activation steering → **Automatic vector creation** controls both automatic
+`/improve settings` → Activation steering → **Automatic vector creation** controls both automatic
 creation and use. **Enable manual vector** controls explicit vectors independently. `/steering`
 shows collecting `N/8` prompts, candidate extraction/evaluation progress, rejection/admission and
 actual runtime use. Jobs share the improvement cycle's compute lease, budget, stop controls and
@@ -462,7 +469,7 @@ fingerprint uses paths, file sizes/timestamps and selected config content, not a
 weight byte. If using LoRA, pass the same `--adapter /absolute/path` to both maintenance commands;
 a base-model vector is bypassed when an adapter is loaded.
 
-For a manually extracted vector, after evaluation open `/settings` → Improvement → Activation steering
+For a manually extracted vector, after evaluation open `/improve settings` → Activation steering
 to enable the manual vector and select
 the vector name and strength. `/steering` reports the evaluation, completed/total job progress,
 and live `loaded`, `used` (with forward-pass count), `bypassed` or `unconfirmed` state. CLI status
@@ -494,7 +501,11 @@ import under `steering/pending/imported-<sha12>.json`, re-bound to this checkout
 evaluation removed. Imports never touch the active vector, and an existing pending import with the
 same name is refused unless `--replace` is passed. Evaluate it locally with
 `dial steering evaluate --pending <name> --cases <file>`, then make it active with
-`dial steering promote <name> [--replace]`. Promotion requires a passing local evaluation of that exact
-vector; without `--replace` it refuses to overwrite an existing active vector.
+`dial steering promote <name> [--replace]`. Promotion uses the same structural, model and
+evaluation checks as runtime loading, including the exact strength and nonregression gates;
+without `--replace` it refuses to overwrite an existing active vector. Import, evaluation,
+automatic creation and promotion share per-vector mutation locks. Promotion locks both the
+pending and active vectors before checking admission or replacement state, so it cannot move
+a vector while another job is evaluating or replacing it. Busy vectors are refused, not queued.
 Packs carry weights and provenance only; exporter admission records are informational and are
 re-verified on import.

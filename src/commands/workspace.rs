@@ -33,7 +33,7 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     },
     super::CommandSpec {
         name: "wt",
-        description: "Git worktrees: create one on a new branch carrying changes and move this session into it, list, switch the session to one, or remove",
+        description: "manage git worktrees for this session",
         args_hint: "[list|create [branch]|switch <path|branch>|remove <path|branch> [--force]]",
         subcommands: &["create", "list", "switch", "remove"],
     },

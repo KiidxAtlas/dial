@@ -14,7 +14,7 @@ Supported lifecycle points include user prompt submission, session start/end, be
 
 ## Runtime extensions
 
-Runtime plugins are operator-installed stdio programs: those declared under `[extensions.plugins.<name>]` and those installed with `dial plugin install` (started from the user `plugins` directory). Dial does not scan `~/.dial/extensions` or the project for plugin executables, so no project-local extension runs without an explicit configuration entry. Plugins communicate using JSON-RPC messages over stdio and may register tools, commands, shortcuts and flags, update active tools, and observe lifecycle events. They run with the privileges of the Dial process; only install code you trust. The Rust SDK is for embedding trusted native integrations and does not bypass tool approvals or workspace controls.
+Runtime plugins are operator-installed stdio programs: those declared under `[extensions.plugins.<name>]` and those installed with `dial plugin install` (started from the user `plugins` directory). Dial does not scan `~/.dial/extensions` or the project for plugin executables, so no project-local extension runs without an explicit configuration entry. Plugins communicate using JSON-RPC messages over stdio and may register tools, commands, shortcuts and flags, update active tools, and observe lifecycle events. They run with the privileges of the Dial process; only install code you trust. The Rust SDK is for embedding trusted native integrations and does not bypass tool approvals or workspace controls. Plugins and skills offered by marketplaces are found and installed in `/extensions`; see Marketplaces below.
 
 ## Context and skills
 
@@ -32,8 +32,9 @@ content-addressed store. Source syntax is `url[@ref][#path]`:
 - `#path`: a relative directory inside the repository. Omitted means the whole repository. `..`,
   absolute paths and drive prefixes are refused.
 
-A package is every `<name>/SKILL.md` under the selected path. Each skill's frontmatter `name` must
-equal its directory name. Symlinks or special files inside a skill are errors; symlinks elsewhere are
+A package is every directory containing `SKILL.md` under the selected path. Installed skill names
+come from frontmatter `name`, falling back to the source directory name; the package name is derived
+from the selected path. Symlinks or special files inside a skill are errors; symlinks elsewhere are
 ignored. Limits: 256 skills, 2000 files, 32 MiB total, 8 MiB per file, depth 12.
 
 Packages are scoped: project (`.dial/`, the default) or user (`--user`). Precedence is project skills,
@@ -74,6 +75,42 @@ An index is one JSON document:
 - `url` uses the source syntax above. `dial skills install <registry-name>` resolves an entry by name.
 - Schemes: `file://`, `https://`, `http://` only. Size cap 1 MiB. 30-second timeout. Redirects are
   not followed.
+
+## Marketplaces and /extensions
+
+`/extensions` is the one place to find and install MCP servers, plugins and skills. Its tabs are MCP servers, Plugins, Skills and Marketplaces. Listings load in the background when the browser opens, and `/` then Enter searches every MCP source. Adding, refreshing or searching an index installs nothing. Installing is one Enter (or `i`) followed by a confirmation, and removing, disabling and installing always wait for that confirmation.
+
+A marketplace is a named index of plugins and skills. Dial bundles three curated skill catalogs:
+
+| Marketplace | Upstream | Selection |
+|---|---|---|
+| `anthropic-skills` | [Anthropic skills](https://github.com/anthropics/skills) | Documents, spreadsheets, presentations, design, testing and skill authoring |
+| `openai-skills` | [OpenAI skills](https://github.com/openai/skills) | GitHub review/CI, OpenAI docs, Playwright, security reviews/threat modeling, notebooks and Cloudflare deployment |
+| `vercel-skills` | [Vercel agent skills](https://github.com/vercel-labs/agent-skills) | React/Next.js performance, composition and transitions, web interface/accessibility reviews, and writing guidelines |
+
+These indexes ship in the binary: browsing and refreshing them requires no network and installs or executes nothing. They are curated selections, not complete mirrors of upstream repositories. Each entry targets its own skill directory (`#skills/<name>` or OpenAI's `#skills/.curated/<name>`). The added OpenAI and Vercel paths and frontmatter were checked against upstream `SKILL.md` files. Listings use package directory names; installed skill names may differ (for example, Vercel's `react-best-practices` package provides `vercel-react-best-practices`). Upstream skills may assume other harness tools or external dependencies; review the skill and its license before explicitly installing or using it. Refreshing a built-in catalog does not discover new upstream entries; catalog updates ship with Dial.
+
+Add an index with the Marketplaces tab (`a`, then a name and an `https://` URL or local JSON file), `/marketplace add <name> <index>`, or `dial plugin marketplace add <name> <index>`. Turn one on or off with `e` (or `/marketplace enable|disable <name>`, `dial plugin marketplace enable|disable <name>`), and remove it with `x`. Removing a marketplace leaves what it installed in place.
+
+Index format (`plugins` and `skills` are both optional):
+
+```json
+{
+  "plugins": [
+    {"name": "alpha", "version": "1.0.0", "source": "git+https://example.com/alpha.git#v1.0.0", "description": "Example plugin"}
+  ],
+  "skills": [
+    {"name": "code-review", "description": "Review diffs for correctness", "url": "https://github.com/acme/skills.git#skills/code-review"}
+  ]
+}
+```
+
+- A plugin `source` is `git+<url>[#ref]`, `npm:<name>[@version]` or `file:<dir>`, as for `dial plugin install`.
+- A skill `url` uses the skill package syntax (`url[@ref][#path]`), so the path and symlink checks above apply.
+- Claude Code `.claude-plugin/marketplace.json` files are not read: their plugin sources are objects, not strings. Use a Dial-format index instead.
+
+Marketplace state lives in `~/.dial/marketplaces/marketplaces.json`, which Dial writes. Each entry has `index`, `enabled` (default `true`) and `refreshed_at`. Downloaded snapshots sit beside it as `<name>.json`. Built-in catalogs use `index: "builtin"` and their marketplace name selects the bundled index. `seeded_builtins` tracks which catalogs were offered, so new catalogs appear once without restoring removed ones or re-enabling disabled ones. Migration honors the legacy `seeded` marker for the original Anthropic catalog and preserves existing custom indexes, including name collisions. Browsing does not write state; these migration markers persist on the next marketplace change. Removing a catalog never removes its installed skills.
+
 
 ## Configuration files
 
@@ -185,6 +222,10 @@ file copy, not `git worktree`, so it works with dirty trees and non-git projects
 `list`, `remove <id>`, `log <id>` and `run [--once]` (a foreground scheduler, one per project; keep it in
 tmux or launchd). Runs are ordinary `dial -p` children, read-only unless `--allow`/`-y` was given at add
 time, one at a time. Watch triggers wait for edits to settle and ignore the run's own changes.
+The interactive `/schedule add` accepts the same repeated or comma-separated `--allow` values
+and reports the resulting access policy when saving. `/schedule run` runs due entries once in a
+background job; `dial schedule run` remains the persistent foreground scheduler unless `--once`
+is supplied. Neither confirmation nor a named allow list grants approval to unlisted write tools.
 
 ## Git tools, budgets, custom agents and HTTP MCP
 
@@ -217,6 +258,35 @@ sign-in (protected-resource and authorization-server discovery, dynamic client r
 via `/mcp login <name>`. Streamable HTTP with JSON or SSE replies and session ids is supported. `transport = "sse"` selects
 the legacy HTTP+SSE transport: the event stream opens first, its `endpoint` event names where
 requests are POSTed (it must stay on the server's origin), and replies arrive on that stream.
+
+**MCP discovery and install.** `/extensions` (MCP tab) immediately shows the curated list and loads
+the first page from the official MCP registry and Smithery in the background, even with no query.
+`/` filters loaded rows while typing; Enter searches both remote catalogs, and `n` loads the next
+page. Remote MCP results for the submitted query retain the provider's relevance matching instead
+of being hidden by an additional literal-text filter. The official registry requests latest versions
+and follows its cursors; browsing is not limited to ten pages. Smithery listings remain visible even
+when their connection details are unavailable; those details are fetched when installing, not while
+browsing. A server listed by both providers on a page appears once with both source badges.
+Provider failures are reported alongside any available results, not treated as a complete catalog.
+These catalogs are not an exhaustive list of every MCP server: a server must be published there to
+appear in remote search. `i` installs; installation always asks for confirmation first.
+The curated list includes the [official Nuxt MCP server](https://nuxt.com/docs/4.x/guide/ai/mcp),
+available as `nuxt` even without registry access. It uses Nuxt's documented stdio bridge,
+`npx -y mcp-remote https://nuxt.com/mcp` (Node.js/npm required).
+Required environment values are requested in a masked
+form and saved in that server's `[mcp.<name>]` entry (`env`); Dial never guesses them. Servers that
+need a header or a templated URL are not installed from here: the details pane names what to add by
+hand. Each install starts the server once and saves nothing unless it starts and lists tools. npm
+and PyPI packages are pinned to the version the registry lists; `npx`, `uvx` or `docker` must be on
+PATH. Config names are the last segment of the listing name (`io.github.acme/notes` → `notes`).
+
+The agent has the same reach through `mcp_servers`: `list` (default), `search` with optional
+`query` (reads listings only, downloads and starts nothing) and `install` with `id` from a search
+result. Only `install` needs approval. It returns `needs_input` with the variable names when values
+are required, and the user enters them in `/extensions`. An installed server takes effect in the
+next session; `/mcp` shows its status. Smithery servers still install through their settings form
+(`/extensions` → `i`, or `/mcp smithery-install`). Archived upstream packages (Brave, Slack,
+GitLab, Puppeteer) are listed with that note because they still install.
 
 ## Structural guidance
 

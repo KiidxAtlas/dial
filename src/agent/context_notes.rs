@@ -631,10 +631,16 @@ impl super::Agent<'_> {
         self.prepare_compaction_memory(ui, Some(backend));
         let enabled = self.config.compaction.experimental_context_management;
         let cancel = self.interrupt.clone();
-        let mut history = rollover_history(
-            &self.session,
-            u64::from(self.config.compaction.keep_recent_tokens),
-        )?;
+        let window = self.budget_window();
+        let selection = self.auth_config.selection();
+        let identity = super::compaction::CompactionIdentity {
+            provider: &selection.provider,
+            model: &selection.model,
+            agent: None,
+        };
+        let fixed_tokens = self.projected_tokens(&self.projected_request(&[], template)?);
+        let keep_recent = self.config.compaction.keep_recent_budget(identity, window, fixed_tokens)?;
+        let mut history = rollover_history(&self.session, keep_recent)?;
         if let Some((authority, advice)) = &self.memory_controller.compaction_advice
             && super::memory_authority_matches(&self.session, authority, 0)
             && let Some(Value::String(content)) = history

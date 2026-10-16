@@ -10,6 +10,7 @@
 #[path = "commands/mod.rs"]
 mod commands;
 
+use crate::config::selection::{changes as selection_changes, protocol as selection_protocol};
 use crate::{
     agent::{self, Agent, Decision, Ui, context, make_backend, todo::TodoList},
     config::session_models::SessionModels,
@@ -38,7 +39,7 @@ use crate::{
             DrawCtx, OverlayEvent,
             compute::ComputeOverlay,
             models::ModelOverlay,
-            palette::{PaletteEntry, PaletteOverlay},
+            palette::{ChoiceItem, ChoiceSpec, PaletteEntry, PaletteOverlay},
             providers::ProviderOverlay,
             settings::SettingsOverlay,
             shortcuts::ShortcutOverlay,
@@ -61,7 +62,7 @@ use serde_json::{Value, json};
 use std::os::unix::fs::MetadataExt;
 use std::{
     cell::RefCell,
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::hash_map::DefaultHasher,
     fs::{self, File},
     hash::{Hash, Hasher},
     path::Path,
@@ -292,10 +293,9 @@ impl App {
         add_dirs: Vec<std::path::PathBuf>,
         mode_flags: crate::cli::mode_flags::ModeFlags,
     ) -> Result<Self> {
-        // Settings unreadable at this instant leave the session unpinned rather than failing launch.
-        let models = settings_store::load_merged(&layout, &overlay)
-            .ok()
-            .map(|merged| SessionModels::capture(&merged));
+        let models = Some(SessionModels::capture(
+            &settings_store::load_merged(&layout, &overlay).context("reading session settings")?,
+        ));
         let mut app = Self {
             layout,
             config: config.for_coding(),
@@ -674,7 +674,7 @@ fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) -> Result<(
                     shell.transcript.notice(
                         "Memory",
                         &format!(
-                            "The selected memory backend is off: {reason}. Fix it in /settings → Memory, or pick another backend there."
+                            "Memory is paused: {reason}. Fix it in /settings → Memory, or choose another backend there."
                         ),
                     );
                 }
@@ -769,7 +769,7 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
         } else {
             Which::Models
         };
-        let outcome = shell.run_overlay(app, which)?;
+        let outcome = shell.run_overlay(app, None, which)?;
         match outcome.latest {
             Some(config) => {
                 app.adopt(config);
@@ -1296,203 +1296,256 @@ fn terminal_dark(value: Option<&str>) -> Option<bool> {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Name and one-line description of every built-in slash command, in the order the list shows them.
-const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+/// Name, arguments syntax and one-line description of every built-in slash command, in the order
+/// the lists show them. The syntax lives in the usage column, never in the description. Hidden
+/// aliases are in [`COMMAND_ALIASES`]; a usage of `""` means the command takes no arguments.
+const BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
     (
         "workers",
-        "view workers, their results, and live cancel/message controls",
+        "[id]",
+        "open the worker panel: results, cancel and message",
     ),
     (
         "processes",
-        "view background commands and attach to their terminals",
+        "",
+        "open background processes and attach to a job's terminal",
     ),
-    (
-        "palette",
-        "search actions, sessions, models, tools and settings",
-    ),
-    ("compute", "open compute owners and background job controls"),
-    (
-        "bg",
-        "list background jobs and attach to a PTY job's terminal",
-    ),
+    ("palette", "", "search commands and actions"),
+    ("compute", "", "compute jobs and local runtimes"),
     (
         "changes",
+        "",
         "list changed files and line counts for this workspace",
     ),
-    ("help", "list commands and shortcuts"),
+    (
+        "help",
+        "[all|text]",
+        "search actions and commands; /help text lists them",
+    ),
     (
         "queue",
-        "manage queued steering and follow-ups; /queue [edit|remove] <number>",
+        "[edit|remove] <number>",
+        "review queued follow-ups; edit or remove one",
     ),
     (
         "review",
-        "read-only AI review: /review [uncommitted|base <ref>|ref <ref>|commit <ref>|pr://N|pr://owner/repo/N|GitHub PR URL]",
+        "[uncommitted|base <ref>|ref <ref>|commit <ref>|pr://N|PR URL]",
+        "read-only AI review of changes",
     ),
     (
         "review-file",
-        "review checkpoint changes; /review-file <turn> [path] offers selective Keep/Revert",
+        "<turn> [path]",
+        "review checkpoint changes; keep or revert them",
     ),
     (
         "model",
-        "choose the main model and assign roles; /model settings tunes it; /model defaults sets context defaults; /model local opens the local models dashboard",
+        "[settings|defaults|local]",
+        "choose the main model and assign roles",
     ),
-    ("providers", "set up providers, keys and endpoints"),
-    ("settings", "appearance, tools and coding preferences"),
+    ("providers", "", "set up providers, keys and endpoints"),
+    ("settings", "", "appearance, tools and coding preferences"),
     (
         "reload",
-        "reload settings, commands, skills, key bindings and themes from disk",
+        "",
+        "reload settings, commands, skills and themes from disk",
     ),
-    ("theme", "list or switch the color theme"),
-    ("hotkeys", "view and edit keyboard shortcuts"),
-    ("new", "start a fresh session"),
-    ("sessions", "search and resume sessions"),
-    ("resume", "search sessions or resume a unique id prefix"),
-    ("fork", "copy this conversation into a new session"),
-    ("rename", "name this session: /rename <title>"),
-    ("export", "export conversation: /export [path] [--html]"),
+    ("theme", "[name|auto]", "list or switch the color theme"),
+    ("hotkeys", "", "view and edit keyboard shortcuts"),
+    ("new", "", "start a fresh session"),
+    ("sessions", "", "search and resume sessions"),
+    (
+        "resume",
+        "[id]",
+        "search sessions or resume a unique id prefix",
+    ),
+    ("fork", "", "copy this conversation into a new session"),
+    ("rename", "<title>", "name this session"),
+    (
+        "export",
+        "[path] [--html]",
+        "export the conversation as Markdown or HTML",
+    ),
     (
         "archive",
-        "browse recent projects, sessions and deduplicated prompts",
-    ),
-    ("autoresearch", "manage branch-scoped benchmark experiments"),
-    ("tree", "browse session forks"),
-    ("copy", "copy the last assistant answer"),
-    ("plan", "toggle read-only planning mode"),
-    (
-        "profile",
-        "list/select capability profile: /profile [name|off]",
+        "",
+        "browse recent projects, sessions and prompts",
     ),
     (
-        "reasoning",
-        "show or set reasoning level: /reasoning [level]",
+        "autoresearch",
+        "[status|init|run|log|notes|resume]",
+        "manage branch-scoped benchmark experiments",
     ),
-    ("thinking", "show or set thinking: /thinking [level|on|off]"),
+    ("tree", "", "browse session forks"),
+    ("copy", "", "copy the last assistant answer"),
+    ("plan", "[on|off]", "toggle read-only planning mode"),
+    ("profile", "[name|off]", "choose a capability profile"),
     (
         "permissions",
-        "list rules; allow/deny [--persist] <tool> [prefix]; remove <number>",
+        "[allow|deny] [--persist] <tool> [prefix] | remove <number>",
+        "list, add or remove allow and deny rules",
     ),
-    ("cost", "show observed runtime cost and usage coverage"),
-    ("jobs", "show live subagents: /jobs [id]"),
+    ("cost", "", "show observed runtime cost and usage coverage"),
     (
         "agents",
-        "browse subagents: inspect, message, resume or cancel: /agents",
+        "[definitions]",
+        "open the worker panel; list agent definitions",
     ),
-    ("message", "steer a live subagent: /message <id> <text>"),
-    ("cancel", "cancel a live subagent: /cancel <id>"),
+    ("message", "<id> <text>", "steer a live subagent"),
+    ("cancel", "<id>", "cancel a live subagent"),
     (
         "compact",
-        "compact context: /compact [soft|remote|snapcompact|handoff|shake] [focus]",
+        "[soft|remote|snapcompact|handoff|shake] [focus]",
+        "compact the conversation context",
     ),
-    ("undo", "drop the last turn and restore its file changes"),
-    ("rollback", "restore files changed in the last n turns"),
+    (
+        "undo",
+        "",
+        "drop the last turn and restore its file changes",
+    ),
+    (
+        "rollback",
+        "[n]",
+        "restore files changed in the last n turns",
+    ),
     (
         "clear",
-        "clear conversation context and start a fresh session",
+        "",
+        "clear the conversation and start a fresh session",
     ),
-    ("todo", "show the task list"),
+    ("todo", "", "show the task list"),
     (
         "skills",
-        "browse, install, update, remove and enable/disable skills and skill packages",
+        "[list|install|update|remove|enable|disable|import|sources]",
+        "browse, install and manage skills",
     ),
     (
         "memory",
-        "what Dial remembers for this project; /memory clear forgets it",
+        "[clear [project|global]]",
+        "what Dial remembers for this project",
     ),
     (
         "reliability",
-        "show live tool success, correction attempts, capability results and verification",
+        "",
+        "live tool success, corrections and verification",
     ),
     (
         "policy",
-        "show live task phase, effective settings, selection reason and recent request metrics",
+        "",
+        "live task phase, effective settings and request metrics",
     ),
     (
         "steering",
-        "inspect activation vector, evaluation, progress and confirmed runtime use",
+        "",
+        "activation vector, evaluation and runtime use",
     ),
     (
         "experience",
-        "inspect learned recipes, failures and investigation: /experience [ledger]",
+        "[ledger]",
+        "learned recipes, failures and investigation",
     ),
     (
         "understanding",
-        "how the project fits together: /understanding [architecture|build|clear|query]",
+        "[architecture|build|clear|query]",
+        "how the project fits together",
     ),
     (
         "laya",
-        "local decision advice: /laya [status|check|start|on|off]",
+        "[status|check|start|on|off]",
+        "local decision advice",
     ),
-    ("commands", "list custom commands"),
-    ("search", "search past sessions"),
-    ("context", "show token usage"),
-    ("approval", "ask, write, auto or readonly"),
-    ("outcome", "record your verdict on the last answer (0-100)"),
-    ("improve", "self-improvement status and job controls"),
-    ("exit", "quit"),
+    ("commands", "", "list custom commands"),
+    ("search", "<query>", "search past sessions"),
+    ("context", "", "show token usage"),
+    (
+        "approval",
+        "[ask|write|auto|readonly]",
+        "choose when tool calls need approval",
+    ),
+    (
+        "outcome",
+        "<0-100> [note]",
+        "record your verdict on the last answer",
+    ),
+    (
+        "improve",
+        "[status|jobs|stop|cycle|train|session|enable|disable]",
+        "self-improvement status and job controls",
+    ),
+    (
+        "accounts",
+        "pin",
+        "pin which ChatGPT account this session uses",
+    ),
+    ("exit", "", "quit"),
 ];
+
+/// Hidden aliases: resolved to the target before dispatch, and listed in no menu, palette or help.
+const COMMAND_ALIASES: &[(&str, &str)] = &[
+    ("quit", "exit"),
+    ("q", "exit"),
+    ("?", "help"),
+    ("models", "model"),
+    ("provider", "providers"),
+    ("reasoning", "effort"),
+    ("thinking", "effort"),
+    ("jobs", "workers"),
+    ("hub", "workers"),
+    ("bg", "processes"),
+    ("doctor", "setup"),
+    ("plugin", "plugins"),
+];
+
+/// The dispatch name for `name`, following one hidden alias.
+fn canonical_command(name: &str) -> &str {
+    COMMAND_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map_or(name, |(_, target)| target)
+}
+
+/// Commands that end or replace the running turn, so typing one stops the turn first. `stops_turn`,
+/// `/help` and the palette all read this list.
+const STOPS_TURN: &[&str] = &[
+    "exit", "new", "clear", "resume", "sessions", "tree", "fork", "undo", "rollback", "compact",
+    "plan",
+];
+
+/// Commands that run at once while a turn runs, without stopping it (see `live_command`). `/help`
+/// and the palette read this list too.
+const RUNS_NOW: &[&str] = &[
+    "help",
+    "hotkeys",
+    "todo",
+    "search",
+    "skills",
+    "commands",
+    "context",
+    "reliability",
+    "policy",
+    "workers",
+    "message",
+    "cancel",
+    "queue",
+];
+
+/// Subcommands that run at once while a turn runs; the command itself is not in [`RUNS_NOW`].
+const RUNS_NOW_ARGS: &[&str] = &["improve status", "improve jobs", "improve stop"];
 
 /// Built-ins always win at dispatch, so a custom command with a built-in's name is never offered.
 fn command_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> Vec<CommandEntry> {
     let mut entries: Vec<CommandEntry> = BUILTIN_COMMANDS
         .iter()
-        .map(|(name, description)| CommandEntry {
+        .map(|(name, usage, description)| CommandEntry {
             name: (*name).into(),
             description: (*description).into(),
             kind: CommandKind::Builtin,
-            args_hint: matches!(
-                *name,
-                "resume"
-                    | "model"
-                    | "search"
-                    | "rollback"
-                    | "review"
-                    | "review-file"
-                    | "approval"
-                    | "outcome"
-                    | "theme"
-                    | "rename"
-                    | "message"
-                    | "cancel"
-            )
-            .then(|| {
-                match *name {
-                    "resume" => "[id]",
-                    "model" => "[settings|defaults]",
-                    "search" => "<query>",
-                    "review" => "[uncommitted|base <ref>|ref <ref>|commit <ref>|pr://N|pr://owner/repo/N|GitHub PR URL]",
-                    "review-file" => "<turn> [path]",
-                    "rename" => "<title>",
-                    "message" => "<id> <text>",
-                    "cancel" => "<id>",
-                    "rollback" => "[n]",
-                    "approval" => "[ask|write|auto|readonly]",
-                    "outcome" => "<0-100> [note]",
-                    _ => "[name]",
-                }
-                .to_owned()
-            }),
+            args_hint: (!usage.is_empty()).then(|| (*usage).to_owned()),
         })
         .collect();
-    // Commands that manage dial itself (self-improvement, reliability, decision services) sit
-    // after the coding commands so the palette and completion lead with the work, not the harness.
-    const HARNESS_COMMANDS: &[&str] = &[
-        "reliability",
-        "policy",
-        "steering",
-        "experience",
-        "understanding",
-        "laya",
-        "improve",
-        "outcome",
-        "autoresearch",
-        "compute",
-    ];
-    for entry in &mut entries {
-        if HARNESS_COMMANDS.contains(&entry.name.as_str()) {
-            entry.description = format!("advanced · {}", entry.description);
-        }
-    }
-    entries.sort_by_key(|entry| HARNESS_COMMANDS.contains(&entry.name.as_str()));
+    // Advanced sections (self-improvement, reliability, decision services, maintenance) sit after
+    // the coding commands so the palette and completion lead with the work. The section is derived
+    // from the category, so a label can never disagree with where the command is listed.
+    entries.sort_by_key(|entry| crate::ui::command_surface::category(&entry.name).advanced());
     for spec in commands::specs() {
         if entries.iter().any(|e| e.name == spec.name) {
             continue;
@@ -1505,11 +1558,11 @@ fn command_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> 
         });
     }
     let reserved = |name: &str| {
-        BUILTIN_COMMANDS.iter().any(|(builtin, _)| *builtin == name)
-            || matches!(
-                name,
-                "quit" | "q" | "?" | "models" | "roles" | "provider" | "model-settings"
-            )
+        BUILTIN_COMMANDS
+            .iter()
+            .any(|(builtin, _, _)| *builtin == name)
+            || COMMAND_ALIASES.iter().any(|(alias, _)| *alias == name)
+            || matches!(name, "roles" | "model-settings" | "status")
     };
     for def in custom.iter().filter(|def| !reserved(&def.name)) {
         if entries.iter().any(|e| e.name == def.name) {
@@ -1541,55 +1594,40 @@ fn command_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> 
     entries
 }
 
+/// What typing `name` during a running turn does. Derived from the same lists dispatch uses.
+fn during_turn_note(name: &str) -> &'static str {
+    let name = canonical_command(name);
+    if STOPS_TURN.contains(&name) {
+        "Stops the current turn before running."
+    } else if name == "reload" {
+        "Refreshes disk resources now; validated settings apply after this turn."
+    } else if matches!(name, "model" | "providers" | "settings" | "compute") {
+        "Opens now; changes to model/config apply after this turn."
+    } else if matches!(name, "workers" | "agents") {
+        "Opens now; m messages or resumes a worker, x x cancels a running one."
+    } else if name == "processes" {
+        "Opens now; keystrokes go to the attached job."
+    } else if RUNS_NOW.contains(&name) {
+        "Runs now without stopping the current turn."
+    } else {
+        "Runs after the current turn finishes."
+    }
+}
+
 fn palette_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> Vec<PaletteEntry> {
     let mut entries = command_entries(custom, skills)
         .into_iter()
-        .map(|command| {
-            let during_turn = if Shell::stops_turn(&command.name) {
-                "Stops the current turn before running."
-            } else if command.name == "reload" {
-                "Refreshes disk resources now; validated settings apply after this turn."
-            } else if matches!(
-                command.name.as_str(),
-                "model" | "providers" | "settings" | "compute"
-            ) {
-                "Opens now; changes to model/config apply after this turn."
-            } else if matches!(command.name.as_str(), "workers" | "agents" | "hub") {
-                "Opens now; m messages or resumes a worker, x x cancels a running one."
-            } else if matches!(command.name.as_str(), "processes" | "bg") {
-                "Opens now; keystrokes go to the attached job."
-            } else if matches!(
-                command.name.as_str(),
-                "help"
-                    | "hotkeys"
-                    | "todo"
-                    | "skills"
-                    | "commands"
-                    | "context"
-                    | "clear"
-                    | "policy"
-                    | "reliability"
-                    | "jobs"
-                    | "message"
-                    | "cancel"
-                    | "search"
-            ) {
-                "Runs now without stopping the current turn."
-            } else {
-                "Runs after the current turn finishes."
-            };
-            PaletteEntry {
-                command,
-                during_turn,
-            }
+        .map(|command| PaletteEntry {
+            during_turn: during_turn_note(&command.name),
+            command,
         })
         .collect::<Vec<_>>();
     // Getting-started commands lead the palette; the rest keep their registry order (stable sort).
     entries.sort_by_key(|entry| {
-        !matches!(
-            entry.command.name.as_str(),
-            "model" | "providers" | "settings" | "help"
-        )
+        crate::ui::command_surface::STARTERS
+            .iter()
+            .position(|starter| *starter == entry.command.name)
+            .unwrap_or(usize::MAX)
     });
     entries
 }
@@ -1628,7 +1666,7 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
         ),
         ("skills import", &["--dry-run", "--user", "--update"]),
         ("skills install", &["--user"]),
-        ("approval", &["ask", "auto", "readonly"]),
+        ("approval", Approval::NAMES),
         ("plan", &["on", "off"]),
         ("permissions", &["allow", "deny", "remove"]),
         ("permissions allow", &["--persist"]),
@@ -1659,7 +1697,7 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
             .map(|name| format!("/profile {name}")),
     );
     if let Ok(Some(profile)) = reasoning_profile(config) {
-        for command in ["reasoning", "thinking"] {
+        for command in ["effort"] {
             candidates.extend(
                 profile
                     .capabilities
@@ -1676,21 +1714,6 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
 // ---------------------------------------------------------------------------
 // Configuration changes as data (pure, so they can be tested without a terminal)
 // ---------------------------------------------------------------------------
-
-fn selection_protocol(
-    config: &Config,
-    selection: &ModelSelection,
-) -> crate::llm::model_config::ApiProtocol {
-    selection
-        .protocol
-        .or_else(|| {
-            config
-                .providers
-                .get(&selection.provider)
-                .and_then(|provider| provider.protocol)
-        })
-        .unwrap_or_else(|| crate::llm::model_config::ApiProtocol::builtin(&selection.provider))
-}
 
 fn selection_headers<'a>(
     config: &'a Config,
@@ -1768,161 +1791,6 @@ fn next_favorite(
         .position(|selection| same(selection, &current))
         .map_or(0, |index| (index + 1) % candidates.len());
     candidates.get(index).cloned()
-}
-
-/// The settings writes that make `selection` the model for `role` (`main` or a helper role).
-fn selection_changes(
-    config: &Config,
-    selection: &ModelSelection,
-    role: &str,
-) -> Result<Vec<Change>> {
-    ensure!(!selection.model.trim().is_empty(), "a model id is required");
-    let mut changes = Vec::new();
-    let set = |path: String, value: toml::Value| Change::Set { path, value };
-    let protocol = selection_protocol(config, selection);
-    if role == "main" {
-        changes.push(set("model".into(), selection.model.clone().into()));
-        changes.push(set("provider".into(), selection.provider.clone().into()));
-        if config.model_profile.as_ref().is_some_and(|name| {
-            config.model_profiles.get(name).is_some_and(|profile| {
-                profile.provider != selection.provider || profile.model != selection.model
-            })
-        }) {
-            // An explicit empty marker clears a profile inherited from the other settings layer.
-            changes.push(set("model_profile".into(), "".into()));
-        }
-        let remote = config.selection_base_url(selection).is_some();
-        match &selection.base_url {
-            Some(base) => {
-                changes.push(set("endpoint.base_url".into(), base.clone().into()));
-                // An empty variable name clears an inherited one (the loader treats it as unset).
-                changes.push(set(
-                    "endpoint.api_key_env".into(),
-                    selection.api_key_env.clone().unwrap_or_default().into(),
-                ));
-                changes.push(set(
-                    "endpoint.allow_insecure".into(),
-                    selection.allow_insecure.into(),
-                ));
-                changes.push(set("endpoint.protocol".into(), protocol.as_str().into()));
-                if !config.providers.contains_key(&selection.provider) {
-                    let prefix = format!("providers.{}", selection.provider);
-                    changes.push(set(
-                        format!("{prefix}.label"),
-                        selection.provider.clone().into(),
-                    ));
-                    changes.push(set(format!("{prefix}.base_url"), base.clone().into()));
-                    if let Some(variable) = &selection.api_key_env {
-                        changes.push(set(
-                            format!("{prefix}.api_key_env"),
-                            variable.clone().into(),
-                        ));
-                    }
-                    changes.push(set(format!("{prefix}.enabled"), true.into()));
-                    changes.push(set(
-                        format!("{prefix}.allow_insecure"),
-                        selection.allow_insecure.into(),
-                    ));
-                    changes.push(set(format!("{prefix}.protocol"), protocol.as_str().into()));
-                }
-            }
-            None if remote => {
-                let resolved = config.selection_endpoint(selection).unwrap();
-                changes.push(set("endpoint.base_url".into(), resolved.base_url.into()));
-                changes.push(set(
-                    "endpoint.api_key_env".into(),
-                    resolved.api_key_env.unwrap_or_default().into(),
-                ));
-                changes.push(set(
-                    "endpoint.allow_insecure".into(),
-                    resolved.allow_insecure.into(),
-                ));
-                changes.push(set(
-                    "endpoint.protocol".into(),
-                    resolved
-                        .protocol
-                        .unwrap_or_else(|| {
-                            crate::llm::model_config::ApiProtocol::builtin(&selection.provider)
-                        })
-                        .as_str()
-                        .into(),
-                ));
-            }
-            None => changes.push(Change::Remove {
-                path: "endpoint".into(),
-            }),
-        }
-        if remote {
-            changes.push(set(
-                "endpoint.headers".into(),
-                crate::llm::model_config::headers_setting(&selection.headers),
-            ));
-            changes.push(set(
-                "endpoint.account_id".into(),
-                selection.account_id.clone().unwrap_or_default().into(),
-            ));
-        }
-        // Capacity is metadata, not a user override. An explicit Auto marker also clears
-        // a numeric cap inherited from the other settings layer when switching models.
-        changes.push(set("context_window".into(), "auto".into()));
-    } else {
-        ensure!(
-            ROLES.iter().any(|(name, _)| *name == role) && role != "main",
-            "unknown model role {role:?}"
-        );
-        let prefix = format!("model_roles.{role}");
-        changes.push(set(
-            format!("{prefix}.provider"),
-            selection.provider.clone().into(),
-        ));
-        changes.push(set(
-            format!("{prefix}.model"),
-            selection.model.clone().into(),
-        ));
-        changes.push(set(format!("{prefix}.protocol"), protocol.as_str().into()));
-        changes.push(set(
-            format!("{prefix}.account_id"),
-            selection.account_id.clone().unwrap_or_default().into(),
-        ));
-        changes.push(set(
-            format!("{prefix}.headers"),
-            crate::llm::model_config::headers_setting(&selection.headers),
-        ));
-        match &selection.base_url {
-            Some(base) => {
-                changes.push(set(format!("{prefix}.base_url"), base.clone().into()));
-                changes.push(set(
-                    format!("{prefix}.api_key_env"),
-                    selection.api_key_env.clone().unwrap_or_default().into(),
-                ));
-                changes.push(set(
-                    format!("{prefix}.allow_insecure"),
-                    selection.allow_insecure.into(),
-                ));
-            }
-            None => {
-                if let Some(resolved) = config.selection_endpoint(selection) {
-                    changes.push(set(format!("{prefix}.base_url"), resolved.base_url.into()));
-                    changes.push(set(
-                        format!("{prefix}.api_key_env"),
-                        resolved.api_key_env.unwrap_or_default().into(),
-                    ));
-                    changes.push(set(
-                        format!("{prefix}.allow_insecure"),
-                        resolved.allow_insecure.into(),
-                    ));
-                } else {
-                    changes.push(Change::Remove {
-                        path: format!("{prefix}.base_url"),
-                    });
-                    changes.push(set(format!("{prefix}.api_key_env"), "".into()));
-                    changes.push(set(format!("{prefix}.allow_insecure"), false.into()));
-                }
-            }
-        }
-        changes.push(set(format!("{prefix}.context_window"), "auto".into()));
-    }
-    Ok(changes)
 }
 
 /// Make `role` follow the main model again. In the project layer an explicit marker is needed so a
@@ -2412,6 +2280,10 @@ struct Shell {
     teach_hint_shown: bool,
     /// What the shell last saw of "Teach this model", to announce changes after a rebuild.
     teach_state: TeachState,
+    /// Last "Teach this model" progress note: 0 none, 1 at three quarters of the threshold, 2 at it.
+    teach_nudge_stage: u8,
+    /// The background job this shell started, watched until it finishes.
+    improve_watch: Option<ImproveWatch>,
     startup: Option<String>,
     /// The configured approval mode last applied to the agent (session cycling may differ from it).
     cfg_approval: Approval,
@@ -2520,12 +2392,20 @@ fn model_settings_profile(config: &Config) -> (String, crate::llm::profiles::Mod
     (key, profile)
 }
 
+/// A background cycle or training run this shell started. Its finish is noted once.
+struct ImproveWatch {
+    state_dir: std::path::PathBuf,
+    started: u64,
+    checked: Instant,
+}
 enum Which {
     Palette,
+    Choice(Box<ChoiceSpec>),
     Compute,
+    Improve,
     Jobs,
     Subagents,
-    LocalModels,
+    ModelDownloads,
     SubagentsActivity,
     SubagentViewer {
         id: String,
@@ -2573,7 +2453,9 @@ fn overlay_destination(action: &str) -> Option<Which> {
         "open:context-defaults" => Some(Which::ContextDefaults),
         "open:shortcuts" => Some(Which::Shortcuts),
         "open:compute" => Some(Which::Compute),
-        "open:local-models" => Some(Which::LocalModels),
+        "open:improve" => Some(Which::Improve),
+        "open:improve-settings" => Some(Which::LearningSettings),
+        "open:improve-models" => Some(Which::LearningModels),
         "open:extensions" => Some(Which::Extensions),
         "subagent-hub" => Some(Which::Subagents),
         "subagent-hub:activity" => Some(Which::SubagentsActivity),
@@ -2658,6 +2540,8 @@ impl Shell {
             teach_pending: Vec::new(),
             teach_hint_shown: false,
             teach_state: TeachState::of(app),
+            teach_nudge_stage: 0,
+            improve_watch: None,
             startup: (!startup.trim().is_empty()).then_some(startup),
             cfg_approval: app.config.approval,
             dark,
@@ -2971,7 +2855,7 @@ impl Shell {
         }
         if resumed {
             replay_session(&mut self.transcript, session);
-            self.note("Resume", session.resume_summary());
+            self.note("Resume", Self::resume_note(session));
         }
     }
 
@@ -3299,6 +3183,7 @@ impl Shell {
                 dirty = true;
             }
             commands::commit::poll(self);
+            self.poll_improve_watch();
             if commands::extensions_browser::poll(self, app, agent) {
                 dirty = true;
             }
@@ -3313,7 +3198,10 @@ impl Shell {
             if self.auth_job.is_none() {
                 self.transcript.settle_job_notices();
             }
-            if let Some((provider, result)) = AuthJob::collect(&mut self.auth_job) {
+            if let Some((provider, result)) = AuthJob::collect(&mut self.auth_job, app) {
+                if provider == "Model" && result.is_ok() {
+                    self.pending_config = Some(app.reload()?);
+                }
                 let step = match result {
                     Err(error) if provider == "Smithery" => {
                         commands::smithery::browser_failed(self, app, agent, &error)?
@@ -3411,9 +3299,10 @@ impl Shell {
                 || ((crate::learn::compute::background_pending(&app.layout.user_dir)?
                     || crate::learn::compute::foreground_pending(&app.layout.user_dir)?)
                     && app.compute.borrow().is_some());
-            // Free resident models while waiting for input, including remote chats with local
-            // role models. Running child agents keep their models and compute lease.
-            if self.startup.is_none() && app.release_idle_compute(agent) && handoff {
+            // Keep resident models loaded between turns so the next turn starts without reloading.
+            // Unload them only when queued training, verification or another session asks for
+            // compute; running child agents keep their models and compute lease.
+            if self.startup.is_none() && handoff && app.release_idle_compute(agent) {
                 self.yield_compute = false;
                 self.note("Compute", "Local models unloaded for queued work. This chat stays open; the next turn reloads the model.");
                 dirty = true;
@@ -4222,6 +4111,7 @@ impl Shell {
                 ),
             );
         }
+        self.teach_nudge(app);
     }
 
     /// Announce what changed for "Teach this model". Each model has its own learning database, so
@@ -4303,10 +4193,323 @@ impl Shell {
         }
     }
 
+    /// Notes the approved-turn count after a turn, once at three quarters of the training threshold
+    /// and again on reaching it, so a session hears about it at most twice.
+    fn teach_nudge(&mut self, app: &App) {
+        let Some(store) = app.store.as_ref() else {
+            return;
+        };
+        let Ok(approved) = store.verified_live_turns() else {
+            return;
+        };
+        let needed = crate::learn::improve::min_examples(&app.config);
+        let stage = if approved >= needed {
+            2
+        } else if approved * 4 >= needed * 3 {
+            1
+        } else {
+            0
+        };
+        if stage == 0 || stage <= self.teach_nudge_stage {
+            return;
+        }
+        self.teach_nudge_stage = stage;
+        let next = if stage == 2 {
+            "enough to train: /improve session starts training on this session's approved turns"
+        } else {
+            "/improve session approves this session's turns"
+        };
+        self.note("Teaching", format!("{approved}/{needed} approved · {next}"));
+    }
+
+    /// Polls the job started by `/improve cycle` or `train`; notes its outcome once. The scheduler
+    /// state is read at most every two seconds, and a queued or running job is not finished yet.
+    fn poll_improve_watch(&mut self) {
+        let Some(watch) = self.improve_watch.as_mut() else {
+            return;
+        };
+        if watch.checked.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        watch.checked = Instant::now();
+        let Ok(store) = Store::open_read_only(&watch.state_dir) else {
+            return;
+        };
+        let status = store
+            .get_meta("auto_status")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or(Value::Null);
+        let state = status["state"].as_str().unwrap_or("");
+        if matches!(state, "" | "queued" | "running")
+            || status["at"].as_u64().unwrap_or(0) < watch.started
+        {
+            return;
+        }
+        let error = agent::truncate(status["error"].as_str().unwrap_or("no details"), 300);
+        let live = status["active"].as_i64().map_or_else(
+            || "the live version is unchanged".to_owned(),
+            |id| format!("v{id} is live"),
+        );
+        let message = match state {
+            "idle" => format!("Improvement cycle finished; {live}. /improve status shows the cycle report."),
+            "paused" => format!("Improvement paused: {error}. It resumes when the budget allows; /improve enable resumes it now."),
+            "stopped" => "Improvement stopped at your request.".to_owned(),
+            "disabled" => "Improvement did not run: automatic improvement is paused. /improve enable resumes it.".to_owned(),
+            "failed" => format!("Improvement failed: {error}. /improve status shows the last error."),
+            other => format!("Improvement ended ({other})."),
+        };
+        self.improve_watch = None;
+        self.note("Improvement", message);
+    }
+
+    /// `/improve status` text. Callers settle pending commits first when they have an agent.
+    fn improve_status_text(&mut self, app: &App) -> String {
+        self.learning.read(app);
+        let mut summary = improve_summary(app);
+        if let Some(monitor) = &self.adapter_monitor {
+            let runtime = monitor.lock();
+            if let Some(path) = &runtime.adapter {
+                summary.push_str(&format!(
+                    "\nThis session: {}\nAdapter: {}",
+                    Lora::Unknown.with_runtime(&runtime).label(),
+                    path.display()
+                ));
+            } else {
+                summary.push_str("\nThis session: no adapter use confirmed.");
+            }
+        }
+        summary
+    }
+
+    /// `/improve` and its subcommands. Bare `/improve` opens the panel. Status, jobs and stop also run
+    /// during a turn (see `live_command`).
+    fn improve_command(&mut self, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+        let (sub, rest) = args
+            .split_once(char::is_whitespace)
+            .map_or((args, ""), |(sub, rest)| (sub, rest.trim()));
+        match sub {
+            "" => return self.open(app, agent, Which::Improve),
+            "settings" => return self.open(app, agent, Which::LearningSettings),
+            "models" => return self.open(app, agent, Which::LearningModels),
+            "status" => {
+                self.settle_commits(app, agent);
+                let text = self.improve_status_text(app);
+                self.note("Improvement", text);
+            }
+            "jobs" => {
+                let text = improve_jobs_text(app);
+                self.note("Improvement", text);
+            }
+            "stop" => {
+                let text = improve_stop_text(app, rest);
+                self.note("Improvement", text);
+            }
+            "cycle" | "train" | "session" | "enable" | "disable" | "versions" | "tasks"
+            | "rollback" => {
+                let text = self
+                    .improve_action(app, sub, rest)
+                    .unwrap_or_else(|error| format!("{error:#}"));
+                self.note("Improvement", text);
+            }
+            other => self.note(
+                "Improvement",
+                format!(
+                    "Unknown /improve action \"{other}\". Use status, jobs, stop <id>, cycle, train, session, enable, disable, versions, tasks, rollback [version], settings or models. Bare /improve opens the panel."
+                ),
+            ),
+        }
+        Ok(Step::Done)
+    }
+
+    fn start_improve_watch(&mut self, learning: &crate::config::types::Config) {
+        self.improve_watch = Some(ImproveWatch {
+            state_dir: learning.state_dir.clone(),
+            started: crate::learn::improve::now(),
+            checked: Instant::now() - Duration::from_secs(2),
+        });
+    }
+
+    /// The `/improve` actions that start work, change the switch or read the learning store. Returns
+    /// the note text. Starting work needs Enabled on; the Enabled switch is never changed here.
+    fn improve_action(&mut self, app: &App, sub: &str, rest: &str) -> Result<String> {
+        let learning = app.reload()?;
+        let store = App::open_store(&learning)?;
+        let off = format!(
+            "Automatic improvement is off for this model, so nothing starts. Turn on Enabled in {} first.",
+            crate::learn::improve::SETTINGS_PATH
+        );
+        match sub {
+            "session" => {
+                let approval = store.approve_session(&self.session_id)?;
+                let mut text = format!(
+                    "This session: {} turn(s) approved for training, {} already verified, {} kept with an existing lower score, {} not usable (failed or no saved request).",
+                    approval.approved, approval.already, approval.judged, approval.unusable
+                );
+                let verified = store.verified_live_turns()?;
+                let needed = crate::learn::improve::min_examples(&learning);
+                if verified < needed {
+                    text.push_str(&format!(
+                        "\n{verified}/{needed} verified turns recorded for this model; training starts once there are {needed}. Run /improve session again after more turns."
+                    ));
+                    return Ok(text);
+                }
+                if !learning.improve.enabled {
+                    text.push_str(&format!("\nTraining not started. {off}"));
+                    return Ok(text);
+                }
+                ensure!(
+                    !crate::learn::compute::paused(&app.layout.user_dir),
+                    "{text}\nResume background work first"
+                );
+                let spawn = auto::start_training(&app.layout, &learning, &store)
+                    .map_err(|error| anyhow::anyhow!("{text}\nTraining not started: {error:#}"))?;
+                match spawn {
+                    auto::Spawn::Started => {
+                        self.yield_compute = app.config.uses_local_compute();
+                        self.start_improve_watch(&learning);
+                        text.push_str("\nTraining and evaluation queued in the background; coding keeps priority. Follow it with /improve jobs; cancel with /improve stop.");
+                    }
+                    auto::Spawn::Refused(reason) => text.push_str(&format!(
+                        "\nTraining not started: {}",
+                        reason.message(&learning.state_dir)
+                    )),
+                }
+                Ok(text)
+            }
+            "cycle" | "train" => {
+                ensure!(learning.improve.enabled, "{}", off);
+                ensure!(
+                    !crate::learn::compute::paused(&app.layout.user_dir),
+                    "Resume background work first"
+                );
+                let spawn = if sub == "train" {
+                    auto::start_training(&app.layout, &learning, &store)?
+                } else {
+                    auto::start_cycle(&app.layout, &learning, &store)?
+                };
+                spawn.ensure_started(&learning.state_dir)?;
+                self.yield_compute = app.config.uses_local_compute();
+                self.start_improve_watch(&learning);
+                let job = if sub == "train" {
+                    "Training and evaluation"
+                } else {
+                    "Improvement cycle"
+                };
+                Ok(format!(
+                    "{job} queued in the background; coding keeps priority. Follow it with /improve jobs; cancel with /improve stop. You will get a note here when it finishes."
+                ))
+            }
+            "enable" => {
+                auto::resume(&learning.state_dir)?;
+                store.set_meta("auto_enabled", "true")?;
+                auto::maybe_spawn(&app.layout, &learning, &store)?;
+                Ok(if learning.improve.enabled {
+                    "Automatic improvement resumed for this project.".to_owned()
+                } else {
+                    format!(
+                        "Automatic improvement resumed, but Enabled is still off. Turn it on in {} to run cycles.",
+                        crate::learn::improve::SETTINGS_PATH
+                    )
+                })
+            }
+            "disable" => {
+                store.set_meta("auto_enabled", "false")?;
+                Ok("Automatic improvement paused for this project; a running cycle is not interrupted.".to_owned())
+            }
+            "versions" => {
+                let live = store.active().ok().map(|version| version.id);
+                let versions = store.versions()?;
+                if versions.is_empty() {
+                    return Ok("No versions recorded yet.".to_owned());
+                }
+                Ok(versions
+                    .iter()
+                    .map(|version| version_line(version, live))
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            "tasks" => {
+                let tasks = crate::learn::repository::load(&learning)?;
+                if tasks.is_empty() {
+                    return Ok("No repository exercises registered.".to_owned());
+                }
+                Ok(tasks
+                    .iter()
+                    .map(|task| {
+                        format!(
+                            "{} · {} · {} files · {}",
+                            task.spec.id,
+                            task.spec.split,
+                            task.files.len(),
+                            task.digest.chars().take(12).collect::<String>()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            "rollback" => {
+                let confirmed = rest.split_whitespace().any(|word| word == "--yes");
+                let wanted = rest
+                    .split_whitespace()
+                    .find(|word| *word != "--yes")
+                    .map(|word| word.trim_start_matches('v').parse::<i64>())
+                    .transpose()
+                    .context("usage: /improve rollback [version]")?;
+                let active = store.active()?;
+                let parent = active
+                    .parent
+                    .context("the live version has no previous version to restore")?;
+                ensure!(
+                    wanted.is_none_or(|id| id == parent),
+                    "only v{parent} can be restored: it is the previous version of the live v{}. /improve versions lists them.",
+                    active.id
+                );
+                if !confirmed
+                    && self.ask(
+                        "Roll back learning",
+                        &format!(
+                            "Make v{parent} live again. v{} stays recorded; the change applies from the next turn.",
+                            active.id
+                        ),
+                        &[("Roll back", 'r'), ("Cancel", 'c')],
+                    ) != Some(0)
+                {
+                    return Ok(format!("Rollback cancelled. v{} stays live.", active.id));
+                }
+                // The same checks as `dial improve rollback`: no cycle may hold the version store.
+                let control = auto::lock_file(&learning.state_dir.join("control.lock"))?;
+                ensure!(
+                    fs2::FileExt::try_lock_exclusive(&control).is_ok(),
+                    "an improvement job is running; stop it with /improve stop first"
+                );
+                crate::learn::improve::verify_adapter(&store, &store.version(parent)?)?;
+                let restored = store.rollback()?;
+                Ok(format!(
+                    "Rolled back: v{} is live again; v{} stays recorded. The change applies from the next turn.",
+                    restored.id, active.id
+                ))
+            }
+            other => anyhow::bail!("unknown /improve action {other}"),
+        }
+    }
     /// Alt+Up / Alt+Down: rate the last finished turn for "Teach this model".
     fn rate_last_turn(&mut self, app: &App, good: bool) {
         let Some(store) = app.store.as_ref() else {
-            self.note("Teaching", TEACH_OFF);
+            let message = if !app.config.improve.teach {
+                TEACH_OFF.to_owned()
+            } else if !app.config.teaching() {
+                format!(
+                    "Teach this model works with local models; {} is hosted, so this turn was not recorded.",
+                    app.config.model
+                )
+            } else if let Some(error) = &app.store_error {
+                format!("Teaching is on, but the learning store could not open: {error}")
+            } else {
+                TEACH_OFF.to_owned()
+            };
+            self.note("Teaching", message);
             return;
         };
         let Some(trajectory) = self.last_trajectory else {
@@ -4665,6 +4868,50 @@ impl Shell {
         }
     }
 
+    /// Keep painting and accepting cancellation while local preparation owns a subprocess.
+    fn wait_local_preparation(
+        &mut self,
+        work: impl FnOnce(Arc<AtomicBool>, &mut dyn FnMut(&str)) -> Result<String> + Send + 'static,
+    ) -> Result<bool> {
+        let mut slot = None;
+        start_streaming_job(&mut slot, "Local models", work);
+        self.status.phase = Phase::Setup;
+        loop {
+            for (label, line) in AuthJob::drain_lines(&mut slot) {
+                self.transcript.notice_merge(label, &line);
+            }
+            if let Some(job) = slot.as_ref() {
+                match job.receiver.try_recv() {
+                    Ok(result) => {
+                        self.transcript.settle_job_notices();
+                        result?;
+                        return Ok(true);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        anyhow::bail!("local preparation worker stopped unexpectedly")
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            self.status.activity = "preparing local model · Esc cancels".into();
+            self.paint(None)?;
+            if poll(TICK)? {
+                match read()? {
+                    Event::Key(key)
+                        if self.keys.matches(Action::Interrupt, &key)
+                            || self.keys.matches(Action::SelectCancel, &key) =>
+                    {
+                        drop(slot);
+                        self.note("Local models", "Preparation cancelled; settings unchanged. Cached downloads can be reused.");
+                        return Ok(false);
+                    }
+                    Event::Resize(..) => self.term.on_resize(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     fn prepare_local(&mut self, app: &App) -> Result<bool> {
         if app.config.endpoint.is_some() {
             return Ok(true);
@@ -4676,10 +4923,17 @@ impl Shell {
             if choice != Some(0) {
                 return Ok(false);
             }
-            self.status.phase = Phase::Setup;
             self.note("Local models", "installing the local runtime…");
-            self.paint(None)?;
-            crate::setup::ensure_runtime(&app.layout)?;
+            let layout = app.layout.clone();
+            if !self.wait_local_preparation(move |cancel, progress| {
+                let progress = RefCell::new(progress);
+                crate::setup::ensure_runtime_with(&layout, &cancel, &|line| {
+                    progress.borrow_mut()(line)
+                })?;
+                Ok(String::new())
+            })? {
+                return Ok(false);
+            }
             ensure!(
                 app.config.python.is_file() && app.config.worker.is_file(),
                 "custom Python/worker paths are missing; update them or use the default local setup paths"
@@ -4694,18 +4948,36 @@ impl Shell {
                 .flatten()
                 .is_none();
             if needs_pin {
-                self.status.phase = Phase::Setup;
-                self.note(
-                    "Local models",
-                    "resolving the local model; the first use may download weights…",
-                );
-                self.paint(None)?;
-                let caps = crate::learn::worker::capabilities(&app.config)?;
-                ensure!(
-                    caps["inference"] == true,
-                    "local model is not supported by this runtime"
-                );
-                if let Some(store) = &app.store {
+                self.note("Local models", "resolving and checking the local model…");
+                let config = app.config.clone();
+                let capabilities = Arc::new(Mutex::new(None));
+                let prepared = capabilities.clone();
+                if !self.wait_local_preparation(move |cancel, progress| {
+                    let progress = RefCell::new(progress);
+                    crate::llm::download::ensure_local_model_with(
+                        &config.python,
+                        &config.model,
+                        &crate::llm::download::Choice::Auto,
+                        &cancel,
+                        &|line| progress.borrow_mut()(line),
+                    )?;
+                    let caps = crate::learn::worker::capabilities_controlled(&config, &cancel)?;
+                    ensure!(
+                        caps["inference"] == true,
+                        "local model is not supported by this runtime: {}",
+                        caps["reason"]
+                    );
+                    *prepared.lock().unwrap_or_else(|e| e.into_inner()) = Some(caps);
+                    Ok(String::new())
+                })? {
+                    return Ok(false);
+                }
+                if let Some(store) = &app.store
+                    && let Some(caps) = capabilities
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                {
                     store.set_meta("serving_capabilities", &caps.to_string())?;
                 }
             }
@@ -4831,18 +5103,12 @@ impl Shell {
     }
 
     fn open(&mut self, app: &App, agent: &mut Agent<'_>, which: Which) -> Result<Step> {
-        if matches!(which, Which::Models | Which::ModelRoles) {
-            app.release_idle_compute(agent);
-        }
         let mut which = which;
         // A settings change that needs a rebuild is carried while the overlay chain keeps
         // navigating, so the requested panel still opens and the rebuild still happens.
         let mut carried = Step::Done;
         loop {
-            if matches!(which, Which::Compute) {
-                app.release_idle_compute(agent);
-            }
-            let outcome = self.run_overlay(app, which)?;
+            let outcome = self.run_overlay(app, Some(&mut *agent), which)?;
             if let Some(config) = outcome.latest {
                 carried = self.config_changed(app, agent, config);
             }
@@ -4947,7 +5213,11 @@ impl Shell {
         self.refresh_resources(app, false, self.status.phase != Phase::Idle);
         if matches!(
             which,
-            Which::Models | Which::ModelRoles | Which::LearningModels | Which::Providers
+            Which::Models
+                | Which::ModelRoles
+                | Which::LearningModels
+                | Which::ModelDownloads
+                | Which::Providers
         ) {
             self.catalog.start(app);
         }
@@ -4963,11 +5233,15 @@ impl Shell {
         let context_defaults = matches!(which, Which::ContextDefaults);
         let learning_models = matches!(which, Which::LearningModels);
         let overlay = match which {
+            Which::Choice(spec) => ActiveOverlay::Palette(PaletteOverlay::choice(*spec)),
             Which::Palette => ActiveOverlay::Palette(PaletteOverlay::new(
                 palette_entries(&self.commands, &self.skills),
                 self.status.phase != Phase::Idle,
             )),
             Which::Compute => ActiveOverlay::Compute(ComputeOverlay::new()),
+            Which::Improve => ActiveOverlay::Improve(Box::new(
+                crate::ui::overlay::improve::ImproveOverlay::new(improve_view(app)),
+            )),
             Which::Subagents => ActiveOverlay::Subagents(Box::new(
                 crate::ui::subagent_hub::SubagentHub::new(self.session_id.clone()),
             )),
@@ -4996,15 +5270,6 @@ impl Shell {
                 )))
             }
             Which::Shortcuts => ActiveOverlay::Shortcuts(ShortcutOverlay::new()),
-            Which::LocalModels => ActiveOverlay::LocalModels(Box::new(
-                crate::ui::overlay::local_models::LocalModelsOverlay::new(
-                    crate::cli::local_models::collect(
-                        app.layout(),
-                        &crate::cli::local_models::Settings::from_config(&effective),
-                        crate::stats::now_ms(),
-                    ),
-                ),
-            )),
             Which::Jobs => {
                 ActiveOverlay::Jobs(Box::new(crate::ui::overlay::jobs::JobsOverlay::new()))
             }
@@ -5022,7 +5287,7 @@ impl Shell {
                 ))
             }
             Which::Settings | Which::LearningSettings | Which::ContextDefaults => {
-                let (values, global, project) = settings_tables(app, &effective);
+                let (values, global, project) = settings_tables(app, &effective)?;
                 let themes = self
                     .themes
                     .names()
@@ -5043,7 +5308,7 @@ impl Shell {
                 overlay.set_setup_offers(setting_setup_offers(&app.layout.user_dir, &effective));
                 ActiveOverlay::Settings(Box::new(overlay))
             }
-            Which::Models | Which::ModelRoles | Which::LearningModels => {
+            Which::Models | Which::ModelRoles | Which::LearningModels | Which::ModelDownloads => {
                 let mut models =
                     ModelOverlay::new(discovery, effective.role_statuses(), self.scope)
                         .with_favorites(favorite_routes(&effective))
@@ -5051,9 +5316,17 @@ impl Shell {
                             &effective.memory,
                         ))
                         .with_main_lora(self.status.lora)
-                        .with_learning(learning_models);
+                        .with_learning(learning_models)
+                        .with_downloads(
+                            app.layout(),
+                            crate::cli::local_models::Settings::from_config(&effective),
+                            effective.python.clone(),
+                        );
                 if matches!(which, Which::ModelRoles) {
                     models.show_roles();
+                }
+                if matches!(which, Which::ModelDownloads) {
+                    models.show_downloads();
                 }
                 ActiveOverlay::Models(models)
             }
@@ -5090,7 +5363,12 @@ impl Shell {
         Ok(overlay)
     }
 
-    fn run_overlay(&mut self, app: &App, which: Which) -> Result<OverlayOutcome> {
+    fn run_overlay(
+        &mut self,
+        app: &App,
+        agent: Option<&mut Agent<'_>>,
+        which: Which,
+    ) -> Result<OverlayOutcome> {
         let compute = matches!(which, Which::Compute);
         self.term.set_overlay_mouse(self.ui.mouse);
         let mut overlay = self.make_overlay(app, which)?;
@@ -5111,6 +5389,8 @@ impl Shell {
             runtime,
             ..
         } = self;
+        // Browsing panels keep resident models loaded; only an explicit compute action releases them.
+        let mut release = overlay_compute_release(app, agent);
         let mut env = OverlayEnv {
             app,
             themes,
@@ -5122,6 +5402,7 @@ impl Shell {
             latest: None,
             next: None,
             verify_lora: None,
+            release_compute: release.as_mut().map(|release| release as &mut dyn FnMut()),
             seen_generation: 0,
             auth_job,
             background_control: background_control.as_ref(),
@@ -5209,6 +5490,7 @@ impl Shell {
             catalog,
             scope,
             dark: *dark,
+            release_compute: None,
         };
         refresh_overlay(&mut env, &mut state.overlay);
         let redraw = event.is_none();
@@ -5373,7 +5655,7 @@ impl Shell {
                 "ask for anything: explain, fix, build, review",
             ),
             row("/", "open the command menu; keep typing to filter"),
-            row(&palette, "search every action, session, model and setting"),
+            row(&palette, "search slash commands"),
             row("@path", "attach a file to the message"),
             row(
                 "!command",
@@ -5413,11 +5695,20 @@ impl Shell {
         ));
         lines.push(row(
             "Stops the turn",
-            "/exit /new /resume /fork /undo /rollback /compact /plan",
+            &STOPS_TURN
+                .iter()
+                .map(|name| format!("/{name}"))
+                .collect::<Vec<_>>()
+                .join(" "),
         ));
         lines.push(row(
             "Runs at once",
-            "/help /hotkeys /todo /skills /commands /context /clear",
+            &RUNS_NOW
+                .iter()
+                .chain(RUNS_NOW_ARGS)
+                .map(|name| format!("/{name}"))
+                .collect::<Vec<_>>()
+                .join(" "),
         ));
         lines.push(row(
             &format!("/model or {}", self.keys.label(Action::ModelSelect)),
@@ -5433,9 +5724,10 @@ impl Shell {
                 Some(hint) if name.len() + 1 + hint.len() <= LEFT => {
                     row(&format!("{name} {hint}"), &entry.description)
                 }
-                Some(hint) => row(
-                    &name,
-                    &format!("{} (usage: {name} {hint})", entry.description),
+                Some(hint) => format!(
+                    "{}\n{}",
+                    row(&name, &entry.description),
+                    row("", &format!("usage: {name} {hint}"))
                 ),
                 None => row(&name, &entry.description),
             }
@@ -5492,22 +5784,7 @@ impl Shell {
             .split_whitespace()
             .next()
             .unwrap_or("");
-        matches!(
-            name,
-            "exit"
-                | "quit"
-                | "q"
-                | "new"
-                | "clear"
-                | "resume"
-                | "sessions"
-                | "tree"
-                | "fork"
-                | "undo"
-                | "rollback"
-                | "compact"
-                | "plan"
-        )
+        STOPS_TURN.contains(&canonical_command(name))
     }
 
     fn queue_command(&mut self, line: &str) {
@@ -5600,7 +5877,9 @@ impl Shell {
             }
             return false;
         }
-        if text.split_whitespace().next() == Some("/queue") {
+        if text.split_whitespace().next().is_some_and(|word| {
+            RUNS_NOW.contains(&word.trim_start_matches('/')) && word == "/queue"
+        }) {
             self.queue_command(&text);
             return false;
         }
@@ -5715,6 +5994,18 @@ impl Shell {
                     }
                     Err(error) => self.note("Search", format!("error: {error:#}")),
                 }
+            }
+            ("improve", "status") => {
+                let text = self.improve_status_text(app);
+                self.note("Improvement", text);
+            }
+            ("improve", "jobs") => {
+                let text = improve_jobs_text(app);
+                self.note("Improvement", text);
+            }
+            ("improve", rest) if rest == "stop" || rest.starts_with("stop ") => {
+                let text = improve_stop_text(app, rest.trim_start_matches("stop"));
+                self.note("Improvement", text);
             }
             ("jobs", "") => {
                 let text = match self.live_tasks.as_ref().map(|control| control.list()) {
@@ -5831,62 +6122,43 @@ impl Shell {
 
     fn pick_session(
         &mut self,
-        agent: &Agent<'_>,
+        agent: &mut Agent<'_>,
         query: &str,
         tree: bool,
         direct: bool,
     ) -> Result<Option<Session>> {
-        let layout = agent.layout().context("agent has no project layout")?;
+        use crate::ui::session_picker::Action as Pick;
+        let layout = agent
+            .layout()
+            .context("agent has no project layout")?
+            .clone();
+        let current = agent.session().id().to_owned();
         if direct && !query.is_empty() {
-            let matches = Session::find_prefix(layout, query)?;
-            if matches.len() == 1 {
-                if matches[0].id == agent.session().id() {
+            let matches = Session::find_prefix(&layout, query)?;
+            match matches.as_slice() {
+                [only] if only.id == current => {
+                    let name = Self::session_name(&only.title, &only.id);
+                    self.note("Session", format!("Already in session {name}"));
                     return Ok(None);
                 }
-                return Session::open(&matches[0].path).map(Some);
-            }
-            if matches.len() > 1 {
-                anyhow::bail!("ambiguous session prefix {query:?}");
+                [only] => return Session::open(&only.path).map(Some),
+                // No match, or an ambiguous prefix: the picker opens with the prefix as its search.
+                _ => {}
             }
         }
-        let mut sessions = Session::list_for_picker(layout, PICKER_SESSION_LIMIT)?;
-        if sessions.is_empty() {
+        let mut scope = (false, PICKER_SESSION_LIMIT);
+        let show_empty = direct && !query.is_empty();
+        let mut picker =
+            Self::load_session_picker(&layout, &current, tree, scope, query, show_empty)?;
+        if picker.sessions.is_empty() {
             self.note("Sessions", "no sessions yet");
             return Ok(None);
         }
-        if tree {
-            let ancestry = |s: &crate::storage::session::SessionInfo| {
-                let mut chain = vec![s.id.clone()];
-                let mut parent = s.parent_id.as_deref();
-                while let Some(id) = parent {
-                    if chain.iter().any(|p| p == id) {
-                        break;
-                    }
-                    chain.push(id.to_owned());
-                    parent = sessions
-                        .iter()
-                        .find(|s| s.id == id)
-                        .and_then(|s| s.parent_id.as_deref());
-                }
-                chain.reverse();
-                chain
-            };
-            let order: HashMap<_, _> = sessions
-                .iter()
-                .map(|s| (s.id.clone(), ancestry(s)))
-                .collect();
-            sessions.sort_by(|a, b| order[&a.id].cmp(&order[&b.id]));
-        }
-        let pinned = crate::storage::session_pins::load(&layout.user_dir)?;
-        let mut picker = crate::ui::session_picker::Picker::new(
-            sessions,
-            pinned,
-            agent.session().id(),
-            query,
-            tree,
-        );
         loop {
             let (cols, height) = self.term.size();
+            if let Some((id, path)) = picker.wanted_preview(cols as usize, height as usize) {
+                picker.set_preview(id, Session::preview_turns(&path).unwrap_or_default());
+            }
             let rows = picker.rows(cols as usize, height as usize, self.themes.current());
             self.paint(Some(rows))?;
             let event = read()?;
@@ -5894,24 +6166,219 @@ impl Shell {
                 self.term.on_resize();
             }
             match picker.handle(&event, height as usize) {
-                crate::ui::session_picker::Action::Cancel => return Ok(None),
-                crate::ui::session_picker::Action::Resume(index) => {
+                Pick::Cancel => return Ok(None),
+                Pick::Resume(index) => {
                     let session = &picker.sessions[index];
-                    if session.id == agent.session().id() {
+                    let (id, path) = (session.id.clone(), session.path.clone());
+                    let name = Self::session_name(&session.title, &id);
+                    if id == current {
+                        self.note("Session", format!("Already in session {name}"));
                         return Ok(None);
                     }
-                    return Session::open(&session.path).map(Some);
+                    if path.parent() != Some(layout.sessions_dir().as_path()) {
+                        let project = session.project.clone();
+                        picker.set_notice(format!(
+                            "{name} belongs to {project}. Run dial there to resume it, or /move it here."
+                        ));
+                        continue;
+                    }
+                    match Session::open(&path) {
+                        Ok(session) => return Ok(Some(session)),
+                        // The picker stays open so another session can be chosen.
+                        Err(error) => picker.set_notice(format!("{error:#}")),
+                    }
                 }
-                crate::ui::session_picker::Action::Pin(index) => {
-                    let pinned = crate::storage::session_pins::toggle(
-                        &layout.user_dir,
-                        &picker.sessions[index].id,
+                Pick::Pin(index) => {
+                    let id = picker.sessions[index].id.clone();
+                    match crate::storage::session_pins::toggle(&layout.user_dir, &id) {
+                        Ok(pinned) => picker.set_pinned(index, pinned),
+                        Err(error) => picker.set_notice(format!("{error:#}")),
+                    }
+                }
+                Pick::Rename(index, title) => {
+                    let (id, path) = {
+                        let session = &picker.sessions[index];
+                        (session.id.clone(), session.path.clone())
+                    };
+                    let result = if id == current {
+                        agent.session_mut().rename(&title)
+                    } else {
+                        Session::open(&path).and_then(|mut session| session.rename(&title))
+                    };
+                    let notice = match result {
+                        Ok(()) => format!("Renamed to {title}."),
+                        Err(error) => format!("Rename failed: {error:#}"),
+                    };
+                    Self::reload_session_picker(
+                        &mut picker,
+                        &layout,
+                        &current,
+                        tree,
+                        scope,
+                        Some(notice),
                     )?;
-                    picker.set_pinned(index, pinned);
                 }
-                crate::ui::session_picker::Action::None => {}
+                Pick::Fork(index) => {
+                    let (id, path, name) = {
+                        let session = &picker.sessions[index];
+                        (
+                            session.id.clone(),
+                            session.path.clone(),
+                            Self::session_name(&session.title, &session.id),
+                        )
+                    };
+                    let forked = if id == current {
+                        agent.session().fork(&layout)
+                    } else {
+                        Session::read(&path).and_then(|source| source.fork(&layout))
+                    };
+                    let notice = match forked {
+                        Ok(fork) => format!("Forked {name} as {}.", short(fork.id())),
+                        Err(error) => format!("Fork failed: {error:#}"),
+                    };
+                    Self::reload_session_picker(
+                        &mut picker,
+                        &layout,
+                        &current,
+                        tree,
+                        scope,
+                        Some(notice),
+                    )?;
+                }
+                Pick::Delete(index) => {
+                    let (id, path, name) = {
+                        let session = &picker.sessions[index];
+                        (
+                            session.id.clone(),
+                            session.path.clone(),
+                            Self::session_name(&session.title, &session.id),
+                        )
+                    };
+                    if id == current {
+                        picker.set_notice("Use /delete to delete the current session.");
+                        continue;
+                    }
+                    let body = format!("Delete {name}? Its file is removed and cannot be resumed.");
+                    if self.ask(
+                        "Delete session?",
+                        &body,
+                        &[("Cancel", 'n'), ("Delete", 'd')],
+                    ) != Some(1)
+                    {
+                        continue;
+                    }
+                    // The pin is dropped only after the journal is gone.
+                    let removed = Session::open(&path)
+                        .and_then(|session| session.remove_file())
+                        .and_then(|()| crate::storage::session_pins::unpin(&layout.user_dir, &id));
+                    let notice = match removed {
+                        Ok(()) => format!("Deleted {name}."),
+                        Err(error) => format!("Delete failed: {error:#}"),
+                    };
+                    Self::reload_session_picker(
+                        &mut picker,
+                        &layout,
+                        &current,
+                        tree,
+                        scope,
+                        Some(notice),
+                    )?;
+                }
+                Pick::Scope => {
+                    scope = (!scope.0, PICKER_SESSION_LIMIT);
+                    Self::reload_session_picker(&mut picker, &layout, &current, tree, scope, None)?;
+                }
+                Pick::LoadAll => {
+                    scope.1 = usize::MAX;
+                    Self::reload_session_picker(&mut picker, &layout, &current, tree, scope, None)?;
+                }
+                Pick::None => {}
             }
         }
+    }
+
+    /// The resume picker for one scope `(all projects, per-kind limit)`. Pins, open-elsewhere marks
+    /// and the journal count behind "showing N of M" are read here, never in the picker.
+    fn load_session_picker(
+        layout: &Layout,
+        current: &str,
+        tree: bool,
+        scope: (bool, usize),
+        query: &str,
+        show_empty: bool,
+    ) -> Result<crate::ui::session_picker::Picker> {
+        let (all, limit) = scope;
+        let sessions = if all {
+            Session::list_for_picker_all(layout, limit)?
+        } else {
+            Session::list_for_picker(layout, limit)?
+        };
+        let total = Session::count_for_picker(layout, all)?;
+        let open_elsewhere: std::collections::HashSet<String> = sessions
+            .iter()
+            .filter(|s| s.id != current && Session::open_elsewhere(&s.path))
+            .map(|s| s.id.clone())
+            .collect();
+        let pinned = crate::storage::session_pins::load(&layout.user_dir)?;
+        Ok(
+            crate::ui::session_picker::Picker::new(sessions, pinned, current, query, tree)
+                .scope(all, total)
+                .with_open_elsewhere(open_elsewhere)
+                .with_show_empty(show_empty),
+        )
+    }
+
+    /// Rebuilds the picker for `scope`, keeping the highlighted session when it is still listed.
+    fn reload_session_picker(
+        picker: &mut crate::ui::session_picker::Picker,
+        layout: &Layout,
+        current: &str,
+        tree: bool,
+        scope: (bool, usize),
+        notice: Option<String>,
+    ) -> Result<()> {
+        let keep = picker.selected_id().map(str::to_owned);
+        let mut next = Self::load_session_picker(
+            layout,
+            current,
+            tree,
+            scope,
+            picker.query(),
+            picker.show_empty(),
+        )?;
+        if let Some(id) = keep {
+            next.select_id(&id);
+        }
+        if let Some(notice) = notice {
+            next.set_notice(notice);
+        }
+        *picker = next;
+        Ok(())
+    }
+
+    /// A session's title with its short id, or the short id alone when it has no title.
+    fn session_name(title: &str, id: &str) -> String {
+        let title = text::one_line(title);
+        if title.trim().is_empty() {
+            short(id)
+        } else {
+            format!("\"{}\" ({})", title.trim(), short(id))
+        }
+    }
+
+    /// What a resumed session reports, at startup and after `/resume`: its name, model, last
+    /// activity, then the recorded state.
+    fn resume_note(session: &Session) -> String {
+        let model = match session.model_name().rsplit('/').next() {
+            Some(name) if !name.is_empty() => name.to_owned(),
+            _ => "unknown model".to_owned(),
+        };
+        format!(
+            "{} · {model} · active {}\n{}",
+            Self::session_name(&session.title(), session.id()),
+            crate::ui::session_picker::age(&session.updated_at()),
+            session.resume_summary()
+        )
     }
 
     fn copy_answer(&mut self, agent: &Agent<'_>) {
@@ -5993,6 +6460,137 @@ impl Shell {
         Ok(())
     }
 
+    /// The value picker a bare command opens in the TUI: `/approval`, `/effort`, `/profile`,
+    /// `/theme`, `/queue` and `/permissions remove`. `None` keeps the command's text output.
+    fn picker(&self, app: &App, agent: &Agent<'_>, name: &str, args: &str) -> Option<ChoiceSpec> {
+        let pick = |value: &str, detail: &str, current: bool| ChoiceItem {
+            value: value.to_owned(),
+            label: value.to_owned(),
+            detail: detail.to_owned(),
+            current,
+        };
+        let picker = |title: &str,
+                      command: &str,
+                      verb: &'static str,
+                      remove: Option<&'static str>,
+                      items: Vec<ChoiceItem>| ChoiceSpec {
+            title: title.to_owned(),
+            command: command.to_owned(),
+            verb,
+            remove,
+            items,
+        };
+        match (name, args) {
+            ("approval", "") => {
+                let current = format!("{:?}", agent.approval()).to_lowercase();
+                let items = Approval::NAMES
+                    .iter()
+                    .map(|value| {
+                        let mode: Approval = serde_json::from_value(serde_json::json!(value))
+                            .expect("approval metadata");
+                        pick(value, mode.description(), *value == current)
+                    })
+                    .collect();
+                Some(picker("Approval", "approval", "", None, items))
+            }
+            ("effort", "") => {
+                let profile = reasoning_profile(&app.config).ok().flatten()?;
+                let level = thinking_label(&profile);
+                let mut items: Vec<ChoiceItem> = profile
+                    .capabilities
+                    .reasoning_efforts
+                    .iter()
+                    .map(|effort| {
+                        let current = !app.config.thinking_auto && effort.as_str() == level;
+                        pick(effort.as_str(), "", current)
+                    })
+                    .collect();
+                items.push(pick(
+                    "auto",
+                    "Dial judges each prompt's thinking level",
+                    app.config.thinking_auto,
+                ));
+                Some(picker("Thinking effort", "effort", "", None, items))
+            }
+            ("profile", "") => {
+                let active = app.config.model_profile.as_deref();
+                let mut items: Vec<ChoiceItem> = app
+                    .config
+                    .model_profiles
+                    .iter()
+                    .map(|(key, profile)| {
+                        let detail = format!("{} / {}", profile.provider, profile.model);
+                        pick(key, &detail, active == Some(key.as_str()))
+                    })
+                    .collect();
+                items.push(pick("off", "no profile", active.is_none()));
+                Some(picker("Capability profile", "profile", "", None, items))
+            }
+            ("theme", "") => {
+                let active = self.themes.current().name().to_owned();
+                let items = self
+                    .themes
+                    .names()
+                    .into_iter()
+                    .filter(|entry| entry.error.is_none())
+                    .map(|entry| pick(&entry.name, "", entry.name == active))
+                    .collect();
+                Some(picker("Theme", "theme", "", None, items))
+            }
+            ("queue", "") => {
+                let items: Vec<ChoiceItem> = self
+                    .composer
+                    .queued_messages()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (message, follow_up))| ChoiceItem {
+                        value: (index + 1).to_string(),
+                        label: format!("{}. {}", index + 1, crate::ui::text::one_line(&message)),
+                        detail: if follow_up {
+                            "follow-up for after the turn"
+                        } else {
+                            "steering the current turn"
+                        }
+                        .to_owned(),
+                        current: false,
+                    })
+                    .collect();
+                (!items.is_empty())
+                    .then(|| picker("Queued messages", "queue", "edit", Some("remove"), items))
+            }
+            ("permissions", "remove") => {
+                let items: Vec<ChoiceItem> = agent
+                    .permission_rules()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, rule)| ChoiceItem {
+                        value: (index + 1).to_string(),
+                        label: format!(
+                            "{}. {} {}",
+                            index + 1,
+                            rule.tool,
+                            rule.command_prefix.join(" ")
+                        )
+                        .trim_end()
+                        .to_owned(),
+                        detail: format!("{:?}", rule.effect),
+                        current: false,
+                    })
+                    .collect();
+                (!items.is_empty()).then(|| {
+                    picker(
+                        "Remove a permission rule",
+                        "permissions",
+                        "remove",
+                        None,
+                        items,
+                    )
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn command(&mut self, app: &App, agent: &mut Agent<'_>, line: &str) -> Result<Step> {
         let Some(rest) = line.strip_prefix('/') else {
             return self.run_turn(app, agent, line);
@@ -6000,10 +6598,23 @@ impl Shell {
         let (name, args) = rest
             .split_once(char::is_whitespace)
             .map_or((rest, ""), |(name, args)| (name, args.trim()));
+        // `/accounts pin` is the clearer spelling of `/session pin`, which pins a ChatGPT account.
+        let accounts_pin;
+        let (name, args) = if name == "accounts" && (args == "pin" || args.starts_with("pin ")) {
+            accounts_pin = format!("pin{}", &args[3..]);
+            ("session", accounts_pin.as_str())
+        } else {
+            (name, args)
+        };
+        let name = canonical_command(name);
+        if args.is_empty() || (name == "permissions" && args == "remove") {
+            if let Some(spec) = self.picker(app, agent, name, args) {
+                return self.open(app, agent, Which::Choice(Box::new(spec)));
+            }
+        }
         if let Some(panel) = work_panel(name, args) {
             return self.open(app, agent, panel);
         }
-        let name = if name == "workers" { "jobs" } else { name };
         if let Some(result) = commands::run(self, app, agent, name, args) {
             return result.or_else(|error| {
                 self.note(&format!("/{name}"), format!("{error:#}"));
@@ -6027,10 +6638,17 @@ impl Shell {
             "compute" => return self.open(app, agent, Which::Compute),
             "processes" | "bg" => return self.open(app, agent, Which::Jobs),
             "exit" | "quit" | "q" => return Ok(Step::Quit),
-            "help" | "?" => {
-                let text = self.help_text(args.trim() == "all");
-                self.note("Help", text);
-            }
+            "help" | "?" => match args {
+                "" => return self.open(app, agent, Which::Palette),
+                "all" => {
+                    let text = self.help_text(true);
+                    self.note("Help", text);
+                }
+                _ => {
+                    let text = self.help_text(false);
+                    self.note("Help", text);
+                }
+            },
             "queue" => self.queue_command(line),
             "review" => {
                 repl::clear_interrupt();
@@ -6182,12 +6800,12 @@ impl Shell {
                 return self.open(app, agent, Which::ContextDefaults);
             }
             "model" | "models" if args == "local" => {
-                return self.open(app, agent, Which::LocalModels);
+                return self.open(app, agent, Which::ModelDownloads);
             }
             "model" if !args.is_empty() => {
                 self.note(
                     "Model",
-                    "Unknown option. Use /model to choose a model, /model settings to tune it, /model defaults for shared context defaults, or /model local for the local models dashboard.",
+                    "Unknown option. Use /model to choose a model, /model settings to tune it, /model defaults for shared context defaults, or /model local for the Get models downloads in /models.",
                 );
             }
             "model" | "models" => return self.open(app, agent, Which::Models),
@@ -6224,31 +6842,6 @@ impl Shell {
                     }
                 }
             }
-            "reasoning" | "thinking" => {
-                if args.is_empty() {
-                    match reasoning_profile(agent.effective_config()) {
-                        Ok(Some(profile))=>self.note("Reasoning",format!("{}: {}\nAvailable: {}\nSet with /reasoning <level> or /thinking <level>",agent.model(),
-                            thinking_label(&profile),
-                            profile.capabilities.reasoning_efforts.iter().map(|effort|effort.as_str()).collect::<Vec<_>>().join(" | "))),
-                        Ok(None)=>self.note("Reasoning","Dial does not know this model's reasoning levels yet.\nOpen /models and press F5 to rescan, or pick a /profile that sets them."),
-                        Err(error)=>self.note("Reasoning",format!("{error:#}")),
-                    }
-                } else {
-                    match reasoning_changes(agent.effective_config(), args).and_then(|(changes, effort)| {
-                        self.persist(app, agent, &changes, Scope::Project)
-                            .map(|step| (step, effort))
-                    }) {
-                        Ok((step, effort)) => {
-                            self.note(
-                                "Reasoning",
-                                format!("{} reasoning set to {effort}", agent.model()),
-                            );
-                            return Ok(step);
-                        }
-                        Err(error) => self.note("Reasoning", format!("not changed: {error:#}")),
-                    }
-                }
-            }
             "providers" | "provider" => return self.open(app, agent, Which::Providers),
             "palette" => return self.open(app, agent, Which::Palette),
             "settings" => return self.open(app, agent, Which::Settings),
@@ -6256,113 +6849,11 @@ impl Shell {
             "improve" if args == "models" => return self.open(app, agent, Which::LearningModels),
             "model-settings" => return self.open(app, agent, Which::ModelSettings),
             "hotkeys" => return self.open(app, agent, Which::Shortcuts),
-            "agents" => return self.open(app, agent, Which::Subagents),
-            "improve" if args == "jobs" || args.starts_with("stop ") => {
-                let result = if args == "jobs" {
-                    auto::jobs_summary(&app.layout)
-                } else {
-                    auto::request_stop(&app.layout, args.trim_start_matches("stop ").trim()).map(
-                        |value| {
-                            value["message"]
-                                .as_str()
-                                .unwrap_or("stop requested")
-                                .to_owned()
-                        },
-                    )
-                };
-                self.note(
-                    "Improvement",
-                    result.unwrap_or_else(|error| format!("{error:#}")),
-                );
-            }
-            "improve" if matches!(args, "cycle" | "train" | "session" | "enable" | "disable" | "versions" | "tasks") => {
-                let result = (|| -> Result<String> {
-                    let mut learning = app.reload()?;
-                    learning.improve.enabled = true;
-                    learning.require_model()?;
-                    let store = App::open_store(&learning)?;
-                    match args {
-                        "session" => {
-                            let approval = store.approve_session(&self.session_id)?;
-                            let mut text = format!(
-                                "This session: {} turn(s) approved for training, {} already verified, {} kept with an existing lower score, {} not usable (failed or no saved request).",
-                                approval.approved, approval.already, approval.judged, approval.unusable
-                            );
-                            let verified = store.verified_live_turns()?;
-                            let needed = learning.improve.lora_min_examples as usize;
-                            if verified < needed {
-                                text.push_str(&format!("\n{verified}/{needed} verified turns recorded for this model; training starts once there are {needed} (improve.lora_min_examples). Run /improve session again after more turns."));
-                                return Ok(text);
-                            }
-                            ensure!(
-                                !crate::learn::compute::paused(&app.layout.user_dir),
-                                "{text}\nResume background work first"
-                            );
-                            let started = auto::start_training(&app.layout, &learning, &store)
-                                .map_err(|error| anyhow::anyhow!("{text}\nTraining not started: {error:#}"))?;
-                            ensure!(started, "{text}\nAn improvement job is already running or queued");
-                            self.yield_compute = app.config.uses_local_compute();
-                            text.push_str("\nTraining and evaluation queued in the background; coding keeps priority. Follow it with /improve jobs; cancel with /improve stop.");
-                            Ok(text)
-                        }
-                        "cycle" | "train" => {
-                            ensure!(
-                                !crate::learn::compute::paused(&app.layout.user_dir),
-                                "Resume background work first"
-                            );
-                            let started = if args == "train" {
-                                auto::start_training(&app.layout, &learning, &store)?
-                            } else {
-                                auto::start_cycle(&app.layout, &learning, &store)?
-                            };
-                            ensure!(started, "An improvement job is already running or queued");
-                            self.yield_compute = app.config.uses_local_compute();
-                            let job = if args == "train" { "Training and evaluation" } else { "Improvement cycle" };
-                            Ok(format!("{job} queued in the background; coding keeps priority. Follow it with /improve jobs; cancel with /improve stop."))
-                        }
-                        "enable" => {
-                            auto::resume(&learning.state_dir)?;
-                            store.set_meta("auto_enabled", "true")?;
-                            auto::maybe_spawn(&app.layout, &learning, &store)?;
-                            Ok("Automatic improvement enabled for this project.".into())
-                        }
-                        "disable" => {
-                            store.set_meta("auto_enabled", "false")?;
-                            Ok("Automatic improvement disabled; a running cycle is not interrupted.".into())
-                        }
-                        "versions" => Ok(serde_json::to_string_pretty(&store.versions()?)?),
-                        _ => {
-                            let tasks = crate::learn::repository::load(&learning)?
-                                .iter()
-                                .map(|t| serde_json::json!({"id":t.spec.id,"split":t.spec.split,"digest":t.digest,"files":t.files.len()}))
-                                .collect::<Vec<_>>();
-                            Ok(serde_json::to_string_pretty(&tasks)?)
-                        }
-                    }
-                })();
-                self.note(
-                    "Improvement",
-                    result.unwrap_or_else(|error| format!("{error:#}")),
-                );
-            }
-            "improve" => {
-                self.settle_commits(app, agent);
-                self.learning.read(app);
-                let mut summary = improve_summary(app);
-                if let Some(monitor) = &self.adapter_monitor {
-                    let runtime = monitor.lock();
-                    if let Some(path) = &runtime.adapter {
-                        summary.push_str(&format!(
-                            "\nThis session: {}\nAdapter: {}",
-                            Lora::Unknown.with_runtime(&runtime).label(),
-                            path.display()
-                        ));
-                    } else {
-                        summary.push_str("\nThis session: no adapter use confirmed.");
-                    }
-                }
-                self.note("Improvement", summary);
-            }
+            "accounts" => self.note(
+                "Accounts",
+                "Usage: /accounts pin (chooses which ChatGPT account this session uses)",
+            ),
+            "improve" => return self.improve_command(app, agent, args),
             "changes" => {
                 let files = self.git.files(&agent.layout().unwrap_or(&app.layout).project_root);
                 let text = if files.is_empty() {
@@ -6413,14 +6904,18 @@ impl Shell {
                 let action = words.next().unwrap_or("status");
                 let result = match action {
                     "init" => match (words.next(), words.next(), words.next(), words.next()) {
-                        (Some(name), Some(metric), Some(direction), Some(benchmark)) => crate::tools::autoresearch::experiment::init(&layout.project_root, &state, name, benchmark, metric, direction != "min").map(|e| format!("Initialized {} on branch {}.", e.name, e.branch)),
+                        (Some(name), Some(metric), Some(direction), Some(benchmark)) => match crate::tools::autoresearch::experiment::parse_direction(direction) {
+                            Ok(maximize) => crate::tools::autoresearch::experiment::init(&layout.project_root, &state, name, benchmark, metric, maximize).map(|e| format!("Initialized {} on branch {}.{}", e.name, e.branch, if e.origin.is_empty() { String::new() } else { format!("\nLeave with /autoresearch exit; it returns to {}.", e.origin) })),
+                            Err(_) => anyhow::bail!("direction must be max or min. Usage: /autoresearch init <name> <metric> <max|min> <benchmark command>"),
+                        },
                         _ => anyhow::bail!("Usage: /autoresearch init <name> <metric> <max|min> <benchmark command>"),
                     },
                     "run" => crate::tools::autoresearch::experiment::run(&layout.project_root, &state).map(|run| format!("{} = {} · {}{}", run.metric, run.commit, if run.kept {"best"} else {"not best"}, if run.output.is_empty(){String::new()}else{format!("\n{}",run.output)})),
                     "log" => crate::tools::autoresearch::experiment::log(&state).map(|runs| runs.into_iter().map(|r| format!("#{} {} {} {}", r.id, r.metric, if r.kept {"best"} else {""}, r.commit)).collect::<Vec<_>>().join("\n")),
                     "notes" => { let text = args.trim().split_once(char::is_whitespace).map_or("", |(_, rest)| rest.trim()); if text.is_empty() { crate::tools::autoresearch::experiment::notes(&state) } else { crate::tools::autoresearch::experiment::update_notes(&state, text).map(|()| "Experiment notes updated.".to_owned()) } }
                     "resume" | "status" | "" => crate::tools::autoresearch::experiment::current(&state).map(|experiment| experiment.map(|e| format!("{} · {} · {} ({})\n{}", e.name, e.metric, e.branch, e.benchmark, crate::tools::autoresearch::experiment::notes(&state).unwrap_or_default())).unwrap_or_else(|| "No autoresearch experiment. Use /autoresearch init <name> <metric> <max|min> <benchmark command>.".to_owned())),
-                    other => anyhow::bail!("Unknown autoresearch action: {other}. Use init, run, log, notes, resume."),
+                    "exit" => crate::tools::autoresearch::experiment::exit(&layout.project_root, &state),
+                    other => anyhow::bail!("Unknown autoresearch action: {other}. Use init, run, log, notes, resume, exit."),
                 };
                 match result { Ok(text) => self.note("Autoresearch", text), Err(error) => self.note("Autoresearch", format!("{error:#}")) }
             }
@@ -6445,10 +6940,7 @@ impl Shell {
                         agent.swap_session(session);
                         agent.set_plan_mode(false);
                         self.stop_loop_for_session_change();
-                        self.note(
-                            "Session",
-                            format!("resumed {}", short(agent.session().id())),
-                        );
+                        self.note("Resume", Self::resume_note(agent.session()));
                     }
                     Ok(None) => {}
                     Err(error) => self.note("Sessions", format!("{error:#}")),
@@ -6638,7 +7130,7 @@ impl Shell {
                 text.push_str("\n\nMissing usage or prices are unknown, not free; local and subscription usage is not an invoice estimate. Caps stop on observed cost before the next step; in-flight workers and discarded attempts can add unobserved charges. Accounting for earlier (resumed) sessions is unavailable.");
                 self.note("Cost and usage", text);
             }
-            "jobs" => {
+            "workers" => {
                 let mut bridge = Bridge {
                     app,
                     shell: self,
@@ -7077,12 +7569,7 @@ impl Shell {
                     }
                 }
                 let mode = format!("{:?}", agent.approval()).to_lowercase();
-                let meaning = match agent.approval() {
-                    Approval::Write => "edits and safe commands run; destructive or outside-the-project actions ask",
-                    Approval::Ask => "asks before every edit and command",
-                    Approval::Auto => "runs everything without asking",
-                    Approval::Readonly => "reads only; edits and commands are refused",
-                };
+                let meaning = agent.approval().description();
                 self.note(
                     "Approval",
                     format!("mode: {mode} · {meaning}\nChange it with /approval ask|write|auto|readonly or Shift+Tab."),
@@ -7227,6 +7714,207 @@ fn app_home_hint() -> String {
         .unwrap_or_else(|| "~/.dial".into())
 }
 
+/// Plain words for the scheduler state recorded in `auto_status`.
+fn state_words(state: &str) -> String {
+    match state {
+        "" => "no cycle has run yet".into(),
+        "idle" => "idle; the next cycle runs when due".into(),
+        "queued" => "queued".into(),
+        "running" => "running".into(),
+        "paused" => "paused (daily compute budget reached)".into(),
+        "stopped" => "stopped at your request".into(),
+        "disabled" => "paused (automatic improvement is off)".into(),
+        "failed" => "the last cycle failed".into(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// One line per version: id, status, kind and parent. The live version is marked.
+fn version_line(version: &crate::config::types::Version, live: Option<i64>) -> String {
+    let mut line = format!("v{} · {} · {}", version.id, version.status, version.kind);
+    if let Some(parent) = version.parent {
+        line.push_str(&format!(" · from v{parent}"));
+    }
+    if live == Some(version.id) {
+        line.push_str(" · live");
+    }
+    line
+}
+
+/// The steps of a saved cycle report, one short line each.
+fn cycle_steps(report: &Value) -> Vec<String> {
+    report["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|step| {
+            let name = step["step"].as_str().unwrap_or("step").replace('_', " ");
+            let detail = match &step["data"] {
+                Value::String(text) => text.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            if detail.is_empty() {
+                name
+            } else {
+                format!("{name}: {}", agent::truncate(&detail, 120))
+            }
+        })
+        .collect()
+}
+
+/// `/improve jobs`: project-wide compute status. It reads job files only, so it runs during a turn.
+fn improve_jobs_text(app: &App) -> String {
+    auto::jobs_summary(&app.layout).unwrap_or_else(|error| format!("{error:#}"))
+}
+
+/// `/improve stop <id>`. A bare stop lists the running jobs and their ids instead of guessing one.
+fn improve_stop_text(app: &App, id: &str) -> String {
+    let id = id.trim();
+    if id.is_empty() {
+        let running: Vec<String> = auto::jobs(&app.layout)
+            .ok()
+            .and_then(|jobs| jobs["project_jobs"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter(|job| job["control_busy"] == true)
+            .filter_map(|job| job["state_id"].as_str().map(str::to_owned))
+            .collect();
+        return if running.is_empty() {
+            "usage: /improve stop <state id>. No improvement job is running in this project.".into()
+        } else {
+            format!(
+                "usage: /improve stop <state id>. Running jobs: {}",
+                running.join(", ")
+            )
+        };
+    }
+    match auto::request_stop(&app.layout, id) {
+        Ok(value) => value["message"]
+            .as_str()
+            .unwrap_or("stop requested")
+            .to_owned(),
+        Err(error) => format!("{error:#}"),
+    }
+}
+
+/// The `/improve` panel's snapshot: the facts of `/improve status` as plain values. It reads the
+/// store and job files, so the controller calls it on open and while a job runs, never from draw.
+fn improve_view(app: &App) -> crate::ui::overlay::improve::View {
+    use crate::ui::overlay::improve::{JobRow, VersionRow, View};
+    let cached = Store::open_read_only(&app.config.state_dir).ok();
+    let needed = crate::learn::improve::min_examples(&app.config);
+    let Some(store) = app.store.as_ref().or(cached.as_ref()) else {
+        return View {
+            enabled: app.config.improve.enabled,
+            readiness: "the learning store is unavailable".into(),
+            state: "unavailable".into(),
+            needed,
+            ..View::default()
+        };
+    };
+    let status = store
+        .get_meta("auto_status")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let state = status["state"].as_str().unwrap_or("");
+    let mut progress = Vec::new();
+    if matches!(state, "queued" | "running") {
+        let cycle = store
+            .get_meta("cycle_progress")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or(Value::Null);
+        progress.push(format!(
+            "Stage: {}",
+            cycle["stage"].as_str().unwrap_or("starting")
+        ));
+        if let Some(started) = cycle["started"].as_u64() {
+            progress.push(format!(
+                "Elapsed: {}",
+                auto::duration(crate::learn::improve::now().saturating_sub(started))
+            ));
+        }
+        if let (Some(iteration), Some(total)) = (
+            cycle["training"]["iteration"].as_u64(),
+            cycle["training"]["total"].as_u64(),
+        ) {
+            progress.push(format!(
+                "Training: {} {iteration}/{total}",
+                cycle["training"]["phase"].as_str().unwrap_or("step")
+            ));
+        }
+    }
+    let last_cycle = store
+        .get_meta("last_cycle_report")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .map(|report| cycle_steps(&report))
+        .unwrap_or_default();
+    let active = store.active().ok();
+    let live = active.as_ref().map(|version| version.id);
+    let previous = active.as_ref().and_then(|version| version.parent);
+    let mut jobs: Vec<JobRow> = auto::jobs(&app.layout)
+        .ok()
+        .and_then(|jobs| jobs["project_jobs"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|job| job.get("error").is_none())
+        .map(|job| {
+            let active = job["control_busy"] == true;
+            let stage = job["progress"]["stage"].as_str().unwrap_or(if active {
+                "running"
+            } else {
+                "idle"
+            });
+            JobRow {
+                id: job["state_id"].as_str().unwrap_or("").to_owned(),
+                label: format!(
+                    "{} · {stage}{}",
+                    job["model"].as_str().unwrap_or("unknown model"),
+                    if job["stop_requested"] == true {
+                        " · stop requested"
+                    } else {
+                        ""
+                    }
+                ),
+                active,
+                stopping: job["stop_requested"] == true,
+            }
+        })
+        .collect();
+    jobs.sort_by_key(|job| !job.active);
+    let versions = store
+        .versions()
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .map(|version| VersionRow {
+            id: version.id,
+            text: version_line(version, None),
+            live: live == Some(version.id),
+            previous: previous == Some(version.id),
+        })
+        .collect();
+    View {
+        enabled: app.config.improve.enabled,
+        readiness: auto::readiness(&app.config, store)
+            .unwrap_or_else(|error| format!("unavailable ({error:#})")),
+        state: state_words(state),
+        live_version: live,
+        approved: store.verified_live_turns().unwrap_or(0),
+        needed,
+        progress,
+        last_cycle,
+        jobs,
+        versions,
+    }
+}
+
 fn improve_summary(app: &App) -> String {
     let cached = Store::open_read_only(&app.config.state_dir).ok();
     let Some(store) = app.store.as_ref().or(cached.as_ref()) else {
@@ -7253,8 +7941,9 @@ fn improve_summary(app: &App) -> String {
     let enabled = auto::enabled(&app.config, store).unwrap_or(false);
     let readiness = auto::readiness(&app.config, store)
         .unwrap_or_else(|error| format!("schedule unavailable: {error:#}"));
+    let state_text = state_words(&state);
     let mut summary = format!(
-        "Selected model: {} · version {version} · {state} · next cycle: {}\nlearning records stay in {}",
+        "Selected model: {} · version {version} · {state_text} · next cycle: {}\nlearning records stay in {}",
         if enabled {
             "automatic improvement enabled"
         } else {
@@ -7268,7 +7957,7 @@ fn improve_summary(app: &App) -> String {
         Ok(wait) => summary.push_str(&format!("\nNext LoRA attempt: cooldown {} remaining.", auto::duration(wait))),
         Err(error) => summary.push_str(&format!("\nLoRA cooldown unavailable: {error:#}")),
     }
-    summary.push_str(&format!("\nTraining requires at least {} verified examples and a validation split. Cooldowns are eligibility delays, not training-duration estimates.", app.config.improve.lora_min_examples.max(app.config.training.batch_size)));
+    summary.push_str(&format!("\nTraining requires at least {} verified examples and a validation split. Cooldowns are eligibility delays, not training-duration estimates.", crate::learn::improve::min_examples(&app.config)));
     if app.store.is_none() {
         summary.push_str(&format!("\n{TEACH_OFF}"));
     }
@@ -7373,7 +8062,7 @@ fn improve_summary(app: &App) -> String {
 enum ActiveOverlay {
     Palette(PaletteOverlay),
     Compute(ComputeOverlay),
-    LocalModels(Box<crate::ui::overlay::local_models::LocalModelsOverlay>),
+    Improve(Box<crate::ui::overlay::improve::ImproveOverlay>),
     Extensions(Box<crate::ui::overlay::extensions::ExtensionsOverlay>),
     Settings(Box<SettingsOverlay>),
     ModelSettings(Box<crate::ui::overlay::model_settings::ModelSettingsOverlay>),
@@ -7393,6 +8082,7 @@ impl ActiveOverlay {
             Self::Settings(o) => o.draw(frame, ctx),
             Self::ModelSettings(o) => o.draw(frame, ctx),
             Self::Compute(o) => o.draw(frame, ctx),
+            Self::Improve(o) => o.draw(frame, ctx),
             Self::Extensions(o) => o.draw(frame, ctx),
             Self::Models(o) => o.draw(frame, ctx),
             Self::Providers(o) => o.draw(frame, ctx),
@@ -7401,7 +8091,6 @@ impl ActiveOverlay {
             Self::Subagents(o) => o.draw(frame, ctx),
             Self::SubagentViewer(o) => o.draw(frame, ctx),
             Self::Jobs(o) => o.draw(frame, ctx),
-            Self::LocalModels(o) => o.draw(frame, ctx),
         }
     }
     /// Native image placements for the frame just drawn. Only the git overlay previews images.
@@ -7422,6 +8111,7 @@ impl ActiveOverlay {
             Self::Settings(o) => o.handle(event, keys),
             Self::ModelSettings(o) => o.event(event, keys),
             Self::Compute(o) => o.handle(event, keys),
+            Self::Improve(o) => o.handle(event, keys),
             Self::Extensions(o) => o.handle(event, keys),
             Self::Models(o) => o.handle(event, keys),
             Self::Providers(o) => o.handle(event, keys),
@@ -7430,7 +8120,6 @@ impl ActiveOverlay {
             Self::Git(o) => o.handle(event, keys),
             Self::SubagentViewer(o) => o.handle(event, keys, std::time::Instant::now()),
             Self::Jobs(o) => o.handle(event, keys),
-            Self::LocalModels(o) => o.handle(event, keys),
         }
     }
     /// Mouse input for panels without their own mouse handling (git has one). A left click selects
@@ -7468,15 +8157,16 @@ impl ActiveOverlay {
     fn banner(&mut self, message: String, is_error: bool) {
         match self {
             Self::Models(o) => o.set_status(message, is_error),
-            Self::Compute(o) => o.banner(message),
+            Self::Compute(o) => o.banner(message, is_error),
+            Self::Improve(o) => o.banner(message, is_error),
             Self::Extensions(o) => o.banner(message),
             Self::Providers(o) => o.set_status(message, is_error),
             Self::ModelSettings(o) => o.banner(message, is_error),
             Self::Subagents(o) => o.banner(message, is_error),
             Self::SubagentViewer(o) => o.set_notice(message),
             Self::Jobs(o) => o.banner(message, is_error),
-            Self::LocalModels(o) => o.banner(message),
-            Self::Palette(_) | Self::Settings(_) | Self::Shortcuts(_) | Self::Git(_) => {}
+            Self::Settings(o) => o.banner(message, is_error),
+            Self::Palette(_) | Self::Shortcuts(_) | Self::Git(_) => {}
         }
     }
 }
@@ -7511,6 +8201,7 @@ pub(crate) fn start_streaming_job(
         receiver,
         cancel,
         lines: Some(line_receiver),
+        model: None,
     });
     true
 }
@@ -7528,23 +8219,42 @@ fn setting_setup_offers(
     config: &crate::config::Config,
 ) -> std::collections::BTreeMap<String, crate::ui::overlay::settings::SetupOffer> {
     let env = crate::setup::deps::Env::current(user_dir);
-    crate::setup::deps::run::setting_offers(
-        &env,
-        &config.voice.tts.backend,
-        &config.voice.stt.backend,
-    )
-    .into_iter()
-    .map(|offer| {
-        (
-            offer.path.clone(),
+    let mut offers: std::collections::BTreeMap<String, crate::ui::overlay::settings::SetupOffer> =
+        crate::setup::deps::run::setting_offers(
+            &env,
+            &config.voice.tts.backend,
+            &config.voice.stt.backend,
+        )
+        .into_iter()
+        .map(|offer| {
+            (
+                offer.path.clone(),
+                crate::ui::overlay::settings::SetupOffer {
+                    id: offer.id.to_owned(),
+                    title: offer.title.to_owned(),
+                    preview: offer.preview,
+                },
+            )
+        })
+        .collect();
+    // The embedding model row offers a local model until one is configured.
+    if let Some(offer) = crate::setup::embeddings::setting_offer(user_dir, config) {
+        offers.insert(
+            offer.path.to_owned(),
             crate::ui::overlay::settings::SetupOffer {
-                id: offer.id.to_owned(),
-                title: offer.title.to_owned(),
+                id: offer.id,
+                title: offer.title,
                 preview: offer.preview,
             },
-        )
-    })
-    .collect()
+        );
+    }
+    offers
+}
+
+struct PreparedModel {
+    changes: Vec<Change>,
+    role: String,
+    scope: Scope,
 }
 
 pub(crate) struct AuthJob {
@@ -7553,6 +8263,8 @@ pub(crate) struct AuthJob {
     cancel: Arc<AtomicBool>,
     /// Progress lines a streaming job sends while it runs; `None` for plain jobs.
     lines: Option<std::sync::mpsc::Receiver<String>>,
+    /// Published only after preparation succeeds and the UI has not cancelled the job.
+    model: Option<PreparedModel>,
 }
 impl Drop for AuthJob {
     fn drop(&mut self) {
@@ -7570,7 +8282,7 @@ impl AuthJob {
         };
         lines.try_iter().map(|line| (job.label, line)).collect()
     }
-    fn collect(slot: &mut Option<Self>) -> Option<(&'static str, Result<String>)> {
+    fn collect(slot: &mut Option<Self>, app: &App) -> Option<(&'static str, Result<String>)> {
         let result = slot.as_ref().and_then(|job| match job.receiver.try_recv() {
             Ok(result) => Some((job.label, result)),
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
@@ -7582,16 +8294,24 @@ impl AuthJob {
                 )),
             )),
         });
-        if result.is_some() {
-            slot.take();
-        }
+        let result = result.map(|(label, result)| {
+            let job = slot.take().expect("completed background job");
+            let result = result.and_then(|message| {
+                ensure!(!job.cancel.load(Ordering::SeqCst), "operation cancelled");
+                if let Some(model) = &job.model {
+                    app.save_settings(model.scope, &model.changes, Some(&model.role))?;
+                }
+                Ok(message)
+            });
+            (label, result)
+        });
         result
     }
 }
 
 struct ComputeMonitor {
     snapshot: Arc<Mutex<Option<Value>>>,
-    message: Arc<Mutex<Option<String>>>,
+    message: Arc<Mutex<Option<(String, bool)>>>,
     commands: std::sync::mpsc::SyncSender<Value>,
     cancel: Arc<AtomicBool>,
 }
@@ -7605,7 +8325,7 @@ impl ComputeMonitor {
         let status = message.clone();
         let stop = cancel.clone();
         let layout = app.layout.clone();
-        let mut config = app.config.clone();
+        let config = app.config.clone();
         std::thread::spawn(move || {
             let mut next = Instant::now();
             while !stop.load(Ordering::SeqCst) {
@@ -7618,8 +8338,12 @@ impl ComputeMonitor {
                                     !crate::learn::compute::paused(&layout.user_dir),
                                     "Resume background work first"
                                 );
+                                ensure!(
+                                    config.improve.enabled,
+                                    "Automatic improvement is off for this model. Turn on Enabled in {} first.",
+                                    crate::learn::improve::SETTINGS_PATH
+                                );
                                 auto::resume(&config.state_dir)?;
-                                config.improve.enabled = true;
                                 let store = Store::open(
                                     &config.state_dir,
                                     &config.model,
@@ -7627,10 +8351,8 @@ impl ComputeMonitor {
                                     &config.harness,
                                 )?;
                                 store.set_meta("auto_enabled", "true")?;
-                                ensure!(
-                                    auto::start_cycle(&layout, &config, &store)?,
-                                    "A cycle is already running or queued"
-                                );
+                                auto::start_cycle(&layout, &config, &store)?
+                                    .ensure_started(&config.state_dir)?;
                                 Ok("Improvement started; coding keeps priority.".into())
                             }
                             "stop_now" => crate::learn::compute_controls::stop_legacy(
@@ -7654,7 +8376,10 @@ impl ComputeMonitor {
                             ),
                         }
                     })();
-                    *shared(&status) = Some(result.unwrap_or_else(|error| format!("{error:#}")));
+                    *shared(&status) = Some(match result {
+                        Ok(text) => (text, false),
+                        Err(error) => (format!("{error:#}"), true),
+                    });
                     next = Instant::now();
                 }
                 if Instant::now() >= next {
@@ -7662,7 +8387,7 @@ impl ComputeMonitor {
                         Ok(value) => *shared(&output) = Some(value),
                         Err(error) => {
                             *shared(&status) =
-                                Some(format!("Compute status unavailable: {error:#}"))
+                                Some((format!("Compute status unavailable: {error:#}"), true))
                         }
                     }
                     next = Instant::now() + Duration::from_millis(750);
@@ -7681,6 +8406,31 @@ impl Drop for ComputeMonitor {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
     }
+}
+
+/// The compute release a panel may run on a compute action; absent without an agent (welcome).
+fn overlay_compute_release<'a>(
+    app: &'a App,
+    agent: Option<&'a mut Agent<'_>>,
+) -> Option<impl FnMut() + 'a> {
+    agent.map(move |agent| {
+        move || {
+            app.release_idle_compute(agent);
+        }
+    })
+}
+
+/// Compute panel actions that start local training, which needs the session's compute lease and
+/// unloaded models; stop, pause and inspection actions keep residency.
+fn compute_starts(payload: &str) -> bool {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|action| {
+            action["action"]
+                .as_str()
+                .map(|name| matches!(name, "start_current" | "start"))
+        })
+        .unwrap_or(false)
 }
 
 struct OverlayEnv<'a> {
@@ -7703,12 +8453,22 @@ struct OverlayEnv<'a> {
     latest: Option<Config>,
     next: Option<String>,
     seen_generation: u64,
+    /// Unloads resident models before a compute action starts training. Absent in busy panels,
+    /// where the chat loop's compute handoff runs while the panel is open.
+    release_compute: Option<&'a mut dyn FnMut()>,
 }
 
-fn settings_tables(app: &App, effective: &Config) -> (toml::Table, toml::Table, toml::Table) {
-    let values = toml::Table::try_from(effective).unwrap_or_default();
-    let layer = |scope| settings_store::load_layer(&app.layout, scope).unwrap_or_default();
-    (values, layer(Scope::Global), layer(Scope::Project))
+fn settings_tables(
+    app: &App,
+    effective: &Config,
+) -> Result<(toml::Table, toml::Table, toml::Table)> {
+    Ok((
+        toml::Table::try_from(effective).context("serializing effective settings")?,
+        settings_store::load_layer(&app.layout, Scope::Global)
+            .context("reading global settings")?,
+        settings_store::load_layer(&app.layout, Scope::Project)
+            .context("reading project settings")?,
+    ))
 }
 
 fn favorite_routes(config: &Config) -> Vec<crate::ui::overlay::models::FavoriteRoute> {
@@ -7765,6 +8525,7 @@ impl OverlayEnv<'_> {
             receiver,
             cancel,
             lines: None,
+            model: None,
         });
         if let ActiveOverlay::Providers(providers) = overlay {
             providers.set_chatgpt_pending(label == "ChatGPT");
@@ -7780,7 +8541,16 @@ impl OverlayEnv<'_> {
         {
             return;
         }
-        let result = AuthJob::collect(self.auth_job);
+        if self
+            .auth_job
+            .as_ref()
+            .is_some_and(|job| job.model.is_some())
+        {
+            for (_, line) in AuthJob::drain_lines(self.auth_job) {
+                overlay.banner(line, false);
+            }
+        }
+        let result = AuthJob::collect(self.auth_job, self.app);
         if let Some((provider, result)) = result {
             if let ActiveOverlay::Providers(providers) = overlay {
                 providers.set_chatgpt_pending(false);
@@ -7791,7 +8561,15 @@ impl OverlayEnv<'_> {
                     &self.app.layout.user_dir,
                 ));
             }
-            let _ = provider;
+            let result = if provider == "Model" {
+                result.and_then(|message| {
+                    self.reload_saved()?;
+                    Ok(message)
+                })
+            } else {
+                result
+            };
+            self.refresh_roles(overlay);
             self.report(overlay, result);
             self.catalog.refresh(self.app);
         }
@@ -7826,6 +8604,10 @@ impl OverlayEnv<'_> {
     fn start_setup(&mut self, overlay: &mut ActiveOverlay, id: String) {
         let layout = self.app.layout.clone();
         let started = start_streaming_job(self.auth_job, "Setup", move |cancel, progress| {
+            // `embeddings:<model>` ids pull a local embedding model; every other id is a dependency.
+            if let Some(model) = crate::setup::embeddings::model_from_id(&id) {
+                return crate::setup::embeddings::setup(&layout, model, &cancel, progress);
+            }
             let saved = crate::setup::deps::run::install_and_save(&layout, &id, &cancel, progress)?;
             Ok(format!("Set up and saved:\n{}", saved.join("\n")))
         });
@@ -7845,7 +8627,16 @@ impl OverlayEnv<'_> {
     /// Returns true when the overlay should close.
     fn apply(&mut self, event: OverlayEvent, overlay: &mut ActiveOverlay) -> bool {
         match event {
-            OverlayEvent::Close => return true,
+            OverlayEvent::Close => {
+                if self
+                    .auth_job
+                    .as_ref()
+                    .is_some_and(|job| job.model.is_some())
+                {
+                    self.auth_job.take();
+                }
+                return true;
+            }
             OverlayEvent::None => {}
             OverlayEvent::SetupDep { id } => self.start_setup(overlay, id),
             OverlayEvent::JobInput { name, bytes } => {
@@ -7904,26 +8695,57 @@ impl OverlayEnv<'_> {
                     .latest
                     .clone()
                     .unwrap_or_else(|| self.app.config.clone());
-                let outcome = selection_changes(&config, &selection, &role).and_then(|changes| {
-                    if selection.provider == "mlx" && selection.base_url.is_none() {
-                        crate::learn::download::ensure_local_model(
-                            &config.python,
-                            &selection.model,
-                        )?;
+                let outcome = (|| -> Result<String> {
+                    let changes = selection_changes(&config, &selection, &role)?;
+                    settings_store::preview_model_config(&self.app.layout, scope, &changes, &role)?;
+                    let message = if role == "main" {
+                        format!("switched to {}", selection.display_name())
+                    } else {
+                        format!("{role} set to {}", selection.display_name())
+                    };
+                    if config.selection_endpoint(&selection).is_none() {
+                        let model = selection.model.clone();
+                        let python = config.python.clone();
+                        let started =
+                            start_streaming_job(self.auth_job, "Model", move |cancel, progress| {
+                                let progress = RefCell::new(progress);
+                                crate::llm::download::ensure_local_model_with(
+                                    &python,
+                                    &model,
+                                    &crate::llm::download::Choice::Auto,
+                                    &cancel,
+                                    &|line| progress.borrow_mut()(line),
+                                )?;
+                                ensure!(
+                                    !cancel.load(Ordering::SeqCst),
+                                    "model selection cancelled"
+                                );
+                                Ok(message)
+                            });
+                        ensure!(
+                            started,
+                            "Another background operation is still running; try again when it finishes."
+                        );
+                        self.auth_job.as_mut().unwrap().model = Some(PreparedModel {
+                            changes,
+                            role,
+                            scope,
+                        });
+                        Ok("Preparing model in the background; settings save only on success. Esc closes this panel and cancels preparation.".into())
+                    } else {
+                        ensure!(
+                            !self
+                                .auth_job
+                                .as_ref()
+                                .is_some_and(|job| job.model.is_some()),
+                            "Cancel the pending model selection first (Esc)."
+                        );
+                        self.app.save_settings(scope, &changes, Some(&role))?;
+                        self.reload_saved()?;
+                        Ok(message)
                     }
-                    self.app.save_settings(scope, &changes, Some(&role))?;
-                    self.reload_saved()
-                });
-                self.report(
-                    overlay,
-                    outcome.map(|_| {
-                        if role == "main" {
-                            format!("switched to {}", selection.display_name())
-                        } else {
-                            format!("{role} set to {}", selection.display_name())
-                        }
-                    }),
-                );
+                })();
+                self.report(overlay, outcome);
                 self.refresh_roles(overlay);
             }
             OverlayEvent::ClearRole { role, scope } => {
@@ -8112,6 +8934,12 @@ impl OverlayEnv<'_> {
                 if let Some(payload) = action.strip_prefix("extensions:") {
                     Shell::queue_extensions(self.extensions_pending, *self.scope, payload, overlay);
                 } else if let Some(payload) = action.strip_prefix("compute:") {
+                    if compute_starts(payload)
+                        && let Some(release) = self.release_compute.as_mut()
+                    {
+                        // The training worker needs the compute lease and the resident server's memory.
+                        release();
+                    }
                     if let Some(monitor) = &self.compute_monitor {
                         match serde_json::from_str(payload)
                             .map_err(anyhow::Error::from)
@@ -8208,19 +9036,17 @@ impl OverlayEnv<'_> {
         let ActiveOverlay::Settings(settings) = overlay else {
             return;
         };
-        match self.save(changes, scope) {
-            Ok(fresh) => {
+        match self
+            .save(changes, scope)
+            .and_then(|fresh| settings_tables(self.app, &fresh).map(|tables| (fresh, tables)))
+        {
+            Ok((fresh, (values, global, project))) => {
                 settings.settled(path, Ok(Self::effective_value(&fresh, path)));
-                let (values, global, project) = settings_tables(self.app, &fresh);
                 settings.replace_values(values, project, global);
             }
             Err(error) => {
                 settings.settled(path, Err(format!("{error:#}")));
-                // The file is written even when the theme fails to apply; show the saved values.
-                if let Some(fresh) = self.latest.clone() {
-                    let (values, global, project) = settings_tables(self.app, &fresh);
-                    settings.replace_values(values, project, global);
-                }
+                settings.banner(format!("{error:#}"), true);
             }
         }
     }
@@ -8235,10 +9061,16 @@ impl OverlayEnv<'_> {
             return;
         }
         settings.set_setup_pending(false);
-        let Ok(config) = self.app.reload() else {
-            return;
-        };
-        let (values, global, project) = settings_tables(self.app, &config);
+        let (config, (values, global, project)) =
+            match self.app.reload().and_then(|config| {
+                settings_tables(self.app, &config).map(|tables| (config, tables))
+            }) {
+                Ok(values) => values,
+                Err(error) => {
+                    settings.banner(format!("{error:#}"), true);
+                    return;
+                }
+            };
         settings.replace_values(values, project, global);
         apply_settings_hints(settings, &config);
         settings.set_setup_offers(setting_setup_offers(&self.app.layout.user_dir, &config));
@@ -8284,12 +9116,17 @@ fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut ActiveOverlay) {
     if let ActiveOverlay::Palette(palette) = overlay {
         palette.set_busy(env.status.phase != Phase::Idle);
     }
+    if let ActiveOverlay::Improve(panel) = &mut *overlay
+        && panel.wants_refresh()
+    {
+        panel.update(improve_view(env.app));
+    }
     if let (Some(monitor), ActiveOverlay::Compute(panel)) = (&env.compute_monitor, &mut *overlay) {
         if let Some(value) = shared(&monitor.snapshot).take() {
             panel.update(value);
         }
-        if let Some(message) = shared(&monitor.message).take() {
-            panel.banner(message);
+        if let Some((message, is_error)) = shared(&monitor.message).take() {
+            panel.banner(message, is_error);
         }
     }
     if let ActiveOverlay::Extensions(panel) = overlay {
@@ -8299,6 +9136,11 @@ fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut ActiveOverlay) {
                 commands::extensions_browser::refresh(panel, env.app.layout(), &config);
             }
         }
+    }
+    if let ActiveOverlay::Models(models) = &mut *overlay
+        && models.take_refresh()
+    {
+        env.catalog.refresh(env.app);
     }
     if let ActiveOverlay::Subagents(hub) = &mut *overlay {
         hub.refresh(
@@ -8741,10 +9583,10 @@ impl Ui for Bridge<'_> {
         self.repaint(false);
     }
     fn tool_arguments_delta(&mut self, _index: u64, _id: &str, name: &str, _delta: &str) {
-        self.set_activity(if name.is_empty() {
-            "generating tool"
+        self.set_activity(&if name.is_empty() {
+            "preparing tool call".into()
         } else {
-            name
+            format!("preparing {name}")
         });
         self.repaint(false);
     }
@@ -8756,6 +9598,10 @@ impl Ui for Bridge<'_> {
     }
     fn tool_progress(&mut self, name: &str, text: &str) {
         self.shell.transcript.tool_progress(name, text);
+        self.repaint(false);
+    }
+    fn background_output(&mut self, name: &str, text: &str, replace: bool) {
+        self.shell.transcript.background_output(name, text, replace);
         self.repaint(false);
     }
     fn background_notice(&mut self, message: &str) {
@@ -8812,7 +9658,7 @@ impl Ui for Bridge<'_> {
             self.shell.transcript.bind_tool(&id, body);
         }
         self.pending.push((id, name.to_owned(), Instant::now()));
-        self.set_activity(name);
+        self.set_activity(&format!("running {name}"));
         self.repaint(true);
     }
 
@@ -8835,7 +9681,11 @@ impl Ui for Bridge<'_> {
             started.elapsed().as_secs_f64(),
         );
         self.attach_write_preview(&id, output);
-        self.set_activity("thinking");
+        let activity = self.pending.last().map_or_else(
+            || "thinking".to_owned(),
+            |(_, name, _)| format!("running {name}"),
+        );
+        self.set_activity(&activity);
         self.repaint(true);
     }
     fn tool_call_with_id(&mut self, id: &str, name: &str, summary: &str) {
@@ -8846,7 +9696,7 @@ impl Ui for Bridge<'_> {
         }
         self.pending
             .push((id.to_owned(), name.to_owned(), Instant::now()));
-        self.set_activity(name);
+        self.set_activity(&format!("running {name}"));
         self.repaint(true);
     }
 
@@ -8876,7 +9726,11 @@ impl Ui for Bridge<'_> {
             self.shell.transcript.tool_data(id, data);
         }
         self.attach_write_preview(id, output);
-        self.set_activity("thinking");
+        let activity = self.pending.last().map_or_else(
+            || "thinking".to_owned(),
+            |(_, name, _)| format!("running {name}"),
+        );
+        self.set_activity(&activity);
         self.repaint(true);
     }
 
@@ -9606,7 +10460,8 @@ mod tests {
         let find = |name: &str| entries.iter().find(|e| e.command.name == name).unwrap();
         assert!(find("undo").during_turn.starts_with("Stops"));
         assert!(find("model").during_turn.starts_with("Opens now"));
-        for name in ["jobs", "message", "cancel", "search", "help", "context"] {
+        assert!(find("workers").during_turn.starts_with("Opens now"));
+        for name in ["message", "cancel", "search", "help", "context"] {
             assert!(find(name).during_turn.starts_with("Runs now"), "{name}");
         }
         for name in ["rename", "review-project", "skill:web-review"] {
@@ -9615,14 +10470,10 @@ mod tests {
         assert_eq!(find("rename").command.args_hint.as_deref(), Some("<title>"));
         assert_eq!(
             find("model").command.args_hint.as_deref(),
-            Some("[settings|defaults]")
+            Some("[settings|defaults|local]")
         );
-        assert!(
-            find("model")
-                .command
-                .description
-                .contains("/model settings")
-        );
+        // Hidden aliases resolve at dispatch but never appear as palette rows.
+        assert!(entries.iter().all(|e| e.command.name != "jobs"));
         let theme = Theme::dark();
         let keys = Keymap::defaults();
         let status = StatusData::default();
@@ -10063,7 +10914,7 @@ mod tests {
     }
     use crate::ui::theme::Theme;
 
-    fn config() -> (tempfile::TempDir, tempfile::TempDir, Layout, Config) {
+    pub(super) fn config() -> (tempfile::TempDir, tempfile::TempDir, Layout, Config) {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let layout = Layout::with_user_dir(project.path(), home.path().join("dial")).unwrap();
@@ -10410,6 +11261,110 @@ mod tests {
             "backend remains available for the next turn"
         );
     }
+    #[cfg(unix)]
+    #[test]
+    fn compute_action_release_unloads_a_resident_server_only_when_started() {
+        if crate::learn::processes::live_inspection_unavailable() {
+            return;
+        }
+        let (_h, _p, layout, mut config) = config();
+        std::fs::create_dir_all(&layout.user_dir).unwrap();
+        let python = crate::llm::server::tests::fake_python(&layout.user_dir);
+        config.python = python.clone();
+        config.endpoint = None;
+        config.provider = Some("mlx".into());
+        config.model = layout
+            .user_dir
+            .join("fake-model-residency")
+            .to_string_lossy()
+            .into_owned();
+        config.improve.enabled = false;
+        let mut backend = crate::llm::provider::Backend::new(
+            crate::llm::provider::ProviderKind::Local {
+                model_dir: config.model.clone(),
+            },
+            python,
+            5,
+        )
+        .with_steering(&config);
+        backend
+            .chat(
+                None,
+                &crate::llm::Chat {
+                    messages: vec![json!({"role":"user","content":"hello"})],
+                    tools: vec![],
+                    temperature: 0.0,
+                    max_tokens: 16,
+                    seed: None,
+                },
+                5,
+                None,
+            )
+            .unwrap();
+        let marker: Value = serde_json::from_slice(&std::fs::read(&config.model).unwrap()).unwrap();
+        let pid = marker["pid"].as_i64().unwrap() as i32;
+        let lock = auto::lock_file(&layout.user_dir.join("compute.lock")).unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let app = App {
+            launch: Default::default(),
+            add_dirs: Vec::new(),
+            mode_flags: Default::default(),
+            models: RefCell::new(None),
+            layout,
+            config,
+            overlay: toml::Table::new(),
+            store: None,
+            store_error: None,
+            interrupt: Arc::new(AtomicBool::new(false)),
+            compute: RefCell::new(Some(lock)),
+        };
+        let session = Session::create(
+            &app.layout,
+            SessionMeta {
+                model: app.config.model.clone(),
+            },
+        )
+        .unwrap();
+        let id = session.id().to_owned();
+        let mut agent = Agent::interactive(
+            &app.config,
+            backend,
+            app.layout.clone(),
+            session,
+            None,
+            None,
+            app.interrupt.clone(),
+        )
+        .unwrap();
+        let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+        // The welcome flow has no agent; panels that only browse never invoke the release.
+        assert!(overlay_compute_release(&app, None).is_none());
+        assert!(alive(pid), "server stays resident while panels are browsed");
+        assert!(
+            app.compute.borrow().is_some(),
+            "compute lease is kept while browsing"
+        );
+        // Non-starting actions (pause, stop, inspection) keep residency.
+        assert!(!compute_starts(r#"{"action":"stop_process","pid":1}"#));
+        assert!(!compute_starts(r#"{"action":"pause"}"#));
+        assert!(!compute_starts("not json"));
+        assert!(alive(pid));
+        // A start action releases the server and the lease through the closure the panel gets.
+        assert!(compute_starts(r#"{"action":"start_current"}"#));
+        let mut release = overlay_compute_release(&app, Some(&mut agent)).unwrap();
+        release();
+        drop(release);
+        for _ in 0..50 {
+            if !alive(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(pid), "start action unloads the resident server");
+        assert!(app.compute.borrow().is_none());
+        assert_eq!(agent.session().id(), id);
+    }
+
     #[test]
     fn completed_probe_releases_compute_even_when_a_handle_was_inherited() {
         let root = tempfile::tempdir().unwrap();
@@ -10986,7 +11941,7 @@ mod tests {
             "never insert usage placeholders"
         );
         let known_head = |choice: &str| {
-            BUILTIN_COMMANDS.iter().any(|(name, _)| {
+            BUILTIN_COMMANDS.iter().any(|(name, _, _)| {
                 choice == format!("/{name}") || choice.starts_with(&format!("/{name} "))
             }) || commands::specs().any(|spec| {
                 choice == format!("/{}", spec.name)
@@ -11292,5 +12247,178 @@ mod group_digits_tests {
         assert_eq!(super::group_digits(999), "999");
         assert_eq!(super::group_digits(32768), "32,768");
         assert_eq!(super::group_digits(1_048_576), "1,048,576");
+    }
+}
+
+#[cfg(test)]
+mod command_registry_tests {
+    use super::*;
+    use crate::ui::command_surface::{EVERYDAY, START_HERE, STARTERS};
+
+    /// A name a user can type that dispatches to a real command, not counting aliases.
+    fn registered(name: &str) -> bool {
+        BUILTIN_COMMANDS
+            .iter()
+            .any(|(builtin, _, _)| *builtin == name)
+            || commands::specs().any(|spec| spec.name == name)
+    }
+
+    #[test]
+    fn every_alias_resolves_to_a_registered_command_and_is_not_listed() {
+        let listed = command_entries(&[], &[]);
+        for (alias, target) in COMMAND_ALIASES {
+            assert!(
+                registered(target),
+                "/{alias} points at unregistered /{target}"
+            );
+            assert!(
+                !registered(alias),
+                "/{alias} is listed as a command and an alias"
+            );
+            assert_eq!(canonical_command(alias), *target);
+            assert!(
+                listed.iter().all(|entry| entry.name != *alias),
+                "/{alias} must stay out of menus, palette and help"
+            );
+        }
+        assert_eq!(canonical_command("exit"), "exit");
+    }
+
+    #[test]
+    fn starters_and_everyday_commands_are_registered() {
+        for name in EVERYDAY.iter().chain(START_HERE).chain(STARTERS) {
+            assert!(
+                registered(name),
+                "/{name} is offered to users but not registered"
+            );
+        }
+        for name in ["compact", "theme", "setup"] {
+            assert!(EVERYDAY.contains(&name), "/{name} must be everyday");
+        }
+    }
+
+    #[test]
+    fn descriptions_are_short_and_plain_and_syntax_lives_in_usage() {
+        for (name, usage, description) in BUILTIN_COMMANDS {
+            assert!(
+                description.chars().count() <= 64,
+                "/{name} description is {} characters",
+                description.chars().count()
+            );
+            assert!(
+                !description.contains('[') && !description.contains('<'),
+                "/{name} puts syntax in its description"
+            );
+            assert!(!usage.contains('\n'), "/{name} usage is one line");
+        }
+        for spec in commands::specs() {
+            assert!(
+                spec.description.chars().count() <= 100,
+                "/{} description is {} characters",
+                spec.name,
+                spec.description.chars().count()
+            );
+            if !spec.subcommands.is_empty() {
+                assert!(
+                    !spec.args_hint.is_empty(),
+                    "/{} takes subcommands but shows no usage",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn turn_lists_drive_stops_turn_and_the_palette_notes_alike() {
+        for name in STOPS_TURN {
+            assert!(
+                registered(name),
+                "/{name} stops the turn but is not registered"
+            );
+            assert!(Shell::stops_turn(&format!("/{name}")), "/{name}");
+            assert_eq!(
+                during_turn_note(name),
+                "Stops the current turn before running."
+            );
+        }
+        for name in RUNS_NOW {
+            assert!(!Shell::stops_turn(&format!("/{name}")), "/{name} runs now");
+            let note = during_turn_note(name);
+            assert!(
+                note.starts_with("Runs now") || note.starts_with("Opens now"),
+                "/{name}: {note}"
+            );
+        }
+        for line in RUNS_NOW_ARGS {
+            assert!(!Shell::stops_turn(&format!("/{line}")), "/{line} runs now");
+        }
+        // Aliases follow their target, so /quit stops a turn exactly like /exit.
+        assert!(
+            Shell::stops_turn("/quit") && Shell::stops_turn("/q") && Shell::stops_turn("/clear")
+        );
+        assert!(!Shell::stops_turn("/review"));
+    }
+
+    #[test]
+    fn model_preparation_only_publishes_successful_uncancelled_results() {
+        let (_home, _project, layout, config) = super::tests::config();
+        let app = App::new(
+            layout.clone(),
+            config.clone(),
+            toml::Table::new(),
+            Default::default(),
+            vec![],
+            Default::default(),
+        )
+        .unwrap();
+        let selection = ModelSelection::new("mlx", "org/prepared");
+        for (cancelled, success) in [(true, true), (false, false), (false, true)] {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let mut job = Some(AuthJob {
+                label: "Model",
+                receiver,
+                lines: None,
+                cancel: Arc::new(AtomicBool::new(cancelled)),
+                model: Some(PreparedModel {
+                    changes: selection_changes(&config, &selection, "main").unwrap(),
+                    role: "main".into(),
+                    scope: Scope::Global,
+                }),
+            });
+            assert!(AuthJob::collect(&mut job, &app).is_none());
+            assert_ne!(app.reload().unwrap().model, selection.model);
+            sender
+                .send(if success {
+                    Ok("prepared".into())
+                } else {
+                    Err(anyhow::anyhow!("download failed"))
+                })
+                .unwrap();
+            let (_, result) = AuthJob::collect(&mut job, &app).unwrap();
+            assert_eq!(result.is_ok(), success && !cancelled);
+            assert!(job.is_none());
+            assert_eq!(
+                app.reload().unwrap().model == selection.model,
+                success && !cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn settings_panel_rejects_unreadable_layers_instead_of_empty_defaults() {
+        let (_home, _project, layout, config) = super::tests::config();
+        let app = App::new(
+            layout.clone(),
+            config.clone(),
+            toml::Table::new(),
+            Default::default(),
+            vec![],
+            Default::default(),
+        )
+        .unwrap();
+        settings_store::private_dir(&layout.state_dir).unwrap();
+        settings_store::write_private(&layout.config_files()[1], b"invalid = [").unwrap();
+        let error = settings_tables(&app, &config).unwrap_err();
+        assert!(format!("{error:#}").contains("reading project settings"));
     }
 }

@@ -9,7 +9,7 @@ use crate::llm::oauth::BannerInteraction;
 use crate::storage::settings_store::{Change, Scope, load_layer};
 use crate::tools::mcp::{connect_extra, validate_server};
 use crate::tools::plugin::installer::{InstalledPlugin, PluginStore};
-use crate::tools::plugin::marketplace::Marketplaces;
+use crate::tools::plugin::marketplace::{MarketplaceEntry, MarketplaceInfo, Marketplaces, SkillListing};
 use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -55,18 +55,6 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
         subcommands: &[],
     },
     super::CommandSpec {
-        name: "agents",
-        description: "list agent definitions available to the task tool",
-        args_hint: "",
-        subcommands: &[],
-    },
-    super::CommandSpec {
-        name: "hub",
-        description: "list live background tasks and their run state",
-        args_hint: "",
-        subcommands: &[],
-    },
-    super::CommandSpec {
         name: "plugins",
         description: "list, enable, or disable installed plugins (alias: /plugin)",
         args_hint: "[list|enable|disable] [name]",
@@ -74,11 +62,13 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     },
     super::CommandSpec {
         name: "marketplace",
-        description: "manage plugin marketplaces: add, remove, update, discover, install, upgrade",
-        args_hint: "[add|remove|update|list|discover|install|uninstall|installed|upgrade|help]",
+        description: "list plugins and skills from marketplaces; add, remove, enable, disable, install",
+        args_hint: "[list|add|remove|enable|disable|update|discover|install|uninstall|installed|upgrade|help]",
         subcommands: &[
             "add",
             "remove",
+            "enable",
+            "disable",
             "update",
             "list",
             "discover",
@@ -109,7 +99,6 @@ pub(super) fn run(
         "tools" => "Tools",
         "extensions" | "status" => "Extensions",
         "agents" => "Agents",
-        "hub" => "Hub",
         "plugins" | "plugin" => "Plugins",
         "marketplace" => "Marketplace",
         "reload-plugins" => "Plugins",
@@ -128,10 +117,6 @@ pub(super) fn run(
         }
         "agents" => {
             shell.note(title, agents_report(&app.config));
-            Ok(Step::Done)
-        }
-        "hub" => {
-            shell.note(title, hub_report(agent));
             Ok(Step::Done)
         }
         "plugins" | "plugin" => plugins(shell, app, args),
@@ -593,18 +578,6 @@ fn agents_report(config: &Config) -> String {
     }
 }
 
-fn hub_report(agent: &Agent<'_>) -> String {
-    let tasks = agent.live_task_control().list();
-    if tasks.is_empty() {
-        return "No background tasks.".into();
-    }
-    tasks
-        .iter()
-        .map(|(id, running)| format!("{id}  {}", if *running { "running" } else { "finished" }))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 // ---- /plugins, /marketplace, /reload-plugins -------------------------------------------------
 
 fn plugins(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
@@ -646,8 +619,12 @@ fn marketplace(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
     let markets_root = marketplaces_root(&app.config);
     match sub {
         "" | "list" => {
-            let markets = Marketplaces::new(&markets_root).list()?;
-            shell.note("Marketplace", marketplace_list(&markets));
+            let markets = Marketplaces::new(&markets_root);
+            let mut text = marketplace_list(&markets.list()?);
+            text.push_str("\n\n");
+            text.push_str(&offerings(&markets.entries(None)?, &markets.skills(None)?));
+            text.push_str("\n\nInstall and manage these in /extensions (Plugins, Skills and Marketplaces tabs).");
+            shell.note("Marketplace", text);
             Ok(Step::Done)
         }
         "add" => {
@@ -662,6 +639,19 @@ fn marketplace(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
             shell.note("Marketplace", format!("Removed marketplace {name}."));
             Ok(Step::Done)
         }
+        "enable" | "disable" => {
+            let name = one_arg(rest, sub)?;
+            let enabled = sub == "enable";
+            Marketplaces::new(&markets_root).set_enabled(name, enabled)?;
+            shell.note(
+                "Marketplace",
+                format!(
+                    "{} marketplace {name}.",
+                    if enabled { "Enabled" } else { "Disabled" }
+                ),
+            );
+            Ok(Step::Done)
+        }
         "update" => {
             let name = optional(rest);
             spawn_job(shell, "Marketplace", move |_| {
@@ -674,27 +664,12 @@ fn marketplace(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
             Ok(Step::Done)
         }
         "discover" => {
-            let entries = Marketplaces::new(&markets_root).entries(optional(rest).as_deref())?;
-            let text = if entries.is_empty() {
-                "No marketplace plugins found.".to_owned()
-            } else {
-                entries
-                    .iter()
-                    .map(|entry| {
-                        format!(
-                            "{}@{}  {}  {}",
-                            entry.name,
-                            entry.marketplace,
-                            entry.version.as_deref().unwrap_or("-"),
-                            entry
-                                .description
-                                .as_deref()
-                                .unwrap_or(entry.source.as_str())
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            let filter = optional(rest);
+            let markets = Marketplaces::new(&markets_root);
+            let text = offerings(
+                &markets.entries(filter.as_deref())?,
+                &markets.skills(filter.as_deref())?,
+            );
             shell.note("Marketplace", text);
             Ok(Step::Done)
         }
@@ -791,7 +766,7 @@ fn marketplace(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
         "help" => {
             shell.note(
                 "Marketplace",
-                "/marketplace list\n/marketplace add <name> <index-url-or-path>\n/marketplace remove <name>\n/marketplace update [name]\n/marketplace discover [name]\n/marketplace install [--force] <plugin@marketplace>\n/marketplace uninstall <plugin>\n/marketplace installed\n/marketplace upgrade [plugin]",
+                "/marketplace list\n/marketplace add <name> <index-url-or-path>\n/marketplace remove <name>\n/marketplace enable <name>\n/marketplace disable <name>\n/marketplace update [name]\n/marketplace discover [name]\n/marketplace install [--force] <plugin@marketplace>\n/marketplace uninstall <plugin>\n/marketplace installed\n/marketplace upgrade [plugin]\nThe built-in anthropic-skills marketplace is on by default. Browse and install in /extensions.",
             );
             Ok(Step::Done)
         }
@@ -818,9 +793,9 @@ fn plugin_list(plugins: &[InstalledPlugin]) -> String {
         .join("\n")
 }
 
-fn marketplace_list(markets: &[crate::tools::plugin::marketplace::MarketplaceInfo]) -> String {
+fn marketplace_list(markets: &[MarketplaceInfo]) -> String {
     if markets.is_empty() {
-        return "No marketplaces added. Use /marketplace add <name> <index>.".into();
+        return "No marketplaces configured. Use /marketplace add <name> <index>.".into();
     }
     markets
         .iter()
@@ -829,10 +804,45 @@ fn marketplace_list(markets: &[crate::tools::plugin::marketplace::MarketplaceInf
                 .refreshed_at
                 .map(|t| t.to_string())
                 .unwrap_or_else(|| "never".into());
-            format!("{}  {}  refreshed: {refreshed}", m.name, m.index)
+            let index = if m.builtin {
+                "built into Dial".to_owned()
+            } else {
+                m.index.clone()
+            };
+            format!(
+                "{}  {}  {index}  refreshed: {refreshed}",
+                m.name,
+                if m.enabled { "enabled" } else { "disabled" }
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Plugin entries and skills offered by marketplaces, one per line.
+fn offerings(entries: &[MarketplaceEntry], skills: &[SkillListing]) -> String {
+    if entries.is_empty() && skills.is_empty() {
+        return "No marketplace plugins or skills found.".into();
+    }
+    let mut lines: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "plugin  {}@{}  {}  {}",
+                entry.name,
+                entry.marketplace,
+                entry.version.as_deref().unwrap_or("-"),
+                entry.description.as_deref().unwrap_or(entry.source.as_str())
+            )
+        })
+        .collect();
+    lines.extend(skills.iter().map(|skill| {
+        format!(
+            "skill   {}@{}  {}",
+            skill.name, skill.marketplace, skill.description
+        )
+    }));
+    lines.join("\n")
 }
 
 fn parse_install(rest: &str) -> Result<(bool, String)> {

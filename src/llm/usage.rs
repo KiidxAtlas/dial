@@ -7,6 +7,21 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// Why inference was requested, independent of model routing and main/worker ownership.
+/// Bounded keys keep reports comparable and never contain prompts or operator role names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Purpose {
+    #[default]
+    Agent,
+    Retrieval,
+    Compaction,
+    Memory,
+    Repair,
+    Judgment,
+    Auxiliary,
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CostCoverage {
@@ -153,21 +168,46 @@ pub struct Groups {
     pub main: Counts,
     pub workers: Counts,
     pub by_model: BTreeMap<String, ModelCounts>,
+    /// Orthogonal breakdown: these counters sum to `all`, not additional usage.
+    pub by_purpose: BTreeMap<Purpose, Counts>,
     pub coverage: Coverage,
 }
 impl Groups {
     fn selected(&self, worker: bool) -> Counts {
         if worker { self.workers } else { self.main }
     }
-    fn validate(&self, worker: bool, model: Option<&str>, delta: Counts) -> Result<()> {
-        self.all.add(delta)?;
-        self.selected(worker).add(delta)?;
-        if let Some(counts) = model.and_then(|model| self.by_model.get(model)) {
-            (if worker { counts.workers } else { counts.main }).add(delta)?;
+    fn validate(&self, scope: &Scope, delta: Counts, reported: bool) -> Result<()> {
+        let model = scope.model.as_deref().map(|model| {
+            self.by_model
+                .get(model)
+                .map_or(Counts::default(), |counts| {
+                    if scope.worker {
+                        counts.workers
+                    } else {
+                        counts.main
+                    }
+                })
+        });
+        for counts in [
+            self.all,
+            self.selected(scope.worker),
+            self.by_purpose
+                .get(&scope.purpose)
+                .copied()
+                .unwrap_or_default(),
+        ]
+        .into_iter()
+        .chain(model)
+        {
+            counts.add(delta)?;
+            ensure!(
+                !reported || counts.unreported_attempts > 0,
+                "reported usage has no matching transport attempt in its scope"
+            );
         }
         Ok(())
     }
-    fn apply(&mut self, worker: bool, model: Option<&str>, delta: Counts, reported: bool) {
+    fn apply(&mut self, scope: &Scope, delta: Counts, reported: bool) {
         let update = |counts: &mut Counts| {
             *counts = counts
                 .add(delta)
@@ -178,18 +218,15 @@ impl Groups {
             counts.refresh_coverage();
         };
         update(&mut self.all);
-        update(if worker {
+        update(if scope.worker {
             &mut self.workers
         } else {
             &mut self.main
         });
-        if let Some(model) = model {
-            if !self.by_model.contains_key(model) {
-                self.by_model
-                    .insert(model.to_owned(), ModelCounts::default());
-            }
-            let counts = self.by_model.get_mut(model).unwrap();
-            update(if worker {
+        update(self.by_purpose.entry(scope.purpose).or_default());
+        if let Some(model) = scope.model.as_deref() {
+            let counts = self.by_model.entry(model.to_owned()).or_default();
+            update(if scope.worker {
                 &mut counts.workers
             } else {
                 &mut counts.main
@@ -216,6 +253,7 @@ pub struct Scope {
     worker: bool,
     worker_limit: u64,
     model: Option<Arc<str>>,
+    purpose: Purpose,
 }
 impl Scope {
     pub fn next_turn(&self, worker_limit: u32) -> Result<Self> {
@@ -234,11 +272,18 @@ impl Scope {
             worker: false,
             worker_limit: u64::from(worker_limit),
             model: None,
+            purpose: Purpose::Agent,
         })
     }
     pub fn for_model(&self, model: String) -> Self {
         Self {
             model: Some(Arc::from(model)),
+            ..self.clone()
+        }
+    }
+    pub fn for_purpose(&self, purpose: Purpose) -> Self {
+        Self {
+            purpose,
             ..self.clone()
         }
     }
@@ -304,27 +349,13 @@ impl Scope {
                     .is_some_and(|n| n < self.worker_limit),
             "shared worker request budget exhausted for this turn"
         );
-        s.turns[&self.turn].validate(self.worker, self.model.as_deref(), delta)?;
-        s.total
-            .validate(self.worker, self.model.as_deref(), delta)?;
-        if reported {
-            ensure!(
-                s.total.selected(self.worker).unreported_attempts > 0
-                    && s.turns[&self.turn]
-                        .selected(self.worker)
-                        .unreported_attempts
-                        > 0,
-                "reported usage has no matching transport attempt"
-            );
-        }
-        s.turns.get_mut(&self.turn).unwrap().apply(
-            self.worker,
-            self.model.as_deref(),
-            delta,
-            reported,
-        );
-        s.total
-            .apply(self.worker, self.model.as_deref(), delta, reported);
+        s.turns[&self.turn].validate(self, delta, reported)?;
+        s.total.validate(self, delta, reported)?;
+        s.turns
+            .get_mut(&self.turn)
+            .unwrap()
+            .apply(self, delta, reported);
+        s.total.apply(self, delta, reported);
         Ok(())
     }
     pub(super) fn begin(&self, billing: Billing) -> Result<()> {
@@ -426,27 +457,22 @@ impl ExternalUsageReceipt {
             ..Counts::default()
         };
         let mut state = self.scope.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.turns.entry(self.scope.turn).or_default().validate(
-            self.scope.worker,
-            self.scope.model.as_deref(),
-            delta,
-        )?;
         state
-            .total
-            .validate(self.scope.worker, self.scope.model.as_deref(), delta)?;
+            .turns
+            .entry(self.scope.turn)
+            .or_default()
+            .validate(&self.scope, delta, false)?;
+        state.total.validate(&self.scope, delta, false)?;
         if self.reserved_worker {
             release_external_reservation(&mut state, self.scope.turn)?;
             self.reserved_worker = false;
         }
-        state.turns.get_mut(&self.scope.turn).unwrap().apply(
-            self.scope.worker,
-            self.scope.model.as_deref(),
-            delta,
-            false,
-        );
         state
-            .total
-            .apply(self.scope.worker, self.scope.model.as_deref(), delta, false);
+            .turns
+            .get_mut(&self.scope.turn)
+            .unwrap()
+            .apply(&self.scope, delta, false);
+        state.total.apply(&self.scope, delta, false);
         self.started = true;
         Ok(())
     }
@@ -491,25 +517,17 @@ impl ExternalUsageReceipt {
         };
         let mut state = self.scope.state.lock().unwrap_or_else(|e| e.into_inner());
         let turn = state.turns.entry(self.scope.turn).or_default();
-        turn.validate(self.scope.worker, self.scope.model.as_deref(), delta)?;
-        state
-            .total
-            .validate(self.scope.worker, self.scope.model.as_deref(), delta)?;
+        turn.validate(&self.scope, delta, reported)?;
+        state.total.validate(&self.scope, delta, reported)?;
         if self.reserved_worker {
             release_external_reservation(&mut state, self.scope.turn)?;
         }
-        state.turns.get_mut(&self.scope.turn).unwrap().apply(
-            self.scope.worker,
-            self.scope.model.as_deref(),
-            delta,
-            reported,
-        );
-        state.total.apply(
-            self.scope.worker,
-            self.scope.model.as_deref(),
-            delta,
-            reported,
-        );
+        state
+            .turns
+            .get_mut(&self.scope.turn)
+            .unwrap()
+            .apply(&self.scope, delta, reported);
+        state.total.apply(&self.scope, delta, reported);
         self.active = false;
         Ok(())
     }
@@ -528,23 +546,18 @@ impl Drop for ExternalUsageReceipt {
                     unpriced_requests: 1,
                     ..Counts::default()
                 };
-                if state.turns.get(&self.scope.turn).is_some_and(|turn| {
-                    turn.validate(self.scope.worker, self.scope.model.as_deref(), delta)
-                        .is_ok()
-                }) && state
-                    .total
-                    .validate(self.scope.worker, self.scope.model.as_deref(), delta)
-                    .is_ok()
+                if state
+                    .turns
+                    .get(&self.scope.turn)
+                    .is_some_and(|turn| turn.validate(&self.scope, delta, false).is_ok())
+                    && state.total.validate(&self.scope, delta, false).is_ok()
                 {
-                    state.turns.get_mut(&self.scope.turn).unwrap().apply(
-                        self.scope.worker,
-                        self.scope.model.as_deref(),
-                        delta,
-                        false,
-                    );
                     state
-                        .total
-                        .apply(self.scope.worker, self.scope.model.as_deref(), delta, false);
+                        .turns
+                        .get_mut(&self.scope.turn)
+                        .unwrap()
+                        .apply(&self.scope, delta, false);
+                    state.total.apply(&self.scope, delta, false);
                 }
             }
             self.active = false;
@@ -693,5 +706,152 @@ mod tests {
         assert_eq!(current.by_model["anthropic/b"].workers.retries, 1);
         assert_eq!(total.workers.cache_read, 40);
         assert!(next.snapshot().1.by_model.is_empty());
+    }
+
+    #[test]
+    fn purposes_partition_usage_without_changing_worker_budgets_or_turn_ownership() {
+        let root = Scope::default().next_turn(2).unwrap();
+        let rank = root
+            .worker()
+            .for_purpose(Purpose::Retrieval)
+            .for_model("shared".into());
+        let compact = root
+            .worker()
+            .for_model("shared".into())
+            .for_purpose(Purpose::Compaction);
+        rank.begin(Billing::Api).unwrap();
+        rank.attempt(false).unwrap();
+        rank.attempt(true).unwrap();
+        compact.begin(Billing::Api).unwrap();
+        compact.attempt(false).unwrap();
+        assert!(
+            root.worker()
+                .for_purpose(Purpose::Memory)
+                .begin(Billing::Api)
+                .is_err()
+        );
+        let next = root.next_turn(2).unwrap();
+        rank.finish(
+            Some(&Reply {
+                prompt_tokens: Some(30),
+                completion_tokens: Some(5),
+                cached_prompt_tokens: Some(20),
+                cache_creation_tokens: Some(3),
+                reasoning_tokens: Some(2),
+                ..Reply::default()
+            }),
+            Some(0.25),
+            Billing::Api,
+            2,
+        )
+        .unwrap();
+        compact.finish(None, None, Billing::Api, 1).unwrap();
+        let (total, turn) = root.snapshot();
+        let ranked = turn.by_purpose[&Purpose::Retrieval];
+        assert_eq!(ranked.requests, 1);
+        assert_eq!(ranked.retries, 1);
+        assert_eq!(ranked.unreported_attempts, 1);
+        assert_eq!(ranked.cache_read, 20);
+        assert_eq!(ranked.cache_write, 3);
+        assert_eq!(ranked.reasoning, 2);
+        assert_eq!(ranked.observed_cost_usd, Some(0.25));
+        assert!(matches!(ranked.cost_coverage, CostCoverage::Partial));
+        assert_eq!(turn.by_purpose[&Purpose::Compaction].failed_requests, 1);
+        assert_eq!(turn.by_model["shared"].workers.requests, 2);
+        let sum = turn
+            .by_purpose
+            .values()
+            .try_fold(Counts::default(), |sum, &c| sum.add(c))
+            .unwrap();
+        assert_eq!(sum.requests, total.all.requests);
+        assert_eq!(sum.input, total.all.input);
+        assert_eq!(sum.output, total.all.output);
+        assert_eq!(sum.observed_cost_usd, total.all.observed_cost_usd);
+        assert!(next.snapshot().1.by_purpose.is_empty());
+        assert_eq!(
+            serde_json::to_value(&turn).unwrap()["by_purpose"]["retrieval"]["input"],
+            30
+        );
+    }
+
+    #[test]
+    fn external_receipts_preserve_purpose_and_release_unstarted_reservations() {
+        let root = Scope::default().next_turn(2).unwrap();
+        let memory = root.worker().for_purpose(Purpose::Memory);
+        drop(memory.reserve_external("memory-service".into()).unwrap());
+        assert!(root.snapshot().0.by_purpose.is_empty());
+        let mut received = memory.reserve_external("memory-service".into()).unwrap();
+        received.mark_started().unwrap();
+        let mut lost = memory.reserve_external("memory-service".into()).unwrap();
+        lost.mark_started().unwrap();
+        assert!(memory.reserve_external("memory-service".into()).is_err());
+        let next = root.next_turn(2).unwrap();
+        received
+            .account(
+                &serde_json::json!({
+                    "prompt_tokens": 9, "completion_tokens": 4, "cost": 0.5
+                }),
+                true,
+                true,
+            )
+            .unwrap();
+        drop(lost);
+        let total = next.snapshot().0;
+        let observed = total.by_purpose[&Purpose::Memory];
+        assert_eq!(observed.requests, 2);
+        assert_eq!(observed.successful_requests, 1);
+        assert_eq!(observed.failed_requests, 1);
+        assert_eq!(observed.discarded_attempts, 2);
+        assert_eq!(observed.reported_responses, 1);
+        assert_eq!(observed.unreported_attempts, 1);
+        assert_eq!(observed.observed_cost_usd, Some(0.5));
+        assert!(matches!(observed.cost_coverage, CostCoverage::Partial));
+        assert_eq!(root.snapshot().1.by_purpose[&Purpose::Memory].input, 9);
+        assert!(next.snapshot().1.by_purpose.is_empty());
+    }
+
+    #[test]
+    fn wrong_purpose_or_model_cannot_settle_another_scopes_transport_attempt() {
+        let root = Scope::default()
+            .next_turn(0)
+            .unwrap()
+            .for_model("model-a".into());
+        root.begin(Billing::Api).unwrap();
+        root.attempt(false).unwrap();
+        let reply = Reply {
+            prompt_tokens: Some(3),
+            completion_tokens: Some(2),
+            ..Reply::default()
+        };
+        let before = serde_json::to_value(root.snapshot().0).unwrap();
+        for wrong in [
+            root.for_purpose(Purpose::Repair),
+            root.for_model("model-b".into()),
+        ] {
+            assert!(wrong.finish(Some(&reply), None, Billing::Api, 1).is_err());
+            assert_eq!(serde_json::to_value(root.snapshot().0).unwrap(), before);
+        }
+        root.finish(Some(&reply), None, Billing::Api, 1).unwrap();
+        assert_eq!(
+            root.snapshot().0.by_purpose[&Purpose::Agent].unreported_attempts,
+            0
+        );
+    }
+
+    #[test]
+    fn purpose_overflow_does_not_partially_update_any_group() {
+        let root = Scope::default().next_turn(0).unwrap();
+        {
+            let mut state = root.state.lock().unwrap();
+            state
+                .total
+                .by_purpose
+                .entry(Purpose::Agent)
+                .or_default()
+                .requests = u64::MAX;
+        }
+        let before = serde_json::to_value(root.snapshot()).unwrap();
+        assert!(root.begin(Billing::Api).is_err());
+        assert_eq!(serde_json::to_value(root.snapshot()).unwrap(), before);
     }
 }

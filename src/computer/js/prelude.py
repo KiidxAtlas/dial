@@ -41,15 +41,13 @@ def _make_computer():
                 "action": action,
             },
         )
-        if isinstance(response, str):
-            return {}
         if not isinstance(response, dict):
             raise RuntimeError("computer returned an invalid response")
         text = response.get("text")
         if isinstance(text, str) and text:
             print(text)
-        details = response.get("details")
-        return details if isinstance(details, dict) else {}
+        # __dial_prelude__ returns raw ToolOutput.data, not a tool-result envelope.
+        return response
 
     async def _call(chain):
         details = await _invoke("call", {"chain": chain})

@@ -245,7 +245,7 @@ pub type AdapterMonitor = Arc<parking_lot::Mutex<AdapterRuntime>>;
 
 pub struct Backend {
     #[cfg(test)]
-    chatgpt_url: Option<String>,
+    pub(crate) chatgpt_url: Option<String>,
     kind: ProviderKind,
     python: PathBuf,
     startup_timeout_secs: u64,
@@ -977,7 +977,11 @@ impl Backend {
             self.metadata.kind.label()
         );
         let mut profile = self.next_profile.take().or_else(|| self.profile.clone());
+        // The detected mechanism only matters to a constrained retry that offers tools; ordinary
+        // requests are never probed.
         if let Some(profile) = profile.as_mut()
+            && profile.tool_repair
+            && !req.tools.is_empty()
             && profile.endpoint_structured_output.is_none()
         {
             profile.endpoint_structured_output = self.endpoint_structured_output();
@@ -1159,7 +1163,16 @@ impl Backend {
                     }
                 };
                 self.adapter_monitor.lock().phase = AdapterPhase::Loaded;
-                server.phase("generating")?;
+                if !on_event(&llm::StreamEvent::Progress(llm::ModelProgress::new(
+                    llm::InferencePhase::Processing,
+                ))) {
+                    self.adapter_monitor.lock().phase = AdapterPhase::Failed;
+                    return Err(server.abort_request(llm::Interrupted.into()));
+                }
+                if let Err(error) = server.begin_request() {
+                    self.adapter_monitor.lock().phase = AdapterPhase::Failed;
+                    return Err(server.abort_request(error));
+                }
                 let result = exchange(
                     llm::Endpoint {
                         headers: &[],
@@ -1177,8 +1190,14 @@ impl Backend {
                         on_event,
                     },
                 );
-                server.phase("loaded")?;
-                if steering.is_some() {
+                let result = if interrupted() {
+                    Err(llm::Interrupted.into())
+                } else {
+                    result
+                };
+                let result = result.and_then(|reply| server.phase("loaded").map(|()| reply));
+                let result = result.map_err(|error| server.abort_request(error));
+                if result.is_ok() && steering.is_some() {
                     let previous = self.steering_runtime["state"].clone();
                     self.steering_runtime = crate::steering::runtime(server.base_url())
                         .unwrap_or_else(
@@ -1199,11 +1218,6 @@ impl Backend {
                         }
                     }
                 }
-                let result = if interrupted() {
-                    Err(llm::Interrupted.into())
-                } else {
-                    result
-                };
                 self.adapter_monitor.lock().phase = if result.is_ok() {
                     AdapterPhase::Used
                 } else {
@@ -2713,11 +2727,14 @@ mod tests {
         repair.tool_repair = true;
 
         let llama = fake::serve(vec![
-            fake::json(200, &json!({"default_generation_settings": {"n_ctx": 4096}})),
+            fake::json(
+                200,
+                &json!({"default_generation_settings": {"n_ctx": 4096}}),
+            ),
             ok("{}"),
         ]);
-        let mut remote = backend(endpoint(&format!("{}/v1", llama.url)))
-            .with_profile(repair.clone());
+        let mut remote =
+            backend(endpoint(&format!("{}/v1", llama.url))).with_profile(repair.clone());
         remote.chat(None, &req, 5, None).unwrap();
         let body = fake::body(&llama.requests()[1]);
         assert_eq!(body["response_format"]["type"], "json_schema");
@@ -3591,6 +3608,95 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn failed_local_inference_preserves_diagnostics_and_restarts_before_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model");
+        std::fs::create_dir(&model).unwrap();
+        let mut local = Backend::new(
+            ProviderKind::Local {
+                model_dir: model.to_string_lossy().into_owned(),
+            },
+            server::tests::fake_python(root.path()),
+            30,
+        );
+        let mut failing = request();
+        failing.messages = vec![json!({"role":"user","content":"dial-test-fail"})];
+        let error = local.chat(None, &failing, 5, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("test inference allocation failed"),
+            "{error:#}"
+        );
+        assert!(
+            error.downcast_ref::<llm::HttpError>().is_some(),
+            "classification must survive diagnostics"
+        );
+        assert!(!local.server.as_ref().unwrap().is_running());
+        let old: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(model.join("info.json")).unwrap()).unwrap();
+        for key in ["pid", "child"] {
+            let pid = old[key].as_i64().unwrap() as libc::pid_t;
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "{key} must be stopped before retry"
+            );
+        }
+        local.chat(None, &request(), 5, None).unwrap();
+        let new: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(model.join("info.json")).unwrap()).unwrap();
+        assert_ne!(old["pid"], new["pid"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_local_prefill_stops_engine_that_ignores_disconnect_before_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model");
+        std::fs::create_dir(&model).unwrap();
+        let mut local = Backend::new(
+            ProviderKind::Local {
+                model_dir: model.to_string_lossy().into_owned(),
+            },
+            server::tests::fake_python(root.path()),
+            30,
+        );
+        let mut stalled = request();
+        stalled.messages = vec![json!({"role":"user","content":"dial-test-stall"})];
+        let mut observed = false;
+        let started = std::time::Instant::now();
+        let error = local
+            .chat_with_control_events(
+                None,
+                &stalled,
+                llm::Limits {
+                    timeout_secs: 5,
+                    interrupt: Arc::new(AtomicBool::new(false)),
+                },
+                Some(&mut |_| true),
+                &mut |_| {},
+                &mut |event| {
+                    if matches!(event, llm::StreamEvent::Progress(p) if p.prompt_tokens == Some(42))
+                    {
+                        observed = true;
+                        false
+                    } else {
+                        true
+                    }
+                },
+            )
+            .unwrap_err();
+        assert!(observed, "cancel only after the engine has begun prefill");
+        assert!(
+            error.downcast_ref::<llm::Interrupted>().is_some(),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(!local.server.as_ref().unwrap().is_running());
+        local.chat(None, &request(), 5, None).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn local_vision_model_receives_pixels_and_uses_one_supervised_vlm_server() {
         use base64::{Engine, engine::general_purpose::STANDARD};
         let root = tempfile::tempdir().unwrap();
@@ -3640,7 +3746,14 @@ mod tests {
         let info: serde_json::Value =
             serde_json::from_slice(&std::fs::read(model.join("info.json")).unwrap()).unwrap();
         assert_eq!(info["engine"], "mlx-vlm");
-        assert_eq!(info["apc"], "0");
+        assert_eq!(info["apc"], "1");
+        assert_eq!(
+            info["apc_config"],
+            json!({
+                "APC_DISK_ENABLED": "0", "APC_NUM_BLOCKS": "256", "APC_MEMORY_MAX_GB": "1",
+                "APC_MEMORY_RESERVE_GB": "0.25", "APC_CHECKPOINT_ENTRIES": "1",
+            })
+        );
         assert!(
             info["argv"]
                 .as_array()

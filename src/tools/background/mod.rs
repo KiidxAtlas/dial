@@ -44,7 +44,7 @@ const MAX_INPUT: usize = 64 * 1024;
 const MAX_OUTPUT: usize = 32 * 1024;
 const MAX_MATCH_LINE: usize = 300;
 const MAX_LISTED_COMMAND: usize = 80;
-const DEFAULT_WAIT_SECS: u64 = 0;
+const DEFAULT_WAIT_SECS: u64 = 5;
 const MAX_WAIT_SECS: u64 = 300;
 
 const DESCRIPTION: &str = "Run session-owned background jobs without persistent shell state. POSIX \
@@ -59,7 +59,7 @@ cancellable; partial writes are reported. `list`, `output` (pipe: delta; PTY: cu
 tail), `wait` (until regex, \
 or exit), `kill` (name or all=true). `ready` on named start or wait: log regex and/or numeric host/port, \
 both required if supplied; port readiness needs network permission and approval, and requires lsof-proven \
-owned listeners on POSIX (unsupported on Windows). Wait timeout 0 is unlimited, positive waits max 300s. \
+owned listeners on POSIX (unsupported on Windows). Waits default to 5s; explicit 0 is unlimited, positive waits max 300s. \
 At most 8 live jobs, 8 retained finished entries. No persist/detach. Drop/session exit kills owned \
 process groups or Windows Job Objects; POSIX descendants that escape with setsid/job control may not \
 be cleaned up.";
@@ -704,10 +704,10 @@ impl Tool for Background {
                     "log": {"type": "string", "description": "regex in this process's retained output"},
                     "host": {"type": "string", "description": "numeric IP address (default 127.0.0.1), requires port"},
                     "port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "owned TCP listener readiness; network permission/approval and lsof required"},
-                    "timeout": {"type": "integer", "minimum": 0, "maximum": 300, "description": "seconds, 0 unlimited (default outer timeout or 0)"}
+                    "timeout": {"type": "integer", "minimum": 0, "maximum": 300, "description": "seconds, explicit 0 unlimited (default outer timeout or 5s)"}
                 }},
                 "tail": {"type": "integer", "minimum": 1, "description": "output: return only the last N lines of the new output"},
-                "timeout": {"type": "integer", "minimum": 0, "maximum": 3600, "description": "wait: seconds (default 0 unlimited, positive max 300); input/close_stdin/resize: 0 unlimited cancellable, positive max 3600"},
+                "timeout": {"type": "integer", "minimum": 0, "maximum": 3600, "description": "wait: seconds (default 5, explicit 0 unlimited, positive max 300); input/close_stdin/resize: 0 unlimited cancellable, positive max 3600"},
                 "until": {"type": "string", "description": "wait: regex to wait for in the output; ^ and $ match at line boundaries (default: wait for exit)"},
                 "all": {"type": "boolean", "description": "kill: kill every background process"},
             }),
@@ -722,6 +722,14 @@ impl Tool for Background {
                 .get("ready")
                 .is_some_and(|ready| present(ready, "port")),
             _ => true,
+        }
+    }
+    fn concurrency(&self, args: &Value) -> super::ext::Concurrency {
+        if matches!(args["action"].as_str(), Some("wait" | "list" | "output")) {
+            // The job table synchronizes these reads; a wait must not lock out independent edits.
+            super::ext::Concurrency::Shared
+        } else {
+            super::ext::Concurrency::Exclusive
         }
     }
 
@@ -739,7 +747,7 @@ impl Tool for Background {
     }
 
     fn interruptible(&self, args: &Value) -> bool {
-        args["action"] == "wait"
+        args["action"] == "wait" || (args["action"] == "start" && args.get("ready").is_some())
     }
 
     fn call(&self, ctx: &ToolContext, args: &Value) -> ToolOutput {
@@ -793,24 +801,5 @@ impl Tool for Background {
         let mut table = self.table();
         table.refresh();
         table.awaited()
-    }
-
-    fn await_work(&self, timeout: std::time::Duration) {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let seen = wake::generation();
-            {
-                let mut table = self.table();
-                table.refresh();
-                if table.awaited().is_empty() {
-                    return;
-                }
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return;
-            }
-            wake::wait_past(seen, Some(deadline));
-        }
     }
 }

@@ -55,6 +55,7 @@ pub mod setup;
 pub mod storage;
 pub mod tools;
 pub mod ui;
+pub(crate) mod workspace_copy;
 
 pub mod pack;
 pub mod steering;

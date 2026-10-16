@@ -346,6 +346,14 @@ impl ComputerSession {
     }
 }
 
+impl Drop for ComputerSession {
+    fn drop(&mut self) {
+        // Native callback threads may still retain the supervisor's inner Arc. Close explicitly
+        // at the execution-owner boundary rather than waiting for the last callback to release it.
+        let _ = self.supervisor.close();
+    }
+}
+
 /// Coordinate-safe image sizing applies to Anthropic-class models, which get frames capped at 1280x896.
 fn coordinate_safe_frames(config: &Config) -> bool {
     let selection = config.selection();
@@ -512,6 +520,7 @@ impl Computer {
             ComputerContent::Text { .. } => None,
         });
         let mut data = json!({
+            "text": text,
             "readOnly": read_only,
             "screenshots": run.screenshots,
             "value": run.return_value,
@@ -531,6 +540,12 @@ impl Computer {
 }
 
 impl Tool for Computer {
+    fn fork_session(&self) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self {
+            session: Arc::new(ComputerSession::new(self.session.cwd.lock().clone())),
+        }))
+    }
+
     fn name(&self) -> &str {
         NAME
     }
@@ -659,5 +674,30 @@ mod computer_tests {
         assert!(capped.contains("line 9999"));
         assert!(capped.ends_with("[raw output: artifact://x]"));
         assert_eq!(cap_inline("short".into(), |_| None), "short");
+    }
+    #[test]
+    fn computer_fork_close_does_not_close_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = crate::tools::Workspace::new(dir.path()).unwrap();
+        let config = Config::default();
+        let context = ToolContext {
+            workspace: &workspace,
+            config: &config,
+            mutation_authorizer: None,
+            confirm: None,
+        };
+        let parent = Computer {
+            session: Arc::new(ComputerSession::new(dir.path().display().to_string())),
+        };
+        let child = parent.fork_session().expect("computer must be owner-local");
+        assert!(!child.call(&context, &json!({"action":"close"})).is_error);
+        assert!(!parent.session.closed.load(Ordering::Acquire));
+        assert!(
+            child
+                .call(&context, &json!({"action":"capabilities"}))
+                .is_error
+        );
+        assert!(!parent.call(&context, &json!({"action":"close"})).is_error);
+        // No desktop backend or process was created by any of these close-only operations.
     }
 }

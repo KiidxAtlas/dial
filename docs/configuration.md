@@ -11,6 +11,12 @@ unreadable, invalid UTF-8, oversized, linked or non-regular layers produce a pat
 than silently falling back to different settings. Files must be owned by the current user without
 hard links; symlinked files and user-owned symlink ancestors are refused. Valid files are owner-private.
 
+`dial config list` and `dial config get` use the runtime resolver, including defaults, migrations and
+command-line overrides. Hooks append and deduplicate across layers rather than replacing earlier hooks.
+Both text and JSON redact credential values recursively (also when requesting an entire table or array);
+ordinary token budgets such as `harness.max_tokens` remain visible. Environment-variable names are not
+credential values. The settings panel reports read failures instead of displaying empty fallback layers.
+
 A running session reloads settings that change on disk, except its model choices. The main model
 (`model`, `provider`, `endpoint`, `model_profile`, `context_window`) and `[model_roles]` stay as
 they were when the session started, so picking a model in one terminal never switches another
@@ -20,6 +26,8 @@ default for sessions started later.
 Learning stores and adapters are additionally isolated under
 `~/.dial/projects/<name>-<hash>/models/<identity>/`, so switching providers/models does not reuse an
 incompatible adapter. Sessions, skills, memory and prompt history remain project-scoped.
+
+Service options are settings too. `fast_mode`, `slow_mode` and `extended_context` are the flags behind `/fast`, `/slow` and `/extended-context`; `/settings` → Model → Requests shows and toggles the same three rows, and `service_tier` sets an explicit tier that takes precedence over them. The session-only modes (`/vibe`, `/skillful`, `/advisor`, `/external-thinking`) are not stored in config and stay command-only.
 
 ## Unlimited execution defaults
 

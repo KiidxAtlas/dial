@@ -209,8 +209,8 @@ def install_vision_server(server, specification):
     if specification is not None:
         def load(model_path,adapter_path):
             model,processor,config=original(model_path,adapter_path)
-            # Dial launches a fixed profile with APC disabled. Reject a manually injected draft
-            # profile rather than sharing a steered target's caches with an unsteered draft.
+            # Dial's APC is process-local to this fixed profile, never shared across steering
+            # changes. Reject injected drafts rather than reuse a steered target's caches there.
             runtime=getattr(server,'runtime',None)
             draft=getattr(getattr(runtime,'config',None),'spec_draft_model',None)
             if draft or os.environ.get('MLX_VLM_DRAFT_MODEL'):

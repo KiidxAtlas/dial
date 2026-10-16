@@ -353,6 +353,10 @@ fn modules_respect_their_dependency_boundaries() {
         ("config", &["ui", "learn"]),
         ("agent", &["ui"]),
         ("learn", &["ui"]),
+        (
+            "workspace_copy",
+            &["agent", "benchmark", "learn", "config", "llm", "ui"],
+        ),
     ];
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let exempt = exempt_paths(&src);

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +13,12 @@ use serde_json::{Value, json};
 use crate::computer::desktop::DesktopSession;
 use crate::computer::desktop::types::DesktopSessionOptions;
 use crate::computer::rpc::{ComputerError, ComputerResult, desktop_error, dispatch};
+
+const MAX_FRAME: usize = crate::runtime::json_transport::MAX_FRAME;
+#[cfg(unix)]
+type WorkerInput = ChildStdin;
+#[cfg(windows)]
+type WorkerInput = crate::platform::io::QueuedWriter<ChildStdin>;
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -81,10 +88,18 @@ enum Status {
 struct Worker {
     generation: u64,
     child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<WorkerInput>>,
+    stopped: AbortSignal,
     pending: HashMap<u64, flume::Sender<ComputerResult<Value>>>,
     ready: Option<flume::Sender<ComputerResult<Value>>>,
     closed: Option<flume::Sender<ComputerResult<Value>>>,
+}
+
+impl Worker {
+    fn stop(self) {
+        self.stopped.abort();
+        kill_child(self.child);
+    }
 }
 
 struct Run {
@@ -109,7 +124,7 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         if let Some(worker) = self.state.get_mut().worker.take() {
-            kill_child(worker.child);
+            worker.stop();
         }
     }
 }
@@ -150,7 +165,7 @@ impl ComputerSupervisor {
         if signal.is_aborted() {
             return Err(ComputerError::abort(ABORTED));
         }
-        ensure_worker(inner, &request.cwd)?;
+        ensure_worker(inner, &request.cwd, signal)?;
         let (reply, rx) = flume::bounded(1);
         let id = {
             let mut guard = inner.state.lock();
@@ -183,7 +198,12 @@ impl ComputerSupervisor {
             "session": request.session,
         });
         let start = Instant::now();
-        if let Err(error) = send(inner, &message) {
+        if let Err(error) = send_guarded(
+            inner,
+            &message,
+            start + Duration::from_millis(request.timeout_ms),
+            Some(signal),
+        ) {
             inner.state.lock().runs.remove(&id);
             return Err(error);
         }
@@ -204,7 +224,12 @@ impl ComputerSupervisor {
                 aborted = true;
                 abort_deadline = Some(now + GRACE);
                 cancel_run(inner, id);
-                let _ = send(inner, &json!({"type": "abort", "id": id.to_string()}));
+                let _ = send_guarded(
+                    inner,
+                    &json!({"type": "abort", "id": id.to_string()}),
+                    now + GRACE,
+                    None,
+                );
             }
             if now >= deadline || abort_deadline.is_some_and(|d| now >= d) {
                 let error = if aborted {
@@ -242,7 +267,7 @@ impl ComputerSupervisor {
         if signal.is_aborted() {
             return Err(ComputerError::abort(ABORTED));
         }
-        ensure_worker(inner, cwd)?;
+        ensure_worker(inner, cwd, signal)?;
         {
             let mut guard = inner.state.lock();
             if guard.status == Status::Closed {
@@ -251,9 +276,11 @@ impl ComputerSupervisor {
             ensure_session_locked(&mut *guard, session)?;
         }
         let (id, rx) = register_pending(inner)?;
-        if let Err(error) = send(
+        if let Err(error) = send_guarded(
             inner,
             &json!({"type": "capabilities", "id": id.to_string(), "session": session}),
+            Instant::now() + CAPABILITIES_TIMEOUT,
+            Some(signal),
         ) {
             forget_pending(inner, id);
             return Err(error);
@@ -297,7 +324,15 @@ impl ComputerSupervisor {
         }
 
         let mut first_error: Option<ComputerError> = None;
-        if worker_running && send(inner, &json!({"type": "close"})).is_ok() {
+        if worker_running
+            && send_guarded(
+                inner,
+                &json!({"type": "close"}),
+                Instant::now() + CLOSE_TIMEOUT,
+                None,
+            )
+            .is_ok()
+        {
             if let Err(error) = await_reply(
                 inner,
                 None,
@@ -338,7 +373,7 @@ impl ComputerSupervisor {
 
         let worker = inner.state.lock().worker.take();
         if let Some(worker) = worker {
-            kill_child(worker.child);
+            worker.stop();
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -365,7 +400,7 @@ fn ensure_session_locked(st: &mut State, session: &Value) -> ComputerResult<()> 
     Ok(())
 }
 
-fn ensure_worker(inner: &Arc<Inner>, cwd: &Path) -> ComputerResult<()> {
+fn ensure_worker(inner: &Arc<Inner>, cwd: &Path, signal: &AbortSignal) -> ComputerResult<()> {
     {
         let st = inner.state.lock();
         if st.status == Status::Closed {
@@ -376,14 +411,15 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path) -> ComputerResult<()> {
         }
     }
 
-    let mut child = Command::new("node")
-        .args(["--input-type=module", "-e", WORKER_SOURCE])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| ComputerError::tool(format!("Failed to start computer worker: {e}")))?;
+    let mut child = crate::platform::process::spawn_group(
+        Command::new("node")
+            .args(["--input-type=module", "-e", WORKER_SOURCE])
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|e| ComputerError::tool(format!("Failed to start computer worker: {e}")))?;
     let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
@@ -391,18 +427,35 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path) -> ComputerResult<()> {
         return Err(ComputerError::internal("Computer worker pipes unavailable"));
     };
 
+    for result in [
+        crate::platform::io::set_nonblocking(&stdin),
+        crate::platform::io::set_nonblocking(&stdout),
+        crate::platform::io::set_nonblocking(&stderr),
+    ] {
+        if let Err(error) = result {
+            kill_child(child);
+            return Err(ComputerError::tool(format!(
+                "Computer pipe setup failed: {error}"
+            )));
+        }
+    }
+    #[cfg(windows)]
+    let stdin = crate::platform::io::QueuedWriter::new(stdin, 64 * 1024);
+    let stopped = AbortSignal::new();
     let tail = Arc::new(Mutex::new(String::new()));
-    spawn_stderr(stderr, Arc::clone(&tail));
+    spawn_stderr(stderr, Arc::clone(&tail), stopped.clone());
     let (ready_tx, ready_rx) = flume::bounded(1);
     let generation = {
         let mut st = inner.state.lock();
         if st.status == Status::Closed {
             drop(st);
+            stopped.abort();
             kill_child(child);
             return Err(closed_error());
         }
         if st.worker.is_some() {
             drop(st);
+            stopped.abort();
             kill_child(child);
             return Ok(());
         }
@@ -412,20 +465,21 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path) -> ComputerResult<()> {
             generation,
             child,
             stdin: Arc::new(Mutex::new(stdin)),
+            stopped: stopped.clone(),
             pending: HashMap::new(),
             ready: Some(ready_tx),
             closed: None,
         });
         generation
     };
-    spawn_reader(Arc::downgrade(inner), generation, stdout);
+    spawn_reader(Arc::downgrade(inner), generation, stdout, stopped);
 
     match await_reply(
         inner,
         None,
         ready_rx,
         Instant::now() + START_TIMEOUT,
-        None,
+        Some(signal),
         "Timed out starting computer worker",
     ) {
         Ok(_) => {
@@ -443,17 +497,15 @@ fn ensure_worker(inner: &Arc<Inner>, cwd: &Path) -> ComputerResult<()> {
     }
 }
 
-fn spawn_stderr(stderr: ChildStderr, tail: Arc<Mutex<String>>) {
+fn spawn_stderr(mut stderr: ChildStderr, tail: Arc<Mutex<String>>, stopped: AbortSignal) {
     std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
+        let mut bytes = [0u8; STDERR_TAIL_BYTES];
+        while !stopped.is_aborted() {
+            match crate::platform::io::read_nonblocking(&mut stderr, &mut bytes) {
+                Ok(0) => break,
+                Ok(n) => {
                     let mut text = tail.lock();
-                    text.push_str(&String::from_utf8_lossy(&line));
+                    text.push_str(&String::from_utf8_lossy(&bytes[..n]));
                     if text.len() > STDERR_TAIL_BYTES {
                         let mut cut = text.len() - STDERR_TAIL_BYTES;
                         while !text.is_char_boundary(cut) {
@@ -462,31 +514,87 @@ fn spawn_stderr(stderr: ChildStderr, tail: Arc<Mutex<String>>) {
                         text.replace_range(..cut, "");
                     }
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let _ = crate::platform::io::wait_readable(&stderr, POLL);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
             }
         }
     });
 }
 
-fn spawn_reader(weak: Weak<Inner>, generation: u64, stdout: ChildStdout) {
+fn spawn_reader(weak: Weak<Inner>, generation: u64, mut stdout: ChildStdout, stopped: AbortSignal) {
     std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            handle_message(&inner, generation, message);
+        let mut pending = Vec::new();
+        let mut scanned = 0;
+        let mut bytes = [0u8; 16384];
+        let mut failure = ComputerError::tool(WORKER_EXITED);
+        while !stopped.is_aborted() {
+            match crate::platform::io::read_nonblocking(&mut stdout, &mut bytes) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pending.extend_from_slice(&bytes[..n]);
+                    // Parse bounded frames, never allocate an unbounded line on a reader thread.
+                    while let Some(end) = pending[scanned..]
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map(|index| scanned + index)
+                    {
+                        if end > MAX_FRAME {
+                            break;
+                        }
+                        let line: Vec<_> = pending.drain(..=end).collect();
+                        scanned = 0;
+                        let message = match serde_json::from_slice(&line) {
+                            Ok(message) => message,
+                            Err(error) => {
+                                if let Some(inner) = weak.upgrade() {
+                                    terminate_inner(
+                                        &inner,
+                                        ComputerError::tool(format!(
+                                            "Invalid computer frame: {error}"
+                                        )),
+                                        Some(generation),
+                                    );
+                                }
+                                return;
+                            }
+                        };
+                        let Some(inner) = weak.upgrade() else {
+                            return;
+                        };
+                        handle_message(&inner, generation, message);
+                    }
+                    scanned = pending.len();
+                    if pending.len() > MAX_FRAME {
+                        failure = ComputerError::tool("Computer response exceeded frame limit");
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let _ = crate::platform::io::wait_readable(&stdout, POLL);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
         }
         if let Some(inner) = weak.upgrade() {
-            terminate_inner(&inner, ComputerError::tool(WORKER_EXITED), Some(generation));
+            terminate_inner(&inner, failure, Some(generation));
         }
     });
 }
 
 fn handle_message(inner: &Arc<Inner>, generation: u64, message: Value) {
+    if !inner
+        .state
+        .lock()
+        .worker
+        .as_ref()
+        .is_some_and(|worker| worker.generation == generation)
+    {
+        return;
+    }
     let ok = message.get("ok").and_then(Value::as_bool) == Some(true);
     match message.get("type").and_then(Value::as_str) {
         Some("ready") => {
@@ -702,21 +810,85 @@ fn spawn_native(inner: &Arc<Inner>, message: &Value) {
 }
 
 fn send(inner: &Arc<Inner>, message: &Value) -> ComputerResult<()> {
-    let stdin = inner
+    send_guarded(inner, message, Instant::now() + START_TIMEOUT, None)
+}
+
+fn send_guarded(
+    inner: &Arc<Inner>,
+    message: &Value,
+    deadline: Instant,
+    signal: Option<&AbortSignal>,
+) -> ComputerResult<()> {
+    let (stdin, stopped, generation) = inner
         .state
         .lock()
         .worker
         .as_ref()
-        .map(|w| Arc::clone(&w.stdin))
+        .map(|w| (Arc::clone(&w.stdin), w.stopped.clone(), w.generation))
         .ok_or_else(not_running)?;
     let mut line =
-        serde_json::to_string(message).map_err(|e| ComputerError::internal(e.to_string()))?;
-    line.push('\n');
-    let mut pipe = stdin.lock();
-    pipe.write_all(line.as_bytes())
-        .map_err(|e| ComputerError::tool(format!("Failed to write to computer worker: {e}")))?;
-    pipe.flush()
-        .map_err(|e| ComputerError::tool(format!("Failed to write to computer worker: {e}")))
+        serde_json::to_vec(message).map_err(|e| ComputerError::internal(e.to_string()))?;
+    if line.len() > MAX_FRAME {
+        return Err(ComputerError::tool("Computer request exceeded frame limit"));
+    }
+    line.push(b'\n');
+    let check = || {
+        if stopped.is_aborted() || signal.is_some_and(AbortSignal::is_aborted) {
+            Err(ComputerError::abort(ABORTED))
+        } else if Instant::now() >= deadline {
+            Err(ComputerError::tool("Timed out writing to computer worker"))
+        } else {
+            Ok(())
+        }
+    };
+    let result = (|| {
+        let mut pipe = loop {
+            check()?;
+            if let Some(pipe) = stdin.try_lock_for(POLL) {
+                break pipe;
+            }
+        };
+        let mut offset = 0;
+        while offset < line.len() {
+            check()?;
+            #[cfg(unix)]
+            let written = pipe.write(&line[offset..]);
+            #[cfg(windows)]
+            let written = pipe.try_write(&line[offset..]);
+            match written {
+                Ok(0) => return Err(ComputerError::tool("Computer worker stdin closed")),
+                Ok(n) => offset += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    #[cfg(unix)]
+                    let _ = crate::platform::io::wait_writable(&*pipe, POLL);
+                    #[cfg(windows)]
+                    let _ = pipe.wait_until_drained(POLL);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return Err(ComputerError::tool(format!(
+                        "Failed to write to computer worker: {error}"
+                    )));
+                }
+            }
+        }
+        #[cfg(windows)]
+        loop {
+            check()?;
+            if pipe
+                .wait_until_drained(POLL)
+                .map_err(|e| ComputerError::tool(e.to_string()))?
+            {
+                break;
+            }
+        }
+        check()
+    })();
+    if let Err(error) = &result {
+        // Partial JSON must never be reused by a later operation.
+        terminate_inner(inner, error.clone(), Some(generation));
+    }
+    result
 }
 
 fn register_pending(
@@ -758,7 +930,9 @@ fn await_reply(
             if let Some(id) = key {
                 forget_pending(inner, id);
             }
-            return Err(ComputerError::abort(ABORTED));
+            let error = ComputerError::abort(ABORTED);
+            terminate(inner, error.clone());
+            return Err(error);
         }
         if Instant::now() >= deadline {
             if let Some(id) = key {
@@ -819,29 +993,12 @@ fn terminate_inner(inner: &Arc<Inner>, error: ComputerError, only_gen: Option<u6
         session.cancel();
     }
     if let Some(worker) = worker {
-        kill_child(worker.child);
+        worker.stop();
     }
 }
 
-fn kill_child(mut child: Child) {
-    #[cfg(unix)]
-    {
-        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-            // SAFETY: pid belongs to the child process this supervisor spawned.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-        }
-        let deadline = Instant::now() + GRACE;
-        while Instant::now() < deadline {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            std::thread::sleep(POLL);
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+fn kill_child(child: Child) {
+    drop(crate::runtime::process::ProcessGroup::new(child));
 }
 
 #[cfg(test)]
@@ -862,5 +1019,123 @@ mod computer_supervisor_tests {
         assert_eq!(id_of(&json!("42")), Some(42));
         assert_eq!(id_of(&json!(7)), Some(7));
         assert_eq!(id_of(&json!("native-1")), None);
+    }
+    // These workers speak only the transport protocol; no DesktopSession is constructed.
+    #[cfg(unix)]
+    fn fake_worker(source: &str) -> ComputerSupervisor {
+        let supervisor = ComputerSupervisor::new();
+        let mut command = Command::new("python3");
+        command
+            .args(["-u", "-c", source])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = crate::platform::process::spawn_group(&mut command).unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        crate::platform::io::set_nonblocking(&stdin).unwrap();
+        crate::platform::io::set_nonblocking(&stdout).unwrap();
+        let stopped = AbortSignal::new();
+        supervisor.inner.state.lock().worker = Some(Worker {
+            generation: 1,
+            child,
+            stdin: Arc::new(Mutex::new(stdin)),
+            stopped: stopped.clone(),
+            pending: HashMap::new(),
+            ready: None,
+            closed: None,
+        });
+        spawn_reader(Arc::downgrade(&supervisor.inner), 1, stdout, stopped);
+        supervisor
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn computer_stalled_write_is_bounded_and_cancellable() {
+        for cancel in [false, true] {
+            let supervisor = fake_worker("import time; time.sleep(30)");
+            let signal = AbortSignal::new();
+            let started = Instant::now();
+            std::thread::scope(|scope| {
+                if cancel {
+                    let signal = &signal;
+                    scope.spawn(move || {
+                        std::thread::sleep(Duration::from_millis(50));
+                        signal.abort();
+                    });
+                }
+                let error = send_guarded(
+                    &supervisor.inner,
+                    &json!({"code":"x".repeat(1024 * 1024)}),
+                    started + Duration::from_millis(200),
+                    Some(&signal),
+                )
+                .unwrap_err();
+                assert_eq!(error.is_abort, cancel, "{error}");
+            });
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(supervisor.inner.state.lock().worker.is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn computer_oversized_unterminated_frame_discards_worker() {
+        let supervisor = fake_worker(
+            "import sys,time; sys.stdout.write('x' * (13 * 1024 * 1024)); sys.stdout.flush(); time.sleep(30)",
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while supervisor.inner.state.lock().worker.is_some() && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+        }
+        let state = supervisor.inner.state.lock();
+        assert!(state.worker.is_none());
+        assert_eq!(state.status, Status::Failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn computer_closing_one_owner_preserves_another_worker() {
+        const ECHO: &str = "import sys,json\nfor line in sys.stdin:\n r=json.loads(line)\n if r['type']=='close': print(json.dumps({'type':'closed'}),flush=True);break\n print(json.dumps({'type':'capabilities','id':r['id'],'ok':True,'capabilities':{'fake':True}}),flush=True)";
+        let first = fake_worker(ECHO);
+        let second = fake_worker(ECHO);
+        first.close().unwrap();
+        let (id, reply) = register_pending(&second.inner).unwrap();
+        send(&second.inner, &json!({"type":"capabilities", "id":id})).unwrap();
+        assert_eq!(
+            reply.recv_timeout(Duration::from_secs(2)).unwrap().unwrap()["fake"],
+            true
+        );
+        assert!(second.inner.state.lock().session.is_none());
+        second.close().unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn computer_partial_frame_read_is_cancellable() {
+        let supervisor = fake_worker(
+            "import sys,time; sys.stdout.write('{'); sys.stdout.flush(); time.sleep(30)",
+        );
+        let (id, reply) = register_pending(&supervisor.inner).unwrap();
+        let signal = AbortSignal::new();
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let signal = &signal;
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                signal.abort();
+            });
+            let error = await_reply(
+                &supervisor.inner,
+                Some(id),
+                reply,
+                started + Duration::from_secs(5),
+                Some(signal),
+                "unexpected timeout",
+            )
+            .unwrap_err();
+            assert!(error.is_abort, "{error}");
+        });
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(supervisor.inner.state.lock().worker.is_none());
     }
 }

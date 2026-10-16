@@ -224,20 +224,34 @@ pub fn resident_bytes(
 
 /// Context to serve a GGUF model with. `llama-server` preallocates the whole KV cache, so the
 /// requested window (else the model's native one) is capped at the largest context that keeps
-/// weights plus cache within the comfortable memory budget, rounded down to 256 tokens. `None` when
-/// the header cannot be read; the native window when memory is unknown.
+/// weights plus cache within the comfortable memory budget, rounded down to 256 tokens.
+///
+/// Returns `Ok(None)` when the header or weight size cannot be read, or when there is no window
+/// to serve. Returns `Ok` with the native (or requested) window when physical memory is unknown.
+/// With known memory, returns an error instead of over-allocating when the budget cannot hold
+/// the minimum serving context of 256 tokens (budget exhausted by weights and overhead, or too
+/// little headroom left for 256 tokens of KV cache).
 pub fn gguf_serving_context(
     path: &Path,
     requested: Option<u64>,
     kv_bits: Option<u8>,
-) -> Option<u64> {
+) -> anyhow::Result<Option<u64>> {
     static MEMORY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let info = crate::llm::local_format::gguf_info(path)?;
-    let arch = Architecture::from_gguf(&info)?;
-    let weights = crate::llm::local_format::gguf_weight_bytes(path)?;
+    let Some(info) = crate::llm::local_format::gguf_info(path) else {
+        return Ok(None);
+    };
+    let Some(arch) = Architecture::from_gguf(&info) else {
+        return Ok(None);
+    };
+    let Some(weights) = crate::llm::local_format::gguf_weight_bytes(path) else {
+        return Ok(None);
+    };
     let memory = *MEMORY.get_or_init(physical_memory_bytes);
     serving_context(weights, &arch, requested, kv_bits, memory)
 }
+
+/// Smallest context llama-server is started with; a known budget below it is refused.
+const MIN_SERVING_CONTEXT: u64 = 256;
 
 fn serving_context(
     weights: u64,
@@ -245,18 +259,28 @@ fn serving_context(
     requested: Option<u64>,
     kv_bits: Option<u8>,
     memory: Option<u64>,
-) -> Option<u64> {
-    let wanted = requested
+) -> anyhow::Result<Option<u64>> {
+    let Some(wanted) = requested
         .filter(|tokens| *tokens > 0)
         .or(arch.max_positions)
-        .map(|tokens| effective_context(tokens, arch))?;
-    let affordable = max_context(weights, arch, kv_bits, memory);
-    let context = if affordable == 0 {
-        wanted
-    } else {
-        wanted.min(affordable)
+        .map(|tokens| effective_context(tokens, arch))
+    else {
+        return Ok(None);
     };
-    Some((context / 256 * 256).max(256))
+    let Some(memory) = memory.filter(|m| *m > 0) else {
+        // Memory unknown: no budget to enforce, so serve the wanted window as before.
+        return Ok(Some((wanted / 256 * 256).max(MIN_SERVING_CONTEXT)));
+    };
+    let affordable = max_context(weights, arch, kv_bits, Some(memory));
+    if affordable < MIN_SERVING_CONTEXT {
+        let budget = (memory as f64 * COMFORTABLE_FRACTION) as u64;
+        anyhow::bail!(
+            "model does not fit in memory: weights {weights} bytes plus runtime overhead leave room for only {affordable} tokens of KV cache within the {budget}-byte comfortable budget (of {memory} bytes physical); llama-server needs at least {MIN_SERVING_CONTEXT}. Choose a smaller or more heavily quantized model"
+        );
+    }
+    // `affordable >= 256`, so rounding up a sub-256 request to 256 stays inside the budget.
+    let context = wanted.min(affordable);
+    Ok(Some((context / 256 * 256).max(MIN_SERVING_CONTEXT)))
 }
 
 /// Context actually used: the requested length capped by the native maximum when known.
@@ -381,20 +405,98 @@ mod tests {
         };
         let weights = 8 * GIB;
         let memory = Some(32 * GIB);
-        let fitted = serving_context(weights, &layout, None, None, memory).unwrap();
+        let fitted = serving_context(weights, &layout, None, None, memory)
+            .unwrap()
+            .unwrap();
         assert!(fitted < 262_144 && fitted % 256 == 0, "{fitted}");
         assert!(resident_bytes(weights, &layout, fitted, None) <= (32 * GIB) * 6 / 10);
         assert_eq!(
-            serving_context(weights, &layout, Some(32_768), None, memory),
+            serving_context(weights, &layout, Some(32_768), None, memory).unwrap(),
             Some(32_768)
         );
+        // Metadata without a window or request yields no context at all.
         assert_eq!(
-            serving_context(weights, &layout, None, None, None),
+            serving_context(weights, &arch(32, 2048), None, None, memory).unwrap(),
+            None
+        );
+    }
+
+    /// Weights chosen so that exactly `headroom_tokens`-worth of fp16 KV cache is left in the
+    /// comfortable budget for `arch(2, 256)` on 16 GiB (1024 bytes per token).
+    fn weights_leaving_tokens(headroom_tokens: u64) -> u64 {
+        let budget = (16 * GIB) as f64 * COMFORTABLE_FRACTION;
+        let fixed = FIXED_OVERHEAD_BYTES as f64;
+        ((budget - fixed - (headroom_tokens * 1024) as f64) * 20.0 / 21.0) as u64
+    }
+
+    #[test]
+    fn serving_context_unknown_memory_serves_native_or_requested_window() {
+        let layout = Architecture {
+            max_positions: Some(262_144),
+            ..arch(2, 256)
+        };
+        let huge = 100 * GIB;
+        assert_eq!(
+            serving_context(huge, &layout, None, None, None).unwrap(),
             Some(262_144)
         );
         assert_eq!(
-            serving_context(weights, &arch(32, 2048), None, None, memory),
-            None
+            serving_context(huge, &layout, Some(8192), None, None).unwrap(),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn serving_context_refuses_when_weights_exhaust_the_budget() {
+        let layout = Architecture {
+            max_positions: Some(262_144),
+            ..arch(2, 256)
+        };
+        let memory = Some(16 * GIB);
+        let error = serving_context(10 * GIB, &layout, None, None, memory).unwrap_err();
+        assert!(
+            error.to_string().contains("does not fit in memory"),
+            "{error}"
+        );
+        assert!(serving_context(10 * GIB, &layout, Some(256), None, memory).is_err());
+    }
+
+    #[test]
+    fn serving_context_refuses_when_headroom_is_below_minimum_context() {
+        let layout = Architecture {
+            max_positions: Some(262_144),
+            ..arch(2, 256)
+        };
+        let memory = Some(16 * GIB);
+        let weights = weights_leaving_tokens(100);
+        let affordable = max_context(weights, &layout, None, memory);
+        assert!((1..256).contains(&affordable), "{affordable}");
+        assert!(serving_context(weights, &layout, None, None, memory).is_err());
+        assert!(serving_context(weights, &layout, Some(64), None, memory).is_err());
+    }
+
+    #[test]
+    fn serving_context_rounds_down_to_256_within_budget() {
+        let layout = Architecture {
+            max_positions: Some(262_144),
+            ..arch(2, 256)
+        };
+        let memory = Some(16 * GIB);
+        let weights = weights_leaving_tokens(300);
+        let affordable = max_context(weights, &layout, None, memory);
+        assert!((256..512).contains(&affordable), "{affordable}");
+        // Requests below the minimum round up to it, which stays within the 256+ budget.
+        assert_eq!(
+            serving_context(weights, &layout, Some(100), None, memory).unwrap(),
+            Some(256)
+        );
+        let capped = serving_context(weights, &layout, None, None, memory)
+            .unwrap()
+            .unwrap();
+        assert_eq!(capped, 256);
+        assert!(
+            resident_bytes(weights, &layout, capped, None) as f64
+                <= 16.0 * GIB as f64 * COMFORTABLE_FRACTION
         );
     }
 

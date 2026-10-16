@@ -2,7 +2,46 @@
 
 ## Persistent kernels and evaluation
 
-Python kernels retain their namespace between successful cells. Interrupting a running cell first sends SIGINT; an interrupt that does not unwind within five seconds escalates to terminating the kernel. Failed transport, cancellation and timeout paths discard the namespace. Effects already performed remain; loss of the final cell result is recorded as uncertain. Kernel interpreters may be selected from the project virtual environment (`.venv`/`VIRTUAL_ENV`) or conda environment when configured/approved, but execution remains sandboxed. Linux execution uses Bubblewrap containment where available. JavaScript evaluation can resolve packages from the managed evaluation package directory; installing a missing package is an explicit approval-gated operation.
+Python kernels retain their namespace between successful cells. Interrupting a running cell first sends SIGINT; an interrupt that does not unwind within five seconds escalates to terminating the kernel. Failed transport, cancellation and timeout paths discard the namespace. Effects already performed remain; loss of the final cell result is recorded as uncertain. Kernel interpreters may be selected from the project virtual environment (`.venv`/`VIRTUAL_ENV`) or conda environment when configured/approved, but execution remains subject to the mandatory process-creation fence.
+
+`kernel` supports macOS process-fork containment and the Windows native no-child-process mitigation;
+Windows additionally requires the explicit unsandboxed setting because filesystem/network isolation
+is unavailable. `eval` supports macOS only. **Both fail closed on Linux**, even when Bubblewrap is
+available or filesystem sandboxing is disabled: Bubblewrap is not the mandatory process-creation
+fence. No Linux or unsandboxed fallback is provided. Tool discovery and `status` expose the same
+platform availability and reason used at startup; this describes platform support, not approval or
+the availability of the configured Python/Node executable. Reset, cancel and status remain usable
+on unsupported platforms.
+
+JavaScript eval requires an operator-installed Node 22 or newer. It uses Node's persistent REPL
+evaluator for lexical declarations and top-level `await`; runtime and syntax failures are reported
+as cell errors without discarding an otherwise healthy namespace. Node 26 uses the public REPL
+error hook, while earlier supported releases use the legacy REPL error path. Strings crossing the
+JSON transport are normalized to well-formed Unicode, including truncated output and nested values.
+
+Computer helpers in JavaScript and Python consume the host's raw structured tool data. Returned
+values, display text, and screenshot artifacts remain available through the same approval-gated
+bridge; a denied or malformed response raises an error rather than returning an empty result.
+
+### Execution ownership and transport
+
+Every forked execution owner gets independent Python, JavaScript, browser and computer session
+state. Closing a child's computer session does not close its parent's worker, handles or captures.
+Native foreground-input arbitration remains global: separate owners cannot bypass the OS input
+lease or inherit another owner's foreground-control grant. Computer preludes still dispatch through
+the current controller's approved tool boundary; they do not capture a shared desktop session.
+
+`runtime/json_transport.rs` owns bounded JSON-lines transport, request/callback sequencing and
+nonblocking deadline/cancellation-aware pipes for kernel/eval/browser. `runtime/process.rs` owns
+process-group cleanup; `tools/shell.rs` keeps its compatibility re-export. Tool adapters retain
+launch policy, sandbox requirements and authorized callback/prelude dispatch. Computer retains its
+separate asynchronous supervisor protocol, with bounded frames and cancellable writes; malformed,
+oversized or interrupted transport is discarded rather than reused. No universal driver is assumed.
+
+Integration names, defaults and legacy always-registered behavior live in `tools/catalog.rs` alongside
+the existing canonical schema catalog. Saved integration lists still retain browser, kernel, eval,
+find, autoresearch and archive; computer and notebook remain opt-in. These declarations describe
+availability only and never grant execution authority.
 
 ## Browser
 
@@ -49,9 +88,12 @@ outputs, or source content. Hook delivery is observational and cannot bypass too
 
 The browser tool provisions its own pinned Playwright-core, Readability, and Chromium into a private
 owner-only cache on first use (`bun install --frozen-lockfile --ignore-scripts`, then Chromium install);
-no operator setup is required. Set `[browser] playwright_module` only to override with an operator-owned
-Playwright entry (absolute path, Playwright-core >=1.48); Readability and Chromium fallback still come from the
-built-in runtime. Approved browser `open`/`navigate`
+no operator setup is required. Cached JavaScript dependencies can be used offline with an installed
+`[browser] chromium_executable` or CDP attach; those modes do not download private Chromium.
+Missing JavaScript dependencies still require registry access, even when attaching to a browser.
+Set `[browser] playwright_module` only to override with an operator-owned Playwright entry
+(absolute path, Playwright-core >=1.48). Workspace-owned entries (including symlink targets) are
+rejected before evaluation. Readability still comes from the built-in runtime. Approved browser `open`/`navigate`
 requests to `localhost` or `127.0.0.1` automatically permit only that exact host and port for the browser
 session, so local development sites work without configuring each port. Redirects and subresources
 cannot grant access to another local endpoint. `/settings` → Tools → Browser controls this behavior;
@@ -63,3 +105,9 @@ readiness, then open its HTTP URL. Foreground `bash` kills servers at its deadli
 Browser failures show the underlying network refusal before Chromium's generic error. Networking is
 paused between approved browser operations. Python and
 Poppler must also be installed when using kernel/PDF capabilities.
+
+Browser `run` executes an async function body in the page realm: use DOM globals such as `document`,
+`assert(condition, message)` and `await sleep(ms)`, and `return` a JSON-serializable result.
+For example, `assert(document.querySelector('h1')); return document.title;` checks the page DOM.
+There is no injected Playwright `page`, `require`, or Node API; page CSP may block dynamic evaluation.
+Use browser actions or the allowlisted `call` chain for Playwright-backed operations.

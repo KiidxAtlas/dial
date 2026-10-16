@@ -1,0 +1,22 @@
+{
+  "plugins": [],
+  "skills": [
+    {"name": "algorithmic-art", "description": "Generative art with p5.js: seeded randomness and interactive parameters", "url": "https://github.com/anthropics/skills.git#skills/algorithmic-art"},
+    {"name": "brand-guidelines", "description": "Apply Anthropic's brand colors and typography to artifacts", "url": "https://github.com/anthropics/skills.git#skills/brand-guidelines"},
+    {"name": "canvas-design", "description": "Create poster and visual art as PNG or PDF documents", "url": "https://github.com/anthropics/skills.git#skills/canvas-design"},
+    {"name": "claude-api", "description": "Build LLM apps with the Claude API and Anthropic SDKs", "url": "https://github.com/anthropics/skills.git#skills/claude-api"},
+    {"name": "doc-coauthoring", "description": "Structured workflow for co-authoring docs, proposals and specs", "url": "https://github.com/anthropics/skills.git#skills/doc-coauthoring"},
+    {"name": "docx", "description": "Create, read and edit Word (.docx) documents", "url": "https://github.com/anthropics/skills.git#skills/docx"},
+    {"name": "frontend-design", "description": "Distinctive, intentional visual design for UI work", "url": "https://github.com/anthropics/skills.git#skills/frontend-design"},
+    {"name": "internal-comms", "description": "Write internal communications in common company formats", "url": "https://github.com/anthropics/skills.git#skills/internal-comms"},
+    {"name": "mcp-builder", "description": "Build MCP servers that wrap external services as tools", "url": "https://github.com/anthropics/skills.git#skills/mcp-builder"},
+    {"name": "pdf", "description": "Read, extract, merge, split, fill and create PDF files", "url": "https://github.com/anthropics/skills.git#skills/pdf"},
+    {"name": "pptx", "description": "Create, read and edit PowerPoint (.pptx) decks", "url": "https://github.com/anthropics/skills.git#skills/pptx"},
+    {"name": "skill-creator", "description": "Create, modify and measure skills", "url": "https://github.com/anthropics/skills.git#skills/skill-creator"},
+    {"name": "slack-gif-creator", "description": "Animated GIFs optimized for Slack", "url": "https://github.com/anthropics/skills.git#skills/slack-gif-creator"},
+    {"name": "theme-factory", "description": "Style artifacts with one of ten preset themes", "url": "https://github.com/anthropics/skills.git#skills/theme-factory"},
+    {"name": "web-artifacts-builder", "description": "Multi-component HTML artifacts with React, Tailwind and shadcn/ui", "url": "https://github.com/anthropics/skills.git#skills/web-artifacts-builder"},
+    {"name": "webapp-testing", "description": "Test local web apps with Playwright", "url": "https://github.com/anthropics/skills.git#skills/webapp-testing"},
+    {"name": "xlsx", "description": "Create, read and edit spreadsheet (.xlsx) files", "url": "https://github.com/anthropics/skills.git#skills/xlsx"}
+  ]
+}

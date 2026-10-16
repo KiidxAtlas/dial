@@ -290,7 +290,7 @@ completed turn, and yields when queued coding arrives. It receives bounded workf
 creates executable steps or checks, and never loads another local model. Local teacher roles are
 skipped to preserve coding compute. No teacher call occurs by default.
 
-All controls are available in `/settings` under Improvement → Local model assistance and Tools →
+All controls are available in `/improve settings` under Local model assistance, and in `/settings` under Tools →
 Verification. Assign the coach role in `/roles`.
 
 ```toml

@@ -215,6 +215,22 @@ pub(super) fn pair_label(keys: &Keymap, a: Action, b: Action) -> String {
     }
 }
 
+/// Which arrow pair a hint shows; ASCII themes get `<-/->` and `^v` instead of the Unicode glyphs.
+#[derive(Clone, Copy)]
+pub(super) enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+/// The arrow pair for a hint, following the theme's ASCII mode.
+pub(super) fn arrows(theme: &Theme, axis: Axis) -> String {
+    match axis {
+        Axis::Horizontal if theme.ascii() => "<-/->".to_owned(),
+        Axis::Horizontal => "←/→".to_owned(),
+        Axis::Vertical => format!("{}{}", theme.sym(Sym::ArrowUp), theme.sym(Sym::ArrowDown)),
+    }
+}
+
 /// `"Esc close"`; empty when the action is unbound.
 pub(super) fn hint(keys: &Keymap, action: Action, what: &str) -> String {
     let label = keys.label(action);
@@ -441,7 +457,10 @@ enum Mode {
 enum Item {
     Header(&'static str),
     Row(usize),
+    /// A save or validation error under a row. Shown in red.
     Note(String),
+    /// A read-only finding under a row (for example a program that is not on PATH). Muted, never red.
+    Hint(String),
     /// A dependency-setup line: the first line of an offer carries the `missing` chip.
     Setup {
         line: String,
@@ -478,6 +497,8 @@ pub struct SettingsOverlay {
     pending: BTreeMap<String, Pending>,
     /// Save feedback is shown only after the controller acknowledges persistence.
     feedback: Option<String>,
+    /// A controller read/setup failure must not masquerade as an empty settings layer.
+    load_error: Option<String>,
     /// Inline messages under a row (validation errors, hints), by setting path.
     notes: BTreeMap<String, String>,
     /// Read-only findings under a row (for example whether a program is on PATH); not cleared by edits.
@@ -495,28 +516,33 @@ pub struct SettingsOverlay {
     advanced_open: BTreeSet<(&'static str, &'static str)>,
 }
 
-/// Plain-language summary of each memory backend, shown on the Backend row.
-fn memory_summary(backend: &str) -> &'static str {
+/// Plain-language summary of a memory backend. `models` is the chord that opens the model selector
+/// (its Roles view assigns the memory role), so the hint follows the user's keymap.
+fn memory_summary(backend: &str, models: &str) -> String {
     match backend {
         "off" => {
             "Memory is off: nothing carries over between sessions and the memory tools are hidden."
+                .to_owned()
         }
         "provenance" => {
             "Saves facts the agent learns, with history and expiry, found again by keyword. Needs no setup."
+                .to_owned()
         }
-        "local" => {
-            "Summarises your past sessions into project memory, using the model on the Memory role (Ctrl+K, Roles)."
-        }
+        "local" => format!(
+            "Summarises your past sessions into project memory, using the model on the Memory role ({models}, Roles)."
+        ),
         "hindsight" => {
             "Connects to a Hindsight memory service you run. Needs its URL, and an API key variable for a remote server."
+                .to_owned()
         }
-        "sharpshooter" => {
-            "Keeps project decision notes, written by the model on the Memory role (Ctrl+K, Roles)."
-        }
+        "sharpshooter" => format!(
+            "Keeps project decision notes, written by the model on the Memory role ({models}, Roles)."
+        ),
         "semantic" => {
             "Recalls facts by keyword, and by meaning when an embedding service is set. Needs no setup; with no service, nothing leaves this machine."
+                .to_owned()
         }
-        _ => "",
+        _ => String::new(),
     }
 }
 
@@ -586,6 +612,34 @@ fn label_of(path: &str) -> &'static str {
 
 fn haystack(def: &SettingDef) -> String {
     format!("{} {} {} {}", def.label, def.section, def.tab, def.path)
+}
+
+/// Match words independently, keeping fuzzy matching on concise metadata rather than long prose.
+/// Description-only hits still match, but do not invent highlights in the setting's label.
+fn search_match(query: &str, metadata: &str, description: &str) -> Option<(i32, Vec<usize>)> {
+    let description = description.to_lowercase();
+    let mut score = 0;
+    let mut positions = Vec::new();
+    for word in query.split_whitespace() {
+        if let Some((rank, matched)) = text::fuzzy(word, metadata) {
+            score += rank;
+            positions.extend(matched);
+        } else if !description.contains(&word.to_lowercase()) {
+            return None;
+        }
+    }
+    positions.sort_unstable();
+    positions.dedup();
+    Some((score, positions))
+}
+
+/// Pickers keep string identifiers, but automatic switches persist actual TOML booleans.
+fn choice_value(kind: Kind, choice: &str) -> Value {
+    match (kind, choice) {
+        (Kind::AutoBool, "true") => Value::Boolean(true),
+        (Kind::AutoBool, "false") => Value::Boolean(false),
+        _ => Value::String(choice.to_owned()),
+    }
 }
 
 fn fmt_float(f: f64) -> String {
@@ -810,6 +864,7 @@ impl SettingsOverlay {
             memory_intent: None,
             advanced_open: BTreeSet::new(),
             feedback: None,
+            load_error: None,
         }
     }
 
@@ -897,6 +952,16 @@ impl SettingsOverlay {
         self.global = global_values;
         self.pending.clear();
         self.notes.clear();
+        self.load_error = None;
+    }
+
+    /// Report background setup and settings-layer failures without replacing last-good values.
+    pub fn banner(&mut self, message: String, is_error: bool) {
+        if is_error {
+            self.load_error = Some(text::one_line(&message));
+        } else {
+            self.feedback = Some(text::one_line(&message));
+        }
     }
 
     /// The controller's verdict for the last `Set`/`Unset` of `path`.
@@ -1072,14 +1137,17 @@ impl SettingsOverlay {
                 .enumerate()
                 .filter(|(_, def)| self.scope_shown(def))
             {
-                if let Some((score, _)) = text::fuzzy(&self.search, &haystack(def)) {
+                if let Some((score, _)) =
+                    search_match(&self.search, &haystack(def), def.description)
+                {
                     hits.push((score, Row::Setting(i)));
                 }
             }
-            for (i, (label, ..)) in LINKS.iter().enumerate() {
-                if let Some((score, _)) = text::fuzzy(
+            for (i, (label, description, _)) in LINKS.iter().enumerate() {
+                if let Some((score, _)) = search_match(
                     &self.search,
                     &format!("{label} {LINK_SECTION} {PROVIDERS_TAB}"),
+                    description,
                 ) {
                     hits.push((score, Row::Link(i)));
                 }
@@ -1326,13 +1394,18 @@ impl SettingsOverlay {
                 self.emit_set(def, Value::Boolean(next))
             }
             Kind::AutoBool => {
-                // Cycles on -> off -> auto -> on; `auto` is the string form, not a boolean.
-                let next = match current {
-                    Value::Boolean(true) => Value::Boolean(false),
-                    Value::Boolean(false) => Value::String("auto".to_owned()),
-                    _ => Value::Boolean(true),
+                let choices = vec!["auto".to_owned(), "true".to_owned(), "false".to_owned()];
+                let cursor = choices
+                    .iter()
+                    .position(|choice| choice_value(Kind::AutoBool, choice) == current)
+                    .unwrap_or(0);
+                self.notes.remove(def.path);
+                self.mode = Mode::Pick {
+                    def,
+                    choices,
+                    cursor,
                 };
-                self.emit_set(def, next)
+                OverlayEvent::None
             }
             Kind::Enum(options) | Kind::Choice(options) => {
                 let mut choices: Vec<String> = options
@@ -1486,7 +1559,8 @@ impl SettingsOverlay {
         }
         if keys.matches(Action::SelectConfirm, key) {
             let chosen = choices[*cursor].clone();
-            let unchanged = self.current(def).as_str() == Some(chosen.as_str());
+            let value = choice_value(def.kind_for(&self.effective), &chosen);
+            let unchanged = self.current(def) == value;
             self.mode = Mode::Browse;
             if def.path == "memory.backend" {
                 let needs = memory_needs(&chosen, |p| self.current_path(p));
@@ -1510,7 +1584,7 @@ impl SettingsOverlay {
                     OverlayEvent::None
                 }
             } else {
-                self.emit_set(def, Value::String(chosen))
+                self.emit_set(def, value)
             };
         }
         let moved = if keys.matches(Action::SelectUp, key) {
@@ -1639,15 +1713,21 @@ impl SettingsOverlay {
                             cursor_item = items.len();
                         }
                         items.push(Item::Choice {
-                            name: value_text(def, &Value::String(name.clone())),
+                            name: match (def.kind_for(&self.effective), name.as_str()) {
+                                (Kind::AutoBool, "auto") => "Auto (let Dial decide)".to_owned(),
+                                (Kind::AutoBool, "true") => "On (enabled)".to_owned(),
+                                (Kind::AutoBool, "false") => "Off (disabled)".to_owned(),
+                                _ => value_text(def, &Value::String(name.clone())),
+                            },
                             on: n == *cursor,
                         });
                     }
                 }
                 if let Some(note) = self.notes.get(def.path) {
                     items.push(Item::Note(note.clone()));
-                } else if let Some(hint) = self.hints.get(def.path) {
-                    items.push(Item::Note(hint.clone()));
+                }
+                if let Some(hint) = self.hints.get(def.path) {
+                    items.push(Item::Hint(hint.clone()));
                 }
                 if let Some(offer) = self.setup_offers.get(def.path) {
                     if self.setup_armed.as_deref() == Some(offer.id.as_str()) {
@@ -1657,10 +1737,7 @@ impl SettingsOverlay {
                         }));
                     } else {
                         items.push(Item::Setup {
-                            line: format!(
-                                "{} is not installed; press Ctrl+L to set it up",
-                                offer.title
-                            ),
+                            line: format!("Ctrl+L installs {}", offer.title),
                             chip: true,
                         });
                     }
@@ -1670,13 +1747,28 @@ impl SettingsOverlay {
         let overflow = items.len() > body_rows;
         let list_w = list_w_total.saturating_sub(usize::from(overflow));
         let mut top = cursor_item;
+        let mut bottom = cursor_item;
+        if matches!(items.get(cursor_item), Some(Item::Choice { .. })) {
+            // Opening a picker near the bottom must reveal its alternatives, not just its
+            // selected value. Keep the setting label with the choices when the block fits.
+            while top > 0 && matches!(items.get(top - 1), Some(Item::Choice { .. })) {
+                top -= 1;
+            }
+            top = top.saturating_sub(1);
+            while matches!(items.get(bottom + 1), Some(Item::Choice { .. })) {
+                bottom += 1;
+            }
+            if bottom - top + 1 > body_rows {
+                top = cursor_item;
+                bottom = cursor_item;
+            }
+        }
         if top > 0 && matches!(items.get(top - 1), Some(Item::Header(_))) {
             top -= 1;
         }
-        let mut bottom = cursor_item;
         while matches!(
             items.get(bottom + 1),
-            Some(Item::Note(_) | Item::Setup { .. })
+            Some(Item::Note(_) | Item::Hint(_) | Item::Setup { .. })
         ) {
             bottom += 1;
         }
@@ -1693,15 +1785,16 @@ impl SettingsOverlay {
                 Row::Setting(i) if searching => {
                     let def = &settings_schema::registry()[i];
                     let label_len = def.label.chars().count();
-                    text::fuzzy(&self.search, &haystack(def))
+                    search_match(&self.search, &haystack(def), def.description)
                         .map(|(_, p)| p.into_iter().filter(|p| *p < label_len).collect())
                         .unwrap_or_default()
                 }
                 Row::Link(i) if searching => {
                     let label = LINKS[i].0;
-                    text::fuzzy(
+                    search_match(
                         &self.search,
                         &format!("{label} {LINK_SECTION} {PROVIDERS_TAB}"),
+                        LINKS[i].1,
                     )
                     .map(|(_, p)| {
                         p.into_iter()
@@ -1755,10 +1848,18 @@ impl SettingsOverlay {
                     list_w,
                     Style::default(),
                 ),
+                Some(Item::Hint(hint)) => filled(
+                    vec![Span::styled(
+                        format!("    {} {}", theme.sym(Sym::Bullet), text::one_line(hint)),
+                        theme.fg(Tok::Muted),
+                    )],
+                    list_w,
+                    Style::default(),
+                ),
                 Some(Item::Setup { line, chip }) => {
                     let mut spans = vec![Span::raw("    ")];
                     if *chip {
-                        spans.push(status_chip(theme, Status::Missing, "missing"));
+                        spans.push(status_chip(theme, Status::Missing, "available"));
                         spans.push(Span::styled(
                             format!(" {}", text::one_line(line)),
                             theme.fg(Tok::Muted),
@@ -1810,6 +1911,9 @@ impl SettingsOverlay {
         if show_desc {
             let wanted = if show_desc2 { 2 } else { 1 };
             let mut desc: Vec<(String, Tok)> = Vec::new();
+            if let Some(error) = &self.load_error {
+                desc.push((error.clone(), Tok::Error));
+            }
             match cursor_row {
                 Some(Row::Setting(i)) => {
                     let def = &settings_schema::registry()[i];
@@ -1819,7 +1923,8 @@ impl SettingsOverlay {
                             desc.push((feedback.clone(), Tok::Success));
                         }
                         let backend = self.memory_backend();
-                        desc.push((memory_summary(&backend).to_owned(), Tok::Text));
+                        let models = ctx.keys.label(Action::ModelSelect);
+                        desc.push((memory_summary(&backend, &models), Tok::Text));
                     } else if matches!(self.mode, Mode::Edit { .. }) {
                         desc.push((input_hint(def.kind_for(&self.effective)), Tok::Muted));
                     } else if show_desc2 || self.feedback.is_some() {
@@ -2208,8 +2313,7 @@ impl SettingsOverlay {
                     }
                     Some(Row::Setting(i)) => match settings_schema::registry()[i].kind {
                         Kind::Bool => "toggle",
-                        Kind::AutoBool => "cycle",
-                        Kind::Enum(_) | Kind::Choice(_) | Kind::Theme => "choose",
+                        Kind::AutoBool | Kind::Enum(_) | Kind::Choice(_) | Kind::Theme => "choose",
                         _ => "edit",
                     },
                     None => "select",
@@ -2217,7 +2321,12 @@ impl SettingsOverlay {
                 let mut hints = vec![
                     hint(keys, Action::SelectConfirm, verb),
                     pair(Action::SelectUp, Action::SelectDown, "move"),
-                    pair(Action::TabPrev, Action::TabNext, "tabs"),
+                    if self.search.is_empty() {
+                        pair(Action::TabPrev, Action::TabNext, "tabs")
+                    } else {
+                        // Tab does not switch tabs while searching, so do not advertise it then.
+                        String::new()
+                    },
                     hint(keys, Action::SectionNext, "sections"),
                     "Ctrl+S scope".to_owned(),
                     "Del inherit".to_owned(),
@@ -2345,6 +2454,26 @@ mod tests {
         o.visible()
             .iter()
             .any(|r| matches!(r, Row::Setting(i) if settings_schema::registry()[*i].path == path))
+    }
+
+    #[test]
+    fn hints_and_optional_offers_read_as_information_not_errors() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        o.set_hint("voice.tts.backend", "Programs: say built in".into());
+        o.set_setup_offers(BTreeMap::from([(
+            "voice.tts.backend".to_owned(),
+            SetupOffer {
+                id: "piper".into(),
+                title: "Piper".into(),
+                preview: "Piper: uv tool install piper-tts".into(),
+            },
+        )]));
+        goto(&mut o, &rig.keys, "voice.tts.backend");
+        let screen = draw(&mut o, &rig, 120, 30);
+        assert!(screen.contains("Programs: say built in"), "{screen}");
+        assert!(screen.contains("Ctrl+L installs Piper"), "{screen}");
+        assert!(!screen.contains("not installed"), "{screen}");
     }
 
     #[test]
@@ -2558,21 +2687,127 @@ mod tests {
     }
 
     #[test]
-    fn auto_bool_cycles_true_false_auto_then_true() {
+    fn auto_bool_picker_preselects_current_value_and_cancel_never_saves() {
+        let rig = Rig::new();
+        let path = "assistance.lean_local";
+        for current in [
+            Value::String("auto".into()),
+            Value::Boolean(true),
+            Value::Boolean(false),
+        ] {
+            let mut o = overlay();
+            settings_schema::set(&mut o.effective, path, current.clone());
+            goto(&mut o, &rig.keys, path);
+            assert!(draw(&mut o, &rig, 120, 30).contains("Enter choose"));
+            assert!(matches!(
+                send(&mut o, &rig.keys, key(KeyCode::Enter)),
+                OverlayEvent::None
+            ));
+            let Mode::Pick {
+                choices, cursor, ..
+            } = &o.mode
+            else {
+                panic!("automatic switches must open a picker")
+            };
+            assert_eq!(choice_value(Kind::AutoBool, &choices[*cursor]), current);
+            let shown = draw(&mut o, &rig, 120, 30);
+            for label in [
+                "Auto (let Dial decide)",
+                "On (enabled)",
+                "Off (disabled)",
+                "Esc cancel",
+            ] {
+                assert!(shown.contains(label), "missing {label}: {shown}");
+            }
+            // Confirming the current choice is also a no-op, including boolean values.
+            assert!(matches!(
+                send(&mut o, &rig.keys, key(KeyCode::Enter)),
+                OverlayEvent::None
+            ));
+            assert!(matches!(
+                send(&mut o, &rig.keys, key(KeyCode::Enter)),
+                OverlayEvent::None
+            ));
+            assert!(matches!(
+                send(&mut o, &rig.keys, key(KeyCode::Down)),
+                OverlayEvent::None
+            ));
+            assert!(matches!(
+                send(&mut o, &rig.keys, key(KeyCode::Esc)),
+                OverlayEvent::None
+            ));
+            assert!(matches!(o.mode, Mode::Browse));
+            assert!(o.pending.is_empty());
+            assert!(o.global.is_empty() && o.project.is_empty());
+            assert_eq!(o.current_path(path), current);
+        }
+    }
+
+    #[test]
+    fn auto_bool_picker_saves_typed_values_in_selected_scope_only_after_confirmation() {
+        let rig = Rig::new();
+        let path = "assistance.lean_local";
+        for scope in [Scope::Global, Scope::Project] {
+            let mut o = overlay();
+            o.scope = scope;
+            goto(&mut o, &rig.keys, path);
+            for expected in [
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::String("auto".into()),
+            ] {
+                let before = o.current_path(path);
+                assert!(matches!(
+                    send(&mut o, &rig.keys, key(KeyCode::Enter)),
+                    OverlayEvent::None
+                ));
+                assert!(matches!(
+                    send(&mut o, &rig.keys, key(KeyCode::Down)),
+                    OverlayEvent::None
+                ));
+                assert!(o.pending.is_empty(), "browsing must not save");
+                assert_eq!(o.current_path(path), before);
+                let (written, value, destination) =
+                    expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+                assert_eq!(
+                    (written.as_str(), &value, destination),
+                    (path, &expected, scope)
+                );
+                assert_eq!(
+                    settings_schema::get(&o.effective, path)
+                        .cloned()
+                        .unwrap_or(Value::String("auto".into())),
+                    before
+                );
+                o.settled(path, Ok(value));
+                assert_eq!(
+                    settings_schema::get(o.layer_ref(scope), path),
+                    Some(&expected)
+                );
+                assert!(o.layer_ref(other_scope(scope)).is_empty());
+                assert_eq!(o.current_path(path), expected);
+            }
+            let previous = o.current_path(path);
+            let _ = expect_set(choose_next(&mut o, &rig.keys));
+            o.settled(path, Err("Could not save".into()));
+            assert_eq!(o.current_path(path), previous);
+            assert_eq!(
+                settings_schema::get(o.layer_ref(scope), path),
+                Some(&previous)
+            );
+        }
+    }
+
+    #[test]
+    fn service_tier_rows_toggle_the_flags_the_slash_commands_write() {
         let rig = Rig::new();
         let mut o = overlay();
-        goto(&mut o, &rig.keys, "assistance.lean_local");
-        let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
-        assert_eq!(
-            (path.as_str(), value),
-            ("assistance.lean_local", Value::Boolean(true))
-        );
-        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
-        assert_eq!(value, Value::Boolean(false));
-        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
-        assert_eq!(value, Value::String("auto".to_owned()));
-        let (_, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
-        assert_eq!(value, Value::Boolean(true));
+        // /fast, /slow and /extended-context persist these same keys; their rows write them too.
+        for path in ["fast_mode", "slow_mode", "extended_context"] {
+            goto(&mut o, &rig.keys, path);
+            let (written, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+            assert_eq!((written.as_str(), value), (path, Value::Boolean(true)));
+        }
     }
 
     #[test]
@@ -2882,6 +3117,57 @@ mod tests {
         assert_eq!(
             (path.as_str(), value),
             ("approval", Value::String("auto".into()))
+        );
+    }
+
+    #[test]
+    fn search_matches_description_words_in_any_order_and_preserves_metadata_search() {
+        let rig = Rig::new();
+        let mut o = overlay();
+        // A natural-language description of the setup link, not its title or location.
+        send_all(&mut o, &rig.keys, typed("reachable remove"));
+        assert!(o.visible().contains(&Row::Link(0)));
+        o.search = "REMOVE reachable".into();
+        assert!(o.visible().contains(&Row::Link(0)));
+
+        let def = settings_schema::registry()
+            .iter()
+            .find(|d| d.path == "assistance.lean_local")
+            .unwrap();
+        // The complete description must be searchable without requiring metadata word order.
+        o.search = def
+            .description
+            .split_whitespace()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(shows(&o, def.path));
+        for query in [
+            def.path.to_owned(),
+            format!("{} {}", def.section, def.label),
+            format!("{} {}", def.tab, def.label),
+        ] {
+            o.search = query;
+            assert!(shows(&o, def.path), "{}", o.search);
+        }
+        assert!(
+            search_match("sessions retain", "Memory", "Retain facts across sessions").is_some()
+        );
+        assert!(
+            search_match(
+                "sessions impossible",
+                "Memory",
+                "Retain facts across sessions"
+            )
+            .is_none()
+        );
+        assert_eq!(
+            search_match("network allow", "Allow network", ""),
+            search_match("allow network", "Allow network", "")
+        );
+        assert_eq!(
+            search_match("retain", "Memory", "Retain facts").unwrap().1,
+            Vec::<usize>::new()
         );
     }
 
@@ -3379,5 +3665,24 @@ mod tests {
             shown.contains("off"),
             "toggles should render disabled:\n{shown}"
         );
+    }
+
+    #[test]
+    fn settings_read_failure_is_visible_and_keeps_last_good_values() {
+        let rig = Rig::new();
+        let mut overlay = SettingsOverlay::new(
+            table("[ui]\ntips=true"),
+            Table::new(),
+            Table::new(),
+            Scope::Global,
+            vec![],
+        );
+        overlay.banner("reading project settings: invalid TOML".into(), true);
+        let shown = draw(&mut overlay, &rig, 120, 30);
+        assert!(
+            shown.contains("reading project settings: invalid TOML"),
+            "{shown}"
+        );
+        assert_eq!(overlay.effective["ui"]["tips"].as_bool(), Some(true));
     }
 }

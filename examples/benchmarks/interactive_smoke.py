@@ -73,7 +73,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             index = self.server.chat_requests
         messages = request["messages"]
         if "PTY-WORKER" in json.dumps(messages):
-            message = self.workers(index, messages)
+            message = self.workers(index, messages, request.get("tools", []))
             self.respond({"id": "pty-" + str(index), "object": "chat.completion", "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}], "usage": {"prompt_tokens": 128, "completion_tokens": 32}})
             return
         # Task packets may quote older prompts. Only actual standalone user messages
@@ -176,8 +176,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def call(index, name, arguments):
         return {"role": "assistant", "content": "", "tool_calls": [{"id": "pty-call-" + str(index), "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}]}
 
-    def workers(self, index, messages):
+    def workers(self, index, messages, tools):
         if any(m["role"] == "user" and m.get("content") == "PTY-WORKERS" for m in messages):
+            # Respect lazy exposure just like a real provider: discovery enables task for
+            # the next request, rather than mistaking an unexecuted call for started workers.
+            if not any(tool.get("function", {}).get("name") == "task" for tool in tools):
+                return self.call(index, "tool_search", {"query": "task"})
             names = [call["function"]["name"] for message in messages for call in message.get("tool_calls", [])]
             if "task" not in names:
                 return self.call(index, "task", {"action": "start", "tasks": [

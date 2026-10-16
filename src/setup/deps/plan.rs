@@ -1,7 +1,8 @@
 //! Turns a recipe into the exact commands that will run. Plans never include sudo and never
 //! write outside Dial's install directory, except for Homebrew, which the user chooses.
 
-use super::{Env, Method, Recipe, install_dir, locate};
+use super::prebuilt::Asset;
+use super::{Env, Method, Recipe, install_dir, locate, recipe};
 use std::path::{Path, PathBuf};
 
 /// One command in a plan. `program` is the resolved executable path, so the confirmation shows
@@ -23,6 +24,14 @@ impl Step {
     }
 }
 
+/// A verified archive download, run before any step. Nothing is fetched without the plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fetch {
+    pub asset: Asset,
+    /// Install directory the archive is unpacked into.
+    pub dest: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub id: &'static str,
@@ -30,6 +39,8 @@ pub struct Plan {
     pub method: String,
     /// Where the install lands, shown in the confirmation. Relative for Homebrew.
     pub destination: PathBuf,
+    /// A direct download, run before `steps`.
+    pub fetch: Option<Fetch>,
     pub steps: Vec<Step>,
     /// Where the installed program is expected once the steps succeed (empty: look on `PATH`).
     pub expected: PathBuf,
@@ -56,7 +67,8 @@ impl std::fmt::Display for Blocked {
     }
 }
 
-/// Plans the first method whose package manager is available, in the recipe's order.
+/// Plans the first method whose package manager is available, in the recipe's order. A direct
+/// download is the last resort, and only on platforms that have a pinned archive.
 /// Callers check `requires` themselves, because readiness depends on other recipes.
 pub fn plan(recipe: &Recipe, env: &Env) -> Result<Plan, Blocked> {
     let destination = install_dir(&env.user_dir, recipe.id);
@@ -64,11 +76,11 @@ pub fn plan(recipe: &Recipe, env: &Env) -> Result<Plan, Blocked> {
     for method in recipe.methods {
         match *method {
             Method::Manual(hint) => return Err(Blocked::Manual(hint.to_owned())),
-            Method::Npm(packages) => match env.find("npm") {
-                Some(npm) => return Ok(npm_plan(recipe, &destination, packages, &npm)),
+            Method::Npm(packages) => match find_npm(env) {
+                Some(npm) => return Ok(npm_plan(recipe, env, &destination, packages, &npm)),
                 None => missing.push("npm"),
             },
-            Method::Uv(package) => match env.find("uv") {
+            Method::Uv(package) => match find_uv(env) {
                 Some(uv) => return Ok(uv_plan(recipe, &destination, package, &uv)),
                 None => missing.push("uv"),
             },
@@ -76,6 +88,13 @@ pub fn plan(recipe: &Recipe, env: &Env) -> Result<Plan, Blocked> {
                 Some(brew) => return Ok(brew_plan(recipe, formula, &brew)),
                 None => missing.push("brew"),
             },
+            Method::Download(prebuilt) => {
+                if let Some(asset) = super::prebuilt::current_platform()
+                    .and_then(|platform| prebuilt.asset(platform))
+                {
+                    return Ok(download_plan(recipe, &destination, prebuilt.version, asset));
+                }
+            }
         }
     }
     if missing.is_empty() {
@@ -91,7 +110,40 @@ fn program_text(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn npm_plan(recipe: &Recipe, destination: &Path, packages: &[&str], npm: &Path) -> Plan {
+/// `npm` on `PATH`, or the one that comes with a Node.js Dial installed.
+fn find_npm(env: &Env) -> Option<PathBuf> {
+    env.find("npm").or_else(|| {
+        let node = locate(recipe("node")?, env)?;
+        let npm = node.parent()?.join("npm");
+        super::is_executable(&npm).then_some(npm)
+    })
+}
+
+/// `uv` on `PATH`, or the one Dial installed.
+fn find_uv(env: &Env) -> Option<PathBuf> {
+    locate(recipe("uv")?, env)
+}
+
+/// A `PATH` that starts with the directory of `program`, so scripts such as npm find the node
+/// beside them even when that node is not on the user's `PATH`.
+fn path_with(program: &Path, env: &Env) -> String {
+    let dirs = program
+        .parent()
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(env.path.iter().cloned());
+    std::env::join_paths(dirs)
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn npm_plan(
+    recipe: &Recipe,
+    env: &Env,
+    destination: &Path,
+    packages: &[&str],
+    npm: &Path,
+) -> Plan {
     let mut args = vec![
         "install".to_owned(),
         "--prefix".to_owned(),
@@ -104,10 +156,11 @@ fn npm_plan(recipe: &Recipe, destination: &Path, packages: &[&str], npm: &Path) 
         id: recipe.id,
         method: format!("npm into {}", destination.display()),
         destination: destination.to_path_buf(),
+        fetch: None,
         steps: vec![Step {
             program: program_text(npm),
             args,
-            env: Vec::new(),
+            env: vec![("PATH".into(), path_with(npm, env))],
         }],
         expected: destination.join(recipe.artifact),
     }
@@ -118,6 +171,7 @@ fn uv_plan(recipe: &Recipe, destination: &Path, package: &str, uv: &Path) -> Pla
         id: recipe.id,
         method: format!("uv tool into {}", destination.display()),
         destination: destination.to_path_buf(),
+        fetch: None,
         steps: vec![Step {
             program: program_text(uv),
             args: vec!["tool".into(), "install".into(), package.into()],
@@ -138,6 +192,7 @@ fn brew_plan(recipe: &Recipe, formula: &str, brew: &Path) -> Plan {
         id: recipe.id,
         method: "Homebrew (no sudo; installs into Homebrew's prefix)".into(),
         destination: PathBuf::from("Homebrew prefix"),
+        fetch: None,
         steps: vec![Step {
             program: program_text(brew),
             args: vec!["install".into(), formula.into()],
@@ -145,6 +200,40 @@ fn brew_plan(recipe: &Recipe, formula: &str, brew: &Path) -> Plan {
         }],
         expected: PathBuf::new(),
     }
+}
+
+fn download_plan(
+    recipe: &Recipe,
+    destination: &Path,
+    version: &str,
+    asset: &'static Asset,
+) -> Plan {
+    Plan {
+        id: recipe.id,
+        method: format!(
+            "download {} {version} into {} (sha256 checked)",
+            recipe.title,
+            destination.display()
+        ),
+        destination: destination.to_path_buf(),
+        fetch: Some(Fetch {
+            asset: *asset,
+            dest: destination.to_path_buf(),
+        }),
+        steps: Vec::new(),
+        expected: destination.join(download_binary(recipe)),
+    }
+}
+
+fn download_binary(recipe: &Recipe) -> &'static str {
+    recipe
+        .methods
+        .iter()
+        .find_map(|method| match method {
+            Method::Download(prebuilt) => Some(prebuilt.binary),
+            _ => None,
+        })
+        .unwrap_or("")
 }
 
 /// Required dependencies that are not ready yet.
@@ -160,7 +249,7 @@ pub fn unmet_requirements(recipe: &Recipe, env: &Env) -> Vec<&'static str> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::setup::deps::recipe;
+    use crate::setup::deps::{prebuilt, recipe};
 
     /// Fake package managers: executable stubs on a fake `PATH` directory.
     pub(crate) fn fake_tools(root: &Path, tools: &[&str]) -> Env {
@@ -190,6 +279,7 @@ pub(crate) mod tests {
         assert!(plan.steps[0].program.ends_with("/fakebin/npm"));
         assert!(plan.steps[0].args.contains(&"bun".to_owned()));
         assert!(plan.destination.starts_with(env.user_dir.join("tools")));
+        assert!(plan.fetch.is_none());
         assert!(
             plan.steps
                 .iter()
@@ -223,10 +313,13 @@ pub(crate) mod tests {
     fn no_package_manager_is_reported_plainly() {
         let tmp = tempfile::tempdir().unwrap();
         let env = fake_tools(tmp.path(), &[]);
-        assert_eq!(
-            plan(recipe("bun").unwrap(), &env),
-            Err(Blocked::NoPackageManager(vec!["brew", "npm"]))
-        );
+        // Bun can be downloaded on supported platforms, so only the package managers that
+        // remain are named when nothing is on PATH.
+        let blocked = plan(recipe("gopls").unwrap(), &env);
+        assert_eq!(blocked, Err(Blocked::NoPackageManager(vec!["brew"])));
+        if prebuilt::current_platform().is_some() {
+            assert!(plan(recipe("bun").unwrap(), &env).is_ok());
+        }
     }
 
     #[test]
@@ -237,5 +330,43 @@ pub(crate) mod tests {
             Err(Blocked::Manual(hint)) => assert!(hint.contains("Docker")),
             other => panic!("expected manual hint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn node_downloads_into_dial_dir_when_no_package_manager_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = fake_tools(tmp.path(), &[]);
+        if prebuilt::current_platform().is_none() {
+            return;
+        }
+        let plan = plan(recipe("node").unwrap(), &env).unwrap();
+        let fetch = plan.fetch.expect("a verified download");
+        assert_eq!(fetch.dest, env.user_dir.join("tools").join("node"));
+        assert!(fetch.asset.url.starts_with("https://nodejs.org/dist/"));
+        assert_eq!(plan.expected, fetch.dest.join("bin/node"));
+        assert!(plan.steps.is_empty());
+        assert!(plan.method.contains("sha256 checked"));
+    }
+
+    #[test]
+    fn npm_recipes_use_the_npm_of_a_dial_installed_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = fake_tools(tmp.path(), &[]);
+        let bin = env.user_dir.join("tools/node/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("node"), "#!/bin/sh\necho v22.23.3\n").unwrap();
+        std::fs::write(bin.join("npm"), "#!/bin/sh\nexit 0\n").unwrap();
+        for path in [bin.join("node"), bin.join("npm")] {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let plan = plan(recipe("pyright-langserver").unwrap(), &env).unwrap();
+        let step = &plan.steps[0];
+        assert_eq!(step.program, bin.join("npm").display().to_string());
+        let path = step.env.iter().find(|(key, _)| key == "PATH").unwrap();
+        assert!(path.1.starts_with(&bin.display().to_string()));
     }
 }

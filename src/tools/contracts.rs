@@ -45,13 +45,15 @@ fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> boo
     known.contains(old) && known.contains(new)
 }
 
+/// Project settled history onto the current contracts. `None` means no historical call needed a
+/// rewrite, so callers send the borrowed history as-is; the history is copied only on first rewrite.
 pub fn project_history(
     messages: &[Value],
     schemas: &[Value],
     registry: &Registry,
-) -> Result<Vec<Value>> {
+) -> Result<Option<Vec<Value>>> {
     let current = identities(schemas, registry);
-    let mut projected = messages.to_vec();
+    let mut projected: Option<Vec<Value>> = None;
     for (index, message) in messages.iter().enumerate() {
         let Some(recorded) = message.get("dial_tool_contracts") else {
             continue;
@@ -106,6 +108,7 @@ pub fn project_history(
                 "tool {} historical projection is nondeterministic",
                 old.name
             );
+            let projected = projected.get_or_insert_with(|| messages.to_vec());
             projected[index]["tool_calls"][call_index]["function"]["arguments"] =
                 json!(lifted.arguments.to_string());
             projected[result_index]["content"] = json!(lifted.output);
@@ -240,9 +243,11 @@ mod tests {
             json!({"role":"assistant", "tool_calls":[{"id":"call", "type":"function", "function":{"name":"edit", "arguments":"{\"input\":\"historical hashline edit\"}"}}], "dial_tool_contracts":{"call":identity}}),
             json!({"role":"tool", "tool_call_id":"call", "content":"actual recorded edit result"}),
         ];
-        assert_eq!(
-            project_history(&history, &[new], &registry).unwrap(),
-            history
+        assert!(
+            project_history(&history, &[new], &registry)
+                .unwrap()
+                .is_none(),
+            "compatible history needs no projection copy"
         );
     }
     #[test]
@@ -290,15 +295,19 @@ mod tests {
         let original = history.clone();
         let mut registry = Registry::new();
         registry.register(std::sync::Arc::new(Lift));
-        let projected = project_history(&history, &[schema("integer")], &registry).unwrap();
+        let projected = project_history(&history, &[schema("integer")], &registry)
+            .unwrap()
+            .expect("a revised historical call must be projected");
         assert_eq!(
             projected[0]["tool_calls"][0]["function"]["arguments"],
             "{\"value\":7}"
         );
         assert_eq!(projected[1]["content"], "revision 2: kept result");
-        assert_eq!(
-            project_history(&projected, &[schema("integer")], &registry).unwrap(),
-            projected
+        assert!(
+            project_history(&projected, &[schema("integer")], &registry)
+                .unwrap()
+                .is_none(),
+            "an already projected history is idempotent without another copy"
         );
         assert_eq!(history, original);
     }

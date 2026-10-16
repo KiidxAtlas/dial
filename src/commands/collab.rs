@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 pub(super) const COMMANDS: &[super::CommandSpec] = &[
     super::CommandSpec {
         name: "collab",
-        description: "Host a live collab session; `view` makes a read-only link, `status` and `stop` manage it",
+        description: "host a live collab session; status and stop manage it",
         args_hint: "[view|status|stop|list]",
         subcommands: &["view", "status", "stop", "list"],
     },
@@ -31,7 +31,7 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     },
     super::CommandSpec {
         name: "share",
-        description: "Upload this session end-to-end encrypted and print the link; `gist` posts a secret gist instead",
+        description: "upload this session encrypted and print the link",
         args_hint: "[gist]",
         subcommands: &["gist"],
     },

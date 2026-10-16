@@ -3,6 +3,7 @@ pub mod arguments;
 pub mod cancellation;
 pub mod execution;
 pub mod fingerprint;
+pub(crate) mod json_transport;
 pub mod presentation;
 pub mod process;
 pub mod schema;

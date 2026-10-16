@@ -33,6 +33,8 @@ still assign an explicit child model.
 Ctrl-C interrupts silent HTTP response reads without replacing the configured inference deadline with
 a short timeout. Connection establishment and partial writes still use their configured deadlines.
 
+RPC `state` replies come from one worker-owned projection, the same one the worker uses, and never include message history; read `messages` or `messages_page` for history. Typed RPC `notice` events keep their plain `message` and add `kind`, `lane` (`context`, `divider` or `alert`) and `tokens` as additive fields. Plain notices remain valid without these fields.
+
 ## Persistent RPC and ACP transports
 
 `dial rpc` is a persistent version-1 JSON-lines control endpoint. Requests have `id`, `method` and `params`;
@@ -49,3 +51,5 @@ stdio with streamed assistant/tool updates. Loaded sessions retain exclusive wri
 sessions are not concurrently writable. ACP does not advertise unsupported filesystem/terminal
 capabilities. Both automation transports use bounded serialized stdout and stop honestly on stalled
 or broken consumers instead of reporting partially delivered success.
+
+ACP renders `notice`, `background` and `fatal` events as unchanged `agent_message_chunk` text. Each chunk also carries standard `_meta.dial` with `event` and, only when present, `kind`, `lane`, `tokens`, `name` and `replace`, so clients can tell sources apart. This is metadata preservation only; ACP does not implement client-side replacement of background output.

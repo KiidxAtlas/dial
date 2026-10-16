@@ -162,7 +162,7 @@ impl Codebase {
 
     /// Check outcomes have their own provenance; a passing command never certifies model prose.
     pub fn record_behavior_check(&self, command: &str, passed: bool) -> Result<()> {
-        let snapshot = self.freshness_snapshot()?;
+        let snapshot = self.source_snapshot()?;
         let record = json!({"command_digest":format!("{:x}",Sha256::digest(command)),"passed":passed,"source_fingerprint":format!("{:x}",Sha256::digest(serde_json::to_vec(&snapshot.files)?)),"environment":snapshot.environment,"complete":snapshot.complete,"recorded_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()});
         self.conn.lock().execute("INSERT INTO codebase_meta(key,value) VALUES('behavior_check',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[record.to_string()])?;
         Ok(())
@@ -234,6 +234,19 @@ impl Codebase {
         !self.root.join(path).is_file()
     }
     pub(super) fn freshness_snapshot(&self) -> Result<Snapshot> {
+        let mut snapshot = self.source_snapshot()?;
+        // Dependency discovery needs the index; behavioral provenance needs only source bytes.
+        snapshot.outlines = self
+            .conn
+            .lock()
+            .prepare("SELECT path,outline FROM codebase_files")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        Ok(snapshot)
+    }
+
+    /// Fresh, bounded source provenance. Never reuse this across checks: external edits count too.
+    fn source_snapshot(&self) -> Result<Snapshot> {
         let ws = Workspace::new(&self.root)?;
         let mut walk = Walk::new(&ws);
         let started = Instant::now();
@@ -285,19 +298,12 @@ impl Codebase {
                 std::env::consts::ARCH
             ))
         );
-        // Reuse the current index for dependency discovery; do not widen the filesystem walk.
-        let outlines = self
-            .conn
-            .lock()
-            .prepare("SELECT path,outline FROM codebase_files")?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
         Ok(Snapshot {
             files,
             inventory,
             environment,
             complete,
-            outlines,
+            outlines: BTreeMap::new(),
         })
     }
 
@@ -1734,6 +1740,108 @@ mod tests {
             cache.architecture_report().unwrap()["sections"][1]["status"],
             "fresh"
         );
+    }
+
+    #[test]
+    #[ignore = "local source-provenance microbenchmark; no model calls"]
+    fn benchmark_behavior_source_snapshot() {
+        let (_home, project, cache, ws) = fixture();
+        let source = (0..32)
+            .map(|index| format!("pub fn entry_{index}(value: u64) -> u64 {{ value + {index} }}\n"))
+            .collect::<String>();
+        for index in 0..256 {
+            fs::write(project.path().join(format!("module_{index}.rs")), &source).unwrap();
+        }
+        cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+        let expected = cache.freshness_snapshot().unwrap();
+        assert!(expected.complete);
+        let outline_bytes: usize = expected.outlines.values().map(String::len).sum();
+        let mut full_times = Vec::new();
+        let mut source_times = Vec::new();
+        // Alternate order so one path does not always inherit the warmer filesystem cache.
+        for round in 0..20 {
+            for full in if round % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                let started = Instant::now();
+                let snapshot = if full {
+                    cache.freshness_snapshot().unwrap()
+                } else {
+                    cache.source_snapshot().unwrap()
+                };
+                let micros = started.elapsed().as_micros();
+                assert_eq!(snapshot.files, expected.files);
+                assert_eq!(snapshot.environment, expected.environment);
+                assert!(snapshot.complete);
+                if full {
+                    full_times.push(micros);
+                } else {
+                    source_times.push(micros);
+                }
+            }
+        }
+        full_times.sort_unstable();
+        source_times.sort_unstable();
+        eprintln!(
+            "source_snapshot files={} rounds=20 outline_bytes_avoided={} full_median_us={} source_only_median_us={}",
+            expected.files.len(),
+            outline_bytes,
+            full_times[10],
+            source_times[10]
+        );
+    }
+
+    #[test]
+    fn behavior_check_provenance_does_not_load_dependency_outlines() {
+        let (_home, project, cache, _ws) = fixture();
+        let full = cache.freshness_snapshot().unwrap();
+        let sources = cache.source_snapshot().unwrap();
+        assert!(!full.outlines.is_empty());
+        assert!(sources.outlines.is_empty());
+        assert_eq!(sources.files, full.files);
+        assert_eq!(sources.inventory, full.inventory);
+        assert_eq!(sources.environment, full.environment);
+        assert_eq!(sources.complete, full.complete);
+
+        // An unavailable dependency index must not prevent recording observed check provenance.
+        cache
+            .conn
+            .lock()
+            .execute("DROP TABLE codebase_files", [])
+            .unwrap();
+        cache
+            .record_behavior_check("configured tests", true)
+            .unwrap();
+        let recorded = || -> Value {
+            let raw: String = cache
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT value FROM codebase_meta WHERE key='behavior_check'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+        let before = recorded();
+        assert_eq!(
+            before["source_fingerprint"],
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&full.files).unwrap())
+            )
+        );
+        assert_eq!(before["complete"], true);
+        fs::write(project.path().join("routing.rs"), "pub fn changed() {}\n").unwrap();
+        cache
+            .record_behavior_check("configured tests", false)
+            .unwrap();
+        let after = recorded();
+        assert_ne!(before["source_fingerprint"], after["source_fingerprint"]);
+        assert_eq!(after["passed"], false);
     }
 
     #[test]

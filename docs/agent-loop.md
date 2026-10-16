@@ -16,7 +16,7 @@ Duplicate recovery withholds only the exact repeated call, including reads. Diff
 
 Explicit evaluation/learning runs capture the actual inference request and target. Normal coding launches disable trajectory and recovery-sample recording, learned candidates, automatic Laya/learned-skill capture, project-learning updates and startup evaluations without rewriting saved learning preferences. When exporting a verified example to the training template, valid tool-result error flags are removed as execution metadata while the evidence text is preserved. Malformed flags and unknown fields remain rejectable. An HTTP 200 response to a WebSocket upgrade establishes SSE-only transport for that session, so an unsupported upgrade is not retried at every request.
 
-Stop hooks can resume a completed candidate within their existing three-round bound. Persistent blocking ends with a blocked outcome, and a hook cannot restart a turn that needs user input, has failed, or was interrupted.
+Stop hooks can resume a completed candidate within their existing three-round bound. Every resumed candidate returns through focused verification before another stop-hook decision; hook resumptions do not reset the repair allowance or turn step budget. Persistent blocking ends with a blocked outcome, and a hook cannot restart a turn that needs user input, has failed, has unknown effects, or was interrupted. Rejected completion reports keep the candidate work summary separately labelled beneath the final verification or hook diagnostic, so callers retain useful work details without mistaking them for accepted completion.
 
 ## Evidence-driven verification and escalation
 
@@ -41,6 +41,13 @@ it remains bounded retrieval, not an exhaustive or resolved call-graph guarantee
 `agent/engine.rs` owns the lifecycle driver used by parent and worker adapters, result settlement, output-length recovery, repetition checkpoints, unchanged-read reuse, narration progress, reply recovery, committed-content edit-loop steering, and the uncertain-effect stop boundary. `tools/execution.rs` owns native dispatch, pre-start cancellation, panic containment, and callback effect propagation. A callback tool cannot hide an uncertain nested result by catching its error or returning success; subsequent callbacks are refused.
 
 `agent/turn.rs` is the parent adapter for durable session state, live steering and learning policy. `agent/child.rs` is the worker adapter for private history, assignment permissions and worker request budgets. Both adapters advance the same lifecycle driver and share inference transport, authorization helpers and the parallel scheduler. Their preparation and persistence callbacks retain explicit role responsibilities. New common execution policy belongs in the shared engine, not copied into both adapters. `agent/tool_runner.rs` handles foreground UI events and routes callbacks back to their owner.
+
+Read-batch admission applies recovery restrictions to every candidate, not just the first call.
+The presence of pre-tool hooks conservatively routes calls through serial admission so rewritten
+arguments can be validated and authorized before execution; hook-free reads remain parallel, and post-tool-only
+hooks do not disable concurrency. Parent and worker hook rewrites both recheck their executable
+schema and path authority. Mutable authorization and recovery decisions are never cached for
+an entire turn.
 
 Unknown effects end the current turn as incomplete after saving results and skipping unstarted actions. They bypass automatic stall recovery, context transitions and memory maintenance. A refusal before execution records no effects. A timeout or interruption after execution starts does not imply rollback. Recovery from a missing durable tool result records an explicit unknown effect and never replays the call. Productive `max_steps = 0` remains unlimited.
 
@@ -97,6 +104,13 @@ diagnostics to repair. Initial work, verification repair and stop-hook continuat
 finite `max_steps` budget; zero remains unlimited. The edited tree and final diagnostics remain
 visible for `/undo` or manual repair. Behavioral credit and final verification use the same
 observed-process verdict; printed success without complete process evidence earns no credit.
+Executable repair records use that same classified, typed execution evidence, not printed exit
+markers. Unverified runs invalidate a matching failure baseline rather than pairing an old failure
+with a later pass. Related-test planning reuses JS package/runner metadata and Go directory scans
+only within one planning invocation; later invocations observe changed manifests and tests.
+Behavioral provenance still hashes fresh bounded source state, but no longer loads dependency
+outlines that its record does not use. See [Core harness review](harness-core-review.md) for the
+comparison, rationale, and measurement limits.
 Approval-denied writes are not treated as successful verification. `todo` is optional progress bookkeeping, not a verification checkpoint. `done` closes the current item and starts the next; findings and references are optional notes, including for legacy investigation entries. No separate tool-activity, citation or text-delivery gate applies. Accepted completion reconciles pending progress entries, while explicit blockers and running workers remain completion prerequisites. Failed checks remain failures independently of todo state.
 
 Plain final replies and `finish` use the same completion prerequisites and final configured verification/repair pipeline. Empty replies, action-only promises and explicit admissions of unfinished work share bounded parent/child reply recovery. Invalid todo arguments still receive a simple corrected call and bounded recovery; there is no separate budget of todo-closing reminder turns. Productive work remains unlimited with `max_steps = 0`.
@@ -110,6 +124,10 @@ context-dependent per-model budget (4–48 KiB); optional `efficiency.tool_previ
 reduces successful retrievable inspections. Errors and mutation results retain their diagnostics.
 Clipping keeps both ends plus error, panic, failed-test and traceback lines from the omitted middle;
 full output stays in artifacts. `bash` also bounds the output it holds in memory.
+Each successfully prepared main-agent request journals `request_prep.elapsed_ms`: wall time from
+the request boundary through history projection, contract checks, hooks and prefix observation,
+including synchronous maintenance or waits along that path. It excludes the ensuing primary model
+inference; it is not a pure CPU-time measurement or a timing of child requests.
 
 Command execution and output storage are reported separately. If artifact writing/finalization fails,
 `bash` retains its inline diagnostics and actual exit status, reports a capture error, and never
@@ -134,9 +152,11 @@ limits, reasoning budgets, approvals or verification requirements:
   so the provider's cached prefix survives ordinary rounds.
   `assistance.compact_tools=true` switches to discovery mode for small local models: a core set
   bounded by `assistance.initial_tool_limit` (default 16) plus `tool_search`/`tool_load`.
-  `assistance.lean_local=true` (default off) is a lean profile that applies only when the main
-  model is served locally (no endpoint, or a loopback or LAN host); hosted routes and hermetic
-  runs are unchanged. It turns on discovery mode, caps the initial tool budget at 8 (an unlimited
+  `assistance.lean_local` defaults to `auto`, which enables a lean profile when the main model is
+  served locally (no endpoint, or a loopback or LAN host) and its planned context window is at most
+  32,768 tokens. TOML `true` forces it on for every local route and `false` turns it off; hosted
+  routes and hermetic runs are unchanged.
+  When active, it turns on discovery mode, caps the initial tool budget at 8 (an unlimited
   0 also becomes 8), and omits the visual-verification guidance unless `browser` or `computer` is
   offered and the skills catalog unless `skill` is offered. The resulting prompt stays
   byte-stable across turns. Measure it with `dial benchmark --ablate-assistance`'s `lean` row
@@ -275,7 +295,11 @@ All editor and compaction policy fields, including typed model/agent maps, are a
 Automatic method selection skips native Remote compaction when the route has no declared
 compatible capability (unless a custom summary endpoint is configured). Explicit `/compact remote`
 still reports an unsupported route honestly. Portable Soft/Handoff requests send an explicit empty
-`tools` array to OpenAI-compatible servers. Shake only elides recoverable tool evidence: if the
+`tools` array to OpenAI-compatible servers. Foreground and background summaries use the `small`
+role when assigned, otherwise the current model, including inside subagents. Internal summary
+budgets never inject output-limit overrides into ChatGPT-plan requests; explicit unsupported
+sampling or output-limit settings in a selected profile still produce a validation error.
+Shake only elides recoverable tool evidence: if the
 result still exceeds the safe request budget it tries the next configured method, never drops
 conversation messages or commits an oversized replacement.
 The compaction banner compares the previous and replacement **final projected requests** using

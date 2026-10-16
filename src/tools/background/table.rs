@@ -574,7 +574,7 @@ impl Proc {
             if let Some(screen) = ring.screen_text() {
                 proc.notice_cursor = ring.total;
                 events.push(ToolEvent {
-                    kind: "progress".into(),
+                    kind: "background_progress".into(),
                     name: proc.name.clone(),
                     text: screen,
                     artifact: None,
@@ -591,7 +591,7 @@ impl Proc {
                 }
                 proc.notice_cursor = ring.total;
                 events.push(ToolEvent {
-                    kind: "output".into(),
+                    kind: "background_output".into(),
                     name: proc.name.clone(),
                     text,
                     artifact: ring.artifact.clone(),

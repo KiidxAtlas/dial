@@ -95,6 +95,7 @@ fallback chains are in [docs/model-routing.md](docs/model-routing.md).
 **Getting started and everyday use**
 
 - [Release and installation](docs/release-and-install.md): installers, manual platform setup, signing, building from source, publishing releases
+- [Optional dependencies and one-key setup](docs/setup.md): `/settings` Ctrl+L, `/setup`, `dial doctor --fix`, verified runtime downloads
 - [Configuration](docs/configuration.md): layers, unlimited execution defaults, annotated example
 - [Terminal interface](docs/terminal-interface.md): composer, slash commands, steering and queueing, shortcuts, `/settings`, model settings, themes, image previews
 - [Composer and editor](docs/composer.md), [TUI rendering](docs/tui-rendering.md), [Voice](docs/voice.md), [Windows](docs/windows.md)

@@ -377,6 +377,130 @@ class VisionProgressMiddleware:
             self.context.reset(token)
 
 
+def _disable_prefill_telemetry(generator, originals, reason, request_id=None):
+    """Restore the pinned methods so later requests run exactly as upstream would."""
+    generator.generate, generator._log_prefill_started, generator._log_prefill_progress = originals
+    logging.warning("Vision prefill telemetry disabled (%s) for request=%s; generation continues",
+        reason, request_id, exc_info=True)
+
+
+def install_vision_prefill_progress(server):
+    """Report measured chunked-prefill state from the pinned batching loop, when its hooks exist.
+
+    Reads only counters MLX-VLM already maintains for each GPU step; it never estimates progress.
+    Upstream exceptions propagate unchanged; only Dial's own bookkeeping is caught, and then the
+    pinned methods are restored so generation continues without telemetry.
+    """
+    generator = server.ResponseGenerator
+    if not (hasattr(generator, "_log_prefill_started") and hasattr(generator, "_log_prefill_progress")):
+        logging.warning("MLX-VLM lacks prefill hooks; vision prefill telemetry stays at the coarse processing phase")
+        return
+    originals = (generator.generate, generator._log_prefill_started, generator._log_prefill_progress)
+    original_generate, original_started, original_progress = originals
+
+    def generate(self, *args, **kwargs):
+        # The request thread owns the context; the GPU thread reads the state from the request args.
+        try:
+            state = VisionProgressMiddleware.context.get()
+            gen_args = kwargs.get("args", args[3] if len(args) > 3 else None)
+            if state is not None and gen_args is not None:
+                gen_args._dial_prefill_state = state
+        except Exception:
+            _disable_prefill_telemetry(generator, originals, "request annotation failed")
+        return original_generate(self, *args, **kwargs)
+
+    def started(self, request, **kwargs):
+        log_state = original_started(self, request, **kwargs)
+        try:
+            state = getattr(getattr(request, "args", None), "_dial_prefill_state", None)
+            if state is not None:
+                log_state["dial_prefill"] = {"state": state, "total": int(request.prompt_tokens), "last": -1}
+        except Exception:
+            _disable_prefill_telemetry(generator, originals, "request bookkeeping failed",
+                getattr(request, "request_id", None))
+        return log_state
+
+    def progress(self, batch_gen, active):
+        original_progress(self, batch_gen, active)
+        request_id = None
+        try:
+            for info in active.values():
+                prefill = info.get("dial_prefill")
+                if prefill is None:
+                    continue
+                request_id = info.get("request_id")
+                processed = int(info.get("prefill_processed", -1))
+                if processed <= prefill["last"]:
+                    continue
+                prefill["last"] = processed
+                prefill["state"].publish(_progress_packet("processing", processed_tokens=processed,
+                    prompt_tokens=prefill["total"]))
+        except Exception:
+            _disable_prefill_telemetry(generator, originals, "measured publish failed", request_id)
+
+    generator.generate = generate
+    generator._log_prefill_started = started
+    generator._log_prefill_progress = progress
+
+
+def install_vision_cache_policy(server, apc=None, runtime=None):
+    """Cache a vision model's prefixes only when MLX-VLM's self-check proves its layout is supported.
+
+    The upstream self-check never raises and app.py discards its result, so this wrapper acts on the
+    returned value. Unsupported, raising or unverifiable layouts close the shared APC manager and
+    prefill runs uncached. If the validation hooks are absent, APC creation is refused outright.
+    """
+    import importlib
+    if not hasattr(server, "ResponseGenerator"):
+        return  # Same compatibility rule as install_vision_progress: nothing to guard.
+    generator = server.ResponseGenerator
+    if apc is None:
+        apc = importlib.import_module("mlx_vlm.apc")
+    if runtime is None:
+        runtime = importlib.import_module("mlx_vlm.server.runtime").runtime
+    if not (hasattr(apc, "self_check_model_apc") and hasattr(apc, "from_env")
+            and hasattr(generator, "wait_until_ready")):
+        logging.warning("MLX-VLM lacks APC self-check hooks; vision prefix cache is disabled")
+        apc.from_env = lambda *args, **kwargs: None
+        return
+
+    def refuse(self, reason):
+        manager = self.apc_manager
+        self.apc_manager = None
+        self.apc_mode = None
+        if getattr(runtime, "apc_manager", None) is manager:
+            runtime.apc_manager = None
+        if manager is not None:
+            manager.close()
+        logging.warning("Vision prefix cache refused for this model (%s); prefill runs uncached", reason)
+
+    original_ready = generator.wait_until_ready
+    import threading
+    validation_lock = threading.Lock()
+
+    def wait_until_ready(self, timeout=None):
+        # Upstream load errors propagate; the check runs once, after the model is ready.
+        result = original_ready(self, timeout)
+        # Other request threads must not observe "checked" before refusal finishes detaching
+        # the manager: their GPU batch could otherwise retain a cache we are about to close.
+        with validation_lock:
+            if getattr(self, "_dial_apc_checked", False) or self.apc_manager is None:
+                return result
+            try:
+                check = apc.self_check_model_apc(result[0], kv_bits=self.kv_bits, log=True)
+                supported = bool(check.ok) and check.apc_mode is not None
+                reason = "; ".join(check.notes or []) or "unsupported cache layout"
+            except Exception as exc:
+                supported, reason = False, f"self-check raised {type(exc).__name__}: {exc}"
+                logging.warning("APC self-check raised; refusing cache", exc_info=True)
+            if not supported:
+                refuse(self, reason)
+            self._dial_apc_checked = True
+        return result
+
+    generator.wait_until_ready = wait_until_ready
+
+
 def install_vision_progress(server):
     from contextvars import ContextVar
     if not hasattr(server, "ResponseGenerator") or not hasattr(server, "app"):
@@ -403,6 +527,7 @@ def install_vision_progress(server):
         return iterator if state is None else _observed_tokens(iterator, state.publish)
     openai.stream_generate = stream
     server.app.add_middleware(VisionProgressMiddleware)
+    install_vision_prefill_progress(server)
     server._dial_progress_installed = True
 
 
@@ -432,6 +557,7 @@ def main():
                 raise RuntimeError("Local vision requires MLX-VLM in Dial's Python runtime; run dial setup") from error
             raise
         install_vision_progress(server)
+        install_vision_cache_policy(server)
         from dial_steering import install_vision_server
         specification = os.environ.get("DIAL_STEERING_SPEC", "")
         install_vision_server(server, json.loads(specification) if specification else None)

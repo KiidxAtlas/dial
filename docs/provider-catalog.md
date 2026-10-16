@@ -56,6 +56,11 @@ Messages API. OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, Mistral and De
 - **GGUF** (a `.gguf` file, or a directory holding one; sharded files load from the first shard): served by llama.cpp's `llama-server` (found via `DIAL_LLAMA_SERVER`, `PATH`, `/opt/homebrew/bin` or `/usr/local/bin`) with `--jinja` and one slot. Tool and reasoning support come from the chat template in the GGUF header; a sibling `mmproj*.gguf` is passed as `--mmproj` and marks the model as vision-capable. `--ctx-size` is the configured context window, or else the largest window the memory estimate below allows (never the full native window by default). Constrained repair uses llama.cpp's JSON-schema grammar, and sampling names are translated (`repeat_penalty`, `repeat_last_n`). `[local_runtime]` maps `draft_model` (a local GGUF) and `num_draft_tokens` to `--model-draft`/`--spec-draft-n-max`, and `kv_bits` 8 or 4 to a `q8_0`/`q4_0` KV cache; the MLX-only `kv_group_size` and `quantized_kv_start` are rejected. An adapter must be a GGUF LoRA (`--lora`); steering and LoRA training need MLX weights.
 - **Splash** (`manifest.json` with `target/` and `tokenizer/`): only LM Studio can run these. Load the model in LM Studio and select it under the LM Studio provider; Dial's own launcher reports this instead of failing obscurely.
 
+GGUF context fitting distinguishes unavailable memory information from an exhausted budget. With
+known physical memory, a model that cannot fit the minimum 256-token context within the estimated
+serving budget is refused before launch with a smaller-model/quantization hint; it never falls back
+to allocating the full native window in that case. Unknown memory retains the native/requested fallback.
+
 The improvement pipeline probes capabilities per format: MLX runs the full gradient and adapter reload probe, GGUF is reported as inference-only (harness improvement and evaluation proceed, weight training is skipped), and Splash is reported unsupported with the LM Studio hint.
 
 **Local chat templates.** Dial combines leading system/developer instructions into one system
@@ -127,9 +132,11 @@ workers to apply a change. Concurrent work can exhaust RAM/GPU memory. Explicit 
 stop and cancellation controls remain active; data-integrity locks are not disabled.
 Laya decision and judge roles never make a session acquire the shared compute lock.
 
-Idle chats unload resident main and role models as soon as the turn and its child agents finish,
-including when no other job is waiting. Queued follow-ups keep their models; the next turn reloads
-an unloaded model. Verification and evaluation also yield for coding requests.
+Idle chats keep resident main and role models loaded between turns, so the next turn starts
+without reloading the weights. Once the turn and its child agents finish, they unload them only
+when training, verification or other queued work requests compute; the next turn then reloads the
+model. Browsing Models, Model Roles or Compute does not unload resident models. `/model restart`
+and explicit compute actions can release a model; verification and evaluation also yield for coding requests.
 If training does not acknowledge a pause within two seconds, Dial terminates its subprocess and
 resumes from its last committed step later. A checkpoint is committed at every step, so only an
 unfinished step may need repeating. **Stop job now** targets a verified detached background worker

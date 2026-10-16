@@ -1,0 +1,10 @@
+{
+  "plugins": [],
+  "skills": [
+    {"name": "composition-patterns", "description": "Design scalable React component APIs with Vercel composition patterns", "url": "https://github.com/vercel-labs/agent-skills.git#skills/composition-patterns"},
+    {"name": "react-best-practices", "description": "Optimize React and Next.js performance with Vercel Engineering guidelines", "url": "https://github.com/vercel-labs/agent-skills.git#skills/react-best-practices"},
+    {"name": "react-view-transitions", "description": "Implement React and Next.js view transitions and route animations", "url": "https://github.com/vercel-labs/agent-skills.git#skills/react-view-transitions"},
+    {"name": "web-design-guidelines", "description": "Review web interfaces for design, usability and accessibility", "url": "https://github.com/vercel-labs/agent-skills.git#skills/web-design-guidelines"},
+    {"name": "writing-guidelines", "description": "Review documentation and prose for clarity, voice and style", "url": "https://github.com/vercel-labs/agent-skills.git#skills/writing-guidelines"}
+  ]
+}

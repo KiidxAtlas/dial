@@ -110,6 +110,25 @@ def tool_schemas(value):
     return value
 
 
+def trajectory_group(source):
+    """Database-local IDs must remain qualified by the learned record's origin."""
+    match = re.fullmatch(r"dial:learned:([^:]+):([0-9]+)(?::.*)?", source, re.DOTALL)
+    if match is not None:
+        origin, identity = match.groups()
+    else:
+        match = re.fullmatch(r"dial:(?:verified|tool-recovery):([0-9]+)(?::.*)?", source, re.DOTALL)
+        if match is None:
+            return None
+        origin, identity = None, match.group(1)
+    # Bound before int(): Python limits huge decimal conversions, while Rust's i64 parser
+    # rejects overflow. Leading zeroes remain accepted by both implementations.
+    identity = identity.lstrip("0") or "0"
+    if len(identity) > 19 or (len(identity) == 19 and identity > "9223372036854775807"):
+        return None
+    identity = int(identity)
+    return f"trajectory:{origin}:{identity}" if origin is not None else f"trajectory:{identity}"
+
+
 def read_records(path, *, trajectory_ids=None):
     """Accept only records marked verified by an external check; raw trajectory logs are never ingested."""
     records, hashes = [], set()
@@ -131,9 +150,9 @@ def read_records(path, *, trajectory_ids=None):
             provenance = record["source"]
             external = provenance.split(":", 3)[-1] if provenance.startswith("dial:verified:") else provenance
             require(not external.startswith("check:"), "agent command exit codes are not verified task outcomes")
-            trajectory = re.fullmatch(r"dial:(?:verified|tool-recovery):(\d+)(?::.*)?", provenance)
+            trajectory = trajectory_group(provenance)
             if trajectory_ids is not None and trajectory is not None:
-                trajectory_ids.add(int(trajectory.group(1)))
+                trajectory_ids.add(trajectory)
             chat = messages(record["messages"], training=True)
             digest = hashlib.sha256(json.dumps(chat, sort_keys=True, ensure_ascii=False,
                                                separators=(",", ":")).encode()).hexdigest()

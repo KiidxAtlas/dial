@@ -65,10 +65,8 @@ const BASH_DIAGNOSTICS: usize = 3 * 1024;
 const CLT_DIR: &str = "/Library/Developer/CommandLineTools";
 
 /// Transfers the process leader out of the foreground owner's drop guard.
-pub(crate) fn release_process(mut group: ProcessGroup) -> Child {
-    group.terminated = true;
-    let group = std::mem::ManuallyDrop::new(group);
-    unsafe { std::ptr::read(&group.child) }
+pub(crate) fn release_process(group: ProcessGroup) -> Child {
+    group.release()
 }
 /// A foreground process and its output stream, transferred intact to the managed background owner.
 #[doc(hidden)]
@@ -127,43 +125,8 @@ impl Drop for ForegroundJob {
     }
 }
 
-/// Kills the whole process group on drop so nothing outlives its owning operation.
-pub(crate) struct ProcessGroup {
-    pub(crate) child: Child,
-    terminated: bool,
-}
-
-impl ProcessGroup {
-    pub(crate) fn new(child: Child) -> Self {
-        ProcessGroup {
-            child,
-            terminated: false,
-        }
-    }
-
-    pub(crate) fn terminate(&mut self) {
-        if !self.terminated {
-            let _ = crate::platform::process::terminate_group(self.child.id());
-            // The leader's exit wakes this wait directly; the group is killed only if it outlives the grace period.
-            let _ = crate::platform::process::wait_exited(&self.child, Duration::from_millis(100));
-            let _ = crate::platform::process::kill_group(self.child.id());
-            self.terminated = true;
-        }
-    }
-
-    /// True once the leader has exited. It is not reaped, so its PID stays reserved.
-    pub(crate) fn exited(&self) -> io::Result<bool> {
-        crate::platform::process::exited(&self.child)
-    }
-}
-
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        self.terminate();
-        let _ = self.child.wait();
-        crate::platform::process::forget_group(self.child.id());
-    }
-}
+// Compatibility path for existing process-owning adapters.
+pub(crate) use crate::runtime::process::ProcessGroup;
 
 /// Keeps the first and last bytes of a stream, counting what was dropped, plus the diagnostic lines
 /// (errors, panics, failed tests) found in the dropped middle.

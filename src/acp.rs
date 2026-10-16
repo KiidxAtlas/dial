@@ -49,6 +49,17 @@ fn error(id: &Value, code: i32, message: impl std::fmt::Display) -> Value {
 fn text_content(text: &Value) -> Value {
     json!({"type":"text","text":text})
 }
+/// Standard ACP `_meta` for text chunks from notice, background and fatal events. The chunk text is
+/// unchanged; `dial` carries Dial's source fields and includes each optional one only when present.
+fn source_meta(event: &Value) -> Value {
+    let mut dial = json!({"event":event["event"]});
+    for field in ["kind", "lane", "tokens", "name", "replace"] {
+        if !event[field].is_null() {
+            dial[field] = event[field].clone();
+        }
+    }
+    json!({"dial":dial})
+}
 fn tool_kind(name: &str) -> &'static str {
     match name {
         "read" => "read",
@@ -713,10 +724,77 @@ impl Adapter {
                 json!({"sessionUpdate":"plan","entries":entries})
             }
             "notice" | "background" | "fatal" => {
-                json!({"sessionUpdate":"agent_message_chunk","content":text_content(&event["message"])})
+                json!({"sessionUpdate":"agent_message_chunk","content":text_content(&event["message"]),"_meta":source_meta(&event)})
             }
             _ => return Vec::new(),
         };
         self.update(update).into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::ui_event::{EventKind, UiEvent};
+
+    /// Session updates for one active session, after each event passes through the adapter.
+    fn session_updates(events: Vec<Value>) -> Vec<Value> {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();
+        let mut adapter = Adapter::new(layout);
+        adapter.emit(json!({"event":"active_session","session_id":"s1"}));
+        events
+            .into_iter()
+            .flat_map(|event| adapter.emit(event))
+            .map(|message| {
+                assert_eq!(message["method"], "session/update");
+                assert_eq!(message["params"]["sessionId"], "s1");
+                message["params"]["update"].clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn typed_notice_keeps_text_chunk_and_carries_dial_source_meta() {
+        let event = crate::rpc::typed_notice(
+            &UiEvent::new(EventKind::Compaction, "History compacted").with_tokens(900, 120),
+        );
+        let updates = session_updates(vec![event]);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(
+            updates[0]["content"],
+            json!({"type":"text","text":"History compacted"})
+        );
+        assert_eq!(
+            updates[0]["_meta"]["dial"],
+            json!({"event":"notice","kind":"compaction","lane":"divider","tokens":[900,120]})
+        );
+    }
+
+    #[test]
+    fn plain_notice_background_and_fatal_omit_absent_fields() {
+        let updates = session_updates(vec![
+            json!({"event":"notice","message":"plain"}),
+            json!({"event":"background","message":"started"}),
+            json!({"event":"background","name":"job","message":"partial","replace":true}),
+            json!({"event":"background","name":"job","message":"append","replace":false}),
+            json!({"event":"fatal","message":"boom"}),
+        ]);
+        assert_eq!(updates.len(), 5);
+        assert_eq!(updates[0]["content"]["text"], "plain");
+        assert_eq!(updates[0]["_meta"]["dial"], json!({"event":"notice"}));
+        assert_eq!(updates[1]["_meta"]["dial"], json!({"event":"background"}));
+        assert_eq!(
+            updates[2]["_meta"]["dial"],
+            json!({"event":"background","name":"job","replace":true})
+        );
+        assert_eq!(
+            updates[3]["_meta"]["dial"],
+            json!({"event":"background","name":"job","replace":false})
+        );
+        assert_eq!(updates[4]["content"]["text"], "boom");
+        assert_eq!(updates[4]["_meta"]["dial"], json!({"event":"fatal"}));
     }
 }

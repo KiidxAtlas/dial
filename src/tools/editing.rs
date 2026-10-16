@@ -143,7 +143,12 @@ pub fn schema(mode: EditMode) -> Value {
         _ => tool_schema(
             "edit",
             instructions(mode),
-            json!({"input":{"type":"string","description":"Hashline patch text; the tool description is the complete contract."}}),
+            json!({"input":{"type":"string","description":match mode {
+                EditMode::Hashline => "Hashline patch text; the tool description is the complete contract.",
+                EditMode::ApplyPatch => "Apply-patch text using *** Begin Patch and *** End Patch; follow the tool description.",
+                EditMode::Sloppy => "Sloppy patch text; the tool description is the complete contract.",
+                _ => unreachable!(),
+            }}}),
             &["input"],
         ),
     }

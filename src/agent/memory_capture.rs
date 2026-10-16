@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     config::types::{Approval, Config},
-    llm::{Chat, usage::Scope},
+    llm::{self, Chat, usage::Scope},
     storage::memory_backend::MemoryAuthority,
 };
 use anyhow::{Context, Result, ensure};
@@ -94,7 +94,10 @@ impl Agent<'_> {
         let capture = Capture {
             authority: memory_authority(&self.session, 0),
             config: self.auth_config.clone(),
-            scope: self.usage_scope.worker(),
+            scope: self
+                .usage_scope
+                .worker()
+                .for_purpose(llm::usage::Purpose::Memory),
             messages,
             body,
             cancel: Arc::new(AtomicBool::new(false)),

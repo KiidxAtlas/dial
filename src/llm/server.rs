@@ -158,6 +158,7 @@ pub struct ModelServer {
     /// The context window a GGUF server's `--ctx-size` was sized from; `None` for MLX.
     gguf_context: Option<Option<u64>>,
     tracking: Option<crate::storage::process_record::Record>,
+    stderr: Arc<Mutex<Tail>>,
 }
 
 enum Failure {
@@ -288,6 +289,35 @@ impl ModelServer {
     pub fn stop(&mut self) {
         self.process.stop();
         self.tracking.take();
+    }
+
+    /// Start a new diagnostic window so a failed request cannot quote a previous request's error.
+    pub fn begin_request(&mut self) -> Result<()> {
+        self.stderr
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bytes
+            .clear();
+        self.phase("generating")
+    }
+
+    /// A disconnected client is not an engine cancellation acknowledgement. Retire this process
+    /// before any retry so abandoned GPU work cannot block the next request.
+    pub fn abort_request(&mut self, error: anyhow::Error) -> anyhow::Error {
+        self.stop();
+        settle_stderr(&self.stderr);
+        if error.downcast_ref::<llm::Interrupted>().is_some() {
+            return error;
+        }
+        let text = tail_text(&self.stderr, ERROR_TAIL_BYTES);
+        if text.is_empty() {
+            error
+        } else {
+            // Keep the original error in the chain for cancellation/context-overflow classifiers.
+            error.context(format!(
+                "local model server stderr (last {ERROR_TAIL_BYTES} bytes):\n{text}"
+            ))
+        }
     }
 
     pub fn phase(&mut self, phase: &str) -> Result<()> {
@@ -604,7 +634,8 @@ fn launch(
             ))
         })?;
         let requested = requested_context(context);
-        let context_tokens = llm::local_fit::gguf_serving_context(file, requested, runtime.kv_bits);
+        let context_tokens = llm::local_fit::gguf_serving_context(file, requested, runtime.kv_bits)
+            .map_err(Failure::Fatal)?;
         let projector = llm::local_format::gguf_projector(file);
         let launch = LlamaLaunch {
             model: file,
@@ -628,7 +659,14 @@ fn launch(
             .arg("--log-level=WARNING");
         if vision {
             command.arg("--vision-cache-size=1").arg("--max-num-seqs=1");
-            command.env("APC_ENABLED", "0");
+            // Bounded, process-local reuse; Python disables APC if its compatibility check fails.
+            command
+                .env("APC_ENABLED", "1")
+                .env("APC_DISK_ENABLED", "0")
+                .env("APC_NUM_BLOCKS", "256")
+                .env("APC_MEMORY_MAX_GB", "1")
+                .env("APC_MEMORY_RESERVE_GB", "0.25")
+                .env("APC_CHECKPOINT_ENTRIES", "1");
         } else if let Some(bytes) = prompt_cache_bytes() {
             command.arg(format!("--prompt-cache-bytes={bytes}"));
         }
@@ -719,6 +757,7 @@ fn launch(
                 tool_grammar: tool_grammar_enabled(context),
                 gguf_context: gguf.is_some().then(|| requested_context(context)),
                 tracking,
+                stderr: tail,
             })
         }
         Err(error) => {
@@ -988,6 +1027,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with open(marker) as f: info = json.load(f)
             info.setdefault("requests", []).append(body)
             with open(marker, "w") as f: json.dump(info, f)
+            if os.path.basename(mode) == "slow-warmup":
+                import time
+                time.sleep(300)
+                return
+            content = body.get("messages", [{}])[-1].get("content")
+            if content == "dial-test-fail":
+                print("RuntimeError: test inference allocation failed", file=sys.stderr, flush=True)
+                self.reply(500, {"error": "inference failed"})
+                return
+            if content == "dial-test-stall":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b'data: {"dial_progress":{"phase":"processing","prompt_tokens":42}}\n\n')
+                self.wfile.flush()
+                # Deliberately ignore a client disconnect, like an uninterruptible GPU prefill.
+                import time
+                time.sleep(300)
+                return
             self.reply(200, {"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "pong"}}],
                              "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
 # A fixture has no public hostname. HTTPServer's default server_bind calls
@@ -999,7 +1057,7 @@ class FixtureServer(http.server.ThreadingHTTPServer):
         self.server_port = self.server_address[1]
 server = FixtureServer((opts["--host"], int(opts["--port"])), Handler)
 if mode != "bad-model":
-    open(marker, "w").write(json.dumps({"pid": os.getpid(), "child": helper.pid, "argv": sys.argv[1:], "engine": os.environ.get("DIAL_MODEL_ENGINE"), "apc": os.environ.get("APC_ENABLED")}))
+    open(marker, "w").write(json.dumps({"pid": os.getpid(), "child": helper.pid, "argv": sys.argv[1:], "engine": os.environ.get("DIAL_MODEL_ENGINE"), "apc": os.environ.get("APC_ENABLED"), "apc_config": {key: os.environ.get(key) for key in ("APC_DISK_ENABLED", "APC_NUM_BLOCKS", "APC_MEMORY_MAX_GB", "APC_MEMORY_RESERVE_GB", "APC_CHECKPOINT_ENTRIES")}}))
 server.serve_forever()
 "#;
 
@@ -1180,6 +1238,57 @@ server.serve_forever()
         });
         assert!(slot.is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn unlimited_startup_can_be_cancelled_during_silent_warmup() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("slow-warmup");
+        fs::create_dir(&model).unwrap();
+        let python = fake_python(dir.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut slot = None;
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let flag = cancel.clone();
+            let marker = model.join("info.json");
+            let observer = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut warmup_started = false;
+                while Instant::now() < deadline {
+                    if let Some(info) = fs::read(&marker)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        && info["requests"]
+                            .as_array()
+                            .is_some_and(|requests| !requests.is_empty())
+                    {
+                        warmup_started = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                flag.store(true, Ordering::SeqCst);
+                warmup_started
+            });
+            let error = ensure_controlled(
+                &mut slot,
+                &python,
+                model.to_str().unwrap(),
+                None,
+                0,
+                Some(cancel),
+            )
+            .err()
+            .expect("silent warmup must be cancellable without a startup deadline");
+            assert!(
+                observer.join().unwrap(),
+                "cancellation must occur during warmup"
+            );
+            assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
+        });
+        assert!(slot.is_none());
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

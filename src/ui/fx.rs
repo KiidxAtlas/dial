@@ -131,6 +131,36 @@ pub fn pulse(theme: &Theme, tick: u64) -> Style {
     theme.fg(Tok::BrandStart).fg(brand_at(theme, t * 0.5))
 }
 
+/// A fixed-width activity track. Known prompt progress fills monotonically; otherwise a
+/// small band travels back and forth. It is an activity cue, never a fabricated percentage.
+pub fn activity_track(theme: &Theme, tick: u64, fraction: Option<f64>) -> Vec<Span<'static>> {
+    const CELLS: usize = 8;
+    let filled = fraction
+        .filter(|f| f.is_finite())
+        .map(|f| (f.clamp(0.0, 1.0) * CELLS as f64).floor() as usize);
+    let position = (tick / 2 % 14) as usize;
+    let head = if position < CELLS {
+        position
+    } else {
+        14 - position
+    };
+    (0..CELLS)
+        .map(|i| {
+            let active = filled.map_or(i == head, |n| i < n);
+            let glyph = match (theme.ascii(), active) {
+                (true, true) => "=",
+                (true, false) => "-",
+                (false, true) => "━",
+                (false, false) => "─",
+            };
+            Span::styled(
+                glyph,
+                theme.fg(if active { Tok::Accent } else { Tok::Border }),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +168,32 @@ mod tests {
 
     fn width(spans: &[Span]) -> usize {
         spans.iter().map(|s| text::width(&s.content)).sum()
+    }
+
+    #[test]
+    fn activity_track_moves_only_when_progress_is_unknown_and_keeps_its_width() {
+        for theme in [
+            Theme::dark(),
+            Theme::light(),
+            Theme::mono(),
+            Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii),
+        ] {
+            assert_ne!(
+                activity_track(&theme, 0, None),
+                activity_track(&theme, 6, None)
+            );
+            for fraction in [Some(0.0), Some(0.5), Some(1.0)] {
+                assert_eq!(
+                    activity_track(&theme, 0, fraction),
+                    activity_track(&theme, 6, fraction)
+                );
+            }
+            for tick in 0..60 {
+                for fraction in [None, Some(0.0), Some(0.5), Some(1.0), Some(f64::NAN)] {
+                    assert_eq!(width(&activity_track(&theme, tick, fraction)), 8);
+                }
+            }
+        }
     }
 
     #[test]

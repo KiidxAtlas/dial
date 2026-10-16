@@ -5,9 +5,10 @@
 pub mod compute;
 pub mod extensions;
 pub mod git;
+pub mod improve;
 mod headers;
+mod model_download;
 pub mod jobs;
-pub mod local_models;
 pub mod model_settings;
 pub mod models;
 pub mod palette;
@@ -64,7 +65,8 @@ pub enum OverlayEvent {
         id: String,
         scope: Scope,
     },
-    /// Install a missing dependency (see `setup::deps`) in the background, then save its settings.
+    /// Install a missing dependency (see `setup::deps`) in the background, then save its settings. Ids
+    /// of the form `embeddings:<model>` pull and wire a local embedding model instead (see `setup::embeddings`).
     SetupDep {
         id: String,
     },

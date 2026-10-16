@@ -953,6 +953,12 @@ fn sse_read_call() -> crate::llm::fake::Script {
     crate::llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
 }
 
+/// A tool call with its own id, so repeated calls keep distinct tool_call_id pairings.
+fn sse_tool_call(id: &str, name: &str, arguments: &str) -> crate::llm::fake::Script {
+    let event = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":arguments}}]},"finish_reason":"tool_calls"}]});
+    crate::llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
+}
+
 fn sent_messages(request: &[u8]) -> String {
     crate::llm::fake::body(request)["messages"].to_string()
 }
@@ -1043,39 +1049,51 @@ fn an_announced_action_without_a_tool_call_is_retried() {
 }
 
 #[test]
-fn repeated_successful_tools_stop_before_the_generic_history_redirect() {
+fn repeated_successful_tools_escalate_and_the_turn_completes() {
+    // The model repeats one successful read eight times, then answers. Nothing stops the turn: stronger
+    // guidance appears, and identical calls past the threshold are answered with their earlier result.
     let config = Config::default();
-    let scripts: Vec<crate::llm::fake::Script> = (0..5).map(|_| sse_read_call()).collect();
-    let server = crate::llm::fake::serve(scripts);
-    let backend = Backend::new(
-        ProviderKind::Endpoint {
-            base_url: format!("{}/v1", server.url),
-            model: "test".into(),
-            api_key: None,
-        },
-        PathBuf::new(),
-        5,
+    let mut scripts: Vec<crate::llm::fake::Script> = (0..8)
+        .map(|n| sse_tool_call(&format!("call_read_{n}"), "read", r#"{"path":"notes.txt"}"#))
+        .collect();
+    scripts.push(sse_reply("done"));
+    let (text, outcome, requests) = scripted_turn(&config, scripts, "hi");
+    assert_eq!((text.as_str(), outcome), ("done", TurnOutcome::Completed));
+    assert_eq!(requests.len(), 9);
+    let last = sent_messages(&requests[8]);
+    assert!(last.contains("tool_call_loop_persisted"), "escalation guidance was not shown");
+    assert!(last.contains("[Not executed:"), "identical repeats were not short-circuited");
+}
+
+#[test]
+fn repeated_failures_escalate_and_never_stop_the_turn() {
+    // Twelve identical failing reads, then an answer: failures warn, escalate and are withheld, but
+    // the turn itself completes.
+    let config = Config::default();
+    let mut scripts: Vec<crate::llm::fake::Script> = (0..12)
+        .map(|n| sse_tool_call(&format!("call_missing_{n}"), "read", r#"{"path":"missing.txt"}"#))
+        .collect();
+    scripts.push(sse_reply("done"));
+    let (text, outcome, requests) = scripted_turn(&config, scripts, "hi");
+    assert_eq!((text.as_str(), outcome), ("done", TurnOutcome::Completed));
+    assert_eq!(requests.len(), 13);
+    let body = crate::llm::fake::body(&requests[12]);
+    let messages = body["messages"].as_array().unwrap();
+    let results: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(
+        results.len(),
+        12,
+        "every attempted call must receive a result"
     );
-    let workspace = tempfile::tempdir().unwrap();
-    std::fs::write(workspace.path().join("notes.txt"), "alpha\n").unwrap();
-    let version = Version {
-        id: 0,
-        parent: None,
-        kind: "config".into(),
-        harness: config.harness.clone(),
-        adapter: None,
-        status: "active".into(),
-    };
-    let mut agent =
-        Agent::hermetic(&config, backend, &version, workspace.path(), None, None).unwrap();
-    let error = agent
-        .turn("hi", &mut NullUi)
-        .err()
-        .expect("repeated unchanged observations must stop");
-    assert!(error.to_string().contains("same observation"));
-    let requests = server.requests();
-    assert_eq!(requests.len(), 5);
-    assert!(!sent_messages(&requests[4]).contains("tool_call_loop_detected"));
+    assert!(results.iter().any(|message| message["is_error"] == true));
+    // Recovery withholds unchanged calls before ten executions; assert escalation, not old prose.
+    assert!(messages.iter().any(|message| message["role"] == "user"
+        && message["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("tool_call_loop_persisted"))));
 }
 
 #[test]
@@ -1101,6 +1119,94 @@ fn a_stalled_stream_after_partial_text_continues_the_turn() {
     assert_eq!(requests.len(), 2);
     assert!(sent_messages(&requests[1]).contains("partial answer"));
     assert!(sent_messages(&requests[1]).contains("Continue exactly where it stopped"));
+}
+
+#[test]
+fn local_slow_first_event_is_not_cancelled_by_the_generation_watchdog() {
+    // A local engine may load a model for longer than the silence limit before its first event.
+    let mut config = Config::default();
+    config.request_recovery.silence_secs = 1;
+    let event = json!({"choices":[{"delta":{"content":"loaded"},"finish_reason":"stop"}]});
+    let (text, outcome, requests) = scripted_turn(
+        &config,
+        vec![crate::llm::fake::Script::ColdStart {
+            delay: Duration::from_millis(1500),
+            body: format!("data: {event}\n\ndata: [DONE]\n\n"),
+        }],
+        "hi",
+    );
+    assert_eq!((text.as_str(), outcome), ("loaded", TurnOutcome::Completed));
+    assert_eq!(
+        requests.len(),
+        1,
+        "a slow local start was cancelled and retried"
+    );
+}
+
+#[test]
+fn local_prefill_silence_is_not_cancelled_by_the_generation_watchdog() {
+    // Processing (prompt prefill) reports progress, then stays silent past the limit before output.
+    let mut config = Config::default();
+    config.request_recovery.silence_secs = 1;
+    let progress =
+        json!({"dial_progress":{"phase":"processing","prompt_tokens":4096,"processed_tokens":512}});
+    let event = json!({"choices":[{"delta":{"content":"prefilled"},"finish_reason":"stop"}]});
+    let (text, outcome, requests) = scripted_turn(
+        &config,
+        vec![crate::llm::fake::Script::SseSlow {
+            pieces: vec![
+                format!("data: {progress}\n\n"),
+                format!("data: {event}\n\ndata: [DONE]\n\n"),
+            ],
+            pause: Duration::from_millis(1500),
+        }],
+        "hi",
+    );
+    assert_eq!(
+        (text.as_str(), outcome),
+        ("prefilled", TurnOutcome::Completed)
+    );
+    assert_eq!(
+        requests.len(),
+        1,
+        "local prefill silence was cancelled and retried"
+    );
+}
+
+#[test]
+fn local_generation_progress_stall_is_still_recovered() {
+    // Once the engine reports Generating, a silent stream is cancelled and the request resumes.
+    let mut config = Config::default();
+    config.request_recovery.silence_secs = 1;
+    let progress = json!({"dial_progress":{"phase":"generating","output_tokens":3}});
+    let (text, outcome, requests) = scripted_turn(
+        &config,
+        vec![
+            crate::llm::fake::Script::StallAfter {
+                first: format!("data: {progress}\n\n"),
+                silence: Duration::from_millis(1500),
+            },
+            sse_reply("resumed"),
+        ],
+        "hi",
+    );
+    assert_eq!(
+        (text.as_str(), outcome),
+        ("resumed", TurnOutcome::Completed)
+    );
+    assert_eq!(
+        requests.len(),
+        2,
+        "a generating local stall was not recovered"
+    );
+}
+
+#[test]
+fn silence_watch_is_armed_for_remote_streams_and_only_generating_local_ones() {
+    assert!(silence_watch_armed(false, false));
+    assert!(silence_watch_armed(false, true));
+    assert!(!silence_watch_armed(true, false));
+    assert!(silence_watch_armed(true, true));
 }
 
 #[test]

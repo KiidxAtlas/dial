@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A fixed, focused verification command selected for changed source files.
@@ -26,6 +26,17 @@ impl CheckStatus {
     /// cancellation, timeout and unverifiable runs are reported without editing application code.
     pub fn repairable(self) -> bool {
         self == CheckStatus::CodeFailed
+    }
+
+    /// Only completed, classified checks can establish a repair baseline or its passing result.
+    /// Unknown runs must still reach the tracker with `None` to invalidate an earlier baseline.
+    pub(super) fn repair_exit_code(self, output: &crate::tools::ToolOutput) -> Option<i32> {
+        let code = output.process_outcome()?.exit_code?;
+        match self {
+            Self::Passed if code == 0 => Some(code),
+            Self::CodeFailed if code != 0 => Some(code),
+            _ => None,
+        }
     }
 }
 
@@ -109,6 +120,87 @@ mod authority_tests {
             output_complete: true,
         });
         assert_eq!(classify(&check, &failed, false), CheckStatus::CodeFailed);
+    }
+
+    #[test]
+    fn repair_exits_use_typed_completion_and_invalidate_unknown_runs() {
+        use crate::runtime::execution::ProcessOutcome;
+        use crate::tools::{ToolOutput, ToolStatus};
+        let check = FocusedCheck {
+            name: "python AST: fixture".into(),
+            command: "python -m pytest".into(),
+            timeout_secs: 1,
+        };
+        let process = ProcessOutcome {
+            started: true,
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            output_complete: true,
+        };
+        let passed = ToolOutput::ok("[exit code: 9]".into()).with_process(process.clone());
+        let failed = ToolOutput::err("[exit code: 0]").with_process(ProcessOutcome {
+            exit_code: Some(7),
+            ..process.clone()
+        });
+        for (output, expected) in [(&passed, Some(0)), (&failed, Some(7))] {
+            let verdict = classify(&check, output, false);
+            assert_eq!(verdict.repair_exit_code(output), expected);
+        }
+        let unknowns = [
+            ToolOutput::ok("[exit code: 0]".into()),
+            ToolOutput::err("[exit code: 7]"),
+            ToolOutput::ok("partial\n[exit code: 0]".into()).with_process(ProcessOutcome {
+                output_complete: false,
+                ..process.clone()
+            }),
+            ToolOutput::ok("Ran 0 tests\n[exit code: 0]".into()).with_process(process.clone()),
+            ToolOutput::err("No module named pytest\n[exit code: 1]").with_process(
+                ProcessOutcome {
+                    exit_code: Some(1),
+                    ..process.clone()
+                },
+            ),
+            passed.clone().with_status(ToolStatus::Blocked),
+            passed.clone().with_process(ProcessOutcome {
+                cancelled: true,
+                ..process.clone()
+            }),
+            passed.clone().with_process(ProcessOutcome {
+                timed_out: true,
+                ..process
+            }),
+        ];
+        let run = |sequence, output: &ToolOutput| super::super::repair_evidence::CheckRun {
+            command: check.command.clone(),
+            cwd: "/workspace".into(),
+            objective: "fixture".into(),
+            kind: super::super::repair_evidence::CheckKind::Behavioral,
+            tool_call_id: format!("check-{sequence}"),
+            evidence_ref: format!("artifact://check-{sequence}"),
+            exit_code: classify(&check, output, false).repair_exit_code(output),
+            sequence,
+        };
+        for unknown in unknowns {
+            let mut tracker = super::super::repair_evidence::Tracker::default();
+            assert!(tracker.observe(run(1, &failed), vec![]).is_none());
+            let unknown_run = run(2, &unknown);
+            assert_eq!(unknown_run.exit_code, None, "{}", unknown.text);
+            assert!(tracker.observe(unknown_run, vec![]).is_none());
+            let change = super::super::repair_evidence::FileChange {
+                path: "fixture.py".into(),
+                before_sha256: Some("a".repeat(64)),
+                after_sha256: Some("b".repeat(64)),
+                before_ref: Some("artifact://before".into()),
+                after_ref: Some("artifact://after".into()),
+            };
+            assert!(tracker.observe(run(3, &passed), vec![change]).is_none());
+        }
+        assert_eq!(
+            classify(&check, &passed, true).repair_exit_code(&passed),
+            None
+        );
     }
 }
 
@@ -559,7 +651,7 @@ fn has_go_package_tests(root: &Path, dir: &Path) -> bool {
     })
 }
 
-fn javascript_test_command(root: &Path, changed: &Path) -> Option<FocusedCheck> {
+fn javascript_test_runner(root: &Path) -> Option<(&'static str, String)> {
     let package_path = root.join("package.json");
     if std::fs::metadata(&package_path).ok()?.len() > 1024 * 1024 {
         return None;
@@ -574,6 +666,24 @@ fn javascript_test_command(root: &Path, changed: &Path) -> Option<FocusedCheck> 
     } else {
         return None;
     };
+    let executable_name = if cfg!(windows) {
+        format!("{runner}.cmd")
+    } else {
+        runner.to_owned()
+    };
+    let executable = root.join("node_modules/.bin").join(executable_name);
+    if !executable.is_file() {
+        return None;
+    }
+    let invocation = shell_invocation(&executable.to_string_lossy());
+    Some((runner, invocation))
+}
+
+fn javascript_test_command(
+    root: &Path,
+    changed: &Path,
+    (runner, invocation): &(&str, String),
+) -> Option<FocusedCheck> {
     let stem = changed.file_stem()?.to_str()?;
     if !stem
         .chars()
@@ -605,17 +715,8 @@ fn javascript_test_command(root: &Path, changed: &Path) -> Option<FocusedCheck> 
         }
     }
     let test = test?;
-    let executable_name = if cfg!(windows) {
-        format!("{runner}.cmd")
-    } else {
-        runner.to_owned()
-    };
-    let executable = root.join("node_modules/.bin").join(executable_name);
-    if !executable.is_file() {
-        return None;
-    }
-    let mut command = format!("{} ", shell_invocation(&executable.to_string_lossy()));
-    if runner == "vitest" {
+    let mut command = format!("{invocation} ");
+    if *runner == "vitest" {
         command.push_str("run ");
     } else {
         command.push_str("--runInBand ");
@@ -641,9 +742,31 @@ pub fn related_tests_with_runner(
     changed: &[PathBuf],
     override_argv: &[String],
 ) -> Vec<FocusedCheck> {
+    related_tests_with_metadata(
+        root,
+        python,
+        changed,
+        override_argv,
+        || javascript_test_runner(root),
+        |directory| has_go_package_tests(root, directory),
+    )
+}
+
+// Keep filesystem metadata resolution injectable for deterministic per-invocation work counts.
+fn related_tests_with_metadata(
+    root: &Path,
+    python: &Path,
+    changed: &[PathBuf],
+    override_argv: &[String],
+    mut javascript_metadata: impl FnMut() -> Option<(&'static str, String)>,
+    mut go_has_tests: impl FnMut(&Path) -> bool,
+) -> Vec<FocusedCheck> {
     let mut selected = Vec::new();
     let cargo_project = root.join("Cargo.toml").is_file() && root.join("src/lib.rs").is_file();
     let go_project = root.join("go.mod").is_file();
+    // Invocation-local metadata only: later edits must be visible on the next selection pass.
+    let mut javascript_runner = None;
+    let mut go_packages = HashMap::new();
     for path in changed.iter().take(RELATED_TEST_PATH_LIMIT) {
         if path.is_absolute()
             || path.components().any(|part| {
@@ -707,7 +830,10 @@ pub fn related_tests_with_runner(
             }
             Some("go") if go_project => {
                 let directory = path.parent().unwrap_or(Path::new(""));
-                if has_go_package_tests(root, directory) {
+                if *go_packages
+                    .entry(directory)
+                    .or_insert_with(|| go_has_tests(directory))
+                {
                     let package = if directory.as_os_str().is_empty() {
                         ".".to_owned()
                     } else {
@@ -721,7 +847,11 @@ pub fn related_tests_with_runner(
                 }
             }
             Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") => {
-                if let Some(check) = javascript_test_command(root, path) {
+                if let Some(runner) = javascript_runner
+                    .get_or_insert_with(&mut javascript_metadata)
+                    .as_ref()
+                    && let Some(check) = javascript_test_command(root, path, runner)
+                {
                     selected.push(check);
                 }
             }
@@ -853,6 +983,7 @@ mod tests {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    use std::fs;
     #[test]
     fn python_checks_share_project_runner_without_sync_or_fallback() {
         let root = tempfile::tempdir().unwrap();
@@ -1037,6 +1168,108 @@ mod selection_tests {
             checks[3].command.contains("vitest")
                 && checks[3].command.contains("run")
                 && checks[3].command.contains("src/ui.test.ts")
+        );
+    }
+
+    #[test]
+    fn related_metadata_is_shared_within_selection_but_refreshed_between_calls() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path();
+        for dir in ["app", "other", "src", "node_modules/.bin"] {
+            fs::create_dir_all(path.join(dir)).unwrap();
+        }
+        fs::write(path.join("go.mod"), "module fixture\n").unwrap();
+        fs::write(path.join("app/main_test.go"), "package app\n").unwrap();
+        for name in ["first", "second"] {
+            fs::write(path.join(format!("src/{name}.test.ts")), "").unwrap();
+        }
+        for runner in ["vitest", "jest"] {
+            let executable = if cfg!(windows) {
+                format!("{runner}.cmd")
+            } else {
+                runner.into()
+            };
+            fs::write(path.join("node_modules/.bin").join(executable), "").unwrap();
+        }
+        let changed = [
+            "src/second.ts".into(),
+            "app/main.go".into(),
+            "src/first.ts".into(),
+            "app/other.go".into(),
+            "src/second.ts".into(),
+            "other/main.go".into(),
+            "other/extra.go".into(),
+        ];
+        let select = || {
+            let mut javascript_reads = 0;
+            let mut go_scans = HashMap::new();
+            let checks = related_tests_with_metadata(
+                path,
+                Path::new("python3"),
+                &changed,
+                &[],
+                || {
+                    javascript_reads += 1;
+                    javascript_test_runner(path)
+                },
+                |directory| {
+                    *go_scans.entry(directory.to_owned()).or_insert(0) += 1;
+                    has_go_package_tests(path, directory)
+                },
+            );
+            // Three JS paths resolve once, four Go paths scan each of two packages once.
+            // The same bounds apply when metadata or a package's tests are absent.
+            assert_eq!(javascript_reads, 1);
+            assert_eq!(
+                go_scans,
+                HashMap::from([(PathBuf::from("app"), 1), (PathBuf::from("other"), 1)])
+            );
+            assert_eq!(checks, related_tests(path, Path::new("python3"), &changed));
+            checks
+        };
+        // Missing and malformed metadata are not cached across invocations either.
+        assert_eq!(select().len(), 1);
+        fs::write(path.join("package.json"), "not json").unwrap();
+        assert_eq!(select().len(), 1);
+        fs::write(
+            path.join("package.json"),
+            r#"{"scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        let checks = select();
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0].name, "related vitest test: src/second.test.ts");
+        assert_eq!(checks[1].command, "go test './app'");
+        assert_eq!(checks[2].name, "related vitest test: src/first.test.ts");
+        assert!(checks[0].command.contains(" run 'src/second.test.ts'"));
+
+        fs::write(path.join("package.json"), r#"{"scripts":{"test":"jest"}}"#).unwrap();
+        fs::remove_file(path.join("app/main_test.go")).unwrap();
+        fs::write(path.join("other/new_test.go"), "package other\n").unwrap();
+        let checks = select();
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0].name, "related jest test: src/second.test.ts");
+        assert_eq!(checks[1].name, "related jest test: src/first.test.ts");
+        assert_eq!(checks[2].command, "go test './other'");
+        assert!(
+            checks[0]
+                .command
+                .contains(" --runInBand 'src/second.test.ts'")
+        );
+
+        let jest = if cfg!(windows) { "jest.cmd" } else { "jest" };
+        fs::remove_file(path.join("node_modules/.bin").join(jest)).unwrap();
+        assert_eq!(select().len(), 1);
+        assert!(
+            related_tests_with_metadata(
+                path,
+                Path::new("python3"),
+                &["README.md".into()],
+                &[],
+                || panic!("unrelated paths must not load JavaScript metadata"),
+                |_| panic!("unrelated paths must not scan Go packages"),
+            )
+            .is_empty()
         );
     }
 
