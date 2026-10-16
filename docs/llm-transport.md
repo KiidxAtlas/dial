@@ -59,6 +59,11 @@ Missing provider usage and missing prices remain unknown, not zero-cost success.
 the current runtime, not restored historical usage or an invoice. Cache/reasoning counters have their
 own coverage fields and must not be interpreted as fully reported when those fields are absent.
 
+Backends created during a fallback or cooldown return join the existing turn ledger before their
+first request. Owner-rejected auxiliary replies and full-generation guidance/edit-preview retries
+record discarded responses under the purpose that requested them; discarding does not erase their
+physical tokens or cost. Partial batch interception is not a discarded full generation.
+
 ## Retries and image input
 
 Transient provider errors use bounded backoff with server retry hints and visible notices (up to `[retry].max_attempts`

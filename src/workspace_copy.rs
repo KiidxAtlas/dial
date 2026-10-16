@@ -79,22 +79,25 @@ fn copy_project_with(source: &Path, copy_file: CopyFile) -> Result<tempfile::Tem
         .with_context(|| format!("resolving benchmark source {}", source.display()))?;
     ensure!(source.is_dir(), "benchmark source must be a directory");
     let destination = tempfile::tempdir().context("creating benchmark workspace")?;
-    let mut visited = std::collections::BTreeSet::new();
+    let mut ancestors = std::collections::BTreeSet::new();
     copy_directory(
         &source,
         destination.path(),
         &source,
-        &mut visited,
+        &mut ancestors,
         copy_file,
     )?;
     Ok(destination)
 }
 
+/// `ancestors` holds the canonical directories being copied on the current path. It cuts symlink
+/// cycles only: a directory reached through a second name is copied again, so no name is left
+/// empty because another name was visited first.
 fn copy_directory(
     source: &Path,
     dest: &Path,
     root: &Path,
-    visited: &mut std::collections::BTreeSet<PathBuf>,
+    ancestors: &mut std::collections::BTreeSet<PathBuf>,
     copy_file: CopyFile,
 ) -> Result<()> {
     let canonical = fs::canonicalize(source)?;
@@ -102,9 +105,21 @@ fn copy_directory(
         canonical.starts_with(root),
         "source symlink escapes project root"
     );
-    if !visited.insert(canonical) {
+    if !ancestors.insert(canonical.clone()) {
         return Ok(());
     }
+    let copied = copy_entries(source, dest, root, ancestors, copy_file);
+    ancestors.remove(&canonical);
+    copied
+}
+
+fn copy_entries(
+    source: &Path,
+    dest: &Path,
+    root: &Path,
+    ancestors: &mut std::collections::BTreeSet<PathBuf>,
+    copy_file: CopyFile,
+) -> Result<()> {
     for entry in fs::read_dir(source).with_context(|| format!("reading {}", source.display()))? {
         let entry = entry?;
         let from = entry.path();
@@ -127,13 +142,13 @@ fn copy_directory(
             }
             if target.is_dir() {
                 fs::create_dir_all(&to)?;
-                copy_directory(&target, &to, root, visited, copy_file)?;
+                copy_directory(&target, &to, root, ancestors, copy_file)?;
             } else {
                 copy_file(&target, &to).with_context(|| format!("copying {}", from.display()))?;
             }
         } else if metadata.is_dir() {
             fs::create_dir(&to)?;
-            copy_directory(&from, &to, root, visited, copy_file)?;
+            copy_directory(&from, &to, root, ancestors, copy_file)?;
         } else if metadata.is_file() {
             copy_file(&from, &to).with_context(|| format!("copying {}", from.display()))?;
         }
@@ -311,5 +326,67 @@ mod tests {
             root.path(),
             &outside.path().join("main.rs")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_aliases_never_leave_the_real_directory_empty() {
+        // Directory read order is unspecified, so the real directory must survive whichever of
+        // its names the copier reaches first.
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("real")).unwrap();
+        fs::write(source.path().join("real/a.txt"), "a").unwrap();
+        for alias in 0..8 {
+            symlink(
+                source.path().join("real"),
+                source.path().join(format!("alias-{alias}")),
+            )
+            .unwrap();
+        }
+        for copied in [
+            clone_project(source.path()).unwrap(),
+            copy_project_plain(source.path()).unwrap(),
+        ] {
+            assert_eq!(
+                fs::read_to_string(copied.path().join("real/a.txt")).unwrap(),
+                "a"
+            );
+            for alias in 0..8 {
+                assert_eq!(
+                    fs::read_to_string(copied.path().join(format!("alias-{alias}/a.txt"))).unwrap(),
+                    "a"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_cycles_stop_and_external_targets_are_refused() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("source.txt"), "source").unwrap();
+        symlink(source.path(), source.path().join("cycle")).unwrap();
+        for copied in [
+            clone_project(source.path()).unwrap(),
+            copy_project_plain(source.path()).unwrap(),
+        ] {
+            assert_eq!(
+                fs::read_to_string(copied.path().join("source.txt")).unwrap(),
+                "source"
+            );
+            assert_eq!(
+                fs::read_dir(copied.path().join("cycle")).unwrap().count(),
+                0
+            );
+        }
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("private.txt"), "untouched").unwrap();
+        symlink(outside.path(), source.path().join("escape")).unwrap();
+        assert!(clone_project(source.path()).is_err());
+        assert!(copy_project_plain(source.path()).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.path().join("private.txt")).unwrap(),
+            "untouched"
+        );
     }
 }

@@ -589,6 +589,44 @@ fn state_reply(projection: &QueryProjection, busy: bool) -> Result<Value> {
     Ok(state)
 }
 
+/// Page the cached history without copying unrelated messages. Invalid cursors must not silently
+/// restart pagination: clients otherwise cannot distinguish a malformed request from the first page.
+fn messages_page(messages: &[Value], params: &Value) -> Result<Value> {
+    anyhow::ensure!(
+        params.is_null() || params.is_object(),
+        "params must be an object"
+    );
+    let offset = match params.get("offset").filter(|value| !value.is_null()) {
+        Some(value) => usize::try_from(
+            value
+                .as_u64()
+                .context("offset must be an unsigned integer")?,
+        )
+        .context("message offset cannot be represented on this platform")?,
+        None => match params.get("cursor").filter(|value| !value.is_null()) {
+            Some(value) => value
+                .as_str()
+                .context("cursor must be a string")?
+                .parse::<usize>()
+                .context("invalid message cursor")?,
+            None => 0,
+        },
+    };
+    let limit = match params.get("limit").filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_u64()
+            .context("limit must be an unsigned integer")?,
+        None => 50,
+    }
+    .clamp(1, 500) as usize;
+    anyhow::ensure!(offset <= messages.len(), "message offset is past the end");
+    let end = offset + limit.min(messages.len() - offset);
+    Ok(
+        json!({"messages":&messages[offset..end],"offset":offset,"total":messages.len(),
+        "next_offset":(end < messages.len()).then_some(end)}),
+    )
+}
+
 /// Typed `notice` event. `text` stays the authoritative plain notice; `kind`, `lane` and `tokens` are additive.
 pub(crate) fn typed_notice(event: &crate::agent::ui_event::UiEvent) -> Value {
     json!({"event":"notice","message":event.text,"kind":event.kind,"lane":event.kind.lane(),"tokens":event.tokens})
@@ -1279,36 +1317,13 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                         match request["method"].as_str().unwrap_or("") {
                             "state" => state_reply(&projection, busy.load(Ordering::SeqCst)),
                             "messages" => Ok(json!({"messages":projection.messages.clone()})),
-                            _ => {
-                                let messages = projection
+                            _ => messages_page(
+                                projection
                                     .messages
                                     .as_array()
-                                    .context("RPC message snapshot is unavailable")?;
-                                let offset = request["params"]["offset"]
-                                    .as_u64()
-                                    .or_else(|| {
-                                        request["params"]["cursor"]
-                                            .as_str()
-                                            .and_then(|v| v.parse().ok())
-                                    })
-                                    .unwrap_or(0)
-                                    as usize;
-                                let limit = request["params"]["limit"]
-                                    .as_u64()
-                                    .unwrap_or(50)
-                                    .clamp(1, 500)
-                                    as usize;
-                                anyhow::ensure!(
-                                    offset <= messages.len(),
-                                    "message offset is past the end"
-                                );
-                                let page: Vec<_> =
-                                    messages.iter().skip(offset).take(limit).cloned().collect();
-                                let next = offset + page.len();
-                                Ok(
-                                    json!({"messages":page,"offset":offset,"total":messages.len(),"next_offset":(next<messages.len()).then_some(next)}),
-                                )
-                            }
+                                    .context("RPC message snapshot is unavailable")?,
+                                &request["params"],
+                            ),
                         }
                     })();
                     out.result(&id, result);
@@ -1700,6 +1715,54 @@ mod tests {
         assert!(state_reply(&QueryProjection::default(), false).is_err());
         assert_eq!(QueryProjection::default().messages, json!([]));
     }
+    #[test]
+    fn history_pages_preserve_boundaries_and_reject_invalid_cursors() {
+        let messages: Vec<_> = (0..600).map(|n| json!({"content":n})).collect();
+        assert_eq!(
+            messages_page(&messages, &Value::Null).unwrap()["next_offset"],
+            50
+        );
+        let page = messages_page(&messages, &json!({"cursor":"599","limit":u64::MAX})).unwrap();
+        assert_eq!(
+            page,
+            json!({"messages":[{"content":599}],"offset":599,"total":600,"next_offset":null})
+        );
+        assert_eq!(
+            messages_page(&messages, &json!({"offset":600})).unwrap()["messages"],
+            json!([])
+        );
+        assert_eq!(
+            messages_page(&messages, &json!({"limit":0})).unwrap()["next_offset"],
+            1
+        );
+        assert_eq!(
+            messages_page(&messages, &json!({"limit":u64::MAX})).unwrap()["next_offset"],
+            500
+        );
+        assert_eq!(
+            messages_page(&messages, &json!({"offset":2,"cursor":"4"})).unwrap()["offset"],
+            2
+        );
+        for params in [
+            json!({"cursor":"bad"}),
+            json!({"cursor":-1}),
+            json!({"offset":-1}),
+            json!({"offset":"2"}),
+            json!({"offset":1.5}),
+            json!({"offset":u64::MAX}),
+            json!({"cursor":"18446744073709551616"}),
+            json!({"limit":-1}),
+            json!({"limit":"2"}),
+            json!([]),
+        ] {
+            assert!(messages_page(&messages, &params).is_err(), "{params}");
+        }
+        assert_eq!(
+            messages_page(&[], &json!({})).unwrap(),
+            json!({"messages":[],"offset":0,"total":0,"next_offset":null})
+        );
+    }
+
     #[test]
     fn typed_notice_adds_lane_and_keeps_plain_text_and_tokens() {
         use crate::agent::ui_event::{EventKind, UiEvent};

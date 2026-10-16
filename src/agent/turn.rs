@@ -610,6 +610,7 @@ impl Agent<'_> {
                 fallback_index = 0;
                 *backend = make_backend(self.effective_config())?
                     .with_session_id(self.session.id().to_owned());
+                join_turn_usage(&self.usage_scope, backend);
                 self.request_phase
                     .recover("fallback cooldown elapsed; returning to the primary model");
                 ui.diagnostic("Fallback cooldown elapsed; returning to the primary model");
@@ -758,6 +759,9 @@ impl Agent<'_> {
             if !self.interrupt.load(Ordering::SeqCst)
                 && (rule_hit.is_some() || scoped_paths.is_some())
             {
+                if result.is_ok() {
+                    record_rejected_reply(&self.usage_scope, backend, repairing)?;
+                }
                 ensure!(
                     rule_regenerations < self.config.portable_rules.max_regenerations,
                     "portable guidance regeneration limit reached; stale tools were not executed"
@@ -897,6 +901,7 @@ impl Agent<'_> {
                                     .unwrap_or(Duration::from_secs(5 * 60));
                                 fallback_cooldown = Some(Instant::now() + cooldown);
                                 *backend = next_backend.with_session_id(self.session.id().to_owned());
+                                join_turn_usage(&self.usage_scope, backend);
                                 self.request_phase
                                     .recover("switching to a configured fallback model");
                                 ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Model, &format!(
@@ -1167,6 +1172,7 @@ impl Agent<'_> {
                 if let Some(paths) =
                     rule_catalog.pending_paths(&rule_root, &rule_state, "main", &reply.tool_calls)
                 {
+                    record_rejected_reply(&self.usage_scope, backend, repairing)?;
                     ensure!(
                         rule_regenerations < self.config.portable_rules.max_regenerations,
                         "portable guidance regeneration limit reached; inline edit was not executed"
@@ -1186,6 +1192,7 @@ impl Agent<'_> {
             }
             if let Some(error) = self.completed_edit_preview_error(&reply) {
                 rejected_edit_previews += 1;
+                record_rejected_reply(&self.usage_scope, backend, repairing)?;
                 ui.inference_discarded(
                     "Completed edit preview failed; no tools from this generation were executed.",
                 );
@@ -1476,6 +1483,7 @@ impl Agent<'_> {
             let scoped_paths =
                 rule_catalog.pending_paths(&rule_root, &rule_state, "main", &reply.tool_calls);
             if normalized_hit.is_some() || scoped_paths.is_some() {
+                record_rejected_reply(&self.usage_scope, backend, repairing)?;
                 ensure!(
                     rule_regenerations < self.config.portable_rules.max_regenerations,
                     "portable guidance regeneration limit reached; stale tools were not executed"
@@ -2648,4 +2656,65 @@ pub(super) fn settle_reliability(
         "no edits this turn"
     });
     state["edit_loop"] = checks.status();
+}
+
+/// A fallback or cooldown return is a new provider backend. It must join the turn's usage ledger
+/// before its first request, or its requests, tokens and prices bypass accounting.
+fn join_turn_usage(usage: &crate::llm::usage::Scope, backend: &mut Backend) {
+    backend.set_usage_scope(Some(usage.clone()));
+}
+
+/// A received reply rejected by this owner remains physical usage. The discard is recorded under
+/// the purpose that requested it, because a repair tag is restored before the rejection is known.
+fn record_rejected_reply(
+    usage: &crate::llm::usage::Scope,
+    backend: &mut Backend,
+    repairing: bool,
+) -> Result<()> {
+    let purpose = if repairing {
+        crate::llm::usage::Purpose::Repair
+    } else {
+        crate::llm::usage::Purpose::Agent
+    };
+    let previous = backend.set_usage_scope(Some(usage.for_purpose(purpose)));
+    let result = backend.record_discarded_response();
+    backend.set_usage_scope(previous);
+    result
+}
+
+#[cfg(test)]
+mod usage_join_tests {
+    use super::*;
+    use crate::llm::usage::{Purpose, Scope};
+
+    fn endpoint(model: &str) -> Backend {
+        Backend::new(
+            ProviderKind::Endpoint {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                model: model.into(),
+                api_key: None,
+            },
+            Default::default(),
+            5,
+        )
+    }
+
+    #[test]
+    fn replacement_backends_join_the_turn_ledger() {
+        let usage = Scope::default().next_turn(0).unwrap();
+        let mut backend = endpoint("fallback");
+        join_turn_usage(&usage, &mut backend);
+        backend.record_discarded_response().unwrap();
+        assert_eq!(usage.snapshot().0.all.discarded_attempts, 1);
+    }
+
+    #[test]
+    fn rejected_replies_are_discarded_under_their_requesting_purpose() {
+        let usage = Scope::default().next_turn(0).unwrap();
+        let mut backend = endpoint("primary");
+        record_rejected_reply(&usage, &mut backend, true).unwrap();
+        let (total, _) = usage.snapshot();
+        assert_eq!(total.by_purpose[&Purpose::Repair].discarded_attempts, 1);
+        assert!(!total.by_purpose.contains_key(&Purpose::Agent));
+    }
 }

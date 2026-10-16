@@ -844,14 +844,19 @@ impl ModelDownloads {
         });
     }
 
-    /// Reads Ollama's model list on a worker thread (a local listing; nothing is pulled).
+    /// Reads the model list of the Ollama endpoint setup uses (a configured `providers.ollama`, or
+    /// the local default) on a worker thread. Nothing is pulled. Without a layout nothing is listed.
     fn refresh_pulled(&mut self) {
+        let Some(source) = self.source.as_ref() else {
+            self.pulled = None;
+            self.pulled_rx = None;
+            return;
+        };
+        let layout = source.layout.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(
-                embeddings::installed_models(crate::llm::ollama::BASE_URL)
-                    .map_err(|error| format!("{error:#}")),
-            );
+            let _ = tx
+                .send(embeddings::configured_models(&layout).map_err(|error| format!("{error:#}")));
         });
         self.pulled_rx = Some(rx);
     }

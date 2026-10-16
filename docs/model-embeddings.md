@@ -19,18 +19,22 @@ Nothing downloads until you ask for it.
   also works.
 - `dial doctor --fix embeddings:<model>` previews and `--yes` runs the same setup from the shell.
 
-The setup starts Ollama if it is installed but not running. If Ollama is missing, it is installed
-through the dependency registry (Homebrew where available) when the registry knows how; otherwise the
-setup stops and shows the download page. It then pulls the model with Ollama's `/api/pull`, which
-streams progress and can be cancelled; Ollama checks each layer's digest. Only after the pull
-succeeds does Dial save the config:
+The setup uses the Ollama endpoint that `ollama` resolves to in config: the default local server, or a
+configured `providers.ollama` base URL with its headers and key (a trailing `/v1` is dropped). It starts
+Ollama if the program is installed but not running, and installs it only for the local default. If
+Ollama is missing, it is installed through the dependency registry (Homebrew where available) when the
+registry knows how; otherwise the setup stops and shows the download page. A remote server must already
+be running; the setup stops with a message when it is not reachable. It then pulls the model with
+Ollama's `/api/pull`, which streams progress and can be cancelled; Ollama checks each layer's digest.
+Only after the pull succeeds does Dial save the config:
 
 - `model_roles.embedding` is replaced as a whole with `provider = "ollama"`, `model = "<model>"`,
   using the same selection writer as the main model. Endpoint and authentication settings come
   from the selected Ollama provider, not the previous embedding role. Stale role-specific URL,
   key variable, custom headers, account and protocol settings are cleared. With the default
   Ollama provider this uses the local server and native `/api/embed`.
-- `memory.semantic.embedding` becomes `on` if it was `off`. `auto` and `on` are left as they are.
+- `memory.semantic.embedding` becomes `on` if it was `off`. `auto` and `on` are left as they are. If a
+  project setting still sets it to `off`, the setup says so instead of reporting `on`.
 - The explicit `embedding_base_url` / `embedding_model` overrides are not changed. They are
   OpenAI-compatible and still win over the role when both are set; clear them to use the role.
 - `memory.backend` is not changed. Semantic recall needs `memory.backend = "semantic"`; select it
@@ -125,3 +129,5 @@ the message names the protocol. Choose a model served over one of the three form
 - Role routes honour the chat endpoint's insecure-HTTP opt-in. Overrides require HTTPS, except on loopback.
 - Gemini: only `batchEmbedContents` is used. Task types and output dimensionality are not sent.
 - Ollama: `truncate:false` means overlong input fails instead of being cut silently.
+- Setup's Ollama pull is cancelled between progress frames. A stream that stops sending frames is not
+  interrupted until the connection fails.

@@ -192,6 +192,44 @@ Next priorities, contingent on measured traces rather than automatic adoption:
 4. Extract a shared prepared-call admission owner only if further parent/worker divergence is found.
    Do not expand the shared engine into a universal controller for persistence, UI, and role policy.
 
+## Executed results and release limits
+
+The broad affected-library run passed 595 tests, with two ignored tests and one failing new
+concurrency fixture. That fixture incorrectly used the hermetic runner, which intentionally hides
+extension tools. It was moved to the existing interactive integration fixture, where it passed.
+The temporary missing test import found during compilation was also corrected.
+
+The subsequent agent/architecture integration run passed 198 tests and failed 27. All three new
+integration regressions passed: `parent_schedules_nohook_reads_concurrently`,
+`batched_read_hook_rewrites_are_validated_and_authorized_without_a_model_retry`, and
+`read_batch_lookahead_does_not_execute_a_later_withheld_read`. The library run also passed the new
+child-rewrite, metadata-work-count, repair-authority, and source-provenance regressions. All four
+architecture boundary tests passed. Scoped formatting and diff whitespace checks passed.
+
+The remaining integration failures include changed recovery-stop expectations, dynamic tool
+exposure/prefix expectations, compaction thresholds, learning/replay, silent-stream recovery, and
+worker concurrency. Concurrent edits to those policies were visible during this review; a
+workspace-copy ownership move also temporarily prevented compilation and then settled without
+being reverted. No clean before/after baseline isolates all 27 failures. They are unresolved
+integration findings, not proven regressions from this patch and not assumed harmless stale tests.
+In particular, the silent-stream late-tool assertion needs investigation before release. This
+work does **not** establish a green full suite or release readiness.
+
+The source-snapshot microbenchmark passed with 258 files and 20 alternating samples per path:
+
+| Measurement | Full snapshot | Source-only snapshot |
+| --- | ---: | ---: |
+| Median elapsed, debug build | 16,061 microseconds | 15,804 microseconds |
+| Dependency outline bytes materialized | 435,009 | 0 |
+
+The 257-microsecond difference is small and is not treated as a statistically established speedup.
+The deterministic gain is one fewer unused index query/materialization and 435,009 avoided outline
+bytes in this fixture; fresh filesystem hashing still dominates. The planner's counting regressions
+establish one JS metadata resolution for three JS paths and one Go scan per directory for four Go
+paths. The hook-rewrite fixture completes within two provider requests rather than requiring a
+rewrite-retry request. These measurements do not establish better live-model task success or total
+turn latency. No paid/provider-backed A/B benchmark or hardware inference test was run.
+
 ## Primary sources read
 
 - OpenAI, [Unrolling the Codex agent loop](https://openai.com/index/unrolling-the-codex-agent-loop/),

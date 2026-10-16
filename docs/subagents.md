@@ -34,6 +34,13 @@ backend = "auto" # auto | clone | overlay | worktree | projfs | copy
 
 A named backend that is unavailable is an error that names the reason; Dial never falls back from a named backend silently.
 
+Copy and clone materialize in-root source symlinks. Directory cycle detection is path-local: both
+a real directory and its aliases retain their contents, regardless of enumeration order. Cycles
+stop at an empty directory; targets outside the project are refused, and excluded targets remain
+excluded. Repeated directory aliases consume extra space; source preflight limits do not account
+for this expansion. Generic dependency names such as `build` and `dist` are still excluded at any
+depth, even when tracked; this audit does not change that exclusion policy.
+
 If removing a worker's temporary worktree metadata or mount fails, the merge result reports a `cleanup` error with the path; it is not hidden. Deletions recorded by fuse-overlayfs (`.wh.<name>` files and `.wh..wh..opq` opaque markers) are understood as deletions when merging back, the same as kernel overlay whiteouts.
 
 The status line names the backend in use, for example `isolation backend: worktree`.

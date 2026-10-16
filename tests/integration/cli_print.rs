@@ -679,6 +679,52 @@ impl RpcChild {
 }
 
 #[test]
+fn rpc_history_pagination_rejects_invalid_input_without_losing_the_snapshot() {
+    let env = Env::new();
+    let server = Server::new(vec![text("pageable answer")]);
+    let mut rpc = RpcChild::start(&env, &server);
+    rpc.send(1, "send", json!({"text":"hello"}));
+    assert_eq!(rpc.result(1)["text"], "pageable answer");
+    rpc.send(2, "messages", json!({}));
+    let history = rpc.result(2)["messages"].as_array().unwrap().clone();
+    assert!(!history.is_empty());
+    for (id, params) in [
+        (3, json!({"cursor":"not-a-cursor"})),
+        (4, json!({"offset":-1})),
+        (5, json!({"limit":"all"})),
+    ] {
+        rpc.send(id, "messages_page", params);
+        loop {
+            let event = rpc.next();
+            if event["id"] == id {
+                assert!(event.get("error").is_some(), "{event}");
+                break;
+            }
+        }
+    }
+    let mut collected = Vec::new();
+    for offset in 0..history.len() {
+        let id = 10 + offset as u64;
+        rpc.send(
+            id,
+            "messages_page",
+            json!({"cursor":offset.to_string(),"limit":1}),
+        );
+        let page = rpc.result(id);
+        assert_eq!(page["total"], history.len());
+        assert_eq!(page["offset"], offset);
+        assert_eq!(
+            page["next_offset"],
+            json!((offset + 1 < history.len()).then_some(offset + 1))
+        );
+        collected.extend(page["messages"].as_array().unwrap().iter().cloned());
+    }
+    assert_eq!(collected, history);
+    rpc.send(1000, "shutdown", json!({}));
+    rpc.result(1000);
+}
+
+#[test]
 fn rpc_projects_shared_results_and_exposes_a_resolvable_execution_tree() {
     let env = Env::new();
     let server = Server::new(vec![

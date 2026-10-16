@@ -384,10 +384,13 @@ fn file_id(name: &str) -> Option<&str> {
 
 // ---------------------------------------------------------------- file helpers
 
-/// Removes a partially moved session: its stream journal first, then the main file. Source files
-/// are never touched. Best effort; the caller already has the error to report.
-fn discard_moved_copy(dst: &Path) {
-    let _ = crate::runtime::stream_journal::remove(dst);
+/// Removes a partially moved session. The move created the main file, so it always goes. The stream
+/// journal goes only when the move created it: a pre-existing journal at the destination is not ours.
+/// Source files are never touched. Best effort; the caller already has the error to report.
+fn discard_moved_copy(dst: &Path, streams_created: bool) {
+    if streams_created {
+        let _ = crate::runtime::stream_journal::remove(dst);
+    }
     let _ = fs::remove_file(dst);
 }
 
@@ -742,15 +745,25 @@ impl Session {
         let mut file =
             platform_fs::open_owner_only(OpenOptions::new().append(true).create_new(true), &path)
                 .with_context(|| format!("creating session {}", path.display()))?;
-        FileExt::try_lock_exclusive(&file).context("claiming new session writer")?;
-        file.write_all(format!("{header}\n").as_bytes())
-            .context("writing session header")?;
+        let created = (|| -> Result<crate::runtime::stream_journal::Journal> {
+            FileExt::try_lock_exclusive(&file).context("claiming new session writer")?;
+            file.write_all(format!("{header}\n").as_bytes())
+                .context("writing session header")?;
+            Ok(crate::runtime::stream_journal::Journal::create_new(&path)?)
+        })();
+        let journal = match created {
+            Ok(journal) => journal,
+            Err(error) => {
+                // This call created the session file, so a failed claim or header leaves nothing behind.
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        let runtime = crate::runtime::Tree::default();
+        runtime.journal(journal);
         Ok(Session {
-            runtime: {
-                let tree = crate::runtime::Tree::default();
-                tree.journal(crate::runtime::stream_journal::Journal::open(&path)?);
-                tree
-            },
+            runtime,
             id,
             model: model.to_string(),
             started,
@@ -1129,8 +1142,14 @@ impl Session {
             path.display()
         );
         drop(self);
-        crate::runtime::stream_journal::remove(&path)?;
-        fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))
+        // The main file goes first: if its removal fails, the session and its streams both survive.
+        fs::remove_file(&path).with_context(|| format!("deleting {}", path.display()))?;
+        crate::runtime::stream_journal::remove(&path).with_context(|| {
+            format!(
+                "session {} was deleted but its stream journal could not be removed",
+                path.display()
+            )
+        })
     }
 
     /// Copies this journal into `target`'s sessions directory with the header cwd rewritten,
@@ -1185,14 +1204,14 @@ impl Session {
         })();
         drop(out);
         if let Err(err) = written {
-            discard_moved_copy(&dst);
+            discard_moved_copy(&dst, false);
             return Err(err).context("writing moved session");
         }
         if let Err(error) = crate::runtime::stream_journal::copy(src, &dst) {
-            discard_moved_copy(&dst);
+            discard_moved_copy(&dst, false);
             return Err(error);
         }
-        reopen(dst.as_path()).inspect_err(|_| discard_moved_copy(&dst))
+        reopen(dst.as_path()).inspect_err(|_| discard_moved_copy(&dst, true))
     }
 
     /// Workspace roots added beyond the project root, as recorded in the session header.
@@ -3570,6 +3589,88 @@ mod tests {
         assert_eq!(body.result.text, "visible prefix");
         drop(answer);
         drop(tree);
+    }
+
+    #[test]
+    fn relocation_refuses_a_preexisting_stream_journal_and_leaves_it_untouched() {
+        let e = env();
+        let mut session = new_session(&e);
+        session.append(user("stream until interrupted")).unwrap();
+        let tree = session.runtime();
+        let answer = tree.start("assistant", "answer", None);
+        answer.append("visible prefix");
+        let src = session.path().unwrap().to_owned();
+        let src_bytes = fs::read(&src).unwrap();
+        let src_streams = crate::runtime::stream_journal::path(&src);
+        let src_streams_bytes = fs::read(&src_streams).unwrap();
+        // Another session's journal already sits where the moved copy would go; it is not ours.
+        let other = new_session(&e);
+        let other_tree = other.runtime();
+        let other_answer = other_tree.start("assistant", "other", None);
+        other_answer.append("unrelated observation");
+        let orphan = fs::read(crate::runtime::stream_journal::path(other.path().unwrap())).unwrap();
+        assert!(!orphan.is_empty());
+        let target_project = tempfile::tempdir().unwrap();
+        let target =
+            Layout::with_user_dir(target_project.path(), e._home.path().join("dial")).unwrap();
+        private_dir(&target.sessions_dir()).unwrap();
+        let dst = target.sessions_dir().join(src.file_name().unwrap());
+        let dst_streams = crate::runtime::stream_journal::path(&dst);
+        fs::write(&dst_streams, &orphan).unwrap();
+        assert!(
+            session.relocate_to(&target).is_err(),
+            "a foreign stream journal must not be adopted"
+        );
+        assert!(!dst.exists(), "the moved main file must be removed");
+        assert_eq!(fs::read(&dst_streams).unwrap(), orphan);
+        assert_eq!(fs::read(&src).unwrap(), src_bytes);
+        assert_eq!(fs::read(&src_streams).unwrap(), src_streams_bytes);
+        drop(answer);
+        drop(tree);
+        drop(other_answer);
+        drop(other_tree);
+    }
+
+    #[test]
+    fn empty_session_relocation_cannot_adopt_an_orphan_stream_journal() {
+        let e = env();
+        let session = new_session(&e);
+        let src = session.path().unwrap();
+        let before = fs::read(src).unwrap();
+        assert!(
+            crate::runtime::stream_journal::recover(src)
+                .unwrap()
+                .is_empty()
+        );
+        let target_project = tempfile::tempdir().unwrap();
+        let target =
+            Layout::with_user_dir(target_project.path(), e._home.path().join("dial")).unwrap();
+        private_dir(&target.sessions_dir()).unwrap();
+        let dst = target.sessions_dir().join(src.file_name().unwrap());
+        let streams = crate::runtime::stream_journal::path(&dst);
+        fs::write(&streams, b"unrelated journal\n").unwrap();
+        assert!(session.relocate_to(&target).is_err());
+        assert!(!dst.exists());
+        assert_eq!(fs::read(&streams).unwrap(), b"unrelated journal\n");
+        assert_eq!(fs::read(src).unwrap(), before);
+    }
+
+    #[test]
+    fn discarding_a_moved_copy_removes_only_stream_journals_the_move_created() {
+        let e = env();
+        let dir = e.layout.sessions_dir();
+        private_dir(&dir).unwrap();
+        let dst = dir.join("moved.jsonl");
+        let streams = crate::runtime::stream_journal::path(&dst);
+        fs::write(&dst, b"moved\n").unwrap();
+        fs::write(&streams, b"foreign\n").unwrap();
+        discard_moved_copy(&dst, false);
+        assert!(!dst.exists());
+        assert_eq!(fs::read(&streams).unwrap(), b"foreign\n");
+        fs::write(&dst, b"moved\n").unwrap();
+        discard_moved_copy(&dst, true);
+        assert!(!dst.exists());
+        assert!(!streams.exists());
     }
 
     #[cfg(unix)]

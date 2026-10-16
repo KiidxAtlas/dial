@@ -64,16 +64,31 @@ pub(crate) fn remove(session: &Path) -> std::io::Result<()> {
         result => result,
     }
 }
+/// Copies recovered frames into an exclusively created, durable journal. Even an empty source
+/// reserves the destination, so reopening the session cannot adopt an unrelated stream journal.
+/// Failure removes only a destination this call created.
 pub(crate) fn copy(source: &Path, destination: &Path) -> anyhow::Result<()> {
     let nodes = recover(source)?;
-    if nodes.is_empty() {
-        return Ok(());
+    let journal = Journal::create_new(destination).map_err(|error| {
+        anyhow::anyhow!(
+            "creating stream journal {}: {error}",
+            path(destination).display()
+        )
+    })?;
+    for node in &nodes {
+        journal.snapshot(node);
     }
-    let journal = Journal::open(destination)?;
-    for node in nodes {
-        journal.snapshot(&node);
+    let durable = journal
+        .check()
+        .map_err(anyhow::Error::msg)
+        .and_then(|()| journal.sync().map_err(anyhow::Error::from));
+    drop(journal);
+    if let Err(error) = durable {
+        // This call created the file, so it is the only owner entitled to remove it.
+        let _ = remove(destination);
+        return Err(error);
     }
-    journal.check().map_err(anyhow::Error::msg)
+    Ok(())
 }
 pub(crate) fn relocate(source: &Path, destination: &Path) -> std::io::Result<()> {
     let source = path(source);
@@ -119,6 +134,13 @@ impl Journal {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).file = read_only;
     }
     pub fn open(session: &Path) -> std::io::Result<Self> {
+        Self::open_with(session, false)
+    }
+    /// Creates the journal of a new session. An existing file is refused rather than adopted.
+    pub fn create_new(session: &Path) -> std::io::Result<Self> {
+        Self::open_with(session, true)
+    }
+    fn open_with(session: &Path, exclusive: bool) -> std::io::Result<Self> {
         let path = path(session);
         let path = path
             .parent()
@@ -130,7 +152,7 @@ impl Journal {
             );
         let mut writers = WRITERS.lock().unwrap_or_else(|poison| poison.into_inner());
         writers.retain(|_, writer| writer.strong_count() > 0);
-        if let Some(existing) = writers.get(&path).and_then(Weak::upgrade) {
+        if !exclusive && let Some(existing) = writers.get(&path).and_then(Weak::upgrade) {
             let writer = existing.lock().unwrap_or_else(|poison| poison.into_inner());
             if crate::platform::fs::identity(&writer.file)?
                 != crate::platform::fs::path_identity(&path)?
@@ -143,7 +165,12 @@ impl Journal {
             return Ok(Self(existing));
         }
         let mut options = std::fs::OpenOptions::new();
-        options.append(true).read(true).create(true);
+        options.append(true).read(true);
+        if exclusive {
+            options.create_new(true);
+        } else {
+            options.create(true);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -208,6 +235,14 @@ impl Journal {
             .error
             .clone()
             .map_or(Ok(()), Err)
+    }
+    /// Makes the frames written so far durable. Relocation syncs before it retires the source.
+    pub fn sync(&self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .file
+            .sync_all()
     }
     pub fn needs_reclamation(&self) -> bool {
         self.0
@@ -404,5 +439,26 @@ mod reclamation_tests {
         assert!(recover(&session).is_err());
         assert!(Journal::open(&session).is_err());
         assert_eq!(std::fs::read(path(&session)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn copy_creates_only_a_fresh_destination_and_keeps_an_existing_one() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jsonl");
+        let destination = root.path().join("copy.jsonl");
+        // Empty sources still reserve the destination and refuse an existing journal.
+        copy(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(path(&destination)).unwrap(), b"");
+        assert!(copy(&source, &destination).is_err());
+        remove(&destination).unwrap();
+        let journal = Journal::open(&source).unwrap();
+        let tree = crate::runtime::Tree::default();
+        tree.journal(journal.clone());
+        let body = tree.start("assistant", "live", None);
+        body.append("kept");
+        copy(&source, &destination).unwrap();
+        let before = std::fs::read(path(&destination)).unwrap();
+        assert!(copy(&source, &destination).is_err());
+        assert_eq!(std::fs::read(path(&destination)).unwrap(), before);
     }
 }

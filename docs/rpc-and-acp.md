@@ -35,6 +35,11 @@ a short timeout. Connection establishment and partial writes still use their con
 
 RPC `state` replies come from one worker-owned projection, the same one the worker uses, and never include message history; read `messages` or `messages_page` for history. Typed RPC `notice` events keep their plain `message` and add `kind`, `lane` (`context`, `divider` or `alert`) and `tokens` as additive fields. Plain notices remain valid without these fields.
 
+`messages_page` accepts an unsigned `offset` or a decimal-string `cursor` (offset takes precedence),
+and an unsigned `limit` defaulting to 50 and clamped to 1–500. Invalid types, malformed cursors and
+offsets past the snapshot end are errors, not a silent restart at page zero. An offset at the end
+returns an empty page with no next offset.
+
 ## Persistent RPC and ACP transports
 
 `dial rpc` is a persistent version-1 JSON-lines control endpoint. Requests have `id`, `method` and `params`;
@@ -53,3 +58,12 @@ capabilities. Both automation transports use bounded serialized stdout and stop 
 or broken consumers instead of reporting partially delivered success.
 
 ACP renders `notice`, `background` and `fatal` events as unchanged `agent_message_chunk` text. Each chunk also carries standard `_meta.dial` with `event` and, only when present, `kind`, `lane`, `tokens`, `name` and `replace`, so clients can tell sources apart. This is metadata preservation only; ACP does not implement client-side replacement of background output.
+
+ACP correlates tool calls and final results by the RPC `call_id`, not the tool name, so overlapping
+calls to the same tool retain distinct output and completion status. Name-only legacy output is
+attached to the latest active call of that name; it does not override explicit call identities.
+
+In-flight ACP request IDs are rejected before prompt preparation or cancellation has side effects.
+Cancellation requests with IDs receive their own replies; cancellation notifications never produce
+responses and cannot consume the pending prompt's final response. Cancelling a parked session does
+not interrupt the active session.
