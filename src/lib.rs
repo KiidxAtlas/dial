@@ -3,7 +3,7 @@ pub mod agent;
 pub mod app;
 pub mod benchmark;
 pub mod browser_relay;
-pub mod build_info;
+pub use dial_build_info::build_info;
 pub mod changelog;
 pub(crate) mod commit;
 pub mod computer;
