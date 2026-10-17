@@ -1,5 +1,5 @@
 use super::*;
-use crate::llm::local_format::gguf_metadata_tests::{header, string, uint32};
+use crate::llm::local_format::gguf_fixtures::{header, string, uint32};
 
 #[test]
 fn gguf_models_are_sized_from_their_header_and_file() {

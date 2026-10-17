@@ -908,7 +908,7 @@ fn idle_unload_stops_a_resident_server_without_a_background_request() {
     }
     let (_h, _p, layout, mut config) = config();
     std::fs::create_dir_all(&layout.user_dir).unwrap();
-    let python = crate::llm::server::tests::fake_python(&layout.user_dir);
+    let python = crate::llm::server::fixtures::fake_python(&layout.user_dir);
     config.python = python.clone();
     config.endpoint = None;
     config.provider = Some("mlx".into());
@@ -1000,7 +1000,7 @@ fn compute_action_release_unloads_a_resident_server_only_when_started() {
     }
     let (_h, _p, layout, mut config) = config();
     std::fs::create_dir_all(&layout.user_dir).unwrap();
-    let python = crate::llm::server::tests::fake_python(&layout.user_dir);
+    let python = crate::llm::server::fixtures::fake_python(&layout.user_dir);
     config.python = python.clone();
     config.endpoint = None;
     config.provider = Some("mlx".into());

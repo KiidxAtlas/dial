@@ -7,11 +7,11 @@ pub use dial_build_info::build_info;
 pub mod changelog;
 pub(crate) mod commit;
 pub mod computer;
-pub mod config;
+pub use dial_llm::config;
 pub mod extensions;
 pub(crate) mod git_panel;
 pub mod learn;
-pub mod llm;
+pub use dial_llm::llm;
 
 pub mod embedded_shell;
 pub mod repl;
@@ -34,9 +34,6 @@ pub mod reliability;
 pub mod stats;
 pub mod telemetry;
 pub mod voice;
-
-#[cfg(test)]
-mod tls_provider_tests;
 
 pub use dial_core::{flush_stdout_on_exit, install_tls_provider, platform, runtime};
 pub(crate) use dial_core::{hex, output, workspace_copy};

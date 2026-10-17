@@ -1,7 +1,7 @@
 use super::*;
 use crate::llm::{
     self,
-    server::{ServerProfile, ensure_profile_tracked, tests::fake_python},
+    server::{ServerProfile, ensure_profile_tracked, fixtures::fake_python},
 };
 use serde_json::json;
 #[cfg(target_os = "macos")]

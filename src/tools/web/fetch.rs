@@ -7,6 +7,10 @@
 //! * One overall deadline across all hops, and a cap on how much of the body is read.
 
 use super::guard::GuardedResolver;
+#[cfg(test)]
+use dial_llm::url::MAX_URL_LEN;
+use dial_llm::url::has_scheme;
+pub use dial_llm::url::parse_url;
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +26,6 @@ pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// How often a blocked request re-checks the interrupt flag.
 const INTERRUPT_POLL: Duration = Duration::from_millis(50);
-const MAX_URL_LEN: usize = 2048;
 pub const USER_AGENT: &str = concat!(
     "dial-agent/",
     env!("CARGO_PKG_VERSION"),
@@ -241,35 +244,6 @@ impl Client {
     }
 }
 
-/// Validate a model- or config-supplied URL: http(s), a host, no embedded credentials.
-pub fn parse_url(url: &str) -> Result<Uri, String> {
-    let url = url.trim();
-    if url.len() > MAX_URL_LEN {
-        return Err(format!("URL is longer than {MAX_URL_LEN} characters"));
-    }
-    if has_scheme(url) {
-        let scheme = url
-            .split(':')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
-            return Err(format!(
-                "unsupported URL scheme {scheme:?}; only http and https are allowed"
-            ));
-        }
-    }
-    let uri: Uri = url.parse().map_err(|_| "not a valid URL".to_string())?;
-    if uri.scheme_str().is_none() {
-        return Err("URL must be absolute and start with http:// or https://".into());
-    }
-    let authority = uri.authority().ok_or("URL has no host")?;
-    if authority.as_str().contains('@') {
-        return Err("URLs with embedded credentials are not allowed".into());
-    }
-    Ok(uri)
-}
-
 fn origin(uri: &Uri) -> (Option<&str>, Option<&str>, Option<u16>) {
     let default_port = if uri.scheme_str() == Some("https") {
         443
@@ -352,19 +326,6 @@ pub fn resolve_url(base: &str, reference: &str) -> Option<String> {
         url.push_str(query);
     }
     Some(url)
-}
-
-fn has_scheme(reference: &str) -> bool {
-    let Some((scheme, _)) = reference.split_once(':') else {
-        return false;
-    };
-    scheme
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Remove `.` and `..` segments (RFC 3986 section 5.2.4), keeping a trailing slash.

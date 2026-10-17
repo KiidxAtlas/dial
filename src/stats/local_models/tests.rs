@@ -79,7 +79,7 @@ fn missing_stats_and_stores_are_unknown_not_errors() {
 
 #[test]
 fn unknown_memory_reports_unknown_fit_and_gguf_is_sized_from_its_header() {
-    use crate::llm::local_format::gguf_metadata_tests::{header, string, uint32};
+    use crate::llm::local_format::gguf_fixtures::{header, string, uint32};
     let root = tempfile::tempdir().unwrap();
     let model = root.path().join("m");
     write_mlx(&model);
