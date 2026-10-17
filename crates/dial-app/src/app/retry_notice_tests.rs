@@ -1,4 +1,4 @@
-use super::RetryNotice;
+use crate::app::notices::RetryNotice;
 
 #[test]
 fn retry_notices_are_recognized_and_other_text_is_not() {

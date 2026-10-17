@@ -1,5 +1,49 @@
 use super::*;
+use crate::agent::Agent;
+use crate::agent::window::context;
+use crate::app::command_registry::{BUILTIN_COMMANDS, command_entries, palette_entries};
+use crate::app::completions::command_argument_completions;
+use crate::app::core::App;
+use crate::app::discovery::{Catalog, ProbeLease};
+use crate::app::display::{config_key, local_time, terminal_dark};
+use crate::app::drive::sign_in_still_pending;
+use crate::app::git::{StatusCache, parse_file_diffs, parse_status};
+use crate::app::improve_view::improve_summary;
+use crate::app::learning::{Learning, lora_state};
+use crate::app::notices::{memory_age, memory_status_text};
+use crate::app::overlay::compute::{compute_starts, overlay_compute_release};
+use crate::app::overlay::{Which, overlay_destination, work_panel};
+use crate::app::panel::{panel_body_limit, panel_inner, panel_rows_window, panel_scroll};
+use crate::app::selection::{
+    PendingFavorite, clear_role_changes, model_settings_profile, next_favorite, reasoning_changes,
+    reasoning_profile, thinking_label,
+};
+use crate::app::shell::Shell;
+use crate::config::paths::Layout;
+use crate::config::selection::changes as selection_changes;
+use crate::config::settings_store::{self, Change, Scope};
+use crate::config::types::{Approval, Config};
+use crate::learn::auto;
+use crate::llm::catalog;
+use crate::llm::model_config::{ModelSelection, UiConfig};
+use crate::storage::session::{Session, SessionMeta};
+use crate::storage::skills;
+use crate::storage::store::Store;
+use crate::ui::composer::CommandKind;
+use crate::ui::keys::{Action, Keymap};
+use crate::ui::overlay::palette::PaletteOverlay;
+use crate::ui::overlay::{DrawCtx, OverlayEvent};
+use crate::ui::status::{Lora, StatusData};
+use crate::ui::text;
+use crate::ui::theme::Sym;
+use crossterm::event::{Event, KeyCode};
 use fs2::FileExt;
+use ratatui::text::Line;
+use serde_json::{Value, json};
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
 #[test]
 fn overlay_navigation_opens_roles_directly_in_every_lifecycle() {

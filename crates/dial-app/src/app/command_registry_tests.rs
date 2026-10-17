@@ -1,5 +1,18 @@
 use super::*;
+use crate::app::command_registry::{
+    BUILTIN_COMMANDS, COMMAND_ALIASES, RUNS_NOW, RUNS_NOW_ARGS, STOPS_TURN, canonical_command,
+    command_entries, during_turn_note,
+};
+use crate::app::core::App;
+use crate::app::overlay::auth::{AuthJob, PreparedModel};
+use crate::app::overlay::env::settings_tables;
+use crate::app::shell::Shell;
+use crate::config::selection::changes as selection_changes;
+use crate::config::settings_store::{self, Scope};
+use crate::llm::model_config::ModelSelection;
 use crate::ui::command_surface::{EVERYDAY, START_HERE, STARTERS};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// A name a user can type that dispatches to a real command, not counting aliases.
 fn registered(name: &str) -> bool {
