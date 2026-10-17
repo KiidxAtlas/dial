@@ -577,7 +577,7 @@ pub fn split(
         state.rounds.is_empty(),
         "The split is frozen once rounds exist; re-splitting would invalidate every gated round"
     );
-    let seed = seed.unwrap_or_else(|| rand::random::<u32>());
+    let seed = seed.unwrap_or_else(rand::random::<u32>);
     let mut random = mulberry32(seed);
 
     let mut buckets: Vec<(&str, Vec<String>)> = Vec::new();

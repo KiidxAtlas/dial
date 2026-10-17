@@ -600,7 +600,7 @@ fn file_stem(path: &Path) -> String {
 }
 
 fn newest_first(mut list: Vec<Candidate>) -> Vec<Candidate> {
-    list.sort_by(|a, b| b.modified.cmp(&a.modified));
+    list.sort_by_key(|candidate| std::cmp::Reverse(candidate.modified));
     list
 }
 
@@ -717,10 +717,11 @@ pub fn import_file(layout: &Layout, source: Source, path: &Path) -> Result<Impor
         Source::Codex => convert_codex(&records),
     };
     t.skip_n("malformed line", malformed);
-    if source == Source::Codex && t.title.is_none() {
-        if let Some(id) = &t.source_id {
-            t.title = codex_index(&codex_root()).remove(id);
-        }
+    if source == Source::Codex
+        && t.title.is_none()
+        && let Some(id) = &t.source_id
+    {
+        t.title = codex_index(&codex_root()).remove(id);
     }
     let source_id = t.source_id.clone();
     let skipped = t.skipped_summary();

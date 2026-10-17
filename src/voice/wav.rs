@@ -42,10 +42,13 @@ pub fn encode_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 /// Decode signed 16-bit little-endian PCM into float samples, appending to `out`. A trailing odd
 /// byte is returned so the caller can prepend it to the next chunk.
 pub fn pcm16le_into(bytes: &[u8], out: &mut Vec<f32>) -> Option<u8> {
-    let pairs = bytes.chunks_exact(2);
-    let rest = pairs.remainder().first().copied();
-    out.extend(pairs.map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0));
-    rest
+    let (pairs, rest) = bytes.as_chunks::<2>();
+    out.extend(
+        pairs
+            .iter()
+            .map(|&pair| i16::from_le_bytes(pair) as f32 / 32768.0),
+    );
+    rest.first().copied()
 }
 
 /// Average interleaved frames of `channels` samples into mono, appending to `out`.

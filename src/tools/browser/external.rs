@@ -192,13 +192,12 @@ fn cmux_action(
     if action == "open" {
         let url = str_arg(args, "url")?;
         let opened = client.open_split(url, None, None).map_err(err)?;
-        if url != "about:blank" {
-            if let Err(error) =
+        if url != "about:blank"
+            && let Err(error) =
                 client.wait_for_load(&opened.surface_id, "complete", LOAD_TIMEOUT_MS)
-            {
-                let _ = client.close_surface(&opened.surface_id);
-                return Err(err(error));
-            }
+        {
+            let _ = client.close_surface(&opened.surface_id);
+            return Err(err(error));
         }
         tabs.push(Tab {
             tab: json!(opened.surface_id),
@@ -280,11 +279,11 @@ fn tern_action(
         let id = client
             .open_tab(owner, TERN_VIEWPORT.0, TERN_VIEWPORT.1)
             .map_err(err)?;
-        if url != "about:blank" {
-            if let Err(error) = client.goto(id, url) {
-                let _ = client.close_tab(id);
-                return Err(err(error));
-            }
+        if url != "about:blank"
+            && let Err(error) = client.goto(id, url)
+        {
+            let _ = client.close_tab(id);
+            return Err(err(error));
         }
         tabs.push(Tab {
             tab: json!(id),

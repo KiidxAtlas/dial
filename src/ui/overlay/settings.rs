@@ -1473,12 +1473,12 @@ impl SettingsOverlay {
                     let basic = defs
                         .iter()
                         .enumerate()
-                        .filter(|(_, d)| in_section(*d) && !self.advanced(d.path))
+                        .filter(|(_, d)| in_section(d) && !self.advanced(d.path))
                         .map(|(i, _)| Row::Setting(i));
                     let advanced: Vec<usize> = defs
                         .iter()
                         .enumerate()
-                        .filter(|(_, d)| in_section(*d) && self.advanced(d.path))
+                        .filter(|(_, d)| in_section(d) && self.advanced(d.path))
                         .map(|(i, _)| i)
                         .collect();
                     rows.extend(basic);
@@ -1486,7 +1486,7 @@ impl SettingsOverlay {
                         continue;
                     }
                     let open = self.advanced_open.contains(&(*tab, *section));
-                    rows.push(Row::Advanced(*tab, *section, advanced.len()));
+                    rows.push(Row::Advanced(tab, section, advanced.len()));
                     if open {
                         rows.extend(advanced.into_iter().map(Row::Setting));
                     }

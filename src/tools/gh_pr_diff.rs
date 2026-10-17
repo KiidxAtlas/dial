@@ -67,7 +67,7 @@ pub fn parse_pr_url(target: &str) -> Option<PrTarget> {
     let base = usize::from(host.is_some());
     let owner = *segs.get(base)?;
     let name = *segs.get(base + 1)?;
-    let number = parse_number(*segs.get(base + 2)?)?;
+    let number = parse_number(segs.get(base + 2)?)?;
     let slug = format!("{owner}/{name}");
     valid_repo(&slug).ok()?;
     let repo = match host {
@@ -361,10 +361,10 @@ fn api_args(host_args: &[String], path: &str, extra: Vec<String>) -> Vec<String>
 
 /// Split `[HOST/]OWNER/REPO` into the optional host and the `OWNER/REPO` slug.
 fn split_host(repo: &str) -> (Option<&str>, &str) {
-    if repo.matches('/').count() == 2 {
-        if let Some((host, slug)) = repo.split_once('/') {
-            return (Some(host), slug);
-        }
+    if repo.matches('/').count() == 2
+        && let Some((host, slug)) = repo.split_once('/')
+    {
+        return (Some(host), slug);
     }
     (None, repo)
 }

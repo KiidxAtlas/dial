@@ -363,10 +363,10 @@ impl Anonymizer {
         if is_flag(word) {
             return word.to_string();
         }
-        if let Some((flag, value)) = word.split_once('=') {
-            if is_flag(flag) {
-                return format!("{flag}={}", self.value_word(value));
-            }
+        if let Some((flag, value)) = word.split_once('=')
+            && is_flag(flag)
+        {
+            return format!("{flag}={}", self.value_word(value));
         }
         if program_position && is_label(word) {
             return word.to_string();

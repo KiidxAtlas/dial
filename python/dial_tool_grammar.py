@@ -38,7 +38,7 @@ ARGUMENTS = object()  # Wrapper "arguments": resolved from the "name" already em
 
 
 class _Spec:
-    __slots__ = ("types", "enum", "props", "required", "closed", "items")
+    __slots__ = ("closed", "enum", "items", "props", "required", "types")
 
     def __init__(self, types=None, enum=None, props=None, required=frozenset(), closed=False,
                  items=None):
@@ -120,7 +120,7 @@ class _Value:
 
 
 class _Object:
-    __slots__ = ("spec", "phase", "seen", "key", "values")
+    __slots__ = ("key", "phase", "seen", "spec", "values")
 
     def __init__(self, s):
         self.spec, self.phase, self.seen, self.key, self.values = s, "first", set(), None, {}
@@ -136,7 +136,7 @@ class _Object:
 
 
 class _Array:
-    __slots__ = ("spec", "phase")
+    __slots__ = ("phase", "spec")
 
     def __init__(self, s):
         self.spec, self.phase = s, "first"
@@ -148,7 +148,7 @@ class _Array:
 
 
 class _String:
-    __slots__ = ("key", "allowed", "buf", "esc")
+    __slots__ = ("allowed", "buf", "esc", "key")
 
     def __init__(self, key, allowed, track):
         self.key, self.allowed, self.esc = key, allowed, 0
@@ -195,7 +195,7 @@ class _Literal:
 
 class JsonMatcher:
     """Incremental, cloneable recognizer for one JSON value under a (subset) JSON Schema."""
-    __slots__ = ("stack", "ws", "tools")
+    __slots__ = ("stack", "tools", "ws")
 
     def __init__(self, root, tools=None):
         self.stack = [_Value(root)]
@@ -458,7 +458,7 @@ class _Tagged(_Stateful):
     schema checks as `json_tools`. Plain values must be JSON literals.
     """
 
-    __slots__ = ("schemas", "quote", "quote_keys", "forbid", "stage", "buf", "j", "mode", "pend")
+    __slots__ = ("buf", "forbid", "j", "mode", "pend", "quote", "quote_keys", "schemas", "stage")
     HEAD = "call:"
 
     def __init__(self, schemas, quote, quote_keys, forbid):
@@ -539,7 +539,7 @@ class _Glm(_Stateful):
     type must be a JSON prefix of that type. The call ends only at the closing marker.
     """
 
-    __slots__ = ("schemas", "stage", "buf", "spec", "key", "seen", "mode", "enum", "j", "pend")
+    __slots__ = ("buf", "enum", "j", "key", "mode", "pend", "schemas", "seen", "spec", "stage")
 
     def __init__(self, schemas):
         self.schemas, self.stage, self.buf = schemas, "name", ""
@@ -649,7 +649,7 @@ class _Mistral(_Stateful):
     Open-ended: the parser reads no closing marker, so the call ends once its JSON is complete.
     """
 
-    __slots__ = ("schemas", "stage", "buf", "j", "pend")
+    __slots__ = ("buf", "j", "pend", "schemas", "stage")
     ARGS = "[ARGS]"
 
     def __init__(self, schemas):
@@ -691,7 +691,7 @@ class _Mistral(_Stateful):
 class _Format:
     """How one mlx-lm tool-parser format is constrained."""
 
-    __slots__ = ("make", "literals", "open_ended")
+    __slots__ = ("literals", "make", "open_ended")
 
     def __init__(self, make, literals=(), open_ended=False):
         self.make, self.literals, self.open_ended = make, tuple(literals), open_ended

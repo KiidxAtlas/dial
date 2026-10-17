@@ -108,7 +108,7 @@ fn content(value: &Value, vision: bool) -> Result<Vec<Value>> {
                 );
                 ensure!(
                     !data.is_empty()
-                        && data.len() <= ((super::images::MAX_IMAGE_BYTES as usize + 2) / 3) * 4,
+                        && data.len() <= (super::images::MAX_IMAGE_BYTES as usize).div_ceil(3) * 4,
                     "Gemini inline image is empty or exceeds 5 MiB"
                 );
                 parts.push(json!({"inlineData":{"mimeType":mime,"data":data}}));
@@ -851,7 +851,7 @@ pub(super) fn exchange_at(
     let body = request(&endpoint, req, profile, &scope)?;
     let patience = Patience::for_stream(
         timeout_secs,
-        super::host_of(&url).is_some_and(|host| super::is_local_host(&host)),
+        super::host_of(url).is_some_and(|host| super::is_local_host(&host)),
     );
     let mut headers = endpoint.headers.to_vec();
     if let Some(key) = endpoint.auth {
@@ -864,7 +864,7 @@ pub(super) fn exchange_at(
         );
     }
     let mut response = super::send_with_headers(
-        &url,
+        url,
         None,
         &body,
         timeout_secs,

@@ -105,10 +105,9 @@ fn generate_fast_workflow(
         &diff,
         &scope_candidates,
         user_context,
-    ) {
-        if validate_commit_message(&commit, config, input.stat, &[]).ok() {
-            return Ok(commit);
-        }
+    ) && validate_commit_message(&commit, config, input.stat, &[]).ok()
+    {
+        return Ok(commit);
     }
     let analysis = analysis_with_map_reduce(
         inference,

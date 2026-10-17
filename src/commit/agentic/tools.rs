@@ -586,7 +586,7 @@ fn git_file_diff(env: &mut ToolEnv<'_>, args: &Json) -> Result<String, String> {
         let diff = file_diff(env, file, staged)?;
         sections.push((file_priority(file), file.clone(), truncate_lines(&diff)));
     }
-    sections.sort_by(|a, b| b.0.cmp(&a.0));
+    sections.sort_by_key(|section| std::cmp::Reverse(section.0));
     let rendered: Vec<String> = sections
         .iter()
         .map(|(_, file, content)| format!("=== {file} ===\n{content}"))
@@ -647,26 +647,26 @@ struct Subject {
 /// Parse `type(scope): summary`; anything else keeps the trimmed subject as the summary.
 fn parse_subject(subject: &str) -> Subject {
     let trimmed = subject.trim();
-    if let Some((head, rest)) = trimmed.split_once(':') {
-        if rest.starts_with(char::is_whitespace) {
-            let head = head.trim();
-            let (ty, scope) = match head.find('(') {
-                Some(open) if head.ends_with(')') => {
-                    (&head[..open], Some(&head[open + 1..head.len() - 1]))
-                }
-                _ => (head, None),
-            };
-            if !ty.is_empty() && ty.chars().all(|c| c.is_ascii_alphabetic()) {
-                return Subject {
-                    subject: trimmed.to_owned(),
-                    commit_type: Some(ty.to_owned()),
-                    scope: scope
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned),
-                    summary: rest.trim().to_owned(),
-                };
+    if let Some((head, rest)) = trimmed.split_once(':')
+        && rest.starts_with(char::is_whitespace)
+    {
+        let head = head.trim();
+        let (ty, scope) = match head.find('(') {
+            Some(open) if head.ends_with(')') => {
+                (&head[..open], Some(&head[open + 1..head.len() - 1]))
             }
+            _ => (head, None),
+        };
+        if !ty.is_empty() && ty.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Subject {
+                subject: trimmed.to_owned(),
+                commit_type: Some(ty.to_owned()),
+                scope: scope
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
+                summary: rest.trim().to_owned(),
+            };
         }
     }
     Subject {

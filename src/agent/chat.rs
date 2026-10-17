@@ -16,7 +16,7 @@ pub(super) enum ChatEvent {
         delta: String,
     },
     Notice(String),
-    Finished(Result<llm::Reply>),
+    Finished(Box<Result<llm::Reply>>),
 }
 
 /// Run blocking work on a scoped thread while the UI keeps painting and taking input (interrupts,
@@ -310,7 +310,7 @@ pub(super) fn chat_attempt_with_ui(
                         &mut on_event,
                     )
                 };
-                let _ = tx.send(ChatEvent::Finished(result));
+                let _ = tx.send(ChatEvent::Finished(Box::new(result)));
             })
             .map_err(|error| anyhow::anyhow!("could not start model worker: {error}"))?;
         // Separate tails: reasoning and visible prose must not concatenate into one cycle. Visible
@@ -535,6 +535,7 @@ pub(super) fn chat_attempt_with_ui(
                     }
                 }
                 Ok(ChatEvent::Finished(result)) => {
+                    let result = *result;
                     if let (Some(monitor), Ok(reply)) = (rules.as_deref_mut(), &result) {
                         if let Some(hit) = monitor.completed(reply) {
                             ui.inference_discarded("Portable guidance matched the completed response; no attempted tools will execute.");

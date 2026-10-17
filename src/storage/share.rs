@@ -16,15 +16,9 @@ use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct Config {
     pub server_url: String,
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server_url: String::new(),
-        }
-    }
 }
 
 const MAGIC: &[u8; 8] = b"DIALSHR1";

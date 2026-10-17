@@ -217,7 +217,7 @@ pub struct SearchHit {
 #[derive(Debug, Clone)]
 enum Kind {
     Message(Value),
-    Runtime(crate::runtime::Node),
+    Runtime(Box<crate::runtime::Node>),
     Compaction {
         summary: String,
         first_kept: Option<String>,
@@ -589,7 +589,9 @@ fn parse_entry(v: &Value) -> Option<Entry> {
         .unwrap_or("")
         .to_string();
     let kind = match v.get("type")?.as_str()? {
-        "runtime" => Kind::Runtime(serde_json::from_value(v.get("node")?.clone()).ok()?),
+        "runtime" => Kind::Runtime(Box::new(
+            serde_json::from_value(v.get("node")?.clone()).ok()?,
+        )),
         "message" => {
             let m = v.get("message")?;
             m.is_object().then_some(())?;
@@ -2319,7 +2321,7 @@ impl Session {
             .check_persistence()
             .map_err(anyhow::Error::msg)?;
         for node in self.runtime.pending() {
-            self.push(Kind::Runtime(node.clone()))?;
+            self.push(Kind::Runtime(Box::new(node.clone())))?;
             self.runtime.persisted(&node);
         }
         self.reclaim_streams()?;
@@ -2327,7 +2329,7 @@ impl Session {
     }
     pub fn flush_settled_runtime(&mut self) -> Result<()> {
         for node in self.runtime.pending_settled() {
-            self.push(Kind::Runtime(node.clone()))?;
+            self.push(Kind::Runtime(Box::new(node.clone())))?;
             self.runtime.persisted(&node);
         }
         self.reclaim_streams()?;
@@ -2367,7 +2369,7 @@ impl Session {
         }
         for &i in &self.active.branch {
             if let Kind::Runtime(node) = &self.entries[i].kind {
-                self.runtime.restore(node.clone());
+                self.runtime.restore((**node).clone());
             }
         }
         if let Some(path) = &self.path {

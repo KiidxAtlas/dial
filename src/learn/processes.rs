@@ -457,10 +457,10 @@ pub fn restart(user: &Path, pid: i32, identity: &str) -> Result<String> {
     wait_until_gone(pid, RESTART_EXIT_WAIT)?;
     // The old process and its record/output are finished; clear what it left behind.
     let _ = fs::remove_file(user.join("compute-processes").join(format!("{pid}.json")));
-    if let Some(old_log) = record["log"].as_str().map(Path::new) {
-        if log_is_managed(user, old_log) {
-            let _ = fs::remove_file(old_log);
-        }
+    if let Some(old_log) = record["log"].as_str().map(Path::new)
+        && log_is_managed(user, old_log)
+    {
+        let _ = fs::remove_file(old_log);
     }
     let log = Log::create(user)?;
     let (stdout, stderr) = log.stdio()?;

@@ -210,7 +210,7 @@ impl Agent<'_> {
                     state.unresolved = Some(question_gaps(&review));
                     ui.event(&crate::agent::ui_event::UiEvent::new(
                         crate::agent::ui_event::EventKind::Coach,
-                        &format!(
+                        format!(
                             "Coach repair limit reached; unresolved unverified findings: {}",
                             question_gaps(&review)
                         ),
@@ -225,7 +225,7 @@ impl Agent<'_> {
                 state.reviews = MAX_REVIEWS;
                 ui.event(&crate::agent::ui_event::UiEvent::new(
                     crate::agent::ui_event::EventKind::Coach,
-                    &format!("Coach review skipped: {error:#}"),
+                    format!("Coach review skipped: {error:#}"),
                 ));
                 self.record(
                     step,

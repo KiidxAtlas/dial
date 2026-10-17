@@ -98,6 +98,11 @@ impl Cache {
                 .query_row("SELECT COUNT(*) FROM judgments", [], |row| row.get(0))?;
         Ok(u64::try_from(count).unwrap_or(0))
     }
+
+    /// Whether no rows are stored.
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
 }
 
 /// Cache location: `DIAL_JUDGE_CACHE_DB` if set, else `<user_dir>/cache/judgment.db`.

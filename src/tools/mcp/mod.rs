@@ -106,9 +106,11 @@ pub fn connect_extra(
     specs: &std::collections::BTreeMap<String, McpServerConfig>,
     root: &std::path::Path,
 ) -> McpLoad {
-    let mut config = Config::default();
-    config.project_root = root.to_path_buf();
-    config.mcp = specs.clone();
+    let config = Config {
+        project_root: root.to_path_buf(),
+        mcp: specs.clone(),
+        ..Config::default()
+    };
     load(&config)
 }
 

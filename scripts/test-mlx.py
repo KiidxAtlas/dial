@@ -2,10 +2,10 @@
 """Run optional local MLX contracts, never provisioning dependencies or model weights."""
 import importlib.util
 import os
-from pathlib import Path
 import platform
 import subprocess
 import sys
+from pathlib import Path
 
 
 def main():

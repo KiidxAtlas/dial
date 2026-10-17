@@ -497,17 +497,18 @@ pub(super) fn read_plain(
         next,
         capped,
     ));
-    if meta.len() <= MAX_EDIT_FILE && !witnessed.is_empty() {
-        if let Ok(text) = hashline::load_text(ws, &path, &ws.rel(&path)) {
-            let lf = hashline::normalize(&text);
-            let lines = hashline::split_lines(&lf);
-            let ranges: Vec<_> = witnessed
-                .into_iter()
-                .filter(|(n, text)| lines.get(n - 1) == Some(&text.as_str()))
-                .map(|(n, _)| (n, n))
-                .collect();
-            ws.store().record(&path, &lf, &ranges);
-        }
+    if meta.len() <= MAX_EDIT_FILE
+        && !witnessed.is_empty()
+        && let Ok(text) = hashline::load_text(ws, &path, &ws.rel(&path))
+    {
+        let lf = hashline::normalize(&text);
+        let lines = hashline::split_lines(&lf);
+        let ranges: Vec<_> = witnessed
+            .into_iter()
+            .filter(|(n, text)| lines.get(n - 1) == Some(&text.as_str()))
+            .map(|(n, _)| (n, n))
+            .collect();
+        ws.store().record(&path, &lf, &ranges);
     }
     Ok(out)
 }

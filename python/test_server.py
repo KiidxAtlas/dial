@@ -1,12 +1,13 @@
 import json
 import os
-from pathlib import Path
 import select
 import subprocess
 import sys
 import unittest
-from unittest import mock
+from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
+
 import dial_server
 from dial_server import ToolCallFormatter
 

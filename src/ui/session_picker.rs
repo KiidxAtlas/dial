@@ -191,9 +191,7 @@ impl Picker {
             }
             let title = text::one_line(&session.title).to_lowercase();
             let hay = &self.searchable[index];
-            let rank = if tokens.is_empty() {
-                0
-            } else if title == query {
+            let rank = if tokens.is_empty() || title == query {
                 0
             } else if tokens.iter().all(|token| title.contains(token)) {
                 1
@@ -496,63 +494,61 @@ impl Picker {
         for unit in units.iter().skip(start).take(visible) {
             match unit {
                 Unit::Header(group) => body.push(Line::from(Span::styled(
-                    clip(*group),
+                    clip(group),
                     theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
                 ))),
                 Unit::Item(position) => self.item_rows(*position, width, compact, theme, &mut body),
             }
         }
-        if !compact {
-            if let Some(&index) = self.found.get(self.selected) {
-                let s = &self.sessions[index];
-                body.push(line(theme.sym(Sym::BoxH).repeat(width), Tok::Border));
-                let branch = s
-                    .parent_id
-                    .as_ref()
-                    .map(|id| format!(" · fork of {}", short(id)))
-                    .unwrap_or_default();
-                let project = if self.all_projects {
-                    format!(" · {}", s.project)
-                } else {
-                    String::new()
-                };
-                body.push(line(
-                    format!(
-                        "{} request{} · {} message{} · {} · {}{}{}",
-                        s.user_messages,
-                        if s.user_messages == 1 { "" } else { "s" },
-                        s.messages,
-                        if s.messages == 1 { "" } else { "s" },
-                        s.model.rsplit('/').next().unwrap_or(&s.model),
-                        short(&s.id),
-                        branch,
-                        project
-                    ),
-                    Tok::Muted,
-                ));
-                body.push(line(
-                    format!(
-                        "You  {}",
-                        if s.last_message.trim().is_empty() {
-                            "No prompt yet"
-                        } else {
-                            &s.last_message
-                        }
-                    ),
-                    Tok::Text,
-                ));
-                body.push(line(
-                    format!(
-                        "Dial {}",
-                        if s.last_answer.trim().is_empty() {
-                            "No answer recorded"
-                        } else {
-                            &s.last_answer
-                        }
-                    ),
-                    Tok::Muted,
-                ));
-            }
+        if !compact && let Some(&index) = self.found.get(self.selected) {
+            let s = &self.sessions[index];
+            body.push(line(theme.sym(Sym::BoxH).repeat(width), Tok::Border));
+            let branch = s
+                .parent_id
+                .as_ref()
+                .map(|id| format!(" · fork of {}", short(id)))
+                .unwrap_or_default();
+            let project = if self.all_projects {
+                format!(" · {}", s.project)
+            } else {
+                String::new()
+            };
+            body.push(line(
+                format!(
+                    "{} request{} · {} message{} · {} · {}{}{}",
+                    s.user_messages,
+                    if s.user_messages == 1 { "" } else { "s" },
+                    s.messages,
+                    if s.messages == 1 { "" } else { "s" },
+                    s.model.rsplit('/').next().unwrap_or(&s.model),
+                    short(&s.id),
+                    branch,
+                    project
+                ),
+                Tok::Muted,
+            ));
+            body.push(line(
+                format!(
+                    "You  {}",
+                    if s.last_message.trim().is_empty() {
+                        "No prompt yet"
+                    } else {
+                        &s.last_message
+                    }
+                ),
+                Tok::Text,
+            ));
+            body.push(line(
+                format!(
+                    "Dial {}",
+                    if s.last_answer.trim().is_empty() {
+                        "No answer recorded"
+                    } else {
+                        &s.last_answer
+                    }
+                ),
+                Tok::Muted,
+            ));
         }
         if let Some(notice) = &self.notice {
             body.push(line(notice.clone(), Tok::Warning));

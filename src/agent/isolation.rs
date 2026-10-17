@@ -268,7 +268,7 @@ fn stamp(path: &Path) -> Result<Option<FileStamp>> {
         MAX_BYTES,
         MAX_BYTES >> 20
     );
-    let mut file = platform_fs::open_nofollow(&fs::OpenOptions::new().read(true), path)?;
+    let mut file = platform_fs::open_nofollow(fs::OpenOptions::new().read(true), path)?;
     let identity = Identity::of(&file.metadata()?, platform_fs::identity(&file)?);
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 8192];
@@ -337,7 +337,7 @@ fn materialize(
             Ok(_) => anyhow::bail!("worker deleted file reappeared after snapshot"),
         };
     };
-    let mut file = platform_fs::open_nofollow(&fs::OpenOptions::new().read(true), path)?;
+    let mut file = platform_fs::open_nofollow(fs::OpenOptions::new().read(true), path)?;
     let meta = file.metadata()?;
     ensure!(
         meta.is_file() && Identity::of(&meta, platform_fs::identity(&file)?) == expected.identity,

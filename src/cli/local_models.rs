@@ -123,16 +123,16 @@ pub fn collect(layout: &Layout, settings: &Settings, generated_ms: i64) -> Dashb
     let mut models: Vec<(String, String, String, PathBuf, LocalFormat)> = Vec::new();
     for entry in catalog::downloaded_local_models(user_dir) {
         let path = PathBuf::from(&entry.selection.model);
-        if let Some(format @ (LocalFormat::Mlx | LocalFormat::Gguf)) = local_format::detect(&path) {
-            if !models.iter().any(|known| known.3 == path) {
-                models.push((
-                    entry.label,
-                    entry.source,
-                    path.to_string_lossy().into_owned(),
-                    path,
-                    format,
-                ));
-            }
+        if let Some(format @ (LocalFormat::Mlx | LocalFormat::Gguf)) = local_format::detect(&path)
+            && !models.iter().any(|known| known.3 == path)
+        {
+            models.push((
+                entry.label,
+                entry.source,
+                path.to_string_lossy().into_owned(),
+                path,
+                format,
+            ));
         }
     }
     if let Some(db) = &db {
@@ -510,7 +510,7 @@ pub fn memory_text(memory: &Memory) -> String {
         }
         _ => match memory.weights_bytes {
             Some(weights) => format!("{fit} · weights {:.1} GiB", weights as f64 / GIB),
-            None => format!("{fit}"),
+            None => fit.to_string(),
         },
     }
 }

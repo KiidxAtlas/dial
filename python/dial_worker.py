@@ -5,9 +5,10 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
+import shutil
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 UNSUPPORTED = [
@@ -367,7 +368,7 @@ def tokenize_preference_pairs(pairs, tokenizer, max_seq_length):
 def preference_loss(model, batch, lengths):
     """Chosen SFT NLL + 0.1 * pairwise softplus ranking for all chosen/rejected pairs in a batch."""
     import mlx.core as mx
-    import mlx.nn as nn
+    from mlx import nn
     inputs, targets = batch[:, :-1], batch[:, 1:]
     logits = model(inputs).astype(mx.float32)
     log_probs = nn.log_softmax(logits, axis=-1)
@@ -430,8 +431,8 @@ def query_targets(model, count=None, keys=None):
     before computing expected tensors, including matches in heterogeneous blocks.
     Explicit keys select an existing adapter's own layout; each must match a projection.
     """
-    import mlx.nn as nn
-    from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear
+    from mlx import nn
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
     supported = (nn.Linear, nn.QuantizedLinear, SwitchLinear, QuantizedSwitchLinear)
     layers = getattr(model, "layers", None)
     require(layers is not None and len(layers) > 0, "model exposes no trainable transformer layers")
@@ -466,9 +467,9 @@ def query_targets(model, count=None, keys=None):
 
 
 def expected_weights(model, selected_ids, rank):
-    from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear
-    from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
     from mlx.utils import tree_flatten
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
     expected = {}
     for name, module in model.named_modules():
         if id(module) not in selected_ids:
@@ -534,8 +535,8 @@ def apply_adapter(model, model_name, path):
 
 def write_adapter(output, model_name, count, parameters, tensors):
     """Publish a complete adapter directory in one rename; an existing output is never replaced."""
-    import shutil
     import tempfile
+
     import mlx.core as mx
     output = Path(output).resolve()
     require(not output.exists(), "output must not already exist")
@@ -630,8 +631,8 @@ def fuse(request):
     The checkpoint keeps the base quantization unless `dequantize` asks for full-precision weights
     (the input llama.cpp's converter expects). Output is published by one rename.
     """
-    import shutil
     import tempfile
+
     from mlx.utils import tree_unflatten
     from mlx_lm.utils import dequantize_model, save
     model_name = resolve_model(string(request, "model"))
@@ -666,8 +667,9 @@ def fuse(request):
 def probe_adapter(model, tokens):
     """One small update and a serialized reload; never saves an admitted adapter."""
     import tempfile
+
     import mlx.core as mx
-    import mlx.nn as nn
+    from mlx import nn
     from mlx.utils import tree_flatten, tree_unflatten
     from mlx_lm.tuner.utils import linear_to_lora_layers, load_adapters
     # Exercise all block types, with rank one and a short sequence to bound overhead.
@@ -855,14 +857,16 @@ def replay_batches(factory, completed, seed):
 
 
 def pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args, expected):
-    import mlx.core as mx
-    import mlx.optimizers as optimizers
-    from mlx.utils import tree_flatten, tree_unflatten
-    from mlx_lm.tuner import TrainingArgs, train as tuner_train
-    from mlx_lm.tuner.trainer import iterate_batches
-    from mlx_lm.tuner.callbacks import TrainingCallback
-    from mlx_lm.tuner.utils import linear_to_lora_layers
     import tempfile
+
+    import mlx.core as mx
+    from mlx import optimizers
+    from mlx.utils import tree_flatten, tree_unflatten
+    from mlx_lm.tuner import TrainingArgs
+    from mlx_lm.tuner import train as tuner_train
+    from mlx_lm.tuner.callbacks import TrainingCallback
+    from mlx_lm.tuner.trainer import iterate_batches
+    from mlx_lm.tuner.utils import linear_to_lora_layers
 
     output = Path(request["output_dir"])
     pause = Path(string(request, "pause_file"))
@@ -926,7 +930,6 @@ def pausable_train(request, model, tokenizer, train_set, valid_set, pairs, args,
                 atomic_json(output / "resume.json", {"fingerprint": fingerprint, "phase": phase,
                             "completed": iteration, "directory": str(saved.relative_to(output))})
                 if prior:
-                    import shutil
                     old = (output / prior["directory"]).resolve()
                     if old.parent == root.resolve() and old != saved.resolve():
                         shutil.rmtree(old)
@@ -1043,8 +1046,9 @@ def train_in(request, scratch):
     if pairs:
         tokenized_pairs = tokenize_preference_pairs(pairs, tokenizer, values["max_seq_length"])
         if tokenized_pairs:
-            import mlx.optimizers as optimizers
-            from mlx_lm.tuner import TrainingArgs, train as tuner_train
+            from mlx import optimizers
+            from mlx_lm.tuner import TrainingArgs
+            from mlx_lm.tuner import train as tuner_train
             iters = preference_iterations(values["iters"], len(tokenized_pairs))
             preference_args = TrainingArgs(
                 batch_size=PREFERENCE_PAIRS_PER_BATCH, iters=iters, val_batches=0, steps_per_report=iters,
@@ -1087,8 +1091,8 @@ def layer_scores(squares, layer_count):
 def sensitivity(request):
     """MAPLE-style score: norm of the loss gradient w.r.t. each layer's LoRA parameters at the seeded init."""
     import mlx.core as mx
-    import mlx.nn as nn
     import numpy as np
+    from mlx import nn
     from mlx.utils import tree_flatten, tree_map
     from mlx_lm.tuner.trainer import default_loss
     from mlx_lm.tuner.utils import linear_to_lora_layers

@@ -297,6 +297,32 @@ fn untracked_head(root: &Path, path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&head).into_owned())
 }
 
+impl Repo {
+    /// Generates a commit message for the staged changes on a worker thread.
+    pub(crate) fn spawn_generate(&self) -> Receiver<Result<Generated, String>> {
+        let (sender, receiver) = mpsc::channel();
+        let (root, config) = (self.root.clone(), self.config.clone());
+        std::thread::spawn(move || {
+            let _ = sender.send(generate_in(&root, &config));
+        });
+        receiver
+    }
+
+    /// Classifies the unstaged `changes` against `instruction` on a worker thread.
+    pub(crate) fn spawn_ai_stage(
+        &self,
+        instruction: String,
+        changes: Vec<Change>,
+    ) -> Receiver<Result<AiSummary, String>> {
+        let (sender, receiver) = mpsc::channel();
+        let (root, config) = (self.root.clone(), self.config.clone());
+        std::thread::spawn(move || {
+            let _ = sender.send(ai_stage_in(&root, &config, &instruction, &changes));
+        });
+        receiver
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,31 +400,5 @@ mod tests {
         assert_eq!(generated.text, "fix: x");
         assert_eq!(generated.validation_error.as_deref(), Some("bad scope"));
         assert!(!generated.staged_all);
-    }
-}
-
-impl Repo {
-    /// Generates a commit message for the staged changes on a worker thread.
-    pub(crate) fn spawn_generate(&self) -> Receiver<Result<Generated, String>> {
-        let (sender, receiver) = mpsc::channel();
-        let (root, config) = (self.root.clone(), self.config.clone());
-        std::thread::spawn(move || {
-            let _ = sender.send(generate_in(&root, &config));
-        });
-        receiver
-    }
-
-    /// Classifies the unstaged `changes` against `instruction` on a worker thread.
-    pub(crate) fn spawn_ai_stage(
-        &self,
-        instruction: String,
-        changes: Vec<Change>,
-    ) -> Receiver<Result<AiSummary, String>> {
-        let (sender, receiver) = mpsc::channel();
-        let (root, config) = (self.root.clone(), self.config.clone());
-        std::thread::spawn(move || {
-            let _ = sender.send(ai_stage_in(&root, &config, &instruction, &changes));
-        });
-        receiver
     }
 }

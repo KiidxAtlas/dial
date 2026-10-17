@@ -1,11 +1,11 @@
 """Offline reporting regressions, not measurements of model quality."""
 import copy
 import json
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from reliability import summarize
 from test_compare import report

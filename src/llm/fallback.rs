@@ -73,12 +73,12 @@ pub fn fallback_models(
             }
             candidate
         };
-        if candidate.provider != selected.provider || candidate.model != selected.model {
-            if !result.iter().any(|seen: &ModelSelection| {
+        if (candidate.provider != selected.provider || candidate.model != selected.model)
+            && !result.iter().any(|seen: &ModelSelection| {
                 seen.provider == candidate.provider && seen.model == candidate.model
-            }) {
-                result.push(candidate);
-            }
+            })
+        {
+            result.push(candidate);
         }
     }
     result

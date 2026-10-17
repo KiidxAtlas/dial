@@ -131,7 +131,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not outputs:
                 return call("write", {"path": "recovered.txt"})
             if len(outputs) == 1:
-                if not re.search(r"error|required|missing|content", outputs[0][1], re.I):
+                if not re.search(r"error|required|missing|content", outputs[0][1], re.IGNORECASE):
                     raise ValueError("malformed tool call did not report a useful failure")
                 return call("write", {"path": "recovered.txt", "content": "contract-recovered"})
             return self.text("Observed contract error and recovered."), "stop"
@@ -174,7 +174,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     @staticmethod
     def goal(transcript):
-        matches = re.findall(r"(?:acceptance goal[^\n]*?exactly|actual task goal is)\s+([A-Z]+-\d+)", transcript, re.I)
+        matches = re.findall(r"(?:acceptance goal[^\n]*?exactly|actual task goal is)\s+([A-Z]+-\d+)", transcript, re.IGNORECASE)
         if not matches:
             raise ValueError("original goal was not preserved in the conversation")
         return matches[0]

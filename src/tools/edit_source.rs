@@ -41,7 +41,7 @@ pub(crate) fn parse_revision(text: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut bytes = [0; 32];
-    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = (pair[0] as char).to_digit(16)?;
         let low = (pair[1] as char).to_digit(16)?;
         bytes[index] = ((high << 4) | low) as u8;
@@ -301,8 +301,8 @@ pub(crate) fn structural_witness(
             .ok_or("notebook cell source ranges do not match parsed cells")?;
         match cell.cell_index {
             None if !complete(new_flags,new_range)=>return Err("new notebook cells cannot inherit unseen source; read it or supply complete authored cell text".into()),
-            Some(index) if index!=position&&original.get(index).is_some_and(|old|old.source!=cell.source)=>{
-                if !old_ranges.get(index).is_some_and(|range|complete(old_flags,*range))||!complete(new_flags,new_range){return Err(format!("retargeting notebook cell marker {index} with different source requires full original and proposed cell-source witnesses"));}
+            Some(index) if index!=position&&original.get(index).is_some_and(|old|old.source!=cell.source)&&(!old_ranges.get(index).is_some_and(|range|complete(old_flags,*range))||!complete(new_flags,new_range))=>{
+                return Err(format!("retargeting notebook cell marker {index} with different source requires full original and proposed cell-source witnesses"));
             },
             _=>{},
         }

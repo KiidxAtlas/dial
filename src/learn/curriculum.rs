@@ -3193,7 +3193,7 @@ mod tests {
             return;
         }
         let case = |seed: u64, t: &Task| {
-            let ws = workspace(&t);
+            let ws = workspace(t);
             assert!(
                 !t.check.verify(ws.path(), ""),
                 "{} untouched/empty passes: {}",
@@ -3205,7 +3205,7 @@ mod tests {
                 "{} untouched/wrong passes",
                 t.family
             );
-            let reply = reference_solution(&t, ws.path());
+            let reply = reference_solution(t, ws.path());
             assert!(
                 t.check.verify(ws.path(), &reply),
                 "{} seed {seed}: reference fails\n{}\n{:?}",
@@ -3220,7 +3220,7 @@ mod tests {
             if !info.needs_tools {
                 // Guard answers are verifiable without touching the workspace.
                 assert!(
-                    t.check.verify(workspace(&t).path(), &reply),
+                    t.check.verify(workspace(t).path(), &reply),
                     "{} guard reply must pass on a fresh workspace",
                     t.family
                 );
@@ -3253,8 +3253,8 @@ mod tests {
             return;
         }
         let case = |t: &Task| {
-            let ws = workspace(&t);
-            let reply = reference_solution(&t, ws.path());
+            let ws = workspace(t);
+            let reply = reference_solution(t, ws.path());
             assert!(
                 t.check.verify(ws.path(), &reply),
                 "{} reference must pass before corruption",

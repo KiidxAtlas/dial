@@ -164,7 +164,7 @@ fn dump_text(layout: &Layout, session: &Session) -> Result<String> {
         return Ok("in-memory session: nothing to dump".to_owned());
     };
     let out_dir = scratch_path("dial-debug-dump", session.id());
-    platform_fs::create_dir_owner_only(&fs::DirBuilder::new().recursive(true), &out_dir)?;
+    platform_fs::create_dir_owner_only(fs::DirBuilder::new().recursive(true), &out_dir)?;
     let report = dump_session(layout, path, DumpKind::All, &out_dir)?;
     Ok(format!(
         "Archive: {}\nEntries: {}\nReview before sharing: the archive holds session content and may contain secrets.",

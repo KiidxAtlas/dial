@@ -11,9 +11,9 @@
 //! [`ToolCall`]s when the request offered tools.
 
 pub(crate) mod anthropic;
-pub mod apple;
 mod anthropic_cache;
 pub(crate) mod anthropic_oauth;
+pub mod apple;
 pub mod auth;
 mod aws_credentials;
 mod azure;

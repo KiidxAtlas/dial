@@ -206,10 +206,10 @@ impl Shared {
             "notifications/tools/list_changed" => self.signal(Signal::ToolsChanged),
             "notifications/prompts/list_changed" => self.signal(Signal::PromptsChanged),
             "notifications/resources/list_changed" => self.signal(Signal::ResourcesChanged),
-            "notifications/resources/updated" => {
-                if params.get("uri").is_some_and(Value::is_string) {
-                    self.signal(Signal::ResourceUpdated);
-                }
+            "notifications/resources/updated"
+                if params.get("uri").is_some_and(Value::is_string) =>
+            {
+                self.signal(Signal::ResourceUpdated);
             }
             _ => {} // logging and anything else carry nothing dial acts on
         }

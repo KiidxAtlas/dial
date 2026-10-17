@@ -172,10 +172,10 @@ fn install_for(server: &Value, version: Option<&str>, user_dir: &Path) -> (Insta
     let options = packages
         .iter()
         .filter_map(|package| package_install(package, version, user_dir))
-        .chain(remotes.iter().filter_map(|remote| remote_install(remote)));
+        .chain(remotes.iter().filter_map(remote_install));
     for found in options {
         match found {
-            Ok((server, inputs)) => return (Install::Server(server), inputs),
+            Ok((server, inputs)) => return (Install::Server(Box::new(server)), inputs),
             Err(reason) => reasons.push(reason),
         }
     }

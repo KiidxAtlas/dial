@@ -137,8 +137,10 @@ fn select_from(
 /// Process-wide probe results, keyed by backend, project root, and entry budget. Probing worktree
 /// runs git and overlay scans the project, so each answer is computed once per project and budget
 /// for the life of the process.
-static PROBES: Mutex<BTreeMap<(Backend, PathBuf, usize), Result<(), String>>> =
-    Mutex::new(BTreeMap::new());
+static PROBES: Mutex<BTreeMap<ProbeKey, Result<(), String>>> = Mutex::new(BTreeMap::new());
+
+/// Backend, project root, and entry budget a probe result was computed for.
+type ProbeKey = (Backend, PathBuf, usize);
 
 /// Whether `backend` can run for `project` on this platform. `max_entries` is the
 /// `isolation_source_files` budget that overlay's secret scan must fit in. Cached per process.

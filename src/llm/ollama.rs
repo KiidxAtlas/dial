@@ -91,7 +91,7 @@ fn content(value: &Value, vision: bool) -> Result<(String, Vec<String>)> {
                 );
                 ensure!(
                     !data.is_empty()
-                        && data.len() <= ((super::images::MAX_IMAGE_BYTES as usize + 2) / 3) * 4,
+                        && data.len() <= (super::images::MAX_IMAGE_BYTES as usize).div_ceil(3) * 4,
                     "Ollama inline image is empty or exceeds 5 MiB"
                 );
                 images.push(data.to_owned());
@@ -244,15 +244,22 @@ fn request(
                 "Ollama history has duplicate tool results"
             );
             converted["tool_name"] = json!(name);
-        } else if role == "assistant" {
-            if let Some(calls) = message["tool_calls"]
+        } else if role == "assistant"
+            && let Some(calls) = message["tool_calls"]
                 .as_array()
                 .filter(|calls| !calls.is_empty())
-            {
-                converted["tool_calls"] = Value::Array(calls.iter().map(|call|
-                    Ok(json!({"type":"function","function":{"name":call["function"]["name"],
-                        "arguments":arguments(&call["function"]["arguments"])?}}))).collect::<Result<Vec<_>>>()?);
-            }
+        {
+            converted["tool_calls"] = Value::Array(
+                calls
+                    .iter()
+                    .map(|call| {
+                        Ok(
+                            json!({"type":"function","function":{"name":call["function"]["name"],
+                        "arguments":arguments(&call["function"]["arguments"])?}}),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
         }
         messages.push(converted);
     }

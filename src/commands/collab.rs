@@ -130,7 +130,7 @@ fn start(shell: &mut Shell, app: &App, agent: &Agent<'_>, read_only: bool) -> Re
         // Re-check under the lock: a guest or host may have claimed the room while this opened.
         let claimed = room::with(|slot| {
             if slot.is_some() {
-                return Err(host);
+                return Err(Box::new(host));
             }
             *slot = Some(Room::Host(host));
             Ok(())

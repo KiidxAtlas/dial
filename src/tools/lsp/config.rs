@@ -57,7 +57,7 @@ pub struct LspServerConfig {
     pub disabled: bool,
 }
 
-fn is_empty_path(path: &PathBuf) -> bool {
+fn is_empty_path(path: &std::path::Path) -> bool {
     path.as_os_str().is_empty()
 }
 

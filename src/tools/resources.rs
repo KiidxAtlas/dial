@@ -99,21 +99,6 @@ pub fn artifact_id(input: &str) -> Result<String, String> {
     Ok(id.to_ascii_lowercase())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn routing_preserves_local_selectors_and_refuses_unknown_authority() {
-        assert_eq!(scheme("src/main.rs:5-10").unwrap(), Scheme::File);
-        assert!(scheme("http://example.com").is_err());
-        assert!(scheme("artifact://../x").is_err());
-        assert_eq!(
-            artifact_id(&format!("artifact://{}", "A".repeat(64))).unwrap(),
-            "a".repeat(64)
-        );
-    }
-}
-
 pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
     let encoded = uri.strip_prefix("file://")?;
     if !encoded.starts_with('/') || encoded.contains(['?', '#']) {
@@ -153,4 +138,19 @@ pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
         )
     };
     Some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn routing_preserves_local_selectors_and_refuses_unknown_authority() {
+        assert_eq!(scheme("src/main.rs:5-10").unwrap(), Scheme::File);
+        assert!(scheme("http://example.com").is_err());
+        assert!(scheme("artifact://../x").is_err());
+        assert_eq!(
+            artifact_id(&format!("artifact://{}", "A".repeat(64))).unwrap(),
+            "a".repeat(64)
+        );
+    }
 }

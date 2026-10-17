@@ -502,7 +502,7 @@ impl TernClient {
     /// Whether the daemon's welcome lists request kind `op`. Connects if needed.
     pub fn supports(&self, op: &str) -> Result<bool, TernError> {
         let mut guard = self.session.lock();
-        self.ensure_session(&mut *guard)?;
+        self.ensure_session(&mut guard)?;
         Ok(guard
             .as_ref()
             .is_some_and(|session| session.ops.iter().any(|name| name == op)))
@@ -604,7 +604,7 @@ impl TernClient {
 
     fn exchange(&self, channel: Channel, body: Value, label: &str) -> Result<Value, TernError> {
         let mut guard = self.session.lock();
-        self.ensure_session(&mut *guard)?;
+        self.ensure_session(&mut guard)?;
         let outcome = match guard.as_mut() {
             Some(session) => {
                 let id = session.next_id;

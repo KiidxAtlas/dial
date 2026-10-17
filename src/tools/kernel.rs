@@ -773,7 +773,7 @@ fn native_cell_once(
                     callback,
                 )
             };
-            if let Some(reply) = preludes::bridge_reply(&request, &mut call) {
+            if let Some(reply) = preludes::bridge_reply(request, &mut call) {
                 return reply;
             }
             let callback = match request.get("callback").and_then(Value::as_str) {

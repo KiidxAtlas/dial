@@ -194,11 +194,11 @@ impl Agent<'_> {
             target: label(&target),
             notices,
         };
-        if let Some(active) = self.modes.prewalk.armed.clone() {
-            if !same_model(&active, &target) {
-                let (_, notices) = self.prewalk_arm(target.clone())?;
-                return Ok(report(RestartOutcome::Rejected, notices));
-            }
+        if let Some(active) = self.modes.prewalk.armed.clone()
+            && !same_model(&active, &target)
+        {
+            let (_, notices) = self.prewalk_arm(target.clone())?;
+            return Ok(report(RestartOutcome::Rejected, notices));
         }
         if self.modes.prewalk.handoff.is_some() {
             self.modes.prewalk.handoff = None;
@@ -355,7 +355,7 @@ impl Agent<'_> {
         self.save_modes()?;
         ui.event(&crate::agent::ui_event::UiEvent::new(
             crate::agent::ui_event::EventKind::Model,
-            &format!(
+            format!(
                 "Prewalk: switched to {} after first {tool} call.",
                 label(&target)
             ),

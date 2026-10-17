@@ -1243,9 +1243,7 @@ mod loopback {
             &mut |_| true,
             &key,
         );
-        let error = result
-            .err()
-            .expect("partial text and tool data must not become a Reply");
+        let error = result.expect_err("partial text and tool data must not become a Reply");
         assert!(
             error
                 .downcast_ref::<super::super::stream::IncompleteStream>()
@@ -1423,7 +1421,7 @@ mod loopback {
         let steering = json!({"role":"user","content":"redirect"});
         session.accepted = vec![(
             "s1".into(),
-            super::super::responses::input_items(&[steering.clone()])
+            super::super::responses::input_items(std::slice::from_ref(&steering))
                 .unwrap()
                 .as_array()
                 .unwrap()

@@ -1,6 +1,6 @@
 """Thinking is redirected inside one completion; answer/tool tokens retain normal sampling."""
-import unittest
 import os
+import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -152,7 +152,7 @@ class MlxTests(unittest.TestCase):
     def test_pinned_sampler_and_text_parser_preserve_a_complete_tool_call(self):
         import mlx.core as mx
         from mlx_lm import server
-        from mlx_lm.generate import make_text_state_machine, TextStateMachine
+        from mlx_lm.generate import TextStateMachine, make_text_state_machine
         from mlx_lm.tokenizer_utils import load
         tokenizer = load(Path(os.environ["DIAL_THINKING_TOKENIZER"]), {"trust_remote_code": False})
         dial.install_thinking_control(server)

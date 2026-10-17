@@ -1417,13 +1417,11 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                         && busy
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                             .is_ok()
-                    {
-                        if commands
+                        && commands
                             .send(json!({"id":null,"method":"_cancel","params":{"_acp":true}}))
                             .is_err()
-                        {
-                            break;
-                        }
+                    {
+                        break;
                     }
                     cancelling = Some(Instant::now());
                     out.result(&id, Ok(json!({"requested":true})));

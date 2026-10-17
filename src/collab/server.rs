@@ -134,12 +134,43 @@ impl Drop for Membership {
 fn would_block(error: &tungstenite::Error) -> bool {
     matches!(error, tungstenite::Error::Io(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted))
 }
+/// Handshake callback that records the requested room and role. A named `Callback` impl rather
+/// than a closure, because the trait fixes the large `ErrorResponse` error type.
+struct HandshakeRecorder {
+    record: Arc<Mutex<Option<(String, bool)>>>,
+}
+impl tungstenite::handshake::server::Callback for HandshakeRecorder {
+    fn on_request(
+        self,
+        request: &Request,
+        response: Response,
+    ) -> std::result::Result<Response, tungstenite::handshake::server::ErrorResponse> {
+        let id = request.uri().path().strip_prefix("/r/").unwrap_or("");
+        let role = request
+            .uri()
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .find_map(|part| part.strip_prefix("role="))
+            .unwrap_or("");
+        if valid_room_id(id) && matches!(role, "host" | "guest") {
+            *self.record.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some((id.to_owned(), role == "host"));
+            Ok(response)
+        } else {
+            let mut error = tungstenite::handshake::server::ErrorResponse::new(Some(
+                "invalid relay path or role".into(),
+            ));
+            *error.status_mut() = tungstenite::http::StatusCode::BAD_REQUEST;
+            Err(error)
+        }
+    }
+}
 fn peer(stream: TcpStream, rooms: Rooms, next_peer: Arc<AtomicU32>) -> Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let captured = Arc::new(Mutex::new(None::<(String, bool)>));
-    let record = captured.clone();
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(MAX_FRAME_BYTES);
     config.max_frame_size = Some(MAX_FRAME_BYTES);
@@ -147,26 +178,8 @@ fn peer(stream: TcpStream, rooms: Rooms, next_peer: Arc<AtomicU32>) -> Result<()
     config.max_write_buffer_size = MAX_FRAME_BYTES.saturating_mul(2).saturating_add(1024);
     let mut socket = accept_hdr_with_config(
         stream,
-        move |request: &Request, response: Response| {
-            let id = request.uri().path().strip_prefix("/r/").unwrap_or("");
-            let role = request
-                .uri()
-                .query()
-                .unwrap_or("")
-                .split('&')
-                .find_map(|part| part.strip_prefix("role="))
-                .unwrap_or("");
-            if valid_room_id(id) && matches!(role, "host" | "guest") {
-                *record.lock().unwrap_or_else(|p| p.into_inner()) =
-                    Some((id.to_owned(), role == "host"));
-                Ok(response)
-            } else {
-                let mut error = tungstenite::handshake::server::ErrorResponse::new(Some(
-                    "invalid relay path or role".into(),
-                ));
-                *error.status_mut() = tungstenite::http::StatusCode::BAD_REQUEST;
-                Err(error)
-            }
+        HandshakeRecorder {
+            record: captured.clone(),
         },
         Some(config),
     )?;

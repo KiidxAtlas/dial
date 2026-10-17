@@ -539,7 +539,7 @@ impl Agent<'_> {
                                         let result = chat_with_ui(
                                             &mut backend,
                                             None,
-                                            &request,
+                                            request,
                                             ChatOptions {
                                                 timeout,
                                                 render_text: false,

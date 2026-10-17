@@ -138,10 +138,11 @@ pub fn parse_link(link: &str, default_relay: &str) -> Result<ParsedLink> {
     }
     let url = url::Url::parse(&text).map_err(|_| anyhow::anyhow!("invalid collab link: {link}"))?;
     let fragment = url.fragment().unwrap_or("");
-    if matches!(url.scheme(), "http" | "https") && !fragment.is_empty() {
-        if let Ok(parsed) = parse_link(fragment, default_relay) {
-            return Ok(parsed);
-        }
+    if matches!(url.scheme(), "http" | "https")
+        && !fragment.is_empty()
+        && let Ok(parsed) = parse_link(fragment, default_relay)
+    {
+        return Ok(parsed);
     }
     let origin = normalize_relay_origin(url.as_str())?;
     let path = url.path();
@@ -511,6 +512,6 @@ mod tests {
         let wide = Value::Array((0..5000).map(|i| json!(i)).collect());
         let text = bounded_json_with(&wide, 200);
         assert!(text.contains("placeholder"));
-        assert_eq!(clip_middle("héllo wörld", 4).chars().count() > 0, true);
+        assert!(clip_middle("héllo wörld", 4).chars().count() > 0);
     }
 }

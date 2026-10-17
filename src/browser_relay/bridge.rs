@@ -925,27 +925,26 @@ fn route_event(st: &mut State, tab: i64, session: Option<&str>, method: &str, pa
             }
         }
         None => {
-            if method == "Target.detachedFromTarget" {
-                if let Some(child) = params["sessionId"].as_str() {
-                    st.sessions.remove(child);
-                }
+            if method == "Target.detachedFromTarget"
+                && let Some(child) = params["sessionId"].as_str()
+            {
+                st.sessions.remove(child);
             }
             let owners = top_sessions(st, tab);
-            if method == "Target.attachedToTarget" {
-                if let (Some(child), Some((_, owner))) =
+            if method == "Target.attachedToTarget"
+                && let (Some(child), Some((_, owner))) =
                     (params["sessionId"].as_str(), owners.first())
-                {
-                    st.sessions.insert(
-                        child.to_owned(),
-                        Session {
-                            owner: *owner,
-                            kind: SessionKind::Page {
-                                tab,
-                                child: Some(child.to_owned()),
-                            },
+            {
+                st.sessions.insert(
+                    child.to_owned(),
+                    Session {
+                        owner: *owner,
+                        kind: SessionKind::Page {
+                            tab,
+                            child: Some(child.to_owned()),
                         },
-                    );
-                }
+                    },
+                );
             }
             for (key, owner) in owners {
                 notify(st, owner, Some(&key), method, params.clone());
@@ -981,7 +980,7 @@ fn close_tab(st: &mut State, tab: i64) {
 /// Records a created or updated tab and reports the tabs that need an auto-attach.
 fn upsert_tab(st: &mut State, tab: TabSnapshot) -> Vec<i64> {
     let id = tab.tab_id;
-    let was = st.tabs.get(&id).is_some_and(|previous| eligible(previous));
+    let was = st.tabs.get(&id).is_some_and(eligible);
     let now = eligible(&tab);
     st.tabs.insert(id, tab);
     let snapshot = st.tabs[&id].clone();

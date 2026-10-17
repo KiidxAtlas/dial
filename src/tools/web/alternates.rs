@@ -77,10 +77,10 @@ pub fn markdown_alternates(page: &str, base: &str) -> Vec<String> {
         {
             continue;
         }
-        if let Some(href) = html::attr(&attrs, "href") {
-            if let Some(resolved) = resolve_url(base, href) {
-                found.push(resolved);
-            }
+        if let Some(href) = html::attr(&attrs, "href")
+            && let Some(resolved) = resolve_url(base, href)
+        {
+            found.push(resolved);
         }
     }
     found

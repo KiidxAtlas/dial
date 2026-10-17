@@ -305,21 +305,24 @@ fn run_git_bounded(
 const SNIFF_BYTES: u64 = 1 << 20;
 /// Largest image the overlay reads and decodes; bigger blobs keep the text placeholder.
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+/// Before/after file bytes of a change; `None` for a missing side.
+type SidePair = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 fn blob_head(root: &Path, change: &Change, rev: Option<&str>) -> Result<(u64, Vec<u8>), String> {
-    if change.area == Area::Unstaged {
-        if let Ok(file) = std::fs::File::open(root.join(&change.path)) {
-            let size = file
-                .metadata()
-                .map_err(|error| format!("read {}: {error}", change.path))?
-                .len();
-            let mut head = Vec::new();
-            if size <= MAX_IMAGE_BYTES {
-                file.take(SNIFF_BYTES)
-                    .read_to_end(&mut head)
-                    .map_err(|error| format!("read {}: {error}", change.path))?;
-            }
-            return Ok((size, head));
+    if change.area == Area::Unstaged
+        && let Ok(file) = std::fs::File::open(root.join(&change.path))
+    {
+        let size = file
+            .metadata()
+            .map_err(|error| format!("read {}: {error}", change.path))?
+            .len();
+        let mut head = Vec::new();
+        if size <= MAX_IMAGE_BYTES {
+            file.take(SNIFF_BYTES)
+                .read_to_end(&mut head)
+                .map_err(|error| format!("read {}: {error}", change.path))?;
         }
+        return Ok((size, head));
     }
     let mut spec = match rev {
         Some(sha) => format!("{sha}:{}", change.path),
@@ -480,11 +483,7 @@ impl Repo {
     }
 
     /// Raw bytes of both sides of an image change; None when the change has no before side.
-    pub(crate) fn image_sides(
-        &self,
-        change: &Change,
-        rev: Option<&str>,
-    ) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    pub(crate) fn image_sides(&self, change: &Change, rev: Option<&str>) -> Option<SidePair> {
         let before_path = change.orig.as_deref().unwrap_or(&change.path);
         let before = side_bytes(&self.root, before_spec(change.area, rev, before_path)?);
         let after = match change.area {

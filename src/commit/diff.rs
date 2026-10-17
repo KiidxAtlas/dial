@@ -245,7 +245,7 @@ pub(crate) fn condense_stat(stat: &str, max_files: usize) -> String {
     }
     let other_lines: Vec<&String> = lines.iter().filter(|line| !line.contains('|')).collect();
     let mut sorted = file_lines.clone();
-    sorted.sort_by(|left, right| stat_change_count(right).cmp(&stat_change_count(left)));
+    sorted.sort_by_key(|line| std::cmp::Reverse(stat_change_count(line)));
     let kept: HashSet<&str> = sorted.iter().take(max_files).map(String::as_str).collect();
     let mut condensed: Vec<String> = file_lines
         .iter()

@@ -292,7 +292,7 @@ pub struct Input {
 #[derive(Clone, Debug)]
 pub enum Install {
     /// A stdio program or a remote URL. Required inputs are filled in as environment entries.
-    Server(McpServerConfig),
+    Server(Box<McpServerConfig>),
     /// Decided by [`resolve`] when installing, from details the listing does not carry. The text
     /// says what is looked up.
     Deferred(String),
@@ -341,7 +341,7 @@ impl Candidate {
     /// The server config to save: the install with each non-blank supplied value as an env entry.
     pub fn server(&self, values: &BTreeMap<String, String>) -> Result<McpServerConfig> {
         let mut server = match &self.install {
-            Install::Server(server) => server.clone(),
+            Install::Server(server) => (**server).clone(),
             Install::Deferred(_) => bail!("`{}` must be resolved before it installs", self.name),
             Install::Blocked(reason) => bail!("{reason}"),
         };
@@ -488,7 +488,7 @@ pub fn curated_candidate(item: &Curated, user_dir: &Path, project_root: &Path) -
         description: item.summary.to_owned(),
         sources: vec![Source::Curated],
         badges: Vec::new(),
-        install: Install::Server(server),
+        install: Install::Server(Box::new(server)),
         repository: None,
         inputs: item
             .env
@@ -811,7 +811,7 @@ mod tests {
             description: String::new(),
             sources: vec![source],
             badges: Vec::new(),
-            install: Install::Server(stdio("npx")),
+            install: Install::Server(Box::new(stdio("npx"))),
             inputs,
             repository: None,
         }
@@ -944,11 +944,11 @@ mod tests {
     }
 
     fn running(mut candidate: Candidate, program: &str, args: &[&str]) -> Candidate {
-        candidate.install = Install::Server(McpServerConfig {
+        candidate.install = Install::Server(Box::new(McpServerConfig {
             program: PathBuf::from(program),
             args: args.iter().map(|arg| arg.to_string()).collect(),
             ..Default::default()
-        });
+        }));
         candidate
     }
 
@@ -1067,7 +1067,7 @@ mod tests {
             ..Default::default()
         };
         let mut c = candidate("git", Source::Curated, vec![]);
-        c.install = Install::Server(server);
+        c.install = Install::Server(Box::new(server));
         assert_eq!(c.install_summary(), "uvx mcp-server-git --repository");
         c.install = Install::Blocked("needs an Authorization header".into());
         assert!(c.install_summary().contains("Authorization"));

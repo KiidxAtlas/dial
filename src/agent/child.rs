@@ -1437,7 +1437,7 @@ fn compact_child(
                 "small",
                 llm::usage::Purpose::Compaction,
                 chat,
-                &mut **steps.borrow_mut(),
+                &mut steps.borrow_mut(),
                 budget,
                 &observer,
                 children,
@@ -1724,11 +1724,10 @@ fn run_inner(
     if let Some(allowed) = &job.resume_tools {
         names.retain(|name| allowed.contains(name));
     }
-    if let Some(sink) = &children.transcript {
-        if let Err(error) = sink.execution_contract(&names, &env.config.selection().display_name())
-        {
-            return Outcome::failed(0, format!("saving worker execution contract: {error:#}"));
-        }
+    if let Some(sink) = &children.transcript
+        && let Err(error) = sink.execution_contract(&names, &env.config.selection().display_name())
+    {
+        return Outcome::failed(0, format!("saving worker execution contract: {error:#}"));
     }
     let mut schemas = match schemas(env, &names) {
         Ok(schemas) => schemas,
@@ -2055,7 +2054,7 @@ fn run_inner(
                 }
             }
         }
-        let projected;
+
         if should_compact && experimental && !children.journal.borrow().exploration.busy() {
             match rollover_child(env, job, backend, &mut request, rule_state, children, None, approver, adapter, &mut steps, budget) {
                 Ok(true) => approver.notice("Private child notes-backed context window committed; original records remain searchable until this task ends."),
@@ -2064,7 +2063,7 @@ fn run_inner(
                 Err(error) => return Ok(super::engine::Tick::Finished(Outcome::failed(steps, format!("{error:#}")))),
             }
         }
-        projected = super::compaction::request_tokens_with_policy(
+        let projected = super::compaction::request_tokens_with_policy(
             &request,
             &env.config.compaction,
             identity,
@@ -2095,7 +2094,7 @@ fn run_inner(
         let observer = std::cell::RefCell::new(&mut *approver);
         let generation_scope = turn_cancel.inference();
         let generation_cancel = generation_scope.flag();
-        let mut rule_monitor = rule_catalog.monitor(rule_root, &rule_state, &rule_agent);
+        let mut rule_monitor = rule_catalog.monitor(rule_root, rule_state, &rule_agent);
         let provider_rewrite = match child_provider_request(&env, &request, &observer) {
             Ok(rewrite) => rewrite,
             Err(error) => return Ok(super::engine::Tick::Finished(Outcome::failed(steps, format!("{error:#}")))),
@@ -2184,7 +2183,7 @@ fn run_inner(
             .and_then(|error| error.downcast_ref::<super::rules::Hit>())
             .cloned();
         let scoped_paths = result.as_ref().ok().and_then(|reply| {
-            rule_catalog.pending_paths(rule_root, &rule_state, &rule_agent, &reply.tool_calls)
+            rule_catalog.pending_paths(rule_root, rule_state, &rule_agent, &reply.tool_calls)
         });
         if !env.interrupt.load(Ordering::SeqCst) && (rule_hit.is_some() || scoped_paths.is_some()) {
             if result.is_ok()
@@ -2582,11 +2581,10 @@ fn run_inner(
                 }
                 approver.notice(&hit.to_string());
             }
-            if let Some(paths) = scoped_paths {
-                if let Err(error) = rule_state.activate(paths) {
+            if let Some(paths) = scoped_paths
+                && let Err(error) = rule_state.activate(paths) {
                     return Ok(super::engine::Tick::Finished(Outcome::failed(steps, error)));
                 }
-            }
             if budget != 0 {
                 budget = budget.saturating_add(1);
             }
@@ -4242,12 +4240,14 @@ fn semantic_find(
     })
 }
 
+/// Veto hook for mutating tool calls: `(tool, paths, ..)` returns `Err(reason)` to refuse.
+type MutationAuthorizer<'a> =
+    &'a dyn Fn(&str, &[std::path::PathBuf], bool) -> std::result::Result<(), String>;
+
 fn execute(
     env: Env,
     call: &llm::ToolCall,
-    mutation_authorizer: Option<
-        &dyn Fn(&str, &[std::path::PathBuf], bool) -> std::result::Result<(), String>,
-    >,
+    mutation_authorizer: Option<MutationAuthorizer<'_>>,
     confirm: Option<&dyn Fn(&str) -> bool>,
 ) -> ToolOutput {
     let context = ToolContext {

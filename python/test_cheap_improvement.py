@@ -1,13 +1,21 @@
 """Reasoning targets, exact adapter combination, likelihood scoring and request contracts."""
-import json
 import importlib.util
+import json
 import math
 import os
 import tempfile
 import unittest
 from pathlib import Path
+
 import dial_steering as s
-from dial_worker import (RequestError, combine_request, encode, messages, reasoning_renderer, score_request)
+from dial_worker import (
+    RequestError,
+    combine_request,
+    encode,
+    messages,
+    reasoning_renderer,
+    score_request,
+)
 
 
 def call(name="read", path="a"):
@@ -169,7 +177,7 @@ class Requests(unittest.TestCase):
 
 try:
     import mlx.core as mx
-    import mlx.nn as nn
+    from mlx import nn
 except ImportError:
     mx = None
 
@@ -258,7 +266,7 @@ class AdapterAlgebra(unittest.TestCase):
             first = self.adapter(root, "first", 2, ["q_proj"], 2, 20.0)
             second = self.adapter(root, "second", 1, ["o_proj"], 1, 1.0)
             combine_adapters(self.model(), "test", [(str(first), 1.0), (str(second), 1.0)], root / "soup")
-            count, parameters, expected, weights = resume_layout(self.model(), "test", root / "soup", root)
+            count, parameters, _expected, weights = resume_layout(self.model(), "test", root / "soup", root)
             self.assertEqual((count, parameters), (2, {"rank": 3, "dropout": 0.0, "scale": 20.0,
                                                        "keys": ["o_proj", "q_proj"]}))
             resumed = root / "resumed"
@@ -285,8 +293,8 @@ class AdapterAlgebra(unittest.TestCase):
                         adapter_layout(self.model(), "test", path)
 
     def test_batched_scores_match_single_sequence_scores(self):
-        from mlx_lm.models.llama import Model, ModelArgs
         from dial_worker import target_logprobs
+        from mlx_lm.models.llama import Model, ModelArgs
         mx.random.seed(3)
         model = Model(ModelArgs(model_type="llama", hidden_size=16, num_hidden_layers=2, intermediate_size=32,
                                 num_attention_heads=2, num_key_value_heads=2, rms_norm_eps=1e-5, vocab_size=32))
@@ -299,6 +307,7 @@ class AdapterAlgebra(unittest.TestCase):
 
     def test_bake_writes_at_the_block_output_then_falls_back_to_the_next_attention(self):
         from unittest.mock import patch
+
         from mlx_lm.models.llama import Model, ModelArgs
         model = Model(ModelArgs(model_type="llama", hidden_size=16, num_hidden_layers=3, intermediate_size=32,
                                 num_attention_heads=2, num_key_value_heads=2, rms_norm_eps=1e-5, vocab_size=32))

@@ -59,19 +59,19 @@ impl JobsOverlay {
     pub fn set_jobs(&mut self, jobs: Vec<JobRow>) {
         let selected = self.jobs.get(self.cursor).map(|job| job.name.clone());
         self.jobs = jobs;
-        if let Some(name) = selected {
-            if let Some(index) = self.jobs.iter().position(|job| job.name == name) {
-                self.cursor = index;
-            }
+        if let Some(name) = selected
+            && let Some(index) = self.jobs.iter().position(|job| job.name == name)
+        {
+            self.cursor = index;
         }
         self.cursor = self.cursor.min(self.jobs.len().saturating_sub(1));
-        if let Some(name) = &self.attached {
-            if !self.jobs.iter().any(|job| &job.name == name) {
-                self.message = Some((format!("{name} is no longer in the job table"), true));
-                self.attached = None;
-                self.screen.clear();
-                self.screen_cursor = None;
-            }
+        if let Some(name) = &self.attached
+            && !self.jobs.iter().any(|job| &job.name == name)
+        {
+            self.message = Some((format!("{name} is no longer in the job table"), true));
+            self.attached = None;
+            self.screen.clear();
+            self.screen_cursor = None;
         }
     }
 
@@ -137,18 +137,18 @@ impl JobsOverlay {
             self.cursor = 0;
         } else if keys.matches(Action::SelectPageDown, key) {
             self.cursor = last;
-        } else if keys.matches(Action::SelectConfirm, key) {
-            if let Some(job) = self.jobs.get(self.cursor) {
-                self.attached = Some(job.name.clone());
-                self.screen.clear();
-                self.screen_cursor = None;
-                self.message = (!job.running).then(|| {
-                    (
-                        format!("{} has exited; showing its last output", job.name),
-                        false,
-                    )
-                });
-            }
+        } else if keys.matches(Action::SelectConfirm, key)
+            && let Some(job) = self.jobs.get(self.cursor)
+        {
+            self.attached = Some(job.name.clone());
+            self.screen.clear();
+            self.screen_cursor = None;
+            self.message = (!job.running).then(|| {
+                (
+                    format!("{} has exited; showing its last output", job.name),
+                    false,
+                )
+            });
         }
         OverlayEvent::None
     }

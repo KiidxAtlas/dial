@@ -1072,12 +1072,11 @@ impl ModelDownloads {
                 };
                 // A background browse must not replace the model under Enter while navigating.
                 let mut hits = hits;
-                if self.query.trim().is_empty() {
-                    if let Some(hit) = &selected_hit {
-                        if !hits.iter().any(|new| new.repo == hit.repo) {
-                            hits.insert(0, hit.clone());
-                        }
-                    }
+                if self.query.trim().is_empty()
+                    && let Some(hit) = &selected_hit
+                    && !hits.iter().any(|new| new.repo == hit.repo)
+                {
+                    hits.insert(0, hit.clone());
                 }
                 if !hits.is_empty() || !self.query.trim().is_empty() {
                     self.hits = hits;

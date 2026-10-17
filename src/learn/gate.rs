@@ -1012,8 +1012,7 @@ mod tests {
             &[],
             &|| false,
         )
-        .err()
-        .expect("3 of 10 excluded cases must abort");
+        .expect_err("3 of 10 excluded cases must abort");
         assert!(error.to_string().contains("did not complete"), "{error}");
     }
 

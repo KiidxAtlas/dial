@@ -470,6 +470,17 @@ impl ImproveOverlay {
     }
 }
 
+impl ImproveOverlay {
+    /// The text of the notice line, for tests and the footer.
+    #[cfg(test)]
+    fn screen_notice(&self) -> String {
+        match &self.notice {
+            Some(Notice::Done(m) | Notice::Failed(m) | Notice::Info(m)) => m.clone(),
+            None => String::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::settings::testkit::*;
@@ -679,17 +690,6 @@ mod tests {
             for height in [1, 4, 12, 30] {
                 render(width, height, |frame| overlay.draw(frame, &ctx));
             }
-        }
-    }
-}
-
-impl ImproveOverlay {
-    /// The text of the notice line, for tests and the footer.
-    #[cfg(test)]
-    fn screen_notice(&self) -> String {
-        match &self.notice {
-            Some(Notice::Done(m) | Notice::Failed(m) | Notice::Info(m)) => m.clone(),
-            None => String::new(),
         }
     }
 }

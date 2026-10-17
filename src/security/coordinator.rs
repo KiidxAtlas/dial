@@ -644,10 +644,10 @@ mod tests {
                     scan::request_cancel(&scan.id);
                 }
             }
-            if let Some((after, path)) = &self.rewrite_after {
-                if self.prompts.len() == *after {
-                    fs::write(path, "fn changed() {}\n").unwrap();
-                }
+            if let Some((after, path)) = &self.rewrite_after
+                && self.prompts.len() == *after
+            {
+                fs::write(path, "fn changed() {}\n").unwrap();
             }
             match self.replies.pop_front() {
                 Some(Ok(text)) => Ok(text),
@@ -796,7 +796,7 @@ mod tests {
         let inventory = paths(1);
         let (_dir, plan, store) = fixture(&inventory);
         let replies = vec![
-            ok(assignment(&[inventory.clone()])),
+            ok(assignment(std::slice::from_ref(&inventory))),
             ok(report_with_finding(&inventory[0])),
         ];
         let mut reviewer = Fake::new(&store, replies);

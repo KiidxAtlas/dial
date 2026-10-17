@@ -57,7 +57,7 @@ def _make_computer():
         return {"method": method, "args": _arguments(args, kwargs)}
 
     class _Element:
-        __slots__ = ("ref", "role", "nativeRole", "title", "description", "enabled", "focused", "childCount")
+        __slots__ = ("childCount", "description", "enabled", "focused", "nativeRole", "ref", "role", "title")
 
         def __init__(self, snapshot):
             for field in self.__slots__:
@@ -104,7 +104,7 @@ def _make_computer():
             return [_Element(snapshot) for snapshot in await self._method("children", (), {})]
 
     class _Namespace:
-        __slots__ = ("_root", "_namespace")
+        __slots__ = ("_namespace", "_root")
 
         def __init__(self, root, namespace):
             self._root = root
@@ -183,7 +183,7 @@ def _make_computer():
             return await _call([_step("display", (self.id,), {}), _step(method, args, kwargs)])
 
     class _Window(_InputTarget):
-        __slots__ = ("id", "app", "title", "pid", "bounds", "focused", "menu")
+        __slots__ = ("app", "bounds", "focused", "id", "menu", "pid", "title")
 
         def __init__(self, snapshot):
             for field in ("id", "app", "title", "pid", "bounds", "focused"):
@@ -226,7 +226,7 @@ def _make_computer():
             return await _call([_step("clipboard.write", (text,), {})])
 
     class _Computer(_InputTarget):
-        __slots__ = ("clipboard", "apps", "control")
+        __slots__ = ("apps", "clipboard", "control")
 
         def __init__(self):
             self.clipboard = _Clipboard()

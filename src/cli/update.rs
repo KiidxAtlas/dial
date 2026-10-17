@@ -337,6 +337,7 @@ fn lock_install_dir(dir: &Path) -> Result<InstallLock> {
 /// 1. copy the current executable to `backup`, verified by digest, without touching the active name;
 /// 2. rename the staged file over the active name (atomic on the same filesystem);
 /// 3. fsync the install directory and run `verify` on the active name.
+///
 /// A failure in 3 renames the verified backup back. If that rollback also fails, both errors are
 /// reported and the backup stays at `backup` for manual recovery.
 #[cfg(unix)]

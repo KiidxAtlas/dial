@@ -341,9 +341,8 @@ pub(crate) fn resolve_entry(
     key: Option<&str>,
 ) -> Option<SearchResult> {
     for candidate in candidate_paths(entry) {
-        match fetch_details_at(registry, &candidate, key) {
-            Ok(Some(details)) => return to_search_result(entry, &details),
-            Ok(None) | Err(_) => {}
+        if let Ok(Some(details)) = fetch_details_at(registry, &candidate, key) {
+            return to_search_result(entry, &details);
         }
     }
     None

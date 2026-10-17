@@ -77,10 +77,11 @@ impl<'a> Dialog<'a> {
         }
         let question = &self.request.questions[self.page];
         let answer = &mut self.answers[self.page];
-        if answer.selected_options.is_empty() && answer.custom_input.is_none() {
-            if let Some(option) = question.options.get(question.recommended.unwrap_or(0)) {
-                answer.selected_options.push(option.label.clone());
-            }
+        if answer.selected_options.is_empty()
+            && answer.custom_input.is_none()
+            && let Some(option) = question.options.get(question.recommended.unwrap_or(0))
+        {
+            answer.selected_options.push(option.label.clone());
         }
         answer.timed_out = true;
         self.advance()

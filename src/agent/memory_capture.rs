@@ -167,7 +167,7 @@ impl Agent<'_> {
                 .remove(&key)
                 .context("capture backend missing")?;
             backend.set_usage_scope(Some(capture.scope.clone()));
-            let execution = (|| -> Result<()> {
+            let execution = {
                 let output = backend.output_budget(self.version.harness.max_tokens).min(
                     backend
                         .model_profile()
@@ -296,7 +296,7 @@ impl Agent<'_> {
                 })();
                 capture.messages = request.messages;
                 turns
-            })();
+            };
             backend.release();
             backend.set_usage_scope(None);
             self.role_backends.insert(key, backend);

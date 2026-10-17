@@ -166,7 +166,7 @@ impl PromptHistory {
 
     /// Open (creating) the user's history database.
     pub fn open(user_dir: &Path) -> Result<Self> {
-        match platform_fs::create_dir_owner_only(&fs::DirBuilder::new().recursive(true), user_dir) {
+        match platform_fs::create_dir_owner_only(fs::DirBuilder::new().recursive(true), user_dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
@@ -191,7 +191,7 @@ impl PromptHistory {
 
     pub fn open_path(path: &Path) -> Result<Self> {
         let _file = platform_fs::open_owner_only(
-            &fs::OpenOptions::new().read(true).write(true).create(true),
+            fs::OpenOptions::new().read(true).write(true).create(true),
             path,
         )
         .with_context(|| format!("opening {}", path.display()))?;
@@ -291,13 +291,11 @@ impl PromptHistory {
         // A malformed FTS expression falls through to the substring path.
         let fts = self
             .rows(
-                &format!(
-                    "SELECT h.id, h.prompt, h.created_at, h.cwd, h.session_id, h.use_count
+                "SELECT h.id, h.prompt, h.created_at, h.cwd, h.session_id, h.use_count
                      FROM history_fts f JOIN history h ON h.id = f.rowid
                      WHERE history_fts MATCH ?1 AND (?2 IS NULL OR h.cwd = ?2)
                        AND (?3 IS NULL OR h.session_id = ?3)
-                     ORDER BY h.seq DESC, h.id DESC LIMIT ?4"
-                ),
+                     ORDER BY h.seq DESC, h.id DESC LIMIT ?4",
                 values,
             )
             .unwrap_or_default();
@@ -421,11 +419,12 @@ pub fn record_prompt(
     Ok(())
 }
 
+/// Searches prompt history: `(query, limit)` to matching prompts.
+pub type HistoryProvider = Arc<dyn Fn(&str, usize) -> Vec<String> + Send + Sync>;
+
 /// Provider for the composer's Ctrl+R search over every project's prompts: an empty query lists
 /// the newest prompts. The connection stays open; each call is one indexed query.
-pub fn history_provider(
-    user_dir: &Path,
-) -> Option<Arc<dyn Fn(&str, usize) -> Vec<String> + Send + Sync>> {
+pub fn history_provider(user_dir: &Path) -> Option<HistoryProvider> {
     let history = Mutex::new(PromptHistory::open(user_dir).ok()?);
     Some(Arc::new(move |query: &str, limit: usize| {
         let history = history.lock().unwrap_or_else(|e| e.into_inner());

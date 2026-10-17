@@ -534,11 +534,12 @@ pub(crate) fn finish(
         progress,
     } = finished;
     let (mut ok, mut message) = (ok, message);
-    if ok && !changes.is_empty() {
-        if let Err(error) = save(&changes, scope) {
-            ok = false;
-            message = format!("Done, but saving the config failed: {error:#}");
-        }
+    if ok
+        && !changes.is_empty()
+        && let Err(error) = save(&changes, scope)
+    {
+        ok = false;
+        message = format!("Done, but saving the config failed: {error:#}");
     }
     if let Ok(mut shown) = progress.lock() {
         shown.label = None;

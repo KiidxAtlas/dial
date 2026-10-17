@@ -14,13 +14,9 @@ use std::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct EditToggle {
     pub enabled: bool,
-}
-impl Default for EditToggle {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -640,7 +636,7 @@ fn replace_plan(
                     )
                 )
             };
-            return Err(format!("{detail}.{}", diagnose_miss(&lf, old)));
+            return Err(format!("{detail}.{}", diagnose_miss(lf, old)));
         }
     };
     let flags = hashline::transition_flags(lf, &replaced.content, &source.flags(ws, &change.path));
@@ -675,25 +671,26 @@ fn diagnose_miss(text: &str, old: &str) -> String {
     }
     let file: Vec<_> = text.lines().collect();
     let pattern: Vec<_> = old.lines().map(str::trim).collect();
-    if !pattern.is_empty() && pattern.len() <= file.len() {
-        if let Some(at) = file.windows(pattern.len()).position(|window| {
+    if !pattern.is_empty()
+        && pattern.len() <= file.len()
+        && let Some(at) = file.windows(pattern.len()).position(|window| {
             window
                 .iter()
                 .map(|line| line.trim())
                 .eq(pattern.iter().copied())
-        }) {
-            let rows = file[at..at + pattern.len()]
-                .iter()
-                .take(14)
-                .enumerate()
-                .map(|(n, line)| format!("{}:{line}\n", at + n + 1))
-                .collect::<String>();
-            return format!(
-                " The text exists at lines {}-{} with different whitespace. Actual text:\n{rows}",
-                at + 1,
-                at + pattern.len()
-            );
-        }
+        })
+    {
+        let rows = file[at..at + pattern.len()]
+            .iter()
+            .take(14)
+            .enumerate()
+            .map(|(n, line)| format!("{}:{line}\n", at + n + 1))
+            .collect::<String>();
+        return format!(
+            " The text exists at lines {}-{} with different whitespace. Actual text:\n{rows}",
+            at + 1,
+            at + pattern.len()
+        );
     }
     let Some(anchor) = content
         .first()
@@ -942,10 +939,10 @@ fn sloppy_plan(
             },
         )
         .map_err(|e| {
-            if matches!(&e, EditError::NoChange(_)) {
-                if let Some(flag) = preview_no_change {
-                    flag.set(true);
-                }
+            if matches!(&e, EditError::NoChange(_))
+                && let Some(flag) = preview_no_change
+            {
+                flag.set(true);
             }
             e.to_string()
         })?;
@@ -1008,10 +1005,12 @@ pub(crate) fn prepare_streaming_preview(
     validate_shape(ws.edit_mode, args)?;
     entries_plan(ws, apply_entries(req_str(args, "input")?, true)?, false)
 }
+/// Authorizes the paths an edit is about to touch.
+type PathAuthorizer<'a> = &'a dyn Fn(&[PathBuf]) -> Result<(), String>;
 #[derive(Default)]
 pub(crate) struct Execution<'a> {
     pub repair: Option<super::syntax::RepairCallback<'a>>,
-    pub authorize: Option<&'a dyn Fn(&[PathBuf]) -> Result<(), String>>,
+    pub authorize: Option<PathAuthorizer<'a>>,
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
     pub preview_no_change: Option<&'a std::cell::Cell<bool>>,
 }
@@ -1236,7 +1235,7 @@ pub(crate) fn finish_with(
         output.insert_str(0, "Preview only; no files modified.\n");
     }
     for note in warnings {
-        output.push_str("\n");
+        output.push('\n');
         output.push_str(&note);
     }
     Ok(output)

@@ -37,19 +37,19 @@ fn working_directory(
         // Retain the bash convenience of accepting an initial `cd path && ...`; PowerShell
         // commands stay untouched and use the explicit `cwd` argument/current directory.
         let trimmed = command.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("cd ") {
-            if let Some((target, script)) = rest.split_once(" && ") {
-                let target = target.trim();
-                if !target.is_empty() && !target.contains(['\'', '"', '`', '$', ';', '|']) {
-                    // Relative targets are relative to the effective cwd, not the primary root.
-                    let candidate = cwd.join(target);
-                    if let Some(path) = candidate
-                        .to_str()
-                        .and_then(|candidate| ws.resolve(candidate).ok())
-                        && path.is_dir()
-                    {
-                        return Ok((path, script.to_owned()));
-                    }
+        if let Some(rest) = trimmed.strip_prefix("cd ")
+            && let Some((target, script)) = rest.split_once(" && ")
+        {
+            let target = target.trim();
+            if !target.is_empty() && !target.contains(['\'', '"', '`', '$', ';', '|']) {
+                // Relative targets are relative to the effective cwd, not the primary root.
+                let candidate = cwd.join(target);
+                if let Some(path) = candidate
+                    .to_str()
+                    .and_then(|candidate| ws.resolve(candidate).ok())
+                    && path.is_dir()
+                {
+                    return Ok((path, script.to_owned()));
                 }
             }
         }
@@ -404,8 +404,9 @@ pub fn bash_tool_streaming_with_adopter(
         cancel,
         on_adopt,
     )?;
-    if let Some(line) =
-        hint.or_else(|| bash_interceptor::ci_poll_hint(config, &offered, command, &output.text))
+    if let Some(line) = hint
+        .or_else(|| bash_interceptor::ci_poll_hint(config, &offered, command, &output.text))
+        .or_else(|| bash_interceptor::trim_hint(config, command))
     {
         if !output.text.ends_with('\n') {
             output.text.push('\n');

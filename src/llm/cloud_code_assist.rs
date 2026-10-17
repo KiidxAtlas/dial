@@ -251,7 +251,7 @@ pub(super) fn exchange(
     route: &Route<'_>,
     req: &Chat,
     timeout: u64,
-    mut on_text: OnText<'_, '_>,
+    on_text: OnText<'_, '_>,
     interrupt: Arc<AtomicBool>,
     profile: Option<&ModelProfile>,
     on_event: &mut dyn FnMut(&StreamEvent) -> bool,
@@ -312,8 +312,10 @@ pub(super) fn exchange(
         Err(error) => return Err(error),
     };
     let first_status = response.status().as_u16();
-    if (first_status == 429 || first_status >= 500) && fallback.is_some() {
-        url = fallback.unwrap();
+    if (first_status == 429 || first_status >= 500)
+        && let Some(fallback) = fallback
+    {
+        url = fallback;
         response = super::send_with_headers(
             &url,
             route.auth,
@@ -359,7 +361,7 @@ pub(super) fn exchange(
             if interrupt.load(Ordering::SeqCst) {
                 return Err(super::Interrupted.into());
             }
-            accumulator.feed(data, &patience, &mut on_text, on_event)
+            accumulator.feed(data, &patience, on_text, on_event)
         },
     );
     if interrupt.load(Ordering::SeqCst) {
@@ -427,12 +429,11 @@ mod tests {
         let body = envelope(&route, json!({"contents": []}), &chat, &scope).unwrap();
         assert_eq!(body["userAgent"], "antigravity");
         assert_eq!(body["requestType"], "agent");
-        assert_eq!(
+        assert!(
             body["request"]["sessionId"]
                 .as_str()
                 .unwrap()
-                .starts_with('-'),
-            true
+                .starts_with('-')
         );
         assert!(body["requestId"].as_str().unwrap().starts_with("agent/"));
         assert_eq!(body["request"]["labels"]["last_execution_id"], "exec");

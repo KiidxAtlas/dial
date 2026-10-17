@@ -225,7 +225,7 @@ impl Store {
     pub(crate) fn open_read_only(state_dir: &Path) -> Result<Self> {
         let path = state_dir.join("state.sqlite3");
         let file =
-            platform_fs::open_nofollow_nonblocking(&fs::OpenOptions::new().read(true), &path)?;
+            platform_fs::open_nofollow_nonblocking(fs::OpenOptions::new().read(true), &path)?;
         ensure!(
             file.metadata()?.is_file(),
             "state database must be a regular file"
@@ -240,8 +240,7 @@ impl Store {
             !model.trim().is_empty() && !use_case.trim().is_empty(),
             "model and use_case must be nonempty"
         );
-        match platform_fs::create_dir_owner_only(&fs::DirBuilder::new().recursive(true), state_dir)
-        {
+        match platform_fs::create_dir_owner_only(fs::DirBuilder::new().recursive(true), state_dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error).context("create state directory"),

@@ -637,7 +637,7 @@ impl RepeatGuard {
         if count < REPEAT_LIMIT {
             return None;
         }
-        if count % FAILURE_LIMIT == 0 {
+        if count.is_multiple_of(FAILURE_LIMIT) {
             return Some(Self::escalation(call, count));
         }
         Some(format!(
@@ -793,7 +793,7 @@ impl StallGuard {
             Stall::Warn(format!(
                 "{rounds} rounds of tool calls in a row have failed completely. Stop and reconsider: read the errors, check the current state of the files, and change your approach, or report the blocker in your answer."
             ))
-        } else if rounds > ROUND_WARN && rounds % ROUND_WARN == 0 {
+        } else if rounds > ROUND_WARN && rounds.is_multiple_of(ROUND_WARN) {
             Stall::Warn(format!(
                 "[Escalation: every tool call has failed for {rounds} rounds in a row. Retrying the same kind of call is not making progress. Run one small call known to work, confirm the project and tools respond, then change approach. The turn continues.]"
             ))

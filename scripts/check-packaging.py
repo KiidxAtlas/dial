@@ -13,15 +13,14 @@ import sys
 import tomllib
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
 FLAKE_DERIVED = re.compile(
     r"version\s*=\s*\(builtins\.fromTOML\s*\(builtins\.readFile\s+\./Cargo\.toml\)\)\.package\.version\s*;"
 )
-FLAKE_LITERAL = re.compile(r'^\s*version\s*=\s*"[^"]*"\s*;', re.M)
-FORMULA_VERSION = re.compile(r'^  version "([^"]+)"$', re.M)
-FORMULA_URL = re.compile(r'^\s*url "([^"]+)"$', re.M)
-FORMULA_SHA = re.compile(r'^\s*sha256 (?::no_check|"[^"]*")$', re.M)
+FLAKE_LITERAL = re.compile(r'^\s*version\s*=\s*"[^"]*"\s*;', re.MULTILINE)
+FORMULA_VERSION = re.compile(r'^  version "([^"]+)"$', re.MULTILINE)
+FORMULA_URL = re.compile(r'^\s*url "([^"]+)"$', re.MULTILINE)
+FORMULA_SHA = re.compile(r'^\s*sha256 (?::no_check|"[^"]*")$', re.MULTILINE)
 
 
 def cargo_version(cargo_text):

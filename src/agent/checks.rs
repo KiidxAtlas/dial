@@ -299,15 +299,17 @@ impl<'a> Agent<'a> {
         let mut results = Vec::new();
         let mut outcomes = Vec::new();
         let receipts = self.config.experimental.verification_receipts && !self.hermetic;
-        let receipt_paths: Vec<String> = receipts
-            .then(|| {
+        let receipt_paths: Vec<String> = if receipts {
+            {
                 self.step_checks
                     .turn
                     .zip(self.checkpoints.as_ref())
                     .map(|(turn, checkpoints)| checkpoints.changed_files(turn))
                     .unwrap_or_default()
-            })
-            .unwrap_or_default();
+            }
+        } else {
+            Default::default()
+        };
         let source_before = receipts
             .then(|| verification_receipts::source_identity(self.workspace.root(), &receipt_paths));
         for (index, check) in checks.iter().enumerate() {
@@ -339,7 +341,7 @@ impl<'a> Agent<'a> {
             if status != verification::CheckStatus::Passed {
                 ui.event(&crate::agent::ui_event::UiEvent::new(
                     crate::agent::ui_event::EventKind::Verification,
-                    &format!("Verification {}: {status:?}", check.name),
+                    format!("Verification {}: {status:?}", check.name),
                 ));
                 self.step_checks.failed_checks.push(check.clone());
                 let description = verification::environment_problem(check, &output.text).unwrap_or(

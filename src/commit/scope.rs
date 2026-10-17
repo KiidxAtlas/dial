@@ -282,17 +282,16 @@ pub(crate) fn extract_path_from_rename(path_part: &str) -> String {
         if let Some(arrow) = value[brace_start..]
             .find(" => ")
             .map(|offset| offset + brace_start)
+            && let Some(brace_end) = value[arrow..].find('}').map(|offset| offset + arrow)
         {
-            if let Some(brace_end) = value[arrow..].find('}').map(|offset| offset + arrow) {
-                return format!(
-                    "{}{}{}",
-                    &value[..brace_start],
-                    value[arrow + 4..brace_end].trim(),
-                    &value[brace_end + 1..]
-                )
-                .trim()
-                .to_owned();
-            }
+            return format!(
+                "{}{}{}",
+                &value[..brace_start],
+                value[arrow + 4..brace_end].trim(),
+                &value[brace_end + 1..]
+            )
+            .trim()
+            .to_owned();
         }
         return value.to_owned();
     }

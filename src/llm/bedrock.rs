@@ -240,10 +240,10 @@ fn request(
                     .context("invalid Bedrock replay blocks")?
                     .clone();
                 for block in &mut blocks {
-                    if let Some(reasoning) = block.pointer("/reasoningContent/reasoningText") {
-                        if reasoning["signature"].as_str().is_none_or(str::is_empty) {
-                            *block = json!({"text":reasoning["text"]});
-                        }
+                    if let Some(reasoning) = block.pointer("/reasoningContent/reasoningText")
+                        && reasoning["signature"].as_str().is_none_or(str::is_empty)
+                    {
+                        *block = json!({"text":reasoning["text"]});
                     }
                 }
                 blocks.retain(|block| {

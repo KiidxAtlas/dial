@@ -440,9 +440,10 @@ mod tests {
 
     /// Config whose user directory (commit cache) lives outside the repository.
     fn test_config(user_dir: &Path) -> Config {
-        let mut config = Config::default();
-        config.user_dir = user_dir.to_path_buf();
-        config
+        Config {
+            user_dir: user_dir.to_path_buf(),
+            ..Default::default()
+        }
     }
 
     fn legacy_args() -> CommitCommandArgs {

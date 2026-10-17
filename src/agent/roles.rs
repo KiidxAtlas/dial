@@ -224,7 +224,7 @@ impl<'a> Agent<'a> {
         main.require_session_identity()?;
         let namespace = match &self.active_side_namespace {
             Some(namespace) => namespace.clone(),
-            None => compaction_runtime::side_request_namespace(&self.session.id())?,
+            None => compaction_runtime::side_request_namespace(self.session.id())?,
         };
         let previous_cache = main.swap_cache_namespace(&namespace, &self.auth_config)?;
         let previous_scope =

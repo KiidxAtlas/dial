@@ -1208,7 +1208,7 @@ pub(super) fn compact(
                 Ok(false)
             },
         )?;
-        let response = completed.ok_or_else(|| {
+        let response = completed.ok_or({
             super::stream::IncompleteStream("V2 compaction stream ended before response.completed")
         })?;
         output = done;
@@ -1278,10 +1278,9 @@ pub(super) fn compact(
         if let Some(text) = item["summary"]
             .as_str()
             .or_else(|| item["content"].as_str())
+            && !text.trim().is_empty()
         {
-            if !text.trim().is_empty() {
-                summary = Some(text.to_owned());
-            }
+            summary = Some(text.to_owned());
         }
         if let Some(object) = item.as_object_mut() {
             object.remove("status");

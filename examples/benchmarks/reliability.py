@@ -3,8 +3,8 @@
 import argparse
 import json
 import math
-from pathlib import Path
 import statistics
+from pathlib import Path
 
 from compare import checked_success, evidence, indexed, invalid_reason
 

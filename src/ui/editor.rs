@@ -79,6 +79,10 @@ impl KillRing {
     pub fn len(&self) -> usize {
         self.ring.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
 }
 
 /// The cursor is a byte offset, always at an extended-grapheme boundary.

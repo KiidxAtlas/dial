@@ -2,8 +2,8 @@
 import asyncio
 import io
 import json
-from types import SimpleNamespace as NS
 import unittest
+from types import SimpleNamespace as NS
 from unittest import mock
 
 import dial_server as dial
@@ -62,7 +62,7 @@ class TextProgressTests(unittest.TestCase):
             def __init__(self):
                 self.wfile = io.BytesIO()
             def handle_completion(self):
-                ctx, response = Generator().generate({}, {}, progress_callback=lambda *a: original_callbacks.append(a))
+                _ctx, response = Generator().generate({}, {}, progress_callback=lambda *a: original_callbacks.append(a))
                 self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
                 self.result = list(response)
         server = NS(APIHandler=Handler, ResponseGenerator=Generator)
@@ -99,7 +99,7 @@ class VisionProgressTests(unittest.IsolatedAsyncioTestCase):
             wire.append(message)
         async def request(scope, receive, send):
             await send({"type":"http.response.start", "status":200, "headers":[(b"content-type", b"text/event-stream")]})
-            ctx, iterator = await asyncio.to_thread(Generator().generate)
+            _ctx, iterator = await asyncio.to_thread(Generator().generate)
             await asyncio.sleep(0.1)
             self.assertTrue(any(p["dial_progress"].get("prompt_tokens") == 17 for p in packets(b"".join(m.get("body", b"") for m in wire))))
             first = await asyncio.to_thread(next, iterator)
@@ -278,14 +278,14 @@ class VisionCachePolicyTests(unittest.TestCase):
         self.assertEqual(apc.self_check_model_apc.call_count, 1)
 
     def test_supported_layout_keeps_block_cache(self):
-        gen, apc, runtime, manager = self.generator(check=NS(ok=True, apc_mode="block", notes=[]))
+        gen, _apc, runtime, manager = self.generator(check=NS(ok=True, apc_mode="block", notes=[]))
         gen.wait_until_ready()
         self.assertIs(gen.apc_manager, manager)
         self.assertIs(runtime.apc_manager, manager)
         manager.close.assert_not_called()
 
     def test_raising_self_check_refuses_cache_with_logged_cause(self):
-        gen, apc, runtime, manager = self.generator(raises=RuntimeError("bad layout"))
+        gen, _apc, _runtime, manager = self.generator(raises=RuntimeError("bad layout"))
         with self.assertLogs(level="WARNING") as logs:
             gen.wait_until_ready()
         self.assertIsNone(gen.apc_manager)

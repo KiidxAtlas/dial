@@ -234,11 +234,10 @@ struct Pending<'a> {
 }
 
 /// Parses one `WorkspaceEdit` into per-document edit lists. `null` means no edits.
-fn collect_documents<'v>(
-    ws: &Workspace,
-    value: &'v Value,
-) -> Result<BTreeMap<PathBuf, (Option<i64>, Vec<&'v Value>)>, String> {
-    let mut documents: BTreeMap<PathBuf, (Option<i64>, Vec<&'v Value>)> = BTreeMap::new();
+type DocumentEdits<'v> = BTreeMap<PathBuf, (Option<i64>, Vec<&'v Value>)>;
+
+fn collect_documents<'v>(ws: &Workspace, value: &'v Value) -> Result<DocumentEdits<'v>, String> {
+    let mut documents = DocumentEdits::new();
     if value.is_null() {
         return Ok(documents);
     }

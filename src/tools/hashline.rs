@@ -1487,7 +1487,7 @@ fn load_job(
     let source = super::edit_source::Source::load(&abs, Some(raw))?;
     super::editing::generated_guard(ws, &abs, Some(&source.text))?;
     let (cur_lf, raw_revision, carrier) = source.into_parts();
-    let (crlf, mixed) = line_endings(&raw);
+    let (crlf, mixed) = line_endings(raw);
     let cur_tag = tag_of(&cur_lf);
     let fallback = Snapshot {
         tag: cur_tag.clone(),
@@ -1535,7 +1535,7 @@ fn load_job(
         if block_lines.is_empty() || matches!(ext.as_str(), "md" | "markdown" | "mdx") {
             None
         } else {
-            super::syntax::block_ends(&abs, if stale { &snap.text } else { &cur_lf }, &block_lines)
+            super::syntax::block_ends(&abs, if stale { &snap.text } else { &cur_lf }, block_lines)
         };
     Ok(Job {
         ext,
@@ -2609,11 +2609,11 @@ pub fn rehydrate<'a>(
             if let Some((number, body)) = line.split_once(':')
                 && number.bytes().all(|b| b.is_ascii_digit())
                 && let Ok(number) = number.parse::<usize>()
+                && entry.1.len() < 32_768
+                && body.len() <= 32 * 1024 * 1024usize - witness_bytes
             {
-                if entry.1.len() < 32_768 && body.len() <= 32 * 1024 * 1024usize - witness_bytes {
-                    witness_bytes += body.len();
-                    entry.1.push((number, body.to_owned()));
-                }
+                witness_bytes += body.len();
+                entry.1.push((number, body.to_owned()));
             }
         }
     }

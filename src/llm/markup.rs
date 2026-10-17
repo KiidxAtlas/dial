@@ -23,7 +23,7 @@ impl Healer {
                     return false;
                 }
                 self.pending.drain(..at + tag.len());
-                self.reasoning = tag.starts_with("</") == false;
+                self.reasoning = !tag.starts_with("</");
                 continue;
             }
             let keep = (1..self.pending.len())

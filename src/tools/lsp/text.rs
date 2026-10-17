@@ -46,7 +46,7 @@ pub use crate::tools::resources::path_from_uri;
 
 /// Read a source file as UTF-8, refusing anything larger than [`MAX_SOURCE_BYTES`].
 pub fn read_source(path: &Path) -> io::Result<String> {
-    let file = crate::platform::fs::open_nofollow(&OpenOptions::new().read(true), path)?;
+    let file = crate::platform::fs::open_nofollow(OpenOptions::new().read(true), path)?;
     let mut text = String::new();
     file.take(MAX_SOURCE_BYTES + 1).read_to_string(&mut text)?;
     if text.len() as u64 > MAX_SOURCE_BYTES {

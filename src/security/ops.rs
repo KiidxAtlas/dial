@@ -142,13 +142,13 @@ struct Reviewer {
 /// The signed-in reviewer account, honoring an optional `account` pin and operator policy.
 fn reviewer(env: &Env, args: &Value) -> Result<Reviewer> {
     let account = auth::select_account(&env.user_dir, str_arg(args, "account").as_deref())?;
-    if let Some(allowed) = &env.allowed_accounts {
-        if !allowed.contains(&account.client_id) {
-            bail!(
-                "ChatGPT account {} is not permitted by policy",
-                account.client_id
-            );
-        }
+    if let Some(allowed) = &env.allowed_accounts
+        && !allowed.contains(&account.client_id)
+    {
+        bail!(
+            "ChatGPT account {} is not permitted by policy",
+            account.client_id
+        );
     }
     Ok(Reviewer {
         client_id: account.client_id,

@@ -110,7 +110,7 @@ impl Agent<'_> {
         }
         let mut policy_signature = String::new();
         let mut stall = guard::StallGuard::default();
-        let mut completion = completion::CompletionGuard::default();
+        let mut completion = completion::CompletionGuard;
         let mut steering_pending = false;
         let mut budget = guard::StepBudget::new(
             max_steps,
@@ -202,13 +202,13 @@ impl Agent<'_> {
             self.pump_subagents(ui);
             self.cur_step = step;
             if self.interrupt.load(Ordering::SeqCst) {
-                return Ok(TurnReport {
+                return Ok(engine::Tick::Finished(TurnReport {
                     text: String::new(),
                     outcome: TurnOutcome::Interrupted,
                     steps: step,
                     interrupted: true,
                     trajectory: None,
-                }).map(engine::Tick::Finished);
+                }));
             }
             // Worker results are persisted before the request is built, so they stay in context and survive
             // an overflow retry; each one is delivered exactly once.
@@ -332,7 +332,7 @@ impl Agent<'_> {
                 stream_guards::TOOL_CALL_LOOP_EXEMPT_TOOLS,
             );
             if let Some(repeat) = &repeat_streak {
-                ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, &format!(
+                ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, format!(
                     "Repeated tool call {}x; redirecting the model",
                     repeat.count
                 )));
@@ -515,17 +515,17 @@ impl Agent<'_> {
                         compaction_retry_floor = Some(request_context.saturating_add(
                             compaction_runtime::SPECULATION_LEAD_MIN_TOKENS,
                         ));
-                        ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, &format!(
+                        ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, format!(
                             "context compaction could not make enough room ({error:#})"
                         )));
                         if self.interrupt.load(Ordering::SeqCst) {
-                            return Ok(TurnReport {
+                            return Ok(engine::Tick::Finished(TurnReport {
                                 text: String::new(),
                                 outcome: TurnOutcome::Interrupted,
                                 steps: step + 1,
                                 interrupted: true,
                                 trajectory: None,
-                            }).map(engine::Tick::Finished);
+                            }));
                         }
                     }
                 }
@@ -535,7 +535,7 @@ impl Agent<'_> {
                 self.rebuild_system();
                 names = self.offered();
                 *schemas = self.schemas(&names)?;
-                ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Model, &format!(
+                ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Model, format!(
                     "Context window {} is small; offering a lean tool set (others load on demand)",
                     self.context_window()
                 )));
@@ -845,7 +845,7 @@ impl Agent<'_> {
                         };
                         self.request_phase
                             .recover("the stream stalled after partial text; continuing");
-                        ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, &format!(
+                        ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, format!(
                             "Stream stalled after partial text; continuing ({stall_continues}/{})",
                             stream_guards::STREAM_STALL_CONTINUE_MAX_RETRIES
                         )));
@@ -902,13 +902,13 @@ impl Agent<'_> {
                         json!({"state":"interrupted","elapsed_ms":started.elapsed().as_millis()}),
                         ui,
                     )?;
-                    return Ok(TurnReport {
+                    return Ok(engine::Tick::Finished(TurnReport {
                         text: String::new(),
                         outcome: TurnOutcome::Interrupted,
                         steps: step,
                         interrupted: true,
                         trajectory: None,
-                    }).map(engine::Tick::Finished);
+                    }));
                 }
                 Err(error)
                     if !self.hermetic
@@ -1124,7 +1124,7 @@ impl Agent<'_> {
                             "output was truncated; retry retains an expanded token budget",
                         );
                         recovering_output = true;
-                        ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, &format!("the model hit its output limit ({requested_tokens} tokens); retrying with {raised}")));
+                        ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, format!("the model hit its output limit ({requested_tokens} tokens); retrying with {raised}")));
                         max_tokens = raised;
                         budget.refund();
                         return Ok(engine::Tick::Again);
@@ -1164,7 +1164,7 @@ impl Agent<'_> {
                     id: format!(
                         "dial-inline-{}-{step}-{}",
                         self.session.id(),
-                        self.session.branch_leaf().as_deref().unwrap_or("ephemeral")
+                        self.session.branch_leaf().unwrap_or("ephemeral")
                     ),
                     name: "edit".into(),
                     arguments,
@@ -1279,7 +1279,7 @@ impl Agent<'_> {
                 turn_recovery::StopAction::Accept => {}
                 turn_recovery::StopAction::Continue { reason, message } => {
                     self.request_phase.recover(reason);
-                    ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, &format!("Recovering: {reason}.")));
+                    ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, format!("Recovering: {reason}.")));
                     if !reply.text.trim().is_empty() {
                         self.push(json!({"role":"assistant","content":reply.text}))?;
                     }
@@ -1301,13 +1301,13 @@ impl Agent<'_> {
                     return Ok(engine::Tick::Again);
                 }
                 if self.interrupt.load(Ordering::SeqCst) {
-                    return Ok(TurnReport {
+                    return Ok(engine::Tick::Finished(TurnReport {
                         text: String::new(),
                         outcome: TurnOutcome::Interrupted,
                         steps: step + 1,
                         interrupted: true,
                         trajectory: None,
-                    }).map(engine::Tick::Finished);
+                    }));
                 }
                 if self.exploration.active.is_some() {
                     self.push(json!({"role":"user","dial_exploration_reminder":true,
@@ -1315,35 +1315,35 @@ impl Agent<'_> {
                     return Ok(engine::Tick::Again);
                 }
                 if self.plan_mode && !completion::open_work(&self.todo).is_empty() {
-                    return Ok(TurnReport {
+                    return Ok(engine::Tick::Finished(TurnReport {
                         text: reply.text,
                         outcome: TurnOutcome::NeedsInput,
                         steps: step + 1,
                         interrupted: false,
                         trajectory: None,
-                    }).map(engine::Tick::Finished);
+                    }));
                 }
                 if let Some(outcome) = completion::declared_outcome(&reply.text)
                     && (outcome != TurnOutcome::Completed || !self.advisor_enabled())
                 {
                     self.disclose_turn_changes(ui);
-                    return Ok(TurnReport {
+                    return Ok(engine::Tick::Finished(TurnReport {
                         text: reply.text,
                         outcome,
                         steps: step + 1,
                         interrupted: false,
                         trajectory: None,
-                    }).map(engine::Tick::Finished);
+                    }));
                 }
                 if !self.hermetic && completion::awaiting_input(&reply.text) {
                     ui.notice("Waiting for your answer; unfinished todos are preserved.");
-                    return Ok(TurnReport {
+                    return Ok(engine::Tick::Finished(TurnReport {
                         text: reply.text,
                         outcome: TurnOutcome::NeedsInput,
                         steps: step + 1,
                         interrupted: false,
                         trajectory: None,
-                    }).map(engine::Tick::Finished);
+                    }));
                 }
                 if self.await_background_jobs(ui) {
                     return Ok(engine::Tick::Again);
@@ -1356,13 +1356,13 @@ impl Agent<'_> {
                     completion::StopAction::Blocked(blockers) => {
                         ui.notice(&blockers);
                         self.disclose_turn_changes(ui);
-                        return Ok(TurnReport {
+                        return Ok(engine::Tick::Finished(TurnReport {
                             text: reply.text,
                             outcome: TurnOutcome::Blocked,
                             steps: step + 1,
                             interrupted: false,
                             trajectory: None,
-                        }).map(engine::Tick::Finished);
+                        }));
                     }
                 }
                 if let Err(reason) = self.validate_completion(ui) {
@@ -1403,13 +1403,13 @@ impl Agent<'_> {
                 if text.len() > streamed_len {
                     ui.text_delta(&text[streamed_len..]);
                 }
-                return Ok(TurnReport {
+                return Ok(engine::Tick::Finished(TurnReport {
                     text,
                     outcome: TurnOutcome::Completed,
                     steps: step + 1,
                     interrupted: false,
                     trajectory: None,
-                }).map(engine::Tick::Finished);
+                }));
             }
             let mut compatibility_loaded = HashSet::new();
             if !self.hermetic {
@@ -1557,13 +1557,13 @@ impl Agent<'_> {
                 }
                 if self.interrupt.load(Ordering::SeqCst) {
                     self.session.repair_incomplete_tools()?;
-                    return Ok(TurnReport {
+                    return Ok(engine::Tick::Finished(TurnReport {
                         text: String::new(),
                         outcome: TurnOutcome::Interrupted,
                         steps: step + 1,
                         interrupted: true,
                         trajectory: None,
-                    }).map(engine::Tick::Finished);
+                    }));
                 }
                 if let Some(results) = &duplicates {
                     let output = ToolOutput::ok(results[index].clone());
@@ -2352,7 +2352,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 // budget still bounds the retries.
                 let failures = reliability.consecutive_contract_failures;
                 let limit = self.config.reliability.max_contract_failures;
-                if self.config.reliability.enabled && limit > 0 && failures >= limit && failures % limit == 0 {
+                if self.config.reliability.enabled && limit > 0 && failures >= limit && failures.is_multiple_of(limit) {
                     pending_nudges.push(json!({"role":"user","dial_transient":true,"content":format!(
                         "[Escalation from dial] {failures} tool calls in a row broke the tool contract, and none of the rejected calls ran. Call only the offered tools, with arguments that match their schemas exactly. Do not restate the rules or explain the failure at length: make the next call now."
                     )}));
@@ -2448,7 +2448,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     }
                     Err(error) => {
                         let reason = format!("{error:#}");
-                        ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Coach, &format!("Automatic escalation skipped: {reason}")));
+                        ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Coach, format!("Automatic escalation skipped: {reason}")));
                         self.record(
                             step,
                             "auto_escalation",
@@ -2475,7 +2475,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 {
                     auto_continues += 1;
                     let headline = message.lines().next().unwrap_or_default().to_owned();
-                    ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Continue, &format!(
+                    ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Continue, format!(
                         "Auto-continue {auto_continues}/{}: {headline}",
                         self.config.reliability.auto_continue_rounds
                     )));
@@ -2541,13 +2541,13 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     return Ok(engine::Tick::Again);
                 }
                 if self.interrupt.load(Ordering::SeqCst) {
-                    return Ok(TurnReport {
+                    return Ok(engine::Tick::Finished(TurnReport {
                         text: String::new(),
                         outcome: TurnOutcome::Interrupted,
                         steps: step + 1,
                         interrupted: true,
                         trajectory: None,
-                    }).map(engine::Tick::Finished);
+                    }));
                 }
                 if finish.outcome == TurnOutcome::Completed {
                     if let Some(message) = self.coach_completion(
@@ -2583,22 +2583,22 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 }
                 self.push(json!({"role":"assistant","content":finish.text}))?;
                 ui.text_delta(&finish.text);
-                return Ok(TurnReport {
+                return Ok(engine::Tick::Finished(TurnReport {
                     text: finish.text,
                     outcome: finish.outcome,
                     steps: step + 1,
                     interrupted: false,
                     trajectory: None,
-                }).map(engine::Tick::Finished);
+                }));
             }
             if self.interrupt.load(Ordering::SeqCst) {
-                return Ok(TurnReport {
+                return Ok(engine::Tick::Finished(TurnReport {
                     text: String::new(),
                     outcome: TurnOutcome::Interrupted,
                     steps: step + 1,
                     interrupted: true,
                     trajectory: None,
-                }).map(engine::Tick::Finished);
+                }));
             }
             if self.take_steering(ui)? {
                 steering_pending = true;

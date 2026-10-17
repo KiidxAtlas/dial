@@ -269,9 +269,9 @@ fn plural(count: u64, one: &str, many: &str) -> String {
 /// Spelled-out budget in the largest exact unit.
 fn format_budget(duration: Duration) -> String {
     let ms = duration.as_millis() as u64;
-    if ms % 3_600_000 == 0 {
+    if ms.is_multiple_of(3_600_000) {
         plural(ms / 3_600_000, "hour", "hours")
-    } else if ms % 60_000 == 0 {
+    } else if ms.is_multiple_of(60_000) {
         plural(ms / 60_000, "minute", "minutes")
     } else {
         plural(ms / 1_000, "second", "seconds")
@@ -430,7 +430,7 @@ impl Drop for Gate {
 
 fn format_timeout(timeout: Duration) -> String {
     let ms = timeout.as_millis();
-    if ms % 1_000 == 0 {
+    if ms.is_multiple_of(1_000) {
         format!("{}s", ms / 1_000)
     } else {
         format!("{ms}ms")
@@ -670,10 +670,10 @@ impl LoopMode {
         let Some(prompt) = self.prompt.clone() else {
             return Due::Idle;
         };
-        if let Some(budget) = &mut self.budget {
-            if !budget.consume(now) {
-                return self.stop(LIMIT_REACHED.to_string());
-            }
+        if let Some(budget) = &mut self.budget
+            && !budget.consume(now)
+        {
+            return self.stop(LIMIT_REACHED.to_string());
         }
         self.submitting = true;
         Due::Submit(prompt)

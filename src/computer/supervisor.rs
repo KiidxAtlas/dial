@@ -276,7 +276,7 @@ impl ComputerSupervisor {
             if guard.status == Status::Closed {
                 return Err(closed_error());
             }
-            ensure_session_locked(&mut *guard, session)?;
+            ensure_session_locked(&mut guard, session)?;
         }
         let (id, rx) = register_pending(inner)?;
         if let Err(error) = send_guarded(
@@ -335,19 +335,17 @@ impl ComputerSupervisor {
                 None,
             )
             .is_ok()
-        {
-            if let Err(error) = await_reply(
+            && let Err(error) = await_reply(
                 inner,
                 None,
                 closed_rx,
                 Instant::now() + CLOSE_TIMEOUT,
                 None,
                 "Timed out closing computer worker",
-            ) {
-                if error.message != WORKER_EXITED {
-                    first_error = Some(error);
-                }
-            }
+            )
+            && error.message != WORKER_EXITED
+        {
+            first_error = Some(error);
         }
 
         if let Some(session) = session {
@@ -1015,14 +1013,13 @@ fn terminate_inner(inner: &Arc<Inner>, error: ComputerError, only_gen: Option<u6
     let (worker, runs, session) = {
         let mut guard = inner.state.lock();
         let st = &mut *guard;
-        if let Some(generation) = only_gen {
-            if !st
+        if let Some(generation) = only_gen
+            && !st
                 .worker
                 .as_ref()
                 .is_some_and(|w| w.generation == generation)
-            {
-                return;
-            }
+        {
+            return;
         }
         if st.status != Status::Closed {
             st.status = Status::Failed;

@@ -15,6 +15,16 @@ const FILES: [&str; 3] = ["architecture.md", "product.md", "style.md"];
 /// Envelopes one background pass extracts; `/memory enqueue` drains up to `ENQUEUE_EXTRACT_MAX`.
 const EXTRACT_PER_PASS: usize = 4;
 const ENQUEUE_EXTRACT_MAX: usize = 64;
+/// One `envelopes` row: id, session, branch, revision, prompt, previous human, assistant context.
+type EnvelopeRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
 struct Sharpshooter {
     layout: Layout,
     config: SharpshooterConfig,
@@ -88,7 +98,7 @@ impl Sharpshooter {
         if active >= self.config.max_parallel as i64 {
             return Ok(false);
         }
-        let row:Option<(String,String,String,String,String,Option<String>,Option<String>)>=tx.query_row("SELECT id,session,branch,revision,prompt,previous_human,assistant_context FROM envelopes WHERE processed=0 AND lease_until<=?1 ORDER BY created,id LIMIT 1",params![at],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).optional()?;
+        let row: Option<EnvelopeRow> =tx.query_row("SELECT id,session,branch,revision,prompt,previous_human,assistant_context FROM envelopes WHERE processed=0 AND lease_until<=?1 ORDER BY created,id LIMIT 1",params![at],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).optional()?;
         let Some((id, session, branch, revision, prompt, previous, assistant)) = row else {
             return Ok(false);
         };
@@ -215,7 +225,7 @@ impl Sharpshooter {
         for name in ["AGENTS.md", "CLAUDE.md"] {
             let path = self.layout.project_root.join(name);
             match platform_fs::open_nofollow_nonblocking(
-                &std::fs::OpenOptions::new().read(true),
+                std::fs::OpenOptions::new().read(true),
                 &path,
             ) {
                 Ok(file) if file.metadata()?.is_file() && file.metadata()?.len() <= 65536 => {
@@ -379,7 +389,7 @@ impl Driver for Sharpshooter {
             }
         }
         // Stable: equal scores keep file and line order.
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         let items: Vec<Value> = scored
             .into_iter()
             .take(limit.min(50))
@@ -445,13 +455,13 @@ impl Driver for Sharpshooter {
             self.consolidate(op, model, false)?;
             Ok(())
         })();
-        if let Err(error) = &result {
-            if op.check().is_ok() {
-                self.db.execute(
-                    "UPDATE state SET last_error=?1 WHERE id=1",
-                    [redact(&format!("{error:#}"))],
-                )?;
-            }
+        if let Err(error) = &result
+            && op.check().is_ok()
+        {
+            self.db.execute(
+                "UPDATE state SET last_error=?1 WHERE id=1",
+                [redact(&format!("{error:#}"))],
+            )?;
         }
         result
     }

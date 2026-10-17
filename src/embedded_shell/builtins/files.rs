@@ -62,10 +62,9 @@ fn line_count_args(args: &[String]) -> Option<(usize, Vec<&str>)> {
             literal = true;
         } else if arg == "-n" {
             count = iter.next()?.parse().ok()?;
-        } else if let Some(value) = arg.strip_prefix("-n") {
-            count = value.parse().ok()?;
         } else {
-            return None;
+            let value = arg.strip_prefix("-n")?;
+            count = value.parse().ok()?;
         }
     }
     Some((count, operands))
@@ -151,10 +150,12 @@ pub(super) fn basename(io: &mut Io<'_>, args: &[String]) -> i32 {
         return io.usage();
     }
     let mut name = base_name(&args[0]);
-    if let Some(suffix) = args.get(1) {
-        if !suffix.is_empty() && name.len() > suffix.len() && name.ends_with(suffix.as_str()) {
-            name = &name[..name.len() - suffix.len()];
-        }
+    if let Some(suffix) = args.get(1)
+        && !suffix.is_empty()
+        && name.len() > suffix.len()
+        && name.ends_with(suffix.as_str())
+    {
+        name = &name[..name.len() - suffix.len()];
     }
     let _ = writeln!(io.stdout, "{name}");
     0
@@ -226,10 +227,10 @@ fn copy_path(src: &Path, dst: &Path, top: bool) -> io::Result<()> {
         }
         Ok(())
     } else {
-        if let (Ok(a), Ok(b)) = (fs::canonicalize(src), fs::canonicalize(dst)) {
-            if a == b {
-                return Err(io::Error::other("are the same file"));
-            }
+        if let (Ok(a), Ok(b)) = (fs::canonicalize(src), fs::canonicalize(dst))
+            && a == b
+        {
+            return Err(io::Error::other("are the same file"));
         }
         fs::copy(src, dst).map(|_| ())
     }
@@ -354,10 +355,10 @@ pub(super) fn rm(io: &mut Io<'_>, args: &[String]) -> i32 {
             Ok(_) => fs::remove_file(&path),
             Err(e) => Err(e),
         };
-        if let Err(e) = result {
-            if !(force && e.kind() == io::ErrorKind::NotFound) {
-                status = report(io, name, &e);
-            }
+        if let Err(e) = result
+            && !(force && e.kind() == io::ErrorKind::NotFound)
+        {
+            status = report(io, name, &e);
         }
     }
     status

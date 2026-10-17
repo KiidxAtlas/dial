@@ -714,7 +714,7 @@ impl InlineTerminal {
         // The program may have scrolled or cleared the screen: repaint from the cursor, erasing below.
         self.force_erase = true;
         self.last_size = self.size();
-        let outcome = rearm.and_then(|()| value);
+        let outcome = rearm.and(value);
         if reopen && rearmed {
             self.open_overlay()?;
         }

@@ -1085,8 +1085,7 @@ fn codex_model_metadata() -> Option<Value> {
                 .map(|home| std::path::PathBuf::from(home).join(".codex"))
         })?;
     let path = home.join("models_cache.json");
-    let file =
-        fs::open_nofollow_nonblocking(&std::fs::OpenOptions::new().read(true), &path).ok()?;
+    let file = fs::open_nofollow_nonblocking(std::fs::OpenOptions::new().read(true), &path).ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.is_file()
         || !fs::owned_by_current_user(&file).ok()?
