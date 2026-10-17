@@ -1784,6 +1784,7 @@ dependencies = [
  "cpal",
  "crc32fast",
  "crossterm",
+ "dial-agent",
  "dial-build-info",
  "dial-computer",
  "dial-core",
@@ -1856,6 +1857,45 @@ dependencies = [
  "xxhash-rust",
  "zbus",
  "zip",
+]
+
+[[package]]
+name = "dial-agent"
+version = "0.1.9"
+dependencies = [
+ "anyhow",
+ "ast-grep-language",
+ "base64 0.23.1",
+ "dial-computer",
+ "dial-core",
+ "dial-llm",
+ "dial-storage",
+ "dial-tools",
+ "flate2",
+ "fontdue",
+ "fs2",
+ "globset",
+ "ignore",
+ "libc",
+ "parking_lot",
+ "png",
+ "rand 0.9.5",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sha2 0.10.9",
+ "shlex 2.0.1",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml 0.9.12+spec-1.1.0",
+ "unicode-normalization",
+ "ureq",
+ "url",
+ "windows-sys 0.61.2",
+ "winreg",
 ]
 
 [[package]]

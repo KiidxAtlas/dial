@@ -1106,7 +1106,7 @@ impl Backend {
         on_event: &mut dyn FnMut(&llm::StreamEvent) -> bool,
     ) -> Result<Reply> {
         let _wire = llm::wire::Scope::enter(self.wire.clone());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let _idle_limit = llm::cancel::TestIdleLimitScope::enter(self.idle_limit);
         let billing = match &self.kind {
             ProviderKind::Local { .. } | ProviderKind::Apple => llm::usage::Billing::Local,
@@ -1281,7 +1281,7 @@ impl Backend {
                     "ChatGPT providers cannot load LoRA adapters"
                 );
                 let url = format!("{}/codex/responses", llm::chatgpt::BASE_URL);
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 let url = self.chatgpt_url.clone().unwrap_or(url);
                 let (account_id, token) = chatgpt_access.as_ref().unwrap();
                 (

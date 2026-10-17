@@ -1,0 +1,53 @@
+[package]
+name = "dial-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dial-core.workspace = true
+dial-llm.workspace = true
+dial-storage.workspace = true
+dial-tools.workspace = true
+dial-computer.workspace = true
+anyhow.workspace = true
+ast-grep-language.workspace = true
+base64.workspace = true
+flate2.workspace = true
+fontdue.workspace = true
+fs2.workspace = true
+globset.workspace = true
+ignore.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+png.workspace = true
+rand.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+unicode-normalization.workspace = true
+ureq.workspace = true
+url.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+winreg.workspace = true
+
+[dev-dependencies]
+dial-core = { workspace = true, features = ["test-support"] }
+dial-llm = { workspace = true, features = ["test-support"] }
+dial-storage = { workspace = true, features = ["test-support"] }
+dial-tools = { workspace = true, features = ["test-support"] }
+
+[features]
+# Test helpers used by other crates' tests (`#[cfg(test)]` items compiled only for this crate otherwise).
+test-support = []

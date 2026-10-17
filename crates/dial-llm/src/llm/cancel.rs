@@ -15,7 +15,7 @@ use ureq::unversioned::{
 // Test seam: scale one-second stall-test limits down without leaking into concurrent tests.
 // Each test drives its model call on its own thread; zero preserves production limits. Backends
 // carry their own limit (see `TestIdleLimitScope`) for calls that run on a worker thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_IDLE_LIMIT_MILLIS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -24,16 +24,16 @@ thread_local! {
 /// first meaningful event. Generous on purpose: a loaded machine can delay the scripted server's head past
 /// the 200 ms idle limit, which then fails as a setup timeout rather than a stalled body. Silence after
 /// progress keeps the tight test idle limit, so body stalls are still measured tightly.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const TEST_SETUP_BUDGET: Duration = Duration::from_millis(1500);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn test_limit_active(idle_secs: u64) -> bool {
     idle_secs == 1 && TEST_IDLE_LIMIT_MILLIS.with(std::cell::Cell::get) != 0
 }
 
 fn stream_idle_limit(idle_secs: u64) -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         if test_limit_active(idle_secs) {
             return Duration::from_millis(TEST_IDLE_LIMIT_MILLIS.with(std::cell::Cell::get));
@@ -43,7 +43,7 @@ fn stream_idle_limit(idle_secs: u64) -> Duration {
 }
 
 fn first_event_limit(_idle_secs: u64, idle: Duration) -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         if test_limit_active(_idle_secs) {
             return TEST_SETUP_BUDGET;
@@ -98,7 +98,7 @@ impl Patience {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_test_idle_limit(limit: Duration) {
         TEST_IDLE_LIMIT_MILLIS.with(|millis| millis.set(limit.as_millis() as u64));
     }
@@ -139,12 +139,12 @@ impl Patience {
 }
 /// Test-only: the thread-local idle limit set for one model call, restored when the call returns. A backend
 /// carries its limit to the worker thread that runs the call; no other thread observes it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct TestIdleLimitScope {
     previous: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl TestIdleLimitScope {
     pub(crate) fn enter(limit: Option<Duration>) -> Self {
         let previous = TEST_IDLE_LIMIT_MILLIS.with(std::cell::Cell::get);
@@ -155,7 +155,7 @@ impl TestIdleLimitScope {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestIdleLimitScope {
     fn drop(&mut self) {
         TEST_IDLE_LIMIT_MILLIS.with(|millis| millis.set(self.previous));
