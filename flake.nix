@@ -15,6 +15,8 @@
             version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
+            # Only the `dial` binary package of the workspace is shipped.
+            cargoBuildFlags = [ "-p" "dial" ];
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
             doCheck = false;

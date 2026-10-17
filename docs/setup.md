@@ -40,7 +40,7 @@ Each recipe tries methods in order and stops at the first one whose tool is avai
    the above is available.
 
 Downloads are explicit: they appear in the plan, show progress, can be cancelled, and are refused
-unless the archive's SHA-256 matches the digest pinned in `src/setup/deps/prebuilt.rs` (Node.js
+unless the archive's SHA-256 matches the digest pinned in `crates/dial-tools/src/setup/deps/prebuilt.rs` (Node.js
 22.23.3, Bun 1.4.3, uv 0.13.1; darwin and linux, x64 and arm64). Archives unpack into a staging
 directory; entries with absolute paths, `..`, hard links, or symlinks that leave the directory are
 rejected. Nothing runs with sudo.

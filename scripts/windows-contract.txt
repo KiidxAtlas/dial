@@ -12,7 +12,7 @@ test cli::update
 # Platform process/window/path helpers, including the Windows-only branches of platform/mod.rs.
 test platform::
 # Background job process identity and Windows job-object group ownership.
-test tools::background::procinfo
+test platform::procinfo
 # Edit transactions exercise filesystem replacement on the native filesystem.
 test tools::edit_transaction
 
