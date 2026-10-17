@@ -452,7 +452,7 @@ fn local_startup_is_visible_and_does_not_trigger_the_reasoning_gate() {
         }
     }
     let dir = tempfile::tempdir().unwrap();
-    let python = llm::server::tests::fake_python(dir.path());
+    let python = llm::server::fixtures::fake_python(dir.path());
     let script = std::fs::read_to_string(&python).unwrap();
     let (shebang, rest) = script.split_once('\n').unwrap();
     std::fs::write(

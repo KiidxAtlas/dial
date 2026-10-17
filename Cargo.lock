@@ -1786,6 +1786,7 @@ dependencies = [
  "crossterm",
  "dial-build-info",
  "dial-core",
+ "dial-llm",
  "encoding_rs",
  "enigo",
  "fancy-regex 0.16.2",
@@ -1878,6 +1879,40 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "windows 0.62.2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "dial-llm"
+version = "0.1.9"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sigv4",
+ "aws-smithy-http-client",
+ "base64 0.23.1",
+ "crc32fast",
+ "dial-core",
+ "flate2",
+ "fs2",
+ "httpdate",
+ "image",
+ "libc",
+ "parking_lot",
+ "rand 0.9.5",
+ "regex",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tungstenite",
+ "ureq",
+ "url",
  "windows-sys 0.61.2",
 ]
 

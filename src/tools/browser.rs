@@ -1170,27 +1170,3 @@ fn bridge(
 
 #[cfg(test)]
 mod tests;
-
-impl BrowserConfig {
-    pub fn validate_allowed_hosts(&self) -> Result<(), String> {
-        if self.allowed_hosts.len() > 128 {
-            return Err("browser.allowed_hosts accepts at most 128 entries".into());
-        }
-        for entry in &self.allowed_hosts {
-            let uri = parse_url(&format!("http://{entry}/"))?;
-            let host = uri.host().ok_or("browser allowed host is missing")?;
-            if uri.authority().map(|a| a.as_str()) != Some(entry.as_str())
-                || uri.port_u16().is_none_or(|p| p == 0)
-                || host.is_empty()
-                || !host
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
-            {
-                return Err(format!(
-                    "browser.allowed_hosts entry {entry:?} must be an exact lowercase hostname:port; no schemes, paths, credentials or wildcards"
-                ));
-            }
-        }
-        Ok(())
-    }
-}

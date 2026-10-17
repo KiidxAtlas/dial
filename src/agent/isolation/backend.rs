@@ -36,16 +36,16 @@ impl Backend {
     }
 }
 
-impl Preference {
-    fn named(self) -> Option<Backend> {
-        match self {
-            Self::Auto => None,
-            Self::Clone => Some(Backend::Clone),
-            Self::Overlay => Some(Backend::Overlay),
-            Self::Worktree => Some(Backend::Worktree),
-            Self::Copy => Some(Backend::Copy),
-            Self::ProjFs => Some(Backend::ProjFs),
-        }
+/// The backend a preference names; `None` for `auto`. A free function because `Preference` is
+/// defined in the config layer, which cannot name `Backend`.
+fn named_backend(preference: Preference) -> Option<Backend> {
+    match preference {
+        Preference::Auto => None,
+        Preference::Clone => Some(Backend::Clone),
+        Preference::Overlay => Some(Backend::Overlay),
+        Preference::Worktree => Some(Backend::Worktree),
+        Preference::Copy => Some(Backend::Copy),
+        Preference::ProjFs => Some(Backend::ProjFs),
     }
 }
 
@@ -93,7 +93,7 @@ fn select_from(
     order: &[Backend],
     probe: impl Fn(Backend) -> Result<(), String>,
 ) -> Result<Selection, String> {
-    if let Some(backend) = preference.named() {
+    if let Some(backend) = named_backend(preference) {
         probe(backend).map_err(|reason| {
             format!(
                 "isolation backend `{}` is unavailable: {reason}. Set [isolation] backend = \"auto\" to use an available backend",
