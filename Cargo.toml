@@ -20,6 +20,7 @@ license = "MIT"
 # the root forwards its features.
 [workspace.dependencies]
 dial-build-info = { path = "crates/dial-build-info" }
+dial-core = { path = "crates/dial-core" }
 anyhow = "1"
 vt100 = "0.15"
 thiserror = "2"
@@ -127,8 +128,12 @@ desktop = [
 wayland-pipewire = ["desktop", "dep:pipewire"]
 
 
+[dev-dependencies]
+dial-core = { workspace = true, features = ["test-support"] }
+
 [dependencies]
 dial-build-info.workspace = true
+dial-core.workspace = true
 anyhow.workspace = true
 vt100.workspace = true
 thiserror.workspace = true
@@ -256,6 +261,10 @@ opt-level = 1
 codegen-units = 64
 
 [profile.local.package.dial-build-info]
+opt-level = 1
+codegen-units = 64
+
+[profile.local.package.dial-core]
 opt-level = 1
 codegen-units = 64
 

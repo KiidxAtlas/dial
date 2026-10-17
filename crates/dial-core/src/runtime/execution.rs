@@ -64,7 +64,7 @@ impl ToolStatus {
 
 thread_local! { static CHANGES: std::cell::RefCell<Vec<Execution>> = const { std::cell::RefCell::new(Vec::new()) }; }
 /// Called by the transaction owner after a real commit, never from rendered output.
-pub(crate) fn committed(paths: impl IntoIterator<Item = PathBuf>) {
+pub fn committed(paths: impl IntoIterator<Item = PathBuf>) {
     CHANGES.with(|stack| {
         let mut stack = stack.borrow_mut();
         if let Some(changes) = stack.last_mut() {
@@ -74,7 +74,7 @@ pub(crate) fn committed(paths: impl IntoIterator<Item = PathBuf>) {
 }
 
 /// The mutation owner could not restore a definite state. This survives callers catching errors.
-pub(crate) fn unsettled() {
+pub fn unsettled() {
     CHANGES.with(|stack| {
         if let Some(facts) = stack.borrow_mut().last_mut() {
             facts.effects = Effects::Unknown;
@@ -115,13 +115,13 @@ fn merge_status(previous: Option<ToolStatus>, incoming: ToolStatus) -> Option<To
     }
 }
 
-pub(crate) struct Capture;
+pub struct Capture;
 impl Capture {
-    pub(crate) fn begin() -> Self {
+    pub fn begin() -> Self {
         CHANGES.with(|stack| stack.borrow_mut().push(Default::default()));
         Self
     }
-    pub(crate) fn finish(self, recovered: bool) -> Execution {
+    pub fn finish(self, recovered: bool) -> Execution {
         let changes = CHANGES.with(|stack| {
             let mut stack = stack.borrow_mut();
             if recovered

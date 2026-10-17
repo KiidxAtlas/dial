@@ -40,11 +40,11 @@ const RECLAIM_AT: u64 = 4 * 1024 * 1024;
 /// Largest row replay reads. Publication refuses larger frames so every stored frame stays replayable.
 const MAX_FRAME: usize = 32 * 1024 * 1024;
 #[derive(Clone, Debug)]
-pub(crate) struct Journal(Arc<Mutex<Writer>>);
-pub(crate) fn path(session: &Path) -> std::path::PathBuf {
+pub struct Journal(Arc<Mutex<Writer>>);
+pub fn path(session: &Path) -> std::path::PathBuf {
     session.with_extension("streams")
 }
-pub(crate) fn remove(session: &Path) -> std::io::Result<()> {
+pub fn remove(session: &Path) -> std::io::Result<()> {
     let target = path(session);
     let canonical = target
         .parent()
@@ -71,7 +71,7 @@ pub(crate) fn remove(session: &Path) -> std::io::Result<()> {
 /// Copies recovered frames into an exclusively created, durable journal. Even an empty source
 /// reserves the destination, so reopening the session cannot adopt an unrelated stream journal.
 /// Failure removes only a destination this call created.
-pub(crate) fn copy(source: &Path, destination: &Path) -> anyhow::Result<()> {
+pub fn copy(source: &Path, destination: &Path) -> anyhow::Result<()> {
     let (nodes, complete) = scan(source)?;
     anyhow::ensure!(
         complete,
@@ -99,7 +99,7 @@ pub(crate) fn copy(source: &Path, destination: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
-pub(crate) fn relocate(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub fn relocate(source: &Path, destination: &Path) -> std::io::Result<()> {
     let source = path(source);
     let destination = path(destination);
     if destination.exists() {
@@ -138,8 +138,8 @@ pub(crate) fn relocate(source: &Path, destination: &Path) -> std::io::Result<()>
     Ok(())
 }
 impl Journal {
-    #[cfg(test)]
-    pub(crate) fn fail_writes_for_test(&self, read_only: File) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_writes_for_test(&self, read_only: File) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).file = read_only;
     }
     pub fn open(session: &Path) -> std::io::Result<Self> {
@@ -421,7 +421,7 @@ fn skip_row(reader: &mut impl BufRead) -> std::io::Result<bool> {
     }
 }
 
-pub(crate) fn recover(session: &Path) -> anyhow::Result<Vec<Node>> {
+pub fn recover(session: &Path) -> anyhow::Result<Vec<Node>> {
     scan(session).map(|(nodes, _)| nodes)
 }
 

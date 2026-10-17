@@ -1785,6 +1785,7 @@ dependencies = [
  "crc32fast",
  "crossterm",
  "dial-build-info",
+ "dial-core",
  "encoding_rs",
  "enigo",
  "fancy-regex 0.16.2",
@@ -1858,6 +1859,26 @@ name = "dial-build-info"
 version = "0.1.9"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "dial-core"
+version = "0.1.9"
+dependencies = [
+ "anyhow",
+ "ast-grep-core",
+ "ast-grep-language",
+ "ignore",
+ "libc",
+ "parking_lot",
+ "regex",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "windows 0.62.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

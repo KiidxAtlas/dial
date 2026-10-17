@@ -293,7 +293,7 @@ pub mod process {
         super::imp::process::kill_checked(process)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     /// Whether `pid` names a live process this user may signal (Unix: `kill(pid, 0) == 0`).
     pub fn alive(pid: u32) -> bool {
         super::imp::process::alive(pid)
@@ -328,7 +328,7 @@ pub mod process {
     }
 }
 
-pub(crate) mod atomic;
+pub mod atomic;
 pub mod interrupt;
 pub mod process_record;
 pub mod procinfo;

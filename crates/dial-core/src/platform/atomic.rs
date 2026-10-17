@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Workspace replacement follows existing symlinks and preserves permissions. New files use
 /// ordinary creation permissions (including the umask), not private-state permissions.
-pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mode = fs::metadata(&target).ok().map(|meta| meta.permissions());
     let temp = temp_path(&target);
@@ -33,7 +33,7 @@ pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Checkpoint restores use the recorded mode and create missing parents. The caller owns path
 /// confinement; unlike private state this may replace workspace files with ordinary permissions.
-pub(crate) fn write_checkpoint(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+pub fn write_checkpoint(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let dir = path.parent().context("path has no parent directory")?;
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut temp = tempfile::NamedTempFile::new_in(dir)?;
@@ -44,7 +44,7 @@ pub(crate) fn write_checkpoint(path: &Path, bytes: &[u8], mode: u32) -> Result<(
 }
 
 /// Validate ancestors without creating directories or changing permissions (also used for reads).
-pub(crate) fn validate_private_path(dir: &Path) -> Result<()> {
+pub fn validate_private_path(dir: &Path) -> Result<()> {
     ensure!(
         !dir.components()
             .any(|part| part == std::path::Component::ParentDir),
@@ -68,7 +68,7 @@ pub(crate) const PRIVATE_LIMIT: usize = 8 * 1024 * 1024;
 
 /// Owner-private publication rejects links and foreign owners. It never creates parent directories
 /// or acquires a lock: the transaction owner must prepare the private directory and hold its lock.
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     ensure!(
         bytes.len() <= PRIVATE_LIMIT,
         "private storage file exceeds size limit"
@@ -153,7 +153,7 @@ fn temp_path(target: &Path) -> PathBuf {
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-pub(crate) fn private_dir(dir: &Path) -> Result<()> {
+pub fn private_dir(dir: &Path) -> Result<()> {
     validate_private_path(dir)?;
     match fs::symlink_metadata(dir) {
         Ok(meta) => {
@@ -187,7 +187,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn check_file(file: &File) -> Result<()> {
+pub fn check_file(file: &File) -> Result<()> {
     let meta = file.metadata()?;
     ensure!(
         meta.is_file()
@@ -201,7 +201,7 @@ pub(crate) fn check_file(file: &File) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
+pub fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
     validate_private_path(path.parent().context("storage path has no parent")?)?;
     let file = match platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path) {
         Ok(file) => file,

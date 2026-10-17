@@ -11,7 +11,7 @@ use std::{
 
 /// Directories that hold a project's private state or credentials. Overlay hides them from the
 /// worker, and the copy backends never copy them.
-pub(crate) const SECRET_DIRS: &[&str] = &[
+pub const SECRET_DIRS: &[&str] = &[
     ".git",
     ".dial",
     ".codegraph",
@@ -25,7 +25,7 @@ pub(crate) const SECRET_DIRS: &[&str] = &[
 ];
 /// Build outputs, caches, and installed dependencies. The copy backends exclude them from their
 /// change sets; overlay leaves them visible and ignores changes made under them.
-pub(crate) const DEPENDENCY_DIRS: &[&str] = &[
+pub const DEPENDENCY_DIRS: &[&str] = &[
     "target",
     "build",
     "dist",
@@ -38,7 +38,7 @@ pub(crate) const DEPENDENCY_DIRS: &[&str] = &[
     "vendor",
 ];
 /// Per-workspace scratch directory exported as TMPDIR for bash; walks skip it.
-pub(crate) const SCRATCH_DIR: &str = ".tmp";
+pub const SCRATCH_DIR: &str = ".tmp";
 
 /// Root-only build caches and tool scratch; unlike these, `bin/` often contains real source.
 const ROOT_GENERATED_DIRS: &[&str] = &[".cargo-work", SCRATCH_DIR];
@@ -66,7 +66,7 @@ pub fn clone_project(source: &Path) -> Result<tempfile::TempDir> {
 
 /// Copy the project file by file with plain reads and writes, never reflinks. The `copy`
 /// isolation backend uses it so its behavior does not depend on the filesystem.
-pub(crate) fn copy_project_plain(source: &Path) -> Result<tempfile::TempDir> {
+pub fn copy_project_plain(source: &Path) -> Result<tempfile::TempDir> {
     copy_project_with(source, plain_copy_file)
 }
 
@@ -159,7 +159,7 @@ fn copy_entries(
     Ok(())
 }
 
-pub(crate) fn is_secret_file(name: &str) -> bool {
+pub fn is_secret_file(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if EXCLUDED_FILES.contains(&lower.as_str()) {
         return true;
@@ -179,7 +179,7 @@ pub(crate) fn is_secret_file(name: &str) -> bool {
 
 /// Whether `path` is a secret or private entry under `root`: a secret directory, a secret file, or
 /// anything outside `root` (which fails closed). Overlay masks these entries.
-pub(crate) fn is_secret_source_path(root: &Path, path: &Path) -> bool {
+pub fn is_secret_source_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return true;
     };
@@ -195,7 +195,7 @@ pub(crate) fn is_secret_source_path(root: &Path, path: &Path) -> bool {
 /// Whether `path` lies in a build output, cache, or installed-dependency directory under `root`,
 /// or is one of the root-level generated directories. Overlay leaves these visible and ignores
 /// changes made under them.
-pub(crate) fn is_dependency_source_path(root: &Path, path: &Path) -> bool {
+pub fn is_dependency_source_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
@@ -234,7 +234,7 @@ fn ignored_bin_output(root: &Path, relative: &Path) -> bool {
 
 /// Whether the copy backends leave `path` out of their copies and change sets: a secret entry or
 /// a dependency directory.
-pub(crate) fn is_excluded_source_path(root: &Path, path: &Path) -> bool {
+pub fn is_excluded_source_path(root: &Path, path: &Path) -> bool {
     is_secret_source_path(root, path) || is_dependency_source_path(root, path)
 }
 
