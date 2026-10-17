@@ -350,35 +350,41 @@ pub fn local_model_metadata(model: &Path) -> ModelMetadata {
             info.vision = Some(info.vision.unwrap_or(false));
             // These are template declarations, not inference or quality checks. Missing
             // template markers remain unknown rather than being classified by model name.
-            let tokenizer = read_json(&model.join("tokenizer_config.json"));
-            let template = tokenizer
-                .as_ref()
-                .and_then(|value| {
-                    let templates = match &value["chat_template"] {
-                        Value::String(template) => vec![template.as_str()],
-                        Value::Array(items) => items
-                            .iter()
-                            .filter_map(|item| item["template"].as_str())
-                            .collect(),
-                        Value::Object(items) => items.values().filter_map(Value::as_str).collect(),
-                        _ => Vec::new(),
-                    };
-                    (!templates.is_empty()).then(|| templates.join("\n"))
-                })
-                .or_else(|| {
-                    let file = fs::File::open(model.join("chat_template.jinja")).ok()?;
-                    let mut template = String::new();
-                    file.take(MAX_RESPONSE + 1)
-                        .read_to_string(&mut template)
-                        .ok()?;
-                    (template.len() as u64 <= MAX_RESPONSE).then_some(template)
-                });
+            let template = chat_template(model);
             if let Some(template) = template {
                 classify_template(&mut info, &template);
             }
             info
         })
         .unwrap_or_default()
+}
+
+/// The chat template a model directory declares: `tokenizer_config.json`'s `chat_template` (a string,
+/// a list of named templates, or a map), else `chat_template.jinja`. Read as text; no weights load.
+pub(crate) fn chat_template(model: &Path) -> Option<String> {
+    let tokenizer = read_json(&model.join("tokenizer_config.json"));
+    tokenizer
+        .as_ref()
+        .and_then(|value| {
+            let templates = match &value["chat_template"] {
+                Value::String(template) => vec![template.as_str()],
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(|item| item["template"].as_str())
+                    .collect(),
+                Value::Object(items) => items.values().filter_map(Value::as_str).collect(),
+                _ => Vec::new(),
+            };
+            (!templates.is_empty()).then(|| templates.join("\n"))
+        })
+        .or_else(|| {
+            let file = fs::File::open(model.join("chat_template.jinja")).ok()?;
+            let mut template = String::new();
+            file.take(MAX_RESPONSE + 1)
+                .read_to_string(&mut template)
+                .ok()?;
+            (template.len() as u64 <= MAX_RESPONSE).then_some(template)
+        })
 }
 
 /// Tool and reasoning support declared by a chat template. These are template declarations, not
@@ -412,6 +418,9 @@ pub fn model_metadata(layout: &Layout, selection: &ModelSelection) -> ModelMetad
             .and_then(|profile| profile.capabilities.vision),
             ..Default::default()
         };
+    }
+    if selection.provider == super::apple::PROVIDER {
+        return super::apple::metadata();
     }
     if selection.provider == "mlx" && selection.base_url.is_none() {
         let model =
@@ -1212,7 +1221,7 @@ fn parse_lmstudio(value: &Value) -> Vec<LmStudioModel> {
 
 /// GET a native (non-OpenAI) endpoint of a local server. Only ever asked of loopback/private hosts; a
 /// hosted API is never sent these probes.
-fn local_get(
+pub(crate) fn local_get(
     base_url: &str,
     path: &str,
     token: Option<&str>,
@@ -1222,7 +1231,7 @@ fn local_get(
 }
 
 /// [`local_get`], or a JSON POST when `body` is set (Ollama's `/api/show` is POST-only).
-fn local_request(
+pub(crate) fn local_request(
     base_url: &str,
     path: &str,
     body: Option<&Value>,
@@ -1281,6 +1290,16 @@ fn local_request(
     serde_json::from_slice(&bytes).ok()
 }
 
+/// A model name that is safe in a URL path segment or query value: non-empty, short, with no control
+/// characters or URL syntax (`?`, `#`, `%`).
+pub(crate) fn valid_model_id(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 512
+        && !model
+            .chars()
+            .any(|c| c.is_control() || c == '?' || c == '#' || c == '%')
+}
+
 fn lmstudio_models_with_headers(
     base_url: &str,
     token: Option<&str>,
@@ -1329,12 +1348,7 @@ pub fn loaded_context(
     headers: &[super::model_config::RequestHeader],
 ) -> Option<u32> {
     let resolved = super::model_config::resolve_headers(headers).ok()?;
-    if model.is_empty()
-        || model.len() > 512
-        || model
-            .chars()
-            .any(|c| c.is_control() || c == '?' || c == '#' || c == '%')
-    {
+    if !valid_model_id(model) {
         return None;
     }
     let positive = |value: Option<&Value>| {
@@ -1627,7 +1641,7 @@ fn annotate_embedding_checkpoints(models: &mut [ModelEntry]) {
     }
 }
 
-fn read_json(path: &Path) -> Option<Value> {
+pub(crate) fn read_json(path: &Path) -> Option<Value> {
     let file = fs::File::open(path).ok()?;
     if file.metadata().ok()?.len() > MAX_RESPONSE {
         return None;
@@ -2016,6 +2030,9 @@ pub(crate) fn model_context_window(user_dir: &Path, selection: &ModelSelection) 
                     selection.account_id.as_deref(),
                     &selection.model,
                 )
+            } else if selection.provider == super::apple::PROVIDER {
+                super::apple::supported_build()
+                    .then(|| super::apple::availability().context_size)
             } else if selection.provider == "mlx" && selection.base_url.is_none() {
                 let model = resolve_local_model(&selection.model).ok()?;
                 context(&read_json(&Path::new(&model).join("config.json"))?)
@@ -2137,7 +2154,12 @@ fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
 /// Studio. Makes no network calls and loads no models; `discover` and `dial models recommend` share
 /// this listing.
 pub fn downloaded_local_models(user_dir: &Path) -> Vec<ModelEntry> {
-    let trainable = mlx_architectures(user_dir);
+    local_model_entries(mlx_architectures(user_dir).as_deref())
+}
+
+/// The listing behind [`downloaded_local_models`]; `trainable` is the mlx-lm model directory that
+/// LoRA support is checked against.
+pub(crate) fn local_model_entries(trainable: Option<&Path>) -> Vec<ModelEntry> {
     let mut models = Vec::new();
     if let Some(cache) = hf_cache() {
         models = local_models(&cache, trainable.as_deref());
@@ -2233,6 +2255,10 @@ pub fn discover(
         detail: "Downloaded MLX and GGUF models, loaded on demand; nothing is downloaded".into(),
         models: discovery.models.len(),
     });
+    if let Some((status, entry)) = super::apple::discover() {
+        discovery.providers.push(status);
+        discovery.models.extend(entry);
+    }
     let mut endpoints = BTreeMap::new();
     for (id, label, variable, default) in [
         (
@@ -2347,6 +2373,17 @@ pub fn discover(
             ));
         }
     }
+    // A signed-in subscription provider that is configured at its canonical endpoint with no API
+    // key cannot be probed (the grant is attached only at inference). Leaving it in the probe
+    // list reports it unavailable and hides its bundled models, so `oauth_catalog` serves it.
+    endpoints.retain(|(id, spec)| {
+        !(spec.enabled
+            && spec.api_key_env.is_none()
+            && spec.headers.as_ref().is_none_or(|h| h.is_empty())
+            && super::oauth::signed_in(&layout.user_dir, id)
+            && super::oauth::flow(id)
+                .is_some_and(|flow| super::oauth::same_origin(&spec.base_url, flow.base_url)))
+    });
     let storage_safe = layout.ensure_project_outside_storage().is_ok();
     if !storage_safe {
         discovery.providers.push(ProviderStatus {
@@ -2622,7 +2659,7 @@ pub fn discover(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -3544,7 +3581,7 @@ mod tests {
         );
     }
     /// Answers any number of requests by path; unknown paths get 404 like a server without the native API.
-    fn routed(routes: Vec<(&'static str, String)>) -> String {
+    pub(crate) fn routed(routes: Vec<(&'static str, String)>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {

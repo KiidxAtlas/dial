@@ -7,7 +7,7 @@ pub const FLOW: Flow = Flow {
     id: "copilot",
     name: "GitHub Copilot",
     base_url: "https://api.githubcopilot.com",
-    protocol: ApiProtocol::ChatCompletions,
+    protocol: ApiProtocol::Copilot,
     needs_terminal: false,
     subscription: true,
     login,

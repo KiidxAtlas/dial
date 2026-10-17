@@ -227,7 +227,7 @@ impl ExtensionsOverlay {
         }
         if keys.matches(Action::SelectDown, key) {
             b.move_cursor(1);
-            return OverlayEvent::None;
+            return self.load_more_near_end();
         }
         if keys.matches(Action::SelectPageUp, key) {
             b.move_cursor(-8);
@@ -235,7 +235,7 @@ impl ExtensionsOverlay {
         }
         if keys.matches(Action::SelectPageDown, key) {
             b.move_cursor(8);
-            return OverlayEvent::None;
+            return self.load_more_near_end();
         }
         if key.code == crossterm::event::KeyCode::Home {
             b.move_cursor(isize::MIN / 2);
@@ -243,7 +243,7 @@ impl ExtensionsOverlay {
         }
         if key.code == crossterm::event::KeyCode::End {
             b.move_cursor(isize::MAX / 2);
-            return OverlayEvent::None;
+            return self.load_more_near_end();
         }
         if keys.matches(Action::SelectConfirm, key) {
             if let Some(intent) = enter_install(b) {
@@ -266,16 +266,13 @@ impl ExtensionsOverlay {
                 if state.loading || (typed_char(key) == Some('n') && !state.more) {
                     return OverlayEvent::None;
                 }
-                let more = typed_char(key) == Some('n');
-                let page = if more { state.page + 1 } else { 1 };
-                let query = if more {
-                    state.query.clone()
-                } else {
-                    b.query().to_owned()
-                };
+                if typed_char(key) == Some('n') {
+                    return self.load_next_page();
+                }
+                let query = b.query().to_owned();
                 self.catalogs.retain(|(pending, _)| *pending != tab);
                 self.catalog_job = true;
-                action(&b.begin_catalog(tab, query, page))
+                action(&b.begin_catalog(tab, query, 1))
             }
             Some('a') if b.tab() == Tab::Marketplaces => {
                 b.form = Some(Form::marketplace());
@@ -294,6 +291,37 @@ impl ExtensionsOverlay {
             },
             None => OverlayEvent::None,
         }
+    }
+
+    /// Rows from the end of the list at which the next catalog page is requested.
+    const PREFETCH: usize = 5;
+
+    /// Infinite scroll: when the cursor nears the last row of a catalog tab that has more pages,
+    /// request the next one. Does nothing while a page or an install is already running.
+    fn load_more_near_end(&mut self) -> OverlayEvent {
+        let b = &self.browser;
+        let tab = b.tab();
+        if matches!(tab, Tab::Plugins | Tab::Marketplaces)
+            || matches!(b.job, Job::Running { .. })
+            || b.cursor() + Self::PREFETCH < b.visible(tab).len()
+        {
+            return OverlayEvent::None;
+        }
+        self.load_next_page()
+    }
+
+    /// Request the page after the last one loaded for the current tab, if there is one.
+    fn load_next_page(&mut self) -> OverlayEvent {
+        let b = &mut self.browser;
+        let tab = b.tab();
+        let state = b.catalog(tab);
+        if state.loading || !state.more {
+            return OverlayEvent::None;
+        }
+        let (query, page) = (state.query.clone(), state.page + 1);
+        self.catalogs.retain(|(pending, _)| *pending != tab);
+        self.catalog_job = true;
+        action(&b.begin_catalog(tab, query, page))
     }
 
     pub fn banner(&mut self, message: impl Into<String>) {
@@ -459,6 +487,9 @@ fn primary_intent(b: &Browser, key: char) -> Option<Intent> {
     let row = b.selected()?;
     let installed = row.origin == Origin::Installed;
     match (b.tab(), key, installed) {
+        (Tab::Mcp, 'i', false) if row.origin == Origin::Foreign => {
+            Some(Intent::ImportMcp { id: row.id.clone() })
+        }
         (Tab::Mcp, 'i', false) if row.origin == Origin::Curated => {
             Some(Intent::InstallCuratedMcp { id: row.id.clone() })
         }
@@ -792,6 +823,38 @@ mod tests {
     }
 
     #[test]
+    fn i_imports_another_tools_server_after_confirmation_and_installs_curated_ones_directly() {
+        let mut b = Browser::new();
+        assert_eq!(b.tab(), Tab::Mcp);
+        b.set_rows(
+            Tab::Mcp,
+            vec![row("codegraph", Origin::Foreign, State::Available)],
+        );
+        let intent = primary_intent(&b, 'i').expect("i imports a found server");
+        assert!(matches!(&intent, Intent::ImportMcp { id } if id == "codegraph"));
+        // The import writes Dial's config, so it waits for Enter instead of running at once.
+        assert!(b.request(intent).is_none());
+        b.decline();
+        b.set_rows(
+            Tab::Mcp,
+            vec![row("github", Origin::Curated, State::Available)],
+        );
+        assert!(matches!(
+            primary_intent(&b, 'i'),
+            Some(Intent::InstallCuratedMcp { id }) if id == "github"
+        ));
+        // An already-installed row is never offered the import.
+        b.set_rows(
+            Tab::Mcp,
+            vec![row("codegraph", Origin::Installed, State::Enabled)],
+        );
+        assert!(!matches!(
+            primary_intent(&b, 'i'),
+            Some(Intent::ImportMcp { .. })
+        ));
+    }
+
+    #[test]
     fn remove_waits_for_enter_and_esc_cancels() {
         let mut b = Browser::new();
         b.set_rows(
@@ -826,5 +889,57 @@ mod tests {
         b.move_cursor(1);
         assert!(enter_install(&b).is_none());
         assert_eq!(enter_label(&b), "details");
+    }
+
+    #[test]
+    fn scrolling_near_the_end_loads_the_next_catalog_page_once() {
+        use crate::ui::overlay::settings::testkit::{Rig, key};
+        use crossterm::event::KeyCode;
+
+        let rig = Rig::new();
+        let mut overlay = ExtensionsOverlay::new();
+        let rows = (0..8)
+            .map(|i| row(&format!("srv{i}"), Origin::Remote, State::Available))
+            .collect();
+        overlay.browser.apply_catalog(model::CatalogUpdate {
+            tab: Tab::Mcp,
+            query: String::new(),
+            page: 1,
+            rows,
+            more: true,
+            error: None,
+            message: "page 1".into(),
+        });
+        // Far from the end: nothing is requested.
+        assert!(matches!(
+            overlay.handle(&key(KeyCode::Down), &rig.keys),
+            OverlayEvent::None
+        ));
+        // Within the prefetch distance: page 2 is requested.
+        overlay.browser.move_cursor(4);
+        let OverlayEvent::Action(request) = overlay.handle(&key(KeyCode::Down), &rig.keys) else {
+            panic!("expected a page request");
+        };
+        assert!(request.contains("\"page\":2"), "{request}");
+        // While that page loads, further scrolling does not request it again.
+        assert!(matches!(
+            overlay.handle(&key(KeyCode::Down), &rig.keys),
+            OverlayEvent::None
+        ));
+    }
+
+    #[test]
+    fn a_failed_page_stops_automatic_paging() {
+        let mut b = Browser::new();
+        b.apply_catalog(model::CatalogUpdate {
+            tab: Tab::Mcp,
+            query: String::new(),
+            page: 2,
+            rows: Vec::new(),
+            more: false,
+            error: Some("offline".into()),
+            message: String::new(),
+        });
+        assert!(!b.catalog(Tab::Mcp).more);
     }
 }

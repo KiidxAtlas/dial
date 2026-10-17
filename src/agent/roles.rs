@@ -56,6 +56,8 @@ impl<'a> Agent<'a> {
                 && selection.model == self.config.model
                 && selection.provider == "mlx"
                 && self.config.provider.as_deref().is_none_or(|p| p == "mlx"))
+                // `assistance.local.side_models = "reuse_main"`: stay on the loaded main model.
+                && !self.local_side_reuses_main(role)
         })
     }
 
@@ -200,12 +202,13 @@ impl<'a> Agent<'a> {
                 backend.reply_cost(reply),
                 started.elapsed(),
             ),
-            Err(_) => crate::telemetry::request_failed(
+            Err(error) => crate::telemetry::request_failed(
                 self.config,
                 self.hermetic,
                 self.session.id(),
                 backend.model_label(),
                 started.elapsed(),
+                error,
             ),
         }
     }
@@ -266,6 +269,7 @@ impl<'a> Agent<'a> {
                     self.auth_config.extended_context,
                 )?);
             }
+            self.prepare_local_side_request(main);
             let rewritten = self.provider_request_with(request, ui)?;
             let request = rewritten.as_ref().unwrap_or(request);
             let started = Instant::now();
@@ -307,6 +311,7 @@ impl<'a> Agent<'a> {
             }
             return accept_auxiliary_reply(main, role, reply);
         };
+        self.observe_local_side_request(role);
         let role_config = self.auth_config.for_role(role);
         let mut backend = match self.role_backends.remove(role) {
             Some(backend) => backend,

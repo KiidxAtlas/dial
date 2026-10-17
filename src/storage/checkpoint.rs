@@ -41,6 +41,18 @@ pub struct RollbackReport {
     pub warnings: Vec<String>,
 }
 
+/// One file a turn changed: its content before the turn's first write and its content now.
+/// `None` means the file did not exist at that point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnVersion {
+    /// Project-relative for the project root, absolute for an added directory.
+    pub path: String,
+    /// Whether the file lives under the project root rather than an added directory.
+    pub in_project: bool,
+    pub before: Option<Vec<u8>>,
+    pub after: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Entry {
     /// Path relative to its workspace root, `/`-separated.
@@ -378,6 +390,46 @@ impl Checkpoints {
             });
         }
         Ok(changes)
+    }
+
+    /// Before and current content of every file `turn` recorded. Files skipped as oversized, no
+    /// longer resolvable, or now larger than [`MAX_FILE_BYTES`] are left out; this is a best-effort
+    /// view for history, unlike [`Self::repair_changes`], which fails closed.
+    pub fn turn_versions(&self, turn: u64) -> Result<Vec<TurnVersion>> {
+        let manifest = self.manifest(turn)?;
+        let base = turn_dir(&self.dir, turn);
+        let mut versions = Vec::with_capacity(manifest.entries.len());
+        for (index, entry) in manifest.entries.iter().enumerate() {
+            let before = if entry.existed {
+                match fs::read(base.join("files").join(index.to_string())) {
+                    Ok(bytes) => Some(bytes),
+                    Err(_) => continue,
+                }
+            } else {
+                None
+            };
+            let Ok((target, _)) = self.target_of(entry) else {
+                continue;
+            };
+            let after = match fs::symlink_metadata(&target) {
+                Ok(meta) if meta.is_file() && meta.len() <= MAX_FILE_BYTES => {
+                    match fs::read(&target) {
+                        Ok(bytes) => Some(bytes),
+                        Err(_) => continue,
+                    }
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => continue,
+            };
+            versions.push(TurnVersion {
+                path: entry.display(),
+                in_project: entry.root.is_none(),
+                before,
+                after,
+            });
+        }
+        Ok(versions)
     }
 
     /// Record `abs` as it is now, unless this turn already did. Must be called BEFORE the file is
@@ -779,6 +831,41 @@ mod tests {
     fn modify(cp: &Checkpoints, fx: &Fixture, rel: &str, text: &str) {
         cp.before_write(&fx.path(rel)).unwrap();
         fx.write(rel, text);
+    }
+
+    #[test]
+    fn turn_versions_pair_saved_content_with_current_content() {
+        let fx = Fixture::new();
+        let cp = fx.open();
+        fx.write("a.txt", "A0");
+        fx.write("gone.txt", "G0");
+        let turn = cp.begin_turn("edit").unwrap();
+        modify(&cp, &fx, "a.txt", "A1");
+        modify(&cp, &fx, "new.txt", "N1");
+        cp.before_write(&fx.path("gone.txt")).unwrap();
+        fs::remove_file(fx.path("gone.txt")).unwrap();
+        let mut versions = cp.turn_versions(turn).unwrap();
+        versions.sort_by(|a, b| a.path.cmp(&b.path));
+        let view: Vec<_> = versions
+            .iter()
+            .map(|v| {
+                (
+                    v.path.as_str(),
+                    v.in_project,
+                    v.before.as_deref(),
+                    v.after.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            view,
+            vec![
+                ("a.txt", true, Some(&b"A0"[..]), Some(&b"A1"[..])),
+                ("gone.txt", true, Some(&b"G0"[..]), None),
+                ("new.txt", true, None, Some(&b"N1"[..])),
+            ]
+        );
+        assert!(cp.turn_versions(turn + 1).is_err());
     }
 
     #[test]

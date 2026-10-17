@@ -698,7 +698,7 @@ impl Env<'_> {
 }
 
 /// `12s`, `1m05s`, `1h02m`.
-fn elapsed(secs: f64) -> String {
+pub(super) fn elapsed(secs: f64) -> String {
     let total = secs as u64;
     match total {
         0..=59 => format!("{total}s"),
@@ -708,7 +708,7 @@ fn elapsed(secs: f64) -> String {
 }
 
 /// `3.9k`, `32k`, `1.2M`: floored so the used amount never looks larger than it is.
-fn human(n: u64) -> String {
+pub(super) fn human(n: u64) -> String {
     let scaled = |unit: u64, suffix: &str| {
         let tenths = n * 10 / unit;
         if tenths.is_multiple_of(10) {

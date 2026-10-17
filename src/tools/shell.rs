@@ -93,9 +93,23 @@ fn output_tail(bytes: &[u8]) -> String {
 
 /// The moment a foreground command is handed to the background owner, or `None` when it may not be.
 /// Named sessions keep their state in this foreground call, and a zero threshold disables
-/// automatic backgrounding, so neither gets a deadline (and no zero-length waits).
-fn adoption_deadline(auto_background: Duration, named_session: bool) -> Option<Duration> {
-    (!named_session && !auto_background.is_zero()).then_some(auto_background)
+/// automatic backgrounding, so neither gets a deadline (and no zero-length waits). An explicit
+/// `timeout` longer than the threshold is the caller saying it will wait that long: the command
+/// stays in the foreground until then, so a long build returns its result in this one call.
+fn adoption_deadline(
+    auto_background: Duration,
+    requested_wait: Option<Duration>,
+    named_session: bool,
+) -> Option<Duration> {
+    (!named_session && !auto_background.is_zero())
+        .then(|| requested_wait.map_or(auto_background, |wait| wait.max(auto_background)))
+}
+
+/// Whether the timeout kills the command on this pass. A command whose adoption deadline is not
+/// after its timeout is handed to `bg` at that deadline instead, as it always was before a timeout
+/// longer than the threshold could keep it in the foreground.
+fn timeout_kills(timeout: Duration, elapsed: Duration, adopt_after: Option<Duration>) -> bool {
+    !timeout.is_zero() && elapsed >= timeout && adopt_after.is_none_or(|adopt| adopt > timeout)
 }
 
 /// Whether this pass should adopt: an explicit background request, steering, or the deadline.
@@ -475,7 +489,8 @@ fn run_bash(
             "Command not started: preview servers must use the managed background tool `bg`: {start}"
         )));
     }
-    let timeout_secs = match opt_u64(args, "timeout")? {
+    let requested_timeout = opt_u64(args, "timeout")?;
+    let timeout_secs = match requested_timeout {
         None => DEFAULT_BASH_TIMEOUT_SECS.min(timeout_secs),
         Some(0) => timeout_secs,
         Some(requested) if timeout_secs == 0 => requested,
@@ -520,7 +535,10 @@ fn run_bash(
     let mut timed_out = false;
     let mut cancelled = false;
     let auto_background = Duration::from_secs(auto_background_secs);
-    let adopt_after = adoption_deadline(auto_background, session.is_some());
+    let requested_wait = requested_timeout
+        .filter(|_| timeout_secs > 0)
+        .map(|_| Duration::from_secs(timeout_secs));
+    let adopt_after = adoption_deadline(auto_background, requested_wait, session.is_some());
     let waiter = crate::platform::wake::Waiter::new()
         .map_err(|e| format!("creating command wait channel: {e}"))?;
     loop {
@@ -555,7 +573,7 @@ fn run_bash(
                     format!("Output so far:\n{so_far}\n")
                 };
                 ToolOutput::ok(format!(
-                    "command is running as background job {id} (after {}s): {command}\n{so_far}Keep working; you are notified when it finishes. Inspect with bg output/wait, stop with bg kill.",
+                    "command is running as background job {id} (after {}s): {command}\n{so_far}Keep working; you are notified when it finishes. bg wait returns its output when it exits; stop it with bg kill. To wait for a long command in one call, pass bash a `timeout` covering its run time.",
                     started.elapsed().as_secs()
                 ))
             });
@@ -585,7 +603,7 @@ fn run_bash(
         {
             break;
         }
-        if !timeout.is_zero() && started.elapsed() >= timeout {
+        if timeout_kills(timeout, started.elapsed(), adopt_after) {
             timed_out = true;
             break;
         }
@@ -1291,6 +1309,49 @@ mod tests {
         );
         assert_eq!(*adopted.lock(), 2);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_timeout_keeps_a_long_command_in_the_foreground_then_adopts_it() {
+        let (_dir, ws) = workspace();
+        let ws = ws.without_sandbox();
+        let cancel = AtomicBool::new(false);
+        let adopted = parking_lot::Mutex::new(0usize);
+        let on_adopt = |_job: ForegroundJob| {
+            *adopted.lock() += 1;
+            Ok("bg7".to_owned())
+        };
+        // Runs past the 1s threshold but within its 10s timeout: one call returns the result.
+        let finished = bash_tool_streaming_with_adopter(
+            &ws,
+            &json!({"command": "sleep 1.5; echo built", "timeout": 10}),
+            0,
+            1,
+            &|_: &[u8]| {},
+            &cancel,
+            &on_adopt,
+        )
+        .unwrap();
+        assert!(
+            finished.text.contains("built") && !finished.is_error,
+            "{}",
+            finished.text
+        );
+        assert_eq!(*adopted.lock(), 0);
+        // Still running at its 2s timeout: moved to bg rather than killed.
+        let long = bash_tool_streaming_with_adopter(
+            &ws,
+            &json!({"command": "sleep 5", "timeout": 2}),
+            0,
+            1,
+            &|_: &[u8]| {},
+            &cancel,
+            &on_adopt,
+        )
+        .unwrap();
+        assert!(long.text.contains("background job bg7"), "{}", long.text);
+        assert_eq!(*adopted.lock(), 1);
+    }
     #[cfg(unix)]
     #[test]
     fn hard_cancel_with_steering_kills_the_command_instead_of_adopting_it() {
@@ -1339,10 +1400,31 @@ mod tests {
     #[test]
     fn named_sessions_never_get_an_adoption_deadline() {
         let threshold = Duration::from_secs(5);
-        assert_eq!(adoption_deadline(threshold, false), Some(threshold));
-        assert_eq!(adoption_deadline(threshold, true), None);
-        assert_eq!(adoption_deadline(Duration::ZERO, false), None);
-        assert_eq!(adoption_deadline(Duration::ZERO, true), None);
+        assert_eq!(adoption_deadline(threshold, None, false), Some(threshold));
+        assert_eq!(adoption_deadline(threshold, None, true), None);
+        assert_eq!(adoption_deadline(Duration::ZERO, None, false), None);
+        assert_eq!(adoption_deadline(Duration::ZERO, None, true), None);
+        let long = Some(Duration::from_secs(600));
+        assert_eq!(adoption_deadline(threshold, long, true), None);
+        assert_eq!(adoption_deadline(Duration::ZERO, long, false), None);
+    }
+
+    #[test]
+    fn an_explicit_timeout_extends_the_foreground_wait_but_never_shortens_it() {
+        let threshold = Duration::from_secs(15);
+        let long = Duration::from_secs(600);
+        assert_eq!(adoption_deadline(threshold, Some(long), false), Some(long));
+        let short = Duration::from_secs(5);
+        assert_eq!(
+            adoption_deadline(threshold, Some(short), false),
+            Some(threshold)
+        );
+        // At a long explicit timeout the command moves to bg rather than being killed ...
+        assert!(!timeout_kills(long, long, Some(long)));
+        // ... while a timeout shorter than the threshold still kills, as before.
+        assert!(timeout_kills(short, short, Some(threshold)));
+        assert!(timeout_kills(short, short, None));
+        assert!(!timeout_kills(Duration::ZERO, long, None));
     }
 
     #[test]

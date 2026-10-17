@@ -11,6 +11,7 @@ pub mod dump;
 pub mod experience;
 pub mod export;
 pub mod foreign;
+pub mod history;
 pub mod image_refs;
 pub mod memory;
 pub mod memory_backend;

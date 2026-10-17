@@ -473,6 +473,9 @@ pub struct AssistanceOverrides {
     pub constrained_repair: Option<bool>,
     /// Maps to `assistance.lean_local`: the lean prompt and tool profile for locally served models.
     pub lean_local: Option<LeanLocal>,
+    /// Maps to `assistance.local.enabled`: the local-model profile (tiers, edit default, sampling,
+    /// reasoning cap, escalation) for locally served models. Absent in older reports.
+    pub local_profile: Option<bool>,
 }
 
 impl AssistanceOverrides {
@@ -2020,6 +2023,11 @@ mod machine_tests {
         let legacy: AssistanceOverrides =
             serde_json::from_value(json!({"lean_local": true})).unwrap();
         assert_eq!(legacy.lean_local, Some(LeanLocal::On));
+        // Reports written before the local profile carry no `local_profile`: it stays unset.
+        assert_eq!(legacy.local_profile, None);
+        let profiled: AssistanceOverrides =
+            serde_json::from_value(json!({"local_profile": false})).unwrap();
+        assert_eq!(profiled.local_profile, Some(false));
         let auto: AssistanceOverrides =
             serde_json::from_value(json!({"lean_local": "auto"})).unwrap();
         assert_eq!(auto.lean_local, Some(LeanLocal::Auto));

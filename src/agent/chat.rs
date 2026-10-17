@@ -149,8 +149,15 @@ pub(super) fn chat_with_ui_inner(
                 // Discard the looping attempt and re-sample the same model with a hidden,
                 // request-local redirect. It is never journaled.
                 loop_attempts += 1;
+                // Local routes with `assistance.local.loop_penalty` re-sample with a presence and
+                // repetition penalty (and thinking off where switchable) for this retry only.
+                let penalty = if backend.retry_with_loop_penalty() {
+                    " with a repetition penalty"
+                } else {
+                    ""
+                };
                 ui.inference_discarded(&format!(
-                    "{error}; discarding the looping attempt and re-sampling ({loop_attempts}/{THINKING_LOOP_MAX_ATTEMPTS})."
+                    "{error}; discarding the looping attempt and re-sampling{penalty} ({loop_attempts}/{THINKING_LOOP_MAX_ATTEMPTS})."
                 ));
                 let redirect = match error.downcast_ref::<stream_guards::GeminiHeaderRunaway>() {
                     Some(runaway) => stream_guards::render_gemini_tool_call_reminder(runaway.count),

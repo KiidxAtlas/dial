@@ -40,6 +40,7 @@ mod investigation;
 pub(crate) mod isolation;
 pub mod laya;
 mod live_tasks;
+mod local_profile;
 pub(crate) mod mailbox;
 mod memory_capture;
 mod memory_controller;
@@ -319,6 +320,8 @@ pub struct Agent<'a> {
     memory: Option<Arc<ProvenanceMemory>>,
     memory_runtime: Option<Arc<crate::storage::memory_backend::MemoryRuntime>>,
     codebase: Option<Arc<Codebase>>,
+    /// Per-turn code diffs searchable across sessions (`code_history`); `None` when disabled.
+    history: Option<Arc<crate::storage::history::ChangeHistory>>,
     experience: Option<Arc<crate::storage::experience::Experience>>,
     assistance: assistance::State,
     checkpoints: Option<Arc<Checkpoints>>,
@@ -376,6 +379,10 @@ pub struct Agent<'a> {
     step_probe: Option<crate::learn::probe::StepProbe>,
     enabled_tools: HashSet<String>,
     lean_tools: bool,
+    /// `[assistance.local]` escalation reached this session (see `local_profile`).
+    local_escalation: local_profile::Escalation,
+    /// `[assistance.local]` per-session server facts, phase state and unsaved evidence.
+    local_session: local_profile::LocalSession,
     metrics: AgentMetrics,
     usage_scope: llm::usage::Scope,
     compaction_runtime: compaction_runtime::CompactionRuntime,

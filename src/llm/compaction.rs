@@ -167,7 +167,7 @@ impl Backend {
                     anthropic,
                 )
             }
-            ProviderKind::Local { .. } => {
+            ProviderKind::Local { .. } | ProviderKind::Apple => {
                 bail!("native history cannot be replayed through a local provider")
             }
         };
@@ -245,7 +245,7 @@ impl Backend {
                     _ => false,
                 }
             }
-            ProviderKind::Local { .. } => false,
+            ProviderKind::Local { .. } | ProviderKind::Apple => false,
         }
     }
     pub fn compact_native(
@@ -389,7 +389,9 @@ impl Backend {
                     anthropic,
                 )
             }
-            ProviderKind::Local { .. } => bail!("local providers have no native compaction route"),
+            ProviderKind::Local { .. } | ProviderKind::Apple => {
+                bail!("local providers have no native compaction route")
+            }
         };
         if anthropic {
             let mut reply = anthropic_compact(

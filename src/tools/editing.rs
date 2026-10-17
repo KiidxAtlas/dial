@@ -72,9 +72,12 @@ impl EditSettings {
     }
     /// Explicit profile/harness pins override selectors; longest matching selector wins, then lexical.
     pub fn resolve_mode(&self, selector: &str, pinned: Option<EditMode>) -> EditMode {
-        if let Some(mode) = pinned {
-            return mode;
-        }
+        pinned
+            .or_else(|| self.variant_mode(selector))
+            .unwrap_or(self.mode)
+    }
+    /// The mode of the longest `model_variants` selector contained in `selector` (ties: lexical).
+    pub fn variant_mode(&self, selector: &str) -> Option<EditMode> {
         let lower = selector.to_lowercase();
         self.model_variants
             .iter()
@@ -84,7 +87,7 @@ impl EditSettings {
                     .cmp(&a.len())
                     .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
             })
-            .map_or(self.mode, |(_, mode)| *mode)
+            .map(|(_, mode)| *mode)
     }
 }
 #[derive(Debug, Clone)]

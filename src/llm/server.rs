@@ -118,19 +118,27 @@ fn settle_stderr(tail: &Mutex<Tail>) {
 }
 
 /// The child and every process it started share one process group (or Windows Job Object).
-struct Supervised {
-    child: Child,
+pub(super) struct Supervised {
+    pub(super) child: Child,
     stopped: bool,
 }
 
 impl Supervised {
+    /// Takes ownership of a child spawned with `platform::process::spawn_group`.
+    pub(super) fn new(child: Child) -> Self {
+        Self {
+            child,
+            stopped: false,
+        }
+    }
+
     /// Exit status is observed without reaping, so the group identifier stays reserved until
     /// `stop` signals the group.
     fn exited(&self) -> io::Result<bool> {
         crate::platform::process::exited(&self.child)
     }
 
-    fn stop(&mut self) {
+    pub(super) fn stop(&mut self) {
         if !self.stopped {
             let _ = crate::platform::process::kill_group(self.child.id());
             let _ = self.child.wait();

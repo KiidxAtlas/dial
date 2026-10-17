@@ -788,12 +788,13 @@ pub(super) fn ask(
             backend.reply_cost(reply),
             started.elapsed(),
         ),
-        Err(_) => crate::telemetry::request_failed(
+        Err(error) => crate::telemetry::request_failed(
             env.config,
             hermetic,
             session,
             backend.model_label(),
             started.elapsed(),
+            error,
         ),
     }
     let reply = result?;

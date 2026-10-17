@@ -155,8 +155,14 @@ pub(super) fn parallel_tools(
                 guard::normalized_arguments(call).to_string(),
             );
             if let Some(&source) = unique.get(&key)
-                && config.hooks.is_empty()
-                && ext.plugins().is_none()
+                && !["pre_tool_use", "post_tool_use"].iter().any(|event| {
+                    hooks::wanted_for_tool(
+                        &config.hooks,
+                        ext.plugins().as_deref(),
+                        event,
+                        &call.name,
+                    )
+                })
             {
                 sources.push(source);
                 remaining[source] += 1;

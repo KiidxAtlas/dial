@@ -984,6 +984,175 @@ impl<'de> Deserialize<'de> for LeanLocal {
     }
 }
 
+/// `assistance.local.edit_mode`: the edit grammar for local routes when nothing pins one. `inherit`
+/// follows `[edit] mode`; any edit mode name selects that grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalEditMode(pub Option<EditMode>);
+
+impl Default for LocalEditMode {
+    fn default() -> Self {
+        Self(Some(EditMode::Replace))
+    }
+}
+
+impl Serialize for LocalEditMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(mode) => mode.serialize(serializer),
+            None => serializer.serialize_str("inherit"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalEditMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        if word == "inherit" {
+            return Ok(Self(None));
+        }
+        EditMode::deserialize(serde::de::value::StrDeserializer::<D::Error>::new(&word))
+            .map(|mode| Self(Some(mode)))
+            .map_err(|_| {
+                serde::de::Error::invalid_value(
+                    serde::de::Unexpected::Str(&word),
+                    &"\"inherit\" or an edit mode (hashline, replace, apply_patch, patch, sloppy)",
+                )
+            })
+    }
+}
+
+/// `assistance.local.sampling`: who chooses sampling on local routes when no temperature is pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalSamplingSource {
+    /// The model's shipped settings: read from a local model's files, or left to the local server's
+    /// own per-model defaults (Dial omits `temperature`).
+    #[default]
+    Model,
+    /// Dial's harness temperature, as on hosted routes.
+    Harness,
+}
+
+/// `assistance.local.thinking`: who decides whether a local thinking model reasons on a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalThinking {
+    /// Reasoning on for planning and recovery (a turn's first request, after a failed round or an
+    /// intercepted generation, after a plan change) and off for mechanical steps that follow a
+    /// successful tool round. Only models whose server exposes a thinking switch are affected.
+    #[default]
+    Phase,
+    /// Leave it to the model, the server and the model profile.
+    Model,
+}
+
+/// `assistance.local.side_models`: side requests (compaction, summaries, retrieval ranking, edit
+/// repair) routed to a different model on the main model's local server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalSideModels {
+    /// Use the configured role model, and say once per session that it swaps models on the server.
+    #[default]
+    Warn,
+    /// Send side requests to the loaded main model instead (with thinking off where switchable).
+    ReuseMain,
+    /// Use the configured role model without a notice.
+    Allow,
+}
+
+/// Default `assistance.local.small_window`: planned windows at or below it get the small tier.
+pub const LOCAL_SMALL_WINDOW: u32 = 16_384;
+
+/// Longest `assistance.local.keep_loaded_secs`: one day.
+pub const LOCAL_KEEP_LOADED_MAX_SECS: u32 = 86_400;
+
+/// `[assistance.local]`: the local-model profile. Every policy here applies only to locally served
+/// main models (`Config::local_main_model`); hosted routes and hermetic runs are unchanged, and explicit
+/// pins (edit-mode override, model profile, harness, `[edit] model_variants`, a pinned temperature) win.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalAssistance {
+    /// Master switch for the policies below. `assistance.lean_local` still owns the lean prompt.
+    pub enabled: bool,
+    /// Planned window (tokens) at or below which a lean local route also gets the small tier: a fixed
+    /// minimal tool set up front (others load on demand). 0 disables the small tier.
+    pub small_window: u32,
+    /// Edit grammar for local routes when nothing pins one; `inherit` follows `[edit] mode`.
+    pub edit_mode: LocalEditMode,
+    /// `model` uses the model's shipped sampling; `harness` sends Dial's harness temperature.
+    pub sampling: LocalSamplingSource,
+    /// Percent of the planned window that streamed reasoning may use per request on lean tiers, when
+    /// `reasoning_guard.max_reasoning_bytes` is unlimited or larger. 0 disables the cap.
+    pub reasoning_share: u32,
+    /// Consecutive failing rounds (malformed tool calls or failed edits) before the session escalates
+    /// one step: first the minimal tool set and lean prompt, then the replace edit grammar. The
+    /// reached step is remembered per model. 0 disables escalation.
+    pub escalate_after: u32,
+    /// Thinking per request phase (`phase`) or left to the model (`model`).
+    pub thinking: LocalThinking,
+    /// Ask the local server to keep the model loaded this long after each request (Ollama
+    /// `keep_alive`, LM Studio `ttl`), and unload a model Dial loaded itself at session end. An
+    /// explicit model-profile `keep_alive` wins. 0 leaves the server default.
+    pub keep_loaded_secs: u32,
+    /// llama.cpp: reuse the server's prompt cache (`cache_prompt`) and keep the main session on one
+    /// slot (`id_slot`) with workers on others, so they do not evict each other's cache.
+    pub prompt_cache: bool,
+    /// Side requests to another model on the same local server: `warn`, `reuse_main` or `allow`.
+    pub side_models: LocalSideModels,
+    /// One actionable notice when the server serves a smaller window than configured, and an Ollama
+    /// window bounded by the model's memory estimate when no window is pinned.
+    pub context_advice: bool,
+    /// Retry a generation the repetition detector stopped with a presence/repetition penalty.
+    pub loop_penalty: bool,
+    /// Record per-model evidence in `local-profile.json` and offer evidence-backed setting suggestions
+    /// (including a speculative-decoding draft model) in `/model` settings. Never applied silently.
+    pub suggestions: bool,
+    /// Derive the pre-action time limit from the model's measured speed when
+    /// `reasoning_guard.max_pre_action_secs` is 0, and show time estimates in the status line.
+    pub time_budget: bool,
+}
+
+impl Default for LocalAssistance {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            small_window: LOCAL_SMALL_WINDOW,
+            edit_mode: LocalEditMode::default(),
+            sampling: LocalSamplingSource::Model,
+            reasoning_share: 50,
+            escalate_after: 2,
+            thinking: LocalThinking::Phase,
+            keep_loaded_secs: 1800,
+            prompt_cache: true,
+            side_models: LocalSideModels::Warn,
+            context_advice: true,
+            loop_penalty: true,
+            suggestions: true,
+            time_budget: true,
+        }
+    }
+}
+
+impl LocalAssistance {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.small_window != 0 && !(1024..=1_048_576).contains(&self.small_window) {
+            return Err("assistance.local.small_window must be 0 or 1024..=1048576".into());
+        }
+        if self.reasoning_share > 90 {
+            return Err("assistance.local.reasoning_share must be 0..=90".into());
+        }
+        if self.escalate_after > 10 {
+            return Err("assistance.local.escalate_after must be 0..=10".into());
+        }
+        if self.keep_loaded_secs > LOCAL_KEEP_LOADED_MAX_SECS {
+            return Err(format!(
+                "assistance.local.keep_loaded_secs must be 0..={LOCAL_KEEP_LOADED_MAX_SECS}"
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AssistanceConfig {
@@ -1010,6 +1179,8 @@ pub struct AssistanceConfig {
     /// only when the planned window is at most `LEAN_AUTO_MAX_WINDOW`; `true` forces it on, `false`
     /// opts out. Hosted routes are unchanged. Measure with `dial benchmark --ablate-assistance`.
     pub lean_local: LeanLocal,
+    /// The local-model profile: tiers, edit grammar, sampling, reasoning cap and escalation.
+    pub local: LocalAssistance,
 }
 impl Default for AssistanceConfig {
     fn default() -> Self {
@@ -1026,6 +1197,7 @@ impl Default for AssistanceConfig {
             repair_hints: false,
             constrained_repair: true,
             lean_local: LeanLocal::Auto,
+            local: LocalAssistance::default(),
         }
     }
 }
@@ -1077,6 +1249,8 @@ pub struct CodebaseConfig {
     pub ambient_context: bool,
     /// Build a bounded architecture synthesis after successful interactive turns.
     pub synthesize_architecture: bool,
+    /// Record each turn's file diffs (branch and prompt included) and offer `code_history`.
+    pub history: bool,
     /// Local MLX model for architecture summaries; blank follows main, explicit roles override.
     pub architecture_model: String,
 }
@@ -1087,6 +1261,7 @@ impl Default for CodebaseConfig {
             context_max_bytes: 0,
             ambient_context: false,
             synthesize_architecture: false,
+            history: true,
             architecture_model: "mlx-community/Qwen2.5-3B-Instruct-4bit".into(),
         }
     }

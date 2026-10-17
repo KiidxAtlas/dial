@@ -134,7 +134,7 @@ pub fn run(layout: &Layout, model: Option<&str>) -> Result<()> {
         println!("ready: {model}\nlora: {}", caps["lora"]);
     } else {
         let config = settings_store::load_config(layout, &toml::Table::new())?;
-        if config.model.trim().is_empty() || config.endpoint.is_some() {
+        if config.model.trim().is_empty() || !config.runs_dial_mlx() {
             ensure_runtime(layout)?;
             eprintln!(
                 "MLX environment ready. Run dial and select a model, or dial setup --model <mlx-model-id>."

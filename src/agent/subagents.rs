@@ -2390,6 +2390,7 @@ fn run_isolated(env: Env, role: &Config, job: &Job, approver: &mut dyn Approver)
     let attempt =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match make_backend(role) {
             Ok(mut backend) => run_job(env, job, approver, |env, approver| {
+                super::local_profile::configure_worker_backend(role, &mut backend, job.index);
                 run_child(env, job, &mut backend, None, approver)
             }),
             Err(error) => Outcome::failed(0, format!("subagent provider unavailable: {error:#}")),

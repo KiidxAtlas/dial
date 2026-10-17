@@ -55,6 +55,8 @@ pub enum ProviderKind {
     },
     /// Claude subscription OAuth refreshed before each request.
     AnthropicSubscription { model: String, user_dir: PathBuf },
+    /// Apple's on-device system model through Dial's FoundationModels helper (`llm::apple`).
+    Apple,
 }
 // Not derived: the key must never reach a log through `{:?}`.
 impl fmt::Debug for ProviderKind {
@@ -91,6 +93,7 @@ impl fmt::Debug for ProviderKind {
                 .field("model", model)
                 .field("api_key", &api_key.as_ref().map(|_| "<redacted>"))
                 .finish(),
+            ProviderKind::Apple => f.write_str("Apple"),
         }
     }
 }
@@ -190,6 +193,7 @@ pub fn validate(kind: &ProviderKind, allow_insecure: bool) -> Result<()> {
             }
             endpoint_url(base_url, allow_insecure).map(drop)
         }
+        ProviderKind::Apple => Ok(()),
     }
 }
 
@@ -203,6 +207,7 @@ pub fn context_window_hint(kind: &ProviderKind) -> Option<u32> {
             llm::catalog::known_context_window(model)
         }
         ProviderKind::Local { model_dir } => local_context_window(Path::new(model_dir)),
+        ProviderKind::Apple => Some(llm::apple::availability().context_size),
     }
 }
 
@@ -296,6 +301,15 @@ pub struct Backend {
     /// Test-only idle limit for this backend's model calls, carried to the worker thread that runs them.
     #[cfg(test)]
     idle_limit: Option<Duration>,
+    /// Persistent local hints for every request (`set_local_hints`).
+    local_hints: llm::local_hints::LocalHints,
+    /// Hints for the next request only (`next_local_hints`), consumed at the request boundary.
+    next_local_hints: Option<llm::local_hints::LocalHints>,
+    /// Merged hints the previous request used; the base of a loop-penalty retry.
+    last_local_hints: llm::local_hints::LocalHints,
+    /// Penalty hints for loop recovery (`set_loop_penalty`); `None` disables retries.
+    loop_penalty: Option<llm::local_hints::LocalHints>,
+    loop_penalty_retries: u32,
 }
 
 impl Backend {
@@ -327,6 +341,11 @@ impl Backend {
             protocol: None,
             headers: Vec::new(),
             next_profile: None,
+            local_hints: Default::default(),
+            next_local_hints: None,
+            last_local_hints: Default::default(),
+            loop_penalty: None,
+            loop_penalty_retries: 0,
             next_reasoning_guard: None,
             steering_config: None,
             steering_runtime: serde_json::json!({"state":"disabled","uses":0}),
@@ -522,6 +541,7 @@ impl Backend {
         let protocol = match &self.kind {
             ProviderKind::ChatGpt { .. } => "chatgpt",
             ProviderKind::Local { .. } => "mlx",
+            ProviderKind::Apple => llm::apple::PROVIDER,
             ProviderKind::Endpoint { .. } => "openai-compatible",
             ProviderKind::AnthropicEndpoint { .. } | ProviderKind::AnthropicSubscription { .. } => {
                 "anthropic"
@@ -648,7 +668,7 @@ impl Backend {
     fn response_timeout(&self, worker_timeout_secs: u64) -> u64 {
         let remote = match &self.kind {
             ProviderKind::ChatGpt { .. } | ProviderKind::AnthropicSubscription { .. } => true,
-            ProviderKind::Local { .. } => false,
+            ProviderKind::Local { .. } | ProviderKind::Apple => false,
             ProviderKind::Endpoint { base_url, .. }
             | ProviderKind::AnthropicEndpoint { base_url, .. } => {
                 !llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host))
@@ -710,6 +730,7 @@ impl Backend {
             .map(|profile| profile.provider.as_str())
             .unwrap_or_else(|| match &self.kind {
                 ProviderKind::Local { .. } => "mlx",
+                ProviderKind::Apple => llm::apple::PROVIDER,
                 ProviderKind::ChatGpt { .. } => "chatgpt",
                 ProviderKind::AnthropicSubscription { .. }
                 | ProviderKind::AnthropicEndpoint { .. } => "anthropic",
@@ -739,6 +760,108 @@ impl Backend {
     /// Consumed once at the request boundary; transport retries keep the same profile.
     pub fn next_request_profile(&mut self, profile: Option<llm::profiles::ModelProfile>) {
         self.next_profile = profile;
+    }
+    /// Persistent local hints for every request of this backend.
+    pub fn set_local_hints(&mut self, hints: llm::local_hints::LocalHints) {
+        self.local_hints = hints;
+    }
+    /// Hints for the next request only: consumed at the request boundary (transport retries keep
+    /// them) and merged over the persistent hints, the next request's value winning per field.
+    pub fn next_local_hints(&mut self, hints: llm::local_hints::LocalHints) {
+        self.next_local_hints = Some(hints);
+    }
+    /// Penalty hints for loop recovery on local routes; `None` disables retries.
+    pub fn set_loop_penalty(&mut self, hints: Option<llm::local_hints::LocalHints>) {
+        self.loop_penalty = hints;
+    }
+    /// Re-samples the next request with the loop penalty overlaid on the hints the previous request
+    /// used (penalty fields win; the request-side never-overwrite rule still keeps profile values).
+    /// Returns false, without retrying, when no penalty is configured or the route is hosted.
+    pub fn retry_with_loop_penalty(&mut self) -> bool {
+        let Some(penalty) = self.loop_penalty.clone() else {
+            return false;
+        };
+        if self.local_server().is_none() {
+            return false;
+        }
+        self.next_local_hints = Some(penalty.over(&self.last_local_hints));
+        self.loop_penalty_retries += 1;
+        true
+    }
+    /// Drains the number of loop-penalty retries requested since the last call.
+    pub fn take_loop_penalty_retries(&mut self) -> u32 {
+        std::mem::take(&mut self.loop_penalty_retries)
+    }
+    /// The local server behind this backend's route, `None` for hosted routes.
+    pub fn local_server(&self) -> Option<llm::local_hints::LocalServer> {
+        let key = self.endpoint_api_key().ok().flatten();
+        self.detect_local(
+            self.next_profile
+                .as_ref()
+                .or(self.profile.as_ref())
+                .map(|p| p.provider.as_str()),
+            None,
+            key.as_deref(),
+        )
+    }
+    /// Provider id a local route is detected under: `mlx` for Dial's runtime, `ollama` for the
+    /// Ollama protocol, else the profile's provider (`endpoint` without one).
+    fn local_provider<'a>(&self, profile_provider: Option<&'a str>) -> &'a str {
+        match &self.kind {
+            ProviderKind::Local { .. } => "mlx",
+            _ if self.protocol == Some(ApiProtocol::Ollama) => "ollama",
+            _ => profile_provider.unwrap_or("endpoint"),
+        }
+    }
+    fn route_model(&self) -> &str {
+        match &self.kind {
+            ProviderKind::Apple => llm::apple::MODEL,
+            ProviderKind::Local { model_dir } => model_dir.as_str(),
+            ProviderKind::Endpoint { model, .. }
+            | ProviderKind::AnthropicEndpoint { model, .. } => model.as_str(),
+            ProviderKind::ChatGpt { model, .. }
+            | ProviderKind::AnthropicSubscription { model, .. } => model.as_str(),
+        }
+    }
+    /// The local server for a route. Only Dial's runtime and OpenAI-compatible chat endpoints on a
+    /// local host qualify; every other route (hosted, Anthropic, Responses) returns `None`.
+    fn detect_local(
+        &self,
+        profile_provider: Option<&str>,
+        base_url: Option<&str>,
+        token: Option<&str>,
+    ) -> Option<llm::local_hints::LocalServer> {
+        let provider = self.local_provider(profile_provider);
+        match &self.kind {
+            ProviderKind::Local { model_dir } => Some(llm::local_hints::LocalServer::detect(
+                provider,
+                model_dir,
+                None,
+                None,
+                &[],
+            )),
+            ProviderKind::Endpoint {
+                base_url: configured,
+                ..
+            } if matches!(
+                self.protocol.unwrap_or(ApiProtocol::ChatCompletions),
+                ApiProtocol::ChatCompletions | ApiProtocol::Ollama
+            ) =>
+            {
+                let base = base_url.unwrap_or(configured.as_str());
+                let local = llm::host_of(base).is_some_and(|host| llm::is_local_host(&host));
+                local.then(|| {
+                    llm::local_hints::LocalServer::detect(
+                        provider,
+                        "",
+                        Some(base),
+                        token,
+                        &self.headers,
+                    )
+                })
+            }
+            _ => None,
+        }
     }
     /// Scoped side requests restore a pending main profile even if no request boundary was reached.
     pub(crate) fn swap_request_profile(
@@ -787,7 +910,7 @@ impl Backend {
             ProviderKind::ChatGpt { .. } | ProviderKind::AnthropicSubscription { .. } => {
                 return None;
             }
-            ProviderKind::Local { .. } => false,
+            ProviderKind::Local { .. } | ProviderKind::Apple => false,
             ProviderKind::Endpoint { base_url, .. }
             | ProviderKind::AnthropicEndpoint { base_url, .. } => {
                 !llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host))
@@ -809,7 +932,7 @@ impl Backend {
             | ProviderKind::AnthropicEndpoint { model, .. }
             | ProviderKind::ChatGpt { model, .. }
             | ProviderKind::AnthropicSubscription { model, .. } => model,
-            ProviderKind::Local { .. } => return None,
+            ProviderKind::Local { .. } | ProviderKind::Apple => return None,
         };
         let bundled = llm::catalog::model_capabilities(model)?;
         let now_ms = std::time::SystemTime::now()
@@ -846,6 +969,7 @@ impl Backend {
             } => {
                 format!("{model} via {}", llm::display_url(base_url))
             }
+            ProviderKind::Apple => format!("{} via FoundationModels", llm::apple::LABEL),
         }
     }
 
@@ -856,7 +980,7 @@ impl Backend {
 
     pub fn local_inference(&self) -> bool {
         match &self.kind {
-            ProviderKind::Local { .. } => true,
+            ProviderKind::Local { .. } | ProviderKind::Apple => true,
             ProviderKind::Endpoint { base_url, .. }
             | ProviderKind::AnthropicEndpoint { base_url, .. } => {
                 llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host))
@@ -874,6 +998,7 @@ impl Backend {
             ProviderKind::ChatGpt { model, .. } => model,
             ProviderKind::AnthropicSubscription { model, .. } => model,
             ProviderKind::Local { .. } => SERVER_MODEL,
+            ProviderKind::Apple => llm::apple::MODEL,
             ProviderKind::Endpoint { model, .. }
             | ProviderKind::AnthropicEndpoint { model, .. } => model,
         }
@@ -959,6 +1084,8 @@ impl Backend {
                 ProviderKind::Local { model_dir } => {
                     llm::catalog::local_model_metadata(Path::new(model_dir)).vision == Some(true)
                 }
+                // The system model reads text only.
+                ProviderKind::Apple => false,
                 _ => true,
             }
     }
@@ -976,7 +1103,7 @@ impl Backend {
         #[cfg(test)]
         let _idle_limit = llm::cancel::TestIdleLimitScope::enter(self.idle_limit);
         let billing = match &self.kind {
-            ProviderKind::Local { .. } => llm::usage::Billing::Local,
+            ProviderKind::Local { .. } | ProviderKind::Apple => llm::usage::Billing::Local,
             ProviderKind::ChatGpt { .. } | ProviderKind::AnthropicSubscription { .. } => {
                 llm::usage::Billing::Subscription
             }
@@ -1098,7 +1225,46 @@ impl Backend {
         // since the backend was built applies to this request. Precedence and origin checks stay in
         // `resolve_credential`.
         let endpoint_key = self.endpoint_api_key()?;
+        if matches!(self.kind, ProviderKind::Apple) {
+            ensure!(
+                adapter.is_none(),
+                "the Apple on-device model cannot load LoRA adapters"
+            );
+            return llm::apple::chat(req, timeout_secs, &interrupt, on_text, on_event);
+        }
+        // Local hints ride the profile as request-scoped carriers; a hosted route never gets any.
+        // Detection (which may probe a local server) runs only when there is something to send.
+        let merged_hints = self
+            .next_local_hints
+            .take()
+            .unwrap_or_default()
+            .over(&self.local_hints);
+        let local_server = if merged_hints.is_empty() {
+            None
+        } else {
+            self.detect_local(
+                profile.as_ref().map(|p| p.provider.as_str()),
+                grant_route.as_deref(),
+                endpoint_key.as_deref(),
+            )
+        };
+        self.last_local_hints = merged_hints.clone();
+        if local_server.is_some() && profile.is_none() {
+            profile = Some(llm::profiles::ModelProfile::minimal(
+                self.local_provider(None),
+                self.route_model(),
+            ));
+        }
+        if let Some(profile) = profile.as_mut() {
+            profile.local_hints = if local_server.is_some() {
+                merged_hints
+            } else {
+                Default::default()
+            };
+            profile.local_server = local_server;
+        }
         let (url, auth, model, protocol, codex_account_id) = match &self.kind {
+            ProviderKind::Apple => unreachable!("handled above"),
             ProviderKind::ChatGpt { model, .. } => {
                 ensure!(
                     self.protocol.is_none_or(|p| p == ApiProtocol::Responses),
@@ -2353,8 +2519,8 @@ fn anthropic_request_body(
 }
 
 const CLAUDE_CODE_VERSION: &str = "2.1.280";
-const CLAUDE_BILLING_PREFIX: &str = "x-anthropic-billing-header:";
-const CCH_PLACEHOLDER: &str = "cch=00000";
+pub(super) const CLAUDE_BILLING_PREFIX: &str = "x-anthropic-billing-header:";
+pub(super) const CCH_PLACEHOLDER: &str = "cch=00000";
 const CCH_SEED: u64 = 0x4d659218e32a3268;
 
 fn claude_billing_header(first_user_message: &str) -> String {
@@ -2789,6 +2955,62 @@ mod tests {
         );
         let hosted = backend(endpoint("https://api.example.invalid/v1"));
         assert_eq!(hosted.endpoint_structured_output(), None);
+    }
+
+    /// Local hints reach a detected local llama-server only: the request carries them, a hosted
+    /// route is never probed or hinted, and a loop retry needs a penalty configured on a local route.
+    #[test]
+    fn local_hints_and_loop_penalty_retries_stay_on_local_routes() {
+        use llm::local_hints::{LocalHints, LocalServer};
+        let props = fake::json(
+            200,
+            &json!({"default_generation_settings": {"n_ctx": 4096}}),
+        );
+        // One connection for the /props probe, then one per chat (the retry is the third).
+        let llama = fake::serve(vec![props, ok("{}"), ok("{}")]);
+        let mut local = backend(endpoint(&format!("{}/v1", llama.url)));
+        local.set_local_hints(LocalHints {
+            cache_slot: Some(1),
+            prompt_progress: true,
+            ..Default::default()
+        });
+        local.set_loop_penalty(Some(LocalHints {
+            thinking: Some(false),
+            presence_penalty: Some(0.6),
+            repetition_penalty: Some(1.3),
+            ..Default::default()
+        }));
+        assert_eq!(local.local_server(), Some(LocalServer::LlamaCpp));
+        local.chat(None, &request(), 5, None).unwrap();
+        assert!(local.retry_with_loop_penalty());
+        local.chat(None, &request(), 5, None).unwrap();
+        assert_eq!(local.take_loop_penalty_retries(), 1);
+        assert_eq!(local.take_loop_penalty_retries(), 0);
+        let requests = llama.requests();
+        let first = fake::body(&requests[1]);
+        assert_eq!(first["cache_prompt"], true);
+        assert_eq!(first["id_slot"], 1);
+        assert_eq!(first["return_progress"], true);
+        assert!(first.get("presence_penalty").is_none());
+        assert!(first.get("chat_template_kwargs").is_none());
+        let retry = fake::body(&requests[2]);
+        assert_eq!(retry["presence_penalty"], 0.6);
+        assert_eq!(retry["repeat_penalty"], 1.3);
+        assert_eq!(retry["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(retry["id_slot"], 1);
+
+        let mut hosted = backend(endpoint("https://api.example.invalid/v1"));
+        hosted.set_local_hints(LocalHints {
+            cache_slot: Some(1),
+            ..Default::default()
+        });
+        hosted.set_loop_penalty(Some(LocalHints {
+            presence_penalty: Some(0.6),
+            ..Default::default()
+        }));
+        assert_eq!(hosted.local_server(), None);
+        assert!(!hosted.retry_with_loop_penalty());
+        assert_eq!(hosted.take_loop_penalty_retries(), 0);
     }
 
     /// The repair retry on a detected llama-server carries `json_schema`; without `/props` the same

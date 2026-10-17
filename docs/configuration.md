@@ -83,6 +83,7 @@ require_plan = true         # after a gate hit with no open todo, only `todo` is
 [codebase]
 enabled = true
 context_max_bytes = 0
+history = true               # record per-turn file diffs for code_history and /code-history
 
 [ui]
 theme = "dark"                    # dark | light | mono | gruvbox | nord | paper | auto

@@ -365,6 +365,22 @@ pub fn wanted(
         || plugins.is_some_and(|host| host.subscribed(event))
 }
 
+/// Whether a hook or plugin observes `event` for this specific tool. Shell hooks honour their
+/// matcher; plugins subscribe per event, so any subscriber counts. Scheduling uses this so a hook
+/// that matches only `bash` no longer serializes reads or disables batch reuse for other tools.
+pub fn wanted_for_tool(
+    hooks: &[HookConfig],
+    plugins: Option<&crate::tools::plugin::Host>,
+    event: &str,
+    tool: &str,
+) -> bool {
+    let event = canonical(event);
+    hooks
+        .iter()
+        .any(|hook| canonical(&hook.event) == event && matches(hook, Some(tool)))
+        || plugins.is_some_and(|host| host.subscribed(event))
+}
+
 /// Run an observe-only lifecycle event (`session_start`, `session_end`). Failures and output come
 /// back as notices; nothing blocks.
 pub fn observe(
@@ -1135,5 +1151,15 @@ mod tests {
         assert!(matches(&h, Some("edit")));
         assert!(!matches(&h, Some("editor")));
         assert!(MATCHERS.lock().contains_key("edit|write"));
+    }
+
+    #[test]
+    fn scheduling_ignores_hooks_that_match_other_tools() {
+        let hooks = [hook("pre_tool_use", Some("bash"), "true")];
+        assert!(wanted_for_tool(&hooks, None, "pre_tool_use", "bash"));
+        assert!(!wanted_for_tool(&hooks, None, "pre_tool_use", "read"));
+        assert!(!wanted_for_tool(&hooks, None, "post_tool_use", "bash"));
+        let unmatched = [hook("tool_call", None, "true")];
+        assert!(wanted_for_tool(&unmatched, None, "pre_tool_use", "read"));
     }
 }

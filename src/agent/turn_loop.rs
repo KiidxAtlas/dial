@@ -52,6 +52,9 @@ impl<'a> Agent<'a> {
         self.live_tasks.bind(self.session.runtime());
         let turn_clock = Instant::now();
         let result = self.turn_inner(user_text, &mut observed, reset_interrupt, prepared);
+        if let Err(error) = self.flush_local_evidence() {
+            observed.diagnostic(&format!("Local model evidence not saved: {error:#}"));
+        }
         if result
             .as_ref()
             .is_ok_and(|report| report.outcome == TurnOutcome::Completed)
@@ -89,6 +92,24 @@ impl<'a> Agent<'a> {
                     .map(|checkpoints| checkpoints.changed_files(turn))
             })
             .unwrap_or_default();
+        if let (Some(history), Some(checkpoints), Some(turn)) =
+            (&self.history, &self.checkpoints, self.step_checks.turn)
+            && !changed_files.is_empty()
+        {
+            let recorded = checkpoints.turn_versions(turn).and_then(|versions| {
+                let branch = crate::storage::history::current_branch(self.workspace.root());
+                history.record(
+                    self.session.id(),
+                    turn,
+                    &prompt::truncate_chars(user_text, 200),
+                    branch.as_deref(),
+                    &versions,
+                )
+            });
+            if let Err(error) = recorded {
+                observed.diagnostic(&format!("Code history not recorded: {error:#}"));
+            }
+        }
         let (outcome, steps) = match &result {
             Ok(report) => (
                 serde_json::to_value(report.outcome)
@@ -215,12 +236,18 @@ impl<'a> Agent<'a> {
                 self.rebuild_system();
             }
         }
+        // A step this local model reached in an earlier session applies from the first request.
+        self.seed_local_escalation();
+        self.begin_local_turn(ui);
         // Offered tools can change with version/harness refresh or skill toggles; rebuild only if content changed.
         self.rebuild_system();
         for notice in self.ext.take_notices() {
             ui.notice(&notice);
         }
         self.probe_context();
+        if let Some(served) = self.context_cap {
+            self.local_context_advice(served, ui);
+        }
         self.step_probe = self
             .store
             .map(crate::learn::probe::load)
@@ -841,7 +868,7 @@ impl<'a> Agent<'a> {
             self.save_investigation_findings(ui);
             // The default architecture model is local MLX. With a cloud main model no compute is held for
             // the turn, so synthesis is skipped rather than making every turn wait for training.
-            let arch_local = self.config.architecture_config().endpoint.is_none();
+            let arch_local = self.config.architecture_config().runs_dial_mlx();
             if !self.hermetic
                 && self.config.codebase.synthesize_architecture
                 && (!arch_local || self.config.uses_local_compute())

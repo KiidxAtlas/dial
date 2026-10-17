@@ -121,6 +121,7 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
                 )?,
             }
         }
+        (Some(provider), _) if provider == crate::llm::apple::PROVIDER => ProviderKind::Apple,
         (_, None) => ProviderKind::Local {
             model_dir: crate::llm::download::ensure_local_model(&config.python, &config.model)?,
         },

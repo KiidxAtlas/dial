@@ -40,6 +40,19 @@ impl ErrorClass {
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::RateLimited { .. } | Self::Transient)
     }
+
+    /// Stable lowercase name for stats rows; carries no provider text.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ContextOverflow => "context_overflow",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::QuotaExhausted { .. } => "quota_exhausted",
+            Self::Auth => "auth",
+            Self::Transient => "transient",
+            Self::Payload => "payload",
+            Self::Fatal => "fatal",
+        }
+    }
 }
 
 /// A non-HTTP error whose class was decided where the original diagnostic was still available.
@@ -670,5 +683,17 @@ mod tests {
         ))
         .context("provider request failed");
         assert!(is_context_overflow(&error));
+    }
+
+    #[test]
+    fn failed_requests_are_labelled_by_class_without_provider_text() {
+        let limited = anyhow::Error::new(Classified::new(
+            ErrorClass::RateLimited { retry_after: None },
+            "secret-token in provider text",
+        ))
+        .context("provider request failed");
+        assert_eq!(classify(&limited).label(), "rate_limited");
+        let other = anyhow::anyhow!("something unclassified");
+        assert_eq!(classify(&other).label(), "fatal");
     }
 }

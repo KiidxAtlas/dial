@@ -11,6 +11,7 @@
 //! [`ToolCall`]s when the request offered tools.
 
 pub(crate) mod anthropic;
+pub mod apple;
 mod anthropic_cache;
 pub(crate) mod anthropic_oauth;
 pub mod auth;
@@ -35,13 +36,17 @@ pub(crate) mod gemini;
 mod gitlab_duo;
 pub mod images;
 pub(crate) mod json_repair;
+pub mod local_evidence;
 pub mod local_fit;
 pub mod local_format;
+pub mod local_hints;
 pub mod local_runtime;
 pub mod local_sampling;
+pub mod local_server;
 mod markup;
 pub(crate) mod messages;
 pub mod model_config;
+pub mod model_sampling;
 pub mod oauth;
 pub(crate) mod ollama;
 pub mod policy;
@@ -268,6 +273,12 @@ pub struct Reply {
     pub credits: Option<ReplyCredits>,
     /// Fingerprint of the final outbound payload that produced this reply (cache diagnostics).
     pub wire: Option<wire::Observation>,
+    /// Measured prompt-processing rate (uncached prompt tokens/s), when the server reported it.
+    pub prefill_tokens_per_second: Option<f64>,
+    /// Measured generation rate (output tokens/s), when the server reported it.
+    pub decode_tokens_per_second: Option<f64>,
+    /// Seconds the server spent loading the model for this request, when reported (Ollama).
+    pub load_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -310,6 +321,12 @@ pub struct ModelProgress {
     pub tokens_per_second: Option<f64>,
     #[serde(default)]
     pub estimated: bool,
+    /// Prompt tokens served from the server's prompt cache (llama.cpp `prompt_progress.cache`).
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+    /// Seconds remaining, computed by the agent from measured speed; never sent by a server.
+    #[serde(default)]
+    pub eta_secs: Option<f64>,
 }
 
 impl ModelProgress {
@@ -321,11 +338,14 @@ impl ModelProgress {
             output_tokens: None,
             tokens_per_second: None,
             estimated: false,
+            cached_tokens: None,
+            eta_secs: None,
         }
     }
 
     pub fn normalize(&mut self) {
         self.tokens_per_second = self.tokens_per_second.filter(|n| n.is_finite() && *n > 0.0);
+        self.eta_secs = self.eta_secs.filter(|n| n.is_finite() && *n >= 0.0);
         if let (Some(done), Some(total)) = (self.processed_tokens, self.prompt_tokens) {
             self.processed_tokens = Some(done.min(total));
         }

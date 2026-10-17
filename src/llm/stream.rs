@@ -284,6 +284,9 @@ pub(super) struct Accumulator {
     reasoning_tokens: Option<u64>,
     cached_prompt_tokens: Option<u64>,
     patience: Option<Patience>,
+    prefill_tps: Option<f64>,
+    decode_tps: Option<f64>,
+    timing_cache_n: Option<u64>,
 }
 
 impl Accumulator {
@@ -347,9 +350,40 @@ impl Accumulator {
         {
             progress.normalize();
             progress_seen = true;
+            // Dial's MLX runtime reports its generation rate on generating progress packets.
+            if progress.phase == super::InferencePhase::Generating {
+                self.decode_tps = progress.tokens_per_second.or(self.decode_tps);
+            }
             if !on_event(&super::StreamEvent::Progress(progress)) {
                 return Err(Interrupted.into());
             }
+        }
+        // llama.cpp `return_progress`: prompt-processing progress, outside the usage chunk.
+        if let Some(pp) = event.get("prompt_progress").filter(|p| p.is_object()) {
+            let mut progress = super::ModelProgress::new(super::InferencePhase::Processing);
+            progress.processed_tokens = pp.get("processed").and_then(Value::as_u64);
+            progress.prompt_tokens = pp.get("total").and_then(Value::as_u64);
+            progress.cached_tokens = pp.get("cache").and_then(Value::as_u64);
+            progress.normalize();
+            progress_seen = true;
+            if !on_event(&super::StreamEvent::Progress(progress)) {
+                return Err(Interrupted.into());
+            }
+        }
+        // llama.cpp `timings` (final chunk): measured prompt and generation rates, reused prompt tokens.
+        if let Some(timings) = event.get("timings").filter(|t| t.is_object()) {
+            let rate = |key: &str| {
+                timings
+                    .get(key)
+                    .and_then(Value::as_f64)
+                    .filter(|n| n.is_finite() && *n > 0.0)
+            };
+            self.prefill_tps = rate("prompt_per_second").or(self.prefill_tps);
+            self.decode_tps = rate("predicted_per_second").or(self.decode_tps);
+            self.timing_cache_n = timings
+                .get("cache_n")
+                .and_then(Value::as_u64)
+                .or(self.timing_cache_n);
         }
         if let Some(usage) = event.get("usage").filter(|u| u.is_object()) {
             progress_seen = true;
@@ -580,7 +614,9 @@ impl Accumulator {
             completion_tokens: self.completion_tokens,
             reasoning: self.reasoning,
             reasoning_tokens: self.reasoning_tokens,
-            cached_prompt_tokens: self.cached_prompt_tokens,
+            cached_prompt_tokens: self.cached_prompt_tokens.or(self.timing_cache_n),
+            prefill_tokens_per_second: self.prefill_tps,
+            decode_tokens_per_second: self.decode_tps,
             ..Default::default()
         })
     }
@@ -662,6 +698,48 @@ mod tests {
     #[test]
     fn final_line_without_newline_is_delivered() {
         assert_eq!(events(b"data: {\"a\":1}").unwrap(), ["{\"a\":1}"]);
+    }
+
+    #[test]
+    fn llama_cpp_prompt_progress_and_timings_become_telemetry() {
+        use crate::llm::{InferencePhase, StreamEvent};
+        let mut acc = Accumulator::default();
+        let mut seen = Vec::new();
+        for event in [
+            json!({"choices":[{"index":0,"delta":{}}],"prompt_progress":{"total":1000,"cache":600,"processed":800,"time_ms":120}}),
+            json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}],
+                "timings":{"cache_n":600,"prompt_per_second":250.0,"predicted_per_second":42.5}}),
+        ] {
+            acc.feed_with_events(&event.to_string(), &mut |_| true, &mut |e| {
+                seen.push(e.clone());
+                true
+            })
+            .unwrap();
+        }
+        let StreamEvent::Progress(p) = &seen[0] else {
+            panic!("missing prompt progress")
+        };
+        assert_eq!(p.phase, InferencePhase::Processing);
+        assert_eq!(
+            (p.processed_tokens, p.prompt_tokens, p.cached_tokens),
+            (Some(800), Some(1000), Some(600))
+        );
+        let reply = acc.finish().unwrap();
+        assert_eq!(reply.text, "hi");
+        assert_eq!(reply.prefill_tokens_per_second, Some(250.0));
+        assert_eq!(reply.decode_tokens_per_second, Some(42.5));
+        assert_eq!(reply.cached_prompt_tokens, Some(600));
+
+        // A usage-reported cache count is the authority; timings only fill the gap.
+        let mut acc = Accumulator::default();
+        for event in [
+            json!({"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1000,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":5}},
+                "timings":{"cache_n":600}}),
+        ] {
+            acc.feed(&event.to_string(), &mut |_| true).unwrap();
+        }
+        assert_eq!(acc.finish().unwrap().cached_prompt_tokens, Some(5));
     }
 
     #[test]
