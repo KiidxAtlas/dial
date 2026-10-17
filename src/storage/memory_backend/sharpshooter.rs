@@ -1,11 +1,11 @@
+use crate::config::memory_backend::{MemoryBackendId, SharpshooterConfig};
+
 use super::{
-    Driver, MemoryModelRequest, MemoryModelRunner, Operation,
-    config::{MemoryBackendId, SharpshooterConfig},
-    files::PrivateDirectory,
-    now, redact, visible_text,
+    Driver, MemoryModelRequest, MemoryModelRunner, Operation, files::PrivateDirectory, now, redact,
+    visible_text,
 };
+use crate::config::paths::Layout;
 use crate::platform::fs as platform_fs;
-use crate::storage::paths::Layout;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};

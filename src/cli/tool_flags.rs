@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use clap::Args;
 
-use crate::tools::{BUILTIN, EXTRA_TOOLS, INTEGRATION_TOOLS, default_tools};
+use crate::config::tools::integrations::INTEGRATION_TOOLS;
+use crate::config::tools::{BUILTIN, EXTRA_TOOLS, default_tools};
 
 /// Flags accepted by `dial` for tools, system prompt, skills, rules, LSP, PTY and title.
 #[derive(Debug, Clone, Default, Args)]

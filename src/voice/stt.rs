@@ -1,10 +1,8 @@
 //! Speech-to-text backends: local whisper.cpp, local mlx-whisper, or the OpenAI transcription API.
 
-use super::{
-    SttBackendChoice, VoiceEnv,
-    process::{self, CommandSpec},
-    wav,
-};
+use crate::config::voice::SttBackendChoice;
+use crate::voice::process::{self, CommandSpec};
+use crate::voice::{VoiceEnv, wav};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{

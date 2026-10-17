@@ -1,3 +1,6 @@
+use crate::config::solve::EscalationConfig;
+use crate::config::solve::SolveConfig;
+
 use super::*;
 fn state(text: &str) -> FileState {
     FileState {

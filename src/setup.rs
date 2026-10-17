@@ -2,14 +2,9 @@
 pub mod deps;
 pub mod embeddings;
 pub mod memory;
-use crate::{
-    config::types::Config,
-    learn::worker,
-    storage::{
-        paths::Layout,
-        settings_store::{self, Scope},
-    },
-};
+use crate::config::paths::Layout;
+use crate::config::settings_store::{self, Scope};
+use crate::config::types::Config;
 use anyhow::{Context, Result, ensure};
 use std::{
     sync::atomic::{AtomicBool, Ordering},
@@ -118,7 +113,13 @@ fn select_model(
     Ok(caps)
 }
 
-pub fn run(layout: &Layout, model: Option<&str>) -> Result<()> {
+/// `capabilities` probes a model's capabilities once its runtime is installed; the caller supplies
+/// the learn-layer probe so this tools-layer module does not depend on `learn`.
+pub fn run(
+    layout: &Layout,
+    model: Option<&str>,
+    capabilities: impl Fn(&Config) -> Result<serde_json::Value>,
+) -> Result<()> {
     let prepare = |config: &Config| {
         eprintln!(
             "installing mlx-lm into {} (uv)…",
@@ -127,7 +128,7 @@ pub fn run(layout: &Layout, model: Option<&str>) -> Result<()> {
         ensure_runtime(layout)?;
         eprintln!("verifying {} (first run downloads weights)…", config.model);
         crate::llm::download::ensure_local_model(&config.python, &config.model)?;
-        worker::capabilities(config)
+        capabilities(config)
     };
     if let Some(model) = model {
         let caps = select_model(layout, model, prepare)?;

@@ -117,27 +117,20 @@ use roles::*;
 use selfplay::*;
 use steering::*;
 
-use crate::{
-    config::types::{Approval, Config, Event, SandboxMode, Version},
-    learn::{verify::Check, worker},
-    llm::{
-        self, Chat, ToolCall,
-        provider::{Backend, ProviderKind},
-    },
-    storage::{
-        checkpoint::Checkpoints,
-        codebase::Codebase,
-        paths::Layout,
-        provenance::ProvenanceMemory,
-        session::{self, Session},
-        skills,
-        store::Store,
-    },
-    tools::{
-        self, ToolOutput, Workspace,
-        ext::{LifecycleEvent, Registry, ToolContext},
-    },
-};
+use crate::config::paths::Layout;
+use crate::config::types::{Approval, Config, Event, SandboxMode, Version};
+use crate::learn::verify::Check;
+use crate::learn::worker;
+use crate::llm::provider::{Backend, ProviderKind};
+use crate::llm::{self, Chat, ToolCall};
+use crate::storage::checkpoint::Checkpoints;
+use crate::storage::codebase::Codebase;
+use crate::storage::provenance::ProvenanceMemory;
+use crate::storage::session::{self, Session};
+use crate::storage::skills;
+use crate::storage::store::Store;
+use crate::tools::ext::{LifecycleEvent, Registry, ToolContext};
+use crate::tools::{self, ToolOutput, Workspace};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{

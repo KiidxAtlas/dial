@@ -10,6 +10,8 @@
 //!
 //! Legacy HTTP+SSE (`transport = "sse"`) uses this module too: the GET stream is opened first, its
 //! `endpoint` event names the POST target, and replies arrive on that stream.
+use crate::config::tools::mcp::validate_url;
+
 use super::client::{Remote, Shared};
 use super::oauth::TokenSource;
 use crate::config::types::{McpServerConfig, McpTransport};
@@ -92,19 +94,6 @@ impl std::fmt::Display for AuthRequired {
 }
 
 impl std::error::Error for AuthRequired {}
-
-/// Plain HTTP only to loopback; everything else must be HTTPS.
-pub fn validate_url(url: &str) -> Result<()> {
-    let uri: ureq::http::Uri = url
-        .parse()
-        .with_context(|| format!("invalid MCP url {url:?}"))?;
-    let host = uri.host().unwrap_or("");
-    match uri.scheme_str() {
-        Some("https") if !host.is_empty() => Ok(()),
-        Some("http") if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1") => Ok(()),
-        _ => bail!("MCP url must be https (http is allowed only for localhost): {url}"),
-    }
-}
 
 /// Request credentials for one remote server.
 pub(super) struct Auth {

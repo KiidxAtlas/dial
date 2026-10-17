@@ -65,7 +65,7 @@ fn subscription_stall_is_bounded_retried_and_never_executes_partial_calls() {
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();
     let layout =
-        crate::storage::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
+        crate::config::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
     llm::chatgpt::test_account(&layout.user_dir, false);
     // This exercises the SSE stall path; the WebSocket handshake would consume a script.
     let overlay: toml::Table = toml::from_str("model='account-model'\nprovider='chatgpt'\napproval='auto'\nintegrations=[]\nremote_model_idle_timeout_secs=1\ncodex_websocket=false\n[retry]\nmax_attempts=2\n[sandbox]\nmode='off'\n[improve]\nenabled=false").unwrap();
@@ -143,7 +143,7 @@ fn codex_server_without_websocket_costs_one_handshake_per_session() {
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();
     let layout =
-        crate::storage::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
+        crate::config::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
     llm::chatgpt::test_account(&layout.user_dir, false);
     let overlay: toml::Table = toml::from_str("model='account-model'\nprovider='chatgpt'\napproval='auto'\nintegrations=[]\n[sandbox]\nmode='off'\n[improve]\nenabled=false").unwrap();
     let config = crate::config::types::Config::load(&layout, Some(overlay)).unwrap();
@@ -205,7 +205,7 @@ fn subscription_provider_recovers_disconnection_runs_real_tools_and_replays_resu
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();
     let layout =
-        crate::storage::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
+        crate::config::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
     llm::chatgpt::test_account(&layout.user_dir, false);
     let overlay:toml::Table=toml::from_str("model='account-model'\nprovider='chatgpt'\napproval='auto'\nintegrations=[]\n[sandbox]\nmode='off'\n[improve]\nenabled=false").unwrap();
     let config = crate::config::types::Config::load(&layout, Some(overlay)).unwrap();

@@ -1857,11 +1857,11 @@ fn effective_config_serializes_for_the_settings_overlay() {
     let (_h, _p, _l, config) = config();
     let table = toml::Table::try_from(&config).expect("Config must serialize to TOML");
     assert_eq!(
-        settings_schema::get(&table, "ui.theme").and_then(toml::Value::as_str),
+        crate::config::schema::get(&table, "ui.theme").and_then(toml::Value::as_str),
         Some("auto")
     );
-    assert!(settings_schema::get(&table, "improve.interval_secs").is_some());
-    assert!(settings_schema::get(&table, "sandbox.mode").is_some());
+    assert!(crate::config::schema::get(&table, "improve.interval_secs").is_some());
+    assert!(crate::config::schema::get(&table, "sandbox.mode").is_some());
 }
 
 #[test]

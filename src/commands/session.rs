@@ -1,12 +1,10 @@
 use crate::agent::Agent;
 use crate::app::{App, AuthJob, Shell, Step};
+use crate::config::paths::Layout;
 use crate::llm::{chatgpt, oauth};
 use crate::stats::{self, Db};
-use crate::storage::{
-    paths::Layout,
-    session::{Session, SessionMeta},
-    session_pins,
-};
+use crate::storage::session::{Session, SessionMeta};
+use crate::storage::session_pins;
 use crate::ui::text::one_line;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;

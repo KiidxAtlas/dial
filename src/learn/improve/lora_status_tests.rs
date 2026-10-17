@@ -4,7 +4,7 @@ fn lora_progress_requires_a_live_lock_and_clears_on_exit() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let layout =
-        crate::storage::paths::Layout::with_user_dir(project.path(), home.path().join("dial"))
+        crate::config::paths::Layout::with_user_dir(project.path(), home.path().join("dial"))
             .unwrap();
     let mut config = Config::load(&layout, None).unwrap();
     config.model = "test-model".into();

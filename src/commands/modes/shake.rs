@@ -3,8 +3,8 @@
 //! `images` and `thinking` have no engine path in Dial and are reported as unsupported.
 
 use crate::agent::Agent;
-use crate::agent::compaction::{CompactionMethod, CompactionOptions};
 use crate::app::{App, Shell, Step};
+use crate::config::compaction::{CompactionMethod, CompactionOptions};
 use anyhow::{Result, bail};
 
 pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {

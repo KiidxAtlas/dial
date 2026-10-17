@@ -12,13 +12,13 @@ fn coherent_runtime_learning_preferences_have_a_separate_view() {
         "memory.autolearn",
     ] {
         coding.search = query.into();
-        assert!(coding.visible().iter().all(|row| !matches!(row, Row::Setting(i) if SettingsOverlay::learning_setting(&settings_schema::registry()[*i]))));
+        assert!(coding.visible().iter().all(|row| !matches!(row, Row::Setting(i) if SettingsOverlay::learning_setting(&crate::config::schema::registry()[*i]))));
     }
     coding.search = "teach this model".into();
-    assert!(coding.visible().iter().any(|row| matches!(row, Row::Setting(i) if settings_schema::registry()[*i].path == "improve.teach")));
+    assert!(coding.visible().iter().any(|row| matches!(row, Row::Setting(i) if crate::config::schema::registry()[*i].path == "improve.teach")));
     let mut learning = overlay().learning_only();
     learning.search = "laya".into();
-    assert!(learning.visible().iter().any(|row| matches!(row, Row::Setting(i) if settings_schema::registry()[*i].path == "laya.enabled")));
+    assert!(learning.visible().iter().any(|row| matches!(row, Row::Setting(i) if crate::config::schema::registry()[*i].path == "laya.enabled")));
     learning.search = "show_tools".into();
     assert!(
         !learning
@@ -68,18 +68,20 @@ fn draw(o: &mut SettingsOverlay, rig: &Rig, w: u16, h: u16) -> String {
 fn goto(o: &mut SettingsOverlay, keys: &Keymap, path: &str) {
     o.search.clear();
     // Advanced settings sit behind their section's "Show advanced" row; open it so the row exists.
-    let def = settings_schema::registry()
+    let def = crate::config::schema::registry()
         .iter()
         .find(|d| d.path == path)
         .unwrap();
-    if settings_schema::is_advanced(path) {
+    if crate::config::schema::is_advanced(path) {
         o.advanced_open.insert((def.tab, def.section));
     }
     o.tab = o.tabs.iter().position(|(t, _)| *t == def.tab).unwrap();
     let at = o
         .visible()
         .iter()
-        .position(|r| matches!(r, Row::Setting(i) if settings_schema::registry()[*i].path == path))
+        .position(
+            |r| matches!(r, Row::Setting(i) if crate::config::schema::registry()[*i].path == path),
+        )
         .unwrap();
     o.cursor = at;
     let _ = keys;
@@ -87,7 +89,7 @@ fn goto(o: &mut SettingsOverlay, keys: &Keymap, path: &str) {
 
 fn path_at_cursor(o: &SettingsOverlay) -> &'static str {
     match o.current_row() {
-        Some(Row::Setting(i)) => settings_schema::registry()[i].path,
+        Some(Row::Setting(i)) => crate::config::schema::registry()[i].path,
         _ => "",
     }
 }
@@ -95,7 +97,7 @@ fn path_at_cursor(o: &SettingsOverlay) -> &'static str {
 fn shows(o: &SettingsOverlay, path: &str) -> bool {
     o.visible()
         .iter()
-        .any(|r| matches!(r, Row::Setting(i) if settings_schema::registry()[*i].path == path))
+        .any(|r| matches!(r, Row::Setting(i) if crate::config::schema::registry()[*i].path == path))
 }
 
 #[test]
@@ -338,7 +340,7 @@ fn auto_bool_picker_preselects_current_value_and_cancel_never_saves() {
         Value::Boolean(false),
     ] {
         let mut o = overlay();
-        settings_schema::set(&mut o.effective, path, current.clone());
+        crate::config::schema::set(&mut o.effective, path, current.clone());
         goto(&mut o, &rig.keys, path);
         assert!(draw(&mut o, &rig, 120, 30).contains("Enter choose"));
         assert!(matches!(
@@ -416,14 +418,14 @@ fn auto_bool_picker_saves_typed_values_in_selected_scope_only_after_confirmation
                 (path, &expected, scope)
             );
             assert_eq!(
-                settings_schema::get(&o.effective, path)
+                crate::config::schema::get(&o.effective, path)
                     .cloned()
                     .unwrap_or(Value::String("auto".into())),
                 before
             );
             o.settled(path, Ok(value));
             assert_eq!(
-                settings_schema::get(o.layer_ref(scope), path),
+                crate::config::schema::get(o.layer_ref(scope), path),
                 Some(&expected)
             );
             assert!(o.layer_ref(other_scope(scope)).is_empty());
@@ -434,7 +436,7 @@ fn auto_bool_picker_saves_typed_values_in_selected_scope_only_after_confirmation
         o.settled(path, Err("Could not save".into()));
         assert_eq!(o.current_path(path), previous);
         assert_eq!(
-            settings_schema::get(o.layer_ref(scope), path),
+            crate::config::schema::get(o.layer_ref(scope), path),
             Some(&previous)
         );
     }
@@ -465,7 +467,7 @@ fn bool_toggles_and_enum_choices_require_confirmation() {
     // Before the controller answers the displayed value stays on the pending value, then follows it.
     o.settled("ui.tips", Ok(Value::Boolean(false)));
     assert_eq!(
-        settings_schema::get(&o.global, "ui.tips"),
+        crate::config::schema::get(&o.global, "ui.tips"),
         Some(&Value::Boolean(false)),
         "source layer updated"
     );
@@ -663,7 +665,7 @@ fn context_editor_displays_auto_and_accepts_cloud_local_caps() {
         assert_eq!(value.as_str(), Some("auto"));
         o.settled(path, Ok(value));
     }
-    let kind = settings_schema::registry()
+    let kind = crate::config::schema::registry()
         .iter()
         .find(|d| d.path == "context_window")
         .unwrap()
@@ -699,7 +701,7 @@ fn delete_unsets_in_the_active_scope_only() {
         other => panic!("{other:?}"),
     }
     o.settled("ui.tips", Ok(Value::Boolean(true)));
-    assert!(settings_schema::get(&o.global, "ui.tips").is_none());
+    assert!(crate::config::schema::get(&o.global, "ui.tips").is_none());
     let screen = draw(&mut o, &rig, 120, 30);
     let row = screen.lines().find(|l| l.contains(" Tips")).unwrap();
     assert!(
@@ -752,7 +754,7 @@ fn search_filters_across_tabs_shows_location_and_escape_clears_before_closing() 
     // Enter on a search hit acts on that hit, wherever it lives.
     send_all(&mut o, &rig.keys, typed("approval"));
     assert!(
-        matches!(o.visible().first(), Some(Row::Setting(i)) if settings_schema::registry()[*i].path == "approval")
+        matches!(o.visible().first(), Some(Row::Setting(i)) if crate::config::schema::registry()[*i].path == "approval")
     );
     let (path, value, _) = expect_set(choose_next(&mut o, &rig.keys));
     assert_eq!(
@@ -771,7 +773,7 @@ fn search_matches_description_words_in_any_order_and_preserves_metadata_search()
     o.search = "REMOVE reachable".into();
     assert!(o.visible().contains(&Row::Link(0)));
 
-    let def = settings_schema::registry()
+    let def = crate::config::schema::registry()
         .iter()
         .find(|d| d.path == "assistance.lean_local")
         .unwrap();
@@ -1208,7 +1210,7 @@ fn long_lists_scroll_to_keep_the_cursor_visible_and_show_a_scrollbar() {
     }
     let shown = draw(&mut o, &rig, 120, 16);
     let label = match o.current_row() {
-        Some(Row::Setting(i)) => settings_schema::registry()[i].label.to_owned(),
+        Some(Row::Setting(i)) => crate::config::schema::registry()[i].label.to_owned(),
         Some(Row::Advanced(..)) => "advanced (".to_owned(),
         _ => panic!("cursor is on a row"),
     };

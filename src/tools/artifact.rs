@@ -75,7 +75,7 @@ impl ArtifactStore {
             !fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_symlink()),
             "artifact root cannot be a symlink"
         );
-        crate::storage::settings_store::private_dir(root)?;
+        crate::config::settings_store::private_dir(root)?;
         Ok(Self {
             root: root.canonicalize()?,
             limits: ArtifactConfig::default(),
@@ -129,7 +129,7 @@ impl ArtifactStore {
     }
 
     fn retention(&self, uri: &str) -> Result<Option<Retention>> {
-        crate::storage::settings_store::read_private(&self.lifecycle_path(uri)?)?
+        crate::config::settings_store::read_private(&self.lifecycle_path(uri)?)?
             .map(|bytes| {
                 serde_json::from_slice(&bytes).context("invalid artifact lifecycle record")
             })
@@ -137,9 +137,9 @@ impl ArtifactStore {
     }
 
     fn record_retention(&self, uri: &str, bytes: u64) -> Result<()> {
-        crate::storage::settings_store::private_dir(&self.root.join(".lifecycle"))?;
+        crate::config::settings_store::private_dir(&self.root.join(".lifecycle"))?;
         let path = self.lifecycle_path(uri)?;
-        let _lock = crate::storage::settings_store::locked(&path.with_extension("lock"))?;
+        let _lock = crate::config::settings_store::locked(&path.with_extension("lock"))?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -151,7 +151,7 @@ impl ArtifactStore {
             last_retained_at: now,
             bytes,
         };
-        crate::storage::settings_store::write_private(&path, &serde_json::to_vec(&record)?)
+        crate::config::settings_store::write_private(&path, &serde_json::to_vec(&record)?)
     }
 
     pub fn info(&self, uri: &str) -> Result<Value> {

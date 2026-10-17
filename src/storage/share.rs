@@ -7,19 +7,11 @@ use ring::{
     aead,
     rand::{SecureRandom, SystemRandom},
 };
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-#[derive(Default)]
-pub struct Config {
-    pub server_url: String,
-}
 
 const MAGIC: &[u8; 8] = b"DIALSHR1";
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -11,7 +11,7 @@
 //! coverage aborts the inference without executing tools; it never silently skips a suffix.
 //! Structural matching uses the shared ast-grep engine and never inspects workspace files.
 mod ast;
-use crate::{llm::ToolCall, storage::paths::Layout};
+use crate::{config::paths::Layout, llm::ToolCall};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use serde::{Deserialize, Serialize};

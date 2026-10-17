@@ -34,7 +34,7 @@ pub fn install(user_dir: &Path, port: u16) -> io::Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let token = super::load_or_create_token(user_dir)?;
     for (name, body) in FILES {
-        crate::storage::atomic::write_replacing(&dir.join(name), body.as_bytes())?;
+        crate::platform::atomic::write_replacing(&dir.join(name), body.as_bytes())?;
     }
     super::write_private(
         &dir.join("relay-config.js"),

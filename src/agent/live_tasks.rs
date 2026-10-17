@@ -7,9 +7,9 @@ use super::{
     subagents::{self, Approver, Env, Outcome},
 };
 use crate::{
+    config::paths::Layout,
     config::types::{Approval, Config, Harness},
     llm::ToolCall,
-    storage::paths::Layout,
     tools::{ToolOutput, Workspace, ext::Registry},
 };
 use serde_json::{Value, json};

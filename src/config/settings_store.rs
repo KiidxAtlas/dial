@@ -31,7 +31,7 @@ pub enum Change {
 }
 
 // Compatibility exports; publication mechanics and private path policy have a neutral owner.
-pub(crate) use super::atomic::{validate_private_path, write_private};
+pub(crate) use crate::platform::atomic::{validate_private_path, write_private};
 
 pub(crate) fn private_dir(dir: &Path) -> Result<()> {
     validate_private_path(dir)?;

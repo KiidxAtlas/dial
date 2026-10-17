@@ -8,23 +8,6 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AskConfig {
-    pub enabled: bool,
-    /// Seconds after actual presentation; zero disables automatic selection.
-    pub timeout_seconds: u64,
-    pub notify: bool,
-}
-impl Default for AskConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            timeout_seconds: 0,
-            notify: true,
-        }
-    }
-}
 pub const MAX_QUESTIONS: usize = 32;
 pub const MAX_OPTIONS: usize = 64;
 pub const MAX_TEXT: usize = 64 * 1024;

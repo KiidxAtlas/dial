@@ -5,8 +5,8 @@
 //! throttled, and under a daily compute budget that is also enforced while a cycle runs. All
 //! limits are in `[improve]`; forced cycles (`dial improve cycle`, `/improve start`) bypass the
 //! start-time checks but still honour the daily budget only if you set one.
+use crate::config::settings_store;
 use crate::config::types::ImproveConfig;
-use crate::storage::settings_store;
 use anyhow::{Context, Result, bail};
 use std::{
     path::Path,

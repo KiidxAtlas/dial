@@ -1,4 +1,6 @@
 //! Request-scoped tool contracts and measured, model-bound interface selection.
+use crate::config;
+
 use crate::{
     config::types::{Config as AppConfig, EditMode},
     llm::{self},
@@ -9,39 +11,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, time::Instant};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Config {
-    pub enabled: bool,
-    pub measured_interfaces: bool,
-    pub examples: bool,
-    pub max_contract_failures: u32,
-    /// When a progress guard would end the turn (repeated observations, a tool failing in a row,
-    /// stalled todo updates), resume the model with a continue notice this many times per turn
-    /// before asking the user for direction. 0 asks immediately.
-    pub auto_continue_rounds: u32,
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            measured_interfaces: false,
-            examples: true,
-            max_contract_failures: 3,
-            auto_continue_rounds: 2,
-        }
-    }
-}
-impl Config {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            (1..=8).contains(&self.max_contract_failures),
-            "reliability.max_contract_failures must be 1..8"
-        );
-        Ok(())
-    }
-}
 
 pub struct Contract {
     pub schemas: Vec<Value>,
@@ -378,11 +347,11 @@ fn calibration_chat_with_deadline(
 
 /// Explicit bounded calibration. Model calls can only touch disposable fixtures after exact checks.
 pub fn check(config: &AppConfig) -> Result<Value> {
-    crate::storage::settings_store::private_dir(&config.state_dir)?;
+    crate::config::settings_store::private_dir(&config.state_dir)?;
     let lock = crate::learn::auto::lock_file(&config.state_dir.join("reliability.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock)
         .context("another capability check is already running")?;
-    let cancel = crate::repl::install_sigint();
+    let cancel = crate::platform::interrupt::install_sigint();
     if config.requires_compute_lock() {
         eprintln!(
             "Capability check queued; waiting for idle compute. Foreground coding preempts; Ctrl+C stops."
@@ -586,8 +555,8 @@ pub fn check(config: &AppConfig) -> Result<Value> {
     results.push(json!({"tool":"batch","passed":batch_passed,"skipped":batch_disabled}));
     let passed = results.iter().filter(|r| r["passed"] == true).count();
     let report = json!({"version":1,"measured_at":crate::learn::improve::now(),"binding":binding(config),"model":config.model,"passed":passed,"total":results.len()-usize::from(batch_disabled),"batch_disabled":batch_disabled,"batch_passed":batch_passed,"cases":results,"scope":"base model without LoRA or steering; disposable fixture contracts; no full coding accuracy certification"});
-    crate::storage::settings_store::private_dir(&config.state_dir)?;
-    crate::storage::settings_store::write_private(
+    crate::config::settings_store::private_dir(&config.state_dir)?;
+    crate::config::settings_store::write_private(
         &config.state_dir.join("reliability.json"),
         &serde_json::to_vec_pretty(&report)?,
     )?;
@@ -708,7 +677,7 @@ pub fn simplify(schemas: &mut Vec<Value>, loaded: &HashSet<String>) {
     schemas.retain(|s| {
         let name = s["function"]["name"].as_str().unwrap_or("");
         loaded.contains(name)
-            || tools::BUILTIN.contains(&name)
+            || config::tools::BUILTIN.contains(&name)
             || matches!(
                 name,
                 "todo"

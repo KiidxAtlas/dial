@@ -2,8 +2,8 @@
 //! wait for the current compute, show the compacting phase, and drive `compact_with_options`.
 
 use crate::agent::Agent;
-use crate::agent::compaction::CompactionOptions;
 use crate::app::{App, Bridge, PAINT_EVERY, Phase, Shell, Step};
+use crate::config::compaction::CompactionOptions;
 use anyhow::Result;
 use std::time::Instant;
 

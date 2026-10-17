@@ -463,15 +463,42 @@ fn violations_in(
     forbidden: &[&str],
     module_path: &[String],
 ) -> Vec<(usize, String)> {
+    violations_in_except(original, forbidden, &[], module_path)
+}
+
+/// Like [`violations_in`], but a reference whose full path is one of `allowed` (for example
+/// `config::schema`, matched on whole path segments) is not a violation even when its top-level
+/// module is forbidden. Everything else under a forbidden module still is.
+fn violations_in_except(
+    original: &str,
+    forbidden: &[&str],
+    allowed: &[&str],
+    module_path: &[String],
+) -> Vec<(usize, String)> {
     let code = strip(original);
     let tests = test_modules(&code, original).inline;
     crate_refs(&code, module_path)
         .into_iter()
         .filter(|(offset, name)| {
-            forbidden.contains(&name.as_str()) && !tests.iter().any(|r| r.contains(offset))
+            forbidden.contains(&name.as_str())
+                && !tests.iter().any(|r| r.contains(offset))
+                && !is_allowed_path(&code, *offset, allowed)
         })
         .map(|(offset, name)| (line_of(&code, offset), name))
         .collect()
+}
+
+/// Whether the path starting at `offset` (for example `config::schema::registry`) is, or lies
+/// under, one of the `allowed` paths. Segments must match exactly: `config::schemas` is not
+/// `config::schema`.
+fn is_allowed_path(code: &str, offset: usize, allowed: &[&str]) -> bool {
+    let path: String = code[offset..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+        .collect();
+    allowed
+        .iter()
+        .any(|a| path == *a || path.starts_with(&format!("{a}::")))
 }
 
 /// Module path of a source file relative to `src`: `ui/composer.rs` → `["ui", "composer"]`,
@@ -494,25 +521,39 @@ fn module_path_of(src: &Path, file: &Path) -> Vec<String> {
 
 #[test]
 fn modules_respect_their_dependency_boundaries() {
-    // (module, forbidden `crate::<x>` paths)
-    let rules: &[(&str, &[&str])] = &[
-        ("ui", &["learn", "tools", "config"]),
-        ("llm", &["ui", "learn", "tools"]),
-        ("tools", &["ui", "learn", "agent"]),
-        ("runtime", &["ui", "learn", "agent", "tools", "llm"]),
-        ("storage", &["ui"]),
-        ("config", &["ui", "learn"]),
-        ("agent", &["ui"]),
-        ("learn", &["ui"]),
+    // (module, forbidden `crate::<x>` paths, allowed sub-paths of a forbidden module)
+    let rules: &[(&str, &[&str], &[&str])] = &[
+        // ui reads the settings declarations (`config::schema`), persists settings through
+        // `config::settings_store`, and uses the dial directory layout (`config::paths`) and the
+        // Laya provider constants (`config::laya`). Any other `config` path is a new dependency
+        // and must be added here deliberately.
+        (
+            "ui",
+            &["learn", "tools", "config"],
+            &[
+                "config::schema",
+                "config::settings_store",
+                "config::paths",
+                "config::laya",
+            ],
+        ),
+        ("llm", &["ui", "learn", "tools"], &[]),
+        ("tools", &["ui", "learn", "agent"], &[]),
+        ("runtime", &["ui", "learn", "agent", "tools", "llm"], &[]),
+        ("storage", &["ui"], &[]),
+        ("config", &["ui", "learn"], &[]),
+        ("agent", &["ui"], &[]),
+        ("learn", &["ui"], &[]),
         (
             "workspace_copy",
             &["agent", "benchmark", "learn", "config", "llm", "ui"],
+            &[],
         ),
     ];
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let exempt = exempt_paths(&src).unwrap_or_else(|error| panic!("architecture guard: {error}"));
     let mut violations = Vec::new();
-    for (module, forbidden) in rules {
+    for (module, forbidden, allowed) in rules {
         let files = match module_files(&src, module) {
             Ok(files) => files,
             Err(error) => {
@@ -527,7 +568,7 @@ fn modules_respect_their_dependency_boundaries() {
             let text = fs::read_to_string(&file)
                 .unwrap_or_else(|error| panic!("unreadable {}: {error}", file.display()));
             let module_path = module_path_of(&src, &file);
-            for (line, bad) in violations_in(&text, forbidden, &module_path) {
+            for (line, bad) in violations_in_except(&text, forbidden, allowed, &module_path) {
                 violations.push(format!(
                     "{}:{line}: {module} must not use {bad}",
                     file.strip_prefix(&src).unwrap().display()
@@ -596,6 +637,26 @@ fn import_forms_are_recognised() {
 fn lookalikes_and_non_paths_are_not_dependencies() {
     let source = "// use crate::tools;\nlet s = \"crate::tools::x\";\nuse crate::toolsmith::X;\nuse my_crate::tools::Y;\nuse crate::config::tools_like;\npub(crate) mod z {}\n";
     assert!(violations_in(source, &["tools"], &[]).is_empty());
+}
+
+#[test]
+fn allowed_sub_paths_of_a_forbidden_module_are_permitted() {
+    let source = "use crate::config::schema::Kind;\n\
+        use crate::config::types::Config;\n\
+        use crate::{config::schema, config::types::Harness};\n\
+        fn f() -> usize { crate::config::schema::registry().len() + crate::config::schemas::x() }\n\
+        use crate::config::schema_extra::Y;\n";
+    assert_eq!(
+        violations_in_except(source, &["config"], &["config::schema"], &[]),
+        vec![
+            (2, "config".to_owned()),
+            (3, "config".to_owned()),
+            (4, "config".to_owned()),
+            (5, "config".to_owned()),
+        ]
+    );
+    // Without an allowlist every reference is a violation, as before.
+    assert_eq!(violations_in(source, &["config"], &[]).len(), 7);
 }
 
 fn module_chain(path: &str) -> Vec<String> {

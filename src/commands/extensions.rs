@@ -4,10 +4,11 @@
 use crate::agent::Agent;
 use crate::agent::agent_defs::Catalog;
 use crate::app::{App, Shell, Step, Which};
+use crate::config::settings_store::{Change, Scope, load_layer};
+use crate::config::tools::mcp::validate_server;
 use crate::config::types::{Config, McpServerConfig, McpTransport};
 use crate::llm::oauth::BannerInteraction;
-use crate::storage::settings_store::{Change, Scope, load_layer};
-use crate::tools::mcp::{connect_extra, validate_server};
+use crate::tools::mcp::connect_extra;
 use crate::tools::plugin::installer::{InstalledPlugin, PluginStore};
 use crate::tools::plugin::marketplace::{
     MarketplaceEntry, MarketplaceInfo, Marketplaces, SkillListing,

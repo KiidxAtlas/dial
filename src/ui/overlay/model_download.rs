@@ -8,13 +8,13 @@
 //! embedding model comes back as a [`Step`] for the models panel to turn into an event: the same
 //! assignment `/models` makes, and the same setup `/setup embeddings:<model> yes` runs.
 use super::settings::{filled, fit, hint, pair_label, selected_fill, typed_char};
-use crate::cli::local_models::{self, Dashboard, ModelRow, Settings};
+use crate::config::paths::Layout;
 use crate::llm::catalog::ModelEntry;
 use crate::llm::download::{self, Choice, Family, Hit, Quant};
 use crate::llm::local_fit::Fit;
 use crate::llm::model_config::ModelSelection;
 use crate::setup::embeddings;
-use crate::storage::paths::Layout;
+use crate::stats::local_models::{self, Dashboard, ModelRow, Settings};
 use crate::ui::{
     chrome,
     keys::{Action, Keymap},

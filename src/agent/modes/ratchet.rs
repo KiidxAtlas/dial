@@ -407,7 +407,7 @@ pub fn save(root: &Path, state: &State) -> Result<()> {
 /// Writes via a synced, uniquely named temp file and rename, so a crash never leaves a truncated
 /// or torn state file and concurrent writers never share a temp path.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    crate::storage::settings_store::write_private(path, bytes)
+    crate::config::settings_store::write_private(path, bytes)
 }
 
 // ---------- setup: init, plan, split ----------

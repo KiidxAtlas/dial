@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::storage::paths::Layout;
+use crate::config::paths::Layout;
 
 const FILE_CAP: usize = 32 * 1024;
 const TOTAL_CAP: usize = 128 * 1024;

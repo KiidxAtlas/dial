@@ -1,3 +1,5 @@
+use crate::config;
+
 #[test]
 fn steering_bypass_announces_changes_and_retains_status() {
     let mut backend = super::Backend::new(
@@ -870,7 +872,7 @@ fn write_grant(user_dir: &Path, id: &str, extra: serde_json::Value) {
         "expires_at_ms": 4_102_444_800_000u64,
         "extra": extra,
     });
-    crate::storage::settings_store::write_private(
+    crate::config::settings_store::write_private(
         &user_dir.join(format!("oauth-{id}.json")),
         grant.to_string().as_bytes(),
     )
@@ -1435,7 +1437,7 @@ fn vision_steering_status_and_notice_respect_manual_automatic_and_disabled_setti
                     model: model.to_string_lossy().into_owned(),
                     user_dir: root.path().join("user"),
                     state_dir: root.path().join("state"),
-                    steering: crate::steering::Config {
+                    steering: config::steering::Config {
                         enabled,
                         automatic,
                         strength,

@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use serde_json::{Value, json};
 
-use super::solve::EscalationConfig;
+use crate::config::solve::EscalationConfig;
 
 const MAX_LEDGER_ITEMS: usize = 8;
 const MAX_ITEM_BYTES: usize = 1200;

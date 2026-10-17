@@ -5,18 +5,14 @@
 //!
 //! This file also holds the small drawing helpers shared by the model and provider panels.
 use super::{DrawCtx, OverlayEvent};
-use crate::{
-    llm::model_config::{ModelSelection, UiConfig},
-    storage::settings_store::Scope,
-    ui::{
-        chrome::{self, Section, Status, status_chip},
-        editor::Editor,
-        keys::{Action, Keymap},
-        settings_schema::{self, Kind, SettingDef},
-        text,
-        theme::{Sym, Theme, Tok},
-    },
-};
+use crate::config::schema::{Kind, SettingDef};
+use crate::config::settings_store::Scope;
+use crate::llm::model_config::{ModelSelection, UiConfig};
+use crate::ui::chrome::{self, Section, Status, status_chip};
+use crate::ui::editor::Editor;
+use crate::ui::keys::{Action, Keymap};
+use crate::ui::text;
+use crate::ui::theme::{Sym, Theme, Tok};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
@@ -584,7 +580,7 @@ fn memory_missing_role(
 
 /// The display name of a `memory.backend` choice (`Hindsight service`).
 fn label_for_choice(backend: &str) -> &'static str {
-    settings_schema::registry()
+    crate::config::schema::registry()
         .iter()
         .find(|d| d.path == "memory.backend")
         .and_then(|d| match d.kind {
@@ -595,7 +591,7 @@ fn label_for_choice(backend: &str) -> &'static str {
 }
 
 fn label_of(path: &str) -> &'static str {
-    settings_schema::registry()
+    crate::config::schema::registry()
         .iter()
         .find(|d| d.path == path)
         .map_or("", |d| d.label)
@@ -837,7 +833,7 @@ impl SettingsOverlay {
             global: global_values,
             scope,
             themes,
-            tabs: settings_schema::tabs(),
+            tabs: crate::config::schema::tabs(),
             coding_only: false,
             learning_only: false,
             tab: 0,
@@ -875,7 +871,7 @@ impl SettingsOverlay {
 
     /// Shared defaults for future model selections, rather than a current-model override.
     pub fn context_defaults(mut self) -> Self {
-        let def = settings_schema::registry()
+        let def = crate::config::schema::registry()
             .iter()
             .find(|def| def.path == "local_context_window")
             .expect("local context setting is registered");
@@ -903,13 +899,13 @@ impl SettingsOverlay {
         (!self.coding_only || !learning) && (!self.learning_only || learning)
     }
     fn filter_tabs(&mut self) {
-        self.tabs = settings_schema::tabs()
+        self.tabs = crate::config::schema::tabs()
             .into_iter()
             .filter_map(|(tab, sections)| {
                 let sections = sections
                     .into_iter()
                     .filter(|section| {
-                        settings_schema::registry().iter().any(|def| {
+                        crate::config::schema::registry().iter().any(|def| {
                             def.tab == tab && def.section == *section && self.scope_shown(def)
                         })
                     })
@@ -992,10 +988,10 @@ impl SettingsOverlay {
             Ok(value) => {
                 match pending {
                     Some(Pending::Set(v, scope)) => {
-                        settings_schema::set(self.layer(scope), path, v);
+                        crate::config::schema::set(self.layer(scope), path, v);
                         self.feedback = Some(
                             if scope == Scope::Global
-                                && settings_schema::get(&self.project, path).is_some()
+                                && crate::config::schema::get(&self.project, path).is_some()
                             {
                                 "Saved globally; this project's override still applies".to_owned()
                             } else {
@@ -1004,12 +1000,12 @@ impl SettingsOverlay {
                         );
                     }
                     Some(Pending::Unset(scope)) => {
-                        settings_schema::unset(self.layer(scope), path);
+                        crate::config::schema::unset(self.layer(scope), path);
                         self.feedback = Some(format!("Removed {} override", scope_name(scope)));
                     }
                     None => {}
                 }
-                settings_schema::set(&mut self.effective, path, value);
+                crate::config::schema::set(&mut self.effective, path, value);
                 if path == "memory.backend" {
                     self.memory_intent = None;
                 }
@@ -1028,7 +1024,7 @@ impl SettingsOverlay {
 
     /// Whether a model role is assigned in the effective settings.
     fn has_role(&self, role: &str) -> bool {
-        settings_schema::get(&self.effective, &format!("model_roles.{role}")).is_some()
+        crate::config::schema::get(&self.effective, &format!("model_roles.{role}")).is_some()
     }
 
     /// While a backend switch waits for its fields, point at the next one or say it is ready.
@@ -1051,7 +1047,7 @@ impl SettingsOverlay {
     /// Whether a row hides behind its section's "Show advanced" toggle. The embedding URL override
     /// rows do while no override URL is set.
     fn advanced(&self, path: &str) -> bool {
-        settings_schema::is_advanced(path)
+        crate::config::schema::is_advanced(path)
             || (EMBEDDING_OVERRIDE_ROWS.contains(&path)
                 && self
                     .current_path(EMBEDDING_URL_PATH)
@@ -1073,7 +1069,7 @@ impl SettingsOverlay {
 
     /// `provider/model` of the assigned embedding role.
     fn embedding_role(&self) -> Option<String> {
-        let role = settings_schema::get(&self.effective, "model_roles.embedding")?;
+        let role = crate::config::schema::get(&self.effective, "model_roles.embedding")?;
         let field = |key: &str| role.get(key).and_then(Value::as_str).unwrap_or("");
         Some(format!("{}/{}", field("provider"), field("model")))
     }
@@ -1246,9 +1242,9 @@ impl SettingsOverlay {
     }
 
     fn source(&self, path: &str) -> &'static str {
-        if settings_schema::get(&self.project, path).is_some() {
+        if crate::config::schema::get(&self.project, path).is_some() {
             "project"
-        } else if settings_schema::get(&self.global, path).is_some() {
+        } else if crate::config::schema::get(&self.global, path).is_some() {
             "global"
         } else {
             "default"
@@ -1257,7 +1253,7 @@ impl SettingsOverlay {
 
     /// What `path` falls back to once it is removed from `scope`.
     fn after_unset(&self, def: &SettingDef, scope: Scope) -> Option<Value> {
-        settings_schema::get(
+        crate::config::schema::get(
             self.layer_ref(super::settings::other_scope(scope)),
             def.path,
         )
@@ -1266,7 +1262,7 @@ impl SettingsOverlay {
     }
 
     fn current_path(&self, path: &str) -> Value {
-        settings_schema::registry()
+        crate::config::schema::registry()
             .iter()
             .find(|d| d.path == path)
             .map_or(Value::String(String::new()), |d| self.current(d))
@@ -1298,12 +1294,14 @@ impl SettingsOverlay {
     fn move_to_path(&mut self, path: &str) {
         let find = |rows: Vec<Row>| {
             rows.iter().position(
-                |r| matches!(r, Row::Setting(i) if settings_schema::registry()[*i].path == path),
+                |r| matches!(r, Row::Setting(i) if crate::config::schema::registry()[*i].path == path),
             )
         };
         let mut found = find(self.visible());
         if found.is_none()
-            && let Some(def) = settings_schema::registry().iter().find(|d| d.path == path)
+            && let Some(def) = crate::config::schema::registry()
+                .iter()
+                .find(|d| d.path == path)
         {
             // A field to fill may sit behind its section's advanced toggle: open it.
             self.advanced_open.insert((def.tab, def.section));
@@ -1320,7 +1318,7 @@ impl SettingsOverlay {
             Some(Pending::Unset(scope)) => self
                 .after_unset(def, *scope)
                 .unwrap_or_else(|| Value::String(String::new())),
-            None => settings_schema::get(&self.effective, def.path)
+            None => crate::config::schema::get(&self.effective, def.path)
                 .cloned()
                 .or_else(|| def.default_value())
                 .unwrap_or_else(|| Value::String(String::new())),
@@ -1332,16 +1330,16 @@ impl SettingsOverlay {
         let mut table = self.effective.clone();
         for (path, pending) in &self.pending {
             match pending {
-                Pending::Set(v, _) => settings_schema::set(&mut table, path, v.clone()),
+                Pending::Set(v, _) => crate::config::schema::set(&mut table, path, v.clone()),
                 Pending::Unset(scope) => {
-                    match settings_schema::registry()
+                    match crate::config::schema::registry()
                         .iter()
                         .find(|d| d.path == path)
                         .and_then(|d| self.after_unset(d, *scope))
                     {
-                        Some(v) => settings_schema::set(&mut table, path, v),
+                        Some(v) => crate::config::schema::set(&mut table, path, v),
                         None => {
-                            settings_schema::unset(&mut table, path);
+                            crate::config::schema::unset(&mut table, path);
                         }
                     }
                 }
@@ -1356,7 +1354,7 @@ impl SettingsOverlay {
     }
 
     fn visible(&self) -> Vec<Row> {
-        let defs = settings_schema::registry();
+        let defs = crate::config::schema::registry();
         if !self.search.is_empty() {
             let mut hits: Vec<(i32, Row)> = Vec::new();
             for (i, def) in defs
@@ -1421,7 +1419,7 @@ impl SettingsOverlay {
 
     fn section_of(row: Row) -> &'static str {
         match row {
-            Row::Setting(i) => settings_schema::registry()[i].section,
+            Row::Setting(i) => crate::config::schema::registry()[i].section,
             Row::Link(_) => LINK_SECTION,
             Row::Advanced(_, section, _) => section,
         }
@@ -1570,7 +1568,7 @@ impl SettingsOverlay {
         let Some(Row::Setting(i)) = self.current_row() else {
             return OverlayEvent::None;
         };
-        let path = settings_schema::registry()[i].path;
+        let path = crate::config::schema::registry()[i].path;
         let Some(offer) = self.setup_offers.get(path) else {
             self.feedback = Some("Nothing to set up on this row".to_owned());
             return OverlayEvent::None;
@@ -1631,7 +1629,7 @@ impl SettingsOverlay {
                 }
                 return OverlayEvent::None;
             }
-            Some(Row::Setting(i)) => &settings_schema::registry()[i],
+            Some(Row::Setting(i)) => &crate::config::schema::registry()[i],
             None => return OverlayEvent::None,
         };
         let current = self.current(def);
@@ -1728,8 +1726,8 @@ impl SettingsOverlay {
         let Some(Row::Setting(i)) = self.current_row() else {
             return OverlayEvent::None;
         };
-        let def = &settings_schema::registry()[i];
-        if settings_schema::get(self.layer_ref(self.scope), def.path).is_some() {
+        let def = &crate::config::schema::registry()[i];
+        if crate::config::schema::get(self.layer_ref(self.scope), def.path).is_some() {
             self.notes.remove(def.path);
             self.pending
                 .insert(def.path.to_owned(), Pending::Unset(self.scope));
@@ -1738,7 +1736,9 @@ impl SettingsOverlay {
                 scope: self.scope,
             }
         } else {
-            if settings_schema::get(self.layer_ref(other_scope(self.scope)), def.path).is_some() {
+            if crate::config::schema::get(self.layer_ref(other_scope(self.scope)), def.path)
+                .is_some()
+            {
                 self.notes.insert(
                     def.path.to_owned(),
                     format!(
@@ -1903,7 +1903,7 @@ impl SettingsOverlay {
         let rows = self.visible();
         self.cursor = self.cursor.min(rows.len().saturating_sub(1));
         let cursor_row = rows.get(self.cursor).copied();
-        let appearance = matches!(cursor_row, Some(Row::Setting(i)) if settings_schema::registry()[i].tab == "Appearance");
+        let appearance = matches!(cursor_row, Some(Row::Setting(i)) if crate::config::schema::registry()[i].tab == "Appearance");
         let body_min = h.min(3);
         let mut spare = h - body_min;
         let mut grant = || {
@@ -1966,7 +1966,7 @@ impl SettingsOverlay {
             }
             items.push(Item::Row(i));
             if let Row::Setting(s) = row {
-                let def = &settings_schema::registry()[*s];
+                let def = &crate::config::schema::registry()[*s];
                 if let Mode::Pick {
                     def: picking,
                     choices,
@@ -2056,7 +2056,7 @@ impl SettingsOverlay {
         let query_positions = |row: Row| -> Vec<usize> {
             match row {
                 Row::Setting(i) if searching => {
-                    let def = &settings_schema::registry()[i];
+                    let def = &crate::config::schema::registry()[i];
                     let label_len = def.label.chars().count();
                     search_match(&self.search, &haystack(def), def.description)
                         .map(|(_, p)| p.into_iter().filter(|p| *p < label_len).collect())
@@ -2189,7 +2189,7 @@ impl SettingsOverlay {
             }
             match cursor_row {
                 Some(Row::Setting(i)) => {
-                    let def = &settings_schema::registry()[i];
+                    let def = &crate::config::schema::registry()[i];
                     if def.path == "memory.backend" && matches!(self.mode, Mode::Browse) {
                         // What the selected backend does and, if setting one up, what remains.
                         if let Some(feedback) = &self.feedback {
@@ -2420,7 +2420,7 @@ impl SettingsOverlay {
                 )
             }
             Row::Setting(i) => {
-                let def = &settings_schema::registry()[i];
+                let def = &crate::config::schema::registry()[i];
                 let editing = match &self.mode {
                     Mode::Edit { def: d, editor } if d.path == def.path => Some(editor),
                     _ => None,
@@ -2588,7 +2588,7 @@ impl SettingsOverlay {
                             "show"
                         }
                     }
-                    Some(Row::Setting(i)) => match settings_schema::registry()[i].kind {
+                    Some(Row::Setting(i)) => match crate::config::schema::registry()[i].kind {
                         Kind::Bool => "toggle",
                         Kind::AutoBool | Kind::Enum(_) | Kind::Choice(_) | Kind::Theme => "choose",
                         _ => "edit",

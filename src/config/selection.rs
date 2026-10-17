@@ -1,7 +1,7 @@
 //! Explicit model selection writes shared by setup and interactive controllers.
 use super::Config;
+use crate::config::settings_store::Change;
 use crate::llm::model_config::{ModelSelection, ROLES};
-use crate::storage::settings_store::Change;
 use anyhow::{Result, ensure};
 
 pub fn protocol(

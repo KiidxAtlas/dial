@@ -173,7 +173,7 @@ fn consecutive_codex_requests_extend_the_previous_prompt_byte_for_byte() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let layout =
-        crate::storage::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
+        crate::config::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
             .unwrap();
     let mut session = crate::storage::session::Session::create(
         &layout,
@@ -206,7 +206,7 @@ fn tool_results_and_encrypted_reasoning_roundtrip_after_session_resume() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let layout =
-        crate::storage::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
+        crate::config::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
             .unwrap();
     let mut session = crate::storage::session::Session::create(
         &layout,

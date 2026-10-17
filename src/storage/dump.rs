@@ -15,11 +15,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::storage::{
-    anonymize::{Anonymizer, Identity, REVIEW_NOTE},
-    paths::Layout,
-    session::Session,
-};
+use crate::config::paths::Layout;
+use crate::storage::anonymize::{Anonymizer, Identity, REVIEW_NOTE};
+use crate::storage::session::Session;
 
 /// Whether the archive holds raw session data or an anonymized copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

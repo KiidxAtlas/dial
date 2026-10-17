@@ -8,7 +8,7 @@ pub mod git;
 pub mod registry;
 pub mod source;
 
-use crate::storage::paths::Layout;
+use crate::config::paths::Layout;
 use crate::storage::skills::Scope;
 use crate::storage::skills::import::lock_root;
 use anyhow::{Context, Result, anyhow, bail, ensure};

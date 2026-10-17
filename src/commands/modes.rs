@@ -3,8 +3,8 @@
 
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step, reasoning_changes, reasoning_profile, thinking_label};
+use crate::config::settings_store::Scope;
 use crate::config::types::Config;
-use crate::storage::settings_store::Scope;
 use anyhow::Result;
 mod btw;
 mod cleanse;

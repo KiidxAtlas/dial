@@ -7,7 +7,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use anyhow::{Context, Result};
 
 use crate::browser_relay::{client, install, protocol::DEFAULT_PORT};
-use crate::storage::paths::Layout;
+use crate::config::paths::Layout;
 
 /// Arguments for `dial browser-relay <action>`.
 #[derive(Debug, Clone, clap::Args)]

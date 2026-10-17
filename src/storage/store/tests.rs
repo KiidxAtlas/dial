@@ -295,7 +295,7 @@ fn admission_is_atomic_and_stale_candidates_cannot_activate() {
 }
 
 fn frozen_bootstrap() -> Harness {
-    let tools = crate::tools::default_tools()
+    let tools = crate::config::tools::default_tools()
         .into_iter()
         .filter(|tool| !["task", "skill", "finish"].contains(&tool.as_str()))
         .collect();

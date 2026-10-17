@@ -1,3 +1,6 @@
+use crate::config::subagents::builtin;
+use crate::config::subagents::is_reserved;
+
 use super::*;
 
 #[test]

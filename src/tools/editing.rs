@@ -4,7 +4,6 @@ use super::{
     edit_transaction::{self, Change},
     hashline, opt_bool, present, req_str, tool_schema,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -12,80 +11,6 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-#[derive(Default)]
-pub struct EditToggle {
-    pub enabled: bool,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct EditSettings {
-    pub mode: EditMode,
-    pub model_variants: BTreeMap<String, EditMode>,
-    pub fuzzy_match: bool,
-    pub fuzzy_threshold: f64,
-    pub streaming_abort: bool,
-    pub recover_inline_edits: bool,
-    pub block_auto_generated: bool,
-    pub enforce_seen_lines: bool,
-    pub blackbox: EditToggle,
-    pub auto_repair: EditToggle,
-}
-impl Default for EditSettings {
-    fn default() -> Self {
-        Self {
-            mode: EditMode::Hashline,
-            model_variants: BTreeMap::new(),
-            fuzzy_match: true,
-            fuzzy_threshold: 0.95,
-            streaming_abort: false,
-            recover_inline_edits: true,
-            block_auto_generated: true,
-            enforce_seen_lines: true,
-            blackbox: EditToggle::default(),
-            auto_repair: EditToggle::default(),
-        }
-    }
-}
-impl EditSettings {
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.fuzzy_threshold.is_finite() || !(0.0..=1.0).contains(&self.fuzzy_threshold) {
-            return Err("edit.fuzzy_threshold must be finite in 0..1".into());
-        }
-        let mut patterns = BTreeSet::new();
-        for pattern in self.model_variants.keys() {
-            if pattern.trim().is_empty() || pattern.len() > 1024 {
-                return Err(
-                    "edit.model_variants selectors must be nonempty and at most 1024 bytes".into(),
-                );
-            }
-            if !patterns.insert(pattern.to_lowercase()) {
-                return Err("edit.model_variants has duplicate case-insensitive selectors".into());
-            }
-        }
-        Ok(())
-    }
-    /// Explicit profile/harness pins override selectors; longest matching selector wins, then lexical.
-    pub fn resolve_mode(&self, selector: &str, pinned: Option<EditMode>) -> EditMode {
-        pinned
-            .or_else(|| self.variant_mode(selector))
-            .unwrap_or(self.mode)
-    }
-    /// The mode of the longest `model_variants` selector contained in `selector` (ties: lexical).
-    pub fn variant_mode(&self, selector: &str) -> Option<EditMode> {
-        let lower = selector.to_lowercase();
-        self.model_variants
-            .iter()
-            .filter(|(pattern, _)| lower.contains(&pattern.to_lowercase()))
-            .min_by(|(a, _), (b, _)| {
-                b.len()
-                    .cmp(&a.len())
-                    .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
-            })
-            .map(|(_, mode)| *mode)
-    }
-}
 #[derive(Debug, Clone)]
 pub struct EditRepairRequest {
     pub path: String,

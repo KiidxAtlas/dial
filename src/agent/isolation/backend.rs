@@ -4,23 +4,11 @@
 //! changes it makes are merged back. `auto` picks the first backend that the platform supports, in
 //! a fixed per-platform order, and records why each earlier candidate was skipped. Probes are cheap
 //! and cached for the life of the process. See `docs/subagents.md` for each backend's guarantees.
+use crate::config::isolation::Preference;
 
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Preference {
-    #[default]
-    Auto,
-    Clone,
-    Overlay,
-    Worktree,
-    Copy,
-    ProjFs,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Backend {
@@ -59,13 +47,6 @@ impl Preference {
             Self::ProjFs => Some(Backend::ProjFs),
         }
     }
-}
-
-/// `[isolation]` settings. Deserialized from the user's config file.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct IsolationConfig {
-    pub backend: Preference,
 }
 
 /// The chosen backend plus every automatic candidate skipped before it, with the reason.

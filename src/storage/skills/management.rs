@@ -1,7 +1,7 @@
 //! User-facing skill inventory, opt-in imports and enablement. Foreign sources are never activated
 //! by browsing them. Preferences live in private storage, separate from agent-authored skills.
 use super::*;
-use crate::storage::settings_store;
+use crate::config::settings_store;
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;

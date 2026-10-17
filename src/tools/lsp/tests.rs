@@ -2,10 +2,12 @@
 //! End-to-end tests of the client and the tool against an in-process fake language server
 //! talking over a unix socket pair: real framing, real threads, no external binaries.
 
+use crate::config::tools::lsp::LspConfig;
+
 use super::client::{Client, ServerOptions, Timeouts};
-use super::config::LspServerConfig;
 use super::framing::{read_message, write_message};
 use super::*;
+use crate::config::tools::lsp::LspServerConfig;
 use crate::config::types::Config;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;

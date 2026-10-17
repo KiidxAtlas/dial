@@ -11,7 +11,7 @@
 //! A configured server claiming an extension replaces every default for that extension. Several
 //! servers may serve one file: primary servers first, linters last.
 
-use super::config::{LspConfig, LspServerConfig};
+use crate::config::tools::lsp::{LspConfig, LspServerConfig};
 use serde::Deserialize;
 use serde_json::Value;
 use std::ffi::OsStr;

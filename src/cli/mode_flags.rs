@@ -299,7 +299,7 @@ fn module_overlay(args: &ModeArgs) -> Result<toml::Table> {
     let mut hooks = Vec::new();
     for raw in &args.hook {
         let program = module_file(Path::new(raw.trim()))?;
-        for event in crate::agent::hooks::EVENTS {
+        for event in crate::config::hooks::EVENTS {
             let mut hook = toml::Table::new();
             hook.insert("event".to_string(), toml::Value::from(*event));
             hook.insert(

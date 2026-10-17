@@ -2,30 +2,22 @@
 //! rows and emits intents; this module builds the rows, plans installs and runs them on a worker
 //! thread. Config changes come back as [`Change`]s and are saved on the main thread by [`poll`],
 //! and only after the install and its health check succeed.
+use crate::agent::Agent;
+use crate::app::{App, Shell};
+use crate::config::Config;
+use crate::config::paths::Layout;
+use crate::config::settings_store::{Change, Scope};
+use crate::config::types::McpServerConfig;
+use crate::storage::skills::packages;
+use crate::storage::skills::packages::registry::Entry as SkillEntry;
+use crate::tools::mcp::catalog::{self, CURATED, Candidate, Endpoints, Install, Source};
+use crate::tools::mcp::{foreign, smithery};
+use crate::tools::plugin::installer::PluginStore;
+use crate::tools::plugin::marketplace::{Marketplaces, SkillListing};
 use crate::ui::overlay::extensions::ExtensionsOverlay;
-use crate::{
-    agent::Agent,
-    app::{App, Shell},
-    config::{Config, types::McpServerConfig},
-    storage::{
-        paths::Layout,
-        settings_store::{Change, Scope},
-        skills::packages::{self, registry::Entry as SkillEntry},
-    },
-    tools::{
-        mcp::{
-            catalog::{self, CURATED, Candidate, Endpoints, Install, Source},
-            foreign, smithery,
-        },
-        plugin::{
-            installer::PluginStore,
-            marketplace::{Marketplaces, SkillListing},
-        },
-    },
-    ui::overlay::extensions::model::{
-        CatalogUpdate, Field, Form, Intent, JobProgress, Origin, Row, SharedCatalog,
-        SharedProgress, State, Tab,
-    },
+use crate::ui::overlay::extensions::model::{
+    CatalogUpdate, Field, Form, Intent, JobProgress, Origin, Row, SharedCatalog, SharedProgress,
+    State, Tab,
 };
 use anyhow::{Result, anyhow};
 use std::{
@@ -1149,7 +1141,7 @@ fn import_mcp(
         )));
     };
     let server = found.server;
-    if let Err(error) = crate::tools::mcp::validate_server(id, &server) {
+    if let Err(error) = crate::config::tools::mcp::validate_server(id, &server) {
         return Ok(failed(format!("{error:#}")));
     }
     if server.enabled {

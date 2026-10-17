@@ -3,6 +3,8 @@
 //! It owns its history and compaction state, never the parent's session or training log.
 //! Its tools are the job's allowlist; every effect is authorized by the live
 //! parent's [`Approver`], and cancellation remains local to the child.
+use crate::config;
+
 use super::{
     approval, call_form_error, describe,
     guard::{LengthAction, clip_evidence},
@@ -137,7 +139,7 @@ struct ChildBackends {
     memory_pending: std::cell::RefCell<Option<llm::ToolCall>>,
     capture_messages: std::cell::RefCell<Vec<String>>,
     journal: std::cell::RefCell<ChildJournal>,
-    layout: crate::storage::paths::Layout,
+    layout: crate::config::paths::Layout,
     _archive_dir: tempfile::TempDir,
     image_store: crate::tools::artifact::ArtifactStore,
     transcript: Option<std::sync::Arc<super::child_transcript::ChildTranscript>>,
@@ -153,7 +155,7 @@ impl ChildBackends {
             .tempdir()
             .context("creating private child journal directory")?;
         let state_dir = std::fs::canonicalize(archive_dir.path())?.join("state");
-        let layout = crate::storage::paths::Layout {
+        let layout = crate::config::paths::Layout {
             project_root: env.workspace.root().to_owned(),
             project_dir: env.workspace.root().join(".dial"),
             user_dir: env.config.user_dir.clone(),
@@ -565,7 +567,7 @@ fn child_role_chat(
                 super::compaction::request_tokens_with_policy(
                     request,
                     &role_config.compaction,
-                    super::compaction::CompactionIdentity {
+                    crate::config::compaction::CompactionIdentity {
                         provider: &selection.provider,
                         model: &selection.model,
                         agent: Some(role)
@@ -777,7 +779,7 @@ impl crate::storage::memory_backend::MemoryModelRunner for ChildMemoryRunner<'_,
                     super::compaction::request_tokens_with_policy(
                         &chat,
                         &config.compaction,
-                        super::compaction::CompactionIdentity {
+                        crate::config::compaction::CompactionIdentity {
                             provider: &selection.provider,
                             model: &selection.model,
                             agent: Some(role)
@@ -1083,7 +1085,7 @@ fn rollover_child(
         )
         .map_err(|denial| anyhow::anyhow!("{}", denial.message()))?;
     let selection = env.config.selection();
-    let identity = compaction::CompactionIdentity {
+    let identity = crate::config::compaction::CompactionIdentity {
         provider: &selection.provider,
         model: &selection.model,
         agent: Some(job.kind),
@@ -1168,7 +1170,7 @@ fn rollover_child(
     Ok(!automatic
         || (env.config.compaction.auto_continue
             && outcome.prompt_tokens
-                <= compaction::continue_band(
+                <= crate::config::compaction::continue_band(
                     env.config
                         .compaction
                         .effective_threshold(identity, child_window(env, backend))?,
@@ -1342,7 +1344,7 @@ fn compact_child(
     steps: &mut u32,
     budget: u32,
     approver: &mut dyn Approver,
-    reason: super::compaction::CompactionReason,
+    reason: crate::config::compaction::CompactionReason,
     children: &ChildBackends,
 ) -> Result<bool> {
     use super::compaction;
@@ -1372,7 +1374,7 @@ fn compact_child(
     };
     let source = compaction::replacement_request(request, &source_history);
     let selection = env.config.selection();
-    let identity = compaction::CompactionIdentity {
+    let identity = crate::config::compaction::CompactionIdentity {
         provider: &selection.provider,
         model: &selection.model,
         agent: Some(job.kind),
@@ -1395,7 +1397,7 @@ fn compact_child(
         observer: &observer,
         steps: *steps,
     };
-    let options = compaction::CompactionOptions {
+    let options = crate::config::compaction::CompactionOptions {
         reason,
         ..Default::default()
     };
@@ -1641,7 +1643,7 @@ fn run_inner(
     });
     if let Some(memory) = &children.memory {
         // Mirror the root offer: the runtime's tools unless an operator pinned the harness list.
-        let pinned = env.config.harness.tools != tools::default_tools();
+        let pinned = env.config.harness.tools != config::tools::default_tools();
         names.extend(
             memory
                 .offered_names()
@@ -1937,7 +1939,7 @@ fn run_inner(
                 .all(|name| names.iter().any(|offered| offered == name));
         children.project(&mut request, job, rule_state, experimental);
         let selection = env.config.selection();
-        let identity = super::compaction::CompactionIdentity {
+        let identity = crate::config::compaction::CompactionIdentity {
             provider: &selection.provider,
             model: &selection.model,
             agent: Some(job.kind),
@@ -1964,7 +1966,7 @@ fn run_inner(
                 session,
                 estimate,
                 threshold,
-                super::compaction_runtime::speculation_lead(threshold),
+                crate::config::compaction::speculation_lead(threshold),
                 reminder,
             ) {
                 request.messages.push(guidance);
@@ -1993,7 +1995,7 @@ fn run_inner(
                         || (needs_room
                             && env.config.compaction.enabled
                             && env.config.compaction.strategy
-                                != super::compaction::CompactionStrategy::Off)
+                                != crate::config::compaction::CompactionStrategy::Off)
                 }
                 Err(error) => return Ok(super::engine::Tick::Finished(Outcome::failed(steps, format!("{error:#}")))),
             };
@@ -2010,11 +2012,11 @@ fn run_inner(
             && !env.config.compaction.experimental_context_management
         {
             let reason = if needs_room {
-                super::compaction::CompactionReason::Overflow
+                crate::config::compaction::CompactionReason::Overflow
             } else if steps == 0 {
-                super::compaction::CompactionReason::Threshold
+                crate::config::compaction::CompactionReason::Threshold
             } else {
-                super::compaction::CompactionReason::MidTurn
+                crate::config::compaction::CompactionReason::MidTurn
             };
             match compact_child(
                 env,
@@ -2045,7 +2047,7 @@ fn run_inner(
                     }
                     compaction_failed = true;
                     compaction_retry_floor = Some(estimate.saturating_add(
-                        super::compaction_runtime::SPECULATION_LEAD_MIN_TOKENS,
+                        crate::config::compaction::SPECULATION_LEAD_MIN_TOKENS,
                     ));
                     if env.interrupt.load(Ordering::SeqCst) {
                         return Ok(super::engine::Tick::Finished(Outcome::interrupted(steps)));
@@ -2245,7 +2247,7 @@ fn run_inner(
                     && !overflow_retried
                     && env.config.compaction.enabled
                     && env.config.compaction.strategy
-                        != super::compaction::CompactionStrategy::Off =>
+                        != crate::config::compaction::CompactionStrategy::Off =>
             {
                 overflow_retried = true;
                 let mut retry = Chat {
@@ -2292,7 +2294,7 @@ fn run_inner(
                     &mut steps,
                     budget,
                     approver,
-                    super::compaction::CompactionReason::Overflow,
+                    crate::config::compaction::CompactionReason::Overflow,
                     children,
                 ) {
                     Ok(true) => {
@@ -3169,7 +3171,7 @@ fn capture_child_memory(
         "content":crate::storage::memory_backend::autolearn_capture_prompt()}),
     );
     let selection = env.config.selection();
-    let identity = super::compaction::CompactionIdentity {
+    let identity = crate::config::compaction::CompactionIdentity {
         provider: &selection.provider,
         model: &selection.model,
         agent: Some(job.kind),
@@ -4294,7 +4296,7 @@ fn schemas(env: Env, names: &[String]) -> Result<Vec<Value>> {
             n if crate::storage::memory_backend::TOOL_NAMES.contains(&n)
                 && crate::storage::memory_backend::schema(&env.config.memory, n).is_some() =>
                 crate::storage::memory_backend::schema(&env.config.memory, n).context("selected memory backend does not offer this tool"),
-            n if tools::BUILTIN.contains(&n) => {
+            n if config::tools::BUILTIN.contains(&n) => {
                 Ok(tools::schemas(&[n], env.workspace.edit_mode())?.remove(0))
             }
             n if env.ext.contains(n) => env

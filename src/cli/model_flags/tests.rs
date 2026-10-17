@@ -1,4 +1,9 @@
+use crate::config::thinking::CliThinking;
+use crate::config::thinking::apply_thinking;
+use crate::config::thinking::parse_thinking;
+
 use super::*;
+use crate::llm::profiles::ReasoningEffort;
 
 #[test]
 fn thinking_accepts_selectors_and_unambiguous_prefixes() {
@@ -200,7 +205,8 @@ fn anthropic_thinking_off_uses_disabled_thinking_not_none_effort() {
 
 #[test]
 fn disk_reload_keeps_launch_selection_and_thinking_without_freezing_other_settings() {
-    use crate::storage::{paths::Layout, settings_store::SettingsReload};
+    use crate::config::paths::Layout;
+    use crate::config::settings_store::SettingsReload;
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let layout = Layout::with_user_dir(project.path(), home.path().to_path_buf()).unwrap();

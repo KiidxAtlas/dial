@@ -337,12 +337,12 @@ fn hook_flag_lands_in_hooks_overlay_for_every_event() {
     std::fs::write(&module, "").unwrap();
     let flags = resolve(&parse(&["--hook", module.to_str().unwrap()]), interactive()).unwrap();
     let hooks = flags.overlay["hooks"].as_array().unwrap();
-    assert_eq!(hooks.len(), crate::agent::hooks::EVENTS.len());
+    assert_eq!(hooks.len(), crate::config::hooks::EVENTS.len());
     let program = std::fs::canonicalize(&module)
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    for (hook, event) in hooks.iter().zip(crate::agent::hooks::EVENTS) {
+    for (hook, event) in hooks.iter().zip(crate::config::hooks::EVENTS) {
         assert_eq!(hook["event"].as_str(), Some(*event));
         assert_eq!(hook["command"][0].as_str(), Some(program.as_str()));
     }
@@ -366,7 +366,7 @@ fn hook_overlay_appends_to_configured_hooks_instead_of_replacing_them() {
     flags.merge_into_overlay(&mut target);
     let hooks = target["hooks"].as_array().unwrap();
     assert_eq!(hooks[0], project_hook, "the configured hook is kept first");
-    assert_eq!(hooks.len(), 1 + crate::agent::hooks::EVENTS.len());
+    assert_eq!(hooks.len(), 1 + crate::config::hooks::EVENTS.len());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

@@ -22,6 +22,9 @@
 //!   tools, or unsandboxed shell commands; those need their own execution/approval boundary.
 //! * Timeouts kill the bash process group. A command that calls `setsid` can
 //!   outlive the call (still sandboxed, but orphaned).
+use crate::config::tools::EditSettings;
+
+use crate::config::tools::BUILTIN;
 
 macro_rules! notebook_edit_description {($description:literal)=>{concat!($description,"\nNotebooks: ordinary .ipynb reads expose cell source as # %% [code|markdown|raw] cell:N (zero-based). Keep indexed markers to retain authentic cells; unindexed # %% markers create cells. Preserve source-literal marker lines with one extra %, e.g. # %%%. All edit modes operate on this projection and retain untouched raw JSON metadata, number lexemes and outputs; changed code cells clear stale outputs/execution counts. Metadata-only changes invalidate witnesses. Read :raw for literal JSON; whole-file write requires actual JSON, not the source projection. Notebook moves/deletes need complete relevant source witnesses.")};}
 
@@ -92,65 +95,9 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub const BUILTIN: &[&str] = &["read", "write", "edit", "glob", "grep", "bash"];
-
-/// dial's own tools beyond the file/shell built-ins.
-pub const EXTRA_TOOLS: &[&str] = &[
-    "todo",
-    "finish",
-    "task",
-    "solve",
-    "escalate",
-    "skill",
-    "skill_manage",
-    "session_search",
-    "tool_search",
-    "tool_load",
-    "artifact_read",
-    "working_state",
-    "message",
-    "recall",
-    "retain",
-    "memory_update",
-    "forget",
-    "memory_history",
-    "memory_import",
-    "context_notes",
-    "new_context",
-    "checkpoint",
-    "rewind",
-    "ask",
-    "tts",
-];
-
 /// Integration tool names accepted in the config's `integrations` list (see [`ext`]). Most are
 /// offered only when listed; `find`, `browser`, `kernel`, `eval`, `autoresearch` and `archive` are
 /// always offered, so older saved lists keep them.
-pub use catalog::INTEGRATION_TOOLS;
-
-/// Tools dial enables by default: the built-ins plus the core dial tools below. The rest of
-/// [`EXTRA_TOOLS`] stays opt-in through the harness or tool flags.
-pub fn default_tools() -> Vec<String> {
-    BUILTIN
-        .iter()
-        .chain(
-            [
-                "todo",
-                "task",
-                "skill",
-                "tool_search",
-                "tool_load",
-                "artifact_read",
-                "working_state",
-                "recall",
-                "retain",
-                "memory_update",
-            ]
-            .iter(),
-        )
-        .map(|s| s.to_string())
-        .collect()
-}
 
 /// Selected tools withheld from the default per-request offer. They stay in the catalog, so the
 /// system prompt lists them under "Loadable tools" and `tool_load` (or `tool_search`) enables them
@@ -268,7 +215,7 @@ impl ToolOutput {
 }
 
 use crate::config::types::EditMode;
-pub use editing::{EditRepair, EditRepairRequest, EditSettings, EditToggle};
+pub use editing::{EditRepair, EditRepairRequest};
 pub use editing::{declared_targets as declared_edit_targets, targets as editing_targets};
 pub use editing::{
     inline_payload as inline_edit_payload, instructions as editing_instructions,
@@ -315,9 +262,12 @@ pub struct Workspace {
     edit_settings: EditSettings,
     /// Bash intent interceptor and the tool names offered this session (a redirect applies only
     /// when its target is offered). `None` leaves bash commands unchecked.
-    bash_interceptor: Option<(bash_interceptor::BashInterceptorConfig, Vec<String>)>,
+    bash_interceptor: Option<(
+        crate::config::tools::bash_interceptor::BashInterceptorConfig,
+        Vec<String>,
+    )>,
     /// User SSH settings (`Config.ssh`) applied to `ssh://` reads and writes this session.
-    ssh: ssh::SshConfig,
+    ssh: crate::config::tools::ssh::SshConfig,
     /// Connection targets for `ssh://` hosts, keyed by name (see [`Workspace::with_ssh_hosts`]).
     ssh_hosts: Arc<BTreeMap<String, ssh::Target>>,
     edit_repair: editing::RepairSlot,
@@ -359,7 +309,7 @@ impl Workspace {
             edit_mode: EditMode::default(),
             edit_settings: EditSettings::default(),
             bash_interceptor: None,
-            ssh: ssh::SshConfig::default(),
+            ssh: crate::config::tools::ssh::SshConfig::default(),
             ssh_hosts: Arc::default(),
             edit_repair: editing::RepairSlot::default(),
             edit_blackbox_dir: None,
@@ -488,7 +438,7 @@ impl Workspace {
     /// offered to the model; a redirect is applied only when its target is among them.
     pub fn with_bash_interceptor(
         mut self,
-        config: bash_interceptor::BashInterceptorConfig,
+        config: crate::config::tools::bash_interceptor::BashInterceptorConfig,
         available_tools: Vec<String>,
     ) -> Self {
         self.bash_interceptor = Some((config, available_tools));
@@ -496,15 +446,18 @@ impl Workspace {
     }
     pub fn bash_interceptor(
         &self,
-    ) -> Option<&(bash_interceptor::BashInterceptorConfig, Vec<String>)> {
+    ) -> Option<&(
+        crate::config::tools::bash_interceptor::BashInterceptorConfig,
+        Vec<String>,
+    )> {
         self.bash_interceptor.as_ref()
     }
     /// Applies the user's SSH settings (`Config.ssh`) to `ssh://` reads and writes.
-    pub fn with_ssh_config(mut self, ssh: ssh::SshConfig) -> Self {
+    pub fn with_ssh_config(mut self, ssh: crate::config::tools::ssh::SshConfig) -> Self {
         self.ssh = ssh;
         self
     }
-    pub fn ssh_config(&self) -> &ssh::SshConfig {
+    pub fn ssh_config(&self) -> &crate::config::tools::ssh::SshConfig {
         &self.ssh
     }
     /// Applies the `[ssh_hosts]` table, merged with `~/.ssh/config` aliases, to `ssh://` targets.

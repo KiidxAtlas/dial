@@ -1,9 +1,8 @@
 //! Evaluation-gated, model-scoped experimental activation steering. No admission from model claims.
-use crate::{
-    config::types::Config as AppConfig,
-    learn::{compute, worker},
-    storage::{atomic::write_private, settings_store},
-};
+use crate::config::settings_store;
+use crate::config::types::Config as AppConfig;
+use crate::learn::{compute, worker};
+use crate::platform::atomic::write_private;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,43 +15,6 @@ use std::{
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Swept strengths are absolute (multiplier × contrast norm at the layer), not the 0..2 setting.
 const MAX_STRENGTH: f64 = 1e4;
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Config {
-    pub enabled: bool,
-    /// Build and admit vectors during automatic improvement.
-    pub automatic: bool,
-    pub vector: String,
-    pub strength: f64,
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            automatic: true,
-            vector: "coding".into(),
-            strength: 0.5,
-        }
-    }
-}
-impl Config {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.vector.is_empty()
-                && self.vector.len() <= 64
-                && self
-                    .vector
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
-            "steering vector name must use 1–64 letters, digits, - or _"
-        );
-        ensure!(
-            self.strength.is_finite() && (0.0..=2.0).contains(&self.strength),
-            "steering strength must be 0..2"
-        );
-        Ok(())
-    }
-}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Specification {
     pub path: PathBuf,
@@ -600,7 +562,7 @@ pub fn run_at(
             progress_path.display()
         );
     }
-    let cancel = crate::repl::install_sigint();
+    let cancel = crate::platform::interrupt::install_sigint();
     let _lease = compute::Background::acquire_controlled(config, Some(&cancel))?;
     if config.compute_locks {
         compute::register(

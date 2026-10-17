@@ -325,7 +325,7 @@ fn argument_parsing_messages() {
     );
     assert_eq!(
         parse_search("x --scope project").expect("parse").scope,
-        crate::storage::settings_store::Scope::Project
+        crate::config::settings_store::Scope::Project
     );
     let parsed = parse_search("foo bar --limit 3 --semantic").expect("parse");
     assert_eq!(parsed.keyword, "foo bar");

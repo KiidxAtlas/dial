@@ -633,7 +633,7 @@ impl super::Agent<'_> {
         let cancel = self.interrupt.clone();
         let window = self.budget_window();
         let selection = self.auth_config.selection();
-        let identity = super::compaction::CompactionIdentity {
+        let identity = crate::config::compaction::CompactionIdentity {
             provider: &selection.provider,
             model: &selection.model,
             agent: None,
@@ -711,7 +711,7 @@ impl super::Agent<'_> {
         let estimate = super::compaction::request_tokens_with_policy(
             &projection,
             &self.config.compaction,
-            super::compaction::CompactionIdentity {
+            crate::config::compaction::CompactionIdentity {
                 provider: &selection.provider,
                 model: &selection.model,
                 agent: None,
@@ -755,7 +755,7 @@ impl super::Agent<'_> {
         backend: &mut crate::llm::provider::Backend,
         ui: &mut dyn super::Ui,
         template: Option<&Chat>,
-        options: &super::compaction::CompactionOptions,
+        options: &crate::config::compaction::CompactionOptions,
     ) -> Result<super::compaction::CompactionOutcome> {
         ensure!(
             self.experimental_context_owner(),
@@ -767,7 +767,7 @@ impl super::Agent<'_> {
         let request = maintenance_request(&self.session, &owner, true, &self.interrupt)?;
         let outcome = self.rollover_context_using(backend, ui, request, template)?;
         let selection = self.auth_config.selection();
-        let identity = super::compaction::CompactionIdentity {
+        let identity = crate::config::compaction::CompactionIdentity {
             provider: &selection.provider,
             model: &selection.model,
             agent: None,
@@ -785,8 +785,8 @@ impl super::Agent<'_> {
             summarized_messages: 0,
             continue_allowed: self.config.compaction.auto_continue
                 && !options.suppress_continuation
-                && options.reason != super::compaction::CompactionReason::Idle
-                && outcome.prompt_tokens <= super::compaction::continue_band(threshold),
+                && options.reason != crate::config::compaction::CompactionReason::Idle
+                && outcome.prompt_tokens <= crate::config::compaction::continue_band(threshold),
             native_usage: None,
             handoff_path: None,
             handoff_error: None,

@@ -1,5 +1,6 @@
 //! Regression tests for lossless escaping of unrenderable glyphs and for honest frame capacity.
 //! Filter: `cargo test agent::snapcompact::tests`.
+use crate::config::snapcompact::SnapcompactConfig;
 
 use super::*;
 use serde_json::json;

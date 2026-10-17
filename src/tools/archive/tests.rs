@@ -1,7 +1,7 @@
 use super::*;
 
 fn tool(home: &Path, project: &Path) -> ArchiveTool {
-    let layout = crate::storage::paths::Layout::with_user_dir(project, home.join("dial")).unwrap();
+    let layout = crate::config::paths::Layout::with_user_dir(project, home.join("dial")).unwrap();
     ArchiveTool {
         user_dir: layout.user_dir.clone(),
         project_root: layout.project_root.clone(),

@@ -9,7 +9,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::storage::{atomic::write_private, settings_store};
+use crate::config::settings_store;
+use crate::platform::atomic::write_private;
 
 /// File in the user directory, keyed by `"{provider}/{model}"`.
 pub const FILE: &str = "local-profile.json";

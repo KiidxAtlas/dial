@@ -1,3 +1,5 @@
+use crate::config::hooks::validate;
+
 use super::*;
 #[cfg(unix)]
 #[test]

@@ -19,6 +19,8 @@
 //!   hook is fail-closed (`fail_closed`, default true for `pre_tool_use`), which blocks instead.
 //!
 //! Hooks are trusted programs and run unsandboxed in the project directory, like `[mcp.*]` servers.
+use crate::config::hooks::canonical;
+
 use crate::config::types::HookConfig;
 use serde_json::{Value, json};
 use std::{
@@ -34,25 +36,6 @@ use std::{
 
 /// Longest hook output kept (bytes).
 const MAX_OUTPUT: usize = 8 * 1024;
-
-/// Canonical event names. Alias names (`tool_call`, `tool_result`, `input`,
-/// `session_shutdown`, `session_before_compact`, `session_stop`) are accepted as well.
-pub const EVENTS: &[&str] = &[
-    "session_start",
-    "session_end",
-    "user_prompt_submit",
-    "pre_tool_use",
-    "post_tool_use",
-    "stop",
-    "before_compact",
-    "before_subagent_spawn",
-    "before_provider_request",
-];
-
-/// The Dial name for an event or one of its aliases.
-pub fn canonical(event: &str) -> &str {
-    crate::tools::plugin::canonical_event(event)
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -136,31 +119,6 @@ pub struct Outcome {
     pub is_error: Option<bool>,
     /// Rewritten `before_provider_request` body.
     pub request: Option<Value>,
-}
-
-pub fn validate(hook: &HookConfig) -> Result<(), String> {
-    if !EVENTS.contains(&canonical(&hook.event)) {
-        return Err(format!(
-            "unknown hook event {:?}; use one of {}",
-            hook.event,
-            EVENTS.join(", ")
-        ));
-    }
-    if hook
-        .command
-        .first()
-        .is_none_or(|program| program.trim().is_empty())
-    {
-        return Err("hook command must name a program".into());
-    }
-    if hook.timeout_secs > 600 {
-        return Err("hook timeout_secs must be 0..=600".into());
-    }
-    if let Some(matcher) = &hook.matcher {
-        regex::Regex::new(&format!("^(?:{matcher})$"))
-            .map_err(|e| format!("invalid hook matcher: {e}"))?;
-    }
-    Ok(())
 }
 
 /// Whether a failure of this hook (crash, timeout, start failure) blocks the action.

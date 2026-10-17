@@ -1,8 +1,7 @@
 //! TTS backend resolution, safe command construction and audio playback.
-use super::{
-    TtsBackendChoice, VoiceEnv,
-    process::{self, CommandSpec},
-};
+use crate::config::voice::TtsBackendChoice;
+use crate::voice::VoiceEnv;
+use crate::voice::process::{self, CommandSpec};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
 use std::{

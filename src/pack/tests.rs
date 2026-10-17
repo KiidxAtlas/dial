@@ -264,7 +264,7 @@ fn steering_import_respects_the_shared_pending_vector_lock() {
     let name = format!("imported-{}", &manifest.files[0].sha256[..12]);
     let pending = steering::pending_path(&config, &name).unwrap();
     let lock = steering::lock_vector(&pending).unwrap();
-    crate::storage::settings_store::write_private(&pending, b"existing vector").unwrap();
+    crate::config::settings_store::write_private(&pending, b"existing vector").unwrap();
     for replace in [false, true] {
         let error = import_steering(&config, &pack, replace).unwrap_err();
         assert!(

@@ -11,12 +11,12 @@ use super::{
     },
 };
 use crate::{
+    config::settings_store::Scope,
     llm::{
         local_evidence::{self, Current, Suggestion},
         local_server,
         profiles::{ModelProfile, ReasoningApi},
     },
-    storage::settings_store::Scope,
     ui::{
         chrome::{self, Section},
         editor::Editor,
@@ -326,7 +326,7 @@ impl ModelSettingsOverlay {
     }
 
     fn value(&self, path: &str) -> Option<toml::Value> {
-        crate::ui::settings_schema::get(&self.table(), path).cloned()
+        crate::config::schema::get(&self.table(), path).cloned()
     }
 
     fn is_override(&self, field: &Field) -> bool {
@@ -515,10 +515,10 @@ impl ModelSettingsOverlay {
         let mut table = self.table();
         match value {
             Some(value) => {
-                crate::ui::settings_schema::set(&mut table, field, value);
+                crate::config::schema::set(&mut table, field, value);
             }
             None => {
-                crate::ui::settings_schema::unset(&mut table, field);
+                crate::config::schema::unset(&mut table, field);
             }
         }
         let profile: ModelProfile = toml::Value::Table(table)

@@ -163,7 +163,7 @@ impl<'a> Agent<'a> {
         config.validate_harness(&version.harness)?;
         version.harness = config.effective_harness(&version.harness)?;
         let memory = if config.memory.backend
-            == crate::storage::memory_backend::config::MemoryBackendId::Provenance
+            == crate::config::memory_backend::MemoryBackendId::Provenance
         {
             Some(Arc::new(ProvenanceMemory::open(&layout)?))
         } else {
@@ -171,8 +171,8 @@ impl<'a> Agent<'a> {
         };
         let memory_runtime = if matches!(
             config.memory.backend,
-            crate::storage::memory_backend::config::MemoryBackendId::Off
-                | crate::storage::memory_backend::config::MemoryBackendId::Provenance
+            crate::config::memory_backend::MemoryBackendId::Off
+                | crate::config::memory_backend::MemoryBackendId::Provenance
         ) {
             None
         } else {

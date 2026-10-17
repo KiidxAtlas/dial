@@ -493,7 +493,9 @@ pub fn ensure_connection(
                         &format!("failed to connect to {destination}"),
                         HELPER_TIMEOUT
                     ),
-                    if settings.config.host_key_checking == super::HostKeyChecking::Yes {
+                    if settings.config.host_key_checking
+                        == crate::config::tools::ssh::HostKeyChecking::Yes
+                    {
                         " and accept the host key"
                     } else {
                         ""
@@ -589,7 +591,7 @@ fn persist_info(settings: &Settings, name: &str, info: &HostInfo) {
     if let Ok(text) = serde_json::to_string_pretty(info) {
         // Synced, uniquely named temp file and rename: concurrent sessions probing the same host
         // never interleave writes into one shared temp path.
-        let _ = crate::storage::settings_store::write_private(&path, text.as_bytes());
+        let _ = crate::config::settings_store::write_private(&path, text.as_bytes());
     }
 }
 
@@ -905,7 +907,7 @@ fn register_cleanup() {
         let _ = std::panic::catch_unwind(|| {
             let settings = Settings {
                 user_dir: super::user_dir().unwrap_or_else(|_| PathBuf::from(".dial")),
-                config: super::SshConfig::default(),
+                config: crate::config::tools::ssh::SshConfig::default(),
             };
             close_all(&settings)
         });

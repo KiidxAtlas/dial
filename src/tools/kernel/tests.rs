@@ -1,3 +1,5 @@
+use crate::config::tools::kernel::KernelConfig;
+
 use super::*;
 #[test]
 fn quote_preserves_shell_metacharacters() {

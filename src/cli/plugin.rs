@@ -1,7 +1,7 @@
 //! `dial plugin` (alias `plugins`): lifecycle management for installed plugins and their
 //! marketplaces. Plugin state lives under the user directory (`<user_dir>/plugins` and
 //! `<user_dir>/marketplaces`), shared across projects.
-use crate::storage::paths::Layout;
+use crate::config::paths::Layout;
 use crate::tools::plugin::{
     installer::{InstalledPlugin, PluginStore, PluginUpdate},
     marketplace::{MarketplaceEntry, MarketplaceInfo, Marketplaces},

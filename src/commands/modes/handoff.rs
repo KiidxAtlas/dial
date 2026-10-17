@@ -2,8 +2,8 @@
 //! Runs the `Handoff` compaction method through the same engine as `/compact`.
 
 use crate::agent::Agent;
-use crate::agent::compaction::{CompactionMethod, CompactionOptions};
 use crate::app::{App, Shell, Step};
+use crate::config::compaction::{CompactionMethod, CompactionOptions};
 use anyhow::Result;
 
 pub(super) fn run(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {

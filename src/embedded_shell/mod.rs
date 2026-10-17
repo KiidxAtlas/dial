@@ -157,7 +157,7 @@ pub fn run_host_with_state(script_path: &Path, state_path: Option<&Path>) -> i32
                         exported,
                     };
                     if let Err(error) = state.validate().and_then(|()| {
-                        crate::storage::settings_store::write_private(
+                        crate::config::settings_store::write_private(
                             path,
                             &serde_json::to_vec(&state).map_err(|error| error.to_string())?,
                         )

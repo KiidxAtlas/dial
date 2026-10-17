@@ -28,11 +28,12 @@
 //! - model-kind filtering for non-chat runners (warned as unmatched instead).
 
 use super::fuzzy_match::fuzzy_match;
-use super::model_flags::{CliThinking, ModelFlags, apply_thinking};
+use crate::cli::model_flags::ModelFlags;
+use crate::config::paths::Layout;
+use crate::config::thinking::{CliThinking, apply_thinking};
 use crate::config::types::Config;
 use crate::llm::catalog::{self, ModelEntry};
 use crate::llm::model_config::ModelSelection;
-use crate::storage::paths::Layout;
 use anyhow::Result;
 use parking_lot::RwLock;
 

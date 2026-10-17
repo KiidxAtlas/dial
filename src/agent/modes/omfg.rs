@@ -448,7 +448,7 @@ impl Agent<'_> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        crate::storage::atomic::write_replacing(&path, candidate.markdown.as_bytes())
+        crate::platform::atomic::write_replacing(&path, candidate.markdown.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         let active = !self.hermetic && self.config.portable_rules.enabled;
         if active && let Some(layout) = self.layout.as_ref() {
@@ -457,7 +457,7 @@ impl Agent<'_> {
             let file = format!("{}.md", candidate.name);
             if let Some(warning) = catalog.warnings.iter().find(|w| w.contains(&file)) {
                 let rollback = match replaced {
-                    Some(bytes) => crate::storage::atomic::write_replacing(&path, &bytes),
+                    Some(bytes) => crate::platform::atomic::write_replacing(&path, &bytes),
                     None => std::fs::remove_file(&path),
                 };
                 if let Err(error) = rollback {

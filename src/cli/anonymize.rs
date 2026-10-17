@@ -7,12 +7,10 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::storage::{
-    anonymize::{Anonymizer, Identity, REVIEW_NOTE, safe_session_name},
-    dump::{is_within, resolve_allowing_missing},
-    paths::Layout,
-    session::Session,
-};
+use crate::config::paths::Layout;
+use crate::storage::anonymize::{Anonymizer, Identity, REVIEW_NOTE, safe_session_name};
+use crate::storage::dump::{is_within, resolve_allowing_missing};
+use crate::storage::session::Session;
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct AnonymizeArgs {

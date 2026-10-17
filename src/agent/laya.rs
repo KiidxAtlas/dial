@@ -3,85 +3,18 @@
 //! A decision engine is selected by `[laya] engine`. Laya is Dial's managed local service
 //! (installed with `dial laya install`). Callers use the free functions below, which dispatch
 //! through the selected engine's [`DecisionEngine`] implementation.
+use crate::config::laya::Config;
+use crate::config::laya::DecisionEngineType;
+use crate::config::laya::expected_checkpoint;
+use crate::config::laya::runtime_dir;
+
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DecisionEngineType {
-    #[default]
-    Laya,
-    Kev,
-}
-
-/// Provider name that marks `model_roles.decision` as the Laya checkpoint.
-pub const PROVIDER: &str = "laya";
-/// Model id of a `judge` role served by Laya. The judge shares the service, and so the checkpoint, of the
-/// `decision` role (else the installed default), so judging never restarts the service with another one.
-pub const JUDGE_MODEL: &str = "decision";
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Config {
-    pub engine: DecisionEngineType,
-    pub enabled: bool,
-    pub auto_start: bool,
-    pub endpoint: String,
-    pub timeout_secs: u64,
-    /// Checkpoint the service loads: the assigned `decision` role. Set from the model roles, never read from TOML.
-    #[serde(skip)]
-    pub checkpoint: Option<String>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            engine: DecisionEngineType::Laya,
-            enabled: false,
-            auto_start: true,
-            endpoint: "http://127.0.0.1:8002".into(),
-            timeout_secs: 0,
-            checkpoint: None,
-        }
-    }
-}
-
-impl Config {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.engine == DecisionEngineType::Laya,
-            "decision engine `kev` has no implementation in this build; set [laya] engine = \"laya\""
-        );
-        let authority = self
-            .endpoint
-            .strip_prefix("http://")
-            .context("Decision engine requires a local http endpoint")?;
-        let (host, port) = authority
-            .split_once(':')
-            .context("Decision engine endpoint requires an explicit port")?;
-        ensure!(
-            matches!(host, "127.0.0.1" | "localhost") && port.parse::<u16>().is_ok_and(|p| p > 0),
-            "Decision engine endpoint must be http://127.0.0.1:PORT or http://localhost:PORT, without a path"
-        );
-        Ok(())
-    }
-}
-
 /// Pid file the managed service writes so a stale checkpoint can be replaced.
 const PID_FILE: &str = "server.pid";
-
-/// The checkpoint the service must load: the assigned `decision` role, else the installed default.
-pub fn expected_checkpoint(config: &Config) -> Option<String> {
-    config.checkpoint.clone().or_else(|| {
-        let model = runtime_dir().ok()?.join("model");
-        model
-            .join("rl_agent_config.json")
-            .is_file()
-            .then(|| model.to_string_lossy().into_owned())
-    })
-}
 
 /// Stops the managed service recorded in the pid file. Returns `false` when this Dial did not launch one.
 fn stop_managed() -> Result<bool> {
@@ -282,30 +215,14 @@ fn request_timed_out(error: &anyhow::Error) -> bool {
     })
 }
 
-pub fn runtime_dir() -> Result<std::path::PathBuf> {
-    let root = match std::env::var_os("DIAL_HOME").filter(|s| !s.is_empty()) {
-        Some(root) => std::path::PathBuf::from(root),
-        None => std::path::PathBuf::from(
-            std::env::var_os("HOME").context("HOME is unavailable; set DIAL_HOME")?,
-        )
-        .join(".dial"),
-    };
-    let root = if root.is_absolute() {
-        root
-    } else {
-        std::env::current_dir()?.join(root)
-    };
-    Ok(root.join("laya"))
-}
-
 const SERVER: &str = include_str!("../../python/dial_laya_server.py");
 const REQUIREMENTS: &str = include_str!("../../python/laya-requirements.txt");
 
 pub fn install(
-    layout: &crate::storage::paths::Layout,
+    layout: &crate::config::paths::Layout,
     checkpoint: Option<&std::path::Path>,
 ) -> Result<Option<std::path::PathBuf>> {
-    use crate::{learn::worker, storage::settings_store};
+    use crate::{config::settings_store, learn::worker};
     let directory = layout.user_dir.join("laya");
     settings_store::private_dir(&directory)?;
     settings_store::write_private(&directory.join("dial_laya_server.py"), SERVER.as_bytes())?;
@@ -398,7 +315,7 @@ fn launch_managed(config: &Config) -> Result<Arc<AtomicBool>> {
         python.is_file() && directory.join("model/rl_agent_config.json").is_file(),
         "Dial Laya is not installed; run dial laya install --checkpoint PATH"
     );
-    crate::storage::settings_store::write_private(
+    crate::config::settings_store::write_private(
         &directory.join("dial_laya_server.py"),
         SERVER.as_bytes(),
     )?;
@@ -442,7 +359,7 @@ fn launch_managed(config: &Config) -> Result<Arc<AtomicBool>> {
         .stderr(Stdio::from(log));
     let mut child = crate::platform::process::spawn_group(&mut command)
         .context("could not start Dial Laya service")?;
-    crate::storage::settings_store::write_private(
+    crate::config::settings_store::write_private(
         &directory.join(PID_FILE),
         child.id().to_string().as_bytes(),
     )?;

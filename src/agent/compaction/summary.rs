@@ -3,11 +3,12 @@
 //! carry across compactions, and summarizer input is planned in message-boundary windows that fit
 //! the compaction model (halving and re-planning when the provider rejects a window as too long).
 use super::super::Ui;
-use super::{
-    CompactionConfig, CompactionContext, CompactionControlDenied, CompactionMethod,
-    MAX_SUMMARY_TOKENS, RemoteCompactionObserver, estimate, interrupted, is_history,
-    public_transcript, summary_instructions, summary_output, with_ui,
+use crate::agent::compaction::{
+    CompactionContext, CompactionControlDenied, MAX_SUMMARY_TOKENS, RemoteCompactionObserver,
+    estimate, interrupted, is_history, public_transcript, summary_instructions, summary_output,
+    with_ui,
 };
+use crate::config::compaction::{CompactionConfig, CompactionMethod};
 use crate::{
     llm::{Chat, provider::Backend},
     storage::session::Session,

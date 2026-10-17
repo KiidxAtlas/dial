@@ -14,7 +14,7 @@
 //! nothing, so it is the first choice on Linux.
 
 use super::{Snapshot, stamp};
-use crate::agent::agent_defs::TaskConfig;
+use crate::config::task::TaskConfig;
 use anyhow::{Context, Result, ensure};
 use std::{
     ffi::{OsStr, OsString},

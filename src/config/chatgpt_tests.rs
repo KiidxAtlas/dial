@@ -256,8 +256,8 @@ fn laya_judge_must_name_the_shared_decision_checkpoint() {
     config.model_roles.insert(
         "judge".into(),
         crate::llm::model_config::ModelSelection::new(
-            crate::agent::laya::PROVIDER,
-            crate::agent::laya::JUDGE_MODEL,
+            crate::config::laya::PROVIDER,
+            crate::config::laya::JUDGE_MODEL,
         ),
     );
     config.validate().unwrap();
@@ -325,8 +325,8 @@ fn laya_roles_never_require_compute_locks_for_cloud_sessions() {
         config.model_roles.insert(
             role.into(),
             crate::llm::model_config::ModelSelection::new(
-                crate::agent::laya::PROVIDER,
-                crate::agent::laya::JUDGE_MODEL,
+                crate::config::laya::PROVIDER,
+                crate::config::laya::JUDGE_MODEL,
             ),
         );
     }

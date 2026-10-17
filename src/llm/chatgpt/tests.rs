@@ -510,7 +510,7 @@ fn catalog_prefers_valid_extended_maximum_over_default_context() {
     );
     let project = tempfile::tempdir().unwrap();
     let layout =
-        crate::storage::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
+        crate::config::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
             .unwrap();
     let auto = crate::config::types::Config::from_table(
         &layout,

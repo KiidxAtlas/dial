@@ -1,7 +1,7 @@
 //! Native compaction transport. Native success requires real provider state, never a text fallback.
 use super::{Backend, ProviderKind, anthropic_url, attest_claude_code_body, endpoint_url};
 use crate::{
-    agent::compaction::NativeCompactionCapability,
+    config::compaction::NativeCompactionCapability,
     llm::{self, Chat, Reply},
 };
 use anyhow::{Context, Result, bail, ensure};

@@ -795,7 +795,7 @@ pub fn diagnose(
         "recurring_failure_categories": signals.recurring_failures,
         "live_failures_recent": signals.live_failures, "highest_risk_trajectories": signals.risky,
         "trajectories": bounded(&recent), "population": population,
-        "approved_tools": crate::tools::default_tools().into_iter().chain(config.tools.keys().cloned()).collect::<Vec<_>>(),
+        "approved_tools": crate::config::tools::default_tools().into_iter().chain(config.tools.keys().cloned()).collect::<Vec<_>>(),
         "approved_subagents": config.subagents.keys().collect::<Vec<_>>(), "exploration": strategy,
     });
     while request.to_string().len() > 65536 {

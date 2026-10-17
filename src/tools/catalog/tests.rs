@@ -1,3 +1,7 @@
+use crate::config::tools::integrations::INTEGRATION_TOOLS;
+use crate::config::tools::integrations::INTEGRATIONS;
+use crate::config::tools::integrations::default_integrations;
+
 use super::*;
 use serde_json::json;
 #[test]

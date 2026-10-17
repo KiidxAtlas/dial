@@ -843,7 +843,9 @@ impl Archive {
     /// The sessions directory of `project`: the state layout when the directory still exists,
     /// else the directory whose newest session ran there.
     fn project_sessions_dir(&self, project: &Path) -> Option<PathBuf> {
-        if let Ok(layout) = super::paths::Layout::with_user_dir(project, self.user_dir.clone()) {
+        if let Ok(layout) =
+            crate::config::paths::Layout::with_user_dir(project, self.user_dir.clone())
+        {
             return Some(layout.sessions_dir());
         }
         let wanted = project.display().to_string();

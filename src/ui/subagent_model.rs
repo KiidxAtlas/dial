@@ -25,8 +25,8 @@ use serde_json::Value;
 
 use crate::agent::LiveTaskControl;
 use crate::agent::child_transcript::{self, TranscriptSummary};
+use crate::config::paths::Layout;
 use crate::runtime::{Phase, Tree};
-use crate::storage::paths::Layout;
 
 /// Transcripts read for the activity feed; older workers keep their lifecycle events only.
 const ACTIVITY_TRANSCRIPTS: usize = 12;

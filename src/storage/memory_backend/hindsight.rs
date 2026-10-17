@@ -1,10 +1,9 @@
 use super::{
-    Driver, MemoryModelRunner, Operation, SaveInput, clean,
-    config::{HindsightConfig, MemoryBackendId, MemoryScoping, RetainMode},
-    files::PrivateDirectory,
-    now, redact, visible_text,
+    Driver, MemoryModelRunner, Operation, SaveInput, clean, files::PrivateDirectory, now, redact,
+    visible_text,
 };
-use crate::{llm, storage::paths::Layout};
+use crate::config::memory_backend::{HindsightConfig, MemoryBackendId, MemoryScoping, RetainMode};
+use crate::{config::paths::Layout, llm};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};

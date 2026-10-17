@@ -13,9 +13,9 @@ use super::{
     },
 };
 use crate::{
+    config::settings_store::Scope,
     llm::catalog::{Discovery, ProviderStatus, UNREACHABLE_DETAIL},
     llm::model_config::ProviderSpec,
-    storage::settings_store::Scope,
     ui::{
         chrome::{self, Section, Status},
         editor::Editor,

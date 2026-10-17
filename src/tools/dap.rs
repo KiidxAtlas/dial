@@ -1,8 +1,12 @@
 //! Approved, event-aware DAP sessions. Launch is a two-phase configuration handshake.
+use crate::config::tools::dap::catalogue;
+
+use crate::config::tools::dap::DapAdapterConfig;
+use crate::config::tools::dap::DapTransport;
+
 use super::shell::ProcessGroup;
 use crate::tools::ext::{Tool, ToolContext, ToolEvent};
 use crate::tools::{ToolOutput, Workspace, tool_schema};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -23,7 +27,6 @@ use std::{
 
 mod breakpoints;
 mod select;
-pub use select::catalogue;
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const MAX_HEADER: usize = 8 * 1024;
@@ -33,44 +36,6 @@ const EVENT_BYTES: usize = 256 * 1024;
 const POLL: Duration = Duration::from_millis(25);
 const REVERSE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const DESCRIPTION: &str = "Approved event-aware DAP control for an operator-installed adapter. launch/attach return when initialized, possibly before their response: setBreakpoints then configurationDone completes configuration. setBreakpoints and removeBreakpoint (source + line) merge into the per-source list; setFunctionBreakpoints and removeFunctionBreakpoint (name) merge into the function list; an empty list clears its scope. Each sends the full merged list and records adapter verification in status.breakpoints. Execution actions also complete configuration. status exposes capabilities/state; output drains bounded events, debuggee output and adapter stderr with loss counters. Positive timeout_secs covers writes and waits; zero is unlimited until cancellation/adapter exit. Reverse runInTerminal/startDebugging requests are refused, never host-launched. Each call requires approval; launch program/cwd remain inside the workspace. Disconnect/terminate/cancellation destroy the owned adapter process group.";
-
-/// Operator-controlled command used to start one DAP adapter.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DapTransport {
-    #[default]
-    Stdio,
-    Tcp,
-    Socket,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DapAdapterConfig {
-    pub program: PathBuf,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default)]
-    pub transport: DapTransport,
-    #[serde(default)]
-    pub address: String,
-    #[serde(default)]
-    pub file_types: Vec<String>,
-    #[serde(default)]
-    pub root_markers: Vec<String>,
-    #[serde(default)]
-    pub launch_defaults: serde_json::Map<String, Value>,
-    #[serde(default)]
-    pub attach_defaults: serde_json::Map<String, Value>,
-}
-
-fn default_timeout_secs() -> u64 {
-    0
-}
 
 /// Creates one lazy, single-session tool per catalogued adapter, plus a `dap` tool that selects an
 /// adapter from its `adapter` argument, the launch program's extension, or project root markers.

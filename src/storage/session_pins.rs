@@ -35,7 +35,7 @@ fn read(user_dir: &Path) -> Result<Vec<String>> {
 /// Pin the session when unpinned, unpin it when pinned. Returns `true` when now pinned.
 pub fn toggle(user_dir: &Path, session_id: &str) -> Result<bool> {
     let _guard = LOCK.lock();
-    let _lock = crate::storage::settings_store::locked(&file(user_dir))?;
+    let _lock = crate::config::settings_store::locked(&file(user_dir))?;
     let mut ids = read(user_dir)?;
     let now_pinned = if let Some(at) = ids.iter().position(|id| id == session_id) {
         ids.remove(at);
@@ -51,7 +51,7 @@ pub fn toggle(user_dir: &Path, session_id: &str) -> Result<bool> {
 /// Remove a pin if present (used when the session is deleted).
 pub fn unpin(user_dir: &Path, session_id: &str) -> Result<()> {
     let _guard = LOCK.lock();
-    let _lock = crate::storage::settings_store::locked(&file(user_dir))?;
+    let _lock = crate::config::settings_store::locked(&file(user_dir))?;
     let mut ids = read(user_dir)?;
     let before = ids.len();
     ids.retain(|id| id != session_id);

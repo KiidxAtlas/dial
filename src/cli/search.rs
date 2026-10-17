@@ -13,8 +13,8 @@
 //! Approval: the `web_search` tool asks for approval inside a session. This command is an explicit
 //! user invocation, so it does not prompt; the sandbox network policy is still enforced by the tool.
 
+use crate::config::paths::Layout;
 use crate::config::types::Config;
-use crate::storage::paths::Layout;
 use crate::tools::ext::ToolContext;
 use crate::tools::{Workspace, web};
 use anyhow::Result;

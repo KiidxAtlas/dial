@@ -28,8 +28,8 @@ use std::{
 
 use crate::platform::fs as platform_fs;
 
-use super::paths::Layout;
 use super::session_pins;
+use crate::config::paths::Layout;
 use crate::tools::ToolOutput;
 
 /// How long a reopen waits for a writer lock that looks busy.
@@ -805,7 +805,7 @@ impl Session {
     /// Opens an existing session for exclusive appending. A competing writer is
     /// refused before loading or repairing history; read-only inspection is separate.
     pub fn open(path: &Path) -> Result<Session> {
-        super::settings_store::validate_private_path(
+        crate::config::settings_store::validate_private_path(
             path.parent().context("session path has no parent")?,
         )?;
         let file = platform_fs::open_nofollow_nonblocking(
@@ -842,7 +842,7 @@ impl Session {
     }
 
     fn load(path: &Path) -> Result<Session> {
-        super::settings_store::validate_private_path(
+        crate::config::settings_store::validate_private_path(
             path.parent().context("session path has no parent")?,
         )?;
         let file = platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path)

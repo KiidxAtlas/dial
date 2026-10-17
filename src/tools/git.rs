@@ -9,7 +9,6 @@
 use super::ext::{Tool, ToolContext, ToolEvent};
 use super::{ToolOutput, Workspace, opt_bool, opt_str, opt_u64, req_str, tool_schema};
 use crate::config::types::Config;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -36,16 +35,6 @@ with `all`), `branch_create` (`name`, optional `from`; switches to it), `switch`
 log and commit use jj unless `vcs` is \"git\"; jj has no staging area. Repository hooks and signing apply to commit/push \
 unless the operator set git.bypass_hooks. Long output is cut with the full text kept as an artifact:// link. For reset, \
 rebase, force-push or anything else, use bash.";
-
-/// `[git]` settings.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct GitConfig {
-    /// Skip repository hooks (`--no-verify`, empty hooksPath) on commit/push in the agent git
-    /// tool, the `/git` panel, and `dial commit`. The agent tool also skips commit signing, since it
-    /// cannot answer a pinentry prompt; user-initiated commits keep the configured signing.
-    pub bypass_hooks: bool,
-}
 
 #[derive(Default)]
 pub struct Git {

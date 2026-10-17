@@ -9,14 +9,14 @@ const MAX_PROMPT_EVIDENCE_REFERENCES: usize = 24;
 impl<'a> Agent<'a> {
     /// Manual/idle maintenance owns the resident backend only for the duration of preparation.
     pub fn compact(&mut self, ui: &mut dyn Ui) -> Result<()> {
-        self.compact_with_options(ui, compaction::CompactionOptions::default())
+        self.compact_with_options(ui, crate::config::compaction::CompactionOptions::default())
             .map(|_| ())
     }
 
     pub fn compact_with_options(
         &mut self,
         ui: &mut dyn Ui,
-        options: compaction::CompactionOptions,
+        options: crate::config::compaction::CompactionOptions,
     ) -> Result<compaction::CompactionOutcome> {
         self.compaction_runtime.cancel();
         self.probe_context();
@@ -170,7 +170,7 @@ impl<'a> Agent<'a> {
         backend: &mut Backend,
         ui: &mut dyn Ui,
         template: Option<&Chat>,
-        options: &compaction::CompactionOptions,
+        options: &crate::config::compaction::CompactionOptions,
     ) -> Result<compaction::CompactionOutcome> {
         self.compaction_runtime.cancel();
         let plugins = self.hook_plugins();
@@ -202,7 +202,7 @@ impl<'a> Agent<'a> {
             && options.instructions.is_none()
         {
             ensure!(
-                options.reason == compaction::CompactionReason::Manual,
+                options.reason == crate::config::compaction::CompactionReason::Manual,
                 "experimental context management never automatically resets or summarizes a turn; save context notes and explicitly invoke new_context"
             );
             if self.config.compaction.summary_instructions.is_none() {
@@ -240,7 +240,7 @@ impl<'a> Agent<'a> {
         backend.next_request_profile(snapshot.native_profile.clone());
         let prepared = match prepared {
             Err(error)
-                if options.reason == compaction::CompactionReason::Manual
+                if options.reason == crate::config::compaction::CompactionReason::Manual
                     && error.is::<compaction::NothingToCompact>() =>
             {
                 ui.notice("nothing to compact yet: history is already within the keep budget");
@@ -272,7 +272,7 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
         snapshot: &compaction::CompactionSnapshot,
         mut prepared: compaction::PreparedCompaction,
-        options: &compaction::CompactionOptions,
+        options: &crate::config::compaction::CompactionOptions,
         template: Option<&Chat>,
         mut live_backend: Option<&mut Backend>,
     ) -> Result<compaction::CompactionOutcome> {
@@ -305,13 +305,14 @@ impl<'a> Agent<'a> {
         let notes = self.compaction_evidence_notes(&prepared.summary, &snapshot.source.messages);
         if matches!(
             prepared.method,
-            compaction::CompactionMethod::Soft | compaction::CompactionMethod::Handoff
-        ) || (prepared.method == compaction::CompactionMethod::Remote
+            crate::config::compaction::CompactionMethod::Soft
+                | crate::config::compaction::CompactionMethod::Handoff
+        ) || (prepared.method == crate::config::compaction::CompactionMethod::Remote
             && prepared.outcome.native_usage.is_none())
         {
             prepared.summary = notes;
             prepared.prefix = vec![Session::compaction_message(&prepared.summary)];
-        } else if prepared.method != compaction::CompactionMethod::Shake {
+        } else if prepared.method != crate::config::compaction::CompactionMethod::Shake {
             // Append new authoritative harness notes; never rewrite the provider's signed block or exact tail.
             prepared.prefix.push(json!({"role":"user","content":format!("<compaction-notes>\n{notes}\n</compaction-notes>"),"dial_compaction_notes":true}));
         }
@@ -345,7 +346,7 @@ impl<'a> Agent<'a> {
             remaining <= budget,
             "next projected request needs about {remaining} tokens, above safe budget {budget}; no compaction was committed. Trim immutable instructions/tools, retained evidence, or select a larger-window model"
         );
-        let identity = compaction::CompactionIdentity {
+        let identity = crate::config::compaction::CompactionIdentity {
             provider: &snapshot.model_selection.provider,
             model: &snapshot.model_selection.model,
             agent: None,
@@ -358,7 +359,7 @@ impl<'a> Agent<'a> {
         {
             ensure!(
                 remaining
-                    <= compaction::continue_band(
+                    <= crate::config::compaction::continue_band(
                         self.config
                             .compaction
                             .effective_threshold(identity, self.budget_window())?,
@@ -383,7 +384,7 @@ impl<'a> Agent<'a> {
                 backend.validate_compaction_request(request, cancel)
             })?;
         }
-        if options.reason == compaction::CompactionReason::Idle {
+        if options.reason == crate::config::compaction::CompactionReason::Idle {
             ensure!(
                 ui.maintenance_ready(),
                 "idle compaction was cancelled by pending input; original history is unchanged"
@@ -454,7 +455,7 @@ impl<'a> Agent<'a> {
         self.metrics.compactions += 1;
         self.last_prompt_tokens = 0;
         self.reported_messages = 0;
-        let identity = compaction::CompactionIdentity {
+        let identity = crate::config::compaction::CompactionIdentity {
             provider: &snapshot.model_selection.provider,
             model: &snapshot.model_selection.model,
             agent: None,
@@ -478,12 +479,12 @@ impl<'a> Agent<'a> {
                 .effective_threshold(identity, self.budget_window())?
             && self.config.compaction.auto_continue
             && !options.suppress_continuation
-            && options.reason != compaction::CompactionReason::Idle
+            && options.reason != crate::config::compaction::CompactionReason::Idle
             && prepared.outcome.journal_warning.is_none();
         if let Some(warning) = &prepared.outcome.journal_warning {
             ui.notice(warning);
         }
-        if prepared.method == compaction::CompactionMethod::Handoff
+        if prepared.method == crate::config::compaction::CompactionMethod::Handoff
             && self.config.compaction.handoff_save_to_disk
         {
             let saved = (|| -> Result<String> {

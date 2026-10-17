@@ -5,8 +5,8 @@
 //! Selection: non-recent sessions are ranked newest first; the newest
 //! `retain_newest_global` are protected globally, and the newest `retain_newest_per_cwd` per working
 //! directory are protected; of the rest, sessions untouched for `cold_archive_after_days` are cold.
+use crate::config::settings_store;
 use crate::platform::fs as platform_fs;
-use crate::storage::settings_store;
 use anyhow::{Context, Result};
 #[cfg(test)]
 use rusqlite::OptionalExtension;

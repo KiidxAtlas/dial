@@ -55,7 +55,7 @@ fn provision_at(
     for (name, body) in [("package.json", PACKAGE), ("bun.lock", LOCK)] {
         let path = root.join(name);
         if std::fs::read_to_string(&path).ok().as_deref() != Some(body) {
-            crate::storage::settings_store::write_private(&path, body.as_bytes())
+            crate::config::settings_store::write_private(&path, body.as_bytes())
                 .map_err(|e| format!("writing private browser runtime: {e}"))?;
         }
         crate::platform::fs::set_owner_only(&path)

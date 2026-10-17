@@ -76,7 +76,7 @@ pub(crate) fn apply_changelog_proposals(
             continue;
         }
         if !dry_run {
-            crate::storage::atomic::write_replacing(&file, updated.as_bytes()).map_err(
+            crate::platform::atomic::write_replacing(&file, updated.as_bytes()).map_err(
                 |error| {
                     CommitError::Git(format!(
                         "Changelog update failed: {}: {error}",

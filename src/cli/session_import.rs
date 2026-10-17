@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::storage::paths::Layout;
+use crate::config::paths::Layout;
 use crate::storage::session::{ImportOrigin, Session, SessionMeta};
 
 /// Summary used when a Codex `compacted` record carries no message.

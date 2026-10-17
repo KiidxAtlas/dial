@@ -164,7 +164,7 @@ impl<'a> Agent<'a> {
         let estimate = compaction::request_tokens_with_policy(
             &chat,
             &role_config.compaction,
-            compaction::CompactionIdentity {
+            crate::config::compaction::CompactionIdentity {
                 provider: &selection.provider,
                 model: &selection.model,
                 agent: Some("coach"),

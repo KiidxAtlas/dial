@@ -7,7 +7,7 @@ use super::{
     BUN_MIN, Env, NODE_MIN, Recipe, Status, WHISPER_MODEL_BYTES, WHISPER_MODEL_SHA256,
     WHISPER_MODEL_URL, is_ready, locate, recipe, report, settings_for, whisper_model_path,
 };
-use crate::voice::{SttBackendChoice, TtsBackendChoice};
+use crate::config::voice::{SttBackendChoice, TtsBackendChoice};
 use anyhow::ensure;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -605,7 +605,7 @@ pub fn preview_text(id: &str, env: &Env) -> String {
 /// its settings are written, so a failed install leaves the config untouched. Returns one
 /// line per dependency that was set up.
 pub fn install_and_save(
-    layout: &crate::storage::paths::Layout,
+    layout: &crate::config::paths::Layout,
     id: &str,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str),
@@ -631,26 +631,23 @@ pub fn install_and_save(
         }
         progress(&format!("== {}", target.title));
         let location = install(next, &env, cancel, progress)?;
-        let mut changes: Vec<crate::storage::settings_store::Change> =
-            settings_for(next, &location)
-                .into_iter()
-                .map(
-                    |(path, value)| crate::storage::settings_store::Change::Set {
-                        path,
-                        value: toml::Value::String(value),
-                    },
-                )
-                .collect();
+        let mut changes: Vec<crate::config::settings_store::Change> = settings_for(next, &location)
+            .into_iter()
+            .map(|(path, value)| crate::config::settings_store::Change::Set {
+                path,
+                value: toml::Value::String(value),
+            })
+            .collect();
         if next == "whisper-cpp" {
-            changes.push(crate::storage::settings_store::Change::Set {
+            changes.push(crate::config::settings_store::Change::Set {
                 path: "voice.stt.whisper_cpp_model".to_owned(),
                 value: toml::Value::String(whisper_model_path(&env.user_dir).display().to_string()),
             });
         }
         if !changes.is_empty() {
-            crate::storage::settings_store::save_config(
+            crate::config::settings_store::save_config(
                 layout,
-                crate::storage::settings_store::Scope::Global,
+                crate::config::settings_store::Scope::Global,
                 &changes,
             )?;
         }

@@ -1,4 +1,7 @@
 use super::*;
+use crate::config::tools::dap::DapTransport;
+use crate::config::tools::dap::defaults;
+use serde_json::Value;
 
 #[test]
 fn bundled_catalogue_has_all_adapters() {

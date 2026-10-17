@@ -78,7 +78,7 @@ impl DocumentLease {
             Sha256::digest(std::env::temp_dir().as_os_str().as_encoded_bytes())
         );
         let directory = std::env::temp_dir().join(format!("dial-document-locks-{owner}"));
-        crate::storage::settings_store::private_dir(&directory).map_err(|e| e.to_string())?;
+        crate::config::settings_store::private_dir(&directory).map_err(|e| e.to_string())?;
         let key = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);

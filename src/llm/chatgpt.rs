@@ -2,8 +2,8 @@
 //! model history, or API-key storage. Protected atomic records and a process lock serialize refresh.
 use super::auth::SecretToken;
 #[cfg(test)]
-use crate::storage::settings_store::locked;
-use crate::storage::settings_store::{locked_cancellable, read_private, write_private};
+use crate::config::settings_store::locked;
+use crate::config::settings_store::{locked_cancellable, read_private, write_private};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;

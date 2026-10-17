@@ -9,7 +9,7 @@
 //! banner and opens the browser, while `dial login <provider>` can also prompt on the terminal.
 use super::auth::SecretToken;
 use super::model_config::ApiProtocol;
-use crate::storage::settings_store::{
+use crate::config::settings_store::{
     locked, locked_cancellable, locked_for, read_private, write_private,
 };
 use anyhow::{Context, Result, bail, ensure};

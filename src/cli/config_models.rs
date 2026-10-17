@@ -1,5 +1,5 @@
 //! `dial config` and `dial models`: config and model commands over Dial's settings
-//! store (`storage::settings_store`) and model catalog (`llm::catalog`).
+//! store (`config::settings_store`) and model catalog (`llm::catalog`).
 //!
 //! Not implemented (no Dial subsystem): `config init-xdg` (Dial stores state under
 //! `DIAL_HOME`, not XDG), `models refresh` (the catalog is local discovery only),
@@ -7,11 +7,11 @@
 //! registry).
 
 use crate::cli::models_recommend;
+use crate::config::paths::Layout;
+use crate::config::settings_store::{self, Change, Scope};
 use crate::config::types::Config;
 use crate::llm::catalog::{self, ModelEntry};
 use crate::llm::model_config::ModelSelection;
-use crate::storage::paths::Layout;
-use crate::storage::settings_store::{self, Change, Scope};
 use anyhow::{Result, bail, ensure};
 use clap::{Args, Subcommand};
 use std::path::Path;
@@ -242,10 +242,24 @@ pub fn run_config_with_overlay(
     let overlay = overlay.unwrap_or_default();
     if matches!(args.action, Some(ConfigAction::Reference)) {
         if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&crate::config::settings::reference())?
-            );
+            let mut reference = crate::config::settings::reference();
+            if let Some(object) = reference.as_object_mut() {
+                object.insert(
+                    "resources".into(),
+                    serde_json::json!(crate::tools::resources::DESCRIPTORS),
+                );
+                object.insert(
+                    "native_tools".into(),
+                    crate::tools::schemas(
+                        crate::config::tools::BUILTIN,
+                        crate::config::types::EditMode::default(),
+                    )
+                    .expect("built-in schemas are valid")
+                    .into(),
+                );
+                object.insert("artifact_tool".into(), crate::tools::artifact::schema());
+            }
+            println!("{}", serde_json::to_string_pretty(&reference)?);
         } else {
             print!("{}", crate::config::settings::reference_markdown());
         }
@@ -402,7 +416,7 @@ pub fn run_models(cwd: &Path, args: &ModelsArgs, overlay: Option<toml::Table>) -
             bail!("models refresh is not supported: Dial's model catalog is local discovery only")
         }
         ModelsRoute::Status => {
-            return crate::cli::local_models::run_status(cwd, args.json, overlay);
+            return crate::stats::local_models::run_status(cwd, args.json, overlay);
         }
         ModelsRoute::Recommend => {
             let options = models_recommend::RecommendOptions {

@@ -50,7 +50,7 @@ pub fn load_or_create_token(user_dir: &Path) -> io::Result<String> {
 
 /// Writes a file that holds relay secrets: replaced atomically, owner-only on unix.
 pub(in crate::browser_relay) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    crate::storage::atomic::write_replacing(path, bytes)?;
+    crate::platform::atomic::write_replacing(path, bytes)?;
     restrict_to_owner(path)
 }
 

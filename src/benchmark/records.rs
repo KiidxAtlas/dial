@@ -154,26 +154,26 @@ impl Recorder {
             contract.schema_version == 1,
             "unsupported run contract version"
         );
-        let lock = crate::storage::settings_store::try_locked(path)?;
-        let data =
-            if resume && let Some(bytes) = crate::storage::settings_store::read_private(path)? {
-                let data: Checkpoints =
-                    serde_json::from_slice(&bytes).context("invalid benchmark checkpoint")?;
-                ensure!(
-                    data.contract == contract,
-                    "resume refused: suite, source, executable or configuration changed"
-                );
-                data
-            } else {
-                ensure!(
-                    !path.exists(),
-                    "run checkpoint already exists; select resume or a new path"
-                );
-                Checkpoints {
-                    contract,
-                    cases: BTreeMap::new(),
-                }
-            };
+        let lock = crate::config::settings_store::try_locked(path)?;
+        let data = if resume && let Some(bytes) = crate::config::settings_store::read_private(path)?
+        {
+            let data: Checkpoints =
+                serde_json::from_slice(&bytes).context("invalid benchmark checkpoint")?;
+            ensure!(
+                data.contract == contract,
+                "resume refused: suite, source, executable or configuration changed"
+            );
+            data
+        } else {
+            ensure!(
+                !path.exists(),
+                "run checkpoint already exists; select resume or a new path"
+            );
+            Checkpoints {
+                contract,
+                cases: BTreeMap::new(),
+            }
+        };
         let recorder = Self {
             _lock: lock,
             path: path.to_owned(),
@@ -206,7 +206,7 @@ impl Recorder {
         &self.data.contract
     }
     fn flush(&self) -> Result<()> {
-        crate::storage::atomic::write_private(&self.path, &serde_json::to_vec(&self.data)?)
+        crate::platform::atomic::write_private(&self.path, &serde_json::to_vec(&self.data)?)
     }
 }
 

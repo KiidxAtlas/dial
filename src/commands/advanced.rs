@@ -8,8 +8,8 @@ use super::security;
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step};
 use crate::computer;
+use crate::config::settings_store::{Change, Scope};
 use crate::security::command::SUBCOMMANDS as SECURITY_SUBCOMMANDS;
-use crate::storage::settings_store::{Change, Scope};
 use anyhow::{Result, bail};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[

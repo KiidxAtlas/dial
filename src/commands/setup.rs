@@ -8,13 +8,13 @@ use super::extensions::spawn_job_streaming;
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step, Which};
 use crate::config::Config;
+use crate::config::memory_backend::MemoryBackendId;
+use crate::config::settings_store::{Change, Scope};
 use crate::setup::deps::{self, Env, plan, recipe, run};
 use crate::setup::embeddings;
 use crate::setup::memory::{
     BACKENDS, backend_label, backend_missing, parse_backend, selected, status_summary,
 };
-use crate::storage::memory_backend::config::MemoryBackendId;
-use crate::storage::settings_store::{Change, Scope};
 use crate::ui::overlay::palette::{ChoiceItem, ChoiceSpec};
 use anyhow::Result;
 use std::sync::Arc;

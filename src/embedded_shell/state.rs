@@ -71,12 +71,12 @@ impl Exchange {
         seed.validate()?;
         let mut seed = seed.clone();
         seed.completed = false;
-        crate::storage::settings_store::private_dir(scratch).map_err(|error| error.to_string())?;
+        crate::config::settings_store::private_dir(scratch).map_err(|error| error.to_string())?;
         let path = scratch.join(format!(
             "dial-shell-state-{:032x}.json",
             rand::random::<u128>()
         ));
-        crate::storage::settings_store::write_private(
+        crate::config::settings_store::write_private(
             &path,
             &serde_json::to_vec(&seed).map_err(|error| error.to_string())?,
         )
@@ -96,7 +96,7 @@ impl Drop for Exchange {
     }
 }
 pub fn read(path: &Path) -> Result<State, String> {
-    let bytes = crate::storage::settings_store::read_private(path)
+    let bytes = crate::config::settings_store::read_private(path)
         .map_err(|error| error.to_string())?
         .ok_or("embedded shell state exchange is missing")?;
     if bytes.len() > 256 * 1024 {

@@ -14,7 +14,7 @@
 //! are tested on every platform.
 
 use super::{Snapshot, stamp};
-use crate::{agent::agent_defs::TaskConfig, workspace_copy::is_excluded_source_path};
+use crate::{config::task::TaskConfig, workspace_copy::is_excluded_source_path};
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeSet,

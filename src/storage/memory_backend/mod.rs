@@ -1,5 +1,5 @@
 //! Mutually exclusive, session-owned memory backends. Provenance remains a separate lexical backend.
-pub mod config;
+
 #[cfg(unix)]
 pub mod files;
 #[cfg(windows)]
@@ -20,11 +20,11 @@ pub fn managed_root(layout: &Layout) -> std::path::PathBuf {
         .join("managed-skills")
 }
 
-use super::paths::Layout;
+use crate::config::memory_backend::{MemoryBackendId, MemoryScoping};
+use crate::config::paths::Layout;
 use crate::config::types::MemoryConfig;
 use anyhow::{Context, Result, ensure};
 use base64::Engine;
-use config::{MemoryBackendId, MemoryScoping};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -568,7 +568,7 @@ impl MemoryRuntime {
         authority: MemoryAuthority,
     ) -> Result<Arc<Self>> {
         let memory = &config.memory;
-        config::validate(memory)?;
+        crate::config::memory_backend::validate(memory)?;
         let scope = bank_scope(layout, memory);
         let embedding = if memory.backend == MemoryBackendId::Semantic {
             semantic::role_from_config(config)

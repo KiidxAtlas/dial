@@ -1,13 +1,10 @@
 //! Versioned newline-delimited JSON control protocol. Stdin is control, stdout is JSON only.
-use crate::{
-    agent::{Agent, Decision, Ui, make_backend, todo::TodoList},
-    config::types::Config,
-    storage::{
-        paths::Layout,
-        session::{Session, SessionMeta},
-    },
-    tools::ToolOutput,
-};
+use crate::agent::todo::TodoList;
+use crate::agent::{Agent, Decision, Ui, make_backend};
+use crate::config::paths::Layout;
+use crate::config::types::Config;
+use crate::storage::session::{Session, SessionMeta};
+use crate::tools::ToolOutput;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{
@@ -1060,7 +1057,7 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                             )
                         }
                         "compact" => {
-                            let mut options: crate::agent::compaction::CompactionOptions =
+                            let mut options: crate::config::compaction::CompactionOptions =
                                 if params.is_null() {
                                     Default::default()
                                 } else {
@@ -1069,7 +1066,7 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                                 };
                             anyhow::ensure!(
                                 options.reason
-                                    == crate::agent::compaction::CompactionReason::Manual,
+                                    == crate::config::compaction::CompactionReason::Manual,
                                 "RPC compact accepts only manual maintenance; automatic reasons are owned by the actor"
                             );
                             options.suppress_continuation = true;

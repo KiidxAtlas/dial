@@ -10,12 +10,15 @@
 //!
 //! Raw request/tool rows are rolled up per hour, project and model (or tool) in the same
 //! transaction that records them, so range queries read only the rollups and stay exact.
+use crate::config::stats::StatsConfig;
+
+pub mod local_models;
 pub mod server;
 
 use crate::platform;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -25,30 +28,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const DEFAULT_PORT: u16 = 3847;
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
 /// Transcript lines longer than this are skipped while counting (they are tool payloads).
 const MAX_LINE: usize = 8 * 1024 * 1024;
-
-/// `[stats]`: local usage ledger and dashboard.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct StatsConfig {
-    /// Record per-request and per-tool usage into the local stats database.
-    pub enabled: bool,
-    /// Dashboard port for `dial stats --serve` (loopback only).
-    pub port: u16,
-}
-
-impl Default for StatsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            port: DEFAULT_PORT,
-        }
-    }
-}
 
 pub fn db_path(user_dir: &Path) -> PathBuf {
     user_dir.join("stats.sqlite3")

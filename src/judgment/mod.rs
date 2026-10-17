@@ -209,7 +209,7 @@ pub fn judge_config(config: &Config) -> Config {
 pub fn judge_uses_laya(config: &Config) -> bool {
     config
         .role_selection("judge")
-        .is_some_and(|selection| selection.provider == crate::agent::laya::PROVIDER)
+        .is_some_and(|selection| selection.provider == crate::config::laya::PROVIDER)
 }
 
 /// Days a judged thinking choice stays valid before it is asked again.
@@ -237,13 +237,13 @@ pub fn judge_turn_thinking(
     };
     if judge_uses_laya(main) {
         let config = main.laya_service();
-        let checkpoint = crate::agent::laya::expected_checkpoint(&config).ok_or_else(|| {
+        let checkpoint = crate::config::laya::expected_checkpoint(&config).ok_or_else(|| {
             anyhow!(
                 "the judge role uses Laya, but no Laya checkpoint is installed or assigned to the decision role"
             )
         })?;
         // The checkpoint is the model identity: a new checkpoint is asked again instead of hitting the cache.
-        let model = format!("{}:{checkpoint}", crate::agent::laya::PROVIDER);
+        let model = format!("{}:{checkpoint}", crate::config::laya::PROVIDER);
         return judge_thinking(
             cache.as_ref(),
             &mut LayaBackend { config, cancel },
@@ -312,7 +312,7 @@ impl Backend for ProviderBackend<'_> {
 /// Laya backend: one typed `choice` prediction from Dial's managed Laya service. Laya validates the choice
 /// itself and runs locally, so answers carry no provider price.
 pub struct LayaBackend {
-    pub config: crate::agent::laya::Config,
+    pub config: crate::config::laya::Config,
     pub cancel: Arc<AtomicBool>,
 }
 

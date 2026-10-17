@@ -3,10 +3,10 @@
 //! Reads weights, `config.json` or the GGUF header, and recorded `dial reliability check` reports
 //! from disk. It loads no model and makes no network calls. Estimates come from `llm::local_fit`.
 
+use crate::config::paths::Layout;
 use crate::config::types::Config;
 use crate::llm::catalog;
 use crate::llm::local_fit::{self, Architecture, Estimate, Fit};
-use crate::storage::paths::Layout;
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use serde_json::Value;

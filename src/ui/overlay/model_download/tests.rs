@@ -1,6 +1,6 @@
 use super::*;
-use crate::cli::local_models::{Improvement, Memory};
 use crate::stats::DecodeSpeed;
+use crate::stats::local_models::{Improvement, Memory};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn key(code: KeyCode) -> KeyEvent {

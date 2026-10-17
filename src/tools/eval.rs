@@ -1,4 +1,6 @@
 //! Owner-local persistent Node code execution. The OS sandbox is the security boundary.
+use crate::config::tools::eval::EvalConfig;
+
 use super::ext::{Tool, ToolCallback, ToolContext, ToolEvent};
 use super::kernel::{
     ActiveGuard, FORK_FENCE, MAX_CODE, NativeProcess, check_operation, code_output, deadline,
@@ -9,7 +11,6 @@ use super::shell::shell_command;
 use super::{ToolOutput, tool_schema};
 use crate::config::types::Config;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -17,23 +18,6 @@ use std::sync::{
 };
 
 const DRIVER: &str = include_str!("eval_driver.cjs");
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct EvalConfig {
-    /// Operator-installed Node executable, never a workspace-owned program.
-    pub node: String,
-    /// Whole-operation cap; zero disables the cap, not cancellation or containment.
-    pub timeout_secs: u64,
-}
-impl Default for EvalConfig {
-    fn default() -> Self {
-        Self {
-            node: "node".into(),
-            timeout_secs: 0,
-        }
-    }
-}
 
 pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(EvalTool::new(config.eval.clone()))]

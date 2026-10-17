@@ -756,7 +756,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Semantic memory",
         "Embedding model",
         "Enter picks the embedding role (Alt+M): discovered embedding models, or a curated Ollama model to set up (Ctrl+L). A typed name here is an advanced OpenAI-compatible override that needs the Embedding service URL too.",
-        Kind::Choice(crate::setup::embeddings::CHOICES),
+        Kind::Choice(crate::config::embeddings::CHOICES),
         false
     ),
     field!(

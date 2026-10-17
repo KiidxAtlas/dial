@@ -90,7 +90,7 @@ Changing a rule means editing that test and stating why here.
   parser formats (`json_tools`, `gemma4`, `function_gemma`, `glm47`, `mistral`; see
   `python/dial_tool_grammar.py`); it never alters free text or thinking, falls back to
   unconstrained sampling at a dead end, and does not replace Rust-side argument validation.
-- Per-project state and secrets live outside the editable workspace (`storage/paths.rs`).
+- Per-project state and secrets live outside the editable workspace (`config/paths.rs`).
 
 ## Checks
 
@@ -135,7 +135,8 @@ Lib tests report timings with `RUSTC_BOOTSTRAP=1 target/debug/deps/dial-<hash> -
 - Embedding setup uses the same model-selection writer as other role pickers. Switching to a
   local role clears stale remote endpoint/auth fields without clearing explicit embedding overrides.
 - `llm/download.rs` owns inference acquisition and quantization planning. The `learn/download.rs` re-export preserves the earlier Rust import path, not learning ownership. Callers supply cancellation and progress; cached discovery does not fetch weights.
-- `storage/atomic.rs` owns publication mechanics with distinct private-state, workspace-replacement and mode-preserving policies. Ownership/link checks and platform durability constraints are not interchangeable.
+- `platform/atomic.rs` owns publication mechanics with distinct private-state, workspace-replacement and mode-preserving policies. Ownership/link checks and platform durability constraints are not interchangeable.
+- Configuration owns its own types, defaults and persistence (`config/settings_store.rs`, `config/paths.rs`, per-domain `config/*.rs`). Feature modules consume configuration; configuration never imports agent, tools, storage or app code.
 - CI records runtime-journal overhead and markdown/terminal encoding p95 without imposing a host-dependent speed threshold.
 - RPC has one state projector for worker and cached queries. Typed notices expose their lane;
   ACP preserves source metadata in `_meta.dial` without requiring clients to change text handling.

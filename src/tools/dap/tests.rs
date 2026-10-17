@@ -1,3 +1,6 @@
+use crate::config::tools::dap::DapAdapterConfig;
+use crate::config::tools::dap::DapTransport;
+
 use super::*;
 #[cfg(unix)]
 use std::fs;

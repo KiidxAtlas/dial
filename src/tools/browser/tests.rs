@@ -1,3 +1,5 @@
+use crate::config::tools::browser::BrowserConfig;
+
 use super::*;
 use std::time::Instant;
 #[test]

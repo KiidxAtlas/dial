@@ -1,6 +1,7 @@
 //! Project-scoped, bounded experience from observed calls and passing executable checks.
 //! Retrieval is advisory. Recipes recheck each step's hashes and use ordinary tool approvals.
-use super::{memory::screen, paths::Layout};
+use crate::config::paths::Layout;
+use crate::storage::memory::screen;
 use crate::tools::Workspace;
 use anyhow::{Result, ensure};
 use parking_lot::Mutex;
