@@ -462,8 +462,11 @@ fn primary_intent(b: &Browser, key: char) -> Option<Intent> {
         (Tab::Mcp, 'i', false) if row.origin == Origin::Curated => {
             Some(Intent::InstallCuratedMcp { id: row.id.clone() })
         }
+        // The first listing decides how a merged row installs: Smithery through its settings
+        // form, every other remote listing through the shared resolver.
         (Tab::Mcp, 'i', false)
-            if row.origin == Origin::Remote && row.tags.iter().any(|tag| tag == "official") =>
+            if row.origin == Origin::Remote
+                && row.tags.first().map(String::as_str) != Some("smithery") =>
         {
             Some(Intent::InstallMcp {
                 id: row.id.clone(),

@@ -25,8 +25,11 @@
 
 pub mod catalog;
 mod client;
+mod fetch;
+mod github;
 mod http;
 mod inventory;
+mod npm;
 pub mod registry;
 pub mod smithery;
 pub use http::validate_url;

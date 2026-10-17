@@ -6,7 +6,9 @@
 //! isLatest}}}], "metadata":{"nextCursor"}}`. Each package has `registryType` (`npm`, `pypi`, `oci`),
 //! `identifier`, `version`, `transport.type` and `environmentVariables[]`; each remote has `type`
 //! (`streamable-http` or `sse`), `url` and `headers[]`.
-use super::catalog::{Candidate, Input, Install, Source, cache_env, looks_secret};
+use super::catalog::{
+    Candidate, Input, Install, Source, cache_env, looks_secret, normalize_repository,
+};
 use super::smithery::safe_metadata;
 use crate::config::types::{McpServerConfig, McpTransport};
 use anyhow::{Context, Result, anyhow, bail};
@@ -150,6 +152,10 @@ pub fn from_entry(entry: &Value, user_dir: &Path) -> Option<Candidate> {
         badges: Vec::new(),
         install,
         inputs,
+        repository: server
+            .pointer("/repository/url")
+            .and_then(Value::as_str)
+            .and_then(normalize_repository),
     })
 }
 
