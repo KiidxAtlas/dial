@@ -43,23 +43,24 @@ jobs:
       - name: Verify Linux sandbox enforcement
         if: runner.os == 'Linux'
         timeout-minutes: 10
-        run: cargo test --locked --profile ci linux_sandbox_enforces_filesystem_and_both_network_modes
+        run: cargo test --locked --profile ci --workspace linux_sandbox_enforces_filesystem_and_both_network_modes
       - name: Format
         run: cargo fmt --check
       - name: Build
         # The `dial` library and its unit-test build each peak near 5 GB in rustc. Built together
         # they exceed the 7 GB macOS arm64 runner and swap (11-16 min); one at a time they fit.
+        # Workspace crates (crates/dial-*) are built one lib target at a time for the same reason.
         # The `ci` profile drops debug info, which cuts rustc memory, link time and cache size.
         run: |
-          cargo build --locked --profile ci --lib
-          cargo test --locked --profile ci --lib --no-run
-          cargo build --locked --profile ci --all-targets
+          cargo build --locked --profile ci --workspace --lib
+          cargo test --locked --profile ci --workspace --lib --no-run
+          cargo build --locked --profile ci --workspace --all-targets
       - name: Test
         # Parallel: tests that change process HOME/PATH hold a shared lock; process fixtures set
         # their environment per child. Serial execution made the lib tests ~4x slower.
         run: make test-rust TEST_PROFILE=ci
       - name: Check slim build
-        run: cargo check --locked --profile ci --no-default-features --bin dial
+        run: cargo check --locked --profile ci --no-default-features -p dial --bin dial
       - name: Install executable and verify artifact contracts
         timeout-minutes: 10
         run: |
@@ -96,7 +97,7 @@ jobs:
         with:
           key: lint
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
+        run: cargo clippy --locked --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check

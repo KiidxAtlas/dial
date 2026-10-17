@@ -1,6 +1,6 @@
 # Provider and model catalog
 
-Dial bundles the provider registry and model pricing/capability cards in `src/llm/catalog/` (`providers.json` and `models.json`). This is Dial's own data, maintained in place: edit the JSON files directly and keep them valid. Each file's `source` header identifies the bundle. Third-party attribution for the catalog data is in `THIRD_PARTY_NOTICES` at the repository root.
+Dial bundles the provider registry and model pricing/capability cards in `crates/dial-llm/src/llm/catalog/` (`providers.json` and `models.json`). This is Dial's own data, maintained in place: edit the JSON files directly and keep them valid. Each file's `source` header identifies the bundle. Third-party attribution for the catalog data is in `THIRD_PARTY_NOTICES` at the repository root.
 
 `catalog::provider_endpoint` resolves known provider IDs to base URL, credential environment variable, and wire protocol. Selecting a bundled provider (for example `together` or `fireworks`) therefore needs only its own API key in the environment, without a local `[providers.*]` endpoint stanza. Credentials remain bound to the provider's configured origin; Dial does not forward a provider key to a different host.
 

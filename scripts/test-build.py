@@ -70,7 +70,7 @@ class BuildTests(unittest.TestCase):
             path.write_bytes(b"old executable")
             path.chmod(0o755)
         self.make("update")
-        self.assertEqual(self.arguments(), ["build", "--bin", "dial", "--profile", "local", "--locked", "--timings"])
+        self.assertEqual(self.arguments(), ["build", "-p", "dial", "--bin", "dial", "--profile", "local", "--locked", "--timings"])
         for path in targets:
             self.assertEqual(path.read_bytes(), BINARY)
             backups = list(path.parent.glob(path.name + ".bak-*"))
@@ -80,7 +80,7 @@ class BuildTests(unittest.TestCase):
 
     def test_slim_features_and_dev_install_path(self):
         self.make("update", "SLIM=1", "FEATURES=aws,desktop", "PROFILE=dev")
-        self.assertEqual(self.arguments(), ["build", "--bin", "dial", "--profile", "dev", "--locked", "--timings", "--no-default-features", "--features", "aws,desktop"])
+        self.assertEqual(self.arguments(), ["build", "-p", "dial", "--bin", "dial", "--profile", "dev", "--locked", "--timings", "--no-default-features", "--features", "aws,desktop"])
         self.assertEqual((self.install / "dial").read_bytes(), BINARY)
         self.assertEqual((self.cache / "debug/dial").read_bytes(), BINARY)
 

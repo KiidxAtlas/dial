@@ -138,15 +138,24 @@ fallback chains are in [docs/model-routing.md](docs/model-routing.md).
 
 ## Source layout
 
+Dial is a Cargo workspace. The root package `dial` holds the binary (`src/main.rs`, `src/cmd/`) and a
+facade library (`src/lib.rs`) that re-exports every crate module, so `dial::<module>` paths keep working.
+Each crate's modules live under `crates/<crate>/src/`:
+
 ```
-src/agent/    agent loop, system prompt, project context, todo, typed subagents, approvals
-src/tools/    Workspace + built-ins (files, search, shell, hashline, sandbox) and pluggable tools
-              (ext.rs registry: bg, web, lsp, ast, mcp)
-src/llm/      backends, providers, catalog, auth, local model servers (MLX, GGUF), tool-call parsing
-src/learn/    self-improvement: curriculum, harvest, mutate, probe, gate, worker, verify
-src/storage/  sessions, memory, skills, checkpoints, SQLite store, paths, settings
-src/config/   configuration types and validation
-src/ui/       terminal renderer, composer, themes, overlays
+crates/dial-build-info/  build_info
+crates/dial-core/        runtime, platform, output, workspace_copy
+crates/dial-llm/         config, llm (backends, providers, catalog, auth, local model servers)
+crates/dial-storage/     storage (sessions, memory, skills, checkpoints, SQLite store, settings)
+crates/dial-tools/       tools (workspace and built-ins, sandbox, extension registry), security, setup, voice
+crates/dial-computer/    computer (desktop capture, accessibility, input)
+crates/dial-agent/       agent (agent loop, subagents, approvals), learn, commit, steering
+crates/dial-ui/          ui (terminal renderer, composer, overlays), git_panel; themes in `crates/dial-ui/themes/`
+crates/dial-app/         app, commands, cli, benchmark, repl, rpc, acp, schedule, collab
 ```
+
+Build, test, and lint across the whole workspace with `make test-lib`, `make lint`, or
+`cargo test --workspace --lib <filter>`. Run the tests of one module with `make test-module MOD=llm::provider`,
+which searches every crate. Build only the shipped binary with `cargo build -p dial`.
 
 Adding a tool: implement `tools::ext::Tool` in its own module, return it from a `tools()` constructor, and list it in `Registry::standard`.

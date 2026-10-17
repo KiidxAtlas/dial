@@ -28,7 +28,7 @@ help:
 		'make build    Build locally with timings (SLIM=1 omits optional integrations; PROFILE=release for shipping)' \
 		'make check    Check Rust compilation' \
 		'make test     Run the Rust tests' \
-		'make test-lib Run library unit tests without building the CLI/integration targets' \
+		'make test-lib Run every workspace crate'"'"'s library unit tests (no CLI/integration targets)' \
 		'make test-integration  Run the single integration test binary (tests/integration)' \
 		'make test-module MOD=llm::provider  Run lib tests under one module path' \
 		'make lint     Run clippy with the CI lint gate' \
@@ -40,7 +40,7 @@ help:
 
 update:
 	$(PYTHON) scripts/install-dev.py check --keep "$(KEEP_BACKUPS)"
-	$(CARGO) build --bin dial --profile $(PROFILE) --locked --timings $(CARGO_FEATURE_FLAGS)
+	$(CARGO) build -p dial --bin dial --profile $(PROFILE) --locked --timings $(CARGO_FEATURE_FLAGS)
 	mkdir -p bin "$(INSTALL_DIR)"
 	$(PYTHON) scripts/install-dev.py install --keep "$(KEEP_BACKUPS)" --build "$(BUILD_DIR)/dial" --bin-target bin/dial --install-dir "$(INSTALL_DIR)" --cargo-bin "$(HOME)/.cargo/bin/dial"
 	@active="$$(command -v dial 2>/dev/null)"; \
@@ -56,29 +56,29 @@ update:
 install: update
 
 build:
-	$(CARGO) build --bin dial --profile $(PROFILE) --locked --timings $(CARGO_FEATURE_FLAGS)
+	$(CARGO) build -p dial --bin dial --profile $(PROFILE) --locked --timings $(CARGO_FEATURE_FLAGS)
 
 check:
-	$(CARGO) check --locked $(CARGO_FEATURE_FLAGS)
+	$(CARGO) check --locked --workspace $(CARGO_FEATURE_FLAGS)
 
 test: test-rust
 
 test-rust:
-	$(CARGO) test --locked --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
+	$(CARGO) test --locked --workspace --profile $(TEST_PROFILE) $(CARGO_FEATURE_FLAGS)
 
 test-lib:
-	$(CARGO) test --locked --lib $(CARGO_FEATURE_FLAGS)
+	$(CARGO) test --locked --workspace --lib $(CARGO_FEATURE_FLAGS)
 
 test-integration:
-	$(CARGO) test --locked --test integration $(CARGO_FEATURE_FLAGS)
+	$(CARGO) test --locked -p dial --test integration $(CARGO_FEATURE_FLAGS)
 
-# Fast loop for one lib module: make test-module MOD=llm::provider
+# Fast loop for one lib module: make test-module MOD=llm::provider (searches every workspace crate)
 test-module:
 	@test -n "$(MOD)" || { printf '%s\n' 'Usage: make test-module MOD=llm::provider' >&2; exit 2; }
-	$(CARGO) test --locked --lib $(CARGO_FEATURE_FLAGS) $(MOD)
+	$(CARGO) test --locked --workspace --lib $(CARGO_FEATURE_FLAGS) $(MOD)
 
 lint:
-	$(CARGO) clippy --locked --all-targets $(CARGO_FEATURE_FLAGS) -- -D clippy::correctness -D clippy::suspicious
+	$(CARGO) clippy --locked --workspace --all-targets $(CARGO_FEATURE_FLAGS) -- -D clippy::correctness -D clippy::suspicious
 
 test-python:
 	HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m pytest -rs python/test_*.py

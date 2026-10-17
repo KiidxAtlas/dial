@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the focused Windows Rust contract listed in scripts/windows-contract.txt.
 
-Each `test` line runs one `cargo test --lib <filter>` invocation; every `skip` line is passed to
+Each `test` line runs one `cargo test --workspace --lib <filter>` invocation; every `skip` line is passed to
 libtest as `--skip` and printed with its reason, so excluded coverage is never silent.
 `--print` shows the commands without running them.
 """
@@ -51,7 +51,7 @@ def main():
 
     skip_args = [arg for name, _ in skips for arg in ("--skip", name)]
     for filter_name in tests:
-        command = ["cargo", "test", "--locked", "--profile", args.profile, "--lib",
+        command = ["cargo", "test", "--locked", "--profile", args.profile, "--workspace", "--lib",
                    filter_name, "--", *skip_args]
         print("+ " + " ".join(command), flush=True)
         if args.dry_run:
