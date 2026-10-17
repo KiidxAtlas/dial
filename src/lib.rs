@@ -19,7 +19,7 @@ pub mod rpc;
 pub mod schedule;
 pub mod security;
 pub mod setup;
-pub mod storage;
+pub use dial_storage::storage;
 pub mod tools;
 pub mod ui;
 

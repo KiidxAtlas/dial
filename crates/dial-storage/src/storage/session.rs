@@ -1470,7 +1470,7 @@ impl Session {
     }
 
     /// Runtime progress does not change memory input; actual history and control changes do.
-    pub(crate) fn memory_revision(&self) -> Option<&str> {
+    pub fn memory_revision(&self) -> Option<&str> {
         self.active
             .maintenance_revision
             .map(|index| self.entries[index].id.as_str())

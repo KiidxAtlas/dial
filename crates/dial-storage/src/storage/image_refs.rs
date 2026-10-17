@@ -94,7 +94,7 @@ pub fn is_sha256_hex(sha: &str) -> bool {
 
 /// Register an image for `session_id`. Identical bytes share one blob and one entry; the session
 /// is added to the entry's references and the serving window is re-armed.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn register(
     user_dir: &Path,
     session_id: &str,

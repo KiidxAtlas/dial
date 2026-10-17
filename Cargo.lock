@@ -1787,6 +1787,7 @@ dependencies = [
  "dial-build-info",
  "dial-core",
  "dial-llm",
+ "dial-storage",
  "encoding_rs",
  "enigo",
  "fancy-regex 0.16.2",
@@ -1914,6 +1915,33 @@ dependencies = [
  "ureq",
  "url",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "dial-storage"
+version = "0.1.9"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "dial-core",
+ "dial-llm",
+ "flate2",
+ "fs2",
+ "image",
+ "libc",
+ "parking_lot",
+ "rand 0.9.5",
+ "regex",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "similar",
+ "tempfile",
+ "ureq",
+ "url",
+ "zip",
 ]
 
 [[package]]

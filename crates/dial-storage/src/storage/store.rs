@@ -222,7 +222,7 @@ fn valid_report(report: &Admission) -> bool {
 
 impl Store {
     /// A separate observational connection for background UI status; never runs migrations or writes.
-    pub(crate) fn open_read_only(state_dir: &Path) -> Result<Self> {
+    pub fn open_read_only(state_dir: &Path) -> Result<Self> {
         let path = state_dir.join("state.sqlite3");
         let file =
             platform_fs::open_nofollow_nonblocking(fs::OpenOptions::new().read(true), &path)?;

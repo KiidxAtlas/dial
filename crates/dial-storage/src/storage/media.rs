@@ -8,7 +8,7 @@ use std::io::Write;
 /// Transfer authorized images into immutable storage before journaling or inference. Source paths
 /// remain provenance and authorization witnesses; only the snapshot supplies historical pixels.
 /// A failed capture is recorded explicitly rather than silently substituting newer source bytes.
-pub(crate) fn retain_message(message: &mut Value, store: &crate::storage::artifact::ArtifactStore) {
+pub fn retain_message(message: &mut Value, store: &crate::storage::artifact::ArtifactStore) {
     retain(message, Some(store));
 }
 
