@@ -1,0 +1,68 @@
+{
+  "name": "nord",
+  "description": "Cool arctic dark",
+  "extends": "dark",
+  "dark": true,
+  "vars": {
+    "frost": "#88c0d0",
+    "blue": "#81a1c1",
+    "deep": "#5e81ac",
+    "green": "#a3be8c",
+    "red": "#bf616a",
+    "yellow": "#ebcb8b",
+    "purple": "#b48ead",
+    "fg": "#d8dee9",
+    "gray": "#7b88a1",
+    "dim": "#4c566a"
+  },
+  "colors": {
+    "muted": "gray",
+    "dim": "dim",
+    "accent": "frost",
+    "border": "dim",
+    "borderAccent": "frost",
+    "borderMuted": "#3b4252",
+    "success": "green",
+    "error": "red",
+    "warning": "yellow",
+    "selectedBg": "#3b4252",
+    "userBg": "#2e3440",
+    "userText": "#eceff4",
+    "toolPendingBg": "#2b303b",
+    "toolSuccessBg": "#2a3330",
+    "toolErrorBg": "#3a2b30",
+    "toolTitle": {
+      "fg": "fg",
+      "bold": true
+    },
+    "toolOutput": "#a3adc2",
+    "thinkingText": {
+      "fg": "gray",
+      "italic": true
+    },
+    "mdHeading": {
+      "fg": "frost",
+      "bold": true
+    },
+    "mdLink": {
+      "fg": "blue",
+      "underline": true
+    },
+    "mdCode": "yellow",
+    "mdCodeBlock": "fg",
+    "mdBullet": "frost",
+    "diffAdded": "green",
+    "diffRemoved": "red",
+    "statusBg": "#242933",
+    "statusModel": "purple",
+    "statusPath": "blue",
+    "statusGitClean": "green",
+    "statusGitDirty": "yellow",
+    "statusContext": "frost",
+    "statusTokens": "fg",
+    "statusRate": "frost",
+    "statusApproval": "yellow",
+    "statusSandbox": "green",
+    "statusLearning": "purple"
+  }
+}

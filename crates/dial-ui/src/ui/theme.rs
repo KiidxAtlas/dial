@@ -551,7 +551,7 @@ impl Theme {
     pub fn light() -> Theme {
         Self::builtin("light").expect("embedded light theme is valid")
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn mono() -> Theme {
         Self::builtin("mono").expect("embedded mono theme is valid")
     }

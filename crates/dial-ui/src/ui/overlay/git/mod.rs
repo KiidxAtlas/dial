@@ -86,7 +86,7 @@ pub struct GitOverlay {
 
 impl GitOverlay {
     /// Opens the panel on the working tree, or on `revision` (read-only) when one is given.
-    pub(crate) fn open(repo: Repo, revision: Option<&str>) -> Result<Self, String> {
+    pub fn open(repo: Repo, revision: Option<&str>) -> Result<Self, String> {
         let (commit, mut changes) = match revision {
             None => (None, repo.status()?),
             Some(rev) => {

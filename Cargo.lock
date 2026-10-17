@@ -1791,6 +1791,7 @@ dependencies = [
  "dial-llm",
  "dial-storage",
  "dial-tools",
+ "dial-ui",
  "encoding_rs",
  "enigo",
  "fancy-regex 0.16.2",
@@ -2081,6 +2082,35 @@ dependencies = [
  "windows 0.62.2",
  "windows-sys 0.61.2",
  "zip",
+]
+
+[[package]]
+name = "dial-ui"
+version = "0.1.9"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "crossterm",
+ "dial-agent",
+ "dial-core",
+ "dial-llm",
+ "dial-storage",
+ "dial-tools",
+ "ignore",
+ "image",
+ "libc",
+ "notify",
+ "parking_lot",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.9.12+spec-1.1.0",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
+ "url",
+ "vt100",
 ]
 
 [[package]]

@@ -1,0 +1,48 @@
+{
+  "name": "paper",
+  "description": "Warm, high-contrast light",
+  "extends": "light",
+  "dark": false,
+  "vars": {
+    "ink": "#1c1917",
+    "brown": "#9a3412",
+    "teal": "#0f766e",
+    "green": "#166534",
+    "red": "#991b1b",
+    "blue": "#1e40af",
+    "gray": "#57534e"
+  },
+  "colors": {
+    "muted": "gray",
+    "accent": "brown",
+    "borderAccent": "brown",
+    "success": "green",
+    "error": "red",
+    "warning": "brown",
+    "selectedBg": "#fde68a",
+    "userBg": "#f5f0e6",
+    "userText": "ink",
+    "toolPendingBg": "#f7f3ea",
+    "toolSuccessBg": "#eef5e8",
+    "toolErrorBg": "#fbeaea",
+    "toolTitle": {
+      "fg": "ink",
+      "bold": true
+    },
+    "toolOutput": "gray",
+    "mdHeading": {
+      "fg": "brown",
+      "bold": true
+    },
+    "mdLink": {
+      "fg": "teal",
+      "underline": true
+    },
+    "mdCode": "brown",
+    "mdBullet": "brown",
+    "statusBg": "#ebe4d4",
+    "statusModel": "blue",
+    "statusPath": "teal",
+    "statusLearning": "blue"
+  }
+}
