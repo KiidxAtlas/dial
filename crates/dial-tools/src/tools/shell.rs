@@ -163,7 +163,7 @@ impl Drop for ForegroundJob {
 }
 
 // Compatibility path for existing process-owning adapters.
-pub(crate) use crate::runtime::process::ProcessGroup;
+pub use crate::runtime::process::ProcessGroup;
 
 /// Keeps the first and last bytes of a stream, counting what was dropped, plus the diagnostic lines
 /// (errors, panics, failed tests) found in the dropped middle.

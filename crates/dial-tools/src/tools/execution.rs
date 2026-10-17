@@ -12,7 +12,7 @@ use std::{cell::RefCell, path::PathBuf};
 
 thread_local! { static MUTATION: RefCell<Option<crate::runtime::cancellation::MutationCancellation>> = const { RefCell::new(None) }; }
 
-pub(crate) fn mutation_scope<R>(
+pub fn mutation_scope<R>(
     scope: &crate::runtime::cancellation::MutationCancellation,
     action: impl FnOnce() -> R,
 ) -> R {
@@ -51,13 +51,13 @@ pub(crate) fn unsettled() {
 }
 use crate::runtime::execution::Capture;
 
-pub(crate) fn before_start() -> ToolOutput {
+pub fn before_start() -> ToolOutput {
     ToolOutput::err("interrupted by the user before this ran")
         .with_status(ToolStatus::Aborted)
         .with_effects(Effects::None)
 }
 
-pub(crate) fn with_dispatch(
+pub fn with_dispatch(
     tool: &dyn super::ext::Tool,
     context: &ToolContext<'_>,
     args: &Value,
@@ -90,7 +90,7 @@ pub(crate) fn with_dispatch(
     })
 }
 
-pub(crate) fn run(cancel: &AtomicBool, action: impl FnOnce() -> ToolOutput) -> ToolOutput {
+pub fn run(cancel: &AtomicBool, action: impl FnOnce() -> ToolOutput) -> ToolOutput {
     if cancel.load(Ordering::SeqCst) {
         return before_start();
     }
@@ -127,7 +127,7 @@ pub(crate) fn run(cancel: &AtomicBool, action: impl FnOnce() -> ToolOutput) -> T
 
 /// Ordinary tools only. Controller-owned tools (memory, task, checkpoints, approvals) cannot be
 /// reached through this function and must re-enter their owning controller for callbacks.
-pub(crate) fn native(
+pub fn native(
     context: &ToolContext<'_>,
     registry: &Registry,
     name: &str,

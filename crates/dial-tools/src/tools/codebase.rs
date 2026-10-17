@@ -1064,7 +1064,7 @@ impl Codebase {
 
     /// Persist task findings only while the supporting indexed sources still match.
     /// These remain untrusted agent findings, never outcomes or training labels.
-    pub(crate) fn remember_investigation(
+    pub fn remember_investigation(
         &self,
         question: &str,
         finding: &str,

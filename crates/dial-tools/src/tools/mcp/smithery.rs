@@ -335,11 +335,7 @@ fn registry_search_url(base: &str, keyword: &str, page_size: usize, page: usize)
     Ok(url.to_string())
 }
 
-pub(crate) fn resolve_entry(
-    registry: &str,
-    entry: &Value,
-    key: Option<&str>,
-) -> Option<SearchResult> {
+pub fn resolve_entry(registry: &str, entry: &Value, key: Option<&str>) -> Option<SearchResult> {
     for candidate in candidate_paths(entry) {
         if let Ok(Some(details)) = fetch_details_at(registry, &candidate, key) {
             return to_search_result(entry, &details);
@@ -915,7 +911,7 @@ pub fn validate_key(key: &str) -> Result<()> {
     validate_key_at(&registry_url(), key)
 }
 
-pub(crate) fn validate_key_at(registry: &str, key: &str) -> Result<()> {
+pub fn validate_key_at(registry: &str, key: &str) -> Result<()> {
     let opts = SearchOptions {
         limit: 1,
         api_key: Some(key.to_owned()),

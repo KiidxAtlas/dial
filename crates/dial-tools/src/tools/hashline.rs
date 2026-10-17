@@ -604,7 +604,7 @@ fn close_section(section: Section, out: &mut Vec<Section>) -> Result<(), String>
 
 /// Submitted literal source fragments for pre-execution structural guidance. This uses the
 /// actual patch grammar without opening files or resolving mutable source registers.
-pub(crate) fn proposed_sources(input: &str) -> Result<Vec<(String, String)>, String> {
+pub fn proposed_sources(input: &str) -> Result<Vec<(String, String)>, String> {
     let mut sources = Vec::new();
     for section in parse_patch(input)? {
         for op in section.ops {

@@ -52,7 +52,7 @@ struct Hunk<'a> {
 /// only the chosen hunk, with its counts recomputed from the emitted body and its original start values
 /// kept (swapped for `reverse`). Returns `None` when the hunk does not exist or the selection contains no
 /// changed line.
-pub(crate) fn line_patch(
+pub fn line_patch(
     file_patch: &str,
     hunk: usize,
     selected: &[usize],
@@ -121,7 +121,7 @@ pub(crate) fn line_patch(
 
 /// Split one file's `git diff` text into its header (everything before the first hunk, verbatim) and
 /// each hunk's text verbatim, header line through last body line. Returns `None` when there is no hunk.
-pub(crate) fn file_header_and_hunks(file_patch: &str) -> Option<(String, Vec<String>)> {
+pub fn file_header_and_hunks(file_patch: &str) -> Option<(String, Vec<String>)> {
     let (header, hunks) = parse(file_patch)?;
     let texts: Vec<String> = hunks
         .iter()

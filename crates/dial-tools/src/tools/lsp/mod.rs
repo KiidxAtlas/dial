@@ -36,7 +36,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
-pub(crate) use text::path_from_uri;
+pub use text::path_from_uri;
 use text::{locate, read_source, uri_from_path};
 use workspace_edit::{Plan, Snapshot};
 

@@ -237,7 +237,7 @@ fn sloppy_sections(
     Ok(sections)
 }
 /// Literal proposals from the native sloppy grammar, without opening any source file.
-pub(crate) fn proposed_sloppy_sources(input: &str) -> Result<Vec<(String, String)>, String> {
+pub fn proposed_sloppy_sources(input: &str) -> Result<Vec<(String, String)>, String> {
     use super::edit_native::sloppy::types::OperationRewrite;
     let mut sources = Vec::new();
     for section in sloppy_sections(input)? {

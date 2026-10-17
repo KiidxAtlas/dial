@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn index_json_matches_script_order() {
     let index: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../runtimes/browser/stealth/index.json"
+        "../../../../../../runtimes/browser/stealth/index.json"
     ))
     .unwrap();
     let listed: Vec<&str> = index["scripts"]
