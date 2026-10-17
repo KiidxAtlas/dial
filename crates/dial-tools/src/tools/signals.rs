@@ -40,7 +40,7 @@ impl CallSignals {
     }
 
     /// Owner-only reset after draining the inbox under its lock.
-    pub(crate) fn clear(&self) {
+    pub fn clear(&self) {
         self.steer.store(false, Ordering::Release);
         self.wait.store(false, Ordering::Release);
     }

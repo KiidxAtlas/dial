@@ -47,7 +47,7 @@ pub(crate) mod edit_source;
 mod edit_transaction;
 pub mod editing;
 pub mod eval;
-pub(crate) mod execution;
+pub mod execution;
 pub mod ext;
 mod files;
 pub mod gh;
@@ -59,7 +59,7 @@ mod gh_run_watch;
 mod gh_search;
 mod gh_view;
 pub mod git;
-pub(crate) mod git_patch;
+pub mod git_patch;
 pub mod hashline;
 pub mod history;
 pub mod kernel;
@@ -207,7 +207,7 @@ pub struct Workspace {
     artifacts: Option<artifact::ArtifactStore>,
     operations: Arc<Mutex<()>>,
     shell_sessions: Arc<Mutex<BTreeMap<String, crate::embedded_shell::state::State>>>,
-    pub(crate) speculation: Arc<speculation::Pool>,
+    pub speculation: Arc<speculation::Pool>,
 }
 
 impl Workspace {
@@ -267,7 +267,7 @@ impl Workspace {
     pub fn artifacts(&self) -> Option<&artifact::ArtifactStore> {
         self.artifacts.as_ref()
     }
-    pub(crate) fn serial_operation(&self) -> MutexGuard<'_, ()> {
+    pub fn serial_operation(&self) -> MutexGuard<'_, ()> {
         self.operations.lock().unwrap_or_else(|e| e.into_inner())
     }
     pub(crate) fn try_serial_operation(&self) -> Option<MutexGuard<'_, ()>> {
@@ -529,7 +529,7 @@ impl Workspace {
         edit_source::record_cell(self, path, raw, index, coverage)
     }
 
-    pub(crate) fn observe_write(&self, abs: &Path) -> Result<(), String> {
+    pub fn observe_write(&self, abs: &Path) -> Result<(), String> {
         self.check_protected_mutation(abs)?;
         navigation::invalidate(abs);
         match &self.observer.0 {
@@ -540,7 +540,7 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn observe_delete(&self, abs: &Path) -> Result<(), String> {
+    pub fn observe_delete(&self, abs: &Path) -> Result<(), String> {
         self.check_protected_mutation(abs)?;
         navigation::invalidate(abs);
         match &self.observer.0 {
@@ -782,7 +782,7 @@ impl Workspace {
 
     /// Bounded, workspace-confined identity for a read observation, including selectors.
     /// Used only to expire recovery feedback; this is not verification evidence.
-    pub(crate) fn read_identity(&self, input: &str) -> Option<[u8; 32]> {
+    pub fn read_identity(&self, input: &str) -> Option<[u8; 32]> {
         let (path, _) = select::split_target(self, input).ok()?;
         self.file_identity(Path::new(path))
             .map(|(_, digest)| digest)
@@ -792,7 +792,7 @@ impl Workspace {
     /// file names may contain `:`). `None` for paths outside every root, protected storage,
     /// non-UTF-8 names, missing or unreadable targets, directories and files over 16 MiB.
     /// Recovery bookkeeping only; this is not verification evidence.
-    pub(crate) fn file_identity(&self, input: &Path) -> Option<(PathBuf, [u8; 32])> {
+    pub fn file_identity(&self, input: &Path) -> Option<(PathBuf, [u8; 32])> {
         use sha2::{Digest, Sha256};
         use std::io::Read;
         const LIMIT: u64 = 16 * 1024 * 1024;
@@ -807,7 +807,7 @@ impl Workspace {
         (data.len() as u64 <= LIMIT).then(|| (path, Sha256::digest(&data).into()))
     }
 
-    pub(crate) fn rel(&self, path: &Path) -> String {
+    pub fn rel(&self, path: &Path) -> String {
         match path.strip_prefix(&self.root) {
             Ok(rest) if rest.as_os_str().is_empty() => ".".to_string(),
             Ok(rest) => rest.to_string_lossy().into_owned(),
@@ -1309,11 +1309,11 @@ fn dispatch(
 
 /// A model-callable argument is present only when set to a non-null value. Strict-tools schemas make
 /// every optional property nullable, so `null` means omitted, never a value.
-pub(crate) fn present(args: &Value, key: &str) -> bool {
+pub fn present(args: &Value, key: &str) -> bool {
     args.get(key).is_some_and(|value| !value.is_null())
 }
 
-pub(crate) fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
+pub fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     match args.get(key) {
         None | Some(Value::Null) => Err(format!("missing required argument {key:?}")),
         Some(Value::String(text)) => Ok(text),

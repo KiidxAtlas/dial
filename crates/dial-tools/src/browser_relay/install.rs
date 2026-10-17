@@ -7,19 +7,19 @@ use std::path::{Path, PathBuf};
 const FILES: [(&str, &str); 4] = [
     (
         "manifest.json",
-        include_str!("../../assets/browser-extension/manifest.json"),
+        include_str!("../../../../assets/browser-extension/manifest.json"),
     ),
     (
         "background.js",
-        include_str!("../../assets/browser-extension/background.js"),
+        include_str!("../../../../assets/browser-extension/background.js"),
     ),
     (
         "popup.html",
-        include_str!("../../assets/browser-extension/popup.html"),
+        include_str!("../../../../assets/browser-extension/popup.html"),
     ),
     (
         "popup.js",
-        include_str!("../../assets/browser-extension/popup.js"),
+        include_str!("../../../../assets/browser-extension/popup.js"),
     ),
 ];
 

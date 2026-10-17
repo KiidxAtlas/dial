@@ -132,7 +132,7 @@ enum Hooks {
 
 /// `-c` overrides that point `core.hooksPath` at the null device, so repository hooks do not run.
 /// Shared by the agent tool, the `/git` panel, and `dial commit` when `git.bypass_hooks` is set.
-pub(crate) fn hooks_off_args() -> [&'static str; 2] {
+pub fn hooks_off_args() -> [&'static str; 2] {
     #[cfg(windows)]
     return ["-c", "core.hooksPath=NUL"];
     #[cfg(not(windows))]
@@ -258,14 +258,14 @@ fn git_streams(
 
 /// One entry of `git worktree list --porcelain`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Worktree {
-    pub(crate) path: PathBuf,
+pub struct Worktree {
+    pub path: PathBuf,
     /// Short branch name with `refs/heads/` stripped; `None` when detached or bare.
-    pub(crate) branch: Option<String>,
-    pub(crate) head: String,
-    pub(crate) bare: bool,
-    pub(crate) detached: bool,
-    pub(crate) locked: bool,
+    pub branch: Option<String>,
+    pub head: String,
+    pub bare: bool,
+    pub detached: bool,
+    pub locked: bool,
 }
 
 /// Parse `git worktree list --porcelain` into one entry per `worktree` block.
@@ -314,7 +314,7 @@ fn git_checked(root: &Path, args: &[String], mutating: bool) -> Result<String, S
 }
 
 /// Worktrees registered for the repository containing `root`; the primary checkout is first.
-pub(crate) fn worktree_list(root: &Path) -> Result<Vec<Worktree>, String> {
+pub fn worktree_list(root: &Path) -> Result<Vec<Worktree>, String> {
     let text = git_checked(root, &strings(&["worktree", "list", "--porcelain"]), false)?;
     Ok(parse_worktrees(&text))
 }
@@ -340,11 +340,7 @@ pub(crate) fn worktree_add(
 /// Create `path` on the new branch `branch` from `HEAD` and carry the source checkout's uncommitted
 /// changes into it: tracked edits, staged or not, are applied as one binary
 /// patch, and untracked files are copied. Returns whether anything was carried over.
-pub(crate) fn worktree_add_keep_changes(
-    root: &Path,
-    path: &Path,
-    branch: &str,
-) -> Result<bool, String> {
+pub fn worktree_add_keep_changes(root: &Path, path: &Path, branch: &str) -> Result<bool, String> {
     worktree_add(root, path, branch, "HEAD")?;
     match carry_changes(root, path, branch) {
         Ok(carried) => Ok(carried),
@@ -416,7 +412,7 @@ fn hash_branch(branch: &str) -> u64 {
 }
 
 /// Remove a registered worktree. A dirty or locked worktree is refused unless `force`.
-pub(crate) fn worktree_remove(root: &Path, path: &Path, force: bool) -> Result<(), String> {
+pub fn worktree_remove(root: &Path, path: &Path, force: bool) -> Result<(), String> {
     let mut args = strings(&["worktree", "remove"]);
     if force {
         args.push("--force".to_owned());
@@ -426,20 +422,20 @@ pub(crate) fn worktree_remove(root: &Path, path: &Path, force: bool) -> Result<(
 }
 
 /// Worktree location for `branch`: `~/.dial/wt/<hash of root>/<branch with / as ->`.
-pub(crate) fn worktree_path_for(root: &Path, branch: &str) -> Result<PathBuf, String> {
+pub fn worktree_path_for(root: &Path, branch: &str) -> Result<PathBuf, String> {
     let base = super::gh_pr::worktrees_root()?;
     let hash = super::gh_pr::hash_path(root);
     Ok(base.join(hash).join(branch.replace('/', "-")))
 }
 
 /// Run a git command and return stdout, or git's stderr on failure.
-pub(crate) fn run_checked(root: &Path, args: &[&str], mutating: bool) -> Result<String, String> {
+pub fn run_checked(root: &Path, args: &[&str], mutating: bool) -> Result<String, String> {
     git_checked(root, &strings(args), mutating)
 }
 
 /// An independent baseline of the filtered development copy: no parent gitdir, remotes,
 /// hooks, credential config, alternates or hardlinked objects are inherited.
-pub(crate) fn initialize_private_snapshot(root: &Path) -> Result<(), String> {
+pub fn initialize_private_snapshot(root: &Path) -> Result<(), String> {
     use std::ffi::OsStr;
     let gitdir = root.join(".git");
     let index = gitdir.join("index");
@@ -515,7 +511,7 @@ fn repo_toplevel(root: &Path) -> Result<PathBuf, String> {
 
 /// Reset tracked files to HEAD and remove untracked, non-ignored files from the source checkout once
 /// `/wt` has moved its changes into a worktree.
-pub(crate) fn clean_source_checkout(root: &Path) -> Result<(), String> {
+pub fn clean_source_checkout(root: &Path) -> Result<(), String> {
     let top = repo_toplevel(root)?;
     run_checked(&top, &["reset", "--hard", "HEAD"], true)?;
     run_checked(&top, &["clean", "-fd"], true)?;

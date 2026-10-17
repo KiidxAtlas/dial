@@ -56,7 +56,7 @@ struct Pending {
     result: Receiver<Option<(String, ToolOutput)>>,
 }
 #[derive(Default)]
-pub(crate) struct Pool {
+pub struct Pool {
     pending: Mutex<BTreeMap<String, Pending>>,
     counters: Arc<Counters>,
 }
@@ -66,7 +66,7 @@ impl std::fmt::Debug for Pool {
     }
 }
 /// Drops unconsumed preparation on every batch exit, including interruption and errors.
-pub(crate) struct Batch(std::sync::Arc<Pool>);
+pub struct Batch(std::sync::Arc<Pool>);
 impl Drop for Batch {
     fn drop(&mut self) {
         self.0.clear();

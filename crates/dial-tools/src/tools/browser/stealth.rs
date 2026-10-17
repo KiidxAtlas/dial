@@ -12,63 +12,63 @@ const STEALTH_ENV: &str = "DIAL_BROWSER_STEALTH";
 pub const STEALTH_SCRIPTS: &[(&str, &str)] = &[
     (
         "00_stealth_tampering.txt",
-        include_str!("../../../runtimes/browser/stealth/00_stealth_tampering.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/00_stealth_tampering.txt"),
     ),
     (
         "01_stealth_activity.txt",
-        include_str!("../../../runtimes/browser/stealth/01_stealth_activity.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/01_stealth_activity.txt"),
     ),
     (
         "02_stealth_hairline.txt",
-        include_str!("../../../runtimes/browser/stealth/02_stealth_hairline.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/02_stealth_hairline.txt"),
     ),
     (
         "03_stealth_botd.txt",
-        include_str!("../../../runtimes/browser/stealth/03_stealth_botd.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/03_stealth_botd.txt"),
     ),
     (
         "04_stealth_iframe.txt",
-        include_str!("../../../runtimes/browser/stealth/04_stealth_iframe.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/04_stealth_iframe.txt"),
     ),
     (
         "05_stealth_webgl.txt",
-        include_str!("../../../runtimes/browser/stealth/05_stealth_webgl.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/05_stealth_webgl.txt"),
     ),
     (
         "06_stealth_screen.txt",
-        include_str!("../../../runtimes/browser/stealth/06_stealth_screen.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/06_stealth_screen.txt"),
     ),
     (
         "07_stealth_fonts.txt",
-        include_str!("../../../runtimes/browser/stealth/07_stealth_fonts.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/07_stealth_fonts.txt"),
     ),
     (
         "08_stealth_audio.txt",
-        include_str!("../../../runtimes/browser/stealth/08_stealth_audio.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/08_stealth_audio.txt"),
     ),
     (
         "09_stealth_locale.txt",
-        include_str!("../../../runtimes/browser/stealth/09_stealth_locale.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/09_stealth_locale.txt"),
     ),
     (
         "10_stealth_plugins.txt",
-        include_str!("../../../runtimes/browser/stealth/10_stealth_plugins.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/10_stealth_plugins.txt"),
     ),
     (
         "11_stealth_hardware.txt",
-        include_str!("../../../runtimes/browser/stealth/11_stealth_hardware.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/11_stealth_hardware.txt"),
     ),
     (
         "12_stealth_codecs.txt",
-        include_str!("../../../runtimes/browser/stealth/12_stealth_codecs.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/12_stealth_codecs.txt"),
     ),
     (
         "13_stealth_worker.txt",
-        include_str!("../../../runtimes/browser/stealth/13_stealth_worker.txt"),
+        include_str!("../../../../../runtimes/browser/stealth/13_stealth_worker.txt"),
     ),
 ];
 
-const BOOTSTRAP: &str = include_str!("../../../runtimes/browser/stealth/bootstrap.js");
+const BOOTSTRAP: &str = include_str!("../../../../../runtimes/browser/stealth/bootstrap.js");
 const BOOTSTRAP_SCRIPTS_MARKER: &str = "/*@@STEALTH_PATCH_SCRIPTS@@*/";
 
 const ENABLE_AUTOMATION_FLAG: &str = "--enable-automation";

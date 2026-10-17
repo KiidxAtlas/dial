@@ -23,6 +23,7 @@ dial-build-info = { path = "crates/dial-build-info" }
 dial-core = { path = "crates/dial-core" }
 dial-llm = { path = "crates/dial-llm", default-features = false }
 dial-storage = { path = "crates/dial-storage" }
+dial-tools = { path = "crates/dial-tools", default-features = false }
 anyhow = "1"
 vt100 = "0.15"
 thiserror = "2"
@@ -116,9 +117,9 @@ default = ["aws", "voice", "embedded-shell", "desktop"]
 # AWS credential chain (env, profiles, SSO, process, web identity, ECS/IMDS) and SigV4 for Bedrock.
 # Bearer-key Bedrock works without it; SigV4 without it fails with a clear error.
 aws = ["dial-llm/aws"]
-voice = ["dep:cpal"]
+voice = ["dial-tools/voice"]
 # Built-in POSIX shell for the `bash` tool (`shell.backend = "embedded"`); brush shell language plus coreutils builtins.
-embedded-shell = ["dep:brush-core", "dep:brush-builtins"]
+embedded-shell = ["dial-tools/embedded-shell"]
 # Native desktop capture, accessibility and input. Browser automation is independent.
 desktop = [
     "dep:xcap", "dep:ashpd", "dep:atspi", "dep:reis", "dep:x11rb", "dep:xkeysym", "dep:zbus",
@@ -134,12 +135,14 @@ wayland-pipewire = ["desktop", "dep:pipewire"]
 dial-core = { workspace = true, features = ["test-support"] }
 dial-llm = { workspace = true, features = ["test-support"] }
 dial-storage = { workspace = true, features = ["test-support"] }
+dial-tools = { workspace = true, features = ["test-support"] }
 
 [dependencies]
 dial-build-info.workspace = true
 dial-core.workspace = true
 dial-llm.workspace = true
 dial-storage.workspace = true
+dial-tools.workspace = true
 anyhow.workspace = true
 vt100.workspace = true
 thiserror.workspace = true
@@ -279,6 +282,10 @@ opt-level = 1
 codegen-units = 64
 
 [profile.local.package.dial-storage]
+opt-level = 1
+codegen-units = 64
+
+[profile.local.package.dial-tools]
 opt-level = 1
 codegen-units = 64
 

@@ -11,13 +11,13 @@ use std::{
     time::Duration,
 };
 
-const WORKER: &str = include_str!("../python/dial_worker.py");
-const STEERING: &str = include_str!("../python/dial_steering.py");
-const PYPROJECT: &str = include_str!("../python/pyproject.toml");
+const WORKER: &str = include_str!("../../../python/dial_worker.py");
+const STEERING: &str = include_str!("../../../python/dial_steering.py");
+const PYPROJECT: &str = include_str!("../../../python/pyproject.toml");
 
 /// Keep the managed worker aligned with the binary without reinstalling Python packages.
 /// Explicit custom worker paths are never replaced.
-pub(crate) fn refresh_worker(config: &Config) -> Result<()> {
+pub fn refresh_worker(config: &Config) -> Result<()> {
     let managed = config.user_dir.join("python/dial_worker.py");
     if config.worker == managed
         && std::fs::read(&managed).ok().as_deref() != Some(WORKER.as_bytes())

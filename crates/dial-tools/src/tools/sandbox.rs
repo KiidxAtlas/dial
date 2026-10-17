@@ -425,8 +425,8 @@ pub fn already_sandboxed() -> bool {
 
 /// For tests that exercise the real sandbox: true when it works; false (skip, with a note) only when
 /// this process is already sandboxed and nesting is impossible; otherwise the missing sandbox fails the test.
-#[cfg(test)]
-pub(crate) fn require_for_test() -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn require_for_test() -> bool {
     match Sandbox::detect().available() {
         Ok(()) => true,
         Err(_) if already_sandboxed() => {

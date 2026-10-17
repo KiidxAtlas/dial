@@ -79,13 +79,13 @@ pub fn annotate(message: &mut Value, output: &ToolOutput) {
     message["dial_effects"] = serde_json::json!(effects(output));
 }
 
-pub(crate) fn message(id: &str, output: &ToolOutput) -> Value {
+pub fn message(id: &str, output: &ToolOutput) -> Value {
     let mut message = crate::llm::tool_message(id, &output.text);
     annotate(&mut message, output);
     message
 }
 
-pub(crate) fn skipped(id: &str, reason: &str) -> Value {
+pub fn skipped(id: &str, reason: &str) -> Value {
     message(
         id,
         &ToolOutput::err(reason)

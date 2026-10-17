@@ -11,8 +11,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const PACKAGE: &str = include_str!("../../../runtimes/browser/package.json");
-const LOCK: &str = include_str!("../../../runtimes/browser/bun.lock");
+const PACKAGE: &str = include_str!("../../../../../runtimes/browser/package.json");
+const LOCK: &str = include_str!("../../../../../runtimes/browser/bun.lock");
 /// Upper bound for dependency installation.
 const INSTALL_CAP: Duration = Duration::from_secs(300);
 /// Upper bound for the Chromium download, which is large.

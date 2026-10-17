@@ -122,7 +122,7 @@ impl Tool for Find {
         }
     }
 }
-pub(crate) fn lsp_args(args: &Value) -> Result<Option<Value>, String> {
+pub fn lsp_args(args: &Value) -> Result<Option<Value>, String> {
     let Some(path) = opt_str(args, "lsp_path")? else {
         if opt_str(args, "lsp_query")?.is_some() {
             return Err("lsp_query requires lsp_path".into());
