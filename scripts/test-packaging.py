@@ -20,7 +20,7 @@ packaging = load_checker()
 GOOD_FLAKE = """
     default = pkgs.rustPlatform.buildRustPackage {
       pname = "dial";
-      version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+      version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       src = self;
     };
 """
@@ -42,8 +42,9 @@ class PackagingTests(unittest.TestCase):
         _, problems = packaging.check()
         self.assertEqual(problems, [])
 
-    def test_cargo_version_comes_from_the_package_table(self):
-        cargo = '[dependencies]\nversion = "9.9.9"\n\n[package]\nname = "dial"\nversion = "0.1.8"\n'
+    def test_cargo_version_comes_from_the_workspace_package_table(self):
+        cargo = ('[dependencies]\nversion = "9.9.9"\n\n[package]\nname = "dial"\nversion.workspace = true\n\n'
+                 '[workspace.package]\nversion = "0.1.8"\n')
         self.assertEqual(packaging.cargo_version(cargo), "0.1.8")
 
     def test_flake_derived_version_is_accepted(self):
@@ -51,7 +52,7 @@ class PackagingTests(unittest.TestCase):
 
     def test_flake_hard_coded_version_is_rejected(self):
         problems = packaging.flake_problems(GOOD_FLAKE.replace(
-            "(builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version",
+            "(builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version",
             '"0.1.7"'))
         self.assertTrue(any("hard-codes" in p for p in problems), problems)
         self.assertTrue(any("must derive" in p for p in problems), problems)

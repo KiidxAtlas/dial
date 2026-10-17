@@ -11,8 +11,8 @@
         in {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "dial";
-            # Single source of truth: the Cargo package version this source tree compiles.
-            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+            # Single source of truth: the workspace version every crate in this source tree compiles with.
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.pkg-config ];

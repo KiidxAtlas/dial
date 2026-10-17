@@ -1,29 +1,22 @@
 [package]
 name = "dial"
+version.workspace = true
+edition.workspace = true
+description = "Local, gated model and harness improvement on Apple Silicon"
+license.workspace = true
+
+[workspace]
+members = ["."]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.9"
 edition = "2024"
-description = "Local, gated model and harness improvement on Apple Silicon"
 license = "MIT"
-[features]
-default = ["aws", "voice", "embedded-shell", "desktop"]
-# AWS credential chain (env, profiles, SSO, process, web identity, ECS/IMDS) and SigV4 for Bedrock.
-# Bearer-key Bedrock works without it; SigV4 without it fails with a clear error.
-aws = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-http-client"]
-voice = ["dep:cpal"]
-# Built-in POSIX shell for the `bash` tool (`shell.backend = "embedded"`); brush shell language plus coreutils builtins.
-embedded-shell = ["dep:brush-core", "dep:brush-builtins"]
-# Native desktop capture, accessibility and input. Browser automation is independent.
-desktop = [
-    "dep:xcap", "dep:ashpd", "dep:atspi", "dep:reis", "dep:x11rb", "dep:xkeysym", "dep:zbus",
-    "dep:block2", "dep:core-graphics", "dep:foreign-types", "dep:objc2", "dep:objc2-app-kit",
-    "dep:objc2-application-services", "dep:objc2-core-foundation", "dep:objc2-core-graphics",
-    "dep:objc2-foundation", "dep:windows", "dep:enigo", "dep:uiautomation",
-]
-# Linux Wayland screencast (PipeWire); off by default.
-wayland-pipewire = ["desktop", "dep:pipewire"]
 
-
-[dependencies]
+# Every dependency version is declared once here. Members opt in with `workspace = true` and keep
+# `optional` and target selection locally.
+[workspace.dependencies]
 anyhow = "1"
 vt100 = "0.15"
 thiserror = "2"
@@ -47,10 +40,10 @@ semver = "1"
 sha1 = "0.10"
 ring = "0.17"
 # The SDK default HTTPS client would pull aws-lc-rs (a C build); its HTTP client is built on ring instead.
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso"], optional = true }
-aws-credential-types = { version = "1", optional = true }
-aws-sigv4 = { version = "1", optional = true }
-aws-smithy-http-client = { version = "1.5", default-features = false, features = ["rustls-ring", "rt-tokio"], optional = true }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso"] }
+aws-credential-types = "1"
+aws-sigv4 = "1"
+aws-smithy-http-client = { version = "1.5", default-features = false, features = ["rustls-ring", "rt-tokio"] }
 crc32fast = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 toml = "0.9"
@@ -85,39 +78,145 @@ tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 flume = "0.12"
 futures = "0.3"
 xxhash-rust = { version = "0.8", features = ["xxh64", "xxh32"] }
-brush-core = { version = "0.5", optional = true }
-brush-builtins = { version = "0.2", optional = true }
-
+brush-core = "0.5"
+brush-builtins = "0.2"
 # Desktop control (computer tool): platform crates pinned to known-good versions.
+ashpd = { version = "=0.11.1", default-features = false, features = ["tokio"] }
+atspi = { version = "=0.30.0", features = ["tokio", "zbus"] }
+pipewire = "=0.9.2"
+reis = { version = "=0.5.0", features = ["tokio"] }
+x11rb = { version = "=0.13.2", features = ["randr", "xinput", "xtest"] }
+xkeysym = "=0.2.1"
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
+xcap = { version = "=0.9.6", default-features = false }
+cpal = "0.16"
+block2 = "=0.6.2"
+core-graphics = { version = "0.25", features = ["highsierra"] }
+foreign-types = "=0.5.0"
+objc2 = "=0.6.4"
+objc2-app-kit = "=0.3.2"
+objc2-application-services = "=0.3.2"
+objc2-core-foundation = "=0.3.2"
+objc2-core-graphics = "=0.3.2"
+objc2-foundation = "=0.3.2"
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_Storage_ProjectedFileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Storage_EnhancedStorage", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem"] }
+enigo = { version = "=0.6.1", default-features = false }
+uiautomation = "=0.25.1"
+winreg = "0.56"
+
+[features]
+default = ["aws", "voice", "embedded-shell", "desktop"]
+# AWS credential chain (env, profiles, SSO, process, web identity, ECS/IMDS) and SigV4 for Bedrock.
+# Bearer-key Bedrock works without it; SigV4 without it fails with a clear error.
+aws = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-http-client"]
+voice = ["dep:cpal"]
+# Built-in POSIX shell for the `bash` tool (`shell.backend = "embedded"`); brush shell language plus coreutils builtins.
+embedded-shell = ["dep:brush-core", "dep:brush-builtins"]
+# Native desktop capture, accessibility and input. Browser automation is independent.
+desktop = [
+    "dep:xcap", "dep:ashpd", "dep:atspi", "dep:reis", "dep:x11rb", "dep:xkeysym", "dep:zbus",
+    "dep:block2", "dep:core-graphics", "dep:foreign-types", "dep:objc2", "dep:objc2-app-kit",
+    "dep:objc2-application-services", "dep:objc2-core-foundation", "dep:objc2-core-graphics",
+    "dep:objc2-foundation", "dep:windows", "dep:enigo", "dep:uiautomation",
+]
+# Linux Wayland screencast (PipeWire); off by default.
+wayland-pipewire = ["desktop", "dep:pipewire"]
+
+
+[dependencies]
+anyhow.workspace = true
+vt100.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+fs2.workspace = true
+rand.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+ureq.workspace = true
+url.workspace = true
+rustls.workspace = true
+base64.workspace = true
+encoding_rs.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+semver.workspace = true
+sha1.workspace = true
+ring.workspace = true
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-sigv4 = { workspace = true, optional = true }
+aws-smithy-http-client = { workspace = true, optional = true }
+crc32fast.workspace = true
+tokio.workspace = true
+toml.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+pulldown-cmark.workspace = true
+quick-xml.workspace = true
+regex.workspace = true
+fancy-regex.workspace = true
+ast-grep-core.workspace = true
+ast-grep-language.workspace = true
+ignore.workspace = true
+globset.workspace = true
+httpdate.workspace = true
+zip.workspace = true
+tar.workspace = true
+flate2.workspace = true
+parking_lot.workspace = true
+similar.workspace = true
+shlex.workspace = true
+image.workspace = true
+fontdue.workspace = true
+png.workspace = true
+notify.workspace = true
+jaq-core.workspace = true
+jaq-std.workspace = true
+jaq-json.workspace = true
+serde_norway.workspace = true
+tungstenite.workspace = true
+flume.workspace = true
+futures.workspace = true
+xxhash-rust.workspace = true
+brush-core = { workspace = true, optional = true }
+brush-builtins = { workspace = true, optional = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "=0.11.1", default-features = false, features = ["tokio"], optional = true }
-atspi = { version = "=0.30.0", features = ["tokio", "zbus"], optional = true }
-pipewire = { version = "=0.9.2", optional = true }
-reis = { version = "=0.5.0", features = ["tokio"], optional = true }
-x11rb = { version = "=0.13.2", features = ["randr", "xinput", "xtest"], optional = true }
-xkeysym = { version = "=0.2.1", optional = true }
-zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"], optional = true }
+ashpd = { workspace = true, optional = true }
+atspi = { workspace = true, optional = true }
+pipewire = { workspace = true, optional = true }
+reis = { workspace = true, optional = true }
+x11rb = { workspace = true, optional = true }
+xkeysym = { workspace = true, optional = true }
+zbus = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-xcap = { version = "=0.9.6", default-features = false, optional = true }
+xcap = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cpal = { version = "0.16", optional = true }
-block2 = { version = "=0.6.2", optional = true }
-core-graphics = { version = "0.25", features = ["highsierra"], optional = true }
-foreign-types = { version = "=0.5.0", optional = true }
-objc2 = { version = "=0.6.4", optional = true }
-objc2-app-kit = { version = "=0.3.2", optional = true }
-objc2-application-services = { version = "=0.3.2", optional = true }
-objc2-core-foundation = { version = "=0.3.2", optional = true }
-objc2-core-graphics = { version = "=0.3.2", optional = true }
-objc2-foundation = { version = "=0.3.2", optional = true }
+cpal = { workspace = true, optional = true }
+block2 = { workspace = true, optional = true }
+core-graphics = { workspace = true, optional = true }
+foreign-types = { workspace = true, optional = true }
+objc2 = { workspace = true, optional = true }
+objc2-app-kit = { workspace = true, optional = true }
+objc2-application-services = { workspace = true, optional = true }
+objc2-core-foundation = { workspace = true, optional = true }
+objc2-core-graphics = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_Storage_ProjectedFileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
-windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Storage_EnhancedStorage", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem"], optional = true }
-enigo = { version = "=0.6.1", default-features = false, optional = true }
-uiautomation = { version = "=0.25.1", optional = true }
-winreg = "0.56"
+windows-sys.workspace = true
+windows = { workspace = true, optional = true }
+enigo = { workspace = true, optional = true }
+uiautomation = { workspace = true, optional = true }
+winreg.workspace = true
 
 
 # Local builds and tests: line tables for our crate (panics and backtraces keep file:line), no debug
