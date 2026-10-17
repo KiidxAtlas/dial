@@ -36,7 +36,12 @@ fn endpoint() -> Backend {
 
 #[test]
 fn plan_review_re_asks_with_the_plan_stored_by_exit_plan() {
-    let config = Config::default();
+    // Plan artifacts land under `state_dir`; keep them out of the crate's working directory.
+    let state = tempfile::tempdir().unwrap();
+    let config = Config {
+        state_dir: state.path().into(),
+        ..Config::default()
+    };
     let workspace = tempfile::tempdir().unwrap();
     let version = Version {
         id: 0,

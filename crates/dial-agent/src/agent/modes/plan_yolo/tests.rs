@@ -17,8 +17,10 @@ fn endpoint() -> Backend {
 
 #[test]
 fn plan_yolo_approves_the_plan_and_hands_off_to_the_target() {
+    let state = tempfile::tempdir().unwrap();
     let mut config = Config {
         model: "test".into(),
+        state_dir: state.path().into(),
         ..Config::default()
     };
     config.endpoint = Some(crate::config::types::EndpointConfig {
@@ -64,8 +66,10 @@ fn plan_yolo_approves_the_plan_and_hands_off_to_the_target() {
 
 #[test]
 fn mid_session_arm_hands_off_once_and_disarm_restores_approval() {
+    let state = tempfile::tempdir().unwrap();
     let mut config = Config {
         model: "test".into(),
+        state_dir: state.path().into(),
         ..Config::default()
     };
     config.endpoint = Some(crate::config::types::EndpointConfig {
