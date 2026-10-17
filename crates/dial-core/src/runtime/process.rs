@@ -8,18 +8,18 @@ use std::{
 };
 
 /// Kills the whole process group on drop so nothing outlives its owning operation.
-pub(crate) struct ProcessGroup {
-    pub(crate) child: Child,
+pub struct ProcessGroup {
+    pub child: Child,
     terminated: bool,
 }
 impl ProcessGroup {
-    pub(crate) fn new(child: Child) -> Self {
+    pub fn new(child: Child) -> Self {
         Self {
             child,
             terminated: false,
         }
     }
-    pub(crate) fn terminate(&mut self) {
+    pub fn terminate(&mut self) {
         if !self.terminated {
             let _ = crate::platform::process::terminate_group(self.child.id());
             let _ = crate::platform::process::wait_exited(&self.child, Duration::from_millis(100));
@@ -28,13 +28,13 @@ impl ProcessGroup {
         }
     }
     /// Transfers ownership without killing or forgetting the process group.
-    pub(crate) fn release(mut self) -> Child {
+    pub fn release(mut self) -> Child {
         self.terminated = true;
         let group = std::mem::ManuallyDrop::new(self);
         unsafe { std::ptr::read(&group.child) }
     }
     /// The exited leader is not reaped, keeping its PID reserved until cleanup.
-    pub(crate) fn exited(&self) -> io::Result<bool> {
+    pub fn exited(&self) -> io::Result<bool> {
         crate::platform::process::exited(&self.child)
     }
 }

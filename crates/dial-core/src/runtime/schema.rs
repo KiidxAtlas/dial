@@ -925,12 +925,7 @@ fn type_of(value: &Value) -> &'static str {
 mod tests;
 
 /// OpenAI-style function schema for a built-in or core-owned tool: `{"type":"function",...}`.
-pub(crate) fn tool_schema(
-    name: &str,
-    description: &str,
-    properties: Value,
-    required: &[&str],
-) -> Value {
+pub fn tool_schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "function",
         "function": {

@@ -12,10 +12,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-pub(crate) const MAX_FRAME: usize = 12 * 1024 * 1024;
+pub const MAX_FRAME: usize = 12 * 1024 * 1024;
 /// Maximum response-drain grace after the caller's interrupt check trips.
-pub(crate) const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
-pub(crate) fn execution_deadline(timeout: Duration) -> Option<Instant> {
+pub const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+pub fn execution_deadline(timeout: Duration) -> Option<Instant> {
     (!timeout.is_zero()).then(|| Instant::now() + timeout)
 }
 
@@ -24,7 +24,7 @@ type ProcessStdin = crate::platform::io::QueuedWriter<ChildStdin>;
 #[cfg(unix)]
 type ProcessStdin = ChildStdin;
 /// Bounded JSON-lines protocol. Pipes are nonblocking so neither output nor input can defeat deadlines.
-pub(crate) struct JsonProcess {
+pub struct JsonProcess {
     group: ProcessGroup,
     input: ProcessStdin,
     output: ChildStdout,
@@ -39,7 +39,7 @@ pub(crate) struct JsonProcess {
     in_flight: bool,
 }
 impl JsonProcess {
-    pub(crate) fn start(mut command: Command, pid: Arc<AtomicI32>) -> Result<Self, String> {
+    pub fn start(mut command: Command, pid: Arc<AtomicI32>) -> Result<Self, String> {
         let child = crate::platform::process::spawn_group(
             command
                 .stdin(Stdio::piped())
@@ -80,7 +80,7 @@ impl JsonProcess {
             in_flight: false,
         })
     }
-    pub(crate) fn alive(&mut self) -> bool {
+    pub fn alive(&mut self) -> bool {
         self.group.exited().is_ok_and(|exited| !exited)
     }
     fn write_frame(
@@ -172,7 +172,7 @@ impl JsonProcess {
             }
         }
     }
-    pub(crate) fn request(
+    pub fn request(
         &mut self,
         value: Value,
         timeout: Duration,
@@ -188,7 +188,7 @@ impl JsonProcess {
     }
     /// Interrupt-aware request: a tripped check (cancel, deadline, interrupt) first gives the driver
     /// [`INTERRUPT_GRACE`] to unwind the cell after SIGINT, then the caller discards the session.
-    pub(crate) fn request_guarded(
+    pub fn request_guarded(
         &mut self,
         value: Value,
         end: Option<Instant>,

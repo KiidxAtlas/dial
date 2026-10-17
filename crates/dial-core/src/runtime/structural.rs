@@ -12,14 +12,14 @@ const MAX_CAPTURE_CHARS: usize = 120;
 const MAX_LINE_CHARS: usize = 300;
 
 /// A pattern (and optional rewrite template) compiled for one language.
-pub(crate) struct Query {
+pub struct Query {
     lang: SupportLang,
     pattern: Pattern,
     template: Option<TemplateFix>,
 }
 
 /// One structural match.
-pub(crate) struct Hit {
+pub struct Hit {
     /// 1-based line and character column of the match start.
     pub line: usize,
     pub column: usize,
@@ -30,24 +30,24 @@ pub(crate) struct Hit {
 }
 
 /// One replaced byte range of the original text.
-pub(crate) struct Splice {
+pub struct Splice {
     pub start: usize,
     pub end: usize,
     pub text: String,
 }
 
-pub(crate) struct Rewritten {
+pub struct Rewritten {
     pub text: String,
     pub splices: Vec<Splice>,
 }
 
-pub(crate) fn parse_lang(name: &str) -> Result<SupportLang, String> {
+pub fn parse_lang(name: &str) -> Result<SupportLang, String> {
     name.trim()
         .parse()
         .map_err(|_| format!("unsupported language {name:?}; supported: {}", lang_names()))
 }
 
-pub(crate) fn lang_names() -> String {
+pub fn lang_names() -> String {
     let names: Vec<String> = SupportLang::all_langs()
         .iter()
         .map(|l| l.to_string().to_lowercase())
@@ -55,7 +55,7 @@ pub(crate) fn lang_names() -> String {
     names.join(", ")
 }
 
-pub(crate) fn lang_of_path(path: &std::path::Path) -> Option<SupportLang> {
+pub fn lang_of_path(path: &std::path::Path) -> Option<SupportLang> {
     SupportLang::from_path(path)
 }
 
@@ -210,7 +210,7 @@ fn captures(found: &NodeMatch<'_, Doc>) -> Vec<(String, String)> {
 }
 
 /// `src` with the (sorted, non-overlapping) splices applied.
-pub(crate) fn apply(src: &str, splices: &[Splice]) -> String {
+pub fn apply(src: &str, splices: &[Splice]) -> String {
     let mut out = String::with_capacity(src.len());
     let mut cursor = 0;
     for splice in splices {

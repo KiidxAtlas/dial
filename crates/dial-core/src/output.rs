@@ -420,25 +420,25 @@ pub(crate) fn drain_stdout(timeout: Option<Duration>) -> io::Result<()> {
 }
 
 #[derive(Clone)]
-pub(crate) struct StdoutWriter {
+pub struct StdoutWriter {
     pipe: Arc<Pipe>,
     interrupt: Arc<AtomicBool>,
     disconnected: Arc<AtomicBool>,
 }
 /// Lets the stdin reader end a connection without holding the writer.
 #[derive(Clone)]
-pub(crate) struct Cancellation {
+pub struct Cancellation {
     interrupt: Arc<AtomicBool>,
     disconnected: Arc<AtomicBool>,
 }
 impl Cancellation {
-    pub(crate) fn disconnect(&self) {
+    pub fn disconnect(&self) {
         self.disconnected.store(true, Ordering::SeqCst);
         self.interrupt.store(true, Ordering::SeqCst);
     }
 }
 impl StdoutWriter {
-    pub(crate) fn new() -> io::Result<Self> {
+    pub fn new() -> io::Result<Self> {
         Ok(Self::over(stdout_pipe()?))
     }
     pub(crate) fn over(pipe: Arc<Pipe>) -> Self {
@@ -451,28 +451,28 @@ impl StdoutWriter {
         }
     }
     /// A write failure raises this flag so the owning turn stops producing output.
-    pub(crate) fn set_interrupt(&mut self, interrupt: Arc<AtomicBool>) {
+    pub fn set_interrupt(&mut self, interrupt: Arc<AtomicBool>) {
         self.pipe.register(&interrupt);
         self.interrupt = interrupt;
     }
     /// Called by the stdin reader on EOF: this connection is over even if stdout still works.
-    pub(crate) fn disconnect(&self) {
+    pub fn disconnect(&self) {
         self.disconnected.store(true, Ordering::SeqCst);
         self.interrupt.store(true, Ordering::SeqCst);
     }
-    pub(crate) fn cancellation(&self) -> Cancellation {
+    pub fn cancellation(&self) -> Cancellation {
         Cancellation {
             interrupt: self.interrupt.clone(),
             disconnected: self.disconnected.clone(),
         }
     }
-    pub(crate) fn is_disconnected(&self) -> bool {
+    pub fn is_disconnected(&self) -> bool {
         self.disconnected.load(Ordering::SeqCst)
     }
-    pub(crate) fn failed(&self) -> bool {
+    pub fn failed(&self) -> bool {
         self.pipe.failure().is_some()
     }
-    pub(crate) fn failure(&self) -> Option<io::Error> {
+    pub fn failure(&self) -> Option<io::Error> {
         self.pipe.failure()
     }
     pub(crate) fn spooling(&self) -> bool {
@@ -491,7 +491,7 @@ impl StdoutWriter {
         Ok(())
     }
     /// Reserve an output position before work that may race with another producer.
-    pub(crate) fn reserve(&self) -> u64 {
+    pub fn reserve(&self) -> u64 {
         let mut state = self.pipe.lock();
         let ticket = state.next_ticket;
         state.next_ticket = state.next_ticket.wrapping_add(1);
@@ -499,7 +499,7 @@ impl StdoutWriter {
     }
     /// Publish a complete batch at its reserved position. Later tickets wait until all earlier
     /// reservations arrive, then enter the bounded queue/spool in the same order.
-    pub(crate) fn json_batch(
+    pub fn json_batch(
         &self,
         ticket: u64,
         values: impl IntoIterator<Item = serde_json::Value>,
@@ -550,7 +550,7 @@ impl StdoutWriter {
         self.check()?;
         self.pipe.enqueue(bytes)
     }
-    pub(crate) fn json(&self, value: &serde_json::Value) -> io::Result<()> {
+    pub fn json(&self, value: &serde_json::Value) -> io::Result<()> {
         self.json_lines(std::iter::once(value))
     }
     /// Several JSON lines that must stay adjacent and ordered.
@@ -565,12 +565,12 @@ impl StdoutWriter {
         }
         self.bytes(bytes)
     }
-    pub(crate) fn text(&self, text: &[u8]) -> io::Result<()> {
+    pub fn text(&self, text: &[u8]) -> io::Result<()> {
         self.bytes(text.to_vec())
     }
     /// Wait until queued output has been written; see `drain_stdout`. A timeout while output sits
     /// in the disk spool says so: spooled frames live in an unlinked file and do not outlive the process.
-    pub(crate) fn drain(&self, timeout: Option<Duration>) -> io::Result<()> {
+    pub fn drain(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.pipe.drain(timeout).map_err(|error| {
             if error.kind() == io::ErrorKind::TimedOut && self.spooling() {
                 io::Error::new(

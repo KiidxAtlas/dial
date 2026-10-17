@@ -4,12 +4,12 @@ pub mod cancellation;
 pub mod clock;
 pub mod execution;
 pub mod fingerprint;
-pub(crate) mod json_transport;
+pub mod json_transport;
 pub mod presentation;
 pub mod process;
 pub mod schema;
-pub(crate) mod stream_journal;
-pub(crate) mod structural;
+pub mod stream_journal;
+pub mod structural;
 pub mod template;
 pub mod tool_output;
 
@@ -274,7 +274,7 @@ struct Inner {
 #[derive(Debug, Clone, Default)]
 pub struct Tree(Arc<Mutex<Inner>>);
 impl Tree {
-    pub(crate) fn journal(&self, journal: stream_journal::Journal) {
+    pub fn journal(&self, journal: stream_journal::Journal) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).journal = Some(journal);
     }
     pub fn check_persistence(&self) -> Result<(), String> {
@@ -285,7 +285,7 @@ impl Tree {
             .as_ref()
             .map_or(Ok(()), |journal| journal.check())
     }
-    pub(crate) fn stream_writer(&self) -> Option<stream_journal::Journal> {
+    pub fn stream_writer(&self) -> Option<stream_journal::Journal> {
         self.0
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

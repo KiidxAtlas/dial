@@ -235,8 +235,8 @@ pub(super) mod process {
         check(unsafe { libc::killpg(pid(leader)?, libc::SIGTERM) })
     }
 
-    #[cfg(test)]
-    pub(in crate::platform) fn alive(target: u32) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn alive(target: u32) -> bool {
         // SAFETY: signal 0 only checks existence and permission.
         pid(target).is_ok_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
     }
@@ -246,7 +246,7 @@ pub(super) mod process {
         pid(target).is_ok_and(|pid| unsafe { libc::getpgid(pid) } == pid)
     }
 
-    pub(in crate::platform) fn exited(child: &Child) -> io::Result<bool> {
+    pub fn exited(child: &Child) -> io::Result<bool> {
         // SAFETY: zeroed siginfo_t is a valid out-parameter; WNOWAIT leaves the child unreaped.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let result = unsafe {
