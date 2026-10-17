@@ -74,7 +74,7 @@ struct ProgressClock {
 }
 
 impl Patience {
-    pub fn new(first_event: Option<Duration>, idle: Duration) -> Self {
+    pub(crate) fn new(first_event: Option<Duration>, idle: Duration) -> Self {
         Patience {
             first_event,
             idle,
@@ -98,8 +98,8 @@ impl Patience {
         )
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn with_test_idle_limit(limit: Duration) {
+    #[cfg(test)]
+    pub(crate) fn with_test_idle_limit(limit: Duration) {
         TEST_IDLE_LIMIT_MILLIS.with(|millis| millis.set(limit.as_millis() as u64));
     }
 

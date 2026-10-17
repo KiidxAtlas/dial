@@ -6,7 +6,7 @@ pub(crate) struct Healer {
 }
 
 impl Healer {
-    pub fn push(
+    pub(crate) fn push(
         &mut self,
         chunk: &str,
         visible: &mut impl FnMut(&str) -> bool,
