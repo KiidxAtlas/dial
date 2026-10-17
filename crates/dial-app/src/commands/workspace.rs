@@ -7,7 +7,7 @@
 
 use crate::agent::Agent;
 use crate::app::{App, Shell, Step};
-use crate::tools::git::{self, Worktree};
+use crate::tools::vcs::git::{self, Worktree};
 use anyhow::{Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

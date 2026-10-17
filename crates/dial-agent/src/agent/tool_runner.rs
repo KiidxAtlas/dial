@@ -1,5 +1,5 @@
 //! Foreground tool owner: keep the UI responsive while authorized native execution runs.
-//! Callbacks return to this owner for admission; tools::execution owns execution and certainty.
+//! Callbacks return to this owner for admission; crate::tools::exec::execution owns execution and certainty.
 use crate::config;
 
 use super::*;
@@ -9,7 +9,7 @@ impl Agent<'_> {
         if self.hermetic
             || !self.effective_config().experimental.tool_speculation
             || name != "ast_search"
-            || self.ext.origin(name) != Some(tools::catalog::Origin::Native)
+            || self.ext.origin(name) != Some(crate::tools::surface::catalog::Origin::Native)
             || approval::denied_by_rule(
                 &self.always,
                 &ToolCall {
@@ -112,7 +112,7 @@ impl Agent<'_> {
         let mutation_cancel = turn_cancel.mutation();
         let cancel = mutation_cancel.interrupt.flag();
         let worker_cancel = mutation_cancel;
-        let signals = tools::signals::CallSignals::new();
+        let signals = crate::tools::exec::signals::CallSignals::new();
         let worker_signals = signals.clone();
         let interruptible = extension
             .as_ref()
@@ -126,8 +126,11 @@ impl Agent<'_> {
             })
             && !approval::parallel_read(&self.ext, &name, &arguments);
         enum Event {
-            Output(tools::ext::ToolEvent),
-            Callback(tools::ext::ToolCallback, mpsc::SyncSender<ToolOutput>),
+            Output(crate::tools::integrations::ext::ToolEvent),
+            Callback(
+                crate::tools::integrations::ext::ToolCallback,
+                mpsc::SyncSender<ToolOutput>,
+            ),
             Mutation(
                 String,
                 Vec<PathBuf>,
@@ -145,7 +148,7 @@ impl Agent<'_> {
         let worker = match thread::Builder::new()
             .name("dial-tool".to_owned())
             .spawn(move || {
-                let output = tools::execution::run(&cancel, || tools::execution::mutation_scope(&worker_cancel, || tools::signals::scope(&worker_signals, || {
+                let output = crate::tools::exec::execution::run(&cancel, || crate::tools::exec::execution::mutation_scope(&worker_cancel, || crate::tools::exec::signals::scope(&worker_signals, || {
                     let _serial = if serial {
                         Some(workspace.serial_operation())
                     } else {
@@ -159,7 +162,7 @@ impl Agent<'_> {
                         let _ = tx.send(Event::Output(event));
                     };
                     if matches!(name.as_str(), "bash" | "read") {
-                        return tools::execution::native(
+                        return crate::tools::exec::execution::native(
                             &ToolContext { workspace: &workspace, config: &config, mutation_authorizer: None, confirm: None },
                             &registry, &name, &arguments, &emit, &cancel,
                         ).expect("native tool");
@@ -222,7 +225,7 @@ impl Agent<'_> {
                         };
                     }
                     if builtin {
-                        return tools::execution::native(&ToolContext { workspace: &workspace, config: &config, mutation_authorizer: Some(&authorize_mutation), confirm: Some(&confirm) }, &registry, &name, &arguments, &emit, &cancel).expect("native tool");
+                        return crate::tools::exec::execution::native(&ToolContext { workspace: &workspace, config: &config, mutation_authorizer: Some(&authorize_mutation), confirm: Some(&confirm) }, &registry, &name, &arguments, &emit, &cancel).expect("native tool");
                     }
                     if let Some(tool) = extension {
                         let mut dispatch = |request| {
@@ -239,16 +242,16 @@ impl Agent<'_> {
                                     Err(RecvTimeoutError::Timeout) if cancel.load(Ordering::SeqCst) => {
                                         return ToolOutput::err("callback interrupted after dispatch")
                                             .with_status(tools::ToolStatus::Aborted)
-                                            .with_effects(tools::outcome::Effects::Unknown);
+                                            .with_effects(crate::tools::surface::outcome::Effects::Unknown);
                                     }
                                     Err(RecvTimeoutError::Timeout) => {}
                                     Err(RecvTimeoutError::Disconnected) => {
-                                        return ToolOutput::err("code-mode callback ended without a result").with_effects(tools::outcome::Effects::Unknown);
+                                        return ToolOutput::err("code-mode callback ended without a result").with_effects(crate::tools::surface::outcome::Effects::Unknown);
                                     }
                                 }
                             }
                         };
-                        return tools::execution::with_dispatch(tool.as_ref(),
+                        return crate::tools::exec::execution::with_dispatch(tool.as_ref(),
                             &ToolContext {
                                 workspace: &workspace,
                                 config: &config,

@@ -5,7 +5,7 @@ use std::path::Path;
 use regex::Regex;
 
 use super::stage::GenerationContext;
-use crate::tools::git::run_checked;
+use crate::tools::vcs::git::run_checked;
 
 /// Subjects read for scope and recent-commit context.
 const LOG_LIMIT: &str = "100";

@@ -18,7 +18,7 @@ use super::super::loop_runner::{collect, read_in_background};
 use super::parsers::{self, Ctx, Kind};
 use super::repair::Checker;
 use super::{CheckResult, Diagnostic, Report, Severity, Skipped, dedupe_project, rel_string};
-use crate::tools::shell::ProcessGroup;
+use crate::tools::exec::shell::ProcessGroup;
 
 /// Directories that are never scanned for checker roots.
 const IGNORED_DIRECTORIES: &[&str] = &[
@@ -940,7 +940,7 @@ fn shell(suite: &mut Suite, root: &Path, files: &[String]) {
 
 /// Project files relative to the root, with `/` separators, excluding ignored directories.
 fn project_files(root: &Path) -> Vec<String> {
-    let listed = crate::tools::git::run_checked(
+    let listed = crate::tools::vcs::git::run_checked(
         root,
         &[
             "ls-files",

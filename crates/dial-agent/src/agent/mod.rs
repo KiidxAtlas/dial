@@ -128,9 +128,9 @@ use crate::storage::checkpoint::Checkpoints;
 use crate::storage::session::{self, Session};
 use crate::storage::skills;
 use crate::storage::store::Store;
-use crate::tools::codebase::Codebase;
-use crate::tools::ext::{LifecycleEvent, Registry, ToolContext};
-use crate::tools::provenance::ProvenanceMemory;
+use crate::tools::integrations::ext::{LifecycleEvent, Registry, ToolContext};
+use crate::tools::knowledge::codebase::Codebase;
+use crate::tools::knowledge::provenance::ProvenanceMemory;
 use crate::tools::{self, Workspace};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -315,7 +315,7 @@ pub struct Agent<'a> {
     memory_runtime: Option<Arc<crate::storage::memory_backend::MemoryRuntime>>,
     codebase: Option<Arc<Codebase>>,
     /// Per-turn code diffs searchable across sessions (`code_history`); `None` when disabled.
-    history: Option<Arc<crate::tools::history::ChangeHistory>>,
+    history: Option<Arc<crate::tools::knowledge::history::ChangeHistory>>,
     experience: Option<Arc<crate::storage::experience::Experience>>,
     assistance: assistance::State,
     checkpoints: Option<Arc<Checkpoints>>,

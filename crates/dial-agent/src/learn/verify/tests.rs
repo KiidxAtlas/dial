@@ -190,7 +190,7 @@ fn paths_cannot_escape_or_follow_symlinks() {
 
 #[test]
 fn command_check_runs_in_the_sandbox() {
-    if !crate::tools::sandbox::require_for_test() {
+    if !crate::tools::exec::sandbox::require_for_test() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();

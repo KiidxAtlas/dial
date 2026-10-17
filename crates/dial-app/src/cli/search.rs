@@ -15,8 +15,8 @@
 
 use crate::config::paths::Layout;
 use crate::config::types::Config;
-use crate::tools::ext::ToolContext;
-use crate::tools::{Workspace, web};
+use crate::tools::integrations::ext::ToolContext;
+use crate::tools::{Workspace, net::web};
 use anyhow::Result;
 use serde_json::{Value, json};
 

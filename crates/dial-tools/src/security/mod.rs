@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::config::types::Config;
-use crate::tools::ext::Tool;
+use crate::tools::integrations::ext::Tool;
 
 pub mod auth;
 pub mod cloud;

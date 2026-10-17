@@ -1195,7 +1195,7 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut group = crate::tools::shell::ProcessGroup::new(
+    let mut group = crate::tools::exec::shell::ProcessGroup::new(
         crate::platform::process::spawn_group(&mut command).ok()?,
     );
     let mut stdout = group.child.stdout.take()?;
@@ -2459,7 +2459,7 @@ struct Shell {
     workers: crate::ui::worker_pins::WorkerBoard,
     /// Worker last opened by `Alt+Shift+A`, so repeated presses cycle through the running ones.
     recent_worker: Option<String>,
-    background_control: Option<Arc<dyn crate::tools::ext::Tool>>,
+    background_control: Option<Arc<dyn crate::tools::integrations::ext::Tool>>,
     pty_approval: Approval,
     maintenance_control: Option<crate::agent::compaction_runtime::CompactionControl>,
     pending_config: Option<Config>,
@@ -4201,7 +4201,7 @@ impl Shell {
                         let on_output = |chunk: &[u8]| {
                             let _ = tx.send(Ok(chunk.to_vec()));
                         };
-                        let result = tools::shell::bash_tool_streaming(
+                        let result = crate::tools::exec::shell::bash_tool_streaming(
                             &ws,
                             &json!({"command":command}),
                             120,
@@ -7246,17 +7246,17 @@ impl Shell {
                 let action = words.next().unwrap_or("status");
                 let result = match action {
                     "init" => match (words.next(), words.next(), words.next(), words.next()) {
-                        (Some(name), Some(metric), Some(direction), Some(benchmark)) => match crate::tools::autoresearch::experiment::parse_direction(direction) {
-                            Ok(maximize) => crate::tools::autoresearch::experiment::init(&layout.project_root, &state, name, benchmark, metric, maximize).map(|e| format!("Initialized {} on branch {}.{}", e.name, e.branch, if e.origin.is_empty() { String::new() } else { format!("\nLeave with /autoresearch exit; it returns to {}.", e.origin) })),
+                        (Some(name), Some(metric), Some(direction), Some(benchmark)) => match crate::tools::knowledge::autoresearch::experiment::parse_direction(direction) {
+                            Ok(maximize) => crate::tools::knowledge::autoresearch::experiment::init(&layout.project_root, &state, name, benchmark, metric, maximize).map(|e| format!("Initialized {} on branch {}.{}", e.name, e.branch, if e.origin.is_empty() { String::new() } else { format!("\nLeave with /autoresearch exit; it returns to {}.", e.origin) })),
                             Err(_) => anyhow::bail!("direction must be max or min. Usage: /autoresearch init <name> <metric> <max|min> <benchmark command>"),
                         },
                         _ => anyhow::bail!("Usage: /autoresearch init <name> <metric> <max|min> <benchmark command>"),
                     },
-                    "run" => crate::tools::autoresearch::experiment::run(&layout.project_root, &state).map(|run| format!("{} = {} · {}{}", run.metric, run.commit, if run.kept {"best"} else {"not best"}, if run.output.is_empty(){String::new()}else{format!("\n{}",run.output)})),
-                    "log" => crate::tools::autoresearch::experiment::log(&state).map(|runs| runs.into_iter().map(|r| format!("#{} {} {} {}", r.id, r.metric, if r.kept {"best"} else {""}, r.commit)).collect::<Vec<_>>().join("\n")),
-                    "notes" => { let text = args.trim().split_once(char::is_whitespace).map_or("", |(_, rest)| rest.trim()); if text.is_empty() { crate::tools::autoresearch::experiment::notes(&state) } else { crate::tools::autoresearch::experiment::update_notes(&state, text).map(|()| "Experiment notes updated.".to_owned()) } }
-                    "resume" | "status" | "" => crate::tools::autoresearch::experiment::current(&state).map(|experiment| experiment.map(|e| format!("{} · {} · {} ({})\n{}", e.name, e.metric, e.branch, e.benchmark, crate::tools::autoresearch::experiment::notes(&state).unwrap_or_default())).unwrap_or_else(|| "No autoresearch experiment. Use /autoresearch init <name> <metric> <max|min> <benchmark command>.".to_owned())),
-                    "exit" => crate::tools::autoresearch::experiment::exit(&layout.project_root, &state),
+                    "run" => crate::tools::knowledge::autoresearch::experiment::run(&layout.project_root, &state).map(|run| format!("{} = {} · {}{}", run.metric, run.commit, if run.kept {"best"} else {"not best"}, if run.output.is_empty(){String::new()}else{format!("\n{}",run.output)})),
+                    "log" => crate::tools::knowledge::autoresearch::experiment::log(&state).map(|runs| runs.into_iter().map(|r| format!("#{} {} {} {}", r.id, r.metric, if r.kept {"best"} else {""}, r.commit)).collect::<Vec<_>>().join("\n")),
+                    "notes" => { let text = args.trim().split_once(char::is_whitespace).map_or("", |(_, rest)| rest.trim()); if text.is_empty() { crate::tools::knowledge::autoresearch::experiment::notes(&state) } else { crate::tools::knowledge::autoresearch::experiment::update_notes(&state, text).map(|()| "Experiment notes updated.".to_owned()) } }
+                    "resume" | "status" | "" => crate::tools::knowledge::autoresearch::experiment::current(&state).map(|experiment| experiment.map(|e| format!("{} · {} · {} ({})\n{}", e.name, e.metric, e.branch, e.benchmark, crate::tools::knowledge::autoresearch::experiment::notes(&state).unwrap_or_default())).unwrap_or_else(|| "No autoresearch experiment. Use /autoresearch init <name> <metric> <max|min> <benchmark command>.".to_owned())),
+                    "exit" => crate::tools::knowledge::autoresearch::experiment::exit(&layout.project_root, &state),
                     other => anyhow::bail!("Unknown autoresearch action: {other}. Use init, run, log, notes, resume, exit."),
                 };
                 match result { Ok(text) => self.note("Autoresearch", text), Err(error) => self.note("Autoresearch", format!("{error:#}")) }
@@ -7676,7 +7676,7 @@ impl Shell {
                 }
             }
             "code-history" => {
-                use crate::tools::history::{self, ChangeHistory, Request};
+                use crate::tools::knowledge::history::{self, ChangeHistory, Request};
                 if !(app.config.codebase.enabled && app.config.codebase.history) {
                     self.note("Code history", "Code history is off. Turn it on in /settings → Project understanding → Code change history (codebase.history).");
                     return Ok(Step::Done);
@@ -7707,7 +7707,7 @@ impl Shell {
                 self.note("Code history", text.unwrap_or_else(|error| format!("{error:#}")));
             }
             "understanding" if args == "clear" => {
-                let result = crate::tools::codebase::Codebase::open(&app.layout)
+                let result = crate::tools::knowledge::codebase::Codebase::open(&app.layout)
                     .and_then(|cache| cache.clear_architecture());
                 match result {
                     Ok(removed) => self.note(
@@ -7738,9 +7738,9 @@ impl Shell {
                 match result {
                     Ok(()) => {
                         let cancel = app.interrupt.clone();
-                        let text = crate::tools::codebase::Codebase::open(&app.layout)
+                        let text = crate::tools::knowledge::codebase::Codebase::open(&app.layout)
                             .and_then(|cache| cache.understanding("architecture", &cancel))
-                            .map(|report| crate::tools::codebase::render_understanding(&report, 40))
+                            .map(|report| crate::tools::knowledge::codebase::render_understanding(&report, 40))
                             .unwrap_or_else(|error| format!("{error:#}"));
                         bridge.shell.note("Understanding", text);
                     }
@@ -7829,10 +7829,10 @@ impl Shell {
                     let cancel = app.interrupt.clone();
                     scope.spawn(move || {
                         let _ = tx.send(
-                            crate::tools::codebase::Codebase::open(layout)
+                            crate::tools::knowledge::codebase::Codebase::open(layout)
                                 .and_then(|cache| cache.understanding(args, &cancel))
                                 .map(|report| {
-                                    crate::tools::codebase::render_understanding(&report, 40)
+                                    crate::tools::knowledge::codebase::render_understanding(&report, 40)
                                 }),
                         );
                     });
@@ -8859,7 +8859,7 @@ struct OverlayEnv<'a> {
     auth_job: &'a mut Option<AuthJob>,
     extensions_pending: &'a mut Option<commands::extensions_browser::Pending>,
     extensions_job: &'a mut Option<commands::extensions_browser::InstallJob>,
-    background_control: Option<&'a Arc<dyn crate::tools::ext::Tool>>,
+    background_control: Option<&'a Arc<dyn crate::tools::integrations::ext::Tool>>,
     pty_approval: Approval,
     app: &'a App,
     themes: &'a mut ThemeManager,
@@ -10267,7 +10267,11 @@ impl Ui for Bridge<'_> {
         self.shell.transcript.tool_input(id, args.to_string());
     }
 
-    fn tool_presentation(&mut self, id: &str, view: &crate::tools::presentation::Presentation) {
+    fn tool_presentation(
+        &mut self,
+        id: &str,
+        view: &crate::tools::surface::presentation::Presentation,
+    ) {
         self.shell.transcript.tool_presentation(id, view);
     }
 

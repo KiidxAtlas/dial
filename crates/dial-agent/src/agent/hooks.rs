@@ -1,5 +1,5 @@
 //! Operator-owned lifecycle hooks: programs run at fixed points of a session, plus the same events
-//! delivered to runtime extension plugins (`tools::plugin`).
+//! delivered to runtime extension plugins (`crate::tools::integrations::plugin`).
 //!
 //! Hooks come from the user's configuration (`[[hooks]]`), which lives outside the project, so the
 //! agent cannot add or edit them. Arrays from every configuration layer are appended, so a project
@@ -315,7 +315,7 @@ pub fn fire(
 /// Whether any hook or plugin observes `event`; callers skip building payloads otherwise.
 pub fn wanted(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::plugin::Host>,
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
     event: &str,
 ) -> bool {
     let event = canonical(event);
@@ -328,7 +328,7 @@ pub fn wanted(
 /// that matches only `bash` no longer serializes reads or disables batch reuse for other tools.
 pub fn wanted_for_tool(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::plugin::Host>,
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
     event: &str,
     tool: &str,
 ) -> bool {
@@ -343,7 +343,7 @@ pub fn wanted_for_tool(
 /// back as notices; nothing blocks.
 pub fn observe(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::plugin::Host>,
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     event: &str,
     payload: Value,
@@ -359,7 +359,7 @@ pub fn observe(
 /// output go to `notice`.
 pub fn gate(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::plugin::Host>,
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     event: &str,
     payload: Value,
@@ -387,7 +387,7 @@ pub fn gate(
 /// sees earlier rewrites; a block refuses the request with its reason.
 pub fn provider_request(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::plugin::Host>,
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     request: &crate::llm::Chat,
     interrupt: &AtomicBool,
@@ -464,7 +464,7 @@ fn apply(
 /// order and each sees earlier rewrites; plugins receive the resulting payload together.
 pub fn fire_with(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::plugin::Host>,
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     event: &str,
     tool: Option<&str>,
@@ -571,7 +571,7 @@ pub fn pre_tool(
 
 pub fn pre_tool_with(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::plugin::Host>,
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     name: &str,
     args: &Value,
@@ -621,7 +621,7 @@ pub fn post_tool(
 #[allow(clippy::too_many_arguments)]
 pub fn post_tool_with(
     hooks: &[HookConfig],
-    plugins: Option<&crate::tools::plugin::Host>,
+    plugins: Option<&crate::tools::integrations::plugin::Host>,
     root: &Path,
     name: &str,
     args: &Value,

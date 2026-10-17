@@ -1,6 +1,6 @@
 //! Shared approval policy for the main conversation and delegated tools.
 use super::{Decision, Ui, subagents};
-use crate::{config::types::Approval, llm::ToolCall, tools::ext::Registry};
+use crate::{config::types::Approval, llm::ToolCall, tools::integrations::ext::Registry};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -325,14 +325,16 @@ pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
             let mut targets = Vec::new();
             collect_declared_paths(args, &mut targets);
             !targets.iter().any(|path| {
-                crate::tools::ssh::url::is_ssh_url(path)
-                    || crate::tools::documents::needs_approval(&serde_json::json!({ "path": path }))
+                crate::tools::integrations::ssh::url::is_ssh_url(path)
+                    || crate::tools::fs::documents::needs_approval(
+                        &serde_json::json!({ "path": path }),
+                    )
             })
         }
         "grep"
             if args["path"]
                 .as_str()
-                .is_some_and(crate::tools::ssh::url::is_ssh_url) =>
+                .is_some_and(crate::tools::integrations::ssh::url::is_ssh_url) =>
         {
             false
         }
@@ -383,7 +385,7 @@ pub fn parallel_read(ext: &Registry, name: &str, args: &Value) -> bool {
     let shared = ext.get(name).map_or_else(
         || matches!(name, "read" | "glob" | "grep" | "ast_search"),
         |tool| {
-            tool.concurrency(args) == crate::tools::ext::Concurrency::Shared
+            tool.concurrency(args) == crate::tools::integrations::ext::Concurrency::Shared
                 && !tool.supports_tool_dispatch()
                 && !tool.needs_approval(args)
         },

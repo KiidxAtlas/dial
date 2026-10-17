@@ -56,9 +56,9 @@ impl Conditions {
                 return Err("AST rule patch coverage budget exceeded".into());
             }
             if input.trim_start().starts_with('[') {
-                owned = crate::tools::hashline::proposed_sources(input)?;
+                owned = crate::tools::edit::hashline::proposed_sources(input)?;
             } else if input.trim_start().starts_with("*** Edit File:") {
-                owned = crate::tools::editing::proposed_sloppy_sources(input)?;
+                owned = crate::tools::edit::editing::proposed_sloppy_sources(input)?;
             } else if input.trim_start().starts_with("*** Begin Patch") {
                 let mut path = None;
                 let mut source = String::new();

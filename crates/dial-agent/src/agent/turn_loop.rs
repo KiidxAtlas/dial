@@ -97,7 +97,8 @@ impl<'a> Agent<'a> {
             && !changed_files.is_empty()
         {
             let recorded = checkpoints.turn_versions(turn).and_then(|versions| {
-                let branch = crate::tools::history::current_branch(self.workspace.root());
+                let branch =
+                    crate::tools::knowledge::history::current_branch(self.workspace.root());
                 history.record(
                     self.session.id(),
                     turn,
@@ -508,7 +509,11 @@ impl<'a> Agent<'a> {
         }
         let names = self.offered();
         let mut schemas = self.schemas(&names)?;
-        tools::contracts::validate_history(&self.session.messages(), &schemas, &self.ext)?;
+        crate::tools::surface::contracts::validate_history(
+            &self.session.messages(),
+            &schemas,
+            &self.ext,
+        )?;
         self.last_trajectory = self.trajectory.as_ref().map(|(id, _, _)| *id);
         let max_steps = if !self.hermetic && self.config.harness.max_steps == 0 {
             0

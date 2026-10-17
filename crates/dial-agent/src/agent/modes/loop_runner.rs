@@ -4,7 +4,7 @@
 //! The loop-limit and loop-condition rules and the loop turn handling. A count or duration limit
 //! bounds every turn, including the one the user submits, so `/loop 2` runs two turns.
 
-use crate::tools::shell::ProcessGroup;
+use crate::tools::exec::shell::ProcessGroup;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};

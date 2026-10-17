@@ -976,7 +976,7 @@ fn argument_paths(root: &Path, tool: &str, args: &Value) -> BTreeSet<String> {
         // boundary. Replacement lines and non-edit source text do not declare targets.
         if let Some(input) = args["patch"].as_str().or_else(|| args["input"].as_str()) {
             if input.trim_start().starts_with("*** Edit File:") {
-                match crate::tools::editing::targets(
+                match crate::tools::edit::editing::targets(
                     crate::config::types::EditMode::Sloppy,
                     &serde_json::json!({"input": input}),
                 ) {
@@ -1031,7 +1031,7 @@ fn argument_paths(root: &Path, tool: &str, args: &Value) -> BTreeSet<String> {
 fn normalize_path(root: &Path, raw: &str, read_selectors: bool) -> Option<String> {
     let decoded;
     let raw = if raw.starts_with("file://") {
-        decoded = crate::tools::lsp::path_from_uri(raw)?;
+        decoded = crate::tools::code::lsp::path_from_uri(raw)?;
         decoded.to_str()?
     } else {
         if raw.contains("://") {

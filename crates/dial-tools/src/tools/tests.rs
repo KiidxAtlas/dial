@@ -1,5 +1,6 @@
 use super::testkit::*;
 use super::*;
+use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 

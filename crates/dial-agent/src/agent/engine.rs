@@ -6,7 +6,7 @@ use crate::{
     llm::ToolCall,
     tools::{
         Workspace,
-        outcome::{self, Effects},
+        surface::outcome::{self, Effects},
     },
 };
 

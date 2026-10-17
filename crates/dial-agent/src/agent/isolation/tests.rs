@@ -12,7 +12,7 @@ fn project() -> (tempfile::TempDir, Workspace) {
 #[test]
 fn development_copy_has_private_git_and_dependencies_and_obeys_source_limits() {
     let (dir, ws) = project();
-    crate::tools::git::initialize_private_snapshot(dir.path()).unwrap();
+    crate::tools::vcs::git::initialize_private_snapshot(dir.path()).unwrap();
     fs::create_dir_all(dir.path().join("node_modules/pkg/node_modules/nested")).unwrap();
     fs::write(
         dir.path()
@@ -335,7 +335,7 @@ fn tracked_bin_scripts_survive_copy_and_merge_without_private_git() {
     let (dir, ws) = project();
     fs::create_dir_all(dir.path().join("bin")).unwrap();
     fs::write(dir.path().join("bin/script"), "original").unwrap();
-    crate::tools::git::initialize_private_snapshot(dir.path()).unwrap();
+    crate::tools::vcs::git::initialize_private_snapshot(dir.path()).unwrap();
     fs::write(dir.path().join(".gitignore"), "/bin/\n").unwrap();
     fs::File::create(dir.path().join("bin/dial"))
         .unwrap()

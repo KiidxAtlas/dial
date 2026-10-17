@@ -2,7 +2,7 @@
 //! passes through the agent's schemas, approvals, confinement and checkpoint observer.
 use crate::{
     agent::{Agent, Ui},
-    tools::ext::Tool,
+    tools::integrations::ext::Tool,
 };
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, sync::Arc};
@@ -51,7 +51,7 @@ impl ExtensionHost {
         let mut seen = std::collections::HashSet::new();
         let existing = agent.available_tool_names();
         for tool in &tools {
-            crate::tools::catalog::validate_tool(tool.as_ref())?;
+            crate::tools::surface::catalog::validate_tool(tool.as_ref())?;
             ensure!(
                 !existing.iter().any(|n| n == tool.name()) && seen.insert(tool.name().to_owned()),
                 "tool name collides: {}",

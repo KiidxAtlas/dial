@@ -61,7 +61,7 @@ pub fn allowed(name: &str, value: &str) -> bool {
                 | "GIT_TERMINAL_PROMPT"
                 | "GCM_INTERACTIVE"
         )
-        && !crate::tools::sandbox::is_secret_env(name, value)
+        && !crate::tools::exec::sandbox::is_secret_env(name, value)
 }
 pub struct Exchange {
     path: PathBuf,

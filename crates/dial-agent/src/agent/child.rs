@@ -16,7 +16,7 @@ use super::{
 use crate::{
     llm::{self, Chat, Interrupted, provider::Backend},
     storage::skills,
-    tools::{self, ext::ToolContext},
+    tools::{self, integrations::ext::ToolContext},
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -272,7 +272,7 @@ impl ChildBackends {
         message: &Value,
         output: &ToolOutput,
         call: &llm::ToolCall,
-        registry: &crate::tools::ext::Registry,
+        registry: &crate::tools::integrations::ext::Registry,
     ) -> Result<()> {
         self.archive(messages)?;
         let mut original = message.clone();
@@ -500,7 +500,11 @@ fn child_provider_request(
 ) -> Result<Option<Chat>> {
     let projected = super::dispatch::projected_request(
         request,
-        tools::contracts::project_history(&request.messages, &request.tools, env.ext)?,
+        crate::tools::surface::contracts::project_history(
+            &request.messages,
+            &request.tools,
+            env.ext,
+        )?,
     );
     let plugin_host = env.ext.plugins();
     let plugins = plugin_host.as_deref().filter(|_| env.layout.is_some());
@@ -1736,7 +1740,8 @@ fn run_inner(
         Ok(schemas) => schemas,
         Err(error) => return Outcome::failed(0, format!("{error:#}")),
     };
-    if let Err(error) = tools::contracts::validate_history(&job.resume_messages, &schemas, env.ext)
+    if let Err(error) =
+        crate::tools::surface::contracts::validate_history(&job.resume_messages, &schemas, env.ext)
     {
         return Outcome::failed(0, format!("{error:#}"));
     }
@@ -1781,7 +1786,7 @@ fn run_inner(
         && env.config.codebase.ambient_context
         && let Some(layout) = env.layout
     {
-        match crate::tools::codebase::Codebase::open(layout).and_then(|cache| {
+        match crate::tools::knowledge::codebase::Codebase::open(layout).and_then(|cache| {
             if env.config.efficiency.enabled {
                 cache.task_context(
                     &job.prompt,
@@ -2604,7 +2609,7 @@ fn run_inner(
             }
         }
         let narration_warning = engine.narration.observe(&reply);
-        let assistant = tools::contracts::assistant_message(&reply, &schemas, env.ext);
+        let assistant = crate::tools::surface::contracts::assistant_message(&reply, &schemas, env.ext);
         if let Err(error) = children.archive_assistant(&messages, &assistant, recovered_original) {
             return Ok(super::engine::Tick::Finished(Outcome::failed(
                 steps,
@@ -2621,7 +2626,7 @@ fn run_inner(
             if parallel.is_empty()
                 && let Some(reason) = engine.pending_refusal()
             {
-                messages.push(tools::outcome::skipped(&call.id, reason));
+                messages.push(crate::tools::surface::outcome::skipped(&call.id, reason));
                 continue;
             }
             if env.interrupt.load(Ordering::SeqCst) {
@@ -2638,7 +2643,7 @@ fn run_inner(
                     &call.name,
                     0.0,
                     tools::ToolStatus::Skipped,
-                    tools::outcome::Effects::None,
+                    crate::tools::surface::outcome::Effects::None,
                 );
                 continue;
             }
@@ -2651,7 +2656,7 @@ fn run_inner(
                     &call.name,
                     0.0,
                     tools::ToolStatus::Skipped,
-                    tools::outcome::Effects::None,
+                    crate::tools::surface::outcome::Effects::None,
                 );
                 continue;
             }
@@ -2667,7 +2672,7 @@ fn run_inner(
                     &call.name,
                     0.0,
                     tools::ToolStatus::Skipped,
-                    tools::outcome::Effects::None,
+                    crate::tools::surface::outcome::Effects::None,
                 );
                 continue;
             }
@@ -2686,7 +2691,7 @@ fn run_inner(
                     &call.name,
                     0.0,
                     tools::ToolStatus::Skipped,
-                    tools::outcome::Effects::None,
+                    crate::tools::surface::outcome::Effects::None,
                 );
                 continue;
             }
@@ -2789,7 +2794,7 @@ fn run_inner(
                 } else {
                     tools::ToolStatus::from_output(&output)
                 },
-                tools::outcome::effects(&output),
+                crate::tools::surface::outcome::effects(&output),
             );
             portable_batch_intercepted |= rule_state.callback_pending();
             let (duplicate, repeat_advice, stop) =
@@ -2853,7 +2858,7 @@ fn run_inner(
                 body.push_str(&notice);
             }
             let mut message = llm::tool_message(&call.id, &body);
-            tools::outcome::annotate(&mut message, &output);
+            crate::tools::surface::outcome::annotate(&mut message, &output);
             message["is_error"] = json!(output.is_error);
             if let Some(image) = image {
                 message["dial_images"] = json!([image]);
@@ -3277,7 +3282,8 @@ fn capture_child_memory(
             |backend| backend.record_discarded_response(),
         )?;
     }
-    let mut assistant = tools::contracts::assistant_message(&reply, &request.tools, env.ext);
+    let mut assistant =
+        crate::tools::surface::contracts::assistant_message(&reply, &request.tools, env.ext);
     assistant["dial_child_autolearn"] = json!(true);
     context
         .children
@@ -3322,7 +3328,7 @@ fn capture_child_memory(
                 .as_ref()
                 .is_some_and(|data| data["is_error"] == true);
         let mut message = llm::tool_message(&call.id, &output.text);
-        tools::outcome::annotate(&mut message, &output);
+        crate::tools::surface::outcome::annotate(&mut message, &output);
         message["dial_child_autolearn"] = json!(true);
         context
             .children
@@ -3422,10 +3428,10 @@ fn call_tool(
         .unwrap_or_default();
     let turn = cancellation.turn(env.interrupt.clone());
     let mutation = turn.mutation();
-    tools::execution::run(env.interrupt, || {
-        tools::execution::mutation_scope(&mutation, || {
+    crate::tools::exec::execution::run(env.interrupt, || {
+        crate::tools::exec::execution::mutation_scope(&mutation, || {
             if let Some(signals) = approver.tool_signals(call, env.ext) {
-                tools::signals::scope(&signals, || {
+                crate::tools::exec::signals::scope(&signals, || {
                     call_tool_inner(
                         env,
                         job,
@@ -3471,7 +3477,7 @@ fn call_tool_inner(
             is_error: true,
         }
         .with_status(tools::ToolStatus::Blocked)
-        .with_effects(tools::outcome::Effects::None)
+        .with_effects(crate::tools::surface::outcome::Effects::None)
     };
     let preview_abort = rerank.as_ref().map(|context| context.preview_abort);
     let children = rerank.as_ref().map(|context| context.children);
@@ -3666,7 +3672,7 @@ fn call_tool_inner(
         authorized
     };
     if call.name == "find" {
-        match tools::navigation::semantic_request(env.workspace, &call.arguments) {
+        match crate::tools::code::navigation::semantic_request(env.workspace, &call.arguments) {
             Ok(Some(request)) => {
                 let mut output = semantic_find(
                     env,
@@ -3807,7 +3813,7 @@ fn call_tool_inner(
                 return ToolOutput::err("code-mode callback limit exceeded (128 per cell)");
             }
             match request {
-                tools::ext::ToolCallback::Schemas => ToolOutput {
+                crate::tools::integrations::ext::ToolCallback::Schemas => ToolOutput {
                     execution: Default::default(),
                     data: Some(Value::Array(
                         schemas
@@ -3827,7 +3833,7 @@ fn call_tool_inner(
                     text: String::new(),
                     is_error: false,
                 },
-                tools::ext::ToolCallback::Call { name, arguments } => {
+                crate::tools::integrations::ext::ToolCallback::Call { name, arguments } => {
                     if env
                         .ext
                         .get(&name)
@@ -3899,7 +3905,7 @@ fn call_tool_inner(
                 }
             }
         };
-        let mut output = tools::execution::with_dispatch(
+        let mut output = crate::tools::exec::execution::with_dispatch(
             tool.as_ref(),
             &ToolContext {
                 workspace: env.workspace,
@@ -4152,14 +4158,14 @@ fn semantic_find(
     schemas: &[Value],
     names: &[String],
     call: &llm::ToolCall,
-    request: tools::navigation::SemanticRequest,
+    request: crate::tools::code::navigation::SemanticRequest,
     rerank: Option<RerankContext<'_>>,
     approver: &std::cell::RefCell<&mut dyn Approver>,
     callback_gate: Option<&std::sync::Mutex<super::rules::CallbackGate<'_>>>,
 ) -> ToolOutput {
     let result = (|| -> Result<ToolOutput> {
-        let supplementary =
-            tools::navigation::lsp_args(&call.arguments).map_err(anyhow::Error::msg)?;
+        let supplementary = crate::tools::code::navigation::lsp_args(&call.arguments)
+            .map_err(anyhow::Error::msg)?;
         let response = if request.has_candidates() {
             let context = rerank
                 .context("semantic find requires the child run's configured model backend")?;
@@ -4259,7 +4265,7 @@ fn execute(
         mutation_authorizer,
         confirm,
     };
-    if let Some(output) = tools::execution::native(
+    if let Some(output) = crate::tools::exec::execution::native(
         &context,
         env.ext,
         &call.name,
@@ -4270,7 +4276,7 @@ fn execute(
         return output;
     }
     match (call.name.as_str(), env.layout) {
-        ("skill", Some(layout)) => tools::execution::run(env.interrupt, || {
+        ("skill", Some(layout)) => crate::tools::exec::execution::run(env.interrupt, || {
             skills::skill_tool::call(layout, &call.arguments)
         }),
         _ => ToolOutput::err(format!("{} is unavailable to subagents", call.name)),

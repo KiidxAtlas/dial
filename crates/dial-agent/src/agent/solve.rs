@@ -13,7 +13,7 @@ use super::{Ui, approval, subagents, verification};
 use crate::{
     config::types::Config,
     llm::{Chat, ToolCall},
-    tools::{self, Workspace},
+    tools::Workspace,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -247,7 +247,7 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
     request.validate(&env.config.solve)?;
     // Child model route is not an implicit escalation/disclosure escape hatch.
     let child_config = local_route(env.config.for_role("small"), false)?;
-    tools::sandbox::Sandbox::detect()
+    crate::tools::exec::sandbox::Sandbox::detect()
         .available()
         .map_err(anyhow::Error::msg)?;
     for check in &request.checks {
@@ -275,7 +275,7 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
     for path in &request.allowed_paths {
         confined_destination(env.workspace.root(), path)?;
     }
-    let ext = tools::ext::Registry::new();
+    let ext = crate::tools::integrations::ext::Registry::new();
     let mut harness = child_config.effective_harness(env.harness)?;
     harness
         .tools
@@ -419,7 +419,7 @@ fn verify(
         let result = std::thread::scope(|scope| {
             let (send, receive) = std::sync::mpsc::channel();
             scope.spawn(move || {
-                let result = tools::shell::bash_tool_streaming(
+                let result = crate::tools::exec::shell::bash_tool_streaming(
                     &workspace,
                     &json!({"command":check.command}),
                     check.timeout_secs,

@@ -69,7 +69,7 @@ fn par_each<T: Sync>(items: &[T], f: impl Fn(&T) + Sync) {
 
 #[test]
 fn untouched_fails_and_reference_passes_for_every_family() {
-    if !crate::tools::sandbox::require_for_test() {
+    if !crate::tools::exec::sandbox::require_for_test() {
         return;
     }
     let case = |seed: u64, t: &Task| {
@@ -129,7 +129,7 @@ fn untouched_fails_and_reference_passes_for_every_family() {
 
 #[test]
 fn corrupting_any_solved_outcome_fails_the_check() {
-    if !crate::tools::sandbox::require_for_test() {
+    if !crate::tools::exec::sandbox::require_for_test() {
         return;
     }
     let case = |t: &Task| {
@@ -324,7 +324,7 @@ fn plausible_wrong_solutions_fail() {
 
 #[test]
 fn fix_bug_rejects_hard_coded_output_and_typo_hunt_rejects_wrong_fix() {
-    if !crate::tools::sandbox::require_for_test() {
+    if !crate::tools::exec::sandbox::require_for_test() {
         return;
     }
     par_each(&(0..10u64).collect::<Vec<_>>(), |&seed| {
@@ -383,7 +383,7 @@ fn fix_bug_rejects_hard_coded_output_and_typo_hunt_rejects_wrong_fix() {
 
 #[test]
 fn command_checks_really_run_python() {
-    if !crate::tools::sandbox::require_for_test() {
+    if !crate::tools::exec::sandbox::require_for_test() {
         return;
     }
     let t = fix_bug_py(&mut StdRng::seed_from_u64(3));
@@ -531,7 +531,7 @@ fn failure_variants_are_isolated_and_deterministic() {
 
 #[test]
 fn syntax_success_and_empty_search_are_not_semantic_success() {
-    if !crate::tools::sandbox::require_for_test() {
+    if !crate::tools::exec::sandbox::require_for_test() {
         return;
     }
     par_each(

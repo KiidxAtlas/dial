@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) fn defer_architecture_attempt_on_failure<T>(
     cache: &Codebase,
-    synthesis: &crate::tools::codebase::architecture::Synthesis,
+    synthesis: &crate::tools::knowledge::codebase::architecture::Synthesis,
     result: Result<T>,
 ) -> Result<T> {
     if result.is_err() {

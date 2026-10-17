@@ -13,7 +13,7 @@
 //! polls. The schedules file is re-parsed when it changes; invalid entries are skipped.
 use crate::{
     config::paths::Layout,
-    tools::{diagnostics::Collector, shell::ProcessGroup},
+    tools::{code::diagnostics::Collector, exec::shell::ProcessGroup},
 };
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;

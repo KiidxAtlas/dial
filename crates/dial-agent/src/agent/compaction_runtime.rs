@@ -29,7 +29,7 @@ pub fn portable_summary_completion(
     root: std::path::PathBuf,
     control_state: serde_json::Value,
     hooks_config: Vec<crate::config::types::HookConfig>,
-    hook_plugins: Option<Arc<crate::tools::plugin::Host>>,
+    hook_plugins: Option<Arc<crate::tools::integrations::plugin::Host>>,
     session_id: String,
     hermetic: bool,
 ) -> impl FnMut(&mut Backend, &Chat, &mut dyn Ui, Arc<AtomicBool>, u64) -> Result<String> + Send {

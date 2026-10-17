@@ -5,7 +5,7 @@ use super::*;
 use crate::commit::ai_stage::{StageUnit, UNIT_CHARS, UnitKind, changed_lines, classify_units};
 use crate::commit::repo_context::generation_context;
 use crate::commit::{GenerationConfig, GenerationInput, format_conventional_commit, generate};
-use crate::tools::git::run_checked;
+use crate::tools::vcs::git::run_checked;
 use std::{
     path::Path,
     sync::mpsc::{self, Receiver},

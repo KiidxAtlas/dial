@@ -10,7 +10,7 @@ fn state(text: &str) -> FileState {
 }
 #[test]
 fn verifier_checks_real_exit_status_and_cannot_modify_candidate_or_source() {
-    if !tools::sandbox::require_for_test() {
+    if !crate::tools::exec::sandbox::require_for_test() {
         return;
     }
     let source = tempfile::tempdir().unwrap();

@@ -779,7 +779,7 @@ impl Agent<'_> {
         thread::scope(|scope| {
             let (tx, rx) = mpsc::sync_channel(1);
             scope.spawn(move || {
-                let _ = tx.send(crate::tools::preview::run(&ws, &args, &cancel));
+                let _ = tx.send(crate::tools::edit::preview::run(&ws, &args, &cancel));
             });
             receive_with_heartbeat(&rx, ui).unwrap_or_else(|e| ToolOutput {
                 execution: Default::default(),

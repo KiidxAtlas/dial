@@ -386,7 +386,7 @@ pub fn check(config: &AppConfig) -> Result<Value> {
     let source = "def value():\n    return 1\n";
     let edit = Some(match edit_mode {
         EditMode::Hashline => {
-            json!({"input":format!("[fixture.py#{}]\nPUT 2.=2:\n+    return 2",tools::hashline::tag_of(source))})
+            json!({"input":format!("[fixture.py#{}]\nPUT 2.=2:\n+    return 2",crate::tools::edit::hashline::tag_of(source))})
         }
         EditMode::Replace => {
             json!({"path":"fixture.py","old_string":"return 1","new_string":"return 2"})

@@ -125,7 +125,7 @@ impl<'a> Agent<'a> {
         self.approval
     }
     /// Shared UI control handle for the session-owned background process registry.
-    pub fn background_control(&self) -> Option<Arc<dyn tools::ext::Tool>> {
+    pub fn background_control(&self) -> Option<Arc<dyn crate::tools::integrations::ext::Tool>> {
         self.ext.get("bg").cloned()
     }
     /// Stateful native adapters belong to one editor session; stateless services remain shared.
@@ -222,14 +222,15 @@ impl<'a> Agent<'a> {
             backend.remember_session_error(error);
         }
         if let Some(memory) = &self.memory {
-            for tool in
-                crate::tools::provenance::tools(memory.clone(), self.session.id().to_owned())
-            {
+            for tool in crate::tools::knowledge::provenance::tools(
+                memory.clone(),
+                self.session.id().to_owned(),
+            ) {
                 self.ext.register(tool);
             }
         }
         if let Some(cache) = &self.codebase {
-            self.ext.register(crate::tools::codebase::tool(
+            self.ext.register(crate::tools::knowledge::codebase::tool(
                 cache.clone(),
                 self.session.id().to_owned(),
             ));
@@ -282,17 +283,18 @@ impl<'a> Agent<'a> {
     }
     /// Authoritative schemas and identities for this owner's directly offered and deferred tools.
     /// Reading metadata does not register tools or grant execution authority.
-    pub fn tool_catalog(&self) -> Result<tools::catalog::Catalog> {
+    pub fn tool_catalog(&self) -> Result<crate::tools::surface::catalog::Catalog> {
         let names = self.catalog();
         let schemas = self.schemas(&names)?;
-        let mut catalog = tools::catalog::Catalog::from_schemas(&schemas, &self.ext)?;
+        let mut catalog =
+            crate::tools::surface::catalog::Catalog::from_schemas(&schemas, &self.ext)?;
         for name in self.config.tools.keys() {
-            catalog.set_origin(name, tools::catalog::Origin::Configured);
+            catalog.set_origin(name, crate::tools::surface::catalog::Origin::Configured);
         }
         Ok(catalog)
     }
     /// Physical preparation metrics; these are not model tool-call or success counters.
-    pub fn speculation_stats(&self) -> tools::speculation::Stats {
+    pub fn speculation_stats(&self) -> crate::tools::exec::speculation::Stats {
         self.workspace.speculation.stats()
     }
     pub fn session_cost(&self) -> Option<f64> {
@@ -343,13 +345,19 @@ impl<'a> Agent<'a> {
         self.version.adapter = Some(path);
         Ok(())
     }
-    pub fn register_tool(&mut self, tool: Arc<dyn tools::ext::Tool>) -> Result<()> {
+    pub fn register_tool(
+        &mut self,
+        tool: Arc<dyn crate::tools::integrations::ext::Tool>,
+    ) -> Result<()> {
         self.validate_tool_registration(tool.as_ref())?;
         self.ext.register(tool);
         self.rebuild_system();
         Ok(())
     }
-    pub fn register_tools(&mut self, tools: Vec<Arc<dyn tools::ext::Tool>>) -> Result<()> {
+    pub fn register_tools(
+        &mut self,
+        tools: Vec<Arc<dyn crate::tools::integrations::ext::Tool>>,
+    ) -> Result<()> {
         let mut names = HashSet::new();
         for tool in &tools {
             self.validate_tool_registration(tool.as_ref())?;
@@ -365,8 +373,11 @@ impl<'a> Agent<'a> {
         self.rebuild_system();
         Ok(())
     }
-    pub(super) fn validate_tool_registration(&self, tool: &dyn tools::ext::Tool) -> Result<()> {
-        tools::catalog::validate_tool(tool)?;
+    pub(super) fn validate_tool_registration(
+        &self,
+        tool: &dyn crate::tools::integrations::ext::Tool,
+    ) -> Result<()> {
+        crate::tools::surface::catalog::validate_tool(tool)?;
         let name = tool.name();
         ensure!(
             !config::tools::BUILTIN.contains(&name)
@@ -450,7 +461,7 @@ impl<'a> Agent<'a> {
                 Some((name, arguments, message["content"].as_str()?))
             })
             .collect();
-        tools::hashline::rehydrate(
+        crate::tools::edit::hashline::rehydrate(
             &self.workspace,
             evidence
                 .iter()

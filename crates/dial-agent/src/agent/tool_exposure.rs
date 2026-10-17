@@ -499,7 +499,7 @@ impl<'a> Agent<'a> {
                 n if config::tools::BUILTIN.contains(&n) => tools::schemas(&[n], mode)?.remove(0),
                 n if self.ext.contains(n) => self.ext.get(n).map(|tool| tool.schema()).context("extension tool vanished")?,
                 "experience" => assistance::schema(),
-                "edit_preview" => crate::tools::preview::schema(),
+                "edit_preview" => crate::tools::edit::preview::schema(),
                 "tts" => crate::voice::tool::schema(),
                 "todo" => todo::schema(),
                 "finish" => completion::schema(),
@@ -575,7 +575,7 @@ impl<'a> Agent<'a> {
                 }
             }
         }
-        tools::catalog::Catalog::from_schemas(&schemas, &self.ext)?;
+        crate::tools::surface::catalog::Catalog::from_schemas(&schemas, &self.ext)?;
         Ok(schemas)
     }
 

@@ -1,12 +1,12 @@
 //! `/mcp smithery-*` slash commands (`/mcp smithery-search|login|logout`, plus `smithery-install`).
-//! Registry logic lives in `tools::mcp::smithery`; this module drives the prompts and config writes.
+//! Registry logic lives in `crate::tools::integrations::mcp::smithery`; this module drives the prompts and config writes.
 
 use super::extensions::{spawn_job, spawn_job_streaming};
 use crate::agent::{Agent, Ui};
 use crate::app::{App, Bridge, PAINT_EVERY, Shell, Step};
 use crate::config::settings_store::Scope;
 use crate::llm::oauth::util::open_browser;
-use crate::tools::mcp::smithery::{self, SearchResult};
+use crate::tools::integrations::mcp::smithery::{self, SearchResult};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;

@@ -65,8 +65,8 @@ fn journal_failure_stops_all_runtime_publication_and_preserves_saved_prose() {
 #[test]
 fn coherent_runtime_extensions_own_call_and_result_presentation() {
     use crate::tools::{
-        ext::{Registry, Tool, ToolContext},
-        presentation::{BodyStyle, Presentation},
+        integrations::ext::{Registry, Tool, ToolContext},
+        surface::presentation::{BodyStyle, Presentation},
     };
     struct Extension;
     impl Tool for Extension {
