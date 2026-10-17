@@ -123,7 +123,7 @@ fn strict_optional_nulls_do_not_relax_required_or_unknown_fields() {
         json!({"path":"fixture.py","limit":0}),
     ] {
         omit_optional_nulls(&mut args, schema);
-        assert!(crate::agent::calls::validate(schema, &args).is_err());
+        assert!(crate::agent::run::calls::validate(schema, &args).is_err());
     }
 }
 #[test]

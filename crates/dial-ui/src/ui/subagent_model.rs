@@ -24,7 +24,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 use crate::agent::LiveTaskControl;
-use crate::agent::child_transcript::{self, TranscriptSummary};
+use crate::agent::workers::child_transcript::{self, TranscriptSummary};
 use crate::config::paths::Layout;
 use crate::runtime::{Phase, Tree};
 

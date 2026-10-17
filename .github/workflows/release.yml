@@ -78,7 +78,7 @@ jobs:
           package="dial-${GITHUB_REF_NAME}-${RELEASE_TARGET}"
           mkdir -p "dist/$package"
           install -m 755 "target/$RELEASE_TARGET/release/dial" "dist/$package/dial"
-          cp LICENSE README.md THIRD_PARTY_NOTICES crates/dial-agent/src/agent/snapcompact/fonts/Silver.LICENSE crates/dial-agent/src/agent/snapcompact/fonts/Unscii.LICENSE "dist/$package/"
+          cp LICENSE README.md THIRD_PARTY_NOTICES crates/dial-agent/src/agent/compact/snapcompact/fonts/Silver.LICENSE crates/dial-agent/src/agent/compact/snapcompact/fonts/Unscii.LICENSE "dist/$package/"
           tar -czf "dist/$package.tar.gz" -C dist "$package"
           smoke="$(mktemp -d "${RUNNER_TEMP:-$PWD/dist}/dial-smoke.XXXXXX")"
           trap 'rm -rf "$smoke"' EXIT
@@ -126,7 +126,7 @@ jobs:
           $dir = "dist/$package"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release/dial.exe "$dir/dial.exe"
-          Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES, crates/dial-agent/src/agent/snapcompact/fonts/Silver.LICENSE, crates/dial-agent/src/agent/snapcompact/fonts/Unscii.LICENSE $dir
+          Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES, crates/dial-agent/src/agent/compact/snapcompact/fonts/Silver.LICENSE, crates/dial-agent/src/agent/compact/snapcompact/fonts/Unscii.LICENSE $dir
           Compress-Archive -Path $dir -DestinationPath "dist/$package.zip"
           $expected = "${{ github.ref_name }}".Substring(1)
           # Capture all output first: piping into `Select-Object -First 1` stops the native

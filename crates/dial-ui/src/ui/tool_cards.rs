@@ -32,7 +32,7 @@ pub struct Tool {
     pub progress: Option<String>,
     pub elapsed: Option<f64>,
     /// For a `todo` call: the list after it, each task flagged when this call changed it.
-    pub todo: Option<Vec<(crate::agent::todo::Task, bool)>>,
+    pub todo: Option<Vec<(crate::agent::workflow::todo::Task, bool)>>,
     /// For a `task` call: the subagents it spawned, as last observed.
     pub agents: Vec<AgentRow>,
 }

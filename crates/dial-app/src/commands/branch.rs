@@ -5,7 +5,7 @@
 
 use crate::agent::Agent;
 use crate::agent::NullUi;
-use crate::agent::compaction;
+use crate::agent::compact::compaction;
 use crate::app::App;
 use crate::llm::Chat;
 use crate::llm::provider::Backend;

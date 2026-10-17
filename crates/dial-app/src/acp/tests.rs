@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::ui_event::{EventKind, UiEvent};
+use crate::agent::ui::ui_event::{EventKind, UiEvent};
 
 /// Session updates for one active session, after each event passes through the adapter.
 fn session_updates(events: Vec<Value>) -> Vec<Value> {

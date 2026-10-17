@@ -93,7 +93,7 @@ fn prompt_stop(value: &Value) -> Value {
 /// ACP plan entry for one todo task. The `Status` match is exhaustive, so a new status cannot
 /// silently render as pending. Abandoned and blocked tasks keep their state and note in `_meta.dial`.
 fn plan_entry(task: &Value) -> Value {
-    use crate::agent::todo::Status;
+    use crate::agent::workflow::todo::Status;
     let raw = match task["status"].as_str() {
         Some("done") => "completed",
         Some("running") => "in_progress",
@@ -823,7 +823,7 @@ impl Adapter {
                         text.push_str(delta);
                     }
                     if text.len() > 24 * 1024 {
-                        *text = crate::agent::guard::clip_middle(text, 24 * 1024);
+                        *text = crate::agent::safety::guard::clip_middle(text, 24 * 1024);
                     }
                     text.clone()
                 } else {

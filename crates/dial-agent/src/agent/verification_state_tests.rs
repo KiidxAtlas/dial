@@ -129,7 +129,13 @@ fn round_settlement_preserves_verification_status_and_bounded_receipts() {
         ..Default::default()
     };
     for _ in 0..3 {
-        turn::settle_reliability(&mut state, &Default::default(), &None, false, &checks);
+        crate::agent::run::turn::settle_reliability(
+            &mut state,
+            &Default::default(),
+            &None,
+            false,
+            &checks,
+        );
     }
     assert_eq!(state["verification_results"], results);
     assert_eq!(state["verification_receipts"], receipts);

@@ -2,7 +2,7 @@
 //! `/marketplace`, `/reload-plugins`, `/security`.
 
 use crate::agent::Agent;
-use crate::agent::agent_defs::Catalog;
+use crate::agent::base::agent_defs::Catalog;
 use crate::app::{App, Shell, Step, Which};
 use crate::config::settings_store::{Change, Scope, load_layer};
 use crate::config::tools::mcp::validate_server;

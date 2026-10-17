@@ -219,7 +219,7 @@ fn independent_slow_reads_overlap_and_results_stay_ordered() {
     let mut calls = calls;
     calls[2].id = "duplicate".into();
     calls[2].arguments["i"] = json!("same observation, different presentation");
-    assert!(approval::parallel_read(
+    assert!(crate::agent::safety::approval::parallel_read(
         &ext,
         "harness_probe",
         &calls[0].arguments
@@ -269,11 +269,15 @@ fn batched_read_only_bash_runs_through_parallel_tools_in_call_order() {
             malformed_arguments: false,
         })
         .collect();
-    assert!(calls.iter().all(|call| approval::parallel_read(
-        &Registry::new(),
-        &call.name,
-        &call.arguments
-    )));
+    assert!(
+        calls
+            .iter()
+            .all(|call| crate::agent::safety::approval::parallel_read(
+                &Registry::new(),
+                &call.name,
+                &call.arguments
+            ))
+    );
     let outputs = parallel_tools(
         &workspace,
         &Config::default(),

@@ -80,7 +80,7 @@ fn history_pages_preserve_boundaries_and_reject_invalid_cursors() {
 
 #[test]
 fn typed_notice_adds_lane_and_keeps_plain_text_and_tokens() {
-    use crate::agent::ui_event::{EventKind, UiEvent};
+    use crate::agent::ui::ui_event::{EventKind, UiEvent};
     let value = typed_notice(
         &UiEvent::new(EventKind::Compaction, "History compacted").with_tokens(900, 120),
     );
