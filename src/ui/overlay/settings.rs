@@ -140,15 +140,9 @@ pub(super) fn selected_fill(theme: &Theme) -> Style {
     chrome::selected_style(theme)
 }
 
-/// Style of a tab-bar cell: the active tab is amber, bold and underlined; the others are muted words.
+/// Style of a tab-bar cell; shared with every panel through [`chrome::tab_style`].
 pub(super) fn tab_style(theme: &Theme, active: bool) -> Style {
-    if active {
-        theme
-            .fg(Tok::Accent)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-    } else {
-        theme.fg(Tok::Muted)
-    }
+    chrome::tab_style(theme, active)
 }
 
 /// One scrollbar cell for list row `row` of `rows` visible, `total` items, first visible `offset`.

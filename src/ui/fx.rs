@@ -6,9 +6,40 @@
 //! so callers can lay text out before styling it.
 use super::theme::{Theme, Tok};
 use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::Span,
 };
+use std::time::Duration;
+
+/// How long the start-up sweep takes to cross the wordmark.
+pub const SWEEP: Duration = Duration::from_millis(700);
+/// How long a panel takes to reveal itself when it opens.
+pub const REVEAL: Duration = Duration::from_millis(140);
+/// Frame interval while a motion is running (the idle loop otherwise polls far more slowly).
+pub const FRAME: Duration = Duration::from_millis(16);
+
+/// Whether anything may move: the user's `ui.motion` setting, and a theme that can show it. ASCII
+/// glyph sets and themes without truecolor brand stops (indexed palettes, `mono`, `NO_COLOR`) stay
+/// still, because a sweep there would only blink.
+pub fn motion(enabled: bool, theme: &Theme) -> bool {
+    enabled && !theme.ascii() && stops(theme).is_some()
+}
+
+/// `elapsed / span` clamped to `0.0..=1.0`; a zero span is already complete.
+pub fn progress(elapsed: Duration, span: Duration) -> f32 {
+    if span.is_zero() {
+        return 1.0;
+    }
+    (elapsed.as_secs_f32() / span.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+/// Cubic ease-out: fast start, gentle landing.
+fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
 
 /// Linear blend of two truecolor values; `t` in `0.0..=1.0`.
 fn mix(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
@@ -70,6 +101,62 @@ pub fn gradient(theme: &Theme, text: &str, phase: f32, base: Style) -> Vec<Span<
             Span::styled(ch.to_string(), base.fg(brand_at(theme, t)))
         })
         .collect()
+}
+
+/// The start-up sweep: [`gradient`] with a bright band that crosses the text once as `progress`
+/// runs from `0.0` to `1.0`, like a needle settling on a station. Outside that range, and without
+/// truecolor stops, this is exactly [`gradient`], so the resting frame never changes.
+pub fn sweep(
+    theme: &Theme,
+    text: &str,
+    phase: f32,
+    progress: f32,
+    base: Style,
+) -> Vec<Span<'static>> {
+    const BAND: f32 = 4.0;
+    let mut spans = gradient(theme, text, phase, base);
+    if !(0.0..1.0).contains(&progress) || stops(theme).is_none() {
+        return spans;
+    }
+    let peak = rgb(theme.color(Tok::Text)).unwrap_or((255, 255, 255));
+    let n = spans.len() as f32;
+    let head = ease_out(progress) * (n + 2.0 * BAND) - BAND;
+    for (i, span) in spans.iter_mut().enumerate() {
+        let distance = (i as f32 - head).abs();
+        if distance >= BAND {
+            continue;
+        }
+        let Some(color) = rgb(span.style.fg) else {
+            continue;
+        };
+        let lift = (1.0 - distance / BAND).powi(2) * 0.85;
+        let (r, g, b) = mix(color, peak, lift);
+        span.style = span.style.fg(Color::Rgb(r, g, b));
+        if distance < 1.0 {
+            span.style = span.style.add_modifier(Modifier::BOLD);
+        }
+    }
+    spans
+}
+
+/// Rows of a `height`-row panel shown at `progress` through its reveal (eased, at least one).
+pub fn reveal_rows(height: u16, progress: f32) -> u16 {
+    if progress >= 1.0 || height == 0 {
+        return height;
+    }
+    ((f32::from(height) * ease_out(progress)).ceil() as u16).clamp(1, height)
+}
+
+/// A panel opening: rows of `area` below the revealed part are blanked, so the panel unrolls from
+/// the top over [`REVEAL`]. A complete reveal leaves the buffer untouched.
+pub fn reveal(buf: &mut Buffer, area: Rect, progress: f32) {
+    let area = area.intersection(buf.area);
+    let shown = reveal_rows(area.height, progress);
+    for y in area.top() + shown..area.bottom() {
+        for x in area.left()..area.right() {
+            buf[(x, y)].reset();
+        }
+    }
 }
 
 /// A shimmer for "working" labels: the text in `base`, with a soft three-character band in the
@@ -249,5 +336,60 @@ mod tests {
         let theme = Theme::dark();
         assert_eq!(brand_at(&theme, 0.0), brand_at(&theme, 1.0));
         assert_eq!(brand_at(&theme, 0.25), brand_at(&theme, 1.25));
+    }
+
+    #[test]
+    fn motion_needs_the_setting_truecolor_and_unicode_glyphs() {
+        assert!(motion(true, &Theme::dark()));
+        assert!(!motion(false, &Theme::dark()), "ui.motion = off");
+        assert!(!motion(true, &Theme::mono()), "no truecolor stops");
+        assert!(
+            !motion(
+                true,
+                &Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii)
+            ),
+            "ASCII stays still"
+        );
+    }
+
+    #[test]
+    fn the_sweep_crosses_once_and_rests_on_the_static_gradient() {
+        let theme = Theme::dark();
+        let word = "▄▄█ ▀ ▄▄▄  █";
+        let still = gradient(&theme, word, 0.1, Style::default());
+        for done in [-0.5, 1.0, 3.0] {
+            assert_eq!(sweep(&theme, word, 0.1, done, Style::default()), still);
+        }
+        let early = sweep(&theme, word, 0.1, 0.2, Style::default());
+        let late = sweep(&theme, word, 0.1, 0.7, Style::default());
+        assert_ne!(early, still, "the band is visible mid-sweep");
+        assert_ne!(early, late, "the band moves");
+        for spans in [&early, &late] {
+            let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(joined, word, "only colors change");
+        }
+        let mono = Theme::mono();
+        assert_eq!(
+            sweep(&mono, word, 0.0, 0.5, Style::default()),
+            gradient(&mono, word, 0.0, Style::default())
+        );
+    }
+
+    #[test]
+    fn a_reveal_unrolls_from_the_top_and_ends_untouched() {
+        assert_eq!(reveal_rows(20, 0.0), 1);
+        assert!(reveal_rows(20, 0.3) > reveal_rows(20, 0.1));
+        assert_eq!(reveal_rows(20, 1.0), 20);
+        assert_eq!(reveal_rows(0, 0.5), 0);
+        let area = Rect::new(0, 0, 4, 4);
+        let mut full = Buffer::filled(area, ratatui::buffer::Cell::new("x"));
+        let untouched = full.clone();
+        reveal(&mut full, area, 1.0);
+        assert_eq!(full, untouched);
+        reveal(&mut full, area, 0.0);
+        assert_eq!(full[(0, 0)].symbol(), "x", "the top row shows at once");
+        assert_eq!(full[(0, 3)].symbol(), " ", "lower rows wait");
+        assert_eq!(progress(Duration::from_millis(70), REVEAL), 0.5);
+        assert_eq!(progress(Duration::from_secs(9), Duration::ZERO), 1.0);
     }
 }

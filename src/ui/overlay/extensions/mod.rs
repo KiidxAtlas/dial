@@ -328,7 +328,7 @@ impl ExtensionsOverlay {
                 "/ to search".to_string()
             } else {
                 format!(
-                    "filter: {}  · {}  · Esc clears",
+                    "filter: {}  · {}  · Esc clear search",
                     browser.query(),
                     browser.match_summary()
                 )
@@ -374,7 +374,7 @@ impl ExtensionsOverlay {
                     let empty = if browser.query().is_empty() {
                         "No catalog entries. r refreshes; / then Enter searches; Marketplaces tab: a adds an index."
                     } else {
-                        "No matches on this tab. Left/Right checks the other tabs; Esc clears the filter."
+                        "No matches on this tab. Left/Right checks the other tabs; Esc clears the search."
                     };
                     lines.push(Line::from(Span::styled(empty, ctx.theme.fg(Tok::Muted))));
                 } else {
@@ -392,14 +392,21 @@ impl ExtensionsOverlay {
                     (ctx.keys.label(Action::SelectCancel), "cancel".to_owned()),
                 ]
             } else {
+                let esc = if browser.details_open {
+                    "back"
+                } else if !browser.query().is_empty() {
+                    "clear search"
+                } else {
+                    "close"
+                };
                 let mut items = vec![
                     (
                         pair_label(ctx.keys, Action::TabPrev, Action::TabNext),
-                        "switch".to_owned(),
+                        "tabs".to_owned(),
                     ),
                     ("/".to_owned(), "search".to_owned()),
                     ("r".to_owned(), "refresh".to_owned()),
-                    ("n".to_owned(), "more".to_owned()),
+                    ("↓".to_owned(), "loads more".to_owned()),
                     (ctx.keys.label(Action::SelectConfirm), enter_label(browser)),
                     ("v".to_owned(), "details".to_owned()),
                     (
@@ -409,7 +416,7 @@ impl ExtensionsOverlay {
                     ("t".to_owned(), "test".to_owned()),
                     ("e".to_owned(), "enable".to_owned()),
                     ("x".to_owned(), "remove".to_owned()),
-                    (ctx.keys.label(Action::SelectCancel), "close".to_owned()),
+                    (ctx.keys.label(Action::SelectCancel), esc.to_owned()),
                 ];
                 if browser.tab() == Tab::Marketplaces {
                     items.insert(5, ("a".to_owned(), "add".to_owned()));
@@ -436,15 +443,8 @@ impl ExtensionsOverlay {
     }
 }
 
-/// Tab label: the active tab is amber, bold and underlined; the rest are muted. No fills.
 fn tab_style(theme: &Theme, active: bool) -> Style {
-    if active {
-        theme
-            .fg(Tok::Accent)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-    } else {
-        theme.fg(Tok::Muted)
-    }
+    chrome::tab_style(theme, active)
 }
 
 fn action(intent: &Intent) -> OverlayEvent {

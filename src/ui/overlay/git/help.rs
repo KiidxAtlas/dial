@@ -195,7 +195,7 @@ pub(super) fn lines(theme: &Theme) -> Vec<Line<'static>> {
     }
     out.push(Line::default());
     let mut footer = vec![Span::raw(" ")];
-    footer.extend(chrome::key_hint_spans(theme, &[("? or esc", "to close")]));
+    footer.extend(chrome::key_hint_spans(theme, &[("?/Esc", "close")]));
     out.push(Line::from(footer));
     out
 }

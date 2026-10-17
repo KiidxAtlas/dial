@@ -112,7 +112,7 @@ Agents tab: Up/Down or `j`/`k` select a worker; Enter opens its transcript at th
 
 Activity tab (`2`, or Tab on a wide layout): `f` cycles the kind filter (all, errors, responses, tools, messages); `s` cycles the scope (all, selected worker, selected subtree); Space toggles follow; `/` searches; Enter opens the entry in its transcript.
 
-Below 96 columns the hub shows only the roster; Tab opens the full-width inspector. Esc clears a search, then leaves the inspector, then closes the hub.
+Below 96 columns the hub shows only the roster; Tab opens the full-width inspector. `1`/`2` or ←/→ switch tabs. Esc clears a search, then leaves the inspector, then closes the hub; the footer's Esc hint names whichever comes next.
 
 Mouse works while the hub is open, because Dial enables mouse capture for overlays: a click selects a worker card or activity row, a second click on the same row within 500 ms opens it, and the wheel scrolls the inspector when the pointer is over it. Long tasks, tool calls and activity text wrap to the pane width; the roster cards and title rows stay single-line.
 

@@ -718,11 +718,7 @@ impl SubagentViewer {
         }
         rows.push(filled(spans, width, Style::default()));
 
-        let back = if self.from_hub {
-            "back to hub"
-        } else {
-            "close"
-        };
+        let back = if self.from_hub { "back" } else { "close" };
         let esc = if self.draft.text.is_empty() {
             back.to_owned()
         } else {

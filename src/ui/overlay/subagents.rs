@@ -13,10 +13,10 @@ use ratatui::{
 
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{filled, hint, hint_line, panel},
+    settings::{filled, hint, hint_line, pair_label, panel},
 };
 use crate::ui::{
-    chrome::Section,
+    chrome::{self, Section},
     keys::{Action, Keymap},
     subagent_model::{
         ActivityEvent, ActivityFilter, ActivityKind, ActivityScope, AgentEntry, AgentStatus,
@@ -169,6 +169,13 @@ impl SubagentsOverlay {
         self.message = None;
         if keys.matches(Action::SelectCancel, key) {
             return self.escape();
+        }
+        if keys.matches(Action::TabNext, key) || keys.matches(Action::TabPrev, key) {
+            self.tab = match self.tab {
+                Tab::Agents => Tab::Activity,
+                Tab::Activity => Tab::Agents,
+            };
+            return OverlayEvent::None;
         }
         match key.code {
             KeyCode::Char('1') if plain(key) => {
@@ -655,14 +662,7 @@ impl SubagentsOverlay {
 
     fn tabs_line(&self, w: usize, theme: &Theme) -> Line<'static> {
         let tab = |label: &str, active: bool| {
-            Span::styled(
-                format!(" {label} "),
-                if active {
-                    theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)
-                } else {
-                    theme.fg(Tok::Muted)
-                },
-            )
+            Span::styled(format!(" {label} "), chrome::tab_style(theme, active))
         };
         let t = &self.totals;
         let tokens = t.tokens_in + t.tokens_out;
@@ -728,7 +728,7 @@ impl SubagentsOverlay {
                 if query.is_empty() {
                     return Line::default();
                 }
-                (format!(" filter: {query}  (Esc clears)"), Tok::Dim)
+                (format!(" filter: {query}  · Esc clear search"), Tok::Dim)
             }
         };
         filled(
@@ -747,7 +747,7 @@ impl SubagentsOverlay {
                     "x cancel".to_owned(),
                     "m message".to_owned(),
                     "t tree".to_owned(),
-                    "/ filter".to_owned(),
+                    "/ search".to_owned(),
                     "r roles".to_owned(),
                 ];
                 if !self.wide.get() {
@@ -764,8 +764,22 @@ impl SubagentsOverlay {
                 "/ search".to_owned(),
             ],
         };
-        segments.push("1/2 tabs".to_owned());
-        segments.push(hint(ctx.keys, Action::SelectCancel, "close"));
+        segments.push(format!(
+            "1/2 {} tabs",
+            pair_label(ctx.keys, Action::TabPrev, Action::TabNext)
+        ));
+        let searching = match self.tab {
+            Tab::Agents => !self.agent_query.is_empty(),
+            Tab::Activity => !self.activity_query.is_empty(),
+        };
+        let esc = if searching {
+            "clear search"
+        } else if self.inspector {
+            "back"
+        } else {
+            "close"
+        };
+        segments.push(hint(ctx.keys, Action::SelectCancel, esc));
         segments
     }
 
@@ -1664,6 +1678,46 @@ mod tests {
         let opened = render(60, 60, |frame| hub.draw(frame, &ctx));
         let text: String = opened.content().iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("Recent activity"), "{text}");
+    }
+
+    #[test]
+    fn left_and_right_switch_tabs_and_the_esc_hint_names_what_esc_does() {
+        let rig = Rig::new();
+        let keys = keymap();
+        let mut hub = SubagentsOverlay::new();
+        hub.set_snapshot(snapshot(vec![agent("task-1", AgentStatus::Running)]));
+        hub.handle(&key(KeyCode::Right), &keys);
+        assert!(hub.tab == Tab::Activity);
+        hub.handle(&key(KeyCode::Left), &keys);
+        assert!(hub.tab == Tab::Agents);
+
+        let ctx = DrawCtx {
+            theme: &rig.theme,
+            keys: &rig.keys,
+            status: &rig.status,
+            preview_status: &preview,
+        };
+        let esc = |hub: &SubagentsOverlay| hub.footer(&ctx).last().cloned().unwrap();
+        assert_eq!(esc(&hub), "Esc close");
+        hub.inspector = true;
+        assert_eq!(esc(&hub), "Esc back");
+        hub.agent_query = "task".into();
+        assert_eq!(esc(&hub), "Esc clear search");
+        // Each label matches what the next Esc actually does.
+        assert!(matches!(
+            hub.handle(&key(KeyCode::Esc), &keys),
+            OverlayEvent::None
+        ));
+        assert_eq!(esc(&hub), "Esc back");
+        assert!(matches!(
+            hub.handle(&key(KeyCode::Esc), &keys),
+            OverlayEvent::None
+        ));
+        assert_eq!(esc(&hub), "Esc close");
+        assert!(matches!(
+            hub.handle(&key(KeyCode::Esc), &keys),
+            OverlayEvent::Close
+        ));
     }
 
     #[test]

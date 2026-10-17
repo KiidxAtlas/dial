@@ -206,19 +206,27 @@ impl Block {
                 Some(b) => b.read(|n| prose_rows(Prose::Thinking, &n.result.text, w, ctx)),
                 None => prose_rows(Prose::Thinking, t, w, ctx),
             }),
-            Kind::Tool(t) => Arc::new(match &self.shared {
-                Some(b) => b.read(|n| {
-                    let mut view = t.clone();
-                    view.output = n.result.text.clone();
-                    if let Some(presentation) = &n.presentation {
-                        view.presentation = presentation.clone();
-                    }
-                    view.state = n.result.phase;
-                    tool_rows(&view, w, ctx)
-                }),
-                None => tool_rows(t, w, ctx),
-            }),
+            // Work rows are laid out one column narrower and hang off the rail in that column.
+            Kind::Tool(t) => Arc::new(on_rail(
+                match &self.shared {
+                    Some(b) => b.read(|n| {
+                        let mut view = t.clone();
+                        view.output = n.result.text.clone();
+                        if let Some(presentation) = &n.presentation {
+                            view.presentation = presentation.clone();
+                        }
+                        view.state = n.result.phase;
+                        tool_rows(&view, w.saturating_sub(1), ctx)
+                    }),
+                    None => tool_rows(t, w.saturating_sub(1), ctx),
+                },
+                ctx.theme,
+            )),
             Kind::Notice { title, text } => Arc::new(super::notice::rows(title, text, w, ctx)),
+            Kind::Event(event) if self.is_tool() => Arc::new(on_rail(
+                super::lanes::rows(event, w.saturating_sub(1), ctx),
+                ctx.theme,
+            )),
             Kind::Event(event) => Arc::new(super::lanes::rows(event, w, ctx)),
             Kind::Error(t) => Arc::new(error_rows(t, w, ctx)),
             Kind::Image(image) => Arc::new(image.rows(w, ctx.theme)),
@@ -430,6 +438,21 @@ pub(super) fn fitted(spans: Vec<Span<'static>>, w: usize, theme: &Theme) -> Line
     Line::from(truncate_spans(spans, w, &ellipsis(theme)))
 }
 
+/// Rows of the work group (tool calls and the context lines beside them) hang off one thin rail in
+/// the first column, so a run of calls reads as one unit set apart from the prose around it. The
+/// rows are laid out one column narrower than the transcript, so the rail never widens them.
+fn on_rail(rows: Rows, theme: &Theme) -> Rows {
+    let rail = Span::styled(theme.sym(Sym::BoxV).to_owned(), theme.fg(Tok::BorderMuted));
+    rows.into_iter()
+        .map(|mut row| {
+            row.spans.insert(0, rail.clone());
+            row
+        })
+        .collect()
+}
+
+/// A user message is its own block: the accent bar, then the text on the theme's user tint across
+/// the full width, so turns are easy to find when scrolling back.
 fn user_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     let w = w as usize;
     let clean = text::sanitize(raw);
@@ -438,24 +461,36 @@ fn user_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
         return Vec::new();
     }
     let theme = ctx.theme;
-    let bar = Span::styled(theme.sym(Sym::Quote).to_owned(), theme.fg(Tok::Accent));
-    let text_style = theme.fg(Tok::UserText);
+    let tint = theme.bg(Tok::UserBg);
+    let bar = Span::styled(
+        theme.sym(Sym::Quote).to_owned(),
+        theme.fg(Tok::Accent).patch(tint),
+    );
+    let text_style = theme.on(Tok::UserText, Tok::UserBg);
+    let tinted = |spans: Vec<Span<'static>>| {
+        let mut line = fitted(spans, w, theme);
+        let used = text::line_width(&line);
+        if used < w {
+            line.spans.push(Span::styled(" ".repeat(w - used), tint));
+        }
+        line
+    };
     let mut rows = Vec::new();
     if w < 4 {
         let flat = body.replace('\n', " ");
-        rows.push(fitted(
-            vec![bar, Span::raw(" "), Span::styled(flat, text_style)],
-            w,
-            theme,
-        ));
+        rows.push(tinted(vec![
+            bar,
+            Span::styled(" ", tint),
+            Span::styled(flat, text_style),
+        ]));
     } else {
         let inner = w - 4;
         for (i, line) in text::wrap_words(body, inner).into_iter().enumerate() {
             let marker = if i == 0 { theme.sym(Sym::Prompt) } else { " " };
-            rows.push(Line::from(vec![
+            rows.push(tinted(vec![
                 bar.clone(),
-                Span::raw(" "),
-                Span::styled(format!("{marker} "), theme.fg(Tok::Accent)),
+                Span::styled(" ", tint),
+                Span::styled(format!("{marker} "), theme.fg(Tok::Accent).patch(tint)),
                 Span::styled(text::clip(&line, inner), text_style),
             ]));
         }
@@ -747,6 +782,11 @@ impl Transcript {
             owed_gap: None,
             outcome: None,
         }
+    }
+
+    /// Whether the conversation has a user message (typed, replayed or resumed).
+    pub fn has_user(&self) -> bool {
+        self.blocks.iter().any(|b| matches!(b.kind, Kind::User(_)))
     }
 
     /// A new model request begins: whatever prose streamed so far is a finished message, so the next
@@ -2450,7 +2490,7 @@ mod tests {
         assert_eq!(text.len(), 3, "{text:?}");
         assert_eq!(text::line_width(&rows[0]), 40);
         assert_eq!(
-            rows[0].spans[3].style.fg,
+            rows[0].spans[4].style.fg,
             env.theme.fg(Tok::SectionSandbox).fg
         );
     }
@@ -2495,7 +2535,8 @@ mod tests {
         let pending = render(None);
         let ok = render(Some(false));
         let err = render(Some(true));
-        let gutter = |rows: &Rows| rows[0].spans[3].style.fg;
+        // Span 0 is the work-group rail; the family gutter follows the indent and the status glyph.
+        let gutter = |rows: &Rows| rows[0].spans[4].style.fg;
         assert_eq!(gutter(&pending), env.theme.fg(Tok::SectionSandbox).fg);
         assert_eq!(gutter(&ok), env.theme.fg(Tok::SectionSandbox).fg);
         assert_eq!(gutter(&err), env.theme.fg(Tok::Error).fg);
@@ -2522,14 +2563,62 @@ mod tests {
         assert_ne!(a, b);
         assert!(a[1].contains(env.theme.spinner(0)) && b[1].contains(env.theme.spinner(1)));
         let compact = a.iter().find(|l| l.contains("Read")).unwrap();
+        let after_rail = |l: &str| l.trim_start_matches('│').trim_start().to_owned();
         assert!(
-            compact.trim_start().starts_with(env.theme.spinner(0)),
+            after_rail(compact).starts_with(env.theme.spinner(0)),
             "{compact}"
         );
         assert!(
             b.iter()
-                .any(|l| l.trim_start().starts_with(env.theme.spinner(1)) && l.contains("Read"))
+                .any(|l| after_rail(l).starts_with(env.theme.spinner(1)) && l.contains("Read"))
         );
+    }
+
+    #[test]
+    fn a_run_of_tool_calls_hangs_off_one_rail_and_prose_does_not() {
+        let env = Env::new();
+        let mut t = Transcript::new();
+        t.push_user("fix it");
+        t.tool_start("1", "read", "a.rs", "");
+        t.tool_end("1", "1: fn a() {}", false, 0.1);
+        t.tool_start("2", "bash", "cargo test", "");
+        t.tool_end("2", "error: one failed\nmore\n", true, 0.2);
+        t.assistant_delta("Done.");
+        t.finish_turn();
+        for width in [40u16, 80] {
+            let rows = t.all_rows(width, &env.ctx());
+            assert_fits(&rows, width);
+            let text = plain(&rows);
+            let first = text.iter().position(|r| r.contains("Read")).unwrap();
+            let last = text.iter().rposition(|r| r.starts_with('│')).unwrap();
+            assert!(
+                text[first..=last].iter().all(|r| r.starts_with('│')),
+                "every row of the group, bodies included, is on the rail: {text:?}"
+            );
+            assert!(
+                text.iter()
+                    .filter(|r| r.contains("fix it") || r.contains("Done."))
+                    .all(|r| !r.starts_with('│')),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_messages_are_tinted_across_the_width() {
+        let mut env = Env::new();
+        env.theme = Theme::builtin("dial-dark").unwrap();
+        let mut t = Transcript::new();
+        t.push_user("a question that wraps onto a second line here");
+        let tint = env.theme.bg(Tok::UserBg).bg;
+        assert!(tint.is_some_and(|c| c != ratatui::style::Color::Reset));
+        let rows = t.all_rows(30, &env.ctx());
+        let user: Vec<_> = rows.iter().filter(|r| text::line_width(r) > 0).collect();
+        assert!(user.len() >= 2, "{:?}", plain(&rows));
+        for row in user {
+            assert_eq!(text::line_width(row), 30, "the tint spans the width");
+            assert!(row.spans.iter().all(|s| s.style.bg == tint), "{row:?}");
+        }
     }
 
     #[test]
@@ -2665,7 +2754,7 @@ mod tests {
         );
         let body: Vec<&str> = text
             .iter()
-            .map(|r| r.trim_matches(|c: char| c == '▎' || c == ' '))
+            .map(|r| r.trim_matches(|c: char| c == '▎' || c == '│' || c == ' '))
             .collect();
         for expected in [
             "src/a.rs",
@@ -2719,7 +2808,7 @@ mod tests {
         );
         assert_eq!(
             plain(&t.all_rows(60, &env.ctx()))[..3],
-            [" ✓ Plan    1/2 done", "  ✓ read", "  ● fix"]
+            ["│ ✓ Plan    1/2 done", "│  ✓ read", "│  ● fix"]
         );
     }
 
@@ -2788,10 +2877,11 @@ mod tests {
                 && plain(&rows)[0].contains("3 lines")
         );
         assert_eq!(
-            rows[0].spans[3].style.fg,
+            rows[0].spans[4].style.fg,
             env.theme.fg(Tok::SectionTools).fg
         );
-        assert_eq!(rows[0].spans[1].style.fg, env.theme.fg(Tok::Success).fg);
+        assert_eq!(rows[0].spans[2].style.fg, env.theme.fg(Tok::Success).fg);
+        assert_eq!(rows[0].spans[0].style.fg, env.theme.fg(Tok::BorderMuted).fg);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "name": "dial-dark",
-  "description": "Dial dark: warm ivory text on the terminal background, amber accent, thin warm-gray rules",
+  "description": "Dial dark: warm ivory text on the terminal background, amber accent, thin warm-gray rules, a faint tint behind your messages",
   "dark": true,
   "vars": {
     "ivory": "#ece6da",
@@ -16,6 +16,7 @@
     "dimText": "#6f6a5f",
     "rule": "#5c574d",
     "selectedTint": "#3a2d17",
+    "userTint": "#1f1b14",
     "linkUrl": "#6f6a5f"
   },
   "colors": {
@@ -31,7 +32,7 @@
     "warning": "orange",
     "selectedBg": "selectedTint",
     "canvasBg": "",
-    "userBg": "",
+    "userBg": "userTint",
     "userText": "ivory",
     "toolPendingBg": "",
     "toolSuccessBg": "",

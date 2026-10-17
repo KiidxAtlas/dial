@@ -549,6 +549,9 @@ pub struct UiConfig {
     pub composer_shape: ComposerShape,
     pub welcome: bool,
     pub tips: bool,
+    /// Short, purposeful animation: the start-up sweep across the wordmark and the reveal when a
+    /// panel opens. Off, or on a terminal without truecolor, ASCII glyphs or `NO_COLOR`, nothing moves.
+    pub motion: bool,
     pub show_tools: bool,
     pub session_rail: bool,
     /// Pinned block above the composer listing running workers.
@@ -562,6 +565,7 @@ pub struct UiConfig {
     pub hints: bool,
     /// Ghost text completing the word under the cursor, from learned prompts and project words.
     pub word_completion: bool,
+    /// Rows in the slash and file menus before they scroll.
     pub autocomplete_items: usize,
     pub history_limit: usize,
     /// Desktop/terminal notification (OSC 9, OSC 777 or OSC 99, else BEL) when a turn finishes
@@ -601,6 +605,7 @@ impl Default for UiConfig {
             composer_shape: ComposerShape::Box,
             welcome: true,
             tips: true,
+            motion: true,
             show_tools: true,
             session_rail: false,
             pinned_workers: PinnedWorkers::Collapsed,
@@ -610,7 +615,7 @@ impl Default for UiConfig {
             show_thinking: true,
             hints: true,
             word_completion: true,
-            autocomplete_items: 8,
+            autocomplete_items: 12,
             history_limit: 0,
             notify: true,
             notify_errors: false,

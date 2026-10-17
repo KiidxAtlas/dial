@@ -423,7 +423,7 @@ impl ImproveOverlay {
                     let hints: Vec<(String, String)> = if self.ask.is_some() {
                         vec![
                             (keys.label(Action::SelectConfirm), "confirm".into()),
-                            (keys.label(Action::SelectCancel), "keep it".into()),
+                            (keys.label(Action::SelectCancel), "cancel".into()),
                         ]
                     } else {
                         let act = match self.tab {
@@ -439,7 +439,7 @@ impl ImproveOverlay {
                                     keys.label(Action::TabPrev),
                                     keys.label(Action::TabNext)
                                 ),
-                                "tab".into(),
+                                "tabs".into(),
                             ),
                             (
                                 format!(
