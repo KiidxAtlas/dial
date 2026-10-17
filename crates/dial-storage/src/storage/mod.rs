@@ -23,4 +23,4 @@ pub mod skills;
 pub mod store;
 pub mod transcript;
 
-pub(crate) mod media;
+pub mod media;

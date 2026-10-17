@@ -413,7 +413,7 @@ fn redact_proofs(value: &mut Value) -> Result<()> {
 }
 /// Screen text and executable arguments while recognizing machine-generated source fingerprints.
 /// Hash fields are checked structurally, never used as an exemption for source text or arguments.
-pub(crate) fn screen_record(payload: &Value) -> Result<()> {
+pub fn screen_record(payload: &Value) -> Result<()> {
     let mut screened = payload.clone();
     redact_proofs(&mut screened)?;
     if let Some(steps) = screened.get_mut("steps").and_then(Value::as_array_mut) {

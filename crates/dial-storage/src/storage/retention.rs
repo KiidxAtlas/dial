@@ -7,11 +7,11 @@
 //! directory are protected; of the rest, sessions untouched for `cold_archive_after_days` are cold.
 use crate::platform::fs as platform_fs;
 use anyhow::{Context, Result};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use rusqlite::OptionalExtension;
 use rusqlite::{Connection, params};
 use serde::Serialize;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -195,7 +195,7 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn archived(&self, session_id: &str) -> Result<Option<ArchiveRecord>> {
         self.conn
             .query_row(
@@ -218,7 +218,7 @@ impl Store {
     }
 
     /// Settings of the most recent applied run, if any.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn last_run_settings(&self) -> Result<Option<Value>> {
         let text: Option<String> = self
             .conn

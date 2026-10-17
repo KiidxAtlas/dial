@@ -22,6 +22,7 @@ license = "MIT"
 dial-build-info = { path = "crates/dial-build-info" }
 dial-core = { path = "crates/dial-core" }
 dial-llm = { path = "crates/dial-llm", default-features = false }
+dial-storage = { path = "crates/dial-storage" }
 anyhow = "1"
 vt100 = "0.15"
 thiserror = "2"
@@ -132,11 +133,13 @@ wayland-pipewire = ["desktop", "dep:pipewire"]
 [dev-dependencies]
 dial-core = { workspace = true, features = ["test-support"] }
 dial-llm = { workspace = true, features = ["test-support"] }
+dial-storage = { workspace = true, features = ["test-support"] }
 
 [dependencies]
 dial-build-info.workspace = true
 dial-core.workspace = true
 dial-llm.workspace = true
+dial-storage.workspace = true
 anyhow.workspace = true
 vt100.workspace = true
 thiserror.workspace = true
@@ -272,6 +275,10 @@ opt-level = 1
 codegen-units = 64
 
 [profile.local.package.dial-llm]
+opt-level = 1
+codegen-units = 64
+
+[profile.local.package.dial-storage]
 opt-level = 1
 codegen-units = 64
 

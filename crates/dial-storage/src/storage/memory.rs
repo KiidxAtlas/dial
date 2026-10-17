@@ -10,7 +10,7 @@ const DELIMITER: &str = "§";
 // Compatibility for skill package publication; new callers name the neutral owner.
 pub(crate) use crate::platform::atomic::write_checkpoint as atomic_write;
 
-pub(crate) fn screen(entry: &str) -> Result<(), String> {
+pub fn screen(entry: &str) -> Result<(), String> {
     if entry.contains(DELIMITER) {
         return Err(format!(
             "entries must not contain the separator character {DELIMITER}"

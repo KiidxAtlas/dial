@@ -53,7 +53,7 @@ fn valid_digest(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-pub(crate) fn valid_change(change: &FileChange) -> bool {
+pub fn valid_change(change: &FileChange) -> bool {
     !change.path.is_empty()
         && Path::new(&change.path)
             .components()
@@ -66,7 +66,7 @@ pub(crate) fn valid_change(change: &FileChange) -> bool {
         && change.after_sha256.is_some() == change.after_ref.as_ref().is_some_and(|s| !s.is_empty())
 }
 
-pub(crate) fn valid_run(run: &CheckRun) -> bool {
+pub fn valid_run(run: &CheckRun) -> bool {
     !run.command.trim().is_empty()
         && run.command.len() <= 16 * 1024
         && Path::new(&run.cwd).is_absolute()
@@ -116,6 +116,6 @@ impl RepairRecord {
     }
 }
 
-pub(crate) fn same_check(a: &CheckRun, b: &CheckRun) -> bool {
+pub fn same_check(a: &CheckRun, b: &CheckRun) -> bool {
     a.command == b.command && a.cwd == b.cwd && a.objective == b.objective && a.kind == b.kind
 }
