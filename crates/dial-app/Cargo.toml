@@ -1,0 +1,41 @@
+[package]
+name = "dial-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dial-build-info.workspace = true
+dial-core.workspace = true
+dial-llm.workspace = true
+dial-storage.workspace = true
+dial-tools.workspace = true
+dial-computer.workspace = true
+dial-agent.workspace = true
+dial-ui.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+fs2.workspace = true
+globset.workspace = true
+ignore.workspace = true
+image.workspace = true
+libc.workspace = true
+notify.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+ratatui.workspace = true
+regex.workspace = true
+ring.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+tungstenite.workspace = true
+unicode-width.workspace = true
+url.workspace = true

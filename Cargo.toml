@@ -27,6 +27,7 @@ dial-tools = { path = "crates/dial-tools", default-features = false }
 dial-computer = { path = "crates/dial-computer", default-features = false }
 dial-agent = { path = "crates/dial-agent" }
 dial-ui = { path = "crates/dial-ui", default-features = false }
+dial-app = { path = "crates/dial-app" }
 anyhow = "1"
 vt100 = "0.15"
 thiserror = "2"
@@ -146,6 +147,7 @@ dial-tools.workspace = true
 dial-computer.workspace = true
 dial-agent.workspace = true
 dial-ui.workspace = true
+dial-app.workspace = true
 anyhow.workspace = true
 vt100.workspace = true
 thiserror.workspace = true
@@ -301,6 +303,10 @@ opt-level = 1
 codegen-units = 64
 
 [profile.local.package.dial-ui]
+opt-level = 1
+codegen-units = 64
+
+[profile.local.package.dial-app]
 opt-level = 1
 codegen-units = 64
 
