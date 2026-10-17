@@ -104,12 +104,13 @@ fn record_child_request(
             backend.reply_cost(reply),
             started.elapsed(),
         ),
-        Err(_) => crate::telemetry::request_failed(
+        Err(error) => crate::telemetry::request_failed(
             env.config,
             false,
             session,
             backend.model_label(),
             started.elapsed(),
+            error,
         ),
     }
 }

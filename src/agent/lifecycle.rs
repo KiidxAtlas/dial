@@ -173,6 +173,7 @@ impl Agent<'_> {
     pub fn end_session_lifecycle(&mut self) {
         self.observe_session_end();
         self.session_lifecycle = false;
+        self.end_local_session();
     }
 }
 
@@ -237,6 +238,13 @@ impl<'a> Agent<'a> {
         }
         let codebase = if config.codebase.enabled {
             Some(Arc::new(Codebase::open(&layout)?))
+        } else {
+            None
+        };
+        let history = if config.codebase.enabled && config.codebase.history {
+            Some(Arc::new(crate::storage::history::ChangeHistory::open(
+                &layout,
+            )?))
         } else {
             None
         };
@@ -308,6 +316,7 @@ impl<'a> Agent<'a> {
             memory,
             memory_runtime,
             codebase,
+            history,
             checkpoints: Some(checkpoints),
             store,
             approval: config.approval,
@@ -352,6 +361,8 @@ impl<'a> Agent<'a> {
             route: Default::default(),
             enabled_tools: HashSet::new(),
             lean_tools: false,
+            local_escalation: Default::default(),
+            local_session: Default::default(),
             metrics: AgentMetrics::default(),
             usage_scope: llm::usage::Scope::default().next_turn(config.harness.max_steps)?,
             compaction_runtime: compaction_runtime::CompactionRuntime::default(),
@@ -393,6 +404,11 @@ impl<'a> Agent<'a> {
                 agent.session.id().to_owned(),
             ));
         }
+        if let Some(history) = &agent.history {
+            agent
+                .ext
+                .register(crate::storage::history::tool(history.clone()));
+        }
         agent.restore_control()?;
         agent.rebuild_system();
         Ok(agent)
@@ -416,7 +432,8 @@ impl<'a> Agent<'a> {
         config.validate_harness(&version.harness)?;
         let mut strict = config.clone();
         strict.sandbox.mode = SandboxMode::Strict;
-        let mode = config.resolved_edit_mode(&version.harness);
+        // Hermetic evaluation measures the harness itself, without the local-route grammar default.
+        let mode = config.base_edit_mode(&version.harness);
         let workspace = configure_strict(Workspace::new(workspace)?, &strict, mode)?;
         let mut agent = Self {
             cancellation: Default::default(),
@@ -435,6 +452,7 @@ impl<'a> Agent<'a> {
             todo: TodoList::default(),
             memory: None,
             codebase: None,
+            history: None,
             memory_runtime: None,
             checkpoints: None,
             store,
@@ -503,6 +521,8 @@ impl<'a> Agent<'a> {
             route: Default::default(),
             enabled_tools: HashSet::new(),
             lean_tools: false,
+            local_escalation: Default::default(),
+            local_session: Default::default(),
             metrics: AgentMetrics::default(),
             usage_scope: llm::usage::Scope::default().next_turn(config.harness.max_steps)?,
             compaction_runtime: compaction_runtime::CompactionRuntime::default(),
@@ -542,7 +562,7 @@ impl<'a> Agent<'a> {
             .clone()
             .with_bash_interceptor(self.config.bash_interceptor.clone(), offered.clone());
         let discoverable = self.discoverable_tools(&offered);
-        let lean = self.lean_local();
+        let lean = self.lean_local() || self.local_escalated();
         let built = prompt::system_messages(prompt::Inputs {
             cwd: self.workspace.root(),
             harness: &self.version.harness,
@@ -550,7 +570,8 @@ impl<'a> Agent<'a> {
             soul: self.parts.soul.clone(),
             overrides: self.parts.overrides.clone(),
             context: &self.parts.context,
-            skills: if (self.lean_tools || lean) && !offered.iter().any(|tool| tool == "skill") {
+            skills: if (self.minimal_tools() || lean) && !offered.iter().any(|tool| tool == "skill")
+            {
                 String::new()
             } else {
                 self.parts.skills.clone()
@@ -626,8 +647,14 @@ impl<'a> Agent<'a> {
         self.system_messages.clone()
     }
 
+    /// The edit grammar in effect: an escalated local route uses `replace` unless pinned; hermetic
+    /// runs ignore the local-route default.
     pub(super) fn edit_mode(&self) -> crate::config::types::EditMode {
-        self.config.resolved_edit_mode(&self.version.harness)
+        if self.hermetic {
+            return self.config.base_edit_mode(&self.version.harness);
+        }
+        self.escalated_edit_mode()
+            .unwrap_or_else(|| self.config.resolved_edit_mode(&self.version.harness))
     }
 
     /// Pick up a version the improvement loop admitted since this session started (between turns only,

@@ -307,23 +307,7 @@ impl Background {
         };
         let snap = self.table().snapshot(name)?;
         snap.settle();
-        let (body, lost) = {
-            let mut ring = lock(&snap.ring);
-            let fresh = match ring.screen_text() {
-                // A terminal's model-facing output is its rendered screen, a snapshot not a delta.
-                Some(screen) => (screen, 0),
-                None => {
-                    // Preserve a UTF-8 lookbehind before render_output applies its character-safe cap.
-                    let (bytes, lost) = ring.recent_since(ring.cursor, MAX_OUTPUT + 3);
-                    let text = String::from_utf8(bytes).unwrap_or_else(|error| {
-                        String::from_utf8_lossy(error.as_bytes()).into_owned()
-                    });
-                    (text, lost)
-                }
-            };
-            ring.cursor = ring.total;
-            fresh
-        };
+        let (body, lost) = take_unread(&snap);
         let is_error = lock(&snap.ring).error.is_some();
         Ok(ToolOutput {
             execution: Default::default(),
@@ -457,9 +441,13 @@ impl Background {
             }
             if exited {
                 let state = snap.state.label();
+                // The exit result carries the unread output, so a finished build or test needs no
+                // separate `output` round trip. Shares the model-visible cursor with `output`.
+                let (body, lost) = take_unread(&snap);
+                let output = render_body(&snap, body, lost, None);
                 return Ok(if conditions {
                     ToolOutput::err(format!(
-                        "not ready: {name} {state} before {} was established",
+                        "not ready: {name} {state} before {} was established\n{output}",
                         until.as_ref().map_or_else(
                             || "port readiness".into(),
                             |pattern| format!(
@@ -473,7 +461,7 @@ impl Background {
                         )
                     ))
                 } else {
-                    ToolOutput::ok(format!("ready: {name} {state}"))
+                    ToolOutput::ok(format!("ready: {name} {state}\n{output}"))
                 });
             }
             if deadline.is_some_and(|end| Instant::now() >= end) {
@@ -625,7 +613,35 @@ fn last_lines(text: &str, n: usize) -> &str {
     &text[start + 1..]
 }
 
-fn render_output(snap: &Snapshot, mut body: String, lost: u64, tail: Option<usize>) -> String {
+/// Model-visible output not yet returned by `output` or `wait`, advancing their shared cursor.
+/// A terminal's model-facing output is its rendered screen, a snapshot not a delta.
+fn take_unread(snap: &Snapshot) -> (String, u64) {
+    let mut ring = lock(&snap.ring);
+    let fresh = match ring.screen_text() {
+        Some(screen) => (screen, 0),
+        None => {
+            // Preserve a UTF-8 lookbehind before render_body applies its character-safe cap.
+            let (bytes, lost) = ring.recent_since(ring.cursor, MAX_OUTPUT + 3);
+            let text = String::from_utf8(bytes)
+                .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+            (text, lost)
+        }
+    };
+    ring.cursor = ring.total;
+    fresh
+}
+
+fn render_output(snap: &Snapshot, body: String, lost: u64, tail: Option<usize>) -> String {
+    format!(
+        "[{}: {}, pid {}]\n{}",
+        snap.name,
+        snap.state.label(),
+        snap.pid,
+        render_body(snap, body, lost, tail)
+    )
+}
+
+fn render_body(snap: &Snapshot, mut body: String, lost: u64, tail: Option<usize>) -> String {
     if let Some(lines) = tail {
         let skip = body.len() - last_lines(&body, lines).len();
         body.drain(..skip);
@@ -639,12 +655,7 @@ fn render_output(snap: &Snapshot, mut body: String, lost: u64, tail: Option<usiz
         omitted += cut as u64;
         body.drain(..cut);
     }
-    let mut text = format!(
-        "[{}: {}, pid {}]\n",
-        snap.name,
-        snap.state.label(),
-        snap.pid
-    );
+    let mut text = String::new();
     if body.is_empty() {
         text.push_str(if snap.terminal {
             "(blank screen)\n"

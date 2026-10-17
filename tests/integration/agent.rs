@@ -2476,6 +2476,40 @@ fn unfinished_todos_continue_into_real_edits_and_completion() {
 }
 
 #[test]
+fn code_history_finds_a_diff_an_earlier_turn_made() {
+    let server = serve(vec![
+        Reply::Call(
+            "write",
+            json!({"path":"marker.txt","content":"retry_backoff = 3\n"}),
+        ),
+        Reply::Text("Created marker."),
+        Reply::Call("tool_load", json!({"names":["code_history"]})),
+        Reply::Call(
+            "code_history",
+            json!({"action":"search","query":"retry_backoff"}),
+        ),
+        Reply::Text("Found it."),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    a.turn("add the backoff marker", &mut Recorder::default())
+        .unwrap();
+    let mut ui = Recorder::default();
+    a.turn("when did the backoff marker appear?", &mut ui)
+        .unwrap();
+    let (_, text, error) = ui
+        .results
+        .iter()
+        .find(|(name, _, _)| name == "code_history")
+        .expect("code_history ran");
+    assert!(!error, "{text}");
+    assert!(
+        text.contains("marker.txt (created +1 -0)") && text.contains("add the backoff marker"),
+        "{text}"
+    );
+}
+
+#[test]
 fn edits_complete_without_a_harness_review_round() {
     let server = serve(vec![
         Reply::Call("write", json!({"path":"marker.txt","content":"first"})),

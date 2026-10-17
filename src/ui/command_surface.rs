@@ -158,7 +158,7 @@ pub fn category(name: &str) -> Category {
             Category::Model
         }
         "review" | "review-file" | "changes" | "undo" | "rollback" | "commit" | "checks"
-        | "plan-review" | "changelog" => Category::Review,
+        | "code-history" | "plan-review" | "changelog" => Category::Review,
         "workers" | "processes" | "bg" | "jobs" | "agents" | "message" | "cancel" | "queue"
         | "todo" | "goal" | "guided-goal" | "loop" | "btw" | "tan" | "compute" => Category::Work,
         "plan" | "plan-yolo" | "advisor" | "external-thinking" | "vibe" | "skillful"

@@ -290,8 +290,23 @@ pub struct ModelProfile {
     /// `capabilities.structured_output` still wins.
     #[serde(skip)]
     pub endpoint_structured_output: Option<StructuredOutput>,
+    /// Request-scoped local hints from the backend (persistent base merged with the next request's
+    /// hints); set only at the request boundary and never persisted. Precedence: explicit profile
+    /// fields (`thinking`, `reasoning_effort`, `keep_alive`, `local_sampling`) win over these.
+    #[serde(skip)]
+    pub local_hints: super::local_hints::LocalHints,
+    /// The local server behind this request, detected at the request boundary. `None` for hosted
+    /// routes, which never receive `local_hints`.
+    #[serde(skip)]
+    pub local_server: Option<super::local_hints::LocalServer>,
 }
 impl ModelProfile {
+    /// `local_hints` minus whatever an explicit profile setting already decides.
+    pub fn effective_local_hints(&self, thinking_decided: bool) -> super::local_hints::LocalHints {
+        self.local_hints
+            .clone()
+            .without_explicit(thinking_decided, self.keep_alive.is_some())
+    }
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.provider.trim().is_empty() && !self.model.trim().is_empty(),
@@ -638,6 +653,12 @@ impl ModelProfile {
         if let Some(tier) = self.request_tiers.service_tier_for(&self.provider) {
             object.insert("service_tier".into(), json!(tier));
         }
+        // Request-scoped local hints go last: a field the profile or body already wrote stays.
+        if let Some(server) = self.local_server {
+            let thinking_decided = self.thinking.is_some() || self.reasoning_effort.is_some();
+            self.effective_local_hints(thinking_decided)
+                .apply_openai(server, body);
+        }
     }
 }
 
@@ -946,5 +967,68 @@ mod tests {
         let body = fake::body(&requests[0]);
         assert_eq!(body["service_tier"], "priority");
         assert_eq!(body["temperature"], 0.2);
+    }
+
+    #[test]
+    fn local_hints_fill_gaps_never_override_profile_values_and_stay_off_hosted_routes() {
+        use crate::llm::local_hints::{LocalHints, LocalServer};
+        use serde_json::json;
+        let hints = LocalHints {
+            thinking: Some(true),
+            keep_alive_secs: Some(60),
+            cache_slot: Some(2),
+            prompt_progress: true,
+            presence_penalty: Some(0.9),
+            repetition_penalty: Some(1.3),
+        };
+        // The profile's own presence penalty wins; the hint fills the missing LM Studio names only.
+        let mut lm = ModelProfile::minimal("lm-studio", "m");
+        lm.local_sampling = Some(crate::llm::local_sampling::LocalSampling {
+            presence_penalty: Some(0.2),
+            ..Default::default()
+        });
+        lm.local_hints = hints.clone();
+        lm.local_server = Some(LocalServer::LmStudio);
+        lm.validate().unwrap();
+        let mut body = json!({"model":"m","max_tokens":8});
+        lm.apply_openai(&mut body);
+        assert_eq!(body["presence_penalty"], 0.2);
+        assert_eq!(body["repeat_penalty"], 1.3);
+        assert_eq!(body["ttl"], 60);
+        assert!(body.get("cache_prompt").is_none());
+
+        // An explicit `thinking` owns the thinking switch, so the hint's enable_thinking is dropped.
+        let mut llama = ModelProfile::minimal("llama-cpp", "m");
+        llama.thinking = Some(false);
+        llama.local_hints = hints.clone();
+        llama.local_server = Some(LocalServer::LlamaCpp);
+        // An explicit `thinking` on a profile without native reasoning is rejected by validate()
+        // (existing rule), so the hint-precedence case applies the profile directly.
+        let mut body = json!({"model":"m","max_tokens":8});
+        llama.apply_openai(&mut body);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert_eq!(body["id_slot"], 2);
+        assert_eq!(body["return_progress"], true);
+
+        // Hosted: a profile without a local server never receives hint fields.
+        let mut hosted = ModelProfile::minimal("openai", "gpt-x");
+        hosted.local_hints = hints;
+        let mut body = json!({"model":"gpt-x","max_tokens":8});
+        hosted.apply_openai(&mut body);
+        for key in [
+            "cache_prompt",
+            "id_slot",
+            "return_progress",
+            "ttl",
+            "chat_template_kwargs",
+            "presence_penalty",
+            "repeat_penalty",
+            "repetition_penalty",
+            "think",
+            "keep_alive",
+        ] {
+            assert!(body.get(key).is_none(), "{key} reached a hosted route");
+        }
     }
 }

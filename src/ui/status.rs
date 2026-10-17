@@ -1,6 +1,15 @@
 //! The facts the status line can show. The controller fills this in; the status line renders from
 //! it. `None`/empty means *unknown* and is shown as absent, never as 0 or "free".
 
+use super::statusline::{elapsed, human};
+
+/// ` · ~12s left` from the measured rate; nothing while the estimate is unknown or not positive.
+fn push_eta(label: &mut String, eta: Option<f64>) {
+    if let Some(secs) = eta.filter(|s| s.is_finite() && *s > 0.0) {
+        label.push_str(&format!(" · ~{} left", elapsed(secs.ceil())));
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Phase {
     #[default]
@@ -174,15 +183,22 @@ impl StatusData {
         let p = self.model_progress.as_ref()?;
         let mut label = match p.phase {
             InferencePhase::Loading => "loading model".to_owned(),
-            InferencePhase::Processing => match (p.processed_tokens, p.prompt_tokens) {
-                (Some(done), Some(total)) if total > 0 => format!(
-                    "processing prompt {}/{total} tokens ({:.0}%)",
-                    done.min(total),
-                    done.min(total) as f64 * 100.0 / total as f64
-                ),
-                (_, Some(total)) => format!("processing prompt {total} tokens"),
-                _ => "processing prompt".into(),
-            },
+            InferencePhase::Processing => {
+                let mut label = match (p.processed_tokens, p.prompt_tokens) {
+                    (Some(done), Some(total)) if total > 0 => format!(
+                        "processing prompt {}/{total} tokens ({:.0}%)",
+                        done.min(total),
+                        done.min(total) as f64 * 100.0 / total as f64
+                    ),
+                    (_, Some(total)) => format!("processing prompt {total} tokens"),
+                    _ => "processing prompt".into(),
+                };
+                if let Some(cached) = p.cached_tokens.filter(|n| *n > 0) {
+                    label.push_str(&format!(" · {} cached", human(cached)));
+                }
+                push_eta(&mut label, p.eta_secs);
+                label
+            }
             InferencePhase::Generating => {
                 let prefix = if p.estimated { "~" } else { "" };
                 let mut label = p.output_tokens.map_or_else(
@@ -192,6 +208,7 @@ impl StatusData {
                 if let Some(rate) = p.tokens_per_second.filter(|r| r.is_finite() && *r > 0.0) {
                     label.push_str(&format!(" · {prefix}{rate:.1} tok/s"));
                 }
+                push_eta(&mut label, p.eta_secs);
                 if self.activity == "reasoning"
                     || self.activity == "writing"
                     || self.activity.starts_with("preparing ")
@@ -307,5 +324,52 @@ mod tests {
         status.activity = "preparing read\nfile\x1b[31m".into();
         let label = status.activity_label();
         assert!(!label.contains('\n') && !label.contains('\x1b'));
+    }
+
+    #[test]
+    fn eta_and_cached_prompt_tokens_show_only_when_known_and_positive() {
+        let mut p = ModelProgress::new(InferencePhase::Processing);
+        p.prompt_tokens = Some(10_000);
+        p.processed_tokens = Some(2_000);
+        let mut status = StatusData {
+            model_progress: Some(p.clone()),
+            ..StatusData::default()
+        };
+        let plain = status.activity_label();
+        assert!(
+            !plain.contains("left") && !plain.contains("cached"),
+            "{plain}"
+        );
+        p.cached_tokens = Some(0);
+        p.eta_secs = Some(f64::NAN);
+        status.model_progress = Some(p.clone());
+        let label = status.activity_label();
+        assert!(
+            !label.contains("left") && !label.contains("cached"),
+            "{label}"
+        );
+        p.cached_tokens = Some(3_900);
+        p.eta_secs = Some(64.2);
+        status.model_progress = Some(p.clone());
+        let label = status.activity_label();
+        assert!(label.ends_with(" · 3.9k cached · ~1m05s left"), "{label}");
+        p.eta_secs = Some(0.0);
+        status.model_progress = Some(p.clone());
+        assert!(!status.activity_label().contains("left"));
+
+        let mut g = ModelProgress::new(InferencePhase::Generating);
+        g.output_tokens = Some(40);
+        g.cached_tokens = Some(5_000);
+        g.eta_secs = Some(12.0);
+        status.model_progress = Some(g.clone());
+        let label = status.activity_label();
+        assert!(
+            label.ends_with("generating 40 tokens · ~12s left"),
+            "{label}"
+        );
+        assert!(!label.contains("cached"), "{label}");
+        g.eta_secs = Some(f64::INFINITY);
+        status.model_progress = Some(g);
+        assert!(!status.activity_label().contains("left"));
     }
 }

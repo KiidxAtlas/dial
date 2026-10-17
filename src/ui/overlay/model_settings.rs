@@ -11,7 +11,11 @@ use super::{
     },
 };
 use crate::{
-    llm::profiles::{ModelProfile, ReasoningApi},
+    llm::{
+        local_evidence::{self, Current, Suggestion},
+        local_server,
+        profiles::{ModelProfile, ReasoningApi},
+    },
     storage::settings_store::Scope,
     ui::{
         chrome::{self, Section},
@@ -27,6 +31,7 @@ use ratatui::{
     style::Modifier,
     text::{Line, Span},
 };
+use std::path::Path;
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -288,6 +293,10 @@ pub struct ModelSettingsOverlay {
     editor: Option<Editor>,
     pending: Option<(ModelProfile, String)>,
     message: Option<(String, bool)>,
+    /// Evidence-backed setting suggestions for a local model (see `with_suggestions`); applied by Enter.
+    suggestions: Vec<Suggestion>,
+    /// The suggestion whose save is in flight; removed from the list once the save succeeds.
+    staged_suggestion: Option<usize>,
 }
 
 impl ModelSettingsOverlay {
@@ -303,6 +312,8 @@ impl ModelSettingsOverlay {
             editor: None,
             pending: None,
             message: None,
+            suggestions: Vec::new(),
+            staged_suggestion: None,
         }
     }
 
@@ -421,28 +432,242 @@ impl ModelSettingsOverlay {
             .join(" · ")
     }
 
+    /// Local models only: fills the suggestion list from the evidence recorded for this model. `base`
+    /// carries the configuration (default edit grammar, side-model policy, global draft model); the
+    /// profile being edited overrides it. Nothing is applied here.
+    pub fn with_suggestions(mut self, user_dir: &Path, base: Current) -> Self {
+        if !is_local_provider(&self.profile.provider) {
+            return self;
+        }
+        // Unreadable evidence means no suggestions; it never blocks the settings page.
+        let Ok(records) = local_evidence::read(user_dir) else {
+            return self;
+        };
+        let key = local_evidence::model_key(&self.profile.provider, &self.profile.model);
+        if let Some(evidence) = records.get(&key) {
+            let current = self.current(base);
+            self.suggestions = local_evidence::suggestions(evidence, &current);
+        }
+        self
+    }
+
+    fn current(&self, mut base: Current) -> Current {
+        let profile = &self.profile;
+        base.provider = profile.provider.clone();
+        base.model = profile.model.clone();
+        base.profile_context_window = profile.context_window;
+        let sampling = profile.local_sampling.as_ref();
+        base.presence_penalty = sampling.and_then(|s| s.presence_penalty);
+        base.repetition_penalty = sampling.and_then(|s| s.repetition_penalty);
+        base.keep_alive = profile.keep_alive.clone();
+        base.draft_model = profile
+            .local_runtime
+            .as_ref()
+            .and_then(|r| r.draft_model.clone())
+            .or(base.draft_model);
+        if let Some(mode) = profile.edit_mode {
+            base.edit_mode = serde_json::to_value(mode)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or(base.edit_mode);
+            base.edit_mode_pinned = true;
+        }
+        if profile.provider == "mlx" {
+            base.draft_candidate = local_server::draft_candidates(&profile.model)
+                .into_iter()
+                .next();
+        }
+        base
+    }
+
+    /// Fields first, then the suggestion rows under their own heading.
+    fn len(&self) -> usize {
+        self.fields.len() + self.suggestions.len()
+    }
+
+    fn section_at(&self, cursor: usize) -> &'static str {
+        self.fields.get(cursor).map_or("Suggestions", |f| f.section)
+    }
+
     fn candidate(&self, field: &str, text: &str) -> anyhow::Result<ModelProfile> {
-        let mut table = self.table();
         if text.trim().is_empty() {
-            crate::ui::settings_schema::unset(&mut table, field);
-        } else {
-            let parsed: toml::Table = format!("value = {text}").parse().map_err(|_| {
-                anyhow::anyhow!(
-                    "Not a valid value: numbers and true/false are bare, text needs \"quotes\""
-                )
-            })?;
-            anyhow::ensure!(parsed.len() == 1, "Enter one value, not extra settings");
-            let value = parsed
-                .get("value")
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Enter a value"))?;
-            crate::ui::settings_schema::set(&mut table, field, value);
+            return self.profile_with(field, None);
+        }
+        let parsed: toml::Table = format!("value = {text}").parse().map_err(|_| {
+            anyhow::anyhow!(
+                "Not a valid value: numbers and true/false are bare, text needs \"quotes\""
+            )
+        })?;
+        anyhow::ensure!(parsed.len() == 1, "Enter one value, not extra settings");
+        let value = parsed
+            .get("value")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Enter a value"))?;
+        self.profile_with(field, Some(value))
+    }
+
+    /// The profile with `field` set to `value` (unset for `None`), if it still validates.
+    fn profile_with(
+        &self,
+        field: &str,
+        value: Option<toml::Value>,
+    ) -> anyhow::Result<ModelProfile> {
+        let mut table = self.table();
+        match value {
+            Some(value) => {
+                crate::ui::settings_schema::set(&mut table, field, value);
+            }
+            None => {
+                crate::ui::settings_schema::unset(&mut table, field);
+            }
         }
         let profile: ModelProfile = toml::Value::Table(table)
             .try_into()
             .map_err(|e: toml::de::Error| anyhow::anyhow!("{}", e.message()))?;
         profile.validate()?;
         Ok(profile)
+    }
+
+    /// Enter on a suggestion row: a profile change saves the profile, a global key saves that config
+    /// key. Either way the change is only staged here; it is removed from the list once saved.
+    fn apply_suggestion(&mut self, index: usize) -> OverlayEvent {
+        let Some(suggestion) = self.suggestions.get(index).cloned() else {
+            return OverlayEvent::None;
+        };
+        let value = if suggestion.value.is_null() {
+            None
+        } else {
+            match toml::Value::try_from(&suggestion.value) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    self.message =
+                        Some((format!("Suggestion is not a setting value: {error}"), true));
+                    return OverlayEvent::None;
+                }
+            }
+        };
+        let what = format!("{} applied", suggestion.title);
+        if suggestion.global {
+            self.staged_suggestion = Some(index);
+            self.pending = Some((self.profile.clone(), what));
+            self.message = None;
+            return match value {
+                Some(value) => OverlayEvent::Set {
+                    path: suggestion.path,
+                    value,
+                    scope: self.scope,
+                },
+                None => OverlayEvent::Unset {
+                    path: suggestion.path,
+                    scope: self.scope,
+                },
+            };
+        }
+        match self.profile_with(&suggestion.path, value) {
+            Ok(profile) => {
+                let value = toml::Value::try_from(&profile).expect("serializable model profile");
+                self.staged_suggestion = Some(index);
+                self.pending = Some((profile, what));
+                self.message = None;
+                OverlayEvent::Set {
+                    path: format!("model_profiles.{}", self.name),
+                    value,
+                    scope: self.scope,
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.message = Some((
+                    message.lines().next().unwrap_or("Invalid value").to_owned(),
+                    true,
+                ));
+                OverlayEvent::None
+            }
+        }
+    }
+
+    fn suggestion_detail(&self, index: usize, w: usize, ctx: &DrawCtx) -> Vec<Line<'static>> {
+        let theme = ctx.theme;
+        let Some(suggestion) = self.suggestions.get(index) else {
+            return Vec::new();
+        };
+        let mut lines = vec![Line::from(fit(
+            vec![chrome::label(
+                theme,
+                &format!(" Suggestion: {}", suggestion.title),
+            )],
+            w,
+        ))];
+        let rows = text::wrap_words(&suggestion.evidence, w.saturating_sub(2).max(8));
+        for row in rows.iter().take(2) {
+            lines.push(Line::from(fit(
+                vec![Span::styled(
+                    text::ellipsize(&format!(" {row}"), w, theme.ascii()),
+                    theme.fg(Tok::Muted),
+                )],
+                w,
+            )));
+        }
+        lines.push(Line::from(fit(
+            vec![Span::styled(
+                " Enter applies it. Nothing changes until you press Enter.",
+                theme.fg(Tok::Muted),
+            )],
+            w,
+        )));
+        lines
+    }
+
+    fn suggestion_row(
+        &self,
+        index: usize,
+        w: usize,
+        ctx: &DrawCtx,
+        label_w: usize,
+    ) -> Line<'static> {
+        let theme = ctx.theme;
+        let suggestion = &self.suggestions[index];
+        let selected = self.fields.len() + index == self.cursor;
+        let prefix_w = 5 + label_w + 2;
+        let spans = vec![
+            Span::styled(
+                format!(
+                    " {} ",
+                    if selected {
+                        theme.sym(Sym::Pointer)
+                    } else {
+                        " "
+                    }
+                ),
+                theme.fg(Tok::Accent),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "{:<label_w$}",
+                    text::ellipsize(&suggestion.title, label_w, theme.ascii())
+                ),
+                theme.fg(Tok::Text),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                text::ellipsize(
+                    &suggestion.evidence,
+                    w.saturating_sub(prefix_w + 1),
+                    theme.ascii(),
+                ),
+                if selected {
+                    theme.fg(Tok::Accent)
+                } else {
+                    theme.fg(Tok::Muted)
+                },
+            ),
+        ];
+        if selected {
+            filled(spans, w, theme.bg(Tok::SelectedBg))
+        } else {
+            Line::from(fit(spans, w))
+        }
     }
 
     pub fn banner(&mut self, text: String, error: bool) {
@@ -456,10 +681,17 @@ impl ModelSettingsOverlay {
                     self.profile = profile;
                     self.message = Some((format!("{what} · applies to the next request"), false));
                 }
+                if let Some(index) = self.staged_suggestion.take()
+                    && index < self.suggestions.len()
+                {
+                    self.suggestions.remove(index);
+                    self.cursor = self.cursor.min(self.len() - 1);
+                }
                 self.editor = None;
             }
             Err(error) => {
                 self.pending = None;
+                self.staged_suggestion = None;
                 self.message = Some((
                     error.lines().next().unwrap_or("Could not save").to_owned(),
                     true,
@@ -499,6 +731,9 @@ impl ModelSettingsOverlay {
 
     /// Left/Right: cycle a choice or toggle, or nudge a number. Unset numbers start at a sensible value.
     fn step(&mut self, direction: i64) -> OverlayEvent {
+        if self.cursor >= self.fields.len() {
+            return OverlayEvent::None;
+        }
         let field = self.fields[self.cursor];
         let current = self.value(field.path);
         let literal = match field.kind {
@@ -586,8 +821,8 @@ impl ModelSettingsOverlay {
             }
             return OverlayEvent::None;
         }
-        let last = self.fields.len() - 1;
-        let section = self.fields[self.cursor].section;
+        let last = self.len() - 1;
+        let section = self.section_at(self.cursor);
         if keys.matches(Action::SelectUp, key) {
             self.cursor = self.cursor.saturating_sub(1);
         } else if keys.matches(Action::SelectDown, key) {
@@ -624,6 +859,9 @@ impl ModelSettingsOverlay {
                 .position(|f| f.section == name)
                 .unwrap_or(0);
         } else if keys.matches(Action::SelectConfirm, key) {
+            if self.cursor >= self.fields.len() {
+                return self.apply_suggestion(self.cursor - self.fields.len());
+            }
             return self.begin_edit();
         } else {
             match key.code {
@@ -632,7 +870,8 @@ impl ModelSettingsOverlay {
                 KeyCode::Home => self.cursor = 0,
                 KeyCode::End => self.cursor = last,
                 KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('r') => {
-                    if self.is_override(self.fields[self.cursor]) {
+                    if self.cursor < self.fields.len() && self.is_override(self.fields[self.cursor])
+                    {
                         return self.apply("");
                     }
                     self.message = Some(("Already using the default".into(), false));
@@ -754,7 +993,7 @@ impl ModelSettingsOverlay {
                     scope_name(self.scope),
                     theme.sym(Sym::Dot),
                     self.cursor + 1,
-                    self.fields.len()
+                    self.len()
                 ),
                 dim,
             )],
@@ -779,6 +1018,12 @@ impl ModelSettingsOverlay {
                 last = f.section;
             }
             rows.push((None, i));
+        }
+        if !self.suggestions.is_empty() {
+            rows.push((Some("Suggestions"), self.fields.len()));
+            for k in 0..self.suggestions.len() {
+                rows.push((None, self.fields.len() + k));
+            }
         }
         let selected_row = rows
             .iter()
@@ -821,6 +1066,10 @@ impl ModelSettingsOverlay {
                     ],
                     w,
                 )));
+                continue;
+            }
+            if *index >= self.fields.len() {
+                out.push(self.suggestion_row(*index - self.fields.len(), w, ctx, label_w));
                 continue;
             }
             let field = self.fields[*index];
@@ -874,7 +1123,14 @@ impl ModelSettingsOverlay {
             out.push(Line::default());
         }
 
-        if detail_h > 0 {
+        if detail_h > 0 && self.cursor >= self.fields.len() {
+            let mut lines = self.suggestion_detail(self.cursor - self.fields.len(), w, ctx);
+            lines.truncate(detail_h);
+            while lines.len() < detail_h {
+                lines.push(Line::default());
+            }
+            out.extend(lines);
+        } else if detail_h > 0 {
             let field = self.fields[self.cursor];
             let mut lines: Vec<Line<'static>> = vec![Line::from(fit(
                 vec![chrome::label(theme, &format!(" {}", field.label))],
@@ -977,6 +1233,10 @@ impl ModelSettingsOverlay {
         out.push(hint_line(theme, &segments, w));
         out
     }
+}
+/// Providers that serve models from this machine or the LAN. Hosted providers never get suggestions.
+fn is_local_provider(provider: &str) -> bool {
+    matches!(provider, "mlx" | "lm-studio" | "ollama" | "llama-cpp")
 }
 
 fn as_number(value: &toml::Value) -> Option<f64> {
@@ -1330,5 +1590,122 @@ mod tests {
             overlay.message,
             Some(("cannot write settings".into(), true))
         );
+    }
+
+    #[test]
+    fn suggestions_are_listed_and_enter_applies_only_the_selected_one() {
+        let rig = Rig::new();
+        let ctx = DrawCtx {
+            theme: &rig.theme,
+            keys: &rig.keys,
+            status: &rig.status,
+            preview_status: &status_preview,
+        };
+        let mut overlay = ModelSettingsOverlay::new("local".into(), mlx());
+        overlay.suggestions = vec![
+            Suggestion {
+                path: "edit_mode".into(),
+                global: false,
+                value: serde_json::json!("apply_patch"),
+                title: "Use the apply_patch edit grammar".into(),
+                evidence: "edits failed 9 of 20 times under replace, 1 of 15 under apply_patch"
+                    .into(),
+            },
+            Suggestion {
+                path: "assistance.local.side_models".into(),
+                global: true,
+                value: serde_json::json!("reuse_main"),
+                title: "Reuse the main model for side requests".into(),
+                evidence: "side requests swapped the loaded model 4 times".into(),
+            },
+        ];
+        overlay.cursor = overlay.fields.len();
+        let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ctx)));
+        assert!(
+            // Long titles are cut to the label column; the detail box shows the whole title.
+            text.contains("SUGGESTIONS") && text.contains("Use the apply_patch"),
+            "{text}"
+        );
+        assert!(text.contains("edits failed 9 of 20"), "{text}");
+
+        // Only the selected row is saved, and only once Enter is pressed.
+        overlay.cursor = overlay.fields.len();
+        assert!(matches!(
+            overlay.event(&key(KeyCode::Right), &rig.keys),
+            OverlayEvent::None
+        ));
+        let OverlayEvent::Set { path, value, .. } = overlay.event(&key(KeyCode::Enter), &rig.keys)
+        else {
+            panic!("expected a profile save")
+        };
+        assert_eq!(path, "model_profiles.local");
+        assert_eq!(value["edit_mode"].as_str(), Some("apply_patch"));
+        assert_eq!(overlay.suggestions.len(), 2, "still listed until saved");
+        overlay.settled(Ok(()));
+        assert_eq!(overlay.suggestions.len(), 1);
+        assert_eq!(
+            overlay.profile.edit_mode,
+            Some(crate::config::types::EditMode::ApplyPatch)
+        );
+
+        // A global key goes through the config path, and a failed save keeps the row.
+        overlay.cursor = overlay.fields.len();
+        let OverlayEvent::Set { path, value, .. } = overlay.event(&key(KeyCode::Enter), &rig.keys)
+        else {
+            panic!("expected a config save")
+        };
+        assert_eq!(path, "assistance.local.side_models");
+        assert_eq!(value.as_str(), Some("reuse_main"));
+        overlay.settled(Err("cannot write settings".into()));
+        assert_eq!(overlay.suggestions.len(), 1);
+        assert!(matches!(
+            overlay.event(&key(KeyCode::Enter), &rig.keys),
+            OverlayEvent::Set { .. }
+        ));
+        overlay.settled(Ok(()));
+        assert!(overlay.suggestions.is_empty());
+        assert_eq!(overlay.cursor, overlay.fields.len() - 1);
+    }
+
+    #[test]
+    fn evidence_file_offers_suggestions_for_local_models_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mlx_key = local_evidence::model_key("mlx", "local-model");
+        let hosted_key = local_evidence::model_key("anthropic", "local-model");
+        let file = serde_json::json!({
+            mlx_key: {
+                "stage": 2,
+                "edits": {
+                    "replace": {"ok": 1, "failed": 9},
+                    "apply_patch": {"ok": 14, "failed": 1}
+                }
+            },
+            hosted_key: {
+                "stage": 2,
+                "edits": {"replace": {"ok": 1, "failed": 9}}
+            }
+        });
+        std::fs::write(dir.path().join(local_evidence::FILE), file.to_string()).unwrap();
+        let base = Current {
+            edit_mode: "replace".into(),
+            side_models: "warn".into(),
+            context_window: 32768,
+            ..Current::default()
+        };
+        let overlay = ModelSettingsOverlay::new("local".into(), mlx())
+            .with_suggestions(dir.path(), base.clone());
+        assert!(
+            overlay
+                .suggestions
+                .iter()
+                .any(|s| s.path == "edit_mode" && s.value == serde_json::json!("apply_patch")),
+            "{:?}",
+            overlay.suggestions
+        );
+        let mut hosted = mlx();
+        hosted.provider = "anthropic".into();
+        let hosted =
+            ModelSettingsOverlay::new("cloud".into(), hosted).with_suggestions(dir.path(), base);
+        assert!(hosted.suggestions.is_empty());
     }
 }

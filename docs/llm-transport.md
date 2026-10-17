@@ -6,6 +6,40 @@ The shared LLM layer provides bounded streaming, provider-aware error classifica
 
 Streaming reads have bounded raw and line sizes. Reasoning markup leaked into visible text is routed to reasoning events where recognized, and tool-call markup is kept out of user-visible output. Remote model context is taken from configuration or the bundled catalog, falling back to a conservative 32768 tokens. Image inputs are resized to model limits before transmission. Provider-specific OAuth credentials are refreshed per request/retry, without exposing secrets in errors.
 
+## Local server request fields
+
+Local-profile requests (`[assistance.local]`) add server-specific fields only when the route is a
+locally served model (Dial's MLX runtime, LM Studio, Ollama, or llama.cpp on a loopback or private
+host). Hosted routes never receive them, and a field already in the request body (an explicit
+model-profile value) is never overwritten. Fields are sent only where the server's own docs or source
+name them:
+
+- llama.cpp `llama-server` (Dial-launched for GGUF models, the `llama-cpp` provider, or a recognised
+  endpoint): `cache_prompt` and `id_slot` (`prompt_cache`; main session on slot 0, side requests on
+  the last slot and workers on the others when `/props` reports several `total_slots`),
+  `return_progress`, `chat_template_kwargs.enable_thinking` (when `/props` `chat_template` reads
+  it), and `presence_penalty` / `repeat_penalty` for loop recovery. Source:
+  [server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md).
+  `cache_prompt`, `id_slot` and `return_progress` are documented under `/completion`; the README
+  says `/completion`-specific features are also supported on `/v1/chat/completions`. Replies'
+  `timings` and streamed `prompt_progress` supply speed, cache and progress telemetry.
+- Dial's MLX runtime (`mlx_lm.server`): `chat_template_kwargs.enable_thinking` (when the model's chat
+  template reads it), `presence_penalty` and `repetition_penalty`. Source: `mlx_lm/server.py` in
+  [mlx-lm v0.32.0](https://github.com/ml-explore/mlx-lm/blob/v0.32.0/mlx_lm/server.py).
+- LM Studio (OpenAI-compatible API): `ttl` (`keep_loaded_secs`; LM Studio applies it to
+  just-in-time loaded models), `presence_penalty` and `repeat_penalty`. No request-level thinking
+  switch is documented, so none is sent. Source: [LM Studio docs](https://lmstudio.ai/docs/developer).
+- Ollama native `/api/chat`: `keep_alive` (`keep_loaded_secs`), `think` (models with the `thinking`
+  capability), `options.presence_penalty` / `options.repeat_penalty`, and `options.num_ctx` limited
+  to the memory estimate when no window is pinned. At exit, a model this session loaded is unloaded
+  with an empty `/api/generate` request carrying `keep_alive: 0`. Source:
+  [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md); the `thinking` capability
+  name is from `types/model/capability.go`. Reply durations (`load_duration`,
+  `prompt_eval_duration`, `eval_duration`, nanoseconds) supply load time and speed.
+
+None of these fields has been measured against a live server by Dial's tests; the tests check the
+request bodies built for each server.
+
 ## Subscription-provider transports
 
 The extended dispatcher uses Dial's blocking protocol clients with bounded SSE parsing, cancellation,

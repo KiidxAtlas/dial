@@ -40,7 +40,7 @@ pub fn now() -> u64 {
 
 /// Use the checkpoint snapshot an earlier run pinned, if any (no model load).
 pub fn apply_pinned_model(config: &mut Config, store: &Store) -> Result<()> {
-    if config.endpoint.is_some() {
+    if !config.runs_dial_mlx() {
         return Ok(());
     }
     if let Some(saved) = store.get_meta("serving_capabilities")? {
@@ -54,7 +54,7 @@ pub fn apply_pinned_model(config: &mut Config, store: &Store) -> Result<()> {
 
 /// Resolve once so a moving Hub branch cannot silently change the serving checkpoint.
 pub fn pin_models(config: &mut Config, store: &Store, coach: bool) -> Result<Value> {
-    let capabilities = if config.endpoint.is_some() {
+    let capabilities = if !config.runs_dial_mlx() {
         let caps = json!({"inference":true,"lora":false,"reason":"OpenAI-compatible endpoint: harness improvement only","resolved_model":config.model});
         store.set_meta("serving_capabilities", &caps.to_string())?;
         caps
@@ -83,7 +83,7 @@ pub fn pin_models(config: &mut Config, store: &Store, coach: bool) -> Result<Val
     };
     if coach && config.model_roles.contains_key("coach") {
         let coach_config = config.for_role("coach");
-        if coach_config.endpoint.is_none() {
+        if coach_config.runs_dial_mlx() {
             let key = format!("coach_snapshot:{}", coach_config.model);
             let snapshot = if let Some(snapshot) = store.get_meta(&key)? {
                 snapshot
@@ -822,7 +822,7 @@ pub fn diagnose(
     ];
     let coach_config = config.for_role("coach");
     let ask = |messages: Vec<Value>| -> Result<String> {
-        if coach_config.endpoint.is_some() {
+        if !coach_config.runs_dial_mlx() {
             Ok(agent::make_backend(&coach_config)?
                 .chat(
                     None,
@@ -948,7 +948,7 @@ fn weight_unavailable(config: &Config, caps: &Value) -> Option<String> {
     if !config.training.enabled {
         return Some("weight training is disabled in the configuration".into());
     }
-    if config.endpoint.is_some() {
+    if !config.runs_dial_mlx() {
         let checkpoint = crate::llm::catalog::resolve_local_model(&config.model).ok();
         return Some(endpoint_unavailable(&config.model, checkpoint.as_deref()));
     }

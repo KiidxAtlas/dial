@@ -455,7 +455,7 @@ impl Binding {
 }
 
 /// Whether `route` and `canonical` are absolute URLs with the same scheme, host and port.
-fn same_origin(route: &str, canonical: &str) -> bool {
+pub(crate) fn same_origin(route: &str, canonical: &str) -> bool {
     match (
         route.parse::<ureq::http::Uri>(),
         canonical.parse::<ureq::http::Uri>(),
@@ -666,6 +666,20 @@ mod tests {
                 .ensure_route(true, "https://gateway.example/v1/anthropic", chat)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn every_flow_protocol_matches_its_provider_route() {
+        // The binding refuses a route whose protocol differs from its flow's, so a flow that disagrees
+        // with its provider's built-in protocol makes that signed-in provider unusable.
+        for flow in flows() {
+            assert_eq!(
+                flow.protocol,
+                ApiProtocol::builtin(flow.id),
+                "{} flow protocol differs from its provider route",
+                flow.id
+            );
+        }
     }
 
     #[test]

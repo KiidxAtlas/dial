@@ -295,7 +295,7 @@ const ASSIST_CASE_TIMEOUT_SECS: u64 = 600;
 /// ships off; `ablate-*` turns off or changes a feature that ships on. Either way exactly one
 /// lever differs from `dial`.
 type FeatureVariant = fn(&mut AssistanceOverrides, EditMode);
-const ASSIST_VARIANTS: [(&str, FeatureVariant); 7] = [
+const ASSIST_VARIANTS: [(&str, FeatureVariant); 8] = [
     ("enable-compact_tools", |o, _| o.compact_tools = Some(true)),
     ("enable-repair_hints", |o, _| o.repair_hints = Some(true)),
     // 0 means unlimited: the initial tool budget is removed.
@@ -316,6 +316,7 @@ const ASSIST_VARIANTS: [(&str, FeatureVariant); 7] = [
     ("ablate-lean_local", |o, _| {
         o.lean_local = Some(LeanLocal::Off)
     }),
+    ("ablate-local_profile", |o, _| o.local_profile = Some(false)),
 ];
 
 /// The shipped assistance and context-economy values, read from `Config` rather than restated, so
@@ -335,6 +336,7 @@ fn shipped_overrides(shipped: &Config) -> (AssistanceOverrides, EfficiencyOverri
             reliability_gate: Some(shipped.reliability.enabled),
             constrained_repair: Some(assistance.constrained_repair),
             lean_local: Some(assistance.lean_local),
+            local_profile: Some(assistance.local.enabled),
         },
         EfficiencyOverrides {
             tool_preview_bytes: Some(shipped.efficiency.tool_preview_bytes),
@@ -367,6 +369,7 @@ fn assist_configurations(
         reliability_gate: Some(false),
         constrained_repair: Some(false),
         lean_local: Some(LeanLocal::Off),
+        local_profile: Some(false),
     };
     let machine = |name: String, assistance: AssistanceOverrides| MachineConfiguration {
         name,
@@ -717,6 +720,9 @@ fn apply_assistance(config: &mut Config, overrides: &AssistanceOverrides) {
     if let Some(value) = overrides.lean_local {
         config.assistance.lean_local = value;
     }
+    if let Some(value) = overrides.local_profile {
+        config.assistance.local.enabled = value;
+    }
 }
 
 /// Applies per-configuration context-economy overrides on top of the user's config; unset fields keep it.
@@ -782,6 +788,7 @@ fn assistance_settings(config: &Config) -> serde_json::Value {
         "reliability_gate": config.reliability.enabled,
         "constrained_repair": config.assistance.constrained_repair,
         "lean_local": config.assistance.lean_local,
+        "local_profile": config.assistance.local.enabled,
         "lean_local_within_auto_window": config.context_window <= LEAN_AUTO_MAX_WINDOW,
     })
 }

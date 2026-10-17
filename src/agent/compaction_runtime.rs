@@ -123,12 +123,13 @@ pub fn portable_summary_completion(
                     backend.reply_cost(reply),
                     started.elapsed(),
                 ),
-                Err(_) => crate::telemetry::request_failed(
+                Err(error) => crate::telemetry::request_failed(
                     &telemetry_config,
                     hermetic,
                     &session_id,
                     backend.model_label(),
                     started.elapsed(),
+                    error,
                 ),
             }
             if cancel.load(Ordering::SeqCst) {

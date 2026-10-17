@@ -347,6 +347,16 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         true
     ),
     field!(
+        "codebase.history",
+        codebase.history,
+        MO,
+        "Project understanding",
+        "Code change history",
+        "Record the diff each turn makes to each project file, with the git branch and prompt, so code_history and /code-history can search why and when code changed across sessions. No model calls. Changes made outside Dial are not recorded.",
+        Kind::Bool,
+        true
+    ),
+    field!(
         "codebase.architecture_model",
         codebase.architecture_model,
         MO,

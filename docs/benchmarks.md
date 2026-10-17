@@ -199,7 +199,8 @@ initial_tool_limit = 0
 
 Supported assistance keys: `enabled`, `compact_tools`, `initial_tool_limit` (0 = unlimited, or 1..=64), `tool_grammar`,
 `repair_hints`, `syntax_guard`, `selective_verification`, `edit_mode`, `constrained_repair`, `lean_local` (`true`,
-`false` or `"auto"`, matching the user config), and `reliability_gate` (maps to `reliability.enabled`). Unknown keys are rejected.
+`false` or `"auto"`, matching the user config), `local_profile` (maps to `assistance.local.enabled`), and
+`reliability_gate` (maps to `reliability.enabled`). Unknown keys are rejected.
 
 Context-economy keys go under `[configurations.efficiency]` and are applied to the same isolated config: `tool_preview_bytes`
 (0 or 1024..=16384), `history_token_cap` (0 or 8192..=2000000), `compaction_enabled` and `keep_recent_tokens`. Operator
@@ -216,8 +217,9 @@ matters on local routes where shipped `auto` would not apply (windows above 3276
 changes exactly one lever from `dial`:
 
 - `enable-compact_tools` and `enable-repair_hints` turn on features that ship off;
-- `ablate-initial_tool_limit`, `ablate-tool_grammar`, `ablate-edit_mode`, `ablate-reliability_gate` and
-  `ablate-lean_local` turn off or change features that ship on.
+- `ablate-initial_tool_limit`, `ablate-tool_grammar`, `ablate-edit_mode`, `ablate-reliability_gate`,
+  `ablate-lean_local` and `ablate-local_profile` turn off or change features that ship on.
+  `ablate-local_profile` sets `assistance.local.enabled = false`; see the local profile in `agent-loop.md`.
 
 The suite defaults to `examples/benchmarks/efficiency.toml`. The command prints a table with checked
 correctness, tool errors, malformed tool calls (tool contract errors), repair rounds, observed tokens and

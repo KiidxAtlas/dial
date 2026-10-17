@@ -150,6 +150,9 @@ limits, reasoning budgets, approvals or verification requirements:
   loads it with `tool_load` in one round; schemas and recorded tool contracts are unchanged. The
   list changes only when a tool is loaded or unloaded, and the offer never reads live-worker state,
   so the provider's cached prefix survives ordinary rounds.
+  MCP tools are the one exception: a server with at most 6 tools is offered up front, whole
+  servers only, in server-name order, up to 16 MCP tools in total. Larger servers stay loadable.
+  Discovery, lean-local, pinned (`[harness] tools`), hermetic and selection-only offers skip this.
   `assistance.compact_tools=true` switches to discovery mode for small local models: a core set
   bounded by `assistance.initial_tool_limit` (default 16) plus `tool_search`/`tool_load`.
   `assistance.lean_local` defaults to `auto`, which enables a lean profile when the main model is
@@ -166,6 +169,90 @@ limits, reasoning budgets, approvals or verification requirements:
   unloading clears both sets. Additive `discovered_tools` control state survives resume, and older
   `enabled_tools` state remains pinned for compatibility. A pinned `[harness] tools` list or a
   model-profile allowlist still restricts the offer; discovery never grants execution permission.
+- Local model profile (`[assistance.local]`) applies only to locally served main models (the same
+  routes as `lean_local`). Hosted routes and hermetic runs are unchanged, and explicit pins win
+  over every local-profile policy below. Its keys are `enabled` (default `true`), `small_window`
+  (default 16384; 0 disables the small tier, otherwise 1024..=1048576), `edit_mode`, `sampling`,
+  `reasoning_share` (default 50), `escalate_after` (default 2), and the keys below.
+  - Tiers: a lean local route whose planned window is at most `small_window` gets the small tier:
+    a fixed minimal tool set (`read`, `write`, `edit`, `bash`, `grep`, `glob`, `todo`, `finish`,
+    `tool_search`, `tool_load`) plus loaded and memory tools; everything else loads on demand. A
+    pinned `[harness] tools` list keeps its own offer. A lean route above that window gets the lean
+    tier (the `lean_local` profile above). Other routes get the full tier.
+  - Edit mode: local routes default to the `replace` grammar. Precedence is the `--edit-mode`
+    override, the model profile `edit_mode`, `[harness] edit_mode`, `[edit] model_variants`, then
+    `assistance.local.edit_mode`, then `[edit] mode`. `inherit` makes the local default follow
+    `[edit] mode`. Hermetic evaluation ignores the local default.
+  - Sampling: `model` (default) leaves sampling to the model. Dial's own runtime (no endpoint)
+    applies the model's shipped `temperature`, `top_p`, `top_k` and `min_p` from its
+    `generation_config.json` (a `do_sample: false` file means greedy, so nothing is applied) or GGUF
+    `general.sampling.*` metadata, and otherwise keeps the harness temperature. On local servers Dial
+    omits `temperature`, so the server's per-model defaults apply. `harness` sends Dial's harness
+    temperature instead. A temperature counts as pinned, and Dial keeps sending its own, when
+    `[harness] temperature` differs from the default 0.2 (including a learned harness value), when a
+    model profile sets a temperature or `thinking = true`, or when adaptive sampling or
+    `adaptive.pin_sampling` is enabled.
+  - Reasoning share: on lean tiers, streamed reasoning per request is capped at `reasoning_share`
+    percent of the planned window, at about 4 bytes per token. The cap applies only when
+    `reasoning_guard.max_reasoning_bytes` is 0 (unlimited) or larger than that cap; a stricter
+    explicit limit still applies. When the cap is hit, the existing reasoning guard discards that
+    generation and retries once; requests to Dial's own runtime also carry the `dial_reasoning`
+    budget (3/4 of the cap). 0 disables it.
+  - Escalation: `escalate_after` consecutive failing rounds (malformed tool calls, or failed `edit`
+    or `write` calls) step the session up. Step 1 switches to the minimal tool set and lean prompt;
+    step 2 switches to the `replace` edit grammar unless a pin chooses otherwise (it is skipped when
+    the grammar is pinned or already `replace`). A step takes effect from the next request, so the
+    prompt and tool offer change at most twice per session. The reached step is remembered per model
+    in the user directory file `local-profile.json` and applied at the first turn of the next
+    session. 0 disables escalation.
+  - Benchmark lever: `ablate-local_profile` in `dial benchmark --ablate-assistance` turns the
+    profile off (`assistance.local.enabled = false`) against the `dial` row.
+  - Thinking (`assistance.local.thinking`, default `phase`): where the server exposes a thinking
+    switch for the model (llama.cpp and Dial's MLX runtime: a chat template that reads
+    `enable_thinking`, sent as `chat_template_kwargs.enable_thinking`; Ollama: a model with the
+    `thinking` capability, sent as `think`), reasoning is on for a turn's first request, after a
+    failed round, an intercepted generation or a successful `todo` update, and off after a
+    successful tool round. LM Studio documents no request-level switch, so nothing is sent there.
+    `model` leaves thinking alone. An explicit model-profile `thinking`, `reasoning_effort`,
+    `thinking_budget` or `chat_template_kwargs.enable_thinking` always wins.
+  - Model residency (`keep_loaded_secs`, default 1800, 0 = server default, max 86400): asks the server
+    to keep the model loaded this long after each request (Ollama `keep_alive`, LM Studio `ttl`,
+    which LM Studio applies to just-in-time loaded models). An explicit model-profile `keep_alive`
+    wins. On Ollama, a model that was not loaded when the session started is unloaded when Dial
+    exits (`keep_alive: 0`); a model that was already loaded is left alone.
+  - Prompt cache (`prompt_cache`, default on, llama.cpp only): requests send `cache_prompt` and an
+    `id_slot`. The main session uses slot 0. When the server reports more than one slot (`/props`
+    `total_slots`), side requests on the main model use the last slot and workers use the others,
+    so neither evicts the main prefix. Prompt tokens served from the cache are counted in the
+    evidence and shown in the status line (`N cached`) while a prompt is processed.
+  - Side models (`side_models`, default `warn`): a side role (`small`, `coach`) assigned to a
+    different model on the main model's local server makes the server swap models for summaries,
+    ranking and edit repair. `warn` keeps the assignment and says so once per session, with the
+    measured load time when known. `reuse_main` sends those side requests to the loaded main model
+    (thinking off where switchable). `allow` keeps the assignment without a notice.
+  - Context fit (`context_advice`, default on): when a local server serves a smaller window than
+    configured, one notice says so and how to raise it on that server. On Ollama without a pinned
+    `context_window`, `num_ctx` is limited to the window the model's memory estimate fits on this
+    machine, so the model is not offloaded or swapped, and a notice says so once.
+  - Loop recovery (`loop_penalty`, default on): when the repetition detector stops a local
+    generation, the retry carries a presence penalty of 0.5 and a repetition penalty of 1.1 (thinking
+    off where switchable) for that retry only. Penalty values set in the model profile's
+    `local_sampling` are kept.
+  - Evidence and suggestions (`suggestions`, default on): per-model counters (failing rounds, edit
+    outcomes per grammar, measured decode and prefill speed, cache-hit tokens, loads, side-model
+    swaps, repetition loops, context overflows) are kept in `local-profile.json`, keyed by provider
+    and model. When the evidence supports a change, `/model settings` lists it under Suggestions with
+    its evidence. Enter applies that one change; nothing is applied silently. A speculative-decoding
+    draft model is suggested only for MLX models with a smaller installed model whose tokenizer is
+    identical. Once one is applied, decode speed with it is recorded against the earlier baseline;
+    after 20 samples each, clearing it is suggested unless it is at least 5% faster. With
+    `suggestions` off only the escalation step is recorded.
+  - Time budget (`time_budget`, default on): when `reasoning_guard.max_pre_action_secs` is 0 and at
+    least three decode-speed samples exist, the pre-action time limit for a request is derived from
+    the measured prefill and decode speed (1.5x margin plus a minute, within 2 to 60 minutes). While
+    a prompt is processed, the status line shows the time left (`~Ns left`) from the measured
+    processing rate.
+  Edit these keys in `/improve settings` under Local model assistance.
 - Ambient codebase retrieval is off by default (`codebase.ambient_context`); the model calls
   `codebase_memory` when it wants the saved understanding. When on, it selects task-relevant
   sources/findings, prefers fresh evidence, omits the directory inventory and bounds stale notices.

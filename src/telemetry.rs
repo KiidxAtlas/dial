@@ -164,13 +164,15 @@ pub fn request(
     );
 }
 
-/// A model request that ended in an error (after transport retries).
+/// A model request that ended in an error (after transport retries). The row's finish reason is
+/// `error:<class>` so stats can separate rate limits and stalls from invalid requests.
 pub fn request_failed(
     config: &Config,
     hermetic: bool,
     session: &str,
     model: &str,
     elapsed: Duration,
+    error: &anyhow::Error,
 ) {
     if hermetic {
         return;
@@ -188,7 +190,7 @@ pub fn request_failed(
             reasoning: None,
             cost_usd: None,
             duration: elapsed,
-            finish_reason: "error".into(),
+            finish_reason: format!("error:{}", crate::llm::errors::classify(error).label()),
             tool_calls: 0,
             error: true,
             end: SystemTime::now(),

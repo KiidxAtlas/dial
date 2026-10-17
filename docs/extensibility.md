@@ -262,8 +262,13 @@ requests are POSTed (it must stay on the server's origin), and replies arrive on
 **MCP discovery and install.** `/extensions` (MCP tab) immediately shows the curated list and loads
 the first page from the official MCP registry, Smithery, npm and GitHub in the background (read
 concurrently), even with no query. `/` filters loaded rows while typing; Enter searches every remote
-catalog, and `n` loads the next page. Remote MCP results for the submitted query retain the
-provider's relevance matching instead
+catalog. The list scrolls
+endlessly: moving the cursor within five rows of the end loads the next catalog page, and `n` still
+loads it on demand. A failed page stops automatic paging until `r` refreshes. Servers that other
+coding agents already configure (`.mcp.json`, `~/.claude.json`, `~/.codex/config.toml`, Cursor,
+Gemini and Windsurf files) appear as `found` rows; `i` copies one into Dial's config after a
+confirmation and a health check. Dial reads those files only to list them and never starts them on
+its own. Remote MCP results for the submitted query retain the provider's relevance matching instead
 of being hidden by an additional literal-text filter; rows whose name equals the query come first,
 then rows whose name contains it, each group in listing order. The official registry requests latest versions
 and follows its cursors; browsing is not limited to ten pages. Its search matches listing names

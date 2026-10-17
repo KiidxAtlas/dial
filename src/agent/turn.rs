@@ -237,7 +237,7 @@ impl Agent<'_> {
             } else {
                 self.config.reasoning_guard.max_pre_action_secs
             };
-            let selection = crate::adaptive::select(
+            let mut selection = crate::adaptive::select(
                 self.config,
                 &self.request_phase,
                 crate::adaptive::Request {
@@ -250,6 +250,9 @@ impl Agent<'_> {
                     hermetic: self.hermetic,
                 },
             );
+            if let Some(source) = self.apply_local_sampling(&mut selection.profile, h.temperature) {
+                selection.sampling_source = format!("local profile: {source}");
+            }
             let mut request_control = self.session.control_state();
             let mut packet_cache = std::mem::take(&mut self.task_packet);
             let mut superseded = std::mem::take(&mut self.superseded);
@@ -358,6 +361,9 @@ impl Agent<'_> {
                     None
                 },
             };
+            if let Some(local) = self.prepare_local_request(backend, &mut selection.profile) {
+                self.record(step, "local_request", local)?;
+            }
             backend.next_request_profile(crate::llm::profiles::request_tiers_for(
                 selection.profile.clone(),
                 &self.auth_config.selection(),
@@ -625,6 +631,21 @@ impl Agent<'_> {
             let timeout = self.config.worker_timeout_secs;
             let mut reasoning_policy = self.config.reasoning_guard.clone();
             reasoning_policy.max_pre_action_secs = selection.pre_action_secs;
+            if reasoning_policy.max_pre_action_secs == 0
+                && let Some(secs) = self.local_time_budget(
+                    request_estimate,
+                    self.local_reasoning_cap()
+                        .map_or(u64::from(selection.max_tokens), |bytes| (bytes / 4) as u64),
+                )
+            {
+                reasoning_policy.max_pre_action_secs = secs;
+            }
+            if let Some(cap) = self.local_reasoning_cap()
+                && (reasoning_policy.max_reasoning_bytes == 0
+                    || reasoning_policy.max_reasoning_bytes > cap)
+            {
+                reasoning_policy.max_reasoning_bytes = cap;
+            }
             let interrupt = self.interrupt.clone();
             // Steering cancels only this generation, never the whole user turn or
             // independent workers that share the ordinary interrupt flag.
@@ -726,6 +747,10 @@ impl Agent<'_> {
                 self.record(step, "provider_wire", serde_json::to_value(observation)?)?;
             }
             backend.next_request_profile(None);
+            match &result {
+                Ok(reply) => self.observe_local_reply(reply, backend),
+                Err(error) => self.observe_local_failure(error, backend),
+            }
             // The projected request is not reused after inference: move its history instead of
             // deep-copying it each iteration. Recovery and training still see the exact bytes sent.
             let (context_before, request_tools) = match rewritten {
@@ -902,6 +927,7 @@ impl Agent<'_> {
                         self.session.id(),
                         backend.model_label(),
                         started.elapsed(),
+                        &error,
                     );
                     return Err(error).map(engine::Tick::Finished);
                 }
@@ -971,6 +997,7 @@ impl Agent<'_> {
                         self.session.id(),
                         backend.model_label(),
                         started.elapsed(),
+                        &error,
                     );
                     return Err(error).map(engine::Tick::Finished);
                 }
@@ -1500,6 +1527,7 @@ impl Agent<'_> {
             let mut stop: Option<String> = None;
             let mut round_succeeded = false;
             let mut last_tool_failure = None;
+            let mut edit_failed = false;
             let mut finished = None;
             let mut round_steering = Vec::new();
             let mut portable_batch_intercepted = false;
@@ -1747,10 +1775,11 @@ impl Agent<'_> {
                     if !single_call
                         && parallel.is_empty()
                         // Rewrites must pass the serial controller's schema and approval checks.
-                        && !hooks::wanted(
+                        && !hooks::wanted_for_tool(
                             self.tool_hooks(),
                             self.hook_plugins().as_deref(),
                             "pre_tool_use",
+                            &call.name,
                         )
                         && approval::parallel_read(&self.ext, &call.name, &call.arguments)
                         && !approval::denied_by_rule(&self.always, call, self.workspace.root())
@@ -1759,6 +1788,12 @@ impl Agent<'_> {
                             .iter()
                             .take(self.config.task.max_concurrency)
                             .take_while(|c| {
+                                !hooks::wanted_for_tool(
+                                    self.tool_hooks(),
+                                    self.hook_plugins().as_deref(),
+                                    "pre_tool_use",
+                                    &c.name,
+                                ) &&
                                 approval::parallel_read(&self.ext, &c.name, &c.arguments)
                                     && !approval::denied_by_rule(
                                         &self.always,
@@ -1868,6 +1903,13 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                         call.name,
                         guard::clip_middle(&output.text, 1200)
                     ));
+                }
+                edit_failed |= output.is_error && matches!(call.name.as_str(), "edit" | "write");
+                if matches!(call.name.as_str(), "edit" | "write") {
+                    self.observe_local_edit(!output.is_error);
+                }
+                if call.name == "todo" && !output.is_error {
+                    self.observe_local_plan_change();
                 }
                 let is_check = call.name == "bash"
                     && call.arguments["command"]
@@ -2286,6 +2328,11 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 self.push(json!({"role":"user","content":format!("Approved plan:\n{plan}\nProceed with implementation.")}))?;
             }
             reliability.round(!form_kinds.is_empty(), round_succeeded);
+            // Escalation is between requests, so the next request is built from the new offer.
+            if self.observe_local_round(!form_kinds.is_empty() || edit_failed, ui) {
+                names = self.offered();
+                *schemas = self.schemas(&names)?;
+            }
             let tool_round_failed = !form_kinds.is_empty()
                 || execution_failed
                 || observed_check_failure

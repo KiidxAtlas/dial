@@ -278,17 +278,43 @@ fn wait_without_pattern_returns_at_exit_with_status() {
         &ws,
         json!({"action": "wait", "name": "quick", "timeout": 10}),
     );
+    // The exit result carries the output, so no separate `output` round trip is needed.
     assert!(
-        !wait.is_error && wait.text.contains("exit code 3"),
+        !wait.is_error && wait.text.contains("exit code 3") && wait.text.contains("hi\n"),
         "{}",
         wait.text
     );
-    // The last output is available even though the process is already gone.
+    // `output` shares the model-visible cursor: nothing is repeated, but the status still is.
     let out = bg(&tool, &ws, json!({"action": "output", "name": "quick"}));
     assert!(
-        out.text.contains("hi\n") && out.text.contains("exited (exit code 3)"),
+        out.text.contains("(no new output)") && out.text.contains("exited (exit code 3)"),
         "{}",
         out.text
+    );
+}
+
+#[test]
+fn wait_after_output_returns_only_unread_output() {
+    let (_dir, ws) = open_workspace();
+    let tool = tool();
+    start(&tool, &ws, "two", "echo first; sleep 0.3; echo second");
+    bg(
+        &tool,
+        &ws,
+        json!({"action": "wait", "name": "two", "until": "^first$", "timeout": 10}),
+    );
+    bg(&tool, &ws, json!({"action": "output", "name": "two"}));
+    let wait = bg(
+        &tool,
+        &ws,
+        json!({"action": "wait", "name": "two", "timeout": 10}),
+    );
+    assert!(
+        wait.text.starts_with("ready: two exited (exit code 0)")
+            && wait.text.contains("second\n")
+            && !wait.text.contains("first"),
+        "{}",
+        wait.text
     );
 }
 
@@ -531,17 +557,16 @@ fn a_finished_name_can_be_reused_and_old_entries_are_pruned() {
     let tool = tool();
     for round in 1..=2 {
         start(&tool, &ws, "job", &format!("echo round {round}"));
-        bg(
+        let wait = bg(
             &tool,
             &ws,
             json!({"action": "wait", "name": "job", "timeout": 10}),
         );
-        let out = bg(&tool, &ws, json!({"action": "output", "name": "job"}));
         assert!(
-            out.text.contains(&format!("round {round}"))
-                && !out.text.contains(&format!("round {}", 3 - round)),
+            wait.text.contains(&format!("round {round}"))
+                && !wait.text.contains(&format!("round {}", 3 - round)),
             "{}",
-            out.text
+            wait.text
         );
     }
     for i in 0..20 {

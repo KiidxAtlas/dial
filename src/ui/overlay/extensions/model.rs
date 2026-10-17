@@ -44,6 +44,8 @@ pub enum Origin {
     Curated,
     /// Found through the Smithery registry or a marketplace index.
     Remote,
+    /// Configured for another coding agent (Claude, Codex, Cursor…); importing copies it.
+    Foreign,
 }
 
 /// Health of an installed item, or availability of a catalog item.
@@ -127,6 +129,10 @@ pub enum Intent {
     RemoveSkill {
         id: String,
     },
+    /// Copy a server that another coding agent has configured into Dial's config.
+    ImportMcp {
+        id: String,
+    },
     /// Install a Smithery registry server. Asks for the API key first when none is stored.
     SmitheryInstall {
         name: String,
@@ -173,6 +179,7 @@ impl Intent {
         match self {
             Intent::InstallCuratedMcp { id } => format!("Install MCP server `{id}`"),
             Intent::InstallMcp { id, .. } => format!("Install MCP server `{id}`"),
+            Intent::ImportMcp { id } => format!("Import MCP server `{id}` into Dial's config"),
             Intent::ToggleMcp { id, enable: true } => format!("Enable MCP server `{id}`"),
             Intent::ToggleMcp { id, enable: false } => format!("Disable MCP server `{id}`"),
             Intent::RemoveMcp { id } => format!("Remove MCP server `{id}`"),
@@ -209,6 +216,7 @@ impl Intent {
         matches!(
             self,
             Intent::InstallCuratedMcp { .. }
+                | Intent::ImportMcp { .. }
                 | Intent::InstallMcp { .. }
                 | Intent::InstallPlugin { .. }
                 | Intent::RemoveMcp { .. }
@@ -522,6 +530,8 @@ impl Browser {
         let state = &mut self.catalog[tab.index()];
         state.loading = false;
         if let Some(error) = update.error {
+            // Stop paging so scrolling does not retry a failing page on every key; `r` restarts.
+            state.more = false;
             state.message =
                 format!("Catalog unavailable: {error}. r retries; cached rows retained.");
             return;

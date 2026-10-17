@@ -186,7 +186,7 @@ pub fn serves_with_llama_cpp(model: &str) -> bool {
 }
 
 /// Hyperparameters read from a GGUF header. Only metadata is parsed; tensor data is never read.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GgufInfo {
     pub architecture: Option<String>,
     /// `tokenizer.chat_template`, the Jinja template `llama-server --jinja` renders.
@@ -205,13 +205,20 @@ pub struct GgufInfo {
     pub rope_dimension_count: Option<u64>,
     /// Hybrid recurrent models: every Nth layer is full attention and the rest keep no KV cache.
     pub full_attention_interval: Option<u64>,
+    /// `general.sampling.temp`: the sampler temperature the model was published with.
+    pub sampling_temp: Option<f64>,
+    /// `general.sampling.top_p`, `general.sampling.top_k` and `general.sampling.min_p`: the other
+    /// sampler defaults llama.cpp converters write into the header.
+    pub sampling_top_p: Option<f64>,
+    pub sampling_top_k: Option<u64>,
+    pub sampling_min_p: Option<f64>,
 }
 
 /// Header metadata of the GGUF model at `path` (a file or a directory holding one).
 pub fn gguf_info(path: &Path) -> Option<GgufInfo> {
     let file = gguf_file(path)?;
     let mut reader = BufReader::new(fs::File::open(file).ok()?);
-    let (mut strings, numbers) = read_gguf_metadata(&mut reader).ok()?;
+    let (mut strings, numbers, floats) = read_gguf_metadata(&mut reader).ok()?;
     let architecture = strings.remove("general.architecture");
     let arch = architecture.clone()?;
     let number = |key: &str| numbers.get(&format!("{arch}.{key}")).copied();
@@ -228,6 +235,10 @@ pub fn gguf_info(path: &Path) -> Option<GgufInfo> {
         kv_lora_rank: number("attention.kv_lora_rank"),
         rope_dimension_count: number("rope.dimension_count"),
         full_attention_interval: number("full_attention_interval"),
+        sampling_temp: floats.get("general.sampling.temp").copied(),
+        sampling_top_p: floats.get("general.sampling.top_p").copied(),
+        sampling_top_k: numbers.get("general.sampling.top_k").copied(),
+        sampling_min_p: floats.get("general.sampling.min_p").copied(),
     })
 }
 
@@ -257,12 +268,23 @@ const GGUF_MAX_KEY_BYTES: u64 = 1 << 16;
 const GGUF_MAX_TEMPLATE_BYTES: u64 = 1 << 20;
 /// String values kept from the header; every other string is skipped without buffering.
 const GGUF_STRINGS: [&str; 2] = ["general.architecture", "tokenizer.chat_template"];
+/// Float keys kept from the header (llama.cpp sampler defaults); other floats are skipped.
+const GGUF_SAMPLING_FLOATS: [&str; 3] = [
+    "general.sampling.temp",
+    "general.sampling.top_p",
+    "general.sampling.min_p",
+];
+
+/// Strings, integers and the `GGUF_SAMPLING_FLOATS` floats of a header's key/value section.
+type GgufMetadata = (
+    HashMap<String, String>,
+    HashMap<String, u64>,
+    HashMap<String, f64>,
+);
 
 /// Reads the key/value section: the strings in `GGUF_STRINGS` and every integer (or the maximum of
 /// every integer array) outside the tokenizer, skipping everything else without buffering it.
-fn read_gguf_metadata<R: Read + Seek>(
-    reader: &mut R,
-) -> std::io::Result<(HashMap<String, String>, HashMap<String, u64>)> {
+fn read_gguf_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<GgufMetadata> {
     let invalid =
         |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_owned());
     let mut magic = [0u8; 4];
@@ -279,7 +301,7 @@ fn read_gguf_metadata<R: Read + Seek>(
     if keys > GGUF_MAX_KEYS {
         return Err(invalid("too many GGUF metadata keys"));
     }
-    let (mut strings, mut numbers) = (HashMap::new(), HashMap::new());
+    let (mut strings, mut numbers, mut floats) = (HashMap::new(), HashMap::new(), HashMap::new());
     for _ in 0..keys {
         let length = read_u64(reader)?;
         if length > GGUF_MAX_KEY_BYTES {
@@ -326,6 +348,14 @@ fn read_gguf_metadata<R: Read + Seek>(
                     }
                 }
             }
+            6 | 12 if GGUF_SAMPLING_FLOATS.contains(&key.as_str()) => {
+                let value = if kind == 6 {
+                    f64::from(f32::from_bits(read_u32(reader)?))
+                } else {
+                    f64::from_bits(read_u64(reader)?)
+                };
+                floats.insert(key, value);
+            }
             _ => {
                 if let Some(value) = read_value(reader, kind, wanted)? {
                     numbers.insert(key, value);
@@ -333,7 +363,81 @@ fn read_gguf_metadata<R: Read + Seek>(
             }
         }
     }
-    Ok((strings, numbers))
+    Ok((strings, numbers, floats))
+}
+
+/// SHA-256 (lowercase hex) of the `tokenizer.ggml.tokens` array in a GGUF header: the vocabulary a
+/// draft model must share with its target for speculative decoding. Only the header is read.
+pub(crate) fn gguf_tokenizer_digest(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    // A single token longer than this is not a real vocabulary entry; refuse the file.
+    const MAX_TOKEN_BYTES: u64 = 1 << 16;
+    let mut reader = BufReader::new(fs::File::open(gguf_file(path)?).ok()?);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic).ok()?;
+    let version = read_u32(&mut reader).ok()?;
+    if &magic != b"GGUF" || !(2..=3).contains(&version) {
+        return None;
+    }
+    read_u64(&mut reader).ok()?;
+    let keys = read_u64(&mut reader).ok()?;
+    if keys > GGUF_MAX_KEYS {
+        return None;
+    }
+    for _ in 0..keys {
+        let length = read_u64(&mut reader).ok()?;
+        if length > GGUF_MAX_KEY_BYTES {
+            return None;
+        }
+        let mut key = vec![0u8; length as usize];
+        reader.read_exact(&mut key).ok()?;
+        let kind = read_u32(&mut reader).ok()?;
+        if key == b"tokenizer.ggml.tokens" && kind == 9 {
+            if read_u32(&mut reader).ok()? != 8 {
+                return None;
+            }
+            let count = read_u64(&mut reader).ok()?;
+            let mut hasher = Sha256::new();
+            hasher.update(count.to_le_bytes());
+            for _ in 0..count {
+                let length = read_u64(&mut reader).ok()?;
+                if length > MAX_TOKEN_BYTES {
+                    return None;
+                }
+                let mut token = vec![0u8; length as usize];
+                reader.read_exact(&mut token).ok()?;
+                hasher.update(length.to_le_bytes());
+                hasher.update(&token);
+            }
+            return Some(
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            );
+        }
+        skip_gguf_value(&mut reader, kind).ok()?;
+    }
+    None
+}
+
+/// Skips one header value of `kind` without buffering it; arrays of any element type are skipped.
+fn skip_gguf_value<R: Read + Seek>(reader: &mut R, kind: u32) -> std::io::Result<()> {
+    if kind != 9 {
+        return read_value(reader, kind, false).map(|_| ());
+    }
+    let item = read_u32(reader)?;
+    let count = read_u64(reader)?;
+    match integer_width(item) {
+        Some(width) => seek_forward(reader, count.saturating_mul(width)),
+        None => {
+            for _ in 0..count {
+                skip_gguf_value(reader, item)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Byte width of a fixed-size GGUF scalar type (integers, floats and bool).
@@ -609,5 +713,36 @@ pub(crate) mod gguf_metadata_tests {
             gguf_weight_bytes(root.path()),
             Some(first.len() as u64 + 100)
         );
+    }
+
+    #[test]
+    fn sampling_defaults_are_read_from_float_and_integer_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("m.gguf");
+        let mut temp = 6u32.to_le_bytes().to_vec();
+        temp.extend(0.7f32.to_le_bytes());
+        let mut top_p = 12u32.to_le_bytes().to_vec();
+        top_p.extend(0.95f64.to_le_bytes());
+        let mut min_p = 6u32.to_le_bytes().to_vec();
+        min_p.extend(0.05f32.to_le_bytes());
+        let mut other = 6u32.to_le_bytes().to_vec();
+        other.extend(0.5f32.to_le_bytes());
+        fs::write(
+            &file,
+            header(&[
+                ("general.architecture", string("llama")),
+                ("general.sampling.temp", temp),
+                ("general.sampling.top_p", top_p),
+                ("general.sampling.top_k", uint32(20)),
+                ("general.sampling.min_p", min_p),
+                ("general.sampling.xtc_probability", other),
+            ]),
+        )
+        .unwrap();
+        let info = gguf_info(&file).unwrap();
+        assert_eq!(info.sampling_temp, Some(f64::from(0.7f32)));
+        assert_eq!(info.sampling_top_p, Some(0.95));
+        assert_eq!(info.sampling_top_k, Some(20));
+        assert_eq!(info.sampling_min_p, Some(f64::from(0.05f32)));
     }
 }

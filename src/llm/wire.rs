@@ -74,7 +74,11 @@ impl Tracker {
                 .map(|a| a.iter().collect())
                 .unwrap_or_else(|| vec![value]);
             for value in values {
-                let encoded = serde_json::to_vec(&(key, value)).expect("JSON value serialization");
+                let mut encoded =
+                    serde_json::to_vec(&(key, value)).expect("JSON value serialization");
+                if key == "system" {
+                    reset_attestation(&mut encoded);
+                }
                 parts.push((Sha256::digest(&encoded).into(), encoded.len()));
             }
         }
@@ -112,6 +116,27 @@ impl Tracker {
         self.model = body["model"].clone();
         self.transport = Some(transport);
         self.parts = parts;
+    }
+}
+
+/// The Claude billing header carries `cch=`, a hash of the whole request body, so it differs on
+/// every request by construction. Restore its placeholder before fingerprinting the part, or the
+/// first system block reports a prompt change that never reached the provider's prefix cache.
+fn reset_attestation(encoded: &mut [u8]) {
+    use super::provider::{CCH_PLACEHOLDER, CLAUDE_BILLING_PREFIX};
+    let Some(start) = encoded
+        .windows(CLAUDE_BILLING_PREFIX.len())
+        .position(|w| w == CLAUDE_BILLING_PREFIX.as_bytes())
+    else {
+        return;
+    };
+    let from = start + CLAUDE_BILLING_PREFIX.len();
+    let to = (from + 150).min(encoded.len());
+    if let Some(at) = encoded[from..to].windows(4).position(|w| w == b"cch=") {
+        let digits = from + at + 4;
+        if let Some(slot) = encoded.get_mut(digits..digits + CCH_PLACEHOLDER.len() - 4) {
+            slot.fill(b'0');
+        }
     }
 }
 pub(crate) fn record(bytes: &[u8], transport: &'static str) {
@@ -188,5 +213,36 @@ mod tests {
         assert!(outer.lock().latest().is_none());
         record(b"{}", "http");
         assert!(outer.lock().latest().is_some() && inner.lock().latest().is_some());
+    }
+    #[test]
+    fn the_per_request_billing_attestation_is_not_a_prompt_change() {
+        let header = |cch: &str| {
+            format!(
+                "x-anthropic-billing-header: cc_version=2.1.280.abc; cc_entrypoint=cli; cch={cch};"
+            )
+        };
+        let body = |cch: &str, tail: &str| {
+            json!({"model":"m","system":[{"type":"text","text":header(cch)},{"type":"text","text":"fixed"}],
+                   "messages":[{"role":"user","content":tail}]})
+        };
+        let mut tracker = Tracker::default();
+        tracker.observe(
+            &serde_json::to_vec(&body("1a2b3", "a")).unwrap(),
+            None,
+            "http",
+        );
+        tracker.observe(
+            &serde_json::to_vec(&body("9f8e7", "a")).unwrap(),
+            None,
+            "http",
+        );
+        let same = tracker.latest().unwrap();
+        assert_eq!(same.invalidation, "none");
+        assert_eq!(same.common_prompt_bytes, same.prompt_bytes);
+        // A real change in the system text after the header is still reported.
+        let mut changed = body("9f8e7", "a");
+        changed["system"][1]["text"] = json!("different");
+        tracker.observe(&serde_json::to_vec(&changed).unwrap(), None, "http");
+        assert_eq!(tracker.latest().unwrap().invalidation, "prompt_changed");
     }
 }

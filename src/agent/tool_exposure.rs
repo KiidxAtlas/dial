@@ -30,17 +30,24 @@ impl<'a> Agent<'a> {
             token.as_deref(),
             config.request_headers(),
         );
+        // Ollama: a window this machine's memory cannot hold is planned at what it can.
+        let loaded = match (loaded, self.local_affordable_context()) {
+            (Some(loaded), Some(affordable)) => Some(loaded.min(affordable)),
+            (loaded, affordable) => loaded.or(affordable),
+        };
         if let Some(loaded) = loaded {
-            let lean = self.lean_local();
+            let profile = (self.lean_local(), self.minimal_tools());
             self.context_cap = Some(loaded);
-            // The loaded window can switch the lean profile on or off; re-render the prompt once here.
-            if self.lean_local() != lean {
+            // The loaded window can switch the lean profile or the local tier; re-render the prompt
+            // once here.
+            if (self.lean_local(), self.minimal_tools()) != profile {
                 self.rebuild_system();
             }
         }
     }
 
-    /// Minimal first-request offer, used only after the full set cannot fit the context window.
+    /// Minimal first-request offer: after the full set cannot fit the context window, on the small
+    /// local tier, or after a local escalation (`local_profile`).
     const LEAN_TOOLS: [&str; 10] = [
         "read",
         "write",
@@ -190,6 +197,31 @@ impl<'a> Agent<'a> {
         "web_search",
     ];
 
+    /// An MCP server with at most this many tools is offered up front.
+    const SMALL_MCP_SERVER_TOOLS: usize = 6;
+    /// Cap across all auto-offered MCP tools so many small servers cannot bloat every request.
+    const AUTO_MCP_TOOL_LIMIT: usize = 16;
+
+    /// Tools of MCP servers small enough to offer up front, whole servers only, in server-name
+    /// order, until the overall cap would be exceeded. Names look like `mcp__<server>__<tool>`.
+    fn small_mcp_tools(catalog: &[String]) -> Vec<String> {
+        let mut servers: std::collections::BTreeMap<&str, Vec<&String>> = Default::default();
+        for name in catalog {
+            if let Some((server, _)) = name.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
+                servers.entry(server).or_default().push(name);
+            }
+        }
+        let mut offered: Vec<String> = Vec::new();
+        for tools in servers.values() {
+            if tools.len() <= Self::SMALL_MCP_SERVER_TOOLS
+                && offered.len() + tools.len() <= Self::AUTO_MCP_TOOL_LIMIT
+            {
+                offered.extend(tools.iter().map(|name| (*name).clone()));
+            }
+        }
+        offered
+    }
+
     /// Tools actually offered: the harness selection, explicitly loaded tools and the essential
     /// integrations present in the catalog. The loaders are offered only while the catalog holds
     /// something not offered. An operator-pinned `[harness] tools` list, a model-profile allowlist
@@ -281,13 +313,21 @@ impl<'a> Agent<'a> {
         if !pinned {
             names.extend(memory_core.iter().cloned());
         }
-        if !(discovery || pinned || self.hermetic || self.lean_tools || selection_only) {
+        // A pinned harness list and the selection lent to a child decide for themselves; only a
+        // context overflow narrows them.
+        let minimal = self.lean_tools || (!pinned && !selection_only && self.minimal_tools());
+        if !(discovery || pinned || self.hermetic || minimal || selection_only) {
             names.extend(
                 Self::ESSENTIAL_INTEGRATIONS
                     .iter()
                     .filter(|tool| catalog.iter().any(|name| name == *tool))
                     .map(|tool| (*tool).to_owned()),
             );
+        }
+        // Small MCP servers (a handful of tools) cost little schema and are otherwise invisible
+        // to a model that never thinks to load them; large ones stay loadable on demand.
+        if !(discovery || pinned || self.hermetic || minimal || selection_only) {
+            names.extend(Self::small_mcp_tools(&catalog));
         }
         // `task` and `skill` are offered whenever the harness selects them; explicit profile
         // allowlists still gate them through the profile tool filter.
@@ -332,7 +372,7 @@ impl<'a> Agent<'a> {
                 && !matches!(name.as_str(), "tool_search" | "tool_load")
                 && self.tool_eligible(name)
         });
-        let loaders = discovery || pinned || self.lean_tools || selection_only || hidden;
+        let loaders = discovery || pinned || minimal || selection_only || hidden;
         for tool in ["tool_search", "tool_load"] {
             if loaders && catalog.iter().any(|n| n == tool) {
                 names.push(tool.into());
@@ -410,7 +450,7 @@ impl<'a> Agent<'a> {
         if self.lean_local() && self.single_request_server() && !loaded.contains("task") {
             names.retain(|name| name != "task" && name != "message");
         }
-        if self.lean_tools {
+        if minimal {
             names.retain(|name| {
                 Self::LEAN_TOOLS.contains(&name.as_str())
                     || loaded.contains(name)
@@ -618,13 +658,13 @@ impl<'a> Agent<'a> {
 }
 
 #[cfg(test)]
-mod default_offer_tests {
+pub(crate) mod default_offer_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
     /// An interactive (non-hermetic) agent over default configuration plus `overlay` and an
     /// unreachable endpoint; these tests inspect the offer and prompt only, so no request is made.
-    fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) -> T {
+    pub(crate) fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) -> T {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir(&project).unwrap();
@@ -1130,6 +1170,197 @@ mod default_offer_tests {
         });
     }
 
+    /// The small tier offers the minimal set up front on local routes at or under `small_window`;
+    /// larger windows, `small_window = 0`, a disabled local profile, `lean_local = false` and hosted
+    /// routes keep their offer.
+    #[test]
+    fn local_small_tier_offers_the_minimal_set_only_where_it_applies() {
+        use super::super::local_profile::Tier;
+        let minimal = |offered: &[String]| {
+            offered.iter().all(|name| {
+                Agent::LEAN_TOOLS.contains(&name.as_str())
+                    || matches!(name.as_str(), "recall" | "retain")
+            })
+        };
+        with_agent("context_window=16384", |agent| {
+            assert_eq!(agent.local_tier(), Some(Tier::Small));
+            let offered = agent.offered();
+            assert!(minimal(&offered), "{offered:?}");
+            assert!(offered.iter().any(|name| name == "edit"), "{offered:?}");
+            // Every other tool stays reachable through the loaders.
+            assert!(
+                offered.iter().any(|name| name == "tool_load"),
+                "{offered:?}"
+            );
+        });
+        for (overlay, tier) in [
+            ("context_window=16385", Some(Tier::Lean)),
+            ("context_window=65536", Some(Tier::Full)),
+            (
+                "context_window=16384\n[assistance.local]\nsmall_window=0",
+                Some(Tier::Lean),
+            ),
+            (
+                "context_window=16384\n[assistance.local]\nenabled=false",
+                Some(Tier::Lean),
+            ),
+            (
+                "context_window=16384\n[assistance]\nlean_local=false",
+                Some(Tier::Full),
+            ),
+            (
+                "context_window=16384\n[endpoint]\nbase_url='https://api.example.com/v1'",
+                None,
+            ),
+        ] {
+            with_agent(overlay, |agent| {
+                assert_eq!(agent.local_tier(), tier, "{overlay}");
+                let offered = agent.offered();
+                assert!(!minimal(&offered), "{overlay}: {offered:?}");
+            });
+        }
+    }
+
+    /// Local routes default to the replace grammar; explicit pins, `inherit`, hosted routes and a
+    /// disabled profile keep `[edit] mode`.
+    #[test]
+    fn local_routes_default_to_replace_edits_unless_pinned() {
+        use crate::config::types::EditMode;
+        let mode = |overlay: &str| with_agent(overlay, |agent| agent.edit_mode());
+        assert_eq!(mode(""), EditMode::Replace);
+        assert_eq!(
+            mode("[endpoint]\nbase_url='http://127.0.0.1:9/v1'"),
+            EditMode::Replace
+        );
+        assert_eq!(
+            mode("[assistance.local]\nedit_mode='apply_patch'"),
+            EditMode::ApplyPatch
+        );
+        assert_eq!(
+            mode("[assistance.local]\nedit_mode='inherit'"),
+            EditMode::Hashline
+        );
+        assert_eq!(
+            mode("[assistance.local]\nenabled=false"),
+            EditMode::Hashline
+        );
+        assert_eq!(mode("[harness]\nedit_mode='patch'"), EditMode::Patch);
+        assert_eq!(
+            mode("[edit.model_variants]\ntest='sloppy'"),
+            EditMode::Sloppy
+        );
+        assert_eq!(
+            mode("[endpoint]\nbase_url='https://api.example.com/v1'"),
+            EditMode::Hashline
+        );
+    }
+
+    /// Failing rounds escalate one step at a time: the minimal set and the short prompt, then the
+    /// replace grammar. A success resets the streak, the step is remembered for the model and a
+    /// new session starts from it.
+    #[test]
+    fn local_escalation_steps_up_on_failing_rounds_and_is_remembered() {
+        use crate::config::types::EditMode;
+        let overlay = "context_window=65536\n[assistance.local]\nedit_mode='inherit'";
+        with_agent(overlay, |agent| {
+            let ui = &mut crate::agent::NullUi;
+            let full = agent.offered();
+            assert!(!agent.minimal_tools());
+            assert_eq!(agent.edit_mode(), EditMode::Hashline);
+            assert!(!agent.observe_local_round(true, ui));
+            assert!(!agent.observe_local_round(false, ui), "a success resets");
+            assert!(!agent.observe_local_round(true, ui));
+            assert!(agent.observe_local_round(true, ui));
+            assert!(agent.minimal_tools());
+            assert!(agent.offered().len() < full.len());
+            assert!(!system_text(agent).contains("# Visual verification"));
+            assert_eq!(agent.edit_mode(), EditMode::Hashline);
+            assert!(!agent.observe_local_round(true, ui));
+            assert!(agent.observe_local_round(true, ui));
+            assert_eq!(agent.edit_mode(), EditMode::Replace);
+            assert_eq!(agent.workspace.edit_mode(), EditMode::Replace);
+            // Nothing is stricter than the last step.
+            assert!(!agent.observe_local_round(true, ui));
+            assert!(!agent.observe_local_round(true, ui));
+            // A later session of the same model starts from the remembered step.
+            agent.local_escalation = Default::default();
+            agent.workspace = agent.workspace.clone().with_edit_mode(EditMode::Hashline);
+            agent.rebuild_system();
+            assert!(!agent.minimal_tools());
+            agent.seed_local_escalation();
+            assert!(agent.minimal_tools());
+            assert_eq!(agent.workspace.edit_mode(), EditMode::Replace);
+        });
+        // A pinned grammar stops at the first step, and escalation is off on hosted routes.
+        with_agent(
+            "context_window=65536\n[harness]\nedit_mode='hashline'",
+            |agent| {
+                let ui = &mut crate::agent::NullUi;
+                assert!(!agent.observe_local_round(true, ui));
+                assert!(agent.observe_local_round(true, ui));
+                assert!(!agent.observe_local_round(true, ui));
+                assert!(!agent.observe_local_round(true, ui));
+                assert_eq!(agent.edit_mode(), EditMode::Hashline);
+            },
+        );
+        with_agent(
+            "[endpoint]\nbase_url='https://api.example.com/v1'",
+            |agent| {
+                let ui = &mut crate::agent::NullUi;
+                for _ in 0..4 {
+                    assert!(!agent.observe_local_round(true, ui));
+                }
+            },
+        );
+    }
+
+    /// `sampling = "model"` leaves a local server's own defaults in charge (no temperature is sent);
+    /// a pinned temperature, `sampling = "harness"` and hosted routes keep Dial's temperature.
+    #[test]
+    fn local_sampling_defers_to_the_server_unless_pinned() {
+        let local = "[endpoint]\nbase_url='http://127.0.0.1:9/v1'";
+        let apply = |overlay: &str, temperature: f64| {
+            with_agent(overlay, |agent| {
+                let mut profile = None;
+                let source = agent.apply_local_sampling(&mut profile, temperature);
+                (source, profile.map(|p| p.capabilities.temperature))
+            })
+        };
+        assert_eq!(
+            apply(local, 0.2),
+            (Some("local server defaults"), Some(false))
+        );
+        assert_eq!(apply(local, 0.7), (None, None));
+        assert_eq!(
+            apply(
+                &format!("{local}\n[assistance.local]\nsampling='harness'"),
+                0.2
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            apply("[endpoint]\nbase_url='https://api.example.com/v1'", 0.2),
+            (None, None)
+        );
+    }
+
+    /// The reasoning cap applies on lean local tiers only and scales with the planned window.
+    #[test]
+    fn local_reasoning_cap_follows_the_lean_tiers() {
+        let cap = |overlay: &str| with_agent(overlay, |agent| agent.local_reasoning_cap());
+        assert_eq!(cap("context_window=16384"), Some(16384 * 4 / 2));
+        assert_eq!(cap("context_window=32768"), Some(32768 * 4 / 2));
+        assert_eq!(cap("context_window=65536"), None);
+        assert_eq!(
+            cap("context_window=16384\n[assistance.local]\nreasoning_share=0"),
+            None
+        );
+        assert_eq!(
+            cap("context_window=16384\n[endpoint]\nbase_url='https://api.example.com/v1'"),
+            None
+        );
+    }
+
     #[test]
     fn restrictions_apply_to_discovery_loading_and_late_offers() {
         for mode in ["plan", "vibe", "allowlist"] {
@@ -1305,5 +1536,21 @@ mod default_offer_tests {
             assert!(ui.0.contains(&("job-identity".into(), "pipe delta".into(), false)));
             assert!(ui.0.contains(&("pty-identity".into(), "screen".into(), true)));
         });
+    }
+
+    #[test]
+    fn only_small_mcp_servers_are_offered_up_front() {
+        let mut catalog: Vec<String> = vec!["read".into()];
+        catalog.extend((0..8).map(|i| format!("mcp__big__t{i}")));
+        catalog.extend(["mcp__small__a".into(), "mcp__small__b".into()]);
+        assert_eq!(
+            Agent::small_mcp_tools(&catalog),
+            ["mcp__small__a", "mcp__small__b"]
+        );
+
+        let many: Vec<String> = (0..10)
+            .flat_map(|s| (0..4).map(move |t| format!("mcp__s{s:02}__t{t}")))
+            .collect();
+        assert!(Agent::small_mcp_tools(&many).len() <= Agent::AUTO_MCP_TOOL_LIMIT);
     }
 }

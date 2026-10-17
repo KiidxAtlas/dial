@@ -347,7 +347,7 @@ pub fn start_training(layout: &Layout, config: &Config, store: &Store) -> Result
         "training is disabled; enable it in settings"
     );
     ensure!(
-        config.endpoint.is_none() && !config.model.is_empty(),
+        config.runs_dial_mlx() && !config.model.is_empty(),
         "training requires Dial's local model runtime and a local MLX checkpoint"
     );
     if let Ok(resolved) = crate::llm::catalog::resolve_local_model(&config.model) {

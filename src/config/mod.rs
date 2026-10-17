@@ -642,7 +642,10 @@ impl Config {
                 types::migrate_memory_tool_names(tools);
             }
         }
-        if config.provider.as_deref() == Some("mlx") {
+        if matches!(
+            config.provider.as_deref(),
+            Some("mlx" | crate::llm::apple::PROVIDER)
+        ) {
             config.endpoint = None;
         } else if config.provider.as_deref() == Some(crate::llm::chatgpt::PROVIDER)
             && config.endpoint.is_none()
@@ -725,7 +728,7 @@ impl Config {
             .model_roles
             .retain(|_, selection| selection.provider != "inherit");
         for selection in config.model_roles.values_mut() {
-            if selection.provider == "mlx" {
+            if selection.provider == "mlx" || selection.provider == crate::llm::apple::PROVIDER {
                 selection.base_url = None;
                 selection.api_key_env = None;
                 selection.allow_insecure = false;
@@ -1104,6 +1107,7 @@ impl Config {
         selection: &crate::llm::model_config::ModelSelection,
     ) -> types::ContextWindow {
         let local = (selection.provider == "mlx" && selection.base_url.is_none())
+            || selection.provider == crate::llm::apple::PROVIDER
             || selection
                 .base_url
                 .as_deref()
@@ -1289,7 +1293,7 @@ impl Config {
             self.providers.contains_key(*provider)
                 || matches!(
                     *provider,
-                    "mlx" | "openai" | "chatgpt" | "anthropic" | "gemini" | "ollama"
+                    "mlx" | "apple" | "openai" | "chatgpt" | "anthropic" | "gemini" | "ollama"
                 )
         })
     }
@@ -1303,6 +1307,10 @@ impl Config {
             .map(|selection| selection.provider.as_str())
             .or(self.provider.as_deref())
             .unwrap_or("mlx");
+        // The system model runs in an OS service, not in Dial's local-compute lease.
+        if provider == crate::llm::apple::PROVIDER && model.is_none() {
+            return false;
+        }
         let base = if let Some((overridden, _)) = model
             .map(str::trim)
             .and_then(|name| self.qualified_model_override(name))
@@ -1404,7 +1412,8 @@ impl Config {
         let resolvable = selection.base_url.is_some()
             || self.providers.contains_key(&selection.provider)
             || matches!(selection.provider.as_str(), "chatgpt" | "gemini" | "ollama")
-            || selection.provider == "mlx";
+            || selection.provider == "mlx"
+            || selection.provider == crate::llm::apple::PROVIDER;
         anyhow::ensure!(
             resolvable,
             "model override {name:?} for {role:?} names provider {:?} without a configured endpoint",
@@ -1433,25 +1442,47 @@ impl Config {
         }
     }
 
-    pub fn resolved_edit_mode(&self, harness: &Harness) -> types::EditMode {
-        let pinned = self
-            .edit_mode_override
+    /// Explicit edit grammar pins, strongest first: the process override, the active model profile,
+    /// the harness, then the longest matching `[edit] model_variants` selector.
+    pub fn pinned_edit_mode(&self, harness: &Harness) -> Option<types::EditMode> {
+        self.edit_mode_override
             .or_else(|| {
                 self.active_model_profile()
                     .and_then(|profile| profile.edit_mode)
             })
-            .or(harness.edit_mode);
-        if pinned.is_some() || self.edit.model_variants.is_empty() {
-            return pinned.unwrap_or(self.edit.mode);
-        }
-        self.edit.resolve_mode(
-            &format!(
-                "{}/{}",
-                self.provider.as_deref().unwrap_or("mlx"),
-                self.model
-            ),
-            None,
-        )
+            .or(harness.edit_mode)
+            .or_else(|| {
+                self.edit.variant_mode(&format!(
+                    "{}/{}",
+                    self.provider.as_deref().unwrap_or("mlx"),
+                    self.model
+                ))
+            })
+    }
+
+    /// The edit grammar in effect: a pin, else the local-route default (`assistance.local.edit_mode`),
+    /// else `[edit] mode`.
+    pub fn resolved_edit_mode(&self, harness: &Harness) -> types::EditMode {
+        self.pinned_edit_mode(harness)
+            .or_else(|| self.local_edit_mode())
+            .unwrap_or(self.edit.mode)
+    }
+
+    /// The edit grammar without the local-route default, for hermetic evaluation.
+    pub fn base_edit_mode(&self, harness: &Harness) -> types::EditMode {
+        self.pinned_edit_mode(harness).unwrap_or(self.edit.mode)
+    }
+
+    /// `assistance.local.edit_mode` when the local profile applies to the main route.
+    fn local_edit_mode(&self) -> Option<types::EditMode> {
+        self.local_profile_applies()
+            .then_some(self.assistance.local.edit_mode.0)
+            .flatten()
+    }
+
+    /// The `[assistance.local]` profile is on and the selected main model is served locally.
+    pub(crate) fn local_profile_applies(&self) -> bool {
+        self.assistance.local.enabled && !self.model.is_empty() && self.local_main_model()
     }
 
     /// Resolve coding controls without changing the learned harness on disk.
@@ -1520,11 +1551,20 @@ impl Config {
         })
     }
 
+    /// Whether the main model runs on Dial's supervised MLX/GGUF runtime (no endpoint and not the
+    /// Apple system model). Training, adapters, steering and the Python runtime apply only here.
+    pub fn runs_dial_mlx(&self) -> bool {
+        self.endpoint.is_none() && self.provider.as_deref() != Some(crate::llm::apple::PROVIDER)
+    }
+
     /// Whether this session needs the shared local-compute lock: a local main model or any explicit local role.
+    /// The Apple system model runs in an OS service and does not take the lease.
     pub fn uses_local_compute(&self) -> bool {
-        (!self.model.is_empty() && self.endpoint.is_none())
+        (!self.model.is_empty() && self.runs_dial_mlx())
             || self.model_roles.values().any(|model| {
-                model.provider != crate::agent::laya::PROVIDER && model.base_url.is_none()
+                model.provider != crate::agent::laya::PROVIDER
+                    && model.provider != crate::llm::apple::PROVIDER
+                    && model.base_url.is_none()
             })
             || self.memory_uses_local_compute()
     }
@@ -1644,8 +1684,12 @@ impl Config {
                     || (8192..=2_000_000).contains(&self.efficiency.history_token_cap)),
             "invalid efficiency context, preview, lightweight, cache-pressure or history-cap bounds"
         );
+        self.assistance
+            .local
+            .validate()
+            .map_err(anyhow::Error::msg)?;
         ensure!(
-            self.endpoint.is_some()
+            !self.runs_dial_mlx()
                 || !self
                     .active_model_profile()
                     .is_some_and(|p| p.capabilities.strict_tools),
@@ -1892,7 +1936,10 @@ impl Config {
                         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
                 "invalid provider id"
             );
-            ensure!(id != "mlx", "mlx is reserved for the local provider");
+            ensure!(
+                id != "mlx" && id != crate::llm::apple::PROVIDER,
+                "{id} is reserved for a built-in local provider"
+            );
             crate::llm::provider::endpoint_url(&provider.base_url, provider.allow_insecure)?;
         }
         let i = &self.improve;

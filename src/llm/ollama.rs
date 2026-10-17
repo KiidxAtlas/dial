@@ -318,6 +318,16 @@ fn request(
             body["think"] = json!(thinking);
         }
     }
+    if let Some(profile) =
+        profile.filter(|p| p.local_server == Some(super::local_hints::LocalServer::Ollama))
+    {
+        let thinking_decided = profile.thinking.is_some() || profile.reasoning_effort.is_some();
+        let mut options = body["options"].take();
+        profile
+            .effective_local_hints(thinking_decided)
+            .apply_ollama(&mut body, &mut options);
+        body["options"] = options;
+    }
     if !req.tools.is_empty() {
         body["tools"] = Value::Array(
             req.tools
@@ -559,6 +569,21 @@ impl Accumulator {
                 self.reply.prompt_tokens = event["prompt_eval_count"].as_u64();
                 self.reply.cached_prompt_tokens = event["prompt_eval_cached_count"].as_u64();
                 self.reply.completion_tokens = event["eval_count"].as_u64();
+                // Durations are nanoseconds (Ollama API reference); a zero duration has no rate.
+                let rate = |count: Option<u64>, nanos: Option<u64>| {
+                    count
+                        .zip(nanos.filter(|n| *n > 0))
+                        .map(|(count, nanos)| count as f64 * 1e9 / nanos as f64)
+                };
+                self.reply.load_secs = event["load_duration"].as_u64().map(|n| n as f64 / 1e9);
+                self.reply.prefill_tokens_per_second = rate(
+                    event["prompt_eval_count"].as_u64(),
+                    event["prompt_eval_duration"].as_u64(),
+                );
+                self.reply.decode_tokens_per_second = rate(
+                    event["eval_count"].as_u64(),
+                    event["eval_duration"].as_u64(),
+                );
                 let mut progress = super::ModelProgress::new(super::InferencePhase::Generating);
                 progress.prompt_tokens = self.reply.prompt_tokens;
                 progress.output_tokens = self.reply.completion_tokens;
@@ -981,6 +1006,55 @@ mod tests {
         let sent = crate::llm::fake::body(&server.requests().remove(0));
         assert_eq!(sent["stream"], true);
         assert_eq!(sent["options"]["num_ctx"], 32768);
+    }
+
+    #[test]
+    fn local_hints_reach_ollama_body_and_explicit_profile_values_win() {
+        use crate::llm::local_hints::{LocalHints, LocalServer};
+        let hints = LocalHints {
+            thinking: Some(false),
+            keep_alive_secs: Some(1800),
+            presence_penalty: Some(0.5),
+            repetition_penalty: Some(1.2),
+            ..Default::default()
+        };
+        let mut profile = ModelProfile::minimal("ollama", "m");
+        profile.local_hints = hints.clone();
+        profile.local_server = Some(LocalServer::Ollama);
+        let body = request(&ENDPOINT, &chat(), Some(&profile), None, "main").unwrap();
+        assert_eq!(body["keep_alive"], "1800s");
+        assert_eq!(body["think"], false);
+        assert_eq!(body["options"]["presence_penalty"], 0.5);
+        assert_eq!(body["options"]["repeat_penalty"], 1.2);
+
+        profile.keep_alive = Some("30m".into());
+        let body = request(&ENDPOINT, &chat(), Some(&profile), None, "main").unwrap();
+        assert_eq!(body["keep_alive"], "30m");
+
+        // Hosted: no server means no hint fields, even with hints present.
+        let mut hosted = ModelProfile::minimal("ollama", "m");
+        hosted.local_hints = hints;
+        let body = request(&ENDPOINT, &chat(), Some(&hosted), None, "main").unwrap();
+        assert!(body.get("keep_alive").is_none() && body.get("think").is_none());
+        assert!(body["options"].get("presence_penalty").is_none());
+    }
+
+    #[test]
+    fn ollama_final_chunk_durations_become_rates_and_load_time() {
+        let server = crate::llm::fake::serve(vec![crate::llm::fake::Script::Http {
+            status: 200,
+            content_type: "application/x-ndjson",
+            body: ndjson(&[
+                json!({"model": "m", "message": {"role": "assistant", "content": "ok"}, "done": true,
+                    "done_reason": "stop", "prompt_eval_count": 100, "prompt_eval_duration": 2_000_000_000u64,
+                    "eval_count": 50, "eval_duration": 1_000_000_000u64, "load_duration": 500_000_000u64}),
+            ]),
+        }]);
+        let mut pieces = Vec::new();
+        let reply = native_exchange(&server.url, None, &mut pieces).unwrap();
+        assert_eq!(reply.prefill_tokens_per_second, Some(50.0));
+        assert_eq!(reply.decode_tokens_per_second, Some(50.0));
+        assert_eq!(reply.load_secs, Some(0.5));
     }
 
     #[test]

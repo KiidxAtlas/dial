@@ -258,6 +258,7 @@ pub fn run_print(
     if completed && result.is_ok() {
         agent.finish_memory_before_exit(&mut ui, PRINT_MEMORY_BUDGET);
     }
+    agent.end_local_session();
     let (total, turn) = agent.usage();
     ui.set_usage_breakdown(total, turn);
     match result {
@@ -1287,7 +1288,7 @@ fn lora_state(
     store: Option<&Store>,
     active: Option<&crate::config::types::Version>,
 ) -> Lora {
-    if config.endpoint.is_some() {
+    if !config.runs_dial_mlx() {
         return Lora::Unsupported;
     }
     if let Some(phase) = store.and_then(|store| crate::learn::improve::lora_phase(config, store)) {
@@ -1549,6 +1550,11 @@ const BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
         "how the project fits together",
     ),
     (
+        "code-history",
+        "[words] [path:<p>] [branch:<b>] | show <id> | clear",
+        "search diffs Dial's turns made, across sessions",
+    ),
+    (
         "laya",
         "[status|check|start|on|off]",
         "local decision advice",
@@ -1790,6 +1796,7 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
             ][..],
         ),
         ("understanding", &["architecture", "build", "clear"][..]),
+        ("code-history", &["show", "clear"]),
         ("checks", &["list", "add", "remove", "help"][..]),
         ("experience", &["ledger"]),
         ("laya", &["status", "check", "start", "on", "off"]),
@@ -2501,6 +2508,27 @@ impl PendingFavorite {
             && self.main.api_key_env == selection.api_key_env
             && self.main.allow_insecure == selection.allow_insecure
             && self.favorites == cycle_set(config)
+    }
+}
+
+/// The configuration side of a local model's suggestion check; the overlay adds the profile's own
+/// values (window, penalties, keep-alive, edit pin, draft model).
+fn local_suggestion_base(config: &Config) -> crate::llm::local_evidence::Current {
+    let name = |value: serde_json::Result<serde_json::Value>| {
+        value
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    crate::llm::local_evidence::Current {
+        edit_mode: name(serde_json::to_value(
+            config.resolved_edit_mode(&config.harness),
+        )),
+        edit_mode_pinned: config.pinned_edit_mode(&config.harness).is_some(),
+        context_window: config.context_window,
+        draft_model: config.local_runtime.draft_model.clone(),
+        side_models: name(serde_json::to_value(config.assistance.local.side_models)),
+        ..Default::default()
     }
 }
 
@@ -5221,7 +5249,7 @@ impl Shell {
     }
 
     fn prepare_local(&mut self, app: &App) -> Result<bool> {
-        if app.config.endpoint.is_some() {
+        if !app.config.runs_dial_mlx() {
             return Ok(true);
         }
         if !app.config.python.is_file() || !app.config.worker.is_file() {
@@ -5590,9 +5618,13 @@ impl Shell {
             )),
             Which::ModelSettings => {
                 let (name, profile) = model_settings_profile(&effective);
-                ActiveOverlay::ModelSettings(Box::new(
-                    crate::ui::overlay::model_settings::ModelSettingsOverlay::new(name, profile),
-                ))
+                let mut overlay =
+                    crate::ui::overlay::model_settings::ModelSettingsOverlay::new(name, profile);
+                if effective.assistance.local.suggestions {
+                    overlay = overlay
+                        .with_suggestions(&effective.user_dir, local_suggestion_base(&effective));
+                }
+                ActiveOverlay::ModelSettings(Box::new(overlay))
             }
             Which::Settings | Which::LearningSettings | Which::ContextDefaults => {
                 let (values, global, project) = settings_tables(app, &effective)?;
@@ -7656,6 +7688,37 @@ impl Shell {
                     }
                 }
             }
+            "code-history" => {
+                use crate::storage::history::{self, ChangeHistory, Request};
+                if !(app.config.codebase.enabled && app.config.codebase.history) {
+                    self.note("Code history", "Code history is off. Turn it on in /settings → Project understanding → Code change history (codebase.history).");
+                    return Ok(Step::Done);
+                }
+                let request = match history::parse_request(args) {
+                    Ok(request) => request,
+                    Err(usage) => {
+                        self.note("Code history", usage);
+                        return Ok(Step::Done);
+                    }
+                };
+                if request == Request::Clear
+                    && self.ask("Clear code history", "Delete every recorded diff for this project? Files are not changed.", &[("Clear code history", 'y'), ("Keep it", 'n')]) != Some(0)
+                {
+                    return Ok(Step::Done);
+                }
+                let text = ChangeHistory::open(&app.layout).and_then(|store| match request {
+                    Request::Search { query, path, branch } => {
+                        let found = store.search(&query, path.as_deref(), branch.as_deref(), 30)?;
+                        Ok(format!("{}\n/code-history show <id> prints a diff · filter with path:<file|dir> branch:<name>", history::render_list(&found)))
+                    }
+                    Request::Show(id) => Ok(match store.show(id)? {
+                        Some((version, diff)) => history::render_version(&version, &diff),
+                        None => format!("No recorded version #{id}."),
+                    }),
+                    Request::Clear => Ok(format!("Cleared {} recorded versions.", store.clear()?)),
+                });
+                self.note("Code history", text.unwrap_or_else(|error| format!("{error:#}")));
+            }
             "understanding" if args == "clear" => {
                 let result = crate::storage::codebase::Codebase::open(&app.layout)
                     .and_then(|cache| cache.clear_architecture());
@@ -9123,7 +9186,10 @@ impl OverlayEnv<'_> {
                     } else {
                         format!("{role} set to {}", selection.display_name())
                     };
-                    if config.selection_endpoint(&selection).is_none() {
+                    // Apple's on-device model lives in the OS; there is nothing to download or prepare.
+                    if config.selection_endpoint(&selection).is_none()
+                        && selection.provider != crate::llm::apple::PROVIDER
+                    {
                         let model = selection.model.clone();
                         let python = config.python.clone();
                         let started =
