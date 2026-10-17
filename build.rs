@@ -10,7 +10,6 @@ const INPUTS: &[&str] = &[
     "build.rs",
     "assets",
     "runtimes",
-    "themes",
     "CHANGELOG.md",
     "examples/benchmarks/efficiency.toml",
     "python/dial_laya_server.py",

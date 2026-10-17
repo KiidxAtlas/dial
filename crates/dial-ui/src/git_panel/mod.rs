@@ -16,13 +16,13 @@ use std::path::{Path, PathBuf};
 
 /// Git handle for one project root. Cheap to clone; background jobs take a clone.
 #[derive(Clone)]
-pub(crate) struct Repo {
+pub struct Repo {
     root: PathBuf,
     config: Config,
 }
 
 impl Repo {
-    pub(crate) fn new(root: &Path, config: &Config) -> Self {
+    pub fn new(root: &Path, config: &Config) -> Self {
         // Porcelain status paths are relative to the repository top, and diff/add/restore pathspecs
         // resolve against the cwd, so every command must run from the top (the overlay root can be a
         // subdirectory when dial was started there).

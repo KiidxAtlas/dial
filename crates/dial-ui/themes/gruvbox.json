@@ -1,0 +1,68 @@
+{
+  "name": "gruvbox",
+  "description": "Warm retro dark",
+  "extends": "dark",
+  "dark": true,
+  "vars": {
+    "orange": "#fe8019",
+    "yellow": "#fabd2f",
+    "green": "#b8bb26",
+    "aqua": "#8ec07c",
+    "blue": "#83a598",
+    "purple": "#d3869b",
+    "red": "#fb4934",
+    "fg": "#ebdbb2",
+    "gray": "#928374",
+    "dim": "#665c54"
+  },
+  "colors": {
+    "muted": "gray",
+    "dim": "dim",
+    "accent": "orange",
+    "border": "dim",
+    "borderAccent": "orange",
+    "borderMuted": "#504945",
+    "success": "green",
+    "error": "red",
+    "warning": "yellow",
+    "selectedBg": "#3c3836",
+    "userBg": "#282828",
+    "userText": "fg",
+    "toolPendingBg": "#2a2623",
+    "toolSuccessBg": "#272b1f",
+    "toolErrorBg": "#33211f",
+    "toolTitle": {
+      "fg": "fg",
+      "bold": true
+    },
+    "toolOutput": "#bdae93",
+    "thinkingText": {
+      "fg": "gray",
+      "italic": true
+    },
+    "mdHeading": {
+      "fg": "yellow",
+      "bold": true
+    },
+    "mdLink": {
+      "fg": "aqua",
+      "underline": true
+    },
+    "mdCode": "orange",
+    "mdCodeBlock": "fg",
+    "mdBullet": "orange",
+    "diffAdded": "green",
+    "diffRemoved": "red",
+    "statusBg": "#1d2021",
+    "statusModel": "purple",
+    "statusPath": "blue",
+    "statusGitClean": "green",
+    "statusGitDirty": "orange",
+    "statusContext": "aqua",
+    "statusTokens": "fg",
+    "statusRate": "aqua",
+    "statusApproval": "yellow",
+    "statusSandbox": "green",
+    "statusLearning": "purple"
+  }
+}
