@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Check that source-built package metadata agrees with the Cargo package version.
+"""Check that source-built package metadata agrees with the Cargo workspace version.
 
-- `flake.nix` must derive `version` from `Cargo.toml` rather than hard-coding a literal.
+- `flake.nix` must derive `version` from `Cargo.toml` (`[workspace.package]`) rather than hard-coding a literal.
 - `Formula/dial.rb` is release-fed: it may lag unreleased source, so its version is not compared
   with Cargo. It must still be self-consistent: every archive URL is versioned by `#{version}`
   and each URL is followed by a sha256 line.
@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FLAKE_DERIVED = re.compile(
-    r"version\s*=\s*\(builtins\.fromTOML\s*\(builtins\.readFile\s+\./Cargo\.toml\)\)\.package\.version\s*;"
+    r"version\s*=\s*\(builtins\.fromTOML\s*\(builtins\.readFile\s+\./Cargo\.toml\)\)\.workspace\.package\.version\s*;"
 )
 FLAKE_LITERAL = re.compile(r'^\s*version\s*=\s*"[^"]*"\s*;', re.MULTILINE)
 FORMULA_VERSION = re.compile(r'^  version "([^"]+)"$', re.MULTILINE)
@@ -24,15 +24,15 @@ FORMULA_SHA = re.compile(r'^\s*sha256 (?::no_check|"[^"]*")$', re.MULTILINE)
 
 
 def cargo_version(cargo_text):
-    """Version of the `[package]` table in Cargo.toml text."""
-    return tomllib.loads(cargo_text)["package"]["version"]
+    """Version of the `[workspace.package]` table in Cargo.toml text; every member inherits it."""
+    return tomllib.loads(cargo_text)["workspace"]["package"]["version"]
 
 
 def flake_problems(flake_text):
     problems = []
     if not FLAKE_DERIVED.search(flake_text):
         problems.append("flake.nix must derive version from ./Cargo.toml "
-                        "(builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version")
+                        "(builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version")
     if FLAKE_LITERAL.search(flake_text):
         problems.append("flake.nix hard-codes a version literal; derive it from Cargo.toml")
     return problems
