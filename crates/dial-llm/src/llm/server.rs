@@ -125,7 +125,7 @@ pub(super) struct Supervised {
 
 impl Supervised {
     /// Takes ownership of a child spawned with `platform::process::spawn_group`.
-    pub fn new(child: Child) -> Self {
+    pub(super) fn new(child: Child) -> Self {
         Self {
             child,
             stopped: false,

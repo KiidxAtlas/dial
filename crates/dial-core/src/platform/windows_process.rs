@@ -149,7 +149,7 @@ pub(in crate::platform) fn kill_checked(
     Ok(())
 }
 #[cfg(any(test, feature = "test-support"))]
-pub fn alive(pid: u32) -> bool {
+pub(in crate::platform) fn alive(pid: u32) -> bool {
     let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) };
     if raw.is_null() {
         return false;
@@ -184,7 +184,7 @@ pub(in crate::platform) fn is_group_leader(pid: u32) -> bool {
     };
     checked != 0 && in_job != 0
 }
-pub fn exited(child: &Child) -> io::Result<bool> {
+pub(in crate::platform) fn exited(child: &Child) -> io::Result<bool> {
     match unsafe { WaitForSingleObject(child.as_raw_handle() as HANDLE, 0) } {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),

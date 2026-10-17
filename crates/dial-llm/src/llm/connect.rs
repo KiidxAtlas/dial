@@ -14,7 +14,7 @@ pub(super) struct Frames {
 }
 
 impl Frames {
-    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<(u8, Vec<u8>)>> {
+    pub(super) fn push(&mut self, bytes: &[u8]) -> Result<Vec<(u8, Vec<u8>)>> {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         while self.buf.len() >= 5 {

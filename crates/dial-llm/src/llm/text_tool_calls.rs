@@ -465,7 +465,7 @@ pub(super) struct Hider<'a> {
 }
 
 impl<'a> Hider<'a> {
-    pub fn new(out: &'a mut dyn FnMut(&str) -> bool, hide_tags: bool) -> Self {
+    pub(super) fn new(out: &'a mut dyn FnMut(&str) -> bool, hide_tags: bool) -> Self {
         Hider {
             out,
             held: String::new(),
@@ -475,7 +475,7 @@ impl<'a> Hider<'a> {
     }
 
     /// False when the consumer asked to stop.
-    pub fn push(&mut self, delta: &str) -> bool {
+    pub(super) fn push(&mut self, delta: &str) -> bool {
         if !self.hide_tags {
             return (self.out)(delta);
         }

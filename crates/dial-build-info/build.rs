@@ -57,8 +57,15 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
     }
     // A linked worktree keeps HEAD in its own Git directory and branch refs in the common one.
-    if let Some(output) = git(&["rev-parse", "--git-dir", "--git-common-dir"])
-        .filter(|output| output.status.success())
+    // `--path-format=absolute` makes both paths independent of the working directory, which is
+    // this crate and not the repository root.
+    if let Some(output) = git(&[
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+        "--git-common-dir",
+    ])
+    .filter(|output| output.status.success())
     {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut dirs = stdout.lines().map(|line| PathBuf::from(line.trim()));

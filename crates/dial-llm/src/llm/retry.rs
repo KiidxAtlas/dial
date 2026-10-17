@@ -166,7 +166,7 @@ pub(crate) struct Policy {
 }
 
 impl Policy {
-    pub fn new(config: &crate::config::types::RetryConfig, backoff: Duration) -> Self {
+    pub(crate) fn new(config: &crate::config::types::RetryConfig, backoff: Duration) -> Self {
         Self {
             max_attempts: config.max_attempts.clamp(1, 50) as usize,
             max_delay: Duration::from_secs(config.max_delay_secs.clamp(1, 3600)),

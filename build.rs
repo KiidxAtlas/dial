@@ -1,10 +1,9 @@
-/// Tracked inputs compiled into the executable: `src` and the other workspace crates, the manifests
-/// and build script, and the files outside `src` embedded with `include_str!`/`include_bytes!`.
-/// Keep in sync when embedding a new file from outside `src`; the revision half lives in
-/// `crates/dial-build-info/build.rs`.
+/// Tracked inputs of the root package: `src`, the manifest and build script, and the files outside
+/// `src` embedded with `include_str!`/`include_bytes!`. Keep in sync when embedding a new file from
+/// outside `src`. The workspace crates watch their own sources, and the revision and dirty state
+/// live in `crates/dial-build-info/build.rs`.
 const INPUTS: &[&str] = &[
     "src",
-    "crates",
     "Cargo.toml",
     "Cargo.lock",
     "build.rs",

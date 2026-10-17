@@ -149,97 +149,25 @@ dial-agent.workspace = true
 dial-ui.workspace = true
 dial-app.workspace = true
 anyhow.workspace = true
-vt100.workspace = true
-thiserror.workspace = true
-unicode-normalization.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 fs2.workspace = true
-rand.workspace = true
 libc.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 ureq.workspace = true
-url.workspace = true
-rustls.workspace = true
 base64.workspace = true
-encoding_rs.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-semver.workspace = true
-sha1.workspace = true
 ring.workspace = true
-aws-config = { workspace = true, optional = true }
-aws-credential-types = { workspace = true, optional = true }
-aws-sigv4 = { workspace = true, optional = true }
-aws-smithy-http-client = { workspace = true, optional = true }
-crc32fast.workspace = true
 tokio.workspace = true
 toml.workspace = true
-ratatui.workspace = true
-crossterm.workspace = true
-unicode-width.workspace = true
-unicode-segmentation.workspace = true
-pulldown-cmark.workspace = true
-quick-xml.workspace = true
-regex.workspace = true
-fancy-regex.workspace = true
-ast-grep-core.workspace = true
-ast-grep-language.workspace = true
-ignore.workspace = true
-globset.workspace = true
-httpdate.workspace = true
 zip.workspace = true
 tar.workspace = true
 flate2.workspace = true
 parking_lot.workspace = true
-similar.workspace = true
-shlex.workspace = true
-image.workspace = true
-fontdue.workspace = true
-png.workspace = true
-notify.workspace = true
-jaq-core.workspace = true
-jaq-std.workspace = true
-jaq-json.workspace = true
-serde_norway.workspace = true
-tungstenite.workspace = true
-flume.workspace = true
-futures.workspace = true
-xxhash-rust.workspace = true
-brush-core = { workspace = true, optional = true }
-brush-builtins = { workspace = true, optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { workspace = true, optional = true }
-atspi = { workspace = true, optional = true }
-pipewire = { workspace = true, optional = true }
-reis = { workspace = true, optional = true }
-x11rb = { workspace = true, optional = true }
-xkeysym = { workspace = true, optional = true }
-zbus = { workspace = true, optional = true }
-
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-xcap = { workspace = true, optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-cpal = { workspace = true, optional = true }
-block2 = { workspace = true, optional = true }
-core-graphics = { workspace = true, optional = true }
-foreign-types = { workspace = true, optional = true }
-objc2 = { workspace = true, optional = true }
-objc2-app-kit = { workspace = true, optional = true }
-objc2-application-services = { workspace = true, optional = true }
-objc2-core-foundation = { workspace = true, optional = true }
-objc2-core-graphics = { workspace = true, optional = true }
-objc2-foundation = { workspace = true, optional = true }
-[target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
-windows = { workspace = true, optional = true }
-enigo = { workspace = true, optional = true }
-uiautomation = { workspace = true, optional = true }
-winreg.workspace = true
 
 
 # Local builds and tests: line tables for our crate (panics and backtraces keep file:line), no debug

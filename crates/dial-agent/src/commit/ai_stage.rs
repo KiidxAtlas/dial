@@ -81,7 +81,7 @@ pub struct StageUnit {
 /// The verdict for one unit, aligned with the input units.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StageDecision {
-    pub score: f64,
+    pub(crate) score: f64,
     pub accepted: bool,
 }
 
