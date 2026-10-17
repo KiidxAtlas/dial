@@ -13,3 +13,5 @@
 /bin/
 .venv/
 *.pyc
+/node_modules/
+/browser/
