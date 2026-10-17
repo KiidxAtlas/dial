@@ -5,7 +5,7 @@ pub mod benchmark;
 pub use dial_build_info::build_info;
 pub mod changelog;
 pub(crate) mod commit;
-pub mod computer;
+pub use dial_computer::computer;
 pub use dial_llm::config;
 pub mod extensions;
 pub(crate) mod git_panel;
