@@ -1,0 +1,66 @@
+[package]
+name = "dial-computer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dial-core.workspace = true
+dial-llm.workspace = true
+dial-tools.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+flume.workspace = true
+futures.workspace = true
+image.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+unicode-segmentation.workspace = true
+xxhash-rust.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { workspace = true, optional = true }
+ashpd = { workspace = true, optional = true }
+atspi = { workspace = true, optional = true }
+reis = { workspace = true, optional = true }
+x11rb = { workspace = true, optional = true }
+xkeysym = { workspace = true, optional = true }
+zbus = { workspace = true, optional = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+xcap = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { workspace = true, optional = true }
+core-graphics = { workspace = true, optional = true }
+foreign-types = { workspace = true, optional = true }
+objc2 = { workspace = true, optional = true }
+objc2-app-kit = { workspace = true, optional = true }
+objc2-application-services = { workspace = true, optional = true }
+objc2-core-foundation = { workspace = true, optional = true }
+objc2-core-graphics = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+enigo = { workspace = true, optional = true }
+uiautomation = { workspace = true, optional = true }
+windows = { workspace = true, optional = true }
+windows-sys.workspace = true
+winreg.workspace = true
+
+[features]
+default = ["desktop"]
+# Native desktop capture, accessibility and input. Browser automation is independent.
+desktop = [
+    "dep:xcap", "dep:ashpd", "dep:atspi", "dep:reis", "dep:x11rb", "dep:xkeysym", "dep:zbus",
+    "dep:block2", "dep:core-graphics", "dep:foreign-types", "dep:objc2", "dep:objc2-app-kit",
+    "dep:objc2-application-services", "dep:objc2-core-foundation", "dep:objc2-core-graphics",
+    "dep:objc2-foundation", "dep:windows", "dep:enigo", "dep:uiautomation",
+]
+# Linux Wayland screencast (PipeWire); off by default.
+wayland-pipewire = ["desktop", "dep:pipewire"]
