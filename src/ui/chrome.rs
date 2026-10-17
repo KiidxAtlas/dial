@@ -108,6 +108,12 @@ pub fn status_chip(theme: &Theme, status: Status, text: &str) -> Span<'static> {
 
 /// Key hints as spans: each key in amber bold with its label in the secondary color, joined by ` · `.
 /// Example: `ctrl+p` `actions` · `/` `commands`.
+///
+/// Every panel uses the same words, so a key always means the same thing: Esc is `close` at a
+/// panel's top level, `back` inside a nested view, `cancel` for an edit or a question, and
+/// `clear search` while a search or filter is typed; `/` is `search`; ←/→ (or Tab where the
+/// panel has no fields) are `tabs`; Enter names the row's main action. The last hint is always
+/// the way out, and its label follows what Esc will do next.
 pub fn key_hint_spans(theme: &Theme, hints: &[(&str, &str)]) -> Vec<Span<'static>> {
     let sep = if theme.ascii() { " | " } else { " · " };
     let mut spans = Vec::with_capacity(hints.len() * 3);
@@ -122,6 +128,18 @@ pub fn key_hint_spans(theme: &Theme, hints: &[(&str, &str)]) -> Vec<Span<'static
         spans.push(Span::styled(format!(" {label}"), theme.fg(Tok::Muted)));
     }
     spans
+}
+
+/// Style of one tab in any panel's tab strip: the active tab is accent, bold and underlined, the
+/// others muted words. No fills, so a tab strip reads the same in every panel and theme.
+pub fn tab_style(theme: &Theme, active: bool) -> Style {
+    if active {
+        theme
+            .fg(Tok::Accent)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        theme.fg(Tok::Muted)
+    }
 }
 
 /// A panel title: a mark in the section's color, then the title in bold body text, e.g.
@@ -282,5 +300,20 @@ mod tests {
         let lines = framed_lines(&theme, Section::Dial, "Sessions", "3 found", vec![], 40);
         let top: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(top.contains("Sessions") && top.contains("3 found"), "{top}");
+    }
+
+    #[test]
+    fn every_tab_strip_marks_the_active_tab_without_a_fill() {
+        let theme = Theme::dark();
+        let active = tab_style(&theme, true);
+        let idle = tab_style(&theme, false);
+        assert_eq!(active.fg, theme.fg(Tok::Accent).fg);
+        assert!(
+            active
+                .add_modifier
+                .contains(Modifier::UNDERLINED | Modifier::BOLD)
+        );
+        assert_eq!(idle.fg, theme.fg(Tok::Muted).fg);
+        assert!(active.bg.is_none() && idle.bg.is_none());
     }
 }

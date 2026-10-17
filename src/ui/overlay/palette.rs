@@ -278,7 +278,7 @@ impl PaletteOverlay {
         if self.arguments.is_some() {
             "back"
         } else if !self.search.text.is_empty() {
-            "clear"
+            "clear search"
         } else {
             "close"
         }

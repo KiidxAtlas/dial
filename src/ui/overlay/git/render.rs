@@ -175,13 +175,7 @@ impl GitOverlay {
         ];
         let mut right = Vec::new();
         for (view, label) in tabs {
-            let style = if self.view == view {
-                theme
-                    .fg(Tok::Accent)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                theme.fg(Tok::Muted)
-            };
+            let style = chrome::tab_style(theme, self.view == view);
             right.push(Span::styled(format!(" {label} "), style));
         }
         let chip = self.whitespace.chip();

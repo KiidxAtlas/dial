@@ -2423,6 +2423,8 @@ struct Shell {
     commands: Vec<context::CommandDef>,
     scope: Scope,
     tools_expanded: bool,
+    /// The live home screen, shown above the composer until the conversation starts.
+    home: Option<welcome::Home>,
     started: Instant,
     request_phase: agent::RequestPhase,
     last_trajectory: Option<i64>,
@@ -2686,6 +2688,7 @@ impl Shell {
             commands,
             scope: Scope::Global,
             tools_expanded: false,
+            home: None,
             started: Instant::now(),
             request_phase: agent::RequestPhase::Waiting,
             last_trajectory: None,
@@ -2913,51 +2916,47 @@ impl Shell {
         self.composer.set_files(paths);
     }
 
-    /// Welcome banner and, for a resumed session, its earlier conversation.
+    /// Home screen and, for a resumed session, its earlier conversation.
     fn begin(&mut self, app: &App, session: &Session, resumed: bool) {
         self.session_id = session.id().to_owned();
-        let (cols, _) = self.term.size();
         if self.ui.welcome {
-            let recent: Vec<(String, String)> = Session::list_newest(&app.layout, 24)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|s| s.id != session.id() && s.messages > 0)
-                // A session that only ever ran a slash command is not a conversation to resume.
-                .filter(|s| !s.first_message.trim_start().starts_with('/'))
-                .map(|s| {
-                    // Untitled sessions are named by their first message, else by size.
-                    let title = [s.title.trim(), s.first_message.trim()]
-                        .into_iter()
-                        .find(|t| !t.is_empty())
-                        .map_or_else(
-                            || format!("untitled · {} messages", s.messages),
-                            str::to_owned,
-                        );
-                    (title, session_age(&s.started))
-                })
-                .take(3)
-                .collect();
+            let (sessions, recent): (Vec<String>, Vec<(String, String)>) =
+                Session::list_newest(&app.layout, 24)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| s.id != session.id() && s.messages > 0)
+                    // A session that only ever ran a slash command is not a conversation to resume.
+                    .filter(|s| !s.first_message.trim_start().starts_with('/'))
+                    .map(|s| {
+                        // Untitled sessions are named by their first message, else by size.
+                        let title = [s.title.trim(), s.first_message.trim()]
+                            .into_iter()
+                            .find(|t| !t.is_empty())
+                            .map_or_else(
+                                || format!("untitled · {} messages", s.messages),
+                                str::to_owned,
+                            );
+                        (s.id.clone(), (title, session_age(&s.started)))
+                    })
+                    .take(3)
+                    .unzip();
+            // The composer's bottom border already offers commands, actions, model and settings;
+            // the home adds only what it does not.
             let tips = if self.ui.tips {
                 vec![
+                    ("@".to_owned(), "attach files".to_owned()),
+                    ("!".to_owned(), "run a shell command".to_owned()),
                     (
-                        self.keys.label(Action::CommandPalette),
-                        "actions".to_owned(),
+                        "/extensions".to_owned(),
+                        "MCP servers and plugins".to_owned(),
                     ),
-                    ("/".to_owned(), "commands".to_owned()),
-                    ("/extensions".to_owned(), "extensions".to_owned()),
-                    ("@".to_owned(), "files".to_owned()),
-                    ("!".to_owned(), "shell".to_owned()),
-                    (self.keys.label(Action::ModelSelect), "model".to_owned()),
                 ]
-                .into_iter()
-                .filter(|(key, _)| !key.is_empty())
-                .collect()
             } else {
                 Vec::new()
             };
             let selection = app.config.selection();
-            // The status line reads git in the background, so it is still empty when the banner is
-            // first drawn; the banner is drawn once, so ask git directly (one fast local call).
+            // The status line reads git in the background, so it is still empty when the home is
+            // first drawn; ask git directly (one fast local call).
             let branch = if self.status.branch.is_empty() {
                 git_output(
                     &app.layout.project_root,
@@ -2990,8 +2989,12 @@ impl Shell {
                 tips,
                 recent,
                 resume_hint: format!(
-                    "/resume or {} to continue one",
-                    self.keys.label(Action::CommandPalette)
+                    "{} to pick one, Enter to resume · /resume for all",
+                    if self.themes.current().ascii() {
+                        "Down"
+                    } else {
+                        "\u{2193}"
+                    }
                 ),
                 setup_hint: format!(
                     "{} or /providers to sign in to a hosted model; /setup installs the local model runtime",
@@ -3000,10 +3003,9 @@ impl Shell {
                 branch,
                 approval: format!("{:?}", app.config.approval).to_lowercase(),
                 sandbox: format!("{:?}", app.config.sandbox.mode).to_lowercase(),
-                shell: crate::tools::shell::shell_label(app.config.shell.backend),
             };
-            let rows = welcome::rows(&info, cols, self.themes.current());
-            self.term.commit(rows);
+            let motion = crate::ui::fx::motion(self.ui.motion, self.themes.current());
+            self.home = Some(welcome::Home::new(info, sessions, motion));
         }
         if resumed {
             replay_session(&mut self.transcript, session);
@@ -3074,6 +3076,12 @@ impl Shell {
         self.status.mode = self.composer.mode();
         self.status.usage = self.usage_status.poll();
         let (cols, rows) = self.term.size();
+        // The conversation has started (a message, a resumed or switched session): the home
+        // steps aside for its one-line summary, which leads the conversation in scrollback.
+        if self.home.is_some() && self.transcript.has_user() {
+            let home = self.home.take().expect("checked");
+            self.term.commit(home.summary(cols, self.themes.current()));
+        }
         let Shell {
             term,
             themes,
@@ -3085,6 +3093,7 @@ impl Shell {
             tools_expanded,
             title,
             todo,
+            home,
             ..
         } = self;
         let theme = themes.current();
@@ -3154,6 +3163,14 @@ impl Shell {
                     spinner,
                     cap.min(available.saturating_sub(bottom.len())),
                 ));
+                if let Some(home) = home {
+                    let budget = (rows as usize).saturating_sub(view.rows.len() + bottom.len() + 1);
+                    if budget > 2 {
+                        let mut above_rail = home.rows(cols, budget, theme);
+                        above_rail.append(&mut bottom);
+                        bottom = above_rail;
+                    }
+                }
                 let above = bottom.len() as u16;
                 bottom.extend(view.rows);
                 (bottom, Some((view.cursor.0 + above, view.cursor.1)))
@@ -3495,7 +3512,6 @@ impl Shell {
                 }
             }
             previous_status = Some(status);
-            dirty = false;
             if let Some(text) = self.startup.take() {
                 dirty = true;
                 match self.submit(app, agent, text)? {
@@ -3535,7 +3551,14 @@ impl Shell {
             } else {
                 timeout
             };
+            let animating = self.home.as_ref().is_some_and(welcome::Home::animating);
+            let timeout = if animating {
+                timeout.min(crate::ui::fx::FRAME)
+            } else {
+                timeout
+            };
             if !poll(timeout)? {
+                dirty = animating;
                 if self.pending_favorite.is_some() {
                     self.catalog.collect();
                     let effective = &app.config;
@@ -3589,6 +3612,15 @@ impl Shell {
                         }
                         continue;
                     }
+                    if let Some(picked) = self.home_key(&key) {
+                        if let Some(command) = picked {
+                            match self.submit(app, agent, command)? {
+                                Step::Done => {}
+                                other => return Ok(other),
+                            }
+                        }
+                        continue;
+                    }
                     let event = self.composer_key(key);
                     let step = match event {
                         ComposerEvent::None => Step::Done,
@@ -3612,6 +3644,35 @@ impl Shell {
                 Event::Paste(text) => self.composer_paste(&text),
                 Event::Resize(..) => self.term.on_resize(),
                 _ => {}
+            }
+        }
+    }
+
+    /// Keys for the live home while the input is empty: Down enters its list, Up walks back to the
+    /// input, Enter picks, Esc leaves. `None` passes the key on; `Some(Some(command))` asks to run it.
+    fn home_key(&mut self, key: &crossterm::event::KeyEvent) -> Option<Option<String>> {
+        let home = self.home.as_mut()?;
+        if !key.modifiers.is_empty()
+            || !self.composer.draft().is_empty()
+            || self.composer.menu_open()
+        {
+            return None;
+        }
+        match key.code {
+            KeyCode::Down => home.down().then_some(None),
+            KeyCode::Up => home.up().then_some(None),
+            KeyCode::Esc => home.deselect().then_some(None),
+            KeyCode::Enter => match home.pick()? {
+                welcome::Pick::Resume(id) => Some(Some(format!("/resume {id}"))),
+                welcome::Pick::Draft(text) => {
+                    self.composer.set_draft(text);
+                    Some(None)
+                }
+            },
+            _ => {
+                // Typing goes to the input; the selection steps aside.
+                home.deselect();
+                None
             }
         }
     }
@@ -9683,10 +9744,31 @@ fn run_overlay(
     overlay: &mut ActiveOverlay,
 ) -> Result<()> {
     let mut paste_guard = crate::ui::input::PasteGuard::default();
+    // Every panel unrolls from the top over a short reveal when it opens, then stays still.
+    let opened = Instant::now();
+    let motion = crate::ui::fx::motion(env.app.config.ui.motion, env.themes.current());
     loop {
         refresh_overlay(env, overlay);
-        ot.draw(|frame| draw_overlay_frame(frame, env, overlay))?;
-        if !poll(TICK)? {
+        let progress = if motion {
+            crate::ui::fx::progress(opened.elapsed(), crate::ui::fx::REVEAL)
+        } else {
+            1.0
+        };
+        ot.draw(|frame| {
+            let placements = draw_overlay_frame(frame, env, overlay);
+            if progress < 1.0 {
+                let area = frame.area();
+                crate::ui::fx::reveal(frame.buffer_mut(), area, progress);
+                return Vec::new();
+            }
+            placements
+        })?;
+        let wait = if progress < 1.0 {
+            crate::ui::fx::FRAME
+        } else {
+            TICK
+        };
+        if !poll(wait)? {
             continue;
         }
         if overlay_input(env, overlay, &mut paste_guard, read()?) {

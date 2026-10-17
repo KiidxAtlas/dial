@@ -1726,13 +1726,7 @@ impl ModelOverlay {
     fn kind_line(&self, theme: &Theme, w: usize) -> Line<'static> {
         let mut spans = vec![chrome::label(theme, " kind ")];
         for kind in KindFilter::ALL {
-            let style = if kind == self.kind {
-                theme
-                    .fg(Tok::Accent)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                theme.fg(Tok::Muted)
-            };
+            let style = chrome::tab_style(theme, kind == self.kind);
             spans.push(Span::styled(format!(" {} ", kind.label()), style));
         }
         // Legend entries are added whole while they fit, so a narrow pane never shows a clipped word.

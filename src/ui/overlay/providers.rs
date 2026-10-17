@@ -1614,7 +1614,7 @@ impl ProviderOverlay {
             ],
             Mode::Headers { .. } => vec![
                 ("F10".to_owned(), "save".to_owned()),
-                ("Esc".to_owned(), "cancel".to_owned()),
+                hint(Action::SelectCancel, "cancel"),
             ],
             Mode::Confirm(_, removal) => vec![
                 hint(

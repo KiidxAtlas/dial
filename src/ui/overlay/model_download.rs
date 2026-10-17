@@ -16,13 +16,14 @@ use crate::llm::model_config::ModelSelection;
 use crate::setup::embeddings;
 use crate::storage::paths::Layout;
 use crate::ui::{
+    chrome,
     keys::{Action, Keymap},
     text,
     theme::{Theme, Tok},
 };
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
 };
 use std::collections::BTreeSet;
@@ -430,7 +431,7 @@ impl ModelDownloads {
         let back = if self.is_downloading() {
             "cancel"
         } else if !self.query.is_empty() {
-            "clear"
+            "clear search"
         } else {
             "back"
         };
@@ -1295,13 +1296,7 @@ impl ModelDownloads {
     fn shelf_line(&self, width: usize, theme: &Theme) -> Line<'static> {
         let mut spans = vec![Span::raw(" ")];
         for shelf in SHELVES {
-            let style = if shelf == self.shelf {
-                theme
-                    .fg(Tok::Accent)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                theme.fg(Tok::Muted)
-            };
+            let style = chrome::tab_style(theme, shelf == self.shelf);
             spans.push(Span::styled(format!(" {} ", shelf.label()), style));
         }
         Line::from(fit(spans, width))

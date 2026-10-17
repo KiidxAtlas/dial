@@ -1337,7 +1337,12 @@ impl Composer {
             cursor = (rows.len() as u16, col as u16);
             rows.extend(list);
         } else if let Some(menu) = &self.menu {
-            rows.extend(self.menu_rows(menu, w, ctx));
+            // The menu opens upward, into the space above the input, so the input never moves
+            // down and the closest rows to the cursor are the selected command's details.
+            let mut menu_rows = self.menu_rows(menu, w, ctx);
+            cursor.0 += menu_rows.len() as u16;
+            menu_rows.append(&mut rows);
+            rows = menu_rows;
         }
         if let Some(notice) = &self.queue_notice {
             rows.insert(
@@ -1602,6 +1607,7 @@ impl Composer {
         let blank_pointer = " ".repeat(text::width(pointer));
         let accent = theme.fg(Tok::Accent);
         let hit = accent.add_modifier(Modifier::BOLD);
+        let groups = menu.file_start.is_none() && menu.arguments.is_none() && menu.query.is_empty();
         let mut rows = render_list(
             theme,
             w,
@@ -1646,15 +1652,34 @@ impl Composer {
                     " ".repeat(name_col.saturating_sub(name_cells) + 2),
                 ));
                 let used = prefix + name_col + 2;
-                let room = budget.saturating_sub(used);
+                // Unfiltered, the list is grouped; each group's first row names it at the right.
+                let group = if groups
+                    && (i == start
+                        || group_of(&entries[menu.matches[i - 1].index]) != group_of(command))
+                {
+                    group_of(command)
+                } else {
+                    ""
+                };
+                let group_w = if group.is_empty() {
+                    0
+                } else {
+                    text::width(group) + 2
+                };
+                let room = budget.saturating_sub(used + group_w);
                 if room > 0 {
                     let description = text::ellipsize(&command.description, room, theme.ascii());
+                    let description_w = text::width(&description);
                     spans.extend(highlighted(
                         &description,
                         &found.desc_hits,
                         theme.fg(Tok::Muted),
                         hit,
                     ));
+                    if !group.is_empty() {
+                        spans.push(Span::raw(" ".repeat(room - description_w + 2)));
+                        spans.push(Span::styled(group.to_uppercase(), theme.fg(Tok::Dim)));
+                    }
                 }
                 spans
             },
@@ -2117,6 +2142,49 @@ const SYNC_RANK_LIMIT: usize = 2_000;
 /// lists in `command_surface`, so the menu and the palette cannot disagree.
 const START_HERE: &[&str] = crate::ui::command_surface::START_HERE;
 
+/// The unfiltered slash menu's groups, in order; the most used come first.
+const MENU_GROUPS: [crate::ui::command_surface::Category; 10] = {
+    use crate::ui::command_surface::Category as C;
+    [
+        C::Model,
+        C::Settings,
+        C::Session,
+        C::Context,
+        C::Review,
+        C::Work,
+        C::Modes,
+        C::Integrations,
+        C::Maintenance,
+        C::Learning,
+    ]
+};
+
+/// Where a command sits in the unfiltered menu: built-ins by category, then skills, then custom.
+fn group_rank(command: &CommandEntry) -> usize {
+    match command.kind {
+        CommandKind::Builtin => {
+            let category = crate::ui::command_surface::category(&command.name);
+            MENU_GROUPS
+                .iter()
+                .position(|c| *c == category)
+                .unwrap_or(MENU_GROUPS.len())
+        }
+        CommandKind::Skill => MENU_GROUPS.len() + 1,
+        CommandKind::Custom => MENU_GROUPS.len() + 2,
+        CommandKind::File => MENU_GROUPS.len() + 3,
+    }
+}
+
+/// The group label for a command in the unfiltered menu.
+fn group_of(command: &CommandEntry) -> &'static str {
+    match command.kind {
+        CommandKind::Builtin => crate::ui::command_surface::category(&command.name).tab(),
+        CommandKind::Skill => "Skills",
+        CommandKind::Custom => "Custom",
+        CommandKind::File => "",
+    }
+}
+
 /// Name matches lead description-only matches; within either field, prefixes lead word starts,
 /// then subsequences. Fuzzy score breaks ties and supplies highlight positions.
 fn rank(commands: &[CommandEntry], query: &str) -> Vec<Match> {
@@ -2163,14 +2231,23 @@ fn rank(commands: &[CommandEntry], query: &str) -> Vec<Match> {
         })
         .collect();
     if lower.is_empty() {
-        // Nothing typed yet: lead with what people reach for first, then the rest as registered.
+        // Nothing typed yet: everyday commands first, grouped (models, setup, sessions, …), each
+        // group led by what people reach for first; then everything else, grouped the same way.
         let priority = |name: &str| {
             START_HERE
                 .iter()
                 .position(|p| p.eq_ignore_ascii_case(name))
                 .unwrap_or(START_HERE.len())
         };
-        scored.sort_by_key(|(_, m)| priority(&commands[m.index].name));
+        scored.sort_by_key(|(_, m)| {
+            let command = &commands[m.index];
+            (
+                !(command.kind == CommandKind::Builtin
+                    && crate::ui::command_surface::everyday(&command.name)),
+                group_rank(command),
+                priority(&command.name),
+            )
+        });
     } else {
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
     }
@@ -3097,8 +3174,8 @@ mod tests {
                 c.set_files(vec!["src/main.rs".into()]);
                 c.set_draft(draft);
                 assert!(!c.menu_open());
-                assert!(screen(&c, &env, 80).last().unwrap().contains(message));
-                let row = c.view(80, &env.ctx()).rows.pop().unwrap();
+                assert!(screen(&c, &env, 80).first().unwrap().contains(message));
+                let row = c.view(80, &env.ctx()).rows.remove(0);
                 assert!(
                     row.spans
                         .iter()
@@ -3928,6 +4005,7 @@ mod tests {
         let ghost = view
             .rows
             .iter()
+            .rev()
             .flat_map(|row| &row.spans)
             .find(|span| span.content == "architecture")
             .unwrap();
@@ -4322,37 +4400,45 @@ mod tests {
     // ---- slash menu -------------------------------------------------------------------------
 
     #[test]
-    fn slash_opens_a_menu_below_the_box_that_filters_fuzzily_as_you_type() {
+    fn slash_opens_a_grouped_menu_above_the_box_that_filters_fuzzily_as_you_type() {
         let env = Env::new();
         let mut c = with_commands();
         assert!(!c.menu_open());
         typed(&mut c, &env, "/");
         assert!(c.menu_open());
-        let rows = screen(&c, &env, 80);
-        let bottom = rows.iter().position(|r| r.starts_with('╰')).unwrap();
-        assert!(
-            rows.len() > bottom + 1,
-            "menu rows come after the box: {rows:?}"
-        );
+        // Everything above the box's top border is the menu.
+        let menu = |c: &Composer| {
+            let rows = screen(c, &env, 80);
+            let top = rows.iter().position(|r| r.starts_with('╭')).unwrap();
+            assert_eq!(rows.len(), top + 3, "the box stays at the bottom: {rows:?}");
+            rows[..top].to_vec()
+        };
+        let rows = menu(&c);
+        assert!(rows.len() > 2, "menu rows come before the box: {rows:?}");
         for name in ["help", "model", "settings"] {
-            assert!(
-                rows[bottom + 1..].iter().any(|r| r.contains(name)),
-                "{name}: {rows:?}"
-            );
+            assert!(rows.iter().any(|r| r.contains(name)), "{name}: {rows:?}");
         }
         assert!(
-            rows[bottom + 1].contains("help") && rows[bottom + 1].contains("Show help"),
-            "name and description on a row: {:?}",
-            rows[bottom + 1]
+            rows[0].contains("model") && rows[0].contains("Switch model"),
+            "name and description on a row, models first: {:?}",
+            rows[0]
+        );
+        assert!(rows[0].trim_end().ends_with("MODELS"), "{rows:?}");
+        let settings = rows.iter().position(|r| r.contains("Show help")).unwrap();
+        assert!(rows[settings].trim_end().ends_with("SETTINGS"), "{rows:?}");
+        assert!(
+            !rows[settings + 1].contains("SETTINGS"),
+            "a group is named once: {rows:?}"
         );
         typed(&mut c, &env, "mo");
-        let names: Vec<_> = screen(&c, &env, 80)[bottom + 1..]
-            .iter()
-            .map(|r| r.trim().to_owned())
-            .collect();
+        let names: Vec<_> = menu(&c).iter().map(|r| r.trim().to_owned()).collect();
         assert!(
             names[0].contains("model") && !names[0].contains("modelpreset"),
             "the exact-prefix match leads: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|r| r.ends_with("MODELS")),
+            "filtered lists are ranked, not grouped: {names:?}"
         );
         for expected in ["modelpreset", "memory", "remove-dir"] {
             assert!(
@@ -4373,7 +4459,7 @@ mod tests {
         typed(&mut c, &env, "/zzz");
         assert!(!c.menu_open(), "no match, no selectable menu");
         assert_eq!(screen(&c, &env, 80).len(), 4);
-        assert!(screen(&c, &env, 80)[3].contains("No matching commands"));
+        assert!(screen(&c, &env, 80)[0].contains("No matching commands"));
     }
 
     #[test]
@@ -4517,7 +4603,7 @@ mod tests {
         typed(&mut c, &env, "/");
         let view = c.view(80, &env.ctx());
         let rows = lines(&view.rows);
-        let menu_start = 3;
+        let menu_start = 0;
         let row_of = |name: &str| {
             rows[menu_start..]
                 .iter()
@@ -4573,7 +4659,7 @@ mod tests {
         typed(&mut c, &ascii, "/");
         let rows = screen(&c, &ascii, 80);
         assert!(
-            rows[3].starts_with("> help") && rows.iter().all(|r| r.is_ascii()),
+            rows[0].starts_with("> model") && rows.iter().all(|r| r.is_ascii()),
             "ascii pointer and no icons: {rows:?}"
         );
     }
@@ -4756,7 +4842,10 @@ mod tests {
         );
         typed(&mut c, &env, "/");
         let t = &env.theme;
-        let menu = |c: &Composer| screen(c, &env, 60)[3..].to_vec();
+        let menu = |c: &Composer| {
+            let rows = screen(c, &env, 60);
+            rows[..rows.len() - 3].to_vec()
+        };
         let rows = menu(&c);
         // Five list rows plus the selected command's usage and description.
         assert_eq!(rows.len(), 7);
@@ -4846,7 +4935,7 @@ mod tests {
         let rows = screen(&c, &env, 40);
         assert_eq!(rows.len(), 7);
         assert!(
-            !rows[3..]
+            !rows[..4]
                 .iter()
                 .any(|r| r.contains("/2") || r.contains(env.theme.sym(Sym::ScrollTrack))),
             "{rows:?}"
@@ -4931,12 +5020,12 @@ mod tests {
         let rows = screen(&c, &env, 80);
         assert_eq!(rows.len(), 6, "only one command survives: {rows:?}");
         assert!(
-            rows[3].contains("review")
-                && rows[3].contains("check this diff")
-                && !rows[3].contains("owned")
-                && !rows[3].contains('\x1b'),
+            rows[0].contains("review")
+                && rows[0].contains("check this diff")
+                && !rows[0].contains("owned")
+                && !rows[0].contains('\x1b'),
             "{:?}",
-            rows[3]
+            rows[0]
         );
     }
 

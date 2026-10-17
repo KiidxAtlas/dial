@@ -1,6 +1,6 @@
 {
   "name": "dial",
-  "description": "Dial light: ink on the terminal background, amber accent, warm-gray rules that stay visible, no fills",
+  "description": "Dial light: ink on the terminal background, amber accent, warm-gray rules that stay visible, a faint tint behind your messages",
   "dark": false,
   "vars": {
     "ink": "#16140f",
@@ -22,6 +22,7 @@
     "orangeText": "#b8500f",
     "dimText": "#8c8576",
     "selectedTint": "#e2d9c6",
+    "userTint": "#f2ede2",
     "rule": "#9c927d"
   },
   "colors": {
@@ -37,7 +38,7 @@
     "warning": "orangeText",
     "selectedBg": "selectedTint",
     "canvasBg": "",
-    "userBg": "",
+    "userBg": "userTint",
     "userText": "ink",
     "toolPendingBg": "",
     "toolSuccessBg": "",

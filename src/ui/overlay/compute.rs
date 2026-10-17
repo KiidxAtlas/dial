@@ -12,7 +12,7 @@ use crate::ui::{
 use crossterm::event::Event;
 use ratatui::{
     Frame,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
 };
 use serde_json::{Value, json};
@@ -36,28 +36,19 @@ enum ListRow {
     Text(String, Tok),
 }
 
-/// The tab strip: the active tab is amber, bold and underlined; the others are secondary. ASCII keeps `[tab]`.
+/// The tab strip in the shared tab style ([`chrome::tab_style`]). ASCII keeps `[tab]`.
 pub(super) fn tab_line(theme: &Theme, tabs: &[&str], active: usize, width: usize) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (i, tab) in tabs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(if i == active {
-            let name = if theme.ascii() {
-                format!("[{tab}]")
-            } else {
-                (*tab).to_owned()
-            };
-            Span::styled(
-                name,
-                theme
-                    .fg(Tok::Accent)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )
+        let name = if i == active && theme.ascii() {
+            format!("[{tab}]")
         } else {
-            Span::styled((*tab).to_owned(), theme.fg(Tok::Muted))
-        });
+            (*tab).to_owned()
+        };
+        spans.push(Span::styled(name, chrome::tab_style(theme, i == active)));
     }
     Line::from(fit(spans, width))
 }
@@ -678,19 +669,25 @@ impl ComputeOverlay {
                     output.push(line);
                 }
                 if output.len() < h {
-                    let hints: &[(&str, &str)] = if self.confirm.is_some() {
-                        &[("Enter", "confirm"), ("Esc", "keep running")]
+                    let confirm = ctx.keys.label(Action::SelectConfirm);
+                    let cancel = ctx.keys.label(Action::SelectCancel);
+                    let hints: Vec<(&str, &str)> = if self.confirm.is_some() {
+                        vec![(confirm.as_str(), "confirm"), (cancel.as_str(), "cancel")]
                     } else {
-                        &[
+                        vec![
                             ("←→/Tab", "section"),
                             ("↑↓", "select"),
-                            ("Enter", "details"),
+                            (confirm.as_str(), "details"),
                             ("x", "remove/stop"),
-                            ("Esc", "back"),
+                            // Esc steps back out of an item's menu, and closes from the list.
+                            (
+                                cancel.as_str(),
+                                if self.menu.is_some() { "back" } else { "close" },
+                            ),
                         ]
                     };
                     let mut spans = vec![Span::raw(" ")];
-                    spans.extend(chrome::key_hint_spans(ctx.theme, hints));
+                    spans.extend(chrome::key_hint_spans(ctx.theme, &hints));
                     output.push(Line::from(fit(spans, w)));
                 }
                 output

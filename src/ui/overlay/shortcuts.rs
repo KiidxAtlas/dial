@@ -344,7 +344,7 @@ impl ShortcutOverlay {
             vec![
                 hint(ctx.keys, Action::SelectConfirm, "save globally"),
                 "empty disables".into(),
-                hint(ctx.keys, Action::SelectCancel, "cancel edit"),
+                hint(ctx.keys, Action::SelectCancel, "cancel"),
             ]
         } else {
             let movement = pair_label(ctx.keys, Action::SelectUp, Action::SelectDown);
@@ -583,10 +583,7 @@ mod tests {
                     shown.contains("Enter save globally"),
                     "height {height}: {shown}"
                 );
-                assert!(
-                    shown.contains("Esc cancel edit"),
-                    "height {height}: {shown}"
-                );
+                assert!(shown.contains("Esc cancel"), "height {height}: {shown}");
                 if failed && height > 5 {
                     assert!(shown.contains("Cannot save"));
                 }

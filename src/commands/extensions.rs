@@ -52,7 +52,7 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     },
     super::CommandSpec {
         name: "extensions",
-        description: "show runtime extension and plugin configuration (alias: /status)",
+        description: "browse and install MCP servers, plugins and skills (/status shows the configuration)",
         args_hint: "",
         subcommands: &[],
     },
