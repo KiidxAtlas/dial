@@ -1,4 +1,4 @@
-//! Shared memory security screening. Persistence is owned by [`super::atomic`].
+//! Shared memory security screening. Persistence is owned by [`crate::platform::atomic`].
 //! Durable provenance/retrieval lives in [`super::provenance`].
 #[cfg(test)]
 use crate::platform::fs as platform_fs;
@@ -8,7 +8,7 @@ use std::fs;
 const DELIMITER: &str = "§";
 
 // Compatibility for skill package publication; new callers name the neutral owner.
-pub(crate) use super::atomic::write_checkpoint as atomic_write;
+pub(crate) use crate::platform::atomic::write_checkpoint as atomic_write;
 
 pub(crate) fn screen(entry: &str) -> Result<(), String> {
     if entry.contains(DELIMITER) {

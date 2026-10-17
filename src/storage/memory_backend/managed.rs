@@ -1,8 +1,6 @@
 use super::{Operation, clean, files::PrivateDirectory, redact};
-use crate::storage::{
-    paths::Layout,
-    skills::{self, Scope, Skill},
-};
+use crate::config::paths::Layout;
+use crate::storage::skills::{self, Scope, Skill};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};

@@ -8,7 +8,7 @@ pub(crate) fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) 
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();
     let layout =
-        crate::storage::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
+        crate::config::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
     let overlay: toml::Table = toml::from_str(&format!(
         "model='test'\n{overlay}\n[improve]\nenabled=false"
     ))
@@ -374,7 +374,7 @@ fn default_stale_reduction_precedes_automatic_summary_pressure() {
             .config
             .compaction
             .effective_threshold(
-                compaction::CompactionIdentity {
+                crate::config::compaction::CompactionIdentity {
                     provider: &selection.provider,
                     model: &selection.model,
                     agent: None,

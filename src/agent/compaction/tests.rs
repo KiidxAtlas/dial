@@ -1,3 +1,10 @@
+use crate::config::compaction::continue_band;
+
+use crate::config::compaction::CompactionConfig;
+use crate::config::compaction::CompactionIdentity;
+use crate::config::compaction::CompactionMethod;
+use crate::config::compaction::CompactionOptions;
+
 use super::*;
 
 #[test]

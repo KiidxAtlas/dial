@@ -314,7 +314,7 @@ fn laya_judge_asks_one_typed_choice_and_caches_by_checkpoint() {
         ),
     ]);
     let mut backend = LayaBackend {
-        config: crate::agent::laya::Config {
+        config: crate::config::laya::Config {
             endpoint: server.url.clone(),
             checkpoint: Some("/ckpt".into()),
             ..Default::default()
@@ -348,8 +348,8 @@ fn judge_role_assigned_to_laya_is_recognised() {
     config.model_roles.insert(
         "judge".into(),
         ModelSelection::new(
-            crate::agent::laya::PROVIDER,
-            crate::agent::laya::JUDGE_MODEL,
+            crate::config::laya::PROVIDER,
+            crate::config::laya::JUDGE_MODEL,
         ),
     );
     assert!(judge_uses_laya(&config));

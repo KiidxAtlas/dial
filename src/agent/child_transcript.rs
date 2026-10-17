@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::storage::paths::Layout;
+use crate::config::paths::Layout;
 use crate::storage::redact::redact_value;
 
 /// Upper bound for one record; larger messages are replaced by a marker line.

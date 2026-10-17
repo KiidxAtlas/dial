@@ -19,8 +19,8 @@ pub mod subagent_viewer;
 pub mod subagents;
 
 use crate::{
+    config::settings_store::Scope,
     llm::model_config::{ModelSelection, ProviderSpec, UiConfig},
-    storage::settings_store::Scope,
     ui::{
         keys::{Action, Keymap},
         status::StatusData,

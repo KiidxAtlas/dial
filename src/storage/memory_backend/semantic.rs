@@ -2,21 +2,21 @@
 //! OpenAI-compatible embeddings endpoint is configured, by cosine similarity over stored vectors.
 //! The two rankings are fused with reciprocal-rank fusion. Without an endpoint recall is lexical only
 //! and nothing is sent off the machine. Retrieved facts are data, never instructions.
+use crate::config::memory_backend::{EmbeddingMode, MemoryBackendId, SemanticConfig};
+
 use super::semantic_store::{
     Fact, MAX_CONTENT_BYTES, MAX_SOURCE_BYTES, Saved, Store, estimate_tokens, fit_budget, fuse,
     nearest, query_tokens,
 };
 use super::{
-    Driver, FactRef, MemoryModelRunner, Operation, SaveInput, clean,
-    config::{EmbeddingMode, MemoryBackendId, SemanticConfig},
-    files::PrivateDirectory,
-    now,
+    Driver, FactRef, MemoryModelRunner, Operation, SaveInput, clean, files::PrivateDirectory, now,
 };
+use crate::config::paths::Layout;
 use crate::llm::model_config::{
     ApiProtocol, HeaderValue, RequestHeader, resolve_headers, validate_headers,
 };
 use crate::llm::provider::endpoint_url;
-use crate::storage::{memory::screen, paths::Layout};
+use crate::storage::memory::screen;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

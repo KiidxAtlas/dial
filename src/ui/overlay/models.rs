@@ -13,12 +13,12 @@ use super::{
     },
 };
 use crate::{
-    cli::local_models::Settings,
+    config::paths::Layout,
+    config::settings_store::Scope,
     llm::catalog::{Discovery, ModelEntry, ModelKind, ProviderStatus},
     llm::model_config::{ModelSelection, ROLES, RoleSource, RoleStatus},
     setup::embeddings,
-    storage::paths::Layout,
-    storage::settings_store::Scope,
+    stats::local_models::Settings,
     ui::{
         chrome::{self, Section},
         keys::{Action, Keymap},
@@ -152,7 +152,7 @@ fn is_embedding(entry: &ModelEntry) -> bool {
 /// cannot chat); `decision` takes a typed Laya checkpoint, never a catalog entry; the Laya engine entry
 /// answers only the `judge` role's typed choices.
 fn role_accepts(role: &str, entry: &ModelEntry) -> bool {
-    if entry.selection.provider == crate::agent::laya::PROVIDER {
+    if entry.selection.provider == crate::config::laya::PROVIDER {
         return role == "judge";
     }
     match role {
@@ -169,7 +169,7 @@ fn role_accepts(role: &str, entry: &ModelEntry) -> bool {
 fn role_picker_accepts(role: &str, entry: &ModelEntry) -> bool {
     role_accepts(role, entry)
         || (role == "embedding"
-            && entry.selection.provider != crate::agent::laya::PROVIDER
+            && entry.selection.provider != crate::config::laya::PROVIDER
             && is_unclassified(entry))
 }
 
@@ -202,8 +202,8 @@ fn laya_judge_entry(roles: &[RoleStatus]) -> ModelEntry {
         .and_then(|status| status.effective.clone());
     ModelEntry {
         selection: ModelSelection::new(
-            crate::agent::laya::PROVIDER,
-            crate::agent::laya::JUDGE_MODEL,
+            crate::config::laya::PROVIDER,
+            crate::config::laya::JUDGE_MODEL,
         ),
         label: "decision checkpoint".into(),
         source: match &checkpoint {
@@ -343,7 +343,7 @@ fn state_of(entry: &ModelEntry) -> &'static str {
 
 /// Why a model cannot be selected.
 fn refusal(entry: &ModelEntry) -> String {
-    if entry.selection.provider == crate::agent::laya::PROVIDER {
+    if entry.selection.provider == crate::config::laya::PROVIDER {
         return "no Laya checkpoint; run `dial laya install --checkpoint PATH` or assign the decision role"
             .to_owned();
     }
@@ -884,7 +884,7 @@ impl ModelOverlay {
             };
             // The Laya engine leads the judge list: it is not a catalog model and is easy to miss.
             let rank = if main.is_some_and(|m| same_model(m, &entry.selection))
-                || entry.selection.provider == crate::agent::laya::PROVIDER
+                || entry.selection.provider == crate::config::laya::PROVIDER
             {
                 0
             } else if self.is_favorite(&entry.selection) {
@@ -1437,7 +1437,7 @@ impl ModelOverlay {
                 ));
                 return OverlayEvent::None;
             }
-            let provider = crate::agent::laya::PROVIDER;
+            let provider = crate::config::laya::PROVIDER;
             return OverlayEvent::AssignModel {
                 role: role.to_owned(),
                 selection: ModelSelection::new(provider, &text),

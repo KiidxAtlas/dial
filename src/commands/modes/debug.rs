@@ -12,9 +12,9 @@ use anyhow::Result;
 use crate::agent::Agent;
 use crate::agent::modes::debug::DebugSnapshot;
 use crate::app::{App, Shell, Step};
+use crate::config::paths::Layout;
 use crate::platform::fs as platform_fs;
 use crate::storage::dump::{DumpKind, dump_session};
-use crate::storage::paths::Layout;
 use crate::storage::session::Session;
 
 enum Action {

@@ -140,7 +140,7 @@ fn round_settlement_preserves_verification_status_and_bounded_receipts() {
 
 #[test]
 fn consultation_attempts_span_repair_state_and_reset_with_next_user_turn() {
-    let settings = solve::EscalationConfig {
+    let settings = crate::config::solve::EscalationConfig {
         enabled: true,
         auto_after_failed_rounds: 2,
         max_auto_per_turn: 1,

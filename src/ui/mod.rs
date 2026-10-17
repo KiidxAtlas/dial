@@ -26,7 +26,6 @@ pub mod questions;
 pub mod rail;
 pub mod recovery;
 pub mod session_picker;
-pub mod settings_schema;
 pub mod status;
 pub mod statusline;
 pub mod subagent_hub;

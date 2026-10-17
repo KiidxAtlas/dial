@@ -29,10 +29,10 @@ impl<'a> Agent<'a> {
         let window = self.budget_window();
         let mut pressure_at = u64::from(window) * pressure_fraction / 100;
         if self.config.compaction.enabled
-            && self.config.compaction.strategy != compaction::CompactionStrategy::Off
+            && self.config.compaction.strategy != crate::config::compaction::CompactionStrategy::Off
         {
             let selection = self.auth_config.selection();
-            let identity = compaction::CompactionIdentity {
+            let identity = crate::config::compaction::CompactionIdentity {
                 provider: &selection.provider,
                 model: &selection.model,
                 agent: None,
@@ -192,7 +192,7 @@ impl<'a> Agent<'a> {
         let estimate = compaction::request_tokens_with_policy(
             request,
             &self.config.compaction,
-            compaction::CompactionIdentity {
+            crate::config::compaction::CompactionIdentity {
                 provider: &selection.provider,
                 model: &selection.model,
                 agent: None,

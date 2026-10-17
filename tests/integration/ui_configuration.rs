@@ -1,7 +1,7 @@
 use dial::{
+    config::paths::Layout,
+    config::settings_store::{self, Change, Scope},
     config::types::Config,
-    storage::paths::Layout,
-    storage::settings_store::{self, Change, Scope},
 };
 use std::fs;
 
@@ -196,7 +196,10 @@ fn adaptive_controls_persist_layered_pins_and_reject_invalid_budget_without_writ
     let config = Config::load(&layout, None).unwrap();
     assert!(config.adaptive.sampling && config.adaptive.pin_sampling);
     assert_eq!(config.adaptive.editing_temperature, 0.25);
-    assert_eq!(config.adaptive.phase, dial::adaptive::Phase::Verification);
+    assert_eq!(
+        config.adaptive.phase,
+        dial::config::adaptive::Phase::Verification
+    );
     assert!(
         settings_store::save_config(
             &layout,

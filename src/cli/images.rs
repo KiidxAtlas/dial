@@ -4,10 +4,8 @@
 //! `status` and `purge --apply` first refresh references from session transcripts, so images that
 //! a live transcript still holds keep their serving window. A dry-run purge only reads the store.
 
-use crate::storage::{
-    image_refs::{self, IMAGE_TTL_HOURS},
-    paths::Layout,
-};
+use crate::config::paths::Layout;
+use crate::storage::image_refs::{self, IMAGE_TTL_HOURS};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde_json::{Value, json};

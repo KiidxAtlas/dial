@@ -1,10 +1,11 @@
+use crate::config::memory_backend::{LocalConfig, MemoryBackendId};
+
 use super::{
     Driver, MemoryModelRequest, MemoryModelRunner, Operation, SaveInput, clean,
-    config::{LocalConfig, MemoryBackendId},
-    files::PrivateDirectory,
-    now, redact,
+    files::PrivateDirectory, now, redact,
 };
-use crate::storage::{paths::Layout, session::Session};
+use crate::config::paths::Layout;
+use crate::storage::session::Session;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};

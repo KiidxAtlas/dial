@@ -4,6 +4,10 @@
 //! never checks out or resets the user's repository. Each candidate and its verifier get
 //! separate strict, network-disabled workspaces. Only explicitly allowed files can return.
 //! A passing check means exactly that command passed, not that the goal is proven correct.
+use crate::config;
+
+use crate::config::solve::SolveConfig;
+
 use super::{Ui, approval, subagents, verification};
 use crate::{
     config::types::Config,
@@ -11,7 +15,7 @@ use crate::{
     tools::{self, ToolOutput, Workspace},
 };
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,56 +27,6 @@ use std::{
 };
 
 const MAX_FILES: usize = 20_000;
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SolveConfig {
-    pub enabled: bool,
-    pub max_candidates: usize,
-    pub max_steps: u32,
-    pub max_snapshot_bytes: usize,
-}
-impl SolveConfig {
-    pub fn validate(&self) -> Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct EscalationConfig {
-    pub enabled: bool,
-    pub allow_remote: bool,
-    pub max_evidence_bytes: usize,
-    /// Consecutive failed tool rounds on one turn before the coach role is consulted automatically. 0 disables.
-    pub auto_after_failed_rounds: u32,
-    /// Automatic consultations allowed per turn.
-    pub max_auto_per_turn: u32,
-}
-impl Default for EscalationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allow_remote: false,
-            max_evidence_bytes: 0,
-            auto_after_failed_rounds: 3,
-            max_auto_per_turn: 1,
-        }
-    }
-}
-impl EscalationConfig {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.auto_after_failed_rounds <= 8,
-            "escalation.auto_after_failed_rounds must be 0..8"
-        );
-        ensure!(
-            self.max_auto_per_turn <= 8,
-            "escalation.max_auto_per_turn must be 0..8"
-        );
-        Ok(())
-    }
-}
 
 pub fn schema() -> Value {
     json!({"type":"function","function":{"name":"solve","description":"Try bounded independent candidate patches in isolated copies, run identical explicit checks, and apply the smallest passing patch only if source is unchanged. Requires operator enablement and approval. No check means no verified winner.","parameters":{"type":"object","properties":{
@@ -324,7 +278,7 @@ fn search(parent: &mut subagents::Parent<'_>, args: &Value, ui: &mut dyn Ui) -> 
     let mut harness = child_config.effective_harness(env.harness)?;
     harness
         .tools
-        .retain(|name| tools::BUILTIN.contains(&name.as_str()));
+        .retain(|name| config::tools::BUILTIN.contains(&name.as_str()));
     ensure!(
         harness.tools.iter().any(|n| n == "write" || n == "edit"),
         "candidate model profile must permit write or edit"

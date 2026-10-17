@@ -1,5 +1,5 @@
 //! Explicit continuation of a worker. History is never replayed as tool execution.
-use crate::storage::paths::Layout;
+use crate::config::paths::Layout;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{

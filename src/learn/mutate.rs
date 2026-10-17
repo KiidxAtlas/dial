@@ -229,7 +229,7 @@ fn ablate_tool(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Muta
 }
 
 fn restore_tool(active: &Harness, _: &Context, rng: &mut dyn RngCore) -> Vec<Mutation> {
-    let mut options: Vec<Mutation> = crate::tools::default_tools().into_iter().filter(|t| !active.tools.contains(t)).map(|tool| {
+    let mut options: Vec<Mutation> = crate::config::tools::default_tools().into_iter().filter(|t| !active.tools.contains(t)).map(|tool| {
         let mut h = active.clone();
         h.tools.push(tool.clone());
         mutation("restore_tool", format!("restore the default {tool} tool: an earlier ablation may have removed something the model needs"), h)

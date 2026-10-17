@@ -16,9 +16,9 @@ use serde_json::json;
 use crate::agent::approval::PermissionRule;
 use crate::agent::todo::TodoList;
 use crate::agent::{Agent, NullUi, make_session_backend};
+use crate::config::paths::Layout;
 use crate::config::types::{Approval, Config};
 use crate::learn::improve::apply_pinned_model;
-use crate::storage::paths::Layout;
 use crate::storage::session::Session;
 use crate::storage::store::Store;
 

@@ -7,53 +7,42 @@
 //! reloads the effective config, and applies the result at a safe boundary. External edits retain
 //! last-good layers on failure; changes found during a turn are staged. Adoption rebuilds the
 //! immutable agent configuration around the same session, task list, permissions and cost.
+use crate::platform;
+
 #[path = "commands/mod.rs"]
 mod commands;
 
+use crate::agent::todo::TodoList;
+use crate::agent::{self, Agent, Decision, Ui, context, make_backend};
+use crate::config::paths::Layout;
 use crate::config::selection::{changes as selection_changes, protocol as selection_protocol};
-use crate::{
-    agent::{self, Agent, Decision, Ui, context, make_backend, todo::TodoList},
-    config::session_models::SessionModels,
-    config::types::{Approval, Config, Outcome},
-    learn::auto,
-    llm::{
-        catalog,
-        model_config::{ModelSelection, ProviderSpec, ROLES, UiConfig},
-        usage,
-    },
-    repl::{self, OutputFormat, PrintExit, PrintUi},
-    storage::{
-        paths::Layout,
-        session::{Session, SessionMeta},
-        settings_store::{self, Change, Scope},
-        skills,
-        store::Store,
-    },
-    tools::ToolOutput,
-    ui::{
-        Rows,
-        composer::{CommandEntry, CommandKind, Composer, ComposerCtx, ComposerEvent},
-        keys::{Action, Keymap},
-        markdown::truncate_spans,
-        overlay::{
-            DrawCtx, OverlayEvent,
-            compute::ComputeOverlay,
-            models::ModelOverlay,
-            palette::{ChoiceItem, ChoiceSpec, PaletteEntry, PaletteOverlay},
-            providers::ProviderOverlay,
-            settings::SettingsOverlay,
-            shortcuts::ShortcutOverlay,
-        },
-        settings_schema,
-        status::{Lora, Phase, StatusData},
-        statusline, tasks,
-        term::{InlineTerminal, OverlayTerminal, Viewport},
-        text,
-        theme::{Sym, ThemeManager, Tok},
-        transcript::{Transcript, TranscriptCtx, TurnStats},
-        welcome::{self, WelcomeInfo},
-    },
-};
+use crate::config::session_models::SessionModels;
+use crate::config::settings_store::{self, Change, Scope};
+use crate::config::types::{Approval, Config, Outcome};
+use crate::learn::auto;
+use crate::llm::model_config::{ModelSelection, ProviderSpec, ROLES, UiConfig};
+use crate::llm::{catalog, usage};
+use crate::repl::{OutputFormat, PrintExit, PrintUi};
+use crate::storage::session::{Session, SessionMeta};
+use crate::storage::skills;
+use crate::storage::store::Store;
+use crate::tools::ToolOutput;
+use crate::ui::composer::{CommandEntry, CommandKind, Composer, ComposerCtx, ComposerEvent};
+use crate::ui::keys::{Action, Keymap};
+use crate::ui::markdown::truncate_spans;
+use crate::ui::overlay::compute::ComputeOverlay;
+use crate::ui::overlay::models::ModelOverlay;
+use crate::ui::overlay::palette::{ChoiceItem, ChoiceSpec, PaletteEntry, PaletteOverlay};
+use crate::ui::overlay::providers::ProviderOverlay;
+use crate::ui::overlay::settings::SettingsOverlay;
+use crate::ui::overlay::shortcuts::ShortcutOverlay;
+use crate::ui::overlay::{DrawCtx, OverlayEvent};
+use crate::ui::status::{Lora, Phase, StatusData};
+use crate::ui::term::{InlineTerminal, OverlayTerminal, Viewport};
+use crate::ui::theme::{Sym, ThemeManager, Tok};
+use crate::ui::transcript::{Transcript, TranscriptCtx, TurnStats};
+use crate::ui::welcome::{self, WelcomeInfo};
+use crate::ui::{Rows, statusline, tasks, text};
 use anyhow::{Context, Result, ensure};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read};
 use ratatui::text::{Line, Span};
@@ -313,7 +302,7 @@ impl App {
             models: RefCell::new(models),
             store: None,
             store_error: None,
-            interrupt: repl::install_sigint(),
+            interrupt: platform::interrupt::install_sigint(),
             compute: RefCell::new(None),
             launch,
             add_dirs,
@@ -1741,7 +1730,7 @@ fn palette_entries(custom: &[context::CommandDef], skills: &[skills::Skill]) -> 
 /// `/memory` argument choices for the selected backend: each backend accepts different
 /// subcommands, and an unknown word is a search, so only real subcommands are offered.
 fn memory_argument_completions(config: &Config) -> Vec<String> {
-    use crate::storage::memory_backend::config::MemoryBackendId;
+    use crate::config::memory_backend::MemoryBackendId;
     let backend = if config.memory.enabled {
         config.memory.backend
     } else {
@@ -4805,7 +4794,7 @@ impl Shell {
         }
         self.loop_mode.turn_started(text);
         self.retry_noted = false;
-        repl::clear_interrupt();
+        platform::interrupt::clear_interrupt();
         app.interrupt.store(false, Ordering::SeqCst);
         self.stop_speech();
         self.live_tasks = Some(agent.live_task_control());
@@ -5648,7 +5637,7 @@ impl Shell {
                 overlay.set_setup_offers(setting_setup_offers(&app.layout.user_dir, &effective));
                 // The Embedding model row lists discovered embedding models and curated setups.
                 if effective.memory.backend
-                    == crate::storage::memory_backend::config::MemoryBackendId::Semantic
+                    == crate::config::memory_backend::MemoryBackendId::Semantic
                 {
                     self.catalog.start(app);
                 }
@@ -5660,22 +5649,18 @@ impl Shell {
                 let mut models =
                     ModelOverlay::new(discovery, effective.role_statuses(), self.scope)
                         .with_favorites(favorite_routes(&effective))
-                        .with_memory_required(
-                            crate::storage::memory_backend::config::requires_memory_role(
-                                &effective.memory,
-                            ),
-                        )
+                        .with_memory_required(crate::config::memory_backend::requires_memory_role(
+                            &effective.memory,
+                        ))
                         .with_main_lora(self.status.lora)
                         .with_learning(learning_models)
                         .with_downloads(
                             app.layout(),
-                            crate::cli::local_models::Settings::from_config(&effective),
+                            crate::stats::local_models::Settings::from_config(&effective),
                             effective.python.clone(),
                         );
                 models.set_memory_optional(
-                    crate::storage::memory_backend::config::auto_retain_uses_memory_role(
-                        &effective.memory,
-                    ),
+                    crate::config::memory_backend::auto_retain_uses_memory_role(&effective.memory),
                 );
                 if matches!(which, Which::ModelRoles) {
                     models.show_roles();
@@ -7006,7 +6991,7 @@ impl Shell {
             },
             "queue" => self.queue_command(line),
             "review" => {
-                repl::clear_interrupt();
+                platform::interrupt::clear_interrupt();
                 self.live_tasks = Some(agent.live_task_control());
                 self.background_control = agent.background_control();
                 self.composer.set_busy(true);
@@ -7529,7 +7514,7 @@ impl Shell {
                 Err(error) => self.note("Session", format!("error: {error:#}")),
             },
             "compact" => {
-                let mut options = match crate::agent::compaction::CompactionOptions::from_args(args) {
+                let mut options = match crate::config::compaction::CompactionOptions::from_args(args) {
                     Ok(options) => options,
                     Err(error) => { self.note("Context", format!("{error:#}")); return Ok(Step::Done); }
                 };
@@ -9026,7 +9011,7 @@ impl OverlayEnv<'_> {
     /// single-key switch offer for when this panel closes (decision: never switch silently).
     /// Returns the line that tells the user so.
     fn queue_semantic_offer(&mut self) -> Option<String> {
-        use crate::storage::memory_backend::config::MemoryBackendId;
+        use crate::config::memory_backend::MemoryBackendId;
         let config = self.latest.clone().or_else(|| self.app.reload().ok())?;
         if config.memory.enabled && config.memory.backend == MemoryBackendId::Semantic {
             return None;
@@ -9068,7 +9053,7 @@ impl OverlayEnv<'_> {
 
     fn effective_value(config: &Config, path: &str) -> toml::Value {
         let table = toml::Table::try_from(config).unwrap_or_default();
-        settings_schema::get(&table, path)
+        crate::config::schema::get(&table, path)
             .cloned()
             .unwrap_or_else(|| toml::Value::String(String::new()))
     }
@@ -9623,13 +9608,11 @@ impl OverlayEnv<'_> {
     fn refresh_roles(&mut self, overlay: &mut ActiveOverlay) {
         if let (ActiveOverlay::Models(models), Some(config)) = (overlay, &self.latest) {
             models.set_roles(config.role_statuses());
-            models.set_memory_required(
-                crate::storage::memory_backend::config::requires_memory_role(&config.memory),
-            );
+            models.set_memory_required(crate::config::memory_backend::requires_memory_role(
+                &config.memory,
+            ));
             models.set_memory_optional(
-                crate::storage::memory_backend::config::auto_retain_uses_memory_role(
-                    &config.memory,
-                ),
+                crate::config::memory_backend::auto_retain_uses_memory_role(&config.memory),
             );
             models.set_favorites(favorite_routes(config));
         }

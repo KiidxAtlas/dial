@@ -1,5 +1,5 @@
 use super::*;
-use crate::tools::ssh::{HostKeyChecking, SshConfig};
+use crate::config::tools::ssh::{HostKeyChecking, SshConfig};
 
 fn settings(user_dir: &str) -> Settings {
     Settings {

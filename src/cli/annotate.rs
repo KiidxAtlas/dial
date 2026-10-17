@@ -1,8 +1,8 @@
 //! Explicit human feedback bound to immutable artifact content and source lines.
-use crate::{
-    storage::{paths::Layout, settings_store},
-    tools::{artifact::ArtifactStore, resources},
-};
+use crate::config::paths::Layout;
+use crate::config::settings_store;
+use crate::tools::artifact::ArtifactStore;
+use crate::tools::resources;
 use anyhow::{Result, ensure};
 use clap::Args;
 use sha2::{Digest, Sha256};

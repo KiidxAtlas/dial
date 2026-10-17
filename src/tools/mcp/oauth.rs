@@ -4,10 +4,10 @@
 //! and resource indicators (RFC 8707). Grants are stored per server in the private user
 //! directory and refreshed with their refresh token. [`login`] is the `/mcp login <server>` entry.
 
+use crate::config::settings_store::{locked, read_private, write_private};
 use crate::config::types::McpServerConfig;
 use crate::llm::oauth::util::{self, Body, Callback, Response};
 use crate::llm::oauth::{Interaction, Login};
-use crate::storage::settings_store::{locked, read_private, write_private};
 use anyhow::{Context, Result, bail, ensure};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};

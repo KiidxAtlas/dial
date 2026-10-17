@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow, bail};
 use clap::Args;
 
 use crate::cli::session_import::{self, Source};
-use crate::storage::paths::Layout;
+use crate::config::paths::Layout;
 use crate::storage::session::Session;
 
 #[derive(Debug, Clone, Default, Args)]

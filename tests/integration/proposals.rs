@@ -1,7 +1,7 @@
 use dial::{
+    config::paths::Layout,
     config::types::{Config, GateConfig, Harness, Proposal, SuiteConfig, ToolConfig, Version},
     learn::improve::validate_proposal,
-    storage::paths::Layout,
 };
 
 struct Fixture {

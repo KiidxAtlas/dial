@@ -1,5 +1,7 @@
 //! Runtime lifecycle plugins. Trusted stdio executables receive JSON-RPC requests and may rewrite
 //! event payloads. They do not gain direct access to agent execution or approvals.
+use crate::config::hooks::canonical_event;
+
 pub mod installer;
 pub mod marketplace;
 use serde_json::{Value, json};
@@ -354,15 +356,3 @@ impl Plugin for ProcessPlugin {
 
 #[cfg(test)]
 mod ownership_tests;
-
-pub fn canonical_event(event: &str) -> &str {
-    match event {
-        "input" | "user_prompt_submit" => "user_prompt_submit",
-        "tool_call" | "pre_tool_use" => "pre_tool_use",
-        "tool_result" | "post_tool_use" => "post_tool_use",
-        "session_shutdown" | "session_end" => "session_end",
-        "session_before_compact" | "before_compact" => "before_compact",
-        "session_stop" | "stop" => "stop",
-        other => other,
-    }
-}

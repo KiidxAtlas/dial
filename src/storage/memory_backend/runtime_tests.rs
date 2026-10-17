@@ -12,7 +12,7 @@ fn semantic_runtime(
         backend: MemoryBackendId::Semantic,
         ..MemoryConfig::default()
     };
-    config.semantic.embedding = config::EmbeddingMode::Off;
+    config.semantic.embedding = crate::config::memory_backend::EmbeddingMode::Off;
     let scope = bank_scope(&layout, &config);
     let authority = authority("session-a");
     let runtime = MemoryRuntime::with_scope(

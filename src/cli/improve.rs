@@ -1,12 +1,11 @@
 //! Operator controls for automatic self-improvement; normal use requires none of these commands.
 use anyhow::{Context, Result, ensure};
 use clap::Subcommand;
-use dial::{
-    agent::Runtime,
-    config::types::{Config, Outcome, Proposal},
-    learn::{auto, harvest, improve, probe},
-    storage::{paths::Layout, store::Store},
-};
+use dial::agent::Runtime;
+use dial::config::paths::Layout;
+use dial::config::types::{Config, Outcome, Proposal};
+use dial::learn::{auto, harvest, improve, probe};
+use dial::storage::store::Store;
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{fs, io::Write, path::PathBuf, thread, time::Duration};

@@ -1,3 +1,5 @@
+use crate::config::embeddings::CHOICES;
+
 use super::*;
 
 #[test]

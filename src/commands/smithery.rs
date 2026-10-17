@@ -4,8 +4,8 @@
 use super::extensions::{spawn_job, spawn_job_streaming};
 use crate::agent::{Agent, Ui};
 use crate::app::{App, Bridge, PAINT_EVERY, Shell, Step};
+use crate::config::settings_store::Scope;
 use crate::llm::oauth::util::open_browser;
-use crate::storage::settings_store::Scope;
 use crate::tools::mcp::smithery::{self, SearchResult};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};

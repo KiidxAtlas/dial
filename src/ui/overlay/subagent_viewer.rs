@@ -23,9 +23,9 @@ use super::{
     settings::{editor_spans, filled, hint, hint_line, is_ctrl, panel, pressed},
 };
 use crate::{
+    config::paths::Layout,
     llm::model_config::UiConfig,
     runtime::Tree,
-    storage::paths::Layout,
     ui::{
         Rows,
         chrome::Section,

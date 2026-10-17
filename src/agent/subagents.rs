@@ -16,15 +16,19 @@
 //! ordering: each works in its own directory and merges back under the workspace's serial lock with
 //! per-file conflict checks. Approval prompts from concurrent children are funnelled
 //! to the calling thread, the only one that owns the [`Ui`].
+use crate::config::subagents::AGENTS;
+use crate::config::subagents::AgentSpec;
+use crate::config::subagents::builtin;
+
 use super::{
     Ui,
     approval::{self, Denial, PermissionRule},
     child, make_backend, prompt,
 };
 use crate::{
+    config::paths::Layout,
     config::types::{Approval, Config, Harness},
     llm::{ToolCall, provider::Backend},
-    storage::paths::Layout,
     tools::{ToolOutput, Workspace, ext::Registry},
 };
 use serde_json::{Value, json};
@@ -50,72 +54,6 @@ const MAX_SKILLS: usize = 8;
 const MAX_NAME: usize = 40;
 /// Budget for all answers in one `task` result; the parent clips tool output beyond this anyway.
 const RESULT_BUDGET: usize = 14_000;
-
-pub struct AgentSpec {
-    pub name: &'static str,
-    pub description: &'static str,
-    /// Role-specific instructions appended to the common subagent preamble.
-    pub prompt: &'static str,
-    /// Built-in tools offered (when the harness enables them); extension tools are added by [`toolset`].
-    pub tools: &'static [&'static str],
-    /// Agent types this definition may recursively launch; an empty list disables spawning.
-    pub spawns: &'static [&'static str],
-    pub max_steps: u32,
-    /// May change files. Such agents run alone, and launching one needs approval.
-    pub mutates: bool,
-}
-
-pub const AGENTS: &[AgentSpec] = &[
-    AgentSpec {
-        name: "scout",
-        description: "read-only investigation: find and read code, run read-only commands, report facts",
-        prompt: "Investigate with your tools and finish with a concise, factual answer that cites file paths and line numbers. You cannot modify files.",
-        tools: &["read", "glob", "grep", "bash", "skill"],
-        spawns: &[],
-        max_steps: 0,
-        mutates: false,
-    },
-    AgentSpec {
-        name: "reviewer",
-        description: "read-only code review of a change or area, with findings ranked by severity",
-        prompt: "Review the requested change or code area. For change reviews, report concrete defects introduced by the supplied change; for area audits, report concrete existing defects within the requested scope. Do not invent a diff, issues or verification. Cite target-relative paths and inclusive line ranges, explain the trigger and consequence, rank findings by severity, and state findings, no findings, or inconclusive with any evidence gaps. If the caller supplies an output schema, follow that schema exactly; otherwise return a concise prose review. Read-only contextual inspection is permitted; no checks, commands, modifications, commits or pushes.",
-        tools: &["read", "glob", "grep", "skill"],
-        spawns: &[],
-        max_steps: 0,
-        mutates: false,
-    },
-    AgentSpec {
-        name: "planner",
-        description: "read-only: study the code and return an implementation plan (files, steps, risks, verification)",
-        prompt: "Produce an implementation plan for the task. Read the relevant code first, then answer with the goal, the files to change and what changes in each, ordered steps, risks, and how to verify the result. Do not write the implementation. You cannot modify files.",
-        tools: &["read", "glob", "grep", "skill"],
-        spawns: &[],
-        max_steps: 0,
-        mutates: false,
-    },
-    AgentSpec {
-        name: "worker",
-        description: "carries out a change: can write and edit files and run commands (each change asks for approval)",
-        prompt: "Implement the assigned slice end to end using existing project conventions. Reuse current evidence and batch coherent edits. Preserve other agents' work and approval boundaries. Run the assigned or relevant project checks once the slice is ready; report changed files, results and any unresolved prerequisites.",
-        tools: &["read", "glob", "grep", "bash", "edit", "write", "skill"],
-        spawns: &[],
-        max_steps: 0,
-        mutates: true,
-    },
-    AgentSpec {
-        name: "test-runner",
-        description: "make and run tests under the direction of the main agent",
-        prompt: "Your only purpose is to make and run tests under the direction of the main agent. Discover existing tests, write new tests when asked, run the test suite, and report pass/fail results with clear evidence. Use the project's test framework (cargo test for Rust, pytest for Python). Report failures with exact error messages and file:line references. Do not modify source code unless explicitly asked; your job is tests only.",
-        tools: &["read", "glob", "grep", "bash", "edit", "write", "skill"],
-        spawns: &[],
-        max_steps: 0,
-        mutates: true,
-    },
-];
-
-pub fn builtin(name: &str) -> Option<&'static AgentSpec> {
-    AGENTS.iter().find(|spec| spec.name == name)
-}
 
 /// Default specialist follows the base agent purpose, including custom definitions.
 /// Implementation workers use task; an assigned specialist wins over task in model_routes.
@@ -144,11 +82,6 @@ fn default_task_role(config: &Config, preferred: &'static str) -> &'static str {
         .find(|role| config.role_selection(role).is_some())
         // Retain the requested role in diagnostics when its final fallback is Main.
         .unwrap_or(preferred)
-}
-
-/// Whether `name` is an agent type and so unavailable as a `[subagents]` preset name.
-pub fn is_reserved(name: &str) -> bool {
-    builtin(name).is_some()
 }
 
 /// Whether a `task` call would launch an agent that can change files, so the call needs approval.
@@ -190,7 +123,9 @@ pub fn toolset(spec: &AgentSpec, enabled: &[String], ext: &Registry) -> Vec<Stri
             enabled.iter().any(|n| n == *name)
                 && (spec.mutates
                     || (approval::is_read_only(ext, name, &json!({}))
-                        && (*name == "find" || !crate::tools::INTEGRATION_TOOLS.contains(name))))
+                        && (*name == "find"
+                            || !crate::config::tools::integrations::INTEGRATION_TOOLS
+                                .contains(name))))
         })
         .map(str::to_owned);
     own.chain(extra)
@@ -523,7 +458,7 @@ fn model_routes(
             if let Some(selector) = selector {
                 let (model, thinking) = selector
                     .rsplit_once(':')
-                    .filter(|(_, level)| super::agent_defs::valid_thinking_level(level))
+                    .filter(|(_, level)| crate::config::agent_defs::valid_thinking_level(level))
                     .map_or((selector, None), |(model, level)| (model, Some(level)));
                 suffix_thinking = thinking;
                 if let Some(named) = model.strip_prefix('@') {
@@ -563,16 +498,16 @@ fn model_routes(
                         .cloned()
                         .ok_or("subagent ultra thinking requires a declared model profile")?;
                     profile.reasoning_effort = Some(crate::llm::profiles::ReasoningEffort::Ultra);
-                    selected = crate::cli::model_flags::install_thinking_profile(selected, profile)
+                    selected = crate::config::thinking::install_thinking_profile(selected, profile)
                         .map_err(|e| format!("subagent thinking: {e:#}"))?;
                 } else {
-                    let level = crate::cli::model_flags::parse_thinking(if level == "none" {
+                    let level = crate::config::thinking::parse_thinking(if level == "none" {
                         "off"
                     } else {
                         level
                     })
                     .map_err(|e| format!("subagent thinking: {e}"))?;
-                    selected = crate::cli::model_flags::apply_thinking(selected, level)
+                    selected = crate::config::thinking::apply_thinking(selected, level)
                         .map_err(|e| format!("subagent thinking: {e:#}"))?;
                 }
             }

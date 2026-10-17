@@ -1,3 +1,5 @@
+use crate::config;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -48,7 +50,7 @@ impl Default for Harness {
         Self {
             system_prompt: "Prioritize correctness and maintainability. Deliver the requested behavior, use evidence already available, and report only verification actually performed.".into(),
             memory: vec![],
-            tools: crate::tools::default_tools(),
+            tools: crate::config::tools::default_tools(),
             subagents: vec![],
             max_steps: 0,
             temperature: 0.2,
@@ -426,16 +428,16 @@ pub struct Config {
     pub codebase: CodebaseConfig,
     pub assistance: AssistanceConfig,
     pub efficiency: EfficiencyConfig,
-    pub steering: crate::steering::Config,
+    pub steering: config::steering::Config,
     pub local_runtime: crate::llm::local_runtime::LocalRuntime,
-    pub adaptive: crate::adaptive::Config,
-    pub reliability: crate::reliability::Config,
-    pub laya: crate::agent::laya::Config,
-    pub stats: crate::stats::StatsConfig,
-    pub telemetry: crate::telemetry::TelemetryConfig,
-    pub voice: crate::voice::VoiceConfig,
-    pub collab: crate::collab::Config,
-    pub share: crate::storage::share::Config,
+    pub adaptive: config::adaptive::Config,
+    pub reliability: config::reliability::Config,
+    pub laya: crate::config::laya::Config,
+    pub stats: config::stats::StatsConfig,
+    pub telemetry: config::telemetry::TelemetryConfig,
+    pub voice: config::voice::VoiceConfig,
+    pub collab: config::collab::Config,
+    pub share: crate::config::share::Config,
     /// Effective model budget, resolved after loading. Never persisted as an operator override.
     #[serde(skip)]
     pub context_window: u32,
@@ -454,13 +456,13 @@ pub struct Config {
     pub approval: Approval,
     pub sandbox: SandboxConfig,
     pub shell: ShellConfig,
-    pub edit: crate::tools::EditSettings,
+    pub edit: crate::config::tools::EditSettings,
     /// Process/CLI mode pin; never persisted as an operator configuration field.
     #[serde(skip)]
     pub edit_mode_override: Option<EditMode>,
-    pub compaction: crate::agent::compaction::CompactionConfig,
-    pub ask: crate::agent::questions::AskConfig,
-    pub checkpoint: crate::agent::exploration::CheckpointConfig,
+    pub compaction: crate::config::compaction::CompactionConfig,
+    pub ask: crate::config::ask::AskConfig,
+    pub checkpoint: crate::config::checkpoint::CheckpointConfig,
     pub tools: BTreeMap<String, ToolConfig>,
     pub subagents: BTreeMap<String, String>,
     /// Operator ceiling for running live subagents across `task start` batches (1..=32).
@@ -471,9 +473,9 @@ pub struct Config {
     pub integrations: Vec<String>,
     /// `[bash_interceptor]`: points bash commands that duplicate a dedicated tool at it. On by
     /// default in `hint` mode (the command runs and gains a one-line pointer); `block` refuses it.
-    pub bash_interceptor: crate::tools::bash_interceptor::BashInterceptorConfig,
+    pub bash_interceptor: crate::config::tools::bash_interceptor::BashInterceptorConfig,
     /// `[ssh]`: host key policy and connection timing for the ssh tool. Hosts come from `~/.ssh/config`.
-    pub ssh: crate::tools::ssh::SshConfig,
+    pub ssh: crate::config::tools::ssh::SshConfig,
     /// `[ssh_hosts.<name>]`: hosts added with `/ssh add`; `~/.ssh/config` hosts are merged with these.
     pub ssh_hosts: BTreeMap<String, SshHostConfig>,
     /// Provider request tier: `none` omits it; `priority` (`/fast`), `flex` (`/slow`), or a provider-accepted tier.
@@ -501,13 +503,13 @@ pub struct Config {
     pub mcp: BTreeMap<String, McpServerConfig>,
     /// MCP behavior shared by all servers. `discover` and `project_approval` are reserved: they load
     /// but nothing reads them yet.
-    pub mcp_settings: crate::tools::mcp::McpSettings,
+    pub mcp_settings: crate::config::tools::mcp::McpSettings,
     /// `[lsp]` write-through switches plus servers overriding or extending the built-in defaults.
-    pub lsp: crate::tools::lsp::LspConfig,
+    pub lsp: crate::config::tools::lsp::LspConfig,
     /// Debug Adapter Protocol adapters keyed by adapter id.
-    pub dap: BTreeMap<String, crate::tools::dap::DapAdapterConfig>,
+    pub dap: BTreeMap<String, crate::config::tools::dap::DapAdapterConfig>,
     /// Git hook/signing policy.
-    pub git: crate::tools::git::GitConfig,
+    pub git: crate::config::tools::git::GitConfig,
     /// `[worktree]`: what `/wt` does to the source checkout after moving the session into a worktree.
     pub worktree: WorktreeConfig,
     /// `[commit]`: persistent reply cache for `/commit` and `dial commit`.
@@ -515,12 +517,12 @@ pub struct Config {
     pub web: WebConfig,
     pub verification: VerificationConfig,
     /// Bounded isolated patch search. Requires explicit paths and executable checks.
-    pub solve: crate::agent::solve::SolveConfig,
+    pub solve: crate::config::solve::SolveConfig,
     /// Narrow stronger-model advice; remote providers require explicit operator opt-in.
-    pub escalation: crate::agent::solve::EscalationConfig,
-    pub browser: crate::tools::browser::BrowserConfig,
-    pub kernel: crate::tools::kernel::KernelConfig,
-    pub eval: crate::tools::eval::EvalConfig,
+    pub escalation: crate::config::solve::EscalationConfig,
+    pub browser: crate::config::tools::browser::BrowserConfig,
+    pub kernel: crate::config::tools::kernel::KernelConfig,
+    pub eval: crate::config::tools::eval::EvalConfig,
     pub memory: MemoryConfig,
     /// Operator-owned lifecycle hooks (`[[hooks]]`); see `agent::hooks`. Arrays from every config
     /// layer are appended, so a project layer can add hooks but never drop global ones.
@@ -531,9 +533,9 @@ pub struct Config {
     /// Named subagents (`[agents.<name>]`) built on a built-in type, with their own instructions,
     /// tool subset, step budget, spawn policy and model. Markdown definitions: `agent::agent_defs`.
     pub agents: BTreeMap<String, AgentConfig>,
-    pub task: crate::agent::agent_defs::TaskConfig,
+    pub task: crate::config::task::TaskConfig,
     /// Private view for `task` workers: backend choice (`[isolation] backend`).
-    pub isolation: crate::agent::isolation::backend::IsolationConfig,
+    pub isolation: crate::config::isolation::IsolationConfig,
     /// Opt-in behaviors that are still under evaluation.
     pub experimental: ExperimentalConfig,
 }
@@ -640,7 +642,7 @@ impl Default for BudgetConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
-    /// Lifecycle event; see `agent::hooks::EVENTS` (alias names such as `tool_call` are accepted).
+    /// Lifecycle event; see `config::hooks::EVENTS` (alias names such as `tool_call` are accepted).
     pub event: String,
     /// Anchored regex on the tool name (tool events only); omitted matches every tool.
     #[serde(default)]
@@ -1272,7 +1274,7 @@ pub struct MemoryConfig {
     /// Legacy migration input; backend is the sole runtime selector.
     #[serde(skip_serializing)]
     pub enabled: bool,
-    pub backend: crate::storage::memory_backend::config::MemoryBackendId,
+    pub backend: crate::config::memory_backend::MemoryBackendId,
     #[serde(skip)]
     pub backend_explicit: bool,
     pub context_limit: usize,
@@ -1281,10 +1283,10 @@ pub struct MemoryConfig {
     pub autolearn: bool,
     pub autolearn_auto_continue: bool,
     pub autolearn_min_tool_calls: usize,
-    pub local: crate::storage::memory_backend::config::LocalConfig,
-    pub hindsight: crate::storage::memory_backend::config::HindsightConfig,
-    pub sharpshooter: crate::storage::memory_backend::config::SharpshooterConfig,
-    pub semantic: crate::storage::memory_backend::config::SemanticConfig,
+    pub local: crate::config::memory_backend::LocalConfig,
+    pub hindsight: crate::config::memory_backend::HindsightConfig,
+    pub sharpshooter: crate::config::memory_backend::SharpshooterConfig,
+    pub semantic: crate::config::memory_backend::SemanticConfig,
 }
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -1311,17 +1313,17 @@ impl<'de> Deserialize<'de> for MemoryConfig {
         #[serde(default, deny_unknown_fields)]
         struct Wire {
             enabled: bool,
-            backend: Option<crate::storage::memory_backend::config::MemoryBackendId>,
+            backend: Option<crate::config::memory_backend::MemoryBackendId>,
             context_limit: usize,
             context_max_bytes: usize,
             request_max_bytes: usize,
             autolearn: bool,
             autolearn_auto_continue: bool,
             autolearn_min_tool_calls: usize,
-            local: crate::storage::memory_backend::config::LocalConfig,
-            hindsight: crate::storage::memory_backend::config::HindsightConfig,
-            sharpshooter: crate::storage::memory_backend::config::SharpshooterConfig,
-            semantic: crate::storage::memory_backend::config::SemanticConfig,
+            local: crate::config::memory_backend::LocalConfig,
+            hindsight: crate::config::memory_backend::HindsightConfig,
+            sharpshooter: crate::config::memory_backend::SharpshooterConfig,
+            semantic: crate::config::memory_backend::SemanticConfig,
         }
         impl Default for Wire {
             fn default() -> Self {
@@ -1346,9 +1348,9 @@ impl<'de> Deserialize<'de> for MemoryConfig {
             enabled: value.enabled,
             backend_explicit: value.backend.is_some(),
             backend: value.backend.unwrap_or(if value.enabled {
-                crate::storage::memory_backend::config::MemoryBackendId::Provenance
+                crate::config::memory_backend::MemoryBackendId::Provenance
             } else {
-                crate::storage::memory_backend::config::MemoryBackendId::Off
+                crate::config::memory_backend::MemoryBackendId::Off
             }),
             context_limit: value.context_limit,
             context_max_bytes: value.context_max_bytes,
@@ -1400,17 +1402,17 @@ impl Default for Config {
             codebase: CodebaseConfig::default(),
             assistance: AssistanceConfig::default(),
             efficiency: EfficiencyConfig::default(),
-            steering: crate::steering::Config::default(),
+            steering: config::steering::Config::default(),
             local_runtime: Default::default(),
-            adaptive: crate::adaptive::Config::default(),
-            reliability: crate::reliability::Config::default(),
+            adaptive: config::adaptive::Config::default(),
+            reliability: config::reliability::Config::default(),
             isolation: Default::default(),
             laya: Default::default(),
-            stats: crate::stats::StatsConfig::default(),
-            telemetry: crate::telemetry::TelemetryConfig::default(),
-            voice: crate::voice::VoiceConfig::default(),
-            collab: crate::collab::Config::default(),
-            share: crate::storage::share::Config::default(),
+            stats: config::stats::StatsConfig::default(),
+            telemetry: config::telemetry::TelemetryConfig::default(),
+            voice: config::voice::VoiceConfig::default(),
+            collab: config::collab::Config::default(),
+            share: crate::config::share::Config::default(),
             harness: Harness::default(),
             skills: SkillsConfig::default(),
             codex_websocket: true,
@@ -1420,15 +1422,15 @@ impl Default for Config {
             approval: Approval::default(),
             sandbox: SandboxConfig::default(),
             shell: ShellConfig::default(),
-            edit: crate::tools::EditSettings::default(),
+            edit: crate::config::tools::EditSettings::default(),
             edit_mode_override: None,
-            compaction: crate::agent::compaction::CompactionConfig::default(),
-            ask: crate::agent::questions::AskConfig::default(),
-            checkpoint: crate::agent::exploration::CheckpointConfig::default(),
+            compaction: crate::config::compaction::CompactionConfig::default(),
+            ask: crate::config::ask::AskConfig::default(),
+            checkpoint: crate::config::checkpoint::CheckpointConfig::default(),
             tools: BTreeMap::new(),
             subagents: BTreeMap::new(),
             subagent_max_live_jobs: 32,
-            integrations: crate::tools::catalog::default_integrations(),
+            integrations: crate::config::tools::integrations::default_integrations(),
             bash_interceptor: Default::default(),
             ssh: Default::default(),
             ssh_hosts: BTreeMap::new(),
@@ -1442,7 +1444,7 @@ impl Default for Config {
             model_presets: BTreeMap::new(),
             foreign_sources: Vec::new(),
             mcp: BTreeMap::new(),
-            lsp: crate::tools::lsp::LspConfig::default(),
+            lsp: crate::config::tools::lsp::LspConfig::default(),
             dap: BTreeMap::new(),
             git: Default::default(),
             worktree: Default::default(),

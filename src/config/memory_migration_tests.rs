@@ -127,10 +127,10 @@ fn zero_step_limit_saves_and_reloads_as_unlimited() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
-    let saved = crate::storage::settings_store::save_config(
+    let saved = crate::config::settings_store::save_config(
         &layout,
-        crate::storage::settings_store::Scope::Global,
-        &[crate::storage::settings_store::Change::Set {
+        crate::config::settings_store::Scope::Global,
+        &[crate::config::settings_store::Change::Set {
             path: "harness.max_steps".into(),
             value: 0.into(),
         }],

@@ -47,7 +47,7 @@ pub(crate) fn detect(
     match setting.trim() {
         "off" | "none" | "" => Ok(None),
         "auto" => {
-            if python != super::DEFAULT_PYTHON {
+            if python != crate::config::tools::kernel::DEFAULT_PYTHON {
                 return Ok(None);
             }
             let mut candidates = Vec::new();

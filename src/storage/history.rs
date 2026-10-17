@@ -2,8 +2,10 @@
 //! tagged with the git branch and the turn's prompt label, searchable across sessions. Built from
 //! checkpoint before/after content with no model calls. Stored text is untrusted project data,
 //! never instructions, and may no longer match the files on disk.
-use super::{checkpoint::TurnVersion, paths::Layout, redact::redact_text};
+use crate::config::paths::Layout;
 use crate::platform::fs as platform_fs;
+use crate::storage::checkpoint::TurnVersion;
+use crate::storage::redact::redact_text;
 use crate::tools::{
     ToolOutput,
     ext::{Tool, ToolContext},

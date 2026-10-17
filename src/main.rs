@@ -7,13 +7,12 @@ mod update;
 
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
-use dial::{
-    app::{self, Options},
-    config::types::Config,
-    repl::{OutputFormat, PrintExit, PrintUi},
-    setup,
-    storage::{paths::Layout, session::Session},
-};
+use dial::app::{self, Options};
+use dial::config::paths::Layout;
+use dial::config::types::Config;
+use dial::repl::{OutputFormat, PrintExit, PrintUi};
+use dial::setup;
+use dial::storage::session::Session;
 use std::{
     io::{IsTerminal, Read},
     path::PathBuf,
@@ -905,14 +904,14 @@ fn real_main(mut cli: Cli) -> Result<()> {
                 LayaCommand::Install { checkpoint } => {
                     eprintln!("Installing Dial-owned Laya runtime and checkpoint…");
                     if let Some(model) = laya::install(&layout, checkpoint.as_deref())? {
-                        use dial::storage::settings_store::{self, Change, Scope};
+                        use dial::config::settings_store::{self, Change, Scope};
                         settings_store::save(
                             &layout,
                             Scope::Global,
                             &[
                                 Change::Set {
                                     path: "model_roles.decision.provider".into(),
-                                    value: laya::PROVIDER.into(),
+                                    value: dial::config::laya::PROVIDER.into(),
                                 },
                                 Change::Set {
                                     path: "model_roles.decision.model".into(),
@@ -983,14 +982,20 @@ fn real_main(mut cli: Cli) -> Result<()> {
                 },
                 ScheduleCommand::Run { once } => {
                     let config = Config::load(&layout, Some(overlay(&cli)?))?;
-                    let stop = dial::repl::install_sigint();
+                    let stop = dial::platform::interrupt::install_sigint();
                     schedule::run(&layout, *once, config.worker_timeout_secs, &stop)?;
                 }
             }
             return Ok(());
         }
         Some(Command::Update { version }) => return update::run(version.as_deref()),
-        Some(Command::Setup) => return setup::run(&layout, cli.model.as_deref()),
+        Some(Command::Setup) => {
+            return setup::run(
+                &layout,
+                cli.model.as_deref(),
+                dial::learn::worker::capabilities,
+            );
+        }
         Some(Command::Doctor { fix, yes }) => {
             let env = dial::setup::deps::Env::current(&layout.user_dir);
             match fix {

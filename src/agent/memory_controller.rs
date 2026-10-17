@@ -201,7 +201,7 @@ impl MemoryModelRunner for Runner<'_, '_> {
         let tokens = compaction::request_tokens_with_policy(
             &chat,
             &config.compaction,
-            compaction::CompactionIdentity {
+            crate::config::compaction::CompactionIdentity {
                 provider: &selection.provider,
                 model: &selection.model,
                 agent: Some(role),
@@ -266,7 +266,7 @@ impl MemoryModelRunner for Runner<'_, '_> {
         let tokens = compaction::request_tokens_with_policy(
             &chat,
             &config.compaction,
-            compaction::CompactionIdentity {
+            crate::config::compaction::CompactionIdentity {
                 provider: &selection.provider,
                 model: &selection.model,
                 agent: Some(&request.role),
@@ -709,7 +709,7 @@ impl Agent<'_> {
             )?);
         }
         let Some(memory) = self.memory_runtime.clone() else {
-            use crate::storage::memory_backend::config::MemoryBackendId;
+            use crate::config::memory_backend::MemoryBackendId;
             let off =
                 !self.config.memory.enabled || self.config.memory.backend == MemoryBackendId::Off;
             anyhow::ensure!(off, "selected memory backend is not active");

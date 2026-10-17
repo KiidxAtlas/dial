@@ -1,4 +1,5 @@
 //! Tool call authorization and dispatch, code callbacks, custom tools and parallel tool groups.
+use crate::config;
 
 use super::*;
 
@@ -278,7 +279,7 @@ impl<'a> Agent<'a> {
     ) -> std::result::Result<(), approval::Denial> {
         let local_memory_write = call.name == "learn"
             && self.memory_runtime.as_ref().is_some_and(|memory| {
-                memory.id() == crate::storage::memory_backend::config::MemoryBackendId::Local
+                memory.id() == crate::config::memory_backend::MemoryBackendId::Local
             });
         let result = if approval::denied_by_rule(&self.always, call, self.workspace.root()) {
             Err(approval::Denial::Rule)
@@ -679,7 +680,7 @@ impl<'a> Agent<'a> {
                 Err(error) => ToolOutput::err(format!("{error:#}")),
             };
         }
-        if tools::BUILTIN.contains(&name) {
+        if config::tools::BUILTIN.contains(&name) {
             let workspace = &self.workspace;
             let out = blocking_with_heartbeat(ui, || tools::execute(workspace, name, args, 120))
                 .unwrap_or_else(|error| ToolOutput::err(format!("{error:#}")));

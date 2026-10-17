@@ -1,11 +1,10 @@
 //! Automatic background scheduling. Training and admission run outside the foreground session.
 use super::improve;
+use crate::agent::Runtime;
+use crate::config::paths::Layout;
+use crate::config::types::Config;
+use crate::storage::store::Store;
 use crate::tools::background::procinfo::ProcId;
-use crate::{
-    agent::Runtime,
-    config::types::Config,
-    storage::{paths::Layout, store::Store},
-};
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,8 @@
+use crate::config::voice::SttBackendChoice;
+use crate::config::voice::SubmitTrigger;
+use crate::config::voice::TtsBackendChoice;
+use crate::config::voice::VoiceConfig;
+
 use super::*;
 
 #[test]

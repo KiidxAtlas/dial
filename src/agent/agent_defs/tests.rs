@@ -1,3 +1,5 @@
+use crate::config::task::TaskConfig;
+
 use super::*;
 
 #[test]

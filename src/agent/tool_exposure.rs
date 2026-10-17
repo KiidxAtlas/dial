@@ -1,4 +1,5 @@
 //! Tool exposure: offered tools, discovery, schemas and request records.
+use crate::config;
 
 use super::*;
 use crate::config::types::{LEAN_AUTO_MAX_WINDOW, LeanLocal};
@@ -295,7 +296,7 @@ impl<'a> Agent<'a> {
             .chain(discovered.iter())
             .cloned()
             .collect();
-        let pinned = self.config.harness.tools != tools::default_tools();
+        let pinned = self.config.harness.tools != config::tools::default_tools();
         let mut names: Vec<String> = self
             .version
             .harness
@@ -495,7 +496,7 @@ impl<'a> Agent<'a> {
                 "session_search" if self.experimental_context_owner() || self.exploration_owner() => session::session_search_tool::schema_owned(),
                 n if crate::storage::memory_backend::schema(&self.config.memory, n).is_some() =>
                     crate::storage::memory_backend::schema(&self.config.memory, n).expect("selected memory tool has a schema"),
-                n if tools::BUILTIN.contains(&n) => tools::schemas(&[n], mode)?.remove(0),
+                n if config::tools::BUILTIN.contains(&n) => tools::schemas(&[n], mode)?.remove(0),
                 n if self.ext.contains(n) => self.ext.get(n).map(|tool| tool.schema()).context("extension tool vanished")?,
                 "experience" => assistance::schema(),
                 "edit_preview" => crate::tools::preview::schema(),
@@ -561,7 +562,7 @@ impl<'a> Agent<'a> {
                             json!({"type":"boolean","enum":[true],"default":true})
                     }
                     "task" => {
-                        let agents: Vec<&str> = subagents::AGENTS
+                        let agents: Vec<&str> = crate::config::subagents::AGENTS
                             .iter()
                             .filter(|a| !a.mutates)
                             .map(|a| a.name)

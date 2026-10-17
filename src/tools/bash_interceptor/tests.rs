@@ -1,3 +1,9 @@
+use crate::config::tools::bash_interceptor::BashInterceptorConfig;
+use crate::config::tools::bash_interceptor::InterceptMode;
+use crate::config::tools::bash_interceptor::Rule;
+use crate::config::tools::bash_interceptor::default_rules;
+use crate::config::tools::bash_interceptor::rule;
+
 use super::*;
 
 const TOOLS: &[&str] = &["read", "grep", "glob", "edit", "write", "bash", "bg"];

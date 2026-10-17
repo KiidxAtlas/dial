@@ -58,7 +58,7 @@ pub fn read(root: &Path, id: &str, start: usize, count: usize) -> Result<Page> {
     let mut bytes_seen = 0;
     let mut next = (start - 1).min(paths.len());
     for path in paths.iter().skip(next).take(count) {
-        if let Some(bytes) = super::settings_store::read_private(path)? {
+        if let Some(bytes) = crate::config::settings_store::read_private(path)? {
             ensure!(bytes.len() <= 20 * 1024, "annotation exceeds record limit");
             if bytes_seen + bytes.len() > 64 * 1024 {
                 break;

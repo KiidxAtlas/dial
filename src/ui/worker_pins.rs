@@ -15,7 +15,7 @@ use super::{
     theme::{Sym, Theme, Tok},
 };
 use crate::{
-    agent::LiveTaskControl, llm::model_config::PinnedWorkers, runtime::Tree, storage::paths::Layout,
+    agent::LiveTaskControl, config::paths::Layout, llm::model_config::PinnedWorkers, runtime::Tree,
 };
 use ratatui::text::{Line, Span};
 

@@ -1,3 +1,5 @@
+use crate::config::telemetry::TelemetryConfig;
+
 use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
 

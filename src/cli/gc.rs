@@ -19,11 +19,9 @@ use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::storage::{
-    paths::Layout,
-    retention::{self, ArchiveRecord, Candidate, RetentionPolicy, Store, Verdict},
-    settings_store,
-};
+use crate::config::paths::Layout;
+use crate::config::settings_store;
+use crate::storage::retention::{self, ArchiveRecord, Candidate, RetentionPolicy, Store, Verdict};
 
 pub const DEFAULT_COLD_ARCHIVE_AFTER_DAYS: u64 = 30;
 pub const DEFAULT_RETAIN_NEWEST_GLOBAL: usize = 20;

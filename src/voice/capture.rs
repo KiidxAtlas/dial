@@ -4,11 +4,9 @@
 //! platform can also read an installed recorder program that writes raw signed 16-bit
 //! little-endian 16 kHz mono PCM to stdout; the first installed one is used.
 
-use super::{
-    CaptureChoice, SttConfig,
-    process::{self, CommandSpec},
-    wav,
-};
+use crate::config::voice::{CaptureChoice, SttConfig};
+use crate::voice::process::{self, CommandSpec};
+use crate::voice::wav;
 use anyhow::{Result, bail};
 use std::{
     io::Read,

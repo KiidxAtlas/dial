@@ -8,8 +8,8 @@ use dial::{
         MachineConfigurationReport, MachineIdentity, RunMetrics, clone_project, compare_baseline,
         named_invalid_runs, rank_machine_configurations, score_report,
     },
+    config::paths::Layout,
     config::types::{Approval, Config, EditMode, LEAN_AUTO_MAX_WINDOW, LeanLocal, SandboxMode},
-    storage::paths::Layout,
     tools::{self, ToolOutput, Workspace},
 };
 use serde::Deserialize;

@@ -27,7 +27,8 @@ mod overlay;
 mod projfs;
 mod worktree;
 
-use backend::{Backend, Preference};
+use crate::config::isolation::Preference;
+use backend::Backend;
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 
@@ -84,7 +85,7 @@ pub struct Isolated {
     root: PathBuf,
     label: String,
     before: Snapshot,
-    limits: super::agent_defs::TaskConfig,
+    limits: crate::config::task::TaskConfig,
     workspace: Workspace,
 }
 
@@ -178,7 +179,7 @@ impl Merge {
 fn snapshot(
     root: &Path,
     baseline: Option<&Snapshot>,
-    limits: &super::agent_defs::TaskConfig,
+    limits: &crate::config::task::TaskConfig,
 ) -> Result<Snapshot> {
     fn walk(
         root: &Path,
@@ -186,7 +187,7 @@ fn snapshot(
         out: &mut Snapshot,
         baseline: Option<&Snapshot>,
         remaining: &mut usize,
-        limits: &super::agent_defs::TaskConfig,
+        limits: &crate::config::task::TaskConfig,
     ) -> Result<()> {
         for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
             let path = entry?.path();
@@ -368,7 +369,7 @@ impl Isolated {
     pub fn create(project: &Workspace) -> Result<Self> {
         Self::with_config(
             project,
-            &super::agent_defs::TaskConfig::default(),
+            &crate::config::task::TaskConfig::default(),
             Preference::Auto,
         )
     }
@@ -376,7 +377,7 @@ impl Isolated {
     /// Build the private copy with the backend `preference` selects for this platform.
     pub fn with_config(
         project: &Workspace,
-        config: &super::agent_defs::TaskConfig,
+        config: &crate::config::task::TaskConfig,
         preference: Preference,
     ) -> Result<Self> {
         // Bound source scanning before copying any tree; a failure here leaves nothing copied.

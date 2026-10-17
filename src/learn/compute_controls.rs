@@ -1,8 +1,9 @@
 //! Inventory and operator controls for shared compute across all Dial projects.
-use crate::{
-    config::types::Config,
-    storage::{paths::Layout, process_record, settings_store, store::Store},
-};
+use crate::config::paths::Layout;
+use crate::config::settings_store;
+use crate::config::types::Config;
+use crate::storage::process_record;
+use crate::storage::store::Store;
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use serde_json::{Value, json};

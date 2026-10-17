@@ -303,10 +303,10 @@ impl Journal {
                 )?;
                 bytes.push(b'\n');
             }
-            if bytes.len() > crate::storage::atomic::PRIVATE_LIMIT {
+            if bytes.len() > crate::platform::atomic::PRIVATE_LIMIT {
                 return Ok(false);
             }
-            crate::storage::settings_store::write_private(&writer.path, &bytes)?;
+            crate::config::settings_store::write_private(&writer.path, &bytes)?;
             let file = crate::platform::fs::open_owner_only(
                 std::fs::OpenOptions::new().append(true),
                 &writer.path,

@@ -372,7 +372,7 @@ impl Agent<'_> {
                 self.auth_config.extended_context,
             )?);
             let compaction_selection = self.auth_config.selection();
-            let compaction_identity = compaction::CompactionIdentity {
+            let compaction_identity = crate::config::compaction::CompactionIdentity {
                 provider: &compaction_selection.provider,
                 model: &compaction_selection.model,
                 agent: None,
@@ -403,7 +403,7 @@ impl Agent<'_> {
                     &self.session,
                     current,
                     threshold,
-                    compaction_runtime::speculation_lead(threshold),
+                    crate::config::compaction::speculation_lead(threshold),
                     &mut self.context_notes_reminder_boundary,
                 ) {
                     // Price only the appended message; re-serializing the whole history again
@@ -418,9 +418,9 @@ impl Agent<'_> {
                 .predict(request_estimate)
                 .max(request_estimate);
             let reason = if step == 0 {
-                compaction::CompactionReason::Threshold
+                crate::config::compaction::CompactionReason::Threshold
             } else {
-                compaction::CompactionReason::MidTurn
+                crate::config::compaction::CompactionReason::MidTurn
             };
             self.poll_background_compaction(ui);
             let mut deferred_compaction = false;
@@ -493,7 +493,7 @@ impl Agent<'_> {
                     step != 0,
                 )?
             {
-                let options = compaction::CompactionOptions {
+                let options = crate::config::compaction::CompactionOptions {
                     reason,
                     ..Default::default()
                 };
@@ -514,7 +514,7 @@ impl Agent<'_> {
                     Err(error) => {
                         compaction_failed = true;
                         compaction_retry_floor = Some(request_context.saturating_add(
-                            compaction_runtime::SPECULATION_LEAD_MIN_TOKENS,
+                            crate::config::compaction::SPECULATION_LEAD_MIN_TOKENS,
                         ));
                         ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, format!(
                             "context compaction could not make enough room ({error:#})"
@@ -938,7 +938,7 @@ impl Agent<'_> {
                         && overflow_retries < 3
                         && self.config.compaction.enabled
                         && self.config.compaction.strategy
-                            != compaction::CompactionStrategy::Off =>
+                            != crate::config::compaction::CompactionStrategy::Off =>
                 {
                     self.request_phase
                         .recover("context overflow; bounded compaction retry");
@@ -961,14 +961,14 @@ impl Agent<'_> {
                         max_tokens: requested_tokens,
                         seed: None,
                     };
-                    let options = compaction::CompactionOptions {
-                        reason: compaction::CompactionReason::Overflow,
+                    let options = crate::config::compaction::CompactionOptions {
+                        reason: crate::config::compaction::CompactionReason::Overflow,
                         ..Default::default()
                     };
                     self.poll_background_compaction(ui);
                     let outcome = match self.claim_background_compaction(
                         ui,
-                        compaction::CompactionReason::Overflow,
+                        crate::config::compaction::CompactionReason::Overflow,
                         Some(&overflow_request),
                         Some(backend),
                     ) {
@@ -2346,7 +2346,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             let tool_round_failed = !form_kinds.is_empty()
                 || execution_failed
                 || observed_check_failure
-                || self.request_phase.phase == crate::adaptive::Phase::Recovery;
+                || self.request_phase.phase == crate::config::adaptive::Phase::Recovery;
             if !self.hermetic {
                 let mut control = self.session.control_state();
                 settle_reliability(

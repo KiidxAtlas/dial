@@ -31,12 +31,15 @@
 //! is bounded by `task.max_recursion_depth`. Claude Code files use Claude tool names (`Read`,
 //! `Edit`, …), which are mapped; their `model` aliases are ignored. Symlinked project definition
 //! files are skipped so a repository cannot point a definition at files outside it.
-use super::subagents::{AGENTS, AgentSpec, builtin};
+use crate::config::agent_defs::valid_name;
+use crate::config::agent_defs::valid_thinking_level;
+
+use crate::config::subagents::{AGENTS, AgentSpec, builtin};
 use crate::config::types::{AgentConfig, Config};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -48,98 +51,6 @@ const MAX_PROMPT: usize = 32 * 1024;
 const MAX_DESCRIPTION: usize = 300;
 /// Tools whose presence makes a definition a writer.
 const WRITE_TOOLS: &[&str] = &["edit", "write", "notebook", "ast_edit"];
-
-/// `[task]`: subagent orchestration limits.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct TaskConfig {
-    /// How many levels deep subagents may start their own subagents: -1 unlimited, 0 none.
-    /// The main agent's children are depth 1; with 2 they may spawn one more level.
-    pub max_recursion_depth: i32,
-    /// Most active worker branches per project in this process (1..=64).
-    pub max_concurrency: usize,
-    pub isolation_dependencies: bool,
-    pub isolation_git: bool,
-    pub isolation_dependency_bytes: u64,
-    pub isolation_source_bytes: usize,
-    pub isolation_source_files: usize,
-    /// Per-provider ceiling on in-flight subagent model requests (provider id → limit; 0 or
-    /// absent = unlimited). A slot is held only while a request streams, never across a child's
-    /// whole run, so deep spawn trees cannot deadlock. A local model server is always 1.
-    pub provider_concurrency: BTreeMap<String, usize>,
-    /// Load Markdown agent definitions from `.dial/agents` and `~/.dial/agents`.
-    pub discover_agents: bool,
-    /// Also load Claude Code definitions from `.claude/agents` and `~/.claude/agents`.
-    pub claude_agents: bool,
-    /// Rejected structured results (`yield` or a JSON answer) a child may correct before failing.
-    pub max_schema_retries: u32,
-    /// Keep finished subagent transcripts (outside the project) so they can be resumed by id.
-    pub persist: bool,
-    /// Pending steering messages a running or parked agent may hold (1..=4096).
-    pub inbox_limit: usize,
-}
-
-impl Default for TaskConfig {
-    fn default() -> Self {
-        Self {
-            max_recursion_depth: 2,
-            max_concurrency: 32,
-            isolation_dependencies: true,
-            isolation_git: true,
-            isolation_dependency_bytes: 4 * 1024 * 1024 * 1024,
-            isolation_source_bytes: 512 * 1024 * 1024,
-            isolation_source_files: 100_000,
-            provider_concurrency: BTreeMap::new(),
-            discover_agents: true,
-            claude_agents: true,
-            max_schema_retries: 3,
-            persist: true,
-            inbox_limit: 256,
-        }
-    }
-}
-
-impl TaskConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            (1..=1_000_000).contains(&self.isolation_source_files)
-                && (1..=2_147_483_648).contains(&self.isolation_source_bytes),
-            "invalid isolation source limits"
-        );
-        anyhow::ensure!(
-            self.isolation_dependency_bytes <= 64 * 1024 * 1024 * 1024,
-            "isolation dependency limit exceeds 64 GiB"
-        );
-        anyhow::ensure!(
-            (-1..=16).contains(&self.max_recursion_depth),
-            "task.max_recursion_depth must be -1 (unlimited) or 0..16"
-        );
-        anyhow::ensure!(
-            (1..=64).contains(&self.max_concurrency),
-            "task.max_concurrency must be 1..64"
-        );
-        anyhow::ensure!(
-            self.max_schema_retries <= 10,
-            "task.max_schema_retries must be 0..10"
-        );
-        anyhow::ensure!(
-            (1..=4096).contains(&self.inbox_limit),
-            "task.inbox_limit must be 1..4096"
-        );
-        for (provider, limit) in &self.provider_concurrency {
-            anyhow::ensure!(
-                !provider.trim().is_empty() && *limit <= 1024,
-                "task.provider_concurrency.{provider:?} must be 0 (unlimited)..1024"
-            );
-        }
-        Ok(())
-    }
-
-    /// Whether an agent at `depth` (main agent 0, its children 1) may still start subagents.
-    pub fn can_spawn_at(&self, depth: u32) -> bool {
-        self.max_recursion_depth < 0 || i64::from(depth) < i64::from(self.max_recursion_depth)
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -287,80 +198,6 @@ impl AgentDef {
         def.autoload_skills = agent.autoload_skills.clone();
         Ok(def)
     }
-}
-
-/// Validate one `[agents.<name>]` entry (called from `Config::validate`).
-pub fn validate_config_agent(name: &str, agent: &AgentConfig) -> anyhow::Result<()> {
-    let base = builtin(&agent.base);
-    anyhow::ensure!(
-        base.is_some(),
-        "custom agent {name:?} must be based on one of: {}",
-        AGENTS.iter().map(|a| a.name).collect::<Vec<_>>().join(", ")
-    );
-    let base = base.expect("checked");
-    anyhow::ensure!(
-        !agent.prompt.trim().is_empty() && agent.prompt.len() <= 16384,
-        "custom agent {name:?} needs a prompt of 1..16384 bytes"
-    );
-    anyhow::ensure!(
-        agent.description.len() <= 200,
-        "custom agent {name:?} description is too long"
-    );
-    for tool in agent.tools.iter().flatten() {
-        anyhow::ensure!(
-            base.tools.contains(&tool.as_str()),
-            "custom agent {name:?}: tool {tool:?} is not available to a {} agent",
-            agent.base
-        );
-    }
-    anyhow::ensure!(
-        agent.model.len() <= 8,
-        "custom agent {name:?}: at most 8 model entries"
-    );
-    for model in &agent.model {
-        anyhow::ensure!(
-            !model.trim().is_empty() && model.len() <= 512,
-            "custom agent {name:?}: model entries must be 1..512 bytes"
-        );
-    }
-    if let Some(level) = &agent.thinking_level {
-        anyhow::ensure!(
-            valid_thinking_level(level),
-            "custom agent {name:?}: unknown thinking_level {level:?}"
-        );
-    }
-    if let Some(schema) = &agent.output {
-        super::output_schema::check_schema(schema).map_err(|why| {
-            anyhow::anyhow!("custom agent {name:?}: invalid output schema: {why}")
-        })?;
-    }
-    for spawn in agent.spawns.iter().flatten() {
-        anyhow::ensure!(
-            spawn == "*" || valid_name(spawn),
-            "custom agent {name:?}: invalid spawns entry {spawn:?}"
-        );
-    }
-    Ok(())
-}
-
-/// Custom definitions accept the same disabled-thinking spelling as the CLI and
-/// retain the existing exact effort values (including none and ultra).
-pub(super) fn valid_thinking_level(level: &str) -> bool {
-    level == "off"
-        || serde_json::from_value::<crate::llm::profiles::ReasoningEffort>(Value::String(
-            level.to_owned(),
-        ))
-        .is_ok()
-}
-
-/// Agent names may use ASCII letters, digits, `_` and `-` (1..64 bytes).
-pub fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        && !matches!(name.to_ascii_lowercase().as_str(), "main" | "sub")
 }
 
 /// Every agent the `task` tool can launch in this configuration.

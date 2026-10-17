@@ -176,8 +176,8 @@ fn judge_role_can_select_laya_once_a_decision_checkpoint_exists() {
         send(&mut o, &rig, key(KeyCode::Enter)),
         OverlayEvent::AssignModel { role, selection, .. }
             if role == "judge"
-                && selection.provider == crate::agent::laya::PROVIDER
-                && selection.model == crate::agent::laya::JUDGE_MODEL
+                && selection.provider == crate::config::laya::PROVIDER
+                && selection.model == crate::config::laya::JUDGE_MODEL
     ));
 }
 

@@ -17,8 +17,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::config::settings_store;
 use crate::platform::fs as platform_fs;
-use crate::storage::settings_store;
 use crate::tools::background::procinfo::ProcId;
 
 /// Largest tail returned by [`read_tail`].

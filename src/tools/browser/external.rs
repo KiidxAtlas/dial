@@ -6,9 +6,9 @@
 
 use serde_json::{Value, json};
 
-use super::BrowserConfig;
 use super::cmux::{CmuxClient, CmuxClientConfig, ResolveCmuxKindOptions, resolve_cmux_kind};
 use super::tern::{ResolveTernKindOptions, TernClient, resolve_tern_kind};
+use crate::config::tools::browser::BrowserConfig;
 
 const LOAD_TIMEOUT_MS: u64 = 30_000;
 const TERN_VIEWPORT: (u32, u32) = (1280, 720);

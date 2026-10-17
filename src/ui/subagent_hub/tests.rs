@@ -1,5 +1,5 @@
 use super::*;
-use crate::storage::paths::Layout;
+use crate::config::paths::Layout;
 use crate::ui::subagent_model::{AgentEntry, AgentStatus};
 use std::time::Duration;
 

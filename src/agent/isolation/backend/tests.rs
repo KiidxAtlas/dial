@@ -1,3 +1,6 @@
+use crate::config::isolation::IsolationConfig;
+use crate::config::isolation::Preference;
+
 use super::*;
 
 fn all_ok(_: Backend) -> Result<(), String> {

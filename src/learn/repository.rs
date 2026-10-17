@@ -237,8 +237,8 @@ fn persist(config: &Config, snapshot: Snapshot) -> Result<Snapshot> {
         "exercise already registered; do not reuse training material for evaluation"
     );
     let dir = config.state_dir.join("repository-tasks");
-    crate::storage::settings_store::private_dir(&dir)?;
-    crate::storage::settings_store::write_private(
+    crate::config::settings_store::private_dir(&dir)?;
+    crate::config::settings_store::write_private(
         &dir.join(format!("{}.json", snapshot.spec.id)),
         &serde_json::to_vec(&snapshot)?,
     )?;
@@ -291,10 +291,8 @@ pub fn register_repair(
         spec,
         digest: String::new(),
     };
-    let layout = crate::storage::paths::Layout::with_user_dir(
-        &config.project_root,
-        config.user_dir.clone(),
-    )?;
+    let layout =
+        crate::config::paths::Layout::with_user_dir(&config.project_root, config.user_dir.clone())?;
     let root = layout.checkpoints_dir().canonicalize()?;
     let read_snapshot = |reference: &Option<String>,
                          digest: &Option<String>|

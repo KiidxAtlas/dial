@@ -3,6 +3,8 @@
 //! Cancellation and timeouts first deliver SIGINT, which the driver turns into `KeyboardInterrupt`
 //! inside the running cell. The interrupted namespace is always discarded; a driver that does
 //! not unwind within [`INTERRUPT_GRACE`] is killed together with its session.
+use crate::config::tools::kernel::KernelConfig;
+
 use super::ext::{Tool, ToolCallback, ToolContext, ToolEvent};
 #[cfg(windows)]
 use super::sandbox::Sandbox;
@@ -11,7 +13,6 @@ use super::shell::shell_command;
 use super::{ToolOutput, Workspace, preludes, tool_schema};
 use crate::config::types::Config;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,31 +27,12 @@ mod env;
 pub(crate) const PYTHON_DRIVER: &str = include_str!("kernel_driver.py");
 pub(crate) const MAX_CODE: usize = 64 * 1024;
 pub(crate) use crate::runtime::json_transport::{INTERRUPT_GRACE, execution_deadline};
-const DEFAULT_PYTHON: &str = "python3";
 // No descendant can detach: even with the operator's filesystem sandbox opt-out, fork/spawn is denied.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) const FORK_FENCE: &str = "(version 1)(allow default)(deny process-fork)";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const BWRAP: &str = "/usr/bin/bwrap";
 const PYTHON_PREFLIGHT: &str = "import sys,json\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'result':{'executable':sys.executable,'version':list(sys.version_info[:2])}}),flush=True)";
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct KernelConfig {
-    pub python: String,
-    pub timeout_secs: u64,
-    /// Project environment: `"auto"`, `"off"`, or an explicit virtualenv/conda prefix.
-    pub venv: String,
-}
-impl Default for KernelConfig {
-    fn default() -> Self {
-        Self {
-            python: DEFAULT_PYTHON.into(),
-            timeout_secs: 0,
-            venv: "auto".into(),
-        }
-    }
-}
 
 pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(KernelTool {

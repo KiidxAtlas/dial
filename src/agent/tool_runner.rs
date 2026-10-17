@@ -1,5 +1,7 @@
 //! Foreground tool owner: keep the UI responsive while authorized native execution runs.
 //! Callbacks return to this owner for admission; tools::execution owns execution and certainty.
+use crate::config;
+
 use super::*;
 
 impl Agent<'_> {
@@ -74,7 +76,7 @@ impl Agent<'_> {
         if self.hermetic {
             return None;
         }
-        let builtin = tools::BUILTIN.contains(&name);
+        let builtin = config::tools::BUILTIN.contains(&name);
         let extension = self.ext.get(name).cloned();
         let registry = self.ext.clone();
         let cancellation = extension.clone();

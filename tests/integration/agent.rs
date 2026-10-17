@@ -1,8 +1,8 @@
 //! The agent loop end to end against a scripted OpenAI-compatible server (no real model).
 use dial::{
     agent::{Agent, Decision, TurnOutcome, Ui, make_backend},
+    config::paths::Layout,
     config::types::{Config, VerificationCommand},
-    storage::paths::Layout,
     storage::session::{Session, SessionMeta},
     storage::store::Store,
     tools::ToolOutput,
@@ -3509,7 +3509,7 @@ fn compaction_keeps_recent_turns_and_replaces_older_ones_with_a_summary() {
 
 #[test]
 fn calibrated_compaction_reports_a_reduction_and_continues_below_the_trigger() {
-    use dial::agent::compaction::{CompactionMethod, CompactionOptions};
+    use dial::config::compaction::{CompactionMethod, CompactionOptions};
 
     let mut recovered_tokens = None;
     for (auto_continue, suppress, at_trigger) in [
@@ -3643,7 +3643,7 @@ fn manual_compaction_with_nothing_to_cut_is_a_successful_no_op() {
     let outcome = a
         .compact_with_options(
             &mut ui,
-            dial::agent::compaction::CompactionOptions::default(),
+            dial::config::compaction::CompactionOptions::default(),
         )
         .expect("manual compaction with nothing to cut must succeed");
     assert_eq!(
@@ -10448,7 +10448,7 @@ fn semantic_memory_retains_a_turn_and_recalls_it_in_a_later_request() {
         None,
     );
     let mut e = env(&server.url, "auto");
-    e.config.memory.backend = dial::storage::memory_backend::config::MemoryBackendId::Semantic;
+    e.config.memory.backend = dial::config::memory_backend::MemoryBackendId::Semantic;
     e.config.memory.backend_explicit = true;
     e.config.model_roles.insert(
         "memory".into(),

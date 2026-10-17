@@ -204,7 +204,7 @@ impl Agent<'_> {
                         let tokens = compaction::request_tokens_with_policy(
                             &request,
                             &config.compaction,
-                            compaction::CompactionIdentity {
+                            crate::config::compaction::CompactionIdentity {
                                 provider: &selection.provider,
                                 model: &selection.model,
                                 agent: Some("memory-capture"),

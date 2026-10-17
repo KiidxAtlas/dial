@@ -50,7 +50,7 @@ fn retained_deletion_replays_before_and_after_independent_checks() {
         ..Config::default()
     };
     let layout =
-        crate::storage::paths::Layout::with_user_dir(&config.project_root, config.user_dir.clone())
+        crate::config::paths::Layout::with_user_dir(&config.project_root, config.user_dir.clone())
             .unwrap();
     let retained = layout.checkpoints_dir().join("repair-evidence");
     fs::create_dir_all(&retained).unwrap();

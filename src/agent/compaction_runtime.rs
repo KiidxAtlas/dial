@@ -1,11 +1,12 @@
 //! Controller-owned automatic maintenance. Workers prepare immutable snapshots and never journal cuts.
-use super::{
-    Ui,
-    compaction::{
-        self, CompactionConfig, CompactionIdentity, CompactionMethod, CompactionOptions,
-        CompactionOutcome, CompactionReason, CompactionSnapshot, CompactionStrategy,
-        PreparedCompaction,
-    },
+use crate::config::compaction::SPECULATION_LEAD_MIN_TOKENS;
+use crate::config::compaction::speculation_lead;
+
+use crate::agent::Ui;
+use crate::agent::compaction::{self, CompactionOutcome, CompactionSnapshot, PreparedCompaction};
+use crate::config::compaction::{
+    CompactionConfig, CompactionIdentity, CompactionMethod, CompactionOptions, CompactionReason,
+    CompactionStrategy,
 };
 use crate::llm::{self, Chat, provider::Backend, usage::Scope};
 use anyhow::{Result, ensure};
@@ -24,7 +25,7 @@ use std::{
 /// summary request. Native provider replay remains on WorkerBackends::main.
 pub fn portable_summary_completion(
     config: crate::config::types::Config,
-    layout: Option<crate::storage::paths::Layout>,
+    layout: Option<crate::config::paths::Layout>,
     root: std::path::PathBuf,
     control_state: serde_json::Value,
     hooks_config: Vec<crate::config::types::HookConfig>,
@@ -176,8 +177,6 @@ pub fn portable_summary_completion(
     }
 }
 
-pub const SPECULATION_LEAD_MIN_TOKENS: u64 = 8_192;
-const SPECULATION_LEAD_MAX_TOKENS: u64 = 32_000;
 const PROGRESS_CAPACITY: usize = 32;
 const PROGRESS_BYTES: usize = 4_096;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -189,10 +188,6 @@ fn maintenance_timeout(configured: u64) -> u64 {
     } else {
         configured.min(MAINTENANCE_TIMEOUT_SECS)
     }
-}
-
-pub fn speculation_lead(threshold: u64) -> u64 {
-    (threshold / 8).clamp(SPECULATION_LEAD_MIN_TOKENS, SPECULATION_LEAD_MAX_TOKENS)
 }
 
 fn policy_methods(policy: &CompactionConfig) -> &[CompactionMethod] {

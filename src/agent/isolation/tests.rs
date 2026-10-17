@@ -45,7 +45,7 @@ fn development_copy_has_private_git_and_dependencies_and_obeys_source_limits() {
         fs::read_to_string(dir.path().join(dep)).unwrap(),
         "module.exports=7;"
     );
-    let limits = super::super::agent_defs::TaskConfig {
+    let limits = crate::config::task::TaskConfig {
         isolation_source_files: 1,
         ..Default::default()
     };
@@ -182,12 +182,8 @@ fn git_project() -> (tempfile::TempDir, Workspace) {
 
 fn round_trip(preference: Preference, expected_backend: &str) {
     let (dir, ws) = git_project();
-    let iso = Isolated::with_config(
-        &ws,
-        &super::super::agent_defs::TaskConfig::default(),
-        preference,
-    )
-    .unwrap();
+    let iso = Isolated::with_config(&ws, &crate::config::task::TaskConfig::default(), preference)
+        .unwrap();
     let root = iso.root().to_path_buf();
     assert_ne!(root, ws.root());
     fs::write(root.join("a.txt"), "a2").unwrap();
@@ -259,7 +255,7 @@ fn worker_file_growing_past_the_limit_is_reported_by_path() {
     let (_dir, ws) = project();
     let iso = Isolated::with_config(
         &ws,
-        &super::super::agent_defs::TaskConfig::default(),
+        &crate::config::task::TaskConfig::default(),
         Preference::Copy,
     )
     .unwrap();
@@ -297,7 +293,7 @@ fn generated_build_outputs_do_not_block_a_copy_worker_but_oversized_source_is_re
             .set_len(MAX_BYTES as u64 + 1)
             .unwrap();
     }
-    let config = super::super::agent_defs::TaskConfig::default();
+    let config = crate::config::task::TaskConfig::default();
     let iso = Isolated::with_config(&ws, &config, Preference::Copy)
         .expect("generated build outputs must not block the worker copy");
     assert_eq!(fs::read_to_string(iso.root().join("a.txt")).unwrap(), "a1");
@@ -345,7 +341,7 @@ fn tracked_bin_scripts_survive_copy_and_merge_without_private_git() {
         .unwrap()
         .set_len(MAX_BYTES as u64 + 1)
         .unwrap();
-    let config = super::super::agent_defs::TaskConfig {
+    let config = crate::config::task::TaskConfig {
         isolation_git: false,
         ..Default::default()
     };

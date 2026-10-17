@@ -11,12 +11,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct CheckpointConfig {
-    pub enabled: bool,
-}
-
 pub(super) const TOOL_NAMES: [&str; 2] = ["checkpoint", "rewind"];
 const MAX_GOAL_BYTES: usize = 8 * 1024;
 const MAX_REPORT_BYTES: usize = 64 * 1024;

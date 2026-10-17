@@ -799,7 +799,7 @@ impl Composer {
         };
         match self.words.to_bytes() {
             Ok(bytes) => {
-                if let Err(error) = crate::storage::settings_store::write_private(path, &bytes) {
+                if let Err(error) = crate::config::settings_store::write_private(path, &bytes) {
                     self.word_notice = Some(format!("Could not save learned words: {error:#}"));
                 }
             }
@@ -841,7 +841,7 @@ impl Composer {
     /// Loads the learned-words file at `store` and saves to it from now on. A missing file is an
     /// empty model; an unreadable or invalid one leaves an empty model and a notice.
     pub fn load_learned_words(&mut self, store: std::path::PathBuf) {
-        match crate::storage::settings_store::read_private(&store) {
+        match crate::config::settings_store::read_private(&store) {
             Ok(Some(bytes)) => match WordModel::from_bytes(&bytes) {
                 Ok(model) => self.words = model,
                 Err(error) => {

@@ -3,7 +3,8 @@
 //! One private database in DIAL_HOME serves all projects. Project keys are canonical workspace
 //! paths; global facts are visible in every project. Legacy text files are only read by an explicit
 //! approved import and are never overwritten. Retrieved notes are untrusted data, not instructions.
-use super::{memory::screen, paths::Layout};
+use crate::config::paths::Layout;
+use crate::storage::memory::screen;
 use crate::tools::{
     ToolOutput,
     ext::{Tool, ToolContext},

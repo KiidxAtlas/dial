@@ -1,14 +1,10 @@
 //! Built-in adapter catalogue and automatic selection by
 //! program extension and project root markers when no adapter is named.
-use super::{DapAdapterConfig, DapTransport};
-use serde::Deserialize;
-use serde_json::{Map, Value};
+use crate::config::tools::dap::DapAdapterConfig;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
-
-const DEFAULTS: &str = include_str!("defaults.json");
 
 /// Preference order when several adapters match equally (declaration order).
 const ORDER: &[&str] = &[
@@ -27,62 +23,6 @@ const ORDER: &[&str] = &[
     "flutter-debug-adapter",
     "elixir-ls-debugger",
 ];
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DefaultAdapter {
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    connect_mode: Option<String>,
-    #[serde(default)]
-    file_types: Vec<String>,
-    #[serde(default)]
-    root_markers: Vec<String>,
-    #[serde(default)]
-    launch_defaults: Map<String, Value>,
-    #[serde(default)]
-    attach_defaults: Map<String, Value>,
-}
-
-/// The built-in adapters, keyed by adapter name.
-pub fn defaults() -> BTreeMap<String, DapAdapterConfig> {
-    let parsed: BTreeMap<String, DefaultAdapter> =
-        serde_json::from_str(DEFAULTS).expect("bundled DAP defaults are valid JSON");
-    parsed
-        .into_iter()
-        .map(|(name, adapter)| {
-            let transport = match adapter.connect_mode.as_deref() {
-                Some("tcp") => DapTransport::Tcp,
-                Some("socket") => DapTransport::Socket,
-                _ => DapTransport::Stdio,
-            };
-            let config = DapAdapterConfig {
-                program: PathBuf::from(adapter.command),
-                args: adapter.args,
-                env: BTreeMap::new(),
-                timeout_secs: 0,
-                transport,
-                address: String::new(),
-                file_types: adapter.file_types,
-                root_markers: adapter.root_markers,
-                launch_defaults: adapter.launch_defaults,
-                attach_defaults: adapter.attach_defaults,
-            };
-            (name, config)
-        })
-        .collect()
-}
-
-/// Configured adapters override built-ins of the same name.
-pub fn catalogue(
-    configured: &BTreeMap<String, DapAdapterConfig>,
-) -> BTreeMap<String, DapAdapterConfig> {
-    let mut all = defaults();
-    all.extend(configured.iter().map(|(k, v)| (k.clone(), v.clone())));
-    all
-}
 
 /// Resolve a bare command on PATH; paths with separators resolve against `root`, the adapter's spawn cwd.
 pub fn which(program: &Path, root: &Path) -> Option<PathBuf> {

@@ -1,7 +1,7 @@
 //! One install shape for every MCP listing: the built-in curated list, the official MCP Registry,
 //! Smithery, npm and GitHub. Discovery only reads listings. Nothing here starts a server or writes
 //! config; callers (the `/extensions` browser and the `mcp_servers` agent tool) run the health
-//! check and save the returned [`Change`](crate::storage::settings_store::Change) themselves,
+//! check and save the returned [`Change`](crate::config::settings_store::Change) themselves,
 //! after approval.
 //!
 //! Secrets are never invented: a server's required environment variables come back as [`Input`]s

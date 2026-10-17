@@ -7,12 +7,12 @@
 //! never estimated. Learning stores are opened read-only with SQL, so a store that does not exist
 //! is not created.
 
+use crate::config::paths::Layout;
 use crate::config::types::Config;
 use crate::llm::catalog;
 use crate::llm::local_fit::{self, Architecture, Estimate, Fit};
 use crate::llm::local_format::{self, LocalFormat};
 use crate::stats::{self, DecodeSpeed};
-use crate::storage::paths::Layout;
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;

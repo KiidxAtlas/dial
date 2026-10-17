@@ -1,7 +1,8 @@
 //! Project-scoped source outlines and agent findings. Source digests gate reuse; cached text is
 //! untrusted evidence, never project instructions or proof that an architectural claim is true.
 pub mod architecture;
-use super::{memory::screen, paths::Layout};
+use crate::config::paths::Layout;
+use crate::storage::memory::screen;
 use crate::tools::{
     ToolOutput, Workspace,
     ext::{Tool, ToolContext},

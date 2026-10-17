@@ -1,4 +1,6 @@
 //! Approved remote execution and SSH URL support.
+use crate::config::tools::ssh::SshConfig;
+
 mod config;
 mod connection;
 pub(crate) mod process;
@@ -17,38 +19,6 @@ use std::{
 pub use config::resolve as resolve_hosts;
 pub use connection::{Os, PosixShell, Target};
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SshConfig {
-    pub host_key_checking: HostKeyChecking,
-    pub connect_timeout_secs: u64,
-    pub control_persist_secs: u64,
-}
-impl Default for SshConfig {
-    fn default() -> Self {
-        Self {
-            host_key_checking: HostKeyChecking::AcceptNew,
-            connect_timeout_secs: 15,
-            control_persist_secs: 3600,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HostKeyChecking {
-    Yes,
-    AcceptNew,
-    No,
-}
-impl HostKeyChecking {
-    fn as_option(self) -> &'static str {
-        match self {
-            Self::Yes => "yes",
-            Self::AcceptNew => "accept-new",
-            Self::No => "no",
-        }
-    }
-}
 pub(super) struct Settings {
     pub(super) user_dir: std::path::PathBuf,
     pub(super) config: SshConfig,

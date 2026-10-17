@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::types::{UsageHistoryEntry, UsageReport, resolve_used_fraction};
-use crate::storage::settings_store::{locked, read_private, write_private};
+use crate::config::settings_store::{locked, read_private, write_private};
 
 const FILE: &str = "usage-history.jsonl";
 const MAX_ENTRIES: usize = 2_048;

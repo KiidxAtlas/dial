@@ -4,9 +4,9 @@
 
 use crate::agent::{Agent, plan_with_runner, related_tests_with_runner};
 use crate::app::{App, Shell, Step};
+use crate::config::settings_store::{self, Change, Scope};
 use crate::config::types::{Config, ModelPreset, SshHostConfig, VerificationCommand};
 use crate::llm::usage_report::{self, Outcome, UsageReport, resolve_used_fraction};
-use crate::storage::settings_store::{self, Change, Scope};
 use anyhow::{Result, anyhow, bail};
 use std::path::PathBuf;
 use std::sync::Arc;

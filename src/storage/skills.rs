@@ -7,10 +7,8 @@
 //! Skill files are untrusted text. They are never executed or interpolated into the prompt except
 //! as a tool result the model requested, every read refuses symlinks and path traversal, and
 //! every size is bounded.
-use super::{
-    memory::{atomic_write, find_secret, has_hidden_chars},
-    paths::Layout,
-};
+use crate::config::paths::Layout;
+use crate::storage::memory::{atomic_write, find_secret, has_hidden_chars};
 use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::{

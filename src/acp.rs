@@ -1,6 +1,6 @@
 //! Agent Client Protocol v1 over stdio JSON-RPC 2.0.
 //! Uses the RPC actor in-process; client filesystem, terminal and MCP bridges are not installed.
-use crate::{config::types::Config, storage::paths::Layout};
+use crate::{config::paths::Layout, config::types::Config};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -560,7 +560,7 @@ impl Adapter {
         );
         let path = dir.join(format!("{hash}.{ext}"));
         // Atomic and always rewritten: a torn file from an earlier crash must never be reused.
-        crate::storage::settings_store::write_private(&path, &bytes)?;
+        crate::config::settings_store::write_private(&path, &bytes)?;
         let reference = crate::llm::images::user_attachment(&self.layout.project_root, &path)?;
         ensure!(
             reference["sha256"].as_str() == Some(hash.as_str()),

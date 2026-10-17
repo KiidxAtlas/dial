@@ -92,7 +92,7 @@ pub fn should_yield(user: &Path) -> Result<bool> {
     Ok(paused(user) || foreground_pending(user)?)
 }
 pub fn register(user: &Path, kind: &str, project: &Path, state: &Path, model: &str) -> Result<()> {
-    crate::storage::settings_store::write_private(
+    crate::config::settings_store::write_private(
         &user.join("compute-owner.json"),
         serde_json::json!({
             "pid":std::process::id(),"proc":ProcId::current(),"kind":kind,"project":project,"state":state,"model":model,

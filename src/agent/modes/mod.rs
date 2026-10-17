@@ -105,10 +105,7 @@ impl Agent<'_> {
     /// Re-roots the session workspace at `target` (used by `/move`). Rules are discovered per turn
     /// from the workspace root, so only the system prompt, which embeds the cwd, needs a rebuild.
     /// Checkpoints are rebound to the target project so later edits snapshot the new root.
-    pub(crate) fn reroot_workspace(
-        &mut self,
-        target: &crate::storage::paths::Layout,
-    ) -> Result<()> {
+    pub(crate) fn reroot_workspace(&mut self, target: &crate::config::paths::Layout) -> Result<()> {
         self.workspace = self.workspace.reroot(&target.project_root)?;
         self.layout = Some(target.clone());
         if self.checkpoints.is_some() {

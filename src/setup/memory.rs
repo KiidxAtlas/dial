@@ -3,7 +3,7 @@
 //! [`Config`]; nothing here reads or writes files.
 
 use crate::config::Config;
-use crate::storage::memory_backend::config::{
+use crate::config::memory_backend::{
     EmbeddingMode, MemoryBackendId, auto_retain_uses_memory_role, half_embedding_override,
 };
 

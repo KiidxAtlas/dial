@@ -1,4 +1,5 @@
 //! Agent accessors and session-level settings: session binding, tool registration, plan mode and permission rules.
+use crate::config;
 
 use super::*;
 
@@ -368,8 +369,8 @@ impl<'a> Agent<'a> {
         tools::catalog::validate_tool(tool)?;
         let name = tool.name();
         ensure!(
-            !tools::BUILTIN.contains(&name)
-                && !tools::EXTRA_TOOLS.contains(&name)
+            !config::tools::BUILTIN.contains(&name)
+                && !config::tools::EXTRA_TOOLS.contains(&name)
                 && !matches!(name, "exit_plan" | "message"),
             "extension cannot replace a core/control tool"
         );
@@ -464,7 +465,7 @@ impl<'a> Agent<'a> {
             .tools
             .iter()
             .cloned()
-            .chain(tools::EXTRA_TOOLS.iter().map(|s| s.to_string()))
+            .chain(config::tools::EXTRA_TOOLS.iter().map(|s| s.to_string()))
             .chain(self.ext.names().map(str::to_owned))
             .chain(self.config.tools.keys().cloned())
             .collect();
@@ -472,7 +473,7 @@ impl<'a> Agent<'a> {
             names.extend(memory.offered_names().into_iter().map(str::to_owned));
         }
         names.retain(|n| {
-            tools::BUILTIN.contains(&n.as_str())
+            config::tools::BUILTIN.contains(&n.as_str())
                 || matches!(
                     n.as_str(),
                     "todo"
@@ -544,7 +545,7 @@ impl<'a> Agent<'a> {
             names.clear();
         }
         if self.hermetic {
-            names.retain(|n| tools::BUILTIN.contains(&n.as_str()) || n == "todo");
+            names.retain(|n| config::tools::BUILTIN.contains(&n.as_str()) || n == "todo");
         }
         names.sort();
         names.dedup();

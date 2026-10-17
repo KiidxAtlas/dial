@@ -8,9 +8,9 @@ use ratatui::Frame;
 
 use crate::{
     agent::LiveTaskControl,
+    config::paths::Layout,
     llm::model_config::{RoleSource, RoleStatus},
     runtime::Tree,
-    storage::paths::Layout,
     ui::{
         keys::Keymap,
         overlay::{DrawCtx, OverlayEvent, subagents::SubagentsOverlay},

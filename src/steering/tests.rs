@@ -1,3 +1,5 @@
+use crate::config::steering::Config;
+
 use super::*;
 fn candidate() -> Value {
     json!({"version":1,"id":"a".repeat(64),"model_name":"test","dimension":2,"layer":0,"layer_count":2,"vector":[1.0,0.0],"pairs":8,"evaluation":{"passed":true,"artifact":"a".repeat(64),"strength":0.5,"cases":8,"baseline_passes":4,"steered_passes":7,"scope":"held-out response contracts","tool_nonregression":true,"repetition_nonregression":true,"latency_nonregression":true}})

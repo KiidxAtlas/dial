@@ -13,9 +13,9 @@
 //! Positions are 1-based `line` plus `column` (characters) or `symbol` (text on that line).
 //! Rename previews remain read-only. Applied edits are validated as one observer-backed text
 //! transaction; ordered file create/rename/delete operations share the same snapshots and rollback. Directory resources require the explicit rename_file workflow.
+use crate::config::tools::lsp::LspConfig;
 
 mod client;
-mod config;
 mod format;
 mod framing;
 mod servers;
@@ -28,7 +28,6 @@ use super::ext::{Tool, ToolContext, ToolEvent};
 use super::{ToolOutput, Workspace, io_message, opt_bool, opt_str, opt_u64, req_str, tool_schema};
 use crate::config::types::Config;
 use client::{Client, ServerOptions, Timeouts};
-pub use config::LspConfig;
 use format::Lines;
 use serde_json::{Value, json};
 use servers::{Resolved, Servers};

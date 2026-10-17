@@ -1,17 +1,40 @@
 //! Configuration loading, layering and validation; the shared data types live in [`types`].
 
+pub mod adaptive;
+pub mod agent_defs;
+pub mod ask;
+pub mod checkpoint;
+pub mod collab;
+pub mod compaction;
+pub mod embeddings;
+pub mod hooks;
+pub mod isolation;
+pub mod laya;
+pub mod memory_backend;
+pub mod paths;
+pub mod reliability;
+pub mod schema;
 pub mod selection;
 pub mod session_models;
 pub mod settings;
+pub mod settings_store;
+pub mod share;
+pub mod snapcompact;
+pub mod solve;
+pub mod stats;
+pub mod steering;
+pub mod subagents;
+pub mod task;
+pub mod telemetry;
+pub mod thinking;
+pub mod tools;
 pub mod types;
-pub use crate::settings_schema as schema;
+pub mod voice;
 
-use crate::{
-    storage::{
-        paths::Layout,
-        settings_store::{locked, read_private, write_private},
-    },
-    tools::{BUILTIN, EXTRA_TOOLS, INTEGRATION_TOOLS},
+use crate::config::{
+    paths::Layout,
+    settings_store::{locked, read_private, write_private},
+    tools::{BUILTIN, EXTRA_TOOLS, integrations::INTEGRATION_TOOLS},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -339,7 +362,7 @@ pub fn migrate_model_role_table(table: &mut toml::Table) -> bool {
                 .as_table()
                 .and_then(|table| table.get("provider"))
                 .and_then(toml::Value::as_str),
-            Some(crate::agent::laya::PROVIDER | "inherit")
+            Some(crate::config::laya::PROVIDER | "inherit")
         )
     {
         roles.remove("decision");
@@ -475,9 +498,9 @@ impl Config {
     /// Resolve an already-merged table; used to validate both edits and removals before saving.
     #[cfg(test)]
     pub fn from_table(layout: &Layout, table: toml::Table) -> Result<Self> {
-        let global = crate::storage::settings_store::load_layer(
+        let global = crate::config::settings_store::load_layer(
             layout,
-            crate::storage::settings_store::Scope::Global,
+            crate::config::settings_store::Scope::Global,
         )?;
         Self::from_table_with_policy(layout, table, &global)
     }
@@ -1190,7 +1213,7 @@ impl Config {
     }
 
     /// Laya service settings: the assigned `decision` role supplies the checkpoint the service loads.
-    pub fn laya_service(&self) -> crate::agent::laya::Config {
+    pub fn laya_service(&self) -> crate::config::laya::Config {
         let mut laya = self.laya.clone();
         laya.checkpoint = self
             .role_selection("decision")
@@ -1213,14 +1236,15 @@ impl Config {
                 let (effective, source) = match (role, &assigned) {
                     ("main", _) => (Some(main.clone()), RoleSource::Main),
                     (_, Some(selection)) => (Some(selection.display_name()), RoleSource::Assigned),
-                    ("decision", None) => match crate::agent::laya::expected_checkpoint(&self.laya)
-                    {
-                        Some(checkpoint) => (
-                            Some(format!("Laya · {checkpoint}")),
-                            RoleSource::LayaInstalled,
-                        ),
-                        None => (None, RoleSource::NotSet),
-                    },
+                    ("decision", None) => {
+                        match crate::config::laya::expected_checkpoint(&self.laya) {
+                            Some(checkpoint) => (
+                                Some(format!("Laya · {checkpoint}")),
+                                RoleSource::LayaInstalled,
+                            ),
+                            None => (None, RoleSource::NotSet),
+                        }
+                    }
                     ("judge", None) => match self.model_roles.get("small") {
                         Some(small) => (Some(small.display_name()), RoleSource::FollowsSmall),
                         None => (Some(main.clone()), RoleSource::FollowsMain),
@@ -1243,7 +1267,7 @@ impl Config {
 
     /// Missing model roles leave memory inactive, without blocking access to its setup UI.
     pub fn memory_setup_error(&self) -> Option<String> {
-        use crate::storage::memory_backend::config::{MemoryBackendId, calls_model};
+        use crate::config::memory_backend::{MemoryBackendId, calls_model};
         if !calls_model(&self.memory) {
             return None;
         }
@@ -1300,7 +1324,7 @@ impl Config {
 
     fn memory_role_is_local(&self, role: &str, model: Option<&str>) -> bool {
         let selection = self.role_selection(role);
-        if selection.is_some_and(|model| model.provider == crate::agent::laya::PROVIDER) {
+        if selection.is_some_and(|model| model.provider == crate::config::laya::PROVIDER) {
             return false;
         }
         let provider = selection
@@ -1334,7 +1358,7 @@ impl Config {
     /// Selected memory work participates in the same local-compute lease as foreground turns.
     /// This route inspection borrows selectors; it never constructs a backend or clones Config.
     pub fn memory_uses_local_compute(&self) -> bool {
-        use crate::storage::memory_backend::config::MemoryBackendId;
+        use crate::config::memory_backend::MemoryBackendId;
         match self.memory.backend {
             MemoryBackendId::Local => {
                 self.memory_role_is_local(&self.memory.local.extraction_role, None)
@@ -1562,7 +1586,7 @@ impl Config {
     pub fn uses_local_compute(&self) -> bool {
         (!self.model.is_empty() && self.runs_dial_mlx())
             || self.model_roles.values().any(|model| {
-                model.provider != crate::agent::laya::PROVIDER
+                model.provider != crate::config::laya::PROVIDER
                     && model.provider != crate::llm::apple::PROVIDER
                     && model.base_url.is_none()
             })
@@ -1797,7 +1821,7 @@ impl Config {
             self.ui.history_limit <= 10000,
             "ui.history_limit must be 0 (unlimited) or 1..10000"
         );
-        crate::storage::memory_backend::config::validate(&self.memory)?;
+        crate::config::memory_backend::validate(&self.memory)?;
         ensure!(
             self.browser.timeout_secs <= 3600 && !self.browser.node.trim().is_empty(),
             "invalid browser program or timeout"
@@ -1867,15 +1891,15 @@ impl Config {
                 "model role {role} has no model"
             );
             ensure!(
-                role != "decision" || selection.provider == crate::agent::laya::PROVIDER,
+                role != "decision" || selection.provider == crate::config::laya::PROVIDER,
                 "the decision role is the Laya checkpoint; assign it with /roles or with dial laya install --checkpoint"
             );
             ensure!(
                 role != "judge"
-                    || selection.provider != crate::agent::laya::PROVIDER
-                    || selection.model == crate::agent::laya::JUDGE_MODEL,
+                    || selection.provider != crate::config::laya::PROVIDER
+                    || selection.model == crate::config::laya::JUDGE_MODEL,
                 "a Laya judge uses the decision role's checkpoint; set model_roles.judge.model = {:?} and choose the checkpoint with the decision role",
-                crate::agent::laya::JUDGE_MODEL
+                crate::config::laya::JUDGE_MODEL
             );
             if selection.provider == crate::llm::chatgpt::PROVIDER {
                 ensure!(
@@ -1994,7 +2018,7 @@ impl Config {
         }
         ensure!(self.hooks.len() <= 32, "at most 32 hooks are allowed");
         for hook in &self.hooks {
-            crate::agent::hooks::validate(hook).map_err(|e| anyhow::anyhow!(e))?;
+            crate::config::hooks::validate(hook).map_err(|e| anyhow::anyhow!(e))?;
         }
         ensure!(
             self.verification.commands.len() <= 16,
@@ -2089,7 +2113,7 @@ impl Config {
             );
         }
         let mut integrations = BTreeSet::new();
-        let dap_adapters = crate::tools::dap::catalogue(&self.dap);
+        let dap_adapters = crate::config::tools::dap::catalogue(&self.dap);
         for name in &self.integrations {
             let dap_tool = name
                 .strip_prefix("dap_")
@@ -2116,7 +2140,7 @@ impl Config {
             );
         }
         for (name, server) in &self.mcp {
-            crate::tools::mcp::validate_server(name, server)?;
+            crate::config::tools::mcp::validate_server(name, server)?;
         }
         for (name, prompt) in &self.subagents {
             ensure!(
@@ -2124,7 +2148,7 @@ impl Config {
                 "invalid subagent specification"
             );
             ensure!(
-                !crate::agent::subagents::is_reserved(name),
+                !crate::config::subagents::is_reserved(name),
                 "subagent preset {name:?} collides with a built-in agent type"
             );
         }
@@ -2134,14 +2158,14 @@ impl Config {
         );
         for (name, agent) in &self.agents {
             ensure!(
-                crate::agent::agent_defs::valid_name(name),
+                crate::config::agent_defs::valid_name(name),
                 "invalid custom agent name {name:?}"
             );
             ensure!(
-                !crate::agent::subagents::is_reserved(name) && !self.subagents.contains_key(name),
+                !crate::config::subagents::is_reserved(name) && !self.subagents.contains_key(name),
                 "custom agent {name:?} collides with a built-in agent or preset"
             );
-            crate::agent::agent_defs::validate_config_agent(name, agent)?;
+            crate::config::agent_defs::validate_config_agent(name, agent)?;
         }
         self.task.validate()?;
         let t = &self.training;

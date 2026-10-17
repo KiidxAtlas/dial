@@ -1,4 +1,4 @@
-use super::super::paths::Layout;
+use crate::config::paths::Layout;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use std::{

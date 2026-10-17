@@ -12,8 +12,8 @@ fn ceiling_limits_huge_windows_only_when_economy_is_on() {
 #[test]
 fn default_ceiling_bounds_the_auto_trigger_on_huge_windows_only() {
     let cap = crate::config::types::EfficiencyConfig::default().history_token_cap;
-    let policy = crate::agent::compaction::CompactionConfig::default();
-    let identity = crate::agent::compaction::CompactionIdentity {
+    let policy = crate::config::compaction::CompactionConfig::default();
+    let identity = crate::config::compaction::CompactionIdentity {
         provider: "anthropic",
         model: "claude-opus-5-5",
         agent: None,

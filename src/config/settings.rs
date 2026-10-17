@@ -53,9 +53,9 @@ impl<T: DeserializeOwned> Setting<T> {
     }
 }
 impl<T: Serialize> Setting<T> {
-    pub fn change(self, value: T) -> Result<crate::storage::settings_store::Change> {
+    pub fn change(self, value: T) -> Result<crate::config::settings_store::Change> {
         self.definition()?;
-        Ok(crate::storage::settings_store::Change::Set {
+        Ok(crate::config::settings_store::Change::Set {
             path: self.path.into(),
             value: Value::try_from(value)?,
         })
@@ -153,7 +153,8 @@ impl Settings {
     }
 }
 
-/// Generated UI/CLI/documentation view; defaults always come from the real Config authority.
+/// Generated UI/CLI/documentation view of the settings registry; defaults always come from the
+/// real Config authority. Callers add the tool and resource sections they own.
 pub fn reference() -> serde_json::Value {
     serde_json::json!({"schema_version": 1, "settings": schema::registry().iter().map(|definition| {
         serde_json::json!({"path": definition.path, "domain": definition.path.split('.').next(),
@@ -161,9 +162,7 @@ pub fn reference() -> serde_json::Value {
             "tab": definition.tab, "section": definition.section,
             "kind": format!("{:?}", definition.kind), "constraints":definition.constraints(), "default": definition.default_value(),
             "restart": definition.restart})
-    }).collect::<Vec<_>>(), "resources":crate::tools::resources::DESCRIPTORS,
-    "native_tools":crate::tools::schemas(crate::tools::BUILTIN, crate::config::types::EditMode::default()).expect("built-in schemas are valid"),
-    "artifact_tool":crate::tools::artifact::schema()})
+    }).collect::<Vec<_>>()})
 }
 pub fn reference_markdown() -> String {
     let mut out =

@@ -13,8 +13,6 @@ pub(crate) mod git_panel;
 pub mod learn;
 pub mod llm;
 pub(crate) mod output;
-#[path = "config/schema.rs"]
-pub mod settings_schema;
 
 /// Waits (bounded) until buffered stdout has been written. Binaries call this on every exit path.
 pub fn flush_stdout_on_exit() -> std::io::Result<()> {

@@ -23,7 +23,7 @@ fn legacy_integration_lists_keep_always_registered_tools() {
     };
     config.extensions.enabled = false;
     let registry = Registry::standard(&config);
-    for entry in super::super::catalog::INTEGRATIONS {
+    for entry in crate::config::tools::integrations::INTEGRATIONS {
         if entry.always_registered {
             assert!(registry.contains(entry.name), "{}", entry.name);
         }

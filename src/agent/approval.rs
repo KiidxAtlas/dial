@@ -771,7 +771,7 @@ pub(crate) fn authorize_source_read_paths(
 
 pub(crate) fn authorize_managed_memory_paths(
     rules: &[PermissionRule],
-    layout: &crate::storage::paths::Layout,
+    layout: &crate::config::paths::Layout,
     read_only: bool,
     original: &ToolCall,
     paths: &[PathBuf],

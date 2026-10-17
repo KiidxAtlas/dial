@@ -5,9 +5,9 @@
 use super::catalog::{self, Endpoints, Input};
 use super::smithery;
 use super::{McpLoad, Session};
+use crate::config::paths::Layout;
+use crate::config::settings_store::{self, Scope};
 use crate::config::types::{Config, McpServerConfig};
-use crate::storage::paths::Layout;
-use crate::storage::settings_store::{self, Scope};
 use crate::tools::ToolOutput;
 use crate::tools::ext::{Tool, ToolContext};
 use anyhow::Result;

@@ -1,8 +1,8 @@
 //! Smithery registry: search,
 //! install planning and API-key login. Slash-command glue lives in `commands/smithery.rs`.
 
+use crate::config::settings_store::{Change, read_private, write_private};
 use crate::config::types::McpServerConfig;
-use crate::storage::settings_store::{Change, read_private, write_private};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
@@ -1106,7 +1106,7 @@ fn local_error(error: anyhow::Error) -> SmitheryError {
 
 // ---- Argument parsing -----------------------------------------------------------------------
 
-use crate::storage::settings_store::Scope;
+use crate::config::settings_store::Scope;
 
 /// Default MCP scope for the Smithery commands.
 const DEFAULT_SCOPE: Scope = Scope::Project;

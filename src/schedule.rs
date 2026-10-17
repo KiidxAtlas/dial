@@ -12,7 +12,7 @@
 //! events (`notify`) select which watch entries to re-fingerprint; without them the scheduler
 //! polls. The schedules file is re-parsed when it changes; invalid entries are skipped.
 use crate::{
-    storage::paths::Layout,
+    config::paths::Layout,
     tools::{diagnostics::Collector, shell::ProcessGroup},
 };
 use anyhow::{Context, Result, bail, ensure};

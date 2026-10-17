@@ -362,7 +362,7 @@ pub fn import_steering(config: &Config, pack: &Path, replace: bool) -> Result<Va
         "a pending import named {name} already exists; pass --replace to overwrite that pending file"
     );
     let staged = pending.with_extension("staging.json");
-    crate::storage::settings_store::write_private(&staged, &raw)?;
+    crate::config::settings_store::write_private(&staged, &raw)?;
     let request = json!({"op":"steering_import","model":config.model,"model_name":config.model,"adapter":null,"output":staged});
     crate::learn::worker::call_controlled(config, &request, None)?;
     fs::rename(&staged, &pending)?;

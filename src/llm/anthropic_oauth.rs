@@ -1,6 +1,6 @@
 //! Anthropic subscription OAuth for the official Messages API.
 use super::{auth::SecretToken, oauth::util::run_opener};
-use crate::storage::settings_store::{
+use crate::config::settings_store::{
     locked, locked_cancellable, locked_for, read_private, write_private,
 };
 use anyhow::{Context, Result, ensure};
