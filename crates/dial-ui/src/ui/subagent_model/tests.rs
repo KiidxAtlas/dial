@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::child_transcript::ChildTranscript;
+use crate::agent::workers::child_transcript::ChildTranscript;
 
 fn entry(id: &str, parent: Option<&str>, status: AgentStatus, last: Option<u64>) -> AgentEntry {
     AgentEntry {

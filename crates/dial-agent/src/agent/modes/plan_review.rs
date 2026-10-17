@@ -1,7 +1,7 @@
 //! `/plan-review`: re-surfaces the last plan submitted through `exit_plan` for approval while plan
 //! mode is active. Approval goes through the same path as `exit_plan`.
 
-use crate::agent::{Agent, Decision, Ui, plan_files};
+use crate::agent::{Agent, Decision, Ui, workflow::plan_files};
 use anyhow::{Result, bail, ensure};
 
 impl Agent<'_> {
@@ -13,8 +13,8 @@ impl Agent<'_> {
             Some(uri) => format!("{plan}\n\nSaved plan: {uri}"),
             None => plan.to_owned(),
         });
-        ui.event(&crate::agent::ui_event::UiEvent::new(
-            crate::agent::ui_event::EventKind::Plan,
+        ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+            crate::agent::ui::ui_event::EventKind::Plan,
             format!("Plan approved:\n{plan}"),
         ));
     }
@@ -29,8 +29,8 @@ impl Agent<'_> {
             Decision::Allow | Decision::AllowAlways | Decision::AllowProject => {
                 self.plan_yolo_approve(&plan, ui)?
             }
-            Decision::Deny => ui.event(&crate::agent::ui_event::UiEvent::new(
-                crate::agent::ui_event::EventKind::Plan,
+            Decision::Deny => ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                crate::agent::ui::ui_event::EventKind::Plan,
                 "Plan not approved; remain in plan mode.",
             )),
         }

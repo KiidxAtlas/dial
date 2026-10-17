@@ -1,5 +1,5 @@
 //! Versioned newline-delimited JSON control protocol. Stdin is control, stdout is JSON only.
-use crate::agent::todo::TodoList;
+use crate::agent::workflow::todo::TodoList;
 use crate::agent::{Agent, Decision, Ui, make_backend};
 use crate::config::paths::Layout;
 use crate::config::types::Config;
@@ -148,7 +148,7 @@ impl Sender {
 }
 #[derive(Clone)]
 struct PendingQuestion {
-    request: crate::agent::questions::QuestionRequest,
+    request: crate::agent::workflow::questions::QuestionRequest,
     presented: bool,
     deadline: Option<Instant>,
 }
@@ -156,7 +156,7 @@ struct RpcUi {
     out: Sender,
     approvals: mpsc::Receiver<(String, Decision)>,
     pending_approval: Arc<Mutex<Option<String>>>,
-    question_answers: mpsc::Receiver<(String, crate::agent::questions::QuestionOutcome)>,
+    question_answers: mpsc::Receiver<(String, crate::agent::workflow::questions::QuestionOutcome)>,
     pending_question: Arc<Mutex<Option<PendingQuestion>>>,
     interrupt: Arc<AtomicBool>,
     input_disconnected: Arc<AtomicBool>,
@@ -290,13 +290,13 @@ impl Ui for RpcUi {
             .emit(json!({"event":"tool_call","call_id":call_id,"name":name,"summary":summary}));
     }
     fn tool_result_with_id(&mut self, call_id: &str, name: &str, output: &ToolOutput) {
-        self.out.emit(json!({"event":"tool_result","call_id":call_id,"name":name,"text":crate::agent::guard::clip_middle(&output.text,24*1024),"is_error":output.is_error,"data":output.data}));
+        self.out.emit(json!({"event":"tool_result","call_id":call_id,"name":name,"text":crate::agent::safety::guard::clip_middle(&output.text,24*1024),"is_error":output.is_error,"data":output.data}));
     }
     fn notice(&mut self, message: &str) {
         self.out.emit(json!({"event":"notice","message":message}));
     }
     /// Same `notice` event clients already read, plus the typed kind and lane for richer clients.
-    fn event(&mut self, event: &crate::agent::ui_event::UiEvent) {
+    fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
         self.out.emit(typed_notice(event));
     }
     fn model_progress(&mut self, progress: &crate::llm::ModelProgress) {
@@ -373,10 +373,10 @@ impl Ui for RpcUi {
     }
     fn ask_questions(
         &mut self,
-        request: &crate::agent::questions::QuestionRequest,
+        request: &crate::agent::workflow::questions::QuestionRequest,
         cancel: &AtomicBool,
-    ) -> crate::agent::questions::QuestionOutcome {
-        use crate::agent::questions::{self, QuestionOutcome};
+    ) -> crate::agent::workflow::questions::QuestionOutcome {
+        use crate::agent::workflow::questions::{self, QuestionOutcome};
         if !self.out.mapping().is_ok_and(|output| output.acp.is_none()) {
             return if self.out.unavailable() {
                 QuestionOutcome::Disconnected
@@ -677,7 +677,7 @@ fn messages_page(messages: &[Value], params: &Value) -> Result<Value> {
 }
 
 /// Typed `notice` event. `text` stays the authoritative plain notice; `kind`, `lane` and `tokens` are additive.
-pub(crate) fn typed_notice(event: &crate::agent::ui_event::UiEvent) -> Value {
+pub(crate) fn typed_notice(event: &crate::agent::ui::ui_event::UiEvent) -> Value {
     json!({"event":"notice","message":event.text,"kind":event.kind,"lane":event.kind.lane(),"tokens":event.tokens})
 }
 /// Live voice state of one control connection. `speech` cancels the reply being read aloud.
@@ -1074,8 +1074,8 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                             options.suppress_continuation = true;
                             let outcome = agent.compact_with_options(&mut ui, options)?;
                             Ok(json!({
-                                "compacted":outcome.kind == crate::agent::compaction::CompactionOutcomeKind::Compaction,
-                                "context_reset":outcome.kind == crate::agent::compaction::CompactionOutcomeKind::NewContext,
+                                "compacted":outcome.kind == crate::agent::compact::compaction::CompactionOutcomeKind::Compaction,
+                                "context_reset":outcome.kind == crate::agent::compact::compaction::CompactionOutcomeKind::NewContext,
                                 "outcome":outcome
                             }))
                         }
@@ -1444,7 +1444,7 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                 "question_presented" => {
                     let result = (|| -> Result<Value> {
                         anyhow::ensure!(!acp, "ACP custom question input is not negotiated");
-                        let correlation: crate::agent::questions::Correlation =
+                        let correlation: crate::agent::workflow::questions::Correlation =
                             serde_json::from_value(request["params"].clone())?;
                         let mut pending = pending_question
                             .lock()
@@ -1473,7 +1473,7 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
                 "question_answer" => {
                     let result = (|| -> Result<Value> {
                         anyhow::ensure!(!acp, "ACP custom question input is not negotiated");
-                        let submission: crate::agent::questions::Submission =
+                        let submission: crate::agent::workflow::questions::Submission =
                             serde_json::from_value(request["params"].clone())?;
                         let correlation = submission.correlation();
                         let question = {

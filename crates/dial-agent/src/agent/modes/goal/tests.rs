@@ -138,7 +138,7 @@ fn coach_finish_repairs_once_and_discloses_remaining_gaps() {
     // Supply the live control schema explicitly to exercise finish termination without
     // enabling non-hermetic provider discovery in this scripted loop test.
     let mut backend = agent.backend.take().unwrap();
-    let mut schemas = vec![crate::agent::completion::schema()];
+    let mut schemas = vec![crate::agent::verify::completion::schema()];
     let report = agent
         .run_loop(
             &mut backend,

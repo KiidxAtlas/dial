@@ -4,7 +4,7 @@ use super::markdown::truncate_spans;
 use super::text;
 use super::theme::{Sym, Theme, Tok};
 use super::{Rows, chrome};
-use crate::agent::todo::{Status, Task, TodoList};
+use crate::agent::workflow::todo::{Status, Task, TodoList};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 

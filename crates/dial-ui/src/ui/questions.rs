@@ -4,7 +4,7 @@ use super::{
     keys::{Action, Keymap},
     text,
 };
-use crate::agent::questions::{self, QuestionAnswer, QuestionOutcome, QuestionRequest};
+use crate::agent::workflow::questions::{self, QuestionAnswer, QuestionOutcome, QuestionRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
     path::{Path, PathBuf},

@@ -319,7 +319,7 @@ pub struct LayaBackend {
 impl Backend for LayaBackend {
     fn answer(&mut self, question: &Question<'_>, _retry: bool) -> Result<Answer> {
         let criteria: Vec<(&str, &str)> = criteria_pairs(question).collect();
-        let choice = crate::agent::laya::choose(
+        let choice = crate::agent::model::laya::choose(
             &self.config,
             question.question,
             &criteria,

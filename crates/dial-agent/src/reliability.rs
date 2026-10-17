@@ -59,8 +59,11 @@ impl Contract {
                         .iter()
                         .find(|s| s["function"]["name"] == name)
                         .unwrap();
-                    if crate::agent::calls::validate(&schema["function"]["parameters"], &example)
-                        .is_ok()
+                    if crate::agent::run::calls::validate(
+                        &schema["function"]["parameters"],
+                        &example,
+                    )
+                    .is_ok()
                     {
                         out.push_str(&format!(
                             "\n{name} argument shape (replace example values): {example}"
@@ -434,7 +437,7 @@ pub fn check(config: &AppConfig) -> Result<Value> {
             );
         }
         let schema = if *name == "todo" {
-            crate::agent::todo::schema()
+            crate::agent::workflow::todo::schema()
         } else {
             tools::schemas(&[name], edit_mode)?.remove(0)
         };
@@ -471,8 +474,11 @@ pub fn check(config: &AppConfig) -> Result<Value> {
             && reply.tool_calls[0].name == *name
             && !reply.tool_calls[0].malformed_arguments
             && reply.tool_calls[0].arguments == *args
-            && crate::agent::calls::validate(&contract.schemas[0]["function"]["parameters"], args)
-                .is_ok();
+            && crate::agent::run::calls::validate(
+                &contract.schemas[0]["function"]["parameters"],
+                args,
+            )
+            .is_ok();
         let executed = if passed && *name != "todo" {
             let out = tools::execute(&workspace, name, args, 10);
             ensure!(

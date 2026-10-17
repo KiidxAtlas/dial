@@ -353,8 +353,8 @@ impl Agent<'_> {
         self.prewalk_clear();
         self.modes.prewalk.handoff = Some(target.clone());
         self.save_modes()?;
-        ui.event(&crate::agent::ui_event::UiEvent::new(
-            crate::agent::ui_event::EventKind::Model,
+        ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+            crate::agent::ui::ui_event::EventKind::Model,
             format!(
                 "Prewalk: switched to {} after first {tool} call.",
                 label(&target)

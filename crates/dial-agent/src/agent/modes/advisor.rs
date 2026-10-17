@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use crate::agent::{Agent, Ui, guard, solve, subagents};
+use crate::agent::{Agent, Ui, safety::guard, workers::subagents, workflow::solve};
 use crate::llm::ToolCall;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -205,26 +205,26 @@ impl Agent<'_> {
                     }),
                 )?;
                 if repair.is_some() {
-                    ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Coach, "Coach found actionable gaps; continuing the active turn for one evidence-based repair pass."));
+                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Coach, "Coach found actionable gaps; continuing the active turn for one evidence-based repair pass."));
                 } else if !review.gaps.is_empty() {
                     state.unresolved = Some(question_gaps(&review));
-                    ui.event(&crate::agent::ui_event::UiEvent::new(
-                        crate::agent::ui_event::EventKind::Coach,
+                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                        crate::agent::ui::ui_event::EventKind::Coach,
                         format!(
                             "Coach repair limit reached; unresolved unverified findings: {}",
                             question_gaps(&review)
                         ),
                     ));
                 } else {
-                    ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Coach, "Coach review found no actionable gaps. This is not verification; local tool evidence remains authoritative."));
+                    ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Coach, "Coach review found no actionable gaps. This is not verification; local tool evidence remains authoritative."));
                     state.reviews = MAX_REVIEWS;
                 }
                 Ok(repair)
             }
             Err(error) => {
                 state.reviews = MAX_REVIEWS;
-                ui.event(&crate::agent::ui_event::UiEvent::new(
-                    crate::agent::ui_event::EventKind::Coach,
+                ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                    crate::agent::ui::ui_event::EventKind::Coach,
                     format!("Coach review skipped: {error:#}"),
                 ));
                 self.record(

@@ -12,8 +12,8 @@ use crate::platform;
 #[path = "commands/mod.rs"]
 mod commands;
 
-use crate::agent::todo::TodoList;
-use crate::agent::{self, Agent, Decision, Ui, context, make_backend};
+use crate::agent::workflow::todo::TodoList;
+use crate::agent::{self, Agent, Decision, Ui, make_backend, window::context};
 use crate::config::paths::Layout;
 use crate::config::selection::{changes as selection_changes, protocol as selection_protocol};
 use crate::config::session_models::SessionModels;
@@ -2461,7 +2461,7 @@ struct Shell {
     recent_worker: Option<String>,
     background_control: Option<Arc<dyn crate::tools::integrations::ext::Tool>>,
     pty_approval: Approval,
-    maintenance_control: Option<crate::agent::compaction_runtime::CompactionControl>,
+    maintenance_control: Option<crate::agent::compact::compaction_runtime::CompactionControl>,
     pending_config: Option<Config>,
     pending_verification: Option<ModelSelection>,
     /// A worker resume raised during a turn; launched when the turn settles.
@@ -4256,7 +4256,7 @@ impl Shell {
         };
         self.transcript.finish_turn();
         if include {
-            agent.session_mut().append(json!({"role": "user", "content": format!("I ran `{command}` myself:\n{}", agent::guard::clip_middle(&output.text, 8000))}))?;
+            agent.session_mut().append(json!({"role": "user", "content": format!("I ran `{command}` myself:\n{}", agent::safety::guard::clip_middle(&output.text, 8000))}))?;
         }
         Ok(Step::Done)
     }
@@ -7353,7 +7353,7 @@ impl Shell {
                         ),
                     }
                 } else if args.starts_with("allow ") || args.starts_with("deny ") {
-                    use crate::agent::approval::{Effect, PermissionRule};
+                    use crate::agent::safety::approval::{Effect, PermissionRule};
                     let mut words = args.split_whitespace();
                     let effect = if words.next() == Some("allow") {
                         Effect::Allow
@@ -7377,7 +7377,7 @@ impl Shell {
                         }
                     }
                     let prefix = if tool == "bash" {
-                        crate::agent::approval::bash_prefix(&command_prefix)
+                        crate::agent::safety::approval::bash_prefix(&command_prefix)
                     } else {
                         Ok(command_prefix)
                     };
@@ -10170,7 +10170,7 @@ impl Ui for Bridge<'_> {
         self.shell.transcript.notice("Background", message);
         self.repaint(true);
     }
-    fn event(&mut self, event: &crate::agent::ui_event::UiEvent) {
+    fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
         self.shell.transcript.event(event);
         self.repaint(true);
     }
@@ -10485,10 +10485,10 @@ impl Ui for Bridge<'_> {
 
     fn ask_questions(
         &mut self,
-        request: &agent::questions::QuestionRequest,
+        request: &agent::workflow::questions::QuestionRequest,
         cancel: &AtomicBool,
-    ) -> agent::questions::QuestionOutcome {
-        use agent::questions::QuestionOutcome;
+    ) -> agent::workflow::questions::QuestionOutcome {
+        use agent::workflow::questions::QuestionOutcome;
         let mut dialog = crate::ui::questions::Dialog::new(request, &self.app.layout.project_root);
         if request.notify && self.shell.ui.notify {
             crate::ui::termcaps::notify(

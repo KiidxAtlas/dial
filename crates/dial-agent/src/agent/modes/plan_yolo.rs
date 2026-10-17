@@ -71,8 +71,8 @@ impl Agent<'_> {
             self.prewalk_switch(target)?;
             self.modes.plan_yolo.armed = None;
             self.accept_plan(plan, ui);
-            ui.event(&crate::agent::ui_event::UiEvent::new(
-                crate::agent::ui_event::EventKind::Plan,
+            ui.event(&crate::agent::ui::ui_event::UiEvent::new(
+                crate::agent::ui::ui_event::EventKind::Plan,
                 "Plan-yolo: execution handed to the target model.",
             ));
         } else {

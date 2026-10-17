@@ -7,7 +7,7 @@ use super::{
     theme::Tok,
     transcript::{TranscriptCtx, fitted},
 };
-use crate::agent::ui_event::{EventKind, Lane, UiEvent};
+use crate::agent::ui::ui_event::{EventKind, Lane, UiEvent};
 use ratatui::{
     style::Modifier,
     text::{Line, Span},

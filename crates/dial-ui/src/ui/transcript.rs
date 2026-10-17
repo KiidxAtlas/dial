@@ -75,7 +75,7 @@ enum Kind {
         text: String,
     },
     /// A typed controller event, drawn in its lane (context line, alert, or divider).
-    Event(crate::agent::ui_event::UiEvent),
+    Event(crate::agent::ui::ui_event::UiEvent),
     Error(String),
     Image(super::images::Thumbnail),
     Stats(TurnStats),
@@ -713,7 +713,7 @@ impl Block {
     fn is_tool(&self) -> bool {
         match &self.kind {
             Kind::Tool(_) => true,
-            Kind::Event(event) => event.kind.lane() != crate::agent::ui_event::Lane::Divider,
+            Kind::Event(event) => event.kind.lane() != crate::agent::ui::ui_event::Lane::Divider,
             _ => false,
         }
     }
@@ -939,7 +939,7 @@ impl Transcript {
     }
 
     /// Attach the task list a pending `todo` call produced, so its card shows what changed.
-    pub fn tool_todo(&mut self, id: &str, tasks: Vec<(crate::agent::todo::Task, bool)>) {
+    pub fn tool_todo(&mut self, id: &str, tasks: Vec<(crate::agent::workflow::todo::Task, bool)>) {
         self.invalidate_tail();
         if let Some(tool) =
             self.blocks[self.cursor..]
@@ -1183,7 +1183,7 @@ impl Transcript {
     }
 
     /// A typed controller event in its own lane.
-    pub fn event(&mut self, event: &crate::agent::ui_event::UiEvent) {
+    pub fn event(&mut self, event: &crate::agent::ui::ui_event::UiEvent) {
         self.close_streaming_text();
         if self.blocks.last().is_some_and(|block| matches!(&block.kind, Kind::Event(previous) if previous.kind == event.kind && previous.text == event.text)) {
             return; // Presentation only: the execution journal keeps the original events.

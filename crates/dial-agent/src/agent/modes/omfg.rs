@@ -2,7 +2,7 @@
 //! assistant output, and save it to the project or user rules directory. Dial's rule loader supports
 //! Regex and finalized-source AST triggers; judged questions remain unsupported.
 
-use crate::agent::rules::{self, Catalog, State};
+use crate::agent::safety::rules::{self, Catalog, State};
 use crate::agent::{Agent, NullUi, make_backend};
 use crate::llm::{Reply, ToolCall};
 use anyhow::{Context, Result, bail};

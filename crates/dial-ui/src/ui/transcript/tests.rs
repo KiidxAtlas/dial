@@ -1158,7 +1158,7 @@ fn edit_cards_show_the_numbered_diff_not_the_model_facing_preview() {
 
 #[test]
 fn todo_calls_render_the_list_with_their_changes() {
-    use crate::agent::todo::TodoList;
+    use crate::agent::workflow::todo::TodoList;
     let env = Env::new();
     let mut before = TodoList::new();
     before.call(

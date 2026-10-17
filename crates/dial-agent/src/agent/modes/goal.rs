@@ -3,7 +3,7 @@
 //! stall rule. Continuations run inside `Agent::turn` as follow-up turns, so one user turn drives the
 //! whole loop.
 
-use crate::agent::todo::{Status as TodoStatus, TodoList};
+use crate::agent::workflow::todo::{Status as TodoStatus, TodoList};
 use crate::agent::{Agent, TurnReport, Ui};
 use crate::llm::usage::Counts;
 use crate::runtime::tool_output::ToolOutput;

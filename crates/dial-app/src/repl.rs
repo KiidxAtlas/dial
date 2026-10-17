@@ -355,7 +355,7 @@ impl Ui for PrintUi {
         }
         self.event(|| serde_json::json!({"type":"panel","title":title,"markdown":markdown}));
     }
-    fn todo(&mut self, todo: &crate::agent::todo::TodoList) {
+    fn todo(&mut self, todo: &crate::agent::workflow::todo::TodoList) {
         self.event(|| serde_json::json!({"type":"todo","tasks":todo.snapshot()}));
     }
     fn text_delta(&mut self, text: &str) {
@@ -395,7 +395,7 @@ impl Ui for PrintUi {
         self.event(|| {
             serde_json::json!({
                 "type":"tool_result", "name":name, "is_error":output.is_error, "seconds":seconds,
-                "text":crate::agent::guard::clip_middle(&output.text, 16_384),
+                "text":crate::agent::safety::guard::clip_middle(&output.text, 16_384),
                 "data":output.data,
             })
         });
@@ -424,7 +424,7 @@ impl Ui for PrintUi {
             self.terminal.tool_result(name, output);
         }
         self.event(|| serde_json::json!({"type":"tool_result","call_id":call_id,"name":name,"is_error":output.is_error,"seconds":seconds,
-            "text":crate::agent::guard::clip_middle(&output.text,16_384),"data":output.data}));
+            "text":crate::agent::safety::guard::clip_middle(&output.text,16_384),"data":output.data}));
     }
     fn notice(&mut self, message: &str) {
         if self.format == OutputFormat::Text {
@@ -445,16 +445,16 @@ impl Ui for PrintUi {
     }
     fn ask_questions(
         &mut self,
-        request: &crate::agent::questions::QuestionRequest,
+        request: &crate::agent::workflow::questions::QuestionRequest,
         _cancel: &AtomicBool,
-    ) -> crate::agent::questions::QuestionOutcome {
+    ) -> crate::agent::workflow::questions::QuestionOutcome {
         if self.check_output().is_err() {
-            return crate::agent::questions::QuestionOutcome::Disconnected;
+            return crate::agent::workflow::questions::QuestionOutcome::Disconnected;
         }
         self.event(
             || serde_json::json!({"type":"question","request":request,"input":"unsupported"}),
         );
-        crate::agent::questions::QuestionOutcome::Unsupported(
+        crate::agent::workflow::questions::QuestionOutcome::Unsupported(
             "print mode has no human input channel; state the assumption and continue, or ask in an interactive session".into(),
         )
     }
