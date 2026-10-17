@@ -28,23 +28,53 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-/// Every Rust file of a top-level module: `src/<m>.rs` plus everything under `src/<m>/`.
-/// A module with neither is reported as missing rather than treated as empty.
-fn module_files(src: &Path, module: &str) -> Result<Vec<PathBuf>, String> {
-    let flat = src.join(format!("{module}.rs"));
-    let dir = src.join(module);
-    if !flat.is_file() && !dir.is_dir() {
+/// Source roots that hold the crate's modules: the root package's `src/` and every workspace
+/// crate's `crates/<name>/src/`. Each module lives under exactly one of them.
+fn source_roots(manifest: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut roots = vec![manifest.join("src")];
+    let crates = manifest.join("crates");
+    let entries = fs::read_dir(&crates)
+        .map_err(|e| format!("unreadable crates directory {}: {e}", crates.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("unreadable entry in {}: {e}", crates.display()))?;
+        let src = entry.path().join("src");
+        if src.is_dir() {
+            roots.push(src);
+        }
+    }
+    roots.sort();
+    Ok(roots)
+}
+
+/// Every Rust file of a top-level module: `<root>/<m>.rs` plus everything under `<root>/<m>/`,
+/// for the one source root that holds it. A module in no root is reported as missing rather
+/// than treated as empty.
+fn module_files(roots: &[PathBuf], module: &str) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    let mut found = false;
+    for src in roots {
+        let flat = src.join(format!("{module}.rs"));
+        let dir = src.join(module);
+        if !flat.is_file() && !dir.is_dir() {
+            continue;
+        }
+        found = true;
+        if flat.is_file() {
+            files.push(flat);
+        }
+        if dir.exists() {
+            rust_files(&dir, &mut files)?;
+        }
+    }
+    if !found {
         return Err(format!(
             "module root `{module}` not found under {} (expected {module}.rs or {module}/)",
-            src.display()
+            roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
-    }
-    let mut files = Vec::new();
-    if flat.is_file() {
-        files.push(flat);
-    }
-    if dir.exists() {
-        rust_files(&dir, &mut files)?;
     }
     files.sort();
     Ok(files)
@@ -325,9 +355,11 @@ fn child_dir(file: &Path) -> PathBuf {
 }
 
 /// Resolve every `#[cfg(test)]` out-of-line module (and its submodule tree) to exempt paths.
-fn exempt_paths(src: &Path) -> Result<BTreeSet<PathBuf>, String> {
+fn exempt_paths(roots: &[PathBuf]) -> Result<BTreeSet<PathBuf>, String> {
     let mut all = Vec::new();
-    rust_files(src, &mut all)?;
+    for src in roots {
+        rust_files(src, &mut all)?;
+    }
     let mut exempt = BTreeSet::new();
     for file in &all {
         let original =
@@ -550,11 +582,12 @@ fn modules_respect_their_dependency_boundaries() {
             &[],
         ),
     ];
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let exempt = exempt_paths(&src).unwrap_or_else(|error| panic!("architecture guard: {error}"));
+    let roots = source_roots(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .unwrap_or_else(|error| panic!("architecture guard: {error}"));
+    let exempt = exempt_paths(&roots).unwrap_or_else(|error| panic!("architecture guard: {error}"));
     let mut violations = Vec::new();
     for (module, forbidden, allowed) in rules {
-        let files = match module_files(&src, module) {
+        let files = match module_files(&roots, module) {
             Ok(files) => files,
             Err(error) => {
                 violations.push(format!("module root `{module}`: {error}"));
@@ -567,11 +600,12 @@ fn modules_respect_their_dependency_boundaries() {
             }
             let text = fs::read_to_string(&file)
                 .unwrap_or_else(|error| panic!("unreadable {}: {error}", file.display()));
-            let module_path = module_path_of(&src, &file);
+            let root = roots.iter().find(|r| file.starts_with(r)).unwrap();
+            let module_path = module_path_of(root, &file);
             for (line, bad) in violations_in_except(&text, forbidden, allowed, &module_path) {
                 violations.push(format!(
                     "{}:{line}: {module} must not use {bad}",
-                    file.strip_prefix(&src).unwrap().display()
+                    file.strip_prefix(root).unwrap().display()
                 ));
             }
         }
@@ -704,13 +738,13 @@ fn missing_and_unreadable_module_roots_are_reported() {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("present")).unwrap();
     fs::write(root.join("present/a.rs"), "").unwrap();
-    let missing = module_files(&root, "absent");
+    let missing = module_files(std::slice::from_ref(&root), "absent");
     assert!(
         matches!(&missing, Err(error) if error.contains("not found")),
         "{missing:?}"
     );
     assert_eq!(
-        module_files(&root, "present").unwrap(),
+        module_files(std::slice::from_ref(&root), "present").unwrap(),
         vec![root.join("present/a.rs")]
     );
     #[cfg(unix)]
@@ -722,7 +756,7 @@ fn missing_and_unreadable_module_roots_are_reported() {
         // Root ignores directory permissions; only assert when the directory really is unreadable.
         if fs::read_dir(&locked).is_err() {
             assert!(matches!(
-                module_files(&root, "locked"),
+                module_files(std::slice::from_ref(&root), "locked"),
                 Err(error) if error.contains("unreadable")
             ));
         }
@@ -748,7 +782,7 @@ fn out_of_line_test_modules_are_exempt_files() {
     )
     .unwrap();
     fs::write(root.join("llm/nested/t.rs"), "use crate::tools::Y;\n").unwrap();
-    let exempt = exempt_paths(&root).unwrap();
+    let exempt = exempt_paths(std::slice::from_ref(&root)).unwrap();
     let _ = fs::remove_dir_all(&root);
     assert!(exempt.contains(&root.join("llm/tests.rs")));
     assert!(exempt.contains(&root.join("llm/nested/t.rs")));
@@ -784,17 +818,21 @@ fn test_attributes(code: &str) -> Vec<usize> {
 /// functions only appear in files reached through a test-gated `mod x;` declaration.
 #[test]
 fn tests_live_in_their_own_files() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let exempt = exempt_paths(&src).unwrap_or_else(|error| panic!("architecture guard: {error}"));
+    let roots = source_roots(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .unwrap_or_else(|error| panic!("architecture guard: {error}"));
+    let exempt = exempt_paths(&roots).unwrap_or_else(|error| panic!("architecture guard: {error}"));
     let mut files = Vec::new();
-    rust_files(&src, &mut files).unwrap_or_else(|error| panic!("architecture guard: {error}"));
+    for src in &roots {
+        rust_files(src, &mut files).unwrap_or_else(|error| panic!("architecture guard: {error}"));
+    }
     files.sort();
     let mut violations = Vec::new();
     for file in files {
         let original = fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("unreadable {}: {error}", file.display()));
         let code = strip(&original);
-        let name = file.strip_prefix(&src).unwrap().display().to_string();
+        let root = roots.iter().find(|r| file.starts_with(r)).unwrap();
+        let name = file.strip_prefix(root).unwrap().display().to_string();
         for range in test_modules(&code, &original).inline {
             violations.push(format!(
                 "{name}:{}: inline test module; move its body to its own file and declare it \
@@ -858,7 +896,97 @@ fn test_files_declared_inside_inline_modules_resolve_below_that_module() {
     )
     .unwrap();
     fs::write(root.join("platform/time/tests.rs"), "#[test]\nfn t() {}\n").unwrap();
-    let exempt = exempt_paths(&root).unwrap();
+    let exempt = exempt_paths(std::slice::from_ref(&root)).unwrap();
     let _ = fs::remove_dir_all(&root);
     assert!(exempt.contains(&root.join("platform/time/tests.rs")));
+}
+
+/// Workspace crates in layer order, lowest first (see ARCHITECTURE.md). A crate may depend on the
+/// crates before it in this list and on nothing else; an unlisted crate is a violation, so a new
+/// crate is placed in the order deliberately.
+const CRATE_LAYERS: &[&str] = &[
+    "dial-build-info",
+    "dial-core",
+    "dial-llm",
+    "dial-storage",
+    "dial-tools",
+    "dial-computer",
+    "dial-agent",
+    "dial-ui",
+    "dial-app",
+];
+
+/// Workspace-crate dependencies of one crate's manifest that are not in the layers below it.
+/// Dev-dependencies count too: a test dependency on a higher crate is the same cycle risk.
+fn crate_layer_violations(name: &str, manifest: &str) -> Vec<String> {
+    let Some(layer) = CRATE_LAYERS.iter().position(|c| *c == name) else {
+        return vec![format!("crates/{name}: not listed in CRATE_LAYERS")];
+    };
+    let parsed: toml::Table = toml::from_str(manifest)
+        .unwrap_or_else(|error| panic!("crates/{name}/Cargo.toml: {error}"));
+    let mut tables = Vec::new();
+    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        tables.extend(parsed.get(key).and_then(|v| v.as_table()));
+    }
+    for target in parsed
+        .get("target")
+        .and_then(|v| v.as_table())
+        .into_iter()
+        .flatten()
+    {
+        for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            tables.extend(target.1.get(key).and_then(|v| v.as_table()));
+        }
+    }
+    let mut violations = Vec::new();
+    for table in tables {
+        for dep in table.keys().filter(|k| k.starts_with("dial-")) {
+            match CRATE_LAYERS.iter().position(|c| c == dep) {
+                Some(below) if below < layer => {}
+                _ => violations.push(format!("crates/{name} must not depend on {dep}")),
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn crates_depend_only_on_lower_layers() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crates = manifest_dir.join("crates");
+    let mut violations = Vec::new();
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&crates).unwrap_or_else(|e| panic!("unreadable crates: {e}")) {
+        let entry = entry.unwrap_or_else(|e| panic!("unreadable crates entry: {e}"));
+        if entry.path().join("Cargo.toml").is_file() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    for name in &names {
+        let text = fs::read_to_string(crates.join(name).join("Cargo.toml"))
+            .unwrap_or_else(|e| panic!("unreadable crates/{name}/Cargo.toml: {e}"));
+        violations.extend(crate_layer_violations(name, &text));
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn crate_manifests_are_checked_against_the_layer_order() {
+    let ok = "[dependencies]\ndial-core = { path = \"../dial-core\" }\n";
+    assert!(crate_layer_violations("dial-llm", ok).is_empty());
+    let up = "[dev-dependencies]\ndial-app.workspace = true\n";
+    assert_eq!(
+        crate_layer_violations("dial-core", up),
+        vec!["crates/dial-core must not depend on dial-app".to_owned()]
+    );
+    let target = "[target.'cfg(unix)'.dependencies]\ndial-ui.workspace = true\n";
+    assert_eq!(
+        crate_layer_violations("dial-agent", target),
+        vec!["crates/dial-agent must not depend on dial-ui".to_owned()]
+    );
+    assert_eq!(
+        crate_layer_violations("dial-new", ok),
+        vec!["crates/dial-new: not listed in CRATE_LAYERS".to_owned()]
+    );
 }

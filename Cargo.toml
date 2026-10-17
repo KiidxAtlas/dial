@@ -6,7 +6,7 @@ description = "Local, gated model and harness improvement on Apple Silicon"
 license.workspace = true
 
 [workspace]
-members = ["."]
+members = [".", "crates/*"]
 resolver = "3"
 
 [workspace.package]
@@ -15,8 +15,11 @@ edition = "2024"
 license = "MIT"
 
 # Every dependency version is declared once here. Members opt in with `workspace = true` and keep
-# `optional` and target selection locally.
+# `optional` and target selection locally. Workspace crates (`crates/dial-*`) are path dependencies
+# declared here too; a crate with optional features is added with `default-features = false` and
+# the root forwards its features.
 [workspace.dependencies]
+dial-build-info = { path = "crates/dial-build-info" }
 anyhow = "1"
 vt100 = "0.15"
 thiserror = "2"
@@ -125,6 +128,7 @@ wayland-pipewire = ["desktop", "dep:pipewire"]
 
 
 [dependencies]
+dial-build-info.workspace = true
 anyhow.workspace = true
 vt100.workspace = true
 thiserror.workspace = true
@@ -248,6 +252,10 @@ incremental = true
 # Dial is a large, frequently edited crate. Favor parallel codegen and faster optimization
 # here without slowing parsing, image processing or other dependency hot paths.
 [profile.local.package.dial]
+opt-level = 1
+codegen-units = 64
+
+[profile.local.package.dial-build-info]
 opt-level = 1
 codegen-units = 64
 

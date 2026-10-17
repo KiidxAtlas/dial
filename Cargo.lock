@@ -1784,6 +1784,7 @@ dependencies = [
  "cpal",
  "crc32fast",
  "crossterm",
+ "dial-build-info",
  "encoding_rs",
  "enigo",
  "fancy-regex 0.16.2",
@@ -1850,6 +1851,13 @@ dependencies = [
  "xxhash-rust",
  "zbus",
  "zip",
+]
+
+[[package]]
+name = "dial-build-info"
+version = "0.1.9"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
