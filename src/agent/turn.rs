@@ -110,6 +110,7 @@ impl Agent<'_> {
         }
         let mut policy_signature = String::new();
         let mut stall = guard::StallGuard::default();
+        let mut pace = guard::PaceGuard::default();
         let mut completion = completion::CompletionGuard;
         let mut steering_pending = false;
         let mut budget = guard::StepBudget::new(
@@ -2078,6 +2079,10 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     output.text.push_str("\n\n");
                     output.text.push_str(&advice);
                 }
+                if let Some(advice) = pace.call(call, &output) {
+                    output.text.push_str("\n\n");
+                    output.text.push_str(&advice);
+                }
                 if output.is_error {
                     stall.note_error(&call.name, &output.text);
                 }
@@ -2322,6 +2327,11 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 guard::Stall::None => None,
             };
             if let Some(advice) = warning {
+                pending_nudges.push(json!({"role":"user","content":advice,"dial_transient":true}));
+            }
+            if duplicates.is_none()
+                && let Some(advice) = pace.round(&reply.tool_calls)
+            {
                 pending_nudges.push(json!({"role":"user","content":advice,"dial_transient":true}));
             }
             if let Some(plan) = self.pending_plan.take() {
@@ -2710,38 +2720,4 @@ fn record_rejected_reply(
 }
 
 #[cfg(test)]
-mod usage_join_tests {
-    use super::*;
-    use crate::llm::usage::{Purpose, Scope};
-
-    fn endpoint(model: &str) -> Backend {
-        Backend::new(
-            ProviderKind::Endpoint {
-                base_url: "http://127.0.0.1:9/v1".into(),
-                model: model.into(),
-                api_key: None,
-            },
-            Default::default(),
-            5,
-        )
-    }
-
-    #[test]
-    fn replacement_backends_join_the_turn_ledger() {
-        let usage = Scope::default().next_turn(0).unwrap();
-        let mut backend = endpoint("fallback");
-        join_turn_usage(&usage, &mut backend);
-        backend.record_discarded_response().unwrap();
-        assert_eq!(usage.snapshot().0.all.discarded_attempts, 1);
-    }
-
-    #[test]
-    fn rejected_replies_are_discarded_under_their_requesting_purpose() {
-        let usage = Scope::default().next_turn(0).unwrap();
-        let mut backend = endpoint("primary");
-        record_rejected_reply(&usage, &mut backend, true).unwrap();
-        let (total, _) = usage.snapshot();
-        assert_eq!(total.by_purpose[&Purpose::Repair].discarded_attempts, 1);
-        assert!(!total.by_purpose.contains_key(&Purpose::Agent));
-    }
-}
+mod usage_join_tests;

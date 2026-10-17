@@ -341,19 +341,4 @@ fn append_previews(out: &mut String, files: &[Planned]) {
 }
 
 #[cfg(test)]
-mod registration {
-    use super::*;
-    use crate::agent::approval::parallel_read;
-    use crate::tools::ext::Registry;
-
-    #[test]
-    fn registered_ast_search_is_declared_shared_and_runs_in_parallel_reads() {
-        let registry = Registry::standard(&Config::default());
-        let args = json!({"pattern": "foo($A)"});
-        let tool = registry
-            .get("ast_search")
-            .expect("ast_search is registered");
-        assert_eq!(tool.concurrency(&args), Concurrency::Shared);
-        assert!(parallel_read(&registry, "ast_search", &args));
-    }
-}
+mod registration;
