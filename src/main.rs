@@ -1,9 +1,4 @@
-#[path = "cli/benchmark/mod.rs"]
-mod benchmark_cli;
-#[path = "cli/improve.rs"]
-mod improve_cli;
-#[path = "cli/update.rs"]
-mod update;
+mod cmd;
 
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -292,7 +287,7 @@ enum Command {
     },
     /// The gated self-improvement loop (evaluation suites, harvesting, LoRA training, rollback).
     #[command(subcommand)]
-    Improve(improve_cli::Cmd),
+    Improve(cmd::improve::Cmd),
     /// Run a reproducible coding benchmark suite in isolated project copies.
     #[command(alias = "bench")]
     Benchmark {
@@ -601,7 +596,7 @@ fn real_main(mut cli: Cli) -> Result<()> {
         return Ok(());
     }
     if let Some(Command::Update { version }) = &cli.command {
-        return update::run(version.as_deref());
+        return cmd::update::run(version.as_deref());
     }
     if let Some(mode) =
         dial::cli::cli_modes::resolve(cli.mode.as_deref(), cli.no_ui).map_err(anyhow::Error::msg)?
@@ -988,7 +983,7 @@ fn real_main(mut cli: Cli) -> Result<()> {
             }
             return Ok(());
         }
-        Some(Command::Update { version }) => return update::run(version.as_deref()),
+        Some(Command::Update { version }) => return cmd::update::run(version.as_deref()),
         Some(Command::Setup) => {
             return setup::run(
                 &layout,
@@ -1231,7 +1226,7 @@ fn real_main(mut cli: Cli) -> Result<()> {
                 baseline.is_none() && profiles.is_none() && checkpoint.is_none(),
                 "--ablate-assistance cannot be combined with --baseline, --profiles or --checkpoint"
             );
-            return benchmark_cli::run_assist(
+            return cmd::benchmark::run_assist(
                 &layout,
                 &config,
                 manifest
@@ -1244,7 +1239,7 @@ fn real_main(mut cli: Cli) -> Result<()> {
         let manifest = manifest.as_deref().ok_or_else(|| {
             anyhow::anyhow!("benchmark requires a suite manifest (or --ablate-assistance)")
         })?;
-        return benchmark_cli::run(
+        return cmd::benchmark::run(
             &layout,
             &config,
             manifest,
@@ -1256,7 +1251,7 @@ fn real_main(mut cli: Cli) -> Result<()> {
         );
     }
     if let Some(Command::Improve(cmd)) = cli.command {
-        return improve_cli::run(cmd, &layout, config);
+        return cmd::improve::run(cmd, &layout, config);
     }
     chat(
         cli,
