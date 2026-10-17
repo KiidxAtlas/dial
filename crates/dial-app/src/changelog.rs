@@ -4,7 +4,7 @@
 //! section plus the most recent release; `full` shows every entry; `last N` shows the first N.
 
 /// The bundled changelog, compiled into the binary.
-pub const CHANGELOG: &str = include_str!("../CHANGELOG.md");
+pub const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
 
 /// Usage line printed for arguments that are not `full` or `last [N]`.
 pub const USAGE: &str = "Usage: /changelog [full|last [N]]";

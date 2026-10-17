@@ -8,11 +8,12 @@ use std::os::windows::fs::symlink_file as symlink;
 
 #[test]
 fn efficiency_suite_and_fixture_are_valid() {
-    let suite =
-        BenchmarkSuite::parse_toml(include_str!("../../examples/benchmarks/efficiency.toml"))
-            .unwrap();
+    let suite = BenchmarkSuite::parse_toml(include_str!(
+        "../../../../examples/benchmarks/efficiency.toml"
+    ))
+    .unwrap();
     assert_eq!(suite.cases.len(), 5);
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for case in &suite.cases {
         let fixture = root.join(case.project.as_ref().unwrap());
         assert!(fixture.join("calc.py").is_file());
