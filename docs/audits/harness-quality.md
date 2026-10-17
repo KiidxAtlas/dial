@@ -68,7 +68,7 @@ coordination overhead still constrain useful concurrency.
    as well as failures against those criteria before changing defaults. Wilson intervals assume
    independent trials; small samples and correlated provider behavior limit conclusions.
 
-See [Benchmarks and measurement](benchmarks.md#repeated-outcomes-not-best-run-scores) for executable
+See [Benchmarks and measurement](../benchmarks.md#repeated-outcomes-not-best-run-scores) for executable
 commands. The repeated-report analyzer is offline and does not add a model judge or consume quota.
 
 ## What the harness deliberately does not claim

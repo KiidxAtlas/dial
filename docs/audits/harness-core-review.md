@@ -162,7 +162,7 @@ Dial's mutation counters. This is deliberately not a cache of passing verificati
 
 ## Measurement and remaining priorities
 
-Use the existing [quality/efficiency evaluation workflow](benchmarks.md#measuring-efficiency):
+Use the existing [quality/efficiency evaluation workflow](../benchmarks.md#measuring-efficiency):
 compare the same model, fixture hashes, settings, and repeated trials, with correctness first.
 Measure successful-task latency alongside total requests, tool errors, prompt/output/cache usage,
 compaction requests, and environment-unavailable checks. Include failed trials in reliability results.

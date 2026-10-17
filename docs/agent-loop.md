@@ -109,7 +109,7 @@ markers. Unverified runs invalidate a matching failure baseline rather than pair
 with a later pass. Related-test planning reuses JS package/runner metadata and Go directory scans
 only within one planning invocation; later invocations observe changed manifests and tests.
 Behavioral provenance still hashes fresh bounded source state, but no longer loads dependency
-outlines that its record does not use. See [Core harness review](harness-core-review.md) for the
+outlines that its record does not use. See [Core harness review](audits/harness-core-review.md) for the
 comparison, rationale, and measurement limits.
 Approval-denied writes are not treated as successful verification. `todo` is optional progress bookkeeping, not a verification checkpoint. `done` closes the current item and starts the next; findings and references are optional notes, including for legacy investigation entries. No separate tool-activity, citation or text-delivery gate applies. Accepted completion reconciles pending progress entries, while explicit blockers and running workers remain completion prerequisites. Failed checks remain failures independently of todo state.
 
