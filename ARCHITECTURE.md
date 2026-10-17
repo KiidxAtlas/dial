@@ -24,7 +24,7 @@ worker used only for MLX inference and LoRA training.
 
 ## Dependency boundaries
 
-Enforced by `tests/integration/architecture.rs` (production code only; `#[cfg(test)]` modules are exempt):
+Enforced by `tests/integration/architecture.rs` (production code only; test modules are exempt):
 
 - `ui` does not depend on `learn`, `tools` or `config`.
 - `llm` does not depend on `ui`, `learn` or `tools`.
@@ -34,6 +34,10 @@ Enforced by `tests/integration/architecture.rs` (production code only; `#[cfg(te
 - `workspace_copy` does not depend on `agent`, `benchmark`, `learn`, `config`, `llm` or `ui`.
   Evaluation and worker isolation consume this shared policy; benchmark re-exports retain the
   earlier public copy API. Private dependency materialization keeps its narrower allowlist.
+
+Tests never live inline in `src/`: a `#[cfg(test)]` module is declared with `mod tests;` and its body
+sits in the sibling `tests.rs` (`foo.rs` → `foo/tests.rs`). The same test rejects inline test module
+bodies and `#[test]` functions outside such files.
 
 Changing a rule means editing that test and stating why here.
 

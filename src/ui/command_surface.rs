@@ -180,52 +180,7 @@ pub fn category(name: &str) -> Category {
 }
 
 #[cfg(test)]
-mod category_tests {
-    use super::*;
-
-    #[test]
-    fn everyday_commands_live_in_visible_sections() {
-        for name in EVERYDAY {
-            assert!(
-                !category(name).advanced(),
-                "/{name} is everyday but its section is collapsed"
-            );
-        }
-    }
-
-    #[test]
-    fn every_category_has_a_palette_tab() {
-        let tabs = [
-            "Sessions", "Models", "Changes", "Tasks", "Modes", "Context", "Tools", "Settings",
-            "Upkeep", "Learn",
-        ];
-        for c in Category::ALL {
-            assert!(tabs.contains(&c.tab()), "{:?}", c);
-        }
-    }
-
-    #[test]
-    fn titles_and_blurbs_are_present_and_distinct() {
-        let mut titles = std::collections::HashSet::new();
-        for c in Category::ALL {
-            assert!(!c.title().is_empty() && !c.blurb().is_empty());
-            assert!(titles.insert(c.title()), "duplicate {}", c.title());
-        }
-    }
-}
+mod category_tests;
 
 #[cfg(test)]
-mod starter_tests {
-    use super::*;
-
-    #[test]
-    fn starter_lists_are_everyday_ordered_and_unique() {
-        for list in [START_HERE, STARTERS] {
-            let mut seen = std::collections::HashSet::new();
-            for name in list {
-                assert!(everyday(name), "/{name} starts a list but is not everyday");
-                assert!(seen.insert(name), "/{name} listed twice");
-            }
-        }
-    }
-}
+mod starter_tests;

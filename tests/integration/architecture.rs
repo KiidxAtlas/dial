@@ -1,9 +1,12 @@
 //! Executable module-boundary checks (see ARCHITECTURE.md). Each rule lists a module and the
 //! sibling modules it must not depend on.
 //!
-//! Only `#[cfg(test)]` modules (inline bodies, out-of-line module files and their submodules,
-//! and files marked `#![cfg(test)]`) are exempt; production code after a test module is still
-//! scanned. Comments and string/char literal contents are ignored.
+//! Test-gated modules (out-of-line module files and their submodules, and files marked
+//! `#![cfg(test)]`) are exempt; production code after a test module is still scanned. Comments
+//! and string/char literal contents are ignored.
+//!
+//! Tests live in their own files: `tests_live_in_their_own_files` rejects inline test-gated
+//! module bodies and `#[test]` functions outside a test module file.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -192,22 +195,87 @@ fn ident(s: &str, i: usize) -> &str {
 }
 
 struct TestModules {
-    /// Byte ranges of inline `#[cfg(test)] mod x { … }` bodies.
+    /// Byte ranges of inline test-gated `mod x { … }` bodies.
     inline: Vec<Range<usize>>,
-    /// Out-of-line `#[cfg(test)] mod x;` declarations: (name, explicit `#[path]`).
-    files: Vec<(String, Option<String>)>,
+    /// Out-of-line test-gated `mod x;` declarations: (name, explicit `#[path]`, names of the
+    /// inline modules that enclose the declaration, outermost first).
+    files: Vec<(String, Option<String>, Vec<String>)>,
 }
 
-/// Find `#[cfg(test)]`-gated module items in stripped source. `original` supplies `#[path]` values.
+/// Whether `attr` (`#[cfg(…)]`, from stripped source) compiles its item only under `cfg(test)`:
+/// `test` itself, or `all(…)` with `test` among its direct arguments. `any(test, …)` and
+/// `not(test)` also build outside tests, so they do not qualify.
+fn is_test_gate(attr: &str) -> bool {
+    let Some(predicate) = attr
+        .strip_prefix("#[cfg(")
+        .and_then(|rest| rest.strip_suffix(")]"))
+    else {
+        return false;
+    };
+    let predicate: String = predicate.chars().filter(|c| !c.is_whitespace()).collect();
+    if predicate == "test" {
+        return true;
+    }
+    let Some(args) = predicate
+        .strip_prefix("all(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let (mut depth, mut start) = (0usize, 0);
+    let mut direct = Vec::new();
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                direct.push(&args[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    direct.push(&args[start..]);
+    direct.contains(&"test")
+}
+
+/// Names of the inline `mod x { … }` blocks that contain `offset`, outermost first.
+fn enclosing_mods(code: &str, offset: usize) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut from = 0;
+    while let Some(n) = code[from..offset].find("mod ") {
+        let at = from + n;
+        from = at + "mod ".len();
+        if code[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let name_at = skip_ws(code, at + "mod".len());
+        let name = ident(code, name_at);
+        let open = skip_ws(code, name_at + name.len());
+        if !name.is_empty()
+            && code.as_bytes().get(open) == Some(&b'{')
+            && matching(code, open, (b'{', b'}')) > offset
+        {
+            chain.push(name.to_owned());
+        }
+    }
+    chain
+}
+
+/// Find test-gated module items in stripped source. `original` supplies `#[path]` values.
 fn test_modules(code: &str, original: &str) -> TestModules {
     let mut found = TestModules {
         inline: Vec::new(),
         files: Vec::new(),
     };
     let mut from = 0;
-    while let Some(at) = code[from..].find("#[cfg(test)]").map(|n| from + n) {
-        from = at + "#[cfg(test)]".len();
-        let mut i = skip_ws(code, from);
+    while let Some(at) = code[from..].find("#[cfg(").map(|n| from + n) {
+        let gate_end = matching(code, at + 1, (b'[', b']'));
+        from = gate_end;
+        if !is_test_gate(&code[at..gate_end]) {
+            continue;
+        }
+        let mut i = skip_ws(code, gate_end);
         let mut path_attr = None;
         // Further attributes on the same item.
         while code[i..].starts_with("#[") {
@@ -237,7 +305,9 @@ fn test_modules(code: &str, original: &str) -> TestModules {
                 found.inline.push(at..end);
                 from = end;
             }
-            Some(b';') => found.files.push((name, path_attr)),
+            Some(b';') => found
+                .files
+                .push((name, path_attr, enclosing_mods(code, at))),
             _ => {}
         }
     }
@@ -267,12 +337,16 @@ fn exempt_paths(src: &Path) -> Result<BTreeSet<PathBuf>, String> {
             exempt.insert(file.clone());
             exempt.insert(child_dir(file));
         }
-        for (name, path_attr) in test_modules(&code, &original).files {
+        for (name, path_attr, inline) in test_modules(&code, &original).files {
             let dir = file.parent().unwrap();
             let candidates = match path_attr {
                 Some(path) => vec![dir.join(path)],
                 None => {
-                    let base = child_dir(file);
+                    // A declaration inside `mod x { … }` looks in `x/` below the file's own
+                    // child directory.
+                    let base = inline
+                        .iter()
+                        .fold(child_dir(file), |dir, module| dir.join(module));
                     vec![
                         base.join(format!("{name}.rs")),
                         base.join(&name).join("mod.rs"),
@@ -627,4 +701,103 @@ fn out_of_line_test_modules_are_exempt_files() {
             .iter()
             .any(|p| root.join("llm/nested.rs").starts_with(p))
     );
+}
+
+/// Offsets of `#[test]`, `#[tokio::test]` and similar test-function attributes in stripped source.
+fn test_attributes(code: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = code[from..].find("#[").map(|n| from + n) {
+        let end = matching(code, at + 1, (b'[', b']'));
+        let attr = &code[at + 2..end - 1];
+        let name = attr.split('(').next().unwrap_or(attr).trim();
+        if name == "test" || name.ends_with("::test") {
+            found.push(at);
+        }
+        from = at + 2;
+    }
+    found
+}
+
+/// Test sources are separate files: no test-gated module body is written inline, and `#[test]`
+/// functions only appear in files reached through a test-gated `mod x;` declaration.
+#[test]
+fn tests_live_in_their_own_files() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let exempt = exempt_paths(&src).unwrap_or_else(|error| panic!("architecture guard: {error}"));
+    let mut files = Vec::new();
+    rust_files(&src, &mut files).unwrap_or_else(|error| panic!("architecture guard: {error}"));
+    files.sort();
+    let mut violations = Vec::new();
+    for file in files {
+        let original = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("unreadable {}: {error}", file.display()));
+        let code = strip(&original);
+        let name = file.strip_prefix(&src).unwrap().display().to_string();
+        for range in test_modules(&code, &original).inline {
+            violations.push(format!(
+                "{name}:{}: inline test module; move its body to its own file and declare it \
+                 with `mod <name>;`",
+                line_of(&code, range.start)
+            ));
+        }
+        if !exempt.iter().any(|path| file.starts_with(path)) {
+            for offset in test_attributes(&code) {
+                violations.push(format!(
+                    "{name}:{}: test function outside a test module file",
+                    line_of(&code, offset)
+                ));
+            }
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn inline_test_modules_and_stray_test_functions_are_detected() {
+    let inline = "fn a() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n\
+        #[cfg(all(test, unix))]\nmod unix_tests { }\n";
+    let code = strip(inline);
+    assert_eq!(test_modules(&code, inline).inline.len(), 2);
+    assert_eq!(test_attributes(&code).len(), 1);
+
+    let out_of_line = "#[cfg(test)]\nmod tests;\n#[cfg(any(test, feature = \"x\"))]\nmod shared {}\n\
+        #[cfg(not(test))]\nmod prod {}\n";
+    let code = strip(out_of_line);
+    let found = test_modules(&code, out_of_line);
+    assert!(found.inline.is_empty());
+    assert_eq!(found.files.len(), 1);
+
+    let tokio = "#[tokio::test(flavor = \"multi_thread\")]\nasync fn t() {}\n// #[test]\n\
+        let s = \"#[test]\";\n#[derive(Debug)]\nstruct S;\n";
+    assert_eq!(test_attributes(&strip(tokio)).len(), 1);
+}
+
+#[test]
+fn test_gates_are_recognised_only_when_they_imply_cfg_test() {
+    assert!(is_test_gate("#[cfg(test)]"));
+    assert!(is_test_gate("#[cfg(all(test, unix))]"));
+    assert!(is_test_gate(
+        "#[cfg(all(unix, test, not(feature = \"desktop\")))]"
+    ));
+    assert!(!is_test_gate("#[cfg(any(test, unix))]"));
+    assert!(!is_test_gate("#[cfg(not(test))]"));
+    assert!(!is_test_gate("#[cfg(all(unix, not(test)))]"));
+    assert!(!is_test_gate("#[cfg(feature = \"test\")]"));
+}
+
+#[test]
+fn test_files_declared_inside_inline_modules_resolve_below_that_module() {
+    let root = std::env::temp_dir().join(format!("dial-arch-nested-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("platform/time")).unwrap();
+    fs::write(
+        root.join("platform/mod.rs"),
+        "pub mod time {\n    #[cfg(test)]\n    mod tests;\n}\n",
+    )
+    .unwrap();
+    fs::write(root.join("platform/time/tests.rs"), "#[test]\nfn t() {}\n").unwrap();
+    let exempt = exempt_paths(&root).unwrap();
+    let _ = fs::remove_dir_all(&root);
+    assert!(exempt.contains(&root.join("platform/time/tests.rs")));
 }
