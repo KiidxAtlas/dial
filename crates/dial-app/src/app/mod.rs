@@ -9,7 +9,7 @@
 //! immutable agent configuration around the same session, task list, permissions and cost.
 use crate::platform;
 
-#[path = "commands/mod.rs"]
+#[path = "../commands/mod.rs"]
 mod commands;
 
 use crate::agent::workflow::todo::TodoList;
