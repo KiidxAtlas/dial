@@ -49,7 +49,7 @@ impl Agent<'_> {
             return;
         }
         let plugins = self.hook_plugins();
-        struct ClosePlugins(Option<Arc<tools::plugin::Host>>);
+        struct ClosePlugins(Option<Arc<crate::tools::integrations::plugin::Host>>);
         impl Drop for ClosePlugins {
             fn drop(&mut self) {
                 if let Some(host) = &self.0 {
@@ -193,9 +193,9 @@ impl<'a> Agent<'a> {
             None
         };
         let history = if config.codebase.enabled && config.codebase.history {
-            Some(Arc::new(crate::tools::history::ChangeHistory::open(
-                &layout,
-            )?))
+            Some(Arc::new(
+                crate::tools::knowledge::history::ChangeHistory::open(&layout)?,
+            ))
         } else {
             None
         };
@@ -343,14 +343,15 @@ impl<'a> Agent<'a> {
             task_packet: Default::default(),
         };
         if let Some(memory) = &agent.memory {
-            for tool in
-                crate::tools::provenance::tools(memory.clone(), agent.session.id().to_owned())
-            {
+            for tool in crate::tools::knowledge::provenance::tools(
+                memory.clone(),
+                agent.session.id().to_owned(),
+            ) {
                 agent.ext.register(tool);
             }
         }
         if let Some(cache) = &agent.codebase {
-            agent.ext.register(crate::tools::codebase::tool(
+            agent.ext.register(crate::tools::knowledge::codebase::tool(
                 cache.clone(),
                 agent.session.id().to_owned(),
             ));
@@ -358,7 +359,7 @@ impl<'a> Agent<'a> {
         if let Some(history) = &agent.history {
             agent
                 .ext
-                .register(crate::tools::history::tool(history.clone()));
+                .register(crate::tools::knowledge::history::tool(history.clone()));
         }
         agent.restore_control()?;
         agent.rebuild_system();

@@ -64,7 +64,7 @@ fn harness_notes_merge_into_one_message_without_touching_history_or_marked_messa
 #[test]
 fn shared_wait_receives_steering_without_losing_the_queued_instruction() {
     struct Wait;
-    impl tools::ext::Tool for Wait {
+    impl crate::tools::integrations::ext::Tool for Wait {
         fn name(&self) -> &str {
             "wait_probe"
         }
@@ -74,22 +74,22 @@ fn shared_wait_receives_steering_without_losing_the_queued_instruction() {
         fn needs_approval(&self, _: &Value) -> bool {
             false
         }
-        fn concurrency(&self, _: &Value) -> tools::ext::Concurrency {
-            tools::ext::Concurrency::Shared
+        fn concurrency(&self, _: &Value) -> crate::tools::integrations::ext::Concurrency {
+            crate::tools::integrations::ext::Concurrency::Shared
         }
         fn interruptible(&self, _: &Value) -> bool {
             true
         }
         fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
             let deadline = Instant::now() + Duration::from_secs(2);
-            while !tools::signals::wait_interrupted() && Instant::now() < deadline {
+            while !crate::tools::exec::signals::wait_interrupted() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(2));
             }
             ToolOutput {
                 execution: Default::default(),
                 data: None,
                 text: "wait ended".into(),
-                is_error: !tools::signals::wait_interrupted(),
+                is_error: !crate::tools::exec::signals::wait_interrupted(),
             }
         }
     }
@@ -169,15 +169,15 @@ fn independent_slow_reads_overlap_and_results_stay_ordered() {
     struct SlowRead {
         entered: std::sync::atomic::AtomicUsize,
     }
-    impl tools::ext::Tool for SlowRead {
+    impl crate::tools::integrations::ext::Tool for SlowRead {
         fn name(&self) -> &str {
             "harness_probe"
         }
         fn schema(&self) -> Value {
             json!({"type":"function","function":{"name":"harness_probe","description":"fake","parameters":{"type":"object","properties":{}}}})
         }
-        fn concurrency(&self, _: &Value) -> tools::ext::Concurrency {
-            tools::ext::Concurrency::Shared
+        fn concurrency(&self, _: &Value) -> crate::tools::integrations::ext::Concurrency {
+            crate::tools::integrations::ext::Concurrency::Shared
         }
         fn needs_approval(&self, _: &Value) -> bool {
             false

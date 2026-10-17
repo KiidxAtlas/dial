@@ -1,7 +1,7 @@
 //! Git commands behind the `/git` panel: status, commits, diffs, patch application and blob reads.
 
 use super::*;
-use crate::tools::{git::run_checked, git_patch::line_patch};
+use crate::tools::{vcs::git::run_checked, vcs::git_patch::line_patch};
 use std::{
     io::{Read, Write},
     path::Path,
@@ -571,7 +571,7 @@ impl Repo {
         let bypass = self.config.git.bypass_hooks;
         let mut args: Vec<&str> = Vec::new();
         if bypass {
-            args.extend(crate::tools::git::hooks_off_args());
+            args.extend(crate::tools::vcs::git::hooks_off_args());
         }
         args.push("commit");
         if bypass {

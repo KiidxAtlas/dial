@@ -30,7 +30,7 @@ use crate::{
     config::paths::Layout,
     config::types::{Approval, Config, Harness},
     llm::{ToolCall, provider::Backend},
-    tools::{Workspace, ext::Registry},
+    tools::{Workspace, integrations::ext::Registry},
 };
 use serde_json::{Value, json};
 use std::{
@@ -1067,7 +1067,7 @@ pub(super) trait Approver {
         &mut self,
         _call: &ToolCall,
         _registry: &Registry,
-    ) -> Option<crate::tools::signals::CallSignals> {
+    ) -> Option<crate::tools::exec::signals::CallSignals> {
         None
     }
 
@@ -1331,7 +1331,7 @@ enum Message {
         reply: mpsc::Sender<Result<(), String>>,
     },
     Done(usize, Outcome),
-    ToolStarted(usize, Weak<dyn crate::tools::ext::Tool>),
+    ToolStarted(usize, Weak<dyn crate::tools::integrations::ext::Tool>),
     ToolFinished(usize),
     Notice(String),
     Cost(f64),
@@ -2098,7 +2098,7 @@ impl Approver for Rebase<'_> {
         &mut self,
         call: &ToolCall,
         registry: &Registry,
-    ) -> Option<crate::tools::signals::CallSignals> {
+    ) -> Option<crate::tools::exec::signals::CallSignals> {
         self.inner.tool_signals(call, registry)
     }
 
@@ -2468,7 +2468,8 @@ fn pump_messages(
 ) {
     // Weak handles cannot keep an owned process alive after its registry is dropped
     // for copy merge/recovery. They are upgraded only to cancel the active operation.
-    let mut active: BTreeMap<usize, Weak<dyn crate::tools::ext::Tool>> = BTreeMap::new();
+    let mut active: BTreeMap<usize, Weak<dyn crate::tools::integrations::ext::Tool>> =
+        BTreeMap::new();
     loop {
         let message = rx.recv_timeout(std::time::Duration::from_millis(100));
         direct.ui.heartbeat();

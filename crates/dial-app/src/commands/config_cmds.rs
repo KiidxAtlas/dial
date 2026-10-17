@@ -574,7 +574,7 @@ fn ssh_list(config: &Config) -> String {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return configured_only_list(config);
     };
-    let hosts = crate::tools::ssh::resolve_hosts(&home, &config.ssh_hosts);
+    let hosts = crate::tools::integrations::ssh::resolve_hosts(&home, &config.ssh_hosts);
     let lines: Vec<String> = hosts
         .iter()
         .map(|host| {
@@ -792,7 +792,7 @@ fn checks_list(config: &Config) -> String {
 
 /// Paths with uncommitted changes in the project, as `git status` reports them. Empty outside Git.
 fn changed_files(root: &std::path::Path) -> Vec<String> {
-    let Ok(stdout) = crate::tools::git::run_checked(
+    let Ok(stdout) = crate::tools::vcs::git::run_checked(
         root,
         &["status", "--porcelain=v1", "--untracked-files=all"],
         false,

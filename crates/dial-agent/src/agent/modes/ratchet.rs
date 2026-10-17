@@ -7,7 +7,7 @@
 //! (the pre-candidate snapshot used to revert).
 //!
 //! The gate rules (paired t-interval verdicts, guardrails, rerun) are not in `learn::gate` or
-//! `tools::autoresearch::experiment`, so they are implemented here.
+//! `crate::tools::knowledge::autoresearch::experiment`, so they are implemented here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

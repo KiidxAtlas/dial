@@ -10,10 +10,12 @@ use crate::config::settings_store::{Change, Scope};
 use crate::config::types::McpServerConfig;
 use crate::storage::skills::packages;
 use crate::storage::skills::packages::registry::Entry as SkillEntry;
-use crate::tools::mcp::catalog::{self, CURATED, Candidate, Endpoints, Install, Source};
-use crate::tools::mcp::{foreign, smithery};
-use crate::tools::plugin::installer::PluginStore;
-use crate::tools::plugin::marketplace::{Marketplaces, SkillListing};
+use crate::tools::integrations::mcp::catalog::{
+    self, CURATED, Candidate, Endpoints, Install, Source,
+};
+use crate::tools::integrations::mcp::{foreign, smithery};
+use crate::tools::integrations::plugin::installer::PluginStore;
+use crate::tools::integrations::plugin::marketplace::{Marketplaces, SkillListing};
 use crate::ui::overlay::extensions::ExtensionsOverlay;
 use crate::ui::overlay::extensions::model::{
     CatalogUpdate, Field, Form, Intent, JobProgress, Origin, Row, SharedCatalog, SharedProgress,

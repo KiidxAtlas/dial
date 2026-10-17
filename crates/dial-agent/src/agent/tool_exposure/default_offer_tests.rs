@@ -766,7 +766,7 @@ fn restrictions_apply_to_discovery_loading_and_late_offers() {
 #[test]
 fn pending_background_work_returns_to_the_model_without_a_hidden_wait() {
     struct Job(std::sync::atomic::AtomicUsize);
-    impl tools::ext::Tool for Job {
+    impl crate::tools::integrations::ext::Tool for Job {
         fn name(&self) -> &str {
             "pending_probe"
         }
@@ -808,7 +808,7 @@ fn pending_background_work_returns_to_the_model_without_a_hidden_wait() {
 #[test]
 fn live_job_output_reaches_the_ui_without_a_matching_foreground_tool() {
     struct Job;
-    impl tools::ext::Tool for Job {
+    impl crate::tools::integrations::ext::Tool for Job {
         fn name(&self) -> &str {
             "output_probe"
         }
@@ -821,15 +821,15 @@ fn live_job_output_reaches_the_ui_without_a_matching_foreground_tool() {
         fn call(&self, _: &ToolContext, _: &Value) -> ToolOutput {
             ToolOutput::ok("done".into())
         }
-        fn drain_notifications(&self) -> Vec<tools::ext::ToolEvent> {
+        fn drain_notifications(&self) -> Vec<crate::tools::integrations::ext::ToolEvent> {
             vec![
-                tools::ext::ToolEvent {
+                crate::tools::integrations::ext::ToolEvent {
                     kind: "background_output".into(),
                     name: "job-identity".into(),
                     text: "pipe delta".into(),
                     artifact: None,
                 },
-                tools::ext::ToolEvent {
+                crate::tools::integrations::ext::ToolEvent {
                     kind: "background_progress".into(),
                     name: "pty-identity".into(),
                     text: "screen".into(),
@@ -841,7 +841,7 @@ fn live_job_output_reaches_the_ui_without_a_matching_foreground_tool() {
             &self,
             ctx: &ToolContext,
             args: &Value,
-            on_event: &(dyn Fn(tools::ext::ToolEvent) + Sync),
+            on_event: &(dyn Fn(crate::tools::integrations::ext::ToolEvent) + Sync),
             _: &AtomicBool,
         ) -> ToolOutput {
             for event in self.drain_notifications() {

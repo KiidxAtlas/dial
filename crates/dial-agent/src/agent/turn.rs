@@ -1518,7 +1518,7 @@ impl Agent<'_> {
             }
             let narration_warning = engine.narration.observe(&reply);
             self.edit_preview_intercepted = false;
-            self.push(tools::contracts::assistant_message(
+            self.push(crate::tools::surface::contracts::assistant_message(
                 &reply, schemas, &self.ext,
             ))?;
             let (mut form_kinds, mut rejected_calls, mut execution_failed) =
@@ -1553,7 +1553,7 @@ impl Agent<'_> {
                 if parallel.is_empty()
                     && let Some(reason) = engine.pending_refusal()
                 {
-                    self.push(tools::outcome::skipped(&call.id, reason))?;
+                    self.push(crate::tools::surface::outcome::skipped(&call.id, reason))?;
                     continue;
                 }
                 if self.interrupt.load(Ordering::SeqCst) {
@@ -1570,7 +1570,7 @@ impl Agent<'_> {
                     let output = ToolOutput::ok(results[index].clone());
                     ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                     ui.tool_result_with_id(&call.id, &call.name, &output);
-                    self.push(tools::outcome::message(&call.id, &output))?;
+                    self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
                     continue;
                 }
                 if self.edit_preview_intercepted && parallel.is_empty() {
@@ -1579,7 +1579,7 @@ impl Agent<'_> {
                     );
                     ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                     ui.tool_result_with_id(&call.id, &call.name, &output);
-                    self.push(tools::outcome::message(&call.id, &output))?;
+                    self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
                     crate::telemetry::tool(
                         self.config,
                         self.hermetic,
@@ -1596,7 +1596,7 @@ impl Agent<'_> {
                     );
                     ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                     ui.tool_result_with_id(&call.id, &call.name, &output);
-                    self.push(tools::outcome::message(&call.id, &output))?;
+                    self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
                     crate::telemetry::tool(
                         self.config,
                         self.hermetic,
@@ -1632,7 +1632,7 @@ impl Agent<'_> {
                     );
                     ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                     ui.tool_result_with_id(&call.id, &call.name, &output);
-                    self.push(tools::outcome::message(&call.id, &output))?;
+                    self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
                     crate::telemetry::tool(
                         self.config,
                         self.hermetic,
@@ -1649,7 +1649,7 @@ impl Agent<'_> {
                     );
                     ui.tool_call_with_args(&call.id, &call.name, &summarize(call), &call.arguments);
                     ui.tool_result_with_id(&call.id, &call.name, &output);
-                    self.push(tools::outcome::message(&call.id, &output))?;
+                    self.push(crate::tools::surface::outcome::message(&call.id, &output))?;
                     crate::telemetry::tool(
                         self.config,
                         self.hermetic,
@@ -1865,9 +1865,9 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     &call.name,
                     tool_seconds,
                     status,
-                    tools::outcome::effects(&output),
+                    crate::tools::surface::outcome::effects(&output),
                 );
-                self.record(step, "tool_outcome", json!({"name":call.name,"id":call.id,"status":status,"effects":tools::outcome::effects(&output),"duration_ms":tool_seconds*1000.0}))?;
+                self.record(step, "tool_outcome", json!({"name":call.name,"id":call.id,"status":status,"effects":tools::surface::outcome::effects(&output),"duration_ms":tool_seconds*1000.0}))?;
                 let callback_intercepted = std::mem::take(&mut self.portable_callback_intercepted);
                 if callback_intercepted || self.ext.contains(&call.name) {
                     rule_state = rules::State::restore(&self.session.control_state());
@@ -2147,7 +2147,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 }
                 self.efficiency_metrics.result(&output.text, &body);
                 let mut message = llm::tool_message(&call.id, &body);
-                tools::outcome::annotate(&mut message, &output);
+                crate::tools::surface::outcome::annotate(&mut message, &output);
                 message["dial_evidence"] = json!({"artifact":artifact,"is_error":output.is_error});
                 message["is_error"] = json!(output.is_error);
                 if call.name == "ask"

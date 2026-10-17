@@ -6,7 +6,7 @@ use super::*;
 fn presentation_hooks_cannot_clear_execution_uncertainty_or_committed_paths() {
     let root = tempfile::tempdir().unwrap();
     let mut output = crate::runtime::tool_output::ToolOutput::structured(json!([{"kept":true}]))
-        .with_effects(crate::tools::outcome::Effects::Unknown)
+        .with_effects(crate::tools::surface::outcome::Effects::Unknown)
         .with_changes([root.path().join("changed")]);
     post_tool(
         &[hook(
@@ -25,7 +25,7 @@ fn presentation_hooks_cannot_clear_execution_uncertainty_or_committed_paths() {
     assert!(output.is_error && output.data.is_none());
     assert_eq!(
         output.execution.effects,
-        crate::tools::outcome::Effects::Unknown
+        crate::tools::surface::outcome::Effects::Unknown
     );
     assert_eq!(
         output.execution.changed_paths,

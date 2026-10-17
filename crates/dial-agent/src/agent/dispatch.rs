@@ -75,7 +75,7 @@ pub(super) fn callback_image_payload(
 }
 
 pub(super) fn interrupted_tool() -> ToolOutput {
-    tools::execution::before_start()
+    crate::tools::exec::execution::before_start()
 }
 
 /// Stdin for an operator-configured tool. With `parameters` the program receives the whole
@@ -112,7 +112,7 @@ pub(super) fn custom_tool_output(
         Ok(input) => input,
         Err(error) => {
             return ToolOutput::err(format!("{error:#}"))
-                .with_effects(tools::outcome::Effects::None);
+                .with_effects(crate::tools::surface::outcome::Effects::None);
         }
     };
     match worker::run_tool_command(&tool.program, &tool.args, &input, tool.timeout_secs, cancel) {
@@ -124,9 +124,9 @@ pub(super) fn custom_tool_output(
         },
         Err(error) => {
             let effects = if error.downcast_ref::<worker::ToolEffectsUnknown>().is_some() {
-                tools::outcome::Effects::Unknown
+                crate::tools::surface::outcome::Effects::Unknown
             } else {
-                tools::outcome::Effects::None
+                crate::tools::surface::outcome::Effects::None
             };
             ToolOutput::err(format!("{error:#}")).with_effects(effects)
         }
@@ -143,7 +143,7 @@ pub(super) fn parallel_tools(
     ui: &mut dyn Ui,
     pending_steering: &mut Vec<String>,
 ) -> Vec<(ToolOutput, f64)> {
-    let signals = tools::signals::CallSignals::new();
+    let signals = crate::tools::exec::signals::CallSignals::new();
     thread::scope(|scope| {
         let mut receivers = Vec::with_capacity(calls.len());
         let mut unique: HashMap<(&str, String), usize> = HashMap::new();
@@ -184,7 +184,7 @@ pub(super) fn parallel_tools(
             scope.spawn(move || {
                 let started = Instant::now();
                 let mut notices = Vec::new();
-                let output = tools::execution::run(interrupt, || tools::signals::scope(&signals, || {
+                let output = crate::tools::exec::execution::run(interrupt, || crate::tools::exec::signals::scope(&signals, || {
                     if interrupt.load(Ordering::SeqCst) {
                         return interrupted_tool();
                     }
@@ -194,7 +194,7 @@ pub(super) fn parallel_tools(
                         Ok(Some(args)) if args != call.arguments => return ToolOutput::err("pre_tool_use changed a scheduled call; retry the revised arguments through the execution controller").with_status(tools::ToolStatus::Blocked),
                         _ => {}
                     }
-                    let mut output = tools::execution::native(
+                    let mut output = crate::tools::exec::execution::native(
                         &ToolContext { workspace, config, mutation_authorizer: None, confirm: None },
                         ext, &call.name, &call.arguments, &|_| {}, interrupt,
                     ).unwrap_or_else(|| ToolOutput::err("parallel tool unavailable"));
@@ -324,7 +324,7 @@ impl<'a> Agent<'a> {
     }
 
     /// The plugin host lifecycle hooks dispatch through. Hermetic runs get none, like `tool_hooks`.
-    pub(super) fn hook_plugins(&self) -> Option<Arc<crate::tools::plugin::Host>> {
+    pub(super) fn hook_plugins(&self) -> Option<Arc<crate::tools::integrations::plugin::Host>> {
         if self.hermetic {
             None
         } else {
@@ -341,7 +341,11 @@ impl<'a> Agent<'a> {
     ) -> Result<Option<Chat>> {
         let projected = projected_request(
             request,
-            tools::contracts::project_history(&request.messages, &request.tools, &self.ext)?,
+            crate::tools::surface::contracts::project_history(
+                &request.messages,
+                &request.tools,
+                &self.ext,
+            )?,
         );
         let mut notices = Vec::new();
         let rewritten = hooks::provider_request(
@@ -489,7 +493,7 @@ impl<'a> Agent<'a> {
                 is_error: true,
             }
             .with_status(tools::ToolStatus::Blocked)
-            .with_effects(tools::outcome::Effects::None)
+            .with_effects(crate::tools::surface::outcome::Effects::None)
         };
         if self.edit_preview_intercepted {
             return denied(
@@ -638,7 +642,7 @@ impl<'a> Agent<'a> {
             return self.preview_tool(args, ui);
         }
         if name == "find" {
-            match tools::navigation::semantic_request(&self.workspace, args) {
+            match crate::tools::code::navigation::semantic_request(&self.workspace, args) {
                 Ok(Some(request)) => return self.run_semantic_find(backend, args, request, ui),
                 Ok(None) => {}
                 Err(text) => {
@@ -1035,7 +1039,7 @@ impl<'a> Agent<'a> {
     pub(super) fn code_callback(
         &mut self,
         backend: &mut Backend,
-        request: tools::ext::ToolCallback,
+        request: crate::tools::integrations::ext::ToolCallback,
         owner: &str,
         ui: &mut dyn Ui,
         gate: &mut rules::CallbackGate<'_>,
@@ -1057,7 +1061,7 @@ impl<'a> Agent<'a> {
                 .is_some_and(|tool| tool.supports_tool_dispatch())
         });
         let (name, arguments) = match request {
-            tools::ext::ToolCallback::Schemas => {
+            crate::tools::integrations::ext::ToolCallback::Schemas => {
                 return match self.schemas(&names) {
                     Ok(schemas) => ToolOutput {
                         execution: Default::default(),
@@ -1070,7 +1074,9 @@ impl<'a> Agent<'a> {
                     }
                 };
             }
-            tools::ext::ToolCallback::Call { name, arguments } => (name, arguments),
+            crate::tools::integrations::ext::ToolCallback::Call { name, arguments } => {
+                (name, arguments)
+            }
         };
         if !names.contains(&name) {
             return ToolOutput::err(format!(
@@ -1098,7 +1104,7 @@ impl<'a> Agent<'a> {
         if let Err(error) = self.record(
             self.cur_step,
             "code_tool_call",
-            json!({"parent":owner,"name":call.name,"input":call.arguments,"contract":tools::contracts::identities(&schemas,&self.ext).get(&call.name)}),
+            json!({"parent":owner,"name":call.name,"input":call.arguments,"contract":tools::surface::contracts::identities(&schemas,&self.ext).get(&call.name)}),
         ) {
             return ToolOutput::err(format!(
                 "recording code-mode call before execution: {error:#}"
@@ -1150,7 +1156,7 @@ impl<'a> Agent<'a> {
                 json!({"parent":owner,"name":call.name,"is_error":output.is_error,"output":output.text,"data":output.data}),
             )
         }) {
-            output.execution.effects = tools::outcome::Effects::Unknown;
+            output.execution.effects = crate::tools::surface::outcome::Effects::Unknown;
             output.is_error = true;
             output.text.push_str(&format!("\n[Recording completed callback evidence failed; inspect state before retrying: {error:#}]"));
         }

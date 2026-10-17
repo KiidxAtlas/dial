@@ -78,7 +78,7 @@ pub(super) fn classify_output(
     let complete = process
         .as_ref()
         .is_some_and(|process| process.started && process.output_complete)
-        && output.execution.effects != crate::tools::outcome::Effects::Unknown;
+        && output.execution.effects != crate::tools::surface::outcome::Effects::Unknown;
     if complete
         && !output.is_error
         && process

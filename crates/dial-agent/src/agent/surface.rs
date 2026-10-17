@@ -62,7 +62,7 @@ pub trait Ui {
     fn tool_presentation(
         &mut self,
         _call_id: &str,
-        _view: &crate::tools::presentation::Presentation,
+        _view: &crate::tools::surface::presentation::Presentation,
     ) {
     }
     fn tool_result_with_id(&mut self, _call_id: &str, name: &str, output: &ToolOutput) {

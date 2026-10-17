@@ -550,7 +550,7 @@ fn park_session(
     agent: &mut Agent<'_>,
     session: Session,
     parked: &mut std::collections::HashMap<String, Session>,
-    parked_tools: &mut std::collections::HashMap<String, crate::tools::ext::Registry>,
+    parked_tools: &mut std::collections::HashMap<String, crate::tools::integrations::ext::Registry>,
     modes: &mut std::collections::HashMap<String, bool>,
     current: bool,
 ) {
@@ -824,8 +824,10 @@ fn run_control(layout: Layout, config: Config, acp: bool) -> Result<()> {
             // Tracks the message count the published projection was built from.
             let mut projected_messages = agent.session().message_count();
             let mut parked = std::collections::HashMap::<String, Session>::new();
-            let mut parked_tools =
-                std::collections::HashMap::<String, crate::tools::ext::Registry>::new();
+            let mut parked_tools = std::collections::HashMap::<
+                String,
+                crate::tools::integrations::ext::Registry,
+            >::new();
             let mut modes = std::collections::HashMap::<String, bool>::new();
             let mut current = !acp;
             loop {

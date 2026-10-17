@@ -26,9 +26,10 @@ impl Repo {
         // Porcelain status paths are relative to the repository top, and diff/add/restore pathspecs
         // resolve against the cwd, so every command must run from the top (the overlay root can be a
         // subdirectory when dial was started there).
-        let root = crate::tools::git::run_checked(root, &["rev-parse", "--show-toplevel"], false)
-            .map(|top| PathBuf::from(top.trim_end_matches(['\n', '\r'])))
-            .unwrap_or_else(|_| root.to_path_buf());
+        let root =
+            crate::tools::vcs::git::run_checked(root, &["rev-parse", "--show-toplevel"], false)
+                .map(|top| PathBuf::from(top.trim_end_matches(['\n', '\r'])))
+                .unwrap_or_else(|_| root.to_path_buf());
         Self {
             root,
             config: config.clone(),

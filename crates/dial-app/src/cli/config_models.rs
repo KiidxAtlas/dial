@@ -246,7 +246,7 @@ pub fn run_config_with_overlay(
             if let Some(object) = reference.as_object_mut() {
                 object.insert(
                     "resources".into(),
-                    serde_json::json!(crate::tools::resources::DESCRIPTORS),
+                    serde_json::json!(crate::tools::integrations::resources::DESCRIPTORS),
                 );
                 object.insert(
                     "native_tools".into(),

@@ -455,7 +455,8 @@ impl Isolated {
             && !matches!(kind, Backend::ProjFs)
             && project.root().join(".git").exists()
         {
-            crate::tools::git::initialize_private_snapshot(&root).map_err(anyhow::Error::msg)?;
+            crate::tools::vcs::git::initialize_private_snapshot(&root)
+                .map_err(anyhow::Error::msg)?;
         }
         let workspace = project.rebased(&root)?;
         Ok(Self {

@@ -37,7 +37,7 @@ fn snapshots_are_immutable_and_cannot_cross_splits() {
 }
 #[test]
 fn retained_deletion_replays_before_and_after_independent_checks() {
-    if !crate::tools::sandbox::require_for_test() {
+    if !crate::tools::exec::sandbox::require_for_test() {
         return;
     }
     use crate::agent::repair_evidence::Tracker;
@@ -117,7 +117,7 @@ fn retained_deletion_replays_before_and_after_independent_checks() {
 #[cfg(unix)]
 #[test]
 fn solver_cannot_replace_sealed_tests_or_follow_symlinks() {
-    if !crate::tools::sandbox::require_for_test() {
+    if !crate::tools::exec::sandbox::require_for_test() {
         return;
     }
     let root = tempfile::tempdir().unwrap();

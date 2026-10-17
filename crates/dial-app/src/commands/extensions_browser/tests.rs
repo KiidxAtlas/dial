@@ -1,5 +1,5 @@
 use super::*;
-use crate::tools::mcp::catalog::Install;
+use crate::tools::integrations::mcp::catalog::Install;
 
 #[test]
 fn snapshot_offers_uninstalled_curated_servers_only() {

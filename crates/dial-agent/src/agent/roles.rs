@@ -7,11 +7,12 @@ impl<'a> Agent<'a> {
         &mut self,
         main: &mut Backend,
         args: &Value,
-        request: tools::navigation::SemanticRequest,
+        request: crate::tools::code::navigation::SemanticRequest,
         ui: &mut dyn Ui,
     ) -> ToolOutput {
         let result = (|| -> Result<ToolOutput> {
-            let supplementary = tools::navigation::lsp_args(args).map_err(anyhow::Error::msg)?;
+            let supplementary =
+                crate::tools::code::navigation::lsp_args(args).map_err(anyhow::Error::msg)?;
             let response = if request.has_candidates() {
                 let chat = semantic_chat(&request, self.version.harness.max_tokens);
                 self.role_chat(main, "small", llm::usage::Purpose::Retrieval, &chat, ui)
@@ -394,7 +395,10 @@ fn accept_auxiliary_reply(backend: &Backend, role: &str, reply: llm::Reply) -> R
     Ok(reply.text)
 }
 
-pub(super) fn semantic_chat(request: &tools::navigation::SemanticRequest, max_tokens: u32) -> Chat {
+pub(super) fn semantic_chat(
+    request: &crate::tools::code::navigation::SemanticRequest,
+    max_tokens: u32,
+) -> Chat {
     Chat {
         messages: vec![
             json!({"role":"system","content":request.system.as_str()}),

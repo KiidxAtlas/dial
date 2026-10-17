@@ -28,74 +28,33 @@ use crate::config::tools::BUILTIN;
 
 macro_rules! notebook_edit_description {($description:literal)=>{concat!($description,"\nNotebooks: ordinary .ipynb reads expose cell source as # %% [code|markdown|raw] cell:N (zero-based). Keep indexed markers to retain authentic cells; unindexed # %% markers create cells. Preserve source-literal marker lines with one extra %, e.g. # %%%. All edit modes operate on this projection and retain untouched raw JSON metadata, number lexemes and outputs; changed code cells clear stale outputs/execution counts. Metadata-only changes invalidate witnesses. Read :raw for literal JSON; whole-file write requires actual JSON, not the source projection. Notebook moves/deletes need complete relevant source witnesses.")};}
 
-pub mod archive;
-pub mod ast;
-pub mod autoresearch;
-pub mod background;
-pub mod bash_interceptor;
-pub mod browser;
-pub mod catalog;
-pub mod codebase;
-pub mod contracts;
-pub mod dap;
-pub mod diagnostics;
-mod diff;
-mod document_transaction;
-pub mod documents;
-mod edit_native;
-pub(crate) mod edit_source;
-mod edit_transaction;
-pub mod editing;
-pub mod eval;
-pub mod execution;
-pub mod ext;
-mod files;
-pub mod gh;
-mod gh_cache;
-mod gh_common;
-mod gh_pr;
-mod gh_pr_diff;
-mod gh_run_watch;
-mod gh_search;
-mod gh_view;
-pub mod git;
-pub mod git_patch;
-pub mod hashline;
-pub mod history;
-pub mod kernel;
-pub mod lsp;
-pub mod mcp;
-pub mod navigation;
-pub mod notebook;
-pub mod outcome;
-pub mod plugin;
-pub mod preludes;
-pub mod presentation;
-pub mod preview;
-pub mod provenance;
-pub mod resources;
-pub mod sandbox;
-mod search;
-mod select;
-pub mod shell;
-pub mod signals;
-pub mod speculation;
-pub mod ssh;
-pub mod syntax;
+pub mod code;
+pub mod edit;
+pub mod exec;
+pub mod fs;
+pub mod integrations;
+pub mod knowledge;
+pub mod net;
+pub mod surface;
 #[cfg(test)]
 mod testkit;
-pub(crate) mod walk;
-pub mod web;
+
+// External `dial::tools::*` paths used by src/main.rs, src/cmd and tests/integration.
+pub use edit::hashline;
+pub use exec::sandbox;
+pub use fs::documents;
+pub use integrations::ext;
+pub use knowledge::{codebase, provenance};
+pub mod vcs;
 
 use crate::config::types::SandboxConfig;
 use crate::runtime::schema::tool_schema;
 use crate::runtime::tool_output::ToolOutput;
 use crate::storage::artifact;
 use anyhow::{Context, Result, bail, ensure};
-use sandbox::Sandbox;
+use exec::sandbox::Sandbox;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -137,15 +96,12 @@ pub fn preview_limit(window: u32, tool: &str, failed: bool, retained: bool) -> u
     model_output_limit(window)
 }
 
-#[cfg(test)]
-mod preview_tests;
-
-pub use outcome::ToolStatus;
+pub use surface::outcome::ToolStatus;
 
 use crate::config::types::EditMode;
-pub use editing::{EditRepair, EditRepairRequest};
-pub use editing::{declared_targets as declared_edit_targets, targets as editing_targets};
-pub use editing::{
+pub use edit::editing::{EditRepair, EditRepairRequest};
+pub use edit::editing::{declared_targets as declared_edit_targets, targets as editing_targets};
+pub use edit::editing::{
     inline_payload as inline_edit_payload, instructions as editing_instructions,
     schema as editing_schema,
 };
@@ -182,7 +138,7 @@ pub struct Workspace {
     protected_paths: Vec<PathBuf>,
     sandbox: Option<Sandbox>,
     allow_network: bool,
-    policy: Option<sandbox::Policy>,
+    policy: Option<exec::sandbox::Policy>,
     unsandboxed: bool,
     /// Shell that runs `bash` commands (`shell.backend`).
     shell_backend: crate::config::types::ShellBackend,
@@ -197,17 +153,17 @@ pub struct Workspace {
     /// User SSH settings (`Config.ssh`) applied to `ssh://` reads and writes this session.
     ssh: crate::config::tools::ssh::SshConfig,
     /// Connection targets for `ssh://` hosts, keyed by name (see [`Workspace::with_ssh_hosts`]).
-    ssh_hosts: Arc<BTreeMap<String, ssh::Target>>,
-    edit_repair: editing::RepairSlot,
+    ssh_hosts: Arc<BTreeMap<String, integrations::ssh::Target>>,
+    edit_repair: edit::editing::RepairSlot,
     edit_blackbox_dir: Option<PathBuf>,
-    native_edits: Arc<edit_native::store::EditStore>,
+    native_edits: Arc<edit::edit_native::store::EditStore>,
     observer: ObserverSlot,
     /// Session snapshots / seen lines / registers for hashline; shared by clones.
-    edits: Arc<Mutex<hashline::EditStore>>,
+    edits: Arc<Mutex<edit::hashline::EditStore>>,
     artifacts: Option<artifact::ArtifactStore>,
     operations: Arc<Mutex<()>>,
     shell_sessions: Arc<Mutex<BTreeMap<String, crate::embedded_shell::state::State>>>,
-    pub speculation: Arc<speculation::Pool>,
+    pub speculation: Arc<exec::speculation::Pool>,
 }
 
 impl Workspace {
@@ -239,7 +195,7 @@ impl Workspace {
             bash_interceptor: None,
             ssh: crate::config::tools::ssh::SshConfig::default(),
             ssh_hosts: Arc::default(),
-            edit_repair: editing::RepairSlot::default(),
+            edit_repair: edit::editing::RepairSlot::default(),
             edit_blackbox_dir: None,
             native_edits: Arc::default(),
             observer: ObserverSlot::default(),
@@ -291,7 +247,7 @@ impl Workspace {
     }
 
     /// Run bash under an explicit sandbox policy (strict or developer).
-    pub fn with_policy(mut self, policy: sandbox::Policy) -> Self {
+    pub fn with_policy(mut self, policy: exec::sandbox::Policy) -> Self {
         self.policy = Some(policy);
         self
     }
@@ -299,14 +255,14 @@ impl Workspace {
     /// The sandbox policy in force at exec time: the configured policy, with every attached root
     /// granted the same write access as the primary root. Attached roots are folded in here, not
     /// stored in the policy, so `add_root` takes effect on the next command.
-    pub fn sandbox_policy(&self) -> sandbox::Policy {
+    pub fn sandbox_policy(&self) -> exec::sandbox::Policy {
         let roots = self.additional_roots.iter().cloned();
         match &self.policy {
-            Some(sandbox::Policy::Dev {
+            Some(exec::sandbox::Policy::Dev {
                 deny_read,
                 extra_write,
                 allow_network,
-            }) => sandbox::Policy::Dev {
+            }) => exec::sandbox::Policy::Dev {
                 deny_read: deny_read
                     .iter()
                     .chain(&self.protected_paths)
@@ -315,11 +271,11 @@ impl Workspace {
                 extra_write: extra_write.iter().cloned().chain(roots).collect(),
                 allow_network: *allow_network,
             },
-            Some(sandbox::Policy::Strict {
+            Some(exec::sandbox::Policy::Strict {
                 allow_network,
                 deny_read,
                 extra_write,
-            }) => sandbox::Policy::Strict {
+            }) => exec::sandbox::Policy::Strict {
                 allow_network: *allow_network,
                 deny_read: deny_read
                     .iter()
@@ -328,7 +284,7 @@ impl Workspace {
                     .collect(),
                 extra_write: extra_write.iter().cloned().chain(roots).collect(),
             },
-            None => sandbox::Policy::Strict {
+            None => exec::sandbox::Policy::Strict {
                 allow_network: self.allow_network,
                 deny_read: self.protected_paths.clone(),
                 extra_write: roots.collect(),
@@ -394,16 +350,16 @@ impl Workspace {
         configured: &BTreeMap<String, crate::config::types::SshHostConfig>,
     ) -> Self {
         self.ssh_hosts = Arc::new(match std::env::var_os("HOME").map(PathBuf::from) {
-            Some(home) => ssh::host_targets(&home, configured),
+            Some(home) => integrations::ssh::host_targets(&home, configured),
             None => BTreeMap::new(),
         });
         self
     }
-    pub fn ssh_hosts(&self) -> &BTreeMap<String, ssh::Target> {
+    pub fn ssh_hosts(&self) -> &BTreeMap<String, integrations::ssh::Target> {
         &self.ssh_hosts
     }
     pub fn with_edit_repair(mut self, repair: Arc<dyn EditRepair>) -> Self {
-        self.edit_repair = editing::RepairSlot(Some(repair));
+        self.edit_repair = edit::editing::RepairSlot(Some(repair));
         self
     }
     pub fn with_edit_blackbox_dir(mut self, path: PathBuf) -> Self {
@@ -440,7 +396,7 @@ impl Workspace {
         proposed: &str,
     ) -> Option<String> {
         if self.syntax_guard {
-            syntax::advisory(path, before, proposed)
+            edit::syntax::advisory(path, before, proposed)
         } else {
             None
         }
@@ -477,7 +433,7 @@ impl Workspace {
         Ok(next)
     }
 
-    pub(crate) fn store(&self) -> MutexGuard<'_, hashline::EditStore> {
+    pub(crate) fn store(&self) -> MutexGuard<'_, edit::hashline::EditStore> {
         self.edits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -492,26 +448,26 @@ impl Workspace {
         if complete_ranges.is_empty() {
             return Ok(());
         }
-        if source.len() > hashline::MAX_FILE as usize {
+        if source.len() > edit::hashline::MAX_FILE as usize {
             return Err("edit witness source exceeds 4 MiB".into());
         }
         let resolved = self.resolve(&self.rel(path))?;
         if resolved != path {
             return Err("edit witness target is not a canonical workspace path".into());
         }
-        let lf = hashline::normalize(source);
-        let count = hashline::split_lines(&lf).len();
+        let lf = edit::hashline::normalize(source);
+        let count = edit::hashline::split_lines(&lf).len();
         if complete_ranges
             .iter()
             .any(|&(a, b)| a == 0 || b < a || b > count)
         {
             return Err("edit witness ranges are out of bounds".into());
         }
-        if lf.len() > hashline::MAX_FILE as usize {
+        if lf.len() > edit::hashline::MAX_FILE as usize {
             return Err("edit witness source exceeds 4 MiB".into());
         }
-        let current =
-            edit_transaction::read(self, path)?.ok_or("edit witness target no longer exists")?;
+        let current = edit::edit_transaction::read(self, path)?
+            .ok_or("edit witness target no longer exists")?;
         if current.text != source {
             return Err("edit witness source changed before publication; not recorded".into());
         }
@@ -526,12 +482,12 @@ impl Workspace {
         index: usize,
         coverage: &[(usize, usize)],
     ) -> Result<(), String> {
-        edit_source::record_cell(self, path, raw, index, coverage)
+        edit::edit_source::record_cell(self, path, raw, index, coverage)
     }
 
     pub fn observe_write(&self, abs: &Path) -> Result<(), String> {
         self.check_protected_mutation(abs)?;
-        navigation::invalidate(abs);
+        code::navigation::invalidate(abs);
         match &self.observer.0 {
             Some(observer) => observer
                 .before_write(abs)
@@ -542,7 +498,7 @@ impl Workspace {
 
     pub fn observe_delete(&self, abs: &Path) -> Result<(), String> {
         self.check_protected_mutation(abs)?;
-        navigation::invalidate(abs);
+        code::navigation::invalidate(abs);
         match &self.observer.0 {
             Some(observer) => observer.before_delete(abs).map_err(|e| {
                 format!(
@@ -669,9 +625,9 @@ impl Workspace {
                     if missing {
                         continue;
                     }
-                    match fs::symlink_metadata(&current) {
+                    match std::fs::symlink_metadata(&current) {
                         Ok(meta) if meta.file_type().is_symlink() => {
-                            current = fs::canonicalize(&current).map_err(|_| {
+                            current = std::fs::canonicalize(&current).map_err(|_| {
                                 format!("path {input:?} goes through a dangling symlink")
                             })?;
                             if !current.starts_with(root) {
@@ -783,7 +739,7 @@ impl Workspace {
     /// Bounded, workspace-confined identity for a read observation, including selectors.
     /// Used only to expire recovery feedback; this is not verification evidence.
     pub fn read_identity(&self, input: &str) -> Option<[u8; 32]> {
-        let (path, _) = select::split_target(self, input).ok()?;
+        let (path, _) = fs::select::split_target(self, input).ok()?;
         self.file_identity(Path::new(path))
             .map(|(_, digest)| digest)
     }
@@ -797,11 +753,11 @@ impl Workspace {
         use std::io::Read;
         const LIMIT: u64 = 16 * 1024 * 1024;
         let path = self.resolve(input.to_str()?).ok()?;
-        let metadata = fs::metadata(&path).ok()?;
+        let metadata = std::fs::metadata(&path).ok()?;
         if !metadata.is_file() || metadata.len() > LIMIT {
             return None;
         }
-        let file = fs::File::open(&path).ok()?;
+        let file = std::fs::File::open(&path).ok()?;
         let mut data = Vec::new();
         file.take(LIMIT + 1).read_to_end(&mut data).ok()?;
         (data.len() as u64 <= LIMIT).then(|| (path, Sha256::digest(&data).into()))
@@ -901,7 +857,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
             }),
             &["path", "content"],
         ),
-        "edit" => editing::schema(mode),
+        "edit" => edit::editing::schema(mode),
         "glob" => tool_schema(
             "glob",
             "List pageable workspace files in sorted component/depth-first order, max 500 per page. Supports \
@@ -981,7 +937,7 @@ pub fn schemas(names: &[&str], mode: EditMode) -> Result<Vec<Value>> {
 
 /// Run one tool call. Never panics: failures become `is_error` output.
 pub fn execute(ws: &Workspace, name: &str, args: &Value, timeout_secs: u64) -> ToolOutput {
-    execution::run(&std::sync::atomic::AtomicBool::new(false), || {
+    exec::execution::run(&std::sync::atomic::AtomicBool::new(false), || {
         dispatch(ws, name, args, timeout_secs).unwrap_or_else(ToolOutput::err)
     })
 }
@@ -999,8 +955,8 @@ pub fn read_tool_streaming(
     if !args.is_object() {
         return ToolOutput::err("tool arguments must be a JSON object");
     }
-    execution::run(cancel, || {
-        match files::read_tool_streaming(ws, args, cancel, budget) {
+    exec::execution::run(cancel, || {
+        match fs::files::read_tool_streaming(ws, args, cancel, budget) {
             Ok(text) => ToolOutput::ok(text),
             Err(error) => ToolOutput::err(error),
         }
@@ -1009,23 +965,23 @@ pub fn read_tool_streaming(
 
 /// Preview uses the same complete payload preparation but never repairs or writes.
 pub fn preview_edit(ws: &Workspace, args: &Value) -> ToolOutput {
-    if let Err(error) = editing::validate_shape(ws.edit_mode, args) {
+    if let Err(error) = edit::editing::validate_shape(ws.edit_mode, args) {
         return ToolOutput::err(error);
     }
     let mut preview = ws.clone();
-    preview.native_edits = Arc::new(edit_native::store::EditStore::default());
+    preview.native_edits = Arc::new(edit::edit_native::store::EditStore::default());
     preview.edits = Arc::new(Mutex::new(ws.store().clone()));
     let no_change = std::cell::Cell::new(false);
-    let execution = editing::Execution {
+    let execution = edit::editing::Execution {
         preview_no_change: Some(&no_change),
         ..Default::default()
     };
     let result = if ws.edit_mode == EditMode::Hashline {
-        hashline::input_arg(args)
-            .and_then(|input| hashline::edit_with(&preview, input, false, &execution))
+        edit::hashline::input_arg(args)
+            .and_then(|input| edit::hashline::edit_with(&preview, input, false, &execution))
     } else {
-        editing::prepare_with_preview(&preview, args, Some(&no_change))
-            .and_then(|changes| editing::finish_with(&preview, changes, false, &execution))
+        edit::editing::prepare_with_preview(&preview, args, Some(&no_change))
+            .and_then(|changes| edit::editing::finish_with(&preview, changes, false, &execution))
     };
     let mut output = match result {
         Ok(text) => ToolOutput::ok(text),
@@ -1036,23 +992,23 @@ pub fn preview_edit(ws: &Workspace, args: &Value) -> ToolOutput {
 }
 /// Preview of a partially streamed edit: an incomplete apply_patch envelope is not an error.
 pub fn preview_edit_streaming(ws: &Workspace, args: &Value) -> ToolOutput {
-    if let Err(error) = editing::validate_shape(ws.edit_mode, args) {
+    if let Err(error) = edit::editing::validate_shape(ws.edit_mode, args) {
         return ToolOutput::err(error);
     }
     let mut preview = ws.clone();
-    preview.native_edits = Arc::new(edit_native::store::EditStore::default());
+    preview.native_edits = Arc::new(edit::edit_native::store::EditStore::default());
     preview.edits = Arc::new(Mutex::new(ws.store().clone()));
     let no_change = std::cell::Cell::new(false);
-    let execution = editing::Execution {
+    let execution = edit::editing::Execution {
         preview_no_change: Some(&no_change),
         ..Default::default()
     };
     let result = if ws.edit_mode == EditMode::Hashline {
-        hashline::input_arg(args)
-            .and_then(|input| hashline::edit_with(&preview, input, false, &execution))
+        edit::hashline::input_arg(args)
+            .and_then(|input| edit::hashline::edit_with(&preview, input, false, &execution))
     } else {
-        editing::prepare_streaming_preview(&preview, args, Some(&no_change))
-            .and_then(|changes| editing::finish_with(&preview, changes, false, &execution))
+        edit::editing::prepare_streaming_preview(&preview, args, Some(&no_change))
+            .and_then(|changes| edit::editing::finish_with(&preview, changes, false, &execution))
     };
     let mut output = match result {
         Ok(text) => ToolOutput::ok(text),
@@ -1089,7 +1045,7 @@ fn bind_edit_targets(
         .collect()
 }
 fn authorize_edit_targets(
-    ctx: &ext::ToolContext<'_>,
+    ctx: &integrations::ext::ToolContext<'_>,
     name: &str,
     bound: &[(String, PathBuf, PathBuf)],
     paths: &[PathBuf],
@@ -1111,25 +1067,25 @@ fn authorize_edit_targets(
 /// Controller entry point: real owner permission/cancellation is checked again after model repair.
 /// The owner retains the workspace serial barrier; this function does not acquire it recursively.
 pub fn edit_with_context(
-    ctx: &ext::ToolContext<'_>,
+    ctx: &integrations::ext::ToolContext<'_>,
     args: &Value,
-    repair: Option<syntax::RepairCallback<'_>>,
+    repair: Option<edit::syntax::RepairCallback<'_>>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
     edit_for_workspace(ctx, ctx.workspace, args, repair, cancel)
 }
 /// Only the trusted terminal-recovery branch calls this; ordinary schemas stay configured.
 pub fn edit_recovered_with_context(
-    ctx: &ext::ToolContext<'_>,
+    ctx: &integrations::ext::ToolContext<'_>,
     args: &Value,
-    repair: Option<syntax::RepairCallback<'_>>,
+    repair: Option<edit::syntax::RepairCallback<'_>>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
     let workspace = ctx.workspace.clone().with_edit_mode(EditMode::Sloppy);
     edit_for_workspace(ctx, &workspace, args, repair, cancel)
 }
 fn repair_source_authority(
-    ctx: &ext::ToolContext<'_>,
+    ctx: &integrations::ext::ToolContext<'_>,
     bound: &[(String, PathBuf, PathBuf)],
     request: &EditRepairRequest,
 ) -> Result<(), String> {
@@ -1139,7 +1095,7 @@ fn repair_source_authority(
     authorize_source_targets(ctx, bound)
 }
 fn authorize_source_targets(
-    ctx: &ext::ToolContext<'_>,
+    ctx: &integrations::ext::ToolContext<'_>,
     bound: &[(String, PathBuf, PathBuf)],
 ) -> Result<(), String> {
     let mut paths = Vec::new();
@@ -1161,13 +1117,13 @@ fn authorize_source_targets(
     }
 }
 fn edit_for_workspace(
-    ctx: &ext::ToolContext<'_>,
+    ctx: &integrations::ext::ToolContext<'_>,
     workspace: &Workspace,
     args: &Value,
-    repair: Option<syntax::RepairCallback<'_>>,
+    repair: Option<edit::syntax::RepairCallback<'_>>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
-    let bound = match editing::targets(workspace.edit_mode, args)
+    let bound = match edit::editing::targets(workspace.edit_mode, args)
         .and_then(|paths| bind_edit_targets(workspace, paths))
     {
         Ok(bound) => bound,
@@ -1192,18 +1148,18 @@ fn edit_for_workspace(
     };
     let effective_repair = (repair.is_some() || workspace.edit_repair.0.is_some())
         .then_some(&guarded_repair as &dyn Fn(&EditRepairRequest) -> Result<String, String>);
-    let execution = editing::Execution {
+    let execution = edit::editing::Execution {
         repair: effective_repair,
         authorize: Some(&authorize),
         cancel: Some(cancel),
         preview_no_change: None,
     };
     let result = if workspace.edit_mode == EditMode::Hashline {
-        hashline::input_arg(args)
-            .and_then(|input| hashline::edit_with(workspace, input, true, &execution))
+        edit::hashline::input_arg(args)
+            .and_then(|input| edit::hashline::edit_with(workspace, input, true, &execution))
     } else {
-        editing::prepare(workspace, args)
-            .and_then(|changes| editing::finish_with(workspace, changes, true, &execution))
+        edit::editing::prepare(workspace, args)
+            .and_then(|changes| edit::editing::finish_with(workspace, changes, true, &execution))
     };
     match result {
         Ok(text) => ToolOutput::ok(text),
@@ -1211,15 +1167,15 @@ fn edit_for_workspace(
     }
 }
 pub fn write_with_context(
-    ctx: &ext::ToolContext<'_>,
+    ctx: &integrations::ext::ToolContext<'_>,
     args: &Value,
-    repair: Option<syntax::RepairCallback<'_>>,
+    repair: Option<edit::syntax::RepairCallback<'_>>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
     if let Some(path) = args
         .get("path")
         .and_then(Value::as_str)
-        .filter(|path| ssh::url::is_ssh_url(path))
+        .filter(|path| integrations::ssh::url::is_ssh_url(path))
     {
         let content = match args.get("content").and_then(Value::as_str) {
             Some(content) => content,
@@ -1228,11 +1184,11 @@ pub fn write_with_context(
         if let Err(error) = ctx.authorize_mutation("write", &[], true) {
             return ToolOutput::err(error);
         }
-        let user_dir = match ssh::user_dir() {
+        let user_dir = match integrations::ssh::user_dir() {
             Ok(path) => path,
             Err(error) => return ToolOutput::err(error),
         };
-        return match ssh::write_url(
+        return match integrations::ssh::write_url(
             path,
             &user_dir,
             ctx.workspace.ssh_config(),
@@ -1266,13 +1222,13 @@ pub fn write_with_context(
     };
     let effective_repair = (repair.is_some() || ctx.workspace.edit_repair.0.is_some())
         .then_some(&guarded_repair as &dyn Fn(&EditRepairRequest) -> Result<String, String>);
-    let execution = editing::Execution {
+    let execution = edit::editing::Execution {
         repair: effective_repair,
         authorize: Some(&authorize),
         cancel: Some(cancel),
         preview_no_change: None,
     };
-    match files::write_with(ctx.workspace, args, &execution) {
+    match fs::files::write_with(ctx.workspace, args, &execution) {
         Ok(text) => ToolOutput::ok(text),
         Err(error) => ToolOutput::err(error),
     }
@@ -1288,18 +1244,18 @@ fn dispatch(
         return Err("tool arguments must be a JSON object".to_string());
     }
     match name {
-        "read" => files::read_tool(ws, args).map(ToolOutput::ok),
-        "write" => files::write_tool(ws, args).map(ToolOutput::ok),
+        "read" => fs::files::read_tool(ws, args).map(ToolOutput::ok),
+        "write" => fs::files::write_tool(ws, args).map(ToolOutput::ok),
         "edit" => match ws.edit_mode {
-            EditMode::Hashline => editing::validate_shape(ws.edit_mode, args)
-                .and_then(|_| hashline::input_arg(args))
-                .and_then(|input| hashline::edit(ws, input))
+            EditMode::Hashline => edit::editing::validate_shape(ws.edit_mode, args)
+                .and_then(|_| edit::hashline::input_arg(args))
+                .and_then(|input| edit::hashline::edit(ws, input))
                 .map(ToolOutput::ok),
-            _ => editing::edit(ws, args).map(ToolOutput::ok),
+            _ => edit::editing::edit(ws, args).map(ToolOutput::ok),
         },
-        "glob" => search::glob_tool(ws, args).map(ToolOutput::ok),
-        "grep" => search::grep_tool(ws, args).map(ToolOutput::ok),
-        "bash" => shell::bash_tool(ws, args, timeout_secs),
+        "glob" => fs::search::glob_tool(ws, args).map(ToolOutput::ok),
+        "grep" => fs::search::grep_tool(ws, args).map(ToolOutput::ok),
+        "bash" => exec::shell::bash_tool(ws, args, timeout_secs),
         _ => Err(format!(
             "unknown tool {name:?}; available tools: {}",
             BUILTIN.join(", ")
@@ -1363,7 +1319,7 @@ pub fn apply_sandbox_config(
     protected: Option<(&Path, &Path)>,
 ) -> Result<Workspace> {
     use crate::config::types::SandboxMode;
-    use sandbox::Policy;
+    use exec::sandbox::Policy;
     let ws = match protected {
         Some((state, user)) => ws.with_protected_paths(&[state.to_owned(), user.to_owned()]),
         None => ws,

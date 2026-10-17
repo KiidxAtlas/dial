@@ -10,7 +10,7 @@ use super::review::Reviewer;
 use crate::config::types::Config;
 use crate::runtime::schema::tool_schema;
 use crate::runtime::tool_output::ToolOutput;
-use crate::tools::ext::{Tool, ToolContext};
+use crate::tools::integrations::ext::{Tool, ToolContext};
 
 pub const NAME: &str = "security_scan";
 

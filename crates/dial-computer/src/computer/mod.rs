@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 
 use crate::config::types::Config;
 use crate::runtime::tool_output::ToolOutput;
-use crate::tools::ext::{Concurrency, Tool, ToolContext, ToolEvent};
-use crate::tools::preludes::{PreludeCall, PreludeDef, PreludeHandler, register_prelude};
+use crate::tools::exec::preludes::{PreludeCall, PreludeDef, PreludeHandler, register_prelude};
+use crate::tools::integrations::ext::{Concurrency, Tool, ToolContext, ToolEvent};
 
 use crate::llm::model_config::ApiProtocol;
 use call::{

@@ -101,7 +101,7 @@ fn otlp_json_payloads_have_the_protocol_shape() {
     exporter.observe(&request_event("s1", false));
     exporter.observe(&Event::Tool(Tool {
         status: crate::tools::ToolStatus::Error,
-        effects: crate::tools::outcome::Effects::Known,
+        effects: crate::tools::surface::outcome::Effects::Known,
         session: "s1".into(),
         project: "proj-1234abcd".into(),
         tool: "read".into(),

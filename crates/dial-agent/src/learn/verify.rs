@@ -2,9 +2,9 @@
 //! agent's final answer and returns pass/fail: no model is involved, which is what makes outcomes
 //! produced with it externally grounded (for gate cases, self-play and training data alike).
 use crate::runtime::{execution::ProcessOutcome, process};
-use crate::tools::sandbox::Sandbox;
+use crate::tools::exec::sandbox::Sandbox;
 #[cfg(test)]
-use crate::tools::{self, Workspace, sandbox::Policy};
+use crate::tools::{self, Workspace, exec::sandbox::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
@@ -177,7 +177,7 @@ fn run_command(
         .current_dir(&root)
         .env_clear()
         .envs(std::env::vars().filter(|(key, value)| {
-            !crate::tools::sandbox::is_secret_env(key, value)
+            !crate::tools::exec::sandbox::is_secret_env(key, value)
                 && !matches!(key.as_str(), "BASH_ENV" | "ENV" | "SHELLOPTS" | "BASHOPTS")
         }))
         .env("TMPDIR", &scratch);

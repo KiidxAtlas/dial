@@ -11,7 +11,7 @@ use crate::{
     config::paths::Layout,
     config::types::{Approval, Config, Harness},
     llm::ToolCall,
-    tools::{Workspace, ext::Registry},
+    tools::{Workspace, integrations::ext::Registry},
 };
 use serde_json::{Value, json};
 use std::{
@@ -81,7 +81,7 @@ impl JobState {
 const DEFAULT_INBOX_LIMIT: usize = 256;
 /// Live jobs by id, for status, cancel and list. Messages travel on the team bus instead.
 type LiveJobs = Arc<Mutex<BTreeMap<String, Arc<ControlJob>>>>;
-type ActiveTool = Arc<Mutex<Option<Arc<dyn crate::tools::ext::Tool>>>>;
+type ActiveTool = Arc<Mutex<Option<Arc<dyn crate::tools::integrations::ext::Tool>>>>;
 struct ControlJob {
     interrupt: Arc<AtomicBool>,
     active_tool: ActiveTool,
@@ -260,7 +260,7 @@ impl Default for LiveTasks {
     }
 }
 struct Bridge {
-    signals: crate::tools::signals::CallSignals,
+    signals: crate::tools::exec::signals::CallSignals,
     interruptible: Arc<AtomicBool>,
     body: crate::runtime::Body,
     tx: mpsc::Sender<Event>,
@@ -275,7 +275,7 @@ impl Approver for Bridge {
         &mut self,
         call: &ToolCall,
         registry: &Registry,
-    ) -> Option<crate::tools::signals::CallSignals> {
+    ) -> Option<crate::tools::exec::signals::CallSignals> {
         self.interruptible.store(
             registry
                 .get(&call.name)
@@ -792,7 +792,7 @@ impl LiveTasks {
             let done_id = id.clone();
             let active_tool: ActiveTool = Arc::default();
             let active = active_tool.clone();
-            let signals = crate::tools::signals::CallSignals::new();
+            let signals = crate::tools::exec::signals::CallSignals::new();
             let interruptible = Arc::new(AtomicBool::new(false));
             let control = Arc::new(ControlJob {
                 interrupt: interrupt.clone(),

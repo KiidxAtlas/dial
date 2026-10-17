@@ -172,5 +172,5 @@ pub(super) fn call_form_error(
     schemas: &[Value],
     names: &[String],
 ) -> Option<(&'static str, String)> {
-    tools::catalog::validate_offered_call(call, schemas, names)
+    crate::tools::surface::catalog::validate_offered_call(call, schemas, names)
 }

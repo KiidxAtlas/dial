@@ -7,7 +7,7 @@ pub fn legacy_tool_presentation(
     name: &str,
     summary: &str,
     input: &str,
-) -> crate::tools::presentation::Presentation {
+) -> crate::tools::surface::presentation::Presentation {
     let args = serde_json::from_str(input).unwrap_or_else(|_| match name {
         "bash" => serde_json::json!({"command":summary}),
         "grep" | "glob" => serde_json::json!({"pattern":summary}),
@@ -16,7 +16,7 @@ pub fn legacy_tool_presentation(
         "read" | "write" | "edit" => serde_json::json!({"path":summary}),
         _ => serde_json::json!({"query":summary}),
     });
-    crate::tools::presentation::render_call(name, &args)
+    crate::tools::surface::presentation::render_call(name, &args)
 }
 
 pub fn legacy_tool_result(
@@ -25,7 +25,7 @@ pub fn legacy_tool_result(
     text: &str,
     is_error: bool,
 ) -> crate::runtime::presentation::Presentation {
-    crate::tools::presentation::render_result(
+    crate::tools::surface::presentation::render_result(
         name,
         args,
         &ToolOutput {

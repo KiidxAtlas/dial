@@ -1,6 +1,6 @@
 use crate::agent::approval::parallel_read;
 use crate::config::types::Config;
-use crate::tools::ext::{Concurrency, Registry};
+use crate::tools::integrations::ext::{Concurrency, Registry};
 use serde_json::json;
 
 #[test]

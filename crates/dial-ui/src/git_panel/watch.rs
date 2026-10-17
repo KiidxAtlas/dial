@@ -2,7 +2,7 @@
 //! `git status` (worktree files outside ignored paths, and the git state files `index`, `HEAD`,
 //! `packed-refs` and `refs/`), then debounced so a burst of writes triggers one refresh.
 
-use crate::tools::git::run_checked;
+use crate::tools::vcs::git::run_checked;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{

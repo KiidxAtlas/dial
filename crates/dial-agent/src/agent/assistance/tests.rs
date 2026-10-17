@@ -23,7 +23,7 @@ fn exact_name_is_authoritative_even_when_other_descriptions_match() {
 #[test]
 fn installed_mcp_inventory_is_discoverable_without_server_domain_words() {
     let config = Config::default();
-    let loaded = crate::tools::mcp::McpLoad::default();
+    let loaded = crate::tools::integrations::mcp::McpLoad::default();
     let inventory = loaded.inventory_tool(&config);
     let description = inventory.schema()["function"]["description"]
         .as_str()

@@ -1,5 +1,5 @@
 use super::*;
-use crate::tools::plugin::marketplace::DEFAULT_NAME;
+use crate::tools::integrations::plugin::marketplace::DEFAULT_NAME;
 
 fn config_in(dir: &tempfile::TempDir) -> Config {
     Config {

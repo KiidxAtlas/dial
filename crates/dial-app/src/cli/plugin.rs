@@ -2,7 +2,7 @@
 //! marketplaces. Plugin state lives under the user directory (`<user_dir>/plugins` and
 //! `<user_dir>/marketplaces`), shared across projects.
 use crate::config::paths::Layout;
-use crate::tools::plugin::{
+use crate::tools::integrations::plugin::{
     installer::{InstalledPlugin, PluginStore, PluginUpdate},
     marketplace::{MarketplaceEntry, MarketplaceInfo, Marketplaces},
 };

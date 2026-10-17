@@ -8,9 +8,9 @@ use crate::config::settings_store::{Change, Scope, load_layer};
 use crate::config::tools::mcp::validate_server;
 use crate::config::types::{Config, McpServerConfig, McpTransport};
 use crate::llm::oauth::BannerInteraction;
-use crate::tools::mcp::connect_extra;
-use crate::tools::plugin::installer::{InstalledPlugin, PluginStore};
-use crate::tools::plugin::marketplace::{
+use crate::tools::integrations::mcp::connect_extra;
+use crate::tools::integrations::plugin::installer::{InstalledPlugin, PluginStore};
+use crate::tools::integrations::plugin::marketplace::{
     MarketplaceEntry, MarketplaceInfo, Marketplaces, SkillListing,
 };
 use anyhow::{Result, anyhow, bail};
@@ -268,14 +268,14 @@ fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
             let owned = name.to_owned();
             spawn_job(shell, "MCP login", move |cancel| {
                 let ui = BannerInteraction { id: "mcp" };
-                crate::tools::mcp::login(&user_dir, &owned, &server, &ui, cancel)
+                crate::tools::integrations::mcp::login(&user_dir, &owned, &server, &ui, cancel)
             });
             Ok(Step::Done)
         }
         "reload" | "reconnect" => Ok(reload_runtime(shell, app, agent)),
         "logout" | "unauth" => {
             let name = existing_server(&app.config, rest, sub)?;
-            let removed = crate::tools::mcp::logout(&app.config.user_dir, name)?;
+            let removed = crate::tools::integrations::mcp::logout(&app.config.user_dir, name)?;
             shell.note(
                 "MCP",
                 if removed {
@@ -308,7 +308,7 @@ fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
 
 /// `/mcp resources|prompts|notifications`: one section per connected server, from its live
 /// session. A failing server reports its own error and does not hide the others.
-fn mcp_listing(kind: &str, load: &crate::tools::mcp::McpLoad) -> String {
+fn mcp_listing(kind: &str, load: &crate::tools::integrations::mcp::McpLoad) -> String {
     if load.sessions.is_empty() {
         return "No MCP servers are connected.".to_owned();
     }

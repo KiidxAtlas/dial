@@ -96,7 +96,7 @@ pub(crate) fn commit_with_message(
     const CONTEXT: &str = "Commit failed";
     let mut command = Command::new("git");
     if bypass_hooks {
-        command.args(crate::tools::git::hooks_off_args());
+        command.args(crate::tools::vcs::git::hooks_off_args());
     }
     command.args(["commit", "--cleanup=strip", "-F", "-"]);
     if bypass_hooks {
@@ -122,7 +122,7 @@ pub(crate) fn commit_with_message(
 pub(crate) fn push_or_abort(cwd: &Path, bypass_hooks: bool) -> Result<(), CommitError> {
     let mut args: Vec<&str> = Vec::new();
     if bypass_hooks {
-        args.extend(crate::tools::git::hooks_off_args());
+        args.extend(crate::tools::vcs::git::hooks_off_args());
     }
     args.push("push");
     if bypass_hooks {

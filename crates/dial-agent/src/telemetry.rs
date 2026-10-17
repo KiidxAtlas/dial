@@ -44,7 +44,7 @@ pub struct Request {
 #[derive(Debug, Clone)]
 pub struct Tool {
     pub status: crate::tools::ToolStatus,
-    pub effects: crate::tools::outcome::Effects,
+    pub effects: crate::tools::surface::outcome::Effects,
     pub session: String,
     pub project: String,
     pub tool: String,
@@ -175,7 +175,7 @@ pub fn tool(
         name,
         seconds,
         status,
-        crate::tools::outcome::Effects::Known,
+        crate::tools::surface::outcome::Effects::Known,
     );
 }
 
@@ -186,7 +186,7 @@ pub fn tool_with_effects(
     name: &str,
     seconds: f64,
     status: crate::tools::ToolStatus,
-    effects: crate::tools::outcome::Effects,
+    effects: crate::tools::surface::outcome::Effects,
 ) {
     if hermetic {
         return;
@@ -200,7 +200,7 @@ pub fn tool_with_effects(
             project: project_key(config),
             tool: name.into(),
             duration: Duration::try_from_secs_f64(seconds).unwrap_or_default(),
-            error: status.failed() || effects == crate::tools::outcome::Effects::Unknown,
+            error: status.failed() || effects == crate::tools::surface::outcome::Effects::Unknown,
             end: SystemTime::now(),
         }),
     );

@@ -23,7 +23,7 @@ pub(super) struct StateUi<'a> {
     reasoning: Option<Body>,
     inference: Option<Body>,
     tools: Vec<PendingTool>,
-    registry: crate::tools::ext::Registry,
+    registry: crate::tools::integrations::ext::Registry,
 }
 impl<'a> StateUi<'a> {
     /// Runtime observations reach every observer only after their journal write succeeded.
@@ -46,13 +46,18 @@ impl<'a> StateUi<'a> {
     }
     #[cfg(test)]
     pub fn new(inner: &'a mut dyn Ui, tree: Tree, parent: Option<String>) -> Self {
-        Self::with_registry(inner, tree, parent, crate::tools::ext::Registry::new())
+        Self::with_registry(
+            inner,
+            tree,
+            parent,
+            crate::tools::integrations::ext::Registry::new(),
+        )
     }
     pub fn with_registry(
         inner: &'a mut dyn Ui,
         tree: Tree,
         parent: Option<String>,
-        registry: crate::tools::ext::Registry,
+        registry: crate::tools::integrations::ext::Registry,
     ) -> Self {
         inner.runtime(&tree);
         Self {
@@ -111,7 +116,7 @@ impl<'a> StateUi<'a> {
                 )
             });
         let mut view = if args.is_null() {
-            crate::tools::presentation::render_result(name, &args, output)
+            crate::tools::surface::presentation::render_result(name, &args, output)
         } else {
             self.registry.render_result(name, &args, output)
         };
@@ -267,7 +272,7 @@ impl Ui for StateUi<'_> {
     fn tool_presentation(
         &mut self,
         call_id: &str,
-        view: &crate::tools::presentation::Presentation,
+        view: &crate::tools::surface::presentation::Presentation,
     ) {
         if let Some(tool) = self
             .tools

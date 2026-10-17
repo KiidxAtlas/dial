@@ -345,10 +345,10 @@ pub fn clip_middle(text: &str, max: usize) -> String {
 }
 
 /// Clip a tool result for the model. Like [`clip_middle`], but diagnostic lines (errors, panics,
-/// failed tests; see [`crate::tools::diagnostics`]) from the omitted middle are kept between the two
+/// failed tests; see [`crate::tools::code::diagnostics`]) from the omitted middle are kept between the two
 /// ends, within a quarter of `max`, so a long build log still shows the first error and its location.
 pub fn clip_evidence(text: &str, max: usize) -> String {
-    use crate::tools::diagnostics;
+    use crate::tools::code::diagnostics;
     if text.len() <= max {
         return text.to_owned();
     }
@@ -646,7 +646,7 @@ impl PaceGuard {
             }
             return None;
         }
-        let heads = crate::tools::bash_interceptor::pipeline_heads(
+        let heads = crate::tools::exec::bash_interceptor::pipeline_heads(
             call.arguments["command"].as_str().unwrap_or_default(),
         );
         let repeated = heads

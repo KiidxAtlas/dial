@@ -4,7 +4,7 @@ use crate::{
     config::types::{Config, Harness},
     tools::{
         Workspace,
-        ext::{Registry, Tool},
+        integrations::ext::{Registry, Tool},
     },
 };
 use std::sync::{Arc, atomic::AtomicBool};
