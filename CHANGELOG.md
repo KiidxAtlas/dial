@@ -5,6 +5,9 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Added
+- The MCP browser and `mcp_servers search` also list npm packages tagged `mcp` that declare a command, and GitHub repositories, next to the official registry, Smithery and the curated list. Sources are read concurrently, and a server listed by several sources shows once with every badge. npm servers install as `npx -y <package>@<version>`. A GitHub repository installs only when its root `package.json` or `pyproject.toml` names an npm or PyPI package that names the same repository as its source and has one clear command; otherwise the row links the repository for manual setup. Every install still asks for approval and must start and list its tools before it is saved.
+
 ## [0.1.9] - 2026-10-16
 
 ### Added

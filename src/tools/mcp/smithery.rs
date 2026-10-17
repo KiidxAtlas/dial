@@ -317,6 +317,7 @@ fn listing_candidate(entry: &Value) -> Option<super::catalog::Candidate> {
             "Smithery servers install from /extensions, which asks for their settings".into(),
         ),
         inputs: Vec::new(),
+        repository: None,
     })
 }
 

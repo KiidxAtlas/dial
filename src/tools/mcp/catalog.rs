@@ -1,12 +1,13 @@
-//! One install shape for every MCP listing: the built-in curated list, the official MCP Registry
-//! and Smithery. Discovery only reads listings. Nothing here starts a server or writes config;
-//! callers (the `/extensions` browser and the `mcp_servers` agent tool) run the health check and
-//! save the returned [`Change`](crate::storage::settings_store::Change) themselves, after approval.
+//! One install shape for every MCP listing: the built-in curated list, the official MCP Registry,
+//! Smithery, npm and GitHub. Discovery only reads listings. Nothing here starts a server or writes
+//! config; callers (the `/extensions` browser and the `mcp_servers` agent tool) run the health
+//! check and save the returned [`Change`](crate::storage::settings_store::Change) themselves,
+//! after approval.
 //!
 //! Secrets are never invented: a server's required environment variables come back as [`Input`]s
 //! that the user must fill in, and a remote that needs a header this module cannot supply is
 //! [`Install::Blocked`] with the reason.
-use super::{registry, smithery};
+use super::{github, npm, registry, smithery};
 use crate::config::types::{Config, McpServerConfig};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, HashMap};
@@ -219,11 +220,15 @@ pub const CURATED: &[Curated] = &[
     },
 ];
 
-/// Where listings are read from. Tests point both at a loopback fixture.
+/// Where listings are read from. Tests point them at a loopback fixture.
 #[derive(Clone, Debug)]
 pub struct Endpoints {
     pub official: String,
     pub smithery: String,
+    pub npm: String,
+    pub pypi: String,
+    pub github_api: String,
+    pub github_raw: String,
 }
 
 impl Endpoints {
@@ -231,6 +236,22 @@ impl Endpoints {
         Self {
             official: registry::OFFICIAL_URL.to_owned(),
             smithery: smithery::registry_url(),
+            npm: npm::URL.to_owned(),
+            pypi: "https://pypi.org/pypi".to_owned(),
+            github_api: github::API_URL.to_owned(),
+            github_raw: github::RAW_URL.to_owned(),
+        }
+    }
+
+    /// Every listing on one base URL, for tests that serve them all from one fixture.
+    pub fn at(base: &str) -> Self {
+        Self {
+            official: base.to_owned(),
+            smithery: base.to_owned(),
+            npm: base.to_owned(),
+            pypi: base.to_owned(),
+            github_api: base.to_owned(),
+            github_raw: base.to_owned(),
         }
     }
 }
@@ -240,6 +261,8 @@ impl Endpoints {
 pub enum Source {
     Official,
     Smithery,
+    Npm,
+    Github,
     Curated,
 }
 
@@ -248,6 +271,8 @@ impl Source {
         match self {
             Source::Official => "official",
             Source::Smithery => "smithery",
+            Source::Npm => "npm",
+            Source::Github => "github",
             Source::Curated => "curated",
         }
     }
@@ -268,6 +293,9 @@ pub struct Input {
 pub enum Install {
     /// A stdio program or a remote URL. Required inputs are filled in as environment entries.
     Server(McpServerConfig),
+    /// Decided by [`resolve`] when installing, from details the listing does not carry. The text
+    /// says what is looked up.
+    Deferred(String),
     /// Cannot be installed from here. The reason is shown to the user.
     Blocked(String),
 }
@@ -275,7 +303,8 @@ pub enum Install {
 /// One server from any listing, in the shape every browser and tool uses.
 #[derive(Clone, Debug)]
 pub struct Candidate {
-    /// Listing name: registry name, curated id, or Smithery qualified name.
+    /// Listing name: registry name, curated id, Smithery qualified name, `npm:<package>` or
+    /// `github:<owner>/<repo>`.
     pub name: String,
     pub title: String,
     pub description: String,
@@ -285,6 +314,8 @@ pub struct Candidate {
     pub badges: Vec<String>,
     pub install: Install,
     pub inputs: Vec<Input>,
+    /// Source repository URL, when the listing names one.
+    pub repository: Option<String>,
 }
 
 impl Candidate {
@@ -292,8 +323,9 @@ impl Candidate {
         self.sources.first().copied().unwrap_or(Source::Official)
     }
 
+    /// Whether installing can be attempted: a ready install or one [`resolve`] decides.
     pub fn installable(&self) -> bool {
-        matches!(self.install, Install::Server(_))
+        matches!(self.install, Install::Server(_) | Install::Deferred(_))
     }
 
     /// The first required input with no value in `values` (blank counts as missing).
@@ -310,6 +342,7 @@ impl Candidate {
     pub fn server(&self, values: &BTreeMap<String, String>) -> Result<McpServerConfig> {
         let mut server = match &self.install {
             Install::Server(server) => server.clone(),
+            Install::Deferred(_) => bail!("`{}` must be resolved before it installs", self.name),
             Install::Blocked(reason) => bail!("{reason}"),
         };
         if let Some(input) = self.missing_required(values) {
@@ -335,6 +368,7 @@ impl Candidate {
     pub fn install_summary(&self) -> String {
         match &self.install {
             Install::Server(server) => command_line(server),
+            Install::Deferred(lookup) => format!("decided when installing: {lookup}"),
             Install::Blocked(reason) => format!("not installable here: {reason}"),
         }
     }
@@ -382,7 +416,12 @@ pub fn cache_env(user_dir: &Path) -> BTreeMap<String, String> {
 /// The config table name for a listing name: the last path segment, lowercased, with only
 /// `[a-z0-9_-]` kept. Dots would make a TOML path nest, so they are never kept.
 pub fn config_name(name: &str) -> String {
-    let last = name.trim().rsplit('/').next().unwrap_or("");
+    let name = name.trim();
+    let name = [npm::PREFIX, github::PREFIX]
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+        .unwrap_or(name);
+    let last = name.rsplit('/').next().unwrap_or("");
     let mut out = String::new();
     for c in last.chars().map(|c| c.to_ascii_lowercase()) {
         let c = if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
@@ -450,6 +489,7 @@ pub fn curated_candidate(item: &Curated, user_dir: &Path, project_root: &Path) -
         sources: vec![Source::Curated],
         badges: Vec::new(),
         install: Install::Server(server),
+        repository: None,
         inputs: item
             .env
             .iter()
@@ -481,24 +521,107 @@ pub fn curated_matches(query: &str, user_dir: &Path, project_root: &Path) -> Vec
 // ---- Merge ------------------------------------------------------------------------------------
 
 /// Owner-qualified identity used to spot one server listed twice: `owner/name` with any leading `@`
-/// and `io.github.` removed, lowercased. Bare curated ids have no owner, so they never match
-/// an unrelated listing that happens to end in the same word.
+/// and `io.github.` removed, lowercased. Bare curated ids and unscoped npm packages have no owner,
+/// so they never match an unrelated listing that happens to end in the same word.
 pub fn dedupe_key(name: &str) -> String {
-    name.trim()
-        .trim_start_matches('@')
+    let name = name.trim();
+    let name = name.strip_prefix(github::PREFIX).unwrap_or(name);
+    if let Some(package) = name.strip_prefix(npm::PREFIX)
+        && !package.starts_with('@')
+    {
+        return name.to_ascii_lowercase();
+    }
+    let name = name.strip_prefix(npm::PREFIX).unwrap_or(name);
+    name.trim_start_matches('@')
         .trim_start_matches("io.github.")
         .to_ascii_lowercase()
 }
 
+/// The package a stdio install runs as a whole (`npx -y <pkg>[@v]`, `npx -y --package=<pkg> <cmd>`,
+/// `uvx [--from <pkg>==v] <cmd>`), so listings that run the same package fold together. Installs
+/// with further arguments (a bridge to a URL, a project root) are not a package identity.
+fn package_key(server: &McpServerConfig) -> Option<String> {
+    let args: Vec<&str> = server.args.iter().map(String::as_str).collect();
+    let program = server.program.to_str()?;
+    let (kind, package) = match (program, args.as_slice()) {
+        ("npx", ["-y", spec]) => ("npm", unversioned(spec)),
+        ("npx", ["-y", spec, _]) => ("npm", unversioned(spec.strip_prefix("--package=")?)),
+        ("uvx", ["--from", spec, _]) => ("pypi", spec.split("==").next()?),
+        ("uvx", [package]) if !package.starts_with('-') => ("pypi", *package),
+        _ => return None,
+    };
+    Some(format!("package:{kind}:{}", package.to_ascii_lowercase()))
+}
+
+/// `name@version` or `@scope/name@version` without the version.
+fn unversioned(spec: &str) -> &str {
+    let start = usize::from(spec.starts_with('@'));
+    match spec[start..].find('@') {
+        Some(at) => &spec[..start + at],
+        None => spec,
+    }
+}
+
+/// `https://<host>/<owner>/<repo>` for a repository given as a git URL, a page inside the
+/// repository, or npm's `github:owner/repo` and `owner/repo` shorthands. `None` when it names no
+/// owner and repository.
+pub fn normalize_repository(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let raw = raw.strip_prefix("git+").unwrap_or(raw);
+    let shorthand = raw
+        .strip_prefix("github:")
+        .or_else(|| (!raw.contains(':')).then_some(raw));
+    let url = if let Some(path) = shorthand {
+        format!("https://github.com/{path}")
+    } else if let Some(path) = raw.strip_prefix("git@") {
+        format!("https://{}", path.replacen(':', "/", 1))
+    } else {
+        raw.replacen("ssh://git@", "https://", 1)
+            .replacen("git://", "https://", 1)
+    };
+    let url = url::Url::parse(&url).ok()?;
+    if !matches!(url.scheme(), "https" | "http") {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (plain(owner) && plain(repo)).then(|| format!("https://{host}/{owner}/{repo}"))
+}
+
 /// Folds listings of the same server into one candidate. The first listing keeps its install;
-/// later ones add their source (and badges) to it.
+/// later ones add their source (and badges) to it. Listings match on their owner-qualified name
+/// or the package their install runs. A GitHub row also matches the one listing that names its
+/// repository; a repository named by several listings holds several servers, so it matches none.
 pub fn merge(candidates: Vec<Candidate>) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    let mut repositories: HashMap<String, Option<usize>> = HashMap::new();
     for candidate in candidates {
-        let key = dedupe_key(&candidate.name);
-        match index.get(&key) {
-            Some(&slot) => {
+        let mut keys = vec![dedupe_key(&candidate.name)];
+        if let Install::Server(server) = &candidate.install {
+            keys.extend(package_key(server));
+        }
+        let repository = candidate.repository.as_deref().map(str::to_ascii_lowercase);
+        let github = candidate.origin() == Source::Github;
+        let found = keys
+            .iter()
+            .find_map(|key| index.get(key).copied())
+            .or_else(|| {
+                github
+                    .then(|| repositories.get(repository.as_deref()?).copied().flatten())
+                    .flatten()
+            });
+        let slot = match found {
+            Some(slot) => {
                 let existing = &mut out[slot];
                 for source in candidate.sources {
                     if !existing.sources.contains(&source) {
@@ -510,11 +633,30 @@ pub fn merge(candidates: Vec<Candidate>) -> Vec<Candidate> {
                         existing.badges.push(badge);
                     }
                 }
+                if existing.repository.is_none() {
+                    existing.repository = candidate.repository;
+                }
+                slot
             }
             None => {
-                index.insert(key, out.len());
                 out.push(candidate);
+                out.len() - 1
             }
+        };
+        for key in keys {
+            index.entry(key).or_insert(slot);
+        }
+        if let Some(repository) = repository
+            && !github
+        {
+            repositories
+                .entry(repository)
+                .and_modify(|owner| {
+                    if *owner != Some(slot) {
+                        *owner = None;
+                    }
+                })
+                .or_insert(Some(slot));
         }
     }
     out
@@ -530,52 +672,111 @@ pub struct Discovery {
     pub notices: Vec<String>,
 }
 
-/// Official registry, then Smithery, then curated. Curated entries appear on the first page only.
+/// Official registry, Smithery, npm and GitHub, read concurrently and merged in that order, then
+/// curated. Curated entries appear on the first page only.
 pub fn discover(endpoints: &Endpoints, config: &Config, query: &str, page: usize) -> Discovery {
     let page = page.max(1);
     let query = query.trim();
+    let user_dir = &config.user_dir;
     let mut found = Vec::new();
     let mut notices = Vec::new();
     let mut more = false;
-    match registry::search_page_at(&endpoints.official, query, page, &config.user_dir) {
-        Ok((rows, next)) => {
-            found.extend(rows);
-            more |= next;
-        }
-        Err(error) => notices.push(format!("official registry: {error:#}")),
-    }
-    let key = match smithery::resolve_api_key(&config.user_dir) {
+    let key = match smithery::resolve_api_key(user_dir) {
         Ok(key) => key,
         Err(error) => {
             notices.push(format!("Smithery key: {error:#}"));
             None
         }
     };
-    match smithery::browse_page_at(&endpoints.smithery, query, page, key.as_deref()) {
-        Ok((rows, next)) => {
-            found.extend(rows);
-            more |= next;
+    let key = key.as_deref();
+    let pages = std::thread::scope(|scope| {
+        [
+            (
+                "official registry",
+                scope
+                    .spawn(|| registry::search_page_at(&endpoints.official, query, page, user_dir)),
+            ),
+            (
+                "Smithery",
+                scope.spawn(|| {
+                    smithery::browse_page_at(&endpoints.smithery, query, page, key)
+                        .map_err(|error| anyhow!(error.message))
+                }),
+            ),
+            (
+                "npm",
+                scope.spawn(|| npm::search_page_at(&endpoints.npm, query, page, user_dir)),
+            ),
+            (
+                "GitHub",
+                scope.spawn(|| github::search_page_at(&endpoints.github_api, query, page)),
+            ),
+        ]
+        .map(|(label, handle)| {
+            let result = handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow!("the listing request panicked")));
+            (label, result)
+        })
+    });
+    for (label, result) in pages {
+        match result {
+            Ok((rows, next)) => {
+                found.extend(rows);
+                more |= next;
+            }
+            Err(error) => notices.push(format!("{label}: {error:#}")),
         }
-        Err(error) => notices.push(format!("Smithery: {}", error.message)),
     }
     if page == 1 {
-        found.extend(curated_matches(
-            query,
-            &config.user_dir,
-            &config.project_root,
-        ));
+        found.extend(curated_matches(query, user_dir, &config.project_root));
     }
+    let mut candidates = merge(found);
+    rank(&mut candidates, query);
     Discovery {
-        candidates: merge(found),
+        candidates,
         more,
         notices,
     }
 }
 
-/// The candidate to install for `id`: a curated id first, then an exact official registry name.
-/// Smithery names are not resolved here; they install through their own settings form.
+/// Moves rows whose name is the query to the top, then rows whose name contains it, keeping
+/// each listing's own order within those groups. Loose provider matches (Smithery matches
+/// descriptions) would otherwise push an exact npm or GitHub match far down the page.
+fn rank(candidates: &mut [Candidate], query: &str) {
+    let query = normalized(query);
+    if query.is_empty() {
+        return;
+    }
+    candidates.sort_by_key(|candidate| {
+        let names = [normalized(&candidate.title), config_name(&candidate.name)];
+        if names.contains(&query) {
+            0
+        } else if names.iter().any(|name| name.contains(&query)) {
+            1
+        } else {
+            2
+        }
+    });
+}
+
+fn normalized(text: &str) -> String {
+    text.trim()
+        .to_ascii_lowercase()
+        .replace(['_', '.', ' '], "-")
+}
+
+/// The candidate to install for `id`: a curated id, an `npm:` package, a `github:` repository, or
+/// an exact official registry name. Smithery names are not resolved here; they install through
+/// their own settings form.
 pub fn resolve(endpoints: &Endpoints, config: &Config, id: &str) -> Result<Candidate> {
     let id = id.trim();
+    if let Some(package) = id.strip_prefix(npm::PREFIX) {
+        return npm::resolve(&endpoints.npm, package, &config.user_dir);
+    }
+    if let Some(repository) = id.strip_prefix(github::PREFIX) {
+        return github::resolve(endpoints, repository, &config.user_dir);
+    }
     if let Some(item) = CURATED.iter().find(|item| item.id == id) {
         return Ok(curated_candidate(
             item,
@@ -586,7 +787,7 @@ pub fn resolve(endpoints: &Endpoints, config: &Config, id: &str) -> Result<Candi
     registry::find_at(&endpoints.official, id, &config.user_dir)?.ok_or_else(
         || {
             anyhow!(
-                "`{id}` is not in the official MCP registry or the curated list. Search first, then use the exact name."
+                "`{id}` is not in the official MCP registry or the curated list. Search first, then use the exact id of a result."
             )
         },
     )
@@ -612,6 +813,7 @@ mod tests {
             badges: Vec::new(),
             install: Install::Server(stdio("npx")),
             inputs,
+            repository: None,
         }
     }
 
@@ -642,15 +844,8 @@ mod tests {
         let config = Config::default();
         let found = curated_matches("NuXt", &config.user_dir, &config.project_root);
         assert_eq!(found.len(), 1);
-        let candidate = resolve(
-            &Endpoints {
-                official: "invalid://unused".into(),
-                smithery: "invalid://unused".into(),
-            },
-            &config,
-            &found[0].name,
-        )
-        .unwrap();
+        let candidate =
+            resolve(&Endpoints::at("invalid://unused"), &config, &found[0].name).unwrap();
         let server = candidate.server(&BTreeMap::new()).unwrap();
         assert_eq!(server.program, PathBuf::from("npx"));
         assert_eq!(server.args, ["-y", "mcp-remote", "https://nuxt.com/mcp"]);
@@ -705,6 +900,32 @@ mod tests {
         assert_eq!(config_name("@Acme/Notes.v2"), "notes-v2");
         assert_eq!(config_name("a//b  c"), "b-c");
         assert_eq!(config_name("///"), "mcp-server");
+        assert_eq!(config_name("npm:context-mode"), "context-mode");
+        assert_eq!(config_name("npm:@upstash/context7-mcp"), "context7-mcp");
+        assert_eq!(config_name("github:headroomlabs-ai/headroom"), "headroom");
+    }
+
+    #[test]
+    fn name_matches_rank_first_and_keep_listing_order() {
+        let mut rows = vec![
+            candidate("@someone/memory-context", Source::Smithery, vec![]),
+            candidate("@other/unrelated", Source::Smithery, vec![]),
+            candidate("npm:context-mode-helper", Source::Npm, vec![]),
+            candidate("github:mksglu/context-mode", Source::Github, vec![]),
+            candidate("npm:context-mode", Source::Npm, vec![]),
+        ];
+        rank(&mut rows, "Context Mode");
+        let names: Vec<&str> = rows.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "github:mksglu/context-mode",
+                "npm:context-mode",
+                "npm:context-mode-helper",
+                "@someone/memory-context",
+                "@other/unrelated",
+            ]
+        );
     }
 
     #[test]
@@ -713,7 +934,114 @@ mod tests {
             dedupe_key("io.github.github/github-mcp-server"),
             dedupe_key("@github/github-mcp-server")
         );
+        assert_eq!(
+            dedupe_key("github:mksglu/context-mode"),
+            dedupe_key("io.github.mksglu/context-mode")
+        );
+        assert_eq!(dedupe_key("npm:@acme/notes"), dedupe_key("@acme/notes"));
         assert_ne!(dedupe_key("github"), dedupe_key("io.github.someone/github"));
+        assert_ne!(dedupe_key("npm:memory"), dedupe_key("memory"));
+    }
+
+    fn running(mut candidate: Candidate, program: &str, args: &[&str]) -> Candidate {
+        candidate.install = Install::Server(McpServerConfig {
+            program: PathBuf::from(program),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            ..Default::default()
+        });
+        candidate
+    }
+
+    #[test]
+    fn listings_running_the_same_package_fold_but_bridges_do_not() {
+        let official = running(
+            candidate("io.github.upstash/context7", Source::Official, vec![]),
+            "npx",
+            &["-y", "@upstash/context7-mcp@1.0.0"],
+        );
+        let npm = running(
+            candidate("npm:@upstash/context7-mcp", Source::Npm, vec![]),
+            "npx",
+            &["-y", "@upstash/context7-mcp@1.0.2"],
+        );
+        let curated = running(
+            candidate("context7", Source::Curated, vec![]),
+            "npx",
+            &["-y", "@upstash/context7-mcp"],
+        );
+        let bridge = running(
+            candidate("npm:mcp-remote", Source::Npm, vec![]),
+            "npx",
+            &["-y", "mcp-remote@0.1.0"],
+        );
+        let nuxt = running(
+            candidate("nuxt", Source::Curated, vec![]),
+            "npx",
+            &["-y", "mcp-remote", "https://nuxt.com/mcp"],
+        );
+        let merged = merge(vec![official, npm, bridge, curated, nuxt]);
+        let names: Vec<&str> = merged.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["io.github.upstash/context7", "npm:mcp-remote", "nuxt"]
+        );
+        assert_eq!(
+            merged[0].sources,
+            vec![Source::Official, Source::Npm, Source::Curated]
+        );
+    }
+
+    #[test]
+    fn a_github_row_folds_into_its_package_unless_the_repository_is_shared() {
+        let repo = |mut c: Candidate, url: &str| {
+            c.repository = Some(url.into());
+            c
+        };
+        let npm = repo(
+            candidate("npm:context-mode", Source::Npm, vec![]),
+            "https://github.com/mksglu/context-mode",
+        );
+        let github = repo(
+            candidate("github:MKSGLU/context-mode", Source::Github, vec![]),
+            "https://github.com/mksglu/context-mode",
+        );
+        let merged = merge(vec![npm, github]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].sources, vec![Source::Npm, Source::Github]);
+
+        let shared = "https://github.com/modelcontextprotocol/servers";
+        let merged = merge(vec![
+            repo(candidate("npm:@mcp/memory", Source::Npm, vec![]), shared),
+            repo(candidate("npm:@mcp/fetch", Source::Npm, vec![]), shared),
+            repo(
+                candidate(
+                    "github:modelcontextprotocol/servers",
+                    Source::Github,
+                    vec![],
+                ),
+                shared,
+            ),
+        ]);
+        assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn repositories_normalize_from_every_common_spelling() {
+        let expected = Some("https://github.com/mksglu/context-mode".to_owned());
+        for raw in [
+            "git+https://github.com/mksglu/context-mode.git",
+            "git://github.com/mksglu/context-mode.git",
+            "git@github.com:mksglu/context-mode.git",
+            "ssh://git@github.com/mksglu/context-mode",
+            "github:mksglu/context-mode",
+            "mksglu/context-mode",
+            "https://github.com/mksglu/context-mode/blob/main/README.md",
+            "https://github.com/mksglu/context-mode#readme",
+        ] {
+            assert_eq!(normalize_repository(raw), expected, "{raw}");
+        }
+        assert_eq!(normalize_repository("https://docs.example.com"), None);
+        assert_eq!(normalize_repository("file:///etc/passwd"), None);
     }
 
     #[test]

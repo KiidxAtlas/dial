@@ -260,16 +260,34 @@ the legacy HTTP+SSE transport: the event stream opens first, its `endpoint` even
 requests are POSTed (it must stay on the server's origin), and replies arrive on that stream.
 
 **MCP discovery and install.** `/extensions` (MCP tab) immediately shows the curated list and loads
-the first page from the official MCP registry and Smithery in the background, even with no query.
-`/` filters loaded rows while typing; Enter searches both remote catalogs, and `n` loads the next
-page. Remote MCP results for the submitted query retain the provider's relevance matching instead
-of being hidden by an additional literal-text filter. The official registry requests latest versions
-and follows its cursors; browsing is not limited to ten pages. Smithery listings remain visible even
+the first page from the official MCP registry, Smithery, npm and GitHub in the background (read
+concurrently), even with no query. `/` filters loaded rows while typing; Enter searches every remote
+catalog, and `n` loads the next page. Remote MCP results for the submitted query retain the
+provider's relevance matching instead
+of being hidden by an additional literal-text filter; rows whose name equals the query come first,
+then rows whose name contains it, each group in listing order. The official registry requests latest versions
+and follows its cursors; browsing is not limited to ten pages. Its search matches listing names
+only. Smithery listings remain visible even
 when their connection details are unavailable; those details are fetched when installing, not while
-browsing. A server listed by both providers on a page appears once with both source badges.
+browsing. A server listed by several providers on a page appears once with every source badge:
+listings fold together when their owner-qualified names match or their installs run the same npm
+or PyPI package, and a GitHub row folds into the one listing that names its repository.
 Provider failures are reported alongside any available results, not treated as a complete catalog.
-These catalogs are not an exhaustive list of every MCP server: a server must be published there to
-appear in remote search. `i` installs; installation always asks for confirmation first.
+
+npm and GitHub cover servers that are not published to a catalog. npm rows are packages tagged
+`mcp` whose manifest declares a command (libraries are left out); they run as
+`npx -y <package>@<version>`, or `npx -y --package=<package>@<version> <command>` when the package
+has several commands and exactly one is named like the package or contains `mcp`. GitHub rows are
+repository search results (an empty query browses `topic:mcp-server` by stars). A repository is
+resolved only when installing: its root `package.json` or `pyproject.toml` must name a package
+published on npm or PyPI whose metadata names that same repository as its source, and the package
+must have one clear command (PyPI packages run as `uvx --from <package>==<version> <command>`).
+Otherwise the row says why and links the repository to set up by hand. Neither listing declares
+environment values, so a server that needs them fails the install health check and nothing is
+saved. Anonymous GitHub search allows about ten searches a minute; `GITHUB_TOKEN` or `GH_TOKEN`
+raises the limit and is sent only to `api.github.com`.
+These catalogs are not an exhaustive list of every MCP server: a server must be published to one
+of them to appear in remote search. `i` installs; installation always asks for confirmation first.
 The curated list includes the [official Nuxt MCP server](https://nuxt.com/docs/4.x/guide/ai/mcp),
 available as `nuxt` even without registry access. It uses Nuxt's documented stdio bridge,
 `npx -y mcp-remote https://nuxt.com/mcp` (Node.js/npm required).
@@ -282,7 +300,7 @@ PATH. Config names are the last segment of the listing name (`io.github.acme/not
 
 The agent has the same reach through `mcp_servers`: `list` (default), `search` with optional
 `query` (reads listings only, downloads and starts nothing) and `install` with `id` from a search
-result. Only `install` needs approval. It returns `needs_input` with the variable names when values
+result (`npm:<package>` and `github:<owner>/<repo>` ids resolve as above). Only `install` needs approval. It returns `needs_input` with the variable names when values
 are required, and the user enters them in `/extensions`. An installed server takes effect in the
 next session; `/mcp` shows its status. Smithery servers still install through their settings form
 (`/extensions` → `i`, or `/mcp smithery-install`). Archived upstream packages (Brave, Slack,

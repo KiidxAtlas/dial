@@ -14,7 +14,7 @@ use crate::{
     },
     tools::{
         mcp::{
-            catalog::{self, CURATED, Candidate, Endpoints, Source},
+            catalog::{self, CURATED, Candidate, Endpoints, Install, Source},
             smithery,
         },
         plugin::{
@@ -662,7 +662,7 @@ fn catalog_update(
                 let found = catalog::discover(endpoints, config, query, page);
                 let rows: Vec<_> = found.candidates.iter().map(candidate_row).collect();
                 let mut message = format!(
-                    "MCP page {page}: {} servers from the official registry, Smithery and curated · {}",
+                    "MCP page {page}: {} servers from the official registry, Smithery, npm, GitHub and curated · {}",
                     rows.len(),
                     if found.more {
                         "n loads more"
@@ -763,8 +763,8 @@ fn say(progress: &SharedProgress, line: impl Into<String>) {
     }
 }
 
-/// Installs a curated or official-registry server. Missing required values reopen the form first;
-/// a server that starts and lists tools is saved, anything else saves nothing.
+/// Installs a curated, official-registry, npm or GitHub server. Missing required values reopen the
+/// form first; a server that starts and lists tools is saved, anything else saves nothing.
 fn install_mcp(
     endpoints: &Endpoints,
     config: &Config,
@@ -1007,8 +1007,8 @@ fn is_secret_key(key: &str) -> bool {
     catalog::looks_secret(key)
 }
 
-/// A catalog row for one merged candidate. Official rows install from `i`, curated rows by id,
-/// and Smithery rows open their settings form.
+/// A catalog row for one merged candidate. Smithery-first rows open their settings form; every
+/// other remote row installs from `i` through [`catalog::resolve`], and curated rows by id.
 fn candidate_row(candidate: &Candidate) -> Row {
     let mut tags: Vec<String> = candidate
         .sources
@@ -1016,16 +1016,21 @@ fn candidate_row(candidate: &Candidate) -> Row {
         .map(|source| source.label().to_owned())
         .collect();
     tags.extend(candidate.badges.iter().cloned());
-    tags.push(
-        if candidate.origin() == Source::Smithery {
-            "settings on install"
-        } else if candidate.inputs.iter().any(|input| input.required) {
-            "needs values"
-        } else {
-            "no key"
-        }
-        .into(),
-    );
+    let state = if candidate.origin() == Source::Smithery {
+        Some("settings on install")
+    } else if matches!(candidate.install, Install::Deferred(_)) {
+        Some("checked on install")
+    } else if !candidate.installable() {
+        Some("manual setup")
+    } else if candidate.inputs.iter().any(|input| input.required) {
+        Some("needs values")
+    } else if matches!(candidate.origin(), Source::Npm | Source::Github) {
+        // These listings do not declare settings, so "no key" would be a guess.
+        None
+    } else {
+        Some("no key")
+    };
+    tags.extend(state.map(str::to_owned));
     let origin = if candidate.origin() == Source::Curated {
         Origin::Curated
     } else {
@@ -1045,6 +1050,9 @@ fn candidate_row(candidate: &Candidate) -> Row {
             input.description
         )
     }));
+    if let Some(repository) = &candidate.repository {
+        details.push(format!("repository: {repository}"));
+    }
     details.push(format!(
         "listed by: {}",
         candidate
@@ -1158,6 +1166,7 @@ mod tests {
             badges: Vec::new(),
             install: Install::Blocked("test".into()),
             inputs: Vec::new(),
+            repository: None,
         }
     }
 
@@ -1332,10 +1341,7 @@ mod smithery_flow_tests {
     ) -> (Outcome, Option<Form>) {
         let layout =
             Layout::with_user_dir(&config.user_dir, config.user_dir.clone()).expect("layout");
-        let endpoints = Endpoints {
-            official: base.to_owned(),
-            smithery: base.to_owned(),
-        };
+        let endpoints = Endpoints::at(base);
         let outcome = run_at(&endpoints, &layout, config, &intent, progress).expect("stage runs");
         let form = progress.lock().expect("progress").form.take();
         (outcome, form)
@@ -1503,7 +1509,11 @@ mod smithery_flow_tests {
             }
         }));
         let update = catalog_update(
-            &Endpoints { official, smithery },
+            &Endpoints {
+                official,
+                smithery,
+                ..Endpoints::at("http://127.0.0.1:9")
+            },
             &layout,
             &config,
             Tab::Mcp,
@@ -1530,11 +1540,7 @@ mod smithery_flow_tests {
             project_root: dir.path().into(),
             ..Default::default()
         };
-        let unused = "http://127.0.0.1:9".to_owned();
-        let endpoints = Endpoints {
-            official: unused.clone(),
-            smithery: unused,
-        };
+        let endpoints = Endpoints::at("http://127.0.0.1:9");
         let progress = SharedProgress::default();
         let out =
             install_mcp(&endpoints, &config, "github", &BTreeMap::new(), &progress).expect("runs");
@@ -1649,10 +1655,7 @@ mod marketplace_tests {
             r#"{"skills":[{"name":"extra-skill","url":"https://example.com/org/skills.git#extra-skill"}]}"#,
         )
         .expect("write index");
-        let endpoints = Endpoints {
-            official: "http://127.0.0.1:9".into(),
-            smithery: "http://127.0.0.1:9".into(),
-        };
+        let endpoints = Endpoints::at("http://127.0.0.1:9");
         let progress = SharedProgress::default();
         let names = |config: &Config| -> Vec<String> {
             Marketplaces::new(marketplaces_root(config))

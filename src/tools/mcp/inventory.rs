@@ -120,6 +120,7 @@ fn search(config: &Config, query: &str) -> ToolOutput {
                 "installable": candidate.installable(),
                 "install": candidate.install_summary(),
                 "inputs": candidate.inputs.iter().map(input_json).collect::<Vec<_>>(),
+                "repository": candidate.repository,
             })
         })
         .collect();
@@ -208,7 +209,7 @@ impl Tool for Inventory {
     fn schema(&self) -> Value {
         json!({"type":"function","function":{
             "name":self.name(),
-            "description":"Inspect and find MCP servers. action `list` (default): configured servers with runtime connection status (connected, disconnected, failed or disabled), negotiated capabilities and registered tool names; starts nothing. action `search` with optional `query`: find servers in the official MCP registry, Smithery and the curated list (read-only). action `install` with `id` from a search result: needs the user's approval, starts the server once to check it, then saves it to the global config; it takes effect in the next session. Servers that need environment values are not installed; the result names them for the user to enter in /extensions. Discover exact listed tools with tool_search or tool_load to use them next round.",
+            "description":"Inspect and find MCP servers. action `list` (default): configured servers with runtime connection status (connected, disconnected, failed or disabled), negotiated capabilities and registered tool names; starts nothing. action `search` with optional `query`: find servers in the official MCP registry, Smithery, npm, GitHub and the curated list (read-only). action `install` with `id` from a search result: needs the user's approval, starts the server once to check it, then saves it to the global config; it takes effect in the next session. Servers that need environment values are not installed; the result names them for the user to enter in /extensions. Discover exact listed tools with tool_search or tool_load to use them next round.",
             "parameters":{"type":"object","properties":{
                 "action":{"type":"string","enum":["list","search","install"]},
                 "query":{"type":"string","description":"Search text for action search; empty lists the catalog"},
