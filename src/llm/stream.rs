@@ -732,13 +732,10 @@ mod tests {
 
         // A usage-reported cache count is the authority; timings only fill the gap.
         let mut acc = Accumulator::default();
-        for event in [
-            json!({"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":1000,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":5}},
-                "timings":{"cache_n":600}}),
-        ] {
-            acc.feed(&event.to_string(), &mut |_| true).unwrap();
-        }
+        let event = json!({"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":1000,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":5}},
+            "timings":{"cache_n":600}});
+        acc.feed(&event.to_string(), &mut |_| true).unwrap();
         assert_eq!(acc.finish().unwrap().cached_prompt_tokens, Some(5));
     }
 

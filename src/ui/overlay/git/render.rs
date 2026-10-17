@@ -323,7 +323,7 @@ impl GitOverlay {
             .rows
             .iter()
             .zip(&heights)
-            .flat_map(|(row, &height)| std::iter::repeat(row_mark(row)).take(height))
+            .flat_map(|(row, &height)| std::iter::repeat_n(row_mark(row), height))
             .collect();
 
         let focused = self.focus == Focus::Diff;

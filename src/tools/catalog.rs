@@ -331,7 +331,8 @@ mod tests {
             .chain(super::super::eval::tools(&config));
         for tool in tools {
             let schema = tool.schema();
-            let catalog = Catalog::from_schemas(&[schema.clone()], &Registry::new()).unwrap();
+            let catalog =
+                Catalog::from_schemas(std::slice::from_ref(&schema), &Registry::new()).unwrap();
             let platform = catalog.get(tool.name()).unwrap().platform.as_ref().unwrap();
             let status = tool.call(&context, &json!({"action":"status"}));
             assert!(!status.is_error, "{}", status.text);

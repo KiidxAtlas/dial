@@ -88,7 +88,7 @@ fn open_lock(path: &Path) -> Result<File> {
         path.extension().and_then(|s| s.to_str()).unwrap_or("")
     ));
     let lock = platform_fs::open_owner_only(
-        &OpenOptions::new()
+        OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -146,7 +146,7 @@ pub(crate) fn locked_for(
 
 pub(crate) fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
     validate_private_path(path.parent().context("storage path has no parent")?)?;
-    let file = match platform_fs::open_nofollow_nonblocking(&OpenOptions::new().read(true), path) {
+    let file = match platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),

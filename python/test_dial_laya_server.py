@@ -1,6 +1,5 @@
 """Exercise the Dial service contract without loading weights or starting a server."""
 import os
-from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch

@@ -289,11 +289,11 @@ impl Host {
     /// the room, so the count simply stays stale until the next change.
     fn refresh_registry(&mut self) {
         let guests = self.guest_count();
-        if let Some((user_dir, record)) = self.published.as_mut() {
-            if record.guests != guests {
-                record.guests = guests;
-                let _ = registry::write(user_dir, record);
-            }
+        if let Some((user_dir, record)) = self.published.as_mut()
+            && record.guests != guests
+        {
+            record.guests = guests;
+            let _ = registry::write(user_dir, record);
         }
     }
 
@@ -307,14 +307,15 @@ impl Host {
     fn on_frame(&mut self, peer: u32, msg: &Value, notes: &mut Vec<String>) {
         match msg["t"].as_str() {
             Some("hello") => self.admit(peer, msg, notes),
-            Some("prompt") => match msg["text"]
-                .as_str()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-            {
-                Some(text) => self.steer(peer, Steer::Prompt(text.to_owned())),
-                None => {}
-            },
+            Some("prompt") => {
+                if let Some(text) = msg["text"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                {
+                    self.steer(peer, Steer::Prompt(text.to_owned()))
+                }
+            }
             Some("abort") => self.steer(peer, Steer::Abort),
             _ => {}
         }

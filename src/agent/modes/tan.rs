@@ -175,22 +175,6 @@ impl Jobs {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cancel_removes_job_and_sets_interrupt() {
-        let mut jobs = Jobs::default();
-        jobs.insert_idle("tan-1");
-        let interrupt = jobs.live["tan-1"].interrupt.clone();
-        assert!(jobs.cancel("tan-1"));
-        assert!(interrupt.load(Ordering::SeqCst));
-        assert!(!jobs.live.contains_key("tan-1"));
-        assert!(!jobs.cancel("tan-1"));
-    }
-}
-
 /// Parent state a clone inherits when it is spawned.
 struct ClonePlan {
     config: Config,
@@ -244,4 +228,20 @@ fn run_clone(
     clone.push(json!({"role":"user","content":CONTEXT_SWITCH}))?;
     let report = clone.turn_preserving_interrupt(work, &mut NullUi)?;
     Ok(report.text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_removes_job_and_sets_interrupt() {
+        let mut jobs = Jobs::default();
+        jobs.insert_idle("tan-1");
+        let interrupt = jobs.live["tan-1"].interrupt.clone();
+        assert!(jobs.cancel("tan-1"));
+        assert!(interrupt.load(Ordering::SeqCst));
+        assert!(!jobs.live.contains_key("tan-1"));
+        assert!(!jobs.cancel("tan-1"));
+    }
 }

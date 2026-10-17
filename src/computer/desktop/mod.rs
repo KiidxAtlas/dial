@@ -734,7 +734,7 @@ impl Worker {
                 let displays =
                     self.capture_metadata(target, &base, &layout, image.width(), image.height())?;
                 let (image, source_width, source_height) =
-                    base.crop_region(image, &fresh, region, &caps)?;
+                    base.crop_region(image, &fresh, region, caps)?;
                 let width = image.width();
                 let height = image.height();
                 let (coordinate_width, coordinate_height) = base.dimensions();

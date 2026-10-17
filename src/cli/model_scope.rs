@@ -473,9 +473,12 @@ fn glob_match(pattern: &[char], text: &[char]) -> bool {
     }
 }
 
+/// A parsed `[...]` class: `(negated, ranges, chars consumed)`.
+type ParsedClass = (bool, Vec<(char, char)>, usize);
+
 /// Parses a `[...]` class at the start of `pattern`: `(negated, ranges, chars consumed)`. `None`
 /// when the class is unclosed, so the `[` is literal.
-fn parse_class(pattern: &[char]) -> Option<(bool, Vec<(char, char)>, usize)> {
+fn parse_class(pattern: &[char]) -> Option<ParsedClass> {
     let mut i = 1;
     let negate = matches!(pattern.get(i), Some('!') | Some('^'));
     if negate {

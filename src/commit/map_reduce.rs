@@ -436,7 +436,7 @@ impl ContextHeaders {
             return String::new();
         }
         let mut shown = others.clone();
-        shown.sort_by(|left, right| right.1.cmp(&left.1));
+        shown.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         shown.truncate(MAX_CONTEXT_FILES);
         let mut lines = vec!["OTHER FILES IN THIS CHANGE:".to_owned()];
         lines.extend(

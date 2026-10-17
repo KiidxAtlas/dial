@@ -473,10 +473,10 @@ impl CmuxClient {
             Some(connection) => connection.exchange(&line, deadline),
             None => Err(CmuxError::Closed),
         };
-        if let Err(error) = &outcome {
-            if error.drops_connection() {
-                *guard = None;
-            }
+        if let Err(error) = &outcome
+            && error.drops_connection()
+        {
+            *guard = None;
         }
         outcome
     }
@@ -714,7 +714,7 @@ fn field_text(value: Option<&Value>, fallback: &str) -> String {
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     text.as_bytes()

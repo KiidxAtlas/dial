@@ -535,13 +535,13 @@ fn go_test(stdout: &str) -> Vec<Draft> {
                 );
             }
         }
-        if value.get("Action").and_then(Value::as_str) == Some("fail") {
-            if let Some(test) = value.get("Test").and_then(Value::as_str) {
-                drafts.push(
-                    Draft::new(Severity::Error, format!("test {test} failed"))
-                        .code(Some("test-failure".to_owned())),
-                );
-            }
+        if value.get("Action").and_then(Value::as_str) == Some("fail")
+            && let Some(test) = value.get("Test").and_then(Value::as_str)
+        {
+            drafts.push(
+                Draft::new(Severity::Error, format!("test {test} failed"))
+                    .code(Some("test-failure".to_owned())),
+            );
         }
     }
     drafts

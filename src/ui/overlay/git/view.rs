@@ -20,15 +20,15 @@ pub(super) const CELL_GUTTER: usize = 7;
 pub(super) enum Whitespace {
     #[default]
     Off,
-    Whitespace,
+    IgnoreSpace,
     Formatting,
 }
 
 impl Whitespace {
     pub(super) fn next(self) -> Self {
         match self {
-            Self::Off => Self::Whitespace,
-            Self::Whitespace => Self::Formatting,
+            Self::Off => Self::IgnoreSpace,
+            Self::IgnoreSpace => Self::Formatting,
             Self::Formatting => Self::Off,
         }
     }
@@ -38,7 +38,7 @@ impl Whitespace {
     pub(super) fn git_args(self) -> &'static [&'static str] {
         match self {
             Self::Off => &[],
-            Self::Whitespace => &["-w"],
+            Self::IgnoreSpace => &["-w"],
             Self::Formatting => &["-w", "--ignore-blank-lines"],
         }
     }
@@ -46,7 +46,7 @@ impl Whitespace {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Off => "Showing all changes",
-            Self::Whitespace => "Ignoring whitespace-only line changes",
+            Self::IgnoreSpace => "Ignoring whitespace-only line changes",
             Self::Formatting => "Ignoring formatting and import-only changes",
         }
     }
@@ -55,7 +55,7 @@ impl Whitespace {
     pub(super) fn chip(self) -> &'static str {
         match self {
             Self::Off => "",
-            Self::Whitespace => " ws",
+            Self::IgnoreSpace => " ws",
             Self::Formatting => " fmt",
         }
     }
@@ -291,17 +291,17 @@ mod tests {
 
     #[test]
     fn whitespace_cycles_and_maps_to_git_args() {
-        assert_eq!(Whitespace::Off.next(), Whitespace::Whitespace);
-        assert_eq!(Whitespace::Whitespace.next(), Whitespace::Formatting);
+        assert_eq!(Whitespace::Off.next(), Whitespace::IgnoreSpace);
+        assert_eq!(Whitespace::IgnoreSpace.next(), Whitespace::Formatting);
         assert_eq!(Whitespace::Formatting.next(), Whitespace::Off);
         assert!(Whitespace::Off.git_args().is_empty());
-        assert_eq!(Whitespace::Whitespace.git_args(), &["-w"]);
+        assert_eq!(Whitespace::IgnoreSpace.git_args(), &["-w"]);
         assert_eq!(
             Whitespace::Formatting.git_args(),
             &["-w", "--ignore-blank-lines"]
         );
         assert!(Whitespace::Off.allows_patch());
-        assert!(!Whitespace::Whitespace.allows_patch());
+        assert!(!Whitespace::IgnoreSpace.allows_patch());
         assert!(!Whitespace::Formatting.allows_patch());
     }
 

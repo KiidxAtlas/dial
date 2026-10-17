@@ -808,11 +808,10 @@ impl LiveTasks {
                 Box::new(move || {
                     wake_signals.request_steering();
                     wake_signals.interrupt_waits();
-                    if wake_interruptible.load(Ordering::SeqCst) {
-                        if let Some(tool) = &*wake_active.lock().unwrap_or_else(|e| e.into_inner())
-                        {
-                            tool.cancel_operation();
-                        }
+                    if wake_interruptible.load(Ordering::SeqCst)
+                        && let Some(tool) = &*wake_active.lock().unwrap_or_else(|e| e.into_inner())
+                    {
+                        tool.cancel_operation();
                     }
                 }),
             )?;
@@ -1312,7 +1311,7 @@ pub(super) fn model_summary(value: &Value) -> String {
                 .map(str::to_owned)
                 .unwrap_or_else(|| result.to_string());
             if !report.trim().is_empty() {
-                text.push_str("\n");
+                text.push('\n');
                 text.push_str(&super::prompt::truncate_chars(&report, 5000));
             }
         }

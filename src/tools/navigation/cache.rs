@@ -177,51 +177,49 @@ pub(super) fn evidence(
     revision: [u8; 32],
     text: &str,
 ) -> Arc<Source> {
-    if let Ok(mut cache) = CACHE.lock() {
-        if let Some(index) = cache
+    if let Ok(mut cache) = CACHE.lock()
+        && let Some(index) = cache
             .entries
             .iter()
             .position(|((scope, file), _)| scope == root && file == path)
-        {
-            let entry = cache.remove(index);
-            if entry.identity == *identity && entry.revision == revision {
-                let source = Arc::clone(&entry.source);
-                cache.bytes += entry.bytes;
-                cache
-                    .entries
-                    .push(((root.to_path_buf(), path.to_path_buf()), entry));
-                return source;
-            }
+    {
+        let entry = cache.remove(index);
+        if entry.identity == *identity && entry.revision == revision {
+            let source = Arc::clone(&entry.source);
+            cache.bytes += entry.bytes;
+            cache
+                .entries
+                .push(((root.to_path_buf(), path.to_path_buf()), entry));
+            return source;
         }
     }
     // Poisoning, an eviction or an uncacheable source uses the same evidence algorithm.
     let source = Arc::new(Source::new(path, relative, text));
     let bytes = source.decoded_bytes + 256 + root.as_os_str().len() + path.as_os_str().len();
-    if bytes <= MAX_CACHE_BYTES {
-        if let Ok(mut cache) = CACHE.lock() {
-            // A concurrent reader may have installed this path while we parsed it.
-            if let Some(index) = cache
-                .entries
-                .iter()
-                .position(|((scope, file), _)| scope == root && file == path)
-            {
-                cache.remove(index);
-            }
-            while cache.entries.len() >= MAX_CACHE_ENTRIES || cache.bytes + bytes > MAX_CACHE_BYTES
-            {
-                cache.remove(0);
-            }
-            cache.bytes += bytes;
-            cache.entries.push((
-                (root.to_path_buf(), path.to_path_buf()),
-                Entry {
-                    identity: identity.clone(),
-                    revision,
-                    source: Arc::clone(&source),
-                    bytes,
-                },
-            ));
+    if bytes <= MAX_CACHE_BYTES
+        && let Ok(mut cache) = CACHE.lock()
+    {
+        // A concurrent reader may have installed this path while we parsed it.
+        if let Some(index) = cache
+            .entries
+            .iter()
+            .position(|((scope, file), _)| scope == root && file == path)
+        {
+            cache.remove(index);
         }
+        while cache.entries.len() >= MAX_CACHE_ENTRIES || cache.bytes + bytes > MAX_CACHE_BYTES {
+            cache.remove(0);
+        }
+        cache.bytes += bytes;
+        cache.entries.push((
+            (root.to_path_buf(), path.to_path_buf()),
+            Entry {
+                identity: identity.clone(),
+                revision,
+                source: Arc::clone(&source),
+                bytes,
+            },
+        ));
     }
     source
 }

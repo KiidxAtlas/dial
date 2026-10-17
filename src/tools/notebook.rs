@@ -620,10 +620,10 @@ impl Notebook {
             let _ = crate::platform::fs::remove_beneath(&loaded.dir, &stage_name);
         }
         #[cfg(unix)]
-        if result.is_err() {
-            if let Ok(n) = std::ffi::CString::new(stage_name.as_os_str().as_bytes()) {
-                unsafe { libc::unlinkat(loaded.dir.as_raw_fd(), n.as_ptr(), 0) };
-            }
+        if result.is_err()
+            && let Ok(n) = std::ffi::CString::new(stage_name.as_os_str().as_bytes())
+        {
+            unsafe { libc::unlinkat(loaded.dir.as_raw_fd(), n.as_ptr(), 0) };
         }
         result?;
         ctx.workspace.store().forget(&loaded.path);

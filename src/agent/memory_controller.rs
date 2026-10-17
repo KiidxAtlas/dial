@@ -131,7 +131,7 @@ impl Runner<'_, '_> {
         );
         if !self.agent.role_backends.contains_key(&key) {
             config.provider_cache_namespace = Some(compaction_runtime::side_request_namespace(
-                &self.agent.session.id(),
+                self.agent.session.id(),
             )?);
             self.agent
                 .role_backends
@@ -922,10 +922,8 @@ impl Agent<'_> {
             memory.stop_maintenance();
         }
         let mut controller = std::mem::take(&mut self.memory_controller);
-        if busy {
-            if let Some(capture) = controller.capture.take() {
-                capture.retire();
-            }
+        if busy && let Some(capture) = controller.capture.take() {
+            capture.retire();
         }
         if let Some(mut worker) = controller.worker.take() {
             let mut done = false;

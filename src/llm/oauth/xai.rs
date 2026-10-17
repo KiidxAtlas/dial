@@ -36,16 +36,16 @@ fn endpoint(cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<St
     Ok(e.into())
 }
 fn login(l: &Login<'_>) -> Result<Credentials> {
-    if let Ok(token) = std::env::var("XAI_OAUTH_TOKEN") {
-        if !token.is_empty() {
-            let mut c = Credentials {
-                access: token,
-                expires_at_ms: util::NEVER_EXPIRES,
-                ..Credentials::default()
-            };
-            identify(&mut c, &l.cancel);
-            return Ok(c);
-        }
+    if let Ok(token) = std::env::var("XAI_OAUTH_TOKEN")
+        && !token.is_empty()
+    {
+        let mut c = Credentials {
+            access: token,
+            expires_at_ms: util::NEVER_EXPIRES,
+            ..Credentials::default()
+        };
+        identify(&mut c, &l.cancel);
+        return Ok(c);
     }
     let scopes = "openid profile email offline_access grok-cli:access api:access";
     let r = util::request(
@@ -120,19 +120,17 @@ fn identify(c: &mut Credentials, cancel: &std::sync::Arc<std::sync::atomic::Atom
         &[("authorization", &format!("Bearer {}", c.access))],
         util::Body::Empty,
         cancel,
-    ) {
-        if r.ok() {
-            if let Ok(v) = r.json() {
-                c.email = v["email"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .or_else(|| c.email.clone());
-                c.account_id = v["sub"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .or_else(|| c.account_id.clone());
-            }
-        }
+    ) && r.ok()
+        && let Ok(v) = r.json()
+    {
+        c.email = v["email"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| c.email.clone());
+        c.account_id = v["sub"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| c.account_id.clone());
     }
 }
 fn refresh(

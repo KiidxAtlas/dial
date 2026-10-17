@@ -1,16 +1,23 @@
 """Real MLX adapter contract tests; run with Dial's managed Python runtime."""
-import unittest
-import tempfile
 import json
+import tempfile
+import unittest
 from pathlib import Path
+
 try:
     import mlx.core as mx
-    import mlx.nn as nn
+    from mlx import nn
     from mlx.utils import tree_flatten
     from mlx_lm.tuner.utils import linear_to_lora_layers
 except ImportError as error:
     raise unittest.SkipTest(f"MLX/Metal runtime required: {error}")
-from dial_worker import query_targets, expected_weights, probe_adapter, validate_adapter, RequestError
+from dial_worker import (
+    RequestError,
+    expected_weights,
+    probe_adapter,
+    query_targets,
+    validate_adapter,
+)
 
 
 class Block(nn.Module):
@@ -45,10 +52,11 @@ class AdapterTests(unittest.TestCase):
         self.check_training_pause("preference", 1, True)
 
     def check_training_pause(self, phase, iteration, preference=False):
-        import dial_worker as worker
-        from unittest.mock import patch
-        from mlx_lm.lora import CONFIG_DEFAULTS
         import copy
+        from unittest.mock import patch
+
+        import dial_worker as worker
+        from mlx_lm.lora import CONFIG_DEFAULTS
         mx.random.seed(42)
         original = Model(("q_proj", "out_proj"))
         weights = dict(tree_flatten(original.parameters()))
@@ -134,7 +142,8 @@ class AdapterTests(unittest.TestCase):
                 validate_adapter(path, "other-model", 2, parameters, expected)
 
     def test_qwen35_hybrid_architecture(self):
-        from mlx_lm.models.qwen3_5 import Model as Qwen, ModelArgs
+        from mlx_lm.models.qwen3_5 import Model as Qwen
+        from mlx_lm.models.qwen3_5 import ModelArgs
         model = Qwen(ModelArgs(model_type="qwen3_5", text_config={
             "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 2,
             "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 16,

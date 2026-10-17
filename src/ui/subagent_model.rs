@@ -420,10 +420,10 @@ fn apply_body(entry: &mut AgentEntry, data: &Value, phase: Phase, now: u64) {
     }
     if let Some(elapsed) = data["elapsed_ms"].as_u64() {
         entry.elapsed_ms = Some(elapsed);
-    } else if let Some(started) = entry.started_ms {
-        if entry.status == AgentStatus::Running {
-            entry.elapsed_ms = Some(now.saturating_sub(started));
-        }
+    } else if let Some(started) = entry.started_ms
+        && entry.status == AgentStatus::Running
+    {
+        entry.elapsed_ms = Some(now.saturating_sub(started));
     }
     if let Some(isolation) = data["isolation"].as_str() {
         entry.isolation = Some(isolation.to_owned());
@@ -453,10 +453,10 @@ fn finish_projection(agent: &mut AgentEntry, live: &HashSet<String>, now: u64) {
     agent.steerable = agent.status == AgentStatus::Running && running_live;
     agent.cancellable = agent.status == AgentStatus::Running && running_live;
     agent.resumable = agent.status.is_finished() && agent.transcript.is_some();
-    if agent.status == AgentStatus::Running {
-        if let (Some(started), None) = (agent.started_ms, agent.elapsed_ms) {
-            agent.elapsed_ms = Some(now.saturating_sub(started));
-        }
+    if agent.status == AgentStatus::Running
+        && let (Some(started), None) = (agent.started_ms, agent.elapsed_ms)
+    {
+        agent.elapsed_ms = Some(now.saturating_sub(started));
     }
     if agent.last_activity_ms.is_none() {
         agent.last_activity_ms = agent.started_ms;
@@ -555,10 +555,10 @@ pub fn subtree(agents: &[AgentEntry], root: &str) -> HashSet<String> {
     loop {
         let before = found.len();
         for agent in agents {
-            if let Some(parent) = &agent.parent {
-                if found.contains(parent) {
-                    found.insert(agent.id.clone());
-                }
+            if let Some(parent) = &agent.parent
+                && found.contains(parent)
+            {
+                found.insert(agent.id.clone());
             }
         }
         if found.len() == before {

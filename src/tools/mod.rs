@@ -1279,7 +1279,7 @@ fn authorize_edit_targets(
 pub fn edit_with_context(
     ctx: &ext::ToolContext<'_>,
     args: &Value,
-    repair: Option<&dyn Fn(&EditRepairRequest) -> Result<String, String>>,
+    repair: Option<syntax::RepairCallback<'_>>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
     edit_for_workspace(ctx, ctx.workspace, args, repair, cancel)
@@ -1288,7 +1288,7 @@ pub fn edit_with_context(
 pub fn edit_recovered_with_context(
     ctx: &ext::ToolContext<'_>,
     args: &Value,
-    repair: Option<&dyn Fn(&EditRepairRequest) -> Result<String, String>>,
+    repair: Option<syntax::RepairCallback<'_>>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
     let workspace = ctx.workspace.clone().with_edit_mode(EditMode::Sloppy);
@@ -1330,7 +1330,7 @@ fn edit_for_workspace(
     ctx: &ext::ToolContext<'_>,
     workspace: &Workspace,
     args: &Value,
-    repair: Option<&dyn Fn(&EditRepairRequest) -> Result<String, String>>,
+    repair: Option<syntax::RepairCallback<'_>>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
     let bound = match editing::targets(workspace.edit_mode, args)
@@ -1379,7 +1379,7 @@ fn edit_for_workspace(
 pub fn write_with_context(
     ctx: &ext::ToolContext<'_>,
     args: &Value,
-    repair: Option<&dyn Fn(&EditRepairRequest) -> Result<String, String>>,
+    repair: Option<syntax::RepairCallback<'_>>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> ToolOutput {
     if let Some(path) = args

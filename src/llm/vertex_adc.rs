@@ -185,10 +185,11 @@ pub(super) fn access_token(
         "metadata".into()
     };
     let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Some((key, token, expiry)) = cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        if key == &source && now().saturating_add(60) < *expiry {
-            return Ok(token.clone());
-        }
+    if let Some((key, token, expiry)) = cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        && key == &source
+        && now().saturating_add(60) < *expiry
+    {
+        return Ok(token.clone());
     }
     let (token, expiry) = if source == "metadata" {
         let response=super::oauth::util::request("GET","http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",&[("Metadata-Flavor","Google")],super::oauth::util::Body::Empty,cancel).context("No ADC file found and metadata server is unavailable")?;

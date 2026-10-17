@@ -27,7 +27,7 @@ pub fn lease(layout: &Layout, session: &str, id: &str) -> Result<File> {
         .state_dir
         .join("subagent-leases")
         .join(transcripts.file_name().context("invalid parent session")?);
-    crate::platform::fs::create_dir_owner_only(&std::fs::DirBuilder::new().recursive(true), &dir)?;
+    crate::platform::fs::create_dir_owner_only(std::fs::DirBuilder::new().recursive(true), &dir)?;
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn continuation_requires_complete_effect_records() {
         let call = json!({"role":"assistant","tool_calls":[{"id":"write-1"}]});
-        assert!(validate_history(&[call.clone()]).is_err());
+        assert!(validate_history(std::slice::from_ref(&call)).is_err());
         assert!(
             validate_history(&[
                 call,

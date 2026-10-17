@@ -77,17 +77,20 @@ fn normalize_fingerprint_path(value: &str) -> String {
         .unwrap_or(slashed)
 }
 
+/// Sort key columns (path, lines, columns, role) followed by the normalized object.
+type LocationRow = (
+    String,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<String>,
+    Value,
+);
+
 /// Locations normalized and sorted (undefined sorts first).
 fn normalized_locations(locations: &[Location]) -> Vec<Value> {
-    let mut rows: Vec<(
-        String,
-        Option<u64>,
-        Option<u64>,
-        Option<u64>,
-        Option<u64>,
-        Option<String>,
-        Value,
-    )> = locations
+    let mut rows: Vec<LocationRow> = locations
         .iter()
         .map(|location| {
             let path = normalize_fingerprint_path(&location.path);

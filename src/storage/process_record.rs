@@ -197,7 +197,7 @@ impl Log {
         let sequence = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!("{}-{sequence}-{nanos}.log", std::process::id()));
         platform_fs::open_owner_only(
-            &OpenOptions::new().read(true).write(true).create_new(true),
+            OpenOptions::new().read(true).write(true).create_new(true),
             &path,
         )
         .with_context(|| format!("creating process log {}", path.display()))?;
@@ -218,7 +218,7 @@ impl Log {
 
 /// The last `max` bytes of a captured log, starting at a line boundary when the file was cut.
 pub fn read_tail(path: &Path, max: u64) -> Result<String> {
-    let mut file = platform_fs::open_nofollow_nonblocking(&OpenOptions::new().read(true), path)
+    let mut file = platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path)
         .with_context(|| format!("opening process log {}", path.display()))?;
     let meta = file.metadata()?;
     ensure!(meta.is_file(), "process log is not a regular file");
@@ -226,10 +226,10 @@ pub fn read_tail(path: &Path, max: u64) -> Result<String> {
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
     (&mut file).take(max).read_to_end(&mut bytes)?;
-    if start > 0 {
-        if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
-            bytes.drain(..=newline);
-        }
+    if start > 0
+        && let Some(newline) = bytes.iter().position(|byte| *byte == b'\n')
+    {
+        bytes.drain(..=newline);
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }

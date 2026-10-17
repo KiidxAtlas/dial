@@ -200,6 +200,42 @@ pub fn check(
     None
 }
 
+/// Stages that reduce their input; a `head`/`tail` after one selects a result (top-N), not a trim.
+const REDUCERS: &[&str] = &[
+    "sort", "uniq", "wc", "awk", "sed", "cut", "tr", "xargs", "jq",
+];
+
+/// One line for a command whose last pipe stage is `| head` / `| tail` over a plain command:
+/// `bash` already bounds long output (keeping its start and end), so the trim only hides lines
+/// that the model then reruns the command to see, which for builds and linters repeats the
+/// full run. Pipelines with a reducing stage (`sort | uniq -c | head`) select and are left alone.
+pub fn trim_hint(config: &BashInterceptorConfig, command: &str) -> Option<String> {
+    if !config.enabled {
+        return None;
+    }
+    let segments = extract_flat_shell_command_segments(command);
+    let trims = segments.iter().enumerate().any(|(index, stage)| {
+        let ends_pipeline = segments.get(index + 1).is_none_or(|next| !next.piped_stdin);
+        if !(stage.piped_stdin && is_trim(&stage.text) && ends_pipeline) {
+            return false;
+        }
+        let start = segments[..index]
+            .iter()
+            .rposition(|s| !s.piped_stdin)
+            .unwrap_or(0);
+        !segments[start..index].iter().any(|upstream| {
+            upstream
+                .text
+                .split_whitespace()
+                .next()
+                .is_some_and(|word| REDUCERS.contains(&word))
+        })
+    });
+    trims.then(|| {
+        "[hint] `bash` already bounds long output (it keeps the start and end), so `| head`/`| tail` only hides lines you may rerun the command to see. Drop the trim, and put independent commands in one response instead of one call each.".to_owned()
+    })
+}
+
 /// `gh` commands that read a workflow run's or a PR's check status.
 static CI_STATUS_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bgh\s+(?:run\s+(?:view|list)|pr\s+checks)\b").expect("valid CI status regex")
@@ -417,10 +453,10 @@ fn interception_candidates(command: &str) -> Vec<String> {
             continue;
         }
         candidates.push(segment.text.clone());
-        if let Some(without) = without_leading_environment_assignments(&segment.text) {
-            if !without.is_empty() {
-                candidates.push(without);
-            }
+        if let Some(without) = without_leading_environment_assignments(&segment.text)
+            && !without.is_empty()
+        {
+            candidates.push(without);
         }
     }
     candidates
@@ -1254,6 +1290,43 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn trim_hint_flags_a_head_tail_over_a_plain_command_even_in_a_batch() {
+        let config = hint_mode();
+        for c in [
+            "cargo clippy --all-targets 2>&1 | tail -30",
+            "cat package.json | head -50; ls",
+            "ls; make lint 2>&1 | tail -15; cargo fmt --check 2>&1 | head -20",
+        ] {
+            let line = trim_hint(&config, c).unwrap_or_else(|| panic!("expected a hint: {c}"));
+            assert!(
+                line.starts_with("[hint] ") && !line.contains('\n'),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn trim_hint_leaves_selection_followed_streams_and_untrimmed_commands_alone() {
+        let config = hint_mode();
+        for c in [
+            "grep -oh 'page[a-z_]*' f | sort | uniq -c | sort -rn | head -5",
+            "ls | wc -l",
+            "head -5 file; ls",
+            "cargo build 2>&1",
+            "tail -f app.log",
+            "tail -f app.log | grep ERROR",
+            "echo $(date) | head",
+        ] {
+            assert_eq!(trim_hint(&config, c), None, "{c}");
+        }
+        let off = BashInterceptorConfig {
+            enabled: false,
+            ..hint_mode()
+        };
+        assert_eq!(trim_hint(&off, "make 2>&1 | tail -5"), None);
     }
 
     #[test]

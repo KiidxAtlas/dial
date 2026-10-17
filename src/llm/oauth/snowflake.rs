@@ -335,8 +335,8 @@ mod tests {
         assert_eq!(FLOW.id, "snowflake");
         assert_eq!(FLOW.name, "Snowflake Cortex");
         assert!(matches!(FLOW.protocol, ApiProtocol::Anthropic));
-        assert!(FLOW.needs_terminal);
-        assert!(!FLOW.subscription);
+        const { assert!(FLOW.needs_terminal) };
+        const { assert!(!FLOW.subscription) };
         assert!(FLOW.refresh.is_some());
         assert_eq!(
             FLOW.base_url,

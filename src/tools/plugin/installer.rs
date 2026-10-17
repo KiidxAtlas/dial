@@ -234,18 +234,7 @@ impl PluginStore {
 
     /// Runtime specs of every enabled plugin, one outcome per plugin. A broken plugin yields an
     /// error naming it, so healthy plugins are still returned. Only enumeration failures are `Err`.
-    pub fn enabled_runtimes(
-        &self,
-    ) -> Result<
-        Vec<
-            Result<(
-                InstalledPlugin,
-                PathBuf,
-                Vec<String>,
-                BTreeMap<String, String>,
-            )>,
-        >,
-    > {
+    pub fn enabled_runtimes(&self) -> Result<Vec<Result<PluginRuntime>>> {
         let mut runtimes = Vec::new();
         for (dir_name, record) in self.scan()? {
             let outcome = record
@@ -365,11 +354,19 @@ impl PluginStore {
     }
 }
 
+/// Program, arguments and environment a plugin runs with.
+pub type RuntimeSpec = (PathBuf, Vec<String>, BTreeMap<String, String>);
+/// An installed plugin together with its runtime spec.
+pub type PluginRuntime = (
+    InstalledPlugin,
+    PathBuf,
+    Vec<String>,
+    BTreeMap<String, String>,
+);
+
 /// Resolves a plugin's runtime executable. Returns `None` when the plugin is disabled or declares
 /// no `program`. The program must be a file inside the plugin directory, after symlink resolution.
-pub fn runtime_spec(
-    plugin: &InstalledPlugin,
-) -> Result<Option<(PathBuf, Vec<String>, BTreeMap<String, String>)>> {
+pub fn runtime_spec(plugin: &InstalledPlugin) -> Result<Option<RuntimeSpec>> {
     if !plugin.enabled {
         return Ok(None);
     }
@@ -378,10 +375,7 @@ pub fn runtime_spec(
 }
 
 /// Parses the runtime fields of a manifest whose plugin tree is at `base`.
-fn runtime_from_manifest(
-    map: &Map<String, Value>,
-    base: &Path,
-) -> Result<Option<(PathBuf, Vec<String>, BTreeMap<String, String>)>> {
+fn runtime_from_manifest(map: &Map<String, Value>, base: &Path) -> Result<Option<RuntimeSpec>> {
     let Some(program) = map.get("program") else {
         return Ok(None);
     };
@@ -525,7 +519,7 @@ fn valid_npm_name(name: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
     };
-    part_ok(package) && scope.map_or(true, part_ok)
+    part_ok(package) && scope.is_none_or(part_ok)
 }
 
 fn stage_git(url: &str, reference: Option<&str>, tree: &Path) -> Result<Fetched> {
@@ -833,17 +827,15 @@ fn swap_into_place(staging: tempfile::TempDir, tree: &Path, target: &Path) -> Re
             .with_context(|| format!("moving aside {}", target.display()))?;
     }
     if let Err(error) = fs::rename(tree, target) {
-        if had_previous {
-            if let Err(restore) = fs::rename(&previous, target) {
-                let kept = staging.keep().join("previous");
-                return Err(error).with_context(|| {
+        if had_previous && let Err(restore) = fs::rename(&previous, target) {
+            let kept = staging.keep().join("previous");
+            return Err(error).with_context(|| {
                     format!(
                         "installing {} failed and the previous install could not be restored ({restore}); it is kept at {}",
                         target.display(),
                         kept.display()
                     )
                 });
-            }
         }
         return Err(error).with_context(|| format!("installing {}", target.display()));
     }

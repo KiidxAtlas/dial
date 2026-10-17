@@ -263,7 +263,7 @@ mod tests {
                 .call(&json!({"op":"block","reason":"needs the staging password"}))
                 .is_error
         );
-        match CompletionGuard::default().stopped(&todo) {
+        match CompletionGuard.stopped(&todo) {
             StopAction::Blocked(text) => assert!(
                 text.contains("1. write code (blocked: needs the staging password)"),
                 "{text}"

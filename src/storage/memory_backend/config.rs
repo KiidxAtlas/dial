@@ -468,10 +468,8 @@ pub fn validate(config: &crate::config::types::MemoryConfig) -> Result<()> {
     // Overrides matter only to the semantic backend, and not at all when embeddings are off.
     let overrides_used =
         config.backend == MemoryBackendId::Semantic && semantic.embedding != EmbeddingMode::Off;
-    if overrides_used {
-        if let Some(message) = half_embedding_override(semantic) {
-            anyhow::bail!("{message}");
-        }
+    if overrides_used && let Some(message) = half_embedding_override(semantic) {
+        anyhow::bail!("{message}");
     }
     if overrides_used && !semantic.embedding_base_url.trim().is_empty() {
         endpoint(
@@ -514,9 +512,11 @@ mod tests {
 
     #[test]
     fn off_and_non_semantic_backends_do_not_validate_embedding_overrides() {
-        let mut memory = crate::config::types::MemoryConfig::default();
-        memory.backend = MemoryBackendId::Semantic;
-        memory.backend_explicit = true;
+        let mut memory = crate::config::types::MemoryConfig {
+            backend: MemoryBackendId::Semantic,
+            backend_explicit: true,
+            ..Default::default()
+        };
         memory.semantic.embedding_base_url = "http://remote.example/v1".into();
         memory.semantic.embedding_model = "embedder".into();
         assert!(validate(&memory).is_err(), "auto still validates overrides");
@@ -532,9 +532,11 @@ mod tests {
 
     #[test]
     fn half_embedding_override_is_rejected_with_embedding_wording() {
-        let mut memory = crate::config::types::MemoryConfig::default();
-        memory.backend = MemoryBackendId::Semantic;
-        memory.backend_explicit = true;
+        let mut memory = crate::config::types::MemoryConfig {
+            backend: MemoryBackendId::Semantic,
+            backend_explicit: true,
+            ..Default::default()
+        };
         memory.semantic.embedding_model = "nomic-embed-text".into();
         let error = validate(&memory).unwrap_err().to_string();
         assert!(error.contains("Embedding service URL"), "{error}");
@@ -558,8 +560,10 @@ mod tests {
 
     #[test]
     fn memory_role_requirement_follows_backend_and_overrides() {
-        let mut memory = crate::config::types::MemoryConfig::default();
-        memory.backend = MemoryBackendId::Sharpshooter;
+        let mut memory = crate::config::types::MemoryConfig {
+            backend: MemoryBackendId::Sharpshooter,
+            ..Default::default()
+        };
         assert!(requires_memory_role(&memory));
         memory.sharpshooter.model = "ollama/qwen3".into();
         assert!(

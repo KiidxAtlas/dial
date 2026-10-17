@@ -43,7 +43,8 @@ use workspace_edit::{Plan, Snapshot};
 
 /// Post-commit owners, one binding per workspace instance (see [`bind_write_owner`]). Each edit is
 /// published only to the service of the session that executed it, never a sibling's.
-static WRITE_THROUGH: LazyLock<Mutex<Vec<(Weak<Mutex<()>>, Weak<LspTool>)>>> =
+type WriteThroughOwners = Vec<(Weak<Mutex<()>>, Weak<LspTool>)>;
+static WRITE_THROUGH: LazyLock<Mutex<WriteThroughOwners>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
@@ -375,6 +376,7 @@ impl Action {
 }
 
 /// Starts a language server for `Resolved` in the given workspace root.
+type BoxedLauncher = Box<dyn Fn(&Resolved, &Path) -> anyhow::Result<Client> + Send + Sync>;
 type Launcher = Arc<dyn Fn(&Resolved, &Path) -> anyhow::Result<Client> + Send + Sync>;
 
 pub struct LspTool {
@@ -514,10 +516,7 @@ impl LspTool {
         tool
     }
 
-    fn with_launcher(
-        config: &LspConfig,
-        launch: Box<dyn Fn(&Resolved, &Path) -> anyhow::Result<Client> + Send + Sync>,
-    ) -> Self {
+    fn with_launcher(config: &LspConfig, launch: BoxedLauncher) -> Self {
         Self {
             servers: Servers::new(config),
             launch: Arc::from(launch),
@@ -1207,10 +1206,10 @@ fn synchronize_applied(
                     errors.push(format!("{}: {error:#}", path.display()));
                 }
                 for other in &clients {
-                    if !Arc::ptr_eq(other, client) {
-                        if let Err(error) = other.sync_if_open(path, &text) {
-                            errors.push(format!("{}: {error:#}", path.display()));
-                        }
+                    if !Arc::ptr_eq(other, client)
+                        && let Err(error) = other.sync_if_open(path, &text)
+                    {
+                        errors.push(format!("{}: {error:#}", path.display()));
                     }
                 }
             }

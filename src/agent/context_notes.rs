@@ -737,7 +737,7 @@ impl super::Agent<'_> {
             return Err(anyhow::Error::msg(reason));
         }
         ui.context_usage(outcome.prompt_tokens, true);
-        ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::ContextReset, &format!("New notes-backed context window committed ({}, {}); original history remains searchable.",
+        ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::ContextReset, format!("New notes-backed context window committed ({}, {}); original history remains searchable.",
             outcome.entry_id, outcome.digest)));
         if let Err(error) = backend.bind_session(self.config, &mut self.session) {
             let reason = format!(

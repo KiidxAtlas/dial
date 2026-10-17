@@ -156,8 +156,8 @@ mod tests {
         assert_eq!(FLOW.id, "cloudflare-ai-gateway");
         assert_eq!(FLOW.name, "Cloudflare AI Gateway");
         assert!(matches!(FLOW.protocol, ApiProtocol::Anthropic));
-        assert!(FLOW.needs_terminal);
-        assert!(!FLOW.subscription);
+        const { assert!(FLOW.needs_terminal) };
+        const { assert!(!FLOW.subscription) };
         assert!(FLOW.refresh.is_none());
         assert!(FLOW.base_url.contains("<account>") && FLOW.base_url.ends_with("/anthropic"));
     }

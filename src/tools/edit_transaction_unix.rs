@@ -102,7 +102,7 @@ impl Drop for ParentCleanup {
             {
                 let metadata = unsafe { metadata.assume_init() };
                 if metadata.st_dev as u64 == entry.dev
-                    && metadata.st_ino as u64 == entry.ino
+                    && metadata.st_ino == entry.ino
                     && metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
                 {
                     // Only owned, still-empty scaffolding can disappear; concurrent data wins.
@@ -527,13 +527,13 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
         // Every original is safely captured before the first replacement is installed.
         for (stage, change) in staged.iter_mut().zip(changes) {
             stage.dir.validate_location(ws, &change.path)?;
-            if let Some(backup) = &stage.backup {
-                if !matches(&stage.dir.read(backup)?, &change.before, true) {
-                    return Err(format!(
-                        "{} original changed after capture",
-                        ws.rel(&change.path)
-                    ));
-                }
+            if let Some(backup) = &stage.backup
+                && !matches(&stage.dir.read(backup)?, &change.before, true)
+            {
+                return Err(format!(
+                    "{} original changed after capture",
+                    ws.rel(&change.path)
+                ));
             }
             if let Some(new) = &stage.new {
                 stage.dir.link(new, &stage.name)?;
@@ -542,13 +542,13 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
         }
         for (stage, change) in staged.iter().zip(changes) {
             stage.dir.validate_location(ws, &change.path)?;
-            if let Some(backup) = &stage.backup {
-                if !matches(&stage.dir.read(backup)?, &change.before, true) {
-                    return Err(format!(
-                        "{} original changed during installation",
-                        ws.rel(&change.path)
-                    ));
-                }
+            if let Some(backup) = &stage.backup
+                && !matches(&stage.dir.read(backup)?, &change.before, true)
+            {
+                return Err(format!(
+                    "{} original changed during installation",
+                    ws.rel(&change.path)
+                ));
             }
         }
         Ok::<(), String>(())
@@ -646,17 +646,17 @@ pub(crate) fn commit(ws: &Workspace, changes: &[Change]) -> Result<Vec<String>, 
     parents.committed = true;
     let mut warnings = Vec::new();
     for stage in &staged {
-        if let Some(backup) = &stage.backup {
-            if let Err(e) = stage.dir.unlink(backup) {
-                warnings.push(format!(
-                    "Edits committed, but original cleanup failed: {e}; retained at {}",
-                    stage
-                        .dir
-                        .path
-                        .join(std::ffi::OsStr::from_bytes(backup.as_bytes()))
-                        .display()
-                ));
-            }
+        if let Some(backup) = &stage.backup
+            && let Err(e) = stage.dir.unlink(backup)
+        {
+            warnings.push(format!(
+                "Edits committed, but original cleanup failed: {e}; retained at {}",
+                stage
+                    .dir
+                    .path
+                    .join(std::ffi::OsStr::from_bytes(backup.as_bytes()))
+                    .display()
+            ));
         }
         if let Err(e) = stage.dir.file.sync_all() {
             warnings.push(format!(

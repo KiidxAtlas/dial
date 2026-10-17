@@ -118,7 +118,7 @@ impl Agent<'_> {
             if let Err(build_error) = self.install_route(backend, &next_config, None) {
                 ui.event(&crate::agent::ui_event::UiEvent::new(
                     crate::agent::ui_event::EventKind::Model,
-                    &format!(
+                    format!(
                         "Configured fallback {}/{} could not be constructed ({build_error:#}); trying the next fallback",
                         next.provider, next.model
                     ),
@@ -133,7 +133,7 @@ impl Agent<'_> {
                 .recover("switching to a configured fallback model");
             ui.event(&crate::agent::ui_event::UiEvent::new(
                 crate::agent::ui_event::EventKind::Model,
-                &format!(
+                format!(
                     "Primary model failed; continuing with configured fallback {}/{}",
                     next.provider, next.model
                 ),

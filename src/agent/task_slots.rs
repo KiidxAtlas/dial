@@ -40,8 +40,10 @@ mod tests {
     use super::*;
     #[test]
     fn saturated_project_refuses_new_branches_without_blocking_the_owner() {
-        let mut config = Config::default();
-        config.project_root = "slot-admission-test".into();
+        let mut config = Config {
+            project_root: "slot-admission-test".into(),
+            ..Default::default()
+        };
         config.task.max_concurrency = 1;
         let held = acquire(&config, &AtomicBool::new(false)).unwrap();
         std::thread::scope(|scope| {

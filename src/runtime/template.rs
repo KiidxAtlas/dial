@@ -207,7 +207,7 @@ fn is_standalone_tag(body: &str) -> bool {
     let keyword = inner.strip_prefix("else").is_some_and(|rest| {
         rest.chars()
             .next()
-            .map_or(true, |c| !(c.is_alphanumeric() || c == '_'))
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
     });
     sigil || keyword
 }
@@ -912,10 +912,10 @@ impl Renderer {
         alt: &[Node],
         out: &mut String,
     ) -> Result<(), String> {
-        if let Expr::Call(call) = head {
-            if BLOCK_HELPERS.contains(&call.name.as_str()) {
-                return self.block_helper(call, main, alt, out);
-            }
+        if let Expr::Call(call) = head
+            && BLOCK_HELPERS.contains(&call.name.as_str())
+        {
+            return self.block_helper(call, main, alt, out);
         }
         let value = self.eval(head)?;
         self.value_block(value, main, alt, out)
@@ -1310,6 +1310,61 @@ fn is_closing_tag(line: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c == '-' || c == '_')
 }
 
+// Conventional commit formatting retains its established compact blank-line policy.
+fn commit_line_has_content(line: &str) -> bool {
+    !line.trim().is_empty()
+}
+
+/// Whitespace normalization applied to rendered prompt text: trailing
+/// whitespace is removed, blank-line runs are dropped outside fenced code,
+/// and leading/trailing blank lines are removed.
+pub fn format_commit(content: &str) -> String {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut in_code = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code = !in_code;
+            out.push(line);
+        } else if in_code {
+            out.push(line);
+        } else if trimmed.is_empty() {
+            let next_blank = lines
+                .get(i + 1)
+                .is_none_or(|next| !commit_line_has_content(next));
+            if next_blank {
+                while out.last().is_some_and(|l| l.is_empty()) {
+                    out.pop();
+                }
+                let mut j = i + 1;
+                while j < lines.len() && !commit_line_has_content(lines[j]) {
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            if out.last().is_some_and(|l| !l.is_empty()) {
+                out.push(line);
+            }
+        } else {
+            if trimmed.starts_with("</") && trimmed.ends_with('>') {
+                while out.last().is_some_and(|l| l.is_empty()) {
+                    out.pop();
+                }
+            }
+            out.push(line);
+        }
+        i += 1;
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1498,59 +1553,4 @@ mod tests {
             "{error}"
         );
     }
-}
-
-// Conventional commit formatting retains its established compact blank-line policy.
-fn commit_line_has_content(line: &str) -> bool {
-    !line.trim().is_empty()
-}
-
-/// Whitespace normalization applied to rendered prompt text: trailing
-/// whitespace is removed, blank-line runs are dropped outside fenced code,
-/// and leading/trailing blank lines are removed.
-pub fn format_commit(content: &str) -> String {
-    let lines: Vec<&str> = content.split('\n').collect();
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
-    let mut in_code = false;
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].trim_end();
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_code = !in_code;
-            out.push(line);
-        } else if in_code {
-            out.push(line);
-        } else if trimmed.is_empty() {
-            let next_blank = lines
-                .get(i + 1)
-                .is_none_or(|next| !commit_line_has_content(next));
-            if next_blank {
-                while out.last().is_some_and(|l| l.is_empty()) {
-                    out.pop();
-                }
-                let mut j = i + 1;
-                while j < lines.len() && !commit_line_has_content(lines[j]) {
-                    j += 1;
-                }
-                i = j;
-                continue;
-            }
-            if out.last().is_some_and(|l| !l.is_empty()) {
-                out.push(line);
-            }
-        } else {
-            if trimmed.starts_with("</") && trimmed.ends_with('>') {
-                while out.last().is_some_and(|l| l.is_empty()) {
-                    out.pop();
-                }
-            }
-            out.push(line);
-        }
-        i += 1;
-    }
-    while out.last().is_some_and(|l| l.is_empty()) {
-        out.pop();
-    }
-    out.join("\n")
 }

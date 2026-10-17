@@ -202,7 +202,7 @@ impl<'a> Agent<'a> {
                     if !output.is_empty() {
                         ui.event(&crate::agent::ui_event::UiEvent::new(
                             crate::agent::ui_event::EventKind::Hook,
-                            &format!("hook: {output}"),
+                            format!("hook: {output}"),
                         ));
                     }
                 }

@@ -136,8 +136,8 @@ fn probe() -> Result<Availability> {
     .context("starting the Apple on-device model helper")?;
     let mut stdout = child.stdout.take().context("helper stdout")?;
     let mut process = super::server::Supervised::new(child);
-    let exited =
-        crate::platform::process::wait_exited(&process.child, AVAILABILITY_TIMEOUT).unwrap_or(false);
+    let exited = crate::platform::process::wait_exited(&process.child, AVAILABILITY_TIMEOUT)
+        .unwrap_or(false);
     if !exited {
         process.stop();
         bail!("the Apple on-device model helper did not answer the availability probe");
@@ -323,7 +323,9 @@ impl Fold<'_, '_> {
             }
             Some("tool_call") => {
                 let raw = event["arguments"].as_str().unwrap_or("{}");
-                let parsed = serde_json::from_str::<Value>(raw).ok().filter(Value::is_object);
+                let parsed = serde_json::from_str::<Value>(raw)
+                    .ok()
+                    .filter(Value::is_object);
                 self.reply.tool_calls.push(ToolCall {
                     id: event["id"].as_str().unwrap_or_default().to_owned(),
                     name: event["name"].as_str().unwrap_or_default().to_owned(),
@@ -333,10 +335,8 @@ impl Fold<'_, '_> {
                 Ok(false)
             }
             Some("done") => {
-                self.reply.finish_reason = event["finish_reason"]
-                    .as_str()
-                    .unwrap_or("stop")
-                    .to_owned();
+                self.reply.finish_reason =
+                    event["finish_reason"].as_str().unwrap_or("stop").to_owned();
                 let usage = &event["usage"];
                 self.reply.prompt_tokens = usage["prompt_tokens"].as_u64();
                 self.reply.completion_tokens = usage["completion_tokens"].as_u64();
@@ -428,7 +428,11 @@ pub(crate) fn chat(
     };
     // 0 means the caller set no limit; the helper still needs a bound so a wedged model service
     // cannot hang the turn.
-    let idle = Duration::from_secs(if idle_secs == 0 { DEFAULT_IDLE_SECS } else { idle_secs });
+    let idle = Duration::from_secs(if idle_secs == 0 {
+        DEFAULT_IDLE_SECS
+    } else {
+        idle_secs
+    });
     let mut last_event = Instant::now();
     let outcome = loop {
         if interrupt.load(Ordering::SeqCst) {
@@ -485,8 +489,10 @@ mod tests {
 
     #[test]
     fn availability_reply_maps_reasons_and_rejects_other_protocols() {
-        let ok = parse_availability(r#"{"type":"availability","protocol":1,"available":true,"context_size":8192}"#)
-            .unwrap();
+        let ok = parse_availability(
+            r#"{"type":"availability","protocol":1,"available":true,"context_size":8192}"#,
+        )
+        .unwrap();
         assert_eq!(
             ok,
             Availability {

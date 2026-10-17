@@ -181,7 +181,7 @@ pub(crate) fn cap_commit_details(details: &mut Vec<String>, max_tokens: usize) {
             }
         })
         .collect();
-    scored.sort_by(|left, right| right.score.cmp(&left.score));
+    scored.sort_by_key(|item| std::cmp::Reverse(item.score));
     let mut budget = max_tokens;
     let mut keep = Vec::new();
     for item in &scored {
@@ -324,7 +324,6 @@ pub(crate) fn post_process_commit_message(
         let mut detail = normalized
             .trim()
             .trim_start_matches(['\u{2022}', '-', '*', '+'])
-            .trim()
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");

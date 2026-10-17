@@ -433,9 +433,7 @@ impl CompactionConfig {
         }
     }
     pub fn summary_budget(&self, window: u32) -> u32 {
-        (self.reserve(window).saturating_mul(4) / 5)
-            .min(MAX_SUMMARY_TOKENS)
-            .max(1)
+        (self.reserve(window).saturating_mul(4) / 5).clamp(1, MAX_SUMMARY_TOKENS)
     }
     /// Verbatim-tail budget for a cut without an explicit per-call value. The default is scaled only
     /// on small windows so that the next request (`fixed_tokens` of system/tools, the summary budget,
@@ -788,10 +786,10 @@ pub fn cut(messages: &[Value], budget: u64) -> Option<usize> {
                     pending.insert(id.to_owned());
                 }
             }
-        } else if message["role"] == "tool" {
-            if let Some(id) = message["tool_call_id"].as_str() {
-                pending.remove(id);
-            }
+        } else if message["role"] == "tool"
+            && let Some(id) = message["tool_call_id"].as_str()
+        {
+            pending.remove(id);
         }
     }
     let &newest = boundaries.last()?;
@@ -829,10 +827,10 @@ pub fn complete_boundary(messages: &[Value], at: usize) -> bool {
                     pending.insert(id.to_owned());
                 }
             }
-        } else if message["role"] == "tool" {
-            if let Some(id) = message["tool_call_id"].as_str() {
-                pending.remove(id);
-            }
+        } else if message["role"] == "tool"
+            && let Some(id) = message["tool_call_id"].as_str()
+        {
+            pending.remove(id);
         }
     }
     pending.is_empty()
@@ -1426,7 +1424,7 @@ pub fn compact_history(
                 }
                 ui.event(&crate::agent::ui_event::UiEvent::new(
                     crate::agent::ui_event::EventKind::Recovery,
-                    &format!("{method:?} compaction unavailable or failed: {error:#}"),
+                    format!("{method:?} compaction unavailable or failed: {error:#}"),
                 ));
                 if options.require_method {
                     return Err(error.context(format!(

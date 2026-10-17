@@ -1059,10 +1059,10 @@ impl Client {
         fresh: bool,
         budget: Duration,
     ) -> Option<Vec<Value>> {
-        if self.supports_pull() {
-            if let Ok(items) = self.pull_diagnostics(path) {
-                return Some(items);
-            }
+        if self.supports_pull()
+            && let Ok(items) = self.pull_diagnostics(path)
+        {
+            return Some(items);
         }
         let expected = self.version(path).map(i64::from);
         let seq_of = |d: &Diagnostics| {

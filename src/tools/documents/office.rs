@@ -256,24 +256,24 @@ fn paragraphs(input: &str, root: &str) -> Result<String, String> {
 fn relationships(input: &str, base: &str) -> Result<HashMap<String, String>, String> {
     let mut out = HashMap::new();
     xml(input, "Relationships", |event| {
-        if let Xml::Start(name, attrs) = event {
-            if name == "Relationship" {
-                let id = attr(&attrs, "Id").ok_or("OOXML relationship missing Id")?;
-                let target = attr(&attrs, "Target").ok_or("OOXML relationship missing Target")?;
-                if attr(&attrs, "TargetMode") == Some("External") {
-                    return Ok(());
-                }
-                let target = if let Some(target) = target.strip_prefix('/') {
-                    target.to_string()
-                } else {
-                    format!("{base}/{target}")
-                };
-                if !super::archives::safe(&target) {
-                    return Err("unsafe OOXML relationship target".into());
-                }
-                if out.insert(id.to_string(), target).is_some() {
-                    return Err("duplicate OOXML relationship Id".into());
-                }
+        if let Xml::Start(name, attrs) = event
+            && name == "Relationship"
+        {
+            let id = attr(&attrs, "Id").ok_or("OOXML relationship missing Id")?;
+            let target = attr(&attrs, "Target").ok_or("OOXML relationship missing Target")?;
+            if attr(&attrs, "TargetMode") == Some("External") {
+                return Ok(());
+            }
+            let target = if let Some(target) = target.strip_prefix('/') {
+                target.to_string()
+            } else {
+                format!("{base}/{target}")
+            };
+            if !super::archives::safe(&target) {
+                return Err("unsafe OOXML relationship target".into());
+            }
+            if out.insert(id.to_string(), target).is_some() {
+                return Err("duplicate OOXML relationship Id".into());
             }
         }
         Ok(())
@@ -397,18 +397,18 @@ pub(super) fn read(file: File, format: &str, selector: Option<&str>) -> Result<S
             let rels = relationships(&rels, "xl")?;
             let mut sheets = Vec::new();
             xml(&workbook, "workbook", |event| {
-                if let Xml::Start(name, attrs) = event {
-                    if name == "sheet" {
-                        if sheets.len() >= MAX_ITEMS {
-                            return Err("OOXML exceeds 100000 sheets".into());
-                        }
-                        sheets.push((
-                            attr(&attrs, "name")
-                                .ok_or("OOXML sheet missing name")?
-                                .to_string(),
-                            relationship_id(&attrs)?.to_string(),
-                        ));
+                if let Xml::Start(name, attrs) = event
+                    && name == "sheet"
+                {
+                    if sheets.len() >= MAX_ITEMS {
+                        return Err("OOXML exceeds 100000 sheets".into());
                     }
+                    sheets.push((
+                        attr(&attrs, "name")
+                            .ok_or("OOXML sheet missing name")?
+                            .to_string(),
+                        relationship_id(&attrs)?.to_string(),
+                    ));
                 }
                 Ok(())
             })?;
@@ -442,13 +442,13 @@ pub(super) fn read(file: File, format: &str, selector: Option<&str>) -> Result<S
             let rels = relationships(&package.xml("ppt/_rels/presentation.xml.rels")?, "ppt")?;
             let mut slides = Vec::new();
             xml(&presentation, "presentation", |event| {
-                if let Xml::Start(name, attrs) = event {
-                    if name == "sldId" {
-                        if slides.len() >= MAX_ITEMS {
-                            return Err("OOXML exceeds 100000 slides".into());
-                        }
-                        slides.push(relationship_id(&attrs)?.to_string());
+                if let Xml::Start(name, attrs) = event
+                    && name == "sldId"
+                {
+                    if slides.len() >= MAX_ITEMS {
+                        return Err("OOXML exceeds 100000 slides".into());
                     }
+                    slides.push(relationship_id(&attrs)?.to_string());
                 }
                 Ok(())
             })?;

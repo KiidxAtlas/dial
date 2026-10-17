@@ -231,7 +231,7 @@ fn median(values: &[f64]) -> Option<f64> {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     let mid = sorted.len() / 2;
-    Some(if sorted.len() % 2 == 0 {
+    Some(if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
         sorted[mid]
@@ -301,7 +301,7 @@ CREATE TABLE IF NOT EXISTS session_tools(path TEXT NOT NULL, tool TEXT NOT NULL,
 ";
 
 fn private_dir(dir: &Path) -> Result<()> {
-    platform::fs::create_dir_owner_only(&fs::DirBuilder::new().recursive(true), dir)
+    platform::fs::create_dir_owner_only(fs::DirBuilder::new().recursive(true), dir)
         .with_context(|| format!("creating private directory {}", dir.display()))
 }
 
@@ -1383,7 +1383,14 @@ mod tests {
             ..request(2, "m", 1000, 10, 0, None, 5)
         })
         .unwrap();
-        let rows: Vec<(String, Option<String>, Option<String>, Option<i64>, Option<i64>)> = db
+        type WireRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let rows: Vec<WireRow> = db
             .conn
             .prepare("SELECT session, transport, invalidation, common_prompt_bytes, prompt_bytes FROM requests ORDER BY id")
             .unwrap()

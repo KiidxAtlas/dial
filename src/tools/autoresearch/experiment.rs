@@ -107,23 +107,20 @@ fn best_ref(name: &str) -> String {
 pub fn parse_metric(output: &str, key: &str) -> Option<f64> {
     for line in output.lines().rev() {
         let value = line.strip_prefix("ASI ").unwrap_or(line);
-        if let Some((k, v)) = value.split_once('=') {
-            if k.trim() == key {
-                if let Ok(n) = v.trim().parse::<f64>() {
-                    if n.is_finite() {
-                        return Some(n);
-                    }
-                }
-            }
+        if let Some((k, v)) = value.split_once('=')
+            && k.trim() == key
+            && let Ok(n) = v.trim().parse::<f64>()
+            && n.is_finite()
+        {
+            return Some(n);
         }
-        if let Ok(j) = serde_json::from_str::<serde_json::Value>(value) {
-            if let Some(n) = j
+        if let Ok(j) = serde_json::from_str::<serde_json::Value>(value)
+            && let Some(n) = j
                 .get(key)
                 .and_then(serde_json::Value::as_f64)
                 .filter(|n| n.is_finite())
-            {
-                return Some(n);
-            }
+        {
+            return Some(n);
         }
     }
     None

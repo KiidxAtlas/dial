@@ -100,11 +100,11 @@ impl TerminalUi {
             self.cancel_output();
             return;
         }
-        if let Ok(writer) = &self.writer {
-            if let Err(error) = writer.text(bytes) {
-                self.write_error = Some(error);
-                self.cancel_output();
-            }
+        if let Ok(writer) = &self.writer
+            && let Err(error) = writer.text(bytes)
+        {
+            self.write_error = Some(error);
+            self.cancel_output();
         }
     }
     fn write_json(&mut self, value: &serde_json::Value) -> io::Result<()> {

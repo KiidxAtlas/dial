@@ -590,6 +590,7 @@ struct Slot {
     armed: Option<PreparedCompaction>,
 }
 
+#[derive(Default)]
 pub struct CompactionRuntime {
     slot: Option<Slot>,
     // A cancelled transport may still be blocked. Retain the one-worker occupancy until it exits;
@@ -599,18 +600,6 @@ pub struct CompactionRuntime {
     idle: IdleClock,
     failed_native: Option<NativeFailureKey>,
     closed: bool,
-}
-impl Default for CompactionRuntime {
-    fn default() -> Self {
-        Self {
-            slot: None,
-            retiring: None,
-            control: Default::default(),
-            idle: Default::default(),
-            failed_native: None,
-            closed: false,
-        }
-    }
 }
 impl CompactionRuntime {
     pub fn control(&self) -> CompactionControl {
@@ -724,10 +713,10 @@ impl CompactionRuntime {
         self.idle.activity(Instant::now());
     }
     fn reap_retiring(&mut self) {
-        if self.retiring.as_ref().is_some_and(JoinHandle::is_finished) {
-            if let Some(worker) = self.retiring.take() {
-                let _ = worker.join();
-            }
+        if self.retiring.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(worker) = self.retiring.take()
+        {
+            let _ = worker.join();
         }
     }
     fn release(&mut self, mut slot: Slot) {
@@ -1077,10 +1066,10 @@ impl CompactionRuntime {
             self.cancel();
             return state;
         }
-        if slot.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            if let Some(worker) = slot.worker.take() {
-                let _ = worker.join();
-            }
+        if slot.worker.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(worker) = slot.worker.take()
+        {
+            let _ = worker.join();
         }
         if slot.armed.is_some() {
             return PollState::Armed;

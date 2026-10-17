@@ -1376,7 +1376,7 @@ impl Backend {
                 if !on_event(&llm::StreamEvent::Progress(llm::ModelProgress::new(phase))) {
                     return Err(llm::Interrupted.into());
                 }
-                let server = match {
+                let started = {
                     // Startup's 1-token warmup is not an attempt of the user's logical request.
                     let _startup_accounting = llm::usage::Transport::suspend();
                     server::ensure_profile_tracked(
@@ -1392,7 +1392,8 @@ impl Backend {
                         self.startup_timeout_secs,
                         Some(Arc::clone(&interrupt)),
                     )
-                } {
+                };
+                let server = match started {
                     Ok(server) => server,
                     Err(error) => {
                         self.adapter_monitor.lock().phase = AdapterPhase::Failed;
@@ -1652,7 +1653,7 @@ impl Backend {
             }));
             let result = if protocol == 2 {
                 let endpoint = llm::responses::Endpoint {
-                    url: &url,
+                    url,
                     token: auth.unwrap(),
                     account_id: Some(
                         active_account
@@ -1697,7 +1698,7 @@ impl Backend {
                 anthropic_exchange(
                     llm::Endpoint {
                         headers: &headers,
-                        url: &url,
+                        url,
                         auth,
                         model,
                     },
@@ -1712,7 +1713,7 @@ impl Backend {
                 llm::responses::exchange_api(
                     llm::Endpoint {
                         headers: &headers,
-                        url: &url,
+                        url,
                         auth,
                         model,
                     },
@@ -1727,7 +1728,7 @@ impl Backend {
             } else if protocol == 4 || protocol == 5 {
                 let endpoint = llm::Endpoint {
                     headers: &headers,
-                    url: &url,
+                    url,
                     auth,
                     model,
                 };
@@ -1782,7 +1783,7 @@ impl Backend {
                 exchange(
                     llm::Endpoint {
                         headers: &headers,
-                        url: &url,
+                        url,
                         auth,
                         model,
                     },
@@ -1861,7 +1862,7 @@ impl Backend {
                 .filter(|_| matches!(class, llm::errors::ErrorClass::Auth))
                 .map(|http| http.status)
             {
-                let host = llm::host_of(&url);
+                let host = llm::host_of(url);
                 let key = match host.as_deref() {
                     Some("api.openai.com") => "OPENAI_API_KEY",
                     Some("api.anthropic.com") => "ANTHROPIC_API_KEY",
@@ -1879,12 +1880,12 @@ impl Backend {
                 .and_then(|http| http.retry_after);
             let delay = match llm::retry::decide(&class, hinted, attempt, &retry_policy) {
                 llm::retry::Decision::Retry { delay, reason } => {
-                    if matches!(
-                        error.downcast_ref::<llm::stream::IncompleteStream>(),
-                        Some(_)
-                    ) || error
-                        .downcast_ref::<llm::anthropic::IncompleteStream>()
+                    if error
+                        .downcast_ref::<llm::stream::IncompleteStream>()
                         .is_some()
+                        || error
+                            .downcast_ref::<llm::anthropic::IncompleteStream>()
+                            .is_some()
                     {
                         on_notice(
                             "Provider stream disconnected or was incomplete; discarding the partial reply and retrying. No partial tool calls will execute.",

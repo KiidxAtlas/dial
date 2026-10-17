@@ -718,10 +718,10 @@ pub(super) fn parse<'c>(args: &Value, config: &'c Config) -> Result<Request<'c>,
         }
     };
     let shared_context = optional_str(args, "context")?;
-    if let Some(text) = shared_context {
-        if text.len() > MAX_CONTEXT {
-            return Err(format!("`context` exceeds {MAX_CONTEXT} bytes"));
-        }
+    if let Some(text) = shared_context
+        && text.len() > MAX_CONTEXT
+    {
+        return Err(format!("`context` exceeds {MAX_CONTEXT} bytes"));
     }
     let default_schema = if batch {
         args.get("output_schema").filter(|value| !value.is_null())
@@ -1710,7 +1710,7 @@ pub(super) fn run(parent: Parent<'_>, args: &Value, ui: &mut dyn Ui) -> ToolOutp
     let mut parallel_jobs: Vec<(&Job, Env)> = Vec::new();
     let mut serial: Vec<Vec<&Job>> = Vec::with_capacity(plans.len());
     for (key, role, harness, jobs) in &plans {
-        ui.role(*key, &role.selection().display_name());
+        ui.role(key, &role.selection().display_name());
         let env = Env {
             config: role,
             harness,

@@ -552,7 +552,7 @@ impl Adapter {
         );
         let hash = format!("{:x}", Sha256::digest(&bytes));
         let dir = self.layout.state_dir.join("acp-images");
-        platform::fs::create_dir_owner_only(&fs::DirBuilder::new().recursive(true), &dir)?;
+        platform::fs::create_dir_owner_only(fs::DirBuilder::new().recursive(true), &dir)?;
         ensure!(
             dir.canonicalize()?
                 .starts_with(self.layout.state_dir.canonicalize()?),
@@ -580,12 +580,11 @@ impl Adapter {
             } else {
                 "agent_message_chunk"
             };
-            if let Some(text) = message["content"].as_str() {
-                if let Some(update) =
+            if let Some(text) = message["content"].as_str()
+                && let Some(update) =
                     self.update(json!({"sessionUpdate":kind,"content":{"type":"text","text":text}}))
-                {
-                    updates.push(update);
-                }
+            {
+                updates.push(update);
             }
             for reference in message["dial_images"].as_array().into_iter().flatten() {
                 let content = match crate::llm::images::verified_bytes(reference) {
@@ -666,11 +665,11 @@ impl Adapter {
                 "session/prompt" => {
                     self.permissions.clear();
                     let plan = value["plan_mode"].as_bool().unwrap_or(false);
-                    if let Some(session) = self.active.clone() {
-                        if self.modes.insert(session, plan) != Some(plan) {
-                            if let Some(update)=self.update(json!({"sessionUpdate":"current_mode_update","currentModeId":if plan {"plan"} else {"default"}})){updates.push(update);}
-                            if let Some(update)=self.update(json!({"sessionUpdate":"config_option_update","configOptions":config_options(plan)})){updates.push(update);}
-                        }
+                    if let Some(session) = self.active.clone()
+                        && self.modes.insert(session, plan) != Some(plan)
+                    {
+                        if let Some(update)=self.update(json!({"sessionUpdate":"current_mode_update","currentModeId":if plan {"plan"} else {"default"}})){updates.push(update);}
+                        if let Some(update)=self.update(json!({"sessionUpdate":"config_option_update","configOptions":config_options(plan)})){updates.push(update);}
                     }
                     prompt_stop(value)
                 }

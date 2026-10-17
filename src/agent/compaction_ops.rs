@@ -435,7 +435,6 @@ impl<'a> Agent<'a> {
         let bound_config = self.effective_config().clone();
         {
             let backend = live_backend
-                .as_deref_mut()
                 .or(self.backend.as_mut())
                 .expect("validated live backend");
             if let Err(error) = backend.bind_session(&bound_config, &mut self.session) {

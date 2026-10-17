@@ -121,10 +121,9 @@ impl State {
             }
             if let Some(path) =
                 normalize_path(root, token.trim_matches(['"', '\'', ',', ')']), true)
+                && self.paths.len() < PATH_LIMIT
             {
-                if self.paths.len() < PATH_LIMIT {
-                    self.paths.insert(path);
-                }
+                self.paths.insert(path);
             }
         }
     }
@@ -729,7 +728,7 @@ impl Monitor<'_> {
                     }
                 })
         };
-        if !self.rules.iter().any(|rule| eligible(rule)) {
+        if !self.rules.iter().any(&eligible) {
             return true;
         }
         let value = if thinking {
@@ -1334,10 +1333,10 @@ fn parse_rule(
         &ast_patterns,
         ast_language.as_ref().map(|langs| langs[0].as_str()),
     )?;
-    if let Some(mode) = values(&fields, "interruptMode", false)? {
-        if mode != ["always"] {
-            return Err("only interruptMode: always is supported".into());
-        }
+    if let Some(mode) = values(&fields, "interruptMode", false)?
+        && mode != ["always"]
+    {
+        return Err("only interruptMode: always is supported".into());
     }
     if fields.contains_key("applyTo") && fields.contains_key("globs") {
         return Err("use one path-scope field, not both applyTo and globs".into());

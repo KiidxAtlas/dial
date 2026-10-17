@@ -49,7 +49,7 @@ impl TodoRecovery {
         };
         // Repeated rejections escalate the same reminder; the turn is never ended for them.
         let attempts = self.failures.max(self.repeated.1);
-        let escalation = if attempts >= FAILURE_LIMIT && attempts % FAILURE_LIMIT == 0 {
+        let escalation = if attempts >= FAILURE_LIMIT && attempts.is_multiple_of(FAILURE_LIMIT) {
             format!(
                 "\nEscalation: {attempts} todo updates have been rejected without a successful plan change. Resending or rewording them is not recovery. Send the single update the diagnostic describes with its operation and indices corrected, or block the step with a concrete reason. The turn continues."
             )

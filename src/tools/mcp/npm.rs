@@ -110,12 +110,12 @@ pub fn from_manifest(manifest: &Value, user_dir: &Path) -> Option<Candidate> {
     // Pinned so a later publish never changes what runs.
     let spec = format!("{name}@{version}");
     let install = match commands.as_slice() {
-        [_] => Install::Server(npx(vec!["-y".into(), spec], user_dir)),
+        [_] => Install::Server(Box::new(npx(vec!["-y".into(), spec], user_dir))),
         _ => match pick_command(&commands, &[&unscoped]) {
-            Ok(command) => Install::Server(npx(
+            Ok(command) => Install::Server(Box::new(npx(
                 vec!["-y".into(), format!("--package={spec}"), command.to_owned()],
                 user_dir,
-            )),
+            ))),
             Err(listed) => Install::Blocked(format!(
                 "the package has several commands ({listed}) and none is clearly its MCP server; add the right one by hand with `npx -y --package={spec} <command>`"
             )),

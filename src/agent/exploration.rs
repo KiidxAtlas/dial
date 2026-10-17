@@ -288,7 +288,7 @@ impl Agent<'_> {
             let mut state = self.session.control_state();
             state["exploration"] = json!({"invalidated":reason});
             self.session.set_control_state(state)?;
-            ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Investigation, &format!("Investigation checkpoint cleared: {reason}. Existing user input, completed effects and archived history are preserved.")));
+            ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Investigation, format!("Investigation checkpoint cleared: {reason}. Existing user input, completed effects and archived history are preserved.")));
         }
         Ok(())
     }
@@ -488,7 +488,7 @@ impl Agent<'_> {
                     ui.notice(&reason);
                     anyhow::bail!(reason)
                 }
-                ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Investigation, &format!("Investigation rewound to its anchored report ({}, checkpoint {}, archived exploration {}). Actual effects and usage are preserved.", commit.entry_id, checkpoint.entry_id, source_leaf)));
+                ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Investigation, format!("Investigation rewound to its anchored report ({}, checkpoint {}, archived exploration {}). Actual effects and usage are preserved.", commit.entry_id, checkpoint.entry_id, source_leaf)));
                 Ok(true)
             }
         }

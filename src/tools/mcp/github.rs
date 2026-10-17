@@ -250,7 +250,7 @@ impl Repo<'_> {
         // Only the package name counts: a CLI named after its repository usually needs a
         // subcommand to serve MCP, which the metadata does not say.
         Ok(Some(match pick_command(&scripts, &[name]) {
-            Ok(script) => Install::Server(McpServerConfig {
+            Ok(script) => Install::Server(Box::new(McpServerConfig {
                 program: PathBuf::from("uvx"),
                 args: vec![
                     "--from".to_owned(),
@@ -260,7 +260,7 @@ impl Repo<'_> {
                 env: cache_env(user_dir),
                 enabled: true,
                 ..Default::default()
-            }),
+            })),
             Err(listed) => blocked(format!(
                 "Python package `{name}` has several commands ({listed}) and none is clearly its MCP server; see {} for the command and add it by hand",
                 self.url

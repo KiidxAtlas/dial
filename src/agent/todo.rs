@@ -784,10 +784,9 @@ mod tests {
             .is_error
         );
         let before = list.snapshot();
-        for args in [json!({"op":"done","finding":"In the parser","evidence":[]})] {
-            assert!(list.call(&args).is_error);
-            assert_eq!(list.snapshot(), before);
-        }
+        let args = json!({"op":"done","finding":"In the parser","evidence":[]});
+        assert!(list.call(&args).is_error);
+        assert_eq!(list.snapshot(), before);
         assert!(!list.call(&json!({"op":"done", "finding":"The parser rejects values above 5", "evidence":["src/parser.rs:24"]})).is_error);
         assert!(list.render().contains("Finding: The parser"));
         let mut resumed = TodoList::new();

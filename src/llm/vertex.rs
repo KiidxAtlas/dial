@@ -22,12 +22,11 @@ fn encode(s: &str) -> String {
     out
 }
 fn location(route: &Route<'_>) -> String {
-    if let Some(host) = super::host_of(route.base_url) {
-        if let Some(loc) = host.strip_suffix("-aiplatform.googleapis.com") {
-            if loc != "aiplatform" {
-                return loc.to_owned();
-            }
-        }
+    if let Some(host) = super::host_of(route.base_url)
+        && let Some(loc) = host.strip_suffix("-aiplatform.googleapis.com")
+        && loc != "aiplatform"
+    {
+        return loc.to_owned();
     }
     std::env::var("GOOGLE_CLOUD_LOCATION")
         .or_else(|_| std::env::var("CLOUDSDK_COMPUTE_REGION"))

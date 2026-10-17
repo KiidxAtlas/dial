@@ -286,7 +286,7 @@ fn fingerprint(path: &Path, scope: &Scope) -> Option<String> {
         return None;
     }
     let mut file = crate::platform::fs::open_nofollow_nonblocking(
-        &std::fs::OpenOptions::new().read(true),
+        std::fs::OpenOptions::new().read(true),
         path,
     )
     .ok()?;

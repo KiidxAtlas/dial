@@ -538,19 +538,19 @@ fn locations_of(commit: &Value) -> Result<Vec<Location>> {
             });
         }
     }
-    if locations.is_empty() {
-        if let Some(Value::Array(files)) = field(commit, "files_involved") {
-            for file in files {
-                if let Some(path) = normalize_path(Some(file)) {
-                    locations.push(Location {
-                        path,
-                        start_line: Some(1),
-                        end_line: None,
-                        start_column: None,
-                        end_column: None,
-                        role: Some("cloud-file".into()),
-                    });
-                }
+    if locations.is_empty()
+        && let Some(Value::Array(files)) = field(commit, "files_involved")
+    {
+        for file in files {
+            if let Some(path) = normalize_path(Some(file)) {
+                locations.push(Location {
+                    path,
+                    start_line: Some(1),
+                    end_line: None,
+                    start_column: None,
+                    end_column: None,
+                    role: Some("cloud-file".into()),
+                });
             }
         }
     }
@@ -625,18 +625,17 @@ fn normalize_finding(raw: &Value) -> Result<Finding> {
 pub fn repository_identity(value: &str) -> String {
     let trimmed = value.trim().trim_end_matches('/');
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    if let Some((user, rest)) = trimmed.split_once('@').filter(|_| !trimmed.contains("://")) {
-        if !user.is_empty() {
-            if let Some((host, path)) = rest.split_once(':') {
-                if !host.is_empty() && !path.is_empty() {
-                    return format!(
-                        "{}/{}",
-                        host.to_lowercase(),
-                        path.trim_start_matches('/').to_lowercase()
-                    );
-                }
-            }
-        }
+    if let Some((user, rest)) = trimmed.split_once('@').filter(|_| !trimmed.contains("://"))
+        && !user.is_empty()
+        && let Some((host, path)) = rest.split_once(':')
+        && !host.is_empty()
+        && !path.is_empty()
+    {
+        return format!(
+            "{}/{}",
+            host.to_lowercase(),
+            path.trim_start_matches('/').to_lowercase()
+        );
     }
     match url::Url::parse(trimmed) {
         Ok(parsed) => format!(

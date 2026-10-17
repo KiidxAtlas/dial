@@ -408,7 +408,7 @@ mod tests {
         let fitted = serving_context(weights, &layout, None, None, memory)
             .unwrap()
             .unwrap();
-        assert!(fitted < 262_144 && fitted % 256 == 0, "{fitted}");
+        assert!(fitted < 262_144 && fitted.is_multiple_of(256), "{fitted}");
         assert!(resident_bytes(weights, &layout, fitted, None) <= (32 * GIB) * 6 / 10);
         assert_eq!(
             serving_context(weights, &layout, Some(32_768), None, memory).unwrap(),

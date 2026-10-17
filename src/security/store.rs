@@ -41,8 +41,8 @@ pub struct Store {
     repository_root: String,
 }
 
-static PROCESS_LOCKS: LazyLock<Mutex<Vec<(PathBuf, Arc<Mutex<()>>)>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+type ProcessLocks = Vec<(PathBuf, Arc<Mutex<()>>)>;
+static PROCESS_LOCKS: LazyLock<Mutex<ProcessLocks>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn process_lock(dir: &Path) -> Arc<Mutex<()>> {
     let mut locks = PROCESS_LOCKS.lock();

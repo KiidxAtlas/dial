@@ -2000,9 +2000,11 @@ mod tests {
     #[test]
     fn off_ignores_unusable_role_and_partial_overrides() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = SemanticConfig::default();
-        config.embedding = EmbeddingMode::Off;
-        config.embedding_base_url = "https://override.example/v1".into();
+        let config = SemanticConfig {
+            embedding: EmbeddingMode::Off,
+            embedding_base_url: "https://override.example/v1".into(),
+            ..Default::default()
+        };
         assert!(
             build_embedder(&config, Err("role unusable".into()), dir.path())
                 .unwrap()
@@ -2013,9 +2015,11 @@ mod tests {
     #[test]
     fn complete_override_is_used_when_the_role_is_unusable() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = SemanticConfig::default();
-        config.embedding_base_url = "https://override.example/v1".into();
-        config.embedding_model = "override-model".into();
+        let config = SemanticConfig {
+            embedding_base_url: "https://override.example/v1".into(),
+            embedding_model: "override-model".into(),
+            ..Default::default()
+        };
         let embedder = build_embedder(&config, Err("role unusable".into()), dir.path())
             .unwrap()
             .unwrap();
@@ -2156,9 +2160,9 @@ mod tests {
     fn consolidation_is_due_only_after_a_positive_interval() {
         assert!(consolidation_due(0, 3600, 3600));
         assert!(!consolidation_due(100, 3599, 3600));
-        assert!(consolidation_due(0, 1, 0) == false, "zero disables merging");
+        assert!(!consolidation_due(0, 1, 0), "zero disables merging");
         assert!(
-            consolidation_due(i64::MAX, 5, 60) == false,
+            !consolidation_due(i64::MAX, 5, 60),
             "a future marker never fires early"
         );
     }

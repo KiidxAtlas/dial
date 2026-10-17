@@ -105,7 +105,7 @@ pub struct Turn {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    Request(Request),
+    Request(Box<Request>),
     Tool(Tool),
     Turn(Turn),
 }
@@ -144,7 +144,7 @@ pub fn request(
     }
     emit(
         config,
-        Event::Request(Request {
+        Event::Request(Box::new(Request {
             session: session.into(),
             project: project_key(config),
             model: model.into(),
@@ -160,7 +160,7 @@ pub fn request(
             error: false,
             end: SystemTime::now(),
             wire: reply.wire.clone(),
-        }),
+        })),
     );
 }
 
@@ -179,7 +179,7 @@ pub fn request_failed(
     }
     emit(
         config,
-        Event::Request(Request {
+        Event::Request(Box::new(Request {
             session: session.into(),
             project: project_key(config),
             model: model.into(),
@@ -195,7 +195,7 @@ pub fn request_failed(
             error: true,
             end: SystemTime::now(),
             wire: None,
-        }),
+        })),
     );
 }
 
@@ -636,7 +636,16 @@ const MS_BOUNDS: &[f64] = &[
 ];
 
 /// (name, unit, description, histogram bounds or None for a monotonic delta sum, double-valued sum)
-const METRICS: &[(&str, &str, &str, Option<&[f64]>, bool)] = &[
+type MetricSpec = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static [f64]>,
+    bool,
+);
+
+/// Every metric the exporter emits.
+const METRICS: &[MetricSpec] = &[
     (
         "gen_ai.client.token.usage",
         "{token}",
@@ -1283,7 +1292,7 @@ mod tests {
     }
 
     fn request_event(session: &str, error: bool) -> Event {
-        Event::Request(Request {
+        Event::Request(Box::new(Request {
             session: session.into(),
             project: "proj-1234abcd".into(),
             model: "test-model".into(),
@@ -1299,7 +1308,7 @@ mod tests {
             error,
             end: SystemTime::now(),
             wire: None,
-        })
+        }))
     }
 
     #[test]

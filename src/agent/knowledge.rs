@@ -394,7 +394,7 @@ impl<'a> Agent<'a> {
         let saved = defer_architecture_attempt_on_failure(&cache, &synthesis, save_result)?;
         ui.event(&crate::agent::ui_event::UiEvent::new(
             crate::agent::ui_event::EventKind::Learning,
-            &format!("Saved {saved} architecture sections. Inspect /understanding architecture."),
+            format!("Saved {saved} architecture sections. Inspect /understanding architecture."),
         ));
         Ok(())
     }

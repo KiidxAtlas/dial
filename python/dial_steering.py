@@ -8,8 +8,8 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import time
+from pathlib import Path
 
 VERSION = 1
 MAX_BYTES = 4 * 1024 * 1024
@@ -110,7 +110,7 @@ def text_model(model):
     """Expose a VLM decoder's logits/cache through MLX-LM's text evaluation interface."""
     if not hasattr(model,'language_model'):
         return model
-    import mlx.nn as nn
+    from mlx import nn
     class Decoder(nn.Module):
         def __init__(self):
             super().__init__()
@@ -128,7 +128,7 @@ def text_model(model):
 
 
 def wrap(layer, callback, observe=None):
-    import mlx.nn as nn
+    from mlx import nn
     class Wrapped(nn.Module):
         def __init__(self):
             super().__init__()
@@ -281,8 +281,8 @@ def load(request):
     require(Path(model_path).is_dir(),'steering requires a resolved local model directory')
     config=read_json(Path(model_path)/'config.json')
     if isinstance(config.get('vision_config'),dict):
-        from mlx_vlm import load as vlm_load
         from mlx_lm.tokenizer_utils import load as load_tokenizer
+        from mlx_vlm import load as vlm_load
         model,processor=vlm_load(model_path,adapter_path=adapter,trust_remote_code=False)
         # Evaluation contracts are text/tool tasks, using the same decoder weights as image
         # inference. Load the model's tokenizer with its EOS and tool markers for exact checks.
@@ -447,7 +447,7 @@ BAKE_MAX_INPUT=8192
 
 def projection(layer):
     """Relative name of a block's attention output projection."""
-    import mlx.nn as nn
+    from mlx import nn
     names=[name for name,module in layer.named_modules() if isinstance(module,(nn.Linear,nn.QuantizedLinear)) and name.rsplit('.',1)[-1] in ('o_proj','out_proj')]
     require(bool(names),'block has no attention output projection')
     return min(names,key=lambda name:(not name.endswith('o_proj'),'attn' not in name,name))
@@ -458,7 +458,7 @@ def down_projection(layer):
 
     Expert and shared-expert projections are gated by routing, so they are not exact placements.
     """
-    import mlx.nn as nn
+    from mlx import nn
     names=[name for name,module in layer.named_modules() if isinstance(module,(nn.Linear,nn.QuantizedLinear)) and name.rsplit('.',1)[-1] in ('down_proj','w2','fc2','dense_4h_to_h') and 'expert' not in name]
     return min(names,key=lambda name:(name.count('.'),name)) if names else None
 
@@ -494,7 +494,14 @@ def bake(request):
     """
     import mlx.core as mx
     import numpy as np
-    from dial_worker import apply_adapter, encode, load_base, read_records, render_records, write_adapter
+    from dial_worker import (
+        apply_adapter,
+        encode,
+        load_base,
+        read_records,
+        render_records,
+        write_adapter,
+    )
     path,strength,data,ridge,output=bake_request(request)
     bundle=validate(read_json(path),strength);bind(bundle,request['model'],request.get('adapter'))
     model,tokenizer=load_base(request['model'])

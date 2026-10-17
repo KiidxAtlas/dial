@@ -32,16 +32,14 @@ pub fn render(
     raw: bool,
     accept: &str,
 ) -> Result<Rendered, String> {
-    if !raw {
-        if let Some(text) = sites::handle(url, client) {
-            return Ok(Rendered {
-                text,
-                url: url.to_owned(),
-                status: 200,
-                media: "site API".to_owned(),
-                truncated: false,
-            });
-        }
+    if !raw && let Some(text) = sites::handle(url, client) {
+        return Ok(Rendered {
+            text,
+            url: url.to_owned(),
+            status: 200,
+            media: "site API".to_owned(),
+            truncated: false,
+        });
     }
     let page = client.get(url, accept, None)?;
     if !(200..300).contains(&page.status) {
@@ -92,10 +90,10 @@ pub fn render(
             return Ok(served_as_markdown(text, cut));
         }
     }
-    if let Some(link) = alternates::md_candidate(&final_url) {
-        if let Some((text, cut)) = probe(client, &link) {
-            return Ok(served_as_markdown(text, cut));
-        }
+    if let Some(link) = alternates::md_candidate(&final_url)
+        && let Some((text, cut)) = probe(client, &link)
+    {
+        return Ok(served_as_markdown(text, cut));
     }
     let negotiated = client
         .send(&final_url, MARKDOWN_ACCEPT, &[], None)

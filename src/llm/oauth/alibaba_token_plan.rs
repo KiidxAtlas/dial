@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(FLOW.id, "alibaba-token-plan");
         assert_eq!(FLOW.base_url, INTERNATIONAL_API_BASE_URL);
         assert!(matches!(FLOW.protocol, ApiProtocol::ChatCompletions));
-        assert!(FLOW.needs_terminal && FLOW.subscription);
+        const { assert!(FLOW.needs_terminal && FLOW.subscription) };
         assert!(FLOW.refresh.is_none());
         assert_eq!(
             crate::llm::oauth::flow("alibaba-token-plan").map(|f| f.name),

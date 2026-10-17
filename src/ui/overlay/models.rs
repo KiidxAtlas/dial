@@ -2827,8 +2827,10 @@ mod tests {
     fn cleared_role_refresh_removes_assignment_and_preserves_selected_row() {
         let rig = Rig::new();
         for (index, &(role, _)) in ROLES.iter().enumerate().skip(1) {
-            let mut config = crate::config::types::Config::default();
-            config.model = "main-model".into();
+            let mut config = crate::config::types::Config {
+                model: "main-model".into(),
+                ..Default::default()
+            };
             config.codebase.architecture_model.clear();
             let provider = if role == "decision" { "laya" } else { "mlx" };
             config

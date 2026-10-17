@@ -622,14 +622,16 @@ fn python(suite: &mut Suite, root: &Path, files: &[String], include_tests: bool)
         }
     }
 
-    let tools: [(
-        &str,
-        &[&str],
-        Option<&str>,
+    /// `(name, config files, pyproject section, binaries, args, parser)`.
+    type PythonTool<'a> = (
+        &'a str,
+        &'a [&'a str],
+        Option<&'a str>,
         &'static [&'static str],
-        Vec<&str>,
+        Vec<&'a str>,
         Kind,
-    ); 5] = [
+    );
+    let tools: [PythonTool<'_>; 5] = [
         (
             "pyright",
             &["pyrightconfig.json"],
@@ -956,13 +958,7 @@ fn project_files(root: &Path) -> Vec<String> {
             .build()
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-            .filter_map(|entry| {
-                entry
-                    .path()
-                    .strip_prefix(root)
-                    .ok()
-                    .map(|path| rel_string(path))
-            })
+            .filter_map(|entry| entry.path().strip_prefix(root).ok().map(rel_string))
             .collect(),
     };
     let files: BTreeSet<String> = raw

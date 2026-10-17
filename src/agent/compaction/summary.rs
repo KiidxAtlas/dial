@@ -689,7 +689,7 @@ fn fold(
                 {
                     return Err(error);
                 }
-                ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, &format!("Summary window of about {tokens} tokens exceeded the compaction model's accepted input; re-planning at {halved} tokens.")));
+                ui.event(&crate::agent::ui_event::UiEvent::new(crate::agent::ui_event::EventKind::Recovery, format!("Summary window of about {tokens} tokens exceeded the compaction model's accepted input; re-planning at {halved} tokens.")));
                 pending.pop_front();
                 ceiling = ceiling.min(halved);
                 replan(&mut pending, range, halved);

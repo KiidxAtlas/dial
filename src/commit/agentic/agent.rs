@@ -56,12 +56,7 @@ fn existing_value(existing: &[ExistingEntries]) -> Value {
                                         ("name", Value::text(name)),
                                         (
                                             "items",
-                                            Value::List(
-                                                items
-                                                    .iter()
-                                                    .map(|item| Value::text(item))
-                                                    .collect(),
-                                            ),
+                                            Value::List(items.iter().map(Value::text).collect()),
                                         ),
                                     ])
                                 })

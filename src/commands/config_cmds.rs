@@ -960,8 +960,10 @@ mod tests {
 
     #[test]
     fn slow_writes_only_slow_mode_and_leaves_fast_alone() {
-        let mut config = Config::default();
-        config.fast_mode = true;
+        let mut config = Config {
+            fast_mode: true,
+            ..Default::default()
+        };
         let plan = slow_plan(&config, "openai", "on").unwrap();
         assert_eq!(written(&plan.changes), vec!["slow_mode"]);
         config.slow_mode = true;
@@ -971,8 +973,10 @@ mod tests {
 
     #[test]
     fn fast_writes_only_fast_state_and_leaves_slow_alone() {
-        let mut config = Config::default();
-        config.slow_mode = true;
+        let config = Config {
+            slow_mode: true,
+            ..Default::default()
+        };
         let plan = fast_plan(&config, "openai", "on").unwrap();
         assert_eq!(written(&plan.changes), vec!["fast_mode"]);
         let plan = fast_plan(&config, "openai", "off").unwrap();
@@ -981,8 +985,10 @@ mod tests {
 
     #[test]
     fn fast_off_clears_explicit_fast_tier_only() {
-        let mut config = Config::default();
-        config.service_tier = "ultrafast".into();
+        let config = Config {
+            service_tier: "ultrafast".into(),
+            ..Default::default()
+        };
         let plan = fast_plan(&config, "openai", "off").unwrap();
         assert_eq!(written(&plan.changes), vec!["service_tier"]);
     }

@@ -30,9 +30,8 @@ impl LeaseHeartbeat {
         let signal = stop.clone();
         let thread = std::thread::spawn(move || {
             let open = || {
-                directory.database("rollouts.sqlite3").ok().map(|db| {
+                directory.database("rollouts.sqlite3").ok().inspect(|db| {
                     let _ = db.busy_timeout(std::time::Duration::from_secs(2));
-                    db
                 })
             };
             let mut db = open();

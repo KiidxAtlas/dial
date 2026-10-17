@@ -617,9 +617,11 @@ mod tests {
 
     #[test]
     fn openrouter_thinking_off_reaches_request_without_manual_profile() {
-        let mut config = Config::default();
-        config.provider = Some("openrouter".into());
-        config.model = "anthropic/claude-haiku-5.5".into();
+        let config = Config {
+            provider: Some("openrouter".into()),
+            model: "anthropic/claude-haiku-5.5".into(),
+            ..Default::default()
+        };
         let original = config.clone();
         let configured = apply_thinking(config, CliThinking::Off).unwrap();
         let mut wire = serde_json::json!({"model":configured.model,"temperature":0.2});
@@ -634,9 +636,11 @@ mod tests {
 
     #[test]
     fn anthropic_thinking_off_uses_disabled_thinking_not_none_effort() {
-        let mut config = Config::default();
-        config.provider = Some("anthropic".into());
-        config.model = "claude-sonnet-4-6".into();
+        let config = Config {
+            provider: Some("anthropic".into()),
+            model: "claude-sonnet-4-6".into(),
+            ..Default::default()
+        };
         let configured = apply_thinking(config, CliThinking::Off).unwrap();
         let profile = configured.active_model_profile().unwrap();
         assert_eq!(profile.thinking, Some(false));

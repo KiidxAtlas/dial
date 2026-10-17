@@ -476,11 +476,8 @@ fn pull_stream(
                 finished = true;
                 break;
             }
-            Some(update) => {
-                if should_report(&update, &mut last) {
-                    progress(&describe(&update));
-                }
-            }
+            Some(update) if should_report(&update, &mut last) => progress(&describe(&update)),
+            Some(_) => {}
         }
     }
     ensure!(

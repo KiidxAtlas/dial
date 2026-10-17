@@ -8,18 +8,17 @@ Run after building: python3 examples/benchmarks/interactive_smoke.py --dial targ
 """
 import argparse
 import base64
-import signal
 import http.server
 import json
 import os
 import pathlib
 import shlex
+import signal
 import subprocess
 import tempfile
 import threading
 import time
 import tomllib
-
 
 PIXEL = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII="
 

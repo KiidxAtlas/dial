@@ -227,7 +227,6 @@ impl Endpointer {
             self.segment_ms = 0.0;
             self.onset_ms = 0.0;
             self.silence_ms = 0;
-            return;
         }
     }
 

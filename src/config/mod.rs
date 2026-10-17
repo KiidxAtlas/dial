@@ -197,16 +197,16 @@ pub fn migrate_removed_settings(table: &mut toml::Table) -> bool {
     }
     // `ui.worker_shards` (bool, default on) became `ui.pinned_workers`: on maps to the default
     // `collapsed` block and off to `off`. An explicit `pinned_workers` value wins.
-    if let Some(ui) = table_mut(table, "ui") {
-        if let Some(value) = ui.remove("worker_shards") {
-            if value.as_bool() == Some(false) && !ui.contains_key("pinned_workers") {
-                ui.insert(
-                    "pinned_workers".to_owned(),
-                    toml::Value::String("off".to_owned()),
-                );
-            }
-            changed = true;
+    if let Some(ui) = table_mut(table, "ui")
+        && let Some(value) = ui.remove("worker_shards")
+    {
+        if value.as_bool() == Some(false) && !ui.contains_key("pinned_workers") {
+            ui.insert(
+                "pinned_workers".to_owned(),
+                toml::Value::String("off".to_owned()),
+            );
         }
+        changed = true;
     }
     changed
 }
@@ -702,14 +702,14 @@ impl Config {
                 account_id: None,
             });
         }
-        if let Some(endpoint) = &mut config.endpoint {
-            if endpoint.protocol.is_none() {
-                endpoint.protocol = config
-                    .provider
-                    .as_ref()
-                    .and_then(|id| config.providers.get(id))
-                    .and_then(|p| p.protocol);
-            }
+        if let Some(endpoint) = &mut config.endpoint
+            && endpoint.protocol.is_none()
+        {
+            endpoint.protocol = config
+                .provider
+                .as_ref()
+                .and_then(|id| config.providers.get(id))
+                .and_then(|p| p.protocol);
         }
         if let Some(endpoint) = &mut config.endpoint {
             endpoint.api_key_env = endpoint
@@ -2886,10 +2886,12 @@ mod tier_precedence_tests {
 
     #[test]
     fn explicit_tier_beats_fast_and_slow_modes() {
-        let mut config = Config::default();
-        config.fast_mode = true;
-        config.slow_mode = true;
-        config.service_tier = "ultrafast".into();
+        let config = Config {
+            fast_mode: true,
+            slow_mode: true,
+            service_tier: "ultrafast".into(),
+            ..Default::default()
+        };
         assert_eq!(config.effective_service_tier(), "ultrafast");
     }
 
@@ -3293,8 +3295,10 @@ mod model_role_tests {
     #[test]
     fn task_status_shows_assigned_model_or_main_without_changing_small_fallback() {
         use crate::llm::model_config::{ModelSelection, RoleSource};
-        let mut config = Config::default();
-        config.model = "main-model".into();
+        let mut config = Config {
+            model: "main-model".into(),
+            ..Default::default()
+        };
         let task = config
             .role_statuses()
             .into_iter()

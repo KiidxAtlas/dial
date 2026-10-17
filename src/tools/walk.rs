@@ -220,10 +220,11 @@ impl<'a> SearchWalk<'a> {
         if depth > 0 && !path.starts_with(prefix) && !(directory && prefix.starts_with(path)) {
             return true;
         }
-        if let Some(after) = &self.resume {
-            if path < after.as_path() && !(directory && after.starts_with(path)) {
-                return true;
-            }
+        if let Some(after) = &self.resume
+            && path < after.as_path()
+            && !(directory && after.starts_with(path))
+        {
+            return true;
         }
         if self
             .resume

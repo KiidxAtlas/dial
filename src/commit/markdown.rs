@@ -469,7 +469,7 @@ fn strip_leading_type_word(text: &str, commit_type: &str) -> (String, bool) {
         format!("{commit_type}ed"),
         format!("{commit_type}d"),
     ];
-    variants.sort_by(|left, right| right.len().cmp(&left.len()));
+    variants.sort_by_key(|variant| std::cmp::Reverse(variant.len()));
     for variant in &variants {
         if let Some(head) = cleaned.get(..variant.len())
             && head.to_lowercase() == variant.to_lowercase()
@@ -522,10 +522,10 @@ fn try_json(text: &str) -> Option<Value> {
 fn parse_json_span(text: &str) -> Option<Value> {
     let mut spans: Vec<(usize, &str)> = Vec::new();
     for (open, close) in [('{', '}'), ('[', ']')] {
-        if let (Some(start), Some(end)) = (text.find(open), text.rfind(close)) {
-            if end >= start {
-                spans.push((start, &text[start..=end]));
-            }
+        if let (Some(start), Some(end)) = (text.find(open), text.rfind(close))
+            && end >= start
+        {
+            spans.push((start, &text[start..=end]));
         }
     }
     spans.sort_by_key(|(start, _)| *start);

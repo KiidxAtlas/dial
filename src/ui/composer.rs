@@ -149,6 +149,9 @@ struct QueuedEdit {
     follow_up: bool,
 }
 
+/// Returns history entries matching a prefix, up to a limit.
+type HistoryProvider = std::sync::Arc<dyn Fn(&str, usize) -> Vec<String> + Send + Sync>;
+
 pub struct Composer {
     editor: Editor,
     double_left: DoubleTap,
@@ -166,7 +169,7 @@ pub struct Composer {
     autocomplete_tx: std::sync::mpsc::Sender<AutocompleteResult>,
     /// Bumped whenever the candidate lists change; background results from older generations are dropped.
     candidates_generation: u64,
-    history_provider: Option<std::sync::Arc<dyn Fn(&str, usize) -> Vec<String> + Send + Sync>>,
+    history_provider: Option<HistoryProvider>,
     menu: Option<Menu>,
     /// The exact draft the user dismissed the menu/ghost on; editing the text ends the dismissal.
     dismissed: Option<String>,
@@ -246,10 +249,7 @@ impl Composer {
         composer
     }
 
-    pub fn set_history_provider(
-        &mut self,
-        provider: Option<std::sync::Arc<dyn Fn(&str, usize) -> Vec<String> + Send + Sync>>,
-    ) {
+    pub fn set_history_provider(&mut self, provider: Option<HistoryProvider>) {
         self.history_provider = provider;
     }
 
@@ -1684,10 +1684,11 @@ impl Composer {
                 spans
             },
         );
-        if menu.file_start.is_none() && menu.arguments.is_none() {
-            if let Some(found) = menu.matches.get(menu.selected) {
-                rows.extend(Self::command_detail_rows(&entries[found.index], w, theme));
-            }
+        if menu.file_start.is_none()
+            && menu.arguments.is_none()
+            && let Some(found) = menu.matches.get(menu.selected)
+        {
+            rows.extend(Self::command_detail_rows(&entries[found.index], w, theme));
         }
         rows
     }

@@ -948,11 +948,6 @@ fn sse_reply(text: &str) -> crate::llm::fake::Script {
     crate::llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
 }
 
-fn sse_read_call() -> crate::llm::fake::Script {
-    let event = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_read","type":"function","function":{"name":"read","arguments":"{\"path\":\"notes.txt\"}"}}]},"finish_reason":"tool_calls"}]});
-    crate::llm::fake::Script::Sse(format!("data: {event}\n\ndata: [DONE]\n\n"))
-}
-
 /// A tool call with its own id, so repeated calls keep distinct tool_call_id pairings.
 fn sse_tool_call(id: &str, name: &str, arguments: &str) -> crate::llm::fake::Script {
     let event = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":arguments}}]},"finish_reason":"tool_calls"}]});

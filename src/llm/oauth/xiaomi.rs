@@ -212,8 +212,8 @@ mod tests {
         assert_eq!(FLOW.name, "Xiaomi MiMo");
         assert_eq!(FLOW.base_url, "https://api.xiaomimimo.com/v1");
         assert!(matches!(FLOW.protocol, ApiProtocol::ChatCompletions));
-        assert!(FLOW.needs_terminal);
-        assert!(!FLOW.subscription);
+        const { assert!(FLOW.needs_terminal) };
+        const { assert!(!FLOW.subscription) };
         assert!(FLOW.refresh.is_none());
     }
 

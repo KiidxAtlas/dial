@@ -231,10 +231,10 @@ pub fn parse_jina(value: &Value) -> Result<Parsed, String> {
     let items = match value {
         Value::Array(items) => items,
         Value::Object(_) => {
-            if let Some(code) = value.get("code").and_then(Value::as_i64) {
-                if code != 200 {
-                    return Err(format!("Jina reported failure code {code}"));
-                }
+            if let Some(code) = value.get("code").and_then(Value::as_i64)
+                && code != 200
+            {
+                return Err(format!("Jina reported failure code {code}"));
             }
             value
                 .get("data")

@@ -87,22 +87,21 @@ impl SettingDef {
         }
     }
     pub fn kind_for(&self, values: &Table) -> Kind {
-        if self.path == "harness.max_tokens" {
-            if let Ok(config) =
+        if self.path == "harness.max_tokens"
+            && let Ok(config) =
                 Value::Table(values.clone()).try_into::<crate::config::types::Config>()
-            {
-                return Kind::Int {
-                    min: 0,
-                    max: i64::from(
-                        config
-                            .active_model_profile()
-                            .and_then(|profile| profile.max_tokens)
-                            .unwrap_or(8192)
-                            .max(8192),
-                    ),
-                    step: 256,
-                };
-            }
+        {
+            return Kind::Int {
+                min: 0,
+                max: i64::from(
+                    config
+                        .active_model_profile()
+                        .and_then(|profile| profile.max_tokens)
+                        .unwrap_or(8192)
+                        .max(8192),
+                ),
+                step: 256,
+            };
         }
         self.kind
     }

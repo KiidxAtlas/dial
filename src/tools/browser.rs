@@ -226,10 +226,10 @@ impl BrowserTool {
     fn run(&self, ctx: &ToolContext, args: &Value) -> Result<Value, String> {
         let mut notes = Vec::new();
         let mut value = self.run_action(ctx, args, &mut notes)?;
-        if !notes.is_empty() {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("notes".into(), json!(notes));
-            }
+        if !notes.is_empty()
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert("notes".into(), json!(notes));
         }
         Ok(value)
     }
@@ -266,12 +266,12 @@ impl BrowserTool {
             self.tern_fell_back.store(false, Ordering::Release);
             return Ok(json!({"closed":true}));
         }
-        if slot.as_ref().is_some_and(|s| s.last_used.elapsed() > IDLE) {
-            if let Err(error) = retire(&mut slot) {
-                notes.push(format!(
-                    "browser profile was not saved on idle close: {error}"
-                ));
-            }
+        if slot.as_ref().is_some_and(|s| s.last_used.elapsed() > IDLE)
+            && let Err(error) = retire(&mut slot)
+        {
+            notes.push(format!(
+                "browser profile was not saved on idle close: {error}"
+            ));
         }
         if ctx.config.sandbox.mode == SandboxMode::Strict
             || (ctx.config.sandbox.mode == SandboxMode::Dev && !ctx.config.sandbox.allow_network)

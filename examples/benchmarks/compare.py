@@ -2,8 +2,8 @@
 """Compare direct Dial benchmark reports; report analysis is not new model-quality proof."""
 import argparse
 import json
-from pathlib import Path
 import statistics
+from pathlib import Path
 
 
 def direct_report(payload):

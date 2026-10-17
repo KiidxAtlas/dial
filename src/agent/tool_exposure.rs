@@ -235,7 +235,7 @@ impl<'a> Agent<'a> {
     pub(super) fn discoverable_tools(&self, offered: &[String]) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for name in self.catalog() {
-            if offered.iter().any(|tool| *tool == name)
+            if offered.contains(&name)
                 || name == "tool_search"
                 || name == "tool_load"
                 || !self.tool_eligible(&name)

@@ -463,30 +463,30 @@ impl SubagentViewer {
             return OverlayEvent::None;
         }
 
-        if empty && !is_ctrl(key, 'c') {
-            if let KeyCode::Char(c) = key.code {
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-                    match c {
-                        'j' => {
-                            self.scroll_by(1);
-                            return OverlayEvent::None;
-                        }
-                        'k' => {
-                            self.scroll_by(-1);
-                            return OverlayEvent::None;
-                        }
-                        'g' => {
-                            self.scroll.to_top();
-                            return OverlayEvent::None;
-                        }
-                        'G' => {
-                            self.scroll.to_bottom();
-                            return OverlayEvent::None;
-                        }
-                        'x' => return self.cancel(armed),
-                        _ => {}
-                    }
+        if empty
+            && !is_ctrl(key, 'c')
+            && let KeyCode::Char(c) = key.code
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        {
+            match c {
+                'j' => {
+                    self.scroll_by(1);
+                    return OverlayEvent::None;
                 }
+                'k' => {
+                    self.scroll_by(-1);
+                    return OverlayEvent::None;
+                }
+                'g' => {
+                    self.scroll.to_top();
+                    return OverlayEvent::None;
+                }
+                'G' => {
+                    self.scroll.to_bottom();
+                    return OverlayEvent::None;
+                }
+                'x' => return self.cancel(armed),
+                _ => {}
             }
         }
 
@@ -544,16 +544,15 @@ impl SubagentViewer {
             Some(cache) => (cache.rows.len(), !cache.anchors.is_empty()),
             None => (0, false),
         };
-        if anchors_ready {
-            if let (Some(entry), Some(cache)) = (self.pending_entry, self.cache.as_ref()) {
-                if let Some(row) = entry_row(&self.conversation.entries, &cache.anchors, entry) {
-                    self.scroll = Scroll {
-                        top: row,
-                        follow: false,
-                    };
-                    self.pending_entry = None;
-                }
-            }
+        if anchors_ready
+            && let (Some(entry), Some(cache)) = (self.pending_entry, self.cache.as_ref())
+            && let Some(row) = entry_row(&self.conversation.entries, &cache.anchors, entry)
+        {
+            self.scroll = Scroll {
+                top: row,
+                follow: false,
+            };
+            self.pending_entry = None;
         }
         self.scroll.clamp(total, body_h);
         self.geometry = (total, body_h);

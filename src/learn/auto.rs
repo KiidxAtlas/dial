@@ -882,9 +882,11 @@ mod tests {
     fn countdown_and_readiness_report_each_real_gate() {
         let root = tempfile::tempdir().unwrap();
         let store = Store::open(root.path(), "model", "project", &Harness::default()).unwrap();
-        let mut cfg = Config::default();
-        // Keep the user dir inside the tempdir so a real ~/.dial pause file cannot leak into the test.
-        cfg.user_dir = root.path().join("user");
+        let mut cfg = Config {
+            // Keep the user dir inside the tempdir so a real ~/.dial pause file cannot leak into the test.
+            user_dir: root.path().join("user"),
+            ..Config::default()
+        };
         // Cloud spend is allowed here, so only the turn-count and cooldown gates apply below.
         cfg.improve.max_daily_usd = 1.0;
         cfg.improve.min_new_turns = 1;

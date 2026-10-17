@@ -928,10 +928,12 @@ mod tests {
             &json!({"choices": [{"index": 0, "finish_reason": "stop",
                 "message": {"role": "assistant", "content": "ok"}}]}),
         )]);
-        let mut config = Config::default();
-        config.provider = Some("openai".into());
-        config.model = "gpt-test".into();
-        config.service_tier = "priority".into();
+        let config = Config {
+            provider: Some("openai".into()),
+            model: "gpt-test".into(),
+            service_tier: "priority".into(),
+            ..Config::default()
+        };
         let selection = config.selection();
         let profile =
             request_tiers_for(None, &selection, config.effective_service_tier(), false).unwrap();

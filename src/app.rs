@@ -1849,7 +1849,8 @@ fn command_argument_completions(config: &Config, skills: &[skills::Skill]) -> Ve
             .map(|name| format!("/profile {name}")),
     );
     if let Ok(Some(profile)) = reasoning_profile(config) {
-        for command in ["effort"] {
+        {
+            let command = "effort";
             candidates.extend(
                 profile
                     .capabilities
@@ -1981,11 +1982,10 @@ fn reasoning_profile(config: &Config) -> Result<Option<crate::llm::profiles::Mod
     if let Some(profile) = config.active_model_profile() {
         return Ok(Some(profile.clone()));
     }
-    if config.provider.as_deref() == Some(crate::llm::chatgpt::PROVIDER) {
-        if let Some(profile) = crate::llm::chatgpt::model_profile(&config.user_dir, &config.model)?
-        {
-            return Ok(Some(profile));
-        }
+    if config.provider.as_deref() == Some(crate::llm::chatgpt::PROVIDER)
+        && let Some(profile) = crate::llm::chatgpt::model_profile(&config.user_dir, &config.model)?
+    {
+        return Ok(Some(profile));
     }
     let selection = config.selection();
     let identity = format!("{}/{}", selection.provider, selection.model);
@@ -3591,7 +3591,7 @@ impl Shell {
                     self.catalog.collect();
                     let effective = &app.config;
                     let pending = self.pending_favorite.as_ref().unwrap();
-                    if !pending.current(&effective, self.scope, self.catalog.request) {
+                    if !pending.current(effective, self.scope, self.catalog.request) {
                         self.pending_favorite = None;
                         self.note("Favorites", "Pending switch cancelled because the model, favorites, scope or discovery request changed.");
                         dirty = true;
@@ -4122,7 +4122,7 @@ impl Shell {
         ) {
             self.note(
                 "History",
-                &format!("could not record prompt history: {error:#}"),
+                format!("could not record prompt history: {error:#}"),
             );
         }
         if trimmed.starts_with('/') {
@@ -5683,7 +5683,7 @@ impl Shell {
                 if matches!(which, Which::ModelDownloads) {
                     models.show_downloads();
                 }
-                ActiveOverlay::Models(models)
+                ActiveOverlay::Models(Box::new(models))
             }
             Which::Providers => {
                 let user_dir = app.layout.user_dir.clone();
@@ -6962,10 +6962,10 @@ impl Shell {
             (name, args)
         };
         let name = canonical_command(name);
-        if args.is_empty() || (name == "permissions" && args == "remove") {
-            if let Some(spec) = self.picker(app, agent, name, args) {
-                return self.open(app, agent, Which::Choice(Box::new(spec)));
-            }
+        if (args.is_empty() || (name == "permissions" && args == "remove"))
+            && let Some(spec) = self.picker(app, agent, name, args)
+        {
+            return self.open(app, agent, Which::Choice(Box::new(spec)));
         }
         if let Some(panel) = work_panel(name, args) {
             return self.open(app, agent, panel);
@@ -7122,9 +7122,9 @@ impl Shell {
                     })
                     .map(|entry| entry.selection.clone())
                     .collect::<Vec<_>>();
-                match next_favorite(&effective, &favorites, &available) {
+                match next_favorite(effective, &favorites, &available) {
                     Some(selection) => {
-                        let changes = selection_changes(&effective, &selection, "main")?;
+                        let changes = selection_changes(effective, &selection, "main")?;
                         match app.save_settings(self.scope, &changes, Some("main"))
                             .and_then(|_| app.reload())
                             .map(|fresh| self.config_changed(app, agent, fresh)) {
@@ -7938,7 +7938,7 @@ impl Shell {
             "context" => {
                 let used = agent.last_prompt_tokens;
                 let window = u64::from(agent.context_window());
-                let percent = if window > 0 { used * 100 / window } else { 0 };
+                let percent = (used * 100).checked_div(window).unwrap_or(0);
                 self.note(
                     "Context",
                     format!(
@@ -8459,7 +8459,7 @@ enum ActiveOverlay {
     Extensions(Box<crate::ui::overlay::extensions::ExtensionsOverlay>),
     Settings(Box<SettingsOverlay>),
     ModelSettings(Box<crate::ui::overlay::model_settings::ModelSettingsOverlay>),
-    Models(ModelOverlay),
+    Models(Box<ModelOverlay>),
     Providers(ProviderOverlay),
     Shortcuts(ShortcutOverlay),
     Git(Box<crate::ui::overlay::git::GitOverlay>),
@@ -8725,7 +8725,8 @@ impl AuthJob {
                 )),
             )),
         });
-        let result = result.map(|(label, result)| {
+
+        result.map(|(label, result)| {
             let job = slot.take().expect("completed background job");
             let result = result.and_then(|message| {
                 ensure!(!job.cancel.load(Ordering::SeqCst), "operation cancelled");
@@ -8735,8 +8736,7 @@ impl AuthJob {
                 Ok(message)
             });
             (label, result)
-        });
-        result
+        })
     }
 }
 
@@ -9684,10 +9684,10 @@ fn refresh_overlay(env: &mut OverlayEnv<'_>, overlay: &mut ActiveOverlay) {
     }
     if let ActiveOverlay::Extensions(panel) = overlay {
         panel.tick();
-        if panel.take_refresh() {
-            if let Ok(config) = env.app.reload() {
-                commands::extensions_browser::refresh(panel, env.app.layout(), &config);
-            }
+        if panel.take_refresh()
+            && let Ok(config) = env.app.reload()
+        {
+            commands::extensions_browser::refresh(panel, env.app.layout(), &config);
         }
     }
     if let ActiveOverlay::Models(models) = &mut *overlay
@@ -12808,7 +12808,7 @@ fn group_digits(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);

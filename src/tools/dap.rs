@@ -1684,14 +1684,14 @@ impl Session {
             return self.breakpoint_action(action, arguments, op);
         }
         let body = self.request(action, arguments, op)?;
-        if action == "threads" {
-            if let Some(threads) = body.get("threads").and_then(Value::as_array) {
-                let mut state = self.wire.state.lock().unwrap_or_else(|e| e.into_inner());
-                state.threads.clear();
-                for thread in threads.iter().take(MAX_EVENTS) {
-                    if let Some(id) = thread.get("id").and_then(Value::as_i64) {
-                        state.threads.insert(id, thread.clone());
-                    }
+        if action == "threads"
+            && let Some(threads) = body.get("threads").and_then(Value::as_array)
+        {
+            let mut state = self.wire.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.threads.clear();
+            for thread in threads.iter().take(MAX_EVENTS) {
+                if let Some(id) = thread.get("id").and_then(Value::as_i64) {
+                    state.threads.insert(id, thread.clone());
                 }
             }
         }

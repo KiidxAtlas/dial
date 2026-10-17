@@ -187,7 +187,7 @@ impl ProvenanceMemory {
     pub fn open(layout: &Layout) -> Result<Self> {
         layout.ensure_project_outside_storage()?;
         match platform_fs::create_dir_owner_only(
-            &fs::DirBuilder::new().recursive(true),
+            fs::DirBuilder::new().recursive(true),
             &layout.user_dir,
         ) {
             Ok(()) => {}
@@ -598,7 +598,7 @@ impl ProvenanceMemory {
             "legacy memory exceeds {MAX_LEGACY_BYTES} bytes; originals are untouched"
         );
         let mut text = String::new();
-        platform_fs::open_nofollow(&fs::OpenOptions::new().read(true), path)?
+        platform_fs::open_nofollow(fs::OpenOptions::new().read(true), path)?
             .take(MAX_LEGACY_BYTES + 1)
             .read_to_string(&mut text)?;
         ensure!(

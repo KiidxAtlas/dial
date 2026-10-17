@@ -362,10 +362,10 @@ fn catalog_id(provider: &str) -> &str {
     }
 }
 
-fn to_bundled(provider: &'static String, entry: &'static Entry) -> BundledModel {
+fn to_bundled(provider: &'static str, entry: &'static Entry) -> BundledModel {
     BundledModel {
         id: entry.id.clone(),
-        provider: provider.as_str(),
+        provider,
         context_window: entry.context_window,
         max_output_tokens: entry.max_output_tokens,
         reasoning: entry.reasoning,
@@ -413,7 +413,7 @@ fn find(provider: &str, model: &str) -> Option<BundledModel> {
     candidates
         .iter()
         .find_map(|id| models.index.get(id))
-        .map(|&i| to_bundled(key, &models.entries[i]))
+        .map(|&i| to_bundled(key.as_str(), &models.entries[i]))
 }
 
 /// The bundled row for `model` as served by `provider` (a Dial or catalog provider id).
@@ -433,7 +433,7 @@ pub fn bundled_models(provider: &str) -> Vec<BundledModel> {
             models
                 .entries
                 .iter()
-                .map(|entry| to_bundled(key, entry))
+                .map(|entry| to_bundled(key.as_str(), entry))
                 .collect()
         })
         .unwrap_or_default()

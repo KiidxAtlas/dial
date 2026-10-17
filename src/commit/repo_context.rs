@@ -200,10 +200,10 @@ fn node_dependency_names(data: &serde_json::Value, content: &str) -> Vec<String>
             names.extend(map.keys().cloned());
         }
     }
-    if names.is_empty() {
-        if let Ok(keys) = Regex::new(r#""([@\w./-]+)"\s*:"#) {
-            names.extend(keys.captures_iter(content).map(|c| c[1].to_owned()));
-        }
+    if names.is_empty()
+        && let Ok(keys) = Regex::new(r#""([@\w./-]+)"\s*:"#)
+    {
+        names.extend(keys.captures_iter(content).map(|c| c[1].to_owned()));
     }
     names
 }
@@ -360,7 +360,7 @@ pub(crate) fn common_scopes(subjects: &[&str]) -> String {
             None => counts.push((scope, 1)),
         }
     }
-    counts.sort_by(|left, right| right.1.cmp(&left.1));
+    counts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     counts
         .iter()
         .take(COMMON_SCOPES)

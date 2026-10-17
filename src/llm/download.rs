@@ -452,6 +452,9 @@ pub enum Choice {
     Files(Vec<String>),
 }
 
+/// Lists the files of a Hugging Face repository.
+type Listing<'a> = Box<dyn Fn(&str) -> Result<Vec<String>> + 'a>;
+
 /// [`ensure_local_model`] with a file choice, a cancel flag and progress lines. A cancelled download
 /// fails with "download cancelled". Files Hugging Face already cached are reused by the next attempt.
 pub fn ensure_local_model_with(
@@ -462,7 +465,7 @@ pub fn ensure_local_model_with(
     progress: &dyn Fn(&str),
 ) -> Result<String> {
     ensure!(!cancel.load(Ordering::SeqCst), "download cancelled");
-    let listing: Box<dyn Fn(&str) -> Result<Vec<String>> + '_> = match choice {
+    let listing: Listing<'_> = match choice {
         Choice::Auto => Box::new(|repo: &str| -> Result<Vec<String>> {
             progress(&format!("listing the files of {repo}"));
             let output = run_python(python, LIST, &[repo.to_owned()], 600, cancel, progress).with_context(
@@ -503,7 +506,7 @@ pub fn ensure_local_model_with(
         matches!(choice, Choice::Auto),
         crate::llm::catalog::resolve_local_model,
         &*listing,
-        &fetch,
+        fetch,
     )
     .map_err(|error| {
         if cancel.load(Ordering::SeqCst) {

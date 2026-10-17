@@ -687,10 +687,10 @@ impl Worker {
                 }
                 continue;
             }
-            if provisional.is_none() {
-                if let Err(error) = self.drain(&mut ws) {
-                    return error;
-                }
+            if provisional.is_none()
+                && let Err(error) = self.drain(&mut ws)
+            {
+                return error;
             }
             if last_ping.elapsed() >= PING_EVERY {
                 last_ping = Instant::now();

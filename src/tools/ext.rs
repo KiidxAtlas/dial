@@ -10,14 +10,17 @@ use crate::config::types::Config;
 use serde_json::Value;
 use std::{collections::BTreeMap, sync::Arc};
 
+/// Authorizes `(tool, paths, unbounded_effects)` before a native tool mutates or starts a process.
+pub type MutationAuthorizer<'a> =
+    &'a dyn Fn(&str, &[std::path::PathBuf], bool) -> Result<(), String>;
+
 /// Everything a tool may use while running. Tools hold no reference to the agent itself.
 pub struct ToolContext<'a> {
     pub workspace: &'a Workspace,
     pub config: &'a Config,
     /// Controller-owned authorization for targets discovered inside native tools.
     /// Missing authority permits inspection, never native mutation or process startup.
-    pub mutation_authorizer:
-        Option<&'a dyn Fn(&str, &[std::path::PathBuf], bool) -> Result<(), String>>,
+    pub mutation_authorizer: Option<MutationAuthorizer<'a>>,
     /// Controller-owned user confirmation for effects a tool gates on its own (for example, computer actions).
     /// `None` means no interactive owner is attached; the tool must refuse. The argument is a summary of the action.
     pub confirm: Option<&'a dyn Fn(&str) -> bool>,
@@ -513,8 +516,10 @@ mod tests {
 
     #[test]
     fn notebook_is_registered_only_when_listed_as_integration() {
-        let mut config = Config::default();
-        config.integrations = vec!["notebook".into()];
+        let mut config = Config {
+            integrations: vec!["notebook".into()],
+            ..Config::default()
+        };
         assert!(Registry::standard(&config).contains("notebook"));
 
         config.integrations.clear();
@@ -523,11 +528,13 @@ mod tests {
     #[test]
     fn legacy_integration_lists_keep_always_registered_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.project_root = dir.path().to_path_buf();
-        config.user_dir = dir.path().join("user");
-        config.state_dir = dir.path().join("state");
-        config.integrations.clear();
+        let mut config = Config {
+            project_root: dir.path().to_path_buf(),
+            user_dir: dir.path().join("user"),
+            state_dir: dir.path().join("state"),
+            integrations: Vec::new(),
+            ..Config::default()
+        };
         config.extensions.enabled = false;
         let registry = Registry::standard(&config);
         for entry in super::super::catalog::INTEGRATIONS {

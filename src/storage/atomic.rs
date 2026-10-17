@@ -82,7 +82,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
                 "unsafe private storage target"
             );
             let target =
-                platform_fs::open_nofollow_nonblocking(&OpenOptions::new().read(true), path)?;
+                platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path)?;
             ensure!(
                 platform_fs::link_count(&target)? == 1
                     && platform_fs::owned_by_current_user(&target)?,

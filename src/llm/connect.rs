@@ -205,7 +205,7 @@ impl<'a> Fields<'a> {
 }
 
 pub(super) fn take<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
-    let current: &'a [u8] = *data;
+    let current: &'a [u8] = data;
     ensure!(current.len() >= len, "truncated protobuf message");
     let (head, tail) = current.split_at(len);
     *data = tail;
@@ -215,7 +215,7 @@ pub(super) fn take<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
 pub(super) fn take_varint(data: &mut &[u8]) -> Result<u64> {
     let mut value = 0u64;
     for shift in (0..64).step_by(7) {
-        let current: &[u8] = *data;
+        let current: &[u8] = data;
         let (&byte, rest) = current.split_first().context("truncated protobuf varint")?;
         *data = rest;
         value |= u64::from(byte & 0x7f) << shift;

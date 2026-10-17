@@ -543,9 +543,11 @@ pub(crate) fn origin(uri: &ureq::http::Uri) -> (String, String, u16) {
     )
 }
 /// `--api-key` for one endpoint origin. Process memory only; never written to disk or logs.
-static CLI_API_KEY: std::sync::LazyLock<
-    parking_lot::RwLock<Option<((String, String, u16), String)>>,
-> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(None));
+static CLI_API_KEY: std::sync::LazyLock<parking_lot::RwLock<Option<ScopedKey>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(None));
+
+/// An API key paired with the origin (scheme, host, port) it applies to.
+type ScopedKey = ((String, String, u16), String);
 
 /// Sets the process-only API key for `base_url`'s origin. Applies ahead of env and saved keys.
 pub fn set_cli_api_key(base_url: &str, key: String) -> Result<()> {
@@ -2031,8 +2033,7 @@ pub(crate) fn model_context_window(user_dir: &Path, selection: &ModelSelection) 
                     &selection.model,
                 )
             } else if selection.provider == super::apple::PROVIDER {
-                super::apple::supported_build()
-                    .then(|| super::apple::availability().context_size)
+                super::apple::supported_build().then(|| super::apple::availability().context_size)
             } else if selection.provider == "mlx" && selection.base_url.is_none() {
                 let model = resolve_local_model(&selection.model).ok()?;
                 context(&read_json(&Path::new(&model).join("config.json"))?)
@@ -2162,12 +2163,12 @@ pub fn downloaded_local_models(user_dir: &Path) -> Vec<ModelEntry> {
 pub(crate) fn local_model_entries(trainable: Option<&Path>) -> Vec<ModelEntry> {
     let mut models = Vec::new();
     if let Some(cache) = hf_cache() {
-        models = local_models(&cache, trainable.as_deref());
+        models = local_models(&cache, trainable);
     }
     if let Some(folder) = lmstudio_folder() {
         let gguf = lmstudio_gguf_models(&folder);
         // The same repository downloaded by both keeps its Hugging Face entry.
-        for entry in lmstudio_mlx_models(&folder, trainable.as_deref())
+        for entry in lmstudio_mlx_models(&folder, trainable)
             .into_iter()
             .chain(gguf)
         {

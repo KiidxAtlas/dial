@@ -251,10 +251,8 @@ fn file_read(ws: &Workspace, args: &Value, cancel: &AtomicBool) -> Result<ToolOu
     // A sniff window can end inside a multi-byte character; only a genuinely invalid byte is binary evidence.
     let invalid_utf8 = std::str::from_utf8(header).is_err_and(|error| error.error_len().is_some());
     let probably_binary = header.contains(&0) || invalid_utf8;
-    if !probably_binary {
-        if let Ok(text) = std::str::from_utf8(&bytes) {
-            return Ok(ToolOutput::ok(clip(ws, text.to_owned())));
-        }
+    if !probably_binary && let Ok(text) = std::str::from_utf8(&bytes) {
+        return Ok(ToolOutput::ok(clip(ws, text.to_owned())));
     }
     Ok(ToolOutput::ok(format!(
         "[Cannot read binary file '{path}' ({}); not valid UTF-8 text. Open {source_url} to view it.]",

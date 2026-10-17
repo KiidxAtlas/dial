@@ -34,10 +34,10 @@ pub fn kind_of(url: &str, media: Option<&str>, body: &[u8]) -> Option<&'static s
     if body.starts_with(b"%PDF-") {
         return Some("pdf");
     }
-    if let Some(media) = media {
-        if let Some((_, kind)) = KINDS.iter().find(|(mime, _)| *mime == media) {
-            return Some(kind);
-        }
+    if let Some(media) = media
+        && let Some((_, kind)) = KINDS.iter().find(|(mime, _)| *mime == media)
+    {
+        return Some(kind);
     }
     let extension = url_extension(url)?;
     KINDS

@@ -876,10 +876,8 @@ fn wait_ready(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod tests {
-    #![cfg(unix)]
-
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

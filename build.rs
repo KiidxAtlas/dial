@@ -81,6 +81,14 @@ fn main() {
                 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())),
         "DIAL_BUILD_REVISION must be a Git hash or unknown"
     );
+    // A shipped binary without its commit makes bug reports and version checks useless. Dev and
+    // local-profile builds keep the fallback for vendored sources without a Git checkout.
+    if env::var("PROFILE").as_deref() == Ok("release") {
+        assert!(
+            revision != "unknown",
+            "release builds need a revision: build from a Git checkout or set DIAL_BUILD_REVISION"
+        );
+    }
     let diff_args = [
         "diff",
         "--no-ext-diff",
@@ -136,8 +144,8 @@ fn build_apple_fm_helper() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set"));
     let source = manifest_dir.join("runtimes/apple/DialAppleFM.swift");
-    let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR should be set"))
-        .join("dial-apple-fm");
+    let output =
+        PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR should be set")).join("dial-apple-fm");
     let architecture = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
         Ok("aarch64") => "arm64",
         Ok("x86_64") => "x86_64",

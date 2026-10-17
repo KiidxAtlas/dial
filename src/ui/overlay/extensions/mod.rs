@@ -63,11 +63,11 @@ impl ExtensionsOverlay {
     fn apply_catalogs(&mut self) {
         let mut ready = Vec::new();
         self.catalogs.retain(|(_, shared)| {
-            if let Ok(mut slot) = shared.lock() {
-                if let Some(update) = slot.take() {
-                    ready.push(update);
-                    return false;
-                }
+            if let Ok(mut slot) = shared.lock()
+                && let Some(update) = slot.take()
+            {
+                ready.push(update);
+                return false;
             }
             true
         });

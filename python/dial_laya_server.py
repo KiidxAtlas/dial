@@ -1,11 +1,11 @@
 """Dial-owned local typed-decision service. No coding-agent framework dependency."""
-from contextlib import asynccontextmanager
 import logging
 import os
-from pathlib import Path
 import signal
 import threading
 import time
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field

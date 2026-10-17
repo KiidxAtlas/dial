@@ -201,7 +201,7 @@ pub(crate) fn is_dependency_source_path(root: &Path, path: &Path) -> bool {
     }) || matches!(
         relative.components().next(),
         Some(Component::Normal(name)) if ROOT_GENERATED_DIRS.contains(&name.to_string_lossy().as_ref())
-    ) || ignored_bin_output(root, &relative)
+    ) || ignored_bin_output(root, relative)
 }
 
 /// Require the project's own ignore rule for `/bin/` and preserve tracked source scripts.

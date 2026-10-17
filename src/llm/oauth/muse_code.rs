@@ -311,8 +311,8 @@ mod tests {
         assert_eq!(FLOW.name, "Muse Code");
         assert_eq!(FLOW.base_url, "https://api.meta.ai/v1");
         assert!(matches!(FLOW.protocol, ApiProtocol::Responses));
-        assert!(!FLOW.needs_terminal);
-        assert!(FLOW.subscription);
+        const { assert!(!FLOW.needs_terminal) };
+        const { assert!(FLOW.subscription) };
         assert!(FLOW.refresh.is_none());
     }
 
@@ -467,7 +467,7 @@ mod tests {
             expires_at_ms: util::NEVER_EXPIRES,
             ..Default::default()
         };
-        let error = access(&credentials).err().expect("no key must fail");
+        let error = access(&credentials).expect_err("no key must fail");
         assert!(format!("{error:#}").contains("sign in again"));
     }
 }

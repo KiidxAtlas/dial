@@ -80,7 +80,7 @@ impl InvestigationGuard {
     /// failures cannot reset an observation's repeat count. Guidance escalates at each further multiple
     /// of four and never ends the turn: the repeated observation is already withheld.
     pub fn escalation(&self) -> Option<String> {
-        (self.unchanged >= 4 && self.unchanged % 4 == 0).then(|| format!(
+        (self.unchanged >= 4 && self.unchanged.is_multiple_of(4)).then(|| format!(
             "[Escalation from dial] This observation has now been repeated {} times unchanged and withheld each time. Its evidence is already in this conversation. Stop re-checking it: act on it, or run one check of a different kind.",
             self.unchanged
         ))

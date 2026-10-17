@@ -295,7 +295,7 @@ pub fn expired_beyond_keep<T: Clone>(
     keep_newest: usize,
     cutoff_ms: i64,
 ) -> (usize, Vec<T>) {
-    items.sort_by(|a, b| b.1.cmp(&a.1));
+    items.sort_by_key(|item| std::cmp::Reverse(item.1));
     let kept = keep_newest.min(items.len());
     let expired = items[kept..]
         .iter()
@@ -474,7 +474,7 @@ pub fn collect_references(layout: &Layout) -> Result<ReferenceScan> {
 /// spool is live. Returns the held claim, or `None` when the spool is live or cannot be opened.
 fn claim_spool(path: &Path) -> Option<fs::File> {
     let file = crate::platform::fs::open_nofollow_nonblocking(
-        &fs::OpenOptions::new().read(true).write(true),
+        fs::OpenOptions::new().read(true).write(true),
         path,
     )
     .ok()?;
@@ -544,14 +544,14 @@ fn sweep_blobs(layout: &Layout, apply: bool, now_ms: i64) -> BlobResult {
             match remove_file_counted(&path, len) {
                 Ok(_) => {
                     result.deleted += 1;
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if is_artifact_hash(name) {
-                            let record = artifacts.join(LIFECYCLE_DIR).join(format!("{name}.json"));
-                            match fs::remove_file(&record) {
-                                Ok(()) => {}
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => result.errors.push(format!("{}: {e}", record.display())),
-                            }
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                        && is_artifact_hash(name)
+                    {
+                        let record = artifacts.join(LIFECYCLE_DIR).join(format!("{name}.json"));
+                        match fs::remove_file(&record) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => result.errors.push(format!("{}: {e}", record.display())),
                         }
                     }
                 }
@@ -661,7 +661,7 @@ fn sweep_archive(
         };
         // Retention never relocates an active actor's claimed inode.
         let claim = match crate::platform::fs::open_nofollow_nonblocking(
-            &std::fs::OpenOptions::new().read(true).write(true),
+            std::fs::OpenOptions::new().read(true).write(true),
             &candidate.path,
         ) {
             Ok(file) => file,

@@ -16,7 +16,7 @@ enum Frame {
     Snapshot {
         #[serde(default)]
         schema_version: u32,
-        node: Node,
+        node: Box<Node>,
     },
     Append {
         #[serde(default)]
@@ -233,7 +233,7 @@ impl Journal {
     pub fn snapshot(&self, node: &Node) {
         self.append(Frame::Snapshot {
             schema_version: 1,
-            node: node.clone(),
+            node: Box::new(node.clone()),
         });
     }
     pub fn text(&self, id: &str, revision: u64, text: &str) {
@@ -298,7 +298,7 @@ impl Journal {
                     &mut bytes,
                     &Frame::Snapshot {
                         schema_version: 1,
-                        node,
+                        node: Box::new(node),
                     },
                 )?;
                 bytes.push(b'\n');
@@ -388,7 +388,7 @@ fn scan(session: &Path) -> anyhow::Result<(Vec<Node>, bool)> {
         };
         match frame {
             Frame::Snapshot { node, .. } => {
-                nodes.insert(node.id.clone(), node);
+                nodes.insert(node.id.clone(), *node);
             }
             Frame::Append {
                 id, revision, text, ..

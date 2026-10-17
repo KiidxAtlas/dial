@@ -317,10 +317,14 @@ type Stat = Option<(Option<std::time::SystemTime>, u64, bool)>;
 
 /// Discovery cache keyed by workspace and user home, valid while every input's stat is unchanged.
 static DISCOVERY_CACHE: std::sync::LazyLock<
-    parking_lot::Mutex<
-        std::collections::HashMap<(PathBuf, Option<PathBuf>), (Vec<(PathBuf, Stat)>, Vec<Skill>)>,
-    >,
+    parking_lot::Mutex<std::collections::HashMap<DiscoveryKey, DiscoveryEntry>>,
 > = std::sync::LazyLock::new(Default::default);
+
+/// Workspace and user home a discovery was run for.
+type DiscoveryKey = (PathBuf, Option<PathBuf>);
+
+/// Every input's stat at discovery time, with the skills found.
+type DiscoveryEntry = (Vec<(PathBuf, Stat)>, Vec<Skill>);
 
 /// Every path whose change can alter discovery: each skill root, each entry inside it, and each
 /// entry's `SKILL.md`. Directory mtimes alone miss in-place `SKILL.md` edits, so files are stat'ed too.

@@ -166,10 +166,10 @@ pub struct Publication {
 }
 impl Drop for Publication {
     fn drop(&mut self) {
-        if !self.committed.get() {
-            if let Some(generations) = self.staging.get_mut().take() {
-                let _ = generations.remove_tree(&self.generation);
-            }
+        if !self.committed.get()
+            && let Some(generations) = self.staging.get_mut().take()
+        {
+            let _ = generations.remove_tree(&self.generation);
         }
     }
 }

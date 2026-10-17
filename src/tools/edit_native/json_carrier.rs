@@ -673,10 +673,10 @@ impl Encoder<'_> {
         if property.duplicate {
             return self.raw(property.value.span.clone());
         }
-        if property.name == "cells" {
-            if let Some(origins) = cells {
-                return self.cells(&property.value, next, origins);
-            }
+        if property.name == "cells"
+            && let Some(origins) = cells
+        {
+            return self.cells(&property.value, next, origins);
         }
         self.node(&property.value, next)
     }

@@ -4,8 +4,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
-from types import SimpleNamespace, ModuleType
+
 import dial_steering as s
 
 
@@ -160,8 +161,7 @@ class MetalHooks(unittest.TestCase):
     def setUpClass(cls):
         try:
             import mlx.core as mx
-            import mlx.nn as nn
-            from mlx_lm.models.llama import Model,ModelArgs
+            from mlx_lm.models.llama import Model, ModelArgs
         except ImportError as error:
             raise unittest.SkipTest(str(error))
         cls.mx=mx;cls.Model=Model;cls.ModelArgs=ModelArgs
@@ -184,11 +184,11 @@ class MetalHooks(unittest.TestCase):
         self.assertIs(model.layers[0],original)
 
     def test_real_generation_and_server_confirmation(self):
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
         from tokenizers import Tokenizer
         from tokenizers.models import WordLevel
         from tokenizers.pre_tokenizers import Whitespace
         from transformers import PreTrainedTokenizerFast
-        from mlx_lm.tokenizer_utils import TokenizerWrapper
         raw=Tokenizer(WordLevel({'<unk>':0,'<eos>':1,'hello':2,'user':3,'assistant':4},unk_token='<unk>'));raw.pre_tokenizer=Whitespace()
         hf=PreTrainedTokenizerFast(tokenizer_object=raw,unk_token='<unk>',eos_token='<eos>')
         hf.chat_template="{% for m in messages %}{{ m['role'] }} {{ m['content'] }} {% endfor %}{% if add_generation_prompt %}assistant{% endif %}"
@@ -208,11 +208,11 @@ class MetalHooks(unittest.TestCase):
             self.assertGreater(result['tokens'],0);self.assertEqual(s.STATUS['state'],'used');self.assertGreater(s.STATUS['uses'],0)
 
     def test_real_heldout_evaluation_records_failure_without_admission(self):
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
         from tokenizers import Tokenizer
         from tokenizers.models import WordLevel
         from tokenizers.pre_tokenizers import Whitespace
         from transformers import PreTrainedTokenizerFast
-        from mlx_lm.tokenizer_utils import TokenizerWrapper
         raw=Tokenizer(WordLevel({'<unk>':0,'<eos>':1,'hello':2,'user':3,'assistant':4},unk_token='<unk>'));raw.pre_tokenizer=Whitespace()
         hf=PreTrainedTokenizerFast(tokenizer_object=raw,unk_token='<unk>',eos_token='<eos>')
         hf.chat_template="{% for m in messages %}{{ m['role'] }} {{ m['content'] }} {% endfor %}{% if add_generation_prompt %}assistant{% endif %}"
@@ -228,7 +228,7 @@ class MetalHooks(unittest.TestCase):
             with self.assertRaises(ValueError):s.validate(s.read_json(path),.5,True)
 
     def test_extraction_resume_produces_same_artifact_and_rejects_heldout_leak(self):
-        mx=self.mx;model=self.model()
+        model=self.model()
         class Tokenizer:
             def apply_chat_template(self,messages,**kwargs):return [1,2,int(messages[-1]['content'])] if messages[-1]['role']=='assistant' else [1,2]
         pairs=[{'positive':[{'role':'user','content':f'task {n}'},{'role':'assistant','content':'3'}],'negative':[{'role':'user','content':f'task {n}'},{'role':'assistant','content':'4'}]} for n in range(8)]
@@ -248,7 +248,11 @@ class VisionMetalHooks(unittest.TestCase):
         try:
             import mlx.core as mx
             from mlx_vlm.models.qwen3_5_moe import Model
-            from mlx_vlm.models.qwen3_5_moe.config import ModelConfig, TextConfig, VisionConfig
+            from mlx_vlm.models.qwen3_5_moe.config import (
+                ModelConfig,
+                TextConfig,
+                VisionConfig,
+            )
             from transformers import Qwen3_5Tokenizer
         except ImportError as error:
             raise unittest.SkipTest(str(error))
@@ -272,6 +276,7 @@ class VisionMetalHooks(unittest.TestCase):
 
     def save_model(self,path):
         from dataclasses import asdict
+
         from mlx.utils import tree_flatten
         model=self.model();path.mkdir()
         (path/'config.json').write_text(json.dumps(asdict(model.config)))
@@ -322,10 +327,11 @@ class VisionMetalHooks(unittest.TestCase):
 
     def test_real_vision_server_thread_and_status_endpoint_confirm_use(self):
         import asyncio
+
         import httpx
         from fastapi import FastAPI
+        from mlx_vlm.server import generation
         from PIL import Image
-        import mlx_vlm.server.generation as generation
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);path=root/'model';self.save_model(path)
             item=bundle();item.update(model=s.identity(path),dimension=32,vector=[1.]+[0.]*31,layer=1,layer_count=4)

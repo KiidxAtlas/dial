@@ -625,7 +625,7 @@ impl Codebase {
     pub fn open(layout: &Layout) -> Result<Self> {
         layout.ensure_project_outside_storage()?;
         match platform_fs::create_dir_owner_only(
-            &fs::DirBuilder::new().recursive(true),
+            fs::DirBuilder::new().recursive(true),
             &layout.state_dir,
         ) {
             Ok(()) => {}

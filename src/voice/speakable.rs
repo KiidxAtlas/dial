@@ -31,7 +31,7 @@ pub fn speakable(text: &str, max_chars: usize) -> String {
 fn truncate_at_sentence(mut out: String, max_chars: usize) -> String {
     if let Some((end, _)) = out.char_indices().nth(max_chars) {
         let cut = out[..end]
-            .rfind(|c: char| matches!(c, '.' | '!' | '?'))
+            .rfind(['.', '!', '?'])
             .filter(|&p| p * 2 >= end)
             .map_or(end, |p| p + 1);
         out.truncate(cut);

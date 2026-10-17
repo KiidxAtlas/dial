@@ -101,11 +101,9 @@ pub(crate) fn line_patch(
         body.push(prefix);
         body.push_str(line.text);
         body.push('\n');
-        if keep_marker {
-            if let Some(marker) = line.marker {
-                body.push_str(marker);
-                body.push('\n');
-            }
+        if keep_marker && let Some(marker) = line.marker {
+            body.push_str(marker);
+            body.push('\n');
         }
     }
     if !changed {
