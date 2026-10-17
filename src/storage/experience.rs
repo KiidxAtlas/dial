@@ -2,7 +2,6 @@
 //! Retrieval is advisory. Recipes recheck each step's hashes and use ordinary tool approvals.
 use crate::config::paths::Layout;
 use crate::storage::memory::screen;
-use crate::tools::Workspace;
 use anyhow::{Result, ensure};
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
@@ -13,6 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
+    path::PathBuf,
     path::{Component, Path},
     time::Duration,
 };
@@ -53,7 +53,13 @@ pub fn safe_path(path: &str) -> bool {
             part == ".dial" || part == ".git" || part == "private" || part.starts_with(".env")
         })
 }
-pub fn source_hash(ws: &Workspace, path: &str) -> Result<Option<String>> {
+/// Project-root resolution for source snapshots. `tools::Workspace` implements it, so storage never
+/// depends on the tools layer; the resolver keeps the workspace's own containment rules.
+pub trait SourceRoot {
+    fn resolve(&self, input: &str) -> Result<PathBuf, String>;
+}
+
+pub fn source_hash(ws: &dyn SourceRoot, path: &str) -> Result<Option<String>> {
     ensure!(safe_path(path), "source path must be relative and public");
     let target = ws.resolve(path).map_err(anyhow::Error::msg)?;
     match fs::metadata(&target) {
@@ -96,7 +102,11 @@ pub fn paths(tool: &str, args: &Value) -> Vec<String> {
     paths.dedup();
     paths
 }
-pub fn preconditions(ws: &Workspace, tool: &str, args: &Value) -> BTreeMap<String, Option<String>> {
+pub fn preconditions(
+    ws: &dyn SourceRoot,
+    tool: &str,
+    args: &Value,
+) -> BTreeMap<String, Option<String>> {
     let paths = paths(tool, args);
     if paths.len() > 4 {
         return BTreeMap::new();
@@ -107,7 +117,7 @@ pub fn preconditions(ws: &Workspace, tool: &str, args: &Value) -> BTreeMap<Strin
         .collect::<Result<_>>()
         .unwrap_or_default()
 }
-pub fn applicable(ws: &Workspace, sources: &BTreeMap<String, Option<String>>) -> bool {
+pub fn applicable(ws: &dyn SourceRoot, sources: &BTreeMap<String, Option<String>>) -> bool {
     !sources.is_empty()
         && sources.len() <= 4
         && sources
@@ -176,7 +186,7 @@ impl Experience {
         screen_record(&payload)?;
         let id = digest(format!("{kind}:{raw}").as_bytes());
         let conn = self.conn.lock();
-        let at = i64::try_from(crate::learn::improve::now()).unwrap_or(i64::MAX);
+        let at = i64::try_from(crate::runtime::clock::unix_secs()).unwrap_or(i64::MAX);
         conn.execute(
             "INSERT INTO experience(id,kind,payload,model,at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET at=excluded.at",
             params![id, kind, raw, model, at],
@@ -239,7 +249,7 @@ impl Experience {
         &self,
         query: &str,
         model: &str,
-        ws: &Workspace,
+        ws: &dyn SourceRoot,
         budget: usize,
     ) -> Result<(String, Vec<String>)> {
         let candidates = self.inspect()?;

@@ -342,9 +342,11 @@ impl Registry {
         }
     }
 
-    /// Every tool dial ships, configured from `config`. MCP servers connect here (concurrently,
-    /// with a startup budget); a server that fails only adds a notice.
-    pub fn standard(config: &Config) -> Self {
+    /// Every tool dial ships, configured from `config`. `native` carries the tool groups owned by
+    /// layers above `tools` (computer use); they register with the built-in groups, before MCP
+    /// servers. MCP servers connect here (concurrently, with a startup budget); a server that
+    /// fails only adds a notice.
+    pub fn standard(config: &Config, native: Vec<Arc<dyn Tool>>) -> Self {
         let mut registry = Self::new();
         let groups = [
             super::background::tools(config),
@@ -355,7 +357,7 @@ impl Registry {
             super::ssh::tools(config),
             super::notebook::tools(config),
             super::gh::tools(config),
-            crate::computer::tools(config),
+            native,
             crate::security::tools(config),
             super::browser::tools(config),
             super::kernel::tools(config),

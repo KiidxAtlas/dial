@@ -340,7 +340,7 @@ fn detailed_unicode_investigation_findings_persist_without_truncation() {
     let (_home, _project, layout, ws) = fixture();
     let cache = Codebase::open(&layout).unwrap();
     cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
-    let answer = "𐍈".repeat(crate::agent::todo::MAX_FINDING_CHARS);
+    let answer = "𐍈".repeat(4_000); // agent::todo::MAX_FINDING_CHARS
     let refs = vec!["src/router.rs:3".into()];
     assert!(
         cache

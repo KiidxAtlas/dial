@@ -1,8 +1,7 @@
 //! Explicit human feedback bound to immutable artifact content and source lines.
 use crate::config::paths::Layout;
 use crate::config::settings_store;
-use crate::tools::artifact::ArtifactStore;
-use crate::tools::resources;
+use crate::storage::artifact::ArtifactStore;
 use anyhow::{Result, ensure};
 use clap::Args;
 use sha2::{Digest, Sha256};
@@ -32,7 +31,7 @@ pub struct AnnotateArgs {
 }
 use crate::storage::annotations::Annotation;
 pub fn run(layout: &Layout, args: &AnnotateArgs) -> Result<()> {
-    let id = resources::artifact_id(&args.artifact).map_err(anyhow::Error::msg)?;
+    let id = crate::storage::artifact::artifact_id(&args.artifact).map_err(anyhow::Error::msg)?;
     let root = layout.state_dir.join("annotations").join(&id);
     if args.list {
         let notes = crate::storage::annotations::read(
@@ -96,7 +95,7 @@ pub fn run(layout: &Layout, args: &AnnotateArgs) -> Result<()> {
     };
     let bytes = serde_json::to_vec(&annotation)?;
     let key = format!("{:x}", Sha256::digest(&bytes));
-    settings_store::private_dir(&root)?;
+    crate::platform::atomic::private_dir(&root)?;
     // Content-addressed records avoid overwriting simultaneous annotations. GC scans their
     // artifact references through the existing state-file traversal, preserving target blobs.
     settings_store::write_private(&root.join(format!("{key}.json")), &bytes)?;

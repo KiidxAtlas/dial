@@ -37,9 +37,9 @@ impl<'a> Agent<'a> {
                 .behavioral_checks
                 .contains(&check.name)
         }) {
-            repair_evidence::CheckKind::Behavioral
+            crate::storage::repair_evidence::CheckKind::Behavioral
         } else {
-            repair_evidence::CheckKind::SyntaxOnly
+            crate::storage::repair_evidence::CheckKind::SyntaxOnly
         };
         let check = configured
             .map(|check| verification::FocusedCheck {
@@ -65,7 +65,7 @@ impl<'a> Agent<'a> {
         let exit = verdict.repair_exit_code(output);
         let passed = verdict == verification::CheckStatus::Passed;
         if !self.hermetic
-            && matches!(kind, repair_evidence::CheckKind::Behavioral)
+            && matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral)
             && let Some(cache) = self.codebase.clone()
         {
             let command = command.to_owned();
@@ -79,10 +79,10 @@ impl<'a> Agent<'a> {
         }
         self.assistance.check(
             command,
-            passed && matches!(kind, repair_evidence::CheckKind::Behavioral),
+            passed && matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral),
         );
         self.verifications.push(passed);
-        if matches!(kind, repair_evidence::CheckKind::Behavioral) {
+        if matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral) {
             self.behavioral_checks.push(passed);
         }
         let _ = self.record(
@@ -121,7 +121,7 @@ impl<'a> Agent<'a> {
                 }
             }
             let evidence_ref = artifacts.retain(&output.text)?;
-            let run = repair_evidence::CheckRun {
+            let run = crate::storage::repair_evidence::CheckRun {
                 command: command.to_owned(),
                 cwd: self.workspace.root().to_string_lossy().into_owned(),
                 objective: configured

@@ -1009,12 +1009,11 @@ fn image_references_reach_both_provider_wire_formats() {
     let root = tempfile::tempdir().unwrap();
     let png = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY4cAAAAASUVORK5CYII=").unwrap();
     std::fs::write(root.path().join("tiny.png"), &png).unwrap();
-    let (message, warnings) = crate::agent::context::expand_message(
-        root.path(),
-        "Describe @tiny.png",
-        &std::sync::atomic::AtomicBool::new(false),
-    );
-    assert!(warnings.is_empty());
+    let message = json!({
+        "role": "user",
+        "content": "Describe @tiny.png",
+        "dial_images": [llm::images::user_attachment(root.path(), std::path::Path::new("tiny.png")).unwrap()],
+    });
     assert!(!message.to_string().contains("base64"));
     for (anthropic, vision) in [
         (false, Some(true)),
@@ -1473,7 +1472,7 @@ fn vision_steering_status_and_notice_respect_manual_automatic_and_disabled_setti
                 assert_eq!(local.steering_runtime()["state"], state);
                 assert_eq!(local.steering_runtime()["uses"], 0);
                 assert_eq!(notices.len(), notice_count, "{notices:?}");
-                assert!(!crate::steering::vector_path(&config).exists());
+                assert!(!crate::llm::steering::vector_path(&config).exists());
             });
         }
     });

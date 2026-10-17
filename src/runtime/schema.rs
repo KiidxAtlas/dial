@@ -26,7 +26,7 @@
 //! Unlike `calls::validate`, which checks flat tool arguments against dial's own schemas, this one
 //! recurses, because a delegated result may be any shape the parent asked for.
 use regex::Regex;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -923,3 +923,25 @@ fn type_of(value: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+/// OpenAI-style function schema for a built-in or core-owned tool: `{"type":"function",...}`.
+pub(crate) fn tool_schema(
+    name: &str,
+    description: &str,
+    properties: Value,
+    required: &[&str],
+) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": false,
+            },
+        },
+    })
+}

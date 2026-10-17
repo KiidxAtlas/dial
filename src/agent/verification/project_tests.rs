@@ -99,7 +99,7 @@ fn structured_outcomes_never_convert_setup_or_empty_checks_into_success() {
             CheckStatus::Unverified,
         ),
     ] {
-        let output = crate::tools::ToolOutput {
+        let output = crate::runtime::tool_output::ToolOutput {
             execution: Default::default(),
             text: text.into(),
             is_error: error,

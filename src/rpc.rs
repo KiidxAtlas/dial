@@ -3,8 +3,8 @@ use crate::agent::todo::TodoList;
 use crate::agent::{Agent, Decision, Ui, make_backend};
 use crate::config::paths::Layout;
 use crate::config::types::Config;
+use crate::runtime::tool_output::ToolOutput;
 use crate::storage::session::{Session, SessionMeta};
-use crate::tools::ToolOutput;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{

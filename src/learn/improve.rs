@@ -1338,7 +1338,7 @@ fn steering_candidate(
     config: &Config,
     store: &Store,
     active: &Version,
-    steering: &crate::steering::Specification,
+    steering: &crate::llm::steering::Specification,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(WeightCandidate, Value)> {
     let train = config.training.train_data.canonicalize()?;
@@ -1425,7 +1425,7 @@ fn screen_weights(
         None => {}
     }
     if weight_unavailable(config, &serving_capabilities(store)?).is_none() {
-        match crate::steering::specification(config, &config.model) {
+        match crate::llm::steering::specification(config, &config.model) {
             Ok(Some(steering)) => {
                 let mut baked: Vec<String> = store
                     .get_meta(BAKED_STEERING)?

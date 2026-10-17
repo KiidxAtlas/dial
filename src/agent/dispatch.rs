@@ -26,7 +26,7 @@ pub(super) fn callback_image(
     }
     // `github` file_read attaches PNG bytes as `data.artifact`, the same shape browser screenshots use.
     let reference = if call.name == "browser" || call.name == "computer" || call.name == "github" {
-        tools::artifact::capture_image(workspace.artifacts(), output)?
+        crate::storage::artifact::capture_image(workspace.artifacts(), output)?
     } else if call.name == "read"
         && let Some(path) = call.arguments["path"]
             .as_str()
@@ -954,7 +954,7 @@ impl<'a> Agent<'a> {
                             .and_then(Value::as_str)
                             .is_some_and(|skill| !self.modes.launch.skill_visible(skill)) =>
                     {
-                        crate::tools::ToolOutput {
+                        crate::runtime::tool_output::ToolOutput {
                             execution: Default::default(),
                             data: None,
                             text: "skill is withheld by the --skills launch allowlist".into(),

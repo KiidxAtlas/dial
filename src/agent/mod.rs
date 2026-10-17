@@ -123,14 +123,15 @@ use crate::learn::verify::Check;
 use crate::learn::worker;
 use crate::llm::provider::{Backend, ProviderKind};
 use crate::llm::{self, Chat, ToolCall};
+use crate::runtime::tool_output::ToolOutput;
 use crate::storage::checkpoint::Checkpoints;
-use crate::storage::codebase::Codebase;
-use crate::storage::provenance::ProvenanceMemory;
 use crate::storage::session::{self, Session};
 use crate::storage::skills;
 use crate::storage::store::Store;
+use crate::tools::codebase::Codebase;
 use crate::tools::ext::{LifecycleEvent, Registry, ToolContext};
-use crate::tools::{self, ToolOutput, Workspace};
+use crate::tools::provenance::ProvenanceMemory;
+use crate::tools::{self, Workspace};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -314,7 +315,7 @@ pub struct Agent<'a> {
     memory_runtime: Option<Arc<crate::storage::memory_backend::MemoryRuntime>>,
     codebase: Option<Arc<Codebase>>,
     /// Per-turn code diffs searchable across sessions (`code_history`); `None` when disabled.
-    history: Option<Arc<crate::storage::history::ChangeHistory>>,
+    history: Option<Arc<crate::tools::history::ChangeHistory>>,
     experience: Option<Arc<crate::storage::experience::Experience>>,
     assistance: assistance::State,
     checkpoints: Option<Arc<Checkpoints>>,
@@ -402,3 +403,6 @@ pub struct Agent<'a> {
     /// session and `session_end` is due when the agent goes away.
     session_lifecycle: bool,
 }
+
+#[cfg(test)]
+mod subscription_tests;

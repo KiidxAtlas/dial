@@ -5,8 +5,9 @@ use crate::config::tools::dap::DapAdapterConfig;
 use crate::config::tools::dap::DapTransport;
 
 use super::shell::ProcessGroup;
+use crate::runtime::tool_output::ToolOutput;
 use crate::tools::ext::{Tool, ToolContext, ToolEvent};
-use crate::tools::{ToolOutput, Workspace, tool_schema};
+use crate::tools::{Workspace, tool_schema};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;

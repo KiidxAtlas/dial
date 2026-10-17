@@ -4,11 +4,9 @@
 //! paths; global facts are visible in every project. Legacy text files are only read by an explicit
 //! approved import and are never overwritten. Retrieved notes are untrusted data, not instructions.
 use crate::config::paths::Layout;
+use crate::runtime::tool_output::ToolOutput;
 use crate::storage::memory::screen;
-use crate::tools::{
-    ToolOutput,
-    ext::{Tool, ToolContext},
-};
+use crate::tools::ext::{Tool, ToolContext};
 use anyhow::{Context, Result, ensure};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};

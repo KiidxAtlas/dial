@@ -4,7 +4,7 @@
 //! and resource indicators (RFC 8707). Grants are stored per server in the private user
 //! directory and refreshed with their refresh token. [`login`] is the `/mcp login <server>` entry.
 
-use crate::config::settings_store::{locked, read_private, write_private};
+use crate::config::settings_store::{locked, write_private};
 use crate::config::types::McpServerConfig;
 use crate::llm::oauth::util::{self, Body, Callback, Response};
 use crate::llm::oauth::{Interaction, Login};
@@ -82,7 +82,7 @@ impl TokenSource {
             return Ok(Self::empty(PathBuf::new()));
         }
         let path = grant_path(user_dir, server);
-        let grant = match read_private(&path)? {
+        let grant = match crate::platform::atomic::read_private(&path)? {
             Some(bytes) => Some(serde_json::from_slice::<Grant>(&bytes).with_context(|| {
                 format!("stored OAuth grant for MCP server `{server}` is corrupt; sign in again")
             })?),

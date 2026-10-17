@@ -978,7 +978,7 @@ impl CompactionRuntime {
                         .as_ref()
                         .err()
                         .and_then(|error| {
-                            error.downcast_ref::<compaction::NativeCompactionFailure>()
+                            error.downcast_ref::<crate::llm::provider::NativeCompactionFailure>()
                         })
                         .is_some_and(|failure| !llm::is_transient(&failure.cause));
                 let state = if deadline.timed_out.load(Ordering::SeqCst) {

@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) fn defer_architecture_attempt_on_failure<T>(
     cache: &Codebase,
-    synthesis: &crate::storage::codebase::architecture::Synthesis,
+    synthesis: &crate::tools::codebase::architecture::Synthesis,
     result: Result<T>,
 ) -> Result<T> {
     if result.is_err() {
@@ -259,7 +259,7 @@ impl<'a> Agent<'a> {
         ui.notice(&timeout_notice);
         let request = Chat {
             messages: vec![
-                json!({"role":"system","content":crate::storage::codebase::architecture::SYSTEM}),
+                json!({"role":"system","content":crate::tools::codebase::architecture::SYSTEM}),
                 json!({"role":"user","content":synthesis.prompt}),
             ],
             tools: vec![],

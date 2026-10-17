@@ -6,7 +6,6 @@ use fs2::FileExt;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Read,
     path::{Path, PathBuf},
     sync::{
         LazyLock, Mutex,
@@ -16,9 +15,9 @@ use std::{
 };
 
 use crate::config::session_models::SessionModels;
+use crate::platform::atomic::{check_file, private_dir};
 use crate::platform::fs as platform_fs;
 
-const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_HISTORY: usize = 10_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -32,54 +31,6 @@ pub enum Change {
 
 // Compatibility exports; publication mechanics and private path policy have a neutral owner.
 pub(crate) use crate::platform::atomic::{validate_private_path, write_private};
-
-pub(crate) fn private_dir(dir: &Path) -> Result<()> {
-    validate_private_path(dir)?;
-    match fs::symlink_metadata(dir) {
-        Ok(meta) => {
-            ensure!(
-                meta.is_dir() && !meta.file_type().is_symlink(),
-                "private storage directory is not a regular directory"
-            );
-            ensure!(
-                platform_fs::path_owned_by_current_user(dir)?,
-                "private storage directory has another owner"
-            );
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let parent = dir.parent().context("private directory has no parent")?;
-            if !parent.exists() {
-                private_dir(parent)?;
-            }
-            match platform_fs::create_dir_owner_only(&fs::DirBuilder::new(), dir) {
-                Ok(()) => {}
-                // Another owner thread/process may create the shared store concurrently.
-                // Re-enter validation; never treat an arbitrary pre-existing path as trusted.
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return private_dir(dir);
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(e) => return Err(e.into()),
-    }
-    platform_fs::set_owner_only(dir)?;
-    Ok(())
-}
-
-fn check_file(file: &File) -> Result<()> {
-    let meta = file.metadata()?;
-    ensure!(
-        meta.is_file()
-            && platform_fs::link_count(file)? == 1
-            && platform_fs::owned_by_current_user(file)?,
-        "private storage target must be an owner-owned regular file without hard links"
-    );
-    if !platform_fs::is_owner_only(file)? {
-        platform_fs::set_owner_only_file(file)?;
-    }
-    Ok(())
-}
 
 fn open_lock(path: &Path) -> Result<File> {
     private_dir(path.parent().context("storage path has no parent")?)?;
@@ -144,27 +95,6 @@ pub(crate) fn locked_for(
     }
 }
 
-pub(crate) fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
-    validate_private_path(path.parent().context("storage path has no parent")?)?;
-    let file = match platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    check_file(&file)?;
-    ensure!(
-        file.metadata()?.len() <= MAX_FILE_BYTES,
-        "private storage file exceeds size limit"
-    );
-    let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_FILE_BYTES,
-        "private storage file exceeds size limit"
-    );
-    Ok(Some(bytes))
-}
-
 fn patch(
     table: &mut toml::map::Map<String, toml::Value>,
     parts: &[&str],
@@ -193,7 +123,7 @@ fn patch(
 }
 
 fn changed_document(path: &Path, changes: &[Change]) -> Result<toml::Table> {
-    let mut doc = match read_private(path)? {
+    let mut doc = match crate::platform::atomic::read_private(path)? {
         Some(bytes) => std::str::from_utf8(&bytes)
             .context("settings are not UTF-8")?
             .parse::<toml::Table>()
@@ -306,7 +236,7 @@ fn save_config_with_project_resets(
     let selected_bytes = toml::to_string_pretty(&layers[selected])?;
     if reset_project {
         let project_bytes = toml::to_string_pretty(&layers[1])?;
-        let original = read_private(&files[0])?;
+        let original = crate::platform::atomic::read_private(&files[0])?;
         write_private(&files[0], selected_bytes.as_bytes())?;
         if let Err(error) = write_private(&files[1], project_bytes.as_bytes()) {
             // Roll back the first publication if the second fails. Never hide partial saves.
@@ -368,7 +298,7 @@ fn prepare_config(
 /// value comes from the global file, the project file, or the built-in default.
 pub fn load_layer(layout: &Layout, scope: Scope) -> Result<toml::Table> {
     let path = &layout.config_files()[if scope == Scope::Global { 0 } else { 1 }];
-    match read_private(path)? {
+    match crate::platform::atomic::read_private(path)? {
         Some(bytes) => Ok(std::str::from_utf8(&bytes)
             .context("settings are not UTF-8")?
             .parse::<toml::Table>()
@@ -528,7 +458,7 @@ fn history_path(layout: &Layout) -> Result<PathBuf> {
     Ok(layout.state_dir.join("prompt-history.json"))
 }
 fn history_read(path: &Path) -> Result<Vec<String>> {
-    match read_private(path)? {
+    match crate::platform::atomic::read_private(path)? {
         None => Ok(Vec::new()),
         Some(bytes) => serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("submitted prompt history is invalid JSON")),

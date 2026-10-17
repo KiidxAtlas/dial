@@ -30,7 +30,10 @@ impl CheckStatus {
 
     /// Only completed, classified checks can establish a repair baseline or its passing result.
     /// Unknown runs must still reach the tracker with `None` to invalidate an earlier baseline.
-    pub(super) fn repair_exit_code(self, output: &crate::tools::ToolOutput) -> Option<i32> {
+    pub(super) fn repair_exit_code(
+        self,
+        output: &crate::runtime::tool_output::ToolOutput,
+    ) -> Option<i32> {
         let code = output.process_outcome()?.exit_code?;
         match self {
             Self::Passed if code == 0 => Some(code),
@@ -42,7 +45,7 @@ impl CheckStatus {
 
 pub fn classify(
     check: &FocusedCheck,
-    output: &crate::tools::ToolOutput,
+    output: &crate::runtime::tool_output::ToolOutput,
     cancelled: bool,
 ) -> CheckStatus {
     classify_output(Some(check), output, cancelled)
@@ -53,7 +56,7 @@ pub fn classify(
 /// Success requires observed process completion, not printed prose such as `[exit code: 0]`.
 pub(super) fn classify_output(
     check: Option<&FocusedCheck>,
-    output: &crate::tools::ToolOutput,
+    output: &crate::runtime::tool_output::ToolOutput,
     cancelled: bool,
 ) -> CheckStatus {
     let process = output.process_outcome();

@@ -8,20 +8,20 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub(crate) struct ProcId {
-    pub(crate) pid: i32,
+pub struct ProcId {
+    pub pid: i32,
     /// Start time in kernel-specific units; only ever compared for equality.
-    pub(crate) start: u64,
+    pub start: u64,
 }
 
 /// Kill signal for `ProcId::signal_group`. Windows has no signals; its group kill is always forceful.
 #[cfg(unix)]
-pub(crate) const SIGKILL: i32 = libc::SIGKILL;
+pub const SIGKILL: i32 = libc::SIGKILL;
 #[cfg(windows)]
-pub(crate) const SIGKILL: i32 = 9;
+pub const SIGKILL: i32 = 9;
 
 impl ProcId {
-    pub(crate) fn of(pid: i32) -> Option<ProcId> {
+    pub fn of(pid: i32) -> Option<ProcId> {
         if pid <= 1 {
             return None;
         }
@@ -29,24 +29,24 @@ impl ProcId {
         (!zombie && start != 0).then_some(ProcId { pid, start })
     }
 
-    pub(crate) fn current() -> Option<ProcId> {
+    pub fn current() -> Option<ProcId> {
         Self::of(std::process::id() as i32)
     }
 
     /// The same process still exists, zombie or not. A zombie group leader can still have live
     /// group members, so group signalling uses this rather than `alive`.
-    pub(crate) fn same_process(&self) -> bool {
+    pub fn same_process(&self) -> bool {
         self.start != 0 && probe(self.pid).is_some_and(|(start, _)| start == self.start)
     }
 
     /// The process is running and not a zombie (exited, zombie or reused PIDs are not).
-    pub(crate) fn alive(&self) -> bool {
+    pub fn alive(&self) -> bool {
         Self::of(self.pid).is_some_and(|live| live == *self)
     }
 
     /// Signal this process's group (`pgid == pid`) only while the identity still matches.
     #[cfg(unix)]
-    pub(crate) fn signal_group(&self, signal: i32) -> bool {
+    pub fn signal_group(&self, signal: i32) -> bool {
         self.same_process() && unsafe { libc::killpg(self.pid, signal) } == 0
     }
 
@@ -54,7 +54,7 @@ impl ProcId {
     /// matches. The identity is read and the kill issued on one handle, which pins the process
     /// object, so a recycled PID can never be the target. Windows has no signals.
     #[cfg(windows)]
-    pub(crate) fn signal_group(&self, _signal: i32) -> bool {
+    pub fn signal_group(&self, _signal: i32) -> bool {
         use std::os::windows::io::AsHandle;
         self.start != 0
             && win::open(self.pid, win::KILL_ACCESS).is_some_and(|handle| {
@@ -65,7 +65,7 @@ impl ProcId {
 
     /// Signal just this process only while the identity still matches.
     #[cfg(unix)]
-    pub(crate) fn signal(&self, signal: i32) -> bool {
+    pub fn signal(&self, signal: i32) -> bool {
         self.alive() && unsafe { libc::kill(self.pid, signal) } == 0
     }
 }

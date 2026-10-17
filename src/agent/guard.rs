@@ -633,7 +633,11 @@ pub struct PaceGuard {
 
 impl PaceGuard {
     /// Observe one finished call; returns guidance when it repeats a still-current shell command.
-    pub fn call(&mut self, call: &ToolCall, output: &crate::tools::ToolOutput) -> Option<String> {
+    pub fn call(
+        &mut self,
+        call: &ToolCall,
+        output: &crate::runtime::tool_output::ToolOutput,
+    ) -> Option<String> {
         use crate::runtime::execution::ToolStatus;
         let observing = OBSERVING_TOOLS.contains(&call.name.as_str());
         if call.name != "bash" {

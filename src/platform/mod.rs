@@ -330,6 +330,8 @@ pub mod process {
 
 pub(crate) mod atomic;
 pub mod interrupt;
+pub mod process_record;
+pub mod procinfo;
 /// Event-driven waits: pipe readiness, child exit, and cancellation wakeups.
 pub mod wake;
 

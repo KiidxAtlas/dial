@@ -753,7 +753,7 @@ fn streaming_output_precedes_result_and_has_bounded_chunks() {
 fn complete_artifact_keeps_middle_of_large_binary_output() {
     let (_dir, ws) = workspace();
     let artifacts = tempfile::tempdir().unwrap();
-    let store = super::super::artifact::ArtifactStore::new(artifacts.path()).unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(artifacts.path()).unwrap();
     let ws = ws.without_sandbox().with_artifacts(store);
     let output = bash_tool_streaming(&ws, &json!({
         "command": "printf 'BEGIN\\n'; head -c 1048576 /dev/zero; printf '\\nMIDDLE\\n'; head -c 1048576 /dev/zero; printf '\\nEND\\n'"

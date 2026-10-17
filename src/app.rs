@@ -23,10 +23,10 @@ use crate::learn::auto;
 use crate::llm::model_config::{ModelSelection, ProviderSpec, ROLES, UiConfig};
 use crate::llm::{catalog, usage};
 use crate::repl::{OutputFormat, PrintExit, PrintUi};
+use crate::runtime::tool_output::ToolOutput;
 use crate::storage::session::{Session, SessionMeta};
 use crate::storage::skills;
 use crate::storage::store::Store;
-use crate::tools::ToolOutput;
 use crate::ui::composer::{CommandEntry, CommandKind, Composer, ComposerCtx, ComposerEvent};
 use crate::ui::keys::{Action, Keymap};
 use crate::ui::markdown::truncate_spans;
@@ -4173,9 +4173,11 @@ impl Shell {
                 .map(|ws| ws.with_shell_backend(app.config.shell.backend))
             })
             .and_then(|ws| {
-                Ok(ws.with_artifacts(tools::artifact::ArtifactStore::new(
-                    &layout.state_dir.join("artifacts"),
-                )?))
+                Ok(
+                    ws.with_artifacts(crate::storage::artifact::ArtifactStore::new(
+                        &layout.state_dir.join("artifacts"),
+                    )?),
+                )
             });
         let output = match ws {
             Ok(ws) => {
@@ -7609,7 +7611,7 @@ impl Shell {
                 self.note("Todo", text)
             }
             "skills" => {
-                let words = context::split_words(args);
+                let words = crate::runtime::arguments::split_words(args);
                 if matches!(words.first().map(String::as_str), Some("install" | "update")) {
                     // Network-bound: run in the job slot so the UI keeps responding; progress streams in.
                     let layout = app.layout.clone();
@@ -7674,7 +7676,7 @@ impl Shell {
                 }
             }
             "code-history" => {
-                use crate::storage::history::{self, ChangeHistory, Request};
+                use crate::tools::history::{self, ChangeHistory, Request};
                 if !(app.config.codebase.enabled && app.config.codebase.history) {
                     self.note("Code history", "Code history is off. Turn it on in /settings → Project understanding → Code change history (codebase.history).");
                     return Ok(Step::Done);
@@ -7705,7 +7707,7 @@ impl Shell {
                 self.note("Code history", text.unwrap_or_else(|error| format!("{error:#}")));
             }
             "understanding" if args == "clear" => {
-                let result = crate::storage::codebase::Codebase::open(&app.layout)
+                let result = crate::tools::codebase::Codebase::open(&app.layout)
                     .and_then(|cache| cache.clear_architecture());
                 match result {
                     Ok(removed) => self.note(
@@ -7736,9 +7738,9 @@ impl Shell {
                 match result {
                     Ok(()) => {
                         let cancel = app.interrupt.clone();
-                        let text = crate::storage::codebase::Codebase::open(&app.layout)
+                        let text = crate::tools::codebase::Codebase::open(&app.layout)
                             .and_then(|cache| cache.understanding("architecture", &cancel))
-                            .map(|report| crate::storage::codebase::render_understanding(&report, 40))
+                            .map(|report| crate::tools::codebase::render_understanding(&report, 40))
                             .unwrap_or_else(|error| format!("{error:#}"));
                         bridge.shell.note("Understanding", text);
                     }
@@ -7827,10 +7829,10 @@ impl Shell {
                     let cancel = app.interrupt.clone();
                     scope.spawn(move || {
                         let _ = tx.send(
-                            crate::storage::codebase::Codebase::open(layout)
+                            crate::tools::codebase::Codebase::open(layout)
                                 .and_then(|cache| cache.understanding(args, &cancel))
                                 .map(|report| {
-                                    crate::storage::codebase::render_understanding(&report, 40)
+                                    crate::tools::codebase::render_understanding(&report, 40)
                                 }),
                         );
                     });

@@ -1,4 +1,9 @@
 use super::*;
+use crate::llm::{
+    self,
+    server::{ServerProfile, ensure_profile_tracked, tests::fake_python},
+};
+use serde_json::json;
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_reads_real_memory_footprint_and_handles_an_exited_pid() {
@@ -139,5 +144,50 @@ fn stop_rechecks_identity_and_terminates_only_the_selected_child() {
             .unwrap()
             .iter()
             .any(|row| row["pid"] == child.id())
+    );
+}
+
+#[test]
+fn tracked_server_exposes_model_phase_and_cleans_up_on_stop() {
+    if crate::learn::processes::live_inspection_unavailable() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let python = fake_python(root.path());
+    let model_path = root.path().join("model-one");
+    let model = model_path.to_str().unwrap();
+    let config = crate::config::types::Config {
+        user_dir: root.path().join("user"),
+        state_dir: root.path().join("state"),
+        project_root: root.path().join("project"),
+        ..Default::default()
+    };
+    let mut slot = None;
+    let server = ensure_profile_tracked(
+        &mut slot,
+        ServerProfile {
+            python: &python,
+            model,
+            adapter: None,
+            steering: None,
+            context: Some(&config),
+            runtime: &llm::local_runtime::LocalRuntime::default(),
+        },
+        30,
+        None,
+    )
+    .unwrap();
+    server.phase("generating").unwrap();
+    let rows = crate::learn::processes::snapshot(&config.user_dir).unwrap();
+    let row = rows.iter().find(|row| row["model"] == model).unwrap();
+    assert_eq!(row["phase"], "generating");
+    assert_eq!(row["project"], json!(config.project_root));
+    let pid = row["pid"].clone();
+    server.stop();
+    assert!(
+        !crate::learn::processes::snapshot(&config.user_dir)
+            .unwrap()
+            .iter()
+            .any(|row| row["pid"] == pid)
     );
 }

@@ -16,7 +16,7 @@
 
 #[path = "compaction.rs"]
 pub(super) mod compaction;
-pub use compaction::NativeCompactionReply;
+pub use compaction::{NativeCompactionFailure, NativeCompactionReply};
 
 use super::model_config::ApiProtocol;
 use super::server::{self, ModelServer};
@@ -273,7 +273,7 @@ pub struct Backend {
     python: PathBuf,
     startup_timeout_secs: u64,
     allow_insecure: bool,
-    retry_backoff: Duration,
+    pub(crate) retry_backoff: Duration,
     remote_idle_timeout_secs: u64,
     server: Option<ModelServer>,
     adapter_monitor: AdapterMonitor,
@@ -310,6 +310,15 @@ pub struct Backend {
     /// Penalty hints for loop recovery (`set_loop_penalty`); `None` disables retries.
     loop_penalty: Option<llm::local_hints::LocalHints>,
     loop_penalty_retries: u32,
+}
+
+/// The conversation state a backend binds to. The storage layer's `Session` implements it, so the
+/// provider never depends on session persistence.
+pub trait BoundSession {
+    fn id(&self) -> &str;
+    fn messages(&self) -> Vec<serde_json::Value>;
+    fn control_state(&self) -> serde_json::Value;
+    fn set_control_state(&mut self, state: serde_json::Value) -> Result<()>;
 }
 
 impl Backend {
@@ -454,7 +463,7 @@ impl Backend {
     pub fn bind_session(
         &mut self,
         config: &crate::config::types::Config,
-        session: &mut crate::storage::session::Session,
+        session: &mut impl BoundSession,
     ) -> Result<()> {
         if self.session_id.as_deref() != Some(session.id()) {
             self.image_notices = Default::default();
@@ -1314,7 +1323,8 @@ impl Backend {
                     phase: AdapterPhase::Loading,
                 };
                 let steering = self.steering_config.as_ref().and_then(|config| {
-                    if let Some(reason) = crate::steering::local_unsupported_reason(model_dir) {
+                    if let Some(reason) = crate::llm::steering::local_unsupported_reason(model_dir)
+                    {
                         if (config.steering.enabled || config.steering.automatic)
                             && config.steering.strength > 0.0
                         {
@@ -1331,7 +1341,7 @@ impl Backend {
                         }
                         return None;
                     }
-                    match crate::steering::specification(config, model_dir) {
+                    match crate::llm::steering::specification(config, model_dir) {
                         Ok(spec) => spec,
                         Err(error) => {
                             if let Some(notice) = Self::steering_bypass(
@@ -1437,7 +1447,7 @@ impl Backend {
                 let result = result.map_err(|error| server.abort_request(error));
                 if result.is_ok() && steering.is_some() {
                     let previous = self.steering_runtime["state"].clone();
-                    self.steering_runtime = crate::steering::runtime(server.base_url())
+                    self.steering_runtime = crate::llm::steering::runtime(server.base_url())
                         .unwrap_or_else(
                             |e| serde_json::json!({"state":"unconfirmed","reason":e.to_string()}),
                         );
@@ -1466,7 +1476,7 @@ impl Backend {
                         .as_ref()
                         .is_some_and(|p| p.capabilities.strict_tools)
                     {
-                        crate::reliability::normalize_reply(&mut reply, &req.tools);
+                        crate::llm::reliability::normalize_reply(&mut reply, &req.tools);
                     }
                     reply
                 });
@@ -1808,7 +1818,7 @@ impl Backend {
                         .as_ref()
                         .is_some_and(|p| p.capabilities.strict_tools)
                     {
-                        crate::reliability::normalize_reply(&mut reply, &req.tools);
+                        crate::llm::reliability::normalize_reply(&mut reply, &req.tools);
                     }
                     return Ok(reply);
                 }
@@ -2508,7 +2518,7 @@ fn anthropic_request_body(
                 .flatten()
             {
                 if let Some(parameters) =
-                    crate::reliability::strict_parameters(&tool["input_schema"])
+                    crate::llm::reliability::strict_parameters(&tool["input_schema"])
                 {
                     tool["input_schema"] = parameters;
                     tool["strict"] = serde_json::json!(true);

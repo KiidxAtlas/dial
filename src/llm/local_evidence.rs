@@ -245,7 +245,7 @@ impl Evidence {
 /// a bare integer per key (the escalation stage), which maps to `Evidence { stage, .. }`. An entry
 /// that does not parse is skipped, so one damaged record never hides the others.
 pub fn read(user_dir: &Path) -> Result<BTreeMap<String, Evidence>> {
-    let Some(bytes) = settings_store::read_private(&user_dir.join(FILE))? else {
+    let Some(bytes) = crate::platform::atomic::read_private(&user_dir.join(FILE))? else {
         return Ok(BTreeMap::new());
     };
     let root: Value = serde_json::from_slice(&bytes).context("local model evidence is not JSON")?;
@@ -270,7 +270,7 @@ fn entry(value: &Value) -> Option<Evidence> {
 
 /// Merges `delta` into the stored record for `key` under the file lock, and writes it back private.
 pub fn update(user_dir: &Path, key: &str, delta: &Evidence) -> Result<()> {
-    settings_store::private_dir(user_dir)?;
+    crate::platform::atomic::private_dir(user_dir)?;
     let path = user_dir.join(FILE);
     let _lock = settings_store::locked(&path)?;
     let mut all = read(user_dir)?;

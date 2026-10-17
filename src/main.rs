@@ -761,7 +761,7 @@ fn real_main(mut cli: Cli) -> Result<()> {
                 } => {
                     let path = match pending {
                         Some(name) => dial::steering::pending_path(&config, name)?,
-                        None => dial::steering::vector_path(&config),
+                        None => dial::llm::steering::vector_path(&config),
                     };
                     println!(
                         "{}",
@@ -804,7 +804,7 @@ fn real_main(mut cli: Cli) -> Result<()> {
             return Ok(());
         }
         Some(Command::Understanding { query, json }) => {
-            let report = dial::storage::codebase::Codebase::open(&layout)?.understanding(
+            let report = dial::tools::codebase::Codebase::open(&layout)?.understanding(
                 query.as_deref().unwrap_or(""),
                 &std::sync::atomic::AtomicBool::new(false),
             )?;
@@ -813,7 +813,7 @@ fn real_main(mut cli: Cli) -> Result<()> {
             } else {
                 println!(
                     "{}",
-                    dial::storage::codebase::render_understanding(&report, usize::MAX)
+                    dial::tools::codebase::render_understanding(&report, usize::MAX)
                 );
             }
             return Ok(());

@@ -97,7 +97,7 @@ impl<'a> Agent<'a> {
             && !changed_files.is_empty()
         {
             let recorded = checkpoints.turn_versions(turn).and_then(|versions| {
-                let branch = crate::storage::history::current_branch(self.workspace.root());
+                let branch = crate::tools::history::current_branch(self.workspace.root());
                 history.record(
                     self.session.id(),
                     turn,
@@ -465,10 +465,9 @@ impl<'a> Agent<'a> {
             let matching: Vec<i64> = related
                 .iter()
                 .filter_map(|(trajectory, payload)| {
-                    let record: repair_evidence::RepairRecord =
+                    let record: crate::storage::repair_evidence::RepairRecord =
                         serde_json::from_value(payload.clone()).ok()?;
-                    record
-                        .matches_current(&self.workspace, &mut hash_budget)
+                    repair_evidence::matches_current(&record, &self.workspace, &mut hash_budget)
                         .then_some(*trajectory)
                 })
                 .collect();

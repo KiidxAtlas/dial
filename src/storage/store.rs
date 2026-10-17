@@ -823,7 +823,7 @@ impl Store {
         version: i64,
         payload: &Value,
     ) -> Result<bool> {
-        let record: crate::agent::repair_evidence::RepairRecord =
+        let record: crate::storage::repair_evidence::RepairRecord =
             serde_json::from_value(payload.clone()).context("invalid executable repair record")?;
         ensure!(
             record.valid(),

@@ -1,4 +1,5 @@
 //! Resource identity and routing policy. Parsing is pure; dispatch retains each owner's authority.
+use crate::storage::artifact::artifact_id;
 use serde::Serialize;
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -88,15 +89,6 @@ pub fn scheme(input: &str) -> Result<Scheme, String> {
         };
     }
     Ok(Scheme::File)
-}
-pub fn artifact_id(input: &str) -> Result<String, String> {
-    let id = input
-        .strip_prefix("artifact://")
-        .ok_or("expected artifact:// identifier")?;
-    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("invalid artifact identifier".into());
-    }
-    Ok(id.to_ascii_lowercase())
 }
 
 pub fn path_from_uri(uri: &str) -> Option<PathBuf> {

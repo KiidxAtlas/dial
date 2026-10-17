@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm::wire::{IMAGE_ESTIMATE_TOKENS, estimate_parts, wire_message_bytes};
 
 #[test]
 fn native_progress_calibrates_context_without_double_counting_text() {

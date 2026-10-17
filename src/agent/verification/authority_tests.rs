@@ -6,7 +6,8 @@ fn printed_success_cannot_replace_observed_process_termination() {
         command: "cargo check".into(),
         timeout_secs: 1,
     };
-    let prose = crate::tools::ToolOutput::ok("checks passed\n[exit code: 0]\n".into());
+    let prose =
+        crate::runtime::tool_output::ToolOutput::ok("checks passed\n[exit code: 0]\n".into());
     assert_eq!(classify(&check, &prose, false), CheckStatus::Unverified);
     let failed = prose.with_process(crate::runtime::execution::ProcessOutcome {
         started: true,
@@ -22,7 +23,8 @@ fn printed_success_cannot_replace_observed_process_termination() {
 #[test]
 fn repair_exits_use_typed_completion_and_invalidate_unknown_runs() {
     use crate::runtime::execution::ProcessOutcome;
-    use crate::tools::{ToolOutput, ToolStatus};
+    use crate::runtime::tool_output::ToolOutput;
+    use crate::tools::ToolStatus;
     let check = FocusedCheck {
         name: "python AST: fixture".into(),
         command: "python -m pytest".into(),
@@ -67,11 +69,11 @@ fn repair_exits_use_typed_completion_and_invalidate_unknown_runs() {
             ..process
         }),
     ];
-    let run = |sequence, output: &ToolOutput| super::super::repair_evidence::CheckRun {
+    let run = |sequence, output: &ToolOutput| crate::storage::repair_evidence::CheckRun {
         command: check.command.clone(),
         cwd: "/workspace".into(),
         objective: "fixture".into(),
-        kind: super::super::repair_evidence::CheckKind::Behavioral,
+        kind: crate::storage::repair_evidence::CheckKind::Behavioral,
         tool_call_id: format!("check-{sequence}"),
         evidence_ref: format!("artifact://check-{sequence}"),
         exit_code: classify(&check, output, false).repair_exit_code(output),
@@ -83,7 +85,7 @@ fn repair_exits_use_typed_completion_and_invalidate_unknown_runs() {
         let unknown_run = run(2, &unknown);
         assert_eq!(unknown_run.exit_code, None, "{}", unknown.text);
         assert!(tracker.observe(unknown_run, vec![]).is_none());
-        let change = super::super::repair_evidence::FileChange {
+        let change = crate::storage::repair_evidence::FileChange {
             path: "fixture.py".into(),
             before_sha256: Some("a".repeat(64)),
             after_sha256: Some("b".repeat(64)),

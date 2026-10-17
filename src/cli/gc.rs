@@ -253,7 +253,7 @@ pub fn execute(layout: &Layout, args: &GcArgs, now_ms: i64) -> Result<GcReport> 
     let db_path = layout.user_dir.join(retention::DB_FILE);
     let lock_path = db_path.with_extension("sqlite3.lock");
     let _lock = if args.apply {
-        settings_store::private_dir(&layout.user_dir)?;
+        crate::platform::atomic::private_dir(&layout.user_dir)?;
         Some(settings_store::locked(&db_path)?)
     } else {
         None
@@ -753,8 +753,8 @@ fn restore_archived(dest: &Path, original: &Path) -> Result<(), String> {
 /// Open the gc store, make sure the archive directory exists, and begin a run.
 fn open_archive_store(layout: &Layout, settings: &AppliedSettings) -> Result<(Store, i64)> {
     let archive_dir = layout.sessions_dir().join(ARCHIVE_DIR);
-    settings_store::private_dir(&layout.sessions_dir())?;
-    settings_store::private_dir(&archive_dir)?;
+    crate::platform::atomic::private_dir(&layout.sessions_dir())?;
+    crate::platform::atomic::private_dir(&archive_dir)?;
     let store = Store::open(&layout.user_dir)?;
     let run_id = store.begin_run(settings)?;
     Ok((store, run_id))

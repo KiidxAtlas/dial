@@ -17,9 +17,10 @@ use super::contracts::{
     self, CloudRef, Confidence, Disposition, Finding, Location, Producer, Scan, ScanStatus,
     Severity, TargetKind, ValidationEvidence, ValidationStatus,
 };
-use super::store::{Store, format_utc};
+use super::store::Store;
 use crate::llm::chatgpt;
 use crate::llm::oauth::util::{self, Body};
+use crate::runtime::clock::format_utc;
 
 pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/aardvark";
 const USER_AGENT: &str = "dial";

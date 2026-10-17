@@ -220,7 +220,7 @@ fn run_command_handoff(
         .unwrap_or_else(|| "working".into());
     let _record = tracking
         .map(|config| {
-            super::processes::Record::new(
+            crate::platform::process_record::Record::new(
                 &config.user_dir,
                 group.child.id(),
                 "models",

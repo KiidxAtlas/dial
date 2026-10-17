@@ -853,7 +853,7 @@ impl Keymap {
             };
             table.insert(action.id().to_owned(), value);
         }
-        crate::config::settings_store::private_dir(user_dir)?;
+        crate::platform::atomic::private_dir(user_dir)?;
         crate::config::settings_store::write_private(
             &path,
             toml::to_string_pretty(&table)?.as_bytes(),

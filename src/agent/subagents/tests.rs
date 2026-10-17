@@ -110,7 +110,7 @@ fn synchronous_previews_retain_complete_single_and_batch_reports() {
     use base64::Engine;
     let config = config(&[]);
     let root = tempfile::tempdir().unwrap();
-    let store = crate::tools::artifact::ArtifactStore::new(root.path()).unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(root.path()).unwrap();
     let report = format!("{}FINAL-EVIDENCE", "évidence ".repeat(4000));
     for batch in [false, true] {
         let args = if batch {
@@ -169,9 +169,9 @@ fn synchronous_retention_failure_and_absence_preserve_full_typed_report() {
     let config = config(&[]);
     let request = parse(&json!({"task":"audit", "solution_space":"s"}), &config).unwrap();
     let root = tempfile::tempdir().unwrap();
-    let store = crate::tools::artifact::ArtifactStore::new(root.path())
+    let store = crate::storage::artifact::ArtifactStore::new(root.path())
         .unwrap()
-        .with_limits(&crate::tools::artifact::ArtifactConfig {
+        .with_limits(&crate::storage::artifact::ArtifactConfig {
             max_bytes: 128,
             head_bytes: 64,
         });

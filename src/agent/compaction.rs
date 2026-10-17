@@ -11,7 +11,9 @@ use crate::config::compaction::CompactionOptions;
 use crate::config::compaction::CompactionReason;
 use crate::config::compaction::CompactionStrategy;
 use crate::config::compaction::NativeCompactionCapability;
+use crate::llm::wire::estimate;
 
+use crate::storage::transcript::{complete_boundary, is_history};
 mod summary;
 use super::Ui;
 use crate::{
@@ -51,22 +53,6 @@ pub struct CompactionOutcome {
     pub reset_entry_id: Option<String>,
     pub reset_digest: Option<String>,
     pub journal_warning: Option<String>,
-}
-
-/// Only an attempted native transport can disable a native route; local preparation errors cannot.
-#[derive(Debug)]
-pub struct NativeCompactionFailure {
-    pub cause: anyhow::Error,
-}
-impl std::fmt::Display for NativeCompactionFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "native compaction failed: {}", self.cause)
-    }
-}
-impl std::error::Error for NativeCompactionFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.cause.as_ref())
-    }
 }
 
 /// No complete message group is older than the keep budget, so there is nothing to summarize yet.
@@ -114,19 +100,6 @@ impl PreparedCompaction {
         history
     }
 }
-pub fn is_history(message: &Value) -> bool {
-    !matches!(message["role"].as_str(), Some("system" | "developer"))
-        && message["dial_transient"] != true
-        && message["dial_portable_rules"] != true
-}
-pub fn estimate(message: &Value) -> u64 {
-    super::context_meter::estimate_parts(std::slice::from_ref(message), &[]).max(
-        message["dial_compaction_output_tokens"]
-            .as_u64()
-            .unwrap_or(0),
-    )
-}
-
 pub fn prompt_budget(policy: &CompactionConfig, window: u32, output: u32) -> u64 {
     u64::from(window.saturating_sub(policy.reserve(window).max(output)))
 }
@@ -177,26 +150,6 @@ pub fn cut(messages: &[Value], budget: u64) -> Option<usize> {
 }
 
 /// A durable boundary never separates a matched call from its result.
-pub fn complete_boundary(messages: &[Value], at: usize) -> bool {
-    let Some(prefix) = messages.get(..at) else {
-        return false;
-    };
-    let mut pending = std::collections::BTreeSet::new();
-    for message in prefix.iter().filter(|m| is_history(m)) {
-        if message["role"] == "assistant" {
-            for call in message["tool_calls"].as_array().into_iter().flatten() {
-                if let Some(id) = call["id"].as_str() {
-                    pending.insert(id.to_owned());
-                }
-            }
-        } else if message["role"] == "tool"
-            && let Some(id) = message["tool_call_id"].as_str()
-        {
-            pending.remove(id);
-        }
-    }
-    pending.is_empty()
-}
 
 pub fn snapshot_signature(
     request: &Chat,

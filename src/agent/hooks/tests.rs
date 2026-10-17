@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn presentation_hooks_cannot_clear_execution_uncertainty_or_committed_paths() {
     let root = tempfile::tempdir().unwrap();
-    let mut output = crate::tools::ToolOutput::structured(json!([{"kept":true}]))
+    let mut output = crate::runtime::tool_output::ToolOutput::structured(json!([{"kept":true}]))
         .with_effects(crate::tools::outcome::Effects::Unknown)
         .with_changes([root.path().join("changed")]);
     post_tool(
@@ -168,7 +168,7 @@ fn failures_and_timeouts_never_block() {
 #[test]
 fn post_hook_output_reaches_the_model_and_block_marks_an_error() {
     let dir = tempfile::tempdir().unwrap();
-    let mut out = crate::tools::ToolOutput {
+    let mut out = crate::runtime::tool_output::ToolOutput {
         execution: Default::default(),
         data: None,
         text: "ok".into(),
@@ -314,7 +314,7 @@ fn structured_output_rewrites_tool_input_and_result() {
         blocked,
         Err("blocked by a pre_tool_use hook: policy".into())
     );
-    let mut out = crate::tools::ToolOutput {
+    let mut out = crate::runtime::tool_output::ToolOutput {
         execution: Default::default(),
         data: Some(json!({"raw":true})),
         text: "secret token=abc".into(),

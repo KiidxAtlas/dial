@@ -293,7 +293,7 @@ impl Backend {
             )
             .map_err(|cause| {
                 if transport.attempts() > 0 && cause.downcast_ref::<llm::Interrupted>().is_none() {
-                    crate::agent::compaction::NativeCompactionFailure { cause }.into()
+                    NativeCompactionFailure { cause }.into()
                 } else {
                     cause
                 }
@@ -760,6 +760,22 @@ fn anthropic_compact(
         retained_messages,
         notices: Vec::new(),
     })
+}
+
+/// Only an attempted native transport can disable a native route; local preparation errors cannot.
+#[derive(Debug)]
+pub struct NativeCompactionFailure {
+    pub cause: anyhow::Error,
+}
+impl std::fmt::Display for NativeCompactionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "native compaction failed: {}", self.cause)
+    }
+}
+impl std::error::Error for NativeCompactionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
 }
 
 #[cfg(test)]

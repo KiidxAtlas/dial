@@ -1,7 +1,7 @@
 //! Smithery registry: search,
 //! install planning and API-key login. Slash-command glue lives in `commands/smithery.rs`.
 
-use crate::config::settings_store::{Change, read_private, write_private};
+use crate::config::settings_store::{Change, write_private};
 use crate::config::types::McpServerConfig;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -937,7 +937,7 @@ pub fn key_file(user_dir: &Path) -> Result<PathBuf> {
 }
 
 pub fn read_key(path: &Path) -> Result<Option<String>> {
-    let Some(bytes) = read_private(path)? else {
+    let Some(bytes) = crate::platform::atomic::read_private(path)? else {
         return Ok(None);
     };
     let value: Value =

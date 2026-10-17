@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::types::Config;
-use crate::tools::ToolOutput;
+use crate::runtime::tool_output::ToolOutput;
 use crate::tools::ext::{Concurrency, Tool, ToolContext, ToolEvent};
 use crate::tools::preludes::{PreludeCall, PreludeDef, PreludeHandler, register_prelude};
 

@@ -162,7 +162,7 @@ fn config_display_uses_runtime_defaults_overlay_and_hook_merging() {
     let global = "[[hooks]]\nevent='pre_tool_use'\ncommand=['global-policy']\n";
     let local = "[[hooks]]\nevent='post_tool_use'\ncommand=['fmt']\n";
     for (path, content) in layout.config_files().iter().zip([global, local]) {
-        settings_store::private_dir(path.parent().unwrap()).unwrap();
+        crate::platform::atomic::private_dir(path.parent().unwrap()).unwrap();
         settings_store::write_private(path, content.as_bytes()).unwrap();
     }
     let overlay: toml::Table = toml::from_str(

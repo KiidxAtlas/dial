@@ -169,7 +169,7 @@ fn run_command(
     ) else {
         return false;
     };
-    let scratch = root.join(crate::tools::SCRATCH_DIR);
+    let scratch = root.join(crate::workspace_copy::SCRATCH_DIR);
     if fs::create_dir_all(&scratch).is_err() {
         return false;
     }

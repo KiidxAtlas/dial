@@ -8,8 +8,9 @@ use serde_json::{Value, json};
 use super::ops::{self, Env, OPERATIONS};
 use super::review::Reviewer;
 use crate::config::types::Config;
+use crate::runtime::schema::tool_schema;
+use crate::runtime::tool_output::ToolOutput;
 use crate::tools::ext::{Tool, ToolContext};
-use crate::tools::{ToolOutput, tool_schema};
 
 pub const NAME: &str = "security_scan";
 

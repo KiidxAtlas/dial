@@ -224,7 +224,7 @@ pub fn install(
 ) -> Result<Option<std::path::PathBuf>> {
     use crate::{config::settings_store, learn::worker};
     let directory = layout.user_dir.join("laya");
-    settings_store::private_dir(&directory)?;
+    crate::platform::atomic::private_dir(&directory)?;
     settings_store::write_private(&directory.join("dial_laya_server.py"), SERVER.as_bytes())?;
     settings_store::write_private(&directory.join("requirements.txt"), REQUIREMENTS.as_bytes())?;
     let venv = directory.join("venv");
@@ -277,7 +277,7 @@ pub fn install(
         }
         let staging = tempfile::tempdir_in(&directory)?;
         let model = staging.path().join("model");
-        settings_store::private_dir(&model)?;
+        crate::platform::atomic::private_dir(&model)?;
         for file in [
             "model.safetensors",
             "rl_agent_config.json",
@@ -291,7 +291,7 @@ pub fn install(
                 "checkpoint asset must be a regular file"
             );
             let output = model.join(file);
-            settings_store::private_dir(output.parent().unwrap())?;
+            crate::platform::atomic::private_dir(output.parent().unwrap())?;
             std::fs::copy(&input, &output)?;
             crate::platform::fs::set_mode(&output, 0o600)?;
         }

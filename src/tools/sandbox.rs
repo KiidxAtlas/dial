@@ -307,7 +307,7 @@ impl Sandbox {
             profile.push_str(&program_rule(program)?);
             #[cfg(target_os = "linux")]
             let _ = (allow_network, deny_read, extra_write);
-            let scratch = workspace.join(crate::tools::SCRATCH_DIR);
+            let scratch = workspace.join(crate::workspace_copy::SCRATCH_DIR);
             std::fs::create_dir_all(&scratch)
                 .map_err(|e| format!("creating scratch directory: {e}"))?;
             #[cfg(target_os = "linux")]

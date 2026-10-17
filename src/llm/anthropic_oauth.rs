@@ -1,8 +1,6 @@
 //! Anthropic subscription OAuth for the official Messages API.
 use super::{auth::SecretToken, oauth::util::run_opener};
-use crate::config::settings_store::{
-    locked, locked_cancellable, locked_for, read_private, write_private,
-};
+use crate::config::settings_store::{locked, locked_cancellable, locked_for, write_private};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
@@ -94,7 +92,7 @@ fn cancelled(cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 fn load(dir: &Path) -> Result<State> {
-    let Some(bytes) = read_private(&dir.join(FILE))? else {
+    let Some(bytes) = crate::platform::atomic::read_private(&dir.join(FILE))? else {
         return Ok(State::default());
     };
     serde_json::from_slice(&bytes).context("Anthropic subscription credentials are invalid")

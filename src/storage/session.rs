@@ -30,7 +30,7 @@ use crate::platform::fs as platform_fs;
 
 use super::session_pins;
 use crate::config::paths::Layout;
-use crate::tools::ToolOutput;
+use crate::runtime::tool_output::ToolOutput;
 
 /// How long a reopen waits for a writer lock that looks busy.
 const WRITER_CLAIM_WAIT: Duration = Duration::from_secs(2);
@@ -1994,7 +1994,7 @@ impl Session {
             .as_ref()
             .context("oversized message requires a durable session")?;
         let artifact_root = artifact_root(path)?;
-        let artifacts = crate::tools::artifact::ArtifactStore::new(&artifact_root)?;
+        let artifacts = crate::storage::artifact::ArtifactStore::new(&artifact_root)?;
         let mut borrowed = Vec::new();
         collect_strings(&fitted, &mut Vec::new(), &mut borrowed);
         let mut candidates: Vec<_> = borrowed
@@ -2114,7 +2114,7 @@ impl Session {
             && let Some(path) = &self.path
         {
             let root = artifact_root(path)?;
-            let store = crate::tools::artifact::ArtifactStore::new(&root)?;
+            let store = crate::storage::artifact::ArtifactStore::new(&root)?;
             crate::storage::media::retain_message(&mut message, &store);
         } else if self.path.is_none() {
             crate::storage::media::retain_volatile_message(&mut message);
@@ -2713,7 +2713,7 @@ impl Session {
                 "compaction prefix must contain nonempty conversation messages, not system/transient controls"
             );
             ensure!(
-                crate::agent::compaction::complete_boundary(prefix, prefix.len()),
+                crate::storage::transcript::complete_boundary(prefix, prefix.len()),
                 "compaction prefix contains an incomplete or orphan tool-call group"
             );
         }
@@ -3551,3 +3551,18 @@ pub mod session_search_tool {
 
 #[cfg(test)]
 mod tests;
+
+impl crate::llm::provider::BoundSession for Session {
+    fn id(&self) -> &str {
+        Session::id(self)
+    }
+    fn messages(&self) -> Vec<serde_json::Value> {
+        Session::messages(self)
+    }
+    fn control_state(&self) -> serde_json::Value {
+        Session::control_state(self)
+    }
+    fn set_control_state(&mut self, state: serde_json::Value) -> Result<()> {
+        Session::set_control_state(self, state)
+    }
+}

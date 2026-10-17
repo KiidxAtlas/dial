@@ -15,7 +15,7 @@ fn command(layout: &Layout, args: &str) -> Result<String> {
     super::command(
         layout,
         &std::collections::BTreeMap::new(),
-        crate::agent::context::split_words(args),
+        crate::runtime::arguments::split_words(args),
         &cancel,
         &mut |_| {},
     )

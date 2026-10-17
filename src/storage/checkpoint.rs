@@ -325,8 +325,8 @@ impl Checkpoints {
     pub fn repair_changes(
         &self,
         turn: u64,
-    ) -> Result<Vec<crate::agent::repair_evidence::FileChange>> {
-        use crate::agent::repair_evidence::FileChange;
+    ) -> Result<Vec<crate::storage::repair_evidence::FileChange>> {
+        use crate::storage::repair_evidence::FileChange;
         use sha2::{Digest, Sha256};
         let inner = self.lock();
         let manifest = inner

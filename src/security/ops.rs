@@ -22,7 +22,8 @@ use super::coordinator;
 use super::preflight::{self, PlanRequest, TargetRequest};
 use super::sarif;
 use super::scan;
-use super::store::{Store, format_utc};
+use super::store::Store;
+use crate::runtime::clock::format_utc;
 
 /// Provider string recorded for a ChatGPT OAuth reviewer account (Dial's credential key).
 const ACCOUNT_PROVIDER: &str = "openai-codex";

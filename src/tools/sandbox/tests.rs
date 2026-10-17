@@ -525,7 +525,10 @@ fn dev_scrubs_secret_environment() {
     assert!(lines.contains(&"KEEP_ME=1"), "{out}");
     assert!(lines.contains(&"HOME=/Users/someone"), "{out}");
     assert!(lines.contains(&"PATH=/usr/bin:/bin"), "{out}");
-    let tmp = format!("TMPDIR={}", fx.ws.join(crate::tools::SCRATCH_DIR).display());
+    let tmp = format!(
+        "TMPDIR={}",
+        fx.ws.join(crate::workspace_copy::SCRATCH_DIR).display()
+    );
     assert!(lines.contains(&tmp.as_str()), "{out}");
     for leaked in [
         "ghp_x",

@@ -1,10 +1,11 @@
-use super::*;
 use crate::agent::approval::parallel_read;
-use crate::tools::ext::Registry;
+use crate::config::types::Config;
+use crate::tools::ext::{Concurrency, Registry};
+use serde_json::json;
 
 #[test]
 fn registered_ast_search_is_declared_shared_and_runs_in_parallel_reads() {
-    let registry = Registry::standard(&Config::default());
+    let registry = Registry::standard(&Config::default(), Vec::new());
     let args = json!({"pattern": "foo($A)"});
     let tool = registry
         .get("ast_search")

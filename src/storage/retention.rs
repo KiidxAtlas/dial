@@ -5,7 +5,6 @@
 //! Selection: non-recent sessions are ranked newest first; the newest
 //! `retain_newest_global` are protected globally, and the newest `retain_newest_per_cwd` per working
 //! directory are protected; of the rest, sessions untouched for `cold_archive_after_days` are cold.
-use crate::config::settings_store;
 use crate::platform::fs as platform_fs;
 use anyhow::{Context, Result};
 #[cfg(test)]
@@ -134,7 +133,7 @@ pub struct Store {
 
 impl Store {
     pub fn open(user_dir: &Path) -> Result<Self> {
-        settings_store::private_dir(user_dir)?;
+        crate::platform::atomic::private_dir(user_dir)?;
         let path = user_dir.join(DB_FILE);
         let mut options = fs::OpenOptions::new();
         options.create(true).read(true).write(true);

@@ -151,5 +151,68 @@ pub(crate) fn record_with_prompt(bytes: &[u8], prompt: Option<&Value>, transport
     });
 }
 
+#[derive(Default)]
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn json_bytes(value: &serde_json::Value) -> usize {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value).expect("JSON value serialization cannot fail");
+    counter.0
+}
+
+/// Conservative wire cost of one attached image; `dial_images` stores only small JSON pointers.
+pub const IMAGE_ESTIMATE_TOKENS: usize = 1_600;
+
+/// Serialized bytes of a message as a provider receives it. Harness bookkeeping (`dial_*`) never
+/// reaches the wire. Provider-native replay content is sent instead of, not beside, the portable
+/// content/tool-call fields, so the larger of the two counts rather than their sum.
+pub fn wire_message_bytes(message: &serde_json::Value) -> usize {
+    let Some(object) = message.as_object() else {
+        return json_bytes(message);
+    };
+    let portable = object
+        .iter()
+        .filter(|(key, _)| !key.starts_with("dial_"))
+        .map(|(key, value)| key.len() + 4 + json_bytes(value))
+        .sum::<usize>()
+        + 2;
+    let native = object
+        .get("dial_provider_content")
+        .filter(|content| content.as_array().is_some_and(|items| !items.is_empty()))
+        .map_or(0, |content| {
+            json_bytes(content) + object.get("role").map_or(0, json_bytes) + 24
+        });
+    let images = object
+        .get("dial_images")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    portable.max(native) + images * IMAGE_ESTIMATE_TOKENS * 4
+}
+
+pub fn estimate_parts(messages: &[serde_json::Value], tools: &[serde_json::Value]) -> u64 {
+    (messages.iter().map(wire_message_bytes).sum::<usize>()
+        + tools.iter().map(json_bytes).sum::<usize>())
+    .div_ceil(4) as u64
+}
+
+pub fn estimate(message: &Value) -> u64 {
+    estimate_parts(std::slice::from_ref(message), &[]).max(
+        message["dial_compaction_output_tokens"]
+            .as_u64()
+            .unwrap_or(0),
+    )
+}
+
 #[cfg(test)]
 mod tests;

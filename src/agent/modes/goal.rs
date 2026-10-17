@@ -6,7 +6,7 @@
 use crate::agent::todo::{Status as TodoStatus, TodoList};
 use crate::agent::{Agent, TurnReport, Ui};
 use crate::llm::usage::Counts;
-use crate::tools::ToolOutput;
+use crate::runtime::tool_output::ToolOutput;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

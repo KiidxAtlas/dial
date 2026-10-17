@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 use serde_json::json;
 
 use super::*;
-use crate::tools::artifact::ArtifactStore;
+use crate::storage::artifact::ArtifactStore;
 use crate::tools::gh_common::test_support::GhOverride;
 
 /// A `gh` for one test, routed through `GhOverride`. It answers an invocation whose argv ends

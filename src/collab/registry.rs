@@ -2,7 +2,7 @@
 //! owner-only JSON record under `<user_dir>/run/collab-hosts/`. Records carry metadata only, never
 //! a link or key. Listing drops records whose process is gone.
 use crate::platform::fs as platform_fs;
-use crate::tools::background::procinfo::ProcId;
+use crate::platform::procinfo::ProcId;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{

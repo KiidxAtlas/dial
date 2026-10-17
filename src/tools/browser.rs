@@ -2,7 +2,6 @@
 //! Chromium has no OS network permission: all HTTP requests cross the guarded Rust bridge.
 use crate::config::tools::browser::BrowserConfig;
 
-use super::background::procinfo::{ProcId, SIGKILL};
 use super::ext::{Tool, ToolContext};
 use super::kernel::{deadline, remaining_timeout, resolve_operator_executable};
 #[cfg(target_os = "macos")]
@@ -10,6 +9,7 @@ use super::sandbox::{Sandbox, profile as sandbox_profile};
 use super::web::{fetch::parse_url, guard::blocked_reason};
 use super::{ToolOutput, tool_schema};
 use crate::config::types::{Config, SandboxMode};
+use crate::platform::procinfo::{ProcId, SIGKILL};
 use crate::runtime::json_transport::{JsonProcess, execution_deadline};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use parking_lot::Mutex;

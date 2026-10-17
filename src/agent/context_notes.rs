@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     llm::{self, Chat},
+    runtime::tool_output::ToolOutput,
     storage::session::{ContextNotesRevision, MAX_CONTEXT_NOTES_BYTES, Session},
-    tools::ToolOutput,
 };
 
 pub const TOOL_NAMES: [&str; 2] = ["context_notes", "new_context"];

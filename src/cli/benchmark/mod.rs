@@ -10,7 +10,8 @@ use dial::{
     },
     config::paths::Layout,
     config::types::{Approval, Config, EditMode, LEAN_AUTO_MAX_WINDOW, LeanLocal, SandboxMode},
-    tools::{self, ToolOutput, Workspace},
+    runtime::tool_output::ToolOutput,
+    tools::{self, Workspace},
 };
 use serde::Deserialize;
 use serde_json::json;

@@ -766,7 +766,7 @@ fn heartbeat_emits_start_live_deltas_then_completion_once() {
 fn background_complete_artifact_preserves_discarded_middle() {
     let (_dir, ws) = open_workspace();
     let artifacts = tempfile::tempdir().unwrap();
-    let store = crate::tools::artifact::ArtifactStore::new(artifacts.path()).unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(artifacts.path()).unwrap();
     let ws = ws.with_artifacts(store);
     let tool = tool();
     start(
@@ -984,7 +984,7 @@ fn escaped_writer_is_drained_bounded_and_kill_yields_one_incomplete_artifact() {
     }
     let (_dir, ws) = open_workspace();
     let artifacts = tempfile::tempdir().unwrap();
-    let store = crate::tools::artifact::ArtifactStore::new(artifacts.path()).unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(artifacts.path()).unwrap();
     let ws = ws.with_artifacts(store);
     let tool = tool();
     // The inner shell starts its own session, so it survives the group kill and keeps the pipe open.

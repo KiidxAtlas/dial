@@ -3,7 +3,7 @@
 
 use super::Session;
 use crate::runtime::execution::Effects;
-use crate::tools::ToolOutput;
+use crate::runtime::tool_output::ToolOutput;
 use crate::tools::ext::{EXTENSION_API_VERSION, LifecycleEvent, Tool, ToolContext};
 use serde_json::{Value, json};
 use std::sync::Arc;

@@ -29,13 +29,13 @@ use crate::config::tools::BUILTIN;
 macro_rules! notebook_edit_description {($description:literal)=>{concat!($description,"\nNotebooks: ordinary .ipynb reads expose cell source as # %% [code|markdown|raw] cell:N (zero-based). Keep indexed markers to retain authentic cells; unindexed # %% markers create cells. Preserve source-literal marker lines with one extra %, e.g. # %%%. All edit modes operate on this projection and retain untouched raw JSON metadata, number lexemes and outputs; changed code cells clear stale outputs/execution counts. Metadata-only changes invalidate witnesses. Read :raw for literal JSON; whole-file write requires actual JSON, not the source projection. Notebook moves/deletes need complete relevant source witnesses.")};}
 
 pub mod archive;
-pub mod artifact;
 pub mod ast;
 pub mod autoresearch;
 pub mod background;
 pub mod bash_interceptor;
 pub mod browser;
 pub mod catalog;
+pub mod codebase;
 pub mod contracts;
 pub mod dap;
 pub mod diagnostics;
@@ -61,6 +61,7 @@ mod gh_view;
 pub mod git;
 pub(crate) mod git_patch;
 pub mod hashline;
+pub mod history;
 pub mod kernel;
 pub mod lsp;
 pub mod mcp;
@@ -71,6 +72,7 @@ pub mod plugin;
 pub mod preludes;
 pub mod presentation;
 pub mod preview;
+pub mod provenance;
 pub mod resources;
 pub mod sandbox;
 mod search;
@@ -86,6 +88,9 @@ pub(crate) mod walk;
 pub mod web;
 
 use crate::config::types::SandboxConfig;
+use crate::runtime::schema::tool_schema;
+use crate::runtime::tool_output::ToolOutput;
+use crate::storage::artifact;
 use anyhow::{Context, Result, bail, ensure};
 use sandbox::Sandbox;
 use serde_json::{Value, json};
@@ -135,84 +140,7 @@ pub fn preview_limit(window: u32, tool: &str, failed: bool, retained: bool) -> u
 #[cfg(test)]
 mod preview_tests;
 
-/// Per-workspace scratch directory exported as TMPDIR for bash; walks skip it.
-pub const SCRATCH_DIR: &str = ".tmp";
-
-#[derive(Debug, Clone)]
-pub struct ToolOutput {
-    pub text: String,
-    pub is_error: bool,
-    /// Original structured result for clients; never recover richer objects by parsing `text`.
-    pub data: Option<Value>,
-    /// Execution metadata is independent of tool payload, hooks and presentation.
-    pub execution: outcome::Execution,
-}
-
 pub use outcome::ToolStatus;
-
-impl ToolOutput {
-    pub fn with_effects(mut self, effects: outcome::Effects) -> Self {
-        self.execution.effects = effects;
-        if effects == outcome::Effects::Unknown {
-            self.is_error = true;
-            const NOTE: &str = "\n[Effects unknown: work may have partially completed. Inspect the affected state before retrying; interruption does not imply rollback.]";
-            if !self.text.ends_with(NOTE) {
-                self.text.push_str(NOTE);
-            }
-        }
-        self
-    }
-    /// Annotate a controller-created outcome without interpreting arbitrary prose.
-    pub fn process_outcome(&self) -> Option<crate::runtime::execution::ProcessOutcome> {
-        self.data
-            .as_ref()?
-            .get("process")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-    }
-    pub fn with_process(mut self, process: crate::runtime::execution::ProcessOutcome) -> Self {
-        let data = self.data.get_or_insert_with(|| serde_json::json!({}));
-        if let Some(data) = data.as_object_mut() {
-            data.insert("process".into(), serde_json::json!(process));
-        }
-        self
-    }
-    pub fn with_status(mut self, status: ToolStatus) -> Self {
-        self.execution.status = Some(status);
-        self.is_error |= status != ToolStatus::Ok;
-        self
-    }
-
-    pub fn with_changes(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        self.execution.changed_paths = paths.into_iter().collect();
-        self
-    }
-
-    pub fn structured(data: Value) -> Self {
-        Self {
-            text: data.to_string(),
-            is_error: false,
-            data: Some(data),
-            execution: Default::default(),
-        }
-    }
-    pub fn ok(text: String) -> Self {
-        Self {
-            data: None,
-            text,
-            is_error: false,
-            execution: Default::default(),
-        }
-    }
-
-    pub fn err(text: impl Into<String>) -> Self {
-        Self {
-            data: None,
-            text: text.into(),
-            is_error: true,
-            execution: Default::default(),
-        }
-    }
-}
 
 use crate::config::types::EditMode;
 pub use editing::{EditRepair, EditRepairRequest};
@@ -896,27 +824,6 @@ impl Workspace {
     }
 }
 
-pub(crate) fn tool_schema(
-    name: &str,
-    description: &str,
-    properties: Value,
-    required: &[&str],
-) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-                "additionalProperties": false,
-            },
-        },
-    })
-}
-
 const HASHLINE_READ_DESC: &str = "Read a text file (or list a directory). Output starts with a header `[PATH#TAG]` \
 followed by `LINE:TEXT` rows; copy that header's TAG into `edit` sections. Select lines by appending to the path \
 `:50-100`, `:50+20` (20 lines from 50), `:50-` (from 50), `:-30` (last 30 lines) or comma-joined ranges such as \
@@ -1510,4 +1417,12 @@ pub fn apply_sandbox_config(
 mod tests;
 
 #[cfg(test)]
+mod image_tests;
+#[cfg(test)]
 mod multi_root_tests;
+
+impl crate::storage::experience::SourceRoot for Workspace {
+    fn resolve(&self, input: &str) -> Result<PathBuf, String> {
+        Workspace::resolve(self, input)
+    }
+}

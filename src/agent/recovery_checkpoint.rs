@@ -22,7 +22,7 @@ impl RecoveryCheckpoint {
         &mut self,
         ws: &crate::tools::Workspace,
         call: &ToolCall,
-        output: &crate::tools::ToolOutput,
+        output: &crate::runtime::tool_output::ToolOutput,
         investigation: &mut super::investigation::InvestigationGuard,
         repeats: &mut super::guard::RepeatGuard,
     ) -> (Option<String>, Option<String>, Option<String>) {
@@ -64,7 +64,7 @@ impl RecoveryCheckpoint {
     pub fn observe(
         &mut self,
         call: &ToolCall,
-        output: &crate::tools::ToolOutput,
+        output: &crate::runtime::tool_output::ToolOutput,
         investigation: &mut super::investigation::InvestigationGuard,
         repeats: &mut super::guard::RepeatGuard,
     ) -> (Option<String>, Option<String>, Option<String>) {

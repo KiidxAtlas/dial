@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::types::{UsageHistoryEntry, UsageReport, resolve_used_fraction};
-use crate::config::settings_store::{locked, read_private, write_private};
+use crate::config::settings_store::{locked, write_private};
 
 const FILE: &str = "usage-history.jsonl";
 const MAX_ENTRIES: usize = 2_048;
@@ -48,7 +48,7 @@ pub fn read(user_dir: &Path, provider: Option<&str>) -> Result<Vec<UsageHistoryE
 }
 
 fn read_entries(path: &Path) -> Result<Vec<UsageHistoryEntry>> {
-    let Some(bytes) = read_private(path)? else {
+    let Some(bytes) = crate::platform::atomic::read_private(path)? else {
         return Ok(Vec::new());
     };
     Ok(String::from_utf8_lossy(&bytes)

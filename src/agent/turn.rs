@@ -89,7 +89,7 @@ impl Agent<'_> {
         let measured = if self.hermetic
             || adapter.is_some()
             || self.config.steering.enabled
-            || crate::steering::specification(self.config, &self.config.model)
+            || crate::llm::steering::specification(self.config, &self.config.model)
                 .ok()
                 .flatten()
                 .is_some()
@@ -408,7 +408,7 @@ impl Agent<'_> {
                 ) {
                     // Price only the appended message; re-serializing the whole history again
                     // per step is pure overhead at large context sizes.
-                    request_estimate = request_estimate.saturating_add(compaction::estimate(&guidance));
+                    request_estimate = request_estimate.saturating_add(crate::llm::wire::estimate(&guidance));
                     request.messages.push(guidance);
                 }
             }
@@ -1836,7 +1836,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                         None => { let started = Instant::now(); let out = self.dispatch(backend, call, ui); (out, started.elapsed().as_secs_f64()) }
                     };
                     if (call.name == "browser" || call.name == "computer") && !out.is_error {
-                        match tools::artifact::capture_image(self.workspace.artifacts(), &mut out) {
+                        match crate::storage::artifact::capture_image(self.workspace.artifacts(), &mut out) {
                             Ok(attachment) => image = attachment,
                             Err(e) => {
                                 out = ToolOutput { execution: Default::default(),
@@ -2169,7 +2169,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     {
                         uris.push(json!(uri));
                     }
-                    for uri in tools::artifact::uris(&output.text) {
+                    for uri in crate::storage::artifact::uris(&output.text) {
                         if !uris.contains(&json!(uri)) {
                             uris.push(json!(uri));
                         }

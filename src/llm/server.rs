@@ -160,12 +160,12 @@ pub struct ModelServer {
     model: String,
     vision: bool,
     adapter: Option<PathBuf>,
-    steering: Option<crate::steering::Specification>,
+    steering: Option<crate::llm::steering::Specification>,
     runtime: llm::local_runtime::LocalRuntime,
     tool_grammar: bool,
     /// The context window a GGUF server's `--ctx-size` was sized from; `None` for MLX.
     gguf_context: Option<Option<u64>>,
-    tracking: Option<crate::storage::process_record::Record>,
+    tracking: Option<crate::platform::process_record::Record>,
     stderr: Arc<Mutex<Tail>>,
 }
 
@@ -214,7 +214,7 @@ impl ModelServer {
         adapter: Option<&Path>,
         startup_timeout_secs: u64,
         interrupt: Option<Arc<AtomicBool>>,
-        steering: Option<&crate::steering::Specification>,
+        steering: Option<&crate::llm::steering::Specification>,
         runtime: &llm::local_runtime::LocalRuntime,
         context: Option<&crate::config::types::Config>,
     ) -> Result<ModelServer> {
@@ -279,7 +279,7 @@ impl ModelServer {
         &self,
         model: &str,
         adapter: Option<&Path>,
-        steering: Option<&crate::steering::Specification>,
+        steering: Option<&crate::llm::steering::Specification>,
         runtime: &llm::local_runtime::LocalRuntime,
         context: Option<&crate::config::types::Config>,
     ) -> bool {
@@ -379,7 +379,7 @@ pub fn ensure_profile_controlled<'a>(
     adapter: Option<&Path>,
     startup_timeout_secs: u64,
     interrupt: Option<Arc<AtomicBool>>,
-    steering: Option<&crate::steering::Specification>,
+    steering: Option<&crate::llm::steering::Specification>,
 ) -> Result<&'a ModelServer> {
     ensure_profile_tracked(
         slot,
@@ -403,7 +403,7 @@ pub struct ServerProfile<'a> {
     pub python: &'a Path,
     pub model: &'a str,
     pub adapter: Option<&'a Path>,
-    pub steering: Option<&'a crate::steering::Specification>,
+    pub steering: Option<&'a crate::llm::steering::Specification>,
     pub context: Option<&'a crate::config::types::Config>,
     pub runtime: &'a llm::local_runtime::LocalRuntime,
 }
@@ -498,7 +498,7 @@ fn launch_script() -> String {
 /// Restartable spawn spec for a managed process: program, args, cwd, and the variables set
 /// explicitly on the command. Inherited variables are not recorded because they may hold secrets;
 /// `env_allow` lists the ones a restart re-reads from the environment.
-fn spawn_spec(command: &Command) -> anyhow::Result<crate::storage::process_record::SpawnSpec> {
+fn spawn_spec(command: &Command) -> anyhow::Result<crate::platform::process_record::SpawnSpec> {
     const ENV_ALLOW: [&str; 6] = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR"];
     let cwd = match command.get_current_dir() {
         Some(dir) => dir.to_path_buf(),
@@ -509,7 +509,7 @@ fn spawn_spec(command: &Command) -> anyhow::Result<crate::storage::process_recor
         .filter(|(name, _)| name.to_str() != Some("DIAL_PARENT_PID"))
         .filter_map(|(name, value)| Some((name.to_str()?.to_owned(), value?.to_str()?.to_owned())))
         .collect();
-    Ok(crate::storage::process_record::SpawnSpec {
+    Ok(crate::platform::process_record::SpawnSpec {
         program: std::path::PathBuf::from(command.get_program()),
         args: command
             .get_args()
@@ -721,7 +721,7 @@ fn launch(
     };
     let mut tracking = context
         .map(|config| {
-            crate::storage::process_record::Record::new(
+            crate::platform::process_record::Record::new(
                 &config.user_dir,
                 process.child.id(),
                 "models",

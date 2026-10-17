@@ -3,7 +3,7 @@
 //! not an OS keychain. They are URL-scoped and written only on explicit user action.
 use super::model_config::{ApiProtocol, ModelSelection, ProviderSpec};
 use crate::config::paths::Layout;
-use crate::config::settings_store::{locked, read_private, write_private};
+use crate::config::settings_store::{locked, write_private};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -474,7 +474,7 @@ fn valid_token(token: &str) -> Result<()> {
     Ok(())
 }
 fn credential_map(user_dir: &Path) -> Result<BTreeMap<String, String>> {
-    let bytes = read_private(&user_dir.join("credentials.json"))?;
+    let bytes = crate::platform::atomic::read_private(&user_dir.join("credentials.json"))?;
     match bytes {
         Some(bytes) => serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("credential file is invalid; no changes saved")),
@@ -1962,7 +1962,7 @@ fn probe_cache_key(probe: &Probe) -> String {
 }
 fn cached(user_dir: &Path) -> BTreeMap<String, Vec<ModelEntry>> {
     let mut cache: BTreeMap<String, Vec<ModelEntry>> =
-        read_private(&user_dir.join("model-catalog.json"))
+        crate::platform::atomic::read_private(&user_dir.join("model-catalog.json"))
             .ok()
             .flatten()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())

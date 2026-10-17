@@ -1,6 +1,6 @@
 //! Cooperative local-compute handoff. Requests are live file locks, not stale PID markers.
 use crate::config::types::Config;
-use crate::tools::background::procinfo::ProcId;
+use crate::platform::procinfo::ProcId;
 use anyhow::{Result, ensure};
 use fs2::FileExt;
 use std::sync::atomic::{AtomicBool, Ordering};

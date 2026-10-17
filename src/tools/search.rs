@@ -76,7 +76,7 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
                 || relative
                     .components()
                     .next()
-                    .is_some_and(|part| part.as_os_str() == super::SCRATCH_DIR)
+                    .is_some_and(|part| part.as_os_str() == crate::workspace_copy::SCRATCH_DIR)
         }) {
             return Err("search scopes must not enter .git or workspace scratch".into());
         }

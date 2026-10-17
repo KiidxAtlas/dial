@@ -695,14 +695,13 @@ fn recent_tool_recoveries_are_newest_first_and_bounded() {
 
 #[test]
 fn executable_repairs_are_scoped_and_never_training_success_labels() {
-    use crate::agent::repair_evidence::{CheckKind, CheckRun, FileChange, Tracker};
+    use crate::storage::repair_evidence::{CheckKind, CheckRun, FileChange, RepairRecord};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), "model", "case", &harness()).unwrap();
     let version = store.active().unwrap().id;
     let trajectory = store
         .begin_trajectory(version, "coding", "repair", "prompt")
         .unwrap();
-    let mut tracker = Tracker::default();
     let run = |sequence, exit_code| CheckRun {
         command: "cargo check".into(),
         cwd: "/workspace/a".into(),
@@ -713,19 +712,21 @@ fn executable_repairs_are_scoped_and_never_training_success_labels() {
         exit_code: Some(exit_code),
         sequence,
     };
-    tracker.observe(run(1, 1), vec![]);
-    let record = tracker
-        .observe(
-            run(2, 0),
-            vec![FileChange {
-                path: "src/lib.rs".into(),
-                before_sha256: Some("a".repeat(64)),
-                after_sha256: Some("b".repeat(64)),
-                before_ref: Some("/state/before".into()),
-                after_ref: Some("/state/after".into()),
-            }],
-        )
-        .unwrap();
+    let record = RepairRecord {
+        schema: 1,
+        project_root: "/workspace/a".into(),
+        kind: CheckKind::SyntaxOnly,
+        before: run(1, 1),
+        after: run(2, 0),
+        changes: vec![FileChange {
+            path: "src/lib.rs".into(),
+            before_sha256: Some("a".repeat(64)),
+            after_sha256: Some("b".repeat(64)),
+            before_ref: Some("/state/before".into()),
+            after_ref: Some("/state/after".into()),
+        }],
+        applicability: "same project and check; re-run after applying".into(),
+    };
     let payload = serde_json::to_value(record).unwrap();
     assert!(
         store

@@ -611,7 +611,7 @@ pub fn post_tool(
     root: &Path,
     name: &str,
     args: &Value,
-    out: &mut crate::tools::ToolOutput,
+    out: &mut crate::runtime::tool_output::ToolOutput,
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) {
@@ -625,7 +625,7 @@ pub fn post_tool_with(
     root: &Path,
     name: &str,
     args: &Value,
-    out: &mut crate::tools::ToolOutput,
+    out: &mut crate::runtime::tool_output::ToolOutput,
     interrupt: &AtomicBool,
     notice: &mut dyn FnMut(&str),
 ) {

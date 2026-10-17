@@ -6,10 +6,10 @@ fn notebook_is_registered_only_when_listed_as_integration() {
         integrations: vec!["notebook".into()],
         ..Config::default()
     };
-    assert!(Registry::standard(&config).contains("notebook"));
+    assert!(Registry::standard(&config, Vec::new()).contains("notebook"));
 
     config.integrations.clear();
-    assert!(!Registry::standard(&config).contains("notebook"));
+    assert!(!Registry::standard(&config, Vec::new()).contains("notebook"));
 }
 #[test]
 fn legacy_integration_lists_keep_always_registered_tools() {
@@ -22,7 +22,7 @@ fn legacy_integration_lists_keep_always_registered_tools() {
         ..Config::default()
     };
     config.extensions.enabled = false;
-    let registry = Registry::standard(&config);
+    let registry = Registry::standard(&config, Vec::new());
     for entry in crate::config::tools::integrations::INTEGRATIONS {
         if entry.always_registered {
             assert!(registry.contains(entry.name), "{}", entry.name);

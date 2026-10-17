@@ -2,7 +2,7 @@
 use crate::config::paths::Layout;
 use crate::config::settings_store;
 use crate::config::types::Config;
-use crate::storage::process_record;
+use crate::platform::process_record;
 use crate::storage::store::Store;
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
@@ -299,7 +299,7 @@ pub fn stop_legacy(user: &Path, state: &str) -> Result<String> {
         "job process exited before it could be stopped"
     );
     ensure!(
-        proc.signal_group(crate::tools::background::procinfo::SIGKILL),
+        proc.signal_group(crate::platform::procinfo::SIGKILL),
         "could not stop background job"
     );
     Ok("Termination requested for the background worker and its model processes; the approved adapter is preserved.".into())

@@ -2,8 +2,8 @@
 use super::{Decision, Ui, todo::TodoList};
 use crate::{
     llm::ModelProgress,
+    runtime::tool_output::ToolOutput,
     runtime::{Body, Phase, Tree},
-    tools::ToolOutput,
 };
 use serde_json::Value;
 use std::{sync::atomic::AtomicBool, time::Duration};

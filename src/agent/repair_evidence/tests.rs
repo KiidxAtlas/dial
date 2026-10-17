@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::repair_evidence::CheckKind;
 
 fn run(sequence: u64, code: i32, kind: CheckKind) -> CheckRun {
     CheckRun {
@@ -69,10 +70,10 @@ fn applicability_checks_current_bytes_and_refuses_exhausted_budget() {
     record.before.cwd = record.project_root.clone();
     record.after.cwd = record.project_root.clone();
     record.changes[0].before_sha256 = Some(format!("{:x}", Sha256::digest(b"broken")));
-    assert!(record.matches_current(&workspace, &mut 100));
-    assert!(!record.matches_current(&workspace, &mut 2));
+    assert!(matches_current(&record, &workspace, &mut 100));
+    assert!(!matches_current(&record, &workspace, &mut 2));
     std::fs::write(dir.path().join("src/lib.rs"), "different").unwrap();
-    assert!(!record.matches_current(&workspace, &mut 100));
+    assert!(!matches_current(&record, &workspace, &mut 100));
 }
 
 #[test]

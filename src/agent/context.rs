@@ -18,6 +18,7 @@ use std::{
 };
 
 use crate::config::paths::Layout;
+use crate::runtime::arguments::split_words;
 
 const FILE_CAP: usize = 32 * 1024;
 const TOTAL_CAP: usize = 128 * 1024;
@@ -916,43 +917,5 @@ pub fn expand_command(def: &CommandDef, args: &str) -> String {
     }
     out
 }
-
-/// Whitespace-separated words with simple `'...'` / `"..."` quoting and backslash escapes.
-pub(crate) fn split_words(s: &str) -> Vec<String> {
-    let (mut words, mut cur, mut quote, mut in_word) =
-        (Vec::new(), String::new(), None::<char>, false);
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), c) => cur.push(c),
-            (None, '"' | '\'') => {
-                quote = Some(c);
-                in_word = true;
-            }
-            (None, '\\') => {
-                if let Some(n) = chars.next() {
-                    cur.push(n);
-                    in_word = true;
-                }
-            }
-            (None, c) if c.is_whitespace() => {
-                if in_word {
-                    words.push(std::mem::take(&mut cur));
-                    in_word = false;
-                }
-            }
-            (None, c) => {
-                cur.push(c);
-                in_word = true;
-            }
-        }
-    }
-    if in_word {
-        words.push(cur);
-    }
-    words
-}
-
 #[cfg(test)]
 mod tests;

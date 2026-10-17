@@ -1084,4 +1084,6 @@ fn authorize_inner(
 mod tests;
 
 #[cfg(test)]
+mod ast_registration_tests;
+#[cfg(test)]
 mod parallel_bash_tests;

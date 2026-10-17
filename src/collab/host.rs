@@ -267,7 +267,7 @@ impl Host {
         let started_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
-        let proc = crate::tools::background::procinfo::ProcId::current()
+        let proc = crate::platform::procinfo::ProcId::current()
             .ok_or_else(|| anyhow::anyhow!("cannot record host process identity"))?;
         let record = HostRecord {
             id: format!("{}-{}", std::process::id(), rand::random::<u32>()),

@@ -290,9 +290,9 @@ fn live_spool_is_kept_until_its_owner_finishes() {
     let l = layout(dir.path());
     let artifacts = l.state_dir.join(ARTIFACTS_DIR);
     fs::create_dir_all(&artifacts).unwrap();
-    let store = crate::tools::artifact::ArtifactStore::new(&artifacts)
+    let store = crate::storage::artifact::ArtifactStore::new(&artifacts)
         .unwrap()
-        .with_limits(&crate::tools::artifact::ArtifactConfig {
+        .with_limits(&crate::storage::artifact::ArtifactConfig {
             max_bytes: 64,
             head_bytes: 16,
         });

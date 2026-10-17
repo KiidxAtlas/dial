@@ -201,7 +201,7 @@ pub fn import_bundle(
     let created_at = created_at_override
         .map(str::to_owned)
         .or(manifest_scan.started_at.clone())
-        .unwrap_or_else(|| super::store::format_utc(now_secs()));
+        .unwrap_or_else(|| crate::runtime::clock::format_utc(now_secs()));
     let producer = Producer {
         kind: "codex-security-bundle".into(),
         name: manifest_scan

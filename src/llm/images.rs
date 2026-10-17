@@ -14,7 +14,7 @@ use std::{
 /// UI diagnostics belong to a backend conversation, not every inference step. Keep only hashes
 /// of failures in the latest image-bearing request; request content never depends on this state.
 #[derive(Default)]
-pub(super) struct NoticeTracker(parking_lot::Mutex<HashSet<[u8; 32]>>);
+pub struct NoticeTracker(parking_lot::Mutex<HashSet<[u8; 32]>>);
 
 impl NoticeTracker {
     fn report(&self, failures: Vec<([u8; 32], String)>, notice: &mut dyn FnMut(&str)) {
@@ -150,7 +150,7 @@ pub(crate) fn authorized_user_reference(messages: &[Value], path: &Path) -> Opti
 }
 
 /// Resolve only the already-authorized attachment, with the same hash and file limits as inference.
-pub(crate) fn verified_bytes(reference: &Value) -> Result<(Vec<u8>, &'static str)> {
+pub fn verified_bytes(reference: &Value) -> Result<(Vec<u8>, &'static str)> {
     if let Some(reason) = reference["unavailable"].as_str() {
         anyhow::bail!("{reason}");
     }
@@ -246,7 +246,7 @@ fn content_parts(parts: Vec<Value>) -> Value {
     Value::Array(parts)
 }
 
-pub(super) fn prepare(
+pub fn prepare(
     req: &super::Chat,
     vision: bool,
     notices: &NoticeTracker,
@@ -346,7 +346,7 @@ fn failure_key(reference: &Value, reason: &str) -> [u8; 32] {
     hash.finalize().into()
 }
 
-pub(super) fn anthropic_content(content: &Value) -> Value {
+pub fn anthropic_content(content: &Value) -> Value {
     let Some(parts) = content.as_array() else {
         return content.clone();
     };

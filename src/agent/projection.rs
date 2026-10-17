@@ -20,7 +20,7 @@ impl<'a> Agent<'a> {
         rule_state: Option<&mut rules::State>,
     ) -> Result<usize> {
         let economy = self.config.efficiency.enabled && !self.hermetic;
-        let raw_estimate = context_meter::estimate_parts(messages, schemas);
+        let raw_estimate = crate::llm::wire::estimate_parts(messages, schemas);
         let pressure_fraction = if economy {
             u64::from(self.config.efficiency.cache_pressure_percent)
         } else {
@@ -88,7 +88,7 @@ impl<'a> Agent<'a> {
         evidence::project(messages, superseded, &policy);
         let sent_messages = messages
             .iter()
-            .filter(|message| compaction::is_history(message))
+            .filter(|message| crate::storage::transcript::is_history(message))
             .count();
         self.project_context_notes(messages, rule_state)?;
         let focus = messages

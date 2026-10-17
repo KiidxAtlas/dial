@@ -2,9 +2,10 @@
 //! untrusted evidence, never project instructions or proof that an architectural claim is true.
 pub mod architecture;
 use crate::config::paths::Layout;
+use crate::runtime::tool_output::ToolOutput;
 use crate::storage::memory::screen;
 use crate::tools::{
-    ToolOutput, Workspace,
+    Workspace,
     ext::{Tool, ToolContext},
     navigation,
     walk::Walk,
@@ -1336,7 +1337,7 @@ impl Tool for CodebaseTool {
         "codebase_memory"
     }
     fn schema(&self) -> Value {
-        crate::tools::tool_schema(
+        crate::runtime::schema::tool_schema(
             self.name(),
             "Recall saved project understanding, refresh its source/symbol map, remember a reusable architectural finding, or forget a topic. Findings are agent observations, never verification proof; only unchanged supporting sources make them eligible for reuse across sessions. Cache operations do not edit project files. For remember, inspect the supporting sources first and save responsibility, relationships, entry points or check commands as facts, not instructions; cite workspace-relative source files (line suffixes are ignored) — sources you edited are re-indexed when saving, so no refresh is needed. expected_revision defaults to 0 for a new topic; recall before updating/forgetting.",
             json!({

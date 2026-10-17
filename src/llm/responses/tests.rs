@@ -169,30 +169,12 @@ fn consecutive_codex_requests_extend_the_previous_prompt_byte_for_byte() {
     ] {
         assert_eq!(first.get(key), third.get(key), "{key} changed");
     }
-    // A resumed session serializes the same bytes as the live one.
-    let project = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let layout =
-        crate::config::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
-            .unwrap();
-    let mut session = crate::storage::session::Session::create(
-        &layout,
-        crate::storage::session::SessionMeta {
-            model: "account-model".into(),
-        },
-    )
-    .unwrap();
-    for message in &c.messages[chat().messages.len()..] {
-        session.append(message.clone()).unwrap();
-    }
-    let path = session.path().unwrap().to_owned();
-    drop(session);
+    // A resumed session serializes the same bytes as the live one (JSON round trip stands in
+    // for session persistence, which storage covers).
     let mut resumed = chat();
-    resumed.messages.extend(
-        crate::storage::session::Session::open(&path)
-            .unwrap()
-            .messages(),
-    );
+    resumed
+        .messages
+        .extend(c.messages[chat().messages.len()..].iter().map(persisted));
     resumed.tools = c.tools.clone();
     assert_eq!(
         prompt_stream(&request_codex("account-model", &resumed, None).unwrap()),
@@ -203,29 +185,15 @@ fn consecutive_codex_requests_extend_the_previous_prompt_byte_for_byte() {
 fn tool_results_and_encrypted_reasoning_roundtrip_after_session_resume() {
     let reasoning = json!({"type":"reasoning","id":"reasoning_id","summary":[],"encrypted_content":"opaque-encrypted-evidence"});
     let reply = completed(&response(vec![reasoning.clone(), call()])).unwrap();
-    let project = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let layout =
-        crate::config::paths::Layout::with_user_dir(project.path(), home.path().to_owned())
-            .unwrap();
-    let mut session = crate::storage::session::Session::create(
-        &layout,
-        crate::storage::session::SessionMeta {
-            model: "account-model".into(),
-        },
-    )
-    .unwrap();
-    session
-        .append(super::super::assistant_message(&reply))
-        .unwrap();
-    session
-        .append(json!({"role":"tool","tool_call_id":"call_write","content":"wrote marker"}))
-        .unwrap();
-    let path = session.path().unwrap().to_owned();
-    drop(session);
-    let session = crate::storage::session::Session::open(&path).unwrap();
     let mut c = chat();
-    c.messages.extend(session.messages());
+    c.messages.extend(
+        [
+            super::super::assistant_message(&reply),
+            json!({"role":"tool","tool_call_id":"call_write","content":"wrote marker"}),
+        ]
+        .iter()
+        .map(persisted),
+    );
     let body = request("account-model", &c, None).unwrap();
     assert_eq!(body["input"][2], reasoning);
     assert_eq!(body["input"][3], call());
@@ -783,4 +751,8 @@ fn long_retention_is_rejected_on_subscription_and_without_declared_caching() {
     assert!(request_api("gpt-5.6", &chat(), Some(&disabled)).is_err());
     let undeclared = cache_profile(None, CacheRetention::Long, false);
     assert!(request_api("gpt-5.6", &chat(), Some(&undeclared)).is_err());
+}
+
+fn persisted(message: &Value) -> Value {
+    serde_json::from_str(&message.to_string()).unwrap()
 }
