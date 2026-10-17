@@ -16,7 +16,7 @@ impl InvestigationGuard {
     pub fn observe_output(
         &mut self,
         call: &ToolCall,
-        output: &crate::tools::ToolOutput,
+        output: &crate::runtime::tool_output::ToolOutput,
     ) -> Option<String> {
         if !output.execution.changed_paths.is_empty() {
             self.observations.clear();

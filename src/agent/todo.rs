@@ -6,7 +6,7 @@
 //! now and the common step ("done, next") is a single call. Tasks may carry a phase label that
 //! groups them in the rendered list. The list is session state; `snapshot`/`restore` persist it.
 //! Resolved work does not pile up: every mutation prunes closed tasks beyond a short recent tail.
-use crate::tools::ToolOutput;
+use crate::runtime::tool_output::ToolOutput;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

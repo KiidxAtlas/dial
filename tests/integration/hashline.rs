@@ -1,8 +1,9 @@
 //! Hashline read/edit/write exercised through `tools::execute` on temp workspaces.
 
 use dial::config::types::EditMode;
+use dial::runtime::tool_output::ToolOutput;
 use dial::tools::hashline::tag_of;
-use dial::tools::{ToolOutput, Workspace, WriteObserver, execute, schemas};
+use dial::tools::{Workspace, WriteObserver, execute, schemas};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::fs;

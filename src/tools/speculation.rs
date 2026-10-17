@@ -259,7 +259,9 @@ fn single_source(workspace: &Workspace, args: &Value) -> Option<PathBuf> {
             .strip_prefix(workspace.root())
             .ok()?
             .components()
-            .any(|part| part.as_os_str() == ".git" || part.as_os_str() == super::SCRATCH_DIR)
+            .any(|part| {
+                part.as_os_str() == ".git" || part.as_os_str() == crate::workspace_copy::SCRATCH_DIR
+            })
     {
         return None;
     }

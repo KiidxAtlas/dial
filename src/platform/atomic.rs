@@ -2,7 +2,7 @@
 use crate::platform::fs as platform_fs;
 use anyhow::{Context, Result, ensure};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -149,6 +149,77 @@ fn temp_path(target: &Path) -> PathBuf {
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()))
+}
+
+const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+pub(crate) fn private_dir(dir: &Path) -> Result<()> {
+    validate_private_path(dir)?;
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            ensure!(
+                meta.is_dir() && !meta.file_type().is_symlink(),
+                "private storage directory is not a regular directory"
+            );
+            ensure!(
+                platform_fs::path_owned_by_current_user(dir)?,
+                "private storage directory has another owner"
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = dir.parent().context("private directory has no parent")?;
+            if !parent.exists() {
+                private_dir(parent)?;
+            }
+            match platform_fs::create_dir_owner_only(&fs::DirBuilder::new(), dir) {
+                Ok(()) => {}
+                // Another owner thread/process may create the shared store concurrently.
+                // Re-enter validation; never treat an arbitrary pre-existing path as trusted.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return private_dir(dir);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    platform_fs::set_owner_only(dir)?;
+    Ok(())
+}
+
+pub(crate) fn check_file(file: &File) -> Result<()> {
+    let meta = file.metadata()?;
+    ensure!(
+        meta.is_file()
+            && platform_fs::link_count(file)? == 1
+            && platform_fs::owned_by_current_user(file)?,
+        "private storage target must be an owner-owned regular file without hard links"
+    );
+    if !platform_fs::is_owner_only(file)? {
+        platform_fs::set_owner_only_file(file)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
+    validate_private_path(path.parent().context("storage path has no parent")?)?;
+    let file = match platform_fs::open_nofollow_nonblocking(OpenOptions::new().read(true), path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    check_file(&file)?;
+    ensure!(
+        file.metadata()?.len() <= MAX_FILE_BYTES,
+        "private storage file exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_FILE_BYTES,
+        "private storage file exceeds size limit"
+    );
+    Ok(Some(bytes))
 }
 
 #[cfg(test)]

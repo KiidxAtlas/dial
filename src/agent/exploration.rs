@@ -1,9 +1,9 @@
 //! Model-owned investigation checkpoints. Rewind replaces context, never files or effects.
-use super::{Agent, Ui, compaction};
+use super::{Agent, Ui};
 use crate::{
     llm::{ToolCall, provider::Backend},
+    runtime::tool_output::ToolOutput,
     storage::session::Session,
-    tools::ToolOutput,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -207,7 +207,7 @@ pub(super) fn report_message(
 /// Reparent only complete, genuine terminal sibling calls/results, not a fabricated native reply.
 pub(super) fn terminal_siblings(messages: &[Value], rewind_id: &str) -> Result<Vec<Value>> {
     ensure!(
-        compaction::complete_boundary(messages, messages.len()),
+        crate::storage::transcript::complete_boundary(messages, messages.len()),
         "rewind requires a closed assistant/tool group"
     );
     let Some(at) = messages.iter().rposition(|message| {
@@ -242,7 +242,7 @@ pub(super) fn terminal_siblings(messages: &[Value], rewind_id: &str) -> Result<V
     let mut result = vec![json!({"role":"assistant","content":null,"tool_calls":calls})];
     result.extend(results);
     ensure!(
-        compaction::complete_boundary(&result, result.len()),
+        crate::storage::transcript::complete_boundary(&result, result.len()),
         "terminal sibling group is incomplete"
     );
     Ok(result)

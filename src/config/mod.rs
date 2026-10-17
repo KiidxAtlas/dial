@@ -33,7 +33,7 @@ pub mod voice;
 
 use crate::config::{
     paths::Layout,
-    settings_store::{locked, read_private, write_private},
+    settings_store::{locked, write_private},
     tools::{BUILTIN, EXTRA_TOOLS, integrations::INTEGRATION_TOOLS},
 };
 use anyhow::{Context, Result, ensure};
@@ -425,7 +425,7 @@ impl Config {
         let mut layers: [toml::Table; 2] = Default::default();
         let mut migrations = Vec::new();
         for (index, path) in layout.config_files().into_iter().enumerate() {
-            let Some(bytes) = read_private(&path)
+            let Some(bytes) = crate::platform::atomic::read_private(&path)
                 .with_context(|| format!("cannot read configuration {}", path.display()))?
             else {
                 continue;
@@ -470,7 +470,7 @@ impl Config {
         // Re-read under the same lock used by the settings editor to preserve concurrent edits.
         for path in migrations {
             let _lock = locked(&path)?;
-            let Some(bytes) = read_private(&path)? else {
+            let Some(bytes) = crate::platform::atomic::read_private(&path)? else {
                 continue;
             };
             let mut current: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)

@@ -613,7 +613,7 @@ impl ModelProfile {
                 _ => {}
             }
         }
-        crate::reliability::constrain_openai(body, self);
+        crate::llm::reliability::constrain_openai(body, self);
         if self.tool_repair
             && self.structured_output() == StructuredOutput::JsonSchema
             && let Some(tools) = body.get("tools").and_then(|tools| tools.as_array())

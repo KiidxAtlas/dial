@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::tools::background::procinfo::ProcId;
+use crate::platform::procinfo::ProcId;
 
 /// Reap only records whose owner has been dead AND untouched this long.
 pub(super) const GRACE: Duration = Duration::from_secs(15);

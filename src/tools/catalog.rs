@@ -175,7 +175,7 @@ pub fn validate_arguments(schema: &Value, arguments: &Value) -> Result<(), Strin
         .pointer("/function/parameters")
         .ok_or("tool has no parameter schema")?;
     let mut arguments = arguments.clone();
-    crate::reliability::omit_optional_nulls(&mut arguments, parameters);
+    crate::llm::reliability::omit_optional_nulls(&mut arguments, parameters);
     crate::runtime::arguments::validate(parameters, &arguments)
 }
 

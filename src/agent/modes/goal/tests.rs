@@ -56,13 +56,11 @@ fn launch_modes_start_the_goal_and_set_launch_state() {
     let config = Config::default();
     let dir = tempfile::tempdir().unwrap();
     let mut agent = new_agent(&config, "http://127.0.0.1:9", dir.path());
-    let flags = crate::cli::mode_flags::ModeFlags {
-        goal: Some("ship it".to_owned()),
-        advisor: true,
-        external_thinking: true,
-        ..Default::default()
-    };
-    flags.apply_to_agent(&mut agent).unwrap();
+    // The launch sequence `cli::mode_flags` applies for `--goal` with advisor and external thinking.
+    agent.set_launch_modes(true, true);
+    agent
+        .goal_mutate(|goal| goal.start("ship it", None))
+        .unwrap();
     let objective = agent
         .goal_mutate(|state| state.goal.as_ref().map(|goal| goal.objective.clone()))
         .unwrap();

@@ -8,7 +8,7 @@ use super::{McpLoad, Session};
 use crate::config::paths::Layout;
 use crate::config::settings_store::{self, Scope};
 use crate::config::types::{Config, McpServerConfig};
-use crate::tools::ToolOutput;
+use crate::runtime::tool_output::ToolOutput;
 use crate::tools::ext::{Tool, ToolContext};
 use anyhow::Result;
 use serde_json::{Value, json};

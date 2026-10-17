@@ -104,47 +104,6 @@ fn legacy_at_references_and_memory_role_fields_are_renamed() {
 }
 
 #[test]
-fn memory_setup_can_load_and_open_before_role_assignment() {
-    use crate::storage::memory_backend::{MemoryAuthority, MemoryRuntime};
-    let project = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
-    let path = layout.config_files()[0].clone();
-    let settings = "model='local'\nprovider='mlx'\n[memory]\nbackend='local'\n";
-    fs::write(&path, settings).unwrap();
-    let authority = MemoryAuthority {
-        session_id: "setup-session".into(),
-        branch_id: "main".into(),
-        revision: "0".into(),
-        task_depth: 0,
-    };
-    let config = Config::load(&layout, None).unwrap();
-    let runtime = MemoryRuntime::open_configured(&layout, &config, authority.clone()).unwrap();
-    assert_eq!(runtime.id(), config.memory.backend);
-    assert!(
-        runtime
-            .open_error()
-            .unwrap()
-            .contains("assign the memory role")
-    );
-    let child = runtime
-        .for_child(MemoryAuthority {
-            task_depth: 1,
-            ..authority.clone()
-        })
-        .unwrap();
-    assert_eq!(child.open_error(), runtime.open_error());
-    fs::write(
-        &path,
-        format!("{settings}[model_roles.memory]\nprovider='mlx'\nmodel='m'\n"),
-    )
-    .unwrap();
-    let config = Config::load(&layout, None).unwrap();
-    let runtime = MemoryRuntime::open_configured(&layout, &config, authority).unwrap();
-    assert!(runtime.open_error().is_none(), "{:?}", runtime.open_error());
-}
-
-#[test]
 fn missing_memory_role_is_recoverable_setup_not_invalid_config() {
     let with_backend = |backend: &str| {
         format!("model='local'\nprovider='mlx'\n[memory]\nenabled=true\nbackend='{backend}'\n")

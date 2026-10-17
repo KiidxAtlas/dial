@@ -9,9 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub use crate::storage::process_record::Record;
-use crate::storage::process_record::{self as process_record, Log};
-use crate::tools::background::procinfo::ProcId;
+use crate::platform::process_record::{self as process_record, Log, Record};
+use crate::platform::procinfo::ProcId;
 
 /// How long a restart waits for the old process to exit before giving up.
 const RESTART_EXIT_WAIT: Duration = Duration::from_secs(10);

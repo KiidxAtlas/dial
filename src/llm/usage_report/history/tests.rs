@@ -72,7 +72,9 @@ fn corrupt_lines_are_skipped() {
     let dir = tempfile::tempdir().unwrap();
     append(dir.path(), &report("anthropic", "", 1_000, 5.0)).unwrap();
     let path = dir.path().join(FILE);
-    let mut bytes = read_private(&path).unwrap().unwrap();
+    let mut bytes = crate::platform::atomic::read_private(&path)
+        .unwrap()
+        .unwrap();
     bytes.extend_from_slice(b"{not json\n");
     write_private(&path, &bytes).unwrap();
     append(dir.path(), &report("anthropic", "", 2_000, 6.0)).unwrap();

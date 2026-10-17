@@ -160,7 +160,7 @@ fn settings_panel_rejects_unreadable_layers_instead_of_empty_defaults() {
         Default::default(),
     )
     .unwrap();
-    settings_store::private_dir(&layout.state_dir).unwrap();
+    crate::platform::atomic::private_dir(&layout.state_dir).unwrap();
     settings_store::write_private(&layout.config_files()[1], b"invalid = [").unwrap();
     let error = settings_tables(&app, &config).unwrap_err();
     assert!(format!("{error:#}").contains("reading project settings"));

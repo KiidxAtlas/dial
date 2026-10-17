@@ -6,7 +6,7 @@ fn verdict(name: &str, command: &str, diagnostic: &str) -> CheckStatus {
         command: command.into(),
         timeout_secs: 0,
     };
-    let output = crate::tools::ToolOutput {
+    let output = crate::runtime::tool_output::ToolOutput {
         execution: Default::default(),
         text: format!("{diagnostic}\n[exit code: 1]"),
         is_error: true,

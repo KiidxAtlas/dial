@@ -4,6 +4,7 @@
 //! Its tools are the job's allowlist; every effect is authorized by the live
 //! parent's [`Approver`], and cancellation remains local to the child.
 use crate::config;
+use crate::runtime::tool_output::ToolOutput;
 
 use super::{
     approval, call_form_error, describe,
@@ -15,7 +16,7 @@ use super::{
 use crate::{
     llm::{self, Chat, Interrupted, provider::Backend},
     storage::skills,
-    tools::{self, ToolOutput, ext::ToolContext},
+    tools::{self, ext::ToolContext},
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -141,7 +142,7 @@ struct ChildBackends {
     journal: std::cell::RefCell<ChildJournal>,
     layout: crate::config::paths::Layout,
     _archive_dir: tempfile::TempDir,
-    image_store: crate::tools::artifact::ArtifactStore,
+    image_store: crate::storage::artifact::ArtifactStore,
     transcript: Option<std::sync::Arc<super::child_transcript::ChildTranscript>>,
 }
 
@@ -189,7 +190,7 @@ impl ChildBackends {
         let image_store = match env.workspace.artifacts() {
             Some(store) => store.clone(),
             None => {
-                crate::tools::artifact::ArtifactStore::new(&layout.state_dir.join("artifacts"))?
+                crate::storage::artifact::ArtifactStore::new(&layout.state_dir.join("artifacts"))?
             }
         };
         Ok(Self {
@@ -228,7 +229,7 @@ impl ChildBackends {
         let mut count = 0;
         for message in messages
             .iter()
-            .filter(|message| super::compaction::is_history(message))
+            .filter(|message| crate::storage::transcript::is_history(message))
         {
             count += 1;
             if count <= cursor {
@@ -1155,7 +1156,7 @@ fn rollover_child(
     journal.cursor = candidate
         .messages
         .iter()
-        .filter(|message| compaction::is_history(message))
+        .filter(|message| crate::storage::transcript::is_history(message))
         .count();
     *request = candidate;
     drop(journal);
@@ -1323,7 +1324,7 @@ fn settle_child_exploration(
                 .session
                 .messages()
                 .iter()
-                .filter(|message| super::compaction::is_history(message))
+                .filter(|message| crate::storage::transcript::is_history(message))
                 .count();
             if let Some(error) = commit.durability_error {
                 anyhow::bail!(
@@ -1349,7 +1350,7 @@ fn compact_child(
 ) -> Result<bool> {
     use super::compaction;
     anyhow::ensure!(
-        compaction::complete_boundary(&request.messages, request.messages.len()),
+        crate::storage::transcript::complete_boundary(&request.messages, request.messages.len()),
         "child compaction requires a complete assistant/tool round"
     );
     children.archive(&request.messages)?;
@@ -1474,14 +1475,14 @@ fn compact_child(
         prefix.extend(
             source.messages[prepared.first_kept..]
                 .iter()
-                .filter(|message| compaction::is_history(message))
+                .filter(|message| crate::storage::transcript::is_history(message))
                 .cloned(),
         );
         0
     } else {
         source.messages[prepared.first_kept..]
             .iter()
-            .filter(|message| compaction::is_history(message))
+            .filter(|message| crate::storage::transcript::is_history(message))
             .count()
     };
     let mut journal = children.journal.borrow_mut();
@@ -1496,7 +1497,7 @@ fn compact_child(
     journal.cursor = candidate
         .messages
         .iter()
-        .filter(|message| compaction::is_history(message))
+        .filter(|message| crate::storage::transcript::is_history(message))
         .count();
     drop(journal);
     observer.borrow_mut().notice(&format!(
@@ -1780,7 +1781,7 @@ fn run_inner(
         && env.config.codebase.ambient_context
         && let Some(layout) = env.layout
     {
-        match crate::storage::codebase::Codebase::open(layout).and_then(|cache| {
+        match crate::tools::codebase::Codebase::open(layout).and_then(|cache| {
             if env.config.efficiency.enabled {
                 cache.task_context(
                     &job.prompt,
@@ -2742,7 +2743,7 @@ fn run_inner(
                     seconds = Some(elapsed);
                     output
                 }
-                None if rejection.is_some() => tools::ToolOutput { execution: Default::default(),
+                None if rejection.is_some() => crate::runtime::tool_output::ToolOutput { execution: Default::default(),
                     data: None,
                     text: rejection.unwrap(),
                     is_error: true,
@@ -2812,7 +2813,7 @@ fn run_inner(
                 output.text.push_str(&advice);
             }
             let image = if (call.name == "browser" || call.name == "computer") && !output.is_error {
-                match tools::artifact::capture_image(env.workspace.artifacts(), &mut output) {
+                match crate::storage::artifact::capture_image(env.workspace.artifacts(), &mut output) {
                     Ok(image) => image,
                     Err(e) => {
                         return Ok(super::engine::Tick::Finished(Outcome::failed(steps, format!("retaining screenshot: {e:#}"))));
@@ -4307,7 +4308,7 @@ fn schemas(env: Env, names: &[String]) -> Result<Vec<Value>> {
             "skill" => Ok(skills::skill_tool::schema()),
             "task" => Ok(super::subagents::nested_schema(env.config)),
             "message" => Ok(super::live_tasks::message_schema()),
-            "artifact_read" => Ok(tools::artifact::schema()),
+            "artifact_read" => Ok(crate::storage::artifact::schema()),
             other => bail!("subagents cannot use {other}"),
         })
         .collect()

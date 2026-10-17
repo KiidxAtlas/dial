@@ -20,7 +20,6 @@
 //! requires lsof-proven owned listeners; Linux sandbox namespace ownership fails closed.
 
 mod input;
-pub(crate) mod procinfo;
 mod readiness;
 mod table;
 mod wake;

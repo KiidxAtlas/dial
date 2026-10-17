@@ -94,15 +94,5 @@ pub(crate) fn skipped(id: &str, reason: &str) -> Value {
     )
 }
 
-impl ToolStatus {
-    pub fn from_output(output: &super::ToolOutput) -> Self {
-        output.execution.status.unwrap_or(if output.is_error {
-            Self::Error
-        } else {
-            Self::Ok
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests;

@@ -431,18 +431,7 @@ impl Harness {
             arguments: args,
             malformed_arguments: false,
         };
-        let authorize = |name: &str, paths: &[std::path::PathBuf], unbounded: bool| {
-            crate::agent::approval::authorize_mutation_paths(
-                &[],
-                self.ws.root(),
-                self.ws.additional_roots(),
-                false,
-                &original,
-                name,
-                paths,
-                unbounded,
-            )
-        };
+        let authorize = crate::tools::testkit::authorize_in_workspace(&self.ws, "lsp");
         self.tool.call(
             &ToolContext {
                 workspace: &self.ws,

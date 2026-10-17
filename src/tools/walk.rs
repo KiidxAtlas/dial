@@ -8,7 +8,8 @@
 //!   are separate checkouts, not project files, and are skipped the same way.
 //! * Symlinks are never followed or reported; entries are visited in sorted order depth-first.
 
-use super::{SCRATCH_DIR, Workspace};
+use super::Workspace;
+use crate::workspace_copy::SCRATCH_DIR;
 use ignore::WalkBuilder;
 use std::path::Path;
 

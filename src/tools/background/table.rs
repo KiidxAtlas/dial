@@ -8,8 +8,8 @@
 use super::input;
 use super::input::{Handle, Input};
 use super::wake;
+use crate::storage::artifact::ArtifactSpool;
 use crate::tools::Workspace;
-use crate::tools::artifact::ArtifactSpool;
 use crate::tools::ext::ToolEvent;
 use crate::tools::shell::{ProcessGroup, shell_command_mode};
 use std::collections::VecDeque;

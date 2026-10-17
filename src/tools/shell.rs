@@ -3,8 +3,9 @@
 use super::sandbox::is_secret_env;
 #[cfg(not(windows))]
 use super::sandbox::{Policy, Sandbox};
-use super::{SCRATCH_DIR, ToolOutput, Workspace, opt_bool, opt_u64, req_str};
+use super::{ToolOutput, Workspace, opt_bool, opt_u64, req_str};
 use crate::config::types::ShellBackend;
+use crate::workspace_copy::SCRATCH_DIR;
 use anyhow::Result;
 use serde_json::Value;
 use std::fs;
@@ -79,7 +80,7 @@ pub struct ForegroundJob {
     /// Output already read before adoption, so the adopted job keeps it.
     pub(crate) captured: Vec<u8>,
     /// Complete-output artifact already being written before adoption.
-    pub(crate) spool: Option<super::artifact::ArtifactSpool>,
+    pub(crate) spool: Option<crate::storage::artifact::ArtifactSpool>,
 }
 
 /// The last lines of output captured before adoption, bounded so the adoption notice stays small.
@@ -137,7 +138,7 @@ impl ForegroundJob {
         Child,
         io::PipeReader,
         Vec<u8>,
-        Option<super::artifact::ArtifactSpool>,
+        Option<crate::storage::artifact::ArtifactSpool>,
     ) {
         let job = std::mem::ManuallyDrop::new(self);
         unsafe {
@@ -235,7 +236,7 @@ impl Capture {
 fn drain_pipe(
     reader: &mut (impl Read + crate::platform::io::Pipe),
     capture: &mut Capture,
-    spool: &mut Option<super::artifact::ArtifactSpool>,
+    spool: &mut Option<crate::storage::artifact::ArtifactSpool>,
     artifact_error: &mut Option<String>,
     on_output: &(dyn Fn(&[u8]) + Sync),
 ) -> io::Result<bool> {

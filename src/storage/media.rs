@@ -8,7 +8,7 @@ use std::io::Write;
 /// Transfer authorized images into immutable storage before journaling or inference. Source paths
 /// remain provenance and authorization witnesses; only the snapshot supplies historical pixels.
 /// A failed capture is recorded explicitly rather than silently substituting newer source bytes.
-pub(crate) fn retain_message(message: &mut Value, store: &crate::tools::artifact::ArtifactStore) {
+pub(crate) fn retain_message(message: &mut Value, store: &crate::storage::artifact::ArtifactStore) {
     retain(message, Some(store));
 }
 
@@ -17,7 +17,7 @@ pub(crate) fn retain_volatile_message(message: &mut Value) {
     retain(message, None);
 }
 
-fn retain(message: &mut Value, store: Option<&crate::tools::artifact::ArtifactStore>) {
+fn retain(message: &mut Value, store: Option<&crate::storage::artifact::ArtifactStore>) {
     for reference in message
         .get_mut("dial_images")
         .and_then(Value::as_array_mut)
@@ -42,7 +42,7 @@ fn retain(message: &mut Value, store: Option<&crate::tools::artifact::ArtifactSt
             // Text-output truncation limits must never truncate binary media.
             let mut spool = store
                 .clone()
-                .with_limits(&crate::tools::artifact::ArtifactConfig {
+                .with_limits(&crate::storage::artifact::ArtifactConfig {
                     max_bytes: MAX_IMAGE_BYTES,
                     head_bytes: MAX_IMAGE_BYTES,
                 })

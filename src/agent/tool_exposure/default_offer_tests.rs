@@ -368,7 +368,7 @@ fn default_stale_reduction_precedes_automatic_summary_pressure() {
             json!({"role":"assistant","content":"","tool_calls":[{"id":"new","function":{"name":"read","arguments":"{}"}}]}),
             json!({"role":"tool","tool_call_id":"new","content":"y".repeat(160_000),"dial_evidence":{"artifact":"artifact://new","observation":"same-range"}}),
         ];
-        let raw = context_meter::estimate_parts(&messages, &[]);
+        let raw = crate::llm::wire::estimate_parts(&messages, &[]);
         let selection = agent.auth_config.selection();
         let threshold = agent
             .config
@@ -399,7 +399,7 @@ fn default_stale_reduction_precedes_automatic_summary_pressure() {
                 .unwrap()
                 .starts_with("[Older read result omitted")
         );
-        assert!(context_meter::estimate_parts(&messages, &[]) < threshold);
+        assert!(crate::llm::wire::estimate_parts(&messages, &[]) < threshold);
     });
 }
 

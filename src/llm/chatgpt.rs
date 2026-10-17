@@ -3,7 +3,7 @@
 use super::auth::SecretToken;
 #[cfg(test)]
 use crate::config::settings_store::locked;
-use crate::config::settings_store::{locked_cancellable, read_private, write_private};
+use crate::config::settings_store::{locked_cancellable, write_private};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
@@ -59,7 +59,7 @@ fn cached_catalog_for(dir: &Path, selected: Option<&str>) -> Result<ModelCatalog
     }) else {
         return Ok(ModelCatalog::default());
     };
-    let Some(bytes) = read_private(&dir.join(CATALOG_FILE))? else {
+    let Some(bytes) = crate::platform::atomic::read_private(&dir.join(CATALOG_FILE))? else {
         return Ok(ModelCatalog::default());
     };
     let mut catalogs: BTreeMap<String, ModelCatalog> =
@@ -110,12 +110,15 @@ pub(crate) fn scoped_model_context_window(
 fn save_catalog(dir: &Path, id: &str, catalog: &ModelCatalog) -> Result<()> {
     let path = dir.join(CATALOG_FILE);
     let _lock = locked_cancellable(&path, &AtomicBool::new(false))?;
-    let mut catalogs: BTreeMap<String, ModelCatalog> = match read_private(&path)? {
-        Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
-            anyhow::anyhow!("ChatGPT model metadata cache is invalid; existing records preserved")
-        })?,
-        None => BTreeMap::new(),
-    };
+    let mut catalogs: BTreeMap<String, ModelCatalog> =
+        match crate::platform::atomic::read_private(&path)? {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
+                anyhow::anyhow!(
+                    "ChatGPT model metadata cache is invalid; existing records preserved"
+                )
+            })?,
+            None => BTreeMap::new(),
+        };
     catalogs.insert(id.into(), catalog.clone());
     write_private(&path, &serde_json::to_vec(&catalogs)?)
 }
@@ -158,7 +161,7 @@ fn now() -> u64 {
         .as_secs()
 }
 fn load(dir: &Path) -> Result<State> {
-    match read_private(&dir.join(FILE))? {
+    match crate::platform::atomic::read_private(&dir.join(FILE))? {
         None => Ok(State::default()),
         Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
             anyhow::anyhow!("ChatGPT credential storage is invalid; existing records preserved")
@@ -828,7 +831,7 @@ fn scoped_account_token_at(
         .or_else(|| state.active.clone())
         .ok_or_else(|| anyhow::anyhow!("Continue with ChatGPT in /providers first"))?;
     // Restrictions are operator-private and authoritative on every dispatch, not a stale UI copy.
-    if let Some(bytes) = read_private(&dir.join("config.toml"))? {
+    if let Some(bytes) = crate::platform::atomic::read_private(&dir.join("config.toml"))? {
         let global: toml::Table = toml::from_str(std::str::from_utf8(&bytes)?)
             .context("invalid private global account policy")?;
         if let Some(raw) = global.get("chatgpt_accounts") {

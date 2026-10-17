@@ -306,7 +306,7 @@ impl Journal {
             if bytes.len() > crate::platform::atomic::PRIVATE_LIMIT {
                 return Ok(false);
             }
-            crate::config::settings_store::write_private(&writer.path, &bytes)?;
+            crate::platform::atomic::write_private(&writer.path, &bytes)?;
             let file = crate::platform::fs::open_owner_only(
                 std::fs::OpenOptions::new().append(true),
                 &writer.path,

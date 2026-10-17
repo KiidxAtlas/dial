@@ -17,9 +17,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::config::settings_store;
 use crate::platform::fs as platform_fs;
-use crate::tools::background::procinfo::ProcId;
+use crate::platform::procinfo::ProcId;
 
 /// Largest tail returned by [`read_tail`].
 pub const LOG_TAIL_BYTES: u64 = 64 * 1024;
@@ -95,7 +94,7 @@ impl Record {
         persist: bool,
     ) -> Result<Self> {
         let path = record_path(user, pid);
-        settings_store::private_dir(path.parent().context("process record directory")?)?;
+        crate::platform::atomic::private_dir(path.parent().context("process record directory")?)?;
         let value = json!({"pid":pid,"parent_pid":parent,"proc":ProcId::of(pid as i32),
             "kind":kind,"model":model,"project":project,"state":state,"phase":phase});
         let record = Self {
@@ -109,7 +108,7 @@ impl Record {
     }
 
     fn save(&self) -> Result<()> {
-        settings_store::write_private(&self.path, self.value.to_string().as_bytes())
+        crate::platform::atomic::write_private(&self.path, self.value.to_string().as_bytes())
     }
 
     pub fn phase(&mut self, phase: &str) -> Result<()> {
@@ -155,7 +154,7 @@ fn record_path(user: &Path, pid: u32) -> PathBuf {
 
 /// Loads the private record for `pid`, if one exists.
 pub fn load(user: &Path, pid: u32) -> Result<Option<Value>> {
-    settings_store::read_private(&record_path(user, pid))?
+    crate::platform::atomic::read_private(&record_path(user, pid))?
         .map(|bytes| serde_json::from_slice(&bytes).context("reading process record"))
         .transpose()
 }
@@ -163,7 +162,7 @@ pub fn load(user: &Path, pid: u32) -> Result<Option<Value>> {
 /// The kernel identity recorded when the process was created. Missing or unverifiable identities
 /// (including records written before identities were recorded) read as `None`, so the record can
 /// never be attached to a recycled PID.
-pub(crate) fn proc_id(record: &Value) -> Option<ProcId> {
+pub fn proc_id(record: &Value) -> Option<ProcId> {
     serde_json::from_value::<ProcId>(record["proc"].clone())
         .ok()
         .filter(|id| id.start != 0)
@@ -189,7 +188,7 @@ static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 impl Log {
     pub fn create(user: &Path) -> Result<Arc<Self>> {
         let dir = user.join("compute-processes").join("logs");
-        settings_store::private_dir(&dir)?;
+        crate::platform::atomic::private_dir(&dir)?;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())

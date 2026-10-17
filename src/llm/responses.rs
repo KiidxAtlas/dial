@@ -262,7 +262,7 @@ fn content(value: &Value, assistant: bool) -> Result<Value> {
     Ok(json!(out))
 }
 #[cfg(test)]
-pub(super) fn request(
+pub fn request(
     model: &str,
     chat: &Chat,
     profile: Option<&super::profiles::ModelProfile>,
@@ -305,7 +305,7 @@ fn request_inner(
             function["strict"] = json!(false);
             if profile.is_some_and(|p| p.capabilities.strict_tools)
                 && let Some(parameters) =
-                    crate::reliability::strict_parameters(&function["parameters"])
+                    crate::llm::reliability::strict_parameters(&function["parameters"])
             {
                 function["parameters"] = parameters;
                 function["strict"] = json!(true);
@@ -1060,7 +1060,7 @@ pub(super) fn compact(
         let mut remaining = u64::from(retained_budget.min(64_000));
         let mut kept = Vec::new();
         for candidate in candidates.into_iter().rev() {
-            let cost = crate::agent::compaction::estimate(&candidate);
+            let cost = crate::llm::wire::estimate(&candidate);
             if cost > remaining {
                 break;
             }

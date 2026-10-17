@@ -1,9 +1,25 @@
 use super::*;
-fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Workspace, Experience) {
+use std::path::{Component, Path};
+
+/// Project root for source snapshots: relative, normal components only, joined under `self.0`.
+struct Root(PathBuf);
+impl SourceRoot for Root {
+    fn resolve(&self, input: &str) -> Result<PathBuf, String> {
+        if input.is_empty()
+            || !Path::new(input)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+        {
+            return Err("path escapes the project".into());
+        }
+        Ok(self.0.join(input))
+    }
+}
+fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Root, Experience) {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::with_user_dir(root.path(), home.path().join("dial")).unwrap();
-    let ws = Workspace::new(root.path()).unwrap();
+    let ws = Root(root.path().to_path_buf());
     let store = Experience::open(&layout).unwrap();
     #[cfg(windows)]
     assert!(
@@ -14,7 +30,7 @@ fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Workspace, Experience) {
     );
     (root, home, ws, store)
 }
-fn recipe(ws: &Workspace) -> Recipe {
+fn recipe(ws: &Root) -> Recipe {
     Recipe {
         objective: "repair arithmetic".into(),
         model: "model-a".into(),

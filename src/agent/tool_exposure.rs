@@ -512,7 +512,7 @@ impl<'a> Agent<'a> {
                 "skill" => skills::skill_tool::schema(),
                 "skill_manage" => skills::manage_tool::schema(),
                 "session_search" => session::session_search_tool::schema(),
-                "artifact_read" => tools::artifact::schema(),
+                "artifact_read" => crate::storage::artifact::schema(),
                 "working_state" => evidence::working_schema(),
                 "tool_search" => json!({"type":"function","function":{"name":"tool_search","description":"Rank eligible tools by capability or exact name and enable up to three strongest matches for the next model round. Returns names, descriptions and activation status. Never executes tools, grants permission or enables same-batch calls; do not rediscover tools already offered.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}),
                 "tool_load" => json!({"type":"function","function":{"name":"tool_load","description":"Explicitly enable or unload exact eligible tool names. Search already enables its strongest matches; use this for exact control. Changes take effect next round, never in this batch, and grant no permissions.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":32,"items":{"type":"string"}},"unload":{"type":"array","maxItems":32,"items":{"type":"string"}}},"additionalProperties":false}}}),

@@ -1,3 +1,6 @@
+use crate::config::{paths::Layout, types::Config};
+use std::fs;
+
 use super::test_support::{FakeRunner, authority};
 use super::*;
 
@@ -320,4 +323,45 @@ fn backlog_keeps_every_turn_across_turns_and_sessions() {
     runtime.observe_owned(&other, second).unwrap();
     runtime.maintain(&other, &mut runner).unwrap();
     assert_eq!(runner.systems.len(), 3);
+}
+
+#[test]
+fn memory_setup_can_load_and_open_before_role_assignment() {
+    use crate::storage::memory_backend::{MemoryAuthority, MemoryRuntime};
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(project.path(), home.path().to_owned()).unwrap();
+    let path = layout.config_files()[0].clone();
+    let settings = "model='local'\nprovider='mlx'\n[memory]\nbackend='local'\n";
+    fs::write(&path, settings).unwrap();
+    let authority = MemoryAuthority {
+        session_id: "setup-session".into(),
+        branch_id: "main".into(),
+        revision: "0".into(),
+        task_depth: 0,
+    };
+    let config = Config::load(&layout, None).unwrap();
+    let runtime = MemoryRuntime::open_configured(&layout, &config, authority.clone()).unwrap();
+    assert_eq!(runtime.id(), config.memory.backend);
+    assert!(
+        runtime
+            .open_error()
+            .unwrap()
+            .contains("assign the memory role")
+    );
+    let child = runtime
+        .for_child(MemoryAuthority {
+            task_depth: 1,
+            ..authority.clone()
+        })
+        .unwrap();
+    assert_eq!(child.open_error(), runtime.open_error());
+    fs::write(
+        &path,
+        format!("{settings}[model_roles.memory]\nprovider='mlx'\nmodel='m'\n"),
+    )
+    .unwrap();
+    let config = Config::load(&layout, None).unwrap();
+    let runtime = MemoryRuntime::open_configured(&layout, &config, authority).unwrap();
+    assert!(runtime.open_error().is_none(), "{:?}", runtime.open_error());
 }

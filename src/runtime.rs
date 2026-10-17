@@ -1,6 +1,7 @@
 //! Shared execution state. Views observe result bodies; snapshots are journal records, never model text.
 pub mod arguments;
 pub mod cancellation;
+pub mod clock;
 pub mod execution;
 pub mod fingerprint;
 pub(crate) mod json_transport;
@@ -10,6 +11,7 @@ pub mod schema;
 pub(crate) mod stream_journal;
 pub(crate) mod structural;
 pub mod template;
+pub mod tool_output;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

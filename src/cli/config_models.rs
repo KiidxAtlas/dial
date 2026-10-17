@@ -257,7 +257,7 @@ pub fn run_config_with_overlay(
                     .expect("built-in schemas are valid")
                     .into(),
                 );
-                object.insert("artifact_tool".into(), crate::tools::artifact::schema());
+                object.insert("artifact_tool".into(), crate::storage::artifact::schema());
             }
             println!("{}", serde_json::to_string_pretty(&reference)?);
         } else {

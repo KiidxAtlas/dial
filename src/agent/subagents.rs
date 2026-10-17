@@ -19,6 +19,7 @@
 use crate::config::subagents::AGENTS;
 use crate::config::subagents::AgentSpec;
 use crate::config::subagents::builtin;
+use crate::runtime::tool_output::ToolOutput;
 
 use super::{
     Ui,
@@ -29,7 +30,7 @@ use crate::{
     config::paths::Layout,
     config::types::{Approval, Config, Harness},
     llm::{ToolCall, provider::Backend},
-    tools::{ToolOutput, Workspace, ext::Registry},
+    tools::{Workspace, ext::Registry},
 };
 use serde_json::{Value, json};
 use std::{
@@ -2683,7 +2684,7 @@ fn render(
     request: &Request,
     outcomes: Vec<Option<Outcome>>,
     models: &std::collections::BTreeMap<usize, String>,
-    artifacts: Option<&crate::tools::artifact::ArtifactStore>,
+    artifacts: Option<&crate::storage::artifact::ArtifactStore>,
 ) -> ToolOutput {
     let outcomes: Vec<Outcome> = outcomes
         .into_iter()

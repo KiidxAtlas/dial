@@ -155,8 +155,7 @@ impl Recorder {
             "unsupported run contract version"
         );
         let lock = crate::config::settings_store::try_locked(path)?;
-        let data = if resume && let Some(bytes) = crate::config::settings_store::read_private(path)?
-        {
+        let data = if resume && let Some(bytes) = crate::platform::atomic::read_private(path)? {
             let data: Checkpoints =
                 serde_json::from_slice(&bytes).context("invalid benchmark checkpoint")?;
             ensure!(

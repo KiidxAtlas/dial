@@ -12,7 +12,7 @@ fn setup() -> (
     let mut config = crate::config::types::Config::default();
     config.extensions.enabled = false;
     config.integrations = vec!["ast_search".into()];
-    let registry = Registry::standard(&config);
+    let registry = Registry::standard(&config, Vec::new());
     (root, workspace, config, registry)
 }
 fn ready(pool: &Pool) {

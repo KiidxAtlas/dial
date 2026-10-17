@@ -59,7 +59,7 @@ fn tool<'a>(loaded: &'a McpLoad, name: &str) -> &'a Arc<dyn Tool> {
         .unwrap_or_else(|| panic!("no tool {name}"))
 }
 
-fn call(loaded: &McpLoad, name: &str, args: Value) -> crate::tools::ToolOutput {
+fn call(loaded: &McpLoad, name: &str, args: Value) -> crate::runtime::tool_output::ToolOutput {
     let (_dir, workspace) = testkit::workspace();
     let config = Config::default();
     tool(loaded, name).call(
@@ -455,11 +455,11 @@ fn inventory_reports_runtime_status_without_exposing_configuration_secrets() {
 #[test]
 fn rebuilt_registry_discovers_and_calls_installed_mcp_tools() {
     use crate::tools::ext::Registry;
-    let before = Registry::standard(&Config::default());
+    let before = Registry::standard(&Config::default(), Vec::new());
     assert!(before.contains("mcp_servers"));
     assert!(!before.contains("mcp__installed__echo"));
     let config = config_with(vec![("installed", fake_config("", 30))]);
-    let registry = Registry::standard(&config);
+    let registry = Registry::standard(&config, Vec::new());
     let (_dir, workspace) = testkit::workspace();
     let ctx = ToolContext {
         workspace: &workspace,
@@ -489,7 +489,7 @@ fn rebuilt_registry_discovers_and_calls_installed_mcp_tools() {
     );
     let mut disabled = config.clone();
     disabled.mcp.get_mut("installed").unwrap().enabled = false;
-    let reloaded = Registry::standard(&disabled);
+    let reloaded = Registry::standard(&disabled, Vec::new());
     assert!(!reloaded.contains(name));
     let listing = reloaded.get("mcp_servers").unwrap().call(&ctx, &json!({}));
     let listing: Value = serde_json::from_str(&listing.text).unwrap();

@@ -2,7 +2,7 @@
 use super::super::{Agent, Ui};
 use crate::{
     llm::{ToolCall, provider::Backend},
-    tools::ToolOutput,
+    runtime::tool_output::ToolOutput,
 };
 use serde_json::Value;
 

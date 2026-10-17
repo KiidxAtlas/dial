@@ -339,6 +339,3 @@ fn append_previews(out: &mut String, files: &[Planned]) {
         out.push_str(&planned.preview);
     }
 }
-
-#[cfg(test)]
-mod registration;

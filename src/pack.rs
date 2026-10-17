@@ -321,7 +321,7 @@ fn localize_adapter_config(dir: &Path, model: &str) -> Result<()> {
 
 /// Export the local steering vector as a verified pack.
 pub fn export_steering(config: &Config, out: &Path) -> Result<Value> {
-    let path = steering::vector_path(config);
+    let path = crate::llm::steering::vector_path(config);
     ensure!(path.is_file(), "no steering vector at {}", path.display());
     let bundle: Value =
         serde_json::from_slice(&fs::read(&path)?).context("steering vector is not valid JSON")?;

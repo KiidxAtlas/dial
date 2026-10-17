@@ -43,7 +43,7 @@ fn externally_changed_source_releases_only_its_read_feedback() {
     checkpoint.observe_at(
         &ws,
         &read,
-        &crate::tools::ToolOutput {
+        &crate::runtime::tool_output::ToolOutput {
             execution: Default::default(),
             data: None,
             text: "original".into(),

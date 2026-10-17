@@ -21,18 +21,7 @@ fn call(ws: &Workspace, tool: &dyn Tool, args: Value) -> ToolOutput {
         arguments: args,
         malformed_arguments: false,
     };
-    let authorize = |name: &str, paths: &[PathBuf], unbounded: bool| {
-        crate::agent::approval::authorize_mutation_paths(
-            &[],
-            ws.root(),
-            ws.additional_roots(),
-            false,
-            &original,
-            name,
-            paths,
-            unbounded,
-        )
-    };
+    let authorize = crate::tools::testkit::authorize_in_workspace(ws, tool.name());
     tool.call(
         &ToolContext {
             workspace: ws,

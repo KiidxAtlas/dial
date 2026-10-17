@@ -223,13 +223,13 @@ impl<'a> Agent<'a> {
         }
         if let Some(memory) = &self.memory {
             for tool in
-                crate::storage::provenance::tools(memory.clone(), self.session.id().to_owned())
+                crate::tools::provenance::tools(memory.clone(), self.session.id().to_owned())
             {
                 self.ext.register(tool);
             }
         }
         if let Some(cache) = &self.codebase {
-            self.ext.register(crate::storage::codebase::tool(
+            self.ext.register(crate::tools::codebase::tool(
                 cache.clone(),
                 self.session.id().to_owned(),
             ));

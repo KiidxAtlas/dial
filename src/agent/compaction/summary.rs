@@ -5,10 +5,10 @@
 use super::super::Ui;
 use crate::agent::compaction::{
     CompactionContext, CompactionControlDenied, MAX_SUMMARY_TOKENS, RemoteCompactionObserver,
-    estimate, interrupted, is_history, public_transcript, summary_instructions, summary_output,
-    with_ui,
+    estimate, interrupted, public_transcript, summary_instructions, summary_output, with_ui,
 };
 use crate::config::compaction::{CompactionConfig, CompactionMethod};
+use crate::storage::transcript::is_history;
 use crate::{
     llm::{Chat, provider::Backend},
     storage::session::Session,

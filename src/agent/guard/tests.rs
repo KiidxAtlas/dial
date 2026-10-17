@@ -490,8 +490,8 @@ fn rounds_where_every_call_failed_are_counted_and_any_success_clears_them() {
     );
 }
 
-fn ok_output() -> crate::tools::ToolOutput {
-    crate::tools::ToolOutput::ok("done".into())
+fn ok_output() -> crate::runtime::tool_output::ToolOutput {
+    crate::runtime::tool_output::ToolOutput::ok("done".into())
 }
 
 fn shell(command: &str) -> ToolCall {

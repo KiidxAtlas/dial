@@ -1,5 +1,6 @@
 //! Headless text output and the process signal bridge. Interactive input belongs to `app`/`tui`.
-use crate::{agent::Ui, tools::ToolOutput};
+use crate::agent::Ui;
+use crate::runtime::tool_output::ToolOutput;
 use std::{
     io::{self, IsTerminal, Write},
     sync::{

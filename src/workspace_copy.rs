@@ -37,8 +37,11 @@ pub(crate) const DEPENDENCY_DIRS: &[&str] = &[
     "node_modules",
     "vendor",
 ];
+/// Per-workspace scratch directory exported as TMPDIR for bash; walks skip it.
+pub(crate) const SCRATCH_DIR: &str = ".tmp";
+
 /// Root-only build caches and tool scratch; unlike these, `bin/` often contains real source.
-const ROOT_GENERATED_DIRS: &[&str] = &[".cargo-work", crate::tools::SCRATCH_DIR];
+const ROOT_GENERATED_DIRS: &[&str] = &[".cargo-work", SCRATCH_DIR];
 const EXCLUDED_FILES: &[&str] = &[
     ".env",
     ".env.local",

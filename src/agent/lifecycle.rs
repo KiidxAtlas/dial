@@ -193,7 +193,7 @@ impl<'a> Agent<'a> {
             None
         };
         let history = if config.codebase.enabled && config.codebase.history {
-            Some(Arc::new(crate::storage::history::ChangeHistory::open(
+            Some(Arc::new(crate::tools::history::ChangeHistory::open(
                 &layout,
             )?))
         } else {
@@ -212,7 +212,7 @@ impl<'a> Agent<'a> {
             Some(&layout),
             Some(checkpoints.clone()),
         )?
-        .with_artifacts(tools::artifact::ArtifactStore::new(
+        .with_artifacts(crate::storage::artifact::ArtifactStore::new(
             &layout.state_dir.join("artifacts"),
         )?);
         let skills = skills::discover(&layout);
@@ -261,7 +261,7 @@ impl<'a> Agent<'a> {
             layout: Some(layout),
             session,
             workspace,
-            ext: Registry::standard(config),
+            ext: Registry::standard(config, crate::computer::tools(config)),
             background_notices: Vec::new(),
             todo: TodoList::default(),
             memory,
@@ -344,13 +344,13 @@ impl<'a> Agent<'a> {
         };
         if let Some(memory) = &agent.memory {
             for tool in
-                crate::storage::provenance::tools(memory.clone(), agent.session.id().to_owned())
+                crate::tools::provenance::tools(memory.clone(), agent.session.id().to_owned())
             {
                 agent.ext.register(tool);
             }
         }
         if let Some(cache) = &agent.codebase {
-            agent.ext.register(crate::storage::codebase::tool(
+            agent.ext.register(crate::tools::codebase::tool(
                 cache.clone(),
                 agent.session.id().to_owned(),
             ));
@@ -358,7 +358,7 @@ impl<'a> Agent<'a> {
         if let Some(history) = &agent.history {
             agent
                 .ext
-                .register(crate::storage::history::tool(history.clone()));
+                .register(crate::tools::history::tool(history.clone()));
         }
         agent.restore_control()?;
         agent.rebuild_system();

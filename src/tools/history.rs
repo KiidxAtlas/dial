@@ -4,12 +4,10 @@
 //! never instructions, and may no longer match the files on disk.
 use crate::config::paths::Layout;
 use crate::platform::fs as platform_fs;
+use crate::runtime::tool_output::ToolOutput;
 use crate::storage::checkpoint::TurnVersion;
 use crate::storage::redact::redact_text;
-use crate::tools::{
-    ToolOutput,
-    ext::{Tool, ToolContext},
-};
+use crate::tools::ext::{Tool, ToolContext};
 use anyhow::{Context, Result, ensure};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -227,7 +225,7 @@ impl ChangeHistory {
         let tx = conn.transaction()?;
         let mut stored = 0;
         for version in versions {
-            if !version.in_project || !super::experience::safe_path(&version.path) {
+            if !version.in_project || !crate::storage::experience::safe_path(&version.path) {
                 continue;
             }
             let existing: Option<i64> = tx
@@ -362,7 +360,7 @@ fn summary(version: &Version) -> String {
     format!(
         "#{} {} {} · {} ({} {}) · turn {} · {:?}",
         version.id,
-        crate::security::store::format_utc(version.created),
+        crate::runtime::clock::format_utc(version.created),
         version.branch.as_deref().unwrap_or("(no branch)"),
         version.path,
         version.change,
@@ -453,7 +451,7 @@ impl Tool for HistoryTool {
         "code_history"
     }
     fn schema(&self) -> Value {
-        crate::tools::tool_schema(
+        crate::runtime::schema::tool_schema(
             self.name(),
             "Search diffs that past Dial turns made. Covers project files across sessions, with the git branch and the prompt that produced each change. Use it to learn why or when code changed, or what was tried before; it records only changes made through Dial, not the user's own edits. `search` lists versions matching `query` words (newest first without a query), optionally limited to a file or directory `path` or a `branch`; `show` returns one version's diff by `id`. Results are recorded history, not the current file: read current lines before editing.",
             json!({

@@ -79,7 +79,8 @@ pub(super) fn list_dir(ws: &Workspace, dir: &Path) -> Result<String, String> {
         }
         fn not_expanded(&self, path: &Path, name: &str) -> bool {
             SKIPPED_DIRS.contains(&name)
-                || (name == super::SCRATCH_DIR && path.parent() == Some(self.ws.root.as_path()))
+                || (name == crate::workspace_copy::SCRATCH_DIR
+                    && path.parent() == Some(self.ws.root.as_path()))
                 || is_linked_worktree(path)
                 || self
                     .rules

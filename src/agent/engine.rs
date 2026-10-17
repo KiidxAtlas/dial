@@ -1,10 +1,11 @@
 //! Shared turn execution policy. Controllers supply role-specific admission, persistence and UI;
 //! recovery decisions and result settlement live here for both parent and worker turns.
 use super::{guard, investigation, mutation_cycles, recovery_checkpoint, turn_recovery};
+use crate::runtime::tool_output::ToolOutput;
 use crate::{
     llm::ToolCall,
     tools::{
-        ToolOutput, Workspace,
+        Workspace,
         outcome::{self, Effects},
     },
 };

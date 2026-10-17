@@ -194,51 +194,6 @@ pub(crate) fn fake_python(dir: &Path) -> PathBuf {
     path
 }
 
-#[test]
-fn tracked_server_exposes_model_phase_and_cleans_up_on_stop() {
-    if crate::learn::processes::live_inspection_unavailable() {
-        return;
-    }
-    let root = tempfile::tempdir().unwrap();
-    let python = fake_python(root.path());
-    let model_path = root.path().join("model-one");
-    let model = model_path.to_str().unwrap();
-    let config = crate::config::types::Config {
-        user_dir: root.path().join("user"),
-        state_dir: root.path().join("state"),
-        project_root: root.path().join("project"),
-        ..Default::default()
-    };
-    let mut slot = None;
-    let server = ensure_profile_tracked(
-        &mut slot,
-        ServerProfile {
-            python: &python,
-            model,
-            adapter: None,
-            steering: None,
-            context: Some(&config),
-            runtime: &llm::local_runtime::LocalRuntime::default(),
-        },
-        30,
-        None,
-    )
-    .unwrap();
-    server.phase("generating").unwrap();
-    let rows = crate::learn::processes::snapshot(&config.user_dir).unwrap();
-    let row = rows.iter().find(|row| row["model"] == model).unwrap();
-    assert_eq!(row["phase"], "generating");
-    assert_eq!(row["project"], json!(config.project_root));
-    let pid = row["pid"].clone();
-    server.stop();
-    assert!(
-        !crate::learn::processes::snapshot(&config.user_dir)
-            .unwrap()
-            .iter()
-            .any(|row| row["pid"] == pid)
-    );
-}
-
 fn alive(pid: i64) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
@@ -264,7 +219,7 @@ fn steering_profile_change_restarts_server_and_clears_cache() {
     let marker = root.path().join("info.json");
     let model = marker.to_str().unwrap();
     let mut slot = None;
-    let mut spec = crate::steering::Specification {
+    let mut spec = crate::llm::steering::Specification {
         path: root.path().join("vector.json"),
         id: "a".repeat(64),
         strength: 0.5,

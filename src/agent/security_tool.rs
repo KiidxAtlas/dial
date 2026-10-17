@@ -8,8 +8,8 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use super::{Agent, Backend, Ui};
+use crate::runtime::tool_output::ToolOutput;
 use crate::security::Reviewer;
-use crate::tools::ToolOutput;
 
 /// Reviewer that runs each request as a `reviewer` child of the agent loop.
 struct LoopReviewer<'r, 'a> {

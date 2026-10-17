@@ -6,11 +6,12 @@ use super::{
     make_backend,
     subagents::{self, Approver, Env, Outcome},
 };
+use crate::runtime::tool_output::ToolOutput;
 use crate::{
     config::paths::Layout,
     config::types::{Approval, Config, Harness},
     llm::ToolCall,
-    tools::{ToolOutput, Workspace, ext::Registry},
+    tools::{Workspace, ext::Registry},
 };
 use serde_json::{Value, json};
 use std::{

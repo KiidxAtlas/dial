@@ -631,10 +631,10 @@ fn schemas_accept_valid_calls() {
             json!({"action": "create", "name": "a", "description": "d", "body": "b", "scope": "user"}),
         ),
     ] {
-        assert!(crate::agent::calls::validate(&s["function"]["parameters"], &args).is_ok());
+        assert!(crate::runtime::arguments::validate(&s["function"]["parameters"], &args).is_ok());
     }
     assert!(
-        crate::agent::calls::validate(
+        crate::runtime::arguments::validate(
             &skill_tool::schema()["function"]["parameters"],
             &json!({"file": "b"})
         )

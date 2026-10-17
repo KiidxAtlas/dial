@@ -203,7 +203,7 @@ fn snapshot(
             if !preserved_source && crate::workspace_copy::is_excluded_source_path(root, &path)
                 || path
                     .file_name()
-                    .is_some_and(|n| n == crate::tools::SCRATCH_DIR)
+                    .is_some_and(|n| n == crate::workspace_copy::SCRATCH_DIR)
             {
                 continue;
             }

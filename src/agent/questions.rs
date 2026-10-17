@@ -1,5 +1,6 @@
 //! Human questions are input, never tool authorization. All surfaces share this bounded protocol.
-use crate::{config::types::Config, tools::ToolOutput};
+use crate::config::types::Config;
+use crate::runtime::tool_output::ToolOutput;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{

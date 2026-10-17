@@ -3,9 +3,9 @@ use dial::{
     agent::{Agent, Decision, TurnOutcome, Ui, make_backend},
     config::paths::Layout,
     config::types::{Config, VerificationCommand},
+    runtime::tool_output::ToolOutput,
     storage::session::{Session, SessionMeta},
     storage::store::Store,
-    tools::ToolOutput,
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -1361,10 +1361,10 @@ fn stale_assumptions_block_blind_edit_retries_until_current_source_is_read() {
     let mut e = env(&server.url, "auto");
     e.config.verification.enabled = false;
     std::fs::write(e.project.path().join("main.rs"), "fn main() {}\n").unwrap();
-    let cache = Arc::new(dial::storage::codebase::Codebase::open(&e.layout).unwrap());
+    let cache = Arc::new(dial::tools::codebase::Codebase::open(&e.layout).unwrap());
     let ws = dial::tools::Workspace::new(e.project.path()).unwrap();
     cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
-    let tool = dial::storage::codebase::tool(cache.clone(), "old".into());
+    let tool = dial::tools::codebase::tool(cache.clone(), "old".into());
     let saved=tool.call(&dial::tools::ext::ToolContext { workspace: &ws, config: &e.config, mutation_authorizer: None, confirm: None },&json!({"action":"remember","topic":"entry ownership","summary":"Main owns dispatch","sources":["main.rs"]}));
     assert!(!saved.is_error, "{}", saved.text);
     cache
@@ -1439,7 +1439,7 @@ fn queued_work_skips_architecture_maintenance_without_consuming_model_calls() {
     let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
     a.turn("Explain", &mut QueuedUi).unwrap();
     assert_eq!(server.requests.lock().len(), 1);
-    let cache = dial::storage::codebase::Codebase::open(&e.layout).unwrap();
+    let cache = dial::tools::codebase::Codebase::open(&e.layout).unwrap();
     assert!(cache.architecture_synthesis(8000, false).unwrap().is_some());
 }
 
@@ -6079,7 +6079,7 @@ fn tool_groups_preserve_order_and_mutations_are_barriers() {
             .as_str()
             .unwrap();
     let artifacts =
-        dial::tools::artifact::ArtifactStore::new(&e.layout.state_dir.join("artifacts")).unwrap();
+        dial::storage::artifact::ArtifactStore::new(&e.layout.state_dir.join("artifacts")).unwrap();
     let first_evidence = artifacts.retrieve(first_uri, 1, 100).unwrap();
     assert!(
         first_evidence.contains("before") && !first_evidence.contains("after"),
@@ -8087,10 +8087,10 @@ fn legacy_admitted_memory_selection_migrates_runtime_without_rewriting_history()
     let mut legacy = e.config.harness.clone();
     legacy.tools.push("memory".into());
     let store = Store::open(&e.layout.state_dir, "scripted", "legacy-consumer", &legacy).unwrap();
-    let memory = dial::storage::provenance::ProvenanceMemory::open(&e.layout).unwrap();
+    let memory = dial::tools::provenance::ProvenanceMemory::open(&e.layout).unwrap();
     memory
         .retain(
-            dial::storage::provenance::Scope::Project,
+            dial::tools::provenance::Scope::Project,
             "durable fixture fact",
             "user-confirmed fixture",
             "primer-session",
@@ -9278,7 +9278,7 @@ fn behavioral_repairs_retain_failure_and_pass_without_marking_task_success() {
     );
     let before_ref = record["changes"][0]["before_ref"].as_str().unwrap();
     let artifacts =
-        dial::tools::artifact::ArtifactStore::new(&e.layout.state_dir.join("artifacts")).unwrap();
+        dial::storage::artifact::ArtifactStore::new(&e.layout.state_dir.join("artifacts")).unwrap();
     assert!(
         artifacts
             .retrieve(before_ref, 1, 10)

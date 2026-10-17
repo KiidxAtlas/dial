@@ -26,7 +26,8 @@ fn unchanged_reads_redirect_but_changed_results_and_mutations_do_not() {
     assert!(guard.observe(&again, "new", true).is_none());
     guard.observe_output(
         &call("edit", json!({})),
-        &crate::tools::ToolOutput::structured(json!({})).with_changes(["changed.rs".into()]),
+        &crate::runtime::tool_output::ToolOutput::structured(json!({}))
+            .with_changes(["changed.rs".into()]),
     );
     assert!(guard.observe(&again, "new", false).is_none());
 }
@@ -70,7 +71,8 @@ fn shell_checks_allow_new_results_different_commands_and_verification_after_edit
     );
     guard.observe_output(
         &call("edit", json!({"path":"version.txt"})),
-        &crate::tools::ToolOutput::structured(json!({})).with_changes(["version.txt".into()]),
+        &crate::runtime::tool_output::ToolOutput::structured(json!({}))
+            .with_changes(["version.txt".into()]),
     );
     assert!(guard.observe(&check, old, false).is_none());
 }
@@ -225,7 +227,8 @@ fn no_op_edits_and_todo_polling_do_not_erase_version_check_loops() {
     }
     guard.observe_output(
         &call("edit", json!({})),
-        &crate::tools::ToolOutput::structured(json!({})).with_changes(["changed.rs".into()]),
+        &crate::runtime::tool_output::ToolOutput::structured(json!({}))
+            .with_changes(["changed.rs".into()]),
     );
     assert!(guard.escalation().is_none());
     assert!(guard.observe(&check, "version = 0.3.31", false).is_none());

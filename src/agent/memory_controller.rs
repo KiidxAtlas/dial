@@ -657,7 +657,7 @@ impl Agent<'_> {
                 );
             }
             if input == "clear" || input.starts_with("clear ") {
-                use crate::storage::provenance::Scope;
+                use crate::tools::provenance::Scope;
                 let scope = match input {
                     "clear" | "clear project" => Scope::Project,
                     "clear global" => Scope::Global,

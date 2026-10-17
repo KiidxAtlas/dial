@@ -40,7 +40,8 @@ fn retained_deletion_replays_before_and_after_independent_checks() {
     if !crate::tools::sandbox::require_for_test() {
         return;
     }
-    use crate::agent::repair_evidence::{CheckKind, CheckRun, FileChange, Tracker};
+    use crate::agent::repair_evidence::Tracker;
+    use crate::storage::repair_evidence::{CheckKind, CheckRun, FileChange};
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let config = Config {

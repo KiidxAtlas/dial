@@ -152,7 +152,7 @@ fn hooks_run_by_default_and_bypass_is_reported() {
 fn large_output_drains_fully_and_spills_to_an_artifact() {
     let (dir, ws) = repo();
     let state = tempfile::tempdir().unwrap();
-    let ws = ws.with_artifacts(crate::tools::artifact::ArtifactStore::new(state.path()).unwrap());
+    let ws = ws.with_artifacts(crate::storage::artifact::ArtifactStore::new(state.path()).unwrap());
     // Far beyond the pipe buffer and the old 4×cap read limit that caused SIGPIPE failures.
     let big: String = (0..60_000).map(|i| format!("line {i}\n")).collect();
     std::fs::write(dir.path().join("big.txt"), &big).unwrap();
@@ -172,7 +172,7 @@ fn large_output_drains_fully_and_spills_to_an_artifact() {
         &show.text[show.text.len().saturating_sub(300)..]
     );
     assert!(show.text.len() < MAX_OUTPUT + 1024);
-    let uris = crate::tools::artifact::uris(&show.text);
+    let uris = crate::storage::artifact::uris(&show.text);
     assert_eq!(
         uris.len(),
         1,

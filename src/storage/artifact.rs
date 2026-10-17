@@ -3,7 +3,7 @@
 //! Spools are capped (default 16 MiB): the first `head_bytes` are kept verbatim, later bytes
 //! feed a rolling tail window in a private ring file, and `finish` writes head, one
 //! `[ARTIFACT TRUNCATED: …]` marker and the tail. The content hash covers the stored bytes.
-use super::ToolOutput;
+use crate::runtime::tool_output::ToolOutput;
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use serde_json::{Value, json};
@@ -75,7 +75,7 @@ impl ArtifactStore {
             !fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_symlink()),
             "artifact root cannot be a symlink"
         );
-        crate::config::settings_store::private_dir(root)?;
+        crate::platform::atomic::private_dir(root)?;
         Ok(Self {
             root: root.canonicalize()?,
             limits: ArtifactConfig::default(),
@@ -120,7 +120,7 @@ impl ArtifactStore {
         Ok(json!({"root":self.root,"path":id,"sha256":id,"uri":uri}))
     }
     fn path(&self, uri: &str) -> Result<PathBuf> {
-        let id = super::resources::artifact_id(uri).map_err(anyhow::Error::msg)?;
+        let id = artifact_id(uri).map_err(anyhow::Error::msg)?;
         Ok(self.root.join(id))
     }
     fn lifecycle_path(&self, uri: &str) -> Result<PathBuf> {
@@ -129,7 +129,7 @@ impl ArtifactStore {
     }
 
     fn retention(&self, uri: &str) -> Result<Option<Retention>> {
-        crate::config::settings_store::read_private(&self.lifecycle_path(uri)?)?
+        crate::platform::atomic::read_private(&self.lifecycle_path(uri)?)?
             .map(|bytes| {
                 serde_json::from_slice(&bytes).context("invalid artifact lifecycle record")
             })
@@ -137,7 +137,7 @@ impl ArtifactStore {
     }
 
     fn record_retention(&self, uri: &str, bytes: u64) -> Result<()> {
-        crate::config::settings_store::private_dir(&self.root.join(".lifecycle"))?;
+        crate::platform::atomic::private_dir(&self.root.join(".lifecycle"))?;
         let path = self.lifecycle_path(uri)?;
         let _lock = crate::config::settings_store::locked(&path.with_extension("lock"))?;
         let now = std::time::SystemTime::now()
@@ -288,8 +288,8 @@ impl ArtifactStore {
     pub fn call(&self, args: &Value) -> ToolOutput {
         if args["annotations"].as_bool() == Some(true) {
             let result = (|| -> Result<Value> {
-                let id = super::resources::artifact_id(args["uri"].as_str().unwrap_or(""))
-                    .map_err(anyhow::Error::msg)?;
+                let id =
+                    artifact_id(args["uri"].as_str().unwrap_or("")).map_err(anyhow::Error::msg)?;
                 let parent = self
                     .root
                     .parent()
@@ -594,4 +594,14 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>> {
             .map(Some)
             .with_context(|| format!("{key} must be a non-negative integer")),
     }
+}
+
+pub fn artifact_id(input: &str) -> Result<String, String> {
+    let id = input
+        .strip_prefix("artifact://")
+        .ok_or("expected artifact:// identifier")?;
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid artifact identifier".into());
+    }
+    Ok(id.to_ascii_lowercase())
 }

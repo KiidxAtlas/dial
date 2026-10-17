@@ -1,4 +1,5 @@
 use crate::config::steering::Config;
+use crate::llm::steering::{MAX_STRENGTH, check, specification};
 
 use super::*;
 fn candidate() -> Value {
@@ -14,7 +15,7 @@ fn promotion_uses_the_same_admission_gate_as_runtime_loading() {
     };
     let pending = pending_path(&config, "imported-test").unwrap();
     let active = vector_path(&config);
-    settings_store::private_dir(pending.parent().unwrap()).unwrap();
+    crate::platform::atomic::private_dir(pending.parent().unwrap()).unwrap();
     write_private(&active, b"existing vector").unwrap();
     for (pointer, value) in [
         ("/id", Value::Null),
@@ -179,7 +180,7 @@ fn vision_models_keep_the_evaluation_gate_and_normal_dataset_validation() {
     config.steering.enabled = true;
     config.steering.automatic = false;
     let path = vector_path(&config);
-    settings_store::private_dir(path.parent().unwrap()).unwrap();
+    crate::platform::atomic::private_dir(path.parent().unwrap()).unwrap();
     let mut vector = candidate();
     vector["model_name"] = json!(config.model);
     vector["origin"] = json!("automatic verified repairs");
@@ -252,7 +253,7 @@ fn passing_candidate_cannot_reduce_incumbent_score() {
     let (_dir, mut config, store) = auto_fixture();
     seed_pairs(&mut config, &store);
     let path = vector_path(&config);
-    settings_store::private_dir(path.parent().unwrap()).unwrap();
+    crate::platform::atomic::private_dir(path.parent().unwrap()).unwrap();
     let mut incumbent = candidate();
     incumbent["origin"] = json!("automatic verified repairs");
     incumbent["automatic_adapter"] = Value::Null;
@@ -279,7 +280,7 @@ fn passing_candidate_cannot_reduce_incumbent_score() {
 fn manual_vectors_are_preserved_and_heldout_cases_are_varied_exact_contracts() {
     let (_dir, mut config, store) = auto_fixture();
     seed_pairs(&mut config, &store);
-    settings_store::private_dir(vector_path(&config).parent().unwrap()).unwrap();
+    crate::platform::atomic::private_dir(vector_path(&config).parent().unwrap()).unwrap();
     write_private(
         &vector_path(&config),
         &serde_json::to_vec(&candidate()).unwrap(),
@@ -395,7 +396,7 @@ fn admission_is_model_scoped_and_content_change_restarts_profile() {
         ..Default::default()
     };
     let path = vector_path(&config);
-    settings_store::private_dir(path.parent().unwrap()).unwrap();
+    crate::platform::atomic::private_dir(path.parent().unwrap()).unwrap();
     let mut item = candidate();
     write_private(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
     let first = specification(&config, "test").unwrap().unwrap();

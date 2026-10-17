@@ -8,8 +8,8 @@
 //! as a tool result the model requested, every read refuses symlinks and path traversal, and
 //! every size is bounded.
 use crate::config::paths::Layout;
+use crate::runtime::tool_output::ToolOutput;
 use crate::storage::memory::{atomic_write, find_secret, has_hidden_chars};
-use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::{
     fs,

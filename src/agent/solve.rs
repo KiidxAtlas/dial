@@ -5,6 +5,7 @@
 //! separate strict, network-disabled workspaces. Only explicitly allowed files can return.
 //! A passing check means exactly that command passed, not that the goal is proven correct.
 use crate::config;
+use crate::runtime::tool_output::ToolOutput;
 
 use crate::config::solve::SolveConfig;
 
@@ -12,7 +13,7 @@ use super::{Ui, approval, subagents, verification};
 use crate::{
     config::types::Config,
     llm::{Chat, ToolCall},
-    tools::{self, ToolOutput, Workspace},
+    tools::{self, Workspace},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -134,7 +135,7 @@ fn tree(root: &Path, max_bytes: usize) -> Result<Tree> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             // Shell scratch is never a patch or a source dependency.
-            if entry.file_name() == tools::SCRATCH_DIR {
+            if entry.file_name() == crate::workspace_copy::SCRATCH_DIR {
                 continue;
             }
             let path = entry.path();

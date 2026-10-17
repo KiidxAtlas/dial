@@ -237,7 +237,7 @@ fn persist(config: &Config, snapshot: Snapshot) -> Result<Snapshot> {
         "exercise already registered; do not reuse training material for evaluation"
     );
     let dir = config.state_dir.join("repository-tasks");
-    crate::config::settings_store::private_dir(&dir)?;
+    crate::platform::atomic::private_dir(&dir)?;
     crate::config::settings_store::write_private(
         &dir.join(format!("{}.json", snapshot.spec.id)),
         &serde_json::to_vec(&snapshot)?,
@@ -253,7 +253,7 @@ pub fn register_repair(
     manifest: &Path,
     trajectory: i64,
 ) -> Result<Snapshot> {
-    use crate::agent::repair_evidence::{CheckKind, RepairRecord};
+    use crate::storage::repair_evidence::{CheckKind, RepairRecord};
     let spec = read_manifest(manifest)?;
     ensure!(
         spec.split == "train",

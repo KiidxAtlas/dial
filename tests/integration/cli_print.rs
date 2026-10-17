@@ -949,8 +949,8 @@ fn rpc_cancels_live_worker_while_its_write_is_waiting_for_approval() {
 #[test]
 fn understanding_cli_needs_no_model_and_exports_all_saved_entries() {
     use dial::config::paths::Layout;
-    use dial::storage::codebase::Codebase;
     use dial::tools::Workspace;
+    use dial::tools::codebase::Codebase;
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let run = |args: &[&str]| {

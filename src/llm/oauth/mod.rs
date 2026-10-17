@@ -9,9 +9,7 @@
 //! banner and opens the browser, while `dial login <provider>` can also prompt on the terminal.
 use super::auth::SecretToken;
 use super::model_config::ApiProtocol;
-use crate::config::settings_store::{
-    locked, locked_cancellable, locked_for, read_private, write_private,
-};
+use crate::config::settings_store::{locked, locked_cancellable, locked_for, write_private};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -233,7 +231,7 @@ fn path(user_dir: &Path, id: &str) -> PathBuf {
 }
 
 fn load(path: &Path) -> Result<Option<Credentials>> {
-    let Some(bytes) = read_private(path)? else {
+    let Some(bytes) = crate::platform::atomic::read_private(path)? else {
         return Ok(None);
     };
     serde_json::from_slice(&bytes)

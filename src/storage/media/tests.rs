@@ -17,7 +17,7 @@ fn ephemeral_pixels_survive_deletion_and_can_be_promoted_to_durable_storage() {
     );
     assert!(message["dial_images"][1].get("unavailable").is_some());
     let storage = tempfile::tempdir().unwrap();
-    let store = crate::tools::artifact::ArtifactStore::new(storage.path()).unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(storage.path()).unwrap();
     retain_message(&mut message, &store);
     assert!(
         message["dial_images"][0]["snapshot"]

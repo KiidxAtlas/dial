@@ -53,7 +53,7 @@ pub fn ensure_runtime_with(
         "local MLX requires macOS on Apple Silicon; use /providers to configure a hosted or OpenAI-compatible provider on Intel Macs or Linux/WSL2"
     );
     let dir = layout.user_dir.join("python");
-    settings_store::private_dir(&dir)?;
+    crate::platform::atomic::private_dir(&dir)?;
     settings_store::write_private(&dir.join("dial_worker.py"), WORKER.as_bytes())?;
     settings_store::write_private(&dir.join("dial_steering.py"), STEERING.as_bytes())?;
     settings_store::write_private(&dir.join("pyproject.toml"), PYPROJECT.as_bytes())?;

@@ -18,7 +18,7 @@ fn preferences_path(layout: &Layout, scope: Scope) -> Result<PathBuf> {
 
 fn preferences(layout: &Layout, scope: Scope) -> Result<BTreeMap<String, bool>> {
     let path = preferences_path(layout, scope)?;
-    let Some(bytes) = settings_store::read_private(&path)? else {
+    let Some(bytes) = crate::platform::atomic::read_private(&path)? else {
         return Ok(BTreeMap::new());
     };
     ensure!(

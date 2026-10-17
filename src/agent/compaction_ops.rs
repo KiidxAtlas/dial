@@ -132,7 +132,8 @@ impl<'a> Agent<'a> {
         let evidence_notes = self.compaction_evidence_notes("", &source.messages);
         // The regenerated notes are part of every committed projection. Refuse a notes block that cannot
         // fit the window before any summary request is spent on a projection that cannot commit.
-        let notes_tokens = compaction::estimate(&json!({"role":"user","content":evidence_notes}));
+        let notes_tokens =
+            crate::llm::wire::estimate(&json!({"role":"user","content":evidence_notes}));
         ensure!(
             notes_tokens < u64::from(self.budget_window()) / 2,
             "regenerated compaction notes need about {notes_tokens} tokens, too large for the context window; no summary was requested. Reduce retained instructions or select a larger-window model"
@@ -298,7 +299,7 @@ impl<'a> Agent<'a> {
             );
         }
         ensure!(
-            compaction::complete_boundary(&current, current.len()),
+            crate::storage::transcript::complete_boundary(&current, current.len()),
             "compaction cannot commit while a tool-call group is incomplete"
         );
         let growth = &current[snapshot.visible_history.len()..];
@@ -322,7 +323,7 @@ impl<'a> Agent<'a> {
         candidate.extend(
             snapshot.source.messages[prepared.first_kept..]
                 .iter()
-                .filter(|m| compaction::is_history(m))
+                .filter(|m| crate::storage::transcript::is_history(m))
                 .map(|message| {
                     if portable_migration {
                         compaction::portable_history_message(message)
@@ -396,7 +397,7 @@ impl<'a> Agent<'a> {
         let mut prefix = prepared.prefix;
         let retained_source = snapshot.source.messages[prepared.first_kept..]
             .iter()
-            .filter(|m| compaction::is_history(m));
+            .filter(|m| crate::storage::transcript::is_history(m));
         let retained = retained_source.clone().count();
         let keep = if snapshot.archive_migration {
             prefix.extend(retained_source.map(|message| {

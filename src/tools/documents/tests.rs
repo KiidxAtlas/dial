@@ -198,7 +198,7 @@ fn pdf_real_poppler_fixture() {
 fn extracted_output_retains_complete_artifact() {
     let (dir, ws) = crate::tools::testkit::workspace();
     let state = tempfile::tempdir().unwrap();
-    let store = crate::tools::artifact::ArtifactStore::new(state.path()).unwrap();
+    let store = crate::storage::artifact::ArtifactStore::new(state.path()).unwrap();
     let ws = ws.with_artifacts(store.clone());
     fs::write(
         dir.path().join("sample.ipynb"),
