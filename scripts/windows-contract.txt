@@ -7,7 +7,7 @@
 # skip as soon as its test has a Windows-native implementation; never add one to hide a failure
 # that a Windows regression would trigger.
 
-# Self-update verification, checksum selection and crash-safe activation (src/cli/update.rs).
+# Self-update verification, checksum selection and crash-safe activation (src/cmd/update.rs).
 test cli::update
 # Platform process/window/path helpers, including the Windows-only branches of platform/mod.rs.
 test platform::
