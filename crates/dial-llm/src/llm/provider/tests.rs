@@ -2160,7 +2160,9 @@ fn native_anthropic_noop_events_cannot_keep_a_failed_tool_round_waiting() {
 
 #[test]
 fn native_anthropic_meaningful_deltas_extend_idle_deadline() {
-    Patience::with_test_idle_limit(Duration::from_millis(200));
+    // Leave scheduling headroom on shared runners while keeping the complete stream
+    // longer than the idle budget: meaningful deltas must extend it to finish once.
+    Patience::with_test_idle_limit(Duration::from_secs(1));
     let events = thinking_tool_events();
     let mut pieces = vec![anthropic_sse(&events[..12])];
     pieces.extend(std::iter::repeat_n(
@@ -2168,7 +2170,7 @@ fn native_anthropic_meaningful_deltas_extend_idle_deadline() {
             "type":"content_block_delta","index":2,
             "delta":{"type":"input_json_delta","partial_json":" "}
         })]),
-        20,
+        40,
     ));
     pieces.push(anthropic_sse(&events[12..]));
     let server = fake::serve(vec![Script::SseSlow {

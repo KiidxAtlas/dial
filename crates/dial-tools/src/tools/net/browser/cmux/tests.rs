@@ -221,3 +221,55 @@ fn open_split_requires_surface_id_in_result() {
     );
     server.join().expect("server");
 }
+
+#[cfg(unix)]
+#[test]
+fn socket_timeouts_accept_nanoseconds_near_a_second_boundary() {
+    for peer_closed in [false, true] {
+        for timeout in [
+            Duration::from_nanos(1),
+            Duration::new(0, 999_999_999),
+            Duration::new(4, 999_999_999),
+            Duration::from_secs(5),
+        ] {
+            let (socket, peer) = UnixStream::pair().unwrap();
+            let stream = Stream::Unix(socket);
+            let _peer = (!peer_closed).then_some(peer);
+            stream.set_timeouts(Some(timeout)).expect("socket timeout");
+            stream.set_timeouts(None).unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn buffered_reply_survives_peer_closure_before_timeout_update() {
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    peer.write_all(b"final reply\n").unwrap();
+    drop(peer);
+    let mut connection = Connection {
+        stream: Stream::Unix(socket),
+        pending: Vec::new(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert_eq!(connection.read_line(deadline).unwrap(), "final reply");
+    assert!(matches!(
+        connection.read_line(deadline),
+        Err(CmuxError::Closed)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn connected_peer_still_respects_read_deadline() {
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let mut connection = Connection {
+        stream: Stream::Unix(socket),
+        pending: Vec::new(),
+    };
+    let deadline = Instant::now() + Duration::from_millis(20);
+    assert!(matches!(
+        connection.read_line(deadline),
+        Err(CmuxError::Timeout)
+    ));
+}
