@@ -126,6 +126,29 @@ pub struct CaseMeasurement {
     pub metrics: Metrics,
 }
 
+/// One sealed case attempt after infrastructure retries. A model-caused failure (thinking loop,
+/// rejected tool-call JSON, context overflow) is an unsolved outcome with no observed cost: the
+/// metrics of an aborted run are not recoverable, so they are never reported as zeros.
+/// Infrastructure failures are not attempts at all; they are retried and then excluded upstream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Attempt {
+    Measured(CaseMeasurement),
+    ModelFailed,
+}
+
+impl Attempt {
+    pub fn passed(&self) -> bool {
+        matches!(self, Attempt::Measured(measurement) if measurement.passed)
+    }
+
+    pub fn measurement(&self) -> Option<&CaseMeasurement> {
+        match self {
+            Attempt::Measured(measurement) => Some(measurement),
+            Attempt::ModelFailed => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Evidence {
     pub source_version: i64,
@@ -259,6 +282,10 @@ pub struct Comparison {
     pub baseline_passed: usize,
     pub candidate_passed: usize,
     pub newly_failed: usize,
+    /// Paired cases where a model-caused failure left a side without cost metrics. Cost totals cover
+    /// only the fully measured pairs, and any such pair blocks admission (fail closed).
+    #[serde(default)]
+    pub unmeasured_cost: usize,
     pub baseline: Metrics,
     pub candidate: Metrics,
     pub measured_reduction: bool,
@@ -267,12 +294,8 @@ pub struct Comparison {
 }
 
 /// Additional fail-closed requirement; this function can never turn a gate rejection into a pass.
-/// Pairs must be the exact cached baseline/candidate runs used by the sealed correctness gate.
-pub fn compare(
-    kind: &str,
-    admission: &mut Admission,
-    pairs: &[(CaseMeasurement, CaseMeasurement)],
-) -> Comparison {
+/// Pairs must be the exact cached baseline/candidate attempts used by the sealed correctness gate.
+pub fn compare(kind: &str, admission: &mut Admission, pairs: &[(Attempt, Attempt)]) -> Comparison {
     let mut report = Comparison {
         baseline_version: admission.baseline,
         candidate_version: admission.candidate,
@@ -280,6 +303,7 @@ pub fn compare(
         baseline_passed: 0,
         candidate_passed: 0,
         newly_failed: 0,
+        unmeasured_cost: 0,
         baseline: Metrics::default(),
         candidate: Metrics::default(),
         measured_reduction: false,
@@ -287,11 +311,16 @@ pub fn compare(
         reason: String::new(),
     };
     for (baseline, candidate) in pairs {
-        report.baseline_passed += usize::from(baseline.passed);
-        report.candidate_passed += usize::from(candidate.passed);
-        report.newly_failed += usize::from(baseline.passed && !candidate.passed);
-        report.baseline.add(&baseline.metrics);
-        report.candidate.add(&candidate.metrics);
+        report.baseline_passed += usize::from(baseline.passed());
+        report.candidate_passed += usize::from(candidate.passed());
+        report.newly_failed += usize::from(baseline.passed() && !candidate.passed());
+        match (baseline.measurement(), candidate.measurement()) {
+            (Some(b), Some(c)) => {
+                report.baseline.add(&b.metrics);
+                report.candidate.add(&c.metrics);
+            }
+            _ => report.unmeasured_cost += 1,
+        }
     }
     let b = &report.baseline;
     let c = &report.candidate;
@@ -312,6 +341,8 @@ pub fn compare(
         Some("workflow comparison missing paired held-out measurements")
     } else if report.newly_failed > 0 {
         Some("workflow comparison lost previously solved held-out cases")
+    } else if report.unmeasured_cost > 0 {
+        Some("workflow comparison has paired cases without measured cost (model failures)")
     } else if c.tool_errors > b.tool_errors
         || c.repeated_calls > b.repeated_calls
         || c.protocol_errors > b.protocol_errors
@@ -345,7 +376,7 @@ pub fn record_comparison(
     baseline: &Version,
     candidate: &Version,
     admission: &mut Admission,
-    pairs: &[(CaseMeasurement, CaseMeasurement)],
+    pairs: &[(Attempt, Attempt)],
 ) -> Result<()> {
     if !is_candidate(candidate) {
         return Ok(());

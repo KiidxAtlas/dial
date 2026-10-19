@@ -41,7 +41,9 @@ pub struct Rules {
     pub max_regression: f64,
     /// Smallest required primary gain, in percentage points.
     pub min_improvement: f64,
-    /// One-sided sign-test level for the primary gain; `1.0` disables the test.
+    /// Statistical mode when below `1.0`: the one-sided level of the primary sign test, and of every
+    /// suite's regression bound (divided evenly across suites). `1.0` is the legacy point-estimate
+    /// mode, used by manual suites so their documented behaviour does not change.
     pub alpha: f64,
     /// Required `candidate_only - baseline_only` on the primary suite.
     pub min_net_wins: u32,
@@ -335,6 +337,73 @@ pub fn sign_test_p(wins: usize, losses: usize) -> f64 {
     p.clamp(0.0, 1.0)
 }
 
+/// Fewest discordant pairs, all favouring one side, at which the one-sided sign test can reach `alpha`.
+/// This is the sample-size floor below which no primary gain can be significant at that level.
+pub fn min_discordant_for(alpha: f64) -> usize {
+    let mut k = 0;
+    while 0.5f64.powi(k as i32) > alpha {
+        k += 1;
+    }
+    k
+}
+
+/// `P(X <= k)` for `X ~ Binomial(n, p)`, summed in log space so large `n` cannot overflow.
+pub fn binomial_cdf(k: usize, n: usize, p: f64) -> f64 {
+    if k >= n || p <= 0.0 {
+        return 1.0;
+    }
+    if p >= 1.0 {
+        return 0.0;
+    }
+    let (lp, lq) = (p.ln(), (1.0 - p).ln());
+    // log P(X = i), walked up from i = 0 by the ratio of consecutive terms.
+    let mut ln_term = n as f64 * lq;
+    let mut total = 0.0;
+    for i in 0..=k {
+        total += ln_term.exp();
+        if i < n {
+            ln_term += ((n - i) as f64 / (i + 1) as f64).ln() + lp - lq;
+        }
+    }
+    total.min(1.0)
+}
+
+/// One-sided Clopper-Pearson upper bound on a success probability: the largest `p` for which seeing
+/// at most `successes` of `trials` still has probability at least `alpha`.
+pub fn clopper_pearson_upper(successes: usize, trials: usize, alpha: f64) -> f64 {
+    if successes >= trials {
+        return 1.0;
+    }
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    for _ in 0..100 {
+        let mid = (lo + hi) / 2.0;
+        // The cdf falls as p rises; the bound is where it crosses alpha.
+        if binomial_cdf(successes, trials, mid) > alpha {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
+}
+
+/// Upper confidence bound, in percentage points, on how far the baseline leads the candidate over the
+/// population behind `pairs` paired cases, given `base_only` and `cand_only` discordant pairs.
+/// The drop is `q * (2p - 1)`: `q` is the discordance rate and `p` the share of discordant pairs that
+/// favour the baseline. Each gets a one-sided Clopper-Pearson bound at `alpha / 2` (union bound, so the
+/// total is `alpha`). A sample without discordant pairs bounds the drop only by `q`: small suites
+/// therefore cannot clear a tight tolerance, and the gate says so rather than assuming no regression.
+pub fn regression_bound(base_only: usize, cand_only: usize, pairs: usize, alpha: f64) -> f64 {
+    let discordant = base_only + cand_only;
+    let q = clopper_pearson_upper(discordant, pairs, alpha / 2.0);
+    let p = if discordant == 0 {
+        1.0
+    } else {
+        clopper_pearson_upper(base_only, discordant, alpha / 2.0)
+    };
+    100.0 * q * (2.0 * p - 1.0).max(0.0)
+}
+
 fn percent(count: usize, total: usize) -> f64 {
     100.0 * count as f64 / total as f64
 }
@@ -487,7 +556,19 @@ pub fn evaluate(
     stop: &dyn Fn() -> bool,
     run: impl FnMut(&Version, &Case) -> Result<bool>,
 ) -> Result<Admission> {
-    evaluate_with(
+    evaluate_outcome(rules, suites, baseline, candidate, stop, run).map(|(admission, _)| admission)
+}
+
+/// [`evaluate`] that also returns the typed verdict, so callers never classify it from reason text.
+pub fn evaluate_outcome(
+    rules: &Rules,
+    suites: &[Suite],
+    baseline: &Version,
+    candidate: &Version,
+    stop: &dyn Fn() -> bool,
+    run: impl FnMut(&Version, &Case) -> Result<bool>,
+) -> Result<(Admission, Outcome)> {
+    judge_with(
         rules,
         suites,
         baseline,
@@ -499,7 +580,21 @@ pub fn evaluate(
 }
 
 /// [`evaluate`] with explicit infrastructure-retry delays: one further attempt after each delay.
+#[cfg(test)]
 fn evaluate_with(
+    rules: &Rules,
+    suites: &[Suite],
+    baseline: &Version,
+    candidate: &Version,
+    run: impl FnMut(&Version, &Case) -> Result<bool>,
+    backoff: &[Duration],
+    stop: &dyn Fn() -> bool,
+) -> Result<Admission> {
+    judge_with(rules, suites, baseline, candidate, run, backoff, stop)
+        .map(|(admission, _)| admission)
+}
+
+fn judge_with(
     rules: &Rules,
     suites: &[Suite],
     baseline: &Version,
@@ -507,7 +602,7 @@ fn evaluate_with(
     mut run: impl FnMut(&Version, &Case) -> Result<bool>,
     backoff: &[Duration],
     stop: &dyn Fn() -> bool,
-) -> Result<Admission> {
+) -> Result<(Admission, Outcome)> {
     ensure!(
         candidate.parent == Some(baseline.id) && candidate.id != baseline.id,
         "candidate does not descend directly from the baseline"
@@ -522,6 +617,12 @@ fn evaluate_with(
     let mut regression = false;
     let mut primary = Primary::TooSmall;
     let mut exclusions = Vec::new();
+    // Statistical mode (alpha < 1): guard suites must be bounded, not just point-estimated. The primary
+    // suite is judged for gain by the sign test, so its regression bound is not separately required.
+    let statistical = rules.alpha < 1.0;
+    let guard_count = suites.iter().filter(|s| !s.primary).count().max(1);
+    let guard_alpha = rules.alpha / guard_count as f64;
+    let mut unproven: Option<String> = None;
     for (index, suite) in suites.iter().enumerate() {
         let (mut base_ok, mut cand_ok, mut base_only, mut cand_only) = (0, 0, 0, 0);
         let (mut evaluated, mut excluded, mut processed) = (0, 0, 0);
@@ -591,6 +692,17 @@ fn evaluate_with(
         let total = evaluated;
         let (base_pts, cand_pts) = (percent(base_ok, total), percent(cand_ok, total));
         regression |= !futile_stop && cand_pts < base_pts - rules.max_regression;
+        if statistical && !suite.primary && !futile_stop && total > 0 {
+            let bound = regression_bound(base_only, cand_only, total, guard_alpha);
+            if bound > rules.max_regression {
+                unproven.get_or_insert_with(|| {
+                    format!(
+                        "suite {}: regression upper bound {bound:.1} points over {total} paired cases exceeds the {:.1}-point tolerance",
+                        suite.name, rules.max_regression
+                    )
+                });
+            }
+        }
         if futile_stop {
             primary = Primary::Futile;
         } else if suite.primary {
@@ -626,34 +738,78 @@ fn evaluate_with(
             break;
         }
     }
-    let reason = match (regression, &primary) {
-        (true, _) => "rejected: at least one suite exceeds the permitted regression",
-        (false, Primary::Futile) => {
+    let outcome = match (regression, unproven.is_some(), &primary) {
+        (true, _, _) => Outcome::Regressed,
+        (false, true, _) => Outcome::Unproven,
+        (false, false, Primary::Futile) => Outcome::Futile,
+        (false, false, Primary::TooSmall) => Outcome::TooSmall,
+        (false, false, Primary::TooFewNetWins) => Outcome::TooFewNetWins,
+        (false, false, Primary::NotSignificant) => Outcome::NotSignificant,
+        (false, false, Primary::Improved) => Outcome::Accepted,
+    };
+    let mut reason = match outcome {
+        Outcome::Regressed => "rejected: at least one suite exceeds the permitted regression",
+        Outcome::Futile => {
             "rejected: primary suite cannot reach the required improvement (stopped early)"
         }
-        (false, Primary::TooSmall) => {
-            "rejected: primary suite does not meet the required improvement"
-        }
-        (false, Primary::TooFewNetWins) => "rejected: primary suite has too few net case wins",
-        (false, Primary::NotSignificant) => {
-            "rejected: primary improvement is not statistically significant"
-        }
-        (false, Primary::Improved) => {
+        Outcome::TooSmall => "rejected: primary suite does not meet the required improvement",
+        Outcome::TooFewNetWins => "rejected: primary suite has too few net case wins",
+        Outcome::NotSignificant => "rejected: primary improvement is not statistically significant",
+        Outcome::Unproven => "rejected: a suite's regression cannot be ruled out at the required confidence (sample too small)",
+        Outcome::Accepted => {
             "accepted: primary improvement and every suite regression bound satisfied"
         }
-    };
-    let mut reason = reason.to_owned();
+        Outcome::Overridden => "rejected: admission overridden after the gate",
+    }
+    .to_owned();
+    if outcome == Outcome::Unproven
+        && let Some(detail) = &unproven
+    {
+        reason.push_str(&format!(" ({detail})"));
+    }
     if !exclusions.is_empty() {
         reason.push_str(&format!(" ({})", exclusions.join("; ")));
     }
-    let passed = !regression && matches!(primary, Primary::Improved);
-    Ok(Admission {
-        candidate: candidate.id,
-        baseline: baseline.id,
-        passed,
-        reason,
-        scores,
-    })
+    let passed = outcome == Outcome::Accepted;
+    Ok((
+        Admission {
+            candidate: candidate.id,
+            baseline: baseline.id,
+            passed,
+            reason,
+            scores,
+        },
+        outcome,
+    ))
+}
+
+/// Typed verdict of one sealed gate run. Callers branch on this, never on the reason text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Accepted,
+    /// A suite exceeded the permitted regression.
+    Regressed,
+    /// The primary suite could not reach the required gain even if every remaining case went its way.
+    Futile,
+    TooSmall,
+    TooFewNetWins,
+    NotSignificant,
+    /// The guard suites' regression bounds cannot exclude the permitted regression at the required
+    /// confidence: too few paired cases (or too many discordant ones) to show the candidate is safe.
+    Unproven,
+    /// The gate accepted, but a later check (drift anchor, workflow measurement) overrode it.
+    Overridden,
+}
+
+impl Outcome {
+    /// Primary shortfalls where more capacity may help: the gain was too small or too uncertain.
+    /// Regressions and net-win shortfalls do not raise LoRA capacity.
+    pub fn needs_more_signal(self) -> bool {
+        matches!(
+            self,
+            Outcome::Futile | Outcome::TooSmall | Outcome::NotSignificant
+        )
+    }
 }
 
 enum Primary {

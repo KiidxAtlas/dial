@@ -61,7 +61,7 @@ pub(super) fn command_argument_completions(
         (
             "model",
             &[
-                "settings", "defaults", "local", "next", "prev", "cancel", "restart",
+                "settings", "defaults", "local", "memory", "next", "prev", "cancel", "restart",
             ][..],
         ),
         ("understanding", &["architecture", "build", "clear"][..]),

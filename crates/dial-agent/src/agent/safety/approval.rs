@@ -13,43 +13,41 @@ use std::{
 const READ_ONLY: &[&str] = &["read", "glob", "grep", "skill", "session_search"];
 
 /// A deliberately small shell lexer. Unsupported shell syntax always asks, never guesses.
+/// Quoted text is literal: an operator inside single quotes, or inside double quotes other than `$` and
+/// backticks, is an argument. A backslash-newline continuation cannot be followed, so it asks.
 pub(in crate::agent) fn shell_words(command: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
-    let mut quote = None;
+    let mut quote: Option<char> = None;
     let mut active = false;
     let mut chars = command.chars();
     while let Some(c) = chars.next() {
-        if matches!(
-            c,
-            '$' | '`' | '\n' | '\r' | '(' | ')' | '{' | '}' | '<' | '>' | '&' | ';' | '|'
-        ) {
-            return None;
-        }
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (None, '\'' | '"') => {
-                quote = Some(c);
-                active = true;
+        if quote.is_none() {
+            if matches!(
+                c,
+                '$' | '`' | '\n' | '\r' | '(' | ')' | '{' | '}' | '<' | '>' | '&' | ';' | '|'
+            ) {
+                return None;
             }
-            (Some('\''), c) => {
-                word.push(c);
-                active = true;
-            }
-            (_, '\\') => {
-                word.push(chars.next()?);
-                active = true;
-            }
-            (None, c) if c.is_whitespace() => {
+            if c.is_whitespace() {
                 if active {
                     words.push(std::mem::take(&mut word));
                     active = false;
                 }
+                continue;
             }
-            (_, c) => {
-                word.push(c);
-                active = true;
-            }
+        }
+        active = true;
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), c) => word.push(c),
+            (Some(_), '$' | '`') => return None,
+            (None, '\'' | '"') => quote = Some(c),
+            (_, '\\') => match chars.next()? {
+                '\n' | '\r' => return None,
+                escaped => word.push(escaped),
+            },
+            (_, c) => word.push(c),
         }
     }
     if quote.is_some() {
@@ -59,6 +57,83 @@ pub(in crate::agent) fn shell_words(command: &str) -> Option<Vec<String>> {
         words.push(word);
     }
     (!words.is_empty()).then_some(words)
+}
+
+/// Splits `command` at unquoted pipe operators (`|` and `|&`; `||` is not a pipe). `None` when a quote is open.
+fn pipe_stages(command: &str) -> Option<Vec<&str>> {
+    let mut stages = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut start = 0;
+    let mut chars = command.char_indices().peekable();
+    while let Some((index, c)) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), _) => {}
+            (Some(_), '\\') => {
+                chars.next();
+            }
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '\\') => {
+                chars.next();
+            }
+            (None, '|') if chars.peek().is_some_and(|&(_, next)| next == '|') => {
+                chars.next();
+            }
+            (None, '|') => {
+                stages.push(&command[start..index]);
+                if chars.peek().is_some_and(|&(_, next)| next == '&') {
+                    chars.next();
+                }
+                start = chars.peek().map_or(command.len(), |&(next, _)| next);
+            }
+            (None, _) => {}
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    stages.push(&command[start..]);
+    Some(stages)
+}
+
+/// Programs that fetch remote content; their output is downloaded code when piped onward.
+const DOWNLOADERS: &[&str] = &["curl", "wget", "fetch", "aria2c", "http", "https"];
+
+/// True when a pipe feeds fetched bytes into a shell or interpreter: `curl x | sh`, `wget -qO- x|/bin/bash`,
+/// `curl x |& sudo -E env python3 -`. Stages are parsed structurally, so a `|` inside quotes is only text.
+/// A stage that cannot be parsed is judged by its words: a fetch word upstream, or any unknown sink downstream
+/// of a fetch, counts as a match.
+pub(in crate::agent) fn download_to_interpreter(command: &str) -> bool {
+    let Some(stages) = pipe_stages(command) else {
+        return false;
+    };
+    let mut fetched = false;
+    for stage in &stages {
+        let argvs = shell_argvs(stage).0;
+        if fetched
+            && (argvs.is_empty()
+                || argvs
+                    .iter()
+                    .any(|argv| CODE_RUNNERS.contains(&program_name(argv))))
+        {
+            return true;
+        }
+        fetched |= if argvs.is_empty() {
+            stage
+                .split(|c: char| c.is_whitespace() || "$()`'\"".contains(c))
+                .any(|word| DOWNLOADERS.contains(&word.rsplit('/').next().unwrap_or(word)))
+        } else {
+            argvs
+                .iter()
+                .any(|argv| DOWNLOADERS.contains(&program_name(argv)))
+        };
+    }
+    false
+}
+
+fn program_name(argv: &[String]) -> &str {
+    argv[0].rsplit('/').next().unwrap_or(&argv[0])
 }
 
 /// Programs that run other programs or code. A reusable grant on them would authorize any payload.
@@ -125,7 +200,14 @@ pub fn bash_prefix(words: &[String]) -> Result<Vec<String>, String> {
     if words.is_empty() {
         return Err("bash permissions require a command prefix".into());
     }
-    let (argvs, complete) = shell_argvs(&words.join(" "));
+    let command = words.join(" ");
+    // Destructive forms never become reusable: `git push origin main` cannot be a prefix that later covers `git push --force`.
+    if destructive_bash(&command) {
+        return Err(
+            "destructive commands cannot be stored as reusable rules; they ask each time".into(),
+        );
+    }
+    let (argvs, complete) = shell_argvs(&command);
     match argvs.as_slice() {
         [argv] if complete => Ok(argv.clone()),
         _ if !complete => Err("command prefix cannot be parsed; simplify the quoting or syntax".into()),
@@ -573,6 +655,24 @@ fn glob_set(patterns: &[String]) -> Result<globset::GlobSet> {
 }
 
 impl PermissionRule {
+    /// Scope of a saved rule in words, for listing grants: effect, tool, command prefix or path globs.
+    pub fn scope(&self) -> String {
+        let effect = match self.effect {
+            Effect::Allow => "allow",
+            Effect::Deny => "deny",
+        };
+        let mut text = format!("{effect} {}", self.tool);
+        if !self.command_prefix.is_empty() {
+            text += &format!(" `{}`", self.command_prefix.join(" "));
+        }
+        if !self.paths.is_empty() {
+            text += &format!(" on {}", self.paths.join(", "));
+        }
+        if self.command_prefix.is_empty() && self.paths.is_empty() {
+            text += " (every call)";
+        }
+        text
+    }
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.tool.is_empty(), "permission tool must not be empty");
         ensure!(
@@ -624,9 +724,8 @@ impl PermissionRule {
         if self.command_prefix.is_empty() {
             return false;
         }
-        let (argvs, complete) = call.arguments["command"]
-            .as_str()
-            .map_or((Vec::new(), false), shell_argvs);
+        let command = call.arguments["command"].as_str().unwrap_or_default();
+        let (argvs, complete) = shell_argvs(command);
         match self.effect {
             // Deny: any executed argv, or any part that cannot be parsed, is a match.
             Effect::Deny => !complete || argvs.iter().any(|a| a.starts_with(&self.command_prefix)),
@@ -635,6 +734,8 @@ impl PermissionRule {
                 complete
                     && !argvs.is_empty()
                     && argvs.iter().all(|a| a.starts_with(&self.command_prefix))
+                    // A reusable prefix never covers a destructive form of the same program.
+                    && !destructive_bash(command)
             }
         }
     }
@@ -905,16 +1006,12 @@ pub(crate) fn edit_preview_allowed(
 /// edit it was asked for, rewrites history, escalates privileges or runs downloaded code. The
 /// sandbox already confines writes to the project; this is the second line.
 pub fn destructive_bash(command: &str) -> bool {
-    let (argvs, complete) = shell_argvs(command);
-    if !complete || argvs.is_empty() {
+    // Fetched bytes reaching a shell or interpreter run code nobody reviewed, whatever else the command does.
+    if download_to_interpreter(command) {
         return true;
     }
-    let lower = command.to_ascii_lowercase();
-    if lower.contains("| sh")
-        || lower.contains("|sh")
-        || lower.contains("| bash")
-        || lower.contains("|bash")
-    {
+    let (argvs, complete) = shell_argvs(command);
+    if !complete || argvs.is_empty() {
         return true;
     }
     argvs.iter().any(|argv| {
@@ -1007,6 +1104,59 @@ pub(crate) fn authorize_with_cancel(
     authorize_inner(approval, rules, root, call, summary, ui, Some(cancel))
 }
 
+/// A harness-run verification command: its check name and the exact shell text.
+pub(in crate::agent) struct AutomaticCheck<'a> {
+    pub name: &'a str,
+    pub command: &'a str,
+    /// Configured commands come from settings and follow approval policy; generated checks are a trusted boundary.
+    pub configured: bool,
+}
+
+/// Gate for harness-run verification, which no model request approves. Explicit deny rules always hold.
+/// A configured command takes the same path as an agent shell command: Readonly refuses it, Ask prompts unless a
+/// grant covers it, Write asks only for destructive forms. Generated checks run without a prompt (documented
+/// trusted boundary); Readonly still refuses them. `Ok(true)` means a project-wide grant should be saved.
+pub(in crate::agent) fn authorize_automatic_check(
+    approval: Approval,
+    rules: &mut Vec<PermissionRule>,
+    root: &Path,
+    check: &AutomaticCheck<'_>,
+    ui: &mut dyn Ui,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<bool, Denial> {
+    let call = ToolCall {
+        id: format!("focused-check:{}", check.name),
+        name: "bash".into(),
+        arguments: serde_json::json!({ "command": check.command }),
+        malformed_arguments: false,
+    };
+    if !check.configured {
+        if denied_by_rule(rules, &call, root) {
+            return Err(Denial::Rule);
+        }
+        return if approval == Approval::Readonly {
+            Err(Denial::ReadOnly)
+        } else {
+            Ok(false)
+        };
+    }
+    let summary = format!("Verification {} runs: {}", check.name, check.command);
+    authorize_inner(approval, rules, root, &call, &summary, ui, cancel)
+}
+
+/// Structured outcome of a check that did not run. `Blocked` is what verification's classifier reads as
+/// `CheckStatus::PermissionDenied`, so a denial never reads as a failing test.
+pub(in crate::agent) fn denied_check_output(
+    name: &str,
+    denial: &Denial,
+) -> crate::runtime::tool_output::ToolOutput {
+    crate::runtime::tool_output::ToolOutput::err(format!(
+        "automatic check {name} not run: {}",
+        denial.message()
+    ))
+    .with_status(crate::tools::ToolStatus::Blocked)
+}
+
 fn authorize_inner(
     approval: Approval,
     rules: &mut Vec<PermissionRule>,
@@ -1050,6 +1200,13 @@ fn authorize_inner(
                 Decision::AllowAlways | Decision::AllowProject => {
                     let persist = decision == Decision::AllowProject;
                     let command_prefix = if call.name == "bash" {
+                        if call.arguments["command"]
+                            .as_str()
+                            .is_some_and(destructive_bash)
+                        {
+                            ui.notice("Not saved as a reusable rule: destructive shell commands are approved one at a time.");
+                            return Ok(false);
+                        }
                         // Only one plain program grants a reusable prefix. Wrappers, shell bodies, code
                         // runners and flag-first invocations would authorize far more than the approved command.
                         let (argvs, complete) = call.arguments["command"]
@@ -1068,12 +1225,14 @@ fn authorize_inner(
                     } else {
                         Vec::new()
                     };
-                    rules.push(PermissionRule {
+                    let rule = PermissionRule {
                         effect: Effect::Allow,
                         tool: call.name.clone(),
                         command_prefix,
                         paths: Vec::new(),
-                    });
+                    };
+                    ui.notice(&format!("Reusable permission: {}", rule.scope()));
+                    rules.push(rule);
                     Ok(persist)
                 }
                 Decision::Deny => Err(Denial::User),
@@ -1089,3 +1248,6 @@ mod tests;
 mod ast_registration_tests;
 #[cfg(test)]
 mod parallel_bash_tests;
+
+#[cfg(test)]
+mod risk_tests;

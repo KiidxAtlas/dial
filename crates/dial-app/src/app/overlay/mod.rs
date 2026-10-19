@@ -36,6 +36,7 @@ pub(super) enum Which {
     Jobs,
     Subagents,
     ModelDownloads,
+    ModelMemory,
     SubagentsActivity,
     SubagentViewer {
         id: String,

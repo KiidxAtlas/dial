@@ -819,6 +819,8 @@ pub struct VerificationConfig {
     pub behavioral_checks: Vec<String>,
     /// Operator-owned Python argv override; empty selects the owning project's runner.
     pub python_command: Vec<String>,
+    /// Optional operator-declared requirement -> evidence contract. Check names refer to commands.
+    pub requirements: BTreeMap<String, VerificationRequirement>,
 }
 
 impl Default for VerificationConfig {
@@ -830,8 +832,18 @@ impl Default for VerificationConfig {
             commands: Vec::new(),
             behavioral_checks: Vec::new(),
             python_command: Vec::new(),
+            requirements: BTreeMap::new(),
         }
     }
+}
+
+/// Evidence needed for a declared behavior. Passing checks show coverage, not independent proof.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerificationRequirement {
+    pub checks: Vec<String>,
+    /// Require delivered browser pixels for the latest effect revision.
+    pub visual: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1510,8 +1522,10 @@ pub struct ImproveConfig {
     pub learn_from_sessions: bool,
     /// Minimum verified training examples before a LoRA candidate is attempted.
     pub lora_min_examples: u32,
-    /// Roll back automatically when a new version's live results fall this many points below its parent's.
+    /// Observational warning threshold: lower-bound net share of matched prompts that got worse,
+    /// in percentage points, not an unpaired mean score drop or automatic rollback authority.
     pub monitor_drop: f64,
+    /// Minimum distinct task-matched prompts before computing a live diagnostic.
     pub monitor_min_turns: u32,
     /// Run the background cycle at session start/exit, subject to idle, AC-power, budget and /compute pause gates. When false, only `dial improve cycle` runs it.
     pub background: bool,

@@ -59,6 +59,18 @@ const RECOMMENDED: &[(Family, &str)] = &[
     (Family::Gguf, "bartowski/Llama-3.2-3B-Instruct-GGUF"),
 ];
 
+/// Small instruction models for the memory role (fact extraction and consolidation run on every
+/// saved turn, so a fast small model is preferred over a strong large one). Checked like
+/// [`RECOMMENDED`].
+const MEMORY_RECOMMENDED: &[(Family, &str)] = &[
+    (Family::Mlx, "mlx-community/Qwen3-1.7B-4bit"),
+    (Family::Mlx, "mlx-community/gemma-3-1b-it-4bit"),
+    (Family::Mlx, "mlx-community/Llama-3.2-1B-Instruct-4bit"),
+    (Family::Gguf, "unsloth/Qwen3-1.7B-GGUF"),
+    (Family::Gguf, "unsloth/gemma-3-1b-it-GGUF"),
+    (Family::Gguf, "bartowski/Llama-3.2-1B-Instruct-GGUF"),
+];
+
 /// Which weight format a search or listing covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
@@ -121,8 +133,16 @@ pub struct Hit {
 
 /// The curated list for `family`, in display order.
 pub fn recommended(family: Family) -> Vec<Hit> {
-    RECOMMENDED
-        .iter()
+    curated(RECOMMENDED, family)
+}
+
+/// The curated small models for the memory role in `family`, in display order.
+pub fn recommended_memory(family: Family) -> Vec<Hit> {
+    curated(MEMORY_RECOMMENDED, family)
+}
+
+fn curated(list: &[(Family, &str)], family: Family) -> Vec<Hit> {
+    list.iter()
         .filter(|(kind, _)| *kind == family)
         .map(|(_, repo)| Hit {
             repo: (*repo).to_owned(),

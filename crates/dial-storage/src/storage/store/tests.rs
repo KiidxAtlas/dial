@@ -766,3 +766,81 @@ fn executable_repairs_are_scoped_and_never_training_success_labels() {
             .is_err()
     );
 }
+
+#[test]
+fn matched_live_scores_pair_only_explicit_same_source_scores_per_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), "model", "case", &harness()).unwrap();
+    let parent = store.active().unwrap();
+    let candidate = store
+        .candidate(parent.id, "harness", &harness(), None)
+        .unwrap();
+    let turn = |version: i64, domain: &str, prompt: &str, score: f64, source: &str| {
+        let id = store
+            .begin_trajectory(version, domain, "session:1", prompt)
+            .unwrap();
+        store.finish_trajectory(id, Some("done"), None).unwrap();
+        store
+            .outcome(&Outcome {
+                trajectory: id,
+                score,
+                source: source.into(),
+                reference: None,
+            })
+            .unwrap();
+    };
+    // Same prompt, same explicit source class on both sides: one pair.
+    // A failed (errored) attempt at the same prompt is a retry, not a result: it never enters the mean.
+    let failed = store
+        .begin_trajectory(parent.id, "coding", "session:1", "a")
+        .unwrap();
+    store
+        .finish_trajectory(failed, None, Some("provider failed"))
+        .unwrap();
+    store
+        .outcome(&Outcome {
+            trajectory: failed,
+            score: 0.0,
+            source: "user:rating".into(),
+            reference: None,
+        })
+        .unwrap();
+    turn(parent.id, "coding", "a", 40.0, "user:rating");
+    turn(candidate.id, "coding", "a", 80.0, "user:rating");
+    // Different source classes: not comparable, no pair.
+    turn(parent.id, "coding", "b", 0.0, "checks:behavioral");
+    turn(candidate.id, "coding", "b", 100.0, "user:rating");
+    // Commits are implicit signals, never explicit scores.
+    turn(parent.id, "coding", "c", 100.0, "git:commit");
+    turn(candidate.id, "coding", "c", 0.0, "user:rating");
+    // Prompt scored in both classes on both sides counts once, by the user verdict.
+    turn(parent.id, "coding", "d", 20.0, "user:rating");
+    turn(parent.id, "coding", "d", 0.0, "checks:behavioral");
+    turn(candidate.id, "coding", "d", 60.0, "user:rating");
+    turn(candidate.id, "coding", "d", 100.0, "checks:behavioral");
+    // Self-play never counts as real use.
+    turn(parent.id, "selfplay:tools", "e", 0.0, "user:rating");
+    turn(candidate.id, "selfplay:tools", "e", 100.0, "user:rating");
+    // Unfinished trajectories are not results.
+    let open = store
+        .begin_trajectory(candidate.id, "coding", "session:1", "f")
+        .unwrap();
+    store
+        .outcome(&Outcome {
+            trajectory: open,
+            score: 100.0,
+            source: "user:rating".into(),
+            reference: None,
+        })
+        .unwrap_err();
+    turn(parent.id, "coding", "f", 10.0, "user:rating");
+    assert_eq!(
+        store.matched_live_scores(candidate.id, parent.id).unwrap(),
+        vec![(20.0, 60.0), (40.0, 80.0)]
+    );
+    // Direction matters: swapping the roles swaps the pairs.
+    assert_eq!(
+        store.matched_live_scores(parent.id, candidate.id).unwrap(),
+        vec![(60.0, 20.0), (80.0, 40.0)]
+    );
+}

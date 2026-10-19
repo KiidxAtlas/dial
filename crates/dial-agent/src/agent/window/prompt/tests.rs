@@ -110,8 +110,8 @@ fn computer_use_block_follows_computer_tool() {
 #[test]
 fn lean_guidance_is_materially_shorter_and_keeps_the_safety_contracts() {
     let tools = vec!["read".to_owned(), "edit".to_owned(), "task".to_owned()];
-    let default = scoped_guidance(EditMode::default(), &tools, false);
-    let lean = scoped_guidance(EditMode::default(), &tools, true);
+    let default = scoped_guidance(&tools, false);
+    let lean = scoped_guidance(&tools, true);
     assert!(
         lean.len() * 10 < default.len() * 7,
         "lean {} vs default {} bytes",
@@ -131,5 +131,16 @@ fn lean_guidance_is_materially_shorter_and_keeps_the_safety_contracts() {
         assert!(lean.contains(phrase), "lean guidance lost {phrase:?}");
     }
     let read_only = vec!["read".to_owned()];
-    assert!(!scoped_guidance(EditMode::default(), &read_only, true).contains("# Delegation"));
+    assert!(!scoped_guidance(&read_only, true).contains("# Delegation"));
+}
+
+#[test]
+fn edit_contract_is_carried_by_the_tool_not_repeated_in_the_prompt() {
+    for mode in [EditMode::Hashline, EditMode::Replace, EditMode::Sloppy] {
+        let contract = crate::tools::editing_instructions(mode);
+        let tools = vec!["read".to_owned(), "edit".to_owned()];
+        for lean in [false, true] {
+            assert!(!scoped_guidance(&tools, lean).contains(contract));
+        }
+    }
 }

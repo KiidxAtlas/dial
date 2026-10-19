@@ -10,6 +10,7 @@ pub mod memory;
 pub mod model;
 pub mod run;
 pub mod safety;
+pub mod tool_trace;
 pub mod ui;
 pub mod verify;
 pub mod window;
@@ -120,6 +121,8 @@ pub struct AgentMetrics {
     pub truncated_recoveries: u64,
     /// Automatic focused-verification repair rounds actually executed.
     pub repair_attempts: u64,
+    /// Main-agent schema offers and admitted executions; worker and extension calls are not included.
+    pub tool_trace: tool_trace::ToolTraceCounts,
     pub reasoning_interceptions: u64,
     pub turns_completed: u64,
 }
@@ -152,8 +155,16 @@ struct StepChecks {
     /// Exact configured checks whose most recent run failed; retain them across new edits.
     failed_checks: Vec<verify::verification::FocusedCheck>,
     failed: bool,
+    evidence: verify::evidence::Ledger,
 }
 impl StepChecks {
+    fn revision(&self) -> verify::evidence::Revision {
+        [
+            self.mutations,
+            self.uncheckpointed_shell_commands,
+            self.uncheckpointed_extension_calls,
+        ]
+    }
     fn clean(&self) -> bool {
         self.checks_current() && !self.uncheckpointed_pending()
     }

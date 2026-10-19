@@ -69,7 +69,8 @@ fn wide_banner_shows_wordmark_card_identity_hints_and_recent_sessions() {
         "via lmstudio",
         "ask",
         "asks before every edit and command",
-        "sandbox dev",
+        "sandbox",
+        "dev",
         "Ctrl+P",
         "actions",
         "RECENT",
@@ -79,22 +80,23 @@ fn wide_banner_shows_wordmark_card_identity_hints_and_recent_sessions() {
         assert!(joined.contains(needle), "missing {needle:?}\n{joined}");
     }
     assert!(
-        joined.contains('\u{256d}') && joined.contains('\u{256f}'),
-        "the facts sit in a rounded card"
+        !joined.contains('\u{256d}') && !joined.contains('\u{2502}'),
+        "the facts stand free, without a frame:\n{joined}"
     );
-    let card_rows: Vec<&String> = text.iter().filter(|l| l.contains('\u{2502}')).collect();
+    for (row, reflection) in REFLECTION.iter().enumerate() {
+        assert!(
+            joined.contains(reflection),
+            "reflection row {row}\n{joined}"
+        );
+    }
     assert!(
-        card_rows.len() >= 2,
-        "model and mode rows are inside the card"
+        joined.contains('\u{2508}'),
+        "the axis divides mark and reflection"
     );
-    let widths: std::collections::HashSet<usize> = card_rows
-        .iter()
-        .map(|l| text::width(l.trim_end()))
-        .collect();
-    assert_eq!(
-        widths.len(),
-        1,
-        "card rows share one right edge: {card_rows:?}"
+    let name = text.iter().position(|l| l.contains("dial 0.3.1")).unwrap();
+    assert!(
+        text[name].contains(WORDMARK[WORDMARK.len() - 2]),
+        "the name sits beside the wordmark's baseline: {text:?}"
     );
     let recent = text.iter().find(|l| l.contains("fix the parser")).unwrap();
     assert!(recent.trim_end().ends_with("2h"), "{recent}");
@@ -169,15 +171,21 @@ fn auto_approval_with_the_sandbox_off_reads_as_a_sentence_and_is_flagged() {
     risky.approval = "auto".into();
     risky.sandbox = "off".into();
     let lines = rows(&risky, 120, &theme);
+    let rendered = plain(&lines);
     assert!(
-        plain(&lines)
-            .join("\n")
-            .contains("auto · runs tools without asking · sandbox off")
+        rendered
+            .iter()
+            .any(|row| row.contains("approval") && row.contains("auto"))
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|row| row.contains("sandbox") && row.contains("off"))
     );
     let spans: Vec<Span<'_>> = lines.iter().flat_map(|l| l.spans.iter().cloned()).collect();
     let sandbox = spans
         .iter()
-        .find(|span| span.content.contains("sandbox off"))
+        .find(|span| span.content == "off")
         .expect("sandbox span");
     assert_eq!(sandbox.style.fg, theme.fg(Tok::Warning).fg);
 }
@@ -193,7 +201,42 @@ fn long_project_path_preserves_project_name() {
 
 #[test]
 fn wordmark_rows_share_one_width_so_the_title_column_lines_up() {
-    assert_eq!(text::width(WORDMARK[0]), text::width(WORDMARK[1]));
+    let w = text::width(WORDMARK[0]);
+    for mark in WORDMARK.iter().chain(&REFLECTION) {
+        assert_eq!(text::width(mark), w, "{mark:?}");
+    }
+    assert_eq!(
+        text::width(WORDMARK_SMALL[0]),
+        text::width(WORDMARK_SMALL[1])
+    );
+}
+
+#[test]
+fn shorter_terminals_shed_the_reflection_then_the_large_wordmark() {
+    let info = info();
+    let full = plain(&rows(&info, 100, &Theme::dark()));
+    let fits = |max_rows: usize| {
+        plain(&render(
+            &info,
+            100,
+            &Theme::dark(),
+            View {
+                max_rows,
+                ..View::default()
+            },
+        ))
+        .join("\n")
+    };
+    let large = fits(full.len() - 1);
+    assert!(
+        large.contains(WORDMARK[0]) && !large.contains(REFLECTION[1]),
+        "{large}"
+    );
+    let small = fits(full.len() - 4);
+    assert!(
+        small.contains(WORDMARK_SMALL[1]) && !small.contains(WORDMARK[0]),
+        "{small}"
+    );
 }
 
 #[test]
@@ -242,7 +285,7 @@ fn info_without_recent() -> WelcomeInfo {
 }
 
 #[test]
-fn wide_terminals_put_the_list_beside_the_card() {
+fn wide_terminals_put_the_list_beside_the_facts() {
     let text = plain(&render(
         &info(),
         140,
@@ -257,15 +300,15 @@ fn wide_terminals_put_the_list_beside_the_card() {
         .find(|l| l.contains("fix the parser"))
         .expect("recent row");
     assert!(
-        beside.contains('\u{2502}'),
-        "list shares rows with the card: {text:?}"
+        beside.contains("project"),
+        "list shares rows with the facts: {text:?}"
     );
     let narrow = plain(&rows(&info(), 100, &Theme::dark()));
     let alone = narrow
         .iter()
         .find(|l| l.contains("fix the parser"))
         .unwrap();
-    assert!(!alone.contains('\u{2502}'), "{narrow:?}");
+    assert!(!alone.contains("project"), "{narrow:?}");
     for width in 1..=220u16 {
         for row in render(&info(), width, &Theme::dark(), View::default()) {
             assert!(text::line_width(&row) <= width as usize, "width {width}");
@@ -296,7 +339,7 @@ fn the_home_selects_rows_and_picks_sessions_or_starters() {
     assert!(
         plain(&first.rows(100, 40, &theme))
             .join("\n")
-            .contains("to pick one, Enter to use it")
+            .contains("to pick one, Enter to edit it")
     );
     let mut bare = info_without_recent();
     bare.tips.clear();
@@ -408,10 +451,95 @@ fn colors_come_from_the_theme_without_fills() {
     let model = spans.iter().find(|s| s.content == "qwen3.5-9b").unwrap();
     assert_eq!(model.style.fg, theme.fg(Tok::Accent).fg);
     let key = spans.iter().find(|s| s.content == "Ctrl+P").unwrap();
-    assert_eq!(key.style.fg, theme.fg(Tok::Accent).fg);
-    let edge = spans
+    assert_eq!(key.style.fg, theme.fg(Tok::Text).fg);
+    let axis = spans
         .iter()
-        .find(|s| s.content.starts_with('\u{256d}'))
+        .find(|s| s.content.starts_with('\u{2508}'))
         .unwrap();
-    assert_eq!(edge.style.fg, theme.fg(Tok::BorderMuted).fg);
+    assert_eq!(axis.style.fg, theme.fg(Tok::BorderMuted).fg);
+}
+
+#[test]
+fn short_homes_window_the_selected_action_instead_of_cutting_it_off() {
+    for theme in [
+        Theme::dark(),
+        Theme::mono(),
+        Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii),
+    ] {
+        for first_visit in [false, true] {
+            let info = if first_visit {
+                info_without_recent()
+            } else {
+                info()
+            };
+            let mut home = Home::new(info.clone(), vec!["s1".into(), "s2".into()], false);
+            for i in 0..items(&info) {
+                assert!(home.down());
+                for budget in 1..=14 {
+                    let rows = home.rows(80, budget, &theme);
+                    assert!(rows.len() <= budget);
+                    let picked = rows
+                        .iter()
+                        .find(|row| {
+                            row.spans
+                                .iter()
+                                .any(|s| s.content == theme.sym(Sym::Pointer))
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("selection {i}, budget {budget}: {:?}", plain(&rows))
+                        });
+                    let expected = if first_visit {
+                        STARTERS[i]
+                    } else {
+                        info.recent[i].0.as_str()
+                    };
+                    assert!(plain(&vec![picked.clone()])[0].contains(expected));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn isolation_and_missing_model_recovery_have_their_own_visible_rows() {
+    let mut info = info_without_recent();
+    info.approval = "auto".into();
+    info.sandbox = "off".into();
+    info.model.clear();
+    info.setup_hint = "/model to choose a model".into();
+    for width in [38, 60, 100, 140] {
+        let theme = Theme::dark();
+        let rows = render(
+            &info,
+            width,
+            &theme,
+            View {
+                max_rows: 18,
+                ..View::default()
+            },
+        );
+        let rendered = plain(&rows);
+        assert!(
+            rendered
+                .iter()
+                .any(|row| row.contains("next") && row.contains("/model")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|row| row.contains("sandbox") && row.contains("off")),
+            "{rendered:?}"
+        );
+        let isolation = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .find(|s| s.content == "off")
+            .unwrap();
+        assert_eq!(isolation.style.fg, theme.fg(Tok::Warning).fg);
+        assert!(
+            rows.iter()
+                .all(|row| text::line_width(row) <= width as usize)
+        );
+    }
 }

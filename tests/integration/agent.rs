@@ -4240,7 +4240,8 @@ fn compaction_that_frees_too_little_pauses_for_an_explicit_resume() {
 
 #[test]
 fn compaction_that_cannot_help_says_why_instead_of_summarising_again_and_again() {
-    // The fixed prompt alone is ~4.6k tokens: on an 8192 window with a 4096-token output reserve, no summary of a tiny conversation can make room.
+    // Give the fixture enough immutable context to exceed half the served window independently of
+    // the default prompt's wording. No history summary can repair the output-reserve deficit.
     let server = serve_with(
         vec![
             Reply::Text("first"),
@@ -4252,6 +4253,10 @@ fn compaction_that_cannot_help_says_why_instead_of_summarising_again_and_again()
     );
     let mut e = env(&server.url, "auto");
     e.config.harness.tools = vec!["read".into()];
+    e.config
+        .harness
+        .system_prompt
+        .push_str(&"fixed immutable context ".repeat(600));
     let side = serve(vec![Reply::Text("SUMMARY")]);
     e.config.model_roles.insert(
         "small".into(),
@@ -4262,7 +4267,7 @@ fn compaction_that_cannot_help_says_why_instead_of_summarising_again_and_again()
             ..Default::default()
         },
     );
-    // The fixed prompt and tool schemas alone are ~4.6k tokens; a 50% threshold makes them exceed it.
+    // The immutable context must exceed the 50% threshold before any summary is attempted.
     e.config.compaction.threshold_percent = Some(50.0);
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None);
@@ -8262,7 +8267,7 @@ fn semantic_find_uses_current_model_and_preserves_native_tool_pairs() {
             } else {
                 Reply::Call(
                     "find",
-                    json!({"query":"reuse an existing value without doing the expensive work again"}),
+                    json!({"query":"reuse an existing value without doing the expensive work again","ranking":"semantic"}),
                 )
             }
         }),
@@ -8323,7 +8328,7 @@ fn semantic_find_rejects_fabricated_ranking_and_exact_mode_bypasses_inference() 
     let server = serve(vec![
         Reply::Call(
             "find",
-            json!({"query":"reuse an existing value without doing the expensive work again"}),
+            json!({"query":"reuse an existing value without doing the expensive work again","ranking":"semantic"}),
         ),
         Reply::Text("{\"indices\":[999]}"),
         Reply::Text("ranking rejected"),
@@ -8392,7 +8397,7 @@ fn delegated_semantic_find_reuses_the_child_backend_and_request_budget() {
             } else {
                 Reply::Call(
                     "find",
-                    json!({"query":"reuse an existing value without doing the expensive work again"}),
+                    json!({"query":"reuse an existing value without doing the expensive work again","ranking":"semantic"}),
                 )
             }
         }),
@@ -10492,5 +10497,138 @@ fn semantic_memory_retains_a_turn_and_recalls_it_in_a_later_request() {
     assert!(
         answering["messages"].to_string().contains("ledger-staging"),
         "the later turn must receive the recalled fact: {answering}"
+    );
+}
+
+#[test]
+fn completion_evidence_keeps_pending_obligations_without_claiming_test_coverage() {
+    let server = serve(vec![
+        Reply::Call(
+            "todo",
+            json!({"op":"set","tasks":[
+                {"content":"Summarize the investigation"},
+                {"content":"Implement separately requested change"}
+            ]}),
+        ),
+        Reply::Text("The investigation found the owning implementation."),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut a = agent_with(&e, None, Arc::new(AtomicBool::new(false)));
+    let report = a
+        .turn("Investigate the implementation", &mut Recorder::default())
+        .unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    assert!(report.text.contains("progress item(s) remain open"));
+    let control = a.session().control_state();
+    let evidence = &control["completion_evidence"];
+    assert_eq!(evidence["execution_outcome"], "completed");
+    assert_eq!(evidence["verification_coverage"], "not_observed");
+    assert_eq!(evidence["deliverable_coverage"], "open_obligations");
+    assert_eq!(evidence["outstanding_tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(control["efficiency"]["completion_evidence"], *evidence);
+    assert!(a.turn("", &mut Recorder::default()).is_err());
+    assert!(a.session().control_state()["completion_evidence"].is_null());
+}
+
+#[test]
+fn completion_evidence_repaired_shell_effects_replace_failing_baseline() {
+    if skip_without_sandbox() {
+        return;
+    }
+    let command = "test \"$(cat value.txt)\" = fixed";
+    let server = serve(vec![
+        Reply::Call("bash", json!({"command":"printf 'fixed\\n' > value.txt"})),
+        Reply::Text("Repaired the value."),
+    ]);
+    let mut e = env(&server.url, "auto");
+    e.config.verification.automatic_checks = true;
+    e.config.verification.commands.push(VerificationCommand {
+        name: "value_behavior".into(),
+        command: command.into(),
+        file_extensions: vec!["txt".into()],
+        timeout_secs: 5,
+    });
+    e.config
+        .verification
+        .behavioral_checks
+        .push("value_behavior".into());
+    std::fs::write(e.project.path().join("value.txt"), "broken\n").unwrap();
+    let store = Store::open(&e.layout.state_dir, "scripted", "coding", &e.config.harness).unwrap();
+    let mut a = agent_with(&e, Some(&store), Arc::new(AtomicBool::new(false)));
+    let report = a.turn("Fix the value", &mut Recorder::default()).unwrap();
+    assert_eq!(report.outcome, TurnOutcome::Completed);
+    let evidence = &a.session().control_state()["completion_evidence"]["checks"];
+    assert_eq!(evidence["baseline"][command]["status"], "code_failed");
+    assert_eq!(evidence["latest"][command]["status"], "passed");
+    assert_eq!(evidence["passing_behavioral_checks"], 1);
+    assert_eq!(store.verified_live_turns().unwrap(), 1);
+}
+
+#[test]
+fn completion_evidence_surfaces_session_recovery_once_without_injecting_damaged_bytes() {
+    let server = serve(vec![
+        Reply::Text("First answer."),
+        Reply::Text("Second answer."),
+    ]);
+    let e = env(&server.url, "auto");
+    let mut session = Session::create(
+        &e.layout,
+        SessionMeta {
+            model: "scripted".into(),
+        },
+    )
+    .unwrap();
+    session
+        .append(json!({"role":"user","content":"Earlier question"}))
+        .unwrap();
+    let path = session.path().unwrap().to_owned();
+    drop(session);
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"DO_NOT_TRUST_JOURNAL\n").unwrap();
+    }
+    let resumed = Session::open(&path).unwrap();
+    let mut a = Agent::interactive(
+        &e.config,
+        make_backend(&e.config).unwrap(),
+        e.layout.clone(),
+        resumed,
+        None,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let mut ui = Recorder::default();
+    a.turn("Answer the first question", &mut ui).unwrap();
+    a.turn("Answer the second question", &mut ui).unwrap();
+    assert_eq!(
+        ui.notices
+            .iter()
+            .filter(|text| text.starts_with("Session recovery:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        a.session()
+            .messages()
+            .iter()
+            .filter(|m| m["dial_session_recovery"] == true)
+            .count(),
+        1
+    );
+    let requests = server.requests.lock();
+    assert!(
+        requests[0]["messages"]
+            .to_string()
+            .contains("resumed history may be incomplete")
+    );
+    assert!(
+        !requests[0]["messages"]
+            .to_string()
+            .contains("DO_NOT_TRUST_JOURNAL")
     );
 }

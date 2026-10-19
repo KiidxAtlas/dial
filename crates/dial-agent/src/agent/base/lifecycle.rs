@@ -31,12 +31,25 @@ fn capability_prose(offered: &[String], discoverable: &[(String, String)]) -> St
         out.push('\n');
         out.push_str(&prose.join(" "));
     }
-    let web: Vec<&str> = ["web_search", "web_fetch"]
+    // Offered web tools are used directly; only loadable ones need discovery first, so the model
+    // is never told to rediscover a tool already in its schema.
+    let offered_tool = |name: &str| offered.iter().any(|tool| tool.as_str() == name);
+    let (ready, loadable): (Vec<&str>, Vec<&str>) = ["web_search", "web_fetch"]
         .into_iter()
         .filter(|tool| available(tool))
-        .collect();
-    if !web.is_empty() {
-        out.push_str(&format!("\nFor live web research, discover {} and use their next-round schemas; cite source URLs and report actual search/network failures. Never invent results.", web.join(" and ")));
+        .partition(|tool| offered_tool(tool));
+    if !ready.is_empty() || !loadable.is_empty() {
+        let mut steps = Vec::new();
+        if !ready.is_empty() {
+            steps.push(format!("use {}", ready.join(" and ")));
+        }
+        if !loadable.is_empty() {
+            steps.push(format!(
+                "discover {} and use their next-round schemas",
+                loadable.join(" and ")
+            ));
+        }
+        out.push_str(&format!("\nFor live web research, {}; cite source URLs and report actual search/network failures. Never invent results.", steps.join("; ")));
     }
     out
 }

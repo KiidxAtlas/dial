@@ -43,3 +43,29 @@ fn every_tab_strip_marks_the_active_tab_without_a_fill() {
     assert_eq!(idle.fg, theme.fg(Tok::Muted).fg);
     assert!(active.bg.is_none() && idle.bg.is_none());
 }
+
+#[test]
+fn selected_rows_read_in_one_body_color_on_the_fill() {
+    let theme = Theme::builtin("dial-dark").unwrap();
+    let mut spans = vec![
+        Span::styled("› ", theme.fg(Tok::Accent)),
+        Span::styled("Local models", theme.fg(Tok::Text)),
+        Span::styled("● cached", theme.fg(Tok::Success)),
+        Span::styled(
+            "8 models",
+            theme.fg(Tok::Muted).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    select_spans(&theme, &mut spans);
+    let fill = theme.bg(Tok::SelectedBg).bg;
+    for span in &spans {
+        assert_eq!(span.style.bg, fill, "{:?}", span.content);
+        assert_eq!(span.style.fg, theme.fg(Tok::Text).fg, "{:?}", span.content);
+    }
+    assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+    assert!(spans[2].style.add_modifier.contains(Modifier::BOLD));
+    assert!(
+        !spans[3].style.add_modifier.contains(Modifier::BOLD),
+        "details stay secondary"
+    );
+}

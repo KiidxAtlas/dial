@@ -54,13 +54,16 @@ impl Shell {
         lines.push(row("/hotkeys", "view and rebind every shortcut"));
         lines.push(String::new());
         lines.push("While a turn is running".to_owned());
-        lines.push(row("Enter", "steer the current turn with your message"));
+        lines.push(row(
+            &self.keys.label(Action::Submit),
+            "choose: add direction now or queue for later",
+        ));
         lines.push(row(
             &self.keys.labels(Action::FollowUp),
             "queue a follow-up for when the turn ends",
         ));
         lines.push(row(
-            "Up",
+            &self.keys.label(Action::SelectUp),
             "edit the last queued message (Esc cancels the edit)",
         ));
         lines.push(row(
@@ -160,7 +163,7 @@ impl Shell {
     pub(super) fn queue_command(&mut self, line: &str) {
         let items = self.composer.queued_messages();
         if items.is_empty() {
-            self.note("Queue", "No queued messages. While busy, Enter steers the current task and the follow-up shortcut queues the next task.");
+            self.note("Queue", "No queued messages. While busy, submit a draft to choose between adding direction now and queuing for later; the follow-up shortcut queues directly.");
             return;
         }
         let words: Vec<_> = line.split_whitespace().collect();

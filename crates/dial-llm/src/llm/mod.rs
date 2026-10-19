@@ -465,6 +465,12 @@ pub(crate) fn host_of(url: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether `url` addresses a server reachable only from this machine or its network (see
+/// [`is_local_host`]). A URL without a host is not local.
+pub fn is_local_url(url: &str) -> bool {
+    host_of(url).is_some_and(|host| is_local_host(&host))
+}
+
 /// The chat-completions URL for `base_url`: `{base}/chat/completions` when the
 /// base already has a path (`…/v1`, `…/openai/v1`), and
 /// `{base}/v1/chat/completions` for a bare `scheme://host[:port]`, which is

@@ -40,12 +40,8 @@ def run_contract(report):
     return contract
 
 
-def summarize_configuration(entry, repetitions):
-    report = entry["report"]
-    reason = invalid_reason(report)
-    if reason:
-        raise ValueError(f"invalid run for {entry['configuration']['name']}: {reason}")
-    run_contract(report)
+def group_trials(report, repetitions):
+    """Return {task: {trial: case}} for a complete, prefix-validated repetition set."""
     groups = {}
     for key, case in indexed(report).items():
         trial, separator, task = key.partition(":")
@@ -53,6 +49,16 @@ def summarize_configuration(entry, repetitions):
             raise ValueError(f"case lacks a valid repetition prefix: {key}")
         task_contract(case)
         groups.setdefault(task, {})[int(trial)] = case
+    return groups
+
+
+def summarize_configuration(entry, repetitions):
+    report = entry["report"]
+    reason = invalid_reason(report)
+    if reason:
+        raise ValueError(f"invalid run for {entry['configuration']['name']}: {reason}")
+    run_contract(report)
+    groups = group_trials(report, repetitions)
     contracts = {}
     tasks = []
     for task, trials in sorted(groups.items()):

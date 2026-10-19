@@ -162,9 +162,10 @@ default, or Dial's user directory with `--user`. A project setting overrides the
 default, including for same-name shadowed skills. Disabling never deletes a skill; it
 removes it from completion, the model catalog and skill-tool loading. Imports and toggles
 refresh chat completion immediately and the model catalog on the next turn. While a turn runs,
-Enter queues steering for the running turn and Option/Alt+Enter queues a follow-up for the next
-turn. With an empty composer, Enter sends the oldest queued message now: the current turn stops
-at its next safe point and the message starts a new turn in the same chat. Other queued messages
+submitting a draft opens a choice between adding direction now and queuing for after the turn;
+Option/Alt+Enter still queues a follow-up directly. Empty Enter with queued work opens a
+keep-working/stop-and-send choice, defaulting to keeping the current work running. Sending the
+oldest queued message requires explicitly choosing stop and confirming. Other queued messages
 are preserved. Slash commands run immediately or are deferred. Previously loaded skill text
 remains in conversation history; disabling is not a sandbox or a way to erase that text.
 

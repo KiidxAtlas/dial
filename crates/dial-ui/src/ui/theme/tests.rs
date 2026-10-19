@@ -474,7 +474,11 @@ fn built_in_names_win_and_listing_includes_custom_themes() {
     write_theme(dir.path(), "dark", r##"{"colors":{"accent":"#ff0000"}}"##);
     write_theme(dir.path(), "zebra", "{}");
     write_theme(dir.path(), "alpha", "{}");
-    let m = manager(dir.path(), &UiConfig::default());
+    let ui = UiConfig {
+        theme: "dark".into(),
+        ..UiConfig::default()
+    };
+    let m = manager(dir.path(), &ui);
     assert_eq!(
         m.current().fg(Tok::Accent),
         Theme::dark().fg(Tok::Accent),

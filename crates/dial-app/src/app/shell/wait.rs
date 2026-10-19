@@ -197,7 +197,10 @@ impl Shell {
     }
 
     fn wait_key(&mut self, app: &App, key: crossterm::event::KeyEvent) -> Result<WaitFlow> {
-        if self.keys.matches(Action::Interrupt, &key) {
+        // Dismiss the local send decision before interpreting the same key as wait cancellation.
+        if self.keys.matches(Action::Interrupt, &key)
+            && !(self.composer.choice_open() && self.keys.matches(Action::Dismiss, &key))
+        {
             return Ok(WaitFlow::Cancel);
         }
         Ok(match self.composer_key(key) {

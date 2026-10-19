@@ -293,3 +293,50 @@ fn speed_from_recorded_requests_uses_only_successful_timed_output() {
     assert_eq!(read.decode_speed(&["/models/b"]).unwrap().samples, Some(0));
     assert_eq!(read.model_names().unwrap(), vec!["/models/a".to_owned()]);
 }
+
+#[test]
+fn model_usage_sums_requests_and_prices_only_priced_ones_per_model() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+        stats::read_model_usage(root.path()).is_empty(),
+        "no database is no data"
+    );
+    let mut db = stats::Db::open(&stats::db_path(root.path())).unwrap();
+    let record = |model: &str, output: u64, cost: Option<f64>, error: bool| stats::RequestRecord {
+        ts_ms: 1,
+        session: "s".into(),
+        project: "p".into(),
+        model: model.into(),
+        input: 1000,
+        output,
+        duration_ms: 1000,
+        cost_usd: cost,
+        error,
+        reported: true,
+        finish_reason: "stop".into(),
+        ..Default::default()
+    };
+    db.record_request(&record("gpt", 40, Some(0.02), false))
+        .unwrap();
+    db.record_request(&record("gpt", 60, Some(0.04), false))
+        .unwrap();
+    db.record_request(&record("gpt", 0, None, true)).unwrap();
+    db.record_request(&record("local", 80, None, false))
+        .unwrap();
+    drop(db);
+    let usage = stats::read_model_usage(root.path());
+    let gpt = &usage["gpt"];
+    assert_eq!(gpt.totals.requests, 3);
+    assert_eq!(gpt.totals.errors, 1);
+    assert_eq!(gpt.totals.priced_requests, 2);
+    assert!((gpt.avg_cost_usd().unwrap() - 0.03).abs() < 1e-9);
+    assert_eq!(gpt.speed.samples, Some(2));
+    assert_eq!(gpt.speed.median_tok_per_s, Some(50.0));
+    let local = &usage["local"];
+    assert_eq!(
+        local.avg_cost_usd(),
+        None,
+        "unpriced requests are never costed"
+    );
+    assert_eq!(local.speed.median_tok_per_s, Some(80.0));
+}

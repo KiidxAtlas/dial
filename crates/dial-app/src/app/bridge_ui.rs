@@ -433,8 +433,8 @@ impl Ui for Bridge<'_> {
             summary,
             &[
                 ("Allow once", 'y'),
-                ("Always allow this session", 'a'),
-                ("Always allow in this project", 'p'),
+                ("Allow for this session", 'a'),
+                ("Allow for this project", 'p'),
                 ("Deny", 'n'),
             ],
             Some(cancel),

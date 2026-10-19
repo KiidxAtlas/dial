@@ -1,3 +1,4 @@
+use super::super::workflow::{Attempt, CaseMeasurement};
 use super::*;
 use crate::config::types::{Admission, Harness, SuiteScore};
 #[test]
@@ -12,20 +13,20 @@ fn profiles_require_acceptance_and_expire_on_rollback() {
         .map(|_| {
             (
                 Kind::Debugging,
-                CaseMeasurement {
+                Attempt::Measured(CaseMeasurement {
                     passed: true,
                     metrics: Metrics {
                         tool_calls: 1,
                         ..Default::default()
                     },
-                },
-                CaseMeasurement {
+                }),
+                Attempt::Measured(CaseMeasurement {
                     passed: true,
                     metrics: Metrics {
                         tool_calls: 3,
                         ..Default::default()
                     },
-                },
+                }),
             )
         })
         .collect::<Vec<_>>();

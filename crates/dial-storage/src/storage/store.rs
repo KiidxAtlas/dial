@@ -1029,6 +1029,35 @@ impl Store {
         Ok((n as usize, mean))
     }
 
+    /// Task-matched live results for a candidate and its parent: one `(parent, candidate)` score pair per
+    /// prompt that both versions answered with an explicit score from the same source class. Only
+    /// explicit scores count (`user*` verdicts, passing `checks:behavioral`); commits and `check:*`
+    /// verifier outcomes never do. Each side is averaged per prompt first. A prompt scored in both
+    /// classes counts once, preferring the user verdict. Prompts never leave this query: callers
+    /// receive only numbers.
+    pub fn matched_live_scores(&self, candidate: i64, parent: i64) -> Result<Vec<(f64, f64)>> {
+        let mut statement = self.conn.prepare(
+            "WITH scored AS (
+                SELECT t.version AS version,t.prompt AS prompt,
+                    CASE WHEN o.source IN ('user','user:rating','user:undo','user:session') THEN 'user' ELSE 'checks' END AS class,
+                    avg(o.score) AS score
+                FROM trajectories t JOIN outcomes o ON o.trajectory=t.id
+                WHERE t.version IN (?1,?2) AND t.finished_at IS NOT NULL AND t.error IS NULL AND t.domain NOT LIKE 'selfplay:%'
+                    AND (o.source IN ('user','user:rating','user:undo','user:session') OR o.source='checks:behavioral')
+                GROUP BY t.version,t.prompt,class),
+            paired AS (
+                SELECT p.score AS parent,c.score AS candidate,c.prompt AS prompt,c.class AS class
+                FROM scored c JOIN scored p ON p.prompt=c.prompt AND p.class=c.class
+                WHERE c.version=?1 AND p.version=?2)
+            SELECT parent,candidate FROM (
+                SELECT parent,candidate,prompt,class,row_number() OVER (PARTITION BY prompt ORDER BY CASE class WHEN 'user' THEN 0 ELSE 1 END,class) AS rank
+                FROM paired)
+            WHERE rank=1 ORDER BY parent,candidate",
+        )?;
+        let rows = statement.query_map([candidate, parent], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Self-play pass rates by family for one version: (family, passed, total), from verifier outcomes.
     pub fn selfplay_rates(&self, version: i64) -> Result<Vec<(String, usize, usize)>> {
         let mut statement = self.conn.prepare("SELECT t.domain,sum(o.score>=100),count(*) FROM trajectories t JOIN outcomes o ON o.trajectory=t.id

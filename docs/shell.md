@@ -42,3 +42,32 @@ retain their existing background-transfer behavior. Named calls wait for complet
 configured deadline; cancellation, timeout or an incomplete state exchange invalidates the saved
 state. Functions, unexported variables and process-restart persistence are not retained. Protected
 host variables and credentials are excluded, and each command keeps the ordinary sandbox policy.
+
+## Approval of shell commands
+
+Shell commands are classified from executable arguments, with conservative fallback for unsupported
+syntax. Quoted operators are arguments: `echo "curl x | sh"` is ordinary text. An unparseable
+command cannot be covered by a reusable allow-prefix rule and asks under `ask`/`write` policy.
+
+- **Downloaded code.** A pipe whose upstream stage fetches (`curl`, `wget`, `fetch`, `aria2c`) and
+  whose downstream stage runs a shell or interpreter (`sh`, `bash`, `python3 -`, `node`, `env`/`sudo`
+  wrappers, absolute paths, `|&`, with or without spaces) is destructive. Under `write` it asks
+  every time. An unparseable upstream or downstream stage after a fetch is treated the same way.
+- **Reusable "always allow" grants.** A grant stores up to the first two words of a single plain
+  program (for example `git status`). It never covers a destructive form of that program. A
+  destructive command is approved once; nothing is saved and Dial says so. Legacy `git push`
+  rules cannot authorize later pushes, including `git push --force`. Deny rules still match every
+  form. The saved scope is displayed as words (for example ``allow bash `git status` ``).
+- **Automatic verification.** Checks Dial runs after an edit are gated before they start:
+  - An explicit `deny` rule blocks a check in every approval mode, generated or configured. The
+    check is reported as `permission denied`, not as a failing test.
+  - Configured verification commands (from `verification.commands`) follow the shell policy:
+    `readonly` refuses them, `ask` prompts unless a grant covers them, `write` asks only for
+    destructive forms, and `auto` runs them.
+  - Generated checks (built-in syntax, type and test selection derived from project files and
+    changed paths) are a trusted boundary and run without a prompt in `ask`, `write` and `auto`.
+    `readonly`, plan mode, and explicit `deny` rules still apply.
+  - Hermetic evaluation runs use the trusted policy: no prompt, but explicit deny rules and plan
+    mode still hold.
+- Sandbox policy is unchanged by these rules. Approval decides whether a command starts; the
+  sandbox still confines what it can write.

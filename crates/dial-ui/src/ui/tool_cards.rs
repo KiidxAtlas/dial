@@ -1,9 +1,7 @@
 //! Tool cards lay out the portable presentation supplied by each tool definition.
 //! The shared execution phase owns settlement; expanded cards retain full evidence.
 use super::{
-    Rows,
-    chrome::Section,
-    markdown,
+    Rows, markdown,
     markdown::truncate_spans,
     text,
     theme::{Sym, Theme, Tok},
@@ -59,17 +57,8 @@ pub struct AgentRow {
 
 // ---- tools ---------------------------------------------------------------------------------
 
-fn family(tone: crate::runtime::presentation::Tone) -> Section {
-    use crate::runtime::presentation::Tone;
-    match tone {
-        Tone::Shell => Section::Sandbox,
-        Tone::Edit => Section::Dial,
-        Tone::Connect => Section::Connect,
-        Tone::Workers => Section::Loop,
-        Tone::Tools => Section::Tools,
-    }
-}
-
+/// The icon in a work row's gutter. A settled call is a quiet dot so the answer around it leads;
+/// only running, failed and unfinished calls draw the eye.
 fn phase_glyph(state: ToolState, ctx: &TranscriptCtx) -> (String, Style) {
     let theme = ctx.theme;
     match state {
@@ -80,9 +69,12 @@ fn phase_glyph(state: ToolState, ctx: &TranscriptCtx) -> (String, Style) {
                 .fg(Tok::Accent)
                 .patch(crate::ui::fx::pulse(theme, ctx.tick)),
         ),
-        ToolState::Completed => (theme.sym(Sym::Check).to_owned(), theme.fg(Tok::Success)),
+        ToolState::Completed => (theme.sym(Sym::Dot).to_owned(), theme.fg(Tok::Dim)),
         ToolState::Failed => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Error)),
-        ToolState::Interrupted => (theme.sym(Sym::Cross2).to_owned(), theme.fg(Tok::Muted)),
+        ToolState::Interrupted => (
+            if theme.ascii() { "-" } else { "⊘" }.to_owned(),
+            theme.fg(Tok::Muted),
+        ),
         ToolState::Incomplete | ToolState::Blocked | ToolState::NeedsInput => {
             (theme.sym(Sym::Warn).to_owned(), theme.fg(Tok::Warning))
         }
@@ -121,6 +113,14 @@ pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
 
 /// Width of the verb column, so targets line up down the transcript.
 const VERB_W: usize = 7;
+/// Cells of the icon gutter: the glyph, then the content column every transcript block shares.
+pub(super) const GUTTER: usize = 3;
+
+/// The glyph padded to the gutter.
+fn gutter_span(glyph: String, style: Style) -> Vec<Span<'static>> {
+    let pad = GUTTER.saturating_sub(text::width(&glyph)).max(1);
+    vec![Span::styled(glyph, style), Span::raw(" ".repeat(pad))]
+}
 
 /// The human verb a call is listed under, and whether it is an automatic check.
 fn verb(t: &Tool) -> String {
@@ -212,9 +212,9 @@ fn write_preview(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, u
     Some((rows, hidden))
 }
 
-/// One tool call: a header row (status glyph, verb column, target, facts at the right edge),
-/// then, when it says something, an indented body under a thin rail: the diff for edits, the new
-/// lines for writes, output for commands, the first error lines for failures.
+/// One tool call: a header row (status glyph in the gutter, bold verb, muted target, facts at the
+/// right edge), then, when it says something, the body hanging off a `└` under the verb: the diff
+/// for edits, the new lines for writes, output for commands, the first error lines for failures.
 fn card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     let theme = ctx.theme;
     let mark = ellipsis(theme);
@@ -225,41 +225,42 @@ fn card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     } else if is_context(t) {
         theme.fg(Tok::Muted)
     } else {
-        theme
-            .fg(family(t.presentation.tone).tok())
-            .add_modifier(Modifier::BOLD)
+        theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD)
     };
     let target_text = target(t);
     let facts_text = facts(t).join(&format!(" {} ", theme.sym(Sym::Dot)));
-    let left_fixed = 1 + text::width(&glyph) + 1 + VERB_W.max(text::width(&verb_text)) + 1;
+    let lead = gutter_span(glyph, glyph_style);
+    let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
+    let left_fixed = lead_w + VERB_W.max(text::width(&verb_text)) + 1;
     let right_w = text::width(&facts_text);
     let room = w.saturating_sub(left_fixed + right_w + if right_w > 0 { 2 } else { 0 });
     let full_target = target_text.clone();
     let target_text = text::clip(&target_text, room.max(1));
     let target_clipped = full_target != target_text;
     let gap = w.saturating_sub(left_fixed + text::width(&target_text) + right_w);
-    let mut head = vec![
-        Span::raw(" "),
-        Span::styled(glyph, glyph_style),
-        Span::raw(" "),
+    let mut head = lead;
+    head.extend([
         Span::styled(format!("{verb_text:<width$}", width = VERB_W), verb_style),
         Span::raw(" "),
-        Span::styled(target_text, theme.fg(Tok::Text)),
-    ];
+        Span::styled(target_text, theme.fg(Tok::Muted)),
+    ]);
     if right_w > 0 {
         head.push(Span::raw(" ".repeat(gap)));
         let style = if t.state == ToolState::Failed {
             theme.fg(Tok::Error)
         } else {
-            theme.fg(Tok::Muted)
+            theme.fg(Tok::Dim)
         };
         head.push(Span::styled(facts_text, style));
     }
     let mut rows = vec![fitted(head, w, theme)];
     if ctx.tools_expanded && target_clipped {
-        for line in text::wrap_words(&full_target, w.saturating_sub(3).max(1)) {
+        for line in text::wrap_words(&full_target, w.saturating_sub(GUTTER).max(1)) {
             rows.push(fitted(
-                vec![Span::raw("   "), Span::styled(line, theme.fg(Tok::Muted))],
+                vec![
+                    Span::raw(" ".repeat(GUTTER)),
+                    Span::styled(line, theme.fg(Tok::Muted)),
+                ],
                 w,
                 theme,
             ));
@@ -279,8 +280,7 @@ fn card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
         rows.extend(agent_tree(&t.agents, w, ctx));
         return rows;
     }
-    let indent = 3;
-    let inner = w.saturating_sub(indent + 2).max(1);
+    let inner = w.saturating_sub(GUTTER + 2).max(1);
     let (body, hidden) = if t.state == ToolState::Failed {
         output_rows(t, inner, ctx, Some(COMPACT_ERROR_ROWS))
     } else if let Some(diff) = diff_rows(t, inner, ctx) {
@@ -290,21 +290,32 @@ fn card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     } else {
         output_rows(t, inner, ctx, None)
     };
-    let rail = Span::styled(
-        format!("{}{} ", " ".repeat(indent), theme.sym(Sym::Quote)),
-        theme.fg(if t.state == ToolState::Failed {
-            Tok::Error
+    let hook_style = theme.fg(if t.state == ToolState::Failed {
+        Tok::Error
+    } else {
+        Tok::Dim
+    });
+    let hook = if theme.ascii() { "`" } else { "└" };
+    let mut first = true;
+    let mut rail = || {
+        let glyph = if std::mem::take(&mut first) {
+            hook
         } else {
-            Tok::Border
-        }),
-    );
+            " "
+        };
+        Span::styled(format!("{}{glyph} ", " ".repeat(GUTTER)), hook_style)
+    };
     for line in body {
-        let mut spans = vec![rail.clone()];
+        let mut spans = vec![rail()];
         spans.extend(truncate_spans(line.spans, inner, &mark));
         rows.push(fitted(spans, w, theme));
     }
     if hidden > 0 {
-        rows.push(fitted(vec![rail, hidden_hint(hidden, theme)], w, theme));
+        rows.push(fitted(
+            vec![rail(), hidden_hint(hidden, ctx.expand_key, theme)],
+            w,
+            theme,
+        ));
     }
     rows
 }
@@ -437,22 +448,24 @@ fn todo_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
         .filter(|(task, _)| !task.status.is_open())
         .count();
     // Same columns as every other card: status glyph, verb, then what it is about.
-    let verb_style = theme
-        .fg(family(t.presentation.tone).tok())
-        .add_modifier(Modifier::BOLD);
-    let spans = vec![
-        Span::raw(" "),
-        Span::styled(glyph, glyph_style),
-        Span::raw(" "),
+    let verb_style = theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD);
+    let mut spans = gutter_span(glyph, glyph_style);
+    spans.extend([
         Span::styled(format!("{:<width$}", "Plan", width = VERB_W), verb_style),
         Span::raw(" "),
         Span::styled(
             format!("{closed}/{} done", tasks.len()),
-            theme.fg(Tok::Text),
+            theme.fg(Tok::Muted),
         ),
-    ];
+    ]);
     let mut rows = vec![fitted(spans, w, theme)];
-    rows.extend(super::tasks::card_rows(tasks, w, theme, ctx.tools_expanded));
+    // The list's own two-cell indent plus one puts each task glyph under the verb.
+    let shift = GUTTER.saturating_sub(2);
+    for row in super::tasks::card_rows(tasks, w.saturating_sub(shift), theme, ctx.tools_expanded) {
+        let mut spans = vec![Span::raw(" ".repeat(shift))];
+        spans.extend(row.spans);
+        rows.push(Line::from(spans));
+    }
     rows
 }
 
@@ -683,10 +696,11 @@ fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx, limit: Option<usize>
     (rows, hidden)
 }
 
-fn hidden_hint(hidden: usize, theme: &Theme) -> Span<'static> {
+fn hidden_hint(hidden: usize, expand_key: &str, theme: &Theme) -> Span<'static> {
+    // The shortcut is the user's own binding, so it is named as the keymap shows it.
     Span::styled(
         format!(
-            "{} {hidden} more line{} (Ctrl-O expands)",
+            "{} {hidden} more line{} ({expand_key} expands)",
             ellipsis(theme),
             if hidden == 1 { "" } else { "s" }
         ),

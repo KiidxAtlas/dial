@@ -2,7 +2,7 @@
 //! Routes are scoped to the active version; admission or rollback invalidates old routes.
 use super::{
     task_policy::Kind,
-    workflow::{CaseMeasurement, Metrics},
+    workflow::{Attempt, Metrics},
 };
 use crate::{config::types::Version, storage::store::Store};
 use anyhow::Result;
@@ -19,6 +19,9 @@ pub struct Profile {
     pub parent_wins: usize,
     pub candidate_wins: usize,
     pub newly_failed: usize,
+    /// Paired cases with a model-caused failure on either side; they have no cost metrics.
+    #[serde(default)]
+    pub unmeasured: usize,
     pub prefer_parent: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,25 +41,33 @@ pub fn measure(
     store: &Store,
     baseline: &Version,
     candidate: &Version,
-    pairs: &[(Kind, CaseMeasurement, CaseMeasurement)],
+    pairs: &[(Kind, Attempt, Attempt)],
 ) -> Result<()> {
     let mut categories = BTreeMap::<Kind, Profile>::new();
     for (kind, b, c) in pairs {
         let p = categories.entry(*kind).or_default();
         p.samples += 1;
-        p.baseline.add(&b.metrics);
-        p.candidate.add(&c.metrics);
-        p.baseline_passed += usize::from(b.passed);
-        p.candidate_passed += usize::from(c.passed);
-        p.newly_failed += usize::from(b.passed && !c.passed);
-        if b.passed && c.passed {
-            p.parent_wins += usize::from(cheaper(&b.metrics, &c.metrics));
-            p.candidate_wins += usize::from(cheaper(&c.metrics, &b.metrics));
+        p.baseline_passed += usize::from(b.passed());
+        p.candidate_passed += usize::from(c.passed());
+        p.newly_failed += usize::from(b.passed() && !c.passed());
+        match (b.measurement(), c.measurement()) {
+            (Some(b), Some(c)) => {
+                p.baseline.add(&b.metrics);
+                p.candidate.add(&c.metrics);
+                if b.passed && c.passed {
+                    p.parent_wins += usize::from(cheaper(&b.metrics, &c.metrics));
+                    p.candidate_wins += usize::from(cheaper(&c.metrics, &b.metrics));
+                }
+            }
+            // A model failure has no observed cost; it is counted as unsolved, never as zero cost.
+            _ => p.unmeasured += 1,
         }
     }
     for p in categories.values_mut() {
         // Small or mixed-success samples keep the global winner. No token/time-only routing.
+        // Any unmeasured pair blocks routing: the cost comparison would describe a different population.
         p.prefer_parent = p.samples >= 8
+            && p.unmeasured == 0
             && p.baseline_passed == p.samples
             && p.candidate_passed == p.samples
             && p.parent_wins >= 6
@@ -116,7 +127,17 @@ pub fn summary(store: &Store) -> Result<String> {
         "Task profiles (correctness-gated; speed alone cannot activate an adapter):".to_owned(),
     ];
     for (kind, p) in report.categories {
-        lines.push(format!("{}: v{} · {} paired cases · actions {} → {} · errors {} → {} · inference tokens {} → {} · elapsed {} → {} ms",
+        // Cost totals cover only pairs both sides measured; the note keeps unmeasured pairs visible.
+        let cost = if p.unmeasured > 0 {
+            format!(
+                " · cost measured for {} of {} paired cases",
+                p.samples - p.unmeasured,
+                p.samples
+            )
+        } else {
+            String::new()
+        };
+        lines.push(format!("{}: v{} · {} paired cases{cost} · actions {} → {} · errors {} → {} · inference tokens {} → {} · elapsed {} → {} ms",
             kind.label(),if p.prefer_parent {report.parent}else{active.id},p.samples,
             p.baseline.tool_calls,p.candidate.tool_calls,p.baseline.tool_errors,p.candidate.tool_errors,
             p.baseline.completion_tokens,p.candidate.completion_tokens,p.baseline.elapsed_ms,p.candidate.elapsed_ms));

@@ -28,7 +28,10 @@ access, with a message saying it is neither a local path nor a repository id.
 ## Finding and downloading in `/models`
 
 Open `/models` and choose **Get models** in the left column (`/models local` opens it directly). It has
-three shelves, **MLX**, **GGUF** and **Embedding**, switched with Right/Tab (Shift+Tab goes back).
+four shelves, **MLX**, **GGUF**, **Memory** and **Embedding**, switched with Right/Tab (Shift+Tab goes back).
+The Memory shelf suggests small 1-2B instruct models (in this machine's default weight format) for the
+`memory` role and lists every installed model whatever its format; Enter on an installed model assigns
+it to `memory`. In the Memory group of `/models`, `Ctrl+G` opens this shelf.
 Suggested models that are not already installed appear **first**, with a selected row visible even
 in short panels. Offline starting points appear immediately; a background Hugging Face catalog
 request adds popular models without requiring a search. Network failures leave the starting points

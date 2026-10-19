@@ -13,9 +13,9 @@ use ratatui::{
     text::{Line, Span},
 };
 
-/// Context and alert lines align with tool cards: one leading space, glyph, space, then the label
-/// padded to the tool-verb column so targets and sentences start at the same x.
-const LEAD: usize = 1;
+/// Context and alert lines align with tool cards: the glyph in the transcript's icon gutter, then
+/// the label padded to the tool-verb column so targets and sentences start at the same x.
+const GUTTER: usize = super::tool_cards::GUTTER;
 const LABEL_W: usize = 7;
 
 fn icon(kind: EventKind, ascii: bool) -> &'static str {
@@ -87,18 +87,18 @@ fn line(event: &UiEvent, w: usize, ctx: &TranscriptCtx) -> Rows {
         theme.fg(Tok::Muted)
     };
     // Hanging indent under the text, past glyph and label.
-    let hang = LEAD + text::width(glyph) + 1 + LABEL_W.max(text::width(label)) + 1;
+    let lead = GUTTER.saturating_sub(text::width(glyph)).max(1);
+    let hang = text::width(glyph) + lead + LABEL_W.max(text::width(label)) + 1;
     let room = w.saturating_sub(hang).max(8);
     let mut rows = Vec::new();
     for (i, part) in text::wrap_words(&first, room).into_iter().enumerate() {
         let mut spans = Vec::new();
         if i == 0 {
-            spans.push(Span::raw(" ".repeat(LEAD)));
             spans.push(Span::styled(
                 glyph.to_owned(),
                 theme.fg(icon_tok(event.kind)),
             ));
-            spans.push(Span::raw(" "));
+            spans.push(Span::raw(" ".repeat(lead)));
             spans.push(Span::styled(format!("{label:<LABEL_W$}"), label_style));
             spans.push(Span::raw(" "));
         } else {

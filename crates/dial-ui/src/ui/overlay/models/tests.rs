@@ -202,10 +202,10 @@ fn provider_browsing_keeps_role_assignment_and_cancel_destination() {
         send(&mut o, &rig, key(KeyCode::Down));
         send(&mut o, &rig, key(KeyCode::Enter));
         send(&mut o, &rig, key(KeyCode::Tab));
-        // All -> Favorites -> Get models -> LM Studio.
-        send(&mut o, &rig, key(KeyCode::Down));
-        send(&mut o, &rig, key(KeyCode::Down));
-        send(&mut o, &rig, key(KeyCode::Down));
+        // All -> Favorites -> Memory -> Get models -> LM Studio.
+        for _ in 0..4 {
+            send(&mut o, &rig, key(KeyCode::Down));
+        }
         assert_eq!(o.group, Group::Provider("lm-studio".into()));
         assert_eq!(o.target_role.as_deref(), Some("small"));
         send(&mut o, &rig, key(KeyCode::Enter));
@@ -702,7 +702,9 @@ fn capability_icons_labels_and_search_use_metadata_in_every_glyph_preset() {
             let line = o.model_line(&rig.theme, &model, &[], selected, 100);
             let icons = line.spans.last().unwrap();
             assert_eq!(icons.content, capability_cell(&rig.theme, &model, 8));
-            assert_eq!(icons.style.fg, rig.theme.fg(Tok::Muted).fg);
+            // On the selection fill every detail takes the body color.
+            let tok = if selected { Tok::Text } else { Tok::Muted };
+            assert_eq!(icons.style.fg, rig.theme.fg(tok).fg);
             assert_eq!(line.width(), 100);
             assert_eq!(
                 line.spans[..line.spans.len() - 1]
@@ -717,9 +719,10 @@ fn capability_icons_labels_and_search_use_metadata_in_every_glyph_preset() {
             role.spans.last().unwrap().content,
             capability_cell(&rig.theme, &model, 8)
         );
+        // Row 0 is under the cursor, so it reads in the body color on the selection fill.
         assert_eq!(
             role.spans.last().unwrap().style.fg,
-            rig.theme.fg(Tok::Muted).fg
+            rig.theme.fg(Tok::Text).fg
         );
         assert!(shown.contains("vision") && shown.contains("tools") && shown.contains("reasoning"));
         o.type_text("vision");
@@ -1007,8 +1010,8 @@ fn typing_filters_fuzzily_and_highlights_matches() {
     let plain = style_of(&buf, "lm-studio/").unwrap();
     let matched = style_of(&buf, "qwen-warm").unwrap();
     assert_ne!(
-        plain.fg,
-        matched.fg,
+        plain,
+        matched,
         "matched characters are emphasized: {plain:?} vs {matched:?}\n{}",
         screen(&buf)
     );
@@ -1068,6 +1071,8 @@ fn provider_group_filters_and_groups_are_walked_with_the_keymap() {
     send(&mut o, &rig, key(KeyCode::Down));
     assert_eq!(o.group, Group::Favorites);
     send(&mut o, &rig, key(KeyCode::Down));
+    assert_eq!(o.group, Group::Memory);
+    send(&mut o, &rig, key(KeyCode::Down));
     assert_eq!(o.group, Group::Download);
     assert!(draw(&mut o, &rig, 120, 30).contains("Get models"));
     send(&mut o, &rig, key(KeyCode::Down));
@@ -1078,6 +1083,8 @@ fn provider_group_filters_and_groups_are_walked_with_the_keymap() {
     send(&mut o, &rig, key(KeyCode::Up));
     send(&mut o, &rig, key(KeyCode::Up));
     assert_eq!(o.group, Group::Download);
+    send(&mut o, &rig, key(KeyCode::Up));
+    assert_eq!(o.group, Group::Memory);
     send(&mut o, &rig, key(KeyCode::Up));
     assert_eq!(o.group, Group::Favorites);
     send(&mut o, &rig, key(KeyCode::Up));
@@ -1305,11 +1312,9 @@ fn discovery_arriving_later_keeps_search_cursor_and_group() {
     // A group that disappears falls back to All.
     send(&mut o, &rig, key(KeyCode::Esc));
     send(&mut o, &rig, key(KeyCode::Tab));
-    send(&mut o, &rig, key(KeyCode::Down));
-    send(&mut o, &rig, key(KeyCode::Down));
-    send(&mut o, &rig, key(KeyCode::Down));
-    send(&mut o, &rig, key(KeyCode::Down));
-    send(&mut o, &rig, key(KeyCode::Down));
+    for _ in 0..6 {
+        send(&mut o, &rig, key(KeyCode::Down));
+    }
     assert_eq!(o.group, Group::Provider("openai".into()));
     let mut smaller = discovery();
     smaller.providers.retain(|p| p.id != "openai");
@@ -1354,10 +1359,9 @@ fn empty_states_explain_themselves() {
     send(&mut o, &rig, key(KeyCode::Right));
     send(&mut o, &rig, key(KeyCode::Right));
     send(&mut o, &rig, key(KeyCode::Tab));
-    send(&mut o, &rig, key(KeyCode::Down));
-    send(&mut o, &rig, key(KeyCode::Down));
-    send(&mut o, &rig, key(KeyCode::Down));
-    send(&mut o, &rig, key(KeyCode::Down));
+    for _ in 0..5 {
+        send(&mut o, &rig, key(KeyCode::Down));
+    }
     send(&mut o, &rig, key(KeyCode::Tab));
     assert_eq!(o.group, Group::Provider("ollama".into()));
     assert_eq!(o.kind, KindFilter::Embedding);
@@ -1467,11 +1471,12 @@ fn get_models_is_reachable_from_the_groups_column_by_keyboard() {
     let rig = Rig::new();
     let mut o = overlay();
     assert_eq!(o.group, Group::All);
-    // Left moves focus to the groups column; Down walks All -> Favorites -> Get models.
+    // Left moves focus to the groups column; Down walks All -> Favorites -> Memory -> Get models.
     send(&mut o, &rig, key(KeyCode::Left));
     assert_eq!(o.focus, Focus::Groups);
-    send(&mut o, &rig, key(KeyCode::Down));
-    send(&mut o, &rig, key(KeyCode::Down));
+    for _ in 0..3 {
+        send(&mut o, &rig, key(KeyCode::Down));
+    }
     assert_eq!(o.group, Group::Download);
     let shown = draw(&mut o, &rig, 120, 30);
     assert!(shown.contains("Get models"), "{shown}");
@@ -1580,6 +1585,8 @@ fn switching_groups_keeps_a_running_download() {
     ));
     assert_eq!(o.focus, Focus::Groups);
     send(&mut o, &rig, key(KeyCode::Up));
+    assert_eq!(o.group, Group::Memory);
+    send(&mut o, &rig, key(KeyCode::Up));
     assert_eq!(o.group, Group::Favorites);
     send(&mut o, &rig, key(KeyCode::Up));
     assert_eq!(o.group, Group::All);
@@ -1607,7 +1614,7 @@ fn model_tabs_use_right_and_tab_while_left_returns_to_groups() {
         send(&mut o, &rig, key(KeyCode::Up)),
         OverlayEvent::None
     ));
-    assert_eq!(o.group, Group::Favorites);
+    assert_eq!(o.group, Group::Memory);
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Down)),
         OverlayEvent::None
@@ -1642,7 +1649,7 @@ fn get_models_escape_returns_to_groups_then_closes() {
         send(&mut o, &rig, key(KeyCode::Up)),
         OverlayEvent::None
     ));
-    assert_eq!(o.group, Group::Favorites);
+    assert_eq!(o.group, Group::Memory);
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Down)),
         OverlayEvent::None
@@ -1694,4 +1701,183 @@ fn show_downloads_opens_the_get_models_group_for_local_models_command() {
     assert_eq!(o.group, Group::Download);
     assert_eq!(o.focus, Focus::List);
     assert!(o.search.is_empty());
+}
+
+fn priced(mut entry: ModelEntry, prompt: f64, completion: f64) -> ModelEntry {
+    entry.metadata.pricing = Some(crate::llm::catalog::TokenPricing {
+        prompt,
+        completion,
+        cache_read: None,
+        cache_write: None,
+    });
+    entry
+}
+
+fn usage(requests: u64, median: Option<f64>, cost_usd: f64) -> ModelUsage {
+    let mut usage = ModelUsage::default();
+    usage.totals.requests = requests;
+    usage.totals.priced_requests = if cost_usd > 0.0 { requests } else { 0 };
+    usage.totals.cost_usd = cost_usd;
+    usage.totals.avg_latency_ms = Some(1500.0);
+    usage.speed.samples = Some(requests);
+    usage.speed.median_tok_per_s = median;
+    usage
+}
+
+fn ctrl(c: char) -> Event {
+    Event::Key(KeyEvent::new(
+        KeyCode::Char(c),
+        crossterm::event::KeyModifiers::CONTROL,
+    ))
+}
+
+#[test]
+fn f2_cycles_the_show_filter_and_escape_resets_it_before_closing() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    send(&mut o, &rig, key(KeyCode::F(2)));
+    assert_eq!(o.show, ShowFilter::Available);
+    let shown = names(&o);
+    assert!(shown.contains(&"llama3".to_owned()), "{shown:?}");
+    assert!(!shown.contains(&"gpt-cached".to_owned()), "{shown:?}");
+    assert!(!shown.contains(&"nomic-embed".to_owned()), "{shown:?}");
+    send(&mut o, &rig, key(KeyCode::F(2)));
+    assert_eq!(o.show, ShowFilter::Loaded);
+    assert_eq!(names(&o), vec!["qwen-warm".to_owned()]);
+    assert!(draw(&mut o, &rig, 120, 24).contains("show  loaded"));
+
+    // A filter matching nothing says which filter hides the models.
+    o.show = ShowFilter::Priced;
+    assert!(names(&o).is_empty());
+    assert!(draw(&mut o, &rig, 120, 24).contains("No models match the \"priced\" filter"));
+
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Esc)),
+        OverlayEvent::None
+    ));
+    assert_eq!(o.show, ShowFilter::Any);
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Esc)),
+        OverlayEvent::Close
+    ));
+}
+
+#[test]
+fn f3_sorts_by_price_speed_and_use_with_unknown_values_last() {
+    let rig = Rig::new();
+    let mut d = discovery();
+    d.models[1] = priced(d.models[1].clone(), 3e-6, 15e-6);
+    d.models[2] = priced(d.models[2].clone(), 0.15e-6, 0.6e-6);
+    let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+    o.usage.insert("llama3".into(), usage(3, Some(20.0), 0.0));
+    o.usage
+        .insert("qwen-chat".into(), usage(9, Some(80.0), 0.09));
+    o.kind = KindFilter::Chat;
+
+    send(&mut o, &rig, key(KeyCode::F(3)));
+    assert_eq!(o.sort, SortOrder::Name);
+    // Names sort as shown: `provider/model`.
+    assert_eq!(
+        names(&o),
+        vec!["qwen-chat", "qwen-warm", "llama3", "gpt-cached"]
+    );
+    send(&mut o, &rig, key(KeyCode::F(3)));
+    assert_eq!(o.sort, SortOrder::Price);
+    assert_eq!(names(&o)[..2], ["qwen-warm", "qwen-chat"]);
+    send(&mut o, &rig, key(KeyCode::F(3)));
+    assert_eq!(o.sort, SortOrder::Speed);
+    assert_eq!(names(&o)[..2], ["qwen-chat", "llama3"]);
+    o.sort = SortOrder::Usage;
+    assert_eq!(names(&o)[..2], ["qwen-chat", "llama3"]);
+    o.sort = SortOrder::Context;
+    assert_eq!(names(&o)[0], "qwen-warm");
+
+    o.show = ShowFilter::Used;
+    o.sort = SortOrder::Default;
+    assert_eq!(names(&o), vec!["llama3", "qwen-chat"]);
+}
+
+#[test]
+fn wide_rows_show_price_per_million_and_speed_and_the_numbers_line_shows_use() {
+    let rig = Rig::new();
+    let mut d = discovery();
+    d.models[1] = priced(d.models[1].clone(), 3e-6, 15e-6);
+    let mut o = ModelOverlay::new(Some(d), roles_with_main(), Scope::Global);
+    o.usage
+        .insert("qwen-chat".into(), usage(4, Some(42.0), 0.04));
+    let at = names(&o).iter().position(|n| n == "qwen-chat").unwrap();
+    o.cursor = at;
+    let screen = draw(&mut o, &rig, 140, 24);
+    assert!(screen.contains("$3/$15"), "{screen}");
+    assert!(screen.contains("42 t/s"), "{screen}");
+    assert!(
+        screen.contains("price per 1M tokens: in $3 out $15"),
+        "{screen}"
+    );
+    assert!(screen.contains("speed 42 t/s median of 4"), "{screen}");
+    assert!(screen.contains("avg $0.010/request"), "{screen}");
+    assert!(screen.contains("4 requests"), "{screen}");
+
+    // A model without price or recorded use shows dashes, never an estimate.
+    o.cursor = names(&o).iter().position(|n| n == "llama3").unwrap();
+    let screen = draw(&mut o, &rig, 140, 24);
+    assert!(screen.contains("price -"), "{screen}");
+    assert!(screen.contains("no recorded requests"), "{screen}");
+
+    // Narrow panes drop the new columns rather than squeezing the names.
+    let narrow = draw(&mut o, &rig, 70, 24);
+    assert!(!narrow.contains("$3/$15"), "{narrow}");
+}
+
+#[test]
+fn memory_group_lists_chat_models_and_enter_assigns_the_memory_role() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.set_memory_backend("local");
+    o.show_memory();
+    assert_eq!(o.group, Group::Memory);
+    let shown = names(&o);
+    assert!(!shown.contains(&"nomic-embed".to_owned()), "{shown:?}");
+    assert!(shown.contains(&"qwen-chat".to_owned()), "{shown:?}");
+    let screen = draw(&mut o, &rig, 140, 24);
+    assert!(screen.contains("MEMORY MODELS"), "{screen}");
+    assert!(screen.contains("backend local"), "{screen}");
+    assert!(screen.contains("memory role: unassigned"), "{screen}");
+    assert!(screen.contains("set memory"), "{screen}");
+    assert!(screen.contains("Ctrl+G get memory models"), "{screen}");
+
+    o.cursor = names(&o).iter().position(|n| n == "qwen-chat").unwrap();
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::AssignModel { role, selection, .. }
+            if role == "memory" && selection.model == "qwen-chat"
+    ));
+}
+
+#[test]
+fn ctrl_g_in_the_memory_group_opens_the_memory_shelf_of_get_models() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.show_memory();
+    send(&mut o, &rig, ctrl('g'));
+    assert_eq!(o.group, Group::Download);
+    let screen = draw(&mut o, &rig, 140, 30);
+    assert!(
+        screen.contains("Small models for memory"),
+        "the Memory shelf is shown: {screen}"
+    );
+}
+
+#[test]
+fn picking_the_memory_role_from_roles_lands_in_the_memory_group() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.show_roles();
+    o.cursor = ROLES
+        .iter()
+        .position(|(role, _)| *role == "memory")
+        .unwrap();
+    send(&mut o, &rig, key(KeyCode::Enter));
+    assert_eq!(o.target_role.as_deref(), Some("memory"));
+    assert_eq!(o.group, Group::Memory);
 }

@@ -422,9 +422,10 @@ impl<'a> Dialog<'a> {
     }
 }
 
-/// [`Dialog::rows`] as a rounded panel: the first row becomes the `◆ Question n/m` title, the
-/// highlighted choice gets the selection fill, check boxes become radio marks (unless ASCII), and
-/// the key-hint row is muted. At most `height` rows, each exactly `width` cells.
+/// [`Dialog::rows`] as an inset panel on the panel surface: the first row becomes the bold
+/// `Question n/m` title, the highlighted choice gets the selection fill, check boxes become radio
+/// marks (unless ASCII), and the key-hint row is muted. At most `height` rows, each exactly
+/// `width` cells.
 pub fn framed(
     rows: Vec<String>,
     width: usize,
@@ -436,7 +437,14 @@ pub fn framed(
         style::Modifier,
         text::{Line, Span},
     };
-    if width < 8 || rows.is_empty() {
+    if height == 0 || width == 0 || rows.is_empty() {
+        return Vec::new();
+    }
+    // There is no room for a frame on one row. Never exceed the caller's viewport.
+    if height == 1 {
+        return vec![Line::from(text::clip(&text::one_line(&rows[0]), width))];
+    }
+    if width < 8 {
         return rows
             .into_iter()
             .map(|row| Line::from(text::clip(&text::one_line(&row), width)))
@@ -444,29 +452,21 @@ pub fn framed(
             .collect();
     }
     let ascii = theme.ascii();
-    let border = theme.fg(Tok::BorderAccent);
     let inner = width - 4;
-    let h = theme.sym(Sym::BoxH);
-    let v = theme.sym(Sym::BoxV).to_owned();
-    let title = text::clip(&text::one_line(&rows[0]), inner.saturating_sub(4));
-    let mark = if ascii { "*" } else { "\u{25c6}" };
-    let used = 2 + text::width(mark) + 1 + text::width(&title) + 1;
-    let mut out = vec![Line::from(vec![
-        Span::styled(format!("{}{h} ", theme.sym(Sym::BoxTl)), border),
-        Span::styled(mark, theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!(" {title} "),
-            theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                "{}{}",
-                h.repeat(width.saturating_sub(used + 2)),
-                theme.sym(Sym::BoxTr)
+    let fill = super::chrome::surface(theme);
+    let title = text::clip(&text::one_line(&rows[0]), inner);
+    let mut out = vec![Line::from(super::chrome::on_surface(
+        theme,
+        vec![
+            Span::raw(" "),
+            Span::styled(
+                title.clone(),
+                theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
             ),
-            border,
-        ),
-    ])];
+            Span::raw(" ".repeat(width.saturating_sub(1 + text::width(&title)))),
+        ],
+    ))];
+    let selected_row = rows.iter().position(|row| row.starts_with("> "));
     let last = rows.len() - 1;
     for (index, row) in rows.into_iter().enumerate().skip(1) {
         let row = text::one_line(&row);
@@ -511,34 +511,39 @@ pub fn framed(
         };
         let content = text::clip(&format!("{lead}{body}"), inner);
         let pad = inner.saturating_sub(text::width(&content));
-        out.push(Line::from(vec![
-            Span::styled(format!("{v} "), border),
-            Span::styled(content, text_style),
-            Span::styled(
-                " ".repeat(pad),
-                if selected {
-                    text_style
-                } else {
-                    Default::default()
-                },
-            ),
-            Span::styled(format!(" {v}"), border),
-        ]));
+        out.push(Line::from(super::chrome::on_surface(
+            theme,
+            vec![
+                Span::raw("  "),
+                Span::styled(content, text_style),
+                Span::styled(
+                    " ".repeat(pad),
+                    if selected {
+                        text_style
+                    } else {
+                        Default::default()
+                    },
+                ),
+                Span::raw("  "),
+            ],
+        )));
     }
-    out.push(Line::from(Span::styled(
-        format!(
-            "{}{}{}",
-            theme.sym(Sym::BoxBl),
-            h.repeat(width.saturating_sub(2)),
-            theme.sym(Sym::BoxBr)
-        ),
-        border,
-    )));
+    out.push(Line::from(Span::styled(" ".repeat(width), fill)));
     if out.len() > height {
-        // Keep the frame: drop rows from the middle rather than the edges.
-        let bottom = out.pop();
-        out.truncate(height.saturating_sub(1).max(1));
-        out.extend(bottom);
+        // Window the body around the choice being acted on, not just the top of the dialog.
+        // Otherwise Enter can select an option that the user cannot see on a short terminal.
+        let bottom = out.pop().expect("the panel has a bottom row");
+        let room = height - 2;
+        let start = selected_row
+            .filter(|&index| index > room)
+            .map_or(1, |index| {
+                index.saturating_sub(room.saturating_sub(1)).max(1)
+            });
+        let end = (start + room).min(out.len());
+        let mut visible = vec![out[0].clone()];
+        visible.extend(out.drain(start..end));
+        visible.push(bottom);
+        out = visible;
     }
     out
 }

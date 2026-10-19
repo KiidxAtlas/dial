@@ -181,7 +181,7 @@ fn page_shows_sections_values_and_help_and_survives_tiny_terminals() {
     go(&mut overlay, &rig, "temperature");
     let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ctx)));
     for needle in [
-        "\u{25c6} Model settings",
+        " Model settings",
         "SAMPLING",
         "Temperature",
         "0.3",

@@ -1700,6 +1700,7 @@ fn command_argument_choices_include_subcommands_flags_and_installed_skill_names(
         "/improve versions",
         "/improve tasks",
         "/model local",
+        "/model memory",
         "/experience ledger",
         "/theme auto",
     ] {
@@ -1856,7 +1857,7 @@ fn paging_long_approval_details_reaches_every_line_at_any_height() {
             .join("\n")
     );
     assert!(body.len() > 1500);
-    for (cols, terminal_height) in [(40u16, 8usize), (40, 10), (60, 14), (100, 40)] {
+    for (cols, terminal_height) in [(40u16, 11usize), (40, 12), (60, 14), (100, 40)] {
         let height = terminal_height.saturating_sub(6);
         let lines = text::wrap_words(&text::sanitize(&body), panel_inner(cols)).len();
         let visible = panel_body_limit(options.len(), height);
@@ -1893,6 +1894,49 @@ fn paging_long_approval_details_reaches_every_line_at_any_height() {
             panel_scroll(offset, lines, visible, false),
             offset - (visible - 1).max(1)
         );
+    }
+}
+
+#[test]
+fn tiny_approval_panels_pause_confirmation_and_stay_within_the_viewport() {
+    use crate::app::panel::panel_has_room;
+    let options = [
+        ("Allow once", 'y'),
+        ("Allow for this project", 'p'),
+        ("Deny", 'n'),
+    ];
+    for width in [0, 1, 12, 24, 35, 36, 80] {
+        for height in 0..=8 {
+            let rows = panel_rows_window(
+                &Theme::dark(),
+                width,
+                "Allow bash?",
+                "cargo test",
+                &options,
+                1,
+                0,
+                height,
+            );
+            assert!(rows.len() <= height, "{width}x{height}");
+            assert!(
+                rows.iter()
+                    .all(|row| text::line_width(row) <= width as usize)
+            );
+            if width < 36 || height < 5 {
+                assert!(!panel_has_room(width, height));
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row.to_string().contains("Allow once"))
+                );
+            } else {
+                assert!(panel_has_room(width, height));
+                assert!(
+                    rows.iter()
+                        .any(|row| row.to_string().contains("Allow for this project"))
+                );
+            }
+        }
     }
 }
 

@@ -43,6 +43,8 @@ pub enum Tok {
     UserBg,
     UserText,
     CanvasBg,
+    /// The inset surface behind panels and menus.
+    PanelBg,
     ToolPendingBg,
     ToolSuccessBg,
     ToolErrorBg,
@@ -138,6 +140,7 @@ impl Tok {
         Tok::UserBg,
         Tok::UserText,
         Tok::CanvasBg,
+        Tok::PanelBg,
         Tok::ToolPendingBg,
         Tok::ToolSuccessBg,
         Tok::ToolErrorBg,
@@ -230,6 +233,7 @@ impl Tok {
             Tok::UserBg => "userBg",
             Tok::UserText => "userText",
             Tok::CanvasBg => "canvasBg",
+            Tok::PanelBg => "panelBg",
             Tok::ToolPendingBg => "toolPendingBg",
             Tok::ToolSuccessBg => "toolSuccessBg",
             Tok::ToolErrorBg => "toolErrorBg",
@@ -562,6 +566,10 @@ impl Theme {
         let mut colors = Map::new();
         for tok in Tok::ALL {
             let style = self.styles[tok.index()];
+            // The optional panel fill stays absent when unset, so the export reloads as no fill.
+            if *tok == Tok::PanelBg && style == Style::default() {
+                continue;
+            }
             colors.insert(tok.id().into(), style_json(*tok, style));
         }
         let mut symbols = Map::new();
@@ -1100,6 +1108,7 @@ fn parse_theme(
             .filter(|t| {
                 !t.id().starts_with("syntax.")
                     && !t.id().starts_with("brand.")
+                    && **t != Tok::PanelBg
                     && top.get("colors").and_then(|c| c.get(t.id())).is_none()
             })
             .map(|t| t.id())

@@ -20,7 +20,7 @@ fn verdict(store: &Store, version: i64, score: f64, source: &str) {
 }
 
 #[test]
-fn monitor_waits_for_evidence_then_rolls_back_the_admitted_lineage() {
+fn monitor_counts_distinct_matched_prompts_and_never_rolls_back_observational_scores() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), "model", "project", &Harness::default()).unwrap();
     let base = store.active().unwrap();
@@ -68,7 +68,10 @@ fn monitor_waits_for_evidence_then_rolls_back_the_admitted_lineage() {
     verdict(&store, candidate.id, 0.0, "check:failed");
     assert!(improve::monitor(&store, &cfg).unwrap().is_none());
     verdict(&store, candidate.id, 0.0, "user");
-    assert!(improve::monitor(&store, &cfg).unwrap().is_some());
-    assert_eq!(store.active().unwrap().id, base.id);
+    // These are retries of one prompt, not two independent matched tasks.
     assert!(improve::monitor(&store, &cfg).unwrap().is_none());
+    assert_eq!(store.active().unwrap().id, candidate.id);
+    let status: serde_json::Value =
+        serde_json::from_str(&store.get_meta("last_monitor").unwrap().unwrap()).unwrap();
+    assert_eq!(status["monitor"]["status"], "insufficient_evidence");
 }

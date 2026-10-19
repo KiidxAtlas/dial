@@ -1850,7 +1850,7 @@ fn run_inner(
             );
 
             reasoning_recovery = Default::default();
-            engine.reset();
+            engine.transition(crate::agent::run::engine::RecoveryTransition::Coordination);
             engine.recovery.reset();
         }
         if env.interrupt.load(Ordering::SeqCst) {
@@ -2195,7 +2195,7 @@ fn run_inner(
             }
 
             reasoning_recovery = Default::default();
-            engine.reset();
+            engine.transition(crate::agent::run::engine::RecoveryTransition::Coordination);
             approver.notice(
                 "New coordination received; discarded the old response before executing tools.",
             );
@@ -2436,7 +2436,7 @@ fn run_inner(
                 rule_state.begin(rule_root, "");
 
                 reasoning_recovery = Default::default();
-                engine.reset();
+                engine.transition(crate::agent::run::engine::RecoveryTransition::Coordination);
                 engine.recovery.reset();
                 if budget != 0 {
                     budget = budget.saturating_add(1);
@@ -2523,7 +2523,7 @@ fn run_inner(
                             rule_state.begin(rule_root, "");
 
                             reasoning_recovery = Default::default();
-                            engine.reset();
+                            engine.transition(crate::agent::run::engine::RecoveryTransition::Coordination);
                             return Ok(crate::agent::run::engine::Tick::Again);
                         }
                     }
@@ -2966,7 +2966,7 @@ fn run_inner(
             rule_state.begin(rule_root, "");
 
             reasoning_recovery = Default::default();
-            engine.reset();
+            engine.transition(crate::agent::run::engine::RecoveryTransition::Coordination);
             if budget != 0 {
                 budget = budget.saturating_add(1);
             }

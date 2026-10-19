@@ -157,6 +157,7 @@ impl Shell {
                 | Which::ModelRoles
                 | Which::LearningModels
                 | Which::ModelDownloads
+                | Which::ModelMemory
                 | Which::Providers
         ) {
             self.catalog.start(app);
@@ -260,7 +261,11 @@ impl Shell {
                 overlay.set_embedding_setups(embedding_setup_offers(&app.layout.user_dir));
                 ActiveOverlay::Settings(Box::new(overlay))
             }
-            Which::Models | Which::ModelRoles | Which::LearningModels | Which::ModelDownloads => {
+            Which::Models
+            | Which::ModelRoles
+            | Which::LearningModels
+            | Which::ModelDownloads
+            | Which::ModelMemory => {
                 let mut models =
                     ModelOverlay::new(discovery, effective.role_statuses(), self.scope)
                         .with_favorites(favorite_routes(&effective))
@@ -269,6 +274,7 @@ impl Shell {
                         ))
                         .with_main_lora(self.status.lora)
                         .with_learning(learning_models)
+                        .with_usage(&app.layout.user_dir)
                         .with_downloads(
                             app.layout(),
                             crate::stats::local_models::Settings::from_config(&effective),
@@ -277,11 +283,14 @@ impl Shell {
                 models.set_memory_optional(
                     crate::config::memory_backend::auto_retain_uses_memory_role(&effective.memory),
                 );
-                if matches!(which, Which::ModelRoles) {
-                    models.show_roles();
-                }
-                if matches!(which, Which::ModelDownloads) {
-                    models.show_downloads();
+                models.set_memory_backend(
+                    crate::config::memory_backend::active_backend(&effective.memory).as_str(),
+                );
+                match which {
+                    Which::ModelRoles => models.show_roles(),
+                    Which::ModelDownloads => models.show_downloads(),
+                    Which::ModelMemory => models.show_memory(),
+                    _ => {}
                 }
                 ActiveOverlay::Models(Box::new(models))
             }

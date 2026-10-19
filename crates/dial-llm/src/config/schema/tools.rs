@@ -348,6 +348,15 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Names of configured verification commands that establish behavior. Recipes require one of these checks to pass after the last edit.",
         Kind::StringList,
     ),
+    field!(
+        "verification.requirements",
+        verification.requirements,
+        TO,
+        "Verification",
+        "Declared requirement evidence",
+        "TOML map of requirement IDs to checks (configured command names) and optional visual=true. Tracks current observed evidence; does not establish complete task coverage or grant tool permissions.",
+        Kind::Table,
+    ),
     def!(
         "lsp.rust-analyzer.program",
         TO,

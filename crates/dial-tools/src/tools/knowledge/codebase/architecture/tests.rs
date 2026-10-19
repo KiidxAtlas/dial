@@ -767,6 +767,16 @@ fn deleted_sources_are_stale_and_missing_even_when_the_snapshot_is_partial() {
         assert_eq!(section["status"], "stale", "{section}");
         assert_eq!(section["source_status"], "missing", "{section}");
     }
+    let text = report.to_string();
+    assert!(
+        !text.contains("Routing is implemented by run"),
+        "a claim whose every source is gone keeps its prose: {text}"
+    );
+    assert!(text.contains("every cited source is gone"), "{text}");
+    assert!(
+        text.contains("Application starts routing."),
+        "sections with surviving sources keep their summary"
+    );
 }
 
 #[test]

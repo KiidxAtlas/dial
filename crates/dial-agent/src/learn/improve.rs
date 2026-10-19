@@ -3,7 +3,7 @@
 //! Grounding never comes from the model's own opinion: self-play and gate cases are procedurally
 //! generated tasks judged by deterministic verifiers (`verify::Check`), live turns are judged by
 //! exit codes and explicit user verdicts. A cycle:
-//!   monitor live results (auto-rollback) -> self-play on train families (verified) -> harvest
+//!   monitor live results (observational, matched prompts; no automatic rollback) -> self-play on train families (verified) -> harvest
 //!   training data -> diagnose -> candidates (LoRA, its adapter soup with the parent, the admitted
 //!   steering vector baked into an adapter, feedback-agent harness edit, deterministic mutations) ->
 //!   likelihood pre-screen of weight candidates (a filter only) -> sealed gate (fresh random
@@ -241,7 +241,19 @@ pub fn build_evaluation(config: &Config, store: &Store) -> Result<Evaluation> {
     })
 }
 
-type Cache = HashMap<(i64, String), workflow::CaseMeasurement>;
+type Cache = HashMap<(i64, String), workflow::Attempt>;
+
+/// Typed attempt for one runner result. A model-caused failure is memoised as an unsolved attempt.
+/// Infrastructure and fatal errors are returned unchanged and never cached, so the caller's retry runs.
+fn settle(result: Result<workflow::CaseMeasurement>) -> Result<workflow::Attempt> {
+    match result {
+        Ok(measurement) => Ok(workflow::Attempt::Measured(measurement)),
+        Err(error) if gate::classify_failure(&error) == gate::FailureKind::Model => {
+            Ok(workflow::Attempt::ModelFailed)
+        }
+        Err(error) => Err(error),
+    }
+}
 
 fn run_case(
     runtime: &mut Runtime,
@@ -253,19 +265,73 @@ fn run_case(
 ) -> Result<bool> {
     super::auto::check_stop(config)?;
     let key = (v.id, case.id.clone());
-    if let Some(r) = cache.get(&key) {
-        return Ok(r.passed);
+    if let Some(attempt) = cache.get(&key) {
+        return Ok(attempt.passed());
     }
-    match agent::check_case_measured(runtime, config, v, &case.prompt, &case.files, &case.check) {
-        Ok(r) => {
-            let passed = r.passed;
-            cache.insert(key, r);
-            Ok(passed)
-        }
-        Err(error) => {
-            *last_error = Some("private evaluation execution failed".into());
-            Err(error)
-        }
+    let attempt = settle(agent::check_case_measured(
+        runtime,
+        config,
+        v,
+        &case.prompt,
+        &case.files,
+        &case.check,
+    ))
+    .inspect_err(|_| {
+        *last_error = Some("private evaluation execution failed".into());
+    })?;
+    let passed = attempt.passed();
+    cache.insert(key, attempt);
+    Ok(passed)
+}
+
+/// Gate verdict plus the typed outcome that callers branch on (never the reason text).
+pub(crate) struct Judgment {
+    pub admission: Admission,
+    pub outcome: gate::Outcome,
+}
+
+/// Paired attempts that both sides measured. The gate scores this same population, so workflow
+/// comparisons and profile measurements describe the same cases; a pair missing a side is excluded.
+fn paired_attempts(
+    suites: &[Suite],
+    baseline: i64,
+    candidate: i64,
+    cache: &Cache,
+) -> Vec<(
+    super::task_policy::Kind,
+    workflow::Attempt,
+    workflow::Attempt,
+)> {
+    suites
+        .iter()
+        .flat_map(|suite| &suite.cases)
+        .filter_map(|case| {
+            let before = cache.get(&(baseline, case.id.clone()))?;
+            let after = cache.get(&(candidate, case.id.clone()))?;
+            Some((
+                super::task_policy::Kind::classify(&case.prompt),
+                before.clone(),
+                after.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// One baseline probe of the primary suite. Infrastructure exclusions are counted, never scored.
+#[derive(Default)]
+struct TierProbe {
+    passed: usize,
+    total: usize,
+    excluded: usize,
+}
+
+/// Promotion from a probe. Any infrastructure exclusion holds the tier: a shrunken denominator
+/// must never promote, so the conservative choice is to stop escalating until a clean probe.
+fn next_tier(tier: u8, probe: &TierProbe) -> u8 {
+    if probe.excluded > 0 {
+        tier
+    } else {
+        curriculum::advance_tier(tier, probe.passed, probe.total)
     }
 }
 
@@ -287,7 +353,7 @@ fn evaluate_candidate(
     baseline: &Version,
     candidate: &Version,
     progress: &mut dyn FnMut(&str),
-) -> Result<Admission> {
+) -> Result<Judgment> {
     let EvaluationContext {
         config,
         store,
@@ -316,26 +382,36 @@ fn evaluate_candidate(
     let mut tier = 0;
     if !eval.manual {
         loop {
-            let (mut passed, mut total) = (0usize, 0usize);
+            let mut probe = TierProbe::default();
             for case in &suites[0].cases {
                 match run_case(runtime, config, cache, baseline, case, &mut last_error) {
                     Ok(true) => {
-                        passed += 1;
-                        total += 1;
+                        probe.passed += 1;
+                        probe.total += 1;
                     }
-                    Ok(false) => total += 1,
-                    Err(error) if gate::classify_failure(&error) != gate::FailureKind::Fatal => {}
+                    // Model failures arrive as unsolved outcomes (Ok(false)) and stay in the denominator.
+                    Ok(false) => probe.total += 1,
+                    // Infrastructure exclusions are not scored; they can only hold the tier.
+                    Err(error) if gate::classify_failure(&error) != gate::FailureKind::Fatal => {
+                        probe.excluded += 1
+                    }
                     Err(error) => return Err(error),
                 }
             }
-            let next = curriculum::advance_tier(tier, passed, total);
+            let next = next_tier(tier, &probe);
             if next == tier {
+                if probe.excluded > 0 {
+                    progress(&format!(
+                        "baseline v{} probe held at tier {tier}: {} case(s) excluded by infrastructure failures",
+                        baseline.id, probe.excluded
+                    ));
+                }
                 break;
             }
             tier = next;
             progress(&format!(
-                "baseline v{} passed {passed}/{total}; primary suite escalated to tier {tier}",
-                baseline.id
+                "baseline v{} passed {}/{}; primary suite escalated to tier {tier}",
+                baseline.id, probe.passed, probe.total
             ));
             suites[0] = primary_suite(tier, eval.primary_cases, eval.primary_seed);
         }
@@ -364,7 +440,7 @@ fn evaluate_candidate(
     let total = suites.iter().map(|suite| suite.cases.len()).sum::<usize>() * 2;
     let mut checked = 0;
     let stop = || super::auto::check_stop(config).is_err();
-    let admission = gate::evaluate(
+    let judged = gate::evaluate_outcome(
         &eval.rules,
         &suites,
         baseline,
@@ -381,8 +457,8 @@ fn evaluate_candidate(
             result
         },
     );
-    let mut admission = match admission {
-        Ok(a) => a,
+    let (mut admission, mut outcome) = match judged {
+        Ok(judged) => judged,
         Err(error) => {
             return Err(error.context("evaluation did not complete; private details withheld"));
         }
@@ -401,37 +477,23 @@ fn evaluate_candidate(
     {
         admission.passed = false;
         admission.reason = reason;
+        outcome = gate::Outcome::Overridden;
     }
+    let paired = paired_attempts(&suites, baseline.id, candidate.id, cache);
     if workflow::is_candidate(candidate) {
-        let pairs = suites
+        let attempts = paired
             .iter()
-            .flat_map(|suite| &suite.cases)
-            .map(|case| {
-                let baseline = cache
-                    .get(&(baseline.id, case.id.clone()))
-                    .context("missing baseline workflow measurement")?;
-                let candidate = cache
-                    .get(&(candidate.id, case.id.clone()))
-                    .context("missing candidate workflow measurement")?;
-                Ok((baseline.clone(), candidate.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        workflow::record_comparison(store, baseline, candidate, &mut admission, &pairs)?;
+            .map(|(_, before, after)| (before.clone(), after.clone()))
+            .collect::<Vec<_>>();
+        let was_passed = admission.passed;
+        workflow::record_comparison(store, baseline, candidate, &mut admission, &attempts)?;
+        if was_passed && !admission.passed {
+            outcome = gate::Outcome::Overridden;
+        }
     }
-    let pairs = suites
-        .iter()
-        .flat_map(|suite| &suite.cases)
-        .filter_map(|case| {
-            Some((
-                super::task_policy::Kind::classify(&case.prompt),
-                cache.get(&(baseline.id, case.id.clone()))?.clone(),
-                cache.get(&(candidate.id, case.id.clone()))?.clone(),
-            ))
-        })
-        .collect::<Vec<_>>();
     // Persist aggregate costs for all candidates; routing only reads a globally accepted version.
-    super::profiles::measure(store, baseline, candidate, &pairs)?;
-    Ok(admission)
+    super::profiles::measure(store, baseline, candidate, &paired)?;
+    Ok(Judgment { admission, outcome })
 }
 
 /// Compounding degradation is the classic way self-modifying loops collapse: every step passes a
@@ -451,9 +513,9 @@ fn drift_failure(
         eval,
     } = context;
     let suite = &eval.suites[anchor];
-    let Some(score) = admission.scores.iter().find(|s| s.name == suite.name) else {
+    if admission.scores.iter().all(|s| s.name != suite.name) {
         return Ok(None);
-    };
+    }
     let versions = store.versions()?;
     let Some(root) = versions.iter().find(|v| v.parent.is_none()) else {
         return Ok(None);
@@ -461,42 +523,88 @@ fn drift_failure(
     if root.id == admission.candidate {
         return Ok(None);
     }
-    let key = format!(
-        "anchor_root_pct:{}",
-        store.get_meta("anchor_seed")?.unwrap_or_default()
-    );
-    let root_pct = match store.get_meta(&key)?.and_then(|s| s.parse::<f64>().ok()) {
-        Some(p) => p,
-        None => {
-            let mut passed = 0usize;
-            for case in &suite.cases {
-                match run_case(runtime, config, cache, root, case, last_error) {
-                    Ok(true) => passed += 1,
-                    Ok(false) => {}
-                    Err(error) => match gate::classify_failure(&error) {
-                        gate::FailureKind::Model => {}
-                        // A partial anchor score must not be cached, so the decision waits for a later cycle.
-                        gate::FailureKind::Infra(category) => {
-                            return Ok(Some(format!(
-                                "rejected: anchor suite could not be measured ({category}); retry in a later cycle"
-                            )));
-                        }
-                        gate::FailureKind::Fatal => return Err(error),
-                    },
+    // Both sides are measured on the anchor cases the candidate was scored on in this cycle. Excluded
+    // pairs are never cached, so a partial population cannot be compared with the original's full suite.
+    let population: Vec<&Case> = suite
+        .cases
+        .iter()
+        .filter(|case| cache.contains_key(&(admission.candidate, case.id.clone())))
+        .collect();
+    if population.is_empty() {
+        return Ok(Some(
+            "rejected: anchor suite has no candidate results to compare (cumulative drift unchecked)"
+                .into(),
+        ));
+    }
+    let candidate_passed = population
+        .iter()
+        .filter(|case| cache[&(admission.candidate, case.id.clone())].passed())
+        .count();
+    let candidate_pct = 100.0 * candidate_passed as f64 / population.len() as f64;
+    let full = population.len() == suite.cases.len();
+    let root_pct = if full {
+        let key = format!(
+            "anchor_root_pct:{}",
+            store.get_meta("anchor_seed")?.unwrap_or_default()
+        );
+        match store.get_meta(&key)?.and_then(|s| s.parse::<f64>().ok()) {
+            Some(pct) => pct,
+            None => {
+                let all: Vec<&Case> = suite.cases.iter().collect();
+                match measure_anchor(runtime, config, cache, root, &all, last_error)? {
+                    Ok(passed) => {
+                        let pct = 100.0 * passed as f64 / all.len() as f64;
+                        store.set_meta(&key, &pct.to_string())?;
+                        pct
+                    }
+                    Err(reason) => return Ok(Some(reason)),
                 }
             }
-            let pct = 100.0 * passed as f64 / suite.cases.len() as f64;
-            store.set_meta(&key, &pct.to_string())?;
-            pct
+        }
+    } else {
+        match measure_anchor(runtime, config, cache, root, &population, last_error)? {
+            Ok(passed) => 100.0 * passed as f64 / population.len() as f64,
+            Err(reason) => return Ok(Some(reason)),
         }
     };
-    if score.candidate + config.improve.drift_tolerance < root_pct {
+    let scope = if full { "full" } else { "matched" };
+    if candidate_pct + config.improve.drift_tolerance < root_pct {
         return Ok(Some(format!(
-            "rejected: anchor suite score {:.1} is more than {:.1} points below the original version's {:.1} (cumulative drift)",
-            score.candidate, config.improve.drift_tolerance, root_pct
+            "rejected: anchor suite score {candidate_pct:.1} on {} {scope} cases is more than {:.1} points below the original version's {root_pct:.1} (cumulative drift)",
+            population.len(),
+            config.improve.drift_tolerance
         )));
     }
     Ok(None)
+}
+
+/// Passes of the original version over `cases`. `Ok(Err(reason))` when an infrastructure failure leaves
+/// the anchor unmeasured: a partial anchor score must never be compared.
+fn measure_anchor(
+    runtime: &mut Runtime,
+    config: &Config,
+    cache: &mut Cache,
+    root: &Version,
+    cases: &[&Case],
+    last_error: &mut Option<String>,
+) -> Result<std::result::Result<usize, String>> {
+    let mut passed = 0;
+    for case in cases {
+        match run_case(runtime, config, cache, root, case, last_error) {
+            Ok(true) => passed += 1,
+            Ok(false) => {}
+            Err(error) => match gate::classify_failure(&error) {
+                gate::FailureKind::Model => {}
+                gate::FailureKind::Infra(category) => {
+                    return Ok(Err(format!(
+                        "rejected: anchor suite could not be measured ({category}); retry in a later cycle"
+                    )));
+                }
+                gate::FailureKind::Fatal => return Err(error),
+            },
+        }
+    }
+    Ok(Ok(passed))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1656,30 +1764,182 @@ mod incremental_tests;
 // ---------------------------------------------------------------------------------------------
 // Post-deployment monitoring.
 
-/// Self-healing: after a version is admitted, real use is the final test. When its live results
-/// (build/test exit codes, user verdicts) fall clearly below its parent's, roll back automatically.
+/// What the live monitor concluded for the active version against its parent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LiveVerdict {
+    /// Too few task-matched prompts to test: nothing is decided and nothing rolls back.
+    Insufficient { pairs: usize, needed: usize },
+    /// The confidence lower bound on the net share of matched prompts that got worse is within the limit.
+    Holds {
+        pairs: usize,
+        look: u64,
+        drop_lower: f64,
+        level: f64,
+    },
+    /// The lower bound exceeds the limit at this look's level: an observed regression, not yet confirmed.
+    Observed {
+        pairs: usize,
+        look: u64,
+        drop_lower: f64,
+        level: f64,
+    },
+}
+
+/// Alpha spent by the `look`-th test of one candidate (1-based): `total * 6 / (pi^2 * look^2)`. Over any
+/// number of looks these levels sum to at most `total`, so monitoring a growing sample stays valid
+/// without knowing in advance how many looks there will be.
+pub(crate) fn look_level(total: f64, look: u64) -> f64 {
+    let look = look as f64;
+    total * 6.0 / (std::f64::consts::PI * std::f64::consts::PI * look * look)
+}
+
+/// One-sided lower confidence bound, in percentage points of matched prompts, on how much worse the
+/// candidate is than its parent: `(parent_better - candidate_better) / pairs`. The discordance rate `q`
+/// and the parent's share `p` of discordant prompts each get a one-sided Clopper-Pearson bound at
+/// `level / 2` (union bound, total `level`); `q * (2p - 1)` is clipped at zero. No discordant prompts
+/// means no evidence of a drop, so the bound is zero.
+pub(crate) fn drop_lower_bound(
+    parent_better: usize,
+    candidate_better: usize,
+    pairs: usize,
+    level: f64,
+) -> f64 {
+    let discordant = parent_better + candidate_better;
+    if pairs == 0 || discordant == 0 {
+        return 0.0;
+    }
+    let q_lower = 1.0 - gate::clopper_pearson_upper(pairs - discordant, pairs, level / 2.0);
+    let p_lower = 1.0 - gate::clopper_pearson_upper(candidate_better, discordant, level / 2.0);
+    100.0 * q_lower * (2.0 * p_lower - 1.0).max(0.0)
+}
+
+/// Diagnoses one look on task-matched `(parent, candidate)` pairs. Reports an unconfirmed
+/// observation when the lower bound exceeds `max_drop`; never authorizes rollback.
+pub(crate) fn judge_live(
+    pairs: &[(f64, f64)],
+    look: u64,
+    min_pairs: usize,
+    max_drop: f64,
+    alpha: f64,
+) -> LiveVerdict {
+    let needed = min_pairs.max(1);
+    if pairs.len() < needed {
+        return LiveVerdict::Insufficient {
+            pairs: pairs.len(),
+            needed,
+        };
+    }
+    let parent_better = pairs.iter().filter(|(p, c)| p > c).count();
+    let candidate_better = pairs.iter().filter(|(p, c)| c > p).count();
+    let level = look_level(alpha, look);
+    let drop_lower = drop_lower_bound(parent_better, candidate_better, pairs.len(), level);
+    if drop_lower > max_drop {
+        LiveVerdict::Observed {
+            pairs: pairs.len(),
+            look,
+            drop_lower,
+            level,
+        }
+    } else {
+        LiveVerdict::Holds {
+            pairs: pairs.len(),
+            look,
+            drop_lower,
+            level,
+        }
+    }
+}
+
+/// Self-healing: after a version is admitted, real use is the final test. The monitor compares the active
+/// version only with its parent, on prompts both answered with an explicit score from the same source
+/// class (`Store::matched_live_scores`). That comparison is observational: exact prompt equality does not
+/// prove the two versions faced the same code, context or tests, so it never rolls back by itself. It
+/// records insufficient evidence below `monitor_min_turns` matched prompts, and an observed lower bound
+/// (alpha spent per new look via `look_level`) as unconfirmed. Unpaired live means are never compared.
 pub fn monitor(store: &Store, config: &Config) -> Result<Option<String>> {
     let active = store.active()?;
     let Some(parent) = active.parent else {
         return Ok(None);
     };
-    let (n, mean) = store.live_score(active.id)?;
-    let (pn, pmean) = store.live_score(parent)?;
-    let need = config.improve.monitor_min_turns as usize;
-    let (Some(mean), Some(pmean)) = (mean, pmean) else {
-        return Ok(None);
-    };
-    if n < need || pn < need || mean >= pmean - config.improve.monitor_drop {
+    let i = &config.improve;
+    let pairs = store.matched_live_scores(active.id, parent)?;
+    let needed = (i.monitor_min_turns as usize).max(1);
+    if pairs.len() < needed {
+        record_monitor(
+            store,
+            active.id,
+            parent,
+            json!({"status": "insufficient_evidence", "matched_prompts": pairs.len(), "needed": needed}),
+        )?;
         return Ok(None);
     }
-    verify_adapter(store, &store.version(parent)?)?;
-    store.rollback()?;
-    let note = format!(
-        "rolled back v{} to v{}: live results {:.0} over {n} turns vs {:.0} over {pn}",
-        active.id, parent, mean, pmean
-    );
-    store.set_meta("last_rollback", &note)?;
-    Ok(Some(note))
+    // A look is a new test on new evidence: the look counter advances only when the matched sample grew.
+    // Re-testing unchanged data would spend alpha for nothing.
+    let key = format!("monitor_look:{}", active.id);
+    let (last_look, last_pairs) = match store.get_meta(&key)? {
+        Some(state) => {
+            let (look, n) = state
+                .split_once(':')
+                .context("corrupt monitor look state")?;
+            (
+                look.parse::<u64>().context("corrupt monitor look count")?,
+                n.parse::<usize>().context("corrupt monitor sample size")?,
+            )
+        }
+        None => (0, 0),
+    };
+    if pairs.len() <= last_pairs {
+        record_monitor(
+            store,
+            active.id,
+            parent,
+            json!({"status": "no_new_evidence", "matched_prompts": pairs.len()}),
+        )?;
+        return Ok(None);
+    }
+    let look = last_look + 1;
+    store.set_meta(&key, &format!("{look}:{}", pairs.len()))?;
+    match judge_live(&pairs, look, needed, i.monitor_drop, i.alpha) {
+        LiveVerdict::Insufficient { .. } => Ok(None),
+        LiveVerdict::Holds {
+            pairs: n,
+            look,
+            drop_lower,
+            level,
+        } => {
+            record_monitor(
+                store,
+                active.id,
+                parent,
+                json!({"status": "holds", "matched_prompts": n, "look": look, "drop_lower_bound": drop_lower, "level": level}),
+            )?;
+            Ok(None)
+        }
+        LiveVerdict::Observed {
+            pairs: n,
+            look,
+            drop_lower,
+            level,
+        } => {
+            // Observational only: a matched prompt is not proof of a causal regression (contexts, code and
+            // test contracts can differ between versions). Nothing rolls back on this alone; the status is
+            // recorded so the gate's anchored corroboration and the user can judge it.
+            record_monitor(
+                store,
+                active.id,
+                parent,
+                json!({"status": "observed_unconfirmed", "matched_prompts": n, "look": look, "drop_lower_bound": drop_lower, "level": level}),
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+fn record_monitor(store: &Store, version: i64, parent: i64, status: Value) -> Result<()> {
+    store.set_meta(
+        "last_monitor",
+        &json!({"version": version, "parent": parent, "monitor": status}).to_string(),
+    )
 }
 
 /// Live monitor for a verdict recorded mid-session (`/outcome`, `/undo`). Skips quietly when a
@@ -2079,7 +2339,7 @@ pub fn run_cycle(
             }
         };
         progress(&format!("evaluating {label} as v{}", candidate.id));
-        let admission = match evaluate_candidate(
+        let Judgment { admission, outcome } = match evaluate_candidate(
             runtime,
             EvaluationContext {
                 config,
@@ -2091,7 +2351,7 @@ pub fn run_cycle(
             &candidate,
             progress,
         ) {
-            Ok(a) => a,
+            Ok(judgment) => judgment,
             Err(error) => {
                 // A stop or exhausted budget interrupts the cycle; the candidate was not judged, so it is not rejected.
                 super::auto::check_stop(config)?;
@@ -2124,9 +2384,7 @@ pub fn run_cycle(
             // Increase capacity while bootstrapping from base; accepted adapters keep a stable layout for warm-starting.
             let next = if admission.passed {
                 0
-            } else if admission.reason.contains("improvement")
-                || admission.reason.contains("significan")
-            {
+            } else if outcome.needs_more_signal() {
                 (level + 1).min(2)
             } else {
                 level
@@ -2198,7 +2456,7 @@ pub fn apply(
         &candidate,
         progress,
     ) {
-        Ok(a) => a,
+        Ok(judgment) => judgment.admission,
         Err(error) => {
             let rejected = Admission {
                 candidate: candidate.id,
@@ -2248,7 +2506,7 @@ pub fn evaluate_queued(
         &candidate,
         progress,
     ) {
-        Ok(a) => a,
+        Ok(judgment) => judgment.admission,
         Err(error) => Admission {
             candidate: candidate.id,
             baseline: active.id,
@@ -2335,3 +2593,9 @@ mod prescreen_tests;
 
 #[cfg(test)]
 mod endpoint_reason_tests;
+
+#[cfg(test)]
+mod attempt_tests;
+
+#[cfg(test)]
+mod monitor_tests;

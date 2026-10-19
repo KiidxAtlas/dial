@@ -32,11 +32,30 @@ Reusable findings remain advisory, never proof that current behavior was verifie
 Privacy: with no endpoint configured, nothing leaves the machine. With an endpoint, fact content and recall queries are sent to that service for embedding. Embedding requests send only the URL, model and bearer key; custom provider headers and `allow_insecure` are not applied to them. Facts are re-embedded only when their content changes or after `/memory rebuild`. Recalled facts are advisory, untrusted text.
 Auto-retain sends the text of each queued turn to the model assigned to the `memory` role.
 
-Automatic recall runs on every user message for the semantic and Hindsight backends. Only facts not already shown in the session are attached, and a cached block is never attached twice. Compaction also consults the selected backend's recall.
+Automatic recall runs on user messages for the semantic and Hindsight backends. Shown-fact dedupe is scoped to the selected runtime's session/history generation. Every committed change to the provider-visible history advances that generation: compaction, a context reset, an investigation rewind, and a real `rewind` (one that removes at least one visible message). Facts removed from the visible transcript therefore attach again on the next matching prompt. Identical raw prompts are deduped by the effective recall query, including the selected history; a changed query gets a new search, while a redundant call does not cancel an in-flight one. Compaction also consults the selected backend's recall. A no-op rewind (no user message in view) commits nothing and keeps shown-fact suppression.
 
 Fact references: a project fact is `<n>` and a user-wide fact is `user:<n>`. `/memory forget <ref> <revision>`, `/memory update <ref> <revision> <text>` and `/memory history <ref>` take either form and require the current revision. `/memory rebuild` recomputes the index and missing embeddings in both banks. `/memory clear` clears only the project bank; `/memory clear user` clears the user-wide bank. `/memory help` lists the commands of the selected backend; text that is not a command searches memory. With the backend off, `/memory` says how to choose one. `/setup memory` lists each backend with its prerequisite and sets `memory.backend`.
 
 `dial -p` runs one bounded memory maintenance pass before it exits, so a one-shot turn is retained. Hindsight flushes every queued write for its endpoint, including writes from earlier sessions.
+
+### Session journal semantics
+
+The session file is append-only. Each entry is one JSON line below an 8 MiB limit.
+
+- **History generation.** `provider_identity.history_generation` is session-monotonic and never reused. The stored value is also floored by the largest generation recorded anywhere in the file, so a rewind to an earlier branch, or a reopen, cannot make it regress. The generation is bumped in the same append batch as the change it covers and before the change is visible.
+- **Oversized records.** A message or compaction record (summary or prefix) at or above the line limit keeps its complete original string in the artifact store. The journal stores the first and last 256 KiB of each oversized string on a UTF-8 boundary, with a `SESSION MESSAGE TRUNCATED` marker that names the artifact URI and the original byte length. Only the journal copy is truncated: the marker-bearing text is what replay and later compactions see; the complete text is recovered by retrieving that URI from the artifact store. If the artifact cannot be stored, the append fails before anything is written, so no record is silently unreadable. Records of other kinds that exceed the limit are rejected at append time.
+- **Artifact unavailability.** Retrieval is by URI at read time. If the artifact file was removed, retrieval returns an error for that URI; the journal is not rewritten or repaired, and nothing is reconstructed from the truncated view.
+
+### Session recovery diagnostics
+
+Loading a journal never repairs or truncates its source. Storage reports tolerated torn tails,
+malformed/oversized complete lines, and absent parents through the drain-once
+`Session::take_recovery_diagnostics()` API. Unknown future record types remain compatible.
+On the next accepted user turn, Dial surfaces an issue count, records a bounded classification
+sample and gives the model a generated warning that resumed history may be incomplete. Damaged
+record bytes and identifiers are not inserted into model context as instructions. A later append
+separates a torn tail from new records rather than overwriting the original. Recovery is a warning
+about available evidence, not a claim that missing history was reconstructed.
 
 Duplicate content is detected by a content hash and returns the existing fact.
 

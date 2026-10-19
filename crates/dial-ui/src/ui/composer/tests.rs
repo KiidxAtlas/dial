@@ -9,8 +9,10 @@ struct Env {
 }
 impl Env {
     fn new() -> Env {
+        // Most tests read the framed shape, whose rows carry visible borders; the band has its own.
         let ui = UiConfig {
             session_accent: false,
+            composer_shape: ComposerShape::Box,
             ..UiConfig::default()
         };
         let status = StatusData {
@@ -665,7 +667,7 @@ fn border_color_follows_state_and_the_session_accent_is_stable() {
     let border = |c: &Composer, env: &Env| c.view(60, &env.ctx()).rows[1].spans[0].style.fg;
     assert_eq!(border(&c, &env), env.theme.fg(Tok::Border).fg);
     c.set_busy(true);
-    assert_eq!(border(&c, &env), env.theme.fg(Tok::Success).fg);
+    assert_eq!(border(&c, &env), env.theme.fg(Tok::Accent).fg);
     c.set_busy(false);
     c.set_draft("!ls");
     assert_eq!(border(&c, &env), env.theme.fg(Tok::ShellMode).fg);
@@ -733,7 +735,10 @@ fn primary_hints_follow_context_and_effective_bindings() {
     c.set_busy(true);
     assert_eq!(c.hint(&env.ctx())[0], "Esc interrupt");
     env.keys.rebind(Action::Interrupt, &["F4"]).unwrap();
-    assert_eq!(&c.hint(&env.ctx())[..2], ["F4 interrupt", "F2 steer"]);
+    assert_eq!(
+        &c.hint(&env.ctx())[..2],
+        ["F4 interrupt", "F2 steer or queue"]
+    );
     env.keys.rebind(Action::Interrupt, &[]).unwrap();
     assert!(!c.hint(&env.ctx()).iter().any(|h| h.contains("interrupt")));
     c.set_busy(false);
@@ -774,6 +779,10 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
             KeyModifiers::NONE
         };
         key(&mut c, &env, KeyCode::Enter, mods);
+        if !follow_up {
+            assert!(c.choice_open());
+            press(&mut c, &env, KeyCode::Enter);
+        }
         press(&mut c, &env, KeyCode::Up);
         let hints = c.hint(&env.ctx());
         assert_eq!(
@@ -802,7 +811,12 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
     assert!(
         c.hint(&env.ctx())
             .iter()
-            .any(|h| h == &format!("{} steer", env.keys.label(Action::Submit)))
+            .any(|h| h == &format!("{} steer or queue", env.keys.label(Action::Submit)))
+    );
+    key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(
+        c.choice_open(),
+        "remapped submit opens the send choice, not direct follow-up"
     );
     key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
     assert_eq!(
@@ -1160,7 +1174,9 @@ fn busy_queue_distinguishes_steering_followups_and_survives_interrupt() {
     let mut c = composer();
     c.set_busy(true);
     typed(&mut c, &env, "steer");
-    press(&mut c, &env, KeyCode::Enter);
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    assert!(c.choice_open(), "Enter asks before routing the draft");
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
     typed(&mut c, &env, "later");
     key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
     assert_eq!(press(&mut c, &env, KeyCode::Esc), ComposerEvent::Interrupt);
@@ -1168,6 +1184,7 @@ fn busy_queue_distinguishes_steering_followups_and_survives_interrupt() {
     assert_eq!(c.take_follow_up().as_deref(), Some("later"));
     assert_eq!(c.take_follow_up(), None);
     typed(&mut c, &env, "keep this");
+    press(&mut c, &env, KeyCode::Enter);
     press(&mut c, &env, KeyCode::Enter);
     press(&mut c, &env, KeyCode::Up);
     assert_eq!(c.draft(), "keep this");
@@ -1196,13 +1213,13 @@ fn busy_hints_follow_the_draft_and_queue() {
         hints(&c)
     );
     typed(&mut c, &env, "later");
-    assert!(hints(&c).contains(&format!("{submit} steer")));
+    assert!(hints(&c).contains(&format!("{submit} steer or queue")));
     assert!(hints(&c).contains(&format!("{follow_up} follow-up")));
     c.set_draft("");
     c.queued.push_back(("oldest".into(), false));
     c.queued.push_back(("newer".into(), true));
     assert!(
-        hints(&c).contains(&format!("{submit} stop & send queued")),
+        hints(&c).contains(&format!("{submit} stop or keep")),
         "an empty Enter with a queue stops the turn: {:?}",
         hints(&c)
     );
@@ -1234,7 +1251,7 @@ fn busy_queue_panel_counts_messages_beyond_its_three_rows() {
     );
     assert!(
         rows.contains(&format!(
-            "5 queued · {} stop turn & send oldest",
+            "5 queued · /queue manage · {} choose stop or keep",
             env.keys.label(Action::Submit)
         )),
         "{rows}"
@@ -1242,33 +1259,43 @@ fn busy_queue_panel_counts_messages_beyond_its_three_rows() {
 }
 
 #[test]
-fn empty_enter_sends_oldest_queued_message_once_without_losing_other_work() {
+fn empty_enter_asks_before_stopping_and_only_the_explicit_stop_sends_the_oldest() {
     let mut env = Env::new();
     for follow_up in [false, true] {
-        for busy in [false, true] {
-            let mut c = composer();
-            c.set_busy(true);
-            c.set_draft("send now");
-            let modifiers = if follow_up {
-                KeyModifiers::ALT
-            } else {
-                KeyModifiers::NONE
-            };
-            key(&mut c, &env, KeyCode::Enter, modifiers);
-            c.set_draft("keep queued");
+        let mut c = composer();
+        c.set_busy(true);
+        c.set_draft("send now");
+        if follow_up {
             key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
-            let history = c.history().to_vec();
-            c.set_busy(busy);
-            assert_eq!(
-                press(&mut c, &env, KeyCode::Enter),
-                ComposerEvent::Submit("send now".into())
-            );
-            assert_eq!(c.queued_messages(), vec![("keep queued".into(), true)]);
-            assert_eq!(c.history(), history);
-            assert_eq!(c.draft(), "");
-            assert_eq!(c.take_follow_up().as_deref(), Some("keep queued"));
-            assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+        } else {
+            press(&mut c, &env, KeyCode::Enter);
+            press(&mut c, &env, KeyCode::Enter);
         }
+        c.set_draft("keep queued");
+        key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
+        let queued = c.queued_messages();
+        let history = c.history();
+        assert_eq!(queued.len(), 2);
+        // The default choice keeps the turn running: nothing is sent or removed.
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+        assert!(c.choice_open());
+        assert_eq!(c.queued_messages(), queued);
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+        assert!(!c.choice_open());
+        assert_eq!(c.queued_messages(), queued);
+        // Only the explicit stop sends the oldest message, once, and keeps the rest queued.
+        press(&mut c, &env, KeyCode::Enter);
+        press(&mut c, &env, KeyCode::Down);
+        assert_eq!(
+            press(&mut c, &env, KeyCode::Enter),
+            ComposerEvent::Submit("send now".into())
+        );
+        assert_eq!(c.queued_messages(), vec![("keep queued".into(), true)]);
+        assert_eq!(c.history(), history);
+        assert_eq!(c.draft(), "");
+        assert!(!c.choice_open());
+        assert_eq!(c.take_follow_up().as_deref(), Some("keep queued"));
+        assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
     }
     env.keys.rebind(Action::Submit, &["F2"]).unwrap();
     let mut c = composer();
@@ -1277,12 +1304,16 @@ fn empty_enter_sends_oldest_queued_message_once_without_losing_other_work() {
     key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
     c.set_draft("   ");
     assert_eq!(press(&mut c, &env, KeyCode::F(2)), ComposerEvent::None);
+    assert!(!c.choice_open(), "a blank draft never opens a choice");
     assert_eq!(
         c.queued_messages().len(),
         1,
         "a nonempty draft never flushes the queue"
     );
     c.set_draft("");
+    assert_eq!(press(&mut c, &env, KeyCode::F(2)), ComposerEvent::None);
+    assert!(c.choice_open());
+    press(&mut c, &env, KeyCode::Down);
     assert_eq!(
         press(&mut c, &env, KeyCode::F(2)),
         ComposerEvent::Submit("queued".into())
@@ -2088,6 +2119,9 @@ fn guarded_raw_paste_never_submits_or_steers_an_active_turn() {
         let event = c.handle_key(enter, &env.ctx());
         if busy {
             assert_eq!(event, ComposerEvent::None);
+            assert!(c.choice_open());
+            assert!(c.take_steering().is_empty());
+            assert_eq!(c.handle_key(enter, &env.ctx()), ComposerEvent::None);
             assert_eq!(c.take_steering(), vec!["first line\nsecond line\n"]);
         } else {
             assert_eq!(
@@ -2352,7 +2386,8 @@ fn menu_rows_have_icons_by_kind_a_pointer_and_a_selected_background() {
         .iter()
         .find(|s| s.style.add_modifier.contains(Modifier::BOLD) && s.content.contains('s'))
         .expect("matched characters are emphasized");
-    assert_eq!(hit.style.fg, env.theme.fg(Tok::Accent).fg);
+    // On the selection fill an accent would blur into the fill, so matches read in the body color.
+    assert_eq!(hit.style.fg, env.theme.fg(Tok::Text).fg);
     let mut ascii = Env::new();
     ascii.theme = Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
     let mut c = with_commands();
@@ -2816,4 +2851,346 @@ fn recording_hint_says_release_when_held_and_busy_paste_lands_in_draft() {
     c.handle_paste("spoken words");
     assert_eq!(c.draft(), "spoken words");
     assert!(c.busy);
+}
+
+#[test]
+fn busy_empty_input_explains_steering_without_changing_submission() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    for width in 8..=120 {
+        let view = c.view(width, &env.ctx());
+        assert!(
+            view.rows
+                .iter()
+                .all(|row| text::line_width(row) <= width as usize)
+        );
+        assert!(view.cursor.1 < width);
+    }
+    let busy = screen(&c, &env, 80).join("\n");
+    assert!(busy.contains("Add direction"));
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    assert!(c.draft().is_empty());
+    typed(&mut c, &env, "Keep the API compatible");
+    assert!(!screen(&c, &env, 80).join("\n").contains("Add direction"));
+    press(&mut c, &env, KeyCode::Enter);
+    assert!(c.choice_open(), "a draft asks whether to steer or queue");
+    assert!(c.take_steering().is_empty());
+    press(&mut c, &env, KeyCode::Enter);
+    assert_eq!(c.take_steering(), ["Keep the API compatible"]);
+}
+
+#[test]
+fn queued_messages_keep_the_management_entry_visible_in_ascii_and_remapped_submit() {
+    let mut env = Env::new();
+    env.theme = env.theme.with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    env.keys.rebind(Action::Submit, &["F2"]).unwrap();
+    env.keys.rebind(Action::SelectUp, &["F3"]).unwrap();
+    let mut c = composer();
+    c.set_busy(true);
+    c.set_draft("a queued request");
+    c.submit_queued(true);
+    let rows = screen(&c, &env, 60).join("\n");
+    assert!(rows.contains("/queue manage"), "{rows}");
+    assert!(rows.contains("F2 choose stop or keep"), "{rows}");
+    assert!(rows.is_ascii(), "{rows}");
+    assert!(screen(&c, &env, 120).join("\n").contains("F3 edit last"));
+}
+
+// ---- busy intent chooser ----------------------------------------------------------------
+
+#[test]
+fn busy_enter_offers_steer_or_queue_and_nothing_moves_until_one_is_chosen() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "change the plan");
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    assert!(c.choice_open());
+    assert_eq!(c.draft(), "change the plan");
+    assert!(c.queued_messages().is_empty());
+    let rows = screen(&c, &env, 100).join("\n");
+    assert!(
+        rows.contains("Add direction now") && rows.contains("Queue for after this turn"),
+        "{rows}"
+    );
+    assert_eq!(press(&mut c, &env, KeyCode::Up), ComposerEvent::None);
+    assert_eq!(c.draft(), "change the plan", "navigation keeps the draft");
+    assert!(c.choice_open());
+    press(&mut c, &env, KeyCode::Down);
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    assert!(!c.choice_open());
+    assert_eq!(c.draft(), "");
+    assert_eq!(c.queued_messages(), vec![("change the plan".into(), true)]);
+}
+
+#[test]
+fn the_default_choice_steers_and_the_selected_choice_routes_as_chosen() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "first");
+    press(&mut c, &env, KeyCode::Enter);
+    press(&mut c, &env, KeyCode::Enter);
+    typed(&mut c, &env, "second");
+    press(&mut c, &env, KeyCode::Enter);
+    press(&mut c, &env, KeyCode::Down);
+    press(&mut c, &env, KeyCode::Enter);
+    assert_eq!(
+        c.queued_messages(),
+        vec![("first".into(), false), ("second".into(), true)]
+    );
+}
+
+#[test]
+fn escape_closes_the_chooser_and_keeps_the_draft_pastes_and_history_exactly() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "see ");
+    c.handle_paste(&"trace line\n".repeat(30));
+    let draft = c.draft();
+    let pastes = c.pastes.clone();
+    let cursor = c.editor.cursor;
+    let history = c.history();
+    press(&mut c, &env, KeyCode::Enter);
+    assert!(c.choice_open());
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Esc),
+        ComposerEvent::None,
+        "Esc closes the chooser before it interrupts"
+    );
+    assert!(!c.choice_open());
+    assert_eq!(c.draft(), draft);
+    assert_eq!(c.pastes, pastes);
+    assert_eq!(c.editor.cursor, cursor);
+    assert_eq!(c.history(), history);
+    assert!(c.queued_messages().is_empty());
+    assert_eq!(press(&mut c, &env, KeyCode::Esc), ComposerEvent::Interrupt);
+}
+
+#[test]
+fn an_empty_enter_while_busy_without_queued_work_is_a_no_op() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    assert!(!c.choice_open());
+    assert!(c.queued_messages().is_empty());
+}
+
+#[test]
+fn a_stop_choice_whose_queue_drained_while_open_sends_nothing() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    c.set_draft("only");
+    c.submit_queued(false);
+    press(&mut c, &env, KeyCode::Enter);
+    assert!(c.choice_open());
+    assert!(c.remove_queued(0));
+    press(&mut c, &env, KeyCode::Down);
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    assert!(!c.choice_open());
+}
+
+#[test]
+fn ending_the_turn_closes_an_open_choice_and_keeps_the_draft() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "keep this draft");
+    press(&mut c, &env, KeyCode::Enter);
+    assert!(c.choice_open());
+    c.set_busy(false);
+    assert!(!c.choice_open());
+    assert_eq!(c.draft(), "keep this draft");
+    assert!(
+        !screen(&c, &env, 100)
+            .join("\n")
+            .contains("Add direction now")
+    );
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit("keep this draft".into())
+    );
+}
+
+#[test]
+fn slash_commands_and_the_follow_up_key_never_open_the_chooser() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "/help");
+    assert_eq!(
+        press(&mut c, &env, KeyCode::Enter),
+        ComposerEvent::Submit("/help".into())
+    );
+    assert!(!c.choice_open());
+    typed(&mut c, &env, "next");
+    assert_eq!(
+        key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT),
+        ComposerEvent::None
+    );
+    assert!(!c.choice_open());
+    assert_eq!(c.queued_messages(), vec![("next".into(), true)]);
+    c.set_draft("");
+    assert_eq!(
+        key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT),
+        ComposerEvent::None,
+        "an empty follow-up is a no-op"
+    );
+    assert!(!c.choice_open());
+    assert_eq!(c.queued_messages(), vec![("next".into(), true)]);
+}
+
+#[test]
+fn a_held_enter_while_busy_neither_opens_nor_confirms_a_choice() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "hold");
+    press(&mut c, &env, KeyCode::Enter);
+    assert!(c.choice_open());
+    let repeat = KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat);
+    assert_eq!(c.handle_key(repeat, &env.ctx()), ComposerEvent::None);
+    assert!(c.choice_open());
+    assert_eq!(c.draft(), "hold");
+    assert!(c.queued_messages().is_empty());
+    press(&mut c, &env, KeyCode::Enter);
+    assert_eq!(c.queued_messages(), vec![("hold".into(), false)]);
+    assert_eq!(c.handle_key(repeat, &env.ctx()), ComposerEvent::None);
+    assert!(!c.choice_open(), "a repeat never opens a new choice");
+    assert_eq!(c.queued_messages(), vec![("hold".into(), false)]);
+}
+
+#[test]
+fn chooser_keys_and_hints_follow_remapping() {
+    let mut env = Env::new();
+    env.keys.rebind(Action::Submit, &["F2"]).unwrap();
+    env.keys.rebind(Action::SelectDown, &["F5"]).unwrap();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "remap");
+    assert_eq!(press(&mut c, &env, KeyCode::F(2)), ComposerEvent::None);
+    assert!(c.choice_open());
+    let hints = c.hint(&env.ctx());
+    assert!(hints.contains(&"F2 confirm".to_owned()), "{hints:?}");
+    assert!(hints.contains(&"Esc cancel".to_owned()), "{hints:?}");
+    assert!(hints.iter().any(|h| h.ends_with("F5 select")), "{hints:?}");
+    press(&mut c, &env, KeyCode::F(5));
+    assert_eq!(press(&mut c, &env, KeyCode::F(2)), ComposerEvent::None);
+    assert_eq!(c.queued_messages(), vec![("remap".into(), true)]);
+}
+
+#[test]
+fn chooser_rows_fit_every_width_in_both_glyph_sets_and_the_cursor_stays_on_the_draft() {
+    for ascii in [false, true] {
+        let mut env = Env::new();
+        if ascii {
+            env.theme = env.theme.with_glyphs(crate::ui::theme::Glyphs::Ascii);
+        }
+        for queue_choice in [false, true] {
+            let mut c = composer();
+            c.set_busy(true);
+            if queue_choice {
+                c.set_draft("queued");
+                c.submit_queued(false);
+                c.set_draft("");
+            } else {
+                typed(&mut c, &env, "short draft");
+            }
+            press(&mut c, &env, KeyCode::Enter);
+            assert!(c.choice_open());
+            for width in 0..=120u16 {
+                let view = c.view(width, &env.ctx());
+                assert!(
+                    view.rows
+                        .iter()
+                        .all(|row| text::line_width(row) <= width as usize),
+                    "width {width}"
+                );
+                if width > 0 {
+                    assert!(view.cursor.1 < width, "width {width}");
+                }
+                assert!((view.cursor.0 as usize) < view.rows.len(), "width {width}");
+                if ascii {
+                    assert!(lines(&view.rows).iter().all(|r| r.is_ascii()));
+                }
+            }
+            if !queue_choice {
+                let view = c.view(60, &env.ctx());
+                let cursor_row = &lines(&view.rows)[view.cursor.0 as usize];
+                assert!(cursor_row.contains("short draft"), "{cursor_row:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn saving_a_queued_edit_keeps_its_route_and_never_opens_the_chooser() {
+    let env = Env::new();
+    for original_follow_up in [false, true] {
+        for save_with_follow_up_key in [false, true] {
+            let mut c = composer();
+            c.set_busy(true);
+            c.set_draft("queued item");
+            c.submit_queued(original_follow_up);
+            assert!(c.edit_queued(0));
+            typed(&mut c, &env, " edited");
+            let modifiers = if save_with_follow_up_key {
+                KeyModifiers::ALT
+            } else {
+                KeyModifiers::NONE
+            };
+            assert_eq!(
+                key(&mut c, &env, KeyCode::Enter, modifiers),
+                ComposerEvent::None
+            );
+            assert!(!c.choice_open());
+            assert_eq!(
+                c.queued_messages(),
+                vec![("queued item edited".into(), original_follow_up)]
+            );
+            assert_eq!(c.draft(), "");
+        }
+    }
+}
+
+#[test]
+fn a_queue_edit_cleared_to_empty_never_opens_the_stop_choice() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    c.set_draft("other");
+    c.submit_queued(false);
+    c.set_draft("keep me");
+    c.submit_queued(true);
+    assert!(c.edit_queued(1));
+    for _ in 0..7 {
+        press(&mut c, &env, KeyCode::Backspace);
+    }
+    assert_eq!(c.draft(), "");
+    assert_eq!(press(&mut c, &env, KeyCode::Enter), ComposerEvent::None);
+    assert!(!c.choice_open());
+    assert_eq!(c.queued_messages(), vec![("other".into(), false)]);
+    assert_eq!(press(&mut c, &env, KeyCode::Esc), ComposerEvent::None);
+    assert_eq!(
+        c.queued_messages(),
+        vec![("other".into(), false), ("keep me".into(), true)]
+    );
+}
+
+#[test]
+fn a_narrow_send_choice_keeps_confirmation_and_escape_visible_before_navigation_hints() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    c.set_draft("a new direction");
+    press(&mut c, &env, KeyCode::Enter);
+    let shown = screen(&c, &env, 38).join("\n");
+    assert!(
+        shown.contains("Enter confirm") && shown.contains("Esc cancel"),
+        "{shown}"
+    );
 }

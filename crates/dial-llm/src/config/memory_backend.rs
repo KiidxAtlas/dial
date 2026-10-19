@@ -291,6 +291,15 @@ fn bank(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// The backend that is in effect: the configured one, or `Off` while memory is disabled.
+pub fn active_backend(config: &crate::config::types::MemoryConfig) -> MemoryBackendId {
+    if config.enabled {
+        config.backend
+    } else {
+        MemoryBackendId::Off
+    }
+}
+
 /// Whether the enabled backend calls a chat model through a memory role: `memory` for local
 /// extraction/consolidation and sharpshooter work (`decision` is not used by these backends).
 /// Hindsight runs server-side and Provenance is deterministic, so neither needs a role. Semantic

@@ -9,6 +9,13 @@ pub struct FocusedCheck {
     pub timeout_secs: u64,
 }
 
+/// Focused checks for changed paths and the explicit gaps the selection leaves unverified.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RelatedTestPlan {
+    pub checks: Vec<FocusedCheck>,
+    pub limits: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
@@ -488,6 +495,7 @@ fn cargo_owner(root: &Path, changed: &Path) -> Option<PathBuf> {
 pub const RELATED_TEST_PATH_LIMIT: usize = 32;
 
 /// Explicit gaps in automatic test selection, so a passing run is not read as full coverage.
+/// Path-only gaps here; root-aware gaps come from `related_test_plan_with_runner`.
 pub fn coverage_limits(changed: &[PathBuf]) -> Vec<String> {
     let mut limits = Vec::new();
     if changed.len() > RELATED_TEST_PATH_LIMIT {
@@ -496,6 +504,7 @@ pub fn coverage_limits(changed: &[PathBuf]) -> Vec<String> {
             changed.len()
         ));
     }
+    limits.extend(changed.iter().filter_map(|path| static_gap(path)));
     limits
 }
 
@@ -511,41 +520,405 @@ fn pytest_configured(root: &Path) -> bool {
         || config_contains(root, "setup.cfg", "[tool:pytest]")
 }
 
-fn rust_test_filter(root: &Path, path: &Path) -> Option<String> {
-    if path.extension()?.to_str()? != "rs" {
+/// Outcome of mapping one changed Rust path to Cargo tests.
+enum RustSelection {
+    Check(FocusedCheck),
+    /// A gap the caller reports; the path gets compile coverage only.
+    Gap(String),
+    /// Already reported by `coverage_limits` from the path alone.
+    Static,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RustKind {
+    Lib,
+    Bin,
+    Test,
+    Example,
+}
+
+/// One Cargo target of a package. `root` is workspace-relative. `module_dir` is the directory whose
+/// files belong to the target's module tree; `None` for a file-form root that owns only itself.
+struct RustTarget {
+    kind: RustKind,
+    name: String,
+    root: PathBuf,
+    module_dir: Option<PathBuf>,
+}
+
+struct RustPackage {
+    dir: PathBuf,
+    targets: Vec<RustTarget>,
+}
+
+fn normalize(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|part| !matches!(part, std::path::Component::CurDir))
+        .collect()
+}
+
+fn read_manifest(root: &Path, manifest: &Path) -> Option<toml::Table> {
+    let path = root.join(manifest);
+    if std::fs::metadata(&path).ok()?.len() > 1024 * 1024 {
         return None;
     }
-    let source_path = root.join(path);
-    if std::fs::metadata(&source_path).ok()?.len() > 1024 * 1024 {
-        return None;
+    toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn target_at(kind: RustKind, name: String, dir: &Path, rel: &str) -> RustTarget {
+    let root = normalize(&dir.join(rel));
+    let crate_root = matches!(
+        root.file_stem().and_then(|s| s.to_str()),
+        Some("lib" | "main")
+    );
+    let module_dir = crate_root.then(|| root.parent().unwrap_or(Path::new("")).to_path_buf());
+    RustTarget {
+        kind,
+        name,
+        root,
+        module_dir,
     }
-    let source = std::fs::read_to_string(source_path).ok()?;
-    if !source.contains("#[test]") || !source.contains("mod tests") {
-        return None;
+}
+
+fn push_target(targets: &mut Vec<RustTarget>, target: RustTarget) {
+    if !targets.iter().any(|existing| existing.root == target.root) {
+        targets.push(target);
     }
-    let src_relative = path.strip_prefix("src").ok()?;
-    let mut modules = src_relative
-        .parent()
-        .unwrap_or(Path::new(""))
-        .components()
-        .map(|part| part.as_os_str().to_str())
-        .collect::<Option<Vec<_>>>()?;
-    let file = src_relative.file_name()?.to_str()?;
-    if file != "mod.rs" {
-        let stem = Path::new(file).file_stem()?.to_str()?;
-        if matches!(stem, "lib" | "main") {
-            return None;
+}
+
+/// Cargo auto-discovers `<sub>/*.rs` and `<sub>/*/main.rs` unless the manifest disables it.
+fn discover_targets(
+    root: &Path,
+    dir: &Path,
+    sub: &str,
+    kind: RustKind,
+    targets: &mut Vec<RustTarget>,
+) {
+    let base = root.join(dir).join(sub);
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
+    let mut found: Vec<(String, String)> = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let (Ok(name), Ok(file_type)) = (entry.file_name().into_string(), entry.file_type()) else {
+            continue;
+        };
+        if file_type.is_file() {
+            if let Some(stem) = name.strip_suffix(".rs") {
+                found.push((stem.to_owned(), format!("{sub}/{name}")));
+            }
+        } else if file_type.is_dir() && base.join(&name).join("main.rs").is_file() {
+            found.push((name.clone(), format!("{sub}/{name}/main.rs")));
         }
-        modules.push(stem);
     }
-    if modules.is_empty()
-        || modules.iter().any(|part| {
-            part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    found.sort();
+    for (name, rel) in found {
+        push_target(targets, target_at(kind, name, dir, &rel));
+    }
+}
+
+/// `(name, path)` of each `[[key]]` table in the manifest.
+fn declared_targets(manifest: &toml::Table, key: &str) -> Vec<(Option<String>, Option<String>)> {
+    manifest
+        .get(key)
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+        .map(|table| {
+            let text = |field: &str| {
+                table
+                    .get(field)
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned)
+            };
+            (text("name"), text("path"))
+        })
+        .collect()
+}
+
+/// Reads a package's Cargo targets from its manifest. `None` for a virtual or unreadable manifest.
+fn load_package(root: &Path, dir: &Path) -> Option<RustPackage> {
+    let manifest = read_manifest(root, &dir.join("Cargo.toml"))?;
+    let package = manifest.get("package")?.as_table()?;
+    let name = package.get("name")?.as_str()?.to_owned();
+    let auto = |key: &str| {
+        package
+            .get(key)
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true)
+    };
+    let base = root.join(dir);
+    let mut targets = Vec::new();
+
+    let lib = manifest.get("lib").and_then(toml::Value::as_table);
+    let lib_field = |field: &str| {
+        lib.and_then(|table| table.get(field))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    if let Some(rel) = lib_field("path").or_else(|| {
+        base.join("src/lib.rs")
+            .is_file()
+            .then(|| "src/lib.rs".to_owned())
+    }) {
+        let lib_name = lib_field("name").unwrap_or_else(|| name.replace('-', "_"));
+        push_target(&mut targets, target_at(RustKind::Lib, lib_name, dir, &rel));
+    }
+
+    // Declared targets come first so their paths win over discovered duplicates.
+    for (bin, path) in declared_targets(&manifest, "bin") {
+        let Some(bin) = bin else {
+            continue;
+        };
+        let rel = path.unwrap_or_else(|| format!("src/bin/{bin}.rs"));
+        push_target(&mut targets, target_at(RustKind::Bin, bin, dir, &rel));
+    }
+    if auto("autobins") {
+        if base.join("src/main.rs").is_file() {
+            push_target(
+                &mut targets,
+                target_at(RustKind::Bin, name.clone(), dir, "src/main.rs"),
+            );
+        }
+        discover_targets(root, dir, "src/bin", RustKind::Bin, &mut targets);
+    }
+    for (test, path) in declared_targets(&manifest, "test") {
+        let Some(test) = test else {
+            continue;
+        };
+        let rel = path.unwrap_or_else(|| format!("tests/{test}.rs"));
+        push_target(&mut targets, target_at(RustKind::Test, test, dir, &rel));
+    }
+    if auto("autotests") {
+        discover_targets(root, dir, "tests", RustKind::Test, &mut targets);
+    }
+    for (example, path) in declared_targets(&manifest, "example") {
+        let Some(example) = example else {
+            continue;
+        };
+        let rel = path.unwrap_or_else(|| format!("examples/{example}.rs"));
+        push_target(
+            &mut targets,
+            target_at(RustKind::Example, example, dir, &rel),
+        );
+    }
+    if auto("autoexamples") {
+        discover_targets(root, dir, "examples", RustKind::Example, &mut targets);
+    }
+    Some(RustPackage {
+        dir: dir.to_path_buf(),
+        targets,
+    })
+}
+
+/// The nearest manifest at or above the file's directory must be a readable package.
+fn owning_package(root: &Path, file: &Path) -> Result<RustPackage, &'static str> {
+    let mut dir = file.parent().map(normalize).unwrap_or_default();
+    loop {
+        if root.join(&dir).join("Cargo.toml").is_file() {
+            return load_package(root, &dir).ok_or("manifest is unreadable or not a package");
+        }
+        if dir.as_os_str().is_empty() {
+            return Err("no owning Cargo package");
+        }
+        dir = dir.parent().map(Path::to_path_buf).unwrap_or_default();
+    }
+}
+
+/// Deepest directory-owning target that contains `file`; the lib wins ties with the bin at `src/`.
+fn owning_target<'a>(package: &'a RustPackage, file: &Path) -> Option<(&'a RustTarget, &'a Path)> {
+    let mut best: Option<(&'a RustTarget, &'a Path)> = None;
+    for target in &package.targets {
+        let Some(module_dir) = target.module_dir.as_deref() else {
+            continue;
+        };
+        if module_dir.as_os_str().is_empty() || !file.starts_with(module_dir) {
+            continue;
+        }
+        if best.is_none_or(|(_, current)| {
+            module_dir.components().count() > current.components().count()
+        }) {
+            best = Some((target, module_dir));
+        }
+    }
+    best
+}
+
+/// Maps a changed Rust path to one focused `cargo test`, or to an explicit gap.
+fn rust_selection(root: &Path, changed: &Path) -> RustSelection {
+    if changed.is_absolute()
+        || changed.components().any(|part| {
+            !matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
         })
     {
-        return None;
+        return RustSelection::Gap("path is absolute or leaves the workspace".into());
     }
-    Some(format!("{}::tests::", modules.join("::")))
+    let file = normalize(changed);
+    if static_gap(&file).is_some() {
+        return RustSelection::Static;
+    }
+    if removed_from(root, &file) {
+        return RustSelection::Gap("deleted or renamed away; no test target to run".into());
+    }
+    let package = match owning_package(root, &file) {
+        Ok(package) => package,
+        Err(reason) => return RustSelection::Gap(reason.into()),
+    };
+    let source_path = root.join(&file);
+    let Ok(metadata) = std::fs::metadata(&source_path) else {
+        return RustSelection::Gap("source is unreadable".into());
+    };
+    if metadata.len() > 1024 * 1024 {
+        return RustSelection::Gap("source is too large to inspect".into());
+    }
+    let Ok(source) = std::fs::read_to_string(&source_path) else {
+        return RustSelection::Gap("source is unreadable".into());
+    };
+
+    if let Some(target) = package.targets.iter().find(|target| target.root == file) {
+        if target.kind == RustKind::Test {
+            return RustSelection::Check(cargo_check(&package, target, None));
+        }
+        if declares_tests_module(&source) {
+            return RustSelection::Check(cargo_check(&package, target, Some("tests::".into())));
+        }
+        if has_test_attribute(&source) {
+            return RustSelection::Check(cargo_check(&package, target, None));
+        }
+        return RustSelection::Gap("crate root declares no tests of its own".into());
+    }
+
+    // Files under `src/bin` belong to a registered binary only, never to the library's tree.
+    let bin_dir = package.dir.join("src/bin");
+    let Some((target, module_dir)) = owning_target(&package, &file)
+        .filter(|(_, dir)| !file.starts_with(&bin_dir) || dir.starts_with(&bin_dir))
+    else {
+        return RustSelection::Gap("not inside any registered target's source tree".into());
+    };
+    let Ok(relative) = file.strip_prefix(module_dir) else {
+        return RustSelection::Gap("not inside any registered target's source tree".into());
+    };
+    let mut module: Vec<String> = relative
+        .with_extension("")
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if module.last().is_some_and(|last| last.as_str() == "mod") {
+        module.pop();
+    }
+    if module.is_empty()
+        || module
+            .iter()
+            .any(|part| !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return RustSelection::Gap("module path is not a plain Rust identifier path".into());
+    }
+    let module_path = module.join("::");
+    let filter = match target.kind {
+        RustKind::Test => has_test_attribute(&source).then(|| format!("{module_path}::")),
+        _ => match module.iter().position(|part| part.as_str() == "tests") {
+            Some(index) => Some(format!("{}::", module[..=index].join("::"))),
+            None if declares_tests_module(&source) => Some(format!("{module_path}::tests::")),
+            None if has_test_attribute(&source) => Some(format!("{module_path}::")),
+            None => {
+                return RustSelection::Gap(
+                    "no tests in its module; only compilation covers it".into(),
+                );
+            }
+        },
+    };
+    RustSelection::Check(cargo_check(&package, target, filter))
+}
+
+fn cargo_check(package: &RustPackage, target: &RustTarget, filter: Option<String>) -> FocusedCheck {
+    let (plain, quoted) = match target.kind {
+        RustKind::Lib => ("--lib".to_owned(), "--lib".to_owned()),
+        RustKind::Bin => (
+            format!("--bin {}", target.name),
+            format!("--bin {}", shell_quote(&target.name)),
+        ),
+        RustKind::Test => (
+            format!("--test {}", target.name),
+            format!("--test {}", shell_quote(&target.name)),
+        ),
+        RustKind::Example => (
+            format!("--example {}", target.name),
+            format!("--example {}", shell_quote(&target.name)),
+        ),
+    };
+    let label = if package.dir.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        package.dir.to_string_lossy().into_owned()
+    };
+    let filter_arg = filter
+        .as_deref()
+        .map(|text| format!(" {}", shell_quote(text)))
+        .unwrap_or_default();
+    let filter_name = filter
+        .as_deref()
+        .map(|text| format!(" {text}"))
+        .unwrap_or_default();
+    FocusedCheck {
+        name: format!("related Rust tests: {label} {plain}{filter_name}"),
+        command: format!(
+            "cargo test --offline --manifest-path {} {quoted}{filter_arg} --quiet -j1",
+            shell_quote(&package.dir.join("Cargo.toml").to_string_lossy())
+        ),
+        timeout_secs: 0,
+    }
+}
+
+/// `mod tests` declared in the file, inline or external (`mod tests;`).
+fn declares_tests_module(source: &str) -> bool {
+    source.match_indices("mod tests").any(|(index, _)| {
+        let before = source[..index].chars().next_back();
+        let after = source[index + "mod tests".len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && matches!(after, Some(' ' | '{' | ';'))
+    })
+}
+
+fn has_test_attribute(source: &str) -> bool {
+    source.contains("#[test]") || source.contains("::test]")
+}
+
+/// Path-only gaps that hold whatever the package layout is.
+fn static_gap(path: &Path) -> Option<String> {
+    let is_rust = path.extension().and_then(|e| e.to_str()) == Some("rs");
+    if is_rust && path.file_name().and_then(|n| n.to_str()) == Some("build.rs") {
+        return Some(format!(
+            "build script {} is compile-only; run broader tests for it",
+            path.display()
+        ));
+    }
+    if is_rust
+        && path
+            .components()
+            .any(|part| part.as_os_str().to_str() == Some("benches"))
+    {
+        return Some(format!(
+            "benchmark {} is not run by related-test selection; run broader tests for it",
+            path.display()
+        ));
+    }
+    (path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml")).then(|| {
+        format!(
+            "manifest {} can change target layout; run broader tests",
+            path.display()
+        )
+    })
+}
+
+fn rust_gap(path: &Path, reason: &str) -> String {
+    format!(
+        "Rust path {}: {reason}; no related test was selected",
+        path.display()
+    )
 }
 
 fn has_go_package_tests(root: &Path, dir: &Path) -> bool {
@@ -651,7 +1024,17 @@ pub fn related_tests_with_runner(
     changed: &[PathBuf],
     override_argv: &[String],
 ) -> Vec<FocusedCheck> {
-    related_tests_with_metadata(
+    related_test_plan_with_runner(root, python, changed, override_argv).checks
+}
+
+/// Focused checks for `changed` plus the explicit gaps the selection could not cover.
+pub fn related_test_plan_with_runner(
+    root: &Path,
+    python: &Path,
+    changed: &[PathBuf],
+    override_argv: &[String],
+) -> RelatedTestPlan {
+    related_test_plan_with_metadata(
         root,
         python,
         changed,
@@ -661,22 +1044,50 @@ pub fn related_tests_with_runner(
     )
 }
 
+#[cfg(test)]
 // Keep filesystem metadata resolution injectable for deterministic per-invocation work counts.
 fn related_tests_with_metadata(
     root: &Path,
     python: &Path,
     changed: &[PathBuf],
     override_argv: &[String],
+    javascript_metadata: impl FnMut() -> Option<(&'static str, String)>,
+    go_has_tests: impl FnMut(&Path) -> bool,
+) -> Vec<FocusedCheck> {
+    related_test_plan_with_metadata(
+        root,
+        python,
+        changed,
+        override_argv,
+        javascript_metadata,
+        go_has_tests,
+    )
+    .checks
+}
+
+fn related_test_plan_with_metadata(
+    root: &Path,
+    python: &Path,
+    changed: &[PathBuf],
+    override_argv: &[String],
     mut javascript_metadata: impl FnMut() -> Option<(&'static str, String)>,
     mut go_has_tests: impl FnMut(&Path) -> bool,
-) -> Vec<FocusedCheck> {
+) -> RelatedTestPlan {
     let mut selected = Vec::new();
-    let cargo_project = root.join("Cargo.toml").is_file() && root.join("src/lib.rs").is_file();
+    let mut gaps = Vec::new();
     let go_project = root.join("go.mod").is_file();
     // Invocation-local metadata only: later edits must be visible on the next selection pass.
     let mut javascript_runner = None;
     let mut go_packages = HashMap::new();
     for path in changed.iter().take(RELATED_TEST_PATH_LIMIT) {
+        if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            match rust_selection(root, path) {
+                RustSelection::Check(check) => selected.push(check),
+                RustSelection::Gap(reason) => gaps.push(rust_gap(path, &reason)),
+                RustSelection::Static => {}
+            }
+            continue;
+        }
         if path.is_absolute()
             || path.components().any(|part| {
                 matches!(
@@ -725,18 +1136,6 @@ fn related_tests_with_metadata(
                     });
                 }
             }
-            Some("rs") if cargo_project => {
-                if let Some(filter) = rust_test_filter(root, path) {
-                    selected.push(FocusedCheck {
-                        name: format!("related Rust tests: {filter}"),
-                        command: format!(
-                            "cargo test --offline --lib {} --quiet -j1",
-                            shell_quote(&filter)
-                        ),
-                        timeout_secs: 0,
-                    });
-                }
-            }
             Some("go") if go_project => {
                 let directory = path.parent().unwrap_or(Path::new(""));
                 if *go_packages
@@ -769,7 +1168,16 @@ fn related_tests_with_metadata(
     }
     let mut seen = HashSet::new();
     selected.retain(|check| seen.insert(check.command.clone()));
-    selected
+    let mut limits = coverage_limits(changed);
+    for gap in gaps {
+        if !limits.contains(&gap) {
+            limits.push(gap);
+        }
+    }
+    RelatedTestPlan {
+        checks: selected,
+        limits,
+    }
 }
 
 #[cfg(windows)]
@@ -804,3 +1212,6 @@ mod project_tests;
 
 #[cfg(test)]
 mod infrastructure_tests;
+
+#[cfg(test)]
+mod rust_selection_tests;

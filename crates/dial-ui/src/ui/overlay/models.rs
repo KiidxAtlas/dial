@@ -1,8 +1,10 @@
-//! The model selector: a left column (Roles, All models, Favorites, Get models, providers with counts and
-//! a state glyph) and a right pane that is either the Roles view, a searchable list of models with a kind
-//! filter, a detail line and the roles that use the highlighted model, or the Get models group (installed
-//! local models, Hugging Face search, GGUF quantizations and curated embedding models; see
-//! `model_download`). It only reports what the user chose; the controller saves it and answers with
+//! The model selector: a left column (Roles, All models, Favorites, Memory, Get models, providers with
+//! counts and a state glyph) and a right pane that is either the Roles view, a searchable list of models
+//! with kind, show and sort filters, price and measured speed columns and three detail lines (what the
+//! model is, the roles using it, its price and recorded usage), or the Get models group (installed local
+//! models, Hugging Face search, small memory models, GGUF quantizations and curated embedding models; see
+//! `model_download`). The Memory group lists models for the `memory` role with the memory backend's
+//! status. It only reports what the user chose; the controller saves it and answers with
 //! [`ModelOverlay::set_roles`].
 use super::model_download::{ModelDownloads, Step};
 use super::{
@@ -18,7 +20,7 @@ use crate::{
     llm::catalog::{Discovery, ModelEntry, ModelKind, ProviderStatus},
     llm::model_config::{ModelSelection, ROLES, RoleSource, RoleStatus},
     setup::embeddings,
-    stats::local_models::Settings,
+    stats::{ModelUsage, local_models::Settings},
     ui::{
         chrome::{self, Section},
         keys::{Action, Keymap},
@@ -33,7 +35,11 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-use std::path::PathBuf;
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KindFilter {
@@ -68,11 +74,96 @@ impl KindFilter {
     }
 }
 
+/// Narrows the list by where a model runs, what it can do, its price or whether it was used (F2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShowFilter {
+    Any,
+    Available,
+    Loaded,
+    Local,
+    Cloud,
+    Tools,
+    Vision,
+    Reasoning,
+    Priced,
+    Used,
+}
+
+impl ShowFilter {
+    const ALL: [ShowFilter; 10] = [
+        ShowFilter::Any,
+        ShowFilter::Available,
+        ShowFilter::Loaded,
+        ShowFilter::Local,
+        ShowFilter::Cloud,
+        ShowFilter::Tools,
+        ShowFilter::Vision,
+        ShowFilter::Reasoning,
+        ShowFilter::Priced,
+        ShowFilter::Used,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            ShowFilter::Any => "any",
+            ShowFilter::Available => "available",
+            ShowFilter::Loaded => "loaded",
+            ShowFilter::Local => "local",
+            ShowFilter::Cloud => "cloud",
+            ShowFilter::Tools => "tools",
+            ShowFilter::Vision => "vision",
+            ShowFilter::Reasoning => "reasoning",
+            ShowFilter::Priced => "priced",
+            ShowFilter::Used => "used",
+        }
+    }
+}
+
+/// List order (F3). `Default` leads with the main model, then favorites, loaded and available models.
+/// The others put models with an unknown value last and keep the default order among ties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortOrder {
+    Default,
+    Name,
+    Price,
+    Speed,
+    Context,
+    Usage,
+}
+
+impl SortOrder {
+    const ALL: [SortOrder; 6] = [
+        SortOrder::Default,
+        SortOrder::Name,
+        SortOrder::Price,
+        SortOrder::Speed,
+        SortOrder::Context,
+        SortOrder::Usage,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            SortOrder::Default => "default",
+            SortOrder::Name => "name",
+            SortOrder::Price => "cheapest",
+            SortOrder::Speed => "fastest",
+            SortOrder::Context => "largest context",
+            SortOrder::Usage => "most used",
+        }
+    }
+}
+
+/// The item of `all` after `current`, wrapping around.
+fn cycle<T: Copy + PartialEq, const N: usize>(all: [T; N], current: T) -> T {
+    let at = all.iter().position(|item| *item == current).unwrap_or(0);
+    all[(at + 1) % N]
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Group {
     Roles,
     All,
     Favorites,
+    /// Chat models for the `memory` role, with the memory backend's status.
+    Memory,
     Download,
     Provider(String),
 }
@@ -122,6 +213,8 @@ pub struct ModelOverlay {
     group: Group,
     focus: Focus,
     kind: KindFilter,
+    show: ShowFilter,
+    sort: SortOrder,
     search: String,
     cursor: usize,
     scroll: usize,
@@ -142,6 +235,12 @@ pub struct ModelOverlay {
     laya_judge: ModelEntry,
     /// The Get models group: installed local models, downloads and the embedding models.
     downloads: ModelDownloads,
+    /// Recorded requests, cost and decode speed per stats model name (see `usage_of`).
+    usage: BTreeMap<String, ModelUsage>,
+    /// The user directory the usage was read from; F5 reads it again.
+    usage_dir: Option<PathBuf>,
+    /// The memory backend's name (`off` when memory is disabled); `None` when the controller did not say.
+    memory_backend: Option<&'static str>,
 }
 
 fn is_embedding(entry: &ModelEntry) -> bool {
@@ -224,6 +323,20 @@ fn source_label(source: RoleSource) -> &'static str {
         RoleSource::LayaInstalled => "installed Laya checkpoint",
         RoleSource::NotSet => "not set",
     }
+}
+
+/// A list row of exactly `w` cells; the selected one gets the selection fill and its colors.
+fn selected_row(
+    theme: &Theme,
+    mut spans: Vec<Span<'static>>,
+    w: usize,
+    selected: bool,
+) -> Line<'static> {
+    if !selected {
+        return filled(spans, w, Style::default());
+    }
+    chrome::select_spans(theme, &mut spans);
+    filled(spans, w, theme.bg(Tok::SelectedBg))
 }
 
 fn same_model(a: &ModelSelection, b: &ModelSelection) -> bool {
@@ -363,6 +476,113 @@ fn is_local_mlx(entry: &ModelEntry) -> bool {
     entry.selection.provider == "mlx" && entry.selection.base_url.is_none()
 }
 
+/// Runs on this machine or its network: local checkpoints, Apple's on-device model and the Laya engine
+/// (no URL), or a server at a loopback, private or `.local` address. Any other host counts as cloud.
+fn is_local(entry: &ModelEntry) -> bool {
+    match entry.selection.base_url.as_deref() {
+        Some(url) => crate::llm::is_local_url(url),
+        None => matches!(
+            entry.selection.provider.as_str(),
+            "mlx" | crate::llm::apple::PROVIDER | crate::config::laya::PROVIDER
+        ),
+    }
+}
+
+/// The provider-reported price when it is usable (finite, not negative); never estimated.
+fn pricing(entry: &ModelEntry) -> Option<crate::llm::catalog::TokenPricing> {
+    entry.metadata.pricing.filter(|p| {
+        [p.prompt, p.completion]
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.0)
+    })
+}
+
+/// Input plus output price per token: the price sort key.
+fn blended_price(entry: &ModelEntry) -> Option<f64> {
+    pricing(entry).map(|p| p.prompt + p.completion)
+}
+
+/// USD per 1M tokens from a per-token price, compact: `3`, `0.15`, `0.075`, `15`.
+fn per_million(per_token: f64) -> String {
+    let v = per_token * 1_000_000.0;
+    if v == 0.0 {
+        return "0".into();
+    }
+    if v < 0.001 {
+        return "<0.001".into();
+    }
+    let text = if v >= 100.0 {
+        format!("{v:.0}")
+    } else if v >= 0.1 {
+        format!("{v:.2}")
+    } else {
+        format!("{v:.3}")
+    };
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        text
+    }
+}
+
+/// The price column: `$input/$output` per 1M tokens, `free`, or `-` when unknown.
+fn price_cell(entry: &ModelEntry) -> String {
+    match pricing(entry) {
+        Some(p) if p.prompt == 0.0 && p.completion == 0.0 => "free".into(),
+        Some(p) => format!("${}/${}", per_million(p.prompt), per_million(p.completion)),
+        None => "-".into(),
+    }
+}
+
+fn price_detail(entry: &ModelEntry) -> String {
+    let Some(p) = pricing(entry) else {
+        return "price -".into();
+    };
+    if p.prompt == 0.0 && p.completion == 0.0 {
+        return "price free".into();
+    }
+    let valid = |v: &f64| v.is_finite() && *v >= 0.0;
+    let mut parts = vec![
+        format!("in ${}", per_million(p.prompt)),
+        format!("out ${}", per_million(p.completion)),
+    ];
+    if let Some(read) = p.cache_read.filter(valid) {
+        parts.push(format!("cache read ${}", per_million(read)));
+    }
+    if let Some(write) = p.cache_write.filter(valid) {
+        parts.push(format!("cache write ${}", per_million(write)));
+    }
+    format!("price per 1M tokens: {}", parts.join(" "))
+}
+
+fn fmt_rate(tok_per_s: f64) -> String {
+    if tok_per_s >= 10.0 {
+        format!("{tok_per_s:.0}")
+    } else {
+        format!("{tok_per_s:.1}")
+    }
+}
+
+fn fmt_usd(usd: f64) -> String {
+    if usd >= 1.0 {
+        format!("${usd:.2}")
+    } else if usd >= 0.01 {
+        format!("${usd:.3}")
+    } else {
+        format!("${usd:.4}")
+    }
+}
+
+/// Orders known values with `cmp` and puts unknown ones last.
+fn known_first<T>(a: Option<T>, b: Option<T>, cmp: impl Fn(T, T) -> Ordering) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => cmp(a, b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 /// The LoRA column: whether dial can train this model, and for the main model whether an adapter is on.
 fn lora_cell(entry: &ModelEntry, main: Option<Lora>) -> (String, Tok) {
     if !entry.metadata.lora_verified
@@ -494,6 +714,8 @@ impl ModelOverlay {
             group: Group::All,
             focus: Focus::List,
             kind: KindFilter::All,
+            show: ShowFilter::Any,
+            sort: SortOrder::Default,
             search: String::new(),
             cursor: 0,
             scroll: 0,
@@ -507,6 +729,9 @@ impl ModelOverlay {
             main_lora: Lora::Unknown,
             learning: false,
             downloads: ModelDownloads::idle(),
+            usage: BTreeMap::new(),
+            usage_dir: None,
+            memory_backend: None,
         }
         .with_discovered_embeddings()
     }
@@ -705,6 +930,69 @@ impl ModelOverlay {
         self
     }
 
+    /// Reads every model's recorded requests, cost and speed from the stats database under
+    /// `user_dir` (read-only; missing data stays unknown). F5 reads it again.
+    pub fn with_usage(mut self, user_dir: &Path) -> Self {
+        self.usage = crate::stats::read_model_usage(user_dir);
+        self.usage_dir = Some(user_dir.to_path_buf());
+        self
+    }
+
+    /// Stats record a request under the backend's model label: the model id for served models. The
+    /// display label is tried second. Local checkpoints served by Dial's own engine are recorded under
+    /// the engine's shared label, so they have no per-model usage and show `-`.
+    fn usage_of(&self, entry: &ModelEntry) -> Option<&ModelUsage> {
+        [entry.selection.model.as_str(), entry.label.as_str()]
+            .into_iter()
+            .find_map(|key| self.usage.get(key))
+            .filter(|usage| usage.totals.requests > 0)
+    }
+
+    fn speed_of(&self, entry: &ModelEntry) -> Option<f64> {
+        self.usage_of(entry)
+            .and_then(|usage| usage.speed.median_tok_per_s)
+    }
+
+    fn shows(&self, entry: &ModelEntry) -> bool {
+        match self.show {
+            ShowFilter::Any => true,
+            ShowFilter::Available => entry.available,
+            ShowFilter::Loaded => state_of(entry) == "loaded",
+            ShowFilter::Local => is_local(entry),
+            ShowFilter::Cloud => !is_local(entry),
+            ShowFilter::Tools => entry.metadata.tools == Some(true),
+            ShowFilter::Vision => entry.metadata.vision == Some(true),
+            ShowFilter::Reasoning => entry.metadata.reasoning == Some(true),
+            ShowFilter::Priced => pricing(entry).is_some(),
+            ShowFilter::Used => self.usage_of(entry).is_some(),
+        }
+    }
+
+    fn sort_cmp(&self, a: &ModelEntry, b: &ModelEntry) -> Ordering {
+        match self.sort {
+            SortOrder::Default => Ordering::Equal,
+            SortOrder::Name => display_name(a)
+                .to_lowercase()
+                .cmp(&display_name(b).to_lowercase()),
+            SortOrder::Price => {
+                known_first(blended_price(a), blended_price(b), |x, y| x.total_cmp(&y))
+            }
+            SortOrder::Speed => {
+                known_first(self.speed_of(a), self.speed_of(b), |x, y| y.total_cmp(&x))
+            }
+            SortOrder::Context => known_first(
+                a.selection.context_window,
+                b.selection.context_window,
+                |x, y| y.cmp(&x),
+            ),
+            SortOrder::Usage => known_first(
+                self.usage_of(a).map(|usage| usage.totals.requests),
+                self.usage_of(b).map(|usage| usage.totals.requests),
+                |x, y| y.cmp(&x),
+            ),
+        }
+    }
+
     /// The main model's LoRA state when `entry` is the main model.
     fn main_lora_for(&self, entry: &ModelEntry) -> Option<Lora> {
         self.role_selection("main")
@@ -732,6 +1020,18 @@ impl ModelOverlay {
         self.target_role = None;
         self.cursor = 0;
         self.scroll = 0;
+    }
+
+    /// Open on the Memory group (`/models memory`): models for the memory role.
+    pub fn show_memory(&mut self) {
+        self.show_roles();
+        self.group = Group::Memory;
+    }
+
+    /// Get models on its Memory shelf: small local models to download for the memory role.
+    fn show_memory_downloads(&mut self) {
+        self.show_downloads();
+        self.downloads.show_memory();
     }
 
     /// Whether a finished download asks for a rescan; the controller takes the request once per frame.
@@ -777,6 +1077,11 @@ impl ModelOverlay {
     /// Whether the memory backend uses the memory role only for optional automatic saving.
     pub fn set_memory_optional(&mut self, optional: bool) {
         self.memory_optional = optional;
+    }
+
+    /// The memory backend's name, shown in the Memory group; `off` when memory is disabled.
+    pub fn set_memory_backend(&mut self, backend: &'static str) {
+        self.memory_backend = Some(backend);
     }
 
     pub fn set_roles(&mut self, roles: Vec<RoleStatus>) {
@@ -827,6 +1132,10 @@ impl ModelOverlay {
             Group::Roles => ROLES.len(),
             Group::All => self.all_entries().count(),
             Group::Favorites => self.favorite_entries.len(),
+            Group::Memory => self
+                .all_entries()
+                .filter(|entry| role_accepts("memory", entry))
+                .count(),
             Group::Download => self.downloads.installed_count(),
             Group::Provider(id) => self
                 .all_entries()
@@ -836,7 +1145,8 @@ impl ModelOverlay {
     }
 
     /// Entries of the right pane in display order, with the positions matched by the search (char
-    /// indexes into the displayed name). Current main model first, then loaded, available, the rest.
+    /// indexes into the displayed name). The lead model (main, or memory in the Memory group) first,
+    /// then favorites, loaded, available, the rest; a chosen sort order then reorders them.
     fn rows(&self) -> Vec<(&ModelEntry, Vec<usize>)> {
         if self.discovery.is_none() {
             return Vec::new();
@@ -844,7 +1154,7 @@ impl ModelOverlay {
         if matches!(self.group, Group::Roles | Group::Download) {
             return Vec::new();
         }
-        let main = self.role_selection("main");
+        let lead = self.role_selection(self.lead_role());
         let mut rows: Vec<(u8, i32, usize, &ModelEntry, Vec<usize>)> = Vec::new();
         for (index, entry) in self.all_entries().enumerate() {
             if let Group::Provider(id) = &self.group
@@ -855,7 +1165,10 @@ impl ModelOverlay {
             if self.group == Group::Favorites && !self.is_favorite(&entry.selection) {
                 continue;
             }
-            if !self.kind.accepts(entry) {
+            if self.group == Group::Memory && !role_accepts("memory", entry) {
+                continue;
+            }
+            if !self.kind.accepts(entry) || !self.shows(entry) {
                 continue;
             }
             let name = display_name(entry);
@@ -883,7 +1196,7 @@ impl ModelOverlay {
                 }
             };
             // The Laya engine leads the judge list: it is not a catalog model and is easy to miss.
-            let rank = if main.is_some_and(|m| same_model(m, &entry.selection))
+            let rank = if lead.is_some_and(|m| same_model(m, &entry.selection))
                 || entry.selection.provider == crate::config::laya::PROVIDER
             {
                 0
@@ -900,6 +1213,10 @@ impl ModelOverlay {
         }
         // With a query the best match leads within a rank; without one the discovery order stands.
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        if self.sort != SortOrder::Default {
+            // Stable: ties keep the ranked order above.
+            rows.sort_by(|a, b| self.sort_cmp(a.3, b.3));
+        }
         if let Some(role) = &self.target_role {
             rows.retain(|row| role_picker_accepts(role, row.3));
             if role == "embedding" {
@@ -910,6 +1227,15 @@ impl ModelOverlay {
         rows.into_iter()
             .map(|(_, _, _, entry, positions)| (entry, positions))
             .collect()
+    }
+
+    /// The role the list marks and leads with: memory in the Memory group, otherwise main.
+    fn lead_role(&self) -> &'static str {
+        if self.group == Group::Memory {
+            "memory"
+        } else {
+            "main"
+        }
     }
 
     fn highlighted(&self) -> Option<&ModelEntry> {
@@ -929,7 +1255,13 @@ impl ModelOverlay {
     }
 
     fn groups(&self) -> Vec<Group> {
-        let mut groups = vec![Group::Roles, Group::All, Group::Favorites, Group::Download];
+        let mut groups = vec![
+            Group::Roles,
+            Group::All,
+            Group::Favorites,
+            Group::Memory,
+            Group::Download,
+        ];
         groups.extend(self.providers().map(|p| Group::Provider(p.id.clone())));
         groups
     }
@@ -1050,6 +1382,13 @@ impl ModelOverlay {
                         scope: self.scope,
                     };
                 }
+                Step::UseMemory(path) => {
+                    return OverlayEvent::AssignModel {
+                        role: "memory".into(),
+                        selection: ModelSelection::new("mlx", &path),
+                        scope: self.scope,
+                    };
+                }
                 Step::SetupEmbedding(model) => {
                     return OverlayEvent::SetupDep {
                         id: embeddings::setup_id(&model),
@@ -1117,9 +1456,38 @@ impl ModelOverlay {
             self.scope = other_scope(self.scope);
             return OverlayEvent::None;
         }
+        let list_view = !matches!(self.group, Group::Roles | Group::Download);
+        if key.code == KeyCode::F(2) && list_view {
+            self.show = cycle(ShowFilter::ALL, self.show);
+            self.focus = Focus::List;
+            self.cursor = 0;
+            self.scroll = 0;
+            return OverlayEvent::None;
+        }
+        if key.code == KeyCode::F(3) && list_view {
+            let anchor = self.highlighted().map(|entry| entry.selection.clone());
+            self.sort = cycle(SortOrder::ALL, self.sort);
+            self.focus = Focus::List;
+            let rows = self.rows();
+            self.cursor = anchor
+                .and_then(|anchor| {
+                    rows.iter()
+                        .position(|(entry, _)| same_model(&entry.selection, &anchor))
+                })
+                .unwrap_or(0);
+            self.scroll = 0;
+            return OverlayEvent::None;
+        }
+        if is_ctrl(key, 'g') && self.group == Group::Memory {
+            self.show_memory_downloads();
+            return OverlayEvent::None;
+        }
         if key.code == KeyCode::F(5) || is_ctrl(key, 'r') {
             if self.group == Group::Download {
                 self.downloads.reload();
+            }
+            if let Some(dir) = &self.usage_dir {
+                self.usage = crate::stats::read_model_usage(dir);
             }
             return OverlayEvent::Refresh;
         }
@@ -1225,6 +1593,14 @@ impl ModelOverlay {
             self.scroll = 0;
             return OverlayEvent::None;
         }
+        // A narrowed or reordered list is undone before Esc closes.
+        if self.show != ShowFilter::Any || self.sort != SortOrder::Default {
+            self.show = ShowFilter::Any;
+            self.sort = SortOrder::Default;
+            self.cursor = 0;
+            self.scroll = 0;
+            return OverlayEvent::None;
+        }
         OverlayEvent::Close
     }
 
@@ -1299,7 +1675,12 @@ impl ModelOverlay {
                 return OverlayEvent::None;
             }
             self.target_role = Some(role.to_owned());
-            self.group = Group::All;
+            // The memory role is picked in its own group, which shows the memory backend's status.
+            self.group = if role == "memory" {
+                Group::Memory
+            } else {
+                Group::All
+            };
             self.search.clear();
             // The embedding role filter (role_accepts) also keeps unclassified models, which the
             // Embedding kind filter would hide.
@@ -1321,7 +1702,9 @@ impl ModelOverlay {
         let target = self
             .target_role
             .as_deref()
-            .unwrap_or(if entry.is_embedding() {
+            .unwrap_or(if self.group == Group::Memory {
+                "memory"
+            } else if entry.is_embedding() {
                 "embedding"
             } else {
                 "main"
@@ -1500,6 +1883,7 @@ impl ModelOverlay {
         // The Get models group draws its own header, query and status, so it takes no kind, search or
         // header rows of the list pane.
         let download_view = self.group == Group::Download;
+        let roles_view = self.group == Group::Roles;
         let mut grant = |wanted: bool| {
             if wanted && spare > 0 {
                 spare -= 1;
@@ -1516,6 +1900,8 @@ impl ModelOverlay {
             grant(!download_view),
             grant(true),
         );
+        // Price and recorded usage of the highlighted model: the first line to give way.
+        let show_numbers = grant(!download_view && !roles_view);
         let flags = [
             show_footer,
             show_kind,
@@ -1523,6 +1909,7 @@ impl ModelOverlay {
             show_detail,
             show_header,
             show_used,
+            show_numbers,
         ];
         let body_rows = h - flags.iter().filter(|f| **f).count();
 
@@ -1534,7 +1921,6 @@ impl ModelOverlay {
         }
         let right_w = w - if left_w > 0 { left_w + 1 } else { 0 };
 
-        let roles_view = self.group == Group::Roles;
         let len = if roles_view {
             ROLES.len()
         } else {
@@ -1659,6 +2045,10 @@ impl ModelOverlay {
                 out.push(Line::from(fit(second, w)));
             }
         }
+        if show_numbers {
+            let numbers = self.numbers_line(theme, rows.get(self.cursor).map(|(e, _)| *e));
+            out.push(Line::from(fit(numbers, w)));
+        }
         if show_footer {
             out.push(hint_line(theme, &self.footer(ctx.keys), w));
         }
@@ -1677,6 +2067,14 @@ impl ModelOverlay {
                 " No models yet. Press Enter to set up a provider or add an API key, open Get models to download a local model, or start LM Studio or Ollama (found automatically)."
                     .to_owned()
             }
+            Some(_) if self.group == Group::Memory && self.search.is_empty() && self.show == ShowFilter::Any => {
+                " No chat models for the memory role yet. Ctrl+G opens Get models › Memory: small local models suited to memory extraction."
+                    .to_owned()
+            }
+            Some(_) if self.show != ShowFilter::Any && self.search.is_empty() => format!(
+                " No models match the \"{}\" filter. F2 shows another set; Esc clears it.",
+                self.show.label()
+            ),
             Some(_) if self.kind == KindFilter::Embedding && self.search.is_empty() => {
                 " No embedding models here. Open Get models and choose the Embedding shelf to set one up."
                     .to_owned()
@@ -1693,6 +2091,7 @@ impl ModelOverlay {
             Group::Roles => "Roles".to_owned(),
             Group::All => "All models".to_owned(),
             Group::Favorites => "Favorites".to_owned(),
+            Group::Memory => "Memory models".to_owned(),
             Group::Download => "Get models".to_owned(),
             Group::Provider(id) => self
                 .providers()
@@ -1720,6 +2119,17 @@ impl ModelOverlay {
                 theme.fg(Tok::Muted),
             ));
         }
+        if self.group == Group::Memory {
+            let (value, tok) = self.role_value("memory");
+            let backend = self
+                .memory_backend
+                .map(|backend| format!("backend {backend} {} ", theme.sym(Sym::Dot)))
+                .unwrap_or_default();
+            spans.push(Span::styled(
+                format!("  {} {backend}memory role: {value}", theme.sym(Sym::Dot)),
+                theme.fg(tok),
+            ));
+        }
         Line::from(fit(spans, w))
     }
 
@@ -1728,6 +2138,19 @@ impl ModelOverlay {
         for kind in KindFilter::ALL {
             let style = chrome::tab_style(theme, kind == self.kind);
             spans.push(Span::styled(format!(" {} ", kind.label()), style));
+        }
+        // Non-default show and sort choices stay in view next to the kind tabs, before the legend.
+        for (name, value, on) in [
+            ("show", self.show.label(), self.show != ShowFilter::Any),
+            ("sort", self.sort.label(), self.sort != SortOrder::Default),
+        ] {
+            if on {
+                spans.push(Span::styled(format!("  {name} "), theme.fg(Tok::Muted)));
+                spans.push(Span::styled(
+                    format!(" {value} "),
+                    chrome::tab_style(theme, true),
+                ));
+            }
         }
         // Legend entries are added whole while they fit, so a narrow pane never shows a clipped word.
         let legend = [
@@ -1867,6 +2290,16 @@ impl ModelOverlay {
             ),
         ));
         entries.push((
+            Some(Group::Memory),
+            line(
+                &Group::Memory,
+                "Memory".to_owned(),
+                self.count_in(&Group::Memory).to_string(),
+                None,
+                self,
+            ),
+        ));
+        entries.push((
             Some(Group::Download),
             line(
                 &Group::Download,
@@ -1931,10 +2364,10 @@ impl ModelOverlay {
             theme.fg(Tok::Text)
         }
         .patch(fill);
-        let is_main = self
-            .role_selection("main")
+        let is_lead = self
+            .role_selection(self.lead_role())
             .is_some_and(|m| same_model(m, &entry.selection));
-        let marker = if is_main {
+        let marker = if is_lead {
             theme.sym(Sym::RadioOn).to_owned()
         } else if self.is_favorite(&entry.selection) {
             "*".to_owned()
@@ -1964,9 +2397,12 @@ impl ModelOverlay {
             0
         };
         let ctx_w = if w >= 40 { 7 } else { 0 };
+        let speed_w = if w >= 96 { 9 } else { 0 };
+        let price_w = if w >= 108 { 14 } else { 0 };
         let caps_w = if w >= 28 { 8 } else { 0 };
         let prefix_w = text::width(&pointer) + text::width(&marker) + 2;
-        let name_w = w.saturating_sub(prefix_w + caps_w + state_w + lora_w + ctx_w);
+        let name_w =
+            w.saturating_sub(prefix_w + caps_w + state_w + lora_w + ctx_w + speed_w + price_w);
         let name = text::ellipsize(
             &display_name(entry),
             name_w.saturating_sub(1),
@@ -1988,6 +2424,28 @@ impl ModelOverlay {
         if ctx_w > 0 {
             spans.push(Span::styled(
                 text::pad(&context, ctx_w),
+                theme.fg(Tok::Muted).patch(fill),
+            ));
+        }
+        if price_w > 0 {
+            let price = price_cell(entry);
+            spans.push(Span::styled(
+                text::pad(
+                    &text::ellipsize(&price, price_w.saturating_sub(1), theme.ascii()),
+                    price_w,
+                ),
+                theme.fg(Tok::Muted).patch(fill),
+            ));
+        }
+        if speed_w > 0 {
+            let speed = self
+                .speed_of(entry)
+                .map_or_else(|| "-".to_owned(), |rate| format!("{} t/s", fmt_rate(rate)));
+            spans.push(Span::styled(
+                text::pad(
+                    &text::ellipsize(&speed, speed_w.saturating_sub(1), theme.ascii()),
+                    speed_w,
+                ),
                 theme.fg(Tok::Muted).patch(fill),
             ));
         }
@@ -2018,7 +2476,7 @@ impl ModelOverlay {
                 theme.fg(Tok::Muted).patch(fill),
             ));
         }
-        filled(spans, w, fill)
+        selected_row(theme, spans, w, selected)
     }
 
     fn role_line(&self, theme: &Theme, index: usize, w: usize) -> Line<'static> {
@@ -2035,22 +2493,7 @@ impl ModelOverlay {
             " "
         };
         let status = self.roles.iter().find(|status| status.role == role);
-        let (value, tok) = match status
-            .and_then(|status| status.effective.as_ref().map(|name| (name, status.source)))
-        {
-            Some((name, RoleSource::FollowsMain)) => {
-                (format!("unassigned · follows main ({name})"), Tok::Dim)
-            }
-            Some((name, source)) => (format!("{name} · {}", source_label(source)), Tok::Accent),
-            None if role == "main" => ("not configured".to_owned(), Tok::Warning),
-            None if role == "memory" && self.memory_required => {
-                ("required: assign a model".to_owned(), Tok::Warning)
-            }
-            None if role == "memory" && self.memory_optional => {
-                ("optional: assign to save facts".to_owned(), Tok::Muted)
-            }
-            None => ("not set".to_owned(), Tok::Dim),
-        };
+        let (value, tok) = self.role_value(role);
         let entry = status
             .and_then(|status| status.assigned.as_ref())
             .and_then(|selection| {
@@ -2066,7 +2509,8 @@ impl ModelOverlay {
         let desc_w = rest.saturating_sub(value_w + 2);
         let value = text::ellipsize(&value, value_w, theme.ascii());
         let desc = text::ellipsize(description, desc_w, theme.ascii());
-        filled(
+        selected_row(
+            theme,
             vec![
                 Span::styled(format!("{pointer} "), theme.fg(Tok::Accent).patch(fill)),
                 Span::styled(
@@ -2095,8 +2539,28 @@ impl ModelOverlay {
                 ),
             ],
             w,
-            fill,
+            selected,
         )
+    }
+
+    /// What a role is set to, as the Roles view and the Memory group header show it.
+    fn role_value(&self, role: &str) -> (String, Tok) {
+        let status = self.roles.iter().find(|status| status.role == role);
+        match status.and_then(|status| status.effective.as_ref().map(|name| (name, status.source)))
+        {
+            Some((name, RoleSource::FollowsMain)) => {
+                (format!("unassigned · follows main ({name})"), Tok::Dim)
+            }
+            Some((name, source)) => (format!("{name} · {}", source_label(source)), Tok::Accent),
+            None if role == "main" => ("not configured".to_owned(), Tok::Warning),
+            None if role == "memory" && self.memory_required => {
+                ("required: assign a model".to_owned(), Tok::Warning)
+            }
+            None if role == "memory" && self.memory_optional => {
+                ("optional: assign to save facts".to_owned(), Tok::Muted)
+            }
+            None => ("not set".to_owned(), Tok::Dim),
+        }
     }
 
     fn chooser_line(
@@ -2134,14 +2598,15 @@ impl ModelOverlay {
         } else {
             theme.sym(Sym::RadioOff)
         };
-        filled(
+        selected_row(
+            theme,
             vec![
                 Span::styled(format!("   {radio} "), theme.fg(Tok::Accent).patch(fill)),
                 Span::styled(text::pad(role, 12), theme.fg(Tok::Text).patch(fill)),
                 Span::styled(description.to_owned(), theme.fg(Tok::Muted).patch(fill)),
             ],
             w,
-            fill,
+            selected,
         )
     }
 
@@ -2213,12 +2678,19 @@ impl ModelOverlay {
             || "context unknown".to_owned(),
             |c| format!("context {}", fmt_context(c)),
         );
+        let max_output = entry
+            .metadata
+            .max_output_tokens
+            .map(|tokens| format!(", max output {}", fmt_context(tokens)))
+            .unwrap_or_default();
         first.push(Span::styled(
             format!(
-                "  {} {context}  {} {}",
+                "  {} {context}{max_output}  {} {}  {} {}",
                 theme.sym(Sym::Dot),
                 theme.sym(Sym::Dot),
-                state_of(entry)
+                state_of(entry),
+                theme.sym(Sym::Dot),
+                if is_local(entry) { "local" } else { "cloud" }
             ),
             theme.fg(Tok::Muted),
         ));
@@ -2268,6 +2740,63 @@ impl ModelOverlay {
             theme.fg(Tok::Muted),
         )]);
         (first, second)
+    }
+
+    /// The third detail line: the provider's price per 1M tokens and the model's recorded use (median
+    /// speed with its trend, requests, average cost and latency). Unknown values show as `-`.
+    fn numbers_line(&self, theme: &Theme, entry: Option<&ModelEntry>) -> Vec<Span<'static>> {
+        if self.prompt.is_some() || self.message.is_some() {
+            return Vec::new();
+        }
+        let Some(entry) = entry else {
+            return Vec::new();
+        };
+        let dot = theme.sym(Sym::Dot);
+        let usage = match self.usage_of(entry) {
+            None => "speed -  avg cost -  (no recorded requests)".to_owned(),
+            Some(usage) => {
+                let speed = &usage.speed;
+                let mut parts = vec![match speed.median_tok_per_s {
+                    Some(rate) => {
+                        let mut text = format!(
+                            "speed {} t/s median of {}",
+                            fmt_rate(rate),
+                            speed.samples.unwrap_or(0)
+                        );
+                        if let (Some(recent), Some(trend)) =
+                            (speed.recent_median_tok_per_s, speed.trend)
+                        {
+                            text.push_str(&format!(", recent {} ({trend})", fmt_rate(recent)));
+                        }
+                        text
+                    }
+                    None => "speed -".to_owned(),
+                }];
+                parts.push(match usage.avg_cost_usd() {
+                    Some(cost) => format!("avg {}/request", fmt_usd(cost)),
+                    None => "avg cost -".to_owned(),
+                });
+                let requests = usage.totals.requests;
+                parts.push(format!(
+                    "{requests} request{}",
+                    if requests == 1 { "" } else { "s" }
+                ));
+                if let Some(ms) = usage.totals.avg_latency_ms {
+                    parts.push(format!("{:.1}s avg latency", ms / 1000.0));
+                }
+                if let Some(rate) = usage.totals.error_rate.filter(|rate| *rate > 0.0) {
+                    parts.push(format!("{rate:.0}% errors"));
+                }
+                if usage.totals.priced_requests > 0 {
+                    parts.push(format!("{} total", fmt_usd(usage.totals.cost_usd)));
+                }
+                parts.join(&format!(" {dot} "))
+            }
+        };
+        vec![
+            Span::styled(format!(" {}", price_detail(entry)), theme.fg(Tok::Muted)),
+            Span::styled(format!("  {dot} {usage}"), theme.fg(Tok::Muted)),
+        ]
     }
 
     fn footer(&self, keys: &Keymap) -> Vec<String> {
@@ -2339,24 +2868,35 @@ impl ModelOverlay {
                 hint(keys, Action::SelectCancel, "close"),
             ];
         }
+        let memory = self.group == Group::Memory;
+        // The footer keeps whole hints while they fit, so the most useful come first.
         vec![
-            "Ctrl+F favorite".to_owned(),
             hint(
                 keys,
                 Action::SelectConfirm,
                 if self.target_role.is_some() {
                     "assign"
+                } else if memory {
+                    "set memory"
                 } else if self.highlighted().is_some_and(ModelEntry::is_embedding) {
                     "set embedding"
                 } else {
                     "set main"
                 },
             ),
+            if memory {
+                "Ctrl+G get memory models".to_owned()
+            } else {
+                String::new()
+            },
+            format!("F2 show {}", self.show.label()),
+            format!("F3 sort {}", self.sort.label()),
+            "Ctrl+F favorite".to_owned(),
+            self.groups_hint(keys),
             format!(
                 "{} models",
                 pair_label(keys, Action::SelectUp, Action::SelectDown)
             ),
-            self.groups_hint(keys),
             "type to search".to_owned(),
             format!(
                 "{} kind",
@@ -2380,10 +2920,12 @@ impl ModelOverlay {
                 Action::SelectCancel,
                 if self.target_role.is_some() {
                     "back"
-                } else if self.search.is_empty() {
-                    "close"
-                } else {
+                } else if !self.search.is_empty() {
                     "clear search"
+                } else if self.show != ShowFilter::Any || self.sort != SortOrder::Default {
+                    "reset filters"
+                } else {
+                    "close"
                 },
             ),
         ]

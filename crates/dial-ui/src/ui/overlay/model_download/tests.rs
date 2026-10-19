@@ -474,14 +474,16 @@ fn window_and_size_helpers_keep_the_cursor_visible_and_read_plainly() {
 }
 
 #[test]
-fn shelves_cycle_through_mlx_gguf_embeddings_and_curated_both_ways() {
+fn shelves_cycle_through_mlx_gguf_memory_embeddings_and_curated_both_ways() {
     assert_eq!(Shelf::Hub(Family::Mlx).next(), Shelf::Hub(Family::Gguf));
-    assert_eq!(Shelf::Hub(Family::Gguf).next(), Shelf::EmbeddingHub);
+    assert_eq!(Shelf::Hub(Family::Gguf).next(), Shelf::Memory);
+    assert_eq!(Shelf::Memory.next(), Shelf::EmbeddingHub);
     assert_eq!(Shelf::EmbeddingHub.next(), Shelf::Embedding);
     assert_eq!(Shelf::Embedding.next(), Shelf::Hub(Family::Mlx));
     assert_eq!(Shelf::Hub(Family::Mlx).prev(), Shelf::Embedding);
     assert_eq!(Shelf::Embedding.prev(), Shelf::EmbeddingHub);
-    assert_eq!(Shelf::EmbeddingHub.prev(), Shelf::Hub(Family::Gguf));
+    assert_eq!(Shelf::EmbeddingHub.prev(), Shelf::Memory);
+    assert_eq!(Shelf::Memory.prev(), Shelf::Hub(Family::Gguf));
 }
 
 #[test]
@@ -490,6 +492,7 @@ fn arrows_cycle_shelves_and_preserve_navigation_focus() {
     let keys = Keymap::defaults();
     for shelf in [
         Shelf::Hub(Family::Gguf),
+        Shelf::Memory,
         Shelf::EmbeddingHub,
         Shelf::Embedding,
         Shelf::Hub(Family::Mlx),
@@ -502,6 +505,41 @@ fn arrows_cycle_shelves_and_preserve_navigation_focus() {
     assert_eq!(group.shelf, Shelf::Embedding);
     group.key(&key(KeyCode::BackTab), &keys);
     assert_eq!(group.shelf, Shelf::EmbeddingHub);
+}
+
+#[test]
+fn memory_shelf_offers_small_curated_models_and_every_installed_format_without_network() {
+    let keys = Keymap::defaults();
+    let mut gguf = row("small-gguf");
+    gguf.format = Some("GGUF");
+    let mut group = ModelDownloads::fixed(dashboard(vec![row("small-mlx"), gguf]));
+    group.show_memory();
+    assert_eq!(group.shelf, Shelf::Memory);
+    assert!(
+        group.search.is_none(),
+        "the Memory shelf never browses on its own"
+    );
+    assert!(group.curated);
+    assert_eq!(
+        group.hits,
+        download::recommended_memory(download::default_family())
+    );
+    assert_eq!(
+        group.installed_rows(),
+        vec![0, 1],
+        "installed rows of any format"
+    );
+    group.focus = Focus::Results;
+    group.cursor = group
+        .picks()
+        .iter()
+        .position(|pick| matches!(pick, Pick::Installed(1)))
+        .unwrap();
+    assert_eq!(
+        group.key(&key(KeyCode::Enter), &keys),
+        Step::UseMemory("/models/small-gguf".into()),
+        "Enter on an installed model assigns the memory role, not main"
+    );
 }
 
 #[test]

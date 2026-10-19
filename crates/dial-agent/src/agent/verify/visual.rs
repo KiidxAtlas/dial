@@ -1,7 +1,7 @@
 //! Bounded prompts for useful visual evidence; pixels are observations, not proof of correctness.
 use std::{collections::HashSet, path::Path};
 
-pub type Revision = (u64, u64);
+pub type Revision = super::evidence::Revision;
 
 pub fn useful(prompt: &str) -> bool {
     let lower = prompt.to_lowercase();
@@ -61,6 +61,15 @@ impl Review {
         }
     }
 
+    pub fn require_rendered(&mut self) {
+        self.required = true;
+        self.render_required = true;
+    }
+
+    pub fn rendered_observed(&self, revision: Revision) -> bool {
+        self.browser_pixels == Some(revision)
+    }
+
     pub fn changed(&mut self, path: &Path) {
         if rendered_file(path) {
             self.required = true;
@@ -92,6 +101,17 @@ impl Review {
             } else {
                 self.image_pixels
             }) != Some(revision)
+    }
+
+    /// Evidence is delivered pixels for the latest effect revision, not a correctness verdict.
+    pub fn status(&self, revision: Revision) -> &'static str {
+        if !self.required {
+            "not_required"
+        } else if self.missing(revision) {
+            "missing"
+        } else {
+            "observed"
+        }
     }
 
     pub fn summary(&self, text: String, revision: Revision) -> String {

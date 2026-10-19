@@ -1012,13 +1012,21 @@ impl Codebase {
                     .optional()?,
             );
         }
-        let sections=saved.sections.iter().zip(invalidation_reasons).map(|(s,invalidation_reason)|json!({
+        let sections=saved.sections.iter().zip(invalidation_reasons).map(|(s,invalidation_reason)|{
+            let mut section=json!({
             "id":s.id,"kind":s.kind,"title":s.title,"summary":s.summary,"sources":s.sources,"status":statuses.get(&s.id),
             "source_status":if s.sources.iter().any(|s|self.source_missing(&s.path)) {"missing"} else if s.sources.iter().any(|s|snapshot.files.get(&s.path).is_some_and(|digest|digest!=&s.digest)) {"changed"} else if !snapshot.complete {"unchecked"} else if s.sources.iter().all(|s|snapshot.files.get(&s.path)==Some(&s.digest)) {"unchanged"} else {"changed"},
             "behavior_status":"unverified",
             "dependency_scope":s.freshness.as_ref().map(|scope|json!({"version":scope.version,"inventory":scope.inventory,"environment":scope.environment,"complete":scope.complete,"dependency_count":scope.dependencies.len(),"paths":scope.dependencies.iter().take(32).map(|s|&s.path).collect::<Vec<_>>(),"paths_truncated":scope.dependencies.len()>32})),
             "invalidation_reason":invalidation_reason
-        })).collect::<Vec<_>>();
+            });
+            // Every cited source is gone (deleted, moved, or a removed worktree): nothing can confirm
+            // the claim, so its prose is withheld instead of spending context on it.
+            if !s.sources.is_empty() && s.sources.iter().all(|s|self.source_missing(&s.path)) {
+                section["summary"]=json!("[withheld: every cited source is gone; re-synthesize or invalidate this section]");
+            }
+            section
+        }).collect::<Vec<_>>();
         Ok(
             json!({"revision":saved.revision,"model":saved.model,"partial":saved.partial,"indexed_files":saved.indexed_files,"supplied_files":saved.supplied_files,"sections":sections,"unknowns":saved.unknowns,"behavioral_evidence":behavior,"status":"model observations; source and dependency freshness checked, semantics unverified"}),
         )

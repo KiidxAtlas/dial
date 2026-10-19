@@ -27,6 +27,12 @@ application imports remain code failures. A command that executes zero tests sup
 no passing behavioral evidence, including in the persisted behavior-check cache.
 Round settlement retains verification statuses and bounded receipt history.
 
+Optional [requirement evidence contracts](requirement-verification.md) map operator-declared
+requirements to configured checks and current rendered pixels. Their coverage is separate from
+the execution outcome and never implies undeclared behaviors are covered. Parent and worker
+settlement provide cause-specific safe next actions without automatic installation, permission
+bypasses or replay of uncertain effects.
+
 Automatic coach consultations retain their failure streak, evidence and attempt cap
 through final-verification repair reentries in the same user turn. A new user turn
 resets that allowance. Attempts count before authorization/routing, so denied or failed
@@ -104,6 +110,12 @@ diagnostics to repair. Initial work, verification repair and stop-hook continuat
 finite `max_steps` budget; zero remains unlimited. The edited tree and final diagnostics remain
 visible for `/undo` or manual repair. Behavioral credit and final verification use the same
 observed-process verdict; printed success without complete process evidence earns no credit.
+Behavioral outcome credit uses the latest controller-observed result for each command at the final
+effect revision (native edits, opaque shell attempts, and extension effects). A failing pre-edit
+baseline is preserved separately and can become a passing repair; it does not permanently poison
+credit. Conversely, a pass before a later effect is stale and cannot earn final-revision credit.
+Recognized manually executed checks are bound after their own call settles. Cancelled, unavailable,
+zero-test, or incomplete-process results never supply passing credit.
 Executable repair records use that same classified, typed execution evidence, not printed exit
 markers. Unverified runs invalidate a matching failure baseline rather than pairing an old failure
 with a later pass. Related-test planning reuses JS package/runner metadata and Go directory scans
@@ -116,6 +128,29 @@ Approval-denied writes are not treated as successful verification. `todo` is opt
 Plain final replies and `finish` use the same completion prerequisites and final configured verification/repair pipeline. Empty replies, action-only promises and explicit admissions of unfinished work share bounded parent/child reply recovery. Invalid todo arguments still receive a simple corrected call and bounded recovery; there is no separate budget of todo-closing reminder turns. Productive work remains unlimited with `max_steps = 0`.
 
 Default guidance starts with focused source inspection and moves to implementation once the path is known. It does not force a plan after an arbitrary number of reads. The optional reasoning-recovery plan gate still applies when explicitly enabled. Progress lists help substantial multi-step work; concise investigations and informational answers need no checklist. Optional source notes survive resume, and ordinary coding does not automatically harvest them into project learning. Identical successful observations remain subject to the shared read/investigation guards; changed sources and new user steering permit fresh observations.
+
+### Completion evidence is not execution status
+
+Every settled turn publishes additive `completion_evidence` in session control, includes it in the
+efficiency event, and exposes it as `evidence` in the completion event. `TurnReport` and its existing
+execution outcomes remain compatible. The versioned evidence distinguishes execution outcome,
+unassessed deliverable coverage versus explicitly open obligations, current/stale check results,
+missing/observed/not-required pixels, and effects outside checkpoints. Baseline and latest check
+observations remain separate. Passing checks establish what ran, not independent proof of all
+requirements. A simple answer needs no todo list and is not forced into verification ceremony.
+
+Accepted reports close only the current progress item outside goal mode, as before. Pending items
+stay open and are disclosed in the report/evidence rather than implicitly called complete. Missing
+visual evidence remains an honest limitation, not a fabricated screenshot or a bypass of browser
+approval. Automatic behavioral learning credit additionally requires no outstanding obligations or
+missing required pixels. Native, shell, and extension effect revisions invalidate old visual evidence.
+
+Recovery transitions have explicit lifetimes. Automatic and directed continuations reset transient
+reply/narration recovery but retain evidence restrictions and committed-content edit-cycle history;
+they cannot retry an unchanged refused edit by resetting the engine. New steering or worker
+coordination can release obsolete call restrictions, but no transition releases an uncertain-effect
+barrier. Inspection and a fresh turn are required after uncertain execution; completed effects are
+never replayed or assumed rolled back.
 
 Mid-turn requests end with a never-stored reminder of the current todo step, next step and recent findings.
 Because it sits after the newest tool result, every earlier byte stays identical between requests and a

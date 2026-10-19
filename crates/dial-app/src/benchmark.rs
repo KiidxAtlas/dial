@@ -98,7 +98,7 @@ pub enum Assertion {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunMetrics {
     pub prompt_tokens: u64,
     pub output_tokens: u64,
@@ -150,7 +150,59 @@ pub struct RunMetrics {
     /// Logical backend requests from the runtime ledger (all purposes); 0 when the ledger was unread.
     #[serde(default)]
     pub requests: u64,
+    /// Main-agent tool trace from the child's final snapshot. Absent in legacy or uninstrumented
+    /// reports, where tool offers and use stay unknown rather than zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_trace: Option<ToolTrace>,
 }
+
+/// Main-agent schema offers and admitted executions for one case. Worker, extension and
+/// compaction-internal calls are outside its scope. `complete` is false when the run failed or
+/// any turn lacked a snapshot; an incomplete trace never establishes that a tool went unused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolTrace {
+    pub scope: ToolTraceScope,
+    pub complete: bool,
+    pub successful_requests: u64,
+    /// Per tool: successful main requests whose offered schemas named it.
+    pub offered: std::collections::BTreeMap<String, u64>,
+    /// Per tool: admitted calls that reached execution.
+    pub invoked: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolTraceScope {
+    #[default]
+    MainAgent,
+}
+
+impl ToolTrace {
+    /// Parses the child's `metrics.tool_trace` snapshot. Any missing or malformed field yields
+    /// `None`, so the trace stays unknown instead of being partially trusted.
+    pub fn from_snapshot(snapshot: &serde_json::Value, complete: bool) -> Option<Self> {
+        let counts = |name: &str| -> Option<std::collections::BTreeMap<String, u64>> {
+            let mut map = std::collections::BTreeMap::new();
+            for (tool, count) in snapshot.get(name)?.as_object()? {
+                if tool.is_empty() {
+                    return None;
+                }
+                map.insert(tool.clone(), count.as_u64()?);
+            }
+            Some(map)
+        };
+        Some(Self {
+            scope: ToolTraceScope::MainAgent,
+            complete,
+            successful_requests: snapshot.get("successful_requests")?.as_u64()?,
+            offered: counts("offered")?,
+            invoked: counts("invoked")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tool_trace_tests;
 
 /// Verification metadata, not prompt contents or a model's claim of success.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

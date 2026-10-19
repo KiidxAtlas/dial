@@ -55,6 +55,30 @@ impl State {
 pub(in crate::agent) fn schema() -> Value {
     json!({"type":"function","function":{"name":"experience","description":"Inspect project experience and investigation observations; record a hypothesis with an observed evidence ID, or replay a source-matched verified recipe through normal approvals. Memories are advisory, never permission grants.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["inspect","ledger","hypothesis","run"]},"id":{"type":"string"},"hypothesis":{"type":"string","maxLength":1024},"status":{"type":"string","enum":["open","supported","ruled_out"]}},"required":["action"],"additionalProperties":false}}})
 }
+/// Small morphological normalization, not semantic authority or a new eligibility source.
+/// Keep exact-name lookup ahead of this: an installed tool named `references` is still exact.
+fn discovery_words(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let word = word.to_lowercase();
+            match word.as_str() {
+                "definitions" => "definition",
+                "references" => "reference",
+                "symbols" => "symbol",
+                "files" => "file",
+                "screenshots" => "screenshot",
+                "servers" => "server",
+                "tests" => "test",
+                "pages" => "page",
+                "dependencies" => "dependency",
+                _ => return word,
+            }
+            .to_owned()
+        })
+        .collect()
+}
+
 /// Rank only the caller's eligible catalog; discovery cannot widen that boundary.
 pub(in crate::agent) fn discover(
     query: &str,
@@ -68,12 +92,7 @@ pub(in crate::agent) fn discover(
         let (name, description) = candidates.swap_remove(index);
         return vec![(name, description, true)];
     }
-    let words = |text: &str| -> HashSet<String> {
-        text.split(|c: char| !c.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .map(str::to_lowercase)
-            .collect()
-    };
+    let words = discovery_words;
     // Remove grammatical filler, not domain terms such as "read", "web" or "file".
     let stopwords = [
         "a",
@@ -459,7 +478,14 @@ impl Agent<'_> {
             return;
         };
         let reused = self.assistance.reused.clone();
-        let verified = !self.assistance.checks.is_empty();
+        let requirements = crate::agent::verify::requirements::snapshot(
+            &self.config.verification,
+            &self.step_checks.evidence,
+            self.step_checks.revision(),
+            &self.step_checks.visual,
+        );
+        let verified = !self.assistance.checks.is_empty()
+            && requirements["declared"] == requirements["observed"];
         let credit_store = store.clone();
         thread::scope(|scope| {
             let (tx, rx) = mpsc::sync_channel(1);
@@ -474,7 +500,7 @@ impl Agent<'_> {
         if !self.assistance.eligible
             || !self.assistance.mutated
             || self.assistance.steps.is_empty()
-            || self.assistance.checks.is_empty()
+            || !verified
         {
             return;
         }

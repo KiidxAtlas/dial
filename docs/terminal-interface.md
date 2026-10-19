@@ -22,23 +22,30 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   local first-event waits remain unlimited by default. Stopping takes precedence over old telemetry.
 - Searchable model/role, provider and settings panels. Settings save globally or per project outside
   the editable workspace, validate before writing, and apply display changes immediately.
-- **Action palette:** `Ctrl-P`, `Alt-K` or `/palette` searches built-ins, custom commands and enabled
-  skills without replacing your chat draft. Everyday actions have task-oriented labels such as
-  **Choose a model** and **Set up optional tools**; search accepts these labels or the original
-  command names. The selected action still shows its exact slash command and description.
-  `Tab` / `Shift-Tab` switch categories; `Enter` chooses an action, asking for required arguments
-  first. The footer offers argument editing only when the selected command accepts arguments.
-  During a turn, the panel explains whether the selected action runs immediately, waits or stops
-  the turn. Pasting never runs an action. Provider discovery waits until Models or Providers opens.
-  On short terminals, details yield space before the navigation/cancel footer does.
+- **Action palette:** `Ctrl-P`, `Alt-K` or `/palette` starts with a short list of goals: start or
+  continue work, review changes, manage ongoing work, configure Dial, or browse all actions.
+  Choose a goal to drill into relevant commands; return to the goal list before closing.
+  Type at any point to search every registered action, including advanced commands and enabled
+  skills, without replacing your chat draft. Command names and task-oriented labels both match.
+  The selected action shows its exact slash command, description and, while busy, whether it
+  runs now, waits or stops the turn. Required arguments are collected before execution.
+  Pasting never runs an action. Provider discovery waits until Models or Providers opens.
 - **Pickers and `/help`:** run bare, `/approval`, `/effort` (`/reasoning` and `/thinking` too), `/profile`,
   `/theme`, `/queue` and `/permissions remove` open a searchable list in the TUI with the current value
   marked; `Enter` applies it and `Esc` cancels. `/queue` rows edit on `Enter` and remove on `Delete`,
   `Backspace` or `x` (on an empty search). The argument forms still work in scripts and text output.
-  `/help` opens this palette on All; `/help text` prints the command list and `/help all` includes the
-  advanced sections. The footer lists only the keys the current mode uses, and `Esc` names what it does.
-- Dark, light, monochrome, Gruvbox, Nord and Paper themes; custom JSON themes, symbol presets,
-  rounded or line composer, styled headings/code/diffs, expandable tool results, and `NO_COLOR`.
+  `/help` opens the goal-first palette; `/help text` prints the command list and `/help all` includes
+  the advanced sections. The footer lists the keys the current mode uses; Esc clears before going back.
+- **Work plan:** the live summary shows the current step, blockers and the next step rather than
+  repeating the whole checklist. `/todo` opens a searchable inspector, ordered by current work,
+  blockers, upcoming steps and closed history. Select a step for its full recorded reason,
+  finding and evidence; Back returns to the plan. Browsing never changes task state.
+  `/todo list` retains plain-text output; `/todo show <number>` opens a recorded step directly.
+- A frameless default look (`dial-dark`/`dial`): shaded bands for your messages and the composer,
+  a shared icon gutter for answers and tool calls, and inset panels and menus with a filled
+  selection. Dark, light, monochrome, Gruvbox, Nord and Paper themes; custom JSON themes, symbol
+  presets, band, box or line composer, styled headings/code/diffs, expandable tool results, and
+  `NO_COLOR`.
 - Unicode-aware multiline editing, bracketed paste, persistent per-project prompt history and history
   search. Secret provider inputs are masked and never enter prompt history.
 - Pasted text stays in the draft. Buffered unbracketed paste preserves line breaks, and an immediate
@@ -54,16 +61,20 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   complete, `Esc` dismisses without losing the draft. `Enter` sends exactly what you typed, so a full command
   runs at once; accept a highlighted suggestion with `Tab`/`Right` first. File mentions (`@path`) are the
   exception: `Enter` completes the highlighted file. Built-ins win over a custom command with the same name.
-- While a turn runs, `Enter` steers the current turn: Dial cancels the pending model request or
-  discards its stale response before executing tools. A tool already running may finish; unstarted
-  actions in its batch are skipped, and completed results are retained. The latest instruction takes
-  precedence over conflicting older plans and task summaries. `Option+Enter` on macOS (`Alt+Enter` elsewhere) queues a follow-up for the
-  next turn. The queue is visible above the composer, showing up to three messages and a `+N more` line for the rest.
-  With an empty draft and queued messages, `Enter` stops the turn and sends the oldest queued message; the hint says so.
-  Hints advertise `steer` or `follow-up` only when the draft is not blank. `Up` brings back the last queued
-  message for editing (`/queue` edits any item); saving keeps its position and steering/follow-up routing, and
-  `Esc` cancels the edit with the original message restored unchanged. Interrupting preserves queued messages and the draft; the status line shows `stopping after <tool>` (or `stopping`) at once, and an interrupted turn does not send a "Turn finished" notification. Slash commands never become
-  model steering: `/hotkeys`, `/todo`, `/skills`, `/commands`, `/context`, `/search`, `/workers`, `/message`,
+- While a turn runs, submitting a non-command draft opens **a message-intent chooser**:
+  **Add direction now** or **Queue for after this turn**. Nothing is sent just by opening it.
+  Choose with the list navigation keys and confirm; Escape returns to the unchanged draft.
+  Adding direction cancels the pending model request or discards its stale response before
+  executing tools. A tool already running may finish; unstarted actions are skipped and completed
+  results retained. The latest instruction takes precedence over conflicting older plans.
+  `Option+Enter` on macOS (`Alt+Enter` elsewhere) still queues a follow-up directly.
+  The queue above the composer previews up to three messages and counts the rest.
+  Empty Enter with queued work opens a separate choice, defaulting to **Keep working**;
+  stopping to send the oldest message requires explicitly selecting that option and confirming.
+  `Up` edits the last queued message (`/queue` edits any item). Saving an edit preserves its queue
+  position and route; Esc restores the original. Interrupting preserves the draft and queue.
+  The status line reports stopping immediately; interrupted turns do not send a finished notification.
+  Slash commands never become model steering: `/hotkeys`, `/todo`, `/skills`, `/commands`, `/context`, `/search`, `/workers`, `/message`,
   `/cancel`, `/policy`, `/reliability`, and `/improve status|jobs|stop` run at once without stopping the turn.
   `/help` lists the exact "Stops the turn" and "Runs at once" sets, generated from the lists the dispatcher
   uses; `/clear` is in the stop set, and other commands wait for the turn to finish. `/model`, `/models`, and the model shortcut (`Ctrl+K` on macOS,
@@ -87,7 +98,10 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   Escape or `/model cancel` cancels that pending switch. Changes to the selected model, saved
   favorites, scope, or discovery request also cancel it rather than applying a stale choice.
 - `F8` edits a model's HTTP headers for the role being picked (`Roles`, then `Enter`, then `F8`). The editor title names the model and role, and saving assigns only that role. Outside a role pick, `F8` asks you to choose a role first, so browsing never reassigns main. Inside the editor, `F9` inherits the provider's headers (`Tab` only moves between fields, so it works on legacy terminals). Below 56 columns the groups column is hidden and cannot take focus.
-- **Get models** is the group after Favorites in `/models` (`/model local` and `/models local` open it directly). It finds and installs local models. Its MLX, GGUF and Embedding shelves switch with `Tab` or `Right`; `Left` and `Esc` return to the groups column. Each Hugging Face shelf lists the models already downloaded in that format (highlight one to see its speed, memory fit and waiting improvement; Enter makes it the main model), then search results: type a query and press Enter, or leave the query empty for a curated list. Enter on a result lists its files and downloads it in the background; GGUF asks which quantization first. The Embedding shelf lists every discovered embedding model (Enter assigns a served one to the `embedding` role), then the curated Ollama embedding models, and Enter on a curated one sets it up as `/setup embeddings:<model> yes` does. Esc cancels a running download first. Downloads keep running while you browse other groups; closing `/models` cancels them. See [model-downloads.md](model-downloads.md) and [model-embeddings.md](model-embeddings.md).
+- Model lists in `/models` filter and sort without leaving the list. `F2` cycles the **show** filter (any, available, loaded, local, cloud, tools, vision, reasoning, priced, used) on top of the kind tabs and search; `F3` cycles the **sort** (default ranking, name, cheapest, fastest, largest context, most used; unknown values sort last). A non-default filter or sort is shown next to the kind tabs, and `Esc` clears the search first, then resets filter and sort, then closes.
+- Each model row shows its context window, then on wide panes the median recorded speed (`t/s`) and the provider price as `$input/$output` per 1M tokens (`free` for zero-priced models). The detail lines add max output tokens, local or cloud, the roles using the model, and a numbers line: price per 1M tokens (input, output, cache read and write when the provider reports them), the speed median with its sample count and trend, average cost per priced request, request count, average latency, error rate and total recorded cost. Usage comes from the stats database (`dial stats`), read when `/models` opens and again on `F5`. Unknown values show as `-`; nothing is estimated. Requests are recorded under the backend's model id, so local checkpoints served by Dial's own engine share one label and show `-` per model.
+- **Memory** is the group after Favorites in `/models` (`/model memory` opens it directly). It lists the chat models that can serve the `memory` role, leads with the one assigned, and its header shows the active memory backend and what the `memory` role is set to. Enter assigns the highlighted model to `memory`; `Ctrl+G` opens Get models on its Memory shelf. Picking the `memory` role from Roles also lands here.
+- **Get models** is the group after Memory in `/models` (`/model local` and `/models local` open it directly). It finds and installs local models. Its MLX, GGUF, Memory and Embedding shelves switch with `Tab` or `Right`; `Left` and `Esc` return to the groups column. Each Hugging Face shelf lists the models already downloaded in that format (highlight one to see its speed, memory fit and waiting improvement; Enter makes it the main model), then search results: type a query and press Enter, or leave the query empty for a curated list. The Memory shelf lists every installed model whatever its format and a curated list of small 1-2B instruct models in this machine's default format; Enter on an installed one assigns it to the `memory` role, and a model downloaded there asks to be assigned to `memory` rather than main. Enter on a result lists its files and downloads it in the background; GGUF asks which quantization first. The Embedding shelf lists every discovered embedding model (Enter assigns a served one to the `embedding` role), then the curated Ollama embedding models, and Enter on a curated one sets it up as `/setup embeddings:<model> yes` does. Esc cancels a running download first. Downloads keep running while you browse other groups; closing `/models` cancels them. See [model-downloads.md](model-downloads.md) and [model-embeddings.md](model-embeddings.md).
   Opening `/models` loads no model, starts no Python or MLX process and makes no network call; the installed list is read when it opens. Search, listing and downloads run only after an explicit key press, in the background. Switching to the Embedding shelf reads Ollama's model list from localhost. The same installed data is printed by `dial models status` (`--json` for the machine-readable form, with identical field names). On short panels the details give way to rows, and the list always keeps at least one row.
   - **Speed** is output tokens per second of request wall time from the recorded stats, the same measure as
     `dial stats`. It uses the newest 40 successful requests with output and timing: a median, the median of the
@@ -211,6 +225,10 @@ source and restart requirements. The **Setup** category opens models, providers 
 
 While you search, the category tabs are not offered and `Tab` does nothing; `Esc` clears the search first.
 
+Choice lists also accept typing to filter their labels and stored values. `Esc` clears that filter
+before returning to settings; `Enter` confirms only a visible match. Clearing an override restores
+its inherited value, rather than resetting unrelated settings.
+
 `/model settings` (alias `/model-settings`; also `F7` in `/model`) tunes the **current main model**.
 Settings are grouped into sections, with a description and the accepted range for the selected row.
 `↑/↓` move, `←/→` cycle a choice or toggle and step a number (the first press starts from a sensible
@@ -259,7 +277,29 @@ pre-existing changes; new files are labelled `new` and binary diffs `binary`. It
 **Pinned workers** sit above the composer and show running and recently finished workers: a header with the active and done counts, up to three rows in collapsed mode, a live line with the latest output (when `ui.worker_live_preview` is on) and an elapsed clock after five seconds. `ui.pinned_workers` selects `collapsed` (default), `full` (more rows) or `off`. The block is hidden on terminals shorter than 16 rows. The `workers` status segment shows `running/total workers`, adding `· $cost` once a worker reports cost; the block, the segment and the hub read the same snapshot. When a worker finishes, needs input or fails while no subagent view is open, one short notice names it and points to `Alt+A`. `Alt+A` opens the subagent hub. `Alt+Shift+A` opens the transcript of the most recently active running worker; press it again to cycle through the running workers. With none running it cycles through all workers, and with none it opens the hub. Double-Left on an empty composer also opens the hub. Pinned rows are not clickable: mouse capture is enabled only while a full-screen panel is open. Rebind `app.subagents.recent` to change the transcript key.
 Toggle the block in `/settings` → Appearance → Display. Ctrl-P and the empty slash menu start with everyday
 actions; advanced controls remain searchable. `/workers`, `/processes` and `/compute` group work
-controls. Ctrl-O expands evidence, including earlier reads, searches, checks and worker reports.
+controls. The evidence-expansion shortcut (Ctrl+O by default; rebind it in `/hotkeys`) expands
+earlier reads, searches, checks and worker reports. Card hints show the current binding.
 Reasoning starts collapsed and per-turn statistics start hidden. Cache accounting and routine
 decision advice stay out of the transcript. Viewed images use compact inline previews when supported
 by the terminal; optional capabilities remain available through `/setup` without a startup dialog.
+
+## Small terminals and safe confirmation
+
+Home keeps the selected session or starter in view, even when there are only a few rows. Starters
+load into the draft for editing; they are not sent automatically. Approval policy and sandbox
+isolation have separate rows so the isolation setting does not disappear behind a long mode label.
+With automatic approval and no sandbox, the home explicitly warns that tools are not isolated.
+
+While Dial works, an empty composer explains that typing adds direction. Queued-message hints
+link to `/queue` and distinguish sending a new direction from stopping to send queued work.
+Search panels distinguish an empty collection from no matches and offer a way back. In sessions,
+`Esc` clears search before closing; actions on the selected journal still respect ownership and
+the existing delete-confirmation flow.
+
+Approval and recovery choices pause confirmation below 36 columns or 11 terminal rows. Resize
+to reveal the details and choices; cancellation remains available. `Enter` and approval hotkeys
+cannot authorize an option hidden by the resize message. Above that minimum, page keys scroll
+long details and navigation keeps the current choice visible. Question dialogs likewise window
+their current choice rather than truncating it out of view.
+
+See [the UX review](ux-review.md) for audit coverage, design decisions and remaining limitations.

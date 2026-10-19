@@ -365,3 +365,154 @@ fn memory_setup_can_load_and_open_before_role_assignment() {
     let runtime = MemoryRuntime::open_configured(&layout, &config, authority).unwrap();
     assert!(runtime.open_error().is_none(), "{:?}", runtime.open_error());
 }
+
+fn turn(role: &str, text: &str) -> Value {
+    json!({"role": role, "content": text})
+}
+
+#[test]
+fn identical_raw_prompt_requeries_only_when_its_effective_context_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let mut runner = FakeRunner::new("{}");
+    runtime
+        .command(
+            &auth,
+            "save the deploy vault token rotates monthly",
+            &mut runner,
+        )
+        .unwrap();
+    runtime
+        .observe_owned(
+            &auth,
+            vec![
+                turn("user", "earlier question"),
+                turn("assistant", "earlier answer"),
+            ],
+        )
+        .unwrap();
+    let first = runtime
+        .prepare_prompt(&auth, "continue", &mut runner)
+        .unwrap()
+        .unwrap();
+    assert!(first.commit(&auth));
+    // Same raw words against the same effective query: nothing new to find.
+    assert!(
+        runtime
+            .prepare_prompt(&auth, "continue", &mut runner)
+            .unwrap()
+            .is_none()
+    );
+    // Same raw words after the conversation moved on are a different question and are queried.
+    runtime
+        .observe_owned(
+            &auth,
+            vec![
+                turn("user", "earlier question"),
+                turn("assistant", "earlier answer"),
+                turn("user", "deploy vault?"),
+                turn("assistant", "it rotates monthly"),
+            ],
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .prepare_prompt(&auth, "continue", &mut runner)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn compaction_rebinds_the_history_generation_and_reattaches_compacted_away_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let mut runner = FakeRunner::new("{}");
+    runtime
+        .command(
+            &auth,
+            "save the deploy vault token rotates monthly",
+            &mut runner,
+        )
+        .unwrap();
+    let question = "how does the deploy vault work?";
+    let first = runtime
+        .prepare_prompt(&auth, question, &mut runner)
+        .unwrap()
+        .unwrap();
+    assert!(first.context.as_deref().unwrap().contains("vault token"));
+    assert!(first.commit(&auth));
+    // While the fact is still in visible context, the identical question attaches nothing again.
+    assert!(
+        runtime
+            .prepare_prompt(&auth, question, &mut runner)
+            .unwrap()
+            .is_none()
+    );
+    // Compaction advances the provider history generation, which memory_authority embeds in the
+    // branch id. Rebinding to that branch resets the shown set, so the fact is attached again.
+    let compacted = MemoryAuthority {
+        branch_id: format!("{}:history:1", auth.session_id),
+        ..auth.clone()
+    };
+    runtime.bind(compacted.clone());
+    let again = runtime
+        .prepare_prompt(&compacted, question, &mut runner)
+        .unwrap()
+        .unwrap();
+    assert!(again.context.as_deref().unwrap().contains("vault token"));
+    assert!(again.commit(&compacted));
+    // The pre-compaction authority is stale and cannot publish or query into the new generation.
+    assert!(
+        runtime
+            .prepare_prompt(&auth, question, &mut runner)
+            .is_err()
+    );
+}
+
+#[test]
+fn rewind_rebinds_the_history_generation_and_reattaches_removed_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, auth) = semantic_runtime(dir.path(), true);
+    let mut runner = FakeRunner::new("{}");
+    runtime
+        .command(
+            &auth,
+            "save the deploy vault token rotates monthly",
+            &mut runner,
+        )
+        .unwrap();
+    let question = "how does the deploy vault work?";
+    let first = runtime
+        .prepare_prompt(&auth, question, &mut runner)
+        .unwrap()
+        .unwrap();
+    assert!(first.context.as_deref().unwrap().contains("vault token"));
+    assert!(first.commit(&auth));
+    // While the fact is still in visible context, the identical question attaches nothing again.
+    assert!(
+        runtime
+            .prepare_prompt(&auth, question, &mut runner)
+            .unwrap()
+            .is_none()
+    );
+    // A real rewind mints history generation 2 (see `session.rewind`); the removed turn no longer
+    // shows its fact, so rebinding to the new branch must attach it again.
+    let rewound = MemoryAuthority {
+        branch_id: format!("{}:history:2", auth.session_id),
+        ..auth.clone()
+    };
+    runtime.bind(rewound.clone());
+    let again = runtime
+        .prepare_prompt(&rewound, question, &mut runner)
+        .unwrap()
+        .unwrap();
+    assert!(again.context.as_deref().unwrap().contains("vault token"));
+    assert!(again.commit(&rewound));
+    // The pre-rewind authority is stale and cannot publish or query into the rewound generation.
+    assert!(
+        runtime
+            .prepare_prompt(&auth, question, &mut runner)
+            .is_err()
+    );
+}

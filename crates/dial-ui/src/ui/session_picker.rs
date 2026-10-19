@@ -42,6 +42,16 @@ enum Unit {
     Item(usize),
 }
 
+/// What a picker key asks of the selected session; [`Picker::blocked`] decides whether it may run.
+#[derive(Clone, Copy)]
+enum Need {
+    Pin,
+    Fork,
+    Rename,
+    Delete,
+    Resume,
+}
+
 pub struct Picker {
     pub sessions: Vec<SessionInfo>,
     /// Fork depth of each session (tree mode), aligned with `sessions`.
@@ -221,6 +231,48 @@ impl Picker {
             .min(self.found.len().saturating_sub(1));
     }
 
+    /// The selected session when `need` may run on it; otherwise the notice says why it cannot.
+    fn gated(&mut self, selected: Option<usize>, need: Need) -> Option<usize> {
+        let Some(index) = selected else {
+            self.notice = Some("Nothing selected to act on.".into());
+            return None;
+        };
+        match self.blocked(index, need) {
+            Some(reason) => {
+                self.notice = Some(reason);
+                None
+            }
+            None => Some(index),
+        }
+    }
+
+    /// Why `need` cannot run on the session at `index`; `None` when it can. Sessions another dial
+    /// process holds open are never resumed, renamed or deleted from here.
+    fn blocked(&self, index: usize, need: Need) -> Option<String> {
+        let s = &self.sessions[index];
+        let open = self.open_elsewhere.contains(&s.id);
+        let name = label(s);
+        match need {
+            Need::Pin | Need::Fork => None,
+            Need::Delete if s.id == self.current => {
+                Some("Use /delete to delete the current session.".into())
+            }
+            Need::Resume if open => Some(format!(
+                "{name} is open in another dial process, so it cannot be resumed here."
+            )),
+            Need::Rename | Need::Delete if open => Some(format!(
+                "{name} is open in another dial process; close it there first."
+            )),
+            _ => None,
+        }
+    }
+
+    /// Re-filters after a query edit, keeping the highlighted session when it still matches.
+    fn refilter_keeping_selection(&mut self) {
+        let keep = self.selected_id().map(str::to_owned);
+        self.refilter(keep.as_deref());
+    }
+
     /// Moves the highlight to the listed session with `id`, if it is still listed.
     pub fn select_id(&mut self, id: &str) {
         if let Some(position) = self.found.iter().position(|&i| self.sessions[i].id == id) {
@@ -267,28 +319,28 @@ impl Picker {
                             return Action::Cancel;
                         }
                         self.query.clear();
-                        self.refilter(None);
+                        self.refilter_keeping_selection();
                     }
                     KeyCode::Char('c') if ctrl => return Action::Cancel,
                     KeyCode::Char('p') if ctrl => {
-                        if let Some(index) = selected {
+                        if let Some(index) = self.gated(selected, Need::Pin) {
                             return Action::Pin(index);
                         }
                     }
                     KeyCode::Char('r') if ctrl => {
-                        if let Some(index) = selected {
+                        if let Some(index) = self.gated(selected, Need::Rename) {
                             let session = &self.sessions[index];
                             self.rename =
                                 Some((session.id.clone(), text::one_line(&session.title)));
                         }
                     }
                     KeyCode::Char('f') if ctrl => {
-                        if let Some(index) = selected {
+                        if let Some(index) = self.gated(selected, Need::Fork) {
                             return Action::Fork(index);
                         }
                     }
                     KeyCode::Char('d') if ctrl => {
-                        if let Some(index) = selected {
+                        if let Some(index) = self.gated(selected, Need::Delete) {
                             return Action::Delete(index);
                         }
                     }
@@ -315,17 +367,17 @@ impl Picker {
                     KeyCode::Home => self.selected = 0,
                     KeyCode::End => self.selected = self.found.len().saturating_sub(1),
                     KeyCode::Enter => {
-                        if let Some(index) = selected {
+                        if let Some(index) = self.gated(selected, Need::Resume) {
                             return Action::Resume(index);
                         }
                     }
                     KeyCode::Char('u') if ctrl => {
                         self.query.clear();
-                        self.refilter(None);
+                        self.refilter_keeping_selection();
                     }
                     KeyCode::Backspace => {
                         self.query.pop();
-                        self.refilter(None);
+                        self.refilter_keeping_selection();
                     }
                     KeyCode::Char(c)
                         if !key
@@ -333,7 +385,7 @@ impl Picker {
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                     {
                         self.query.push(c);
-                        self.refilter(None);
+                        self.refilter_keeping_selection();
                     }
                     _ => {}
                 }
@@ -343,7 +395,7 @@ impl Picker {
                     draft.push_str(&text::one_line(value));
                 } else {
                     self.query.push_str(&text::one_line(value));
-                    self.refilter(None);
+                    self.refilter_keeping_selection();
                 }
             }
             _ => {}
@@ -386,11 +438,26 @@ impl Picker {
     }
 
     fn page_size(&self, height: usize) -> usize {
-        if height < 18 {
-            height.saturating_sub(7).max(1)
+        let compact = height < 18;
+        let has_selection = self.found.get(self.selected).is_some();
+        let availability = self.found.get(self.selected).is_some_and(|&index| {
+            let session = &self.sessions[index];
+            self.open_elsewhere.contains(&session.id) || session.id == self.current
+        });
+        let search = usize::from(!(height == 5 && self.notice.is_some()));
+        let context = usize::from(height >= 7) + usize::from(self.found.is_empty());
+        let details = if !compact && has_selection {
+            4 + usize::from(availability)
         } else {
-            height.saturating_sub(14).checked_div(2).unwrap_or(1).max(1)
-        }
+            0
+        };
+        let footer = if compact || self.rename.is_some() {
+            1
+        } else {
+            2
+        };
+        let fixed = 2 + search + context + details + footer + usize::from(self.notice.is_some());
+        (height.saturating_sub(fixed) / if compact { 1 } else { 2 }).max(1)
     }
 
     /// The list in display order: date headers (outside tree and search views) and sessions.
@@ -417,6 +484,9 @@ impl Picker {
     }
 
     pub fn rows(&self, cols: usize, height: usize, theme: &Theme) -> Rows {
+        if height == 0 || cols == 0 {
+            return Vec::new();
+        }
         if height < 5 || cols < 12 {
             return vec![Line::from(Span::styled(
                 text::ellipsize(
@@ -442,11 +512,28 @@ impl Picker {
         let mut body = vec![Line::from(vec![
             Span::styled(prompt, theme.fg(Tok::Accent)),
             Span::styled(
-                text::ellipsize(draft, width.saturating_sub(9), theme.ascii()),
-                theme.fg(Tok::Text),
+                text::ellipsize(
+                    if draft.is_empty() && self.rename.is_none() {
+                        "type to filter titles and messages"
+                    } else {
+                        draft
+                    },
+                    width.saturating_sub(9),
+                    theme.ascii(),
+                ),
+                theme.fg(if draft.is_empty() && self.rename.is_none() {
+                    Tok::Dim
+                } else {
+                    Tok::Text
+                }),
             ),
             Span::styled(theme.sym(Sym::BoxV).to_owned(), theme.fg(Tok::Accent)),
         ])];
+        // At five rows, a refusal takes priority over search: keep the selected journal,
+        // its explanation, the exit hint and both frame edges visible.
+        if height == 5 && self.notice.is_some() {
+            body.clear();
+        }
         let empty = self
             .sessions
             .iter()
@@ -478,6 +565,8 @@ impl Picker {
                 "No matches. Ctrl+U clears search; Tab includes empty sessions.".into()
             } else if empty > 0 && !self.show_empty {
                 "No conversations yet. Tab shows empty sessions.".into()
+            } else if !self.all_projects {
+                "No sessions in this project yet. Ctrl+G lists every project.".into()
             } else {
                 "No sessions yet.".into()
             };
@@ -527,6 +616,22 @@ impl Picker {
                 ),
                 Tok::Muted,
             ));
+            let state = if self.open_elsewhere.contains(&s.id) {
+                Some((
+                    "Open in another dial process: resume, rename and delete are unavailable here",
+                    Tok::Warning,
+                ))
+            } else if s.id == self.current {
+                Some((
+                    "Current session: Ctrl+D is unavailable; use /delete",
+                    Tok::Muted,
+                ))
+            } else {
+                None
+            };
+            if let Some((note, tok)) = state {
+                body.push(line(note.into(), tok));
+            }
             body.push(line(
                 format!(
                     "You  {}",
@@ -563,6 +668,15 @@ impl Picker {
                 "Enter saves the title · Esc cancels rename".into(),
                 Tok::Muted,
             ));
+        } else if self.found.is_empty() {
+            let hint = if loaded < self.total {
+                "Esc back · Ctrl+A load all"
+            } else if self.query.is_empty() {
+                "Esc close · Ctrl+G projects"
+            } else {
+                "Esc clear search · Ctrl+G projects"
+            };
+            body.push(line(hint.into(), Tok::Muted));
         } else if compact {
             body.push(line(
                 format!(

@@ -156,6 +156,78 @@ fn file_ops_track_reads_writes_edits_and_skip_urls() {
 }
 
 #[test]
+fn file_ops_observe_read_paths_arrays_with_selectors() {
+    let mut ops = FileOps::default();
+    ops.observe(&assistant_call(
+        "1",
+        "read",
+        json!({"paths":["src/a.rs:1-80","src/b.rs:12+5","src/c.rs:3,9","src/d.rs","artifact://xyz:1-2"]}),
+    ));
+    assert_eq!(
+        ops.read.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"],
+    );
+    assert!(ops.modified.is_empty());
+}
+
+#[test]
+fn file_ops_record_ast_edit_only_when_applied() {
+    let mut ops = FileOps::default();
+    ops.observe(&assistant_call(
+        "1",
+        "ast_edit",
+        json!({"pattern":"old($A)","rewrite":"new($A)","path":"src"}),
+    ));
+    assert!(
+        ops.modified.is_empty(),
+        "a dry run defaults to preview and modifies nothing"
+    );
+    ops.observe(&assistant_call(
+        "2",
+        "ast_edit",
+        json!({"pattern":"old($A)","rewrite":"new($A)","path":"src/lib.rs","dry_run":true}),
+    ));
+    assert!(ops.modified.is_empty());
+    ops.observe(&assistant_call(
+        "3",
+        "ast_edit",
+        json!({"pattern":"old($A)","rewrite":"new($A)","path":"src/lib.rs","dry_run":false}),
+    ));
+    assert_eq!(
+        ops.modified.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["src/lib.rs"]
+    );
+}
+
+#[test]
+fn file_ops_record_rename_file_moves_but_not_previews_or_server_edits() {
+    let mut ops = FileOps::default();
+    ops.observe(&assistant_call(
+        "1",
+        "lsp",
+        json!({"action":"rename_file","path":"src/old.rs","new_name":"src/new.rs","apply":false}),
+    ));
+    assert!(ops.modified.is_empty());
+    assert!(ops.read.contains("src/old.rs"));
+    ops.observe(&assistant_call(
+        "2",
+        "lsp",
+        json!({"action":"rename_file","path":"src/old.rs","new_name":"src/new.rs"}),
+    ));
+    assert!(ops.modified.contains("src/old.rs") && ops.modified.contains("src/new.rs"));
+    ops.observe(&assistant_call(
+        "3",
+        "lsp",
+        json!({"action":"rename","path":"src/lib.rs","line":1,"column":1,"new_name":"other"}),
+    ));
+    assert!(
+        !ops.modified.contains("src/lib.rs"),
+        "rename edits touch files the arguments do not name"
+    );
+    assert!(ops.read.contains("src/lib.rs"));
+}
+
+#[test]
 fn split_turn_is_detected_only_when_the_cut_lands_inside_a_turn() {
     let messages = vec![
         user("first"),

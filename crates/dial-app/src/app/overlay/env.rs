@@ -359,6 +359,9 @@ impl OverlayEnv<'_> {
             models.set_memory_optional(
                 crate::config::memory_backend::auto_retain_uses_memory_role(&config.memory),
             );
+            models.set_memory_backend(
+                crate::config::memory_backend::active_backend(&config.memory).as_str(),
+            );
             models.set_favorites(favorite_routes(config));
         }
     }

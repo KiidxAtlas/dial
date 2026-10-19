@@ -55,6 +55,10 @@ impl<'a> Agent<'a> {
         );
         self.live_tasks.bind(self.session.runtime());
         let turn_clock = Instant::now();
+        // A failure before finalization must not expose the previous turn's evidence as current.
+        let mut control = self.session.control_state();
+        control["completion_evidence"] = Value::Null;
+        self.session.set_control_state(control)?;
         let result = self.turn_inner(user_text, &mut observed, reset_interrupt, prepared);
         if let Err(error) = self.flush_local_evidence() {
             observed.diagnostic(&format!("Local model evidence not saved: {error:#}"));
@@ -134,7 +138,7 @@ impl<'a> Agent<'a> {
             u64::from(steps),
             turn_clock.elapsed(),
         );
-        let summary = json!({"outcome":outcome,"steps":steps,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":state["reliability"]["verification_results"],"checks_current":self.step_checks.checks_current(),"review":"/review-file","undo":"/undo"});
+        let summary = json!({"outcome":outcome,"steps":steps,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":state["reliability"]["verification_results"],"checks_current":self.step_checks.checks_current(),"evidence":state["completion_evidence"],"review":"/review-file","undo":"/undo"});
         observed.completion(&summary);
         observed.finish(!result.as_ref().is_ok_and(|turn| !turn.interrupted));
         let result = match (result, self.session.flush_runtime()) {
@@ -316,6 +320,15 @@ impl<'a> Agent<'a> {
             },
             ..StepChecks::default()
         };
+        if self
+            .config
+            .verification
+            .requirements
+            .values()
+            .any(|requirement| requirement.visual)
+        {
+            self.step_checks.visual.require_rendered();
+        }
         if !self.hermetic
             && message.get("dial_images").is_some()
             && self
@@ -323,7 +336,7 @@ impl<'a> Agent<'a> {
                 .as_ref()
                 .is_some_and(Backend::accepts_image_input)
         {
-            self.step_checks.visual.captured((0, 0), false);
+            self.step_checks.visual.captured([0, 0, 0], false);
         }
         for reference in message["dial_images"].as_array().into_iter().flatten() {
             ui.image(reference);
@@ -406,6 +419,27 @@ impl<'a> Agent<'a> {
         if !self.hermetic && crate::agent::verify::visual::useful(user_text) {
             context.push_str("\n\n");
             context.push_str(crate::agent::verify::visual::INITIAL_GUIDANCE);
+        }
+        if !self.config.verification.requirements.is_empty() {
+            context.push_str("\n\nDeclared verification requirements (evidence mapping, not permission or proof of full task coverage):\n");
+            let commands: Vec<_> = self
+                .config
+                .verification
+                .commands
+                .iter()
+                .filter(|command| {
+                    self.config
+                        .verification
+                        .requirements
+                        .values()
+                        .any(|requirement| requirement.checks.contains(&command.name))
+                })
+                .collect();
+            context.push_str(&serde_json::to_string(&json!({
+                "requirements": self.config.verification.requirements,
+                "configured_commands": commands,
+            }))?);
+            context.push_str("\nRun the named configured checks against the final result; required visuals need delivered browser pixels. Missing, stale, failed or unavailable evidence remains uncovered. Do not weaken checks or edit code to hide environment failures.");
         }
         if let Some(memory) = &self.memory {
             // The lookup is a search query, not the prompt: a pasted file or log must not fail the turn.
@@ -509,6 +543,28 @@ impl<'a> Agent<'a> {
         }
         message["dial_context_request"] = json!(true);
         self.session.append(message)?;
+        let recovery = self.session.take_recovery_diagnostics();
+        if !recovery.is_empty() {
+            let count = recovery.len();
+            // Journal identifiers/details are untrusted source data. Give the model only a
+            // bounded controller-generated classification, never damaged bytes as instructions.
+            let sample: Vec<_> = recovery
+                .iter()
+                .take(16)
+                .map(|issue| json!({"kind":issue.kind,"line":issue.line}))
+                .collect();
+            let sample = Value::Array(sample);
+            let notice = format!(
+                "Session recovery: {count} journal issue(s) were detected. Source bytes were preserved; resumed history may be incomplete. Inspect history before relying on missing context."
+            );
+            ui.notice(&notice);
+            self.record(
+                0,
+                "session_recovery",
+                json!({"count":count,"sample":sample}),
+            )?;
+            self.push(json!({"role":"user","content":format!("{notice}\nRecovery classifications (at most 16): {sample}"),"dial_session_recovery":true}))?;
+        }
         // A plan approved between turns (e.g. /plan-review) must reach this turn's first request.
         if let Some(plan) = self.pending_plan.take() {
             self.push(json!({"role":"user","content":format!("Approved plan:\n{plan}\nProceed with implementation.")}))?;
@@ -581,6 +637,7 @@ impl<'a> Agent<'a> {
                     "Recording the configured behavioral baseline before edits.",
                 ));
                 let failures = self.run_checks(&baseline, ui).failures;
+                self.step_checks.evidence.capture_baseline();
                 let baseline_context = if failures.is_empty() {
                     "Configured behavioral baseline passed before editing. Preserve these behaviors and rerun relevant checks after the change.".to_owned()
                 } else {
@@ -873,6 +930,25 @@ impl<'a> Agent<'a> {
         {
             self.publish_no_automatic_check(ui);
         }
+        let completion_evidence = result
+            .as_ref()
+            .ok()
+            .map(|report| self.completion_evidence(report.outcome));
+        if let Some(evidence) = &completion_evidence {
+            let remaining = evidence["outstanding_tasks"].as_array().map_or(0, Vec::len);
+            if remaining > 0 {
+                let notice = format!(
+                    "{remaining} progress item(s) remain open; this report does not establish their completion."
+                );
+                ui.notice(&notice);
+                if let Ok(report) = &mut result
+                    && report.outcome == TurnOutcome::Completed
+                {
+                    report.text.push_str(&format!("\n\n{notice}"));
+                }
+            }
+            self.record(0, "completion_evidence", evidence.clone())?;
+        }
         self.ext.fire_lifecycle(&LifecycleEvent {
             event: "turn_finished".into(),
             session_id: Some(self.session.id().to_owned()),
@@ -887,6 +963,7 @@ impl<'a> Agent<'a> {
         if let Ok(report) = &result {
             let mut state = self.session.control_state();
             state["turn_outcome"] = json!(report.outcome);
+            state["completion_evidence"] = completion_evidence.clone().unwrap_or(Value::Null);
             self.session.set_control_state(state)?;
         }
         if let Some(plan) = self.pending_plan.take() {
@@ -924,6 +1001,7 @@ impl<'a> Agent<'a> {
             "outcome":result.as_ref().map(|r| r.outcome).ok(),
             "duration_ms":self.workflow_started.elapsed().as_millis(),
             "usage":usage,
+            "completion_evidence":completion_evidence,
             "projection_bytes":self.efficiency_metrics,
             "note":"Usage is provider-reported and may be partial; cache semantics vary by protocol. Projection bytes are not billed tokens. Completion is not independent correctness proof."
         });
@@ -939,16 +1017,26 @@ impl<'a> Agent<'a> {
                         if report.outcome == TurnOutcome::Completed
                             && self.domain_override.is_none()
                             && !self.hermetic
-                            && !self.behavioral_checks.is_empty()
-                            && self.behavioral_checks.iter().all(|passed| *passed)
+                            && self
+                                .step_checks
+                                .evidence
+                                .passing_behavioral(self.step_checks.revision())
+                                > 0
                             && self.step_checks.clean()
+                            && completion_evidence.as_ref().is_some_and(|e| {
+                                e["outstanding_tasks"].as_array().is_some_and(Vec::is_empty)
+                                    && e["visual_evidence"] != "missing"
+                                    && e["requirements"]["coverage"] != "requirements_uncovered"
+                            })
                             && let Err(error) = store.outcome(&crate::config::types::Outcome {
                                 trajectory: id,
                                 score: 100.0,
                                 source: "checks:behavioral".into(),
                                 reference: Some(format!(
                                     "{} behavioral check(s) passed after the last edit",
-                                    self.behavioral_checks.len()
+                                    self.step_checks
+                                        .evidence
+                                        .passing_behavioral(self.step_checks.revision())
                                 )),
                             })
                         {

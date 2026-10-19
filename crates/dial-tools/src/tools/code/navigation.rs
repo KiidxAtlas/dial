@@ -42,12 +42,12 @@ impl Tool for Find {
     fn schema(&self) -> Value {
         tool_schema(
             "find",
-            "Find implementation evidence from a behavior description. Behavior mode defaults to real configured-model semantic reranking of bounded lexical/syntax candidates, including declarations with no matching query terms; source evidence stays grounded to indexed paths and spans. Set ranking=lexical for deterministic local retrieval. No embeddings or semantic-probability claims. Exact mode matches literal text case-sensitively (including multiline) deterministically. Optional lsp_path requests actual language-server metadata.",
+            "Find implementation evidence from a behavior description. Behavior mode defaults to deterministic local retrieval over lexical/syntax candidates. Set ranking=semantic to have the configured model rerank bounded candidates (one extra model request), which can surface declarations with no matching query terms; evidence stays grounded to indexed paths and spans. Exact mode matches literal text case-sensitively (including multiline) deterministically. Optional lsp_path requests actual language-server metadata.",
             json!({
                 "query": {"type":"string", "description":"Behavior description, quoted mandatory phrases, or exact text"},
                 "path": {"type":"string", "description":"File/directory scope, default workspace"},
                 "mode": {"type":"string", "enum":["behavior", "exact"]},
-                "ranking": {"type":"string", "enum":["semantic", "lexical"], "description":"Behavior mode defaults to configured-model semantic reranking; lexical explicitly selects deterministic local retrieval. Exact mode is always deterministic."},
+                "ranking": {"type":"string", "enum":["lexical", "semantic"], "description":"Behavior mode defaults to lexical; semantic adds one configured-model reranking request. Exact mode is always deterministic."},
                 "grep_keywords": {"type":"array", "items":{"type":"string"}, "description":"Optional known literal terms to boost in behavior mode"},
                 "lsp_path": {"type":"string", "description":"Optional source file selecting a real language server for supplementary workspace-symbol metadata; startup needs approval"},
                 "lsp_query": {"type":"string", "description":"Optional exact symbol query for language-server metadata, defaults to query"},
@@ -66,7 +66,7 @@ impl Tool for Find {
         match semantic::enabled(args) {
             Ok(true) => {
                 return ToolOutput::err(
-                    "semantic find requires the agent's configured-model reranking integration; use ranking=lexical only when deterministic lexical retrieval is intended",
+                    "semantic find requires the agent's configured-model reranking integration; omit ranking (lexical) for deterministic local retrieval",
                 );
             }
             Ok(false) => {}

@@ -43,6 +43,8 @@ pub enum Step {
     Handled,
     /// Make the installed model at this path the main model.
     UseModel(String),
+    /// Assign the installed model at this path to the memory role (the Memory shelf).
+    UseMemory(String),
     /// Set up this curated embedding model, as `/setup embeddings:<model> yes` does.
     SetupEmbedding(String),
     /// Assign this discovered, served embedding model to the embedding role.
@@ -58,11 +60,15 @@ struct Source {
     python: PathBuf,
 }
 
-/// The shelves of the group: one Hugging Face weight format, a Hugging Face browse shelf for
-/// embedding models, or the curated embedding models.
+/// The shelves of the group: one Hugging Face weight format, small models for the memory role, a
+/// Hugging Face browse shelf for embedding models, or the curated embedding models.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shelf {
     Hub(Family),
+    /// Small instruction models for the memory role in this machine's weight format: curated
+    /// suggestions (a query searches Hugging Face) and every installed local model. Enter on an
+    /// installed model assigns it to the memory role instead of the main one.
+    Memory,
     /// Browse Hugging Face for embedding models (pipeline tag `feature-extraction`); downloads are
     /// GGUF embedders, which Dial then serves through `llama-server` and assigns to the embedding
     /// role. Reuses the Hub download flow but searches embeddings instead of weight formats.
@@ -70,9 +76,10 @@ enum Shelf {
     Embedding,
 }
 
-const SHELVES: [Shelf; 4] = [
+const SHELVES: [Shelf; 5] = [
     Shelf::Hub(Family::Mlx),
     Shelf::Hub(Family::Gguf),
+    Shelf::Memory,
     Shelf::EmbeddingHub,
     Shelf::Embedding,
 ];
@@ -81,32 +88,26 @@ impl Shelf {
     fn label(self) -> &'static str {
         match self {
             Shelf::Hub(family) => family.label(),
+            Shelf::Memory => "Memory",
             Shelf::EmbeddingHub => "Embeddings",
             Shelf::Embedding => "Curated",
         }
     }
 
     fn next(self) -> Self {
-        match self {
-            Shelf::Hub(Family::Mlx) => Shelf::Hub(Family::Gguf),
-            Shelf::Hub(Family::Gguf) => Shelf::EmbeddingHub,
-            Shelf::EmbeddingHub => Shelf::Embedding,
-            Shelf::Embedding => Shelf::Hub(Family::Mlx),
-        }
+        let at = SHELVES.iter().position(|s| *s == self).unwrap_or(0);
+        SHELVES[(at + 1) % SHELVES.len()]
     }
 
     fn prev(self) -> Self {
-        match self {
-            Shelf::Hub(Family::Mlx) => Shelf::Embedding,
-            Shelf::Hub(Family::Gguf) => Shelf::Hub(Family::Mlx),
-            Shelf::EmbeddingHub => Shelf::Hub(Family::Gguf),
-            Shelf::Embedding => Shelf::EmbeddingHub,
-        }
+        let at = SHELVES.iter().position(|s| *s == self).unwrap_or(0);
+        SHELVES[(at + SHELVES.len() - 1) % SHELVES.len()]
     }
 
     fn family(self) -> Option<Family> {
         match self {
             Shelf::Hub(family) => Some(family),
+            Shelf::Memory => Some(download::default_family()),
             Shelf::EmbeddingHub => Some(Family::Gguf),
             Shelf::Embedding => None,
         }
@@ -299,6 +300,13 @@ impl ModelDownloads {
         std::mem::take(&mut self.rescan)
     }
 
+    /// Opens the Memory shelf: small local models for the memory role.
+    pub fn show_memory(&mut self) {
+        if self.shelf != Shelf::Memory {
+            self.switch_shelf(Shelf::Memory);
+        }
+    }
+
     /// Re-reads the installed models (and Ollama's list on the Embedding shelf). Explicit refresh only.
     pub fn reload(&mut self) {
         self.browse_attempted = false;
@@ -318,7 +326,13 @@ impl ModelDownloads {
         if self.source.is_none() || self.picker.is_some() || self.task.is_some() {
             return;
         }
-        if self.query.trim().is_empty() && !self.browse_attempted && self.shelf.family().is_some() {
+        // The Memory shelf keeps its curated small models until the user searches: a popular-models
+        // browse would replace them with large general models.
+        if self.query.trim().is_empty()
+            && !self.browse_attempted
+            && self.shelf.family().is_some()
+            && self.shelf != Shelf::Memory
+        {
             self.start_search();
         }
         if self.search.is_some() || self.metadata.is_some() || self.focus != Focus::Results {
@@ -413,11 +427,12 @@ impl ModelDownloads {
         }
         let enter = if self.focus == Focus::Query {
             match self.shelf {
-                Shelf::Hub(_) | Shelf::EmbeddingHub => "search",
+                Shelf::Hub(_) | Shelf::Memory | Shelf::EmbeddingHub => "search",
                 Shelf::Embedding => "list",
             }
         } else {
             match self.current() {
+                Some(Pick::Installed(_)) if self.shelf == Shelf::Memory => "use for memory",
                 Some(Pick::Installed(_)) => "use as main",
                 Some(Pick::Hit(_)) => "list files",
                 Some(Pick::Embedding(_)) => "set up",
@@ -526,6 +541,10 @@ impl ModelDownloads {
                     " Enter searches Hugging Face; an empty query browses suggested models."
                         .to_owned()
                 }
+                Shelf::Memory => {
+                    " Enter searches Hugging Face; an empty query shows small models suited to memory extraction."
+                        .to_owned()
+                }
                 Shelf::EmbeddingHub => {
                     " Enter searches Hugging Face for embedding models; an empty query browses popular embedders."
                         .to_owned()
@@ -627,11 +646,15 @@ impl ModelDownloads {
         let Some(family) = self.shelf.family() else {
             return Vec::new();
         };
+        // Any installed chat model can serve the memory role, whatever its weight format.
+        let any_format = self.shelf == Shelf::Memory;
         self.dashboard
             .models
             .iter()
             .enumerate()
-            .filter(|(_, row)| row.format == Some(family.label()) && self.query_matches(&row.label))
+            .filter(|(_, row)| {
+                (any_format || row.format == Some(family.label())) && self.query_matches(&row.label)
+            })
             .map(|(index, _)| index)
             .collect()
     }
@@ -716,7 +739,7 @@ impl ModelDownloads {
     /// Every selectable row, in display order: available downloads, then installed models.
     fn picks(&self) -> Vec<Pick> {
         match self.shelf {
-            Shelf::Hub(_) | Shelf::EmbeddingHub => self
+            Shelf::Hub(_) | Shelf::Memory | Shelf::EmbeddingHub => self
                 .available_hits()
                 .into_iter()
                 .map(Pick::Hit)
@@ -761,7 +784,7 @@ impl ModelDownloads {
     fn confirm(&mut self) -> Step {
         if self.focus == Focus::Query {
             match self.shelf {
-                Shelf::Hub(_) => {
+                Shelf::Hub(_) | Shelf::Memory => {
                     self.run_search();
                     if self.query.trim().is_empty() {
                         self.focus = Focus::Results;
@@ -779,6 +802,7 @@ impl ModelDownloads {
         }
         match self.current() {
             Some(Pick::Installed(index)) => match self.dashboard.models.get(index) {
+                Some(row) if self.shelf == Shelf::Memory => Step::UseMemory(row.path.clone()),
                 Some(row) => Step::UseModel(row.path.clone()),
                 None => Step::Handled,
             },
@@ -865,11 +889,11 @@ impl ModelDownloads {
         self.cursor = 0;
         self.status.clear();
         match shelf {
-            Shelf::Hub(_) if self.query.trim().is_empty() => {
+            Shelf::Hub(_) | Shelf::Memory if self.query.trim().is_empty() => {
                 self.show_curated();
                 self.focus = Focus::Results;
             }
-            Shelf::Hub(_) => self.run_search(),
+            Shelf::Hub(_) | Shelf::Memory => self.run_search(),
             Shelf::EmbeddingHub if self.query.trim().is_empty() => {
                 // Browse popular embedders; keep the query so switching back re-searches.
                 self.curated = false;
@@ -893,7 +917,11 @@ impl ModelDownloads {
 
     fn show_curated(&mut self) {
         if let Some(family) = self.shelf.family() {
-            self.hits = download::recommended(family);
+            self.hits = if self.shelf == Shelf::Memory {
+                download::recommended_memory(family)
+            } else {
+                download::recommended(family)
+            };
         }
         self.curated = true;
         self.cursor = 0;
@@ -908,7 +936,7 @@ impl ModelDownloads {
     fn run_search(&mut self) {
         if self.query.trim().is_empty() {
             self.show_curated();
-            if self.source.is_none() {
+            if self.source.is_none() || self.shelf == Shelf::Memory {
                 return;
             }
         } else {
@@ -1241,7 +1269,10 @@ impl ModelDownloads {
                 local_models::collect(&source.layout, &source.settings, crate::stats::now_ms());
         }
         self.rescan = true;
-        self.shelf = Shelf::Hub(family);
+        let memory = self.shelf == Shelf::Memory;
+        if !memory {
+            self.shelf = Shelf::Hub(family);
+        }
         self.picker = None;
         self.focus = Focus::Results;
         self.cursor = self
@@ -1256,7 +1287,11 @@ impl ModelDownloads {
                 _ => false,
             })
             .unwrap_or(0);
-        self.message = format!("Downloaded {repo}. Enter makes it the main model.");
+        self.message = if memory {
+            format!("Downloaded {repo}. Enter assigns it to the memory role.")
+        } else {
+            format!("Downloaded {repo}. Enter makes it the main model.")
+        };
     }
 
     // ---- drawing --------------------------------------------------------------------------
@@ -1303,6 +1338,16 @@ impl ModelDownloads {
 
     fn facts_line(&self, width: usize, theme: &Theme) -> Line<'static> {
         let facts = match self.shelf {
+            Shelf::Memory => {
+                let installed = self.dashboard.models.len();
+                let memory = match self.dashboard.memory_bytes {
+                    Some(bytes) => format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64),
+                    None => "unknown".into(),
+                };
+                format!(
+                    " Memory extraction runs on saved turns: a small fast model is enough · {installed} installed · memory {memory}"
+                )
+            }
             Shelf::Hub(_) | Shelf::EmbeddingHub => {
                 let family = self.shelf.family().unwrap_or(Family::Gguf);
                 let memory = match self.dashboard.memory_bytes {
@@ -1344,6 +1389,7 @@ impl ModelDownloads {
         if focused && self.query.is_empty() {
             let placeholder = match self.shelf {
                 Shelf::Hub(_) => "  type a name, Enter searches Hugging Face",
+                Shelf::Memory => "  type a name, Enter searches Hugging Face for small models",
                 Shelf::EmbeddingHub => "  type to search embedders, Enter searches Hugging Face",
                 Shelf::Embedding => "  type to filter the catalog",
             };
@@ -1379,11 +1425,14 @@ impl ModelDownloads {
         };
         let mut rows = Vec::new();
         match self.shelf {
-            Shelf::Hub(_) | Shelf::EmbeddingHub => {
+            Shelf::Hub(_) | Shelf::Memory | Shelf::EmbeddingHub => {
+                let memory = self.shelf == Shelf::Memory;
                 let family = self.shelf.family().unwrap_or(Family::Gguf);
                 let available = self.available_hits();
                 rows.push(heading(if available.is_empty() {
                     "No new models match · try a search"
+                } else if memory && self.curated {
+                    "Small models for memory · download, then Enter assigns the memory role"
                 } else if self.curated {
                     "Suggested downloads · available without a search"
                 } else if self.query.trim().is_empty() {
@@ -1413,7 +1462,13 @@ impl ModelDownloads {
                 }
                 let installed = self.installed_rows();
                 if !installed.is_empty() {
-                    rows.push(heading("Installed on this machine"));
+                    rows.push(heading(if memory {
+                        "Installed on this machine · Enter assigns the memory role"
+                    } else {
+                        "Installed on this machine"
+                    }));
+                } else if memory && self.query.trim().is_empty() {
+                    rows.push(heading("No local models installed yet."));
                 } else if self.query.trim().is_empty() {
                     rows.push(heading(&format!(
                         "None downloaded in {} yet.",

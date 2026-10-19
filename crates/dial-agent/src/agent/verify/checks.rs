@@ -64,6 +64,13 @@ impl<'a> Agent<'a> {
         );
         let exit = verdict.repair_exit_code(output);
         let passed = verdict == crate::agent::verify::verification::CheckStatus::Passed;
+        self.step_checks.evidence.observe(
+            command,
+            &call.id,
+            verdict,
+            self.step_checks.revision(),
+            matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral),
+        );
         if !self.hermetic
             && matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral)
             && let Some(cache) = self.codebase.clone()
@@ -168,10 +175,50 @@ impl<'a> Agent<'a> {
         let mut display = args.clone();
         display["_dial_check"] = json!(check.name);
         ui.tool_call_with_args(&call_id, "bash", &title, &display);
+        // Hermetic evaluation runs keep their trusted, non-prompting policy; explicit deny rules still hold.
+        let approval = if self.plan_mode {
+            crate::config::types::Approval::Readonly
+        } else if self.hermetic {
+            crate::config::types::Approval::Auto
+        } else {
+            self.approval
+        };
+        let configured = self
+            .config
+            .verification
+            .commands
+            .iter()
+            .any(|custom| custom.command == check.command);
+        let gate = crate::agent::safety::approval::authorize_automatic_check(
+            approval,
+            &mut self.always,
+            self.workspace.root(),
+            &crate::agent::safety::approval::AutomaticCheck {
+                name: &check.name,
+                command: &check.command,
+                configured,
+            },
+            ui,
+            Some(self.interrupt.as_ref()),
+        );
         let started = Instant::now();
-        let output = self
-            .run_background_tool("bash", &args, ui, None)
-            .unwrap_or_else(|| tools::execute(&self.workspace, "bash", &args, check.timeout_secs));
+        let output = match gate {
+            Ok(persist) => {
+                if persist && let Err(error) = self.persist_permissions() {
+                    ui.notice(&format!(
+                        "The rule applies to this session but could not be saved: {error:#}"
+                    ));
+                }
+                self.run_background_tool("bash", &args, ui, None)
+                    .unwrap_or_else(|| {
+                        tools::execute(&self.workspace, "bash", &args, check.timeout_secs)
+                    })
+            }
+            Err(denial) => {
+                ui.notice(denial.message());
+                crate::agent::safety::approval::denied_check_output(&check.name, &denial)
+            }
+        };
         ui.tool_timing("bash", started.elapsed().as_secs_f64());
         ui.tool_result_with_id(&call_id, "bash", &output);
         self.note_verification(
@@ -214,17 +261,17 @@ impl<'a> Agent<'a> {
             &self.config.verification.python_command,
         );
         if self.config.assistance.enabled && self.config.assistance.selective_verification {
-            checks.extend(
-                crate::agent::verify::verification::related_tests_with_runner(
-                    self.workspace.root(),
-                    &python,
-                    &paths,
-                    &self.config.verification.python_command,
-                ),
-            );
+            checks.extend(self.related_test_plan(&paths).checks);
         }
         for custom in &self.config.verification.commands {
-            let matches = custom.file_extensions.is_empty()
+            let required = self
+                .config
+                .verification
+                .requirements
+                .values()
+                .any(|requirement| requirement.checks.contains(&custom.name));
+            let matches = required
+                || custom.file_extensions.is_empty()
                 || paths.iter().any(|path| {
                     path.extension()
                         .and_then(|ext| ext.to_str())
@@ -243,6 +290,27 @@ impl<'a> Agent<'a> {
         checks
     }
 
+    fn related_test_plan(
+        &self,
+        paths: &[PathBuf],
+    ) -> crate::agent::verify::verification::RelatedTestPlan {
+        let python = if self.config.python.is_file() {
+            self.config.python.clone()
+        } else {
+            PathBuf::from("python3")
+        };
+        let mut plan = crate::agent::verify::verification::related_test_plan_with_runner(
+            self.workspace.root(),
+            &python,
+            paths,
+            &self.config.verification.python_command,
+        );
+        if !self.config.assistance.enabled || !self.config.assistance.selective_verification {
+            plan.limits.push("selective behavioral test mapping is disabled; build/configured checks do not establish full behavioral coverage".into());
+        }
+        plan
+    }
+
     pub(in crate::agent) fn publish_no_automatic_check(&mut self, ui: &mut dyn Ui) {
         if self.hermetic {
             return;
@@ -252,6 +320,17 @@ impl<'a> Agent<'a> {
             control["reliability"]["verification"] =
                 json!("no automatic focused check available; behavior unverified");
             control["reliability"]["checked_commands"] = json!([]);
+            let changed: Vec<_> = self
+                .step_checks
+                .turn
+                .zip(self.checkpoints.as_ref())
+                .map(|(turn, checkpoints)| checkpoints.changed_files(turn))
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            control["reliability"]["coverage_limits"] =
+                json!(self.related_test_plan(&changed).limits);
             control["reliability"]["edit_loop"] = self.step_checks.status();
             if let Err(error) = self.session.set_control_state(control.clone()) {
                 ui.diagnostic(&format!("could not save verification status: {error:#}"));
@@ -326,6 +405,16 @@ impl<'a> Agent<'a> {
                 for skipped in &checks[index..] {
                     self.step_checks.failed_checks.push(skipped.clone());
                     results.push(json!({"name":skipped.name,"command":skipped.command,"status":crate::agent::verify::verification::CheckStatus::Cancelled}));
+                    self.step_checks.evidence.observe(
+                        &skipped.command,
+                        &format!("focused-check:{}", skipped.name),
+                        crate::agent::verify::verification::CheckStatus::Cancelled,
+                        self.step_checks.revision(),
+                        self.config
+                            .verification
+                            .behavioral_checks
+                            .contains(&skipped.name),
+                    );
                     outcomes.push(crate::agent::verify::verification_receipts::Outcome {
                         name: skipped.name.clone(),
                         command: skipped.command.clone(),
@@ -412,7 +501,7 @@ impl<'a> Agent<'a> {
                     .into_iter()
                     .map(PathBuf::from)
                     .collect::<Vec<_>>();
-                let limits = crate::agent::verify::verification::coverage_limits(&changed);
+                let limits = self.related_test_plan(&changed).limits;
                 state["verification"] = json!(if checks.is_empty() {
                     "no automatic focused check available; behavior unverified"
                 } else if failures.is_empty() && !limits.is_empty() {
@@ -514,6 +603,55 @@ impl<'a> Agent<'a> {
             self.disclose_turn_changes(ui);
         }
         Ok(())
+    }
+
+    /// An execution outcome is not a verdict on the deliverable. Keep the two independently
+    /// observable without changing TurnReport or requiring a checklist for ordinary answers.
+    pub(in crate::agent) fn completion_evidence(&self, outcome: TurnOutcome) -> Value {
+        let accepted = outcome == TurnOutcome::Completed;
+        let remaining = self
+            .todo
+            .tasks()
+            .iter()
+            .filter(|task| {
+                task.status.is_open()
+                    && !(accepted
+                        && !self.modes.goal.tool_offered()
+                        && task.status == crate::agent::workflow::todo::Status::InProgress)
+            })
+            .collect::<Vec<_>>();
+        let revision = self.step_checks.revision();
+        let checks = self.step_checks.evidence.snapshot(revision);
+        let visual = self.step_checks.visual.status(revision);
+        let requirements = crate::agent::verify::requirements::snapshot(
+            &self.config.verification,
+            &self.step_checks.evidence,
+            revision,
+            &self.step_checks.visual,
+        );
+        let verification = if self.step_checks.failed {
+            "failed"
+        } else if checks["stale_checks"].as_u64().unwrap_or(0) > 0 {
+            "partial_or_stale"
+        } else if checks["current_checks"].as_u64().unwrap_or(0) == 0 {
+            "not_observed"
+        } else if checks["passing_checks"] != checks["current_checks"] {
+            "failed_or_unavailable"
+        } else {
+            "observed_checks_passed"
+        };
+        json!({
+            "version": 1,
+            "execution_outcome": outcome,
+            "deliverable_coverage": if !remaining.is_empty() { "open_obligations" } else { requirements["coverage"].as_str().unwrap_or("not_independently_assessed") },
+            "outstanding_tasks": remaining,
+            "verification_coverage": verification,
+            "visual_evidence": visual,
+            "checks": checks,
+            "requirements": requirements,
+            "uncheckpointed_effects": self.step_checks.has_uncheckpointed_operations(),
+            "note": "Observed checks and delivered pixels are evidence, not independent proof of every requested behavior. Undeclared requirements remain unassessed, not complete."
+        })
     }
 }
 

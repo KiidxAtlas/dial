@@ -1,13 +1,15 @@
-//! Shared chrome: labels, panel titles, key hints, status marks and thin rounded panel frames.
+//! Shared chrome: labels, panel titles, key hints, status marks and the inset panel surface.
 //!
-//! Everything here is text on the terminal's own background. There are no chips, no page fills and
-//! no shadows. The only filled cells in the UI are the selected row (`Tok::SelectedBg`) and the
-//! text cursor. Section colors appear as foreground text or as a 1-cell `▎` gutter, never as fills.
+//! There are no frames. A panel is an inset surface (`Tok::PanelBg`) with a bold title row and a
+//! muted, italic hint at its right edge; prose and tool rows sit on the terminal's own background
+//! and hang off a one-glyph gutter. The filled cells in the UI are the panel surface, the shaded
+//! bands behind the user's messages and the composer (`Tok::UserBg`), the selected row
+//! (`Tok::SelectedBg`) and the text cursor. Section colors appear as foreground text only.
 use ratatui::{
+    layout::Alignment,
     style::{Modifier, Style},
-    symbols::border,
     text::{Line, Span},
-    widgets::{Block, Borders},
+    widgets::{Block, Padding},
 };
 
 use super::{
@@ -106,8 +108,8 @@ pub fn status_chip(theme: &Theme, status: Status, text: &str) -> Span<'static> {
     )
 }
 
-/// Key hints as spans: each key in amber bold with its label in the secondary color, joined by ` · `.
-/// Example: `ctrl+p` `actions` · `/` `commands`.
+/// Key hints as spans: each key in bold body text with its label in the secondary color, joined by
+/// ` · `. Example: `ctrl+p` `actions` · `/` `commands`.
 ///
 /// Every panel uses the same words, so a key always means the same thing: Esc is `close` at a
 /// panel's top level, `back` inside a nested view, `cancel` for an edit or a question, and
@@ -119,11 +121,11 @@ pub fn key_hint_spans(theme: &Theme, hints: &[(&str, &str)]) -> Vec<Span<'static
     let mut spans = Vec::with_capacity(hints.len() * 3);
     for (i, (key, label)) in hints.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(sep, theme.fg(Tok::Muted)));
+            spans.push(Span::styled(sep, theme.fg(Tok::Dim)));
         }
         spans.push(Span::styled(
             (*key).to_owned(),
-            theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+            theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(format!(" {label}"), theme.fg(Tok::Muted)));
     }
@@ -142,44 +144,42 @@ pub fn tab_style(theme: &Theme, active: bool) -> Style {
     }
 }
 
-/// A panel title: a mark in the section's color, then the title in bold body text, e.g.
-/// `◆ Settings`. ASCII glyph sets use `*`.
+/// A panel title: the title in bold, in the section's color, e.g. `Settings`. No mark, no frame:
+/// the surface it sits on already sets the panel apart.
 pub fn fig_label(theme: &Theme, section: Section, title: &str) -> Vec<Span<'static>> {
-    let mark = if theme.ascii() { "*" } else { "\u{25c6}" };
-    vec![
-        Span::styled(mark, theme.fg(section.tok()).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!(" {title}"),
-            theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
-        ),
-    ]
+    vec![Span::styled(
+        title.to_owned(),
+        theme.fg(section.tok()).add_modifier(Modifier::BOLD),
+    )]
 }
 
-/// Thin rounded frame in the muted rule color (`╭─╮│╰─╯`). The frame never paints a background.
+/// The panel surface: the theme's inset fill, or the terminal background when the theme has none.
+pub fn surface(theme: &Theme) -> Style {
+    theme.bg(Tok::PanelBg)
+}
+
+/// `spans` drawn on the panel surface: spans that set no background of their own get the fill.
+pub fn on_surface(theme: &Theme, spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let fill = surface(theme);
+    spans
+        .into_iter()
+        .map(|mut span| {
+            span.style = fill.patch(span.style);
+            span
+        })
+        .collect()
+}
+
+/// The borderless panel surface with one cell of breathing room on every side, so its inner area
+/// is the same as a one-cell frame's would be.
 pub fn panel_block(theme: &Theme) -> Block<'static> {
-    const ASCII: border::Set = border::Set {
-        top_left: "+",
-        top_right: "+",
-        bottom_left: "+",
-        bottom_right: "+",
-        vertical_left: "|",
-        vertical_right: "|",
-        horizontal_top: "-",
-        horizontal_bottom: "-",
-    };
-    let set = if theme.ascii() {
-        ASCII
-    } else {
-        border::ROUNDED
-    };
     Block::default()
-        .borders(Borders::ALL)
-        .border_set(set)
-        .border_style(theme.fg(Tok::BorderMuted))
+        .style(surface(theme))
+        .padding(Padding::uniform(1))
 }
 
-/// [`panel_block`] with the title in the top border: `╭ ◆ Settings ──────── extra ╮`. `extra`
-/// sits at the right edge when non-empty.
+/// [`panel_block`] whose top row carries the title, ` Settings ……… extra `: the title in bold
+/// section color, `extra` muted and italic at the right edge when non-empty.
 pub fn panel_block_titled(
     theme: &Theme,
     section: Section,
@@ -188,19 +188,30 @@ pub fn panel_block_titled(
 ) -> Block<'static> {
     let mut left = vec![Span::raw(" ")];
     left.extend(fig_label(theme, section, title));
-    left.push(Span::raw(" "));
-    let mut block = panel_block(theme).title_top(Line::from(left));
+    let mut block = Block::default()
+        .style(surface(theme))
+        .padding(Padding {
+            left: 1,
+            right: 1,
+            top: 0,
+            bottom: 1,
+        })
+        .title_top(Line::from(left));
     if !extra.is_empty() {
         block = block.title_top(
-            Line::from(Span::styled(format!(" {extra} "), theme.fg(Tok::Muted))).right_aligned(),
+            Line::from(Span::styled(
+                format!("{extra} "),
+                theme.fg(Tok::Muted).add_modifier(Modifier::ITALIC),
+            ))
+            .alignment(Alignment::Right),
         );
     }
     block
 }
 
-/// Rows drawn inline (not through a ratatui block) wrapped in the standard rounded frame:
-/// `╭─ ◆ Title ───── extra ─╮`, each row as `│ row │` padded to `width`, then `╰───╯`. Rows wider
-/// than the inner width are clipped. Every returned line is exactly `width` cells (when ≥ 6).
+/// Rows drawn inline (not through a ratatui block) on the panel surface: a title row
+/// ` Title ……… extra `, each row as `  row  ` padded to `width`, then one blank surface row. Rows
+/// wider than the inner width are clipped. Every returned line is exactly `width` cells (when ≥ 6).
 pub fn framed_lines(
     theme: &Theme,
     section: Section,
@@ -213,51 +224,43 @@ pub fn framed_lines(
     if width < 6 {
         return rows;
     }
-    let border = theme.fg(Tok::BorderMuted);
-    let h = theme.sym(Sym::BoxH);
-    let v = theme.sym(Sym::BoxV).to_owned();
+    let fill = surface(theme);
     let inner = width - 4;
     let ellipsis = theme.sym(Sym::Ellipsis).to_owned();
-    let mut head = vec![Span::styled(
-        format!("{}{h} ", theme.sym(Sym::BoxTl)),
-        border,
-    )];
-    let mut label = fig_label(theme, section, &text::one_line(title));
-    label.push(Span::raw(" "));
-    head.extend(super::markdown::truncate_spans(label, inner, &ellipsis));
+    let mut head = vec![Span::raw(" ")];
+    let label = fig_label(theme, section, &text::one_line(title));
+    head.extend(super::markdown::truncate_spans(label, width - 2, &ellipsis));
     let used: usize = head.iter().map(|s| text::width(&s.content)).sum();
     let extra = text::one_line(extra);
-    let tail = if extra.is_empty() || used + text::width(&extra) + 4 > width {
+    let tail = if extra.is_empty() || used + text::width(&extra) + 3 > width {
         String::new()
     } else {
-        format!(" {extra} ")
+        format!("{extra} ")
     };
-    let fill = width.saturating_sub(used + text::width(&tail) + 1);
-    head.push(Span::styled(h.repeat(fill), border));
+    head.push(Span::raw(
+        " ".repeat(width.saturating_sub(used + text::width(&tail))),
+    ));
     if !tail.is_empty() {
-        head.push(Span::styled(tail, theme.fg(Tok::Muted)));
+        head.push(Span::styled(
+            tail,
+            theme.fg(Tok::Muted).add_modifier(Modifier::ITALIC),
+        ));
     }
-    head.push(Span::styled(theme.sym(Sym::BoxTr).to_owned(), border));
-    let mut out = vec![Line::from(head)];
+    let mut out = vec![Line::from(on_surface(theme, head))];
     for row in rows {
-        let style = row.style;
-        let mut spans = vec![Span::styled(format!("{v} "), border)];
+        let style = fill.patch(row.style);
+        let mut spans = vec![Span::raw("  ")];
         let body = super::markdown::truncate_spans(row.spans, inner, &ellipsis);
         let used: usize = body.iter().map(|s| text::width(&s.content)).sum();
-        spans.extend(body);
+        spans.extend(body.into_iter().map(|mut span| {
+            span.style = style.patch(span.style);
+            span
+        }));
         spans.push(Span::styled(" ".repeat(inner.saturating_sub(used)), style));
-        spans.push(Span::styled(format!(" {v}"), border));
-        out.push(Line::from(spans));
+        spans.push(Span::raw("  "));
+        out.push(Line::from(on_surface(theme, spans)));
     }
-    out.push(Line::from(Span::styled(
-        format!(
-            "{}{}{}",
-            theme.sym(Sym::BoxBl),
-            h.repeat(width - 2),
-            theme.sym(Sym::BoxBr)
-        ),
-        border,
-    )));
+    out.push(Line::from(Span::styled(" ".repeat(width), fill)));
     out
 }
 
@@ -267,6 +270,33 @@ pub fn selected_style(theme: &Theme) -> Style {
         .fg(Tok::Text)
         .patch(theme.bg(Tok::SelectedBg))
         .add_modifier(Modifier::BOLD)
+}
+
+/// Restyles the spans of the selected list row the way the menus draw it: the selection fill under
+/// one body color, since accents and status colors blur into a colored fill. Primary text turns
+/// bold; muted and dim details keep their normal weight, so they read as secondary; bold accent
+/// emphasis (search matches) is underlined so it still stands out.
+pub fn select_spans(theme: &Theme, spans: &mut [Span<'static>]) {
+    let fill = theme.bg(Tok::SelectedBg);
+    let body = theme.fg(Tok::Text);
+    let accent = theme.fg(Tok::Accent).fg;
+    let faded = [theme.fg(Tok::Muted).fg, theme.fg(Tok::Dim).fg];
+    for span in spans {
+        let fg = span.style.fg;
+        let secondary = fg.is_some() && faded.contains(&fg);
+        let emphasis = fg.is_some()
+            && fg == accent
+            && span.style.add_modifier.contains(Modifier::BOLD)
+            && !span.content.trim().is_empty();
+        let style = span.style.patch(body).patch(fill);
+        span.style = if secondary {
+            style.remove_modifier(Modifier::BOLD)
+        } else if emphasis {
+            style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            style.add_modifier(Modifier::BOLD)
+        };
+    }
 }
 
 #[cfg(test)]

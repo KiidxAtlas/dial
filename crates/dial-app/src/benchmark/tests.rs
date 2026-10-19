@@ -313,7 +313,7 @@ fn runs_without_model_activity_are_invalid_and_refused_as_baselines() {
                 source.path(),
                 |case, _| match case.id.as_str() {
                     "a" => Err(AgentFailure {
-                        metrics,
+                        metrics: metrics.clone(),
                         detail: "stopped".into(),
                     }
                     .into()),
@@ -422,7 +422,7 @@ fn rejects_escape_paths_and_symlinks_and_detects_baseline_regressions() {
             passed: true,
             checks_passed: 1,
             checks_total: 1,
-            metrics,
+            metrics: metrics.clone(),
         }],
     );
     let bad = score_report(
@@ -433,7 +433,7 @@ fn rejects_escape_paths_and_symlinks_and_detects_baseline_regressions() {
             passed: false,
             checks_passed: 0,
             checks_total: 1,
-            metrics,
+            metrics: metrics.clone(),
         }],
     );
     assert!(compare_baseline(&bad, &good).regressed);
@@ -448,7 +448,7 @@ fn rejects_escape_paths_and_symlinks_and_detects_baseline_regressions() {
             checks_total: 1,
             metrics: RunMetrics {
                 elapsed_ms: 20,
-                ..metrics
+                ..metrics.clone()
             },
         }],
     );
