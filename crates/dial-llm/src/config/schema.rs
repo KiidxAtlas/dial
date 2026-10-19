@@ -320,19 +320,12 @@ macro_rules! field {
         declaration
     }};
 }
-#[path = "settings/compaction.rs"]
 mod compaction;
-#[path = "settings/experimental.rs"]
 mod experimental;
-#[path = "settings/improvement.rs"]
 mod improvement;
-#[path = "settings/memory.rs"]
 mod memory;
-#[path = "settings/model.rs"]
 mod model;
-#[path = "settings/tools.rs"]
 mod tools;
-#[path = "settings/voice.rs"]
 mod voice;
 static UI: &[SettingDef] = &[
     field!(
@@ -1182,5 +1175,4 @@ pub fn unset(table: &mut Table, path: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "schema/tests.rs"]
 mod tests;

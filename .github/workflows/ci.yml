@@ -28,6 +28,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test embedded driver contracts
+        run: make test-drivers
       - name: Install Rust
         # Honor rust-toolchain.toml instead of downloading an unrelated moving stable toolchain.
         run: rustup show active-toolchain

@@ -138,8 +138,10 @@ fallback chains are in [docs/model-routing.md](docs/model-routing.md).
 
 ## Source layout
 
-Dial is a Cargo workspace. The root package `dial` holds the binary (`src/main.rs`, `src/cmd/`) and a
-facade library (`src/lib.rs`) that re-exports every crate module, so `dial::<module>` paths keep working.
+Dial is a Cargo workspace. The root package `dial` holds the binary and a facade library (`src/lib.rs`)
+that re-exports every crate module, so `dial::<module>` paths keep working. Binary startup lives in
+`src/main.rs`; arguments, overlays, routing and chat launch have separate sibling modules, and
+binary-only command handlers live in `src/cmd/`.
 Each crate's modules live under `crates/<crate>/src/`:
 
 ```
@@ -151,7 +153,7 @@ crates/dial-tools/       tools (workspace and built-ins, sandbox, extension regi
 crates/dial-computer/    computer (desktop capture, accessibility, input)
 crates/dial-agent/       agent (agent loop, subagents, approvals), learn, commit, steering
 crates/dial-ui/          ui (terminal renderer, composer, overlays), git_panel; themes in `crates/dial-ui/themes/`
-crates/dial-app/         app, commands, cli, benchmark, repl, rpc, acp, schedule, collab
+crates/dial-app/         app (including app/commands), cli, benchmark, repl, rpc, acp, schedule, collab
 ```
 
 Build, test, and lint across the whole workspace with `make test-lib`, `make lint`, or

@@ -59,10 +59,6 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Integration tool names accepted in the config's `integrations` list (see [`ext`]). Most are
-/// offered only when listed; `find`, `browser`, `kernel`, `eval`, `autoresearch` and `archive` are
-/// always offered, so older saved lists keep them.
-
 /// Selected tools withheld from the default per-request offer. They stay in the catalog, so the
 /// system prompt lists them under "Loadable tools" and `tool_load` (or `tool_search`) enables them
 /// for the next round; schemas and historical contracts are unchanged. Each overlaps a tool that

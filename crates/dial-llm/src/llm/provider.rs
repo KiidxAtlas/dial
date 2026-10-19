@@ -14,7 +14,6 @@
 //!
 //! Neither prompts nor the API key appear in any error produced here.
 
-#[path = "compaction.rs"]
 pub(super) mod compaction;
 pub use compaction::{NativeCompactionFailure, NativeCompactionReply};
 

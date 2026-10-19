@@ -390,5 +390,4 @@ pub fn spawn_conpty(
     }
 }
 #[cfg(test)]
-#[path = "windows_pty/tests.rs"]
 mod tests;

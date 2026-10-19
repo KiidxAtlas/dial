@@ -216,6 +216,42 @@ Rollback unit is one commit; phases 0–2 leave the tree a single crate, so aban
 | `1c68fcf2` | 5 in-crate grouping: tools into sub-domain modules (exec, edit, fs, code, net, vcs, integrations, knowledge, surface) | not recorded in the commit |
 | `d3fc82c1` | 5 in-crate grouping: agent into sub-domain modules (run, model, window, compact, verify, safety, workers, workflow, memory, ui, base; `modes/` stays at root) | not recorded in the commit |
 
+### Completion pass: physical ownership and binary separation
+
+The crate extraction above is retained. This pass finishes specific in-crate ownership mismatches
+without creating more crates, changing the layer order, or rewriting runtime behavior.
+
+| Old location | Destination / change | Reason and preserved contract |
+|---|---|---|
+| Root `src/main.rs` declarations and handlers | `src/{args,overlay,dispatch,chat}.rs`, command implementations in `src/cmd/`, parser contracts in `src/args/tests.rs` | Entry point owns startup, not every command; CLI flags and exit behavior stay unchanged |
+| `dial-core/src/platform/windows_*.rs` and their test directories | `platform/windows/{console,fs,io,process,pty}.rs` with matching test children | Physical paths now match existing private logical modules |
+| Inline portable and native platform modules | `platform/{fs,process,io,time,sys}.rs`, `platform/unix/{fs,process,io,sys}.rs` and `platform/windows/{time,sys}.rs` | Separate concerns symmetrically without changing portable APIs |
+| `dial-llm/src/llm/compaction.rs` and tests | `llm/provider/compaction.rs` and `provider/compaction/tests.rs` | Compaction already belongs logically to the provider |
+| `dial-llm/src/config/settings/` schema declaration files | `config/schema/{compaction,experimental,improvement,memory,model,tools,voice}.rs` | Stop mixing schema children with the settings module's own tests |
+| `dial-app/src/commands/` | `dial-app/src/app/commands/` | Preserve private `app::commands` ownership and visibility rather than promoting an internal API |
+| `dial-tools/src/tools/edit/edit_transaction_{unix,windows}.rs` | `edit_transaction/{unix,windows}.rs` | Keep native implementations beneath the transaction owner |
+| `dial-agent/src/learn/processes_windows.rs` | `learn/processes/native.rs` | Preserve the existing cfg-gated native module path |
+| Redundant `#[path]` attributes in catalog, schema, snapcompact and tests | Ordinary module declarations | Let Rust resolve conventional paths directly |
+
+Automation: extend the integration architecture guards to reject ambiguous module definitions and
+require the workspace's discovered crates and layer registry to agree in both directions. Existing
+dependency-boundary and separate-test-source checks remain enabled.
+
+Cleanup completion: embedded browser/eval/kernel drivers and their protocol tests now live beneath
+their Rust owners (`tools/net/browser/`, `tools/exec/{eval,kernel}/`); compile-time includes follow
+the moves. `make test-drivers` runs the existing browser, eval and Python kernel contracts in CI.
+Unused root Tokio and workspace semver declarations are removed; libc, rusqlite and parking_lot
+are test-only dependencies of the root package. The redundant update-test path mount is removed.
+Generated browser/npm leftovers, Python caches and nine obsolete target experiment directories
+were deleted with explicit approval. Active builds, `.tmp`, local toolchains, private state,
+worktrees and unfinished plans are intentionally preserved.
+
+Verification is performed after all parallel slices are integrated: workspace all-target compilation,
+slim binary compilation, architecture and CLI contracts, affected crate tests, formatting and packaging
+metadata checks. Native Windows-only checks require the installed cross-toolchain; runtime behavior
+on another OS is not established by host tests. Actual results are reported separately, not inferred
+from this plan. Historical audit citations remain historical rather than being rewritten as new evidence.
+
 Test aborts ("fatal runtime error: failed to initiate panic, error 5") are an environment
 defect, not a code regression: the tracked `.cargo/config.toml` passes
 `-C link-arg=-Wl,-no_compact_unwind` on macOS, and with Homebrew rustc 1.99 that breaks

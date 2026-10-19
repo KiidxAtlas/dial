@@ -8,7 +8,6 @@
 //! last-good layers on failure; changes found during a turn are staged. Adoption rebuilds the
 //! immutable agent configuration around the same session, task list, permissions and cost.
 
-#[path = "../commands/mod.rs"]
 mod commands;
 
 use crate::agent::Ui;

@@ -15,10 +15,8 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
-#[path = "snapcompact/renderer.rs"]
 mod renderer;
 #[cfg(test)]
-#[path = "snapcompact/tests.rs"]
 mod tests;
 
 const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;

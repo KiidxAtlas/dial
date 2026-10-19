@@ -2,8 +2,8 @@ Third-party notices
 ===================
 
 Portions of the bundled provider/model catalog, the snapcompact renderer, the edit algorithms in
-`src/tools/edit_native`, and several other modules are derived from software distributed under the
-following license.
+`crates/dial-tools/src/tools/edit/edit_native/`, and several other modules are derived from
+software distributed under the following license.
 
 MIT License
 

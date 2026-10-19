@@ -1,9 +1,8 @@
-//! Flag resolution and top-level subcommands that `main.rs` dispatches.
+//! Reusable flag resolution and subcommands for the binary's dispatcher.
 //!
-//! `src/commands/` is the slash-command module (mounted privately by `app.rs`); CLI
-//! subcommand and flag logic lives here instead.
-//! `benchmark/`, `improve.rs`, and `update.rs` are private binary modules mounted
-//! by `main.rs`, not part of this library module's public API.
+//! `app/commands/` owns private interactive slash-command handlers. CLI subcommand and
+//! flag logic lives here instead. Binary-only benchmark, improvement and update handlers
+//! live in the root package's `src/cmd/`, not in this library module's public API.
 
 pub mod annotate;
 pub mod anonymize;

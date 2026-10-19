@@ -61,11 +61,7 @@ fn argument_guide(parameters: &Value) -> String {
     )
 }
 
-#[cfg(test)]
-mod tests;
-
 /// Whitespace-separated words with simple `'...'` / `"..."` quoting and backslash escapes.
-
 pub fn split_words(s: &str) -> Vec<String> {
     let (mut words, mut cur, mut quote, mut in_word) =
         (Vec::new(), String::new(), None::<char>, false);
@@ -101,3 +97,6 @@ pub fn split_words(s: &str) -> Vec<String> {
     }
     words
 }
+
+#[cfg(test)]
+mod tests;

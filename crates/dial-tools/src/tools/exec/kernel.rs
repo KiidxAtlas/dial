@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 mod env;
 
-pub(crate) const PYTHON_DRIVER: &str = include_str!("../kernel_driver.py");
+pub(crate) const PYTHON_DRIVER: &str = include_str!("kernel/driver.py");
 pub(crate) const MAX_CODE: usize = 64 * 1024;
 pub(crate) use crate::runtime::json_transport::{INTERRUPT_GRACE, execution_deadline};
 // No descendant can detach: even with the operator's filesystem sandbox opt-out, fork/spawn is denied.

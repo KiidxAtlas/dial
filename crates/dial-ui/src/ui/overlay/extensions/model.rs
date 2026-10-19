@@ -1,6 +1,6 @@
 //! Pure state for the `/extensions` browser: tabs, rows, search, cursor and the confirm step.
 //!
-//! Nothing here touches the disk, the network or config. The controller in `commands/` builds the
+//! Nothing here touches the disk, the network or config. The controller in `dial-app/src/app/commands/` builds the
 //! rows and turns confirmed [`Intent`]s into work.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

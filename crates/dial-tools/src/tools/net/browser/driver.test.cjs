@@ -1,10 +1,10 @@
 'use strict';
-// Deterministic producer-side protocol tests: node --test src/tools/browser_driver.test.cjs
+// Deterministic producer-side protocol tests: make test-drivers
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const source = fs.readFileSync(require('node:path').join(__dirname,'browser_driver.cjs'),'utf8');
+const source = fs.readFileSync(require('node:path').join(__dirname,'driver.cjs'),'utf8');
 function harness() {
   const timers = new Set(), frames = [];
   const stdout = { writableNeedDrain:false,writableLength:0,write(line,callback) { frames.push(JSON.parse(line));callback();return true; } };
@@ -79,7 +79,7 @@ test('network failures lead with the current operation cause, not stale tab fail
 });
 
 test('run uses DOM globals and assert/sleep in the page realm, not Playwright or Node', async () => {
-  const { runCode } = require('./browser_driver/run.cjs');
+  const { runCode } = require('./run.cjs');
   const heading = { textContent: 'Page heading' };
   const context = vm.createContext({
     document: { title: 'DOM title', querySelector(selector) { return selector === 'h1' ? heading : null; } },

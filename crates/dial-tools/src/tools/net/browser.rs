@@ -40,8 +40,8 @@ mod stealth;
 mod tern;
 mod ws;
 
-const BROWSER_DRIVER: &str = include_str!("../browser_driver.cjs");
-const BROWSER_RUN: &str = include_str!("../browser_driver/run.cjs");
+const BROWSER_DRIVER: &str = include_str!("browser/driver.cjs");
+const BROWSER_RUN: &str = include_str!("browser/run.cjs");
 /// Driver program for `node -e`. The run/call module is inlined as an IIFE because `-e` has no `require` base.
 fn driver_source() -> String {
     format!(

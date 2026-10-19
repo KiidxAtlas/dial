@@ -14,12 +14,13 @@ INSTALL_DIR ?= $(shell path="$$(command -v dial 2>/dev/null)"; if [ -n "$$path" 
 KEEP_BACKUPS ?= 3
 # Checks never install dependencies or download models. Python tests report optional skips.
 PYTHON ?= python3
+NODE ?= node
 TEST_PROFILE ?= dev
 DIAL ?= $(BUILD_DIR)/dial
 
 
 .DEFAULT_GOAL := help
-.PHONY: help update install build check test test-lib test-integration test-module lint test-rust test-python test-bench-offline test-smoke test-mlx
+.PHONY: help update install build check test test-lib test-integration test-module lint test-rust test-drivers test-python test-bench-offline test-smoke test-mlx
 
 help:
 	@printf '%s\n' \
@@ -33,6 +34,7 @@ help:
 		'make test-module MOD=llm::provider  Run lib tests under one module path' \
 		'make lint     Run clippy with the CI lint gate' \
 		'make test-rust TEST_PROFILE=dev  Run portable Rust tests (CI uses ci)' \
+		'make test-drivers  Run browser, JavaScript eval and Python kernel transport contracts (Node 22+, Python 3)' \
 		'make test-python  Run Python contracts; report unavailable optional MLX checks' \
 		'make test-bench-offline  Run benchmark grader/reporting tests, no model or binary needed' \
 		'make test-smoke DIAL=target/local/dial  Check an already-built binary and scripted recovery' \
@@ -79,6 +81,9 @@ test-module:
 
 lint:
 	$(CARGO) clippy --locked --workspace --all-targets $(CARGO_FEATURE_FLAGS) -- -D clippy::correctness -D clippy::suspicious
+
+test-drivers:
+	DIAL_TEST_PYTHON="$(PYTHON)" $(NODE) --test crates/dial-tools/src/tools/net/browser/driver.test.cjs crates/dial-tools/src/tools/exec/eval/driver.test.cjs
 
 test-python:
 	HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $(PYTHON) -m pytest -rs python/test_*.py

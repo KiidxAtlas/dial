@@ -14,7 +14,6 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-#[path = "catalog/bundled.rs"]
 mod bundled;
 pub use bundled::{
     ThinkingMode, builtin_provider, bundled_model, bundled_models, known_context_window,

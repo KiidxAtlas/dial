@@ -779,5 +779,4 @@ impl std::error::Error for NativeCompactionFailure {
 }
 
 #[cfg(test)]
-#[path = "compaction/tests.rs"]
 mod tests;

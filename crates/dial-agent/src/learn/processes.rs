@@ -16,7 +16,6 @@ use crate::platform::procinfo::ProcId;
 const RESTART_EXIT_WAIT: Duration = Duration::from_secs(10);
 
 #[cfg(windows)]
-#[path = "processes_windows.rs"]
 mod native;
 
 #[derive(Debug)]

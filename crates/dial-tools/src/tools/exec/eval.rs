@@ -17,7 +17,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
 };
 
-const DRIVER: &str = include_str!("../eval_driver.cjs");
+const DRIVER: &str = include_str!("eval/driver.cjs");
 
 pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(EvalTool::new(config.eval.clone()))]

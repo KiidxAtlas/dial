@@ -1,8 +1,10 @@
 use super::*;
+#[cfg(unix)]
 use crate::llm::{
     self,
     server::{ServerProfile, ensure_profile_tracked, fixtures::fake_python},
 };
+#[cfg(unix)]
 use serde_json::json;
 #[cfg(target_os = "macos")]
 #[test]
@@ -147,6 +149,7 @@ fn stop_rechecks_identity_and_terminates_only_the_selected_child() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn tracked_server_exposes_model_phase_and_cleans_up_on_stop() {
     if crate::learn::processes::live_inspection_unavailable() {

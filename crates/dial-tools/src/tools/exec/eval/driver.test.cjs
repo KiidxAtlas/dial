@@ -1,5 +1,5 @@
 'use strict';
-// Standalone transport regressions: node --test src/tools/eval_driver.test.cjs
+// Standalone transport regressions: make test-drivers
 // Run with each supported Node release; no sandbox or desktop host is required.
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
@@ -16,7 +16,7 @@ function wireSafe(value) {
 
 function run(frames, python = false) {
   const child = spawnSync(python ? (process.env.DIAL_TEST_PYTHON || 'python3') : process.execPath,
-    [path.join(__dirname, python ? 'kernel_driver.py' : 'eval_driver.cjs')], {
+    [path.join(__dirname, python ? '../kernel/driver.py' : 'driver.cjs')], {
       input: frames.map(frame => JSON.stringify(frame) + '\n').join(''),
       encoding: 'utf8', timeout: 10000, maxBuffer: 16 * 1024 * 1024,
       stdio: python ? ['pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe', 'pipe'],
@@ -77,7 +77,7 @@ test('all wire boundaries repair lone surrogates without damaging emoji or liter
 
 for (const python of [false, true]) {
   test(`actual ${python ? 'Python' : 'JS'} computer prelude consumes raw bridge values/text/images and propagates denial`, () => {
-    const source = fs.readFileSync(path.join(__dirname, '../computer/js', python ? 'prelude.py' : 'prelude.js'), 'utf8');
+    const source = fs.readFileSync(path.join(__dirname, '../../../../../dial-computer/src/computer/js', python ? 'prelude.py' : 'prelude.js'), 'utf8');
     const windows = [{ id: '7', app: 'Editor', title: 'Document' }];
     const artifact = { data: 'aW1hZ2U=', encoding: 'base64', media_type: 'image/png' };
     const output = run([

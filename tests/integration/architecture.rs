@@ -80,6 +80,46 @@ fn module_files(roots: &[PathBuf], module: &str) -> Result<Vec<PathBuf>, String>
     Ok(files)
 }
 
+/// Module definitions made twice under one directory: `foo.rs` beside `foo/mod.rs`. A module is
+/// either `foo.rs` (children, if any, in `foo/`) or `foo/mod.rs`, never both. Every directory
+/// under `base` is checked, so crate source roots are covered like the root package's `src/`.
+fn ambiguous_modules(dir: &Path, base: &Path, out: &mut Vec<String>) -> Result<(), String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("unreadable module directory {}: {e}", dir.display()))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("unreadable entry in {}: {e}", dir.display()))?;
+        paths.push(entry.path());
+    }
+    paths.sort();
+    for path in &paths {
+        if path.is_dir() {
+            ambiguous_modules(path, base, out)?;
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem != "mod" && dir.join(stem).join("mod.rs").is_file() {
+                out.push(format!(
+                    "{}: `{stem}.rs` and `{stem}/mod.rs` both define module `{stem}`; keep \
+                     `{stem}.rs` (children in `{stem}/`) or `{stem}/mod.rs`",
+                    path.strip_prefix(base).unwrap_or(path).display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Layout violations across the root package's `src/` and every crate's `src/`.
+fn layout_violations(manifest: &Path) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for src in source_roots(manifest)? {
+        ambiguous_modules(&src, &src, &mut out)?;
+    }
+    Ok(out)
+}
+
 /// Blank comments and the contents of string/char literals (keeping byte offsets and newlines),
 /// so braces and paths inside them are neither counted nor matched.
 fn strip(text: &str) -> String {
@@ -950,25 +990,214 @@ fn crate_layer_violations(name: &str, manifest: &str) -> Vec<String> {
     violations
 }
 
+/// Workspace crate names: every `crates/<name>/` directory that holds a manifest.
+fn workspace_crate_names(manifest_dir: &Path) -> Result<BTreeSet<String>, String> {
+    let crates = manifest_dir.join("crates");
+    let entries = fs::read_dir(&crates)
+        .map_err(|e| format!("unreadable crates directory {}: {e}", crates.display()))?;
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("unreadable entry in {}: {e}", crates.display()))?;
+        if entry.path().join("Cargo.toml").is_file() {
+            names.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// The root manifest's `workspace.members` patterns.
+fn workspace_members(manifest_dir: &Path) -> Result<Vec<String>, String> {
+    let path = manifest_dir.join("Cargo.toml");
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("unreadable {}: {e}", path.display()))?;
+    let parsed: toml::Table =
+        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let members = parsed
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .ok_or_else(|| format!("{}: no workspace.members array", path.display()))?;
+    members
+        .iter()
+        .map(|m| {
+            m.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{}: non-string workspace member {m}", path.display()))
+        })
+        .collect()
+}
+
+/// Whether one `workspace.members` pattern selects `path`: an exact path, or `dir/*` for each
+/// direct child of `dir`.
+fn member_matches(pattern: &str, path: &str) -> bool {
+    match pattern.strip_suffix("/*") {
+        Some(dir) => path
+            .strip_prefix(dir)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|child| !child.is_empty() && !child.contains('/')),
+        None => pattern == path,
+    }
+}
+
+/// Registry and workspace discovery must agree in both directions: every layer names an existing
+/// crate that is a workspace member, every crate with a manifest is listed, and none is listed
+/// twice.
+fn registry_violations(
+    layers: &[&str],
+    crates: &BTreeSet<String>,
+    members: &[String],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut seen = BTreeSet::new();
+    for layer in layers {
+        if !seen.insert(*layer) {
+            violations.push(format!("CRATE_LAYERS lists {layer} more than once"));
+        }
+        if !crates.contains(*layer) {
+            violations.push(format!(
+                "CRATE_LAYERS lists {layer}, but crates/{layer}/Cargo.toml does not exist"
+            ));
+        }
+    }
+    for name in crates {
+        if !layers.contains(&name.as_str()) {
+            violations.push(format!(
+                "crates/{name} has a manifest but is not in CRATE_LAYERS"
+            ));
+        }
+        let path = format!("crates/{name}");
+        if !members.iter().any(|m| member_matches(m, &path)) {
+            violations.push(format!(
+                "crates/{name} is not selected by workspace.members"
+            ));
+        }
+    }
+    violations
+}
+
 #[test]
 fn crates_depend_only_on_lower_layers() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let crates = manifest_dir.join("crates");
+    let names = workspace_crate_names(manifest_dir).unwrap_or_else(|e| panic!("{e}"));
     let mut violations = Vec::new();
-    let mut names = Vec::new();
-    for entry in fs::read_dir(&crates).unwrap_or_else(|e| panic!("unreadable crates: {e}")) {
-        let entry = entry.unwrap_or_else(|e| panic!("unreadable crates entry: {e}"));
-        if entry.path().join("Cargo.toml").is_file() {
-            names.push(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-    names.sort();
     for name in &names {
         let text = fs::read_to_string(crates.join(name).join("Cargo.toml"))
             .unwrap_or_else(|e| panic!("unreadable crates/{name}/Cargo.toml: {e}"));
         violations.extend(crate_layer_violations(name, &text));
     }
     assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+/// Every crate is discovered and registered exactly once, and every registered layer exists.
+#[test]
+fn workspace_crates_and_layer_registry_agree() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let names = workspace_crate_names(manifest_dir).unwrap_or_else(|e| panic!("{e}"));
+    let members = workspace_members(manifest_dir).unwrap_or_else(|e| panic!("{e}"));
+    let violations = registry_violations(CRATE_LAYERS, &names, &members);
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+/// Modules have one conventional definition in every source root (`src/` and `crates/*/src/`).
+#[test]
+fn modules_have_one_conventional_definition() {
+    let violations = layout_violations(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .unwrap_or_else(|error| panic!("architecture guard: {error}"));
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn conventional_layout_accepts_leaf_and_mod_files_and_rejects_ambiguity() {
+    let base = std::env::temp_dir().join(format!("dial-arch-layout-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let clean = base.join("clean");
+    let dirty = base.join("dirty");
+    for manifest in [&clean, &dirty] {
+        fs::create_dir_all(manifest.join("src")).unwrap();
+        fs::create_dir_all(manifest.join("crates/app/src")).unwrap();
+    }
+    // Accepted: leaf `foo.rs` with children in `foo/`, and `foo/mod.rs` alone.
+    fs::create_dir_all(clean.join("src/leaf")).unwrap();
+    fs::write(clean.join("src/leaf.rs"), "").unwrap();
+    fs::write(clean.join("src/leaf/children.rs"), "").unwrap();
+    fs::create_dir_all(clean.join("crates/app/src/modern")).unwrap();
+    fs::write(clean.join("crates/app/src/modern/mod.rs"), "").unwrap();
+    fs::write(clean.join("crates/app/src/modern/inner.rs"), "").unwrap();
+    // Rejected: the same module defined by both `top.rs` and `top/mod.rs`, in the root package
+    // and in a crate source root.
+    fs::write(dirty.join("src/top.rs"), "").unwrap();
+    fs::create_dir_all(dirty.join("src/top")).unwrap();
+    fs::write(dirty.join("src/top/mod.rs"), "").unwrap();
+    fs::write(dirty.join("crates/app/src/nest.rs"), "").unwrap();
+    fs::create_dir_all(dirty.join("crates/app/src/nest")).unwrap();
+    fs::write(dirty.join("crates/app/src/nest/mod.rs"), "").unwrap();
+    let accepted = layout_violations(&clean);
+    let rejected = layout_violations(&dirty);
+    let _ = fs::remove_dir_all(&base);
+    assert_eq!(accepted.unwrap(), Vec::<String>::new());
+    let found = rejected.unwrap();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found.iter().any(|v| v.starts_with("top.rs:")), "{found:?}");
+    assert!(found.iter().any(|v| v.starts_with("nest.rs:")), "{found:?}");
+}
+
+#[test]
+fn member_patterns_select_direct_children_only() {
+    assert!(member_matches("crates/*", "crates/app"));
+    assert!(!member_matches("crates/*", "crates"));
+    assert!(!member_matches("crates/*", "crates/"));
+    assert!(!member_matches("crates/*", "crates/app/inner"));
+    assert!(member_matches("crates/app", "crates/app"));
+    assert!(!member_matches("crates/app", "crates/other"));
+    assert!(!member_matches(".", "crates/app"));
+}
+
+#[test]
+fn registry_reports_unlisted_missing_duplicate_and_unselected_crates() {
+    let crates: BTreeSet<String> = ["dial-core", "dial-extra"].map(str::to_owned).into();
+    let all = ["crates/*".to_owned()];
+    assert_eq!(
+        registry_violations(&["dial-core", "dial-ghost", "dial-core"], &crates, &all),
+        vec![
+            "CRATE_LAYERS lists dial-ghost, but crates/dial-ghost/Cargo.toml does not exist"
+                .to_owned(),
+            "CRATE_LAYERS lists dial-core more than once".to_owned(),
+            "crates/dial-extra has a manifest but is not in CRATE_LAYERS".to_owned(),
+        ]
+    );
+    let only_core = ["crates/dial-core".to_owned()];
+    assert_eq!(
+        registry_violations(&["dial-core", "dial-extra"], &crates, &only_core),
+        vec!["crates/dial-extra is not selected by workspace.members".to_owned()]
+    );
+    assert!(registry_violations(&["dial-core", "dial-extra"], &crates, &all).is_empty());
+}
+
+#[test]
+fn workspace_discovery_is_read_from_the_manifests() {
+    let base = std::env::temp_dir().join(format!("dial-arch-registry-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("crates/dial-a")).unwrap();
+    fs::create_dir_all(base.join("crates/dial-b")).unwrap();
+    fs::write(base.join("crates/dial-a/Cargo.toml"), "").unwrap();
+    fs::write(base.join("crates/loose.txt"), "").unwrap();
+    fs::write(
+        base.join("Cargo.toml"),
+        "[workspace]\nmembers = [\".\", \"crates/*\"]\n",
+    )
+    .unwrap();
+    let names = workspace_crate_names(&base);
+    let members = workspace_members(&base);
+    let _ = fs::remove_dir_all(&base);
+    assert_eq!(
+        names.unwrap(),
+        ["dial-a".to_owned()].into_iter().collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        members.unwrap(),
+        vec![".".to_owned(), "crates/*".to_owned()]
+    );
 }
 
 #[test]
