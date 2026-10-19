@@ -249,6 +249,56 @@ pub fn speed_summary(rates: &[f64]) -> DecodeSpeed {
     }
 }
 
+/// Recorded use of one model over all time: request totals and decode speed. Both stay empty
+/// (unknown) for a model without matching requests; nothing is estimated.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ModelUsage {
+    pub totals: Totals,
+    pub speed: DecodeSpeed,
+}
+
+impl ModelUsage {
+    /// Mean recorded cost of a priced request, when any request was priced.
+    pub fn avg_cost_usd(&self) -> Option<f64> {
+        (self.totals.priced_requests > 0)
+            .then(|| self.totals.cost_usd / self.totals.priced_requests as f64)
+    }
+}
+
+/// Every model's recorded usage, keyed by the model name stats record (the backend's model label).
+/// Empty when the stats database is missing or unreadable; the database is opened read-only.
+pub fn read_model_usage(user_dir: &Path) -> BTreeMap<String, ModelUsage> {
+    Db::open_read_only(&db_path(user_dir))
+        .and_then(|db| db.model_usage())
+        .unwrap_or_default()
+}
+
+const TOTALS_SQL: &str =
+    "SUM(requests), SUM(errors), SUM(reported), SUM(input), SUM(output), SUM(cache_read),
+    SUM(cache_write), SUM(reasoning), SUM(cost), SUM(priced), SUM(duration_ms)";
+
+/// Reads the [`TOTALS_SQL`] columns starting at column `at`.
+fn read_totals(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Totals> {
+    let n = |i: usize| -> rusqlite::Result<u64> {
+        Ok(r.get::<_, Option<i64>>(at + i)?.unwrap_or(0).max(0) as u64)
+    };
+    Ok(Totals {
+        requests: n(0)?,
+        errors: n(1)?,
+        reported: n(2)?,
+        input: n(3)?,
+        output: n(4)?,
+        cache_read: n(5)?,
+        cache_write: n(6)?,
+        reasoning: n(7)?,
+        cost_usd: r.get::<_, Option<f64>>(at + 8)?.unwrap_or(0.0),
+        priced_requests: n(9)?,
+        duration_ms: n(10)?,
+        ..Default::default()
+    }
+    .finish())
+}
+
 // ---------------------------------------------------------------- database
 // ---------------------------------------------------------------- database
 
@@ -381,6 +431,23 @@ impl Db {
             rates.push(output as f64 / (duration_ms as f64 / 1000.0));
         }
         Ok(speed_summary(&rates))
+    }
+
+    /// All-time totals and decode speed of every model with recorded requests.
+    pub fn model_usage(&self) -> Result<BTreeMap<String, ModelUsage>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT model, {TOTALS_SQL} FROM request_hourly GROUP BY model"
+        ))?;
+        let totals: Vec<(String, Totals)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, read_totals(r, 1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        totals
+            .into_iter()
+            .map(|(model, totals)| {
+                let speed = self.decode_speed(&[model.as_str()])?;
+                Ok((model, ModelUsage { totals, speed }))
+            })
+            .collect()
     }
 
     pub fn record_request(&mut self, r: &RequestRecord) -> Result<()> {
@@ -529,29 +596,7 @@ impl Db {
         let since = since_ms.unwrap_or(i64::MIN);
         let labels = self.project_labels()?;
         let label = |key: &str| labels.get(key).cloned().unwrap_or_else(|| key.to_owned());
-        let totals_sql =
-            "SUM(requests), SUM(errors), SUM(reported), SUM(input), SUM(output), SUM(cache_read),
-            SUM(cache_write), SUM(reasoning), SUM(cost), SUM(priced), SUM(duration_ms)";
-        let read_totals = |r: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Totals> {
-            let n = |i: usize| -> rusqlite::Result<u64> {
-                Ok(r.get::<_, Option<i64>>(at + i)?.unwrap_or(0).max(0) as u64)
-            };
-            Ok(Totals {
-                requests: n(0)?,
-                errors: n(1)?,
-                reported: n(2)?,
-                input: n(3)?,
-                output: n(4)?,
-                cache_read: n(5)?,
-                cache_write: n(6)?,
-                reasoning: n(7)?,
-                cost_usd: r.get::<_, Option<f64>>(at + 8)?.unwrap_or(0.0),
-                priced_requests: n(9)?,
-                duration_ms: n(10)?,
-                ..Default::default()
-            }
-            .finish())
-        };
+        let totals_sql = TOTALS_SQL;
         let overall = self.conn.query_row(
             &format!("SELECT {totals_sql} FROM request_hourly WHERE hour >= ?1"),
             [hour],

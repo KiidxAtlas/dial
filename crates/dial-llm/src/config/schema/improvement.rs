@@ -163,8 +163,8 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         improve.monitor_drop,
         IM,
         "Automatic improvement",
-        "Rollback drop (pts)",
-        "Roll back when a version's live results fall this many points below its parent's.",
+        "Observed matched drop (pts)",
+        "Warn when the lower confidence bound on the net share of matched prompts that got worse exceeds this many points. Observational only; does not authorize automatic rollback.",
         Kind::Float {
             min: 1.0,
             max: 100.0,
@@ -176,8 +176,8 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         improve.monitor_min_turns,
         IM,
         "Automatic improvement",
-        "Rollback min turns",
-        "Live turns needed before the rollback check applies (at least 2).",
+        "Minimum matched prompts",
+        "Distinct same-source prompts scored for both versions before a live diagnostic (at least 2). Unpaired turns do not count.",
         Kind::Int {
             min: 2,
             max: 100_000,

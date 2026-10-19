@@ -24,6 +24,10 @@ project, so changing visible tests cannot weaken them. No third-party Python pac
 Run `python3 -m unittest discover -s examples/benchmarks -p 'test_*.py'` to verify the
 evaluation machinery and fixture acceptance contracts without making model calls.
 
+For independently checked tool-selection/composition, boundary, context and diagnosis cases, see
+[tool-effectiveness.md](tool-effectiveness.md). Its offline analyzer compares all-trial work with
+matched-success work on the existing repeated-run contracts; it does not reward tool use for its own sake.
+
 Compare repeated runs with the same fixture revision and model using
 `python3 examples/benchmarks/compare.py before.json after.json` (CLI report envelopes are accepted).
 Reports record case categories, outcome-check counts, failed/unavailable check indices, and a
@@ -71,6 +75,26 @@ python3 -m unittest discover -s examples/benchmarks -p 'test_*.py'
 The smoke uses a loopback scripted provider with baseline and compact-tool configurations.
 It verifies orchestration and graders, **not real-model performance**. See
 [Harness quality design](audits/harness-quality.md) for the research rationale and interpretation rules.
+
+### Core-reliability acceptance protocol
+
+Use deterministic regressions first for approval escalation, automatic-check denial, workspace and
+external Rust test selection, recall across compaction, journal damage diagnostics, evaluation
+exclusions, and final-revision completion evidence. These establish contracts, not model quality.
+The completion/efficiency events expose versioned `completion_evidence`; do not treat
+`execution_outcome=completed` or `observed_checks_passed` as an independent correctness label.
+Keep baseline, stale and unavailable check evidence distinct from current passing observations.
+
+For provider-backed comparisons, fix the model/configuration and fixture revision; use at least
+three repetitions through the runner above, keep every unavailable/failed trial, and compare
+independently checked task success before latency or observed cost per successful task. Include
+workspace Rust and JS/Go projects and long journeys in project-specific suites, not only the small
+Python quality fixture. Run paired harness configurations with one feature changed at a time
+(memory, coaching/escalation, delegation, or adaptation). Inspect patches and user corrections as
+well as executable acceptance checks. Compare latency/cost only with complete usage and equivalent
+checked success populations; report missing usage as unknown. Existing assistance ablation support
+is a starting point, not evidence that every feature improves results. No live-model improvement is
+established by the scripted regressions or this integration alone.
 
 ## Repository benchmark suites
 

@@ -1,6 +1,6 @@
 //! Benchmark child protocol: every turn stays in one process/session, with bounded event capture.
 use anyhow::{Context, Result, ensure};
-use dial::benchmark::{AgentFailure, BenchmarkCase, RunMetrics, failure_detail};
+use dial::benchmark::{AgentFailure, BenchmarkCase, RunMetrics, ToolTrace, failure_detail};
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -76,6 +76,18 @@ fn request(
         }
     }
 }
+/// The child's snapshots are cumulative, so the last one covers the case. It is complete only when
+/// the run succeeded and every send reported a snapshot; with no snapshot the trace stays unknown.
+fn tool_trace_for_run(
+    snapshot: Option<&Value>,
+    sends: u64,
+    snapshots: u64,
+    succeeded: bool,
+) -> Option<ToolTrace> {
+    let complete = succeeded && sends > 0 && snapshots == sends;
+    ToolTrace::from_snapshot(snapshot?, complete)
+}
+
 fn observe(m: &mut RunMetrics, event: &Value) {
     match event["event"].as_str() {
         Some("usage") => {
@@ -266,6 +278,8 @@ pub fn run_configured(
     });
     let mut metrics = RunMetrics::default();
     let mut ledger_read = false;
+    let mut trace_snapshot: Option<Value> = None;
+    let (mut trace_sends, mut trace_snapshots) = (0u64, 0u64);
     let result = (|| -> Result<()> {
         loop {
             let event = receive(&rx, deadline)?;
@@ -374,6 +388,11 @@ pub fn run_configured(
             {
                 metrics.repair_attempts = Some(n);
             }
+            trace_sends += 1;
+            if let Some(snapshot) = report.pointer("/metrics/tool_trace") {
+                trace_snapshots += 1;
+                trace_snapshot = Some(snapshot.clone());
+            }
         }
         // Runtime-wide ledger (every purpose and worker), read once after the last turn. It
         // replaces the main-agent usage events above, so the two are never summed.
@@ -404,6 +423,13 @@ pub fn run_configured(
     metrics.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     metrics.agent_succeeded = result.is_ok();
     metrics.agent_error = result.is_err();
+    // Snapshots are cumulative for the child runtime; the last one describes the whole case.
+    metrics.tool_trace = tool_trace_for_run(
+        trace_snapshot.as_ref(),
+        trace_sends,
+        trace_snapshots,
+        result.is_ok(),
+    );
     // A failure before the ledger read leaves runtime usage unknown once the model was active.
     let active = metrics.token_usage_observed
         || metrics.tool_calls > 0

@@ -184,7 +184,7 @@ impl Agent<'_> {
                 rule_state.save(&mut control);
                 self.session.set_control_state(control)?;
                 completion.reset_for_steering();
-                engine.reset();
+                engine.transition(crate::agent::run::engine::RecoveryTransition::Steering);
 
                 todo_recovery = Default::default();
                 stall = Default::default();
@@ -1004,6 +1004,10 @@ impl Agent<'_> {
                     return Err(error).map(crate::agent::run::engine::Tick::Finished);
                 }
             };
+            // Counted when a provider reply is received: its schemas were sent, whether the reply later
+            // ends in text, a tool dispatch, or a guidance discard. Pre-reply regenerations, stream failures
+            // and interceptions return earlier and are not counted.
+            self.metrics.tool_trace.record_offered(&request_tools);
             if self.external_thinking_instruction().is_some() {
                 reply.text = crate::agent::modes::external_thinking::strip_scratchpad(&reply.text);
                 if !reply.text.is_empty() {
@@ -1397,10 +1401,7 @@ impl Agent<'_> {
                 let streamed_len = reply.text.len();
                 let text = self.step_checks.visual.summary(
                     reply.text,
-                    (
-                        self.step_checks.mutations,
-                        self.step_checks.uncheckpointed_shell_commands,
-                    ),
+                    self.step_checks.revision(),
                 );
                 if text.len() > streamed_len {
                     ui.text_delta(&text[streamed_len..]);
@@ -1822,20 +1823,24 @@ impl Agent<'_> {
                             self.pending_tool_steering.extend(steering);
                         }
                     }
-                    let (mut out, seconds) = match parallel.pop_front() {
+                    let (mut out, seconds, executed) = match parallel.pop_front() {
                         Some(result) => {
                             // Batched bash skips `dispatch`; record verification evidence as the serial path does.
                             if call.name == "bash" {
                                 self.note_verification(call, &result.0, ui);
                             }
-                            result
+                            (result.0, result.1, true)
                         }
                         None if call.name == "finish" && call.arguments["outcome"] == "completed" && (execution_failed || !form_kinds.is_empty()) => {
                             (ToolOutput { execution: Default::default(),  data: None,
-text: "finish completed cannot follow a failed call in the same batch; address its error first".into(), is_error: true }, 0.0)
+text: "finish completed cannot follow a failed call in the same batch; address its error first".into(), is_error: true }, 0.0, false)
                         }
-                        None => { let started = Instant::now(); let out = self.dispatch(backend, call, ui); (out, started.elapsed().as_secs_f64()) }
+                        None => { let started = Instant::now(); let out = self.dispatch(backend, call, ui); (out, started.elapsed().as_secs_f64(), true) }
                     };
+                    // Only admitted calls that reached execution count; rejected, skipped and blocked forms do not.
+                    if executed {
+                        self.metrics.tool_trace.record_invoked(&call.name);
+                    }
                     if (call.name == "browser" || call.name == "computer") && !out.is_error {
                         match crate::storage::artifact::capture_image(self.workspace.artifacts(), &mut out) {
                             Ok(attachment) => image = attachment,
@@ -1992,6 +1997,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                         .uncheckpointed_extension_tools
                         .insert(call.name.clone());
                 }
+                self.step_checks.evidence.settle_call(&call.id, self.step_checks.revision());
                 if !self.hermetic
                     && !output.is_error
                     && matches!(call.name.as_str(), "write" | "edit" | "ast_edit")
@@ -2237,10 +2243,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     && backend.accepts_image_input()
                 {
                     self.step_checks.visual.captured(
-                        (
-                            self.step_checks.mutations,
-                            self.step_checks.uncheckpointed_shell_commands,
-                        ),
+                        self.step_checks.revision(),
                         call.name == "browser" || call.name == "computer",
                     );
                 }
@@ -2502,7 +2505,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     stall = Default::default();
 
                     todo_recovery = Default::default();
-                    engine.reset();
+                    engine.transition(crate::agent::run::engine::RecoveryTransition::AutomaticContinue);
 
                     reliability.consecutive_contract_failures = 0;
                     names = self.offered();
@@ -2529,7 +2532,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     stall = Default::default();
 
                     todo_recovery = Default::default();
-                    engine.reset();
+                    engine.transition(crate::agent::run::engine::RecoveryTransition::DirectedContinue);
 
                     reliability.consecutive_contract_failures = 0;
                     names = self.offered();
@@ -2575,10 +2578,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     finish.text.push_str(&coach_turn.completion_note());
                     finish.text = self.step_checks.visual.summary(
                         finish.text,
-                        (
-                            self.step_checks.mutations,
-                            self.step_checks.uncheckpointed_shell_commands,
-                        ),
+                        self.step_checks.revision(),
                     );
                     if self.logging {
                         self.training_capture.record(

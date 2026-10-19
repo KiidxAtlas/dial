@@ -49,6 +49,13 @@ impl Shell {
             (name, args)
         };
         let name = canonical_command(name);
+        if name == "todo" {
+            self.todo = agent.todo().clone();
+            return match self.work_plan(args) {
+                Some(spec) => self.open(app, agent, Which::Choice(Box::new(spec))),
+                None => Ok(Step::Done),
+            };
+        }
         if (args.is_empty() || (name == "permissions" && args == "remove"))
             && let Some(spec) = self.picker(app, agent, name, args)
         {
@@ -244,10 +251,13 @@ impl Shell {
             "model" | "models" if args == "local" => {
                 return self.open(app, agent, Which::ModelDownloads);
             }
+            "model" | "models" if args == "memory" => {
+                return self.open(app, agent, Which::ModelMemory);
+            }
             "model" if !args.is_empty() => {
                 self.note(
                     "Model",
-                    "Unknown option. Use /model to choose a model, /model settings to tune it, /model defaults for shared context defaults, or /model local for the Get models downloads in /models.",
+                    "Unknown option. Use /model to choose a model, /model settings to tune it, /model defaults for shared context defaults, /model local for the Get models downloads in /models, or /model memory for the memory role's models.",
                 );
             }
             "model" | "models" => return self.open(app, agent, Which::Models),
@@ -700,15 +710,6 @@ impl Shell {
                     },
                     None => self.note("Rollback", "checkpoints unavailable"),
                 }
-            }
-            "todo" => {
-                let text = agent.todo().render();
-                let text = if text.trim().is_empty() {
-                    "No tasks yet. The agent adds a checklist here when work has several steps.".to_owned()
-                } else {
-                    text
-                };
-                self.note("Todo", text)
             }
             "skills" => {
                 let words = crate::runtime::arguments::split_words(args);

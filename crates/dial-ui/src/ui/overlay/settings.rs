@@ -314,6 +314,21 @@ pub(super) mod testkit;
 // Settings panel
 // ---------------------------------------------------------------------------------------------
 
+/// Choices a picker shows at once; longer lists get a filter line.
+const PICK_ROWS: usize = 7;
+
+/// Indexes of the `choices` the filter keeps, in order. Each space-separated term must appear in
+/// the choice's label or raw value, ignoring case, so "auto" finds "Auto (let Dial decide)".
+fn pick_matches(labels: &[String], choices: &[String], filter: &str) -> Vec<usize> {
+    let terms: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
+    (0..choices.len())
+        .filter(|&n| {
+            let haystack = format!("{} {}", labels[n], choices[n]).to_lowercase();
+            terms.iter().all(|term| haystack.contains(term.as_str()))
+        })
+        .collect()
+}
+
 const PROVIDERS_TAB: &str = "Setup";
 const LINK_SECTION: &str = "Models, connections & controls";
 /// Launchers for dedicated setup panels: (label, description, application action).
@@ -363,6 +378,8 @@ enum Mode {
         def: &'static SettingDef,
         choices: Vec<String>,
         cursor: usize,
+        /// Type-to-filter text. Matches a choice's label or raw value, ignoring case.
+        filter: Editor,
     },
 }
 
@@ -381,6 +398,12 @@ enum Item {
     Choice {
         name: String,
         on: bool,
+    },
+    /// The picker's filter line: its editor (drawn with its caret), choices kept, and choices total.
+    Filter {
+        editor: Editor,
+        shown: usize,
+        total: usize,
     },
 }
 
@@ -1134,6 +1157,7 @@ impl SettingsOverlay {
             def,
             choices,
             cursor,
+            filter: Editor::default(),
         };
         OverlayEvent::None
     }
@@ -1446,9 +1470,11 @@ impl SettingsOverlay {
                         self.cursor = 0;
                         self.scroll = 0;
                     }
-                    Mode::Pick { .. } => {}
+                    Mode::Pick { filter, .. } => {
+                        filter.insert(&pasted);
+                    }
                 }
-                OverlayEvent::None
+                self.refit_pick()
             }
             _ => OverlayEvent::None,
         }
@@ -1649,6 +1675,7 @@ impl SettingsOverlay {
                     def,
                     choices,
                     cursor,
+                    filter: Editor::default(),
                 };
                 OverlayEvent::None
             }
@@ -1683,6 +1710,7 @@ impl SettingsOverlay {
                     def,
                     choices,
                     cursor,
+                    filter: Editor::default(),
                 };
                 OverlayEvent::None
             }
@@ -1703,6 +1731,7 @@ impl SettingsOverlay {
                     def,
                     choices,
                     cursor,
+                    filter: Editor::default(),
                 };
                 OverlayEvent::None
             }
@@ -1786,29 +1815,51 @@ impl SettingsOverlay {
     }
 
     fn pick_key(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
+        let Mode::Pick { def, .. } = &self.mode else {
+            return OverlayEvent::None;
+        };
+        let def: &'static SettingDef = def;
+        let labels: Vec<String> = match &self.mode {
+            Mode::Pick { choices, .. } => choices
+                .iter()
+                .map(|choice| self.choice_label(def, choice))
+                .collect(),
+            _ => return OverlayEvent::None,
+        };
+        let is_theme = matches!(def.kind_for(&self.effective), Kind::Theme);
         let Mode::Pick {
-            def,
             choices,
             cursor,
+            filter,
+            ..
         } = &mut self.mode
         else {
             return OverlayEvent::None;
         };
-        let def: &'static SettingDef = def;
-        let last = choices.len().saturating_sub(1);
+        let at = *cursor;
+        let visible = pick_matches(&labels, choices, &filter.text);
         if keys.matches(Action::SelectCancel, key) {
+            // Esc first clears the filter; only a bare Esc leaves the picker.
+            if !filter.text.is_empty() {
+                filter.set("");
+                return OverlayEvent::None;
+            }
             self.mode = Mode::Browse;
             if def.path == "memory.backend" {
                 self.memory_intent = None;
             }
-            return if matches!(def.kind_for(&self.effective), Kind::Theme) {
+            return if is_theme {
                 OverlayEvent::PreviewTheme(None)
             } else {
                 OverlayEvent::None
             };
         }
         if keys.matches(Action::SelectConfirm, key) {
-            let chosen = choices[*cursor].clone();
+            // A filter that matches nothing has nothing to save; Esc clears it.
+            if !visible.contains(&at) {
+                return OverlayEvent::None;
+            }
+            let chosen = choices[at].clone();
             let value = choice_value(def.kind_for(&self.effective), &chosen);
             let unchanged = self.current(def) == value;
             self.mode = Mode::Browse;
@@ -1848,7 +1899,7 @@ impl SettingsOverlay {
                 self.memory_intent = None;
             }
             return if unchanged {
-                if matches!(def.kind_for(&self.effective), Kind::Theme) {
+                if is_theme {
                     OverlayEvent::PreviewTheme(None)
                 } else {
                     OverlayEvent::None
@@ -1857,26 +1908,92 @@ impl SettingsOverlay {
                 self.emit_set(def, value)
             };
         }
-        let moved = if keys.matches(Action::SelectUp, key) {
-            *cursor = if *cursor == 0 { last } else { *cursor - 1 };
-            true
+        let pos = visible.iter().position(|&n| n == at).unwrap_or(0);
+        let last = visible.len().saturating_sub(1);
+        let next = if keys.matches(Action::SelectUp, key) {
+            Some(if pos == 0 { last } else { pos - 1 })
         } else if keys.matches(Action::SelectDown, key) {
-            *cursor = if *cursor >= last { 0 } else { *cursor + 1 };
-            true
+            Some(if pos >= last { 0 } else { pos + 1 })
         } else if keys.matches(Action::SelectPageUp, key) {
-            *cursor = 0;
-            true
+            Some(0)
         } else if keys.matches(Action::SelectPageDown, key) {
-            *cursor = last;
-            true
+            Some(last)
         } else {
-            false
+            None
         };
-        if moved && matches!(def.kind_for(&self.effective), Kind::Theme) {
-            OverlayEvent::PreviewTheme(Some(choices[*cursor].clone()))
+        if let Some(next) = next {
+            let Some(&n) = visible.get(next) else {
+                return OverlayEvent::None;
+            };
+            *cursor = n;
+            return if is_theme {
+                OverlayEvent::PreviewTheme(Some(choices[n].clone()))
+            } else {
+                OverlayEvent::None
+            };
+        }
+        // Any other editing key goes to the filter; only a change to its text re-fits the selection.
+        let before = filter.text.clone();
+        if !filter.key_with(*key, keys) || filter.text == before {
+            return OverlayEvent::None;
+        }
+        self.refit_pick()
+    }
+
+    /// After the filter text changed, keep the selection on a choice it still shows. The chosen
+    /// value is untouched until Enter; a theme picker previews whichever choice is now selected.
+    fn refit_pick(&mut self) -> OverlayEvent {
+        let Mode::Pick { def, choices, .. } = &self.mode else {
+            return OverlayEvent::None;
+        };
+        let def: &'static SettingDef = def;
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|choice| self.choice_label(def, choice))
+            .collect();
+        let is_theme = matches!(def.kind_for(&self.effective), Kind::Theme);
+        let Mode::Pick {
+            choices,
+            cursor,
+            filter,
+            ..
+        } = &mut self.mode
+        else {
+            return OverlayEvent::None;
+        };
+        let visible = pick_matches(&labels, choices, &filter.text);
+        if visible.contains(&*cursor) {
+            return OverlayEvent::None;
+        }
+        let Some(&first) = visible.first() else {
+            return OverlayEvent::None;
+        };
+        *cursor = first;
+        if is_theme {
+            OverlayEvent::PreviewTheme(Some(choices[first].clone()))
         } else {
             OverlayEvent::None
         }
+    }
+
+    /// What a picker row shows for a raw choice value. The saved value is always the raw one.
+    fn choice_label(&self, def: &SettingDef, choice: &str) -> String {
+        match (def.kind_for(&self.effective), choice) {
+            (Kind::AutoBool, "auto") => "Auto (let Dial decide)".to_owned(),
+            (Kind::AutoBool, "true") => "On (enabled)".to_owned(),
+            (Kind::AutoBool, "false") => "Off (disabled)".to_owned(),
+            _ if def.path == EMBEDDING_MODEL_PATH => self.embedding_choice_label(choice),
+            _ => value_text(def, &Value::String(choice.to_owned())),
+        }
+    }
+
+    /// Indexes of the choices the picker filter keeps, in order.
+    fn pick_visible(&self, def: &SettingDef, choices: &[String], filter: &str) -> Vec<usize> {
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|choice| self.choice_label(def, choice))
+            .collect();
+        pick_matches(&labels, choices, filter)
     }
 
     // ---- drawing --------------------------------------------------------------------------
@@ -1971,27 +2088,39 @@ impl SettingsOverlay {
                     def: picking,
                     choices,
                     cursor,
+                    filter,
                 } = &self.mode
                     && picking.path == def.path
                     && i == self.cursor
                 {
-                    let first = cursor
+                    let labels: Vec<String> = choices
+                        .iter()
+                        .map(|choice| self.choice_label(def, choice))
+                        .collect();
+                    let visible = pick_matches(&labels, choices, &filter.text);
+                    if choices.len() > PICK_ROWS || !filter.text.is_empty() {
+                        items.push(Item::Filter {
+                            editor: filter.clone(),
+                            shown: visible.len(),
+                            total: choices.len(),
+                        });
+                    }
+                    if visible.is_empty() {
+                        items.push(Item::Hint(format!(
+                            "No option matches \"{}\". Esc clears the filter.",
+                            text::one_line(&filter.text)
+                        )));
+                    }
+                    let at = visible.iter().position(|&n| n == *cursor).unwrap_or(0);
+                    let first = at
                         .saturating_sub(3)
-                        .min(choices.len().saturating_sub(7));
-                    for (n, name) in choices.iter().enumerate().skip(first).take(7) {
+                        .min(visible.len().saturating_sub(PICK_ROWS));
+                    for &n in visible.iter().skip(first).take(PICK_ROWS) {
                         if n == *cursor {
                             cursor_item = items.len();
                         }
                         items.push(Item::Choice {
-                            name: match (def.kind_for(&self.effective), name.as_str()) {
-                                (Kind::AutoBool, "auto") => "Auto (let Dial decide)".to_owned(),
-                                (Kind::AutoBool, "true") => "On (enabled)".to_owned(),
-                                (Kind::AutoBool, "false") => "Off (disabled)".to_owned(),
-                                _ if def.path == EMBEDDING_MODEL_PATH => {
-                                    self.embedding_choice_label(name)
-                                }
-                                _ => value_text(def, &Value::String(name.clone())),
-                            },
+                            name: labels[n].clone(),
                             on: n == *cursor,
                         });
                     }
@@ -2024,11 +2153,19 @@ impl SettingsOverlay {
         if matches!(items.get(cursor_item), Some(Item::Choice { .. })) {
             // Opening a picker near the bottom must reveal its alternatives, not just its
             // selected value. Keep the setting label with the choices when the block fits.
-            while top > 0 && matches!(items.get(top - 1), Some(Item::Choice { .. })) {
+            while top > 0
+                && matches!(
+                    items.get(top - 1),
+                    Some(Item::Choice { .. } | Item::Filter { .. })
+                )
+            {
                 top -= 1;
             }
             top = top.saturating_sub(1);
-            while matches!(items.get(bottom + 1), Some(Item::Choice { .. })) {
+            while matches!(
+                items.get(bottom + 1),
+                Some(Item::Choice { .. } | Item::Filter { .. })
+            ) {
                 bottom += 1;
             }
             if bottom - top + 1 > body_rows {
@@ -2041,7 +2178,7 @@ impl SettingsOverlay {
         }
         while matches!(
             items.get(bottom + 1),
-            Some(Item::Note(_) | Item::Hint(_) | Item::Setup { .. })
+            Some(Item::Note(_) | Item::Hint(_) | Item::Setup { .. } | Item::Filter { .. })
         ) {
             bottom += 1;
         }
@@ -2097,7 +2234,10 @@ impl SettingsOverlay {
             let list_line = match item {
                 None if rows.is_empty() && y == 0 => {
                     let msg = if searching {
-                        format!(" No settings match \"{}\"", text::one_line(&self.search))
+                        format!(
+                            " No settings match \"{}\". Esc clears the search.",
+                            text::one_line(&self.search)
+                        )
                     } else {
                         " Nothing here".to_owned()
                     };
@@ -2142,6 +2282,22 @@ impl SettingsOverlay {
                     }
                     filled(spans, list_w, Style::default())
                 }
+                Some(Item::Filter {
+                    editor,
+                    shown,
+                    total,
+                }) => {
+                    let count = if editor.text.trim().is_empty() {
+                        format!("{total} options")
+                    } else {
+                        format!("{shown} of {total}")
+                    };
+                    let mut spans = vec![Span::styled("      Filter: ", theme.fg(Tok::Muted))];
+                    let room = list_w.saturating_sub(spans_width(&spans) + text::width(&count) + 3);
+                    spans.extend(editor_spans(theme, editor, room, false));
+                    spans.push(Span::styled(format!("   {count}"), theme.fg(Tok::Muted)));
+                    filled(spans, list_w, Style::default())
+                }
                 Some(Item::Choice { name, on }) => {
                     let pointer = if *on {
                         theme.sym(Sym::RadioOn)
@@ -2183,9 +2339,12 @@ impl SettingsOverlay {
 
         if show_desc {
             let wanted = if show_desc2 { 2 } else { 1 };
-            let mut desc: Vec<(String, Tok)> = Vec::new();
+            // The explanation leads; the path, source and restart state follow it, so a one-row
+            // panel still says what the setting does. Save feedback and errors come first.
+            let mut head: Vec<(String, Tok)> = Vec::new();
+            let mut meta: Option<(String, Tok)> = None;
             if let Some(error) = &self.load_error {
-                desc.push((error.clone(), Tok::Error));
+                head.push((error.clone(), Tok::Error));
             }
             match cursor_row {
                 Some(Row::Setting(i)) => {
@@ -2193,15 +2352,18 @@ impl SettingsOverlay {
                     if def.path == "memory.backend" && matches!(self.mode, Mode::Browse) {
                         // What the selected backend does and, if setting one up, what remains.
                         if let Some(feedback) = &self.feedback {
-                            desc.push((feedback.clone(), Tok::Success));
+                            head.push((feedback.clone(), Tok::Success));
                         }
                         let backend = self.memory_backend();
                         let models = ctx.keys.label(Action::ModelSelect);
-                        desc.push((memory_summary(&backend, &models), Tok::Text));
+                        head.push((memory_summary(&backend, &models), Tok::Text));
                     } else if matches!(self.mode, Mode::Edit { .. }) {
-                        desc.push((input_hint(def.kind_for(&self.effective)), Tok::Muted));
-                    } else if show_desc2 || self.feedback.is_some() {
-                        let detail = self.feedback.clone().unwrap_or_else(|| {
+                        head.push((input_hint(def.kind_for(&self.effective)), Tok::Muted));
+                    } else {
+                        if let Some(feedback) = &self.feedback {
+                            head.push((feedback.clone(), Tok::Success));
+                        }
+                        meta = Some((
                             format!(
                                 "{}  |  Using {} value{}",
                                 def.path,
@@ -2211,35 +2373,39 @@ impl SettingsOverlay {
                                 } else {
                                     ""
                                 }
-                            )
-                        });
-                        desc.push((
-                            detail,
-                            if self.feedback.is_some() {
-                                Tok::Success
-                            } else {
-                                Tok::Dim
-                            },
+                            ),
+                            Tok::Dim,
                         ));
                     }
-                    desc.extend(
+                    head.extend(
                         text::wrap_words(def.description, w.saturating_sub(2).max(1))
                             .into_iter()
                             .map(|l| (l, Tok::Muted)),
                     );
                 }
-                Some(Row::Advanced(_, _, count)) => desc.push((
+                Some(Row::Advanced(_, _, count)) => head.push((
                     format!("{count} tuning settings: timeouts, limits and budgets. Search also finds them."),
                     Tok::Muted,
                 )),
-                Some(Row::Link(i)) => desc.extend(
+                Some(Row::Link(i)) => head.extend(
                     text::wrap_words(LINKS[i].1, w.saturating_sub(2).max(1))
                         .into_iter()
                         .map(|l| (l, Tok::Muted)),
                 ),
                 None => {}
             }
-            desc.truncate(wanted);
+            // With two rows, the meta line takes the second so the path and source stay visible.
+            let lead = if wanted > 1 && meta.is_some() {
+                wanted - 1
+            } else {
+                wanted
+            };
+            let mut desc: Vec<(String, Tok)> = head.into_iter().take(lead).collect();
+            if let Some(meta) = meta
+                && (wanted > 1 || desc.is_empty())
+            {
+                desc.push(meta);
+            }
             for n in 0..wanted {
                 lines.push(match desc.get(n) {
                     Some((line, tok)) => Line::from(fit(
@@ -2565,19 +2731,37 @@ impl SettingsOverlay {
                     hint(keys, Action::SelectCancel, "cancel"),
                 ]
             }
-            Mode::Pick { def, .. } => vec![
-                hint(keys, Action::SelectConfirm, "save"),
-                pair(
-                    Action::SelectUp,
-                    Action::SelectDown,
-                    if matches!(def.kind_for(&self.effective), Kind::Theme) {
-                        "preview"
-                    } else {
-                        "choose"
-                    },
-                ),
-                hint(keys, Action::SelectCancel, "cancel"),
-            ],
+            Mode::Pick {
+                def,
+                choices,
+                filter,
+                ..
+            } => {
+                let filtering = !filter.text.is_empty();
+                let matched = !self.pick_visible(def, choices, &filter.text).is_empty();
+                let mut hints = Vec::new();
+                if matched {
+                    hints.push(hint(keys, Action::SelectConfirm, "save"));
+                    hints.push(pair(
+                        Action::SelectUp,
+                        Action::SelectDown,
+                        if matches!(def.kind_for(&self.effective), Kind::Theme) {
+                            "preview"
+                        } else {
+                            "choose"
+                        },
+                    ));
+                }
+                if choices.len() > PICK_ROWS || filtering {
+                    hints.push("Type filter".to_owned());
+                }
+                hints.push(hint(
+                    keys,
+                    Action::SelectCancel,
+                    if filtering { "clear filter" } else { "cancel" },
+                ));
+                hints
+            }
             Mode::Browse => {
                 let verb = match self.current_row() {
                     Some(Row::Link(_)) => "open",
@@ -2606,7 +2790,7 @@ impl SettingsOverlay {
                     },
                     hint(keys, Action::SectionNext, "sections"),
                     "Ctrl+S scope".to_owned(),
-                    "Del inherit".to_owned(),
+                    "Del clear override".to_owned(),
                     if self.setup_offers.is_empty() {
                         String::new()
                     } else {

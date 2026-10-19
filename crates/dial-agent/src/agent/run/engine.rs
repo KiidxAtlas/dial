@@ -28,6 +28,16 @@ pub(in crate::agent) struct Engine {
     length_nudges: u32,
 }
 
+/// State lifetimes are explicit: new instructions release old call restrictions; retries do not.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::agent) enum RecoveryTransition {
+    Steering,
+    Coordination,
+    AutomaticContinue,
+    DirectedContinue,
+}
+
 pub(in crate::agent) enum Tick<R> {
     Again,
     Exhausted,
@@ -79,8 +89,20 @@ impl Engine {
     pub fn pending_refusal(&self) -> Option<&'static str> {
         self.uncertain.then_some("This call was not executed: an earlier tool ended with uncertain effects. Inspect affected state before starting further actions.")
     }
-    pub fn reset(&mut self) {
-        *self = Self::default();
+    pub fn transition(&mut self, reason: RecoveryTransition) {
+        match reason {
+            RecoveryTransition::Steering | RecoveryTransition::Coordination => {
+                // Even a new instruction cannot turn an uninspected partial effect into permission.
+                let uncertain = self.uncertain;
+                *self = Self::default();
+                self.uncertain = uncertain;
+            }
+            RecoveryTransition::AutomaticContinue | RecoveryTransition::DirectedContinue => {
+                // A retry changes the approach, not the evidence or committed-content history.
+                self.narration = Default::default();
+                self.recovery.reset();
+            }
+        }
     }
     pub fn rejection_at(&mut self, workspace: &Workspace, call: &ToolCall) -> Option<String> {
         if let Some(path) = self.cycles.blocked(&call_identity(call)) {
@@ -125,6 +147,11 @@ impl Engine {
                     call.name
                 )),
             );
+        }
+        if let Some((kind, advice)) = crate::agent::run::failure_guidance::classify(call, output) {
+            output
+                .text
+                .push_str(&format!("\n[Dial recovery: {kind}] {advice}"));
         }
         let observation = self.cycles.observe(
             workspace,

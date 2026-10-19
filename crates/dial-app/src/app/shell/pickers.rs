@@ -144,4 +144,37 @@ impl Shell {
             _ => None,
         }
     }
+
+    /// A read-only plan browser shared by idle commands and the live-turn command route.
+    /// Detail panels return to the plan; cancelling either layer never alters the agent's tasks.
+    pub(super) fn work_plan(&mut self, args: &str) -> Option<ChoiceSpec> {
+        if args == "list" {
+            self.note("Work plan", self.todo.render());
+            return None;
+        }
+        let mut selected = None;
+        if !args.is_empty() {
+            let index = args
+                .strip_prefix("show ")
+                .and_then(|number| number.trim().parse::<usize>().ok())
+                .and_then(|number| number.checked_sub(1));
+            let Some(task) = index.and_then(|index| self.todo.tasks().get(index)) else {
+                self.note("Work plan", "Use /todo to browse, /todo list for text, or /todo show <number>. No task state changed.");
+                return None;
+            };
+            let detail = crate::ui::tasks::step_detail(task);
+            self.ask("Step details", &detail, &[("Back to work plan", 'b')])?;
+            selected = index;
+        }
+        let mut plan = crate::ui::tasks::plan_picker(&self.todo);
+        if let (Some(plan), Some(index)) = (&mut plan, selected) {
+            for item in &mut plan.items {
+                item.current = item.value == (index + 1).to_string();
+            }
+        }
+        if plan.is_none() {
+            self.note("Work plan", "No plan recorded yet. Dial creates steps when work needs a checklist; you can keep writing in the composer.");
+        }
+        plan
+    }
 }

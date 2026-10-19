@@ -12,6 +12,12 @@ use ratatui::text::{Line, Span};
 /// Title of the agent's stop panel. The summary/raw toggle applies only to this panel.
 pub(super) const RECOVERY_PANEL: &str = "Recovery needs direction";
 
+/// Below this size an option's scope and the detail viewport cannot both be shown.
+/// Confirmation must remain paused (not implicitly accepted) until the panel fits again.
+pub(super) fn panel_has_room(width: u16, height: usize) -> bool {
+    width >= 36 && height >= 5
+}
+
 pub(super) fn panel_rows_window(
     theme: &crate::ui::theme::Theme,
     width: u16,
@@ -22,10 +28,21 @@ pub(super) fn panel_rows_window(
     offset: usize,
     height: usize,
 ) -> Rows {
-    let width = width as usize;
-    if width < 6 {
-        return vec![Line::from(text::clip(title, width))];
+    if width == 0 || height == 0 {
+        return Vec::new();
     }
+    if !panel_has_room(width, height) {
+        return [
+            "Resize terminal to show choices.",
+            "Esc cancels; confirmation is paused.",
+        ]
+        .into_iter()
+        .flat_map(|line| text::wrap_words(line, width as usize))
+        .take(height)
+        .map(|line| Line::from(Span::styled(line, theme.fg(Tok::Warning))))
+        .collect();
+    }
+    let width = width as usize;
     let inner = panel_inner(width as u16);
     let border = theme.fg(Tok::Warning);
     let pad_row = |spans: Vec<Span<'static>>| -> Line<'static> {

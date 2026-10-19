@@ -59,7 +59,7 @@ fn correct_file_cannot_hide_missing_turn_or_compaction() {
                 source.path(),
                 |_, workspace| {
                     fs::write(workspace.join("answer"), "correct")?;
-                    Ok(metrics)
+                    Ok(metrics.clone())
                 },
                 |_, _| Ok(true),
             )
@@ -273,7 +273,11 @@ checks=[{kind="metric",metric="tool_contract_errors",min=1,max=1},{kind="metric"
     ] {
         assert!(
             !suite
-                .run(source.path(), |_, _| Ok(metrics), |_, _| unreachable!())
+                .run(
+                    source.path(),
+                    |_, _| Ok(metrics.clone()),
+                    |_, _| unreachable!()
+                )
                 .unwrap()
                 .cases[0]
                 .passed
@@ -288,7 +292,11 @@ checks=[{kind="metric",metric="tool_contract_errors",min=1,max=1},{kind="metric"
         ..Default::default()
     };
     let report = suite
-        .run(source.path(), |_, _| Ok(observed), |_, _| unreachable!())
+        .run(
+            source.path(),
+            |_, _| Ok(observed.clone()),
+            |_, _| unreachable!(),
+        )
         .unwrap();
     assert!(report.cases[0].passed);
     let normalized = normalize(&report, None);

@@ -16,7 +16,7 @@ fn capability_prose_is_byte_identical_when_every_named_tool_is_present() {
     ]);
     assert_eq!(
         capability_prose(&offered, &[]),
-        "\ntool_search enables up to three strongest matches for the next model round. working_state preserves goals, decisions, constraints and evidence. artifact_read retrieves omitted output; task tasks[] batches independent substantial work, and action=start creates live runs controlled by status/wait/message/cancel. Descendants require explicit role spawn permissions and obey the configured depth limit.\nFor live web research, discover web_search and web_fetch and use their next-round schemas; cite source URLs and report actual search/network failures. Never invent results."
+        "\ntool_search enables up to three strongest matches for the next model round. working_state preserves goals, decisions, constraints and evidence. artifact_read retrieves omitted output; task tasks[] batches independent substantial work, and action=start creates live runs controlled by status/wait/message/cancel. Descendants require explicit role spawn permissions and obey the configured depth limit.\nFor live web research, use web_search and web_fetch; cite source URLs and report actual search/network failures. Never invent results."
     );
 }
 
@@ -42,4 +42,15 @@ fn capability_prose_omits_clauses_for_tools_that_are_neither_offered_nor_loadabl
     ] {
         assert!(!prose.contains(absent), "{absent}: {prose}");
     }
+}
+
+#[test]
+fn capability_prose_only_asks_to_discover_web_tools_that_are_not_offered() {
+    let loadable = vec![("web_fetch".to_owned(), String::new())];
+    let prose = capability_prose(&names(&["web_search"]), &loadable);
+    assert!(
+        prose.contains("For live web research, use web_search; discover web_fetch and use their next-round schemas;"),
+        "{prose}"
+    );
+    assert!(!prose.contains("discover web_search"), "{prose}");
 }

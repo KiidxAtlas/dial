@@ -27,6 +27,16 @@ impl Shell {
             }
             return false;
         }
+        if let Some(rest) = text.trim().strip_prefix("/todo")
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            if let Some(spec) = self.work_plan(rest.trim())
+                && let Err(error) = self.start_busy_overlay(app, Which::Choice(Box::new(spec)))
+            {
+                self.note("Work plan", format!("{error:#}"));
+            }
+            return false;
+        }
         if text.split_whitespace().next().is_some_and(|word| {
             RUNS_NOW.contains(&word.trim_start_matches('/')) && word == "/queue"
         }) {
@@ -116,15 +126,6 @@ impl Shell {
             ("hotkeys", "") => {
                 let text = self.hotkeys_text();
                 self.note("Hotkeys", text);
-            }
-            ("todo", "") => {
-                let text = if self.todo.is_empty() {
-                    "No tasks yet. The agent adds a checklist here when work has several steps."
-                        .to_owned()
-                } else {
-                    self.todo.render()
-                };
-                self.note("Todo", text);
             }
             ("search", "") => self.note("Search", Self::SEARCH_USAGE),
             ("search", query) if !query.is_empty() => {

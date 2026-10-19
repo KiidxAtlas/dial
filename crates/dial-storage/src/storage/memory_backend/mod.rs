@@ -310,7 +310,7 @@ struct Active {
     shown: HashSet<String>,
     /// The same facts, oldest first, for transient (child) context rebuilt on every request.
     shown_items: Vec<Value>,
-    /// The latest user message that automatic recall answered; an identical message is not re-queried.
+    /// The effective query the last automatic recall answered; an unchanged one is not re-queried.
     last_query: Option<String>,
 }
 impl Active {
@@ -428,7 +428,7 @@ pub struct PreparedRecall {
     runtime: Arc<MemoryRuntime>,
     operation: Operation,
     recall_generation: u64,
-    /// The user message this recall answered.
+    /// The effective query (latest message read against its history) this recall answered.
     query: String,
     /// Facts rendered into `context`, keyed for the shown-this-session set.
     items: Vec<(String, Value)>,
@@ -985,10 +985,33 @@ impl MemoryRuntime {
         if !enabled || key.is_empty() {
             return Ok(None);
         }
-        // Every new user message is queried; the same message again has nothing new to find.
-        if self.active.lock().last_query.as_deref() == Some(key) {
-            return Ok(None);
+        // Validates the caller's authority before any history is read; stale callers get an error.
+        self.operation(authority)?;
+        let (mut history, shown) = {
+            let active = self.active.lock();
+            (active.history.clone(), active.shown.len())
+        };
+        if history
+            .last()
+            .is_some_and(|message| visible_text(message).trim() == key)
+        {
+            history.pop();
         }
+        let query = recall_query(user, &history, context_turns, max_chars);
+        // Dedupe on the effective query, not the raw message: the same words read against different
+        // history are a different question. An unchanged effective query has nothing new to find.
+        let recall_generation = {
+            let mut active = self.active.lock();
+            ensure!(
+                &active.authority == authority,
+                "memory request belongs to a stale session/branch/revision"
+            );
+            if active.last_query.as_deref() == Some(query.as_str()) {
+                return Ok(None);
+            }
+            active.recall_generation = active.recall_generation.wrapping_add(1);
+            active.recall_generation
+        };
         self.stop_maintenance();
         let mut op = self.operation(authority)?;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -998,22 +1021,6 @@ impl MemoryRuntime {
         op.cancel = cancel.clone();
         op.deadline = Some(std::time::Instant::now() + RECALL_DEADLINE);
         let timer = DeadlineGuard::start(RECALL_DEADLINE, cancel);
-        let (recall_generation, mut history, shown) = {
-            let mut active = self.active.lock();
-            active.recall_generation = active.recall_generation.wrapping_add(1);
-            (
-                active.recall_generation,
-                active.history.clone(),
-                active.shown.len(),
-            )
-        };
-        if history
-            .last()
-            .is_some_and(|message| visible_text(message).trim() == key)
-        {
-            history.pop();
-        }
-        let query = recall_query(user, &history, context_turns, max_chars);
         let limit = if self.config.context_limit == 0 {
             default_limit
         } else {
@@ -1054,7 +1061,7 @@ impl MemoryRuntime {
             runtime: self.clone(),
             operation: op,
             recall_generation,
-            query: key.to_owned(),
+            query,
             items: fresh,
             context,
         }))

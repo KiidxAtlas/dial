@@ -31,6 +31,40 @@ fn text_of(rows: &Rows) -> String {
         .join("\n")
 }
 #[test]
+fn notices_and_selected_sessions_fit_even_the_smallest_browse_layout() {
+    let mut picker = Picker::new(
+        (0..20)
+            .map(|n| session(&format!("id-{n}"), &format!("choice-{n}"), 1))
+            .collect(),
+        vec![],
+        "",
+        "",
+        false,
+    );
+    picker.selected = 19;
+    picker.notice = Some("This journal is open elsewhere; close it there first.".into());
+    for cols in [0, 1, 11, 12, 38, 80, 120] {
+        for height in 0..=30 {
+            let rows = picker.rows(cols, height, &Theme::dark());
+            assert!(rows.len() <= height, "{cols}x{height}: {} rows", rows.len());
+            assert!(rows.iter().all(|row| text::line_width(row) <= cols));
+            if cols == 0 || height == 0 {
+                assert!(rows.is_empty());
+            }
+            if cols >= 38 && height >= 5 {
+                assert!(
+                    text_of(&rows).contains("choice-19"),
+                    "selection hidden at {cols}x{height}"
+                );
+                assert!(
+                    text_of(&rows).contains("open elsewhere"),
+                    "refusal hidden at {cols}x{height}"
+                );
+            }
+        }
+    }
+}
+#[test]
 fn conversations_hide_empty_but_pins_and_all_view_keep_them_accessible() {
     let mut p = Picker::new(
         vec![
@@ -288,4 +322,119 @@ fn layout_fits_small_and_wide_terminals_without_losing_selection() {
             Action::Resume(29)
         ));
     }
+}
+
+#[test]
+fn sessions_another_process_holds_or_the_current_one_refuse_unsafe_actions_with_a_reason() {
+    let mut p = Picker::new(
+        vec![session("one", "Busy", 1), session("cur", "Here", 1)],
+        vec![],
+        "cur",
+        "",
+        false,
+    )
+    .with_open_elsewhere(HashSet::from(["one".to_string()]));
+    assert!(matches!(
+        p.handle(&key(KeyCode::Enter, KeyModifiers::NONE), 24),
+        Action::None
+    ));
+    assert!(
+        p.notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("another dial process")
+    );
+    assert!(matches!(
+        p.handle(&key(KeyCode::Char('d'), KeyModifiers::CONTROL), 24),
+        Action::None
+    ));
+    assert!(matches!(
+        p.handle(&key(KeyCode::Char('r'), KeyModifiers::CONTROL), 24),
+        Action::None
+    ));
+    assert!(p.rename.is_none());
+    p.handle(&key(KeyCode::Down, KeyModifiers::NONE), 24);
+    assert_eq!(p.selected_id(), Some("cur"));
+    assert!(matches!(
+        p.handle(&key(KeyCode::Char('d'), KeyModifiers::CONTROL), 24),
+        Action::None
+    ));
+    assert!(p.notice.as_deref().unwrap_or("").contains("/delete"));
+    assert!(matches!(
+        p.handle(&key(KeyCode::Char('f'), KeyModifiers::CONTROL), 24),
+        Action::Fork(1)
+    ));
+}
+
+#[test]
+fn delete_is_offered_only_for_a_session_that_can_be_removed() {
+    let mut p = Picker::new(vec![session("one", "Old", 1)], vec![], "other", "", false);
+    assert!(matches!(
+        p.handle(&key(KeyCode::Char('d'), KeyModifiers::CONTROL), 24),
+        Action::Delete(0)
+    ));
+}
+
+#[test]
+fn actions_with_nothing_selected_say_so_instead_of_doing_nothing() {
+    let mut p = Picker::new(
+        vec![session("one", "Title", 1)],
+        vec![],
+        "",
+        "zzz-none",
+        false,
+    );
+    assert!(matches!(
+        p.handle(&key(KeyCode::Enter, KeyModifiers::NONE), 24),
+        Action::None
+    ));
+    assert!(
+        p.notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("Nothing selected")
+    );
+}
+
+#[test]
+fn query_edits_keep_the_highlighted_session_while_it_still_matches() {
+    let mut p = Picker::new(
+        vec![session("a", "Alpha", 1), session("b", "Beta", 1)],
+        vec![],
+        "",
+        "",
+        false,
+    );
+    p.handle(&key(KeyCode::Down, KeyModifiers::NONE), 24);
+    assert_eq!(p.selected_id(), Some("b"));
+    for c in "be".chars() {
+        p.handle(&key(KeyCode::Char(c), KeyModifiers::NONE), 24);
+    }
+    assert_eq!(p.found, [1]);
+    assert_eq!(p.selected_id(), Some("b"));
+    p.handle(&key(KeyCode::Esc, KeyModifiers::NONE), 24);
+    assert_eq!(p.found.len(), 2);
+    assert_eq!(p.selected_id(), Some("b"));
+}
+
+#[test]
+fn empty_project_points_to_all_projects_and_search_shows_a_hint() {
+    let theme = Theme::dark();
+    let empty = Picker::new(vec![], vec![], "", "", false).scope(false, 0);
+    let rendered = text_of(&empty.rows(80, 24, &theme));
+    assert!(
+        rendered.contains("Ctrl+G lists every project"),
+        "{rendered}"
+    );
+    let narrow = text_of(&empty.rows(38, 16, &theme));
+    assert!(narrow.contains("Ctrl+G projects"), "{narrow}");
+    assert!(!narrow.contains("Enter resume"), "{narrow}");
+    let p = Picker::new(vec![session("one", "Busy", 1)], vec![], "", "", false)
+        .with_open_elsewhere(HashSet::from(["one".to_string()]));
+    let rendered = text_of(&p.rows(80, 24, &theme));
+    assert!(rendered.contains("type to filter"), "{rendered}");
+    assert!(
+        rendered.contains("Open in another dial process: resume, rename and delete"),
+        "{rendered}"
+    );
 }

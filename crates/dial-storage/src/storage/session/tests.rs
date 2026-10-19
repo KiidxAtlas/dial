@@ -361,7 +361,7 @@ fn active_reads_follow_append_compaction_rewind_fork_and_reopen() {
     assert_eq!(s.messages(), vec![user("first"), assistant("first answer")]);
     assert_eq!(
         s.control_state(),
-        json!({"turn":1,"provider_identity":{"history_generation":1}})
+        json!({"turn":1,"provider_identity":{"history_generation":2}})
     );
     assert_eq!(s.runtime().snapshots().len(), 1);
     assert_eq!(s.title(), "branch title");
@@ -1297,4 +1297,341 @@ fn iso_formats_known_instants() {
     assert_eq!(iso(0), "1970-01-01T00:00:00.000Z");
     assert_eq!(iso(951_782_400_000 + 1_234), "2000-02-29T00:00:01.234Z");
     assert_eq!(iso(1_790_000_000_000), "2026-09-21T14:13:20.000Z");
+}
+
+fn journal_header(id: &str) -> String {
+    json!({"type": "session", "id": id, "started": "2026-01-01T00:00:00.000Z", "model": "m"})
+        .to_string()
+}
+
+fn journal_message(id: &str, parent: Option<&str>, text: &str) -> String {
+    json!({"type": "message", "id": id, "parent": parent, "ts": "t",
+        "message": {"role": "user", "content": text}})
+    .to_string()
+}
+
+fn write_journal(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
+    private_dir(dir).unwrap();
+    let path = dir.join(name);
+    fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn torn_tail_is_reported_tolerated_and_left_byte_for_byte() {
+    let e = env();
+    let mut s = new_session(&e);
+    s.append(user("one")).unwrap();
+    s.append(assistant("two")).unwrap();
+    let path = s.path().unwrap().to_path_buf();
+    drop(s);
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(b"{\"type\":\"message\",\"id\":\"zz\"").unwrap();
+    drop(f);
+    let before = fs::read(&path).unwrap();
+
+    let mut read = Session::read(&path).unwrap();
+    assert_eq!(contents(&read.messages()), ["one", "two"].map(String::from));
+    let found = read.take_recovery_diagnostics();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].kind, JournalIssueKind::TornTail);
+    assert_eq!(
+        found[0].line,
+        before.iter().filter(|&&byte| byte == b'\n').count() + 1
+    );
+    assert_eq!(
+        serde_json::to_value(&found[0]).unwrap()["kind"],
+        json!("torn_tail")
+    );
+    // Draining is one-shot, and inspection never rewrites the source journal.
+    assert!(read.take_recovery_diagnostics().is_empty());
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn malformed_interior_and_torn_tail_are_distinguished_and_recovered_around() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut body = String::new();
+    body += &format!("{}\n", journal_header("abc123"));
+    body += &format!("{}\n", journal_message("m1", None, "one"));
+    body += "not json at all\n";
+    body += &format!("{}\n", journal_message("m2", Some("m1"), "two"));
+    body += "{\"type\":\"message\",\"id\":\"m3\"";
+    let path = write_journal(
+        dir.path(),
+        "20260101T000000000Z_abc123.jsonl",
+        body.as_bytes(),
+    );
+    let before = fs::read(&path).unwrap();
+
+    let mut read = Session::read(&path).unwrap();
+    // The interior garbage is skipped; the chain through it is intact and still loads.
+    assert_eq!(contents(&read.messages()), ["one", "two"].map(String::from));
+    let found = read.take_recovery_diagnostics();
+    let kinds: Vec<_> = found.iter().map(|d| (d.kind, d.line)).collect();
+    assert_eq!(
+        kinds,
+        [
+            (JournalIssueKind::MalformedInterior, 3),
+            (JournalIssueKind::TornTail, 5)
+        ]
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn oversized_interior_line_is_reported_and_its_children_show_missing_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let huge = "y".repeat(MAX_LINE + 10);
+    let huge_line = json!({"type": "message", "id": "m1", "parent": null, "ts": "t",
+        "message": {"role": "user", "content": huge}})
+    .to_string();
+    let mut body = format!("{}\n", journal_header("abc124"));
+    body += &format!("{huge_line}\n");
+    body += &format!("{}\n", journal_message("m2", Some("m1"), "small"));
+    let path = write_journal(
+        dir.path(),
+        "20260101T000000000Z_abc124.jsonl",
+        body.as_bytes(),
+    );
+    let mut read = Session::read(&path).unwrap();
+    assert_eq!(contents(&read.messages()), ["small".to_string()]);
+    let found = read.take_recovery_diagnostics();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0].kind, JournalIssueKind::OversizedInterior);
+    assert_eq!(found[0].line, 2);
+    assert_eq!(found[1].kind, JournalIssueKind::MissingParent);
+    assert_eq!(found[1].line, 3);
+    assert_eq!(found[1].entry_id.as_deref(), Some("m2"));
+}
+
+#[test]
+fn missing_parent_truncates_only_the_unreachable_prefix_and_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut body = format!("{}\n", journal_header("abc125"));
+    body += &format!("{}\n", journal_message("m2", Some("gone"), "two"));
+    body += &format!("{}\n", journal_message("m3", Some("m2"), "three"));
+    let path = write_journal(
+        dir.path(),
+        "20260101T000000000Z_abc125.jsonl",
+        body.as_bytes(),
+    );
+    let before = fs::read(&path).unwrap();
+    let mut read = Session::read(&path).unwrap();
+    assert_eq!(
+        contents(&read.messages()),
+        ["two", "three"].map(String::from)
+    );
+    let found = read.take_recovery_diagnostics();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].kind, JournalIssueKind::MissingParent);
+    assert_eq!(found[0].line, 2);
+    assert_eq!(found[0].entry_id.as_deref(), Some("m2"));
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn compaction_advances_history_generation_and_rewind_keeps_it_monotonic() {
+    let e = env();
+    let mut s = new_session(&e);
+    for text in ["one", "two", "three", "four"] {
+        s.append(user(text)).unwrap();
+    }
+    assert_eq!(s.context_history_generation(), 0);
+    s.compact("summary".into(), 2).unwrap();
+    assert_eq!(s.context_history_generation(), 1);
+    // A real rewind removes facts from context, so it mints a new generation; the session-monotonic
+    // provider generation is never reused across the rewind or after reopen.
+    s.rewind(1).unwrap();
+    assert_eq!(s.context_history_generation(), 2);
+    // A no-op rewind (no user message in view) mints nothing.
+    assert_eq!(s.rewind(0).unwrap(), 0);
+    assert_eq!(s.context_history_generation(), 2);
+    let path = s.path().unwrap().to_path_buf();
+    drop(s);
+    assert_eq!(
+        Session::read(&path).unwrap().context_history_generation(),
+        2
+    );
+}
+
+#[test]
+fn rewind_generation_increments_from_the_current_value_across_non_head_parents_and_reopen() {
+    let e = env();
+    let mut s = new_session(&e);
+    for text in ["one", "two", "three"] {
+        s.append(user(text)).unwrap();
+        s.append(assistant(&format!("a-{text}"))).unwrap();
+    }
+    s.compact("summary".into(), 2).unwrap();
+    assert_eq!(s.context_history_generation(), 1);
+    assert!(s.rewind(1).unwrap() > 0);
+    assert_eq!(s.context_history_generation(), 2);
+    // Appending below the rewind point makes the next marker's parent a non-head entry.
+    s.append(user("four")).unwrap();
+    s.append(assistant("a-four")).unwrap();
+    assert!(s.rewind(1).unwrap() > 0);
+    assert_eq!(s.context_history_generation(), 3);
+    assert_eq!(
+        s.control_state()["provider_identity"]["history_generation"],
+        3
+    );
+    let path = s.path().unwrap().to_path_buf();
+    drop(s);
+    {
+        let read = Session::read(&path).unwrap();
+        assert_eq!(read.context_history_generation(), 3);
+        assert_eq!(
+            read.control_state()["provider_identity"]["history_generation"],
+            3
+        );
+    }
+    // A reopened writer continues from the durable floor, not from the branch it lands on.
+    let mut writer = Session::open(&path).unwrap();
+    writer.append(user("five")).unwrap();
+    writer.append(assistant("a-five")).unwrap();
+    assert!(writer.rewind(1).unwrap() > 0);
+    assert_eq!(writer.context_history_generation(), 4);
+    drop(writer);
+    assert_eq!(
+        Session::read(&path).unwrap().context_history_generation(),
+        4
+    );
+}
+
+#[test]
+fn context_reset_rewind_mints_a_generation_and_stays_monotonic_after_reopen() {
+    let e = env();
+    let mut s = new_session(&e);
+    s.append(user("one")).unwrap();
+    s.append(assistant("a1")).unwrap();
+    s.append(user("two")).unwrap();
+    s.append(assistant("a2")).unwrap();
+    let owner = s.id().to_owned();
+    let leaf = s.branch_leaf().map(str::to_owned);
+    // The bootstrap user equals its source entry, so the reset resolves to ordinary rewind targets.
+    s.reset_context(
+        &owner,
+        leaf.as_deref(),
+        vec![user("two"), assistant("a2")],
+        false,
+        "a".repeat(64),
+    )
+    .unwrap();
+    assert_eq!(s.context_history_generation(), 1);
+    assert!(s.context_rewind_targets().is_some());
+    // A no-op context rewind mints nothing.
+    assert_eq!(s.rewind(0).unwrap(), 0);
+    assert_eq!(s.context_history_generation(), 1);
+    assert!(s.rewind(1).unwrap() > 0);
+    assert_eq!(s.context_history_generation(), 2);
+    let path = s.path().unwrap().to_path_buf();
+    drop(s);
+    assert_eq!(
+        Session::read(&path).unwrap().context_history_generation(),
+        2
+    );
+}
+
+/// Reads a complete artifact by following `retrieve_bytes` pages; the store caps one page at 16 KiB.
+fn artifact_text(path: &Path, uri: &str) -> String {
+    use base64::Engine;
+    let store =
+        crate::storage::artifact::ArtifactStore::new(&artifact_root(path).unwrap()).unwrap();
+    let mut bytes = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let page: Value =
+            serde_json::from_str(&store.retrieve_bytes(uri, offset, 16384).unwrap()).unwrap();
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(page["data"].as_str().unwrap())
+            .unwrap();
+        let next = page["next_offset"].as_u64().unwrap();
+        bytes.extend_from_slice(&data);
+        if next >= page["total_bytes"].as_u64().unwrap() {
+            break;
+        }
+        assert!(next > offset, "artifact pages must make progress");
+        offset = next;
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+/// Multi-byte text puts the 256 KiB inline bound on a char boundary; the rest of the record is kept.
+fn oversized_text(head: &str, unit: &str, bytes: usize) -> String {
+    let mut text = head.to_owned();
+    while text.len() < bytes {
+        text.push_str(unit);
+    }
+    text.push_str("TAIL-END");
+    text
+}
+
+#[test]
+fn oversized_compaction_summary_is_bounded_and_recovers_the_complete_artifact_after_reopen() {
+    let e = env();
+    let mut s = new_session(&e);
+    for text in ["one", "two"] {
+        s.append(user(text)).unwrap();
+        s.append(assistant(&format!("a-{text}"))).unwrap();
+    }
+    let summary = oversized_text("HEAD-", "é", 9 * 1024 * 1024);
+    s.compact(summary.clone(), 2).unwrap();
+    let path = s.path().unwrap().to_path_buf();
+    let line_bytes = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(str::len)
+        .max()
+        .unwrap();
+    assert!(
+        line_bytes < MAX_LINE,
+        "record {line_bytes} bytes must be bounded"
+    );
+    drop(s);
+
+    let reopened = Session::read(&path).unwrap();
+    let stored = reopened.latest_compaction_summary().unwrap().to_owned();
+    assert!(
+        stored.len() < summary.len(),
+        "the journal keeps a bounded view"
+    );
+    assert!(stored.starts_with("HEAD-") && stored.ends_with("TAIL-END"));
+    assert!(stored.contains("SESSION MESSAGE TRUNCATED"));
+    let uri = crate::storage::artifact::uris(&stored)[0];
+    assert_eq!(artifact_text(&path, uri), summary);
+    // The recovered artifact is the complete original, not the marker-bearing view.
+    let mut writer = Session::open(&path).unwrap();
+    writer.append(user("after")).unwrap();
+    assert_eq!(
+        Session::read(&path)
+            .unwrap()
+            .latest_compaction_summary()
+            .unwrap(),
+        stored
+    );
+}
+
+#[test]
+fn oversized_compaction_prefix_recovers_the_complete_message_after_reopen() {
+    let e = env();
+    let mut s = new_session(&e);
+    s.append(user("tail")).unwrap();
+    let big = oversized_text("PREFIX-", "ß", 9 * 1024 * 1024);
+    s.compact_with_prefix(
+        "summary".into(),
+        Some(vec![user(&big), assistant("prefix-answer")]),
+        1,
+    )
+    .unwrap();
+    let path = s.path().unwrap().to_path_buf();
+    drop(s);
+
+    let reopened = Session::read(&path).unwrap();
+    let messages = reopened.messages();
+    let stored = messages[0]["content"].as_str().unwrap();
+    assert!(stored.len() < big.len() && stored.contains("SESSION MESSAGE TRUNCATED"));
+    assert_eq!(messages[1]["content"], "prefix-answer");
+    let uri = crate::storage::artifact::uris(stored)[0];
+    assert_eq!(artifact_text(&path, uri), big);
 }

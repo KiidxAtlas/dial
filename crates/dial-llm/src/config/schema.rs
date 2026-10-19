@@ -151,7 +151,7 @@ const SEPARATOR: EnumValues = &[
     ("none", "None"),
     ("ascii", "ASCII"),
 ];
-const SHAPE: EnumValues = &[("box", "Box"), ("line", "Line")];
+const SHAPE: EnumValues = &[("band", "Band"), ("box", "Box"), ("line", "Line")];
 const MODEL_ROLES: EnumValues = &[
     ("main", "Main"),
     ("small", "Small"),
@@ -379,7 +379,7 @@ static UI: &[SettingDef] = &[
         AP,
         "Composer",
         "Composer shape",
-        "Box: rounded frame with the status line in its border. Line: plain rules, easier to copy from.",
+        "Band: a shaded band with the status line inside it. Box: rounded frame with the status line in its border. Line: plain rules, easier to copy from.",
         Kind::Enum(SHAPE),
     ),
     field!(
@@ -919,6 +919,7 @@ static REGISTRY: &[SettingDef] = &[
     tools::DECLARATIONS[38],
     tools::DECLARATIONS[39],
     tools::DECLARATIONS[40],
+    tools::DECLARATIONS[41],
 ];
 const _: () = assert!(
     REGISTRY.len()

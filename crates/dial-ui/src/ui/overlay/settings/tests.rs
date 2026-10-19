@@ -282,7 +282,7 @@ fn renders_title_tabs_sections_rows_and_footer() {
     let mut o = overlay();
     let screen = draw(&mut o, &rig, 130, 30);
     for needle in [
-        "\u{25c6} Settings",
+        " Settings",
         "Save to: All projects",
         "Appearance",
         "Interaction",
@@ -297,7 +297,10 @@ fn renders_title_tabs_sections_rows_and_footer() {
     ] {
         assert!(screen.contains(needle), "missing {needle:?} in\n{screen}");
     }
-    assert!(screen.starts_with('╭'), "consistent rounded frame");
+    assert!(
+        screen.starts_with(" Settings") && !screen.contains('╭'),
+        "a borderless panel titled on its first row"
+    );
 }
 
 #[test]
@@ -494,10 +497,13 @@ fn bool_toggles_and_enum_choices_require_confirmation() {
     ));
     assert!(matches!(o.mode, Mode::Browse));
     let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
+    assert_eq!(value, Value::String("box".into()));
+    o.settled("ui.composer_shape", Ok(value));
+    let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
     assert_eq!(value, Value::String("line".into()));
     o.settled("ui.composer_shape", Ok(value));
     let (_, value, _) = expect_set(choose_next(&mut o, &rig.keys));
-    assert_eq!(value, Value::String("box".into()), "wraps around");
+    assert_eq!(value, Value::String("band".into()), "wraps around");
 }
 
 #[test]
@@ -1325,4 +1331,156 @@ fn settings_read_failure_is_visible_and_keeps_last_good_values() {
         "{shown}"
     );
     assert_eq!(overlay.effective["ui"]["tips"].as_bool(), Some(true));
+}
+
+#[test]
+fn empty_search_names_the_key_that_leaves_it() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    send_all(&mut o, &rig.keys, typed("zzzzqq"));
+    let shown = draw(&mut o, &rig, 100, 24);
+    assert!(
+        shown.contains("No settings match \"zzzzqq\". Esc clears the search."),
+        "{shown}"
+    );
+    send(&mut o, &rig.keys, key(KeyCode::Esc));
+    assert!(!draw(&mut o, &rig, 100, 24).contains("No settings match"));
+}
+
+fn theme_overlay(themes: &[&str]) -> SettingsOverlay {
+    SettingsOverlay::new(
+        Table::new(),
+        Table::new(),
+        Table::new(),
+        Scope::Global,
+        themes.iter().map(|t| (*t).to_owned()).collect(),
+    )
+}
+
+fn open_theme_picker(o: &mut SettingsOverlay, keys: &Keymap) {
+    goto(o, keys, "ui.theme");
+    assert!(matches!(
+        send(o, keys, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    assert!(matches!(o.mode, Mode::Pick { .. }), "picker should open");
+}
+
+fn filter_text(o: &SettingsOverlay) -> String {
+    match &o.mode {
+        Mode::Pick { filter, .. } => filter.text.clone(),
+        _ => panic!("picker should be open"),
+    }
+}
+
+fn picker_value(o: &SettingsOverlay) -> &str {
+    match &o.mode {
+        Mode::Pick {
+            choices, cursor, ..
+        } => choices[*cursor].as_str(),
+        _ => panic!("picker should be open"),
+    }
+}
+
+#[test]
+fn picker_filter_narrows_previews_the_match_and_esc_clears_before_closing() {
+    let rig = Rig::new();
+    let mut o = theme_overlay(&["dark", "light", "mono"]);
+    open_theme_picker(&mut o, &rig.keys);
+    // "m" leaves only mono, so the selection moves onto it and the theme previews.
+    match send(&mut o, &rig.keys, ch('m')) {
+        OverlayEvent::PreviewTheme(Some(name)) => assert_eq!(name, "mono"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(picker_value(&o), "mono");
+    let shown = draw(&mut o, &rig, 100, 30);
+    assert!(shown.contains("1 of 4"), "{shown}");
+    // Esc clears the filter first and keeps the picker open on the same value.
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Esc)),
+        OverlayEvent::None
+    ));
+    assert!(matches!(o.mode, Mode::Pick { .. }));
+    assert_eq!(filter_text(&o), "");
+    assert_eq!(picker_value(&o), "mono");
+    // Only a bare Esc closes it, restoring the saved theme preview.
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Esc)),
+        OverlayEvent::PreviewTheme(None)
+    ));
+    assert!(matches!(o.mode, Mode::Browse));
+}
+
+#[test]
+fn picker_filter_matches_unicode_case_insensitively_and_saves_the_raw_value() {
+    let rig = Rig::new();
+    let mut o = theme_overlay(&["dark", "Éclair", "mono"]);
+    open_theme_picker(&mut o, &rig.keys);
+    send_all(&mut o, &rig.keys, typed("Éa"));
+    // Backspace removes one whole character, never half of a multi-byte one.
+    send(&mut o, &rig.keys, key(KeyCode::Backspace));
+    assert_eq!(filter_text(&o), "É");
+    send(&mut o, &rig.keys, ch('c'));
+    assert_eq!(picker_value(&o), "Éclair");
+    let (path, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+    assert_eq!(path, "ui.theme");
+    assert_eq!(value.as_str(), Some("Éclair"), "the raw value is saved");
+}
+
+#[test]
+fn picker_filter_matches_labels_but_saves_the_raw_value() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    let path = "assistance.lean_local";
+    crate::config::schema::set(&mut o.effective, path, Value::Boolean(true));
+    goto(&mut o, &rig.keys, path);
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    // "decide" appears only in the label "Auto (let Dial decide)", never in the raw value.
+    send_all(&mut o, &rig.keys, typed("decide"));
+    let shown = draw(&mut o, &rig, 120, 30);
+    assert!(shown.contains("Auto (let Dial decide)"), "{shown}");
+    assert!(!shown.contains("Off (disabled)"), "{shown}");
+    let (saved, value, _) = expect_set(send(&mut o, &rig.keys, key(KeyCode::Enter)));
+    assert_eq!(saved, path);
+    assert_eq!(value, choice_value(Kind::AutoBool, "auto"));
+}
+
+#[test]
+fn picker_filter_with_no_matches_saves_nothing_and_says_how_to_recover() {
+    let rig = Rig::new();
+    let mut o = theme_overlay(&["dark", "light", "mono"]);
+    open_theme_picker(&mut o, &rig.keys);
+    send_all(&mut o, &rig.keys, typed("zzz"));
+    let shown = draw(&mut o, &rig, 100, 30);
+    assert!(shown.contains("No option matches \"zzz\""), "{shown}");
+    assert!(shown.contains("clear filter"), "{shown}");
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Enter)),
+        OverlayEvent::None
+    ));
+    assert!(matches!(o.mode, Mode::Pick { .. }), "still picking");
+}
+
+#[test]
+fn long_pickers_offer_a_filter_and_each_new_picker_starts_unfiltered() {
+    let rig = Rig::new();
+    let mut o = theme_overlay(&[
+        "dark", "light", "mono", "ember", "forest", "ocean", "rose", "slate", "violet",
+    ]);
+    open_theme_picker(&mut o, &rig.keys);
+    let shown = draw(&mut o, &rig, 100, 30);
+    assert!(shown.contains("10 options"), "{shown}");
+    assert!(shown.contains("Type filter"), "{shown}");
+    send_all(&mut o, &rig.keys, typed("o"));
+    assert!(draw(&mut o, &rig, 100, 30).contains(" of 10"));
+    // Esc clears the filter, a second Esc closes the picker, and reopening starts unfiltered.
+    send(&mut o, &rig.keys, key(KeyCode::Esc));
+    send(&mut o, &rig.keys, key(KeyCode::Esc));
+    assert!(matches!(o.mode, Mode::Browse));
+    open_theme_picker(&mut o, &rig.keys);
+    assert_eq!(filter_text(&o), "");
+    assert!(draw(&mut o, &rig, 100, 30).contains("10 options"));
 }

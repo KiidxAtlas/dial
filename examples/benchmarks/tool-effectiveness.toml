@@ -1,0 +1,61 @@
+version = 1
+name = "tool-effectiveness-v1"
+
+# Independent-outcome suite: every check reads the final workspace or runs a verifier from outside
+# the copied project. No check counts tool calls, so tool use is never a success proxy.
+[[cases]]
+id = "selection-find-function"
+project = "examples/benchmarks/tool-effectiveness-fixture"
+prompt = "Locate the function in this ledger project that returns a bounded transaction total. Write only its exact name, with no newline, to selection.txt. Do not edit any source file."
+categories = ["tool_selection", "semantic_find"]
+checks = [{kind="file_equals",path="selection.txt",content="bounded_transaction_total"}, {kind="file_equals",path="ledger.py",content='''"""Transaction ledger helpers. Amounts are integer cents."""
+from settings import LIMIT_CENTS
+
+
+def transaction_total(rows):
+    return sum(row["cents"] for row in rows)
+
+
+def bounded_transaction_total(rows):
+    return min(transaction_total(rows), LIMIT_CENTS)
+'''}]
+
+[[cases]]
+id = "composition-rename-consumers"
+project = "examples/benchmarks/tool-effectiveness-fixture"
+prompt = "Rename the function transaction_total to ledger_total in ledger.py and update every consumer in this project. Remove the old name, keep its behavior, and verify that the statement output is unchanged."
+categories = ["tool_composition", "callers", "multi_file"]
+checks = [{kind="command",command="python3 -c 'import ledger, statement; assert ledger.ledger_total([{\"cents\":5},{\"cents\":7}])==12; assert not hasattr(ledger, \"transaction_total\"); assert statement.render_statement([{\"cents\":5}])==\"total=5\"'"}, {kind="command",command="python3 -c 'import pathlib, re; text=\"\".join(p.read_text() for p in pathlib.Path(\".\").glob(\"*.py\")); assert not re.search(r\"\\btransaction_total\\b\", text)'"}]
+
+[[cases]]
+id = "requirement-boundary-floor"
+project = "examples/benchmarks/tool-effectiveness-fixture"
+prompt = "bounded_transaction_total must never return a negative amount and must still cap totals at LIMIT_CENTS. Fix it in ledger.py, keep settings.py unchanged, and verify the empty, negative, under-limit, exact-limit and over-limit cases."
+categories = ["requirement_boundary", "debugging", "verification"]
+checks = [{kind="command",command="python3 -c 'from ledger import bounded_transaction_total as b; from settings import LIMIT_CENTS as L; assert b([])==0; assert b([{\"cents\":-5}])==0; assert b([{\"cents\":1000}])==1000; assert b([{\"cents\":L}])==L; assert b([{\"cents\":L+1}])==L'"}, {kind="file_equals",path="settings.py",content="LIMIT_CENTS = 50_000\nREPORT_CODE = \"CURRENT-7741\"\n"}]
+
+[[cases]]
+id = "long-context-current-code"
+project = "examples/benchmarks/tool-effectiveness-fixture"
+prompt = "Write the current REPORT_CODE from the source declarations, exactly, to report-code.txt. Archived notes are superseded and must not be used as the answer."
+context_messages = ["Archived note for reference: REPORT_CODE candidates ARCHIVE-1200 and ARCHIVE-3319 were superseded; they are not current facts.", "Unrelated archive text: LIMIT_CENTS candidate 10000 was superseded in an older revision."]
+turns = [{prompt="Follow-up: also confirm the answer you chose comes from settings.py, not from the archive notes, and say so in your reply without changing settings.py.", compact_before=true}]
+categories = ["long_context", "evidence_selection", "multi_turn", "compaction"]
+checks = [{kind="file_equals",path="report-code.txt",content="CURRENT-7741"}, {kind="file_equals",path="settings.py",content="LIMIT_CENTS = 50_000\nREPORT_CODE = \"CURRENT-7741\"\n"}]
+
+[[cases]]
+id = "diagnosis-environment-not-code"
+project = "examples/benchmarks/tool-effectiveness-fixture"
+prompt = "The command python3 check_environment.py fails. Decide whether the failure is a missing test environment or an application defect. Write diagnosis.txt containing exactly environment (no newline) for environment setup, or code for an application defect. Do not change application code or the check runner."
+categories = ["diagnosis", "infrastructure", "verification"]
+checks = [{kind="file_equals",path="diagnosis.txt",content="environment"}, {kind="command",command="LEDGER_TEST_ENV=fixture python3 check_environment.py"}, {kind="file_equals",path="ledger.py",content='''"""Transaction ledger helpers. Amounts are integer cents."""
+from settings import LIMIT_CENTS
+
+
+def transaction_total(rows):
+    return sum(row["cents"] for row in rows)
+
+
+def bounded_transaction_total(rows):
+    return min(transaction_total(rows), LIMIT_CENTS)
+'''}]

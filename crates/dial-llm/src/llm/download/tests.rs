@@ -445,7 +445,10 @@ fn platform_choice_prefers_mlx_only_on_apple_silicon() {
 #[test]
 fn curated_entries_are_valid_ids_in_their_family() {
     for family in [Family::Mlx, Family::Gguf] {
-        let list = recommended(family);
+        let list = recommended(family)
+            .into_iter()
+            .chain(recommended_memory(family))
+            .collect::<Vec<_>>();
         assert!(!list.is_empty());
         for hit in list {
             assert!(is_repo_id(&hit.repo), "{}", hit.repo);

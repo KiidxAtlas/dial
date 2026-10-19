@@ -1300,6 +1300,9 @@ impl ProviderOverlay {
                         .patch(fill),
                 ));
             }
+            if selected {
+                chrome::select_spans(theme, &mut spans);
+            }
             let mut line = filled(spans, list_w, fill);
             if overflow {
                 line.spans

@@ -284,7 +284,7 @@ fn streaming_prefix_matches_full_render_at_every_delta() {
             for end in (0..=source.len()).filter(|&n| source.is_char_boundary(n)) {
                 assert_eq!(
                     *cache.render(&source[..end], width, &theme),
-                    markdown::render(&source[..end], width, &theme, false),
+                    answer_rows(&source[..end], width, &theme, true),
                     "at {end}, width {width}: {source:?}"
                 );
             }
@@ -297,7 +297,7 @@ fn streaming_prefix_matches_full_render_at_every_delta() {
         for width in [10, 80] {
             assert_eq!(
                 *cache.render(source, width, &theme),
-                markdown::render(source, width, &theme, false)
+                answer_rows(source, width, &theme, true)
             );
         }
     }
@@ -312,7 +312,7 @@ fn streaming_cache_rerenders_when_settled_text_replaces_the_streamed_prefix() {
     let settled = "Rewritten opening.\n\nSecond paragraph.\n\nTail";
     assert_eq!(
         *cache.render(settled, 40, &theme),
-        markdown::render(settled, 40, &theme, false)
+        answer_rows(settled, 40, &theme, true)
     );
 }
 
@@ -651,7 +651,7 @@ fn repeated_shared_prose_binding_tracks_identity_and_settlement() {
     t.bind_prose(&first.clone());
     let mut committed = t.take_settled(80, &ctx);
     assert!(t.is_streaming(), "the second body is still running");
-    assert_eq!(plain(&committed), ["FIRST-BODY"]);
+    assert_eq!(plain(&committed), ["●  FIRST-BODY"]);
     t.bind_prose(&first);
     assert!(t.take_settled(80, &ctx).is_empty());
     second.append("-TAIL");
@@ -669,7 +669,10 @@ fn repeated_shared_prose_binding_tracks_identity_and_settlement() {
     committed.extend(t.take_settled(80, &ctx));
     t.bind_prose(&second.clone());
     assert!(t.take_settled(80, &ctx).is_empty());
-    assert_eq!(plain(&committed), ["FIRST-BODY", "", "SECOND-BODY-TAIL"]);
+    assert_eq!(
+        plain(&committed),
+        ["●  FIRST-BODY", "", "●  SECOND-BODY-TAIL"]
+    );
     assert_eq!(plain(&committed), plain(&t.all_rows(80, &ctx)));
 }
 
@@ -681,10 +684,10 @@ fn assistant_streams_into_one_block_and_rerenders_as_it_grows() {
     t.assistant_delta("Hello **wor");
     let (spilled, live) = t.live(40, &ctx, 20);
     assert!(spilled.is_empty());
-    assert_eq!(plain(&live), ["Hello **wor", ""]);
+    assert_eq!(plain(&live), ["●  Hello **wor", ""]);
     t.assistant_delta("ld** again");
     let (_, live) = t.live(40, &ctx, 20);
-    assert_eq!(plain(&live), ["Hello world again", ""]);
+    assert_eq!(plain(&live), ["●  Hello world again", ""]);
     assert!(
         live[0]
             .spans
@@ -693,7 +696,7 @@ fn assistant_streams_into_one_block_and_rerenders_as_it_grows() {
     );
     assert!(t.take_settled(40, &ctx).is_empty(), "still streaming");
     t.finish_turn();
-    assert_eq!(plain(&t.take_settled(40, &ctx)), ["Hello world again"]);
+    assert_eq!(plain(&t.take_settled(40, &ctx)), ["●  Hello world again"]);
 }
 
 #[test]
@@ -741,8 +744,15 @@ fn user_block_is_compact_and_has_a_prompt_marker() {
     for row in &body {
         assert!(text::line_width(row) <= 20);
     }
-    assert!(plain(&rows)[0].starts_with("▎ › hello"));
-    assert_eq!(body[0].spans[0].style.fg, env.theme.fg(Tok::Accent).fg);
+    let text = plain(&rows);
+    let first = text.iter().position(|r| r.contains("hello")).unwrap();
+    assert!(text[first].starts_with(" › hello"), "{text:?}");
+    let prompt = body[first]
+        .spans
+        .iter()
+        .find(|s| s.content.contains('›'))
+        .unwrap();
+    assert_eq!(prompt.style.fg, env.theme.fg(Tok::Accent).fg);
 }
 
 #[test]
@@ -763,11 +773,15 @@ fn reasoning_is_muted_italic_prose_or_collapses() {
     t.thinking_delta("first thought\nsecond thought\n\nthird");
     t.finish_turn();
     let rows = t.all_rows(40, &env.ctx());
-    assert!(plain(&rows).contains(&"▎ first thought".to_owned()));
+    assert!(
+        plain(&rows).contains(&"▎  first thought".to_owned()),
+        "{:?}",
+        plain(&rows)
+    );
     assert_eq!(rows[0].spans[1].style, env.theme.fg(Tok::ThinkingText));
     env.ui.show_thinking = false;
     let rows = t.all_rows(40, &env.ctx());
-    assert_eq!(plain(&rows), ["› reasoning (3 lines)"]);
+    assert_eq!(plain(&rows), ["›  reasoning (3 lines)"]);
 }
 
 #[test]
@@ -824,7 +838,7 @@ fn errors_and_notices_wrap_with_hanging_indent() {
     let rows = t.all_rows(24, &env.ctx());
     assert_fits(&rows, 24);
     let text = plain(&rows);
-    assert!(text[0].starts_with("✗ connection"));
+    assert!(text[0].starts_with("✗  connection"), "{text:?}");
     assert!(text[1].starts_with("  "));
     assert_eq!(rows[0].spans[0].style.fg, env.theme.fg(Tok::Error).fg);
     assert!(text.iter().any(|l| l.to_uppercase().contains("HEADS UP")));
@@ -846,17 +860,25 @@ fn bash_tool_has_a_compact_header_and_output_without_bookkeeping() {
     );
     let rows = t.take_settled(40, &ctx);
     let text = plain(&rows);
-    assert!(text[0].contains("✓ Run") && text[0].contains("ls -la") && text[0].ends_with("0.06s"));
+    assert!(
+        text[0].starts_with('·')
+            && text[0].contains("Run")
+            && text[0].contains("ls -la")
+            && text[0].ends_with("0.06s"),
+        "{text:?}"
+    );
     assert!(text[1].contains("total 0") && text[2].contains("file.txt"));
     assert!(!text_of(&rows).contains("exit code") && !text_of(&rows).contains("artifact://"));
     // Shell bookkeeping stays out of the body; the run time sits in the header row.
     // The block ends with its separating blank row.
     assert_eq!(text.len(), 3, "{text:?}");
     assert_eq!(text::line_width(&rows[0]), 40);
+    // The verb is bold; the gutter glyph of a settled call is quiet.
     assert_eq!(
-        rows[0].spans[4].style.fg,
-        env.theme.fg(Tok::SectionSandbox).fg
+        rows[0].spans[2].style,
+        env.theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD)
     );
+    assert_eq!(rows[0].spans[0].style.fg, env.theme.fg(Tok::Dim).fg);
 }
 
 #[test]
@@ -886,7 +908,7 @@ fn failed_tool_output_wraps_at_word_boundaries() {
 }
 
 #[test]
-fn tool_gutter_follows_family_and_failure() {
+fn tool_gutter_marks_running_settled_and_failed_calls() {
     let env = Env::new();
     let render = |end: Option<bool>| {
         let mut t = Transcript::new();
@@ -899,12 +921,13 @@ fn tool_gutter_follows_family_and_failure() {
     let pending = render(None);
     let ok = render(Some(false));
     let err = render(Some(true));
-    // Span 0 is the work-group rail; the family gutter follows the indent and the status glyph.
-    let gutter = |rows: &Rows| rows[0].spans[4].style.fg;
-    assert_eq!(gutter(&pending), env.theme.fg(Tok::SectionSandbox).fg);
-    assert_eq!(gutter(&ok), env.theme.fg(Tok::SectionSandbox).fg);
+    // Span 0 is the gutter glyph; the verb follows at the shared content column.
+    let gutter = |rows: &Rows| rows[0].spans[0].style.fg;
+    assert_eq!(gutter(&pending), env.theme.fg(Tok::Accent).fg);
+    assert_eq!(gutter(&ok), env.theme.fg(Tok::Dim).fg);
     assert_eq!(gutter(&err), env.theme.fg(Tok::Error).fg);
-    assert!(plain(&err)[0].contains('✗'));
+    assert!(plain(&ok)[0].starts_with('·'));
+    assert!(plain(&err)[0].starts_with('✗'));
     let body = err
         .iter()
         .flat_map(|r| &r.spans)
@@ -939,7 +962,7 @@ fn pending_spinner_animates_with_tick() {
 }
 
 #[test]
-fn a_run_of_tool_calls_hangs_off_one_rail_and_prose_does_not() {
+fn tool_calls_share_the_gutter_with_prose_and_bodies_hang_off_a_hook() {
     let env = Env::new();
     let mut t = Transcript::new();
     t.push_user("fix it");
@@ -949,22 +972,21 @@ fn a_run_of_tool_calls_hangs_off_one_rail_and_prose_does_not() {
     t.tool_end("2", "error: one failed\nmore\n", true, 0.2);
     t.assistant_delta("Done.");
     t.finish_turn();
+    let column = |row: &str, needle: &str| text::width(&row[..row.find(needle).unwrap()]);
     for width in [40u16, 80] {
         let rows = t.all_rows(width, &env.ctx());
         assert_fits(&rows, width);
         let text = plain(&rows);
-        let first = text.iter().position(|r| r.contains("Read")).unwrap();
-        let last = text.iter().rposition(|r| r.starts_with('│')).unwrap();
+        let read = text.iter().find(|r| r.contains("Read")).unwrap();
+        let done = text.iter().find(|r| r.contains("Done.")).unwrap();
+        assert_eq!(column(read, "Read"), column(done, "Done."), "{text:?}");
+        let failed = text.iter().position(|r| r.contains("one failed")).unwrap();
+        assert!(text[failed].trim_start().starts_with('└'), "{text:?}");
         assert!(
-            text[first..=last].iter().all(|r| r.starts_with('│')),
-            "every row of the group, bodies included, is on the rail: {text:?}"
+            text[failed + 1].starts_with("     more"),
+            "later body rows keep the indent: {text:?}"
         );
-        assert!(
-            text.iter()
-                .filter(|r| r.contains("fix it") || r.contains("Done."))
-                .all(|r| !r.starts_with('│')),
-            "{text:?}"
-        );
+        assert!(text.iter().all(|r| !r.starts_with('│')), "{text:?}");
     }
 }
 
@@ -1001,7 +1023,7 @@ fn long_output_is_capped_with_a_hint_until_expanded() {
         "{capped}"
     );
     assert!(
-        capped.contains("… 12 more lines (Ctrl-O expands)"),
+        capped.contains("… 12 more lines (Ctrl+O expands)"),
         "{capped}"
     );
     let expanded = text_of(&t.all_rows(
@@ -1051,7 +1073,10 @@ fn output_lines_setting_controls_the_cap() {
     t.tool_end("1", "a\nb\nc", false, 1.0);
     let text = text_of(&t.all_rows(40, &env.ctx()));
     assert!(
-        text.contains("▎ b") && !text.contains("▎ c") && text.contains("1 more line (Ctrl-O"),
+        text.contains("└ a")
+            && text.lines().any(|l| l.trim() == "b")
+            && !text.lines().any(|l| l.trim() == "c")
+            && text.contains("1 more line (Ctrl+O"),
         "{text}"
     );
 }
@@ -1085,7 +1110,7 @@ fn edit_output_colors_diff_lines_and_hashline_previews() {
     assert!(
         plain(&rows)
             .iter()
-            .any(|r| r.contains("✓ Edit") && r.ends_with("0.50s"))
+            .any(|r| r.starts_with('·') && r.contains("Edit") && r.ends_with("0.50s"))
     );
 }
 
@@ -1123,7 +1148,7 @@ fn edit_cards_show_the_numbered_diff_not_the_model_facing_preview() {
     );
     let body: Vec<&str> = text
         .iter()
-        .map(|r| r.trim_matches(|c: char| c == '▎' || c == '│' || c == ' '))
+        .map(|r| r.trim_matches(|c: char| c == '└' || c == ' '))
         .collect();
     for expected in [
         "src/a.rs",
@@ -1177,7 +1202,7 @@ fn todo_calls_render_the_list_with_their_changes() {
     );
     assert_eq!(
         plain(&t.all_rows(60, &env.ctx()))[..3],
-        ["│ ✓ Plan    1/2 done", "│  ✓ read", "│  ● fix"]
+        ["·  Plan    1/2 done", "   ✓ read", "   ● fix"]
     );
 }
 
@@ -1241,16 +1266,17 @@ fn simple_tools_are_compact_rows() {
     let rows = t.all_rows(60, &env.ctx());
     assert_eq!(rows.len(), 1);
     assert!(
-        plain(&rows)[0].contains("✓ Read")
+        plain(&rows)[0].starts_with('·')
+            && plain(&rows)[0].contains("Read")
             && plain(&rows)[0].contains("notes.txt")
             && plain(&rows)[0].contains("3 lines")
     );
+    // The verb is bold and the settled glyph is quiet.
     assert_eq!(
-        rows[0].spans[4].style.fg,
-        env.theme.fg(Tok::SectionTools).fg
+        rows[0].spans[2].style,
+        env.theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD)
     );
-    assert_eq!(rows[0].spans[2].style.fg, env.theme.fg(Tok::Success).fg);
-    assert_eq!(rows[0].spans[0].style.fg, env.theme.fg(Tok::BorderMuted).fg);
+    assert_eq!(rows[0].spans[0].style.fg, env.theme.fg(Tok::Dim).fg);
 }
 
 #[test]
@@ -1260,7 +1286,7 @@ fn failed_simple_tool_shows_its_error_underneath() {
     t.tool_start("1", "grep", "foo", "");
     t.tool_end("1", "regex parse error\nunclosed group", true, 0.2);
     let text = plain(&t.all_rows(40, &env.ctx()));
-    assert!(text[0].contains("✗ Search") && text[0].contains("foo"));
+    assert!(text[0].starts_with('✗') && text[0].contains("Search") && text[0].contains("foo"));
     assert!(text[1].contains("regex parse error"));
     assert!(text[2].contains("unclosed group"));
 }
@@ -1378,7 +1404,7 @@ fn nothing_spills_while_the_tail_fits() {
     t.assistant_delta("one\n\ntwo\n\nthree");
     let (spilled, live) = t.live(40, &ctx, 20);
     assert!(spilled.is_empty());
-    assert_eq!(plain(&live), ["one", "", "two", "", "three", ""]);
+    assert_eq!(plain(&live), ["●  one", "", "   two", "", "   three", ""]);
 }
 
 #[test]
@@ -1556,4 +1582,56 @@ fn long_reasoning_spills_like_prose() {
     t.finish_turn();
     committed.extend(t.take_settled(26, &ctx));
     assert_eq!(plain(&committed), plain(&t.all_rows(26, &ctx)));
+}
+
+#[test]
+fn hidden_output_hint_names_the_bound_expand_key() {
+    let mut env = Env::new();
+    env.ui.tool_output_lines = 2;
+    let mut t = Transcript::new();
+    t.tool_start("1", "bash", "x", "");
+    t.tool_end("1", "a\nb\nc", false, 1.0);
+    let ctx = TranscriptCtx {
+        expand_key: "Alt+E",
+        ..env.ctx()
+    };
+    let text = text_of(&t.all_rows(40, &ctx));
+    assert!(text.contains("1 more line (Alt+E expands)"), "{text}");
+    assert!(!text.contains("Ctrl"), "{text}");
+}
+
+#[test]
+fn interrupted_tool_is_named_once_by_its_status() {
+    let env = Env::new();
+    let ctx = env.ctx();
+    let mut t = Transcript::new();
+    t.tool_start("x", "bash", "sleep 100", "");
+    t.finish_turn();
+    let text = text_of(&t.take_settled(40, &ctx));
+    assert_eq!(text.matches("interrupted").count(), 1, "{text}");
+}
+
+#[test]
+fn unnamed_turn_outcome_is_unknown_not_failed() {
+    let mut env = Env::new();
+    env.ui.show_turn_stats = false;
+    let mut t = Transcript::new();
+    t.completion(TurnOutcome {
+        status: "unknown".into(),
+        changed_files: 0,
+        open_tasks: 0,
+    });
+    t.turn_stats(TurnStats {
+        clock: String::new(),
+        elapsed_secs: 1.0,
+        prompt_tokens: None,
+        output_tokens: None,
+        tokens_per_second: None,
+        outcome: None,
+    });
+    let line = plain(&t.all_rows(80, &env.ctx()))[0].clone();
+    assert!(
+        line.contains("unknown") && !line.contains("failed"),
+        "{line}"
+    );
 }

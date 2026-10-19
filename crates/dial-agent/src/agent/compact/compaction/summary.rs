@@ -267,6 +267,21 @@ struct FileOps {
     modified: BTreeSet<String>,
 }
 
+/// `read` `paths` entries may carry a line selector (`src/a.rs:1-80`); observe the file itself.
+fn strip_selector(target: &str) -> &str {
+    match target.rsplit_once(':') {
+        Some((path, selector))
+            if !selector.is_empty()
+                && selector
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b',')) =>
+        {
+            path
+        }
+        _ => target,
+    }
+}
+
 impl FileOps {
     fn observe(&mut self, message: &Value) {
         if message["role"] != "assistant" {
@@ -278,7 +293,14 @@ impl FileOps {
                 other => other.clone(),
             };
             match call["function"]["name"].as_str().unwrap_or("") {
-                "read" => self.add(false, arguments["path"].as_str()),
+                "read" => match arguments["paths"].as_array() {
+                    Some(paths) => {
+                        for path in paths {
+                            self.add(false, path.as_str().map(strip_selector));
+                        }
+                    }
+                    None => self.add(false, arguments["path"].as_str()),
+                },
                 "write" => self.add(true, arguments["path"].as_str()),
                 "edit" => match crate::tools::declared_edit_targets(&arguments) {
                     Ok(paths) if !paths.is_empty() => {
@@ -288,6 +310,24 @@ impl FileOps {
                     }
                     _ => self.add(true, arguments["path"].as_str()),
                 },
+                // Applied ast_edit rewrites modify the `path` they were given (a file, or a directory
+                // whose contents are not enumerated here). Previews (dry_run defaults to true) modify nothing.
+                "ast_edit" if arguments["dry_run"] == false => {
+                    self.add(true, arguments["path"].as_str());
+                }
+                // rename_file moves `path` to `new_name` unless apply:false previews it. Its server
+                // edits touch other files that the arguments do not name, so only the move is recorded.
+                "lsp" if arguments["action"] == "rename_file" => {
+                    if arguments["apply"] != false {
+                        self.add(true, arguments["path"].as_str());
+                        self.add(true, arguments["new_name"].as_str());
+                    } else {
+                        self.add(false, arguments["path"].as_str());
+                    }
+                }
+                // Other LSP actions read their file. Rename and code-action edits can touch files the
+                // arguments do not name, so they are not enumerated as modified.
+                "lsp" => self.add(false, arguments["path"].as_str()),
                 _ => {}
             }
         }

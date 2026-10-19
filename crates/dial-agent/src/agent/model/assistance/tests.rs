@@ -166,3 +166,31 @@ fn check_failure_invalidates_capture() {
     state.check("cargo test", false);
     assert!(state.checks.is_empty());
 }
+
+#[test]
+fn singular_and_plural_capabilities_share_evidence_without_activating_unrelated_tools() {
+    let catalog = candidates(&[
+        ("lsp", "Inspect symbols definitions references"),
+        ("browser", "Capture screenshots of rendered pages"),
+        ("read", "Read files"),
+        ("mcp_servers", "Inspect installed servers"),
+    ]);
+    for (query, expected) in [
+        ("symbol definition", "lsp"),
+        ("rendered page screenshot", "browser"),
+        ("read file", "read"),
+        ("installed server", "mcp_servers"),
+    ] {
+        let matches = discover(query, catalog.clone());
+        assert_eq!(matches[0].0, expected, "{query}");
+        assert!(matches[0].2);
+        assert_eq!(matches.iter().filter(|entry| entry.2).count(), 1, "{query}");
+    }
+    assert!(discover("symbol definitions", candidates(&[("read", "Read files")])).is_empty());
+    let exact = discover(
+        "references",
+        candidates(&[("references", "Custom tool"), ("lsp", "Find references")]),
+    );
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].0, "references");
+}

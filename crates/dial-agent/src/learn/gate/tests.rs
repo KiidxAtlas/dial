@@ -491,9 +491,12 @@ fn interleaves_baseline_and_candidate_per_case() {
 #[test]
 fn net_wins_and_significance_gate_the_primary() {
     let (baseline, candidate) = versions();
-    let suites = [suite("primary", true, 20), suite("guard", false, 2)];
+    // A 1000-case guard with no discordant pairs bounds the drop below 1 point (see `regression_bound`);
+    // small guards are fail-closed as Unproven, tested below.
+    let suites = [suite("primary", true, 20), suite("guard", false, 1000)];
     let gate = Rules {
         alpha: 0.1,
+        max_regression: 1.0,
         ..rules()
     };
     // 5 candidate-only wins, no losses: p = 1/32.
@@ -548,6 +551,7 @@ fn net_wins_and_significance_gate_the_primary() {
     // The sign test boundary is inclusive.
     let exact = Rules {
         alpha: 1.0 / 32.0,
+        max_regression: 1.0,
         ..rules()
     };
     assert!(
@@ -601,6 +605,7 @@ fn net_wins_and_significance_gate_the_primary() {
     let big = Rules {
         min_improvement: 30.0,
         alpha: 0.1,
+        max_regression: 1.0,
         ..rules()
     };
     let report = evaluate(
@@ -957,4 +962,280 @@ fn a_hopeless_primary_suite_skips_its_remaining_cases_and_says_so() {
         "stops once 11 of 20 cases are done (best case can no longer gain 50 points); a full run is 80 calls"
     );
     assert_eq!(report.scores.len(), 1, "the guard suite was skipped");
+}
+
+fn stat(alpha: f64, max_regression: f64) -> Rules {
+    Rules {
+        alpha,
+        max_regression,
+        ..rules()
+    }
+}
+
+#[test]
+fn binomial_cdf_matches_exact_sums_and_edges() {
+    // n=4, p=1/2: P(X <= 1) = (1 + 4) / 16.
+    assert!((binomial_cdf(1, 4, 0.5) - 5.0 / 16.0).abs() < 1e-12);
+    assert!((binomial_cdf(0, 10, 0.1) - 0.9f64.powi(10)).abs() < 1e-12);
+    assert_eq!(binomial_cdf(4, 4, 0.3), 1.0);
+    assert_eq!(binomial_cdf(0, 4, 0.0), 1.0);
+    assert_eq!(binomial_cdf(3, 4, 1.0), 0.0);
+    assert!(binomial_cdf(5, 20, 0.3) > binomial_cdf(5, 20, 0.4));
+    // Large samples stay finite and inside [0, 1].
+    let big = binomial_cdf(500, 1000, 0.5);
+    assert!(
+        (0.0..=1.0).contains(&big) && (big - 0.5).abs() < 0.05,
+        "{big}"
+    );
+}
+
+#[test]
+fn clopper_pearson_bounds_invert_the_binomial_and_handle_edges() {
+    // Zero successes: the upper bound solves (1 - p)^n = alpha.
+    let upper = clopper_pearson_upper(0, 20, 0.05);
+    assert!((upper - (1.0 - 0.05f64.powf(1.0 / 20.0))).abs() < 1e-9);
+    // Round trip: the cdf at the bound is exactly alpha.
+    let bound = clopper_pearson_upper(7, 30, 0.025);
+    assert!((binomial_cdf(7, 30, bound) - 0.025).abs() < 1e-9);
+    assert_eq!(clopper_pearson_upper(5, 5, 0.05), 1.0);
+    assert!(clopper_pearson_upper(3, 30, 0.05) < clopper_pearson_upper(4, 30, 0.05));
+    assert!(clopper_pearson_upper(0, 10, 0.05) > clopper_pearson_upper(0, 100, 0.05));
+}
+
+#[test]
+fn sample_floor_for_significance_is_exact_at_the_boundary() {
+    assert_eq!(min_discordant_for(1.0), 0);
+    assert_eq!(min_discordant_for(0.5), 1);
+    assert_eq!(min_discordant_for(0.1), 4);
+    // 1/32 is reached exactly by five wins with no losses (boundary inclusive).
+    assert_eq!(min_discordant_for(1.0 / 32.0), 5);
+    assert!(sign_test_p(4, 0) <= 0.1 && sign_test_p(3, 0) > 0.1);
+    assert!(sign_test_p(5, 0) <= 1.0 / 32.0);
+}
+
+#[test]
+fn regression_bound_shrinks_with_samples_and_never_proves_zero_tolerance() {
+    let small = regression_bound(0, 0, 20, 0.05);
+    let large = regression_bound(0, 0, 1000, 0.05);
+    assert!(
+        small > 15.0,
+        "20 clean cases cannot show a 1-point drop: {small}"
+    );
+    assert!(large < 1.0, "1000 clean cases can: {large}");
+    assert!(regression_bound(0, 0, 100_000, 0.05) < large);
+    // A zero tolerance is never provable from finite clean samples.
+    assert!(regression_bound(0, 0, 1_000_000, 0.05) > 0.0);
+    // Discordance favouring the baseline raises the bound; favouring the candidate gives zero.
+    assert!(regression_bound(10, 0, 100, 0.05) > regression_bound(0, 0, 100, 0.05));
+    assert_eq!(regression_bound(0, 10, 100, 0.05), 0.0);
+    assert!(!Outcome::Unproven.needs_more_signal());
+}
+
+#[test]
+fn small_guard_is_fail_closed_as_unproven_even_when_point_estimates_pass() {
+    let (baseline, candidate) = versions();
+    // Primary: 5 candidate-only wins (significant at alpha 0.1). Guard: identical, 20 cases.
+    let suites = [suite("primary", true, 20), suite("guard", false, 20)];
+    let run = runner(10, 15, "primary");
+    let report = evaluate(
+        &stat(0.1, 1.0),
+        &suites,
+        &baseline,
+        &candidate,
+        &|| false,
+        &run,
+    )
+    .unwrap();
+    assert!(!report.passed);
+    assert!(
+        report.reason.contains("cannot be ruled out"),
+        "{}",
+        report.reason
+    );
+    assert!(
+        report.reason.contains("20 paired cases"),
+        "{}",
+        report.reason
+    );
+    // The same evidence passes the legacy point rule, which manual suites keep.
+    let legacy = evaluate(
+        &stat(1.0, 1.0),
+        &suites,
+        &baseline,
+        &candidate,
+        &|| false,
+        &run,
+    )
+    .unwrap();
+    assert!(legacy.passed, "{}", legacy.reason);
+    // Exactly 10 guard losses of 1000: the point drop is 1.0 (inside tolerance) but the bound is not.
+    let guard_losses = |v: &Version, c: &Case| -> Result<bool> {
+        if let Some(i) =
+            c.id.strip_prefix("guard")
+                .and_then(|i| i.parse::<usize>().ok())
+        {
+            return Ok(!(v.id == 2 && i < 10));
+        }
+        run(v, c)
+    };
+    let big = [suite("primary", true, 20), suite("guard", false, 1000)];
+    let report = evaluate(
+        &stat(0.1, 1.0),
+        &big,
+        &baseline,
+        &candidate,
+        &|| false,
+        guard_losses,
+    )
+    .unwrap();
+    assert!(
+        !report.passed && report.reason.contains("cannot be ruled out"),
+        "{}",
+        report.reason
+    );
+}
+
+#[test]
+fn point_losses_beyond_tolerance_stay_a_definite_regression() {
+    let (baseline, candidate) = versions();
+    let suites = [suite("primary", true, 20), suite("guard", false, 20)];
+    let primary = runner(10, 15, "primary");
+    let run = |v: &Version, c: &Case| -> Result<bool> {
+        if let Some(i) =
+            c.id.strip_prefix("guard")
+                .and_then(|i| i.parse::<usize>().ok())
+        {
+            return Ok(!(v.id == 2 && i < 10));
+        }
+        primary(v, c)
+    };
+    for rules in [stat(0.1, 1.0), rules()] {
+        let report = evaluate(&rules, &suites, &baseline, &candidate, &|| false, &run).unwrap();
+        assert!(
+            !report.passed && report.reason.contains("at least one suite exceeds"),
+            "{}",
+            report.reason
+        );
+    }
+}
+
+#[test]
+fn clean_and_noisy_large_guards_are_admitted_and_retries_never_count_as_losses() {
+    let (baseline, candidate) = versions();
+    let suites = [suite("primary", true, 20), suite("guard", false, 1000)];
+    let primary = runner(10, 15, "primary");
+    // Three real guard losses in 1000 cases: about 0.6 points at the one-sided level, inside tolerance.
+    let noisy = |v: &Version, c: &Case| -> Result<bool> {
+        if let Some(i) =
+            c.id.strip_prefix("guard")
+                .and_then(|i| i.parse::<usize>().ok())
+        {
+            return Ok(!(v.id == 2 && i < 3));
+        }
+        primary(v, c)
+    };
+    let report = evaluate(
+        &stat(0.1, 1.0),
+        &suites,
+        &baseline,
+        &candidate,
+        &|| false,
+        noisy,
+    )
+    .unwrap();
+    assert!(report.passed, "{}", report.reason);
+    assert_eq!(report.scores[1].cases, 1000);
+    // Three candidate infrastructure failures exclude those pairs: they are neither losses nor cases.
+    let excluded = |v: &Version, c: &Case| -> Result<bool> {
+        if v.id == 2 && ["guard0", "guard1", "guard2"].contains(&c.id.as_str()) {
+            bail!("model server returned HTTP 503: service unavailable");
+        }
+        primary(v, c)
+    };
+    let report = evaluate_with(
+        &stat(0.1, 1.0),
+        &suites,
+        &baseline,
+        &candidate,
+        excluded,
+        &[Duration::ZERO; 2],
+        &|| false,
+    )
+    .unwrap();
+    assert!(report.passed, "{}", report.reason);
+    assert_eq!(report.scores[1].cases, 997);
+    assert_eq!(
+        (report.scores[1].baseline, report.scores[1].candidate),
+        (100.0, 100.0)
+    );
+    // The surviving guard population is clean; infrastructure failures do not become losses.
+    assert!(
+        !report.reason.contains("cannot be ruled out"),
+        "{}",
+        report.reason
+    );
+    assert!(
+        report.reason.contains("3 case pairs excluded"),
+        "{}",
+        report.reason
+    );
+}
+
+#[test]
+fn a_baseline_failure_removes_the_pair_from_both_sides_of_the_guard() {
+    let (baseline, candidate) = versions();
+    let suites = [suite("primary", true, 20), suite("guard", false, 1000)];
+    let candidate_guard_calls = std::cell::Cell::new(0usize);
+    let run = |v: &Version, c: &Case| -> Result<bool> {
+        if v.id == 1 && ["guard0", "guard1"].contains(&c.id.as_str()) {
+            bail!("model server returned HTTP 503: service unavailable");
+        }
+        if v.id == 2 && c.id.starts_with("guard") {
+            candidate_guard_calls.set(candidate_guard_calls.get() + 1);
+        }
+        Ok(true)
+    };
+    let report = evaluate_with(
+        &stat(0.1, 1.0),
+        &suites,
+        &baseline,
+        &candidate,
+        run,
+        &[Duration::ZERO; 2],
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(report.scores[1].cases, 998);
+    assert_eq!(
+        candidate_guard_calls.get(),
+        998,
+        "the candidate is never run on an unmatched pair"
+    );
+    assert!(
+        !report.reason.contains("cannot be ruled out"),
+        "{}",
+        report.reason
+    );
+}
+
+#[test]
+fn tiny_suites_cannot_pass_the_statistical_gate() {
+    let (baseline, candidate) = versions();
+    let suites = [suite("primary", true, 2), suite("guard", false, 2)];
+    let report = evaluate(
+        &stat(0.1, 1.0),
+        &suites,
+        &baseline,
+        &candidate,
+        &|| false,
+        runner(0, 2, "primary"),
+    )
+    .unwrap();
+    assert!(!report.passed, "{}", report.reason);
+    // Two wins cannot reach alpha 0.1 (needs four): the primary shortfall is reported as not significant.
+    assert!(
+        report.reason.contains("significant") || report.reason.contains("cannot be ruled out"),
+        "{}",
+        report.reason
+    );
 }

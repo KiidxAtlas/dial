@@ -1994,7 +1994,7 @@ impl Config {
                 && i.monitor_drop > 0.0
                 && i.monitor_drop <= 100.0
                 && i.monitor_min_turns >= 2,
-            "invalid live rollback threshold"
+            "invalid matched live-monitor threshold"
         );
         ensure!(
             self.improve.idle_minutes <= 1440 && self.improve.daily_compute_minutes <= 1440,
@@ -2057,6 +2057,37 @@ impl Config {
                     == 1),
             "behavioral_checks must name unique configured verification commands"
         );
+        ensure!(
+            self.verification.requirements.len() <= 50,
+            "at most 50 verification requirements are allowed"
+        );
+        for (name, requirement) in &self.verification.requirements {
+            ensure!(
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "invalid verification requirement name"
+            );
+            ensure!(
+                requirement.visual || !requirement.checks.is_empty(),
+                "verification requirement {name} needs checks or visual evidence"
+            );
+            let unique: std::collections::HashSet<_> = requirement.checks.iter().collect();
+            ensure!(
+                requirement.checks.len() <= 16
+                    && unique.len() == requirement.checks.len()
+                    && requirement.checks.iter().all(|name| self
+                        .verification
+                        .commands
+                        .iter()
+                        .filter(|check| &check.name == name)
+                        .count()
+                        == 1),
+                "verification requirement {name} must name unique configured checks"
+            );
+        }
         ensure!(
             i.lora_min_examples >= 1,
             "lora_min_examples must be positive"
@@ -2307,3 +2338,6 @@ mod hook_layer_tests;
 
 #[cfg(test)]
 mod model_role_tests;
+
+#[cfg(test)]
+mod requirement_tests;

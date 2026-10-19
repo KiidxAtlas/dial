@@ -125,7 +125,11 @@ pub(super) const BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
         "",
         "clear the conversation and start a fresh session",
     ),
-    ("todo", "", "show the task list"),
+    (
+        "todo",
+        "[list|show <number>]",
+        "browse the work plan, blockers and recorded evidence",
+    ),
     (
         "skills",
         "[list|install|update|remove|enable|disable|import|sources]",

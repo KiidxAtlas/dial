@@ -101,6 +101,8 @@ pub(crate) fn announces_unexpected_stop(text: &str) -> bool {
     }
     let lower = last.to_lowercase();
     let sentence = lower.rsplit(". ").next().unwrap_or(&lower).trim();
+    // Closing offers ("Let me know what you'd like to change.") hand the turn back to the user;
+    // they are not announced actions.
     if [
         "optional",
         "later",
@@ -109,6 +111,10 @@ pub(crate) fn announces_unexpected_stop(text: &str) -> bool {
         "when you",
         "leave ",
         "can help",
+        "let me know",
+        "would you like",
+        "want me to",
+        "happy to",
     ]
     .iter()
     .any(|phrase| sentence.contains(phrase))

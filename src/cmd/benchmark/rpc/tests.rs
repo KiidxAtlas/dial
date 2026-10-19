@@ -118,3 +118,36 @@ fn snapshot_from_the_real_usage_type_parses() {
     assert!(ledger.complete);
     assert_eq!(ledger.requests, 0);
 }
+
+fn snapshot(successful: u64, offered: u64, invoked: u64) -> Value {
+    json!({"successful_requests": successful, "offered": {"read": offered}, "invoked": {"read": invoked}})
+}
+
+#[test]
+fn multi_turn_trace_uses_the_last_cumulative_snapshot() {
+    let trace = tool_trace_for_run(Some(&snapshot(4, 4, 3)), 2, 2, true).expect("snapshot present");
+    assert!(trace.complete);
+    assert_eq!(trace.successful_requests, 4);
+    assert_eq!(trace.offered.get("read"), Some(&4));
+    assert_eq!(trace.invoked.get("read"), Some(&3));
+}
+
+#[test]
+fn failed_runs_and_missing_turn_snapshots_are_incomplete_not_absent() {
+    let failed =
+        tool_trace_for_run(Some(&snapshot(2, 2, 1)), 2, 2, false).expect("partial trace kept");
+    assert!(!failed.complete);
+    assert_eq!(failed.invoked.get("read"), Some(&1));
+    let partial =
+        tool_trace_for_run(Some(&snapshot(2, 2, 1)), 3, 2, true).expect("partial trace kept");
+    assert!(!partial.complete);
+}
+
+#[test]
+fn legacy_children_without_snapshots_stay_unknown() {
+    assert_eq!(tool_trace_for_run(None, 2, 0, true), None);
+    assert_eq!(
+        tool_trace_for_run(Some(&json!({"offered": {}})), 1, 1, true),
+        None
+    );
+}

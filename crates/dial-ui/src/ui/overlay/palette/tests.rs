@@ -3,6 +3,26 @@ use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[test]
+fn the_goal_header_and_count_use_ascii_separators_when_requested() {
+    let mut rig = Rig::new();
+    rig.theme = rig.theme.with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &|_, _| Line::default(),
+    };
+    let mut palette = PaletteOverlay::new(entries(), false);
+    let shown = palette.compose(38, 16, &ctx);
+    assert!(
+        shown
+            .iter()
+            .flat_map(|row| &row.spans)
+            .all(|span| span.content.is_ascii())
+    );
+}
+
+#[test]
 fn consistent_ux_advanced_commands_stay_searchable_outside_the_everyday_menu() {
     let mut entries = entries();
     entries.push(PaletteEntry {
@@ -14,15 +34,11 @@ fn consistent_ux_advanced_commands_stay_searchable_outside_the_everyday_menu() {
         },
         during_turn: "Runs after this turn.",
     });
+    let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(entries, false);
-    assert!(
-        !palette
-            .rows()
-            .iter()
-            .any(|&i| palette.entries[i].command.name == "ratchet")
-    );
-    palette.handle(&Event::Paste("ratchet".into()), &Keymap::defaults());
-    assert_eq!(palette.entries[palette.rows()[0]].command.name, "ratchet");
+    assert!(palette.entry_rows().is_empty());
+    palette.handle(&Event::Paste("ratchet".into()), &keys);
+    assert_eq!(names(&palette).first(), Some(&"ratchet"));
 }
 
 fn entries() -> Vec<PaletteEntry> {
@@ -53,23 +69,196 @@ fn plain(code: KeyCode) -> Event {
     key(code, KeyModifiers::NONE)
 }
 
+/// Command names in the visible command rows, in display order.
+fn names(palette: &PaletteOverlay) -> Vec<&str> {
+    palette
+        .entry_rows()
+        .into_iter()
+        .map(|index| palette.entries[index].command.name.as_str())
+        .collect()
+}
+
+fn text_lines(palette: &mut PaletteOverlay) -> Vec<String> {
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    palette
+        .compose(100, 24, &ctx)
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect()
+}
+
+#[test]
+fn goals_are_the_first_screen_and_open_their_commands() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    assert_eq!(
+        palette.rows(),
+        [
+            Row::Goal(0),
+            Row::Goal(1),
+            Row::Goal(2),
+            Row::Goal(3),
+            Row::AllActions
+        ]
+    );
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Enter), &keys),
+        OverlayEvent::None
+    ));
+    assert_eq!(palette.view, View::Goal(0));
+    assert_eq!(names(&palette), ["resume", "model", "rename"]);
+    assert!(
+        matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/resume")
+    );
+}
+
+#[test]
+fn back_from_a_goal_returns_to_goals_without_running_anything() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    palette.handle(&plain(KeyCode::Down), &keys);
+    palette.handle(&plain(KeyCode::Enter), &keys);
+    assert_eq!(palette.view, View::Goal(1));
+    assert_eq!(names(&palette), ["undo"]);
+    palette.handle(&Event::Paste("mod".into()), &keys);
+    // Esc clears the search first and stays on the goal.
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Esc), &keys),
+        OverlayEvent::None
+    ));
+    assert!(palette.search.text.is_empty());
+    assert_eq!(palette.view, View::Goal(1));
+    // The next Esc returns to the goals with the cursor on the goal it came from.
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Esc), &keys),
+        OverlayEvent::None
+    ));
+    assert_eq!(palette.view, View::Goals);
+    assert_eq!(palette.cursor, 1);
+    // Only Esc on the goal list closes the panel.
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Esc), &keys),
+        OverlayEvent::Close
+    ));
+}
+
+#[test]
+fn goal_search_covers_every_registered_command() {
+    let keys = Keymap::defaults();
+    let mut source = entries();
+    source.push(PaletteEntry {
+        command: CommandEntry {
+            name: "ratchet".into(),
+            description: "Advanced verification loop".into(),
+            kind: CommandKind::Builtin,
+            args_hint: None,
+        },
+        during_turn: "Runs after this turn.",
+    });
+    let mut palette = PaletteOverlay::new(source, false);
+    palette.handle(&plain(KeyCode::Enter), &keys);
+    assert_eq!(palette.view, View::Goal(0));
+    // "undo" belongs to another goal, and "ratchet" to none; both are found from here.
+    palette.handle(&Event::Paste("undo".into()), &keys);
+    assert_eq!(names(&palette).first(), Some(&"undo"));
+    palette.handle(&plain(KeyCode::Esc), &keys);
+    palette.handle(&Event::Paste("ratchet".into()), &keys);
+    assert_eq!(names(&palette).first(), Some(&"ratchet"));
+    assert!(
+        matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/ratchet")
+    );
+}
+
+#[test]
+fn goal_with_no_matching_search_says_so_and_escape_leaves_in_steps() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    palette.handle(&plain(KeyCode::Enter), &keys);
+    palette.handle(&Event::Paste("zzzz".into()), &keys);
+    assert!(palette.entry_rows().is_empty());
+    assert!(
+        text_lines(&mut palette)
+            .iter()
+            .any(|l| l.contains("No actions match")),
+    );
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Enter), &keys),
+        OverlayEvent::None
+    ));
+    palette.handle(&plain(KeyCode::Esc), &keys);
+    assert_eq!(palette.view, View::Goal(0));
+    palette.handle(&plain(KeyCode::Esc), &keys);
+    assert_eq!(palette.view, View::Goals);
+}
+
+#[test]
+fn busy_turn_still_lets_goals_open_and_leaves_command_policy_to_the_app() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), true);
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Enter), &keys),
+        OverlayEvent::None
+    ));
+    assert_eq!(palette.view, View::Goal(0));
+    let lines = text_lines(&mut palette);
+    assert!(lines.iter().any(|l| l.contains("Stops the current turn")));
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Enter), &keys),
+        OverlayEvent::Action(action) if action == "command:/resume"
+    ));
+}
+
+#[test]
+fn all_actions_opens_the_category_tabs_and_tab_cycles_them() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    for _ in 0..4 {
+        palette.handle(&plain(KeyCode::Down), &keys);
+    }
+    palette.handle(&plain(KeyCode::Enter), &keys);
+    assert_eq!(palette.view, View::Tabs);
+    assert_eq!(palette.group, 0);
+    let all = names(&palette);
+    assert_eq!(
+        all.len(),
+        entries().len(),
+        "All actions must include advanced commands too: {all:?}"
+    );
+    assert!(all.contains(&"model") && all.contains(&"undo") && all.contains(&"compute"));
+    palette.handle(&plain(KeyCode::Tab), &keys);
+    assert_eq!(names(&palette), ["resume", "rename"]);
+    palette.handle(&Event::Paste("compute".into()), &keys);
+    assert_eq!(
+        names(&palette),
+        ["compute"],
+        "typed search escapes the category scope"
+    );
+    palette.handle(&plain(KeyCode::Esc), &keys);
+    palette.handle(&plain(KeyCode::Esc), &keys);
+    assert_eq!(palette.view, View::Goals);
+    assert_eq!(palette.cursor, GOALS.len());
+}
+
 #[test]
 fn search_categories_and_default_actions_use_the_selected_command() {
     let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(entries(), true);
     palette.handle(&Event::Paste("MODEL".into()), &keys);
-    assert_eq!(palette.entries[palette.rows()[0]].command.name, "model");
+    assert_eq!(names(&palette).first(), Some(&"model"));
     assert!(
         matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/model")
     );
     palette.handle(&plain(KeyCode::Esc), &keys);
+    // Tab from the goal list opens "All"; a second Tab moves to "Sessions".
     palette.handle(&plain(KeyCode::Tab), &keys);
-    let rows: Vec<_> = palette
-        .rows()
-        .iter()
-        .map(|&i| palette.entries[i].command.name.as_str())
-        .collect();
-    assert_eq!(rows, ["resume", "rename"]);
+    palette.handle(&plain(KeyCode::Tab), &keys);
+    assert_eq!(names(&palette), ["resume", "rename"]);
     assert!(
         matches!(palette.handle(&plain(KeyCode::Enter), &keys), OverlayEvent::Action(action) if action == "command:/resume")
     );
@@ -135,7 +324,7 @@ fn unmatched_and_untrusted_entries_cannot_dispatch() {
     let mut palette = PaletteOverlay::new(source, false);
     assert_eq!(palette.entries.len(), entries().len());
     palette.handle(&Event::Paste("unmatchable-command".into()), &keys);
-    assert!(palette.rows().is_empty());
+    assert!(palette.entry_rows().is_empty());
     assert!(matches!(
         palette.handle(&plain(KeyCode::Enter), &keys),
         OverlayEvent::None
@@ -151,6 +340,7 @@ fn layout_preserves_details_controls_and_fits_small_terminals() {
         status: &rig.status,
         preview_status: &status_preview,
     };
+    let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(entries(), true);
     for (w, h) in [(0, 0), (1, 1), (2, 2), (8, 4), (30, 10), (100, 24)] {
         for mode in [false, true] {
@@ -165,18 +355,14 @@ fn layout_preserves_details_controls_and_fits_small_terminals() {
         }
     }
     palette.arguments = None;
-    let lines = palette.compose(100, 24, &ctx);
-    let lines: Vec<String> = lines
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect();
-    assert!(lines.iter().any(|l| l.contains("Stops the current turn")));
+    let lines = text_lines(&mut palette);
+    assert!(lines.iter().any(|l| l.contains("Start or continue work")));
+    assert!(lines.iter().any(|l| l.contains("All actions")));
     assert!(lines.last().unwrap().contains("close"));
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("All") && l.contains("Extensions"))
-    );
+    palette.handle(&plain(KeyCode::Enter), &keys);
+    let lines = text_lines(&mut palette);
+    assert!(lines.iter().any(|l| l.contains("Stops the current turn")));
+    assert!(lines.last().unwrap().contains("back"));
 }
 
 #[test]
@@ -184,7 +370,7 @@ fn task_labels_are_searchable_without_changing_command_dispatch() {
     let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(entries(), false);
     palette.handle(&Event::Paste("Choose a model".into()), &keys);
-    assert_eq!(palette.rows().len(), 1);
+    assert_eq!(palette.entry_rows().len(), 1);
     assert!(matches!(palette.handle(&plain(KeyCode::Enter), &keys),
         OverlayEvent::Action(action) if action == "command:/model"));
     let custom = CommandEntry {
@@ -194,6 +380,27 @@ fn task_labels_are_searchable_without_changing_command_dispatch() {
         args_hint: None,
     };
     assert_eq!(action_label(&custom), "model");
+}
+
+#[test]
+fn manage_goal_lists_todo_alongside_work_commands() {
+    let keys = Keymap::defaults();
+    let mut source = entries();
+    source.push(PaletteEntry {
+        command: CommandEntry {
+            name: "todo".into(),
+            description: "Browse the task plan".into(),
+            kind: CommandKind::Builtin,
+            args_hint: None,
+        },
+        during_turn: "Runs after this turn.",
+    });
+    let mut palette = PaletteOverlay::new(source, false);
+    palette.handle(&plain(KeyCode::Down), &keys);
+    palette.handle(&plain(KeyCode::Down), &keys);
+    palette.handle(&plain(KeyCode::Enter), &keys);
+    assert_eq!(palette.view, View::Goal(2));
+    assert_eq!(names(&palette), ["todo", "compute"]);
 }
 
 #[test]
@@ -238,15 +445,61 @@ fn short_panels_keep_cancel_visible_and_clicks_match_drawn_rows() {
             assert_eq!(rows.len(), usize::from(height));
         }
         let buffer = render(80, 24, |frame| palette.draw(frame, &ctx));
-        let first_row = rows(&buffer)[palette.list_top()].clone();
-        assert!(first_row.contains(if picker { "dark" } else { "Choose a model" }));
-        let expected = if picker {
-            "command:/theme dark"
+        let list_top = palette.list_top();
+        let first_row = rows(&buffer)[list_top].clone();
+        if picker {
+            assert!(first_row.contains("dark"));
+            // The first click on the cursor row runs it, like Enter.
+            assert!(matches!(
+                palette.click(list_top as u16),
+                OverlayEvent::Action(action) if action == "command:/theme dark"
+            ));
         } else {
-            "command:/model"
-        };
-        assert!(
-            matches!(palette.click(palette.list_top() as u16), OverlayEvent::Action(action) if action == expected)
-        );
+            assert!(first_row.contains("Start or continue work"), "{first_row}");
+            // Clicking an unselected goal only selects it; the next click opens it.
+            assert!(matches!(
+                palette.click(list_top as u16 + 1),
+                OverlayEvent::None
+            ));
+            assert_eq!(palette.view, View::Goals);
+            assert_eq!(palette.cursor, 1);
+            assert!(matches!(
+                palette.click(list_top as u16 + 1),
+                OverlayEvent::None
+            ));
+            assert_eq!(palette.view, View::Goal(1));
+            assert_eq!(names(&palette), ["undo"]);
+        }
     }
+}
+
+#[test]
+fn picker_opens_on_the_current_value_and_click_targets_it() {
+    let keys = Keymap::defaults();
+    let spec = ChoiceSpec {
+        title: "Approval".into(),
+        command: "approval".into(),
+        verb: "",
+        remove: None,
+        items: ["ask", "write", "auto"]
+            .into_iter()
+            .map(|value| ChoiceItem {
+                value: value.into(),
+                label: value.into(),
+                detail: String::new(),
+                current: value == "write",
+            })
+            .collect(),
+    };
+    let mut palette = PaletteOverlay::choice(spec);
+    assert_eq!(palette.cursor, 1);
+    assert!(matches!(
+        palette.handle(&plain(KeyCode::Enter), &keys),
+        OverlayEvent::Action(action) if action == "command:/approval write"
+    ));
+    let list_top = palette.list_top() as u16;
+    assert!(matches!(
+        palette.click(list_top + 1),
+        OverlayEvent::Action(action) if action == "command:/approval write"
+    ));
 }

@@ -420,7 +420,7 @@ fn unknown_effects_keep_their_stop_over_edit_cycles() {
 fn reset_from_new_steering_clears_turn_local_cycle_state() {
     let mut edits = Edits::new();
     assert_eq!(edits.sequence("a.txt", "ABABA"), Some(4));
-    edits.engine.reset();
+    edits.engine.transition(RecoveryTransition::Steering);
     assert!(edits.refused("edit", "a.txt", "B").is_none());
     assert_eq!(edits.sequence("a.txt", "BABA"), None);
 }
@@ -453,4 +453,71 @@ fn many_novel_versions_and_loops_stay_bounded() {
         "{files} files, {versions} versions, {refused} refused calls"
     );
     assert!(edits.refused("edit", "loop39.txt", "A").is_some());
+}
+
+#[test]
+fn continuation_retains_cycle_restrictions_but_allows_a_different_approach() {
+    let mut edits = Edits::new();
+    assert_eq!(edits.sequence("a.txt", "ABABA"), Some(4));
+    for reason in [
+        RecoveryTransition::AutomaticContinue,
+        RecoveryTransition::DirectedContinue,
+    ] {
+        edits.engine.transition(reason);
+        assert!(edits.refused("edit", "a.txt", "B").is_some());
+        assert!(edits.refused("write", "a.txt", "final").is_none());
+    }
+}
+
+#[test]
+fn no_recovery_transition_releases_an_uncertain_effect_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let call = ToolCall {
+        id: "uncertain".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({"command":"update"}),
+        malformed_arguments: false,
+    };
+    for reason in [
+        RecoveryTransition::Steering,
+        RecoveryTransition::Coordination,
+        RecoveryTransition::AutomaticContinue,
+        RecoveryTransition::DirectedContinue,
+    ] {
+        let mut engine = Engine::default();
+        let mut output = ToolOutput::err("lost execution").with_effects(Effects::Unknown);
+        engine.settle(&workspace, &call, &mut output, false, false, |_| false);
+        engine.transition(reason);
+        assert!(engine.pending_refusal().is_some(), "{reason:?}");
+        let report = engine
+            .drive(|_| Ok(Tick::Finished(completed_report())))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.outcome, crate::agent::TurnOutcome::Incomplete);
+    }
+}
+
+#[test]
+fn shared_settlement_delivers_cause_specific_advice_without_changing_execution_facts() {
+    use crate::runtime::execution::ToolStatus;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let call = ToolCall {
+        id: "denied".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({"command":"cargo test"}),
+        malformed_arguments: false,
+    };
+    let mut engine = Engine::default();
+    let mut output = ToolOutput::err("denied by policy")
+        .with_status(ToolStatus::Blocked)
+        .with_effects(Effects::None);
+    let facts = output.execution.clone();
+    let (_, _, stop) = engine.settle(&workspace, &call, &mut output, false, false, |_| false);
+    assert!(stop.is_none());
+    assert_eq!(output.execution, facts);
+    assert!(output.is_error);
+    assert!(output.text.contains("permission_or_policy"));
+    assert!(output.text.starts_with("denied by policy"));
 }

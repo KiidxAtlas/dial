@@ -1,8 +1,9 @@
-//! The home screen: a gradient wordmark beside the name, version and tagline; a framed card that
-//! says what dial is ready to work with (model, project and branch, approval and sandbox); starter
-//! requests on a first visit or the recent sessions on a return; and the key hints. Every row fits
-//! the width it is given. Below `CARD_MIN` columns, or with the ASCII glyph set, the wordmark and
-//! the frame drop and the same facts stay as plain rows.
+//! The home screen: a block wordmark over a dotted axis and its faint reflection, with the name,
+//! version and tagline on its baseline; borderless facts that say what dial is ready to work with
+//! (model, project and branch, approval and sandbox); starter requests on a first visit or the
+//! recent sessions on a return; and the key hints. Every row fits the width it is given. Short
+//! terminals drop the reflection, then swap in a two-row wordmark; below `ART_MIN` columns, or with
+//! the ASCII glyph set, the art drops and the same facts stay as plain rows.
 //!
 //! [`Home`] keeps it live in the viewport until the conversation starts: its list rows are
 //! selectable, the wordmark gets one start-up sweep, and on the first message it collapses to the
@@ -57,19 +58,41 @@ const RECENT_MAX: usize = 72;
 const MARK: &str = "◉";
 const MARK_ASCII: &str = "*";
 const TAGLINE: &str = "Your coding agent, wired into this project.";
-/// Narrowest width that gets the wordmark and the framed card.
-const CARD_MIN: usize = 56;
-/// The card never grows past this, so it reads as a card rather than a rule on wide terminals.
-const CARD_MAX: usize = 92;
-/// Narrowest width that puts the list beside the card instead of under it.
+/// Narrowest width that gets the wordmark.
+const ART_MIN: usize = 56;
+/// The facts column never grows past this, so values stay near their labels on wide terminals.
+const FACTS_MAX: usize = 92;
+/// Narrowest width that puts the list beside the facts instead of under them.
 const TWO_COLUMN_MIN: usize = 110;
-/// Cells between the card and the list in two columns.
+/// Cells between the facts and the list in two columns.
 const COLUMN_GAP: usize = 4;
-/// "dial" in half-block pixels, two rows tall.
-const WORDMARK: [&str; 2] = [
+/// "dial" in full blocks, six rows tall; the last two rows carry the name and tagline beside it.
+const WORDMARK: [&str; 6] = [
+    "      \u{2588}\u{2588}  \u{2588}\u{2588}            \u{2588}\u{2588}",
+    "      \u{2588}\u{2588}                \u{2588}\u{2588}",
+    " \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}   \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}",
+    "\u{2588}\u{2588}    \u{2588}\u{2588}  \u{2588}\u{2588}  \u{2588}\u{2588}    \u{2588}\u{2588}  \u{2588}\u{2588}",
+    "\u{2588}\u{2588}    \u{2588}\u{2588}  \u{2588}\u{2588}  \u{2588}\u{2588}    \u{2588}\u{2588}  \u{2588}\u{2588}",
+    " \u{2580}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}   \u{2580}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}",
+];
+/// The wordmark's last rows seen in still water: the first bright, the second broken up and faint.
+const REFLECTION: [&str; 2] = [
+    " \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}   \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}  \u{2588}\u{2588}",
+    "\u{2588}\u{2580}    \u{2588}\u{2580}  \u{2588}\u{2580}  \u{2588}\u{2580}    \u{2588}\u{2580}  \u{2588}\u{2580}",
+];
+/// "dial" in half-block pixels, two rows tall, for terminals too short for the full wordmark.
+const WORDMARK_SMALL: [&str; 2] = [
     "\u{2584}\u{2584}\u{2588} \u{2580} \u{2584}\u{2584}\u{2584}  \u{2588} ",
     "\u{2588}\u{2584}\u{2588} \u{2588} \u{2588}\u{2584}\u{2588}\u{2584} \u{2588}\u{2584}",
 ];
+
+/// How much artwork the home draws, largest first; [`render`] takes the first that fits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Art {
+    Reflected,
+    Large,
+    Small,
+}
 
 /// Left margin, then `spans` clipped to the remaining width.
 fn row(margin: usize, spans: Vec<Span<'static>>, width: usize, ellipsis: &str) -> Line<'static> {
@@ -111,10 +134,6 @@ fn facts(
             format!("{} no model selected", theme.sym(Sym::Warn)),
             theme.fg(Tok::Warning).add_modifier(Modifier::BOLD),
         ));
-        let hint = text::one_line(info.setup_hint.trim());
-        if !hint.is_empty() {
-            spans.push(Span::styled(format!("{dot}{hint}"), muted));
-        }
     } else {
         spans.push(Span::styled(
             model,
@@ -125,6 +144,12 @@ fn facts(
         }
     }
     out.push(("model", spans));
+    if info.model.trim().is_empty() {
+        let hint = text::one_line(info.setup_hint.trim());
+        if !hint.is_empty() {
+            out.push(("next", vec![Span::styled(hint, theme.fg(Tok::Accent))]));
+        }
+    }
 
     let project = text::one_line(info.project.trim());
     let branch = text::one_line(info.branch.trim());
@@ -163,61 +188,24 @@ fn facts(
         if !meaning.is_empty() {
             spans.push(Span::styled(format!("{dot}{meaning}"), muted));
         }
-        let sandbox = text::one_line(info.sandbox.trim());
-        if !sandbox.is_empty() {
-            // Auto approval with the sandbox off is the unguarded pairing: flag it in the warning colour.
-            let unguarded = approval == "auto" && sandbox.eq_ignore_ascii_case("off");
-            let style = if unguarded {
-                theme.fg(Tok::Warning)
-            } else {
-                muted
-            };
-            spans.push(Span::styled(format!("{dot}sandbox {sandbox}"), style));
+        out.push(("approval", spans));
+    }
+    // Isolation is a separate fact, not a tail that disappears behind a long approval sentence.
+    let sandbox = text::one_line(info.sandbox.trim());
+    if !sandbox.is_empty() {
+        let unguarded = approval == "auto" && sandbox.eq_ignore_ascii_case("off");
+        let style = if unguarded {
+            theme.fg(Tok::Warning)
+        } else {
+            muted
+        };
+        let mut spans = vec![Span::styled(sandbox, style.add_modifier(Modifier::BOLD))];
+        if unguarded {
+            spans.push(Span::styled(format!("{dot}tools are not isolated"), style));
         }
-        out.push(("mode", spans));
+        out.push(("sandbox", spans));
     }
     out
-}
-
-/// One row inside the card frame: `│ spans … │`, padded to `inner` cells.
-fn card_row(
-    theme: &Theme,
-    margin: usize,
-    inner: usize,
-    spans: Vec<Span<'static>>,
-    ellipsis: &str,
-) -> Line<'static> {
-    let border = theme.fg(Tok::BorderMuted);
-    let v = theme.sym(Sym::BoxV).to_owned();
-    let body = truncate_spans(spans, inner, ellipsis);
-    let used: usize = body.iter().map(|s| text::width(&s.content)).sum();
-    let mut out = vec![
-        Span::raw(" ".repeat(margin)),
-        Span::styled(v.clone(), border),
-    ];
-    out.extend(body);
-    out.push(Span::raw(" ".repeat(inner.saturating_sub(used))));
-    out.push(Span::styled(v, border));
-    Line::from(out)
-}
-
-/// A horizontal card edge: `╭──────╮` or `╰──────╯`.
-fn card_edge(theme: &Theme, margin: usize, inner: usize, top: bool) -> Line<'static> {
-    let (left, right) = if theme.ascii() {
-        ("+", "+")
-    } else if top {
-        ("\u{256d}", "\u{256e}")
-    } else {
-        ("\u{2570}", "\u{256f}")
-    };
-    let h = theme.sym(Sym::BoxH);
-    Line::from(vec![
-        Span::raw(" ".repeat(margin)),
-        Span::styled(
-            format!("{left}{}{right}", h.repeat(inner)),
-            theme.fg(Tok::BorderMuted),
-        ),
-    ])
 }
 
 /// How the banner draws: the selected list row, how far the start-up sweep has run, and how many
@@ -248,13 +236,16 @@ pub fn rows(info: &WelcomeInfo, width: u16, theme: &Theme) -> Rows {
     render(info, width, theme, View::default())
 }
 
-/// Rows for `view`: the full layout when it fits `view.max_rows`, else the compact one, cut to fit.
+/// Rows for `view`: the largest layout that fits `view.max_rows`, else the compact one, cut to fit.
 pub fn render(info: &WelcomeInfo, width: u16, theme: &Theme, view: View) -> Rows {
-    let mut out = layout(info, width as usize, theme, &view, false);
-    if out.len() > view.max_rows {
-        out = layout(info, width as usize, theme, &view, true);
-        out.truncate(view.max_rows);
+    for art in [Art::Reflected, Art::Large, Art::Small] {
+        let out = layout(info, width as usize, theme, &view, false, art);
+        if out.len() <= view.max_rows {
+            return out;
+        }
     }
+    let mut out = layout(info, width as usize, theme, &view, true, Art::Small);
+    out.truncate(view.max_rows);
     out
 }
 
@@ -275,6 +266,7 @@ fn list_lines(
     theme: &Theme,
     view: &View,
     room: usize,
+    limit: usize,
 ) -> Vec<Vec<Span<'static>>> {
     let ascii = theme.ascii();
     let muted = theme.fg(Tok::Muted);
@@ -298,11 +290,33 @@ fn list_lines(
         }
     };
     let mut out = Vec::new();
+    if limit == 0 {
+        return out;
+    }
+    let total = items(info);
+    let shown = total.min(limit.saturating_sub(2).max(1));
+    let start = view
+        .selected
+        .unwrap_or(0)
+        .saturating_sub(shown.saturating_sub(1))
+        .min(total.saturating_sub(shown));
+    let heading = |title: &str| {
+        let mut spans = vec![label(theme, title)];
+        if shown < total {
+            spans.push(Span::styled(
+                format!("  {}-{}/{total}", start + 1, start + shown),
+                muted,
+            ));
+        }
+        spans
+    };
 
     // first visit to this project: things to try
     if info.recent.is_empty() && !info.tips.is_empty() {
-        out.push(vec![label(theme, "start with")]);
-        for (i, starter) in STARTERS.iter().enumerate() {
+        if limit > 1 {
+            out.push(heading("start with"));
+        }
+        for (i, starter) in STARTERS.iter().enumerate().skip(start).take(shown) {
             // Bullets, not numbers: digits typed into the composer are text, not a starter pick.
             out.push(vec![
                 pad(1),
@@ -310,20 +324,22 @@ fn list_lines(
                 Span::styled(format!("  {starter}"), body(i)),
             ]);
         }
-        if view.live {
+        if view.live && out.len() < limit {
             let down = if ascii { "Down" } else { "\u{2193}" };
             out.push(vec![
                 pad(1),
-                Span::styled(format!("{down} to pick one, Enter to use it"), muted),
+                Span::styled(format!("{down} to pick one, Enter to edit it"), muted),
             ]);
         }
     }
 
     // recent sessions: a label, then title … age
     if !info.recent.is_empty() {
-        out.push(vec![label(theme, "recent")]);
+        if limit > 1 {
+            out.push(heading("recent"));
+        }
         let room = room.min(RECENT_MAX).saturating_sub(1);
-        for (i, (title, age)) in info.recent.iter().take(MAX_RECENT).enumerate() {
+        for (i, (title, age)) in info.recent.iter().enumerate().skip(start).take(shown) {
             let title = text::one_line(title);
             let age = text::one_line(age);
             let age_w = text::width(&age);
@@ -342,14 +358,21 @@ fn list_lines(
             out.push(spans);
         }
         let hint = text::one_line(info.resume_hint.trim());
-        if !hint.is_empty() {
+        if !hint.is_empty() && out.len() < limit {
             out.push(vec![pad(1), Span::styled(hint, muted)]);
         }
     }
     out
 }
 
-fn layout(info: &WelcomeInfo, width: usize, theme: &Theme, view: &View, compact: bool) -> Rows {
+fn layout(
+    info: &WelcomeInfo,
+    width: usize,
+    theme: &Theme,
+    view: &View,
+    compact: bool,
+    art: Art,
+) -> Rows {
     if width == 0 {
         return Vec::new();
     }
@@ -368,11 +391,15 @@ fn layout(info: &WelcomeInfo, width: usize, theme: &Theme, view: &View, compact:
     };
     let version = text::one_line(info.version.trim());
 
-    let mut out: Rows = vec![Line::default()];
-    let framed = width >= CARD_MIN && !ascii && !compact;
+    let mut out: Rows = if compact {
+        Vec::new()
+    } else {
+        vec![Line::default()]
+    };
+    let framed = width >= ART_MIN && !ascii && !compact;
     let mut list_placed = false;
     if framed {
-        // Wordmark on the left, identity on the right.
+        // Wordmark on the left; the name and tagline sit beside its last two rows.
         let title = |line: usize| -> Vec<Span<'static>> {
             match line {
                 0 => {
@@ -389,56 +416,85 @@ fn layout(info: &WelcomeInfo, width: usize, theme: &Theme, view: &View, compact:
                 _ => vec![Span::styled(TAGLINE, muted)],
             }
         };
-        for (i, mark) in WORDMARK.iter().enumerate() {
+        let marks: &[&str] = if art == Art::Small {
+            &WORDMARK_SMALL
+        } else {
+            &WORDMARK
+        };
+        let side = marks.len() - 2;
+        for (i, mark) in marks.iter().enumerate() {
             let mut spans = fx::sweep(theme, mark, i as f32 * 0.08, view.sweep, Style::default());
-            spans.push(pad(4));
-            spans.extend(title(i));
+            if i >= side {
+                spans.push(pad(4));
+                spans.extend(title(i - side));
+            }
             out.push(row(margin, spans, width, &ellipsis));
+        }
+        if art == Art::Reflected {
+            let art_w = text::width(WORDMARK[0]);
+            out.push(row(
+                margin,
+                vec![Span::styled(
+                    "\u{2508}".repeat(art_w),
+                    theme.fg(Tok::BorderMuted),
+                )],
+                width,
+                &ellipsis,
+            ));
+            for (mark, tok) in REFLECTION.iter().zip([Tok::Dim, Tok::Border]) {
+                out.push(row(
+                    margin,
+                    vec![Span::styled(*mark, theme.fg(tok))],
+                    width,
+                    &ellipsis,
+                ));
+            }
         }
         out.push(Line::default());
 
-        // Wide terminals put the list beside the card, so the home stays short.
+        // The facts stand free: a dim label column, then the value. Wide terminals put the list
+        // beside them, so the home stays short.
         let two_columns = width >= TWO_COLUMN_MIN && items(info) > 0;
-        let card_w = if two_columns {
-            ((inner - COLUMN_GAP) * 11 / 20).min(CARD_MAX + 2)
+        let facts_w = if two_columns {
+            ((inner - COLUMN_GAP) * 11 / 20).min(FACTS_MAX)
         } else {
-            inner.min(CARD_MAX + 2)
+            inner.min(FACTS_MAX)
         };
-        let card_inner = card_w.saturating_sub(2);
         let label_w = 9;
-        let value_room = card_inner.saturating_sub(label_w + 3);
-        let mut card = vec![card_edge(theme, 0, card_inner, true)];
-        for (name, value) in facts(info, theme, value_room) {
-            let mut spans = vec![
-                Span::raw(" "),
-                Span::styled(format!("{name:<label_w$}"), theme.fg(Tok::Dim)),
-                Span::raw(" "),
-            ];
-            spans.extend(value);
-            card.push(card_row(theme, 0, card_inner, spans, &ellipsis));
-        }
-        card.push(card_edge(theme, 0, card_inner, false));
+        let fact_rows: Vec<Vec<Span<'static>>> =
+            facts(info, theme, facts_w.saturating_sub(label_w + 1))
+                .into_iter()
+                .map(|(name, value)| {
+                    let mut spans = vec![
+                        Span::styled(format!("{name:<label_w$}"), theme.fg(Tok::Dim)),
+                        Span::raw(" "),
+                    ];
+                    spans.extend(value);
+                    truncate_spans(spans, facts_w, &ellipsis)
+                })
+                .collect();
         if two_columns {
-            let right_w = inner - card_w - COLUMN_GAP;
-            let list = list_lines(info, theme, view, right_w);
-            for i in 0..card.len().max(list.len()) {
+            let right_w = inner - facts_w - COLUMN_GAP;
+            let list = list_lines(info, theme, view, right_w, usize::MAX);
+            for i in 0..fact_rows.len().max(list.len()) {
                 let mut spans = vec![pad(margin)];
-                match card.get(i) {
-                    Some(line) => spans.extend(line.spans.iter().skip(1).cloned()),
-                    None => spans.push(pad(card_w)),
-                }
+                let used = match fact_rows.get(i) {
+                    Some(line) => {
+                        spans.extend(line.iter().cloned());
+                        line.iter().map(|s| text::width(&s.content)).sum()
+                    }
+                    None => 0,
+                };
                 if let Some(line) = list.get(i) {
-                    spans.push(pad(COLUMN_GAP));
+                    spans.push(pad(facts_w.saturating_sub(used) + COLUMN_GAP));
                     spans.extend(truncate_spans(line.clone(), right_w, &ellipsis));
                 }
                 out.push(Line::from(spans));
             }
             list_placed = true;
         } else {
-            for line in card {
-                let mut spans = vec![pad(margin)];
-                spans.extend(line.spans.into_iter().skip(1));
-                out.push(Line::from(spans));
+            for spans in fact_rows {
+                out.push(row(margin, spans, width, &ellipsis));
             }
         }
     } else {
@@ -453,7 +509,9 @@ fn layout(info: &WelcomeInfo, width: usize, theme: &Theme, view: &View, compact:
             head.push(Span::styled(format!(" {version}"), muted));
         }
         head.push(Span::styled(format!("{dot}{greeting}"), muted));
-        out.push(row(margin, head, width, &ellipsis));
+        if !compact || view.max_rows > usize::from(items(info) > 0) {
+            out.push(row(margin, head, width, &ellipsis));
+        }
         if !compact {
             out.push(row(
                 margin,
@@ -462,7 +520,22 @@ fn layout(info: &WelcomeInfo, width: usize, theme: &Theme, view: &View, compact:
                 &ellipsis,
             ));
         }
-        for (name, value) in facts(info, theme, inner.saturating_sub(9)) {
+        let mut facts = facts(info, theme, inner.saturating_sub(9));
+        if compact {
+            // Keep a selected action visible even in very short terminals. Shed context before
+            // approval/isolation facts; list navigation windows the remaining rows around selection.
+            let room = view
+                .max_rows
+                .saturating_sub(out.len() + usize::from(items(info) > 0));
+            while facts.len() > room {
+                let remove = ["project", "next", "model"]
+                    .iter()
+                    .find_map(|name| facts.iter().position(|(label, _)| label == name))
+                    .unwrap_or(0);
+                facts.remove(remove);
+            }
+        }
+        for (name, value) in facts {
             let mut spans = vec![Span::styled(format!("{name:<8} "), theme.fg(Tok::Dim))];
             spans.extend(value);
             out.push(row(margin, spans, width, &ellipsis));
@@ -470,8 +543,13 @@ fn layout(info: &WelcomeInfo, width: usize, theme: &Theme, view: &View, compact:
     }
 
     if !list_placed {
-        let list = list_lines(info, theme, view, inner);
-        if !list.is_empty() {
+        let limit = if compact {
+            view.max_rows.saturating_sub(out.len())
+        } else {
+            usize::MAX
+        };
+        let list = list_lines(info, theme, view, inner, limit);
+        if !list.is_empty() && !compact {
             out.push(Line::default());
         }
         for spans in list {
@@ -501,7 +579,9 @@ fn layout(info: &WelcomeInfo, width: usize, theme: &Theme, view: &View, compact:
         out.push(row(margin, line, width, &ellipsis));
     }
 
-    out.push(Line::default());
+    if !compact {
+        out.push(Line::default());
+    }
     out
 }
 

@@ -1,0 +1,5 @@
+Archived ledger notes (older revision, not current).
+REPORT_CODE candidate: ARCHIVE-1200
+REPORT_CODE candidate: ARCHIVE-3319
+LIMIT_CENTS candidate: 10000 (archived, superseded)
+Old function name transaction_sum was renamed; do not follow archived names.

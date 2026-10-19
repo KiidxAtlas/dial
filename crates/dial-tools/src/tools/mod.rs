@@ -856,12 +856,11 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         "edit" => edit::editing::schema(mode),
         "glob" => tool_schema(
             "glob",
-            "List pageable workspace files in sorted component/depth-first order, max 500 per page. Supports \
+            "List pageable workspace files in sorted order, max 500 per page. Supports \
              `*`, `?`, `[a-z]`, `{a,b}` and `**`; bare patterns match names at any depth. \
-             Coverage and JSON next_cursor/remaining_skip are always reported. Copy them to cursor/skip \
-             with the same query and unchanged workspace. Directories over 50,000 immediate entries are \
-             explicitly omitted before sorting; narrow the scope to their children. Directory enumeration \
-             is bounded to 2,050,000 entries/call. Symlinks, .git and scratch are never searched.",
+             The footer reports coverage and next_cursor/remaining_skip; copy them to cursor/skip with the \
+             same query to continue. Oversized directories are reported as omitted; narrow the scope to \
+             their children. Symlinks, .git and scratch are never searched.",
             json!({
                 "pattern": {"type": "string", "description": "Glob such as `src/**/*.rs` or `*.py`, relative to the workspace root."},
                 "path": {"type": "string", "description": "File/directory scope, or semicolon-separated scopes; an existing literal filename wins. Default workspace root."},
@@ -875,15 +874,12 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
         ),
         "grep" => tool_schema(
             "grep",
-            "Search with Rust regex (no lookaround/backreferences) or fixed_string. Default line matching \
-             returns path:line:text; context uses path-line-text and -- groups. Newline patterns or multiline \
-             match whole files and return path:start:end:text with inclusive source lines. Pages are ordered \
-             by sorted component/depth-first files then matching lines/non-overlapping matches. Always inspect \
-             coverage and JSON next_cursor/remaining_skip; copy to cursor/skip with the same query and unchanged \
-             workspace. Limits: 50,000 considered walk entries, 2,050,000 directory entries enumerated, \
-             64 MiB scanned, 4 MiB/file and 48 KiB result rows. Directories over 50,000 immediate entries \
-             are explicitly omitted before sorting; narrow to children. Skipped/unreadable/ignored/depth-capped \
-             coverage is explicit, never exhaustive empty success.",
+            "Search with Rust regex (no lookaround/backreferences) or fixed_string. Line matching returns \
+             path:line:text; context uses path-line-text and -- groups. Newline patterns or multiline match \
+             whole files and return path:start:end:text. The footer reports coverage (skipped, unreadable, \
+             ignored or capped entries are named, never silently empty) and next_cursor/remaining_skip; copy \
+             them to cursor/skip with the same query to continue. Oversized directories are reported as \
+             omitted; narrow to their children.",
             json!({
                 "pattern": {"type": "string", "description": "Regular expression (Rust `regex` syntax, e.g. `fn \\w+\\(` or `TODO|FIXME`; non-empty). Set fixed_string to search literal text instead."},
                 "fixed_string": {"type": "boolean", "description": "Treat pattern as literal text, not a regex (default false)."},

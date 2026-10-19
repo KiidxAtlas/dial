@@ -24,7 +24,7 @@ The built-in tool roster, specialist integrations, safety model, context sources
   After repeated unsuccessful recovery, the interactive interface asks for direction: continue with
   a corrected approach, supply an instruction, or pause while keeping completed work. Noninteractive
   and sealed runs retain finite loop safeguards; declining the prompt also pauses safely.
-  `/todo` displays full blocked reasons; `Ctrl-O` expands todo change cards and wraps long reasons.
+  `/todo` opens a read-only plan inspector; selecting a step shows full blocked reasons, findings and recorded evidence. `/todo list` prints the list. The evidence-expansion shortcut expands todo change cards and wraps long reasons.
   Retained artifacts have private lifecycle records. `artifact_read` with `info=true` reports
   availability, retention timestamps and byte size without reading content. A missing blob with
   a record is distinguished from a legacy/foreign reference with no local record; removal or

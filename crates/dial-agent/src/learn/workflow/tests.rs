@@ -153,9 +153,9 @@ fn admission(passed: bool, cases: usize) -> Admission {
     }
 }
 
-fn pair(baseline_pass: bool, candidate_pass: bool) -> (CaseMeasurement, CaseMeasurement) {
+fn pair(baseline_pass: bool, candidate_pass: bool) -> (Attempt, Attempt) {
     (
-        CaseMeasurement {
+        Attempt::Measured(CaseMeasurement {
             passed: baseline_pass,
             metrics: Metrics {
                 tool_calls: 5,
@@ -163,8 +163,8 @@ fn pair(baseline_pass: bool, candidate_pass: bool) -> (CaseMeasurement, CaseMeas
                 protocol_errors: 2,
                 ..Metrics::default()
             },
-        },
-        CaseMeasurement {
+        }),
+        Attempt::Measured(CaseMeasurement {
             passed: candidate_pass,
             metrics: Metrics {
                 tool_calls: 3,
@@ -172,7 +172,7 @@ fn pair(baseline_pass: bool, candidate_pass: bool) -> (CaseMeasurement, CaseMeas
                 protocol_errors: 0,
                 ..Metrics::default()
             },
-        },
+        }),
     )
 }
 
@@ -200,11 +200,16 @@ fn requires_complete_measurements_and_targeted_reduction_without_hidden_tradeoff
     let mut incomplete = admission(true, 2);
     assert!(!compare("workflow:protocol", &mut incomplete, &[pair(false, true)]).admitted);
     let mut unchanged = pair(false, true);
-    unchanged.1.metrics = unchanged.0.metrics.clone();
+    let same = unchanged.0.measurement().unwrap().metrics.clone();
+    if let Attempt::Measured(c) = &mut unchanged.1 {
+        c.metrics = same;
+    }
     let mut no_gain = admission(true, 1);
     assert!(!compare("workflow:protocol", &mut no_gain, &[unchanged]).admitted);
     let mut costly = pair(false, true);
-    costly.1.metrics.chatter_bytes = 1;
+    if let Attempt::Measured(c) = &mut costly.1 {
+        c.metrics.chatter_bytes = 1;
+    }
     let mut tradeoff = admission(true, 1);
     assert!(!compare("workflow:protocol", &mut tradeoff, &[costly]).admitted);
 }

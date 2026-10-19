@@ -24,7 +24,7 @@ fn normalize_arguments(name: &str, arguments: &serde_json::Value) -> serde_json:
             if let Some(command) = object.get("command").and_then(|v| v.as_str())
                 // Expansions and escapes depend on quoting; keep them exact.
                 // This fingerprint never changes the executed command.
-                && !command.contains(['*', '?', '[', ']', '~', '#', '!', '\\'])
+                && !command.contains(['*', '?', '[', ']', '~', '#', '!', '\\', '$', '`'])
                 && let Some(words) = crate::agent::safety::approval::shell_words(command)
             {
                 object.insert("command".into(), serde_json::json!(words));

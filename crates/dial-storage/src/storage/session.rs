@@ -13,6 +13,10 @@
 //! Search keeps an FTS5 index in `<state_dir>/sessions.sqlite3`. The index is derived data: each
 //! search first catches up on every session file from the byte offset it last indexed, so it also
 //! picks up lines written by other processes and survives a crash between append and indexing.
+//!
+//! Load-time recovery: a torn final line (interrupted append) is tolerated; malformed or oversized
+//! interior lines, and entries whose parent is missing, are skipped and reported through
+//! `Session::take_recovery_diagnostics`. Loading never rewrites or truncates the file.
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -214,6 +218,39 @@ pub struct SearchHit {
     pub when: String,
 }
 
+/// Why a journal line or link was not loaded as written. Loading never repairs the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalIssueKind {
+    /// The final line has no newline and does not parse: an interrupted append, tolerated.
+    TornTail,
+    /// A complete line that is not valid JSON, is a duplicate, or is a malformed known record.
+    MalformedInterior,
+    /// A complete line over the size limit; its content was not loaded.
+    OversizedInterior,
+    /// An entry names a parent absent from the file; history above that link is unreachable.
+    MissingParent,
+}
+
+/// One load-time finding. `line` is the 1-based physical line in the journal file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct JournalDiagnostic {
+    pub kind: JournalIssueKind,
+    pub line: usize,
+    pub entry_id: Option<String>,
+    pub detail: String,
+}
+
+/// Record types this build understands. Other types are skipped silently for forward compatibility.
+const KNOWN_ENTRY_TYPES: &[&str] = &[
+    "runtime",
+    "message",
+    "compaction",
+    "custom",
+    "reset_boundary",
+    "meta",
+];
+
 #[derive(Debug, Clone)]
 enum Kind {
     Message(Value),
@@ -281,6 +318,8 @@ pub struct Session {
     history_generation_floor: u64,
     /// Workspace roots added beyond the project root; persisted as the header's `additional_dirs`.
     additional_dirs: Vec<PathBuf>,
+    /// Load-time findings about this journal; `take_recovery_diagnostics` drains them.
+    recovery: Vec<JournalDiagnostic>,
 }
 
 // ---------------------------------------------------------------- time / ids
@@ -779,6 +818,7 @@ impl Session {
             active: ActiveView::default(),
             history_generation_floor: 0,
             additional_dirs: Vec::new(),
+            recovery: Vec::new(),
         })
     }
 
@@ -799,6 +839,7 @@ impl Session {
             active: ActiveView::default(),
             history_generation_floor: 0,
             additional_dirs: Vec::new(),
+            recovery: Vec::new(),
         }
     }
 
@@ -841,6 +882,11 @@ impl Session {
         Self::load(path)
     }
 
+    /// Load-time findings about this journal, drained once. Reading never repairs or rewrites the file.
+    pub fn take_recovery_diagnostics(&mut self) -> Vec<JournalDiagnostic> {
+        std::mem::take(&mut self.recovery)
+    }
+
     fn load(path: &Path) -> Result<Session> {
         crate::config::settings_store::validate_private_path(
             path.parent().context("session path has no parent")?,
@@ -876,18 +922,49 @@ impl Session {
             active: ActiveView::default(),
             history_generation_floor: 0,
             additional_dirs: Vec::new(),
+            recovery: Vec::new(),
         };
         let mut header_id: Option<String> = None;
         let mut saw_header = false;
         let mut buf = Vec::new();
         let mut ends_with_newline = true;
+        // Physical line of each loaded entry, for lineage diagnostics.
+        let mut entry_lines: Vec<usize> = Vec::new();
+        let mut line_no = 0usize;
         while let Some(line) = read_bounded_line(&mut reader, &mut buf)? {
+            line_no += 1;
             ends_with_newline = line.terminated;
+            // Only the final line can lack its newline: an interrupted append. It is tolerated and
+            // never repaired here; the next append starts a fresh line.
+            let issue = |kind: JournalIssueKind, detail: String| JournalDiagnostic {
+                kind: if line.terminated {
+                    kind
+                } else {
+                    JournalIssueKind::TornTail
+                },
+                line: line_no,
+                entry_id: None,
+                detail,
+            };
             if line.oversized {
+                s.recovery.push(issue(
+                    JournalIssueKind::OversizedInterior,
+                    format!("line is longer than {MAX_LINE} bytes and was not loaded"),
+                ));
                 continue;
             }
-            let Ok(v) = serde_json::from_slice::<Value>(&buf) else {
+            if buf.iter().all(u8::is_ascii_whitespace) {
                 continue;
+            }
+            let v = match serde_json::from_slice::<Value>(&buf) {
+                Ok(v) => v,
+                Err(error) => {
+                    s.recovery.push(issue(
+                        JournalIssueKind::MalformedInterior,
+                        format!("not valid JSON: {error}"),
+                    ));
+                    continue;
+                }
             };
             if v.get("type").and_then(Value::as_str) == Some("session") {
                 if !saw_header && s.entries.is_empty() {
@@ -926,16 +1003,49 @@ impl Session {
                 continue;
             }
             let Some(entry) = parse_entry(&v) else {
+                if let Some(kind) = v.get("type").and_then(Value::as_str)
+                    && KNOWN_ENTRY_TYPES.contains(&kind)
+                {
+                    s.recovery.push(issue(
+                        JournalIssueKind::MalformedInterior,
+                        format!("{kind} record has an invalid shape and was not loaded"),
+                    ));
+                }
                 continue;
             };
             if s.by_id.contains_key(&entry.id) {
+                s.recovery.push(issue(
+                    JournalIssueKind::MalformedInterior,
+                    format!("duplicate entry id {} was not loaded", entry.id),
+                ));
                 continue;
             }
             s.leaf = Some(entry.id.clone());
             s.by_id.insert(entry.id.clone(), s.entries.len());
             s.observe_history_generation(&entry.kind);
+            entry_lines.push(line_no);
             s.entries.push(entry);
         }
+        // A parent outside this file leaves the chain above the entry unreachable. Nothing is
+        // deleted: the active branch stops at the gap, as it always has.
+        let missing: Vec<JournalDiagnostic> = s
+            .entries
+            .iter()
+            .zip(&entry_lines)
+            .filter_map(|(entry, &line)| {
+                let parent = entry.parent.as_deref()?;
+                (!s.by_id.contains_key(parent)).then(|| JournalDiagnostic {
+                    kind: JournalIssueKind::MissingParent,
+                    line,
+                    entry_id: Some(entry.id.clone()),
+                    detail: format!(
+                        "parent {parent} is not in this journal; entries above it are unreachable from {}",
+                        entry.id
+                    ),
+                })
+            })
+            .collect();
+        s.recovery.extend(missing);
         s.pending_newline = !ends_with_newline;
         s.id = header_id
             .or(name_id)
@@ -1962,14 +2072,7 @@ impl Session {
             .checked_sub(1)
             .map(|pos| self.entries[self.active.branch[pos]].id.clone());
         let removed = self.message_count().saturating_sub(visible_pos);
-        self.push_under(
-            new_leaf,
-            Kind::Meta {
-                kind: "rewind".to_owned(),
-                removed,
-            },
-        )?;
-        self.restore_runtime()?;
+        self.push_rewind_marker(new_leaf, removed)?;
         Ok(Some(removed))
     }
 
@@ -2035,6 +2138,99 @@ impl Session {
     fn push(&mut self, kind: Kind) -> Result<String> {
         self.push_under(self.leaf.clone(), kind)
     }
+    /// Bounds one journal record. Oversized messages and compaction records keep their complete
+    /// strings in the artifact store; the journal keeps a UTF-8-safe prefix and suffix with a marker.
+    /// Other kinds are returned unchanged and still fail the line-limit check at the append site.
+    fn fit_kind_for_journal(&self, kind: Kind, line_len: usize) -> Result<Kind> {
+        match kind {
+            Kind::Message(message) => Ok(Kind::Message(
+                self.fit_oversized_message(&message, line_len)?,
+            )),
+            Kind::Compaction {
+                summary,
+                first_kept,
+                prefix,
+            } => {
+                let wrapper = json!({"summary": summary, "prefix": prefix});
+                let fitted = self.fit_oversized_message(&wrapper, line_len)?;
+                Ok(Kind::Compaction {
+                    summary: fitted["summary"].as_str().unwrap_or_default().to_owned(),
+                    first_kept,
+                    prefix: fitted["prefix"].as_array().cloned(),
+                })
+            }
+            other => Ok(other),
+        }
+    }
+    /// Commits a real rewind: a provider-generation bump (so shown recall cannot suppress facts the
+    /// rewind removed from context) and the rewind marker, then rebuilds runtime. Callers guarantee
+    /// `removed > 0`; a no-op rewind never reaches here.
+    fn push_rewind_marker(&mut self, new_leaf: Option<String>, removed: usize) -> Result<()> {
+        if removed == 0 {
+            return Ok(());
+        }
+        let generation = self.control_state()["provider_identity"]["history_generation"]
+            .as_u64()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("provider history generation exhausted; no rewind committed")?;
+        // Restore the target branch's state, not obligations from the discarded turn.
+        let end = match new_leaf.as_ref() {
+            Some(leaf) => {
+                self.active
+                    .branch
+                    .iter()
+                    .position(|&i| self.entries[i].id == *leaf)
+                    .context("rewind parent is outside the active branch")?
+                    + 1
+            }
+            None => 0,
+        };
+        let mut control = json!({});
+        for &i in self.active.branch.iter().take(end) {
+            if let Kind::Message(message) = &self.entries[i].kind
+                && message["role"] == "dial_state"
+            {
+                apply_control_entry(&mut control, message);
+            }
+        }
+        if control.is_null() {
+            control = json!({});
+        }
+        ensure!(
+            control.is_object(),
+            "rewind control state is not an object; no rewind committed"
+        );
+        if !control["provider_identity"].is_object() {
+            control["provider_identity"] = json!({});
+        }
+        control["provider_identity"]["history_generation"] = json!(generation);
+        let meta = Kind::Meta {
+            kind: "rewind".to_owned(),
+            removed,
+        };
+        if self.owns_journal() {
+            // Generation precedes the marker so no reader sees the shortened window under the old key.
+            self.append_context_batch(
+                new_leaf,
+                vec![
+                    Kind::Message(json!({"role":"dial_state","state":control})),
+                    meta,
+                ],
+            )?;
+        } else {
+            ensure!(
+                self.path.is_none(),
+                "read-only session cannot commit rewind"
+            );
+            let control_id = self.push_under(
+                new_leaf,
+                Kind::Message(json!({"role":"dial_state","state":control})),
+            )?;
+            self.push_under(Some(control_id), meta)?;
+        }
+        self.restore_runtime()
+    }
     /// Appends an entry whose parent is `parent` (a rewind marker's parent is the rewind point, not the leaf).
     fn push_under(&mut self, parent: Option<String>, kind: Kind) -> Result<String> {
         let extends_active = parent == self.leaf && self.active.extendable;
@@ -2049,12 +2245,8 @@ impl Session {
             self.path.is_none() || self.file.is_some(),
             "read-only session snapshot cannot be modified; claim writer ownership with Session::open"
         );
-        if self.file.is_some()
-            && line.len() >= MAX_LINE
-            && let Kind::Message(message) = &entry.kind
-        {
-            let fitted = self.fit_oversized_message(message, line.len())?;
-            entry.kind = Kind::Message(fitted);
+        if self.file.is_some() && line.len() >= MAX_LINE {
+            entry.kind = self.fit_kind_for_journal(entry.kind.clone(), line.len())?;
             line = entry_json(&entry, false).to_string();
         }
         ensure!(
@@ -2816,14 +3008,7 @@ impl Session {
         let new_leaf = pos
             .checked_sub(1)
             .map(|p| self.entries[branch[p]].id.clone());
-        self.push_under(
-            new_leaf,
-            Kind::Meta {
-                kind: "rewind".into(),
-                removed,
-            },
-        )?;
-        self.restore_runtime()?;
+        self.push_rewind_marker(new_leaf, removed)?;
         Ok(removed)
     }
 
@@ -3194,13 +3379,17 @@ impl Session {
                     break id;
                 }
             };
-            let entry = Entry {
+            let mut entry = Entry {
                 id,
                 parent,
                 ts: iso_now(),
                 kind,
             };
-            let line = entry_json(&entry, false).to_string();
+            let mut line = entry_json(&entry, false).to_string();
+            if line.len() >= MAX_LINE {
+                entry.kind = self.fit_kind_for_journal(entry.kind.clone(), line.len())?;
+                line = entry_json(&entry, false).to_string();
+            }
             ensure!(
                 line.len() < MAX_LINE,
                 "context transition entry exceeds the session journal line limit; no transition appended"

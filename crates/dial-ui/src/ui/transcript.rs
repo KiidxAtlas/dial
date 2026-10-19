@@ -206,27 +206,20 @@ impl Block {
                 Some(b) => b.read(|n| prose_rows(Prose::Thinking, &n.result.text, w, ctx)),
                 None => prose_rows(Prose::Thinking, t, w, ctx),
             }),
-            // Work rows are laid out one column narrower and hang off the rail in that column.
-            Kind::Tool(t) => Arc::new(on_rail(
-                match &self.shared {
-                    Some(b) => b.read(|n| {
-                        let mut view = t.clone();
-                        view.output = n.result.text.clone();
-                        if let Some(presentation) = &n.presentation {
-                            view.presentation = presentation.clone();
-                        }
-                        view.state = n.result.phase;
-                        tool_rows(&view, w.saturating_sub(1), ctx)
-                    }),
-                    None => tool_rows(t, w.saturating_sub(1), ctx),
-                },
-                ctx.theme,
-            )),
+            // Work rows put their own status glyph in the shared icon gutter.
+            Kind::Tool(t) => Arc::new(match &self.shared {
+                Some(b) => b.read(|n| {
+                    let mut view = t.clone();
+                    view.output = n.result.text.clone();
+                    if let Some(presentation) = &n.presentation {
+                        view.presentation = presentation.clone();
+                    }
+                    view.state = n.result.phase;
+                    tool_rows(&view, w, ctx)
+                }),
+                None => tool_rows(t, w, ctx),
+            }),
             Kind::Notice { title, text } => Arc::new(super::notice::rows(title, text, w, ctx)),
-            Kind::Event(event) if self.is_tool() => Arc::new(on_rail(
-                super::lanes::rows(event, w.saturating_sub(1), ctx),
-                ctx.theme,
-            )),
             Kind::Event(event) => Arc::new(super::lanes::rows(event, w, ctx)),
             Kind::Error(t) => Arc::new(error_rows(t, w, ctx)),
             Kind::Image(image) => Arc::new(image.rows(w, ctx.theme)),
@@ -314,10 +307,10 @@ impl StreamingRows {
             self.cut = 0;
             self.head.clear();
             self.prefix = std::sync::Arc::new(Vec::new());
-            return std::sync::Arc::new(markdown::render(source, width, theme, false));
+            return std::sync::Arc::new(answer_rows(source, width, theme, true));
         }
         if source[self.cut..].contains(['[', '<']) || width == 0 {
-            let rendered = markdown::render(&source[self.cut..], width, theme, false);
+            let rendered = answer_rows(&source[self.cut..], width, theme, self.prefix.is_empty());
             return join_rows(&self.prefix, rendered);
         }
         let tail = &source[self.cut..];
@@ -329,7 +322,8 @@ impl StreamingRows {
                 .is_some_and(char::is_alphanumeric)
         });
         if let Some(cut) = cut {
-            let rows = markdown::render(&tail[..cut], width, theme, false);
+            let first = self.prefix.is_empty();
+            let rows = answer_rows(&tail[..cut], width, theme, first);
             if !rows.is_empty() {
                 // Grown in place: the prefix is only shared with rows already handed out.
                 let prefix = std::sync::Arc::make_mut(&mut self.prefix);
@@ -341,7 +335,7 @@ impl StreamingRows {
             self.head.push_str(&tail[..cut]);
             self.cut += cut;
         }
-        let tail = markdown::render(&source[self.cut..], width, theme, false);
+        let tail = answer_rows(&source[self.cut..], width, theme, self.prefix.is_empty());
         join_rows(&self.prefix, tail)
     }
 }
@@ -438,21 +432,37 @@ pub(super) fn fitted(spans: Vec<Span<'static>>, w: usize, theme: &Theme) -> Line
     Line::from(truncate_spans(spans, w, &ellipsis(theme)))
 }
 
-/// Rows of the work group (tool calls and the context lines beside them) hang off one thin rail in
-/// the first column, so a run of calls reads as one unit set apart from the prose around it. The
-/// rows are laid out one column narrower than the transcript, so the rail never widens them.
-fn on_rail(rows: Rows, theme: &Theme) -> Rows {
-    let rail = Span::styled(theme.sym(Sym::BoxV).to_owned(), theme.fg(Tok::BorderMuted));
+/// The assistant's answer: markdown laid out past the icon gutter, its first row marked with `●`.
+/// `lead` is false for a continuation of an answer whose first row is already marked. Too narrow
+/// for a gutter, the markdown fills the width as is.
+fn answer_rows(source: &str, width: u16, theme: &Theme, lead: bool) -> Rows {
+    let gutter = super::tool_cards::GUTTER;
+    let w = usize::from(width);
+    if w < gutter + 12 {
+        return markdown::render(source, width, theme, false);
+    }
+    let rows = markdown::render(source, (w - gutter) as u16, theme, false);
+    let mut marked = !lead;
     rows.into_iter()
         .map(|mut row| {
-            row.spans.insert(0, rail.clone());
+            if row.spans.iter().all(|s| s.content.is_empty()) {
+                return row;
+            }
+            let glyph = if marked {
+                Span::raw(" ".repeat(gutter))
+            } else {
+                marked = true;
+                Span::styled(in_gutter(theme.sym(Sym::Bullet)), theme.fg(Tok::Accent))
+            };
+            row.spans.insert(0, glyph);
             row
         })
         .collect()
 }
 
-/// A user message is its own block: the accent bar, then the text on the theme's user tint across
-/// the full width, so turns are easy to find when scrolling back.
+/// A user message is a shaded band across the full width: a row of padding, the text after the
+/// `›` prompt in the icon gutter, and another row of padding, so turns are easy to find when
+/// scrolling back.
 fn user_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     let w = w as usize;
     let clean = text::sanitize(raw);
@@ -462,10 +472,10 @@ fn user_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     }
     let theme = ctx.theme;
     let tint = theme.bg(Tok::UserBg);
-    let bar = Span::styled(
-        theme.sym(Sym::Quote).to_owned(),
-        theme.fg(Tok::Accent).patch(tint),
-    );
+    let prompt_style = theme
+        .fg(Tok::Accent)
+        .patch(tint)
+        .add_modifier(Modifier::BOLD);
     let text_style = theme.on(Tok::UserText, Tok::UserBg);
     let tinted = |spans: Vec<Span<'static>>| {
         let mut line = fitted(spans, w, theme);
@@ -475,32 +485,39 @@ fn user_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
         }
         line
     };
+    let gutter = super::tool_cards::GUTTER;
     let mut rows = Vec::new();
-    if w < 4 {
+    if w < gutter + 4 {
         let flat = body.replace('\n', " ");
         rows.push(tinted(vec![
-            bar,
-            Span::styled(" ", tint),
+            Span::styled(format!("{} ", theme.sym(Sym::Prompt)), prompt_style),
             Span::styled(flat, text_style),
         ]));
-    } else {
-        let inner = w - 4;
-        for (i, line) in text::wrap_words(body, inner).into_iter().enumerate() {
-            let marker = if i == 0 { theme.sym(Sym::Prompt) } else { " " };
-            rows.push(tinted(vec![
-                bar.clone(),
-                Span::styled(" ", tint),
-                Span::styled(format!("{marker} "), theme.fg(Tok::Accent).patch(tint)),
-                Span::styled(text::clip(&line, inner), text_style),
-            ]));
-        }
+        return rows;
+    }
+    // Padding rows only when the theme tints the band; untinted they would read as stray gaps.
+    let padded = tint.bg.is_some_and(|c| c != ratatui::style::Color::Reset);
+    if padded {
+        rows.push(tinted(Vec::new()));
+    }
+    let inner = w - gutter - 1;
+    for (i, line) in text::wrap_words(body, inner).into_iter().enumerate() {
+        let marker = format!(" {}", if i == 0 { theme.sym(Sym::Prompt) } else { "" });
+        let pad = gutter.saturating_sub(text::width(&marker));
+        rows.push(tinted(vec![
+            Span::styled(format!("{marker}{}", " ".repeat(pad)), prompt_style),
+            Span::styled(text::clip(&line, inner), text_style),
+        ]));
+    }
+    if padded {
+        rows.push(tinted(Vec::new()));
     }
     rows
 }
 
 fn prose_rows(kind: Prose, raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     match kind {
-        Prose::Assistant => markdown::render(raw, w, ctx.theme, false),
+        Prose::Assistant => answer_rows(raw, w, ctx.theme, true),
         Prose::Thinking => thinking_rows(raw, w, ctx),
     }
 }
@@ -516,15 +533,16 @@ fn thinking_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     if !ctx.ui.show_thinking {
         let n = body.lines().filter(|l| !l.trim().is_empty()).count();
         let label = format!(
-            "{} reasoning ({n} line{})",
-            ctx.theme.sym(Sym::Pointer),
+            "{}reasoning ({n} line{})",
+            in_gutter(ctx.theme.sym(Sym::Pointer)),
             if n == 1 { "" } else { "s" }
         );
         return vec![fitted(vec![Span::styled(label, style)], w, ctx.theme)];
     }
-    let prefix = format!("{} ", ctx.theme.sym(Sym::Quote));
-    let lead = text::width(&prefix);
-    if w <= lead {
+    // Reasoning hangs off a quote bar in the icon gutter, quieter than the answer's `●`.
+    let rail = in_gutter(ctx.theme.sym(Sym::Quote));
+    let lead = text::width(&rail);
+    if w <= lead + 4 {
         return vec![fitted(
             vec![Span::styled(body.to_owned(), style)],
             w,
@@ -535,11 +553,20 @@ fn thinking_rows(raw: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
         .into_iter()
         .map(|row| {
             Line::from(vec![
-                Span::styled(prefix.clone(), ctx.theme.fg(Tok::Border)),
+                Span::styled(rail.clone(), ctx.theme.fg(Tok::Border)),
                 Span::styled(text::clip(&row, w - lead), style),
             ])
         })
         .collect()
+}
+
+/// `mark` padded to the transcript's icon gutter, so the text after it starts at the content column.
+pub(super) fn in_gutter(mark: &str) -> String {
+    let gutter = super::tool_cards::GUTTER;
+    format!(
+        "{mark}{}",
+        " ".repeat(gutter.saturating_sub(text::width(mark)).max(1))
+    )
 }
 
 fn error_rows(body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
@@ -551,7 +578,7 @@ fn error_rows(body: &str, w: u16, ctx: &TranscriptCtx) -> Rows {
     }
     let theme = ctx.theme;
     let style = theme.fg(Tok::Error);
-    let glyph = format!("{} ", theme.sym(Sym::Cross2));
+    let glyph = in_gutter(theme.sym(Sym::Cross2));
     let gw = text::width(&glyph);
     let room = w.saturating_sub(gw).max(1);
     text::wrap_words(body, room)
@@ -581,8 +608,8 @@ fn compact_count(n: u64) -> String {
     }
 }
 
-/// The turn's closing rule: how it ended, what it changed, how long it took and what it cost, with
-/// the follow-up commands at the right edge when files changed.
+/// The turn's closing line: how it ended (its mark in the icon gutter), what it changed, how long
+/// it took and what it cost, with the follow-up commands at the right edge when files changed.
 fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
     let timing = ctx.ui.show_turn_stats;
     if w == 0 || (!timing && s.outcome.is_none()) {
@@ -591,11 +618,8 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
     let theme = ctx.theme;
     let w = w as usize;
     let dot = format!(" {} ", theme.sym(Sym::Dot));
-    let rule = theme.sym(Sym::BoxH).to_owned();
-    let mut left: Vec<Span<'static>> = vec![Span::styled(
-        format!("{rule}{rule} "),
-        theme.fg(Tok::Border),
-    )];
+    let gutter = |mark: &str, style: ratatui::style::Style| Span::styled(in_gutter(mark), style);
+    let mut left: Vec<Span<'static>> = vec![gutter(theme.sym(Sym::Dot), theme.fg(Tok::Dim))];
     let push = |left: &mut Vec<Span<'static>>, text: String, style| {
         if left.len() > 1 {
             left.push(Span::styled(dot.clone(), theme.fg(Tok::Dim)));
@@ -604,23 +628,38 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
     };
     let mut changed = 0;
     if let Some(o) = &s.outcome {
+        // An outcome the agent did not name is reported as unknown, never as a failure or success.
+        let known = matches!(
+            o.status.as_str(),
+            "running"
+                | "pending"
+                | "done"
+                | "completed"
+                | "blocked"
+                | "needs_input"
+                | "incomplete"
+                | "failed"
+                | "interrupted"
+                | "cancelled"
+                | "canceled"
+        );
         let phase = crate::runtime::Phase::from_status(&o.status);
-        let word = phase.label();
+        let word = if known { phase.label() } else { "unknown" };
         let (tok, mark) = match phase {
+            _ if !known => (Tok::Warning, Sym::Warn),
             crate::runtime::Phase::Completed => (Tok::Success, Sym::Check),
             crate::runtime::Phase::Failed => (Tok::Error, Sym::Cross2),
             crate::runtime::Phase::Interrupted => (Tok::Muted, Sym::Cross2),
             crate::runtime::Phase::Running => (Tok::Accent, Sym::Working),
             _ => (Tok::Warning, Sym::Warn),
         };
-        // The outcome leads with its mark so the end of a turn is findable at a glance.
-        // ASCII marks (`+`, `x`) read as arithmetic in a rule, so the word stands alone there.
-        let label = if theme.ascii() {
-            word.to_owned()
-        } else {
-            format!("{} {word}", theme.sym(mark))
-        };
-        push(&mut left, label, theme.fg(tok).add_modifier(Modifier::BOLD));
+        // The outcome's mark takes the gutter so the end of a turn is findable at a glance.
+        left[0] = gutter(theme.sym(mark), theme.fg(tok));
+        push(
+            &mut left,
+            word.to_owned(),
+            theme.fg(tok).add_modifier(Modifier::BOLD),
+        );
         changed = o.changed_files;
         if changed > 0 {
             push(
@@ -672,17 +711,10 @@ fn stats_rows(s: &TurnStats, w: u16, ctx: &TranscriptCtx) -> Rows {
     };
     let left_w: usize = left.iter().map(|s| text::width(&s.content)).sum();
     let right_w: usize = right.iter().map(|s| text::width(&s.content)).sum();
-    if left_w + right_w + 4 <= w {
-        let fill = w - left_w - right_w - if right_w > 0 { 2 } else { 0 };
-        left.push(Span::styled(
-            format!(" {}", rule.repeat(fill.saturating_sub(1))),
-            theme.fg(Tok::Border),
-        ));
-        if right_w > 0 {
-            left.push(Span::raw(" "));
-            left.extend(right);
-            left.push(Span::raw(" "));
-        }
+    if right_w > 0 && left_w + right_w + 4 <= w {
+        left.push(Span::raw(" ".repeat(w - left_w - right_w - 1)));
+        left.extend(right);
+        left.push(Span::raw(" "));
     }
     vec![fitted(left, w, theme)]
 }
@@ -1343,9 +1375,6 @@ impl Transcript {
                 && t.state == ToolState::Running
             {
                 t.state = ToolState::Interrupted;
-                if t.output.is_empty() {
-                    t.output = "interrupted".into();
-                }
             }
             block.active = false;
         }

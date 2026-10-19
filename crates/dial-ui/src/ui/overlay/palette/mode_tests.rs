@@ -51,7 +51,7 @@ fn footer_lists_only_the_keys_each_mode_uses() {
     let mut palette = PaletteOverlay::new(entries(), false);
     let footer = rendered(&mut palette, 100).pop().unwrap();
     assert!(
-        footer.contains("Tab category") && footer.contains("arguments") && footer.contains("close"),
+        footer.contains("Tab category") && footer.contains("choose") && footer.contains("close"),
         "{footer}"
     );
     palette.handle(&Event::Paste("rename".into()), &keys);
@@ -96,7 +96,7 @@ fn picker_applies_the_selected_value_and_marks_the_current_one() {
             .iter()
             .any(|l| l.contains("current"))
     );
-    palette.handle(&plain(KeyCode::Down), &keys);
+    // The cursor starts on the current value, so Enter applies it without moving first.
     assert!(matches!(
         palette.handle(&plain(KeyCode::Enter), &keys),
         OverlayEvent::Action(action) if action == "command:/approval write"
@@ -135,6 +135,7 @@ fn picker_with_remove_edits_or_removes_the_selected_row() {
 
 #[test]
 fn long_details_end_in_an_ellipsis_instead_of_disappearing() {
+    let keys = Keymap::defaults();
     let mut palette = PaletteOverlay::new(
         vec![PaletteEntry {
             command: CommandEntry {
@@ -147,6 +148,67 @@ fn long_details_end_in_an_ellipsis_instead_of_disappearing() {
         }],
         false,
     );
+    palette.handle(&Event::Paste("verbose".into()), &keys);
     let lines = rendered(&mut palette, 40);
     assert!(lines.iter().any(|l| l.contains('…')), "{lines:?}");
+}
+
+#[test]
+fn empty_picker_search_names_choices_and_drops_selection_keys() {
+    let keys = Keymap::defaults();
+    let spec = ChoiceSpec {
+        title: "Approval".into(),
+        command: "approval".into(),
+        verb: "",
+        remove: None,
+        items: vec![item("ask", false), item("write", true)],
+    };
+    let mut palette = PaletteOverlay::choice(spec);
+    let footer = rendered(&mut palette, 100).pop().unwrap();
+    assert!(footer.contains("apply"), "{footer}");
+    palette.handle(&Event::Paste("zzzz".into()), &keys);
+    let lines = rendered(&mut palette, 100);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("No choices match. Esc clears the search.")),
+        "{lines:?}"
+    );
+    let footer = lines.last().unwrap();
+    assert!(
+        !footer.contains("apply") && !footer.contains("Delete") && footer.contains("clear search"),
+        "{footer}"
+    );
+}
+
+#[test]
+fn empty_action_search_offers_category_switch_instead_of_dead_enter() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    palette.handle(&Event::Paste("zzzz".into()), &keys);
+    let lines = rendered(&mut palette, 100);
+    assert!(
+        lines.iter().any(|l| {
+            l.contains("No actions match. Esc clears the search; Tab changes category.")
+        }),
+        "{lines:?}"
+    );
+    let footer = lines.last().unwrap();
+    assert!(
+        footer.contains("category") && !footer.contains("navigate") && !footer.contains("choose"),
+        "{footer}"
+    );
+}
+
+#[test]
+fn search_header_names_its_scope_and_keeps_the_count_on_narrow_panels() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    palette.handle(&Event::Paste("name".into()), &keys);
+    let lines = rendered(&mut palette, 24);
+    let header = lines
+        .iter()
+        .find(|l| l.contains("Search ·"))
+        .expect("search header");
+    assert!(header.trim_end().ends_with("· 1/1"), "{header}");
 }

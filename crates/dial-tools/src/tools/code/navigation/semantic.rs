@@ -117,7 +117,9 @@ pub(super) fn enabled(args: &Value) -> Result<bool, String> {
         "exact" => true,
         _ => return Err("mode must be behavior or exact".into()),
     };
-    let semantic = match opt_str(args, "ranking")?.unwrap_or("semantic") {
+    // Lexical is the default: semantic reranking costs an extra model request per call, so the
+    // model opts into it only when lexical candidates are not enough.
+    let semantic = match opt_str(args, "ranking")?.unwrap_or("lexical") {
         "semantic" => true,
         "lexical" => false,
         _ => return Err("ranking must be semantic or lexical".into()),

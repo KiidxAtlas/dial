@@ -1,7 +1,7 @@
 //! Asking the user a question from inside a turn, with optional cancellation.
 
 use crate::app::panel::{
-    RECOVERY_PANEL, panel_body_limit, panel_inner, panel_rows_window, panel_scroll,
+    RECOVERY_PANEL, panel_body_limit, panel_has_room, panel_inner, panel_rows_window, panel_scroll,
 };
 use crate::app::shell::{Shell, TICK};
 use crate::ui::keys::Action;
@@ -72,6 +72,17 @@ impl Shell {
             match read() {
                 Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    if !panel_has_room(cols, height.saturating_sub(6) as usize) {
+                        // A tiny viewport cannot show what a confirmation would authorize. Keep
+                        // cancellation available, but never act on Enter or an approval hotkey.
+                        if self.keys.matches(Action::Dismiss, &key)
+                            || key.code == KeyCode::Esc
+                            || (key.code == KeyCode::Char('c') && ctrl)
+                        {
+                            return None;
+                        }
+                        continue;
+                    }
                     // Page by the body rows actually visible, keeping one row of overlap, so a short
                     // terminal never skips details the user has not seen.
                     let down = self.keys.matches(Action::SelectPageDown, &key);

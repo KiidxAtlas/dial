@@ -54,6 +54,9 @@ fn finished_reports_quotes_and_optional_work_do_not_restart_the_turn() {
         "> I will run the tests.",
         "```text\nI will run the tests.",
         "I'll help if you need another change.",
+        "Done. Let me know what you'd like to change.",
+        "Let me know which test to run next.",
+        "I'm happy to update the parser too.",
         "The parser now handles nested tables.",
     ] {
         assert!(!announces_unexpected_stop(text), "{text}");

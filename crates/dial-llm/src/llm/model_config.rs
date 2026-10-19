@@ -514,8 +514,11 @@ pub enum StatusSeparator {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComposerShape {
-    /// Rounded box; the status line is embedded in its top border and key hints in its bottom border.
+    /// A full-width shaded band, `›` before the input and the status line inside it; key hints sit
+    /// below. No frame.
     #[default]
+    Band,
+    /// Rounded box; the status line is embedded in its top border and key hints in its bottom border.
     Box,
     /// Rules above and below with no side borders (cleaner when copying text).
     Line,
@@ -602,7 +605,7 @@ impl Default for UiConfig {
             status_git_counts: true,
             status_transparent: false,
             session_accent: true,
-            composer_shape: ComposerShape::Box,
+            composer_shape: ComposerShape::Band,
             welcome: true,
             tips: true,
             motion: true,

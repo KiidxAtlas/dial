@@ -1,5 +1,5 @@
-//! The live task panel: the agent's todo list pinned above the composer while any task is open, so
-//! the plan and the current step stay visible instead of scrolling away with the tool lines.
+//! Work is presented in two layers: a small live focus summary and a searchable full plan.
+//! The plan inspector exposes recorded reasons, findings and evidence without changing task state.
 use super::markdown::truncate_spans;
 use super::text;
 use super::theme::{Sym, Theme, Tok};
@@ -8,11 +8,11 @@ use crate::agent::workflow::todo::{Status, Task, TodoList};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
-/// Fewer rows than this cannot show a header, the focus and both overflow markers.
-const MIN_ROWS: usize = 4;
+/// Even a two-row budget can show the current step and how to inspect the plan.
+const MIN_ROWS: usize = 2;
 
-/// Panel rows exactly fitted to `width` and at most `max_rows` tall; empty when nothing is open or
-/// it cannot fit. `spinner` animates the in-progress task while a turn runs.
+/// A focused live summary: current step, blockers, then the next step. Closed work belongs in the
+/// inspector, not in the scarce space beside an actively edited draft.
 pub fn rows(
     todo: &TodoList,
     width: usize,
@@ -23,81 +23,99 @@ pub fn rows(
     if !todo.has_open() || width < 12 || max_rows < MIN_ROWS {
         return Vec::new();
     }
+    let mark = theme.sym(Sym::Ellipsis);
+    let fit = |spans| Line::from(truncate_spans(spans, width, mark));
+    let mut out = vec![fit(header(todo, theme))];
     let tasks = todo.tasks();
-    let phased = tasks.iter().any(|t| t.phase.is_some());
-    // (task index, row); phase headings have no task.
-    let mut entries: Vec<(Option<usize>, Vec<Span<'static>>)> = Vec::with_capacity(tasks.len() * 2);
-    for (i, task) in tasks.iter().enumerate() {
-        if phased && (i == 0 || tasks[i - 1].phase != task.phase) {
-            let name = task.phase.as_deref().unwrap_or("Other");
-            entries.push((
-                None,
-                vec![
-                    Span::raw("  "),
-                    Span::styled(name.to_owned(), theme.fg(Tok::Muted)),
-                ],
-            ));
-        }
-        entries.push((
-            Some(i),
-            task_spans(
-                task,
-                if phased { "    " } else { "  " },
-                theme,
-                spinner,
-                false,
-            ),
-        ));
-    }
-
-    let body = max_rows - 1;
-    let total = entries.len();
-    let (mut lo, mut hi) = (0, total);
-    if total > body {
-        // Keep the active task (or the first open one) in view with one row of context above it; an
-        // overflow marker takes the place of the first and last rows it replaces.
-        let focus = entries
-            .iter()
-            .position(|(i, _)| i.is_some_and(|i| tasks[i].status == Status::InProgress))
-            .or_else(|| {
-                entries
-                    .iter()
-                    .position(|(i, _)| i.is_some_and(|i| tasks[i].status.is_open()))
-            })
-            .unwrap_or(0);
-        let context = if body > 3 { 2 } else { 1 };
-        let start = focus.saturating_sub(context).min(total - body);
-        (lo, hi) = (start, start + body);
-        if lo > 0 {
-            lo += 1;
-        }
-        if hi < total {
-            hi -= 1;
-        }
-    }
-    let hidden = |range: &[(Option<usize>, Vec<Span<'static>>)]| {
-        range.iter().filter(|(i, _)| i.is_some()).count()
-    };
-    let (earlier, later) = (hidden(&entries[..lo]), hidden(&entries[hi..]));
-
-    let mark = theme.sym(Sym::Ellipsis).to_owned();
-    let fit = |spans: Vec<Span<'static>>| Line::from(truncate_spans(spans, width, &mark));
-    let more = |n: usize, word: &str| {
-        fit(vec![Span::styled(
-            format!("  {mark} {n} {word}"),
-            theme.fg(Tok::Dim),
-        )])
-    };
-    let mut out = Vec::with_capacity(max_rows);
-    out.push(fit(header(todo, theme)));
-    if lo > 0 {
-        out.push(more(earlier, "earlier"));
-    }
-    out.extend(entries.drain(lo..hi).map(|(_, spans)| fit(spans)));
-    if hi < total {
-        out.push(more(later, "more"));
+    let focus = tasks.iter().find(|t| t.status == Status::InProgress);
+    let blocked = tasks.iter().filter(|t| t.status == Status::Blocked);
+    let next = tasks.iter().find(|t| t.status == Status::Pending);
+    for (label, task) in focus
+        .map(|task| ("Now", task))
+        .into_iter()
+        .chain(blocked.map(|task| ("Blocked", task)))
+        .chain(next.map(|task| ("Next", task)))
+        .take(max_rows.saturating_sub(1).min(3))
+    {
+        let mut spans = vec![Span::styled(format!("  {label}: "), theme.fg(Tok::Muted))];
+        spans.extend(task_spans(task, "", theme, spinner, false));
+        out.push(fit(spans));
     }
     out
+}
+
+fn status_label(status: Status) -> &'static str {
+    match status {
+        Status::Pending => "Next",
+        Status::InProgress => "Working",
+        Status::Completed => "Done",
+        Status::Abandoned => "Dropped",
+        Status::Blocked => "Blocked",
+    }
+}
+
+/// Recorded detail, not a fresh verification claim. Keep the full reason and evidence available
+/// even when the compact summary and the picker's preview must truncate them.
+pub fn step_detail(task: &Task) -> String {
+    let mut lines = vec![
+        task.content.clone(),
+        format!("Status: {}", status_label(task.status)),
+    ];
+    if let Some(phase) = &task.phase {
+        lines.push(format!("Phase: {phase}"));
+    }
+    if task.investigation {
+        lines.push("Investigation: a question to resolve before implementation".into());
+    }
+    if let Some(reason) = &task.note {
+        lines.push(format!("Reason: {reason}"));
+    }
+    if let Some(finding) = &task.finding {
+        lines.push(format!("Recorded finding: {finding}"));
+    }
+    if !task.evidence.is_empty() {
+        lines.push(format!("Recorded evidence:\n{}", task.evidence.join("\n")));
+    }
+    lines.join("\n\n")
+}
+
+/// Stable task numbers survive priority ordering and filtering. Selecting a row opens details;
+/// browsing never starts, completes, unblocks or otherwise mutates the agent's plan.
+pub fn plan_picker(todo: &TodoList) -> Option<super::overlay::palette::ChoiceSpec> {
+    use super::overlay::palette::{ChoiceItem, ChoiceSpec};
+    if todo.is_empty() {
+        return None;
+    }
+    let mut ordered: Vec<_> = todo.tasks().iter().enumerate().collect();
+    ordered.sort_by_key(|(index, task)| {
+        let priority = match task.status {
+            Status::InProgress => 0,
+            Status::Blocked => 1,
+            Status::Pending => 2,
+            Status::Completed | Status::Abandoned => 3,
+        };
+        (priority, *index)
+    });
+    Some(ChoiceSpec {
+        title: "Work plan - select a step for details".into(),
+        command: "todo".into(),
+        verb: "show",
+        remove: None,
+        items: ordered
+            .into_iter()
+            .map(|(index, task)| ChoiceItem {
+                value: (index + 1).to_string(),
+                label: format!(
+                    "{}. {}: {}",
+                    index + 1,
+                    status_label(task.status),
+                    task.content
+                ),
+                detail: step_detail(task),
+                current: task.status == Status::InProgress,
+            })
+            .collect(),
+    })
 }
 
 fn header(todo: &TodoList, theme: &Theme) -> Vec<Span<'static>> {
@@ -109,11 +127,9 @@ fn header(todo: &TodoList, theme: &Theme) -> Vec<Span<'static>> {
         .count();
     let mut counts = format!("  {closed}/{total} done");
     if blocked > 0 {
-        counts.push_str(&format!(
-            " {} {blocked} blocked — /todo details",
-            theme.sym(Sym::Dot)
-        ));
+        counts.push_str(&format!(" {} {blocked} blocked", theme.sym(Sym::Dot)));
     }
+    counts.push_str(&format!(" {} /todo inspect plan", theme.sym(Sym::Dot)));
     vec![
         chrome::label(theme, "tasks"),
         Span::styled(counts, theme.fg(Tok::Dim)),

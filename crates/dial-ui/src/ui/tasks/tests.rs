@@ -57,56 +57,76 @@ fn hidden_when_nothing_is_open_or_too_small() {
 }
 
 #[test]
-fn shows_progress_status_glyphs_and_blockers() {
-    let theme = Theme::dark();
-    let mut todo = list(
-        json!([{"content": "read", "status": "completed"}, {"content": "fix"}, {"content": "ship"}]),
-    );
-    todo.call(&json!({"op": "block", "index": 3, "reason": "no creds"}));
-    let text = plain(&rows(&todo, 60, &theme, Some("⠋"), 10));
-    assert_eq!(
-        text,
-        [
-            "TASKS  1/3 done · 1 blocked — /todo details",
-            "  ✓ read",
-            "  ⠋ fix",
-            "  ⚠ ship · no creds"
-        ]
-    );
+fn live_summary_prioritizes_current_work_and_blockers_over_closed_history() {
+    let mut todo = list(json!([
+        {"content":"read", "status":"completed"},
+        {"content":"fix", "phase":"Implement"},
+        {"content":"ship"},
+        {"content":"verify"}
+    ]));
+    todo.call(&json!({"op":"block", "index":3, "reason":"no creds"}));
+    let shown = plain(&rows(&todo, 100, &Theme::dark(), Some("⠋"), 10));
+    assert_eq!(shown.len(), 4, "{shown:?}");
+    assert!(shown[0].contains("1/4") && shown[0].contains("1 blocked"));
+    assert!(shown[1].contains("fix") && shown[1].contains("Now"));
+    assert!(shown[2].contains("ship") && shown[2].contains("no creds"));
+    assert!(shown[3].contains("verify") && shown[3].contains("Next"));
+    assert!(!shown[1..].iter().any(|line| line.contains("read")));
+    assert!(shown[0].contains("/todo"));
 }
 
 #[test]
-fn long_lists_window_around_the_active_task_and_fit_the_width() {
-    let theme = Theme::dark();
-    let tasks: Vec<_> = (1..=12).map(|i| json!({"content": format!("task {i} with a fairly long description"), "status": if i < 7 { "completed" } else { "pending" }})).collect();
+fn summary_budget_keeps_focus_instead_of_repeating_the_entire_plan() {
+    let tasks: Vec<_> = (1..=12).map(|i| json!({"content":format!("task {i}"), "status":if i < 7 {"completed"} else {"pending"}})).collect();
     let todo = list(json!(tasks));
-    let rows = rows(&todo, 30, &theme, None, 6);
-    let text = plain(&rows);
-    assert_eq!(text.len(), 6, "{text:?}");
-    assert!(
-        text[1].contains("2 earlier") && text[3].contains("task 7") && text[5].contains("4 more"),
-        "{text:?}"
-    );
-    assert!(rows.iter().all(|r| text::line_width(r) <= 30));
+    for theme in [
+        Theme::dark(),
+        Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii),
+    ] {
+        for width in [0, 11, 12, 30, 80] {
+            for budget in 0..=10 {
+                let lines = rows(&todo, width, &theme, None, budget);
+                assert!(lines.len() <= budget.min(4));
+                assert!(lines.iter().all(|row| text::line_width(row) <= width));
+                if width >= 30 && budget >= MIN_ROWS {
+                    assert!(plain(&lines)[1].contains("task 7"));
+                }
+                if theme.ascii() {
+                    assert!(plain(&lines).join("").is_ascii());
+                }
+            }
+        }
+    }
 }
 
 #[test]
-fn phases_become_headings() {
-    let theme = Theme::dark();
-    let todo = list(
-        json!([{"content": "read", "phase": "Investigate"}, {"content": "fix", "phase": "Implement"}]),
-    );
-    let text = plain(&rows(&todo, 60, &theme, None, 10));
+fn inspector_retains_stable_task_numbers_phases_findings_and_evidence_without_mutation() {
+    let mut todo = list(json!([
+        {"content":"read", "phase":"Investigate"},
+        {"content":"fix", "phase":"Implement"},
+        {"content":"ship"}
+    ]));
+    todo.call(&json!({"op":"done", "finding":"Cause identified", "evidence":["src/main.rs:42"]}));
+    todo.call(&json!({"op":"block", "index":3, "reason":"Full blocked reason END-OF-REASON"}));
+    let before = todo.clone();
+    let spec = plan_picker(&todo).unwrap();
     assert_eq!(
-        text,
-        [
-            "TASKS  0/2 done",
-            "  Investigate",
-            "    ● read",
-            "  Implement",
-            "    ○ fix"
-        ]
+        spec.items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>(),
+        ["2", "3", "1"]
     );
+    assert!(spec.items[0].current);
+    assert!(spec.items[0].detail.contains("Phase: Implement"));
+    assert!(spec.items[1].detail.contains("END-OF-REASON"));
+    assert!(spec.items[2].detail.contains("Cause identified"));
+    assert!(spec.items[2].detail.contains("src/main.rs:42"));
+    assert_eq!(spec.command, "todo");
+    assert_eq!(spec.verb, "show");
+    assert!(spec.remove.is_none());
+    assert_eq!(todo, before);
+    assert!(plan_picker(&TodoList::new()).is_none());
 }
 
 #[test]
@@ -163,4 +183,26 @@ fn long_cards_collapse_to_the_change_unless_expanded() {
         card_rows(&changes(&before, &after), 60, &theme, true).len(),
         13
     );
+}
+
+#[test]
+fn filtering_the_plan_opens_the_original_task_number_not_the_visible_row_number() {
+    use crate::ui::{
+        keys::Keymap,
+        overlay::{OverlayEvent, palette::PaletteOverlay},
+    };
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let mut todo =
+        list(json!([{"content":"investigate"},{"content":"implement"},{"content":"release"}]));
+    todo.call(&json!({"op":"block","index":3,"reason":"credentials unavailable"}));
+    let before = todo.clone();
+    let mut picker = PaletteOverlay::choice(plan_picker(&todo).unwrap());
+    let keys = Keymap::defaults();
+    picker.handle(&Event::Paste("credentials".into()), &keys);
+    let action = picker.handle(
+        &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &keys,
+    );
+    assert!(matches!(action, OverlayEvent::Action(command) if command == "command:/todo show 3"));
+    assert_eq!(todo, before);
 }

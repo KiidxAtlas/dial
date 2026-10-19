@@ -80,7 +80,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         system = "\n".join(str(message.get("content", "")) for message in messages if message["role"] == "system")
         transcript = "\n".join(str(message.get("content", "")) for message in messages)
         if "Summarize user-AI coding-assistant conversations" in system:
-            goal = self.goal(transcript)
+            # Portable compaction may summarize archival windows without the original request.
+            # Only the final task reply requires the goal: never invent one for an unrelated chunk.
+            goal = self.goal(transcript, required=False)
+            if goal is None:
+                return self.text("Archival context only; this window states no acceptance goal."), "stop"
             return self.text("BENCH_CASE=goal-compaction. Immutable acceptance goal: result.txt must contain exactly " + goal + ". Archival notes are distractors. Read context.txt; complete original goal at finish."), "stop"
         if "rank repository evidence" in system:
             # Semantic `find` asks the configured model to pick candidate indices. Play that role the way
@@ -173,10 +177,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raise ValueError("unknown scenario: " + case)
 
     @staticmethod
-    def goal(transcript):
+    def goal(transcript, required=True):
         matches = re.findall(r"(?:acceptance goal[^\n]*?exactly|actual task goal is)\s+([A-Z]+-\d+)", transcript, re.IGNORECASE)
         if not matches:
-            raise ValueError("original goal was not preserved in the conversation")
+            if required:
+                raise ValueError("original goal was not preserved in the conversation")
+            return None
         return matches[0]
 
     @staticmethod

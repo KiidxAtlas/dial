@@ -35,7 +35,7 @@ fn synonym_and_disjoint_query_ranking_remains_source_grounded() {
         "def paint():\n    canvas.flush()\n",
     )
     .unwrap();
-    let args = json!({"query":"reuse an existing value without doing the expensive work again"});
+    let args = json!({"query":"reuse an existing value without doing the expensive work again", "ranking":"semantic"});
     let request = semantic_request(&ws, &args).unwrap().unwrap();
     assert!(request.has_candidates());
     let response = fake_provider(&request.system, &request.prompt);
@@ -61,7 +61,7 @@ fn large_high_ranked_file_does_not_crowd_out_semantic_paths() {
     assert!(super::super::declarations(std::path::Path::new("a.rs"), &large).len() > 1000);
     fs::write(dir.path().join("a.rs"), &large).unwrap();
     fs::write(dir.path().join("z_cache.rs"), "fn cached_lookup(key: &str) {\n    if let Some(hit) = memo.get(key) { return hit; }\n    calculate(key)\n}\n").unwrap();
-    let args = json!({"query":"reuse an existing value without doing the expensive work again"});
+    let args = json!({"query":"reuse an existing value without doing the expensive work again", "ranking":"semantic"});
     let lexical = retrieve(&ws, &args, false).unwrap();
     assert_eq!(lexical.results.len(), 1000);
     assert!(lexical.results.iter().all(|hit| hit.path == "a.rs"));
@@ -100,7 +100,7 @@ fn semantic_diversity_preserves_global_and_prompt_bounds() {
         )
         .unwrap();
     }
-    let args = json!({"query":"work"});
+    let args = json!({"query":"work", "ranking":"semantic"});
     let retrieved = retrieve(&ws, &args, true).unwrap();
     assert_eq!(retrieved.results.len(), 1000);
     let mut counts = BTreeMap::new();
@@ -122,12 +122,16 @@ fn exact_and_explicit_lexical_never_request_a_model_and_empty_is_honest() {
             .unwrap()
             .is_none()
     );
-    assert!(
-        semantic_request(&ws, &json!({"query":"x", "ranking":"lexical"}))
-            .unwrap()
-            .is_none()
-    );
-    let request = semantic_request(&ws, &json!({"query":"x"}))
+    for lexical in [
+        json!({"query":"x", "ranking":"lexical"}),
+        json!({"query":"x"}),
+    ] {
+        assert!(
+            semantic_request(&ws, &lexical).unwrap().is_none(),
+            "{lexical}"
+        );
+    }
+    let request = semantic_request(&ws, &json!({"query":"x", "ranking":"semantic"}))
         .unwrap()
         .unwrap();
     assert!(!request.has_candidates());
@@ -139,9 +143,12 @@ fn exact_and_explicit_lexical_never_request_a_model_and_empty_is_honest() {
     );
     assert!(request.render_response("{\"indices\":[0]}").is_err());
     fs::write(dir.path().join("a.rs"), "fn cached() { return stored; }\n").unwrap();
-    let limited = semantic_request(&ws, &json!({"query":"memoize", "limit":1}))
-        .unwrap()
-        .unwrap();
+    let limited = semantic_request(
+        &ws,
+        &json!({"query":"memoize", "limit":1, "ranking":"semantic"}),
+    )
+    .unwrap()
+    .unwrap();
     assert!(limited.render_response("{\"indices\":[0,1]}").is_err());
     assert!(limited.prompt.len() <= MAX_PROMPT);
 }
@@ -164,7 +171,7 @@ fn configured_model_semantic_smoke() {
         "def paint():\n    canvas.flush()\n",
     )
     .unwrap();
-    let request = semantic_request(&ws, &json!({"query":"reuse an existing value without doing the expensive work again", "limit":1})).unwrap().unwrap();
+    let request = semantic_request(&ws, &json!({"query":"reuse an existing value without doing the expensive work again", "limit":1, "ranking":"semantic"})).unwrap().unwrap();
     let chat = Chat {
         messages: vec![
             json!({"role":"system", "content":request.system}),
