@@ -603,7 +603,7 @@ impl Drop for Allocation {
         }
     }
 }
-fn current_user() -> io::Result<Vec<usize>> {
+fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
     let mut token = ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
@@ -613,7 +613,7 @@ fn current_user() -> io::Result<Vec<usize>> {
     unsafe {
         GetTokenInformation(
             token.as_raw_handle() as HANDLE,
-            TokenUser,
+            class,
             ptr::null_mut(),
             0,
             &mut length,
@@ -626,7 +626,7 @@ fn current_user() -> io::Result<Vec<usize>> {
     if unsafe {
         GetTokenInformation(
             token.as_raw_handle() as HANDLE,
-            TokenUser,
+            class,
             bytes.as_mut_ptr().cast(),
             length,
             &mut length,
@@ -637,8 +637,25 @@ fn current_user() -> io::Result<Vec<usize>> {
     }
     Ok(bytes)
 }
+fn current_user() -> io::Result<Vec<usize>> {
+    token_information(TokenUser)
+}
 fn user_sid(bytes: &[usize]) -> PSID {
     unsafe { (*(bytes.as_ptr().cast::<TOKEN_USER>())).User.Sid }
+}
+fn default_owner_sid(bytes: &[usize]) -> PSID {
+    unsafe { (*(bytes.as_ptr().cast::<TOKEN_OWNER>())).Owner }
+}
+/// Windows gives each new object the token's default owner: the user SID, or BUILTIN\Administrators
+/// for elevated administrator tokens. Only the user and that default owner count as ours; any other
+/// owner is foreign.
+fn owned_by_token(owner: PSID) -> io::Result<bool> {
+    let user = current_user()?;
+    if unsafe { EqualSid(owner, user_sid(&user)) } != 0 {
+        return Ok(true);
+    }
+    let default = token_information(TokenOwner)?;
+    Ok(unsafe { EqualSid(owner, default_owner_sid(&default)) } != 0)
 }
 fn security(file: &File) -> io::Result<(Allocation, PSID, *mut ACL)> {
     let mut owner = ptr::null_mut();
@@ -663,8 +680,7 @@ fn security(file: &File) -> io::Result<(Allocation, PSID, *mut ACL)> {
 }
 pub(in crate::platform) fn owned_by_current_user(file: &File) -> io::Result<bool> {
     let (_sd, owner, _) = security(file)?;
-    let token = current_user()?;
-    Ok(!owner.is_null() && unsafe { EqualSid(owner, user_sid(&token)) } != 0)
+    Ok(!owner.is_null() && owned_by_token(owner)?)
 }
 pub(in crate::platform) fn path_owned_by_current_user(path: &Path) -> io::Result<bool> {
     owned_by_current_user(&open_nofollow(OpenOptions::new().read(true), path, false)?)
@@ -682,12 +698,9 @@ pub(in crate::platform) fn is_owner_only(file: &File) -> io::Result<bool> {
     let (_sd, owner, acl) = security(file)?;
     let token = current_user()?;
     let sid = user_sid(&token);
-    // An elevated administrator token creates objects owned by BUILTIN\Administrators rather than by
-    // its own user SID; the DACL below still grants access to the current user alone.
-    let owned = !owner.is_null()
-        && (unsafe { EqualSid(owner, sid) } != 0
-            || unsafe { IsWellKnownSid(owner, WinBuiltinAdministratorsSid) } != 0);
-    if !owned || acl.is_null() {
+    // An elevated administrator token creates objects owned by its default owner
+    // (BUILTIN\Administrators). The DACL check below still grants access to the current user alone.
+    if owner.is_null() || acl.is_null() || !owned_by_token(owner)? {
         return Ok(false);
     }
     for index in 0..unsafe { (*acl).AceCount } as u32 {
@@ -766,6 +779,22 @@ fn install_private_acl(file: &File) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(result as i32));
     }
     Ok(())
+}
+/// The caller's handle may lack WRITE_DAC (append or create_new opens), so the DACL is installed
+/// through a second handle that must name the same object as `file`.
+fn install_private_acl_bound(file: &File, path: &Path) -> io::Result<()> {
+    let control = OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    reject_reparse(&control)?;
+    if identity(&control)? != identity(file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private file changed during setup",
+        ));
+    }
+    install_private_acl(&control)
 }
 pub(in crate::platform) fn set_owner_only_file(file: &File) -> io::Result<()> {
     if !file.metadata()?.is_file() && !file.metadata()?.is_dir() {
@@ -852,8 +881,12 @@ pub(in crate::platform) fn open_owner_only(options: &OpenOptions, path: &Path) -
             "private file must be a regular file",
         ));
     }
-    install_private_acl(&file)?;
-    if !owned_by_current_user(&file)? || !is_owner_only(&file)? {
+    // Ownership is decided before any DACL change, so a foreign object is never modified.
+    let owned = owned_by_current_user(&file)?;
+    if owned {
+        install_private_acl_bound(&file, path)?;
+    }
+    if !owned || !is_owner_only(&file)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "private file access cannot be enforced",
