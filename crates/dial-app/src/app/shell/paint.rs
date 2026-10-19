@@ -1,7 +1,6 @@
 //! Repainting the shell: transcript tail, composer, status line and worker rows.
 
 use crate::agent::Agent;
-#[cfg(unix)]
 use crate::app::core::App;
 use crate::app::display::{local_time, short};
 use crate::app::overlay::ActiveOverlay;

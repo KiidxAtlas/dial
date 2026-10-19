@@ -5,6 +5,8 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-10-19
+
 ### Added
 - The MCP browser and `mcp_servers search` also list npm packages tagged `mcp` that declare a command, and GitHub repositories, next to the official registry, Smithery and the curated list. Sources are read concurrently, and a server listed by several sources shows once with every badge. npm servers install as `npx -y <package>@<version>`. A GitHub repository installs only when its root `package.json` or `pyproject.toml` names an npm or PyPI package that names the same repository as its source and has one clear command; otherwise the row links the repository for manual setup. Every install still asks for approval and must start and list its tools before it is saved.
 - The start screen is live: it sits above the input until your first message, with the model, project and mode beside your recent sessions (or starter ideas on a first visit). Down from an empty input selects a row and Enter resumes that session or loads that starter; Esc returns to the input. After the first message it folds into one summary line in scrollback. Terminals under 24 rows get a compact single-column version. The wordmark gets one 0.7 s brand-colour sweep at start-up.
@@ -12,11 +14,18 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Code change history: every turn that changes project files records each file's diff with the git branch and the prompt that produced it, in private per-project storage and without model calls. The loadable `code_history` tool and `/code-history [words] [path:<p>] [branch:<b>] | show <id> | clear` search these versions across sessions. On by default; turn off with `codebase.history = false` or `/settings` → Project understanding → Code change history.
 
 ### Changed
+- Completed the Rust workspace layout: command handlers, platform backends, provider compaction, configuration schemas and embedded tool drivers live with their owning modules. Architecture checks guard module definitions and workspace layering; CI now runs the embedded driver protocol contracts.
 - Fewer model round trips on long commands. A `bash` call with a `timeout` longer than `shell.auto_background_secs` (15 s by default) now waits in the foreground up to that timeout, so a long build or test returns its result in one call; if it is still running then, it moves to `bg` instead of being killed. A `bg wait` that sees a job exit now returns its unread output, so a separate `bg output` call is no longer needed. The system prompt tells the agent to give long checks a `timeout`, and to launch subagents with `task action=start` when it has its own work to continue.
 - The slash menu opens upward from the input, so the input stays put, and shows 12 rows by default (`ui.autocomplete_items`). Typed alone, `/` lists everyday commands grouped as Models, Settings, Sessions, Context, Changes, Tasks and Tools, each group named once at the right; typing still ranks fuzzy matches across every command.
 - Your messages in the transcript sit on a faint full-width tint behind the accent bar (the Dial themes now define `userBg`), and each run of tool calls hangs off one thin rail in the first column, so prose, your turns and the agent's work read as separate blocks.
 - Panel footers use the same words everywhere: Esc is `close` at a panel's top level, `back` inside a nested view, `cancel` for an edit or question and `clear search` while a search or filter is typed, and the Esc hint changes with what the next Esc will do (Extensions, the subagent hub). Tab strips share one style (accent, bold, underlined) in every panel, and ←/→ also switches the subagent hub's tabs. The Compute panel no longer says `back` where Esc closes it, and keys follow your keymap instead of a hard-coded `Esc`.
 - `/extensions` is described as the MCP server, plugin and skill browser it opens; `/status` still prints the configuration.
+
+### Fixed
+- Windows shell status painting imports its application type on every supported platform.
+- JavaScript eval preserves falsy asynchronous rejection reasons on Node 22 and keeps the REPL usable after a failed cell.
+- Browser tests keep orphan-process bookkeeping inside temporary state directories instead of recreating runtime folders in the checkout.
+- The GitHub-release-only root package is explicitly non-publishable, matching its workspace members and satisfying the dependency policy for local path dependencies.
 
 ## [0.1.9] - 2026-10-16
 

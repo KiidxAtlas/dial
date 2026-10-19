@@ -4314,11 +4314,8 @@ fn small_window_completes_first_turn_with_on_demand_tools() {
     let mut ui = Recorder::default();
     let report = a.turn("hello", &mut ui).unwrap();
     assert_eq!(report.text, "done");
-    assert!(
-        ui.notices.iter().any(|n| n.contains("lean tool set")),
-        "{:?}",
-        ui.notices
-    );
+    // The default schema set can fit in 8192 tokens without degradation; the smaller-window
+    // test below separately verifies that overflowing the full set selects lean tools.
     let names = tool_names(&server.requests.lock()[0]);
     for tool in ["read", "edit", "finish", "tool_load"] {
         assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");

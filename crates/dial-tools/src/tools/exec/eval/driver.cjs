@@ -2,8 +2,20 @@
 // Trusted transport driver. vm/repl is namespace management, never a security boundary.
 // The containing process has the workspace OS sandbox and mandatory process-fork fence.
 const fs = require('node:fs');
-const repl = require('node:repl');
 const vm = require('node:vm');
+// Node 22 REPL only routes truthy awaited rejections to its error domain; falsy reasons (null,
+// undefined, 0, "") reach the evaluation callback as a successful cell. Box those reasons on the
+// REPL's own await path only, before the REPL captures vm.Script.prototype.runInContext. Unboxed in finish.
+class AwaitRejection { constructor(reason) { this.reason = reason; } }
+const unwrapRejection = error => (error instanceof AwaitRejection ? error.reason : error);
+let awaitingCell = false;
+const replRunInContext = vm.Script.prototype.runInContext;
+vm.Script.prototype.runInContext = function runInContext(contextified, options) {
+  const result = Reflect.apply(replRunInContext, this, arguments);
+  if (!awaitingCell || contextified !== context || typeof result?.then !== 'function') return result;
+  return result.then(undefined, reason => { throw reason ? reason : new AwaitRejection(reason); });
+};
+const repl = require('node:repl');
 const util = require('node:util');
 const { PassThrough, Writable } = require('node:stream');
 const { AsyncLocalStorage } = require('node:async_hooks');
@@ -164,7 +176,8 @@ if (kernel._domain) {
   kernel._domain.removeAllListeners('error');
   kernel._domain.on('error', handleEvaluationError);
 }
-function handleEvaluationError(error) {
+function handleEvaluationError(rawError) {
+  const error = unwrapRejection(rawError);
   const operation = operationStorage.getStore();
   if (pendingEvaluation && operation === pendingEvaluation.operation) {
     pendingEvaluation.finish(error, undefined, true);
@@ -185,9 +198,11 @@ function evaluate(code) {
     const finish = (error, value, failed = error !== null && error !== undefined) => {
       if (!pendingEvaluation || pendingEvaluation.finish !== finish) return;
       pendingEvaluation = null;
-      resolve({ error, value, failed });
+      awaitingCell = false;
+      resolve({ error: unwrapRejection(error), value, failed });
     };
     pendingEvaluation = { operation, finish };
+    awaitingCell = code.includes('await');
     try {
       kernel.eval(code + '\n', context, '<dial-eval>', finish);
     } catch (error) {
