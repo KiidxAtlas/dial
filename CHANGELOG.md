@@ -5,6 +5,12 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-10-19
+
+### Fixed
+- Release container builds receive the tagged source revision explicitly, so excluding Git metadata from the Docker context no longer causes release compilation to fail. Containers also embed the release's trusted update public key.
+- The terminal lifecycle regression follows the interactive work-plan inspector, including paging through long blocked-step details and returning to the plan.
+
 ## [0.1.10] - 2026-10-19
 
 ### Added

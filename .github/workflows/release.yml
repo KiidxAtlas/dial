@@ -247,7 +247,7 @@ jobs:
           embedded = placeholder.sub(lambda m: "    $DialReleasePublicKeyPem = @'\n" + pem + "\n'@", source, count=1)
           Path('dist/install.ps1').write_text(embedded, encoding='utf-8', newline='\n')
           PY
-          (cd dist && sha256sum *.tar.gz *.zip install.sh install.ps1 > SHA256SUMS)
+          (cd dist && sha256sum -- *.tar.gz *.zip install.sh install.ps1 > SHA256SUMS)
           printf '%s\n' "$DIAL_RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/release-key.pem"
           openssl pkeyutl -sign -inkey "$RUNNER_TEMP/release-key.pem" -rawin \
             -in dist/SHA256SUMS -out "$RUNNER_TEMP/SHA256SUMS.sig"
@@ -317,6 +317,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          build-args: |
+            DIAL_BUILD_REVISION=${{ github.sha }}
+            DIAL_RELEASE_PUBLIC_KEY=${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
           push: true
           tags: ${{ steps.docker-meta.outputs.tags }}
           labels: ${{ steps.docker-meta.outputs.labels }}
