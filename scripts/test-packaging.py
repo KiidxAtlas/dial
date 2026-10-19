@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Regression tests for scripts/check-packaging.py (run in CI; no Nix or network needed)."""
 import importlib.util
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -65,6 +68,33 @@ class PackagingTests(unittest.TestCase):
     def test_formula_urls_need_checksums(self):
         broken = GOOD_FORMULA.replace('      sha256 "685b07e644fa265aa3d088473c561339e29bf4d85ac6b2e913fbe3fe2d34f55c"\n', "")
         self.assertTrue(any("sha256" in p for p in packaging.formula_problems(broken)))
+
+
+class ReleaseBuildIdentityTests(unittest.TestCase):
+    def test_release_build_requires_an_explicit_revision_without_git_metadata(self):
+        source = Path(__file__).resolve().parent.parent / "crates/dial-build-info/build.rs"
+        with tempfile.TemporaryDirectory(prefix="dial-release-identity-") as directory:
+            root = Path(directory)
+            executable = root / ("build-info.exe" if os.name == "nt" else "build-info")
+            subprocess.run(["rustc", "--edition=2024", str(source), "-o", str(executable)],
+                           check=True, capture_output=True, text=True)
+            env = os.environ.copy()
+            env.update(CARGO_MANIFEST_DIR=str(root), GIT_CEILING_DIRECTORIES=str(root.parent),
+                       PROFILE="release", TARGET="x86_64-unknown-linux-gnu")
+            env.pop("GIT_DIR", None)
+            env.pop("GIT_WORK_TREE", None)
+            env.pop("DIAL_BUILD_REVISION", None)
+            for revision, accepted in [(None, False), ("unknown", False), ("not-a-hash", False),
+                                       ("0123456789abcdef0123456789abcdef01234567", True)]:
+                with self.subTest(revision=revision):
+                    case_env = env.copy()
+                    if revision is not None:
+                        case_env["DIAL_BUILD_REVISION"] = revision
+                    result = subprocess.run([str(executable)], cwd=root, env=case_env,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                    if accepted:
+                        self.assertIn(f"cargo:rustc-env=DIAL_BUILD_REVISION={revision}", result.stdout)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,7 @@
 FROM rust:1.99-bookworm AS build
+# The build context excludes .git; release builds require the source commit explicitly.
+ARG DIAL_BUILD_REVISION
+ARG DIAL_RELEASE_PUBLIC_KEY
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p dial

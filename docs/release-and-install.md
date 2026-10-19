@@ -30,6 +30,16 @@ For local use of the source-tree installers, provide the trusted public PEM befo
 
 The Homebrew formula is in `Formula/dial.rb`; the Nix flake is `flake.nix`; the Docker image is built from `Dockerfile` and published to `ghcr.io/kiidxatlas/dial` on releases. Pin versions or image digests for reproducible deployment. The container is intended for non-interactive use; mount the project directory and persistent Dial state explicitly.
 
+To build the container locally, pass the source revision explicitly because `.dockerignore`
+excludes Git metadata:
+
+```sh
+docker build --build-arg DIAL_BUILD_REVISION="$(git rev-parse HEAD)" -t dial .
+```
+
+The release workflow supplies the tagged commit and `DIAL_RELEASE_PUBLIC_KEY` as build arguments
+so the container binary retains its source identity and trusted update key.
+
 ## Build from source
 
 Install the pinned Rust toolchain from `rust-toolchain.toml` and run `cargo build --release --locked -p dial` for shipping optimization. `make build` and `make update` default to the optimized `local` profile (incremental compilation, no LTO); pass `PROFILE=release` for shipping-equivalent builds (thin LTO). `make update` rebuilds from the checkout, backs up existing binaries, and retains only the three newest backups at each managed location. `make check`, `make test-lib`, and `make test-module MOD=module::path` provide narrower development checks; `make test` retains the full Rust suite. CI builds and tests with the `ci` profile (unoptimized, no debug info) and caches Rust dependencies separately for test, lint, and release jobs. Release builds start as soon as a tag is pushed and run alongside CI; the publish job waits for CI to pass on the tagged commit before signing and publishing anything. Python tests run under pytest in CI; optional model/runtime dependencies are separate from the Rust executable.
