@@ -303,6 +303,10 @@ theme="dark"
 [harness]
 max_steps=8
 max_tokens=2048
+[task.provider_concurrency]
+# This threaded mock can serve the parent and both scouts concurrently. A local endpoint
+# otherwise defaults to one slot: held BETA would prevent ALPHA from ever replying first.
+openai=3
 '''
     (home / "config.toml").write_text(config)
     (home / "config.toml").chmod(0o600)
