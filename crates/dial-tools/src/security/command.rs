@@ -2,7 +2,7 @@
 //!
 //! Arguments are whitespace-separated tokens: positional values fill the operation's named
 //! parameters in order, `key=value` sets a named parameter (repeatable for lists), and a bare
-//! `archive` sets `archiveExisting`. The slash-command glue lives in `commands/security.rs`.
+//! `archive` sets `archiveExisting`. Slash-command glue lives in `dial-app/src/app/commands/security.rs`.
 
 use anyhow::{Result, bail};
 use serde_json::{Map, Value};

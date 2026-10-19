@@ -874,5 +874,4 @@ pub(in crate::platform) fn create_dir_owner_only(
     Ok(())
 }
 #[cfg(test)]
-#[path = "windows_fs/transaction_tests.rs"]
 mod transaction_tests;

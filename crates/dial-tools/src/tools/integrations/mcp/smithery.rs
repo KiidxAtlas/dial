@@ -1,5 +1,5 @@
 //! Smithery registry: search,
-//! install planning and API-key login. Slash-command glue lives in `commands/smithery.rs`.
+//! install planning and API-key login. Slash-command glue lives in `dial-app/src/app/commands/smithery.rs`.
 
 use crate::config::settings_store::{Change, write_private};
 use crate::config::types::McpServerConfig;

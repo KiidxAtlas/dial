@@ -415,5 +415,4 @@ fn verify_version(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 #[cfg(test)]
-#[path = "update/tests.rs"]
 mod tests;

@@ -592,5 +592,4 @@ pub(super) fn known_kind(selection: &ModelSelection, reported: ModelKind) -> Mod
 }
 
 #[cfg(test)]
-#[path = "bundled/tests.rs"]
 mod tests;

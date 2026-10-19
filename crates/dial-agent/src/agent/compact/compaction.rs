@@ -150,7 +150,6 @@ pub fn cut(messages: &[Value], budget: u64) -> Option<usize> {
 }
 
 /// A durable boundary never separates a matched call from its result.
-
 pub fn snapshot_signature(
     request: &Chat,
     identity: CompactionIdentity<'_>,

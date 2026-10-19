@@ -6,9 +6,11 @@ fn compiler_preview_reports_type_failure_and_preserves_project() {
     }
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("src")).unwrap();
+    // TMPDIR may be inside this checkout. Keep this standalone fixture (and its
+    // disposable preview copy) out of the enclosing Cargo workspace.
     fs::write(
         root.path().join("Cargo.toml"),
-        "[package]\nname='preview_fixture'\nversion='0.0.0'\nedition='2024'\n",
+        "[package]\nname='preview_fixture'\nversion='0.0.0'\nedition='2024'\n\n[workspace]\n",
     )
     .unwrap();
     fs::write(

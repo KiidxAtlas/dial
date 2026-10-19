@@ -7,3 +7,17 @@ python/.venv
 python/.pytest_cache
 **/__pycache__
 **/*.pyc
+.dial
+.cargo-work
+.worktrees
+.codegraph
+plans
+private
+grounded
+dial.toml
+browser
+crates/dial-tools/browser
+**/node_modules
+**/.venv
+**/.pytest_cache
+**/.ruff_cache

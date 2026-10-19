@@ -1,7 +1,7 @@
 'use strict';
 // Page-realm `run` and `call` helpers for the Dial browser driver (CommonJS, Node 20+).
 // Code executes only inside the page via Playwright page.evaluate; Node never evaluates page code.
-// Rust counterpart: src/tools/browser/run.rs (CALL_METHODS and the caps below must stay in sync).
+// Rust counterpart: run.rs (CALL_METHODS and the caps below must stay in sync).
 
 const RUN_VALUE_PREVIEW_CHARS = 256 * 1024;
 const SCREENSHOT_MAX_BYTES = 5 * 1024 * 1024;

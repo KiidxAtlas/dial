@@ -5,14 +5,16 @@ worker used only for MLX inference and LoRA training.
 
 ## Workspace layout
 
-The repository is one Cargo workspace. The root package `dial` holds only the binary (`src/main.rs`,
-`src/cmd/`), a facade library (`src/lib.rs`) and the integration tests (`tests/`). Every other
-member lives under `crates/`. The facade re-exports each crate's modules under their historical
+The repository is one Cargo workspace. The root package `dial` holds only the binary, a facade
+library (`src/lib.rs`) and the integration tests (`tests/`). The binary separates process startup
+(`src/main.rs`), argument declarations (`src/args.rs`), configuration overlays (`src/overlay.rs`),
+launch routing (`src/dispatch.rs`), chat launch (`src/chat.rs`) and command handlers (`src/cmd/`).
+Every other member lives under `crates/`. The facade re-exports each crate's modules under their historical
 paths (`pub use dial_agent::{agent, …}`), so `dial::<module>` keeps resolving for the binary, tests
 and external callers.
 
-Crates are listed lowest layer first. A crate may depend only on crates in the layers above it in
-this table (see Dependency boundaries).
+Crates are listed lowest layer first. A crate may depend only on earlier, lower-numbered layers
+in this table (see Dependency boundaries).
 
 | Layer | Crate | Modules and contents |
 |---|---|---|
@@ -24,9 +26,35 @@ this table (see Dependency boundaries).
 | 6 | `dial-computer` | `computer`: desktop capture and input; `build.rs` sets the desktop cfg and builds the macOS capture helper |
 | 7 | `dial-agent` | `agent` (agent loop, grouped below), `learn`, `judgment`, `adaptive`, `steering`, `reliability`, `telemetry`, `stats`, `extensions`, `commit`, `pack` |
 | 8 | `dial-ui` | `ui` (terminal interface: composer, transcript, overlays, themes), `git_panel`; bundled palettes live in `crates/dial-ui/themes/` |
-| 9 | `dial-app` | `app` (application wiring; directory module `app/`), `commands` (slash commands), `cli` (subcommands, flags, plain-text tables), `benchmark`, `repl`, `rpc`, `acp`, `schedule`, `changelog`, `collab` |
+| 9 | `dial-app` | `app` (application wiring, with private slash-command handlers in `app/commands/`), `cli` (subcommands, flags, plain-text tables), `benchmark`, `repl`, `rpc`, `acp`, `schedule`, `changelog`, `collab` |
 
 The root `build.rs` only declares rerun inputs; per-crate build scripts own their own outputs.
+
+### File ownership conventions
+
+- A module uses either `name.rs` with children in `name/`, or `name/mod.rs`, never both.
+  Keep working conventions within a subsystem; neither spelling warrants a repository-wide rename.
+- Physical paths follow logical module ownership. Provider-native compaction lives in
+  `dial-llm/src/llm/provider/compaction.rs`; settings declarations consumed by the schema live in
+  `dial-llm/src/config/schema/`. `config/settings/` holds the settings module's own children.
+- `dial-core/src/platform/` exposes portable primitives by concern (`fs`, `process`, `io`,
+  `time`, `sys`). Native implementations live beneath `unix/` and `windows/` behind the same
+  portable facade. Edit transaction backends similarly live in
+  `dial-tools/src/tools/edit/edit_transaction/{unix,windows}.rs`.
+- Slash-command handlers belong to the interactive application in `dial-app/src/app/commands/`.
+  Binary-only subcommands remain in root `src/cmd/`; reusable CLI helpers remain in `dial-app/src/cli/`.
+- Use ordinary `mod` declarations. Reserve `#[path]` for deliberate platform selection where
+  the on-disk platform grouping is clearer than duplicating the API hierarchy; do not use it to
+  conceal unfinished moves. Tests stay with the logical owner and move with it.
+- Keep runtime assets in `assets/`, language-specific helpers in `python/` and `runtimes/`,
+  and palettes in `crates/dial-ui/themes/`. Source moves must preserve compile-time includes and
+  packaging discovery. Build output and private local state are not source modules.
+- Embedded tool drivers live beside their Rust owners: browser JavaScript under
+  `dial-tools/src/tools/net/browser/`, eval JavaScript under `tools/exec/eval/`, and the Python
+  kernel driver under `tools/exec/kernel/`. `make test-drivers` exercises their transport contracts
+  locally and in CI without installing Playwright or downloading models.
+- Generated caches and runtime state are ignored and excluded from Docker contexts. Do not remove
+  active build directories, installed toolchains, private state or unfinished plans as source cleanup.
 
 ### Tools sub-domains (`crates/dial-tools/src/tools/`)
 
@@ -75,6 +103,8 @@ Enforced by `tests/integration/architecture.rs`.
   crate, including dev-dependencies, to appear earlier in that list. An unlisted crate is a
   violation, so a new crate is placed in the order deliberately.
   `crate_manifests_are_checked_against_the_layer_order` tests that check against fixture manifests.
+  `workspace_crates_and_layer_registry_agree` additionally rejects missing, duplicate or unregistered
+  crates and crates not selected by `workspace.members`.
 - **Module rules.** `modules_respect_their_dependency_boundaries` scans the production code (test
   modules exempt) of every `crates/*/src` root and rejects `crate::<module>` paths that cross these
   rules, by module name:
@@ -91,6 +121,10 @@ Enforced by `tests/integration/architecture.rs`.
 Tests never live inline in `src/`: a `#[cfg(test)]` module is declared with `mod tests;` and its body
 sits in the sibling `tests.rs` (`foo.rs` → `foo/tests.rs`). The same test rejects inline test module
 bodies and `#[test]` functions outside such files.
+
+`modules_have_one_conventional_definition` rejects ambiguous `foo.rs` plus `foo/mod.rs`
+definitions across the root and all member source trees. Fixture tests cover both accepted Rust
+layouts and violations in nested crate directories.
 
 Changing a rule means editing that test and stating why here.
 

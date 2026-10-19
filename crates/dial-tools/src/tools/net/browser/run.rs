@@ -1,5 +1,5 @@
 //! Browser `run` and `call` actions: pure request parsing, validation and output shaping.
-//! Execution lives in `browser_driver/run.cjs` (page-realm JavaScript plus the allowlisted
+//! Execution lives in `run.cjs` (page-realm JavaScript plus the allowlisted
 //! page-helper table). Nothing here touches Chromium, so every function is unit-testable.
 
 use serde_json::{Value, json};
@@ -23,7 +23,7 @@ pub const RUN_TIMEOUT_DEFAULT_SECS: u64 = 30;
 pub const RUN_TIMEOUT_MIN_SECS: u64 = 1;
 /// Upper clamp for `timeout` (seconds); matches the browser tool's global 3600s ceiling.
 pub const RUN_TIMEOUT_MAX_SECS: u64 = 3600;
-/// Page-helper names accepted by `call`, in driver order. MUST match `HELPERS` in `browser_driver/run.cjs`.
+/// Page-helper names accepted by `call`, in driver order. MUST match `HELPERS` in `run.cjs`.
 pub const CALL_METHODS: &[&str] = &[
     "url",
     "title",

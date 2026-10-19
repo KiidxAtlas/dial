@@ -4,11 +4,14 @@ use crate::tools::Workspace;
 use crate::tools::code::lsp;
 
 #[cfg(unix)]
-#[path = "edit_transaction_unix.rs"]
-mod imp;
+mod unix;
 #[cfg(windows)]
-#[path = "edit_transaction_windows.rs"]
-mod imp;
+mod windows;
+
+#[cfg(unix)]
+use self::unix as imp;
+#[cfg(windows)]
+use self::windows as imp;
 
 pub(crate) use imp::{Change, MAX_BYTES, MAX_FILE, Original, inherit_permissions, open_read, read};
 

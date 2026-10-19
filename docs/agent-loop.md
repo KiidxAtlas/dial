@@ -474,7 +474,7 @@ summary also receives a private `artifact://` URI. Export errors and post-commit
 `journal_warning` fields describe an already-applied operation, not a rollback or invitation
 to retry. Notes-mode idle pressure produces guidance; it never silently resets context.
 
-Bundled image-archive renderer/font notices are in `crates/dial-agent/src/agent/snapcompact/fonts/` and `THIRD_PARTY_NOTICES`:
+Bundled image-archive renderer/font notices are in `crates/dial-agent/src/agent/compact/snapcompact/fonts/` and `THIRD_PARTY_NOTICES`:
 public-domain bitmap fonts, Unscii CC0 and Silver by Poppy Works/Wolfgang Wozniak under CC BY 4.0.
 
 ## Live task and phase policy
