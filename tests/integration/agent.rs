@@ -4329,29 +4329,50 @@ fn small_window_completes_first_turn_with_on_demand_tools() {
 
 #[test]
 fn window_too_small_for_the_full_set_offers_a_lean_tool_set() {
-    let server = serve(vec![Reply::Text("done")]);
+    let server = serve(vec![Reply::Text("baseline"), Reply::Text("done")]);
     let mut e = env(&server.url, "auto");
     e.config.assistance.compact_tools = true;
-    // Full set projects to ~7.9k tokens and the lean set to ~6.5k, so 7168 must degrade.
-    e.config.context_window = 7168;
     // `agent_with` seeds enabled_tools=["task"] whenever the harness selects task (delegation
     // tests). A fresh session starts with nothing on demand, which is the lean set under test.
     e.config
         .harness
         .tools
         .retain(|tool| tool.as_str() != "task");
+    // Sandbox instructions and path lengths differ by platform. Measure the full request
+    // instead of assuming that a fixed window overflows on every supported host.
+    let full_tokens = {
+        let mut backend = make_backend(&e.config).unwrap();
+        let mut a = agent(&e, &mut backend, None);
+        assert_eq!(
+            a.turn("hello", &mut Recorder::default()).unwrap().text,
+            "baseline"
+        );
+        let requests = server.requests.lock();
+        let request = &requests[0];
+        assert!(tool_names(request).iter().any(|name| name == "find"));
+        dial::llm::wire::estimate_parts(
+            request["messages"].as_array().unwrap(),
+            request["tools"].as_array().unwrap(),
+        )
+    };
+    e.config.context_window = u32::try_from(full_tokens.checked_sub(256).unwrap()).unwrap();
+    let expected_notice = format!(
+        "Context window {} is small; offering a lean tool set (others load on demand)",
+        e.config.context_window
+    );
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None);
     let mut ui = Recorder::default();
     let report = a.turn("hello", &mut ui).unwrap();
     assert_eq!(report.text, "done");
     assert!(
-        ui.notices.iter().any(|n| n
-            == "Context window 7168 is small; offering a lean tool set (others load on demand)"),
+        ui.notices.iter().any(|notice| notice == &expected_notice),
         "{:?}",
         ui.notices
     );
-    let names = tool_names(&server.requests.lock()[0]);
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 2);
+    let names = tool_names(&requests[1]);
     for tool in ["read", "write", "edit", "bash", "finish", "tool_search"] {
         assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");
     }
