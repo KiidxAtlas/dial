@@ -94,7 +94,8 @@ impl DocumentLease {
             match fs2::FileExt::try_lock_exclusive(&file) {
                 Ok(()) => break,
                 Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
+                    if (error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
                         && started.elapsed() < Duration::from_secs(10) =>
                 {
                     std::thread::sleep(Duration::from_millis(10))

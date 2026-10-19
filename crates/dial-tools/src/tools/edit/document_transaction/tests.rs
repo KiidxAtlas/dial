@@ -69,3 +69,26 @@ fn independent_workspaces_commit_stale_nonoverlapping_proposals() {
         "left=1\nright=2\n"
     );
 }
+
+#[test]
+fn contended_document_waits_until_the_current_writer_releases_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared");
+    let held = Lease::acquire([path.clone()]).unwrap();
+    std::thread::scope(|scope| {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            started_tx.send(()).unwrap();
+            let _other = Lease::acquire([path]).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            acquired_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+}
