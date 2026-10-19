@@ -188,9 +188,23 @@ fn project_jobs_distinguish_locks_from_stale_status_and_stop_pauses() {
     );
     drop(control);
     drop(compute);
+    // Concurrent subprocess tests can briefly inherit either lock before exec closes it.
+    // As above, bound the wait rather than requiring immediate descriptor release after drop.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let status = jobs(&layout).unwrap();
+        if status["shared_compute_busy"] == false
+            && status["project_jobs"][0]["control_busy"] == false
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "locks still busy: {status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let status = jobs(&layout).unwrap();
-    assert_eq!(status["shared_compute_busy"], false);
-    assert_eq!(status["project_jobs"][0]["control_busy"], false);
     assert_eq!(status["project_jobs"][0]["scheduler"]["state"], "running");
     resume(&state).unwrap();
     assert!(enabled(&config, &store).unwrap());
