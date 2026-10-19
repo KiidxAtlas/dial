@@ -115,8 +115,9 @@ for (const python of [false, true]) {
 test('throwing falsy values is still a failed cell and leaves the REPL usable', () => {
   const output = run([
     cell(1, 'throw null'), cell(2, 'throw undefined'), cell(3, 'throw 0'),
-    cell(4, 'throw ""'), cell(5, 'await Promise.reject(null)'), cell(6, '21 * 2'),
+    cell(4, 'throw ""'), cell(5, 'await Promise.reject(null)'), cell(6, 'await Promise.reject(undefined)'),
+    cell(7, 'await Promise.reject(0)'), cell(8, '21 * 2'),
   ]);
-  assert.deepEqual(output.slice(0, 5).map(frame => frame.result.error), ['null', 'undefined', '0', '', 'null']);
-  assert.equal(output[5].result.value, '42');
+  assert.deepEqual(output.slice(0, 7).map(frame => frame.result.error), ['null', 'undefined', '0', '', 'null', 'undefined', '0']);
+  assert.equal(output[7].result.value, '42');
 });
