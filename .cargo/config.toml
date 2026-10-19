@@ -1,8 +1,0 @@
-# Dial's debug builds exceed the 16MB __eh_frame limit of ld64's compact unwind table.
-# The linker already falls back to DWARF unwinding after warning; skipping compact unwind
-# encoding silences the warning without changing runtime behavior.
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-Wl,-no_compact_unwind"]
-
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "link-arg=-Wl,-no_compact_unwind"]

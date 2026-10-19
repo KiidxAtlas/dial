@@ -23,6 +23,8 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ### Fixed
 - Windows shell status painting imports its application type on every supported platform.
+- Windows private storage recognizes the current token's default owner on elevated processes and installs private ACLs through an identity-checked handle without changing append-only access.
+- macOS builds retain compact unwind information so caught panics and panic-contract tests unwind correctly instead of aborting.
 - JavaScript eval preserves falsy asynchronous rejection reasons on Node 22 and keeps the REPL usable after a failed cell.
 - Browser tests keep orphan-process bookkeeping inside temporary state directories instead of recreating runtime folders in the checkout.
 - The GitHub-release-only root package is explicitly non-publishable, matching its workspace members and satisfying the dependency policy for local path dependencies.
