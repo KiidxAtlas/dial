@@ -181,8 +181,26 @@ impl Stream {
         match self {
             #[cfg(unix)]
             Self::Unix(stream) => {
-                stream.set_read_timeout(timeout)?;
-                stream.set_write_timeout(timeout)
+                let result = stream
+                    .set_read_timeout(timeout)
+                    .and_then(|()| stream.set_write_timeout(timeout));
+                // macOS discards the Unix socket's PCB when its peer closes. Both
+                // setsockopt and getpeername then return EINVAL, but buffered replies
+                // remain readable. No operation can block waiting on that closed peer.
+                #[cfg(target_os = "macos")]
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.raw_os_error() == Some(libc::EINVAL))
+                    && stream.peer_addr().is_err_and(|error| {
+                        matches!(
+                            error.raw_os_error(),
+                            Some(libc::EINVAL) | Some(libc::ENOTCONN)
+                        )
+                    })
+                {
+                    return Ok(());
+                }
+                result
             }
             Self::Tcp(stream) => {
                 stream.set_read_timeout(timeout)?;
