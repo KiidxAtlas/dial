@@ -8,12 +8,10 @@ use crate::app::core::App;
 use crate::app::display::{group_digits, short};
 use crate::app::drive::Step;
 use crate::app::notices::memory_status_text;
-use crate::app::overlay::{Which, start_streaming_job, work_panel};
+use crate::app::overlay::{Which, work_panel};
 use crate::app::selection::{PendingFavorite, cycle_set, next_favorite};
-use crate::app::shell::teach::TEACH_OFF;
 use crate::app::shell::{PAINT_EVERY, Shell};
 use crate::config::selection::changes as selection_changes;
-use crate::config::settings_store::{Change, Scope};
 use crate::config::types::{Approval, Outcome};
 use crate::llm::usage;
 use crate::platform;
@@ -262,38 +260,7 @@ impl Shell {
             }
             "model" | "models" => return self.open(app, agent, Which::Models),
             "roles" => return self.open(app, agent, Which::ModelRoles),
-            "profile" => {
-                if args.is_empty() {
-                    self.note(
-                        "Profiles",
-                        app.config
-                            .model_profiles
-                            .iter()
-                            .map(|(name, profile)| {
-                                format!("{name}: {} / {}", profile.provider, profile.model)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    );
-                } else if args != "off" && !app.config.model_profiles.contains_key(args) {
-                    self.note("Profile", format!("Unknown profile `{args}`. Define it under [model_profiles] or run /profile to list them."));
-                } else {
-                    let changes = if args == "off" {
-                        vec![Change::Remove {
-                            path: "model_profile".into(),
-                        }]
-                    } else {
-                        vec![Change::Set {
-                            path: "model_profile".into(),
-                            value: args.into(),
-                        }]
-                    };
-                    match self.persist(app, agent, &changes, Scope::Project) {
-                        Ok(step) => return Ok(step),
-                        Err(error) => self.note("Profile", format!("not changed: {error:#}")),
-                    }
-                }
-            }
+            "profile" => return self.profile_command(app, Some(agent), args),
             "providers" | "provider" => return self.open(app, agent, Which::Providers),
             "palette" => return self.open(app, agent, Which::Palette),
             "settings" => return self.open(app, agent, Which::Settings),
@@ -301,13 +268,10 @@ impl Shell {
             "improve" if args == "models" => return self.open(app, agent, Which::LearningModels),
             "model-settings" => return self.open(app, agent, Which::ModelSettings),
             "hotkeys" => return self.open(app, agent, Which::Shortcuts),
-            "accounts" => self.note(
-                "Accounts",
-                "Usage: /accounts pin (chooses which ChatGPT account this session uses)",
-            ),
+            "accounts" => self.accounts_note(),
             "improve" => return self.improve_command(app, agent, args),
             "changes" => self.changes_note(&agent.layout().unwrap_or(&app.layout).project_root),
-            "theme" => return self.theme_command(app, agent, args),
+            "theme" => return self.theme_command(app, Some(agent), args),
             "new" | "clear" => match agent.layout().context("agent has no project layout").and_then(|layout| {
                 Session::create(
                     layout,
@@ -676,47 +640,10 @@ impl Shell {
                     None => self.note("Rollback", "checkpoints unavailable"),
                 }
             }
-            "skills" => {
-                let words = crate::runtime::arguments::split_words(args);
-                if matches!(words.first().map(String::as_str), Some("install" | "update")) {
-                    // Network-bound: run in the job slot so the UI keeps responding; progress streams in.
-                    let layout = app.layout.clone();
-                    let registries = app.config.skills.registries.clone();
-                    let started = start_streaming_job(&mut self.auth_job, "Skills", move |cancel, progress| {
-                        skills::management::command(&layout, &registries, words, &cancel, progress)
-                    });
-                    if !started {
-                        self.note("Skills", "Another background job is running; try again when it finishes.");
-                    }
-                } else {
-                    let result = skills::management::command(
-                        &app.layout,
-                        &app.config.skills.registries,
-                        words,
-                        &std::sync::atomic::AtomicBool::new(false),
-                        &mut |_: &str| {},
-                    );
-                    match result {
-                        Ok(text) => self.note("Skills", text),
-                        Err(error) => self.note("Skills", format!("{error:#}")),
-                    }
-                }
-                self.refresh_commands(app);
-            }
+            "skills" => self.skills_command(app, args),
             "laya" => {
                 if matches!(args, "on" | "off") {
-                    let enabled = args == "on";
-                    let step = self.persist(
-                        app,
-                        agent,
-                        &[Change::Set {
-                            path: "laya.enabled".into(),
-                            value: toml::Value::Boolean(enabled),
-                        }],
-                        Scope::Project,
-                    )?;
-                    self.note("Laya",if enabled {"Decision advice enabled for this project. /laya check probes Dial's managed service."} else {"Decision advice disabled for this project. The managed service can shut down when idle."});
-                    return Ok(step);
+                    return self.laya_toggle(app, Some(agent), args == "on");
                 }
                 if !matches!(args, "" | "status" | "check" | "start") {
                     self.note("Laya", "Usage: /laya status | check | start | on | off");
@@ -741,48 +668,8 @@ impl Shell {
                     }
                 }
             }
-            "code-history" => {
-                use crate::tools::knowledge::history::{self, ChangeHistory, Request};
-                if !(app.config.codebase.enabled && app.config.codebase.history) {
-                    self.note("Code history", "Code history is off. Turn it on in /settings → Project understanding → Code change history (codebase.history).");
-                    return Ok(Step::Done);
-                }
-                let request = match history::parse_request(args) {
-                    Ok(request) => request,
-                    Err(usage) => {
-                        self.note("Code history", usage);
-                        return Ok(Step::Done);
-                    }
-                };
-                if request == Request::Clear
-                    && self.ask("Clear code history", "Delete every recorded diff for this project? Files are not changed.", &[("Clear code history", 'y'), ("Keep it", 'n')]) != Some(0)
-                {
-                    return Ok(Step::Done);
-                }
-                let text = ChangeHistory::open(&app.layout).and_then(|store| match request {
-                    Request::Search { query, path, branch } => {
-                        let found = store.search(&query, path.as_deref(), branch.as_deref(), 30)?;
-                        Ok(format!("{}\n/code-history show <id> prints a diff · filter with path:<file|dir> branch:<name>", history::render_list(&found)))
-                    }
-                    Request::Show(id) => Ok(match store.show(id)? {
-                        Some((version, diff)) => history::render_version(&version, &diff),
-                        None => format!("No recorded version #{id}."),
-                    }),
-                    Request::Clear => Ok(format!("Cleared {} recorded versions.", store.clear()?)),
-                });
-                self.note("Code history", text.unwrap_or_else(|error| format!("{error:#}")));
-            }
-            "understanding" if args == "clear" => {
-                let result = crate::tools::knowledge::codebase::Codebase::open(&app.layout)
-                    .and_then(|cache| cache.clear_architecture());
-                match result {
-                    Ok(removed) => self.note(
-                        "Understanding",
-                        format!("Cleared saved architecture synthesis ({removed} records)."),
-                    ),
-                    Err(error) => self.note("Understanding", format!("error: {error:#}")),
-                }
-            }
+            "code-history" => self.code_history(app, args),
+            "understanding" if args == "clear" => self.understanding_clear(app),
             "understanding" if args == "build" => {
                 app.interrupt.store(false, Ordering::SeqCst);
                 if !self.wait_compute(app)? || !self.prepare_local(app)? {
@@ -1021,35 +908,7 @@ impl Shell {
                     format!("mode: {mode} · {meaning}\nChange it with /approval ask|write|auto|readonly or Shift+Tab."),
                 );
             }
-            "outcome" => {
-                let (score, comment) = args
-                    .split_once(char::is_whitespace)
-                    .map_or((args, ""), |(score, comment)| (score, comment.trim()));
-                match (
-                    score.parse::<f64>().ok(),
-                    self.last_trajectory,
-                    app.store.as_ref(),
-                ) {
-                    (Some(score), Some(trajectory), Some(store)) => {
-                        let outcome = Outcome {
-                            trajectory,
-                            score,
-                            source: "user".into(),
-                            reference: (!comment.is_empty()).then(|| comment.to_owned()),
-                        };
-                        match store.outcome(&outcome) {
-                            Ok(()) => {
-                                self.note("Outcome", format!("recorded {score} for trajectory {trajectory}"));
-                                self.start_live_monitor("Outcome", app.config.clone());
-                            }
-                            Err(error) => self.transcript.error(&format!("{error:#}")),
-                        }
-                    }
-                    (None, _, _) => self.note("Outcome", Self::OUTCOME_USAGE),
-                    (_, None, _) => self.note("Outcome", "No completed turn to score yet. Finish a turn, then rate it with /outcome <0-100>."),
-                    (_, _, None) => self.note("Outcome", TEACH_OFF),
-                }
-            }
+            "outcome" => self.outcome_command(app, args),
             other if other.starts_with("skill:") => {
                 let skill = &other["skill:".len()..];
                 let known = skills::discover(&app.layout)

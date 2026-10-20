@@ -155,6 +155,19 @@ impl Seen {
         (pos <= b).then_some((pos, b))
     }
 
+    fn unseen_ranges(&self, a: usize, b: usize) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut pos = a;
+        while pos <= b {
+            let Some((lo, hi)) = self.first_unseen(pos, b) else {
+                break;
+            };
+            ranges.push((lo, hi));
+            pos = hi + 1;
+        }
+        ranges
+    }
+
     fn flags(&self, len: usize) -> Vec<bool> {
         let mut flags = vec![false; len];
         for &(a, b) in &self.0 {
@@ -1399,8 +1412,8 @@ struct Job {
     base: Vec<String>,
     seen: Seen,
     enforce_seen: bool,
-    /// The unseen range that last blocked an anchor, for [`show_unseen`].
-    unseen: Option<(usize, usize)>,
+    /// All unseen ranges blocked during anchor preflight, for [`show_unseen`].
+    unseen: Vec<(usize, usize)>,
     original: super::edit_transaction::Original,
     syntactic_blocks: Option<std::collections::BTreeMap<usize, Result<usize, String>>>,
     carrier: Option<super::edit_source::Carrier>,
@@ -1428,8 +1441,10 @@ impl Job {
         if !self.enforce_seen {
             return Ok(());
         }
-        self.unseen = self.seen.first_unseen(a, b);
-        match self.unseen {
+        let ranges = self.seen.unseen_ranges(a, b);
+        let first = ranges.first().copied();
+        self.unseen.extend(ranges);
+        match first {
             None => Ok(()),
             Some((x, y)) => Err(format!(
                 "{}#{}: lines {} have not been shown by a read; read `{}:{x}-{y}` first (anchors may only touch lines you have seen)",
@@ -1547,7 +1562,7 @@ fn load_job(
         base,
         seen: snap.seen.clone(),
         enforce_seen: ws.edit_settings.enforce_seen_lines,
-        unseen: None,
+        unseen: Vec::new(),
         original,
         syntactic_blocks,
         carrier: Some(carrier),
@@ -1759,31 +1774,52 @@ fn mismatch_error(
     )
 }
 
-/// An anchor on unseen lines costs a read and a retry. When the snapshot is current, show those
-/// lines in the error and count them as read, so the re-issued edit needs no separate read. Nothing
-/// is written either way; the model still sees the lines before it edits them.
+/// Show all unread anchor ranges together, without allowing the rejected patch to write.
+/// Only complete, displayed rows become witnesses; oversized previews require an explicit read.
 fn show_unseen(job: &mut Job, store: &mut EditStore, error: String) -> String {
-    let Some(range) = job.unseen.take() else {
+    let ranges = Seen::from_ranges(&std::mem::take(&mut job.unseen)).0;
+    if ranges.is_empty() {
         return error;
-    };
+    }
     let Some(raw_revision) = store.snapshot(&job.abs, &job.tag).map(|s| s.raw_revision) else {
         return error;
     };
     if job.stale {
         return error;
     }
-    let (rows, shown) = preview_rows(&job.cur, &[range], 0, MISMATCH_MAX_ROWS);
+    let (rows, shown) = preview_rows(&job.cur, &ranges, 0, MISMATCH_MAX_ROWS);
     store.record_version(&job.abs, &job.cur_lf, raw_revision, &shown);
-    let (x, y) = range;
+    let spans = ranges
+        .iter()
+        .map(|&(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}-{b}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let displayed = Seen::from_ranges(&shown);
+    let complete = ranges
+        .iter()
+        .all(|&(a, b)| displayed.first_unseen(a, b).is_none());
+    let next = if complete {
+        format!(
+            "All unread anchor lines are shown below and now count as read; check them, then re-issue the edit against [{rel}#{tag}].",
+            rel = job.rel,
+            tag = job.tag
+        )
+    } else {
+        format!(
+            "Only complete lines shown below now count as read. Before retrying, read the remaining affected ranges: `{rel}:{spans}` (ranges use snapshot numbering).",
+            rel = job.rel
+        )
+    };
     format!(
-        "{rel}#{tag}: lines {span} have not been shown by a read, so nothing was written. They are shown below and now count as read; check them, then re-issue the edit against [{rel}#{tag}].\n[{rel}#{tag}]\n{rows}",
+        "{rel}#{tag}: lines {spans} have not been shown by a read, so nothing was written. {next}\n[{rel}#{tag}]\n{rows}",
         rel = job.rel,
         tag = job.tag,
-        span = if x == y {
-            x.to_string()
-        } else {
-            format!("{x}-{y}")
-        },
     )
 }
 
@@ -1991,8 +2027,9 @@ pub(crate) fn edit_with(
         ..Registers::default()
     };
     let mut jobs: Vec<Job> = Vec::new();
-    for (abs, sec) in resolved {
-        let ji = match jobs.iter().position(|j| j.abs == abs) {
+    let mut section_jobs = Vec::with_capacity(resolved.len());
+    for (abs, sec) in &resolved {
+        let ji = match jobs.iter().position(|j| j.abs == *abs) {
             Some(i) => {
                 if jobs[i].tag != sec.tag {
                     return Err(format!(
@@ -2003,11 +2040,51 @@ pub(crate) fn edit_with(
                 i
             }
             None => {
-                let anchors = block_anchors.get(&abs).map_or(&[][..], Vec::as_slice);
-                jobs.push(load_job(ws, &store, sec, abs, anchors)?);
+                let anchors = block_anchors.get(abs).map_or(&[][..], Vec::as_slice);
+                jobs.push(load_job(ws, &store, sec, abs.clone(), anchors)?);
                 jobs.len() - 1
             }
         };
+        section_jobs.push(ji);
+    }
+
+    // Validate every anchor before resolving registers or staging edits. Otherwise each retry
+    // reveals just the next unread range (and a CUT can hide later blockers behind a register).
+    let mut failures: Vec<Vec<String>> = vec![Vec::new(); jobs.len()];
+    let mut unseen_failures: Vec<Option<String>> = vec![None; jobs.len()];
+    for ((_, sec), &ji) in resolved.iter().zip(&section_jobs) {
+        let job = &mut jobs[ji];
+        for op in &sec.ops {
+            let anchor = match &op.kind {
+                OpKind::Put { anchor, .. } | OpKind::Cut { anchor, .. } => anchor,
+            };
+            let unseen_before = job.unseen.len();
+            if let Err(error) = resolve_anchor(job, anchor) {
+                let error = format!("line {}: {error}", op.line_no);
+                if job.unseen.len() > unseen_before {
+                    unseen_failures[ji].get_or_insert(error);
+                } else {
+                    failures[ji].push(error);
+                }
+            }
+        }
+        job.warnings.clear(); // Actual execution emits fallback warnings once.
+    }
+    if failures.iter().any(|errors| !errors.is_empty())
+        || unseen_failures.iter().any(Option::is_some)
+    {
+        let mut errors = Vec::new();
+        for ((job, failures), unseen_failure) in jobs.iter_mut().zip(failures).zip(unseen_failures)
+        {
+            errors.extend(failures);
+            if let Some(error) = unseen_failure {
+                errors.push(show_unseen(job, &mut store, error));
+            }
+        }
+        return Err(errors.join("\n\n"));
+    }
+
+    for ((_, sec), &ji) in resolved.iter().zip(&section_jobs) {
         if sec.rem {
             jobs[ji].rem = true;
         }

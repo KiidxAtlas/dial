@@ -5,6 +5,42 @@ impl Terminal for () {
 impl Terminal for u32 {
     fn prevent_completion(&mut self, _: &str) {}
 }
+
+#[test]
+fn first_failure_preserves_the_diagnostic_and_adds_recovery_for_any_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    for (name, output) in [
+        ("read", ToolOutput::err("missing file: a.rs")),
+        (
+            "custom-mcp-tool",
+            ToolOutput::err("remote service unavailable"),
+        ),
+        (
+            "write",
+            ToolOutput::err("partial commit").with_effects(Effects::Unknown),
+        ),
+    ] {
+        let call = ToolCall {
+            id: "first".into(),
+            name: name.into(),
+            arguments: serde_json::json!({}),
+            malformed_arguments: false,
+        };
+        let mut engine = Engine::default();
+        let diagnostic = output.text.clone();
+        let mut output = output;
+        let (_, _, stop) = engine.settle(&workspace, &call, &mut output, false, false, |_| false);
+        assert!(output.text.starts_with(&diagnostic));
+        assert!(
+            output
+                .text
+                .contains(crate::agent::run::failure_guidance::DIAGNOSE_FIRST)
+        );
+        assert!(output.text.contains("[Dial recovery:"));
+        assert_eq!(stop.is_some(), output.execution.effects == Effects::Unknown);
+    }
+}
 #[test]
 fn shared_driver_cannot_publish_a_completed_report_after_uncertain_effects() {
     let dir = tempfile::tempdir().unwrap();

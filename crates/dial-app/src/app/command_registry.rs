@@ -232,8 +232,9 @@ pub(super) const STOPS_TURN: &[&str] = &[
     "plan",
 ];
 
-/// Commands that run at once while a turn runs, without stopping it (see `live_command` and
-/// `commands::run_live`). `/help` and the palette read this list too.
+/// Commands that run at once while a turn runs, without stopping it (see `live_command`,
+/// `commands::run_live` and `commands::run_settings`). Settings they save land at once; the agent
+/// adopts them when the turn finishes. `/help` and the palette read this list too.
 pub(super) const RUNS_NOW: &[&str] = &[
     "help",
     "hotkeys",
@@ -265,6 +266,18 @@ pub(super) const RUNS_NOW: &[&str] = &[
     "logout",
     "stats",
     "changelog",
+    "fast",
+    "slow",
+    "extended-context",
+    "modelpreset",
+    "ssh",
+    "checks",
+    "plugins",
+    "reload-plugins",
+    "effort",
+    "theme",
+    "profile",
+    "outcome",
 ];
 
 /// Subcommands that run at once while a turn runs; the command itself is not in [`RUNS_NOW`].
@@ -273,6 +286,8 @@ pub(super) const RUNS_NOW_ARGS: &[&str] = &[
     "improve jobs",
     "improve stop",
     "computer status",
+    "computer on",
+    "computer off",
     "security plan",
     "security status",
     "security cancel",
@@ -287,13 +302,13 @@ pub(super) const RUNS_NOW_ARGS: &[&str] = &[
     "collab list",
     "collab stop",
     "collab abort",
-    "fast status",
-    "slow status",
-    "extended-context status",
-    "modelpreset list",
-    "ssh list",
-    "checks list",
     "mcp list",
+    "mcp help",
+    "mcp add",
+    "mcp remove",
+    "mcp enable",
+    "mcp disable",
+    "mcp reload",
     "mcp test",
     "mcp login",
     "mcp logout",
@@ -301,10 +316,14 @@ pub(super) const RUNS_NOW_ARGS: &[&str] = &[
     "mcp prompts",
     "mcp notifications",
     "mcp smithery-logout",
-    "plugins list",
     "setup list",
     "setup <id>",
     "setup embeddings",
+    "laya on",
+    "laya off",
+    "code-history search",
+    "code-history show",
+    "understanding clear",
 ];
 
 /// Built-ins always win at dispatch, so a custom command with a built-in's name is never offered.
@@ -392,7 +411,7 @@ pub(super) fn during_turn_note(name: &str) -> &'static str {
         .iter()
         .any(|line| line.split_whitespace().next() == Some(name))
     {
-        "Listings and status run now; changes run after the current turn finishes."
+        "Some forms run now; the rest run after the current turn finishes."
     } else {
         "Runs after the current turn finishes."
     }

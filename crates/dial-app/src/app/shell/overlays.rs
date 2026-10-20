@@ -129,15 +129,7 @@ impl Shell {
         fresh: Config,
     ) -> Step {
         let fresh = fresh.for_coding();
-        self.ui = fresh.ui.clone();
-        self.composer.set_history_limit(fresh.ui.history_limit);
-        self.composer.set_word_completion(fresh.ui.word_completion);
-        let themes = ThemeManager::new(&app.layout.user_dir, &fresh.ui, self.dark);
-        if let Some(error) = themes.last_error() {
-            self.note("Theme", format!("{error}; keeping last good theme"));
-        } else {
-            self.themes = themes;
-        }
+        self.apply_display(app, &fresh);
         if fresh.approval != self.cfg_approval {
             self.cfg_approval = fresh.approval;
             agent.set_approval(fresh.approval);
@@ -146,6 +138,19 @@ impl Shell {
             Step::Rebuild(Box::new(fresh))
         } else {
             Step::Done
+        }
+    }
+
+    /// The settings the shell itself draws with (UI, composer, theme); safe during a turn.
+    pub(in crate::app) fn apply_display(&mut self, app: &App, fresh: &Config) {
+        self.ui = fresh.ui.clone();
+        self.composer.set_history_limit(fresh.ui.history_limit);
+        self.composer.set_word_completion(fresh.ui.word_completion);
+        let themes = ThemeManager::new(&app.layout.user_dir, &fresh.ui, self.dark);
+        if let Some(error) = themes.last_error() {
+            self.note("Theme", format!("{error}; keeping last good theme"));
+        } else {
+            self.themes = themes;
         }
     }
 

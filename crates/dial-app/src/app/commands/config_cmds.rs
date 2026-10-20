@@ -116,10 +116,12 @@ pub(super) const COMMANDS: &[super::CommandSpec] = &[
     },
 ];
 
-pub(super) fn run(
+/// Every form of these commands, including the ones that save settings. `agent` is `None` during
+/// a turn: the write lands at once and the agent adopts it when the turn finishes.
+pub(super) fn run_settings(
     shell: &mut Shell,
     app: &App,
-    agent: &mut Agent<'_>,
+    agent: Option<&mut Agent<'_>>,
     name: &str,
     args: &str,
 ) -> Option<Result<Step>> {
@@ -143,13 +145,14 @@ pub(super) fn run_live(
     name: &str,
     args: &str,
 ) -> Option<Result<Step>> {
+    let config = shell.settings_config(app).clone();
     let result = match (name, args) {
         ("fast" | "slow", "status") => {
-            let provider = app.config.selection().provider;
+            let provider = config.selection().provider;
             let (title, plan) = if name == "fast" {
-                ("Fast", fast_plan(&app.config, &provider, args))
+                ("Fast", fast_plan(&config, &provider, args))
             } else {
-                ("Slow", slow_plan(&app.config, &provider, args))
+                ("Slow", slow_plan(&config, &provider, args))
             };
             plan.map(|plan| {
                 shell.note(title, plan.note);
@@ -157,16 +160,12 @@ pub(super) fn run_live(
             })
         }
         ("extended-context", "status") => {
-            let state = if app.config.extended_context {
-                "on"
-            } else {
-                "off"
-            };
+            let state = if config.extended_context { "on" } else { "off" };
             shell.note("Extended context", format!("Extended context is {state}."));
             Ok(Step::Done)
         }
         ("modelpreset", "" | "list") => {
-            let presets = &app.config.model_presets;
+            let presets = &config.model_presets;
             let text = if presets.is_empty() {
                 "No model presets saved. Use /modelpreset save <name> to create one.".to_owned()
             } else {
@@ -182,7 +181,7 @@ pub(super) fn run_live(
         ("ssh", "" | "list") => {
             let text = format!(
                 "{}\n\nAdd a host with /ssh add <name> --host <host>.",
-                ssh_list(&app.config)
+                ssh_list(&config)
             );
             shell.note("SSH", text);
             Ok(Step::Done)
@@ -192,7 +191,7 @@ pub(super) fn run_live(
             Ok(Step::Done)
         }
         ("checks", "" | "list") => {
-            shell.note("Checks", checks_list(&app.config));
+            shell.note("Checks", checks_list(&config));
             Ok(Step::Done)
         }
         ("checks", "help") => {
@@ -353,7 +352,7 @@ fn slow_plan(config: &Config, provider: &str, args: &str) -> Result<TierPlan> {
 fn apply_tier_plan(
     shell: &mut Shell,
     app: &App,
-    agent: &mut Agent<'_>,
+    agent: Option<&mut Agent<'_>>,
     title: &str,
     plan: TierPlan,
 ) -> Result<Step> {
@@ -361,31 +360,33 @@ fn apply_tier_plan(
         shell.note(title, plan.note);
         return Ok(Step::Done);
     }
-    let step = shell.persist(app, agent, &plan.changes, Scope::Global)?;
+    let step = shell.save(app, agent, &plan.changes, Scope::Global)?;
     shell.note(title, plan.note);
     Ok(step)
 }
 
-fn fast(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
-    let provider = app.config.selection().provider;
-    let plan = fast_plan(&app.config, &provider, args)?;
+fn fast(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) -> Result<Step> {
+    let config = shell.settings_config(app);
+    let provider = config.selection().provider;
+    let plan = fast_plan(config, &provider, args)?;
     apply_tier_plan(shell, app, agent, "Fast", plan)
 }
 
-fn slow(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
-    let provider = app.config.selection().provider;
-    let plan = slow_plan(&app.config, &provider, args)?;
+fn slow(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) -> Result<Step> {
+    let config = shell.settings_config(app);
+    let provider = config.selection().provider;
+    let plan = slow_plan(config, &provider, args)?;
     apply_tier_plan(shell, app, agent, "Slow", plan)
 }
 
 fn extended_context(
     shell: &mut Shell,
     app: &App,
-    agent: &mut Agent<'_>,
+    agent: Option<&mut Agent<'_>>,
     args: &str,
 ) -> Result<Step> {
     const TITLE: &str = "Extended context";
-    let current = app.config.extended_context;
+    let current = shell.settings_config(app).extended_context;
     let (enabled, reply) = match args.trim() {
         "" | "toggle" => {
             let enabled = !current;
@@ -401,7 +402,7 @@ fn extended_context(
         "off" => (false, "Extended context disabled.".to_owned()),
         other => bail!("Usage: /extended-context [on|off|status] (got {other:?})"),
     };
-    let step = shell.persist(
+    let step = shell.save(
         app,
         agent,
         &[Change::Set {
@@ -420,8 +421,14 @@ fn valid_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn modelpreset(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+fn modelpreset(
+    shell: &mut Shell,
+    app: &App,
+    agent: Option<&mut Agent<'_>>,
+    args: &str,
+) -> Result<Step> {
     const TITLE: &str = "Model preset";
+    let config = shell.settings_config(app);
     let trimmed = args.trim();
     let (sub, rest) = match trimmed.split_once(char::is_whitespace) {
         Some((sub, rest)) => (sub, rest.trim()),
@@ -435,9 +442,8 @@ fn modelpreset(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) 
                 );
             }
             let preset = ModelPreset {
-                roles: app.config.model_roles.clone(),
-                thinking: app
-                    .config
+                roles: config.model_roles.clone(),
+                thinking: config
                     .active_model_profile()
                     .and_then(|profile| profile.reasoning_effort),
             };
@@ -445,12 +451,12 @@ fn modelpreset(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) 
                 path: format!("model_presets.{rest}"),
                 value: toml::Value::try_from(&preset)?,
             };
-            let step = shell.persist(app, agent, &[change], Scope::Global)?;
+            let step = shell.save(app, agent, &[change], Scope::Global)?;
             shell.note(TITLE, format!("Saved model preset \"{rest}\"."));
             Ok(step)
         }
         "switch" => {
-            let Some(preset) = app.config.model_presets.get(rest) else {
+            let Some(preset) = config.model_presets.get(rest) else {
                 shell.note(TITLE, format!("Preset not found: {rest}"));
                 return Ok(Step::Done);
             };
@@ -459,10 +465,9 @@ fn modelpreset(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) 
                 value: toml::Value::try_from(&preset.roles)?,
             }];
             if let Some(effort) = preset.thinking
-                && let Some(active) = app.config.active_model_profile()
+                && let Some(active) = config.active_model_profile()
             {
-                let profile_name = app
-                    .config
+                let profile_name = config
                     .model_profiles
                     .iter()
                     .find(|(_, profile)| std::ptr::eq(*profile, active))
@@ -473,7 +478,7 @@ fn modelpreset(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) 
                     value: toml::Value::try_from(effort)?,
                 });
             }
-            let step = shell.persist(app, agent, &changes, Scope::Global)?;
+            let step = shell.save(app, agent, &changes, Scope::Global)?;
             shell.note(TITLE, format!("Switched to model preset \"{rest}\"."));
             Ok(step)
         }
@@ -486,11 +491,11 @@ fn modelpreset(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) 
             {
                 bail!("Preset {rest} is defined in the project config; delete it there.");
             }
-            if !app.config.model_presets.contains_key(rest) {
+            if !config.model_presets.contains_key(rest) {
                 shell.note(TITLE, format!("Preset not found: {rest}"));
                 return Ok(Step::Done);
             }
-            let step = shell.persist(
+            let step = shell.save(
                 app,
                 agent,
                 &[Change::Remove {
@@ -562,7 +567,7 @@ fn report_text(report: &UsageReport) -> String {
 
 const SSH_USAGE: &str = "Usage: /ssh [list|add <name> --host <host> [--user <user>] [--port <port>] [--key <path>] [--scope project|user]|remove <name> [--scope project|user]|help]";
 
-fn ssh(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+fn ssh(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) -> Result<Step> {
     const TITLE: &str = "SSH";
     let trimmed = args.trim();
     let (sub, rest) = match trimmed.split_once(char::is_whitespace) {
@@ -572,23 +577,23 @@ fn ssh(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
     match sub {
         "add" => {
             let (name, host, scope) = parse_ssh_add(rest)?;
-            if app.config.ssh_hosts.contains_key(&name) {
+            if shell.settings_config(app).ssh_hosts.contains_key(&name) {
                 bail!("SSH host {name} already exists; remove it first.");
             }
             let change = Change::Set {
                 path: format!("ssh_hosts.{name}"),
                 value: toml::Value::try_from(&host)?,
             };
-            let step = shell.persist(app, agent, &[change], scope)?;
+            let step = shell.save(app, agent, &[change], scope)?;
             shell.note(TITLE, format!("Added SSH host {name}."));
             Ok(step)
         }
         "remove" => {
             let (name, scope) = parse_ssh_remove(rest)?;
-            if !app.config.ssh_hosts.contains_key(&name) {
+            if !shell.settings_config(app).ssh_hosts.contains_key(&name) {
                 bail!("SSH host not found: {name}");
             }
-            let step = shell.persist(
+            let step = shell.save(
                 app,
                 agent,
                 &[Change::Remove {
@@ -635,7 +640,7 @@ fn ssh_list(config: &Config) -> String {
 
 const CHECKS_USAGE: &str = "Usage: /checks [list|add <name> [--ext rs,py] [--timeout secs] -- <command>|remove <name>|help]";
 
-fn checks(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+fn checks(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) -> Result<Step> {
     const TITLE: &str = "Checks";
     let trimmed = args.trim();
     let (sub, rest) = match trimmed.split_once(char::is_whitespace) {
@@ -656,7 +661,7 @@ fn checks(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Re
             }
             let mut commands = project_checks(app)?;
             commands.push(toml::Value::try_from(&check)?);
-            let step = shell.persist(
+            let step = shell.save(
                 app,
                 agent,
                 &[Change::Set {
@@ -681,7 +686,7 @@ fn checks(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Re
                     "no check named {name} in the project config; checks from the user config must be removed from that file"
                 );
             }
-            let step = shell.persist(
+            let step = shell.save(
                 app,
                 agent,
                 &[Change::Set {

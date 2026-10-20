@@ -95,27 +95,42 @@ pub(super) fn run(
     app: &App,
     agent: &mut Agent<'_>,
     name: &str,
-    args: &str,
 ) -> Option<Result<Step>> {
     let title = match name {
-        "mcp" => "MCP",
         "tools" => "Tools",
         "extensions" => "Extensions",
-        "plugins" | "plugin" => "Plugins",
-        "reload-plugins" => "Plugins",
         _ => return None,
     };
     let result = match name {
-        "mcp" => mcp(shell, app, agent, args),
         "tools" => {
             shell.note(title, tools_report(agent));
             Ok(Step::Done)
         }
-        "extensions" => shell.open(app, agent, Which::Extensions),
-        "plugins" | "plugin" => plugins(shell, app, args),
+        _ => shell.open(app, agent, Which::Extensions),
+    };
+    Some(noted(shell, title, result))
+}
+
+/// `/mcp`, `/plugins` and `/reload-plugins` forms that change settings or ask for a rebuild.
+/// `agent` is `None` during a turn: writes land at once and the rebuild waits for the turn's end.
+pub(super) fn run_settings(
+    shell: &mut Shell,
+    app: &App,
+    agent: Option<&mut Agent<'_>>,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    let (title, result) = match name {
+        "mcp" if !split_subcommand(args).0.starts_with("smithery-") => {
+            ("MCP", mcp(shell, app, agent, args))
+        }
+        "plugins" | "plugin" => ("Plugins", plugins(shell, app, args)),
         "reload-plugins" => {
-            shell.note(title, "Reloading plugins.");
-            Ok(Step::Rebuild(Box::new(app.config.clone())))
+            shell.note("Plugins", "Reloading plugins.");
+            (
+                "Plugins",
+                Ok(Step::Rebuild(Box::new(shell.settings_config(app).clone()))),
+            )
         }
         _ => return None,
     };
@@ -194,19 +209,20 @@ pub(super) fn completions(config: &Config) -> Vec<String> {
 
 // ---- /mcp ----------------------------------------------------------------------------------
 
-fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+fn mcp(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) -> Result<Step> {
     let (sub, rest) = split_subcommand(args);
+    let config = shell.settings_config(app).clone();
     match sub {
         "add" => {
             let (name, server, scope) = parse_mcp_add(rest)?;
-            if app.config.mcp.contains_key(&name) {
+            if config.mcp.contains_key(&name) {
                 bail!("MCP server {name} already exists; remove it first.");
             }
             let change = Change::Set {
                 path: format!("mcp.{name}"),
                 value: toml::Value::try_from(&server)?,
             };
-            let step = shell.persist(app, agent, &[change], scope)?;
+            let step = shell.save(app, agent, &[change], scope)?;
             shell.note(
                 "MCP",
                 format!("Added MCP server {name}. It takes effect at the next rebuild; the check below uses a temporary connection."),
@@ -215,8 +231,8 @@ fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
             Ok(step)
         }
         "remove" => {
-            let name = existing_server(&app.config, rest, "remove")?;
-            let step = shell.persist(
+            let name = existing_server(&config, rest, "remove")?;
+            let step = shell.save(
                 app,
                 agent,
                 &[Change::Remove {
@@ -228,9 +244,9 @@ fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
             Ok(step)
         }
         "enable" | "disable" => {
-            let name = existing_server(&app.config, rest, sub)?;
+            let name = existing_server(&config, rest, sub)?;
             let enabled = sub == "enable";
-            let step = shell.persist(
+            let step = shell.save(
                 app,
                 agent,
                 &[Change::Set {
@@ -257,22 +273,23 @@ fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
 /// connections, sign-in and sign-out. `None` leaves the subcommand to [`mcp`].
 fn mcp_live(shell: &mut Shell, app: &App, args: &str) -> Option<Result<Step>> {
     let (sub, rest) = split_subcommand(args);
+    let config = shell.settings_config(app).clone();
     let result = match sub {
         "" | "list" => {
-            shell.note("MCP", mcp_list(&app.config));
+            shell.note("MCP", mcp_list(&config));
             Ok(Step::Done)
         }
         "help" => {
             shell.note("MCP", MCP_HELP);
             Ok(Step::Done)
         }
-        "test" => existing_server(&app.config, rest, "test").map(|name| {
-            test_server(shell, app, name.to_owned(), app.config.mcp[name].clone());
+        "test" => existing_server(&config, rest, "test").map(|name| {
+            test_server(shell, app, name.to_owned(), config.mcp[name].clone());
             Step::Done
         }),
-        "login" => existing_server(&app.config, rest, "login").map(|name| {
-            let server = app.config.mcp[name].clone();
-            let user_dir = app.config.user_dir.clone();
+        "login" => existing_server(&config, rest, "login").map(|name| {
+            let server = config.mcp[name].clone();
+            let user_dir = config.user_dir.clone();
             let owned = name.to_owned();
             spawn_job(shell, "MCP login", move |cancel| {
                 let ui = BannerInteraction { id: "mcp" };
@@ -280,7 +297,7 @@ fn mcp_live(shell: &mut Shell, app: &App, args: &str) -> Option<Result<Step>> {
             });
             Step::Done
         }),
-        "logout" | "unauth" => existing_server(&app.config, rest, sub).and_then(|name| {
+        "logout" | "unauth" => existing_server(&config, rest, sub).and_then(|name| {
             let removed = crate::tools::integrations::mcp::logout(&app.config.user_dir, name)?;
             shell.note(
                 "MCP",
@@ -623,7 +640,7 @@ fn plugins(shell: &mut Shell, app: &App, args: &str) -> Result<Step> {
                     if enabled { "Enabled" } else { "Disabled" }
                 ),
             );
-            Ok(Step::Rebuild(Box::new(app.config.clone())))
+            Ok(Step::Rebuild(Box::new(shell.settings_config(app).clone())))
         }
         "help" => {
             shell.note(
@@ -952,7 +969,13 @@ pub(super) fn spawn_job_streaming(
     shell.note_pending(label);
 }
 
-fn reload_runtime(shell: &mut Shell, app: &App, agent: &mut Agent<'_>) -> Step {
+fn reload_runtime(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>) -> Step {
+    let Some(agent) = agent else {
+        // During a turn: anything changed is held for the turn's end (`adopt_after_turn`).
+        shell.refresh_resources(app, true, true);
+        shell.note("MCP", "Reconnects when the current turn finishes.");
+        return Step::Done;
+    };
     shell.refresh_resources(app, true, false);
     if let Some(config) = shell.pending_config.take() {
         return shell.config_changed(app, agent, config);

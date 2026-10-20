@@ -129,26 +129,8 @@ impl Shell {
                         self.note(provider, message);
                         crate::app::commands::smithery::resume(self, app, agent)?
                     }
-                    Ok(message) if message.is_empty() => {
-                        if self.transcript.job_waiting(provider) {
-                            self.transcript.notice_merge(provider, "Done.");
-                        }
-                        Step::Done
-                    }
-                    // Streamed output already said everything; a bare "Finished." adds nothing.
-                    Ok(message)
-                        if message == "Finished."
-                            && self.transcript.notice_has_output(provider) =>
-                    {
-                        Step::Done
-                    }
                     result => {
-                        match result {
-                            Ok(message) => self.transcript.notice_merge(provider, &message),
-                            Err(error) => self
-                                .transcript
-                                .notice_merge(provider, &format!("{error:#}")),
-                        }
+                        self.report_job_result(provider, result);
                         Step::Done
                     }
                 };

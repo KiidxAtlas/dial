@@ -2,6 +2,7 @@
 
 use crate::agent::Agent;
 use crate::app::core::App;
+use crate::app::display::config_key;
 use crate::app::drive::Step;
 use crate::app::overlay::{ActiveOverlay, start_streaming_job};
 use crate::app::shell::Shell;
@@ -9,6 +10,25 @@ use crate::config::settings_store::{Change, Scope};
 use crate::config::types::Config;
 use crate::storage::store::Store;
 use anyhow::Result;
+
+/// The command view stays ahead of the immutable config borrowed by a running agent.
+pub(in crate::app) fn settings_config<'a>(
+    active: &'a Config,
+    pending: &'a Option<Config>,
+) -> &'a Config {
+    pending.as_ref().unwrap_or(active)
+}
+
+/// A write that returns to the active config must discard an earlier pending change.
+pub(in crate::app) fn stage_settings(
+    active: &Config,
+    pending: &mut Option<Config>,
+    fresh: Config,
+) -> bool {
+    let changed = config_key(&fresh) != config_key(active);
+    *pending = changed.then_some(fresh);
+    changed
+}
 
 impl Shell {
     pub(in crate::app) fn note(&mut self, title: &str, text: impl AsRef<str>) {
@@ -77,5 +97,48 @@ impl Shell {
         app.save_settings(scope, changes, None)?;
         let fresh = app.reload()?;
         Ok(self.config_changed(app, agent, fresh))
+    }
+
+    /// Settings commands plan against the latest saved snapshot, not the config borrowed by
+    /// the running agent. This also lets a later command find entries saved during this turn.
+    pub(in crate::app) fn settings_config<'a>(&'a self, app: &'a App) -> &'a Config {
+        settings_config(&app.config, &self.pending_config)
+    }
+
+    /// [`Shell::persist`] when the agent is at hand (idle). During a turn (`None`) the write lands
+    /// now and display settings apply now; the agent adopts the rest when the turn finishes.
+    pub(crate) fn save(
+        &mut self,
+        app: &App,
+        agent: Option<&mut Agent<'_>>,
+        changes: &[Change],
+        scope: Scope,
+    ) -> Result<Step> {
+        if let Some(agent) = agent {
+            return self.persist(app, agent, changes, scope);
+        }
+        app.save_settings(scope, changes, None)?;
+        let fresh = app.reload()?.for_coding();
+        self.apply_display(app, &fresh);
+        self.adopt_after_turn(app, Step::Rebuild(Box::new(fresh)));
+        Ok(Step::Done)
+    }
+
+    /// Holds a rebuild that a command asked for during a turn until the turn finishes: a changed
+    /// config through `pending_config`, a same-config rebuild (plugins, resources) through
+    /// `pending_resource_rebuild`. The idle loop applies both at its next boundary.
+    pub(in crate::app) fn adopt_after_turn(&mut self, app: &App, step: Step) {
+        let Step::Rebuild(config) = step else {
+            return;
+        };
+        if stage_settings(&app.config, &mut self.pending_config, *config) {
+            self.note(
+                "Settings",
+                "Saved; the agent adopts it when the current turn finishes.",
+            );
+        } else {
+            self.pending_resource_rebuild = true;
+            self.note("Settings", "Reloads when the current turn finishes.");
+        }
     }
 }

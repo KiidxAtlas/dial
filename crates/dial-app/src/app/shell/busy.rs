@@ -3,7 +3,9 @@
 use crate::app::command_registry::{RUNS_NOW, canonical_command};
 use crate::app::core::App;
 use crate::app::display::{app_home_hint, short};
+use crate::app::drive::Step;
 use crate::app::improve_view::{improve_jobs_text, improve_stop_text};
+use crate::app::overlay::auth::AuthJob;
 use crate::app::overlay::{Which, work_panel};
 use crate::app::shell::Shell;
 use crate::storage::session::Session;
@@ -234,16 +236,82 @@ impl Shell {
             }
             ("archive", args) => self.archive_note(app, args),
             ("changes", "") => self.changes_note(&app.layout.project_root),
+            ("outcome", args) => self.outcome_command(app, args),
+            ("code-history", args) if args.trim() != "clear" => self.code_history(app, args),
+            ("understanding", "clear") => self.understanding_clear(app),
+            ("skills", args) => self.skills_command(app, args),
+            ("theme", args) => {
+                let result = self.theme_command(app, None, args);
+                self.adopt_live(app, "Theme", result);
+            }
+            ("profile", args) => {
+                let result = self.profile_command(app, None, args);
+                self.adopt_live(app, "Profile", result);
+            }
+            ("laya", "on" | "off") => {
+                let result = self.laya_toggle(app, None, args == "on");
+                self.adopt_live(app, "Laya", result);
+            }
             _ => {
                 let name = canonical_command(name);
-                match crate::app::commands::run_live(self, app, name, args) {
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => self.note(name, format!("{error:#}")),
-                    None => return false,
-                }
+                let result = match crate::app::commands::run_live(self, app, name, args) {
+                    Some(result) => result,
+                    None => match crate::app::commands::run_settings(self, app, None, name, args) {
+                        Some(result) => result,
+                        None => return false,
+                    },
+                };
+                self.adopt_live(app, name, result);
             }
         }
         true
+    }
+
+    /// A command run during a turn may ask for a rebuild; hold it for the turn's end.
+    fn adopt_live(&mut self, app: &App, title: &str, result: anyhow::Result<Step>) {
+        match result {
+            Ok(step) => self.adopt_after_turn(app, step),
+            Err(error) => self.note(title, format!("{error:#}")),
+        }
+    }
+
+    /// Background jobs (usage, sign-in, installs) stream progress and report while a turn runs.
+    /// Jobs whose result continues an agent-bound flow wait for the idle loop.
+    pub(in crate::app) fn pump_jobs_during_turn(&mut self, app: &App) {
+        for (label, line) in AuthJob::drain_lines(&mut self.auth_job) {
+            self.transcript.notice_merge(label, &line);
+        }
+        if self
+            .auth_job
+            .as_ref()
+            .is_some_and(|job| matches!(job.label, "Smithery" | "Setup" | "Model"))
+        {
+            return;
+        }
+        if let Some((label, result)) = AuthJob::collect(&mut self.auth_job, app) {
+            self.report_job_result(label, result);
+            self.transcript.settle_job_notices();
+            self.catalog.refresh(app);
+        }
+    }
+
+    /// The transcript report for a finished background job that needs no follow-up.
+    pub(in crate::app) fn report_job_result(
+        &mut self,
+        label: &'static str,
+        result: anyhow::Result<String>,
+    ) {
+        match result {
+            Ok(message) if message.is_empty() => {
+                if self.transcript.job_waiting(label) {
+                    self.transcript.notice_merge(label, "Done.");
+                }
+            }
+            // Streamed output already said everything; a bare "Finished." adds nothing.
+            Ok(message) if message == "Finished." && self.transcript.notice_has_output(label) => {}
+            Ok(message) => self.transcript.notice_merge(label, &message),
+            Err(error) => self.transcript.notice_merge(label, &format!("{error:#}")),
+        }
     }
 
     /// `/archive [sessions|prompts|projects|<project>]`: the user-wide history archive.
