@@ -1,77 +1,145 @@
+<div align="center">
+
 # dial
 
-A local-first coding agent harness for macOS, Linux and Windows (native or through WSL2). Run it in a project directory like any agent CLI. Learning is optional and separate: `dial improve` runs verified practice, harness proposals and local LoRA training behind an external evaluation gate. Ordinary coding sessions do not open a learning store, collect training trajectories, apply learned candidates or launch training/evaluation workers, unless you turn on **Teach this model** for a local model (`/settings` → Model → Learning). Local MLX inference and training require Apple Silicon; Intel Macs and Linux/WSL2 use hosted or OpenAI-compatible providers.
+**A local-first coding agent for your terminal.**
 
-Standalone: no dependency on any external agent harness or hosted service. Rust control plane and tools; Python for local MLX inference/training (`mlx-lm`, plus `mlx-vlm` for vision); GGUF models run through llama.cpp's `llama-server`.
+Run it in any project directory on macOS, Linux or Windows. Use local models (MLX, GGUF, LM Studio,
+Ollama) or hosted providers, with approvals, sandboxing and checkpoints included.
 
-Inspect the executable you are actually running with `dial --version` (compiled revision and
-whether its compiled sources differed from that revision at build time) or `dial --build-info` (JSON including target, profile, build time and
-actual executable path). This does not read runtime configuration or contact a model. Builds
-without Git metadata report `unknown`; release/archive builders can set `DIAL_BUILD_REVISION`
-and `SOURCE_DATE_EPOCH` explicitly. Rebuild/restart to pick up source changes.
+[![CI](https://github.com/KiidxAtlas/dial/actions/workflows/ci.yml/badge.svg)](https://github.com/KiidxAtlas/dial/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/KiidxAtlas/dial?sort=semver)](https://github.com/KiidxAtlas/dial/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-This README is an index. Detailed documentation lives in [`docs/`](docs/) and the module layout,
-dependency boundaries and invariants are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+[Install](#install) · [Quick start](#quick-start) · [Screenshots](#a-look-around) · [Configuration](#configuration-essentials) · [Docs](#documentation)
+
+<img src="docs/images/home.png" alt="Dial's home screen: the dial wordmark, a centered composer asking what are we building, and the active model, project and branch" width="640">
+
+</div>
+
+---
+
+## Why dial
+
+- **Local-first, no lock-in.** You can run entirely on your own machine with MLX on Apple Silicon or
+  GGUF through llama.cpp. Or point Dial at any OpenAI-compatible endpoint, a hosted provider, or a
+  Claude or ChatGPT/Codex subscription. Dial does not depend on any external agent harness or hosted service.
+- **Safe by default.** Edits and commands go through approval modes (`ask`, `write`, `auto`, `readonly`)
+  and an OS sandbox. Checkpoints let you review and undo changes. Hashline edits refuse to change
+  lines the agent has not read.
+- **Verified work.** Dial runs focused checks after changes. It reports what failed and why before
+  retrying, and keeps the evidence (commands, results, diffs) in the transcript.
+- **Keyboard-driven terminal UI.** Steer or queue messages while the agent works, browse its work
+  plan, open the action palette with `Ctrl-P`, and change settings without leaving the session.
+- **Delegation and integrations.** Subagents with typed roles, MCP servers, skills, hooks, SSH,
+  browser and kernel tools, an RPC/ACP interface for editors, and a one-shot print mode for scripts.
+- **Optional learning.** `dial improve` runs verified practice, harness proposals and local LoRA
+  training behind an external evaluation gate. This stays off unless you turn on **Teach this model**
+  for a local model (`/settings` → Model → Learning). Ordinary sessions never open a learning store
+  or collect training data.
+
+## A look around
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/work-evidence.png" alt="A turn showing the user's request, a cargo test run with 18 passed, and the agent's verified answer"><br><sub><b>Evidence in the transcript</b>: commands, results and the conclusion they support.</sub></td>
+<td width="50%"><img src="docs/images/steering.png" alt="While Dial is working, a picker asks whether a new message should steer the task or be queued for after the turn"><br><sub><b>Steer or queue while it works</b>: messages never interrupt a running turn by accident.</sub></td>
+</tr>
+<tr>
+<td><img src="docs/images/work-plan.png" alt="The interactive work plan listing steps with their status"><br><sub><b>Work plan</b>: browse each step's status, blockers and findings (<code>/todo</code>).</sub></td>
+<td><img src="docs/images/palette.png" alt="The action palette listing commands with fuzzy search"><br><sub><b>Action palette</b>: every command, searchable (<code>Ctrl-P</code>).</sub></td>
+</tr>
+<tr>
+<td colspan="2" align="center"><img src="docs/images/settings.png" alt="The settings hub with tabs for Appearance, Interaction, Model, Memory, Tools, Experimental, Voice and Setup" width="720"><br><sub><b>Settings hub</b>: every option, saved globally or per project (<code>/settings</code>, <code>Ctrl-S</code> switches scope).</sub></td>
+</tr>
+</table>
+
+<sub>These screenshots come from Dial's real terminal components, rendered with sample data
+(<code>cargo run -p dial-ui --example ux_gallery</code>). Fonts and colors depend on your terminal and theme.</sub>
 
 ## Install
 
 Prebuilt releases target **macOS 13+ (Apple Silicon or Intel)**, **Linux x86-64 (Ubuntu 22.04 or
-newer, also under WSL2)** and **native Windows x86-64**. No Rust toolchain is needed for a release.
+newer, also under WSL2)** and **native Windows x86-64**. You do not need a Rust toolchain to install a release.
 
-macOS and Linux:
+**macOS and Linux**
 
 ```sh
 curl -fsSL https://github.com/KiidxAtlas/dial/releases/latest/download/install.sh | bash
 ```
 
-The installer adds `~/.local/bin` to your shell profile when it is not already on `PATH`
+The installer adds `~/.local/bin` to your shell profile if it is not already on `PATH`
 (`DIAL_NO_MODIFY_PATH=1` skips this). It checks the archive's SHA-256 against the release's
-`SHA256SUMS`, and also verifies that file's Ed25519 signature when OpenSSL 3 is available
-(`brew install openssl@3` on macOS; `DIAL_REQUIRE_SIGNATURE=1` makes the signature mandatory).
-Windows (PowerShell 5.1 or 7; no OpenSSL or admin rights needed):
+`SHA256SUMS`. When OpenSSL 3 is available (`brew install openssl@3` on macOS), it also verifies that
+file's Ed25519 signature; set `DIAL_REQUIRE_SIGNATURE=1` to make the signature mandatory.
+
+**Windows** (PowerShell 5.1 or 7; no OpenSSL or admin rights needed)
 
 ```powershell
 irm https://github.com/KiidxAtlas/dial/releases/latest/download/install.ps1 | iex
 ```
 
-Or use the Linux commands inside WSL2. See [docs/windows.md](docs/windows.md) for pinned versions and next steps.
+You can also run the Linux commands inside WSL2. [docs/windows.md](docs/windows.md) covers pinned
+versions and next steps.
 
-- **Linux/WSL2** needs `bubblewrap` and `ca-certificates`, working unprivileged user namespaces, and
+**Homebrew, Nix and Docker** are also published; see
+[docs/release-and-install.md](docs/release-and-install.md#other-distribution-channels).
+
+<details>
+<summary><b>Platform requirements</b></summary>
+
+- **Linux/WSL2** needs `bubblewrap` and `ca-certificates`, working unprivileged user namespaces and
   a normal (non-root) user. Under WSL2, **Windows executable interop must be disabled** in
   `/etc/wsl.conf`; Dial refuses sandboxed commands while it is enabled.
 - **Local MLX inference and training** require macOS on Apple Silicon plus `uv`. **GGUF models** need
-  llama.cpp's `llama-server` on `PATH` (or `DIAL_LLAMA_SERVER`) and serve inference and evaluation only.
+  llama.cpp's `llama-server` on `PATH` (or `DIAL_LLAMA_SERVER`) and are used for inference and evaluation only.
   Hosted and OpenAI-compatible providers work everywhere without Python.
 - **From source:** `make update` builds and installs the faster, incremental `local` profile
-  from a checkout; `make update SLIM=1` omits optional integrations. Use
-  `cargo install --path . --locked` when you specifically want shipping optimization.
+  from a checkout; `make update SLIM=1` leaves out optional integrations. Use
+  `cargo install --path . --locked` for full shipping optimization.
 
-Manual installation per platform, WSL2 interop settings, the Linux sandbox model, build-from-source
-details, the development loop and release publishing are in
-[docs/release-and-install.md](docs/release-and-install.md#platform-installation-details). Native
-Windows behavior is in [docs/windows.md](docs/windows.md).
+[docs/release-and-install.md](docs/release-and-install.md#platform-installation-details) covers
+manual installation for each platform, WSL2 interop settings, the Linux sandbox model, building from
+source, the development loop and release publishing.
+
+</details>
 
 ## Quick start
 
 ```sh
 cd ~/code/my-project
-dial                                        # terminal UI; first run opens model/provider setup
-dial "fix the failing test in src/lib.rs"   # interactive, opening with a message
-dial -p -y "summarize this repo"            # one-shot; prints the answer (-y or --approval auto for changes)
-dial -c                                     # continue the latest session (-r <id-prefix> to pick one)
+dial                                        # terminal UI; the first run opens model/provider setup
+dial "fix the failing test in src/lib.rs"   # interactive, starting with a message
+dial -p -y "summarize this repo"            # one-shot; prints the answer (-y or --approval auto to allow changes)
+dial -c                                     # continue the latest session (-r <id-prefix> picks one)
 ```
 
-Useful first commands inside the UI: `/providers` (sign in or add an endpoint, including a Claude or
-ChatGPT/Codex subscription), `/models` and `/roles` (choose models), `/settings` (configuration
-hub), `Ctrl-P` (action palette), `/help` and `/hotkeys`. See
-[docs/terminal-interface.md](docs/terminal-interface.md) for shortcuts and panels.
+Useful first commands in the UI:
+
+| Command | What it does |
+| --- | --- |
+| `/providers` | Sign in or add an endpoint, including a Claude or ChatGPT/Codex subscription |
+| `/models`, `/roles` | Choose the main model and helper-role models |
+| `/settings` | Configuration hub |
+| `Ctrl-P` | Action palette |
+| `/todo` | Browse the current work plan |
+| `/review` | Inspect checkpoint changes, then revert or undo them |
+| `/help`, `/hotkeys` | Commands and shortcuts |
+
+[docs/terminal-interface.md](docs/terminal-interface.md) covers shortcuts and panels.
+
+To check which build you are running, use `dial --version`. It shows the compiled revision and
+whether the sources differed from that revision at build time. `dial --build-info` prints JSON with
+the target, profile, build time and executable path. Neither command reads your configuration or
+contacts a model. Builds without Git metadata report `unknown`; release and archive builders can set
+`DIAL_BUILD_REVISION` and `SOURCE_DATE_EPOCH` explicitly.
 
 ## Configuration essentials
 
-Configuration is layered TOML: `~/.dial/config.toml`, then the private per-project file
-`~/.dial/projects/<name>-<hash>/config.toml`, then command-line flags. Dial never reads
-configuration from the project directory itself. Most settings are also editable in `/settings`,
-which saves globally or per project (`Ctrl-S`).
+Configuration is layered TOML, applied in this order: `~/.dial/config.toml`, then the private
+per-project file `~/.dial/projects/<name>-<hash>/config.toml`, then command-line flags. Dial never
+reads configuration from the project directory itself. You can also edit most settings in
+`/settings`, which saves them globally or per project (`Ctrl-S`).
 
 ```toml
 model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
@@ -86,11 +154,14 @@ provider = "openai"
 model = "gpt-4o-mini"
 ```
 
-Most execution limits default to `0`, meaning unlimited. The full annotated example, layering rules
-and unlimited defaults are in [docs/configuration.md](docs/configuration.md); model roles and
-fallback chains are in [docs/model-routing.md](docs/model-routing.md).
+Most execution limits default to `0`, which means unlimited.
+[docs/configuration.md](docs/configuration.md) has the full annotated example, layering rules and
+defaults; [docs/model-routing.md](docs/model-routing.md) covers model roles and fallback chains.
 
 ## Documentation
+
+This README is an overview. Detailed documentation lives in [`docs/`](docs/), and
+[`ARCHITECTURE.md`](ARCHITECTURE.md) describes the module layout, dependency boundaries and invariants.
 
 **Getting started and everyday use**
 
@@ -129,20 +200,23 @@ fallback chains are in [docs/model-routing.md](docs/model-routing.md).
 
 ## Known limits
 
-- Tool-calling quality depends on the model: 7B-class instruct models handle the tool set; sub-1B models often emit unreadable calls (which become training signal rather than being hidden).
-- Local compute is serialized across projects by default. Disable **Compute locks** in Settings → Model → Local worker (`compute_locks = false`) to allow concurrent model work; this can exhaust RAM/GPU memory. Laya roles never require the compute lock. With locks enabled, a session that queues improvement releases compute when idle and its child agents have finished; a subsequent turn waits if the cycle holds compute. There is no claim of zero-downtime training.
-  While waiting for compute, the elapsed timer advances and commands follow the same live/deferred/interrupting policy as during inference. Turn duration includes that wait; acquiring compute returns the status to Working rather than leaving it marked as waiting.
-- The TUI is keyboard-driven; not every terminal supports modified Enter keys. `dial schedule` provides scheduling but no daemon installer. Voice (text-to-speech, push-to-talk dictation and protocol live sessions) is described in `docs/voice.md`. Browser and kernel require available OS containment; they fail closed rather than falling back to unrestricted execution.
-- Live memory/skill edits are the user's working state and are not gated; only the admitted harness is.
-- Operator tools are trusted programs and are not sandboxed during live work; they are excluded from automatic evaluation. Non-macOS: `bash` is unavailable unless `sandbox.mode = "off"` for live use, while generated evaluations still require the strict sandbox.
+- Tool-calling quality depends on the model. 7B-class instruct models handle the tool set; sub-1B models often emit unreadable calls (which become training signal rather than being hidden).
+- Local MLX inference and training require Apple Silicon. Intel Macs and Linux/WSL2 use hosted or OpenAI-compatible providers, or GGUF through llama.cpp.
+- By default, local compute is serialized across projects. Turning off **Compute locks** in Settings → Model → Local worker (`compute_locks = false`) allows concurrent model work, but this can exhaust RAM or GPU memory. Laya roles never require the compute lock. With locks enabled, a session that queues improvement releases compute once it is idle and its child agents have finished; a later turn waits if the cycle holds compute. Dial makes no claim of zero-downtime training.
+  While a turn waits for compute, the elapsed timer keeps running and commands follow the same live/deferred/interrupting policy as during inference. Turn duration includes the wait; once compute is acquired, the status returns to Working.
+- The TUI is keyboard-driven, and not every terminal supports modified Enter keys. `dial schedule` handles scheduling but does not install a daemon. Voice (text-to-speech, push-to-talk dictation and protocol live sessions) is described in [docs/voice.md](docs/voice.md). The browser and kernel tools require OS containment; they fail closed rather than falling back to unrestricted execution.
+- Live memory and skill edits are your working state and are not gated; only the admitted harness is.
+- Operator tools are trusted programs and are not sandboxed during live work; they are excluded from automatic evaluation. Outside macOS, `bash` is unavailable for live use unless `sandbox.mode = "off"`, while generated evaluations still require the strict sandbox.
 
 ## Source layout
 
-Dial is a Cargo workspace. The root package `dial` holds the binary and a facade library (`src/lib.rs`)
-that re-exports every crate module, so `dial::<module>` paths keep working. Binary startup lives in
-`src/main.rs`; arguments, overlays, routing and chat launch have separate sibling modules, and
-binary-only command handlers live in `src/cmd/`.
-Each crate's modules live under `crates/<crate>/src/`:
+Dial is a Cargo workspace. The Rust control plane and tools live in these crates; Python handles
+local MLX inference and training (`mlx-lm`, plus `mlx-vlm` for vision), and GGUF models run through llama.cpp's `llama-server`.
+
+The root package `dial` holds the binary and a facade library (`src/lib.rs`) that re-exports every
+crate module, so `dial::<module>` paths keep working. Binary startup lives in `src/main.rs`;
+arguments, overlays, routing and chat launch are in separate sibling modules, and binary-only
+command handlers live in `src/cmd/`. Each crate's modules live under `crates/<crate>/src/`:
 
 ```
 crates/dial-build-info/  build_info
@@ -156,8 +230,12 @@ crates/dial-ui/          ui (terminal renderer, composer, overlays), git_panel; 
 crates/dial-app/         app (including app/commands), cli, benchmark, repl, rpc, acp, schedule, collab
 ```
 
-Build, test, and lint across the whole workspace with `make test-lib`, `make lint`, or
-`cargo test --workspace --lib <filter>`. Run the tests of one module with `make test-module MOD=llm::provider`,
-which searches every crate. Build only the shipped binary with `cargo build -p dial`.
+To build, test and lint the whole workspace, use `make test-lib`, `make lint`, or
+`cargo test --workspace --lib <filter>`. `make test-module MOD=llm::provider` runs one module's
+tests, searching every crate. `cargo build -p dial` builds only the shipped binary.
 
-Adding a tool: implement `tools::ext::Tool` in its own module, return it from a `tools()` constructor, and list it in `Registry::standard`.
+To add a tool, implement `tools::ext::Tool` in its own module, return it from a `tools()` constructor, and list it in `Registry::standard`.
+
+## License
+
+MIT; see [LICENSE](LICENSE). Bundled third-party notices are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
