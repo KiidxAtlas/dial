@@ -360,7 +360,12 @@ impl Agent<'_> {
                 label(&target)
             ),
         ));
-        nudges.push(nudge(CHECKLIST));
+        let mut checklist = nudge(CHECKLIST);
+        crate::agent::run::guidance::tag(
+            &mut checklist,
+            crate::agent::run::guidance::Priority::Review,
+        );
+        nudges.push(checklist);
         Ok(true)
     }
 }

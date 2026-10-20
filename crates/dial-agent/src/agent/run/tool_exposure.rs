@@ -49,7 +49,7 @@ impl<'a> Agent<'a> {
 
     /// Minimal first-request offer: after the full set cannot fit the context window, on the small
     /// local tier, or after a local escalation (`local_profile`).
-    const LEAN_TOOLS: [&str; 10] = [
+    const LEAN_TOOLS: [&str; 11] = [
         "read",
         "write",
         "edit",
@@ -58,6 +58,7 @@ impl<'a> Agent<'a> {
         "glob",
         "todo",
         "finish",
+        "check",
         "tool_search",
         "tool_load",
     ];
@@ -351,6 +352,11 @@ impl<'a> Agent<'a> {
         if !self.hermetic && catalog.iter().any(|name| name == "finish") {
             names.push("finish".into());
         }
+        // The agent and the completion gate agree on "passing" only if the gate's checks are callable;
+        // an operator-pinned list still decides for itself.
+        if !self.hermetic && !pinned && catalog.iter().any(|name| name == "check") {
+            names.push("check".into());
+        }
         if catalog.iter().any(|name| name == "codebase_memory") {
             names.push("codebase_memory".into());
         }
@@ -506,6 +512,8 @@ impl<'a> Agent<'a> {
                 "tts" => crate::voice::tool::schema(),
                 "todo" => crate::agent::workflow::todo::schema(),
                 "finish" => crate::agent::verify::completion::schema(),
+                "check" => crate::agent::verify::check_tool::schema(),
+                "revert_edit" => crate::agent::verify::revert_edit::schema(),
                 "goal" => modes::goal::schema(),
                 "ask" => crate::agent::workflow::questions::schema(),
                 "task" => crate::agent::workers::subagents::schema(self.config),

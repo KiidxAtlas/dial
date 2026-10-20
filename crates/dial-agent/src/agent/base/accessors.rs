@@ -494,6 +494,8 @@ impl<'a> Agent<'a> {
                         | "artifact_read"
                         | "working_state"
                         | "tts"
+                        | "check"
+                        | "revert_edit"
                 )
                 || (self.layout.is_some()
                     && matches!(
@@ -508,6 +510,12 @@ impl<'a> Agent<'a> {
                     .is_some_and(|memory| memory.offered_names().contains(&n.as_str()))
         });
         names.retain(|name| name != "ask" || self.config.ask.enabled);
+        // `check` runs the verification gate's selection; `revert_edit` needs the checkpoint journal.
+        names.retain(|name| match name.as_str() {
+            "check" => self.config.verification.enabled,
+            "revert_edit" => self.checkpoints.is_some(),
+            _ => true,
+        });
         if !self.hermetic && self.layout.is_some() {
             if self.config.solve.enabled {
                 names.push("solve".into());

@@ -33,6 +33,9 @@ use std::time::{Duration, Instant};
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 /// `config.json` files larger than this are not read for the context hint.
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+/// Shown once per conversation when llama.cpp's `/props` `chat_template_caps` say the model's chat
+/// template cannot render tools natively; llama.cpp's own log warns its fallback may do badly.
+const LLAMA_TOOL_TEMPLATE_NOTICE: &str = "llama-server reports this model's chat template has no native tool support (/props chat_template_caps), so tool calls may be unreliable. Restart it with --jinja --chat-template-file <a tool-use template for this model>; see llama.cpp docs/function-calling.md.";
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -296,6 +299,8 @@ pub struct Backend {
     session_id: Option<String>,
     codex_websocket: bool,
     image_notices: llm::images::NoticeTracker,
+    /// The llama.cpp tool-template notice was shown in this conversation.
+    tool_template_noticed: bool,
     wire: llm::wire::Shared,
     /// Test-only idle limit for this backend's model calls, carried to the worker thread that runs them.
     #[cfg(any(test, feature = "test-support"))]
@@ -366,6 +371,7 @@ impl Backend {
             credential: None,
             codex_websocket: false,
             image_notices: Default::default(),
+            tool_template_noticed: false,
             wire: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             idle_limit: None,
@@ -409,6 +415,7 @@ impl Backend {
         let session_id = session_id.into();
         if self.session_id.as_deref() != Some(&session_id) {
             self.image_notices = Default::default();
+            self.tool_template_noticed = false;
             self.wire = Default::default();
         }
         self.session_id = Some(session_id);
@@ -466,6 +473,7 @@ impl Backend {
     ) -> Result<()> {
         if self.session_id.as_deref() != Some(session.id()) {
             self.image_notices = Default::default();
+            self.tool_template_noticed = false;
             self.wire = Default::default();
         }
         self.session_id = Some(session.id().to_owned());
@@ -895,19 +903,40 @@ impl Backend {
     /// loopback/private OpenAI-compatible endpoint that answers llama.cpp's `/props` enforces
     /// `json_schema`. Hosted endpoints are never probed; `catalog::is_llama_server` caches per base URL.
     pub fn endpoint_structured_output(&self) -> Option<llm::profiles::StructuredOutput> {
+        let (base_url, api_key) = self.local_chat_completions_endpoint()?;
+        llm::catalog::is_llama_server(base_url, api_key, &self.headers)
+            .then_some(llm::profiles::StructuredOutput::JsonSchema)
+    }
+
+    /// Base URL and key of a Chat Completions endpoint on a loopback/private host, the only routes
+    /// that can be an external llama.cpp server.
+    fn local_chat_completions_endpoint(&self) -> Option<(&str, Option<&str>)> {
         let ProviderKind::Endpoint {
             base_url, api_key, ..
         } = &self.kind
         else {
             return None;
         };
-        if self.protocol.unwrap_or(ApiProtocol::ChatCompletions) != ApiProtocol::ChatCompletions
-            || !llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host))
-        {
-            return None;
+        (self.protocol.unwrap_or(ApiProtocol::ChatCompletions) == ApiProtocol::ChatCompletions
+            && llm::host_of(base_url).is_some_and(|host| llm::is_local_host(&host)))
+        .then_some((base_url.as_str(), api_key.as_deref()))
+    }
+
+    /// Once per conversation, when a request offers tools to an external llama.cpp server whose
+    /// `/props` (already fetched by detection; never probed here) says the model's chat template
+    /// cannot render tools natively.
+    fn tool_template_notice(&mut self, req: &Chat, on_notice: &mut dyn FnMut(&str)) {
+        if req.tools.is_empty() || self.tool_template_noticed {
+            return;
         }
-        llm::catalog::is_llama_server(base_url, api_key.as_deref(), &self.headers)
-            .then_some(llm::profiles::StructuredOutput::JsonSchema)
+        let lacking = self
+            .local_chat_completions_endpoint()
+            .and_then(|(base_url, _)| llm::catalog::known_llama_props(base_url))
+            .is_some_and(|props| props.native_tool_template == Some(false));
+        if lacking {
+            self.tool_template_noticed = true;
+            on_notice(LLAMA_TOOL_TEMPLATE_NOTICE);
+        }
     }
 
     pub fn reply_cost(&self, reply: &Reply) -> Option<f64> {
@@ -1268,6 +1297,7 @@ impl Backend {
             };
             profile.local_server = local_server;
         }
+        self.tool_template_notice(req, on_notice);
         let (url, auth, model, protocol, codex_account_id) = match &self.kind {
             ProviderKind::Apple => unreachable!("handled above"),
             ProviderKind::ChatGpt { model, .. } => {

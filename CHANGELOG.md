@@ -8,11 +8,37 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 ### Added
 - Live local-model request settings in the status bar (`inference` in custom layouts), with deduplicated Model settings notices when controls change and full details in `/policy`. Server-controlled values are explicitly unknown rather than guessed.
 - Busy messages default to agent-selected routing: changes of approach steer the current task, while clearly independent requests start isolated background workers. Explicit after-turn queueing remains available.
+- The `browser` tool's `back`, `forward`, `reload` and `events` actions run in Dial's own Chromium driver. Previously they worked only inside an external Tern pane. `events` returns the tab's console, network, dialog, download and navigation events in `seq` order; pass `after` set to the returned `last_seq` to get only newer events. `evidence` also includes the tab's navigation history.
+- `check` tool: runs the focused checks the completion gate would select for the current changes and records results in the same evidence ledger, so the agent and the gate agree on what passes. Offered by default and on the small/lean local tiers when verification is enabled.
+- Loadable `revert_edit` tool: restores one file to before Dial's last change this turn (or the turn start), refusing files changed outside Dial's journal; the revert is itself checkpointed.
+- Loadable read-only `dep_source` tool: reads and searches a dependency's source at the version the workspace locked or installed (cargo, npm, python venv, go) without fetching or running anything.
+- `read path:outline` lists a file's declarations with line ranges (not an edit witness).
+- File tools add a `Did you mean:` line with up to five existing paths when a workspace path does not exist.
+- After an edit, a running language server's new error diagnostics for that file are appended as an advisory (at most 1.5 s, 8 lines; no wait without a live server).
+- Small local tier: prompt ends with a compact worked example in the active edit grammar (its check step uses `check` when offered), and calls are one per response unless the model's saved reliability record passed the batch check.
+- `/model settings` suggests enabling coach escalation (choose the coach in `/roles`) for local models with many failing rounds and no coach role.
+- llama-server: a notice names `--jinja --chat-template-file` when `/props` shows the chat template lacks native tool support.
+- Read-only subagents (scouts, reviewers, planners) may use `dep_source`; its results count as observations for pacing advice and context pruning.
+- Benchmarks: `reliability.py` reports unbiased per-task and mean `pass_at_k` and `pass_hat_k` (τ-bench pass^k) curves for k = 1..repetitions.
+- `grep` `output = "files"` lists matching files with match counts (paged by file) and `output = "count"` gives totals; capped line pages point to them. Sessions recorded before this addition still resume.
+- MLX: schema-constrained tool calls cover Qwen3-Coder's XML format (`<function=…><parameter=…>`): declared names and keys, required keys, string enums, and typed values checked as each parameter closes.
+
+### Changed
+- Small and lean local tiers: `edit` refuses a change that would add parser errors to a Rust, Python, TypeScript/TSX, JavaScript or Go file and writes nothing; reads stay valid for a corrected retry, and `allow_syntax_errors: true` overrides. The full tier keeps the advisory.
+- First tool failures get a one-line recovery instruction; the full recovery contract is attached when the same tool fails the same way again (always for uncertain effects). Each request carries at most one advisory harness note, chosen by priority.
+- Local escalation steps take effect at the next user turn, so the prompt and tool offer stay stable within a turn; the reached step is still saved per model immediately.
+- The system prompt only mentions `skill`, saved project maps and the LSP when those tools are offered.
+- Codebase-memory sections and findings whose sources are all gone are shown compactly, without source or dependency path lists.
+
+### Removed
+- The Tern integration. Tern is not part of Dial. Removed: its browser-pane backend (`TERN_PANE_SOCKET`/`TERN_PANE`, `DIAL_BROWSER_TERN`), the `browser.tern` setting, the Tern-only `fork` browser action and the `tern` terminal id for notifications. Saved configuration that still sets `browser.tern` is migrated on load.
 
 ### Fixed
 - Changing models on the welcome screen updates its model label and the status bar together as soon as the new configuration is adopted, without resetting recent-session navigation.
 - Local models that ship `do_sample: false` now request greedy decoding (temperature zero) instead of falling back to the harness temperature. Explicit sampling overrides retain precedence.
 - Local thinking now defaults to `assistance.local.thinking = "model"`, preserving model/server settings instead of automatically switching thinking by request phase. Phase-based switching remains an explicit opt-in.
+- A llama-server started without `--jinja` that rejects `tools` is now a fatal error naming the fix, instead of being retried as transient.
+- `codebase_memory refresh` drops index entries for deleted files even when a scan stops at a limit.
 
 ## [0.1.13] - 2026-10-19
 

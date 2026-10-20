@@ -64,6 +64,13 @@ impl Ledger {
         }
     }
 
+    /// The most recent status recorded for `command` at any revision (`check failed_only`).
+    pub fn latest_status(&self, command: &str) -> Option<CheckStatus> {
+        self.latest
+            .get(command)
+            .map(|observation| observation.status)
+    }
+
     /// Missing and old observations are not interchangeable with a current passing result.
     pub fn current_status(&self, command: &str, revision: Revision) -> &'static str {
         match self.latest.get(command) {

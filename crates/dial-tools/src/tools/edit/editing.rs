@@ -51,18 +51,22 @@ pub fn instructions(mode: EditMode) -> &'static str {
         ),
     }
 }
+/// Optional on every grammar: commits an edit the lean local tiers would refuse for new parser errors.
+const ALLOW_SYNTAX_ERRORS: &str =
+    "Set true only when valid code is refused for new syntax errors (parser dialect gap).";
 pub fn schema(mode: EditMode) -> Value {
+    let allow = json!({"type":"boolean","description":ALLOW_SYNTAX_ERRORS});
     match mode {
         EditMode::Replace => tool_schema(
             "edit",
             instructions(mode),
-            json!({"path":{"type":"string"},"old_string":{"type":"string","minLength":1},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}}),
+            json!({"path":{"type":"string"},"old_string":{"type":"string","minLength":1},"new_string":{"type":"string"},"replace_all":{"type":"boolean"},"allow_syntax_errors":allow}),
             &["path", "old_string", "new_string"],
         ),
         EditMode::Patch => tool_schema(
             "edit",
             instructions(mode),
-            json!({"path":{"type":"string"},"edits":{"type":"array","minItems":1,"maxItems":128,"items":{"type":"object","properties":{"op":{"type":"string","enum":["create","update","delete"]},"rename":{"type":"string"},"diff":{"type":"string"}},"additionalProperties":false}}}),
+            json!({"path":{"type":"string"},"edits":{"type":"array","minItems":1,"maxItems":128,"items":{"type":"object","properties":{"op":{"type":"string","enum":["create","update","delete"]},"rename":{"type":"string"},"diff":{"type":"string"}},"additionalProperties":false}},"allow_syntax_errors":allow}),
             &["path", "edits"],
         ),
         _ => tool_schema(
@@ -73,7 +77,7 @@ pub fn schema(mode: EditMode) -> Value {
                 EditMode::ApplyPatch => "Apply-patch text using *** Begin Patch and *** End Patch; follow the tool description.",
                 EditMode::Sloppy => "Sloppy patch text; the tool description is the complete contract.",
                 _ => unreachable!(),
-            }}}),
+            }},"allow_syntax_errors":allow}),
             &["input"],
         ),
     }
@@ -100,9 +104,15 @@ fn literal_path(input: &str) -> Result<String, String> {
 pub(crate) fn validate_shape(mode: EditMode, args: &Value) -> Result<(), String> {
     let object = args.as_object().ok_or("edit arguments must be an object")?;
     let allowed: &[&str] = match mode {
-        EditMode::Replace => &["path", "old_string", "new_string", "replace_all"],
-        EditMode::Patch => &["path", "edits"],
-        _ => &["input"],
+        EditMode::Replace => &[
+            "path",
+            "old_string",
+            "new_string",
+            "replace_all",
+            "allow_syntax_errors",
+        ],
+        EditMode::Patch => &["path", "edits", "allow_syntax_errors"],
+        _ => &["input", "allow_syntax_errors"],
     };
     if object
         .iter()
@@ -939,6 +949,14 @@ pub(crate) struct Execution<'a> {
     pub authorize: Option<PathAuthorizer<'a>>,
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
     pub preview_no_change: Option<&'a std::cell::Cell<bool>>,
+    /// Refuse, before commit, a change that adds parser errors (see [`syntax_gate`]).
+    pub refuse_syntax_errors: bool,
+}
+/// Whether this edit call refuses new parser errors: the workspace blocks them (small/lean local
+/// tiers) and the call did not pass `allow_syntax_errors: true`. Write and ast_edit never refuse.
+pub(crate) fn syntax_gate(ws: &Workspace, args: &Value) -> Result<bool, String> {
+    let allow = opt_bool(args, "allow_syntax_errors")?;
+    Ok(ws.syntax_blocking() && !allow)
 }
 impl Execution<'_> {
     pub fn mark_no_change(&self) {
@@ -964,6 +982,7 @@ impl Execution<'_> {
         }
     }
 }
+#[cfg(test)]
 pub(crate) fn finish(ws: &Workspace, changes: Vec<Change>, commit: bool) -> Result<String, String> {
     finish_with(ws, changes, commit, &Execution::default())
 }
@@ -1020,6 +1039,7 @@ pub(crate) fn finish_with(
                     &proposed.text,
                     change.seen_after.as_deref(),
                     execution.repair,
+                    execution.refuse_syntax_errors,
                 )?;
                 if let Some(flags) = &change.seen_after {
                     change.seen_after = Some(hashline::transition_flags(
@@ -1166,6 +1186,15 @@ pub(crate) fn finish_with(
     }
     Ok(output)
 }
+/// The `edit` tool without an owner context (tests, `tools::execute`), in any grammar.
 pub(crate) fn edit(ws: &Workspace, args: &Value) -> Result<String, String> {
-    finish(ws, prepare(ws, args)?, true)
+    let execution = Execution {
+        refuse_syntax_errors: syntax_gate(ws, args)?,
+        ..Default::default()
+    };
+    if ws.edit_mode == EditMode::Hashline {
+        validate_shape(ws.edit_mode, args)?;
+        return hashline::edit_with(ws, hashline::input_arg(args)?, true, &execution);
+    }
+    finish_with(ws, prepare(ws, args)?, true, &execution)
 }

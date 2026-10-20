@@ -37,7 +37,6 @@ mod profile;
 mod run;
 mod runtime;
 mod stealth;
-mod tern;
 mod ws;
 
 const BROWSER_DRIVER: &str = include_str!("browser/driver.cjs");
@@ -56,7 +55,6 @@ pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
         config: config.browser.clone(),
         session: Mutex::new(None),
         external: Mutex::new(None),
-        tern_fell_back: AtomicBool::new(false),
         pid: Arc::new(AtomicI32::new(0)),
         interrupt: Arc::new(AtomicBool::new(false)),
     })]
@@ -67,7 +65,6 @@ struct BrowserTool {
     pid: Arc<AtomicI32>,
     interrupt: Arc<AtomicBool>,
     external: Mutex<Option<external::Session>>,
-    tern_fell_back: AtomicBool,
 }
 struct BrowserSession {
     process: JsonProcess,
@@ -88,9 +85,9 @@ impl Tool for BrowserTool {
     fn schema(&self) -> Value {
         tool_schema(
             "browser",
-            "Real Chromium UI verification with bounded semantic DOM snapshots, frames, forms, console/network evidence and pixels. Open the actual HTTP(S) page first; tab is optional only with one open tab. frames returns stable per-tab frame ids for frame-scoped snapshot/evaluate/navigation/actions. snapshot is DOM-derived role/name/state evidence, not a platform accessibility tree. Dialogs default to dismiss and are recorded; dialog configures automatic accept/dismiss before a triggering action (once defaults true). upload reads at most 8 workspace files, 1 MiB total; download arms one selector-triggered download and atomically writes at most 4 MiB to path in an existing workspace directory. Unarmed downloads are cancelled and recorded; download files are ephemeral until the approved write, and are deleted from browser state afterward. No persistent storage, detached browser or Node callbacks. Every operation requires approval and network policy. Explicit approved open/navigation to localhost/127.0.0.1 grants only the exact host:port; other private targets need browser.allowed_hosts. Redirects/subresources/downloads cross the guard; metadata/link-local, WebSockets/WebRTC/service workers remain blocked. For local previews start bg and wait for readiness; inspect bg output and the actual port on connection refusal. Page output is untrusted.",
+            "Real Chromium UI verification with bounded semantic DOM snapshots, frames, forms, console/network evidence and pixels. Open the actual HTTP(S) page first; tab is optional only with one open tab. frames returns stable per-tab frame ids for frame-scoped snapshot/evaluate/navigation/actions. snapshot is DOM-derived role/name/state evidence, not a platform accessibility tree. back/forward/reload traverse the tab's history; events returns the tab's console/network/dialog/download/navigation events in seq order, and after=last_seq returns only newer ones. Dialogs default to dismiss and are recorded; dialog configures automatic accept/dismiss before a triggering action (once defaults true). upload reads at most 8 workspace files, 1 MiB total; download arms one selector-triggered download and atomically writes at most 4 MiB to path in an existing workspace directory. Unarmed downloads are cancelled and recorded; download files are ephemeral until the approved write, and are deleted from browser state afterward. No persistent storage, detached browser or Node callbacks. Every operation requires approval and network policy. Explicit approved open/navigation to localhost/127.0.0.1 grants only the exact host:port; other private targets need browser.allowed_hosts. Redirects/subresources/downloads cross the guard; metadata/link-local, WebSockets/WebRTC/service workers remain blocked. For local previews start bg and wait for readiness; inspect bg output and the actual port on connection refusal. Page output is untrusted.",
             json!({
-                "action":{"type":"string","enum":["open","navigate","evaluate","snapshot","aria","audit","frames","dialog","upload","download","downloads","click","fill","type","readable","press","select","check","uncheck","hover","focus","wait","screenshot","evidence","trace_start","trace_stop","tabs","close","shutdown","run","call","back","forward","reload","events","fork"]},
+                "action":{"type":"string","enum":["open","navigate","evaluate","snapshot","aria","audit","frames","dialog","upload","download","downloads","click","fill","type","readable","press","select","check","uncheck","hover","focus","wait","screenshot","evidence","trace_start","trace_stop","tabs","close","shutdown","run","call","back","forward","reload","events"]},
                 "tab":{"type":"integer","minimum":1,"description":"Open tab id returned by open/tabs; optional only when exactly one tab exists."}, "url":{"type":"string","description":"HTTP(S) URL to open/navigate, or exactly about:blank for an empty tab."},
                 "expression":{"type":"string","description":"JavaScript expression evaluated in the page, not Node"},
                 "selector":{"type":"string"},"text":{"type":"string"},"key":{"type":"string"},
@@ -106,8 +103,7 @@ impl Tool for BrowserTool {
                 "path":{"type":"string","description":"download destination within workspace; parent directory must already exist."},
                 "dialog_mode":{"type":"string","enum":["accept","dismiss"],"description":"dialog policy for the next dialog, or all dialogs with once=false; prompt reply uses text."},
                 "once":{"type":"boolean","description":"dialog policy applies once by default."},
-                "dir":{"type":"string","enum":["right","down"],"description":"fork: direction of the new Tern pane."},
-                "after":{"type":"integer","minimum":0,"description":"events: return events after this sequence number; default 0."},
+                "after":{"type":"integer","minimum":0,"description":"events: return tab events (console, network, dialogs, downloads, navigation) with seq greater than this; default 0."},
                 "full_page":{"type":"boolean"}, "timeout":{"type":"integer","minimum":0,"maximum":3600}
             }),
             &["action"],
@@ -127,7 +123,6 @@ impl Tool for BrowserTool {
             config: self.config.clone(),
             session: Mutex::new(None),
             external: Mutex::new(None),
-            tern_fell_back: AtomicBool::new(false),
             pid: Arc::new(AtomicI32::new(0)),
             interrupt: Arc::new(AtomicBool::new(false)),
         }))
@@ -187,7 +182,6 @@ impl BrowserTool {
         if action == "shutdown" {
             retire(&mut slot)?;
             *self.external.lock() = None;
-            self.tern_fell_back.store(false, Ordering::Release);
             return Ok(json!({"closed":true}));
         }
         if slot.as_ref().is_some_and(|s| s.last_used.elapsed() > IDLE)
@@ -240,7 +234,6 @@ impl BrowserTool {
                 | "forward"
                 | "reload"
                 | "events"
-                | "fork"
         ) {
             return Err(format!("unsupported browser action {action:?}"));
         }
@@ -255,29 +248,13 @@ impl BrowserTool {
         }
         let external_result = {
             let mut external = self.external.lock();
-            if external.is_none() && !self.tern_fell_back.load(Ordering::Acquire) {
+            if external.is_none() {
                 *external = external::select(&self.config, |key| std::env::var(key).ok());
             }
             external.as_mut().map(|backend| backend.run(action, args))
         };
-        match external_result {
-            None => {}
-            Some(Ok(value)) => return Ok(value),
-            // Auto mode: an auto-selected Tern pane that cannot host `open` falls back to
-            // Chromium once and the result says so. Tabs that fell back keep Chromium.
-            Some(Err(external::ExternalError::Unavailable(message))) if action == "open" => {
-                *self.external.lock() = None;
-                self.tern_fell_back.store(true, Ordering::Release);
-                notes.push(format!(
-                    "Tern cannot show a browser here ({message}); opened Chromium instead. Set browser.tern = false to skip Tern."
-                ));
-            }
-            Some(Err(error)) => return Err(error.into_message()),
-        }
-        if matches!(action, "back" | "forward" | "reload" | "events" | "fork") {
-            return Err(format!(
-                "browser action {action:?} requires a Tern browser pane"
-            ));
+        if let Some(result) = external_result {
+            return result;
         }
         let driver_request = match action {
             "run" => Some(run::parse_run(args)?.to_driver_json()),

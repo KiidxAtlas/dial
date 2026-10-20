@@ -524,6 +524,104 @@ fn spawn_spec(command: &Command) -> anyhow::Result<crate::platform::process_reco
     })
 }
 
+/// Slots of a Dial-launched `llama-server` that lists the shared-pool flags: slot 0 keeps the main
+/// session's prompt, the other takes side requests (summaries, ranking, repair) so they no longer
+/// evict it.
+pub const LLAMA_SHARED_SLOTS: u32 = 2;
+/// Flags a `llama-server --help` must list before Dial launches the two-slot layout: one unified KV
+/// pool, a per-slot context cap so the main slot keeps the whole window, and idle-slot clearing off
+/// (with it on, unified-KV builds clear the main slot at every new task and a pinned `id_slot`
+/// request never reloads it). Builds without all three keep the single-slot launch.
+const SHARED_SLOT_FLAGS: [&str; 3] = [
+    "--kv-unified",
+    "--kv-unified-per-slot",
+    "--no-cache-idle-slots",
+];
+/// Bound on the offline `llama-server --help` probe; a slower or hung binary counts as old.
+const HELP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const HELP_PROBE_MAX_BYTES: u64 = 1 << 20;
+
+/// Whether `help` lists every shared-slot flag as a whole option name (`--kv-unified` is not
+/// matched by `--kv-unified-per-slot`).
+fn help_lists_shared_slots(help: &str) -> bool {
+    let options: std::collections::HashSet<&str> = help
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|word| word.starts_with("--"))
+        .collect();
+    SHARED_SLOT_FLAGS.iter().all(|flag| options.contains(flag))
+}
+
+/// Runs `program --help` once with a deadline and returns its standard output (capped), or `None`
+/// when it cannot start or does not finish in time. Nothing is loaded and no network is used.
+fn probe_help(program: &Path, timeout: Duration) -> Option<String> {
+    let mut child = Command::new(program)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.take(HELP_PROBE_MAX_BYTES).read_to_string(&mut text);
+        text
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    reader.join().ok()
+}
+
+/// Whether the `llama-server` at `program` supports the shared two-slot layout, probed once per
+/// path and process so routing and launches agree for the whole session.
+fn shared_slots_supported(program: &Path) -> bool {
+    static PROBED: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, bool>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut probed = PROBED.lock().unwrap_or_else(|p| p.into_inner());
+    *probed.entry(program.to_path_buf()).or_insert_with(|| {
+        probe_help(program, HELP_PROBE_TIMEOUT).is_some_and(|help| help_lists_shared_slots(&help))
+    })
+}
+
+/// Slots a Dial-launched `llama-server` is asked for: [`LLAMA_SHARED_SLOTS`] when the installed
+/// binary supports the shared layout, else `None` (one slot, the server chooses). A launch whose
+/// reserve does not fit in memory still starts one slot; llama.cpp wraps an out-of-range `id_slot`
+/// onto it, which is the single-slot behavior.
+pub fn dial_llama_slots() -> Option<u32> {
+    llm::local_format::llama_server()
+        .is_some_and(|program| shared_slots_supported(&program))
+        .then_some(LLAMA_SHARED_SLOTS)
+}
+
+/// KV tokens reserved beyond the main window for the side slot: a quarter of the window within
+/// 4096..=16384, never more than the window, in 256-token steps.
+fn side_reserve(tokens: u64) -> u64 {
+    (tokens / 4).clamp(4096, 16384).min(tokens) / 256 * 256
+}
+
+/// The shared KV pool for a two-slot launch: the main window plus the side reserve, when the binary
+/// supports the layout, the window is known and the larger pool fits in memory. `None` keeps the
+/// single-slot launch, so the main window is never reduced to make room.
+fn shared_pool(
+    context_tokens: Option<u64>,
+    supported: bool,
+    fits: impl FnOnce(u64) -> bool,
+) -> Option<u64> {
+    let tokens = context_tokens.filter(|_| supported)?;
+    let pool = tokens + side_reserve(tokens);
+    fits(pool).then_some(pool)
+}
+
 /// Command line for a Dial-supervised `llama-server` serving one GGUF model.
 struct LlamaLaunch<'a> {
     model: &'a Path,
@@ -533,29 +631,50 @@ struct LlamaLaunch<'a> {
     adapter: Option<&'a Path>,
     /// Memory-fitted context; `None` leaves llama.cpp's own default.
     context_tokens: Option<u64>,
+    /// Unified KV pool for the two-slot layout (see [`shared_pool`]); `None` launches one slot.
+    shared_pool: Option<u64>,
     port: u16,
 }
 
 impl LlamaLaunch<'_> {
     /// Maps `[local_runtime]` onto llama.cpp. Settings without an exact llama.cpp equivalent are
     /// refused rather than approximated, so a launch never silently ignores configuration.
+    /// llama.cpp matches option names exactly, so every value is a separate argument.
     fn args(
         &self,
         runtime: &llm::local_runtime::LocalRuntime,
     ) -> anyhow::Result<Vec<std::ffi::OsString>> {
         let mut args: Vec<std::ffi::OsString> = vec!["-m".into(), self.model.into()];
-        args.extend(
-            [
-                "--host=127.0.0.1".to_owned(),
-                format!("--port={}", self.port),
-                "--jinja".to_owned(),
+        let mut push = |pairs: &[&str]| args.extend(pairs.iter().map(Into::into));
+        push(&[
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &self.port.to_string(),
+            "--jinja",
+        ]);
+        match (self.shared_pool, self.context_tokens) {
+            (Some(pool), Some(tokens)) => {
+                // Two slots over one KV pool; each slot may use the whole window, so the main
+                // session keeps it, and the reserve lets a side request run without evicting it.
+                push(&[
+                    "--parallel",
+                    &LLAMA_SHARED_SLOTS.to_string(),
+                    "--kv-unified",
+                    "--kv-unified-per-slot",
+                    &tokens.to_string(),
+                    "--no-cache-idle-slots",
+                    "--ctx-size",
+                    &pool.to_string(),
+                ]);
+            }
+            (_, tokens) => {
                 // One slot keeps the whole context and prompt cache for the single session.
-                "--parallel=1".to_owned(),
-            ]
-            .map(Into::into),
-        );
-        if let Some(tokens) = self.context_tokens {
-            args.push(format!("--ctx-size={tokens}").into());
+                push(&["--parallel", "1"]);
+                if let Some(tokens) = tokens {
+                    push(&["--ctx-size", &tokens.to_string()]);
+                }
+            }
         }
         if let Some(projector) = self.projector {
             args.extend(["--mmproj".into(), projector.into()]);
@@ -579,7 +698,7 @@ impl LlamaLaunch<'_> {
             let count = runtime
                 .num_draft_tokens
                 .unwrap_or(llm::local_runtime::DEFAULT_NUM_DRAFT_TOKENS);
-            args.push(format!("--spec-draft-n-max={count}").into());
+            args.extend(["--spec-draft-n-max".into(), count.to_string().into()]);
         }
         if let Some(bits) = runtime.kv_bits {
             let kind = match bits {
@@ -593,8 +712,7 @@ impl LlamaLaunch<'_> {
                 runtime.kv_group_size.is_none() && runtime.quantized_kv_start.is_none(),
                 "kv_group_size and quantized_kv_start are MLX-only; llama.cpp quantizes the whole KV cache with fixed blocks"
             );
-            args.push(format!("--cache-type-k={kind}").into());
-            args.push(format!("--cache-type-v={kind}").into());
+            args.extend(["--cache-type-k", kind, "--cache-type-v", kind].map(Into::into));
         }
         Ok(args)
     }
@@ -648,11 +766,15 @@ fn launch(
         let context_tokens = llm::local_fit::gguf_serving_context(file, requested, runtime.kv_bits)
             .map_err(Failure::Fatal)?;
         let projector = llm::local_format::gguf_projector(file);
+        let shared_pool = shared_pool(context_tokens, shared_slots_supported(&program), |pool| {
+            llm::local_fit::gguf_pool_fits(file, pool, runtime.kv_bits)
+        });
         let launch = LlamaLaunch {
             model: file,
             projector: projector.as_deref(),
             adapter,
             context_tokens,
+            shared_pool,
             port,
         };
         let mut command = Command::new(program);

@@ -128,6 +128,8 @@ impl std::fmt::Debug for ObserverSlot {
 #[derive(Debug, Clone)]
 pub struct Workspace {
     syntax_guard: bool,
+    /// Small/lean local tier: edits that add parser errors to a high-confidence grammar are refused.
+    syntax_block: bool,
     root: PathBuf,
     additional_roots: Vec<PathBuf>,
     /// Private application trees excluded independently of shell sandbox mode.
@@ -178,6 +180,7 @@ impl Workspace {
         );
         Ok(Workspace {
             syntax_guard: false,
+            syntax_block: false,
             root,
             additional_roots: Vec::new(),
             protected_paths: Vec::new(),
@@ -385,6 +388,15 @@ impl Workspace {
     pub(crate) fn syntax_guard_enabled(&self) -> bool {
         self.syntax_guard
     }
+    /// Refuse (instead of only reporting) edits that add parser errors; the controller sets it on the
+    /// small and lean local tiers. It needs the syntax guard, and `allow_syntax_errors` overrides it.
+    pub fn with_syntax_block(mut self, enabled: bool) -> Self {
+        self.syntax_block = enabled;
+        self
+    }
+    pub fn syntax_blocking(&self) -> bool {
+        self.syntax_guard && self.syntax_block
+    }
     pub(crate) fn syntax_advisory(
         &self,
         path: &Path,
@@ -413,6 +425,7 @@ impl Workspace {
         copy.edit_repair = self.edit_repair.clone();
         copy.edit_blackbox_dir = self.edit_blackbox_dir.clone();
         copy.syntax_guard = self.syntax_guard;
+        copy.syntax_block = self.syntax_block;
         copy.ssh = self.ssh.clone();
         copy.ssh_hosts = Arc::clone(&self.ssh_hosts);
         copy.artifacts = self.artifacts.clone();
@@ -782,6 +795,7 @@ followed by `LINE:TEXT` rows; copy that header's TAG into `edit` sections. Selec
 `:5-16,960-973`; or use offset/limit (not together with a selector). A footer states the lines returned and the \
 file's total line count. \
 `:raw` (e.g. `src/a.rs:raw:1-40`) returns verbatim text without anchors; raw output cannot be edited. \
+`:outline` lists declarations with line ranges. \
 Without a range, output is capped at 48 KiB and the footer names the range to read next, so read large files in \
 ranges. `edit` may only touch lines you have been shown.";
 
@@ -813,8 +827,8 @@ Put all changes to one file in one section. On success you get the fresh [PATH#T
 const REPLACE_READ_DESC: &str = "Read a text file in the workspace with line numbers (or list a directory). \
 Select lines by appending to the path `:50-100`, `:50+150` (150 lines from 50), `:50-` (from 50), `:-60` (last 60 lines) \
 or comma-joined ranges such as `:5-16,960-973`; or use offset/limit (not together with a selector). A footer states \
-the lines returned and the file's total line count. Without a range, output is capped at 48 KiB and the footer names \
-the range to read next, so read large files in ranges.";
+the lines returned and the file's total line count. `path:outline` lists declarations with line ranges. Without a \
+range, output is capped at 48 KiB and the footer names the range to read next, so read large files in ranges.";
 
 fn schema(name: &str, mode: EditMode) -> Option<Value> {
     let hashline = mode == EditMode::Hashline;
@@ -828,7 +842,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                     REPLACE_READ_DESC
                 },
                 json!({
-                    "path": {"type": "string", "description": "Workspace file/directory or `ssh://host/path` remote file. SSH URL reads require explicit approval; absolute and `~/` remote paths supported. Use paths instead to read several targets in one call."},
+                    "path": {"type": "string", "description": "Workspace file/directory or `ssh://host/path` remote file. SSH URL reads require explicit approval; absolute and `~/` remote paths supported. `pr://N[/diff]` and `issue://N` read GitHub through gh; `conflict://` lists unmerged paths and `conflict://PATH` reads its merge-conflict hunks with edit anchors. Use paths instead to read several targets in one call."},
                     "offset": {"type": "integer", "minimum": 1, "description": "1-based line to start at (default 1); not together with a path selector."},
                     "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of lines (default 2000)."},
                     "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Several targets read in one call, each a path with its own optional selector (e.g. `src/a.rs:1-80`); results come back in order. Use instead of path."},
@@ -888,6 +902,7 @@ fn schema(name: &str, mode: EditMode) -> Option<Value> {
                 "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default false)."},
                 "context": {"type": "integer", "minimum": 0, "description": "Lines of context to show before and after each match (default 0; values above 10 are capped at 10)."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum number of matching lines (default 400). Without max_results a single file contributes at most 20 matching lines to a page; its remaining matches are named in the footer and later files still appear. An explicit max_results lifts that per-file cap."},
+                "output": {"type": "string", "enum": ["lines", "files", "count"], "description": "lines (default) shows matches; files lists matching files with counts (max_results/skip count files); count gives totals."},
                 "multiline": {"type": "boolean", "description": "Match whole-file bytes (default false, automatic for actual newlines or regex \\n). Anchors match each line; use (?s) to make dot match newline."},
                 "hidden": {"type": "boolean", "description": "Include hidden entries (default true)."},
                 "gitignore": {"type": "boolean", "description": "Honor local ignore rules and skip dependency/build directories (default true); false includes them, never .git/scratch/symlinks."},
@@ -1140,11 +1155,16 @@ fn edit_for_workspace(
     };
     let effective_repair = (repair.is_some() || workspace.edit_repair.0.is_some())
         .then_some(&guarded_repair as &dyn Fn(&EditRepairRequest) -> Result<String, String>);
+    let refuse_syntax_errors = match edit::editing::syntax_gate(workspace, args) {
+        Ok(refuse) => refuse,
+        Err(error) => return ToolOutput::err(error),
+    };
     let execution = edit::editing::Execution {
         repair: effective_repair,
         authorize: Some(&authorize),
         cancel: Some(cancel),
         preview_no_change: None,
+        refuse_syntax_errors,
     };
     let result = if workspace.edit_mode == EditMode::Hashline {
         edit::hashline::input_arg(args)
@@ -1155,7 +1175,7 @@ fn edit_for_workspace(
     };
     match result {
         Ok(text) => ToolOutput::ok(text),
-        Err(error) => ToolOutput::err(error),
+        Err(error) => ToolOutput::err(fs::suggest::annotate_edit(workspace, args, error)),
     }
 }
 pub fn write_with_context(
@@ -1219,6 +1239,7 @@ pub fn write_with_context(
         authorize: Some(&authorize),
         cancel: Some(cancel),
         preview_no_change: None,
+        refuse_syntax_errors: false,
     };
     match fs::files::write_with(ctx.workspace, args, &execution) {
         Ok(text) => ToolOutput::ok(text),
@@ -1238,13 +1259,9 @@ fn dispatch(
     match name {
         "read" => fs::files::read_tool(ws, args).map(ToolOutput::ok),
         "write" => fs::files::write_tool(ws, args).map(ToolOutput::ok),
-        "edit" => match ws.edit_mode {
-            EditMode::Hashline => edit::editing::validate_shape(ws.edit_mode, args)
-                .and_then(|_| edit::hashline::input_arg(args))
-                .and_then(|input| edit::hashline::edit(ws, input))
-                .map(ToolOutput::ok),
-            _ => edit::editing::edit(ws, args).map(ToolOutput::ok),
-        },
+        "edit" => edit::editing::edit(ws, args)
+            .map(ToolOutput::ok)
+            .map_err(|error| fs::suggest::annotate_edit(ws, args, error)),
         "glob" => fs::search::glob_tool(ws, args).map(ToolOutput::ok),
         "grep" => fs::search::grep_tool(ws, args).map(ToolOutput::ok),
         "bash" => exec::shell::bash_tool(ws, args, timeout_secs),

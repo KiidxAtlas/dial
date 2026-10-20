@@ -789,9 +789,8 @@ fn builtin_runtime_end_to_end_sandboxed() {
     config.sandbox.mode = SandboxMode::Dev;
     config.sandbox.allow_network = true;
     config.browser.auto_localhost = false;
-    // Isolate from cmux/tern sessions on the host so this test always exercises Chromium.
+    // Isolate from cmux sessions on the host so this test always exercises Chromium.
     config.browser.cmux = false;
-    config.browser.tern = false;
     config.browser.allowed_hosts = vec![format!("127.0.0.1:{}", app.port)];
     assert!(
         config.browser.playwright_module.trim().is_empty(),
@@ -830,6 +829,29 @@ fn builtin_runtime_end_to_end_sandboxed() {
             .contains("Local browser readable extraction"),
         "{article}"
     );
+    let first = format!("http://127.0.0.1:{}/first", app.port);
+    let article_url = format!("http://127.0.0.1:{}/article", app.port);
+    assert_eq!(call(json!({"action":"back","tab":tab}))["url"], first);
+    assert_eq!(
+        call(json!({"action":"forward","tab":tab}))["url"],
+        article_url
+    );
+    assert_eq!(call(json!({"action":"reload","tab":tab}))["status"], 200);
+    let events = call(json!({"action":"events","tab":tab}));
+    let all = events["events"].as_array().unwrap();
+    assert!(
+        all.iter()
+            .any(|event| event["channel"] == "console" && event["text"] == "verified-click"),
+        "{events}"
+    );
+    assert!(
+        all.iter()
+            .any(|event| event["channel"] == "navigation" && event["url"] == first),
+        "{events}"
+    );
+    let last = events["last_seq"].as_u64().unwrap();
+    let newer = call(json!({"action":"events","tab":tab,"after":last}));
+    assert_eq!(newer["events"], json!([]), "{newer}");
     let screenshot = call(json!({"action":"screenshot","tab":tab}));
     let png = STANDARD
         .decode(screenshot["artifact"]["data"].as_str().unwrap())

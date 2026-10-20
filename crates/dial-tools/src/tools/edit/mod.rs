@@ -11,4 +11,5 @@ pub mod hashline;
 pub mod preview;
 #[cfg(test)]
 mod preview_tests;
+pub mod revert;
 pub mod syntax;

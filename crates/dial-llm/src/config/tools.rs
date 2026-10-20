@@ -123,6 +123,8 @@ pub const EXTRA_TOOLS: &[&str] = &[
     "rewind",
     "ask",
     "tts",
+    "check",
+    "revert_edit",
 ];
 
 /// Tools dial enables by default: the built-ins plus the core dial tools below. The rest of

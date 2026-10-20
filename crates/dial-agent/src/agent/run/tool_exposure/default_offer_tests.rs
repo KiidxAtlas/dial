@@ -597,27 +597,37 @@ fn local_routes_default_to_replace_edits_unless_pinned() {
 }
 
 /// Failing rounds escalate one step at a time: the minimal set and the short prompt, then the
-/// replace grammar. A success resets the streak, the step is remembered for the model and a
-/// new session starts from it.
+/// replace grammar. A success resets the streak. A reached step takes effect at the next turn, so a
+/// turn's prompt and offer never change; it is remembered for the model and a new session starts
+/// from it.
 #[test]
 fn local_escalation_steps_up_on_failing_rounds_and_is_remembered() {
     use crate::config::types::EditMode;
     let overlay = "context_window=65536\n[assistance.local]\nedit_mode='inherit'";
     with_agent(overlay, |agent| {
         let ui = &mut crate::agent::NullUi;
+        agent.seed_local_escalation();
         let full = agent.offered();
+        let prompt = system_text(agent);
         assert!(!agent.minimal_tools());
         assert_eq!(agent.edit_mode(), EditMode::Hashline);
         assert!(!agent.observe_local_round(true, ui));
         assert!(!agent.observe_local_round(false, ui), "a success resets");
         assert!(!agent.observe_local_round(true, ui));
         assert!(agent.observe_local_round(true, ui));
+        // The reached step waits for the turn boundary.
+        assert!(!agent.minimal_tools());
+        assert_eq!(agent.offered(), full);
+        assert_eq!(system_text(agent), prompt);
+        agent.seed_local_escalation();
         assert!(agent.minimal_tools());
         assert!(agent.offered().len() < full.len());
         assert!(!system_text(agent).contains("# Visual verification"));
         assert_eq!(agent.edit_mode(), EditMode::Hashline);
         assert!(!agent.observe_local_round(true, ui));
         assert!(agent.observe_local_round(true, ui));
+        assert_eq!(agent.edit_mode(), EditMode::Hashline, "not within the turn");
+        agent.seed_local_escalation();
         assert_eq!(agent.edit_mode(), EditMode::Replace);
         assert_eq!(agent.workspace.edit_mode(), EditMode::Replace);
         // Nothing is stricter than the last step.
@@ -631,6 +641,18 @@ fn local_escalation_steps_up_on_failing_rounds_and_is_remembered() {
         agent.seed_local_escalation();
         assert!(agent.minimal_tools());
         assert_eq!(agent.workspace.edit_mode(), EditMode::Replace);
+    });
+    // Both steps reached within one turn apply together at the next one.
+    with_agent(overlay, |agent| {
+        let ui = &mut crate::agent::NullUi;
+        for _ in 0..4 {
+            agent.observe_local_round(true, ui);
+        }
+        assert!(!agent.minimal_tools());
+        assert_eq!(agent.edit_mode(), EditMode::Hashline);
+        agent.seed_local_escalation();
+        assert!(agent.minimal_tools());
+        assert_eq!(agent.edit_mode(), EditMode::Replace);
     });
     // A pinned grammar stops at the first step, and escalation is off on hosted routes.
     with_agent(

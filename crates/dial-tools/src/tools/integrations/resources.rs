@@ -13,6 +13,8 @@ pub enum Scheme {
     File,
     Ssh,
     PullRequest,
+    Issue,
+    Conflict,
     Artifact,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -53,6 +55,20 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         requires_network: true,
     },
     Descriptor {
+        scheme: Scheme::Issue,
+        prefix: "issue://",
+        provenance: Provenance::Remote,
+        accepts_line_arguments: false,
+        requires_network: true,
+    },
+    Descriptor {
+        scheme: Scheme::Conflict,
+        prefix: "conflict://",
+        provenance: Provenance::Workspace,
+        accepts_line_arguments: false,
+        requires_network: false,
+    },
+    Descriptor {
         scheme: Scheme::Artifact,
         prefix: "artifact://",
         provenance: Provenance::ImmutableArtifact,
@@ -79,12 +95,14 @@ pub fn scheme(input: &str) -> Result<Scheme, String> {
             }
             "ssh" => Ok(Scheme::Ssh),
             "pr" => Ok(Scheme::PullRequest),
+            "issue" => Ok(Scheme::Issue),
+            "conflict" => Ok(Scheme::Conflict),
             "artifact" => {
                 artifact_id(input)?;
                 Ok(Scheme::Artifact)
             }
             _ => Err(format!(
-                "unsupported resource scheme {prefix:?}; use a workspace path, ssh://, pr:// or artifact://"
+                "unsupported resource scheme {prefix:?}; use a workspace path, ssh://, pr://, issue://, conflict:// or artifact://"
             )),
         };
     }

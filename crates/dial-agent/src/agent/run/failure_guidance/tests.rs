@@ -108,3 +108,20 @@ fn every_tool_failure_gets_guidance_on_its_first_result() {
         );
     }
 }
+
+#[test]
+fn feedback_is_compact_first_and_full_on_repetition_with_the_tag_kept() {
+    let first = feedback("tool_failure", "Check the path.", 1);
+    assert_eq!(
+        first,
+        format!("\n[Dial recovery: tool_failure] {FIRST_FAILURE} Check the path.")
+    );
+    assert!(first.split_whitespace().count() < 25, "{first}");
+    let repeat = feedback("tool_failure", "Check the path.", 2);
+    assert!(repeat.starts_with("\n[Dial recovery: tool_failure] "));
+    assert!(repeat.contains("2 times in a row") && repeat.contains(DIAGNOSE_FIRST));
+    assert!(repeat.ends_with("Check the path."));
+    // Uncertain effects are never compacted.
+    assert!(feedback("effects_unknown", "Inspect.", 1).contains(DIAGNOSE_FIRST));
+    assert_eq!(feedback("timeout", "a", 3), feedback("timeout", "a", 3));
+}

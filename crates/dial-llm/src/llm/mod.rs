@@ -1113,6 +1113,12 @@ fn http_error(
     } else if status == 404 {
         excerpt.push_str(" — refresh /models and select an available model; check the provider endpoint in /providers.");
     }
+    if message
+        .as_deref()
+        .is_some_and(|m| errors::LLAMA_NO_JINJA.is_match(m))
+    {
+        excerpt.push_str(" — this llama-server has Jinja chat templates disabled, so it cannot accept tool calls; restart it with --jinja.");
+    }
     // Validation errors often list every allowed content type, including "image". Only an
     // explicit capability rejection justifies suggesting another model, not malformed history,
     // oversized images, or unsupported image encodings.

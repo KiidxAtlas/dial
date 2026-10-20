@@ -6,8 +6,18 @@ impl Terminal for u32 {
     fn prevent_completion(&mut self, _: &str) {}
 }
 
+fn failing(name: &str) -> ToolCall {
+    ToolCall {
+        id: "first".into(),
+        name: name.into(),
+        arguments: serde_json::json!({}),
+        malformed_arguments: false,
+    }
+}
+
 #[test]
-fn first_failure_preserves_the_diagnostic_and_adds_recovery_for_any_tool() {
+fn first_failure_preserves_the_diagnostic_and_adds_compact_recovery_for_any_tool() {
+    use crate::agent::run::failure_guidance::{DIAGNOSE_FIRST, FIRST_FAILURE};
     let dir = tempfile::tempdir().unwrap();
     let workspace = Workspace::new(dir.path()).unwrap();
     for (name, output) in [
@@ -21,25 +31,86 @@ fn first_failure_preserves_the_diagnostic_and_adds_recovery_for_any_tool() {
             ToolOutput::err("partial commit").with_effects(Effects::Unknown),
         ),
     ] {
-        let call = ToolCall {
-            id: "first".into(),
-            name: name.into(),
-            arguments: serde_json::json!({}),
-            malformed_arguments: false,
-        };
+        let call = failing(name);
         let mut engine = Engine::default();
         let diagnostic = output.text.clone();
         let mut output = output;
         let (_, _, stop) = engine.settle(&workspace, &call, &mut output, false, false, |_| false);
         assert!(output.text.starts_with(&diagnostic));
-        assert!(
-            output
-                .text
-                .contains(crate::agent::run::failure_guidance::DIAGNOSE_FIRST)
-        );
         assert!(output.text.contains("[Dial recovery:"));
-        assert_eq!(stop.is_some(), output.execution.effects == Effects::Unknown);
+        let uncertain = output.execution.effects == Effects::Unknown;
+        // Uncertain effects always carry the full contract; other first failures stay short.
+        assert_eq!(output.text.contains(DIAGNOSE_FIRST), uncertain, "{name}");
+        assert_eq!(output.text.contains(FIRST_FAILURE), !uncertain, "{name}");
+        assert_eq!(stop.is_some(), uncertain);
     }
+}
+
+#[test]
+fn repeated_failure_carries_the_full_contract_and_success_resets_it() {
+    use crate::agent::run::failure_guidance::{DIAGNOSE_FIRST, FIRST_FAILURE};
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let mut engine = Engine::default();
+    let mut settle = |name: &str, output: ToolOutput| {
+        let mut output = output;
+        engine.settle(
+            &workspace,
+            &failing(name),
+            &mut output,
+            false,
+            false,
+            |_| false,
+        );
+        output.text
+    };
+    let first = settle("read", ToolOutput::err("missing file: a.rs"));
+    assert!(first.contains("[Dial recovery: tool_failure] ") && first.contains(FIRST_FAILURE));
+    assert!(!first.contains(DIAGNOSE_FIRST));
+    // Another tool's failure is its own first failure.
+    assert!(settle("grep", ToolOutput::err("bad regex")).contains(FIRST_FAILURE));
+    let second = settle("read", ToolOutput::err("missing file: b.rs"));
+    assert!(
+        second.contains("[Dial recovery: tool_failure] "),
+        "{second}"
+    );
+    assert!(second.contains(DIAGNOSE_FIRST) && !second.contains(FIRST_FAILURE));
+    assert!(second.contains("2 times in a row"), "{second}");
+    assert!(settle("read", ToolOutput::err("missing")).contains("3 times in a row"));
+    // A success of the tool ends its streak.
+    settle("read", ToolOutput::ok("1:fn main() {}".into()));
+    let again = settle("read", ToolOutput::err("missing file: c.rs"));
+    assert!(again.contains(FIRST_FAILURE) && !again.contains(DIAGNOSE_FIRST));
+}
+
+#[test]
+fn parent_and_worker_settlement_produce_identical_feedback_bytes() {
+    // Both roles settle through `Engine`; the same history yields byte-identical feedback, so
+    // stored results stay byte-stable across replays and roles.
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    let run = || {
+        let mut engine = Engine::default();
+        ["edit", "edit", "bash", "edit"]
+            .into_iter()
+            .map(|name| {
+                let mut output = ToolOutput::err("stale anchors");
+                engine.settle(
+                    &workspace,
+                    &failing(name),
+                    &mut output,
+                    false,
+                    false,
+                    |_| false,
+                );
+                output.text
+            })
+            .collect::<Vec<_>>()
+    };
+    let (parent, worker) = (run(), run());
+    assert_eq!(parent, worker);
+    assert!(parent[0].contains("[Dial recovery: source_or_call_contract] "));
+    assert!(parent[3].contains("3 times in a row"));
 }
 #[test]
 fn shared_driver_cannot_publish_a_completed_report_after_uncertain_effects() {

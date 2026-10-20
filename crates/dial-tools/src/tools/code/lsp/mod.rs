@@ -73,7 +73,8 @@ pub enum WriteOrigin {
 }
 
 /// Synchronizes committed files with already-running language servers and returns the notes to
-/// append to the edit result: watched-file notices, format-on-write status, and diagnostics.
+/// append to the edit result: watched-file notices, format-on-write status, and an advisory list of
+/// the error diagnostics this edit introduced (bounded wait; none without a live server).
 /// `kind` is the LSP `FileChangeType`: 1 created, 2 changed, 3 deleted. The write path starts project
 /// code only when `[lsp] start_on_write` opts in, and never holds a workspace lock while a server answers.
 /// The servers are those of the tool bound to `ws` (see [`bind_write_owner`]); other sessions' are untouched.
@@ -120,6 +121,10 @@ pub fn writethrough(ws: &Workspace, paths: &[(PathBuf, u8)], origin: WriteOrigin
     if !tool.diagnostics_on_write || origin == WriteOrigin::Formatted {
         return output;
     }
+    let mut errors = Vec::new();
+    let mut unknown_baseline = false;
+    // One budget for the whole edit, however many files and servers it touches.
+    let deadline = std::time::Instant::now() + WRITE_DIAGNOSTICS_BUDGET;
     for (path, kind) in paths {
         if *kind == 3 {
             continue;
@@ -134,6 +139,8 @@ pub fn writethrough(ws: &Workspace, paths: &[(PathBuf, u8)], origin: WriteOrigin
             else {
                 continue;
             };
+            // What the server said before this edit: only errors beyond these are reported.
+            let before = client.last_diagnostics(path);
             let mark = client.diagnostics_mark(path);
             // A document the server has not seen is opened here; `changed` is false when it already
             // holds this exact text, so the answer is the current publish rather than a new one.
@@ -143,33 +150,105 @@ pub fn writethrough(ws: &Workspace, paths: &[(PathBuf, u8)], origin: WriteOrigin
             if client.did_save(path, &source).is_err() {
                 continue;
             }
-            let Some(items) = client.diagnostics(path, mark, changed) else {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                continue;
+            }
+            let Some(items) = client.diagnostics_bounded(path, mark, changed, left) else {
                 continue;
             };
-            for item in items {
-                let message = item
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("diagnostic");
-                let line = item
-                    .pointer("/range/start/line")
-                    .and_then(Value::as_u64)
-                    .map_or(1, |n| n.saturating_add(1));
-                let column = item
-                    .pointer("/range/start/character")
-                    .and_then(Value::as_u64)
-                    .map_or(1, |n| n.saturating_add(1));
-                let _ = writeln!(
-                    output,
-                    "[LSP {}:{}:{}] {message}",
-                    ws.rel(path),
-                    line,
-                    column
-                );
-            }
+            let new = new_errors(before.as_deref().unwrap_or_default(), &items);
+            unknown_baseline |= before.is_none() && !new.is_empty();
+            errors.extend(new.into_iter().map(|item| diagnostic_line(ws, path, item)));
         }
     }
+    output.push_str(&new_errors_note(&errors, unknown_baseline));
     output
+}
+
+/// Longest an edit waits for a live server's diagnostics of the new text, pull request included.
+const WRITE_DIAGNOSTICS_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Most new-error lines appended to one edit result.
+const WRITE_DIAGNOSTICS_LINES: usize = 8;
+
+/// Error-severity items of `after` with no counterpart in `before`. Positions are ignored, since an
+/// edit shifts lines; each earlier error with the same message, code and source absorbs one item.
+fn new_errors<'a>(before: &[Value], after: &'a [Value]) -> Vec<&'a Value> {
+    let is_error = |item: &&Value| item.get("severity").and_then(Value::as_u64) == Some(1);
+    let key = |item: &Value| {
+        (
+            item.get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            item.get("code").map(Value::to_string),
+            item.get("source")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
+    };
+    let mut known: HashMap<_, usize> = HashMap::new();
+    for item in before.iter().filter(is_error) {
+        *known.entry(key(item)).or_default() += 1;
+    }
+    after
+        .iter()
+        .filter(is_error)
+        .filter(|item| match known.get_mut(&key(item)) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// `path:line:col: message` for one diagnostic (1-based positions, first message line).
+fn diagnostic_line(ws: &Workspace, path: &Path, item: &Value) -> String {
+    let message = item
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("diagnostic");
+    let message = message.lines().next().unwrap_or_default().trim();
+    let position = |key: &str| {
+        item.pointer(&format!("/range/start/{key}"))
+            .and_then(Value::as_u64)
+            .map_or(1, |n| n.saturating_add(1))
+    };
+    format!(
+        "{}:{}:{}: {message}",
+        ws.rel(path),
+        position("line"),
+        position("character")
+    )
+}
+
+/// The advisory block appended to an edit result; empty when the edit added no errors.
+fn new_errors_note(errors: &[String], unknown_baseline: bool) -> String {
+    if errors.is_empty() {
+        return String::new();
+    }
+    let mut note = format!(
+        "[LSP advisory, not verification] {} new error(s) after this edit{}:\n",
+        errors.len(),
+        if unknown_baseline {
+            " (file had no earlier diagnostics; some may predate the edit)"
+        } else {
+            ""
+        }
+    );
+    for line in errors.iter().take(WRITE_DIAGNOSTICS_LINES) {
+        note.push_str(line);
+        note.push('\n');
+    }
+    if errors.len() > WRITE_DIAGNOSTICS_LINES {
+        let _ = writeln!(
+            note,
+            "... {} more; lsp diagnostics lists all",
+            errors.len() - WRITE_DIAGNOSTICS_LINES
+        );
+    }
+    note
 }
 
 /// The tool bound to this workspace instance, if it is still alive.

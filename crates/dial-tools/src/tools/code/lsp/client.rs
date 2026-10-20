@@ -999,8 +999,9 @@ impl Client {
         self.supports("/diagnosticProvider", "textDocument/diagnostic")
     }
 
-    /// Pull diagnostics for the current version of `path`, stored like a publish.
-    pub fn pull_diagnostics(&self, path: &Path) -> Result<Vec<Value>> {
+    /// Pull diagnostics for the current version of `path`, stored like a publish. With `limit`,
+    /// one request bounded by it and never retried; otherwise the usual retried request.
+    fn pull_diagnostics(&self, path: &Path, limit: Option<Duration>) -> Result<Vec<Value>> {
         let previous = lock(&self.shared.diagnostics).result_ids.get(path).cloned();
         let version = self.version(path).map(i64::from);
         let mut params = json!({"textDocument": {"uri": uri_from_path(path)}});
@@ -1008,7 +1009,10 @@ impl Client {
         if let Some((id, _)) = &previous {
             params["previousResultId"] = json!(id);
         }
-        let result = self.request("textDocument/diagnostic", params)?;
+        let result = match limit {
+            Some(limit) => self.request_within("textDocument/diagnostic", params, limit)?,
+            None => self.request("textDocument/diagnostic", params)?,
+        };
         let unchanged = result.get("kind").and_then(Value::as_str) == Some("unchanged");
         // "unchanged" means the items of the result id we sent, not whatever was published last.
         let items = match (unchanged, previous) {
@@ -1043,9 +1047,29 @@ impl Client {
             .map_or(0, |(seq, _, _)| *seq)
     }
 
+    /// The diagnostics the server last reported for `path`, whatever version they describe.
+    pub fn last_diagnostics(&self, path: &Path) -> Option<Vec<Value>> {
+        lock(&self.shared.diagnostics)
+            .by_file
+            .get(path)
+            .map(|(_, _, items)| items.clone())
+    }
+
     /// Diagnostics for `path` within the default diagnostics timeout; see [`Self::diagnostics_within`].
     pub fn diagnostics(&self, path: &Path, mark: u64, fresh: bool) -> Option<Vec<Value>> {
         self.diagnostics_within(path, mark, fresh, self.timeouts.diagnostics)
+    }
+
+    /// Like [`Self::diagnostics_within`], but `budget` bounds the whole call, a pull request
+    /// included (which is then sent once, without retries), so an edit never waits longer.
+    pub fn diagnostics_bounded(
+        &self,
+        path: &Path,
+        mark: u64,
+        fresh: bool,
+        budget: Duration,
+    ) -> Option<Vec<Value>> {
+        self.collect_diagnostics(path, mark, fresh, budget, true)
     }
 
     /// Diagnostics for the current document version of `path`. When `fresh` (the document was
@@ -1059,10 +1083,23 @@ impl Client {
         fresh: bool,
         budget: Duration,
     ) -> Option<Vec<Value>> {
-        if self.supports_pull()
-            && let Ok(items) = self.pull_diagnostics(path)
-        {
-            return Some(items);
+        self.collect_diagnostics(path, mark, fresh, budget, false)
+    }
+
+    fn collect_diagnostics(
+        &self,
+        path: &Path,
+        mark: u64,
+        fresh: bool,
+        budget: Duration,
+        bounded: bool,
+    ) -> Option<Vec<Value>> {
+        let started = Instant::now();
+        if self.supports_pull() {
+            let pulled = self.pull_diagnostics(path, bounded.then_some(budget));
+            if let Ok(items) = pulled {
+                return Some(items);
+            }
         }
         let expected = self.version(path).map(i64::from);
         let seq_of = |d: &Diagnostics| {
@@ -1071,7 +1108,7 @@ impl Client {
                 .filter(|(_, version, _)| version.is_none() || *version == expected)
                 .map_or(0, |(seq, _, _)| *seq)
         };
-        let deadline = Instant::now() + budget;
+        let deadline = if bounded { started } else { Instant::now() } + budget;
         let mut guard = lock(&self.shared.diagnostics);
         let needed = if fresh { mark } else { 0 };
         guard = self.wait_diagnostics(guard, deadline, |d| seq_of(d) > needed);

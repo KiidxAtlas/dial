@@ -368,6 +368,13 @@ pub(super) fn local_suggestion_base(config: &Config) -> crate::llm::local_eviden
         context_window: config.context_window,
         draft_model: config.local_runtime.draft_model.clone(),
         side_models: name(serde_json::to_value(config.assistance.local.side_models)),
+        coach: crate::llm::local_evidence::CoachEscalation {
+            main_local: config.local_main_model(),
+            coach_assigned: config.role_selection("coach").is_some(),
+            enabled: config.escalation.enabled,
+            auto_after_failed_rounds: config.escalation.auto_after_failed_rounds,
+            max_auto_per_turn: config.escalation.max_auto_per_turn,
+        },
         ..Default::default()
     }
 }

@@ -45,10 +45,13 @@ const LOOP_REPETITION_PENALTY: f64 = 1.1;
 /// Measured speed samples needed before the time budget trusts them.
 const TIME_BUDGET_MIN_SAMPLES: u64 = 3;
 
-/// Session escalation state; `stage` only grows within a session.
+/// Session escalation state. `reached` grows as failing rounds accumulate; `stage` is the step in
+/// effect and catches up only at a user-turn boundary, so the prompt, tool offer and edit grammar
+/// stay stable within a turn.
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::agent) struct Escalation {
     pub(in crate::agent) stage: u8,
+    reached: u8,
     strikes: u32,
     seeded: bool,
 }
@@ -141,6 +144,9 @@ pub(in crate::agent) struct LocalSession {
     shown: BTreeSet<&'static str>,
     /// Whether the main model was loaded when this session first asked (`None`: unknown).
     loaded_at_start: Option<bool>,
+    /// Whether this model's saved reliability record passed the two-call batch fixture, read once
+    /// per session so the one-call decision (and the prompt that states it) cannot change mid-session.
+    batch_record_passed: std::cell::OnceCell<bool>,
 }
 
 /// A worker's llama.cpp slot: the main session keeps `MAIN_SLOT`; with fewer than two slots there is
@@ -233,6 +239,18 @@ impl Agent<'_> {
         self.local_escalation.stage >= 1 && self.local_profile_active()
     }
 
+    /// One tool call per response: the small tier, unless this model's saved reliability record
+    /// (`dial reliability check`) passed the two-call batch fixture. Uses the reliability one-call
+    /// interface; `reliability.enabled = false` turns it off with the rest of that interface.
+    pub(in crate::agent) fn local_one_call(&self) -> bool {
+        self.local_tier() == Some(Tier::Small)
+            && self.config.reliability.enabled
+            && !*self.local_session.batch_record_passed.get_or_init(|| {
+                crate::reliability::measured(self.config)
+                    .is_some_and(|record| record["batch_passed"] == true)
+            })
+    }
+
     /// The edit grammar after the second escalation step, unless a pin decides it.
     pub(in crate::agent) fn escalated_edit_mode(&self) -> Option<EditMode> {
         (self.local_escalation.stage >= 2
@@ -310,31 +328,39 @@ impl Agent<'_> {
         Some("local server defaults")
     }
 
-    /// Restores the escalation step this model reached in earlier sessions, once per session, and
-    /// keeps its record for the draft-model trial.
+    /// Turn start: restores the step this model reached in earlier sessions (once per session,
+    /// keeping its record for the draft-model trial), then puts into effect a step reached during an
+    /// earlier turn. Only here do steps change the prompt, offer and grammar, so a turn never sees
+    /// them change.
     pub(in crate::agent) fn seed_local_escalation(&mut self) {
-        if std::mem::replace(&mut self.local_escalation.seeded, true)
-            || !self.local_profile_active()
+        if !std::mem::replace(&mut self.local_escalation.seeded, true)
+            && self.local_profile_active()
         {
+            self.local_session.recorded = local_evidence::read(&self.config.user_dir)
+                .ok()
+                .and_then(|mut records| records.remove(&self.local_model_key()))
+                .unwrap_or_default();
+            if self.config.assistance.local.escalate_after > 0 {
+                let state = &mut self.local_escalation;
+                state.reached = state
+                    .reached
+                    .max(self.local_session.recorded.stage.min(MAX_STAGE));
+            }
+        }
+        if !self.local_profile_active() || self.config.assistance.local.escalate_after == 0 {
             return;
         }
-        self.local_session.recorded = local_evidence::read(&self.config.user_dir)
-            .ok()
-            .and_then(|mut records| records.remove(&self.local_model_key()))
-            .unwrap_or_default();
-        if self.config.assistance.local.escalate_after == 0 {
-            return;
-        }
-        let stage = self.local_session.recorded.stage.min(MAX_STAGE);
-        if stage > self.local_escalation.stage {
-            self.local_escalation.stage = stage;
+        let state = &mut self.local_escalation;
+        if state.reached > state.stage {
+            state.stage = state.reached;
             self.apply_local_stage();
         }
     }
 
     /// Counts one tool round. `failed` is a malformed tool call or a failed edit or write. After
-    /// `escalate_after` failing rounds in a row the session moves one step stricter and remembers the
-    /// step for this model. Returns whether the offer changed, so the caller re-reads it.
+    /// `escalate_after` failing rounds in a row the session reaches one step stricter and remembers
+    /// it for this model; the step takes effect at the next turn (`seed_local_escalation`). Returns
+    /// whether a step was reached.
     pub(in crate::agent) fn observe_local_round(&mut self, failed: bool, ui: &mut dyn Ui) -> bool {
         if self.local_profile_active() {
             self.local_session.pending.rounds.add(!failed);
@@ -351,7 +377,7 @@ impl Agent<'_> {
             .pinned_edit_mode(&self.version.harness)
             .is_some();
         // The second step only changes an unpinned grammar that is not already `replace`.
-        let stricter = match self.local_escalation.stage {
+        let stricter = match self.local_escalation.reached {
             0 => true,
             1 => !pinned && self.edit_mode() != EditMode::Replace,
             _ => false,
@@ -366,9 +392,8 @@ impl Agent<'_> {
             return false;
         }
         state.strikes = 0;
-        state.stage += 1;
-        let stage = state.stage;
-        self.apply_local_stage();
+        state.reached += 1;
+        let stage = state.reached;
         let what = if stage == 1 {
             "offering the minimal tool set and the short prompt (other tools load on demand)"
         } else {
@@ -376,12 +401,14 @@ impl Agent<'_> {
         };
         ui.event(&crate::agent::ui::ui_event::UiEvent::new(
             crate::agent::ui::ui_event::EventKind::Model,
-            format!("Local model: {after} failing tool rounds in a row; {what}"),
+            format!(
+                "Local model: {after} failing tool rounds in a row; from the next turn, {what}"
+            ),
         ));
         self.local_session.pending.stage = self.local_session.pending.stage.max(stage);
         if let Err(error) = self.flush_local_evidence() {
             ui.diagnostic(&format!(
-                "Local profile step not remembered ({error:#}); it still applies to this session."
+                "Local profile step not remembered ({error:#}); it still applies from the next turn of this session."
             ));
         }
         true

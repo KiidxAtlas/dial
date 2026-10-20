@@ -289,6 +289,83 @@ fn repair_retry_carries_json_schema_only_on_a_detected_llama_server() {
     assert!(body.get("tools").is_some());
 }
 
+/// A first attempt on a detected llama-server sends `tools` with no `response_format`, `grammar`,
+/// `json_schema` or forced `tool_choice`: llama.cpp then applies its lazy tool-call grammar and
+/// leaves plain answers free. A template whose `/props` caps lack native tools gets one notice per
+/// conversation; a template with them gets none.
+#[test]
+fn first_attempt_on_llama_server_keeps_answers_free_and_flags_tool_less_templates() {
+    use llm::local_hints::LocalHints;
+    let read = json!({"type": "function", "function": {"name": "read_file", "parameters": {
+        "type": "object", "properties": {"path": {"type": "string"}}}}});
+    let mut req = request();
+    req.tools = vec![read];
+    let props = |native: bool| {
+        fake::json(
+            200,
+            &json!({"default_generation_settings": {"n_ctx": 4096},
+                "chat_template_caps": {"supports_tools": native, "supports_tool_calls": native}}),
+        )
+    };
+    let run = |native: bool| {
+        // One connection for the /props probe (made by local detection), then one per chat.
+        let llama = fake::serve(vec![props(native), ok("{}"), ok("{}")]);
+        let mut local = backend(endpoint(&format!("{}/v1", llama.url))).with_session_id("one");
+        local.set_local_hints(LocalHints {
+            prompt_progress: true,
+            ..Default::default()
+        });
+        let mut notices = Vec::new();
+        for _ in 0..2 {
+            local
+                .chat_with_control(
+                    None,
+                    &req,
+                    5,
+                    None,
+                    &mut |n| notices.push(n.to_owned()),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+        }
+        let body = fake::body(&llama.requests()[1]);
+        assert!(body["tools"].as_array().is_some_and(|t| t.len() == 1));
+        for field in ["response_format", "grammar", "json_schema", "tool_choice"] {
+            assert!(body.get(field).is_none(), "{field}: {body}");
+        }
+        notices
+    };
+    let notices = run(false);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("--chat-template-file"), "{notices:?}");
+    assert!(run(true).is_empty());
+}
+
+/// llama-server without Jinja refuses tools with HTTP 500; Dial stops at once with the flag to add
+/// instead of retrying the same request.
+#[test]
+fn llama_server_without_jinja_fails_once_with_the_flag_to_add() {
+    let mut req = request();
+    req.tools = vec![json!({"type": "function", "function": {"name": "read_file",
+        "parameters": {"type": "object", "properties": {}}}})];
+    let server = fake::serve(vec![fake::json(
+        500,
+        &json!({"error": {"code": 500, "message": "tools param requires --jinja flag",
+            "type": "server_error"}}),
+    )]);
+    let mut remote = backend(endpoint(&format!("{}/v1", server.url)));
+    let error = remote.chat(None, &req, 5, None).unwrap_err();
+    assert_eq!(
+        llm::errors::classify(&error),
+        llm::errors::ErrorClass::Fatal
+    );
+    assert!(
+        format!("{error:#}").contains("restart it with --jinja"),
+        "{error:#}"
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
 #[test]
 fn url_normalization() {
     for (base, want) in [

@@ -3,6 +3,7 @@
 pub mod gh;
 pub(in crate::tools) mod gh_cache;
 pub(in crate::tools) mod gh_common;
+pub(in crate::tools) mod gh_issue;
 pub(in crate::tools) mod gh_pr;
 pub(in crate::tools) mod gh_pr_diff;
 pub(in crate::tools) mod gh_run_watch;

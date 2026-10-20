@@ -248,6 +248,23 @@ impl<'a> Agent<'a> {
             .into_iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
+        self.focused_checks_for(&paths)
+    }
+
+    /// The gate's selection for the active checkpoint turn; only path-independent checks before one exists.
+    pub(in crate::agent) fn current_focused_checks(
+        &self,
+    ) -> Vec<crate::agent::verify::verification::FocusedCheck> {
+        match self.step_checks.turn {
+            Some(turn) => self.focused_checks(turn),
+            None => self.focused_checks_for(&[]),
+        }
+    }
+
+    fn focused_checks_for(
+        &self,
+        paths: &[PathBuf],
+    ) -> Vec<crate::agent::verify::verification::FocusedCheck> {
         // Endpoint users may never have run `dial setup`; a missing interpreter must not read as broken code.
         let python = if self.config.python.is_file() {
             self.config.python.clone()
@@ -257,11 +274,11 @@ impl<'a> Agent<'a> {
         let mut checks = crate::agent::verify::verification::plan_with_runner(
             self.workspace.root(),
             &python,
-            &paths,
+            paths,
             &self.config.verification.python_command,
         );
         if self.config.assistance.enabled && self.config.assistance.selective_verification {
-            checks.extend(self.related_test_plan(&paths).checks);
+            checks.extend(self.related_test_plan(paths).checks);
         }
         for custom in &self.config.verification.commands {
             let required = self
@@ -290,7 +307,7 @@ impl<'a> Agent<'a> {
         checks
     }
 
-    fn related_test_plan(
+    pub(in crate::agent) fn related_test_plan(
         &self,
         paths: &[PathBuf],
     ) -> crate::agent::verify::verification::RelatedTestPlan {

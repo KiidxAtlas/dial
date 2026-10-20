@@ -159,3 +159,58 @@ fn changed_schema_refuses_continuation_but_legacy_and_documentation_remain_reada
     .unwrap();
     validate_history(&history, &[], &registry).unwrap();
 }
+#[test]
+fn history_recorded_before_an_additive_builtin_property_stays_valid() {
+    let registry = Registry::new();
+    let current = crate::tools::schema("grep", crate::config::types::EditMode::Replace).unwrap();
+    let mut before = current.clone();
+    before["function"]["parameters"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("output");
+    let old = identities(&[before], &registry)["grep"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"id":old}})];
+    validate_history(&history, &[current.clone()], &registry).unwrap();
+    let mut changed = current;
+    changed["function"]["parameters"]["properties"]["pattern"]["type"] = json!("integer");
+    let mut other = history;
+    other[0]["dial_tool_contracts"]["id"] = json!(identities(&[changed], &registry)["grep"]);
+    assert!(
+        validate_history(
+            &other,
+            &[crate::tools::schema("grep", crate::config::types::EditMode::Replace).unwrap()],
+            &registry
+        )
+        .is_err()
+    );
+}
+
+/// `edit` gained the optional `allow_syntax_errors`; sessions recorded before it resume in every
+/// edit grammar.
+#[test]
+fn edit_history_recorded_before_allow_syntax_errors_stays_valid() {
+    use crate::config::types::EditMode;
+    let registry = Registry::new();
+    for mode in [
+        EditMode::Hashline,
+        EditMode::Replace,
+        EditMode::Patch,
+        EditMode::ApplyPatch,
+        EditMode::Sloppy,
+    ] {
+        let current = crate::tools::schema("edit", mode).unwrap();
+        let mut before = current.clone();
+        assert!(
+            before["function"]["parameters"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("allow_syntax_errors")
+                .is_some(),
+            "{mode:?}"
+        );
+        let old = identities(&[before], &registry)["edit"].clone();
+        let history = vec![json!({"role":"assistant","dial_tool_contracts":{"edit":old}})];
+        validate_history(&history, &[current], &registry)
+            .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+    }
+}

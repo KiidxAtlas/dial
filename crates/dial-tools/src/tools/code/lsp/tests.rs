@@ -1009,6 +1009,77 @@ fn format_on_write_formats_once_and_observes_its_own_commit() {
 }
 
 #[test]
+fn edit_results_list_only_errors_the_edit_introduced() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let logs: Arc<Mutex<Vec<Log>>> = Arc::default();
+    let tool = owner_tool(&fake_config(false), &logs);
+    let file = ws.root().join("a.fk");
+    std::fs::write(&file, "ERROR one\nfine\n").unwrap();
+    let symbols = json!({"action": "document_symbols", "path": "a.fk"});
+    assert!(!run_as(&*tool, &ws, symbols).is_error);
+    let client = lock(&tool.running).values().next().cloned().unwrap();
+    wait_until("the pre-edit publish", || {
+        client.diagnostics_mark(&file) > 0
+    });
+
+    std::fs::write(&file, "ERROR one\nfine\nERROR three\n").unwrap();
+    let notes = writethrough(&ws, &[(file.clone(), 2)], WriteOrigin::Edit);
+    assert!(
+        notes.contains(
+            "[LSP advisory, not verification] 1 new error(s) after this edit:\na.fk:3:1: found ERROR\n"
+        ),
+        "{notes}"
+    );
+    assert!(
+        !notes.contains("a.fk:1:1"),
+        "a pre-existing error was reported: {notes}"
+    );
+
+    // Fewer errors than before: nothing new, nothing appended.
+    std::fs::write(&file, "fine\nERROR one\n").unwrap();
+    let notes = writethrough(&ws, &[(file.clone(), 2)], WriteOrigin::Edit);
+    assert!(!notes.contains("new error"), "{notes}");
+
+    // Many new errors are capped.
+    let many: String = (0..11).map(|n| format!("ERROR {n}\n")).collect();
+    std::fs::write(&file, many).unwrap();
+    let notes = writethrough(&ws, &[(file.clone(), 2)], WriteOrigin::Edit);
+    assert!(notes.contains("10 new error(s)"), "{notes}");
+    assert_eq!(notes.matches(": found ERROR").count(), 8, "{notes}");
+    assert!(notes.contains("... 2 more"), "{notes}");
+}
+
+#[test]
+fn edits_without_a_live_language_server_never_wait_for_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let logs: Arc<Mutex<Vec<Log>>> = Arc::default();
+    let tool = owner_tool(&fake_config(false), &logs);
+    // `status` binds the write-through owner without starting a server.
+    assert!(!run_as(&*tool, &ws, json!({"action": "status"})).is_error);
+    let file = ws.root().join("a.fk");
+    std::fs::write(&file, "ERROR\n").unwrap();
+    let started = Instant::now();
+    let notes = writethrough(&ws, &[(file.clone(), 2)], WriteOrigin::Edit);
+    assert!(notes.is_empty(), "{notes}");
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(logs.lock().is_empty(), "an edit started a language server");
+}
+
+#[test]
+fn bounded_diagnostics_give_up_within_their_budget() {
+    let (_dir, ws) = project();
+    let (client, _log) = fake_client(ws.root(), fast());
+    // Never synchronized, so the server never publishes for it.
+    let path = ws.root().join("silent.fk");
+    let started = Instant::now();
+    let items = client.diagnostics_bounded(&path, 0, true, Duration::from_millis(200));
+    assert!(items.is_none(), "{items:?}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
 fn resource_operation_description_matches_the_approved_transactions() {
     let tool = LspTool::new(&LspConfig::default());
     let schema = tool.schema();

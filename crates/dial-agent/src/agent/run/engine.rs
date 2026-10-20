@@ -26,7 +26,15 @@ pub(in crate::agent) struct Engine {
     /// edits, reads or todos. A cycle steers the model and never ends the turn.
     cycles: mutation_cycles::MutationCycles,
     length_nudges: u32,
+    /// Consecutive failures per (tool, recovery kind); a tool's success clears its entries. The
+    /// first failure gets compact feedback, a repeat the full diagnose-first contract. Kept across
+    /// continuations and compaction, like the other failure counters.
+    failures: std::collections::BTreeMap<(String, &'static str), u32>,
 }
+
+/// Bound on distinct (tool, kind) failure streaks; past it the streaks are cleared and a repeat
+/// is simply treated as a first failure again.
+const MAX_FAILURE_STREAKS: usize = 64;
 
 /// State lifetimes are explicit: new instructions release old call restrictions; retries do not.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -137,11 +145,24 @@ impl Engine {
         task_changed: bool,
         holds_result: impl Fn(&str) -> bool,
     ) -> (Option<String>, Option<String>, Option<String>) {
-        if let Some((kind, advice)) = crate::agent::run::failure_guidance::classify(call, output) {
-            output.text.push_str(&format!(
-                "\n[Dial recovery: {kind}] {} {advice}",
-                crate::agent::run::failure_guidance::DIAGNOSE_FIRST
-            ));
+        match crate::agent::run::failure_guidance::classify(call, output) {
+            Some((kind, advice)) => {
+                if self.failures.len() >= MAX_FAILURE_STREAKS
+                    && !self.failures.contains_key(&(call.name.clone(), kind))
+                {
+                    self.failures.clear();
+                }
+                let consecutive = self.failures.entry((call.name.clone(), kind)).or_default();
+                *consecutive += 1;
+                output
+                    .text
+                    .push_str(&crate::agent::run::failure_guidance::feedback(
+                        kind,
+                        advice,
+                        *consecutive,
+                    ));
+            }
+            None => self.failures.retain(|(tool, _), _| *tool != call.name),
         }
         if outcome::effects(output) == Effects::Unknown {
             self.uncertain = true;

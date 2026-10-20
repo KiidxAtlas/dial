@@ -1,6 +1,6 @@
 //! Turn-local enforcement of corrective feedback. Notices alone are not a control plane.
 use crate::llm::ToolCall;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Default)]
@@ -161,9 +161,10 @@ impl RecoveryCheckpoint {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n");
-        messages.push(json!({"role":"user","dial_transient":true,"content":format!(
+        // Advisory text only: the withheld calls are refused with their own tool results.
+        messages.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Loop, format!(
             "[Recovery checkpoint from Dial]\n{reasons}\nDo not repeat the unchanged calls. The tools remain available with corrected arguments or for genuinely different evidence. Resume the existing task; do not create a new plan or edit merely to restore tool access. If no useful action is available, call finish with a specific blocker or question."
-        )}));
+        )));
     }
 
     pub fn progress(&mut self, call: &ToolCall, success: bool, todo_changed: bool, mutated: bool) {

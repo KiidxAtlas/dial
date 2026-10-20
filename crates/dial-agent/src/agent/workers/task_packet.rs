@@ -18,6 +18,7 @@ const OBSERVATIONS: &[&str] = &[
     "find",
     "lsp",
     "ast_search",
+    "dep_source",
     "web_fetch",
     "web_search",
 ];

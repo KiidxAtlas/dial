@@ -750,23 +750,28 @@ fn deleted_sources_are_stale_and_missing_even_when_the_snapshot_is_partial() {
     .unwrap();
     fs::remove_file(project.path().join("routing.rs")).unwrap();
     let report = cache.architecture_report().unwrap();
-    let citing: Vec<_> = report["sections"]
+    let router = report["sections"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|section| {
-            section["sources"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|source| source["path"] == "routing.rs")
-        })
-        .collect();
-    assert!(!citing.is_empty(), "{report}");
-    for section in citing {
-        assert_eq!(section["status"], "stale", "{section}");
-        assert_eq!(section["source_status"], "missing", "{section}");
-    }
+        .find(|section| section["id"] == "router")
+        .unwrap();
+    assert_eq!(router["status"], "stale", "{router}");
+    assert_eq!(router["source_status"], "missing", "{router}");
+    // Compact: identity, revision and a recovery note, no digests or dependency path lists.
+    assert_eq!(router["revision"], report["revision"], "{router}");
+    assert_eq!(router["missing_sources"], 1, "{router}");
+    assert!(
+        router.get("sources").is_none() && router.get("dependency_scope").is_none(),
+        "{router}"
+    );
+    assert!(
+        router["summary"]
+            .as_str()
+            .unwrap()
+            .contains("action=invalidate section_ids=[\"router\"]"),
+        "{router}"
+    );
     let text = report.to_string();
     assert!(
         !text.contains("Routing is implemented by run"),
@@ -776,6 +781,16 @@ fn deleted_sources_are_stale_and_missing_even_when_the_snapshot_is_partial() {
     assert!(
         text.contains("Application starts routing."),
         "sections with surviving sources keep their summary"
+    );
+    let purpose = &report["sections"][0];
+    assert!(
+        purpose["sources"].is_array() && purpose.get("dependency_scope").is_some(),
+        "{purpose}"
+    );
+    // The saved section is withheld, never silently deleted.
+    assert_eq!(
+        cache.architecture_saved().unwrap().unwrap().sections.len(),
+        2
     );
 }
 

@@ -1,13 +1,13 @@
 use super::*;
 
-struct Fixture {
+pub(super) struct Fixture {
     _state: tempfile::TempDir,
     project: tempfile::TempDir,
     dir: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let state = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let dir = state.path().join("session-1");
@@ -17,21 +17,21 @@ impl Fixture {
             dir,
         }
     }
-    fn root(&self) -> PathBuf {
+    pub(super) fn root(&self) -> PathBuf {
         fs::canonicalize(self.project.path()).unwrap()
     }
-    fn open(&self) -> Checkpoints {
+    pub(super) fn open(&self) -> Checkpoints {
         Checkpoints::new(self.dir.clone(), self.root()).unwrap()
     }
-    fn path(&self, rel: &str) -> PathBuf {
+    pub(super) fn path(&self, rel: &str) -> PathBuf {
         self.root().join(rel)
     }
-    fn write(&self, rel: &str, text: &str) {
+    pub(super) fn write(&self, rel: &str, text: &str) {
         let p = self.path(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, text).unwrap();
     }
-    fn read(&self, rel: &str) -> Option<String> {
+    pub(super) fn read(&self, rel: &str) -> Option<String> {
         fs::read_to_string(self.path(rel)).ok()
     }
 }

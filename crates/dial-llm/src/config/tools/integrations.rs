@@ -39,6 +39,7 @@ integrations! {
     ("find", true, true),
     ("autoresearch", true, true),
     ("archive", true, true),
+    ("dep_source", true, true),
     ("github", false, false),
     ("notebook", false, false),
     ("security_scan", false, false),

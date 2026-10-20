@@ -292,10 +292,14 @@ impl Agent<'_> {
             }
             planning_notice = planning_required;
             engine.apply(schemas, &mut names, &mut messages);
-            let single_call = !self.hermetic
+            let measured_single = !self.hermetic
                 && crate::reliability::single_call(self.config, measured.as_ref(), &reliability);
+            // The small local tier defaults to one call per response unless its saved record passed
+            // the batch fixture; the system prompt states the same mode for the whole session. Its
+            // offer is already minimal and listed in that prompt, so it is not simplified further.
+            let single_call = measured_single || (!self.hermetic && self.local_one_call());
             let mut contract = crate::reliability::Contract::new(schemas.clone())?;
-            if single_call {
+            if measured_single {
                 let loaded = self.enabled_tools.iter().cloned().chain(self.discovered_tools()).collect();
                 crate::reliability::simplify(&mut contract.schemas, &loaded);
                 // Simplification can drop offered schemas, so the offered contract is validated again.
@@ -344,8 +348,10 @@ impl Agent<'_> {
                 } else {
                     crate::agent::safety::stream_guards::render_tool_call_loop_redirect(&repeat.tool_name, repeat.count, &repeat.arguments_summary, &repeat.result_summary)
                 };
-                messages.push(json!({"role":"user","dial_transient":true,"content":guidance}));
+                messages.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Repetition, guidance));
             }
+            // One advisory note per request, by priority; protocol notes and gates are unaffected.
+            crate::agent::run::guidance::cap(&mut messages);
             coalesce_harness_notes(&mut messages, notes_start);
             if !self.experimental_context_owner()
                 && let Some(guidance) = rule_catalog.guidance(&mut rule_state, "main")
@@ -1991,6 +1997,10 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 if !output.is_error {
                     round_succeeded = true;
                 }
+                // Close this call's per-file revisions so `revert_edit` can detect later outside edits.
+                if let Some(checkpoints) = &self.checkpoints {
+                    checkpoints.settle_changes();
+                }
                 // Committed facts decide: any tool whose transaction committed paths (LSP rename, code
                 // actions, checkpointed edits) advances the mutation epoch, even when it failed after
                 // a partial commit. The name list covers writers that commit without reporting paths.
@@ -2346,7 +2356,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
             }
             if let Some(advice) = narration_warning {
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Recovery, advice.as_str()));
-                pending_nudges.push(json!({"role":"user","content":advice,"dial_transient":true}));
+                pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Loop, advice));
             }
             // A short-circuited round neither failed nor succeeded, so it must not advance failure streaks.
             let stall_round = if duplicates.is_some() { crate::agent::safety::guard::Stall::None } else { stall.round(!round_succeeded) };
@@ -2355,22 +2365,20 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 crate::agent::safety::guard::Stall::None => None,
             };
             if let Some(advice) = warning {
-                pending_nudges.push(json!({"role":"user","content":advice,"dial_transient":true}));
+                pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Failure, advice));
             }
             if duplicates.is_none()
                 && let Some(advice) = pace.round(&reply.tool_calls)
             {
-                pending_nudges.push(json!({"role":"user","content":advice,"dial_transient":true}));
+                pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Loop, advice));
             }
             if let Some(plan) = self.pending_plan.take() {
                 self.push(json!({"role":"user","content":format!("Approved plan:\n{plan}\nProceed with implementation.")}))?;
             }
             reliability.round(!form_kinds.is_empty(), round_succeeded);
-            // Escalation is between requests, so the next request is built from the new offer.
-            if self.observe_local_round(!form_kinds.is_empty() || edit_failed, ui) {
-                names = self.offered();
-                *schemas = self.schemas(&names)?;
-            }
+            // A reached escalation step takes effect at the next turn, so this turn's prompt and
+            // offer stay as they are.
+            self.observe_local_round(!form_kinds.is_empty() || edit_failed, ui);
             let tool_round_failed = !form_kinds.is_empty()
                 || execution_failed
                 || observed_check_failure
@@ -2391,9 +2399,9 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 let failures = reliability.consecutive_contract_failures;
                 let limit = self.config.reliability.max_contract_failures;
                 if self.config.reliability.enabled && limit > 0 && failures >= limit && failures.is_multiple_of(limit) {
-                    pending_nudges.push(json!({"role":"user","dial_transient":true,"content":format!(
+                    pending_nudges.push(crate::agent::run::guidance::note(crate::agent::run::guidance::Priority::Failure, format!(
                         "[Escalation from dial] {failures} tool calls in a row broke the tool contract, and none of the rejected calls ran. Call only the offered tools, with arguments that match their schemas exactly. Do not restate the rules or explain the failure at length: make the next call now."
-                    )}));
+                    )));
                 }
                 let mut result = control["adaptive_policy"]["result"].clone();
                 result["tool_round_failed"] = json!(tool_round_failed);

@@ -7,6 +7,7 @@ that the loaded model's tool parser reads back. Supported parser formats:
 - `gemma4`: `call:NAME{key:value,...}`; strings delimited by `<|"|>`
 - `function_gemma`: `call:NAME{key:value,...}`; strings delimited by `<escape>`
 - `glm47`: `NAME<arg_key>k</arg_key><arg_value>v</arg_value>...`
+- `qwen3_coder`: `<function=NAME><parameter=KEY>VALUE</parameter>...</function>`
 - `mistral`: a `[TOOL_CALLS]` JSON array of calls, or `NAME[ARGS]{...}`. Open-ended: the parser
   reads no closing marker, so the constraint ends once the call's JSON is complete.
 
@@ -18,7 +19,8 @@ argument keys (unless `additionalProperties` permits extras), required keys befo
 types, string enums/consts, array item schemas and nested objects. Combinators (`anyOf`,
 `oneOf`, `allOf`, `$ref`, `not`, `if`) and numeric/string bounds remain syntax-only; Rust-side
 validation stays authoritative. Plain (unquoted) gemma and function_gemma values must be JSON
-literals. A dead end releases the constraint for the rest of that call, so the existing
+literals; raw-text formats (glm47, qwen3_coder) check non-string values once the value closes.
+A dead end releases the constraint for the rest of that call, so the existing
 malformed-call handling sees the output instead of the decoder stalling.
 """
 import codecs
@@ -643,6 +645,188 @@ class _Glm(_Stateful):
         return True
 
 
+_QWEN_TAGS = ("<function=", "</function>", "<parameter=", "</parameter>")
+_QWEN_STRINGS = frozenset(("string", "str", "text", "varchar", "char", "enum"))
+_QWEN_BOOLS = frozenset(("boolean", "bool", "binary"))
+_QWEN_EDGES = ("", "\n")
+
+
+def _qwen_strip(value):
+    """The parser drops one leading and one trailing newline from every value."""
+    value = value[1:] if value.startswith("\n") else value
+    return value[:-1] if value.endswith("\n") else value
+
+
+def _qwen_literals(values):
+    """Exact raw texts the parser reads back as one of `values`."""
+    return frozenset(a + v + b for v in values for a in _QWEN_EDGES for b in _QWEN_EDGES)
+
+
+def _qwen_value(raw, schemas):
+    """(mode, literals, JSON matcher) for a parameter, following the parser's type rules.
+
+    The parser reads by the declared `type` string: string kinds stay raw, integers and numbers
+    go through float(), booleans compare to "true", objects/arrays are JSON. Undeclared keys,
+    empty schemas and union `type` lists (read with ast.literal_eval) stay free text.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return "any", None, None
+    declared = raw.get("type", "string")
+    if not isinstance(declared, str):
+        return "any", None, None
+    kind = declared.strip().lower()
+    if kind in _QWEN_STRINGS:
+        s = spec(raw)
+        if s.enum is not None and s.types == frozenset(("string",)):
+            # A raw "null" reads back as None, never as the string member.
+            return "literal", _qwen_literals(v for v in s.enum if v.lower() != "null"), None
+        return "str", None, None
+    if kind in _QWEN_BOOLS:
+        return "literal", _qwen_literals(("true", "false")), None
+    if kind == "null":
+        return "literal", _qwen_literals(("null",)), None
+    if kind.startswith(("int", "uint", "long", "short", "unsigned")):
+        return "json", None, JsonMatcher(_Spec(frozenset(("integer",))), schemas)
+    if kind.startswith(("num", "float")):
+        return "json", None, JsonMatcher(_Spec(frozenset(("number",))), schemas)
+    if kind in ("object", "array"):
+        s = spec(raw)
+        if s.types == frozenset((kind,)):
+            return "json", None, JsonMatcher(s, schemas)
+    return "any", None, None
+
+
+class _QwenCoder(_Stateful):
+    """`<function=NAME><parameter=KEY>VALUE</parameter>...</function>` (qwen3_coder).
+
+    Values are raw text up to `</parameter>`, minus one newline at each edge. String values are
+    free (enums exact, `null` refused because it reads back as None), booleans and nulls must be
+    the exact literal, other types a JSON prefix of that type. Names and keys end at `>` with no
+    whitespace before it (the parser would fold it into the value). After `</function>` only one
+    newline may follow; the call ends only at the closing marker.
+    """
+
+    __slots__ = ("buf", "enum", "j", "key", "mode", "pend", "schemas", "seen", "spec", "stage",
+                 "ws")
+
+    def __init__(self, schemas):
+        self.schemas, self.stage, self.buf, self.ws = schemas, "start", "", 0
+        self.spec, self.key, self.seen = None, "", set()
+        self.mode, self.enum, self.j, self.pend = None, None, None, ""
+
+    def clone(self):
+        other = super().clone()
+        other.seen = set(self.seen)
+        return other
+
+    def feed(self, text):
+        self.pend, events = _scan(_QWEN_TAGS, self.pend, text)
+        return all(self._event(kind, value) for kind, value in events)
+
+    @property
+    def complete(self):
+        return False
+
+    @property
+    def can_end(self):
+        return self.stage in ("done", "end") and not self.pend
+
+    def _space(self, ch):
+        self.ws += 1
+        return ch in _WS and self.ws <= _MAX_WS
+
+    def _remaining(self):
+        return [key for key in self.spec.props if key not in self.seen]
+
+    def _event(self, kind, value):
+        stage = self.stage
+        if stage == "value":
+            return self._value(kind, value)
+        if stage in ("name", "key"):
+            return kind == "text" and self._name(value)
+        if kind == "text":
+            if stage == "done" and value == "\n":
+                self.stage = "end"  # `</function>$`: at most one trailing newline.
+                return True
+            return stage in ("start", "gap") and self._space(value)
+        self.ws = 0
+        if stage == "start":
+            if value != "<function=":
+                return False
+            self.stage = "name"
+            return True
+        if stage != "gap":
+            return False
+        if value == "<parameter=":
+            if self.spec.closed and not self._remaining():
+                return False
+            self.stage = "key"
+            return True
+        if value == "</function>" and self.spec.required <= self.seen:
+            self.stage = "done"
+            return True
+        return False
+
+    def _name(self, ch):
+        if ch in _WS:
+            return not self.buf and self._space(ch)
+        if ch == ">":
+            return self._close_name()
+        if ch == "<":
+            return False
+        buf = self.buf + ch
+        names = self.schemas if self.stage == "name" else (
+            self._remaining() if self.spec.closed else None)
+        if names is not None and not any(name.startswith(buf) for name in names):
+            return False
+        self.buf = buf
+        return True
+
+    def _close_name(self):
+        name, self.buf, self.ws = self.buf, "", 0
+        if self.stage == "name":
+            schema = self.schemas.get(name)
+            if schema is None:
+                return False
+            self.spec, self.stage = spec(schema), "gap"
+            return True
+        if not name or name in self.seen or (self.spec.closed and name not in self.spec.props):
+            return False
+        self.seen.add(name)
+        self.key, self.stage = name, "value"
+        self.mode, self.enum, self.j = _qwen_value(self.spec.props.get(name), self.schemas)
+        return True
+
+    def _value(self, kind, value):
+        if kind == "tag" and value == "</parameter>":
+            return self._close_value()
+        # Other tags are literal value text: the parser's lazy matches read them back unchanged.
+        if self.mode == "json":
+            return self.j.feed(value)
+        if self.mode == "literal":
+            buf = self.buf + value
+            if not any(text.startswith(buf) for text in self.enum):
+                return False
+            self.buf = buf
+        elif self.mode == "str":
+            self.buf = (self.buf + value)[:7]  # Enough to recognise a bare "\nnull\n".
+        return True
+
+    def _close_value(self):
+        if self.mode == "json":
+            done = self.j.clone()
+            if not (done.feed(" ") and done.complete):
+                return False
+        elif self.mode == "literal":
+            if self.buf not in self.enum:
+                return False
+        elif self.mode == "str" and _qwen_strip(self.buf).lower() == "null":
+            return False
+        self.stage, self.buf, self.ws = "gap", "", 0
+        self.mode, self.enum, self.j = None, None, None
+        return True
+
+
 class _Mistral(_Stateful):
     """`[TOOL_CALLS]` then a JSON array of calls, or `NAME[ARGS]{...}` (mistral).
 
@@ -704,6 +888,7 @@ _FORMATS = {
     "function_gemma": _Format(lambda schemas: _Tagged(schemas, "<escape>", False, "}"),
                               ("<escape>",)),
     "glm47": _Format(_Glm, _GLM_TAGS),
+    "qwen3_coder": _Format(_QwenCoder, _QWEN_TAGS),
     "mistral": _Format(_Mistral, ("[ARGS]",), open_ended=True),
 }
 

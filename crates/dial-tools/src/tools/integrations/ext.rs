@@ -375,6 +375,7 @@ impl Registry {
             crate::tools::code::navigation::tools(config),
             crate::tools::knowledge::autoresearch::tools(config),
             crate::tools::fs::archive::tools(config),
+            crate::tools::knowledge::deps::tools(config),
         ];
         for tool in crate::tools::code::dap::tools(&config.dap) {
             if config

@@ -533,11 +533,20 @@ impl<'a> Agent<'a> {
 
     pub(in crate::agent) fn rebuild_system(&mut self) {
         let offered = self.offered();
-        // The interceptor names a dedicated tool only when this request offers it.
+        // The interceptor names a dedicated tool only when this request offers it. The small and
+        // lean local tiers refuse edits that add parser errors (the edit tool's `allow_syntax_errors`).
+        let syntax_block = matches!(
+            self.local_tier(),
+            Some(
+                crate::agent::model::local_profile::Tier::Small
+                    | crate::agent::model::local_profile::Tier::Lean
+            )
+        );
         self.workspace = self
             .workspace
             .clone()
-            .with_bash_interceptor(self.config.bash_interceptor.clone(), offered.clone());
+            .with_bash_interceptor(self.config.bash_interceptor.clone(), offered.clone())
+            .with_syntax_block(syntax_block);
         let discoverable = self.discoverable_tools(&offered);
         let lean = self.lean_local() || self.local_escalated();
         let built =
@@ -560,6 +569,9 @@ impl<'a> Agent<'a> {
                 discoverable: &discoverable,
                 template: self.parts.system_template.as_ref(),
                 lean,
+                one_call: self.local_one_call(),
+                worked_example: self.local_tier()
+                    == Some(crate::agent::model::local_profile::Tier::Small),
             });
         let mut messages = match built {
             Ok(messages) => {

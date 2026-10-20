@@ -175,7 +175,7 @@ fn removed_settings_migrate_and_the_rest_still_loads() {
              [memory.local]\nextraction_role='embedding'\nconsolidation_role='coach'\n\
              [memory.sharpshooter]\nmodel_role='embedding'\n\
              [harness]\nmax_steps=3\nallow_skill_install_scripts=true\ntools=['read','memory_edit']\n\
-             [browser]\nrelay=true\nrelay_url='http://localhost:1'\n\
+             [browser]\nrelay=true\nrelay_url='http://localhost:1'\ntern=false\n\
              [reliability]\nauto_check='local'\nenabled=true\n\
              [model_roles.embedding]\nprovider='mlx'\nmodel='e'\n\
              [model_roles.memory]\nprovider='mlx'\nmodel='m'\n\
@@ -198,6 +198,7 @@ fn removed_settings_migrate_and_the_rest_still_loads() {
         table["browser"]["relay_url"].as_str(),
         Some("http://localhost:1")
     );
+    assert!(!table["browser"].as_table().unwrap().contains_key("tern"));
     assert!(!table["memory"].as_table().unwrap().contains_key("mnemopi"));
     assert_eq!(table["memory"]["backend"].as_str(), Some("semantic"));
     assert!(

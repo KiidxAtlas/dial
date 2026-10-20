@@ -27,8 +27,6 @@ pub struct BrowserConfig {
     pub stealth: bool,
     /// Drive browser surfaces through a cmux socket when `CMUX_SOCKET_PATH` is set. `DIAL_BROWSER_CMUX` overrides.
     pub cmux: bool,
-    /// Drive browser panes through Tern when `TERN_PANE_SOCKET` and `TERN_PANE` are set. `DIAL_BROWSER_TERN` overrides.
-    pub tern: bool,
     /// Drive the Chrome tabs you already use through the Dial browser extension and relay. Requires allow_attach. `DIAL_BROWSER_RELAY` overrides.
     pub relay: bool,
     /// Loopback relay address the browser extension connects to. Empty uses http://127.0.0.1:9224.
@@ -51,7 +49,6 @@ impl Default for BrowserConfig {
             auto_localhost: true,
             stealth: true,
             cmux: true,
-            tern: true,
             relay: false,
             relay_url: String::new(),
         }
