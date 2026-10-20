@@ -7,6 +7,13 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
 - Inline, scrollback-native transcript with a live composer; finished turns remain in normal terminal
   scrollback. Model, provider and settings panels use a full-screen overlay and restore the terminal
   when closed. Approval prompts and settings adapt to narrow terminal widths.
+- New conversations open on a centered launch screen: a braille knob and wordmark (the needle turns
+  into place at start-up when `ui.motion` allows) above a compact input card near the window
+  midpoint. One line beneath shows the model, current directory and Git branch, then a quiet
+  shortcut hint; setup and unsafe-mode warnings appear only when relevant. `Down` reveals suggested
+  requests or recent sessions; `Enter` opens a request for editing or resumes a session. Small
+  windows shed artwork before warnings and selected actions. Sending a message restores the
+  normal conversation.
 - A configurable status line shows model, role, path, Git state, context, token usage/rate, approval,
   sandbox and session state. Settings let you choose presets or define left/right segments. Learning diagnostics are available in the explicit improvement views.
 - Local inference shows **loading model**, **processing prompt**, then a live **generating tokens**

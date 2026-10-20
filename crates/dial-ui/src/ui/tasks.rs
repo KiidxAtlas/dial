@@ -97,7 +97,7 @@ pub fn plan_picker(todo: &TodoList) -> Option<super::overlay::palette::ChoiceSpe
         (priority, *index)
     });
     Some(ChoiceSpec {
-        title: "Work plan - select a step for details".into(),
+        title: "Work plan".into(),
         command: "todo".into(),
         verb: "show",
         remove: None,

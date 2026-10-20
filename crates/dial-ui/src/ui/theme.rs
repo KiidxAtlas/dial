@@ -1539,7 +1539,7 @@ fn symbol(glyphs: Glyphs, s: Sym) -> &'static str {
         (Ascii, Pointer) => ">",
         (_, Pointer) => "›",
         (Ascii, ScrollThumb) => "#",
-        (_, ScrollThumb) => "█",
+        (_, ScrollThumb) => "┃",
         (Ascii, ScrollTrack) => "|",
         (_, ScrollTrack) => "│",
         (Ascii, RadioOn) => "(*)",

@@ -248,6 +248,17 @@ fn words(parts: &[&str]) -> String {
         .join(" ")
 }
 
+/// The one-line description for a picker row. A detail whose first paragraph repeats the label
+/// drops it, so the list column shows what the label does not already say.
+fn list_detail(label: &str, detail: &str) -> String {
+    let rest = match detail.split_once("\n\n") {
+        Some((first, rest)) if label.contains(first.trim()) => rest,
+        None if label.contains(detail.trim()) => "",
+        _ => detail,
+    };
+    text::one_line(rest)
+}
+
 /// The action that runs `/command verb value` for a picker row.
 fn choice_action(spec: &ChoiceSpec, value: &str, verb: &str) -> OverlayEvent {
     OverlayEvent::Action(format!("command:/{}", words(&[&spec.command, verb, value])))
@@ -314,7 +325,7 @@ impl PaletteOverlay {
             .map(|item| PaletteEntry {
                 command: CommandEntry {
                     name: item.label.clone(),
-                    description: text::one_line(&item.detail),
+                    description: list_detail(&item.label, &item.detail),
                     kind: CommandKind::Builtin,
                     args_hint: None,
                 },
@@ -639,7 +650,8 @@ impl PaletteOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        let extra = if self.busy { "turn running" } else { "ready" };
+        // Only a running turn is worth a title note; an idle palette needs no status.
+        let extra = if self.busy { "turn running" } else { "" };
         let title = self
             .choice
             .as_ref()
@@ -975,7 +987,12 @@ impl PaletteOverlay {
                         } else {
                             " Your chat draft is preserved.".into()
                         };
-                        (header, entry.command.description.clone(), note)
+                        // The list column trims what the label repeats; the detail pane keeps all.
+                        let description = match &self.choice {
+                            Some(spec) => text::one_line(&spec.items[index].detail),
+                            None => entry.command.description.clone(),
+                        };
+                        (header, description, note)
                     }
                 };
                 out.push(line(text::ellipsize(&header, w, ascii), Tok::Accent));

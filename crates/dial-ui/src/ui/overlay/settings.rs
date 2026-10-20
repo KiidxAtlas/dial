@@ -164,10 +164,7 @@ pub(super) fn scroll_cell(
             theme.fg(Tok::Accent),
         )
     } else {
-        Span::styled(
-            theme.sym(Sym::ScrollTrack).to_owned(),
-            theme.fg(Tok::BorderMuted),
-        )
+        Span::styled(theme.sym(Sym::ScrollTrack).to_owned(), theme.fg(Tok::Dim))
     }
 }
 
@@ -2003,7 +2000,7 @@ impl SettingsOverlay {
             Scope::Global => "All projects",
             Scope::Project => "This project",
         };
-        let extra = format!("{} Save to: {scope}  (Ctrl+S)", ctx.theme.sym(Sym::Dot));
+        let extra = format!("Save to: {scope} {} Ctrl+S", ctx.theme.sym(Sym::Dot));
         panel(
             frame,
             ctx.theme,
@@ -2363,15 +2360,16 @@ impl SettingsOverlay {
                         if let Some(feedback) = &self.feedback {
                             head.push((feedback.clone(), Tok::Success));
                         }
+                        let dot = format!(" {} ", theme.sym(Sym::Dot));
                         meta = Some((
                             format!(
-                                "{}  |  Using {} value{}",
+                                "{}{dot}Using {} value{}",
                                 def.path,
                                 self.source(def.path),
                                 if def.restart {
-                                    "  |  Restart required"
+                                    format!("{dot}Restart required")
                                 } else {
-                                    ""
+                                    String::new()
                                 }
                             ),
                             Tok::Dim,
@@ -2445,34 +2443,21 @@ impl SettingsOverlay {
             .map(|(t, _)| *t)
             .chain(std::iter::once(PROVIDERS_TAB))
             .collect();
-        let cells: Vec<String> = names
-            .iter()
-            .map(|name| {
-                let icon = theme.sym(match *name {
-                    "Appearance" => Sym::IconSettings,
-                    "Model" => Sym::IconModel,
-                    "Interaction" => Sym::IconKeyboard,
-                    "Tools" => Sym::IconSandbox,
-                    "Memory" => Sym::IconSession,
-                    "Improvement" => Sym::IconLearning,
-                    _ => Sym::IconProvider,
-                });
-                if icon.is_empty() {
-                    format!(" {name} ")
-                } else {
-                    format!(" {icon} {name} ")
-                }
-            })
-            .collect();
-        let widths: Vec<usize> = cells.iter().map(|c| text::width(c)).collect();
+        // Plain words, two cells apart: the active tab's accent and underline mark it, so icons
+        // would only add noise. The strip scrolls to keep the active tab in view.
+        let gap = 2;
+        let widths: Vec<usize> = names.iter().map(|n| text::width(n) + gap).collect();
         let mut start = 0;
         while start < self.tab && widths[start..=self.tab].iter().sum::<usize>() > w {
             start += 1;
         }
-        let mut spans = Vec::new();
-        for (i, cell) in cells.into_iter().enumerate().skip(start) {
+        let mut spans = vec![Span::raw(" ")];
+        for (i, name) in names.iter().enumerate().skip(start) {
+            if i > start {
+                spans.push(Span::raw(" ".repeat(gap)));
+            }
             let style = tab_style(theme, i == self.tab && self.search.is_empty());
-            spans.push(Span::styled(cell, style));
+            spans.push(Span::styled((*name).to_owned(), style));
         }
         Line::from(fit(spans, w))
     }

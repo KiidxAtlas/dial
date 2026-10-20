@@ -44,6 +44,11 @@ pub(super) fn drive(app: &mut App, shell: &mut Shell, session: Option<Session>) 
     let mut runtime_accounting = None;
     let mut plan_carry: (Option<String>, Option<String>) = Default::default();
     shell.begin(app, &session, resumed);
+    // Draw the home before the first agent is built: that waits for MCP servers to connect.
+    let _ = shell.paint(None);
+    Shell::warm_session_index(&app.layout);
+    // Typing stays live while configured MCP servers finish connecting for the first agent.
+    shell.edit_while(crate::tools::integrations::mcp::prefetch_pending);
     // The backend and its open error last reported, so the paused notice repeats only on change.
     let mut memory_reported: Option<(String, Option<String>)> = None;
     // `session_end` is handed from one agent to the next across same-session rebuilds.

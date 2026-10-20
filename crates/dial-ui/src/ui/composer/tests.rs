@@ -1450,6 +1450,36 @@ fn browsing_a_multiline_entry_moves_within_it_before_leaving_it() {
 }
 
 #[test]
+fn browsing_past_a_command_keeps_walking_history_until_the_entry_is_edited() {
+    let env = Env::new();
+    let mut c = Composer::new(
+        vec![
+            "oldest prompt".into(),
+            "/model".into(),
+            "newest prompt".into(),
+        ],
+        10,
+    );
+    c.set_commands(vec![
+        cmd("model", "Choose a model", CommandKind::Builtin),
+        cmd("models", "List models", CommandKind::Builtin),
+    ]);
+    press(&mut c, &env, KeyCode::Up);
+    press(&mut c, &env, KeyCode::Up);
+    assert_eq!(c.draft(), "/model");
+    assert!(!c.menu_open(), "a recalled command does not open the menu");
+    press(&mut c, &env, KeyCode::Up);
+    assert_eq!(c.draft(), "oldest prompt", "Up keeps browsing history");
+    press(&mut c, &env, KeyCode::Down);
+    assert_eq!(c.draft(), "/model");
+    press(&mut c, &env, KeyCode::Char('s'));
+    assert!(
+        c.menu_open(),
+        "editing the recalled command completes it again"
+    );
+}
+
+#[test]
 fn history_is_bounded_deduplicated_sanitized_and_only_holds_submissions() {
     let env = Env::new();
     let mut c = Composer::new((0..10).map(|n| format!("entry {n}")).collect(), 3);

@@ -109,6 +109,7 @@ impl Shell {
             deferred_editor: false,
             deferred_approval_cycle: false,
             deferred_display_reset: false,
+            held: Default::default(),
             live_tasks: None,
             workers: Default::default(),
             recent_worker: None,

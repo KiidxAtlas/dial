@@ -514,8 +514,8 @@ pub enum StatusSeparator {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComposerShape {
-    /// A full-width shaded band, `›` before the input and the status line inside it; key hints sit
-    /// below. No frame.
+    /// A full-width tinted card with an accent edge that follows the input state; the status line
+    /// and key hints sit beneath it. No frame.
     #[default]
     Band,
     /// Rounded box; the status line is embedded in its top border and key hints in its bottom border.

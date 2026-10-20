@@ -497,7 +497,8 @@ impl Picker {
                 theme.fg(Tok::Muted),
             ))];
         }
-        let wide = wide(cols, height);
+        // Nothing to preview: the message and hints get the full width instead of a split.
+        let wide = wide(cols, height) && !self.found.is_empty();
         let inner = cols.saturating_sub(4);
         // Wide layouts split the inner width: the list on the left, the preview pane on the right.
         let width = if wide { inner * 3 / 5 } else { inner };
@@ -527,7 +528,7 @@ impl Picker {
                     Tok::Text
                 }),
             ),
-            Span::styled(theme.sym(Sym::BoxV).to_owned(), theme.fg(Tok::Accent)),
+            Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED)),
         ])];
         // At five rows, a refusal takes priority over search: keep the selected journal,
         // its explanation, the exit hint and both frame edges visible.

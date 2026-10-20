@@ -215,18 +215,20 @@ fn main() -> anyhow::Result<()> {
             ui: &ui,
             status: &status,
         };
-        let view = composer.view(width, &context);
-        let mut rows = welcome::render(
+        let view = composer.home_view(welcome::content_width(width), &context);
+        let rows = welcome::frame(
             &info,
             width,
+            height - 1,
             &theme,
             View {
-                max_rows: height as usize - view.rows.len(),
                 live: true,
                 ..Default::default()
             },
-        );
-        rows.extend(view.rows);
+            view,
+            Vec::new(),
+        )
+        .rows;
         screen(
             &mut out,
             &format!("Home / {name}"),

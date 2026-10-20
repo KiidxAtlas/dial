@@ -93,7 +93,16 @@ impl Shell {
         let (bottom, cursor) = match panel {
             Some(rows) => (rows, None),
             None => {
-                let view = composer.view(cols, &cctx);
+                let input_width = if home.is_some() {
+                    crate::ui::welcome::content_width(cols)
+                } else {
+                    cols
+                };
+                let view = if home.is_some() {
+                    composer.home_view(input_width, &cctx)
+                } else {
+                    composer.view(input_width, &cctx)
+                };
                 let spinner = (status.phase == Phase::Working).then(|| theme.spinner(status.tick));
                 let cap = (rows as usize / 3).min(10);
                 let available = (rows as usize).saturating_sub(view.rows.len() + 3);
@@ -135,16 +144,13 @@ impl Shell {
                     cap.min(available.saturating_sub(bottom.len())),
                 ));
                 if let Some(home) = home {
-                    let budget = (rows as usize).saturating_sub(view.rows.len() + bottom.len() + 1);
-                    if budget > 2 {
-                        let mut above_rail = home.rows(cols, budget, theme);
-                        above_rail.append(&mut bottom);
-                        bottom = above_rail;
-                    }
+                    let frame = home.frame(cols, rows.saturating_sub(1), theme, view, bottom);
+                    (frame.rows, Some(frame.cursor))
+                } else {
+                    let above = bottom.len() as u16;
+                    bottom.extend(view.rows);
+                    (bottom, Some((view.cursor.0 + above, view.cursor.1)))
                 }
-                let above = bottom.len() as u16;
-                bottom.extend(view.rows);
-                (bottom, Some((view.cursor.0 + above, view.cursor.1)))
             }
         };
         let room = (rows as usize).saturating_sub(bottom.len()).max(1);

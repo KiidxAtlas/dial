@@ -126,6 +126,9 @@ pub(super) struct Shell {
     /// Shift+Tab / display reset pressed during a turn; applied at the next idle boundary.
     pub(super) deferred_approval_cycle: bool,
     pub(super) deferred_display_reset: bool,
+    /// Input read before the main loop could take it (typing while the first agent is built);
+    /// the loop handles these before reading the terminal again.
+    pub(super) held: std::collections::VecDeque<crossterm::event::Event>,
     /// Handle to the agent's live jobs, usable while a turn holds the agent.
     pub(super) live_tasks: Option<crate::agent::LiveTaskControl>,
     /// Session workers for the pinned block, the `workers` segment and finish notices.

@@ -11,15 +11,30 @@ use crate::storage::session::Session;
 use crate::ui::text;
 use crate::ui::transcript::Transcript;
 use anyhow::{Context, Result};
-use crossterm::event::{Event, read};
+use crossterm::event::{Event, poll, read};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// The picker loads only the newest sessions; parsing every journal would block the UI thread.
 /// Older sessions remain reachable by id through the direct prefix lookup.
 const PICKER_SESSION_LIMIT: usize = 200;
 
+/// A preview being loaded off the UI thread: the session id and the channel its lines arrive on.
+type PendingPreview = (String, mpsc::Receiver<Vec<(String, String)>>);
+
 impl Shell {
+    /// Refresh the listing index off the UI thread, so the first `/resume` after new or changed
+    /// journals reads cached summaries instead of parsing every journal while the user waits.
+    pub(in crate::app) fn warm_session_index(layout: &Layout) {
+        let layout = layout.clone();
+        let _ = std::thread::Builder::new()
+            .name("session-index".into())
+            .spawn(move || {
+                let _ = Session::list_for_picker(&layout, PICKER_SESSION_LIMIT);
+            });
+    }
+
     /// Show a different session's conversation: clear the screen and replay it from the session file.
     pub(in crate::app) fn show_session(&mut self, session: &Session) {
         let _ = self.term.clear_screen();
@@ -62,14 +77,50 @@ impl Shell {
             self.note("Sessions", "no sessions yet");
             return Ok(None);
         }
+        // Previews parse a whole journal; they load on a worker so moving the selection over a
+        // large session never stalls the list ("Loading preview" shows meanwhile).
+        let mut preview: Option<PendingPreview> = None;
+        // Waiting on a preview polls; the list repaints only when an event or a preview arrives.
+        let mut dirty = true;
         loop {
             let (cols, height) = self.term.size();
-            if let Some((id, path)) = picker.wanted_preview(cols as usize, height as usize) {
-                picker.set_preview(id, Session::preview_turns(&path).unwrap_or_default());
+            if let Some((id, rx)) = &preview {
+                match rx.try_recv() {
+                    Ok(turns) => {
+                        picker.set_preview(id.clone(), turns);
+                        preview = None;
+                        dirty = true;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        picker.set_preview(id.clone(), Vec::new());
+                        preview = None;
+                        dirty = true;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
             }
-            let rows = picker.rows(cols as usize, height as usize, self.themes.current());
-            self.paint(Some(rows))?;
+            if preview.is_none()
+                && let Some((id, path)) = picker.wanted_preview(cols as usize, height as usize)
+            {
+                let (tx, rx) = mpsc::channel();
+                std::thread::Builder::new()
+                    .name("session-preview".into())
+                    .spawn(move || {
+                        let _ = tx.send(Session::preview_turns(&path).unwrap_or_default());
+                    })
+                    .context("starting the session preview")?;
+                preview = Some((id, rx));
+            }
+            if dirty {
+                let rows = picker.rows(cols as usize, height as usize, self.themes.current());
+                self.paint(Some(rows))?;
+                dirty = false;
+            }
+            if preview.is_some() && !poll(Duration::from_millis(30))? {
+                continue;
+            }
             let event = read()?;
+            dirty = true;
             if matches!(event, Event::Resize(..)) {
                 self.term.on_resize();
             }
