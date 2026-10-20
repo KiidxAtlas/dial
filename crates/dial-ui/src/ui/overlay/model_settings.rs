@@ -1,8 +1,10 @@
 //! `/model settings`: a profile editor for the current main model.
 //!
 //! Values are grouped into sections. Toggles and choices cycle with Left/Right, numbers step the same
-//! way (Enter types an exact value), and anything else is a TOML literal. Every change is validated
-//! against the provider capabilities and saved immediately; an unset value follows the provider default.
+//! way (Enter types an exact value), text rows take plain typed text, and anything else is a TOML
+//! literal. Local models add rows read from their own files: each option the chat template accepts,
+//! and the installed draft models that can speed up an MLX model. Every change is validated against
+//! the provider capabilities and saved immediately; an unset value follows the provider default.
 use super::{
     DrawCtx, OverlayEvent,
     settings::{
@@ -16,6 +18,7 @@ use crate::{
         local_evidence::{self, Current, Suggestion},
         local_server,
         profiles::{ModelProfile, ReasoningApi},
+        template_options::{self, OptionKind, TemplateOption},
     },
     ui::{
         chrome::{self, Section},
@@ -31,9 +34,9 @@ use ratatui::{
     style::Modifier,
     text::{Line, Span},
 };
-use std::path::Path;
+use std::{borrow::Cow, path::Path};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Kind {
     Number {
         min: f64,
@@ -42,20 +45,51 @@ enum Kind {
         start: f64,
         int: bool,
     },
+    /// Fixed options; `bare` options are numbers and are saved without quotes.
     Choice {
         options: &'static [&'static str],
         optional: bool,
+        bare: bool,
     },
+    /// Options found at runtime (template literals, installed draft models); always optional text.
+    Found(Vec<String>),
     Toggle,
+    /// Plain text: typed without quotes and saved as a string.
+    Text,
     Toml,
 }
 
+#[derive(Clone)]
 struct Field {
+    path: Cow<'static, str>,
+    label: Cow<'static, str>,
+    section: &'static str,
+    kind: Kind,
+    help: Cow<'static, str>,
+}
+
+const fn field(
     path: &'static str,
     label: &'static str,
     section: &'static str,
     kind: Kind,
     help: &'static str,
+) -> Field {
+    Field {
+        path: Cow::Borrowed(path),
+        label: Cow::Borrowed(label),
+        section,
+        kind,
+        help: Cow::Borrowed(help),
+    }
+}
+
+const fn choice(options: &'static [&'static str], optional: bool) -> Kind {
+    Kind::Choice {
+        options,
+        optional,
+        bare: false,
+    }
 }
 
 const EFFORTS: &[&str] = &[
@@ -81,184 +115,232 @@ const fn int(min: f64, max: f64, step: f64, start: f64) -> Kind {
     }
 }
 
+/// The `chat_template_kwargs` table every template row writes into.
+const TEMPLATE_KWARGS: &str = "local_sampling.chat_template_kwargs";
+const DRAFT_MODEL: &str = "local_runtime.draft_model";
+
 static FIELDS: &[Field] = &[
-    Field {
-        path: "context_window",
-        label: "Context size",
-        section: "Context",
-        kind: int(2048.0, 2_097_152.0, 1024.0, 32768.0),
-        help: "This model's history/compaction cap, limited by model/server capacity. Reset follows shared defaults. Press d to change the local/cloud defaults for future model selections; this does not resize an external server.",
-    },
-    Field {
-        path: "temperature",
-        label: "Temperature",
-        section: "SAMPLING",
-        kind: float(0.0, 2.0, 0.05, 0.2),
-        help: "Randomness of the output. Lower is more deterministic and usually better for coding.",
-    },
-    Field {
-        path: "top_p",
-        label: "Top-p",
-        section: "SAMPLING",
-        kind: float(0.0, 1.0, 0.05, 0.95),
-        help: "Nucleus sampling: only the most likely tokens whose probabilities add up to this value are considered.",
-    },
-    Field {
-        path: "max_tokens",
-        label: "Max output tokens",
-        section: "Output",
-        kind: int(1.0, 1_048_576.0, 1024.0, 8192.0),
-        help: "Upper bound on tokens generated per model response, including reasoning where the provider counts it.",
-    },
-    Field {
-        path: "reasoning_effort",
-        label: "Reasoning effort",
-        section: "Reasoning",
-        kind: Kind::Choice {
-            options: EFFORTS,
+    field(
+        "context_window",
+        "Context size",
+        "Context",
+        int(2048.0, 2_097_152.0, 1024.0, 32768.0),
+        "This model's history/compaction cap, limited by model/server capacity. Reset follows shared defaults. Press d to change the local/cloud defaults for future model selections; this does not resize an external server.",
+    ),
+    field(
+        "temperature",
+        "Temperature",
+        "SAMPLING",
+        float(0.0, 2.0, 0.05, 0.2),
+        "Randomness of the output. Lower is more deterministic and usually better for coding.",
+    ),
+    field(
+        "top_p",
+        "Top-p",
+        "SAMPLING",
+        float(0.0, 1.0, 0.05, 0.95),
+        "Nucleus sampling: only the most likely tokens whose probabilities add up to this value are considered.",
+    ),
+    field(
+        "max_tokens",
+        "Max output tokens",
+        "Output",
+        int(1.0, 1_048_576.0, 1024.0, 8192.0),
+        "Upper bound on tokens generated per model response, including reasoning where the provider counts it.",
+    ),
+    field(
+        "reasoning_effort",
+        "Reasoning effort",
+        "Reasoning",
+        choice(EFFORTS, true),
+        "How much the model thinks before answering. Higher costs more time and tokens.",
+    ),
+    field(
+        "thinking",
+        "Thinking",
+        "Reasoning",
+        Kind::Toggle,
+        "Force extended thinking on or off. Default lets the provider and reasoning effort decide.",
+    ),
+    field(
+        "thinking_budget",
+        "Thinking budget",
+        "Reasoning",
+        int(1024.0, 1_048_576.0, 1024.0, 4096.0),
+        "Token budget for Anthropic-style extended thinking. Must stay below the output limit.",
+    ),
+    field(
+        "prompt_cache",
+        "Prompt caching",
+        "Caching",
+        Kind::Toggle,
+        "Reuse the stable prompt prefix between requests to cut cost and latency. Default is automatic.",
+    ),
+    field(
+        "cache_retention",
+        "Cache lifetime",
+        "Caching",
+        choice(&["auto", "short", "long"], false),
+        "How long cached prompt prefixes live. Auto uses 1 hour for subscription sign-in and 5 minutes otherwise.",
+    ),
+    field(
+        "edit_mode",
+        "Edit style",
+        "Agent behavior",
+        choice(
+            &["hashline", "replace", "apply_patch", "patch", "sloppy"],
+            true,
+        ),
+        "Pin this exact model's edit grammar: replace, hashline, apply_patch, structured patch or sloppy matching.",
+    ),
+    field(
+        "tools",
+        "Tool allow-list",
+        "Agent behavior",
+        Kind::Toml,
+        "Limit which tools this model sees, e.g. [\"read\", \"grep\", \"edit\"]. Blank offers the normal set.",
+    ),
+    field(
+        "local_sampling.top_k",
+        "Top-k",
+        "Local sampling",
+        int(0.0, 1000.0, 5.0, 40.0),
+        "Only sample from the k most likely tokens. 0 disables the limit.",
+    ),
+    field(
+        "local_sampling.min_p",
+        "Min-p",
+        "Local sampling",
+        float(0.0, 1.0, 0.01, 0.05),
+        "Drop tokens less likely than this fraction of the best token. A good alternative to top-p.",
+    ),
+    field(
+        "local_sampling.seed",
+        "Seed",
+        "Local sampling",
+        int(0.0, 4_294_967_295.0, 1.0, 0.0),
+        "Fixed random seed for repeatable output. Needs the seed capability to be declared.",
+    ),
+    field(
+        "local_sampling.xtc_probability",
+        "XTC probability",
+        "Local sampling",
+        float(0.0, 1.0, 0.05, 0.1),
+        "Chance of excluding top choices to increase variety. 0 turns XTC off.",
+    ),
+    field(
+        "local_sampling.xtc_threshold",
+        "XTC threshold",
+        "Local sampling",
+        float(0.0, 1.0, 0.05, 0.1),
+        "Probability above which a token may be excluded by XTC.",
+    ),
+    field(
+        "local_sampling.repetition_penalty",
+        "Repetition penalty",
+        "Repetition",
+        float(0.0, 3.0, 0.05, 1.1),
+        "Discourage repeating recent tokens. 1.0 is neutral; slightly above 1 reduces loops.",
+    ),
+    field(
+        "local_sampling.repetition_context_size",
+        "Repetition window",
+        "Repetition",
+        int(0.0, 8192.0, 16.0, 64.0),
+        "How many recent tokens the repetition penalty looks back over.",
+    ),
+    field(
+        "local_sampling.presence_penalty",
+        "Presence penalty",
+        "Repetition",
+        float(-2.0, 2.0, 0.1, 0.0),
+        "Penalize any token that already appeared, encouraging new topics.",
+    ),
+    field(
+        "local_sampling.presence_context_size",
+        "Presence window",
+        "Repetition",
+        int(0.0, 8192.0, 16.0, 64.0),
+        "How many recent tokens the presence penalty considers.",
+    ),
+    field(
+        "local_sampling.frequency_penalty",
+        "Frequency penalty",
+        "Repetition",
+        float(-2.0, 2.0, 0.1, 0.0),
+        "Penalize tokens in proportion to how often they appeared.",
+    ),
+    field(
+        "local_sampling.frequency_context_size",
+        "Frequency window",
+        "Repetition",
+        int(0.0, 8192.0, 16.0, 64.0),
+        "How many recent tokens the frequency penalty considers.",
+    ),
+    field(
+        TEMPLATE_KWARGS,
+        "All template arguments",
+        "Chat template",
+        Kind::Toml,
+        "Every chat template argument as one TOML table, e.g. { enable_thinking = false }. Options this model's template reads are listed above it on their own rows.",
+    ),
+    field(
+        DRAFT_MODEL,
+        "Draft model",
+        "MLX server",
+        Kind::Text,
+        "A smaller model with the same tokenizer that drafts tokens for speculative decoding. Enter types a model id or path. Any value on this page replaces the global local_runtime for this model; Dial restarts its MLX server to apply it.",
+    ),
+    field(
+        "local_runtime.num_draft_tokens",
+        "Draft tokens",
+        "MLX server",
+        int(1.0, 16.0, 1.0, 3.0),
+        "Tokens the draft model proposes per step. Needs a draft model; default 3.",
+    ),
+    field(
+        "local_runtime.kv_bits",
+        "KV cache bits",
+        "MLX server",
+        Kind::Choice {
+            options: &["2", "3", "4", "6", "8"],
             optional: true,
+            bare: true,
         },
-        help: "How much the model thinks before answering. Higher costs more time and tokens.",
-    },
-    Field {
-        path: "thinking",
-        label: "Thinking",
-        section: "Reasoning",
-        kind: Kind::Toggle,
-        help: "Force extended thinking on or off. Default lets the provider and reasoning effort decide.",
-    },
-    Field {
-        path: "thinking_budget",
-        label: "Thinking budget",
-        section: "Reasoning",
-        kind: int(1024.0, 1_048_576.0, 1024.0, 4096.0),
-        help: "Token budget for Anthropic-style extended thinking. Must stay below the output limit.",
-    },
-    Field {
-        path: "prompt_cache",
-        label: "Prompt caching",
-        section: "Caching",
-        kind: Kind::Toggle,
-        help: "Reuse the stable prompt prefix between requests to cut cost and latency. Default is automatic.",
-    },
-    Field {
-        path: "cache_retention",
-        label: "Cache lifetime",
-        section: "Caching",
-        kind: Kind::Choice {
-            options: &["auto", "short", "long"],
-            optional: false,
-        },
-        help: "How long cached prompt prefixes live. Auto uses 1 hour for subscription sign-in and 5 minutes otherwise.",
-    },
-    Field {
-        path: "edit_mode",
-        label: "Edit style",
-        section: "Agent behavior",
-        kind: Kind::Choice {
-            options: &["hashline", "replace", "apply_patch", "patch", "sloppy"],
+        "Quantize the KV cache to this many bits: less memory for long contexts, slightly lower quality. Default keeps it unquantized.",
+    ),
+    field(
+        "local_runtime.kv_group_size",
+        "KV group size",
+        "MLX server",
+        Kind::Choice {
+            options: &["32", "64", "128"],
             optional: true,
+            bare: true,
         },
-        help: "Pin this exact model's edit grammar: replace, hashline, apply_patch, structured patch or sloppy matching.",
-    },
-    Field {
-        path: "tools",
-        label: "Tool allow-list",
-        section: "Agent behavior",
-        kind: Kind::Toml,
-        help: "Limit which tools this model sees, e.g. [\"read\", \"grep\", \"edit\"]. Blank offers the normal set.",
-    },
-    Field {
-        path: "local_sampling.top_k",
-        label: "Top-k",
-        section: "Local sampling",
-        kind: int(0.0, 1000.0, 5.0, 40.0),
-        help: "Only sample from the k most likely tokens. 0 disables the limit.",
-    },
-    Field {
-        path: "local_sampling.min_p",
-        label: "Min-p",
-        section: "Local sampling",
-        kind: float(0.0, 1.0, 0.01, 0.05),
-        help: "Drop tokens less likely than this fraction of the best token. A good alternative to top-p.",
-    },
-    Field {
-        path: "local_sampling.seed",
-        label: "Seed",
-        section: "Local sampling",
-        kind: int(0.0, 4_294_967_295.0, 1.0, 0.0),
-        help: "Fixed random seed for repeatable output. Needs the seed capability to be declared.",
-    },
-    Field {
-        path: "local_sampling.xtc_probability",
-        label: "XTC probability",
-        section: "Local sampling",
-        kind: float(0.0, 1.0, 0.05, 0.1),
-        help: "Chance of excluding top choices to increase variety. 0 turns XTC off.",
-    },
-    Field {
-        path: "local_sampling.xtc_threshold",
-        label: "XTC threshold",
-        section: "Local sampling",
-        kind: float(0.0, 1.0, 0.05, 0.1),
-        help: "Probability above which a token may be excluded by XTC.",
-    },
-    Field {
-        path: "local_sampling.repetition_penalty",
-        label: "Repetition penalty",
-        section: "Repetition",
-        kind: float(0.0, 3.0, 0.05, 1.1),
-        help: "Discourage repeating recent tokens. 1.0 is neutral; slightly above 1 reduces loops.",
-    },
-    Field {
-        path: "local_sampling.repetition_context_size",
-        label: "Repetition window",
-        section: "Repetition",
-        kind: int(0.0, 8192.0, 16.0, 64.0),
-        help: "How many recent tokens the repetition penalty looks back over.",
-    },
-    Field {
-        path: "local_sampling.presence_penalty",
-        label: "Presence penalty",
-        section: "Repetition",
-        kind: float(-2.0, 2.0, 0.1, 0.0),
-        help: "Penalize any token that already appeared, encouraging new topics.",
-    },
-    Field {
-        path: "local_sampling.presence_context_size",
-        label: "Presence window",
-        section: "Repetition",
-        kind: int(0.0, 8192.0, 16.0, 64.0),
-        help: "How many recent tokens the presence penalty considers.",
-    },
-    Field {
-        path: "local_sampling.frequency_penalty",
-        label: "Frequency penalty",
-        section: "Repetition",
-        kind: float(-2.0, 2.0, 0.1, 0.0),
-        help: "Penalize tokens in proportion to how often they appeared.",
-    },
-    Field {
-        path: "local_sampling.frequency_context_size",
-        label: "Frequency window",
-        section: "Repetition",
-        kind: int(0.0, 8192.0, 16.0, 64.0),
-        help: "How many recent tokens the frequency penalty considers.",
-    },
-    Field {
-        path: "local_sampling.chat_template_kwargs",
-        label: "Template arguments",
-        section: "Chat template",
-        kind: Kind::Toml,
-        help: "Extra arguments for the model's chat template, e.g. { enable_thinking = false }.",
-    },
-    Field {
-        path: "capabilities",
-        label: "Declared capabilities",
-        section: "Advanced",
-        kind: Kind::Toml,
-        help: "What this exact model supports, one line per capability. Settings are validated against it. Enter opens the exact values as TOML.",
-    },
+        "Quantization group size for the KV cache. Needs KV cache bits.",
+    ),
+    field(
+        "local_runtime.quantized_kv_start",
+        "Quantize KV after",
+        "MLX server",
+        int(0.0, 1_048_576.0, 1024.0, 4096.0),
+        "Keep the first this-many tokens of the KV cache at full precision. Needs KV cache bits.",
+    ),
+    field(
+        "keep_alive",
+        "Keep loaded",
+        "Ollama",
+        choice(&["5m", "30m", "1h", "4h", "-1"], true),
+        "How long Ollama keeps the model in memory after a request; -1 keeps it loaded. Default is Ollama's own.",
+    ),
+    field(
+        "capabilities",
+        "Declared capabilities",
+        "Advanced",
+        Kind::Toml,
+        "What this exact model supports, one line per capability. Settings are validated against it. Enter opens the exact values as TOML.",
+    ),
 ];
 
 fn shown(field: &Field, profile: &ModelProfile) -> bool {
@@ -276,17 +358,41 @@ fn shown(field: &Field, profile: &ModelProfile) -> bool {
                 _ => false,
             }
         }
-        "Chat template" => mlx,
+        "Chat template" | "MLX server" => mlx,
+        "Ollama" => profile.provider == "ollama",
         "Caching" => !mlx && profile.provider != "lm-studio",
         "Reasoning" => !mlx || profile.capabilities.reasoning != ReasoningApi::None,
         _ => true,
     }
 }
 
+/// One row for an option the model's chat template reads, saved under `chat_template_kwargs`.
+fn template_row(option: TemplateOption) -> Field {
+    let (kind, what) = match option.kind {
+        OptionKind::Flag => (Kind::Toggle, "an on/off switch"),
+        OptionKind::Choice(options) => (Kind::Found(options), "one of the values it compares"),
+        OptionKind::Text => (Kind::Text, "a value; Enter types it"),
+    };
+    let default = option.default.map_or_else(
+        || "Default lets the template decide.".to_owned(),
+        |value| format!("The template's own default is {value}."),
+    );
+    Field {
+        path: Cow::Owned(format!("{TEMPLATE_KWARGS}.{}", option.name)),
+        label: Cow::Owned(option.name.clone()),
+        section: "Chat template",
+        kind,
+        help: Cow::Owned(format!(
+            "This model's chat template reads `{}` as {what}. {default} Sent as chat_template_kwargs.{} with every request.",
+            option.name, option.name
+        )),
+    }
+}
+
 pub struct ModelSettingsOverlay {
     pub name: String,
     profile: ModelProfile,
-    fields: Vec<&'static Field>,
+    fields: Vec<Field>,
     cursor: usize,
     scroll: usize,
     scope: Scope,
@@ -301,7 +407,11 @@ pub struct ModelSettingsOverlay {
 
 impl ModelSettingsOverlay {
     pub fn new(name: String, profile: ModelProfile) -> Self {
-        let fields = FIELDS.iter().filter(|f| shown(f, &profile)).collect();
+        let fields = FIELDS
+            .iter()
+            .filter(|f| shown(f, &profile))
+            .cloned()
+            .collect();
         Self {
             name,
             profile,
@@ -317,6 +427,36 @@ impl ModelSettingsOverlay {
         }
     }
 
+    /// Local models only: adds the rows this model's own files offer. Each option its chat template
+    /// reads gets a row before the raw template-arguments table, and an MLX model's draft-model row
+    /// cycles through the installed models that share its tokenizer. Reads files; never loads weights.
+    pub fn with_model_files(mut self) -> Self {
+        let options = template_options::detect(&self.profile.provider, &self.profile.model);
+        let drafts = if self.profile.provider == "mlx" {
+            local_server::draft_candidates(&self.profile.model)
+        } else {
+            Vec::new()
+        };
+        self.add_model_rows(options, drafts);
+        self
+    }
+
+    fn add_model_rows(&mut self, options: Vec<TemplateOption>, drafts: Vec<String>) {
+        if !drafts.is_empty()
+            && let Some(row) = self.fields.iter_mut().find(|f| f.path == DRAFT_MODEL)
+        {
+            row.kind = Kind::Found(drafts);
+            row.help = Cow::Borrowed(
+                "A smaller installed model with the same tokenizer drafts tokens for speculative decoding; Left/Right picks one. Any value on this page replaces the global local_runtime for this model; Dial restarts its MLX server to apply it.",
+            );
+        }
+        let Some(at) = self.fields.iter().position(|f| f.path == TEMPLATE_KWARGS) else {
+            return;
+        };
+        self.fields
+            .splice(at..at, options.into_iter().map(template_row));
+    }
+
     fn table(&self) -> toml::Table {
         toml::Value::try_from(&self.profile)
             .expect("serializable model profile")
@@ -330,10 +470,10 @@ impl ModelSettingsOverlay {
     }
 
     fn is_override(&self, field: &Field) -> bool {
-        match field.path {
+        match field.path.as_ref() {
             "capabilities" => false,
             "cache_retention" => self
-                .value(field.path)
+                .value(&field.path)
                 .is_some_and(|v| v.as_str() != Some("auto")),
             path => self.value(path).is_some(),
         }
@@ -341,7 +481,7 @@ impl ModelSettingsOverlay {
 
     fn unsupported(&self, field: &Field) -> Option<&'static str> {
         let c = &self.profile.capabilities;
-        match field.path {
+        match field.path.as_ref() {
             "temperature" if !c.temperature => Some(
                 "Not declared as supported for this model. Declare it under Advanced → capabilities.",
             ),
@@ -365,7 +505,7 @@ impl ModelSettingsOverlay {
     }
 
     fn choices(&self, field: &Field) -> Vec<String> {
-        match field.kind {
+        match &field.kind {
             Kind::Choice { options, .. } => {
                 if field.path == "reasoning_effort"
                     && !self.profile.capabilities.reasoning_efforts.is_empty()
@@ -380,6 +520,7 @@ impl ModelSettingsOverlay {
                     options.iter().map(|s| (*s).to_owned()).collect()
                 }
             }
+            Kind::Found(options) => options.clone(),
             _ => Vec::new(),
         }
     }
@@ -701,8 +842,8 @@ impl ModelSettingsOverlay {
     }
 
     fn apply(&mut self, text: &str) -> OverlayEvent {
-        let field = self.fields[self.cursor];
-        match self.candidate(field.path, text) {
+        let field = self.fields[self.cursor].clone();
+        match self.candidate(&field.path, text) {
             Ok(profile) => {
                 let what = if text.trim().is_empty() {
                     format!("{} reset to default", field.label)
@@ -734,8 +875,8 @@ impl ModelSettingsOverlay {
         if self.cursor >= self.fields.len() {
             return OverlayEvent::None;
         }
-        let field = self.fields[self.cursor];
-        let current = self.value(field.path);
+        let field = self.fields[self.cursor].clone();
+        let current = self.value(&field.path);
         let literal = match field.kind {
             Kind::Toggle => {
                 let options = [None, Some(true), Some(false)];
@@ -745,17 +886,10 @@ impl ModelSettingsOverlay {
                     .unwrap_or(0) as i64;
                 options[(at + direction).rem_euclid(3) as usize].map(|b| b.to_string())
             }
-            Kind::Choice { optional, .. } => {
-                let list = self.choices(field);
-                let lead = i64::from(optional);
-                let at = current
-                    .as_ref()
-                    .and_then(toml::Value::as_str)
-                    .and_then(|s| list.iter().position(|o| o == s))
-                    .map_or(0, |i| i as i64 + lead);
-                let next = (at + direction).rem_euclid(list.len() as i64 + lead);
-                (next >= lead).then(|| format!("\"{}\"", list[(next - lead) as usize]))
+            Kind::Choice { optional, bare, .. } => {
+                self.cycle(&field, current.as_ref(), optional, bare, direction)
             }
+            Kind::Found(_) => self.cycle(&field, current.as_ref(), true, false, direction),
             Kind::Number {
                 min,
                 max,
@@ -766,28 +900,57 @@ impl ModelSettingsOverlay {
                 None => number_text(start, int),
                 Some(v) => number_text((v + step * direction as f64).clamp(min, max), int),
             }),
-            Kind::Toml => return OverlayEvent::None,
+            Kind::Toml | Kind::Text => return OverlayEvent::None,
         };
         self.apply(&literal.unwrap_or_default())
     }
 
-    fn begin_edit(&mut self) -> OverlayEvent {
-        let field = self.fields[self.cursor];
-        match field.kind {
-            Kind::Number { .. } | Kind::Toml => {
-                let mut editor = Editor::default();
-                editor.set(
-                    &self
-                        .value(field.path)
-                        .map(|v| v.to_string())
-                        .unwrap_or_default(),
-                );
-                self.editor = Some(editor);
-                self.message = None;
-                OverlayEvent::None
+    /// The next option after `current` as a TOML literal; `None` is the default slot of an
+    /// optional choice. A current value outside the list starts from the beginning.
+    fn cycle(
+        &self,
+        field: &Field,
+        current: Option<&toml::Value>,
+        optional: bool,
+        bare: bool,
+        direction: i64,
+    ) -> Option<String> {
+        let list = self.choices(field);
+        let lead = i64::from(optional);
+        let at = current
+            .map(|value| match value {
+                toml::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .and_then(|text| list.iter().position(|option| *option == text))
+            .map_or(0, |i| i as i64 + lead);
+        let next = (at + direction).rem_euclid(list.len() as i64 + lead);
+        (next >= lead).then(|| {
+            let option = &list[(next - lead) as usize];
+            if bare {
+                option.clone()
+            } else {
+                toml::Value::String(option.clone()).to_string()
             }
-            _ => self.step(1),
-        }
+        })
+    }
+
+    fn begin_edit(&mut self) -> OverlayEvent {
+        let value = self.value(&self.fields[self.cursor].path);
+        let shown = match self.fields[self.cursor].kind {
+            Kind::Number { .. } | Kind::Toml => value.map(|v| v.to_string()),
+            // Text rows, and found options where a value outside the list can still be typed.
+            Kind::Text | Kind::Found(_) => value.map(|v| match v {
+                toml::Value::String(text) => text,
+                other => other.to_string(),
+            }),
+            _ => return self.step(1),
+        };
+        let mut editor = Editor::default();
+        editor.set(&shown.unwrap_or_default());
+        self.editor = Some(editor);
+        self.message = None;
+        OverlayEvent::None
     }
 
     pub fn event(&mut self, event: &Event, keys: &Keymap) -> OverlayEvent {
@@ -814,6 +977,11 @@ impl ModelSettingsOverlay {
         if let Some(editor) = &mut self.editor {
             if keys.matches(Action::SelectConfirm, key) {
                 let text = editor.text.clone();
+                // Text rows take what was typed; save it as a TOML string unless it is blank (reset).
+                let plain = matches!(self.fields[self.cursor].kind, Kind::Text | Kind::Found(_));
+                if plain && !text.trim().is_empty() {
+                    return self.apply(&toml::Value::String(text.trim().to_owned()).to_string());
+                }
                 return self.apply(&text);
             }
             if editor.key(*key) {
@@ -870,7 +1038,8 @@ impl ModelSettingsOverlay {
                 KeyCode::Home => self.cursor = 0,
                 KeyCode::End => self.cursor = last,
                 KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('r') => {
-                    if self.cursor < self.fields.len() && self.is_override(self.fields[self.cursor])
+                    if self.cursor < self.fields.len()
+                        && self.is_override(&self.fields[self.cursor])
                     {
                         return self.apply("");
                     }
@@ -925,7 +1094,7 @@ impl ModelSettingsOverlay {
         if selected && let Some(editor) = &self.editor {
             return editor_spans(theme, editor, width, false);
         }
-        let value = self.value(field.path);
+        let value = self.value(&field.path);
         let custom = self.is_override(field);
         let shown = match &value {
             Some(v) if field.path == "capabilities" => Self::capability_summary(v),
@@ -933,7 +1102,7 @@ impl ModelSettingsOverlay {
             Some(v) if field.path == "cache_retention" => Self::show_value(v),
             _ => "default".to_owned(),
         };
-        let adjustable = !matches!(field.kind, Kind::Toml);
+        let adjustable = !matches!(field.kind, Kind::Toml | Kind::Text);
         let (left, right) = if theme.ascii() {
             ("<", ">")
         } else {
@@ -1047,7 +1216,7 @@ impl ModelSettingsOverlay {
         let label_w = self
             .fields
             .iter()
-            .map(|f| text::width(f.label))
+            .map(|f| text::width(&f.label))
             .max()
             .unwrap_or(10)
             .min(w.saturating_sub(12).max(8));
@@ -1072,7 +1241,7 @@ impl ModelSettingsOverlay {
                 out.push(self.suggestion_row(*index - self.fields.len(), w, ctx, label_w));
                 continue;
             }
-            let field = self.fields[*index];
+            let field = &self.fields[*index];
             let selected = *index == self.cursor;
             let blocked = self.unsupported(field).is_some();
             let label_style = if blocked {
@@ -1103,7 +1272,7 @@ impl ModelSettingsOverlay {
                 Span::styled(
                     format!(
                         "{:<label_w$}",
-                        text::ellipsize(field.label, label_w, theme.ascii())
+                        text::ellipsize(&field.label, label_w, theme.ascii())
                     ),
                     label_style,
                 ),
@@ -1131,13 +1300,13 @@ impl ModelSettingsOverlay {
             }
             out.extend(lines);
         } else if detail_h > 0 {
-            let field = self.fields[self.cursor];
+            let field = &self.fields[self.cursor];
             let mut lines: Vec<Line<'static>> = vec![Line::from(fit(
                 vec![chrome::label(theme, &format!(" {}", field.label))],
                 w,
             ))];
             // The title and the range (or the unsupported reason) always keep their rows; help gets the rest.
-            let help = text::wrap_words(field.help, w.saturating_sub(2).max(8));
+            let help = text::wrap_words(&field.help, w.saturating_sub(2).max(8));
             let help_rows = detail_h.saturating_sub(2);
             for (index, row) in help.iter().take(help_rows).enumerate() {
                 let mut shown = format!(" {row}");
@@ -1162,7 +1331,12 @@ impl ModelSettingsOverlay {
                     "Choose: {}",
                     self.choices(field).join(" · ") + if optional { " · default" } else { "" }
                 ),
+                Kind::Found(_) => format!(
+                    "Choose: {} · default; Enter types another value",
+                    self.choices(field).join(" · ")
+                ),
                 Kind::Toggle => "Choose: on · off · default".to_owned(),
+                Kind::Text => "Enter types a value; blank resets to default".to_owned(),
                 Kind::Toml => "Enter edits a TOML value; blank resets to default".to_owned(),
             };
             match self.unsupported(field) {

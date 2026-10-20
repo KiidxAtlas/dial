@@ -1,12 +1,13 @@
 //! Routing commands typed while a turn is running, and the hotkey reference.
 
-use crate::app::command_registry::RUNS_NOW;
+use crate::app::command_registry::{RUNS_NOW, canonical_command};
 use crate::app::core::App;
 use crate::app::display::{app_home_hint, short};
 use crate::app::improve_view::{improve_jobs_text, improve_stop_text};
 use crate::app::overlay::{Which, work_panel};
 use crate::app::shell::Shell;
 use crate::storage::session::Session;
+use std::path::Path;
 
 impl Shell {
     /// Shared by inference and local-compute waiting. Only explicit session/work changes, or an
@@ -91,8 +92,9 @@ impl Shell {
         }
     }
 
-    /// Run a command that only reads what the shell already holds, so it works while a turn runs. Returns false
-    /// for commands that need the agent: those stop the turn ([`Shell::stops_turn`]) or run right after it.
+    /// Run a command that needs only the shell and app, never the agent, so it works while a turn
+    /// runs. Returns false for commands that need the agent: those stop the turn
+    /// ([`Shell::stops_turn`]) or run right after it.
     fn live_command(&mut self, app: &App, line: &str) -> bool {
         let Some(rest) = line.trim().strip_prefix('/') else {
             return false;
@@ -230,9 +232,59 @@ impl Shell {
                     ),
                 );
             }
-            _ => return false,
+            ("archive", args) => self.archive_note(app, args),
+            ("changes", "") => self.changes_note(&app.layout.project_root),
+            _ => {
+                let name = canonical_command(name);
+                match crate::app::commands::run_live(self, app, name, args) {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => self.note(name, format!("{error:#}")),
+                    None => return false,
+                }
+            }
         }
         true
+    }
+
+    /// `/archive [sessions|prompts|projects|<project>]`: the user-wide history archive.
+    pub(super) fn archive_note(&mut self, app: &App, args: &str) {
+        let archive = crate::storage::archive::Archive::new(&app.layout.user_dir);
+        let result = match args.trim() {
+            "sessions" => archive.sessions(None, 30).map(|view| view.text),
+            "prompts" => archive.prompts(None, None, 30).map(|view| view.text),
+            "projects" | "" => archive.projects(30).map(|view| view.text),
+            other => archive.prompts(Some(other), None, 30).map(|view| view.text),
+        };
+        match result {
+            Ok(text) if text.trim().is_empty() => self.note("Archive", "no archived history"),
+            Ok(text) => self.note("Archive", text),
+            Err(error) => self.note("Archive", format!("{error:#}")),
+        }
+    }
+
+    /// `/changes`: files changed in the current Git snapshot of `root`.
+    pub(super) fn changes_note(&mut self, root: &Path) {
+        let files = self.git.files(root);
+        let text = if files.is_empty() {
+            "No changes in the current Git snapshot.".into()
+        } else {
+            files
+                .iter()
+                .map(|file| {
+                    let stats = if file.untracked {
+                        "new".into()
+                    } else {
+                        match (file.added, file.removed) {
+                            (Some(a), Some(r)) => format!("+{a} −{r}"),
+                            _ => "binary".into(),
+                        }
+                    };
+                    format!("{}  {stats}", crate::ui::text::one_line(&file.path))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        self.note("Changes", text);
     }
 
     fn hotkeys_text(&self) -> String {

@@ -949,13 +949,14 @@ impl Default for PortableRulesConfig {
     }
 }
 
-/// `assistance.lean_local`. `auto` (default) turns the lean profile on for local routes whose planned
-/// context window is at most [`LEAN_AUTO_MAX_WINDOW`]; TOML `true` forces it on for every local route
-/// and `false` opts out, so boolean configurations keep their meaning.
+/// `assistance.lean_local`. TOML `true` (the default) turns the lean profile on for every local route,
+/// whatever its window: a large window does not make a small model able to use the full prompt and
+/// tool offer. `"auto"` enables it only for planned windows of at most [`LEAN_AUTO_MAX_WINDOW`], and
+/// `false` opts out, so boolean configurations keep their meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LeanLocal {
-    #[default]
     Auto,
+    #[default]
     On,
     Off,
 }
@@ -1054,9 +1055,9 @@ pub enum LocalThinking {
     /// Reasoning on for planning and recovery (a turn's first request, after a failed round or an
     /// intercepted generation, after a plan change) and off for mechanical steps that follow a
     /// successful tool round. Only models whose server exposes a thinking switch are affected.
-    #[default]
     Phase,
     /// Leave it to the model, the server and the model profile.
+    #[default]
     Model,
 }
 
@@ -1135,7 +1136,7 @@ impl Default for LocalAssistance {
             sampling: LocalSamplingSource::Model,
             reasoning_share: 50,
             escalate_after: 2,
-            thinking: LocalThinking::Phase,
+            thinking: LocalThinking::Model,
             keep_loaded_secs: 1800,
             prompt_cache: true,
             side_models: LocalSideModels::Warn,
@@ -1189,9 +1190,9 @@ pub struct AssistanceConfig {
     pub constrained_repair: bool,
     /// Lean profile for locally served models (no endpoint, or a loopback/LAN host): compact tool
     /// interface, an initial tool budget of at most 8, optional prompt sections and the delegation
-    /// guidance omitted when the local server runs one request at a time. `auto` (default) enables it
-    /// only when the planned window is at most `LEAN_AUTO_MAX_WINDOW`; `true` forces it on, `false`
-    /// opts out. Hosted routes are unchanged. Measure with `dial benchmark --ablate-assistance`.
+    /// guidance omitted when the local server runs one request at a time. `true` (default) enables it
+    /// for every local route; `auto` only when the planned window is at most `LEAN_AUTO_MAX_WINDOW`;
+    /// `false` opts out. Hosted routes are unchanged. Measure with `dial benchmark --ablate-assistance`.
     pub lean_local: LeanLocal,
     /// The local-model profile: tiers, edit grammar, sampling, reasoning cap and escalation.
     pub local: LocalAssistance,
@@ -1210,7 +1211,7 @@ impl Default for AssistanceConfig {
             tool_grammar: true,
             repair_hints: false,
             constrained_repair: true,
-            lean_local: LeanLocal::Auto,
+            lean_local: LeanLocal::On,
             local: LocalAssistance::default(),
         }
     }

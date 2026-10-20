@@ -131,13 +131,9 @@ fn remote_inference_needs_explicit_opt_in() {
 fn assist_variants_change_exactly_one_feature_from_dial() {
     let configurations = assist_configurations(&Config::default(), "openai", "model");
     let names: Vec<_> = configurations.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names[..3], ["raw", "dial", "lean"]);
-    assert_eq!(names.len(), 3 + ASSIST_VARIANTS.len());
-    assert_eq!(
-        configurations[1].assistance.lean_local,
-        Some(LeanLocal::Auto)
-    );
-    assert_eq!(configurations[2].assistance.lean_local, Some(LeanLocal::On));
+    assert_eq!(names[..2], ["raw", "dial"]);
+    assert_eq!(names.len(), 2 + ASSIST_VARIANTS.len());
+    assert_eq!(configurations[1].assistance.lean_local, Some(LeanLocal::On));
     let dial = serde_json::to_value(&configurations[1].assistance).unwrap();
     for variant in &configurations[2..] {
         let value = serde_json::to_value(&variant.assistance).unwrap();
@@ -165,10 +161,10 @@ fn dial_baseline_tracks_shipped_defaults_and_ignores_user_config() {
     user.efficiency.history_token_cap = 8192;
     let configurations = assist_configurations(&user, "openai", "model");
     let dial = &configurations[1];
-    // Shipped: compact_tools and repair_hints are off, lean_local is auto.
+    // Shipped: compact_tools and repair_hints are off, lean_local is on.
     assert_eq!(dial.assistance.compact_tools, Some(false));
     assert_eq!(dial.assistance.repair_hints, Some(false));
-    assert_eq!(dial.assistance.lean_local, Some(LeanLocal::Auto));
+    assert_eq!(dial.assistance.lean_local, Some(LeanLocal::On));
     assert_eq!(
         dial.assistance.initial_tool_limit,
         Some(shipped.assistance.initial_tool_limit)

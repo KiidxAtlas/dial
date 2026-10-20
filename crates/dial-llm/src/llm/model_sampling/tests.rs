@@ -30,14 +30,21 @@ fn generation_config_values_are_recommended() {
 }
 
 #[test]
-fn do_sample_false_is_greedy_with_no_recommendation() {
+fn do_sample_false_recommends_greedy_instead_of_inactive_sampler_values() {
     let root = tempfile::tempdir().unwrap();
     fs::write(
         root.path().join(GENERATION_CONFIG),
         r#"{"do_sample": false, "temperature": 0.7, "top_k": 40}"#,
     )
     .unwrap();
-    assert_eq!(read_model(root.path()), None);
+    assert_eq!(
+        read_model(root.path()),
+        Some(RecommendedSampling {
+            temperature: Some(0.0),
+            source: GENERATION_CONFIG,
+            ..Default::default()
+        })
+    );
 }
 
 #[test]

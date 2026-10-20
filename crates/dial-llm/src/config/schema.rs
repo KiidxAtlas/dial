@@ -433,7 +433,7 @@ static UI: &[SettingDef] = &[
         AP,
         "Status Line",
         "Left segments",
-        "Segments for the custom preset: spinner, model, role, path, git, context, tokens, rate, approval, sandbox, learning, session, time.",
+        "Segments for the custom preset: spinner, model, thinking, inference (last local request settings), role, path, git, context, tokens, rate, approval, sandbox, learning, session, time.",
         Kind::StringList,
     ),
     field!(

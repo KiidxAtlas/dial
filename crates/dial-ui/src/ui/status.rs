@@ -99,6 +99,8 @@ pub struct StatusData {
     pub model: String,
     /// Configured reasoning level, toggle or provider default; empty if metadata is unavailable.
     pub thinking: String,
+    /// Last main local request's overrides; empty before a request or after a model switch.
+    pub inference: String,
     /// Which role the running request uses (`main`, `subagent`, …); empty when idle on main.
     pub role: String,
     /// Absolute project path; the segment abbreviates `$HOME` to `~`.

@@ -59,13 +59,29 @@ pub(super) fn run(
     let result = match name {
         "collab" => collab(shell, app, agent, args),
         "join" => join(shell, app, args),
-        "leave" => leave(shell),
         "share" => share_session(shell, app, agent, args),
         "dump" => dump(shell, app, agent, args),
         "trace" => trace(shell, app, agent),
         _ => return None,
     };
     Some(result)
+}
+
+/// The collab commands that only read or end the room: they run at once even during a turn.
+pub(super) fn run_live(
+    shell: &mut Shell,
+    app: &App,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    match (name, args) {
+        ("collab", "status") => Some(status(shell)),
+        ("collab", "list") => Some(list(shell, app)),
+        ("collab", "stop") => Some(stop(shell)),
+        ("collab", "abort") => Some(guest_abort(shell)),
+        ("leave", _) => Some(leave(shell)),
+        _ => None,
+    }
 }
 
 pub(super) fn completions(_config: &crate::config::types::Config) -> Vec<String> {
@@ -86,10 +102,6 @@ fn collab(shell: &mut Shell, app: &App, agent: &Agent<'_>, args: &str) -> Result
     match args.trim() {
         "" | "start" => start(shell, app, agent, false),
         "view" => start(shell, app, agent, true),
-        "status" => status(shell),
-        "list" => list(shell, app),
-        "stop" => stop(shell),
-        "abort" => guest_abort(shell),
         _ => {
             shell.note("Collab", "Usage: /collab [view|status|stop|list|abort]");
             Ok(Step::Done)

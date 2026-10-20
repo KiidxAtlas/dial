@@ -1,5 +1,6 @@
 pub mod output;
 pub mod platform;
+pub mod prose;
 pub mod runtime;
 pub mod workspace_copy;
 

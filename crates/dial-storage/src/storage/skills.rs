@@ -476,30 +476,32 @@ pub fn catalog_block(skills: &[Skill]) -> String {
     out
 }
 
-/// One line naming up to three skills whose name or description shares words with the user's message.
-/// Deterministic word overlap only: the model still decides whether a skill applies. Returns `None`
-/// when nothing overlaps, so ordinary prompts receive no hint.
+/// One line naming up to three skills that share words with the prose of the user's message: every
+/// word of the skill's name, or at least two from its description. One generic word ("code",
+/// "file") is too weak a signal. Deterministic word overlap only: the model still decides whether a
+/// skill applies. Returns `None` when nothing matches, so ordinary prompts get no hint.
 pub fn match_hint(skills: &[Skill], text: &str) -> Option<String> {
     const STOP: &[&str] = &[
         "with", "this", "that", "from", "when", "your", "into", "about", "should", "will", "need",
         "make", "have", "what", "them", "they", "some", "also", "than", "then",
     ];
+    let keep = |word: &String| word.chars().count() >= 4 && !STOP.contains(&word.as_str());
     let words = |source: &str| -> std::collections::BTreeSet<String> {
         source
             .split(|c: char| !c.is_alphanumeric())
-            .filter(|word| word.chars().count() >= 4)
             .map(str::to_lowercase)
-            .filter(|word| !STOP.contains(&word.as_str()))
+            .filter(keep)
             .collect()
     };
-    let asked = words(text);
+    let asked: std::collections::BTreeSet<String> =
+        dial_core::prose::words(text).filter(keep).collect();
     let mut hits: Vec<(usize, &Skill)> = skills
         .iter()
         .filter_map(|skill| {
-            let shared = asked
-                .intersection(&words(&format!("{} {}", skill.name, skill.description)))
-                .count();
-            (shared > 0).then_some((shared, skill))
+            let name = words(&skill.name);
+            let named = !name.is_empty() && name.is_subset(&asked);
+            let description = asked.intersection(&words(&skill.description)).count();
+            (named || description >= 2).then_some((2 * usize::from(named) + description, skill))
         })
         .collect();
     if hits.is_empty() {

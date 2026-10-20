@@ -2,8 +2,8 @@
 //! directory, then the `general.sampling.*` keys llama.cpp converters write into a GGUF header.
 //!
 //! The answer comes from the files, never from the model's name. Each value is validated on its
-//! own, so one bad entry does not discard the rest. A `do_sample: false` config means the model is
-//! published for greedy decoding: there is no recommendation, and a GGUF header does not override it.
+//! own, so one bad entry does not discard the rest. A `do_sample: false` config requests greedy
+//! decoding (temperature zero), and a GGUF header does not override it.
 
 use super::catalog::{read_json, resolve_local_model};
 use super::local_format::gguf_info;
@@ -54,7 +54,11 @@ fn read_model(path: &Path) -> Option<RecommendedSampling> {
         && let Some(config) = read_json(&path.join(GENERATION_CONFIG))
     {
         if config.get("do_sample").and_then(Value::as_bool) == Some(false) {
-            return None;
+            return Some(RecommendedSampling {
+                temperature: Some(0.0),
+                source: GENERATION_CONFIG,
+                ..Default::default()
+            });
         }
         let found = validated(
             GENERATION_CONFIG,

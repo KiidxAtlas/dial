@@ -152,8 +152,8 @@ struct QueuedEdit {
 /// A decision the busy composer offers before it acts on a message. Nothing changes until one is chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BusyChoice {
-    /// Steer the running turn with the draft; it is taken at the next steering point.
-    Steer,
+    /// Let the agent decide whether this changes the current task or starts independent work.
+    Auto,
     /// Send the draft after the running turn finishes.
     AfterTurn,
     /// Leave the queue alone and let the turn finish.
@@ -165,7 +165,7 @@ enum BusyChoice {
 impl BusyChoice {
     fn label(self) -> &'static str {
         match self {
-            BusyChoice::Steer => "Add direction now",
+            BusyChoice::Auto => "Let Dial decide",
             BusyChoice::AfterTurn => "Queue for after this turn",
             BusyChoice::KeepWorking => "Keep working",
             BusyChoice::StopAndSend => "Stop and send oldest",
@@ -174,7 +174,7 @@ impl BusyChoice {
 
     fn detail(self) -> &'static str {
         match self {
-            BusyChoice::Steer => "applies at the next step of this turn",
+            BusyChoice::Auto => "steer this task or start an independent worker",
             BusyChoice::AfterTurn => "sent when this turn finishes",
             BusyChoice::KeepWorking => "queued messages stay queued",
             BusyChoice::StopAndSend => "stops this turn and sends the oldest queued message",
@@ -182,8 +182,8 @@ impl BusyChoice {
     }
 }
 
-/// Offered for a non-empty draft while busy. Steering is first, so a plain Enter steers.
-const DRAFT_CHOICES: &[BusyChoice] = &[BusyChoice::Steer, BusyChoice::AfterTurn];
+/// Offered for a non-empty draft while busy. Automatic routing is the default.
+const DRAFT_CHOICES: &[BusyChoice] = &[BusyChoice::Auto, BusyChoice::AfterTurn];
 /// Offered for an empty Enter with queued work. Stopping the turn is never the default.
 const QUEUE_CHOICES: &[BusyChoice] = &[BusyChoice::KeepWorking, BusyChoice::StopAndSend];
 
@@ -448,7 +448,7 @@ impl Composer {
         self.refresh();
     }
 
-    /// While busy, Enter asks whether to steer or queue (an empty Enter asks before stopping),
+    /// While busy, Enter asks whether to route automatically or queue (empty Enter asks before stopping),
     /// Alt-Enter queues a follow-up directly, and Esc interrupts. Ending the turn closes any open
     /// choice and leaves the draft as it was.
     pub fn set_busy(&mut self, busy: bool) {
@@ -512,6 +512,13 @@ impl Composer {
             }
         }
         steering
+    }
+
+    /// Return unhandled automatic input in submission order; it already passed queue admission.
+    pub fn restore_pending_messages(&mut self, messages: Vec<String>) {
+        for message in messages.into_iter().rev() {
+            self.queued.push_front((message, false));
+        }
     }
 
     pub fn take_follow_up(&mut self) -> Option<String> {
@@ -782,7 +789,7 @@ impl Composer {
             if self.editing_queue.is_some() {
                 return self.submit_queued(false);
             }
-            // Enter while busy asks whether to steer or queue; nothing is sent until the choice is made.
+            // Busy Enter asks whether to route automatically or queue; wait for the user's choice.
             if !self.editor.text.trim().is_empty() {
                 self.open_choice(DRAFT_CHOICES);
             }
@@ -867,7 +874,7 @@ impl Composer {
         if keys.matches(Action::Submit, &key) {
             self.choice = None;
             let event = match options[selected] {
-                BusyChoice::Steer => self.submit_queued(false),
+                BusyChoice::Auto => self.submit_queued(false),
                 BusyChoice::AfterTurn => self.submit_queued(true),
                 BusyChoice::KeepWorking => ComposerEvent::None,
                 BusyChoice::StopAndSend => self.send_oldest_queued(),
@@ -1600,7 +1607,11 @@ impl Composer {
                     text::ellipsize(
                         &format!(
                             "queued {}: {}",
-                            if *follow_up { "follow-up" } else { "steering" },
+                            if *follow_up {
+                                "follow-up"
+                            } else {
+                                "auto-route"
+                            },
                             text::one_line(message)
                         ),
                         w,
@@ -1810,7 +1821,7 @@ impl Composer {
             if let Some(QueuedEdit { follow_up, .. }) = self.editing_queue {
                 pieces.push(plain(format!(
                     "editing queued {}",
-                    if follow_up { "follow-up" } else { "steering" }
+                    if follow_up { "follow-up" } else { "auto-route" }
                 )));
                 pieces.push(hint(
                     Action::Submit,
@@ -1833,7 +1844,7 @@ impl Composer {
                 let command = self.editor.text.trim_start().starts_with('/');
                 let blank = self.editor.text.trim().is_empty();
                 // Mirrors `submit`: an empty Enter asks to stop (only with queued work); a blank draft
-                // is ignored; otherwise Enter asks whether to steer or queue the draft.
+                // is ignored; otherwise Enter asks whether to route automatically or queue the draft.
                 if command {
                     pieces.push(hint(Action::Submit, "run command"));
                 } else if self.editor.text.is_empty() {
@@ -1841,7 +1852,7 @@ impl Composer {
                         pieces.push(hint(Action::Submit, "stop or keep"));
                     }
                 } else if !blank {
-                    pieces.push(hint(Action::Submit, "steer or queue"));
+                    pieces.push(hint(Action::Submit, "route or queue"));
                 }
                 // Alt-Enter only queues a non-blank draft.
                 if !command && !blank {

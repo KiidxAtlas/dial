@@ -59,6 +59,7 @@ mod retry;
 pub mod server;
 pub mod steering;
 mod stream;
+pub mod template_options;
 mod text_tool_calls;
 pub mod thinking_loop;
 pub mod tool_repair;

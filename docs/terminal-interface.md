@@ -251,9 +251,13 @@ This shortcut starts in global scope so the defaults persist across projects and
 switch scope to set a project-only default instead. Enter a token count (for example `131072`)
 or `auto` to follow model capacity. Per-model overrides and smaller loaded-server limits still apply.
 Local MLX models (and LM Studio, with a subset of these controls) additionally expose top-k, min-p, XTC, seed, repetition/presence/frequency penalties with
-their windows, and chat-template arguments (for example `{ enable_thinking = false }`); LM Studio rejects XTC and chat-template arguments. Those request
-controls are never sent to cloud providers. Startup options of externally managed servers belong to
-those servers, not this page.
+their windows, and chat-template arguments; LM Studio rejects XTC and chat-template arguments. For an MLX model, every option its
+chat template reads (for example `enable_thinking`) gets its own row: flags toggle with ←/→, options the template compares against
+cycle through those values, and other options take typed text. **All template arguments** still edits the whole table as TOML.
+MLX models also get **MLX server** rows: a draft model for speculative decoding (←/→ cycles installed models that share the
+tokenizer; Enter types any other), draft tokens, and KV-cache bits, group size and start offset, picked from their valid values.
+Ollama models get a **Keep alive** row. Those request controls are never sent to cloud providers. Startup options of externally
+managed servers belong to those servers, not this page.
 
 To create a theme, put a JSON file such as
 `~/.dial/themes/custom.json` there; it may extend a built-in (`dark`, `light`, `mono`, `gruvbox`,

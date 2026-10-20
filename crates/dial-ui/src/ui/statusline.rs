@@ -30,17 +30,36 @@ pub fn segments(cfg: &UiConfig) -> (Vec<String>, Vec<String>) {
     let names = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     match cfg.status {
         StatusPreset::Default | StatusPreset::Nerd | StatusPreset::Ascii => (
-            names(&["spinner", "model", "mode", "thinking", "path", "git"]),
+            names(&[
+                "spinner",
+                "model",
+                "mode",
+                "thinking",
+                "inference",
+                "path",
+                "git",
+            ]),
             names(&["workers", "context"]),
         ),
-        StatusPreset::Minimal => (names(&["model", "thinking"]), names(&["context"])),
+        StatusPreset::Minimal => (
+            names(&["model", "thinking", "inference"]),
+            names(&["context"]),
+        ),
         StatusPreset::Compact => (
-            names(&["spinner", "model", "thinking", "git"]),
+            names(&["spinner", "model", "thinking", "inference", "git"]),
             names(&["workers", "context", "tokens"]),
         ),
         StatusPreset::Full => (
             names(&[
-                "spinner", "model", "thinking", "role", "path", "git", "approval", "sandbox",
+                "spinner",
+                "model",
+                "thinking",
+                "inference",
+                "role",
+                "path",
+                "git",
+                "approval",
+                "sandbox",
             ]),
             names(&["workers", "tokens", "rate", "learning", "context"]),
         ),
@@ -245,6 +264,7 @@ fn canonical(name: &str) -> Option<(&'static str, u8)> {
         "context" => ("context", 90),
         "spinner" => ("spinner", 80),
         "thinking" | "reasoning" => ("thinking", 85),
+        "inference" => ("inference", 75),
         "path" => ("path", 60),
         "role" => ("role", 55),
         "git" => ("git", 50),
@@ -409,6 +429,17 @@ impl Env<'_> {
                 )
             }
             "thinking" => {
+                if !data.inference.is_empty()
+                    && (self.cfg.status != StatusPreset::Custom
+                        || self
+                            .cfg
+                            .status_left
+                            .iter()
+                            .chain(&self.cfg.status_right)
+                            .any(|name| name.trim().eq_ignore_ascii_case("inference")))
+                {
+                    return None; // The request-specific thinking switch is in the inference segment.
+                }
                 let level = text::one_line(&data.thinking);
                 if level.trim().is_empty() {
                     return None;
@@ -420,6 +451,17 @@ impl Env<'_> {
                         super::chrome::Section::Learn,
                         &format!("think {}", level.trim()),
                     ))],
+                )
+            }
+            "inference" => {
+                let settings = text::one_line(&data.inference);
+                if settings.trim().is_empty() {
+                    return None;
+                }
+                self.seg(
+                    name,
+                    importance,
+                    vec![Some(self.part(settings, Tok::StatusModel))],
                 )
             }
             "role" => {

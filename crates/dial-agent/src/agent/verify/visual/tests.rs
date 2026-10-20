@@ -13,6 +13,12 @@ fn visual_work_is_conditional_and_test_or_backend_edits_do_not_trigger_it() {
     assert!(review.missing([2, 0, 0]));
 }
 #[test]
+fn pasted_tracebacks_and_identifiers_do_not_request_visual_work() {
+    let paste = "why does this crash\nTraceback (most recent call last):\n  File \"drawing.py\", line 40, in __init__\n    self._build_toolbar()\n  canvas.bind(\"<Button-1>\", self._paint)\nAttributeError: module 'tkinter.ttk' has no attribute 'Checkbar'";
+    assert!(!useful(paste));
+    assert!(useful("build a page with a button"));
+}
+#[test]
 fn only_rendered_pixels_delivered_after_latest_edit_satisfy_site_review() {
     let mut review = Review::new("fix the site layout");
     review.changed(Path::new("style.css"));

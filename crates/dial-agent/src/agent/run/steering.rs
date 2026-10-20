@@ -2,6 +2,8 @@
 
 use crate::agent::*;
 
+mod routing;
+
 /// Server acknowledgement deadline for live Codex steering; afterwards the receipt is uncertain.
 pub(in crate::agent) const LIVE_STEER_ACK: Duration = Duration::from_secs(10);
 pub(in crate::agent) struct PendingSteer {

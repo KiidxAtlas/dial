@@ -46,6 +46,41 @@ const ALL_SEPARATORS: [StatusSeparator; 7] = [
 ];
 
 #[test]
+fn custom_thinking_segment_is_not_hidden_when_inference_is_not_requested() {
+    let status = StatusData {
+        thinking: "high".into(),
+        inference: "temp 0.2 · think on · out 4096".into(),
+        ..data()
+    };
+    let cfg = UiConfig {
+        status_left: vec!["thinking".into()],
+        status_right: vec![],
+        ..cfg_with(StatusPreset::Custom)
+    };
+    assert!(plain(&render(&cfg, &status, 80)).contains("THINK HIGH"));
+}
+
+#[test]
+fn local_request_settings_segment_is_live_optional_and_width_safe() {
+    let mut status = data();
+    let cfg = UiConfig {
+        status_left: vec!["model".into(), "inference".into()],
+        status_right: vec![],
+        ..cfg_with(StatusPreset::Custom)
+    };
+    let initial = plain(&render(&cfg, &status, 160));
+    status.inference = "temp 0.6 · think on · out 4096".into();
+    let active = plain(&render(&cfg, &status, 160));
+    assert_ne!(initial, active);
+    assert!(active.contains(&status.inference));
+    for width in 8..160 {
+        assert_eq!(render(&cfg, &status, width).width(), usize::from(width));
+    }
+    status.inference = "temp server default · think off · out 2048".into();
+    assert!(plain(&render(&cfg, &status, 160)).contains(&status.inference));
+}
+
+#[test]
 fn activity_row_fits_all_widths_and_preserves_silence_and_custom_preferences() {
     let mut status = StatusData {
         phase: Phase::Working,
@@ -216,18 +251,29 @@ fn presets_map_to_their_segment_lists_and_custom_uses_the_configured_ones() {
     assert_eq!(
         segments(&cfg_with(StatusPreset::Default)),
         (
-            names(&["spinner", "model", "mode", "thinking", "path", "git"]),
+            names(&[
+                "spinner",
+                "model",
+                "mode",
+                "thinking",
+                "inference",
+                "path",
+                "git"
+            ]),
             names(&["workers", "context"])
         )
     );
     assert_eq!(
         segments(&cfg_with(StatusPreset::Minimal)),
-        (names(&["model", "thinking"]), names(&["context"]))
+        (
+            names(&["model", "thinking", "inference"]),
+            names(&["context"])
+        )
     );
     assert_eq!(
         segments(&cfg_with(StatusPreset::Compact)),
         (
-            names(&["spinner", "model", "thinking", "git"]),
+            names(&["spinner", "model", "thinking", "inference", "git"]),
             names(&["workers", "context", "tokens"])
         )
     );
@@ -235,7 +281,15 @@ fn presets_map_to_their_segment_lists_and_custom_uses_the_configured_ones() {
         segments(&cfg_with(StatusPreset::Full)),
         (
             names(&[
-                "spinner", "model", "thinking", "role", "path", "git", "approval", "sandbox"
+                "spinner",
+                "model",
+                "thinking",
+                "inference",
+                "role",
+                "path",
+                "git",
+                "approval",
+                "sandbox"
             ]),
             names(&["workers", "tokens", "rate", "learning", "context"])
         )

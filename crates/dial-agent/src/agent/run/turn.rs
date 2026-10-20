@@ -171,7 +171,8 @@ impl Agent<'_> {
                 return self.stop_turn(ui, "Stopped: --max-time deadline reached.".into(), step).map(crate::agent::run::engine::Tick::Finished);
             }
             let accepted_live = self.flush_accepted_live_steering(ui)?;
-            if self.take_steering(ui)? || accepted_live {
+            let routed_steering = self.route_pending_messages(backend, ui)?;
+            if self.take_steering(ui)? || accepted_live || routed_steering {
                 steering_pending = true;
             }
             if std::mem::take(&mut steering_pending) {
@@ -363,8 +364,9 @@ impl Agent<'_> {
                     None
                 },
             };
-            if let Some(local) = self.prepare_local_request(backend, &mut selection.profile) {
-                self.record(step, "local_request", local)?;
+            let local_control = self.prepare_local_request(backend, &mut selection.profile);
+            if let Some(local) = &local_control {
+                self.record(step, "local_request", local.clone())?;
             }
             backend.next_request_profile(crate::llm::profiles::request_tiers_for(
                 selection.profile.clone(),
@@ -559,6 +561,7 @@ impl Agent<'_> {
                 .request(&request_overhead, lightweight);
             let requested_tokens = request.max_tokens;
             let repairing = repair.take_request();
+            let mut request_selection = None;
             if !self.hermetic {
                 let mut profile = selection.profile.clone();
                 if single_call
@@ -586,6 +589,9 @@ impl Agent<'_> {
                     });
                     profile.tool_repair = true;
                 }
+                let effective = local_control.as_ref().map(|local| {
+                    crate::adaptive::local_request_settings(&request, profile.as_ref(), local, &selection.sampling_source)
+                });
                 backend.next_request_profile(crate::llm::profiles::request_tiers_for(
                     profile,
                     &self.auth_config.selection(),
@@ -616,12 +622,13 @@ impl Agent<'_> {
                 });
                 control["reliability"]["current_tools"] = json!(names);
                 self.session.set_control_state(control)?;
-                self.record(step, "request_policy", serde_json::to_value(&selection)?)?;
-                self.save_request_policy(
-                    Some(serde_json::to_value(&selection)?),
-                    json!({"state":"awaiting response"}),
-                    ui,
-                )?;
+                let mut selected = serde_json::to_value(&selection)?;
+                if let Some(effective) = effective {
+                    selected["temperature"] = effective["temperature"].clone();
+                    selected["top_p"] = effective["top_p"].clone();
+                    selected["effective"] = effective;
+                }
+                request_selection = Some(selected);
             }
             // The headroom gate used this exact projected request, including transient guidance.
             self.record(
@@ -647,6 +654,14 @@ impl Agent<'_> {
                     || reasoning_policy.max_reasoning_bytes > cap)
             {
                 reasoning_policy.max_reasoning_bytes = cap;
+            }
+            if let Some(mut selected) = request_selection {
+                if selected["effective"].is_object() {
+                    selected["effective"]["max_reasoning_bytes"] = json!(if reasoning_policy.enabled { reasoning_policy.max_reasoning_bytes } else { 0 });
+                    selected["effective"]["max_pre_action_secs"] = json!(if reasoning_policy.enabled { reasoning_policy.max_pre_action_secs } else { 0 });
+                }
+                self.record(step, "request_policy", selected.clone())?;
+                self.save_request_policy(Some(selected), json!({"state":"awaiting response"}), ui)?;
             }
             let interrupt = self.interrupt.clone();
             // Steering cancels only this generation, never the whole user turn or
@@ -767,6 +782,15 @@ impl Agent<'_> {
                 Err(error) => {
                     steering_error.get_or_insert(error);
                 }
+            }
+            // Undecided input never cancels a live generation or a running tool. Classify only at
+            // this safe boundary, before admitting any calls from the completed response.
+            if !steered_during_generation && !self.interrupt.load(Ordering::SeqCst)
+                && self.route_pending_messages(backend, ui)? {
+                if result.is_ok() {
+                    record_rejected_reply(&self.usage_scope, backend, repairing)?;
+                }
+                steered_during_generation = true;
             }
             if let Some(error) = steering_error {
                 return Err(error).map(crate::agent::run::engine::Tick::Finished);

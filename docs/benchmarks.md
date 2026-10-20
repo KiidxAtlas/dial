@@ -236,9 +236,8 @@ config files are never modified. Each configuration records the resolved values 
 `dial benchmark --ablate-assistance [suite.toml] [-m model] [--report out.json] [--allow-remote]` runs an
 automatic matrix on one model. `raw` turns assistance off. `dial` pins the assistance switches and
 listed context-economy levers to `Config::default()` rather than your config file. Other settings remain
-shared across the matrix and are subject to benchmark isolation. `lean` forces `lean_local = true`, which
-matters on local routes where shipped `auto` would not apply (windows above 32768 tokens). Each variant
-changes exactly one lever from `dial`:
+shared across the matrix and are subject to benchmark isolation. Each variant changes exactly one lever
+from `dial`:
 
 - `enable-compact_tools` and `enable-repair_hints` turn on features that ship off;
 - `ablate-initial_tool_limit`, `ablate-tool_grammar`, `ablate-edit_mode`, `ablate-reliability_gate`,

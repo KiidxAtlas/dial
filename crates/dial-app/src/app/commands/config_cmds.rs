@@ -128,9 +128,77 @@ pub(super) fn run(
         "slow" => slow(shell, app, agent, args),
         "extended-context" => extended_context(shell, app, agent, args),
         "modelpreset" => modelpreset(shell, app, agent, args),
-        "usage" => usage(shell, app, args),
         "ssh" => ssh(shell, app, agent, args),
         "checks" => checks(shell, app, agent, args),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// The status, list and help forms, plus `/usage`: they only read settings or start a background
+/// job, so they run at once even during a turn.
+pub(super) fn run_live(
+    shell: &mut Shell,
+    app: &App,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    let result = match (name, args) {
+        ("fast" | "slow", "status") => {
+            let provider = app.config.selection().provider;
+            let (title, plan) = if name == "fast" {
+                ("Fast", fast_plan(&app.config, &provider, args))
+            } else {
+                ("Slow", slow_plan(&app.config, &provider, args))
+            };
+            plan.map(|plan| {
+                shell.note(title, plan.note);
+                Step::Done
+            })
+        }
+        ("extended-context", "status") => {
+            let state = if app.config.extended_context {
+                "on"
+            } else {
+                "off"
+            };
+            shell.note("Extended context", format!("Extended context is {state}."));
+            Ok(Step::Done)
+        }
+        ("modelpreset", "" | "list") => {
+            let presets = &app.config.model_presets;
+            let text = if presets.is_empty() {
+                "No model presets saved. Use /modelpreset save <name> to create one.".to_owned()
+            } else {
+                format!(
+                    "Model presets: {}",
+                    presets.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            };
+            shell.note("Model preset", text);
+            Ok(Step::Done)
+        }
+        ("usage", _) => usage(shell, app, args),
+        ("ssh", "" | "list") => {
+            let text = format!(
+                "{}\n\nAdd a host with /ssh add <name> --host <host>.",
+                ssh_list(&app.config)
+            );
+            shell.note("SSH", text);
+            Ok(Step::Done)
+        }
+        ("ssh", "help") => {
+            shell.note("SSH", SSH_USAGE);
+            Ok(Step::Done)
+        }
+        ("checks", "" | "list") => {
+            shell.note("Checks", checks_list(&app.config));
+            Ok(Step::Done)
+        }
+        ("checks", "help") => {
+            shell.note("Checks", CHECKS_USAGE);
+            Ok(Step::Done)
+        }
         _ => return None,
     };
     Some(result)
@@ -319,16 +387,6 @@ fn extended_context(
     const TITLE: &str = "Extended context";
     let current = app.config.extended_context;
     let (enabled, reply) = match args.trim() {
-        "status" => {
-            shell.note(
-                TITLE,
-                format!(
-                    "Extended context is {}.",
-                    if current { "on" } else { "off" }
-                ),
-            );
-            return Ok(Step::Done);
-        }
         "" | "toggle" => {
             let enabled = !current;
             (
@@ -370,19 +428,6 @@ fn modelpreset(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) 
         None => (trimmed, ""),
     };
     match sub {
-        "" | "list" => {
-            let presets = &app.config.model_presets;
-            let text = if presets.is_empty() {
-                "No model presets saved. Use /modelpreset save <name> to create one.".to_owned()
-            } else {
-                format!(
-                    "Model presets: {}",
-                    presets.keys().cloned().collect::<Vec<_>>().join(", ")
-                )
-            };
-            shell.note(TITLE, text);
-            Ok(Step::Done)
-        }
         "save" => {
             if !valid_name(rest) {
                 bail!(
@@ -525,18 +570,6 @@ fn ssh(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
         None => (trimmed, ""),
     };
     match sub {
-        "" | "list" => {
-            let text = format!(
-                "{}\n\nAdd a host with /ssh add <name> --host <host>.",
-                ssh_list(&app.config)
-            );
-            shell.note(TITLE, text);
-            Ok(Step::Done)
-        }
-        "help" => {
-            shell.note(TITLE, SSH_USAGE);
-            Ok(Step::Done)
-        }
         "add" => {
             let (name, host, scope) = parse_ssh_add(rest)?;
             if app.config.ssh_hosts.contains_key(&name) {
@@ -610,14 +643,6 @@ fn checks(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Re
         None => (trimmed, ""),
     };
     match sub {
-        "" | "list" => {
-            shell.note(TITLE, checks_list(&app.config));
-            Ok(Step::Done)
-        }
-        "help" => {
-            shell.note(TITLE, CHECKS_USAGE);
-            Ok(Step::Done)
-        }
         "add" => {
             let (name, check) = parse_check_add(rest)?;
             if app

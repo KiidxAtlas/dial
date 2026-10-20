@@ -38,3 +38,20 @@ fn short_and_stop_words_never_match_on_their_own() {
             .into()
     ));
 }
+
+#[test]
+fn one_generic_description_word_or_pasted_code_is_not_a_match() {
+    let skills = [skill(
+        "code-cleanup",
+        "Audit or clean up dead code and duplicated behavior",
+    )];
+    assert_eq!(match_hint(&skills, "why does my code crash"), None);
+    assert_eq!(
+        match_hint(
+            &skills,
+            "why does this crash\n    dead_code = cleanup(code)"
+        ),
+        None
+    );
+    assert!(match_hint(&skills, "remove the dead code here").is_some());
+}

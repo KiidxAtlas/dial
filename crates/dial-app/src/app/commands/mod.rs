@@ -5,6 +5,8 @@
 //! A group module exposes:
 //! - `COMMANDS`: specs for commands it adds (never names already listed in app.rs `BUILTIN_COMMANDS`).
 //! - `run`: returns `None` when the name is not handled by the group, otherwise the handler result.
+//! - `run_live` (optional): the commands and subcommands that need only the shell and app, never
+//!   the agent. They run at once even while a turn runs; `run` tries them first.
 //! - `completions`: extra composer argument candidates such as `/mcp login <server>`.
 
 use super::{App, Shell, Step};
@@ -60,6 +62,9 @@ pub(super) fn run(
     name: &str,
     args: &str,
 ) -> Option<Result<Step>> {
+    if let Some(result) = run_live(shell, app, name, args) {
+        return Some(result);
+    }
     if let Some(result) = advanced::run(shell, app, agent, name, args) {
         return Some(result);
     }
@@ -91,6 +96,26 @@ pub(super) fn run(
         return Some(result);
     }
     modes::run(shell, app, agent, name, args)
+}
+
+/// Group commands that need only the shell and app. `Shell::live_command` runs these at once while
+/// a turn runs; the idle dispatcher reaches them through [`run`]. Every result is `Step::Done`.
+/// Keep `RUNS_NOW` and `RUNS_NOW_ARGS` in `command_registry` in step with this set.
+pub(super) fn run_live(
+    shell: &mut Shell,
+    app: &App,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    let args = args.trim();
+    advanced::run_live(shell, app, name, args)
+        .or_else(|| maintenance::run_live(shell, app, name, args))
+        .or_else(|| collab::run_live(shell, app, name, args))
+        .or_else(|| smithery::run_live(shell, app, name, args))
+        .or_else(|| extensions::run_live(shell, app, name, args))
+        .or_else(|| config_cmds::run_live(shell, app, name, args))
+        .or_else(|| session::run_live(shell, app, name, args))
+        .or_else(|| setup::run_live(shell, app, name, args))
 }
 
 /// Composer argument candidates: `/<name> <subcommand>` for every static subcommand, plus each

@@ -593,7 +593,8 @@ impl Agent<'_> {
             LocalHints {
                 presence_penalty: Some(LOOP_PRESENCE_PENALTY),
                 repetition_penalty: Some(LOOP_REPETITION_PENALTY),
-                thinking: (self.local_session.facts.thinking_switch == Some(true)
+                thinking: (local.thinking == LocalThinking::Phase
+                    && self.local_session.facts.thinking_switch == Some(true)
                     && !Self::thinking_pinned(profile.as_ref()))
                 .then_some(false),
                 ..Default::default()

@@ -111,6 +111,19 @@ inherited remote endpoint. Helper roles use the same rule. A project role with `
 follows the main model even if a global role assignment exists. An admitted harness may pin an edit mode;
 the settings panel labels that mode as pinned instead of claiming an ineffective override.
 
+### Live local-model settings
+
+Before each main local-model request, Dial shows its requested temperature, thinking switch and
+output-token limit in the status bar. These are the **last request's overrides**, not measured engine
+defaults. Unspecified values say `server default` or `model default`; no settings are shown before
+the first request, and switching models clears the previous model's values. Narrow terminals may
+drop the segment; custom status layouts can include `inference` in `ui.status_left` or `ui.status_right`.
+
+A **Model settings** transcript notice appears for the first request and whenever those controls
+change (including phase thinking and loop-recovery penalties), not for every token or result update.
+The full notice and `/policy` include top-p, top-k, min-p, sampling source, explicit reasoning
+effort/budget and reasoning-guard limits. No sampler or thinking policy is changed by this display.
+
 ```toml
 model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 approval = "write"        # ask | write | auto | readonly

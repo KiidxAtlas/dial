@@ -1,11 +1,11 @@
 use super::*;
 
 #[test]
-fn lean_local_accepts_true_false_and_auto_and_defaults_to_auto() {
+fn lean_local_accepts_true_false_and_auto_and_defaults_to_on() {
     let lean =
         |text: &str| toml::from_str::<AssistanceConfig>(text).map(|config| config.lean_local);
-    assert_eq!(AssistanceConfig::default().lean_local, LeanLocal::Auto);
-    assert_eq!(lean("").unwrap(), LeanLocal::Auto);
+    assert_eq!(AssistanceConfig::default().lean_local, LeanLocal::On);
+    assert_eq!(lean("").unwrap(), LeanLocal::On);
     assert_eq!(lean("lean_local = \"auto\"").unwrap(), LeanLocal::Auto);
     assert_eq!(lean("lean_local = true").unwrap(), LeanLocal::On);
     assert_eq!(lean("lean_local = false").unwrap(), LeanLocal::Off);

@@ -183,6 +183,15 @@ pub trait Ui {
     fn take_steering(&mut self) -> Vec<String> {
         Vec::new()
     }
+    /// Busy input whose intent is undecided. Unlike explicit steering, this must not cancel work
+    /// until the agent has decided whether to steer or start an independent worker.
+    fn take_pending_messages(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Restore unhandled busy input after cancellation, ahead of later queued messages.
+    fn restore_pending_messages(&mut self, _messages: Vec<String>) {}
+    /// An undecided message was accepted for routing; surfaces can show it exactly once.
+    fn pending_message_accepted(&mut self, _text: &str) {}
     /// Maintenance must yield to queued foreground work without consuming that work.
     fn maintenance_ready(&mut self) -> bool {
         true
