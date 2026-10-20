@@ -296,8 +296,13 @@ contract. Recalled recipes accumulate display, source-overlap reuse and subseque
 counts. These are observed-use proxies, not causal accuracy estimates.
 
 The syntax guard provides advisory parser diagnostics on write, replace/hashline edit and AST commits.
-Parser errors never reject changes, even with `assistance.syntax_guard = true`; setting it to `false`
-disables these advisories. Unsupported languages (including zsh, which has no grammar here) still need their native checks. `edit_preview` parses
+On the full tier parser errors never reject changes; setting `assistance.syntax_guard = false`
+disables these advisories. On the small and lean local tiers, an `edit` that would raise the parser
+error count of a Rust, Python, TypeScript, TSX, JavaScript or Go file is refused before anything is
+written: the error names the first new error with a short window of the would-be result, earlier reads
+and tags stay valid for a corrected retry, and `allow_syntax_errors: true` applies the edit anyway (with
+the advisory). Files that already had errors are refused only when the count rises; `write` and
+`ast_edit` stay advisory. Unsupported languages (including zsh, which has no grammar here) still need their native checks. `edit_preview` parses
 proposed source without changing files; its
 optional `check="type"` uses an offline Cargo check in a disposable project copy. That copy is limited
 to 2,048 files, 32 MiB, a three-second preparation budget and a 30-second compiler timeout. Compiler

@@ -1,4 +1,5 @@
-//! Advisory source parsing. Diagnostics never block writes or certify behavior or types.
+//! Source parsing. Diagnostics are advisory, except that small/lean local tiers refuse edits that
+//! add parser errors to a high-confidence grammar (see [`refusal`]). Never a type or behavior check.
 use ast_grep_core::{AstGrep, Language};
 use ast_grep_language::SupportLang;
 use serde_json::{Value, json};
@@ -51,6 +52,83 @@ pub fn advisory(path: &Path, before: &str, proposed: &str) -> Option<String> {
         new,
         old,
         after["errors"][0]
+    ))
+}
+/// Grammars whose tree-sitter parsers are trusted enough to refuse an edit that adds errors.
+fn high_confidence(lang: SupportLang) -> bool {
+    matches!(
+        lang,
+        SupportLang::Rust
+            | SupportLang::Python
+            | SupportLang::TypeScript
+            | SupportLang::Tsx
+            | SupportLang::JavaScript
+            | SupportLang::Go
+    )
+}
+/// Error/missing node positions (1-based line, column, missing), bounded so huge broken files stay cheap.
+fn error_positions(lang: SupportLang, content: &str) -> Option<Vec<(usize, usize, bool)>> {
+    let tree = AstGrep::try_new(content, lang).ok()?;
+    Some(
+        tree.root()
+            .dfs()
+            .filter(|node| node.is_error() || node.is_missing())
+            .take(4096)
+            .map(|node| {
+                let pos = node.start_pos();
+                (pos.line() + 1, pos.column(&node) + 1, node.is_missing())
+            })
+            .collect(),
+    )
+}
+/// The refusal for an edit that raises the parser error count of a high-confidence grammar, naming
+/// the first new error with a few lines of the would-be result. `None` lets the edit proceed.
+pub(crate) fn refusal(path: &Path, rel: &str, before: &str, after: &str) -> Option<String> {
+    if after.len() > 4 * 1024 * 1024 || before.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let lang = language(path).filter(|lang| high_confidence(*lang))?;
+    let new = error_positions(lang, after)?;
+    if new.is_empty() {
+        return None;
+    }
+    let old = error_positions(lang, before)?;
+    if new.len() <= old.len() {
+        return None;
+    }
+    let old_lines: Vec<&str> = before.lines().collect();
+    let new_lines: Vec<&str> = after.lines().collect();
+    let prefix = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = old_lines[prefix..]
+        .iter()
+        .rev()
+        .zip(new_lines[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let changed = prefix + 1..=new_lines.len().saturating_sub(suffix).max(prefix + 1);
+    let &(line, column, missing) = new
+        .iter()
+        .find(|(line, ..)| changed.contains(line))
+        .or_else(|| new.iter().find(|error| !old.contains(error)))
+        .unwrap_or(&new[0]);
+    let last = new_lines.len().max(1);
+    let window = (line.saturating_sub(2).max(1)..=(line + 2).min(last))
+        .map(|n| format!("{n}:{}", new_lines.get(n - 1).copied().unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "Edit refused: it would add {lang} syntax errors to {rel} ({} before, {} after); nothing was written. First new error at {line}:{column} ({}). Would-be result:\n{window}\nFix the edit text and retry; earlier reads and tags stay valid. If the code is valid, retry with allow_syntax_errors: true.",
+        old.len(),
+        new.len(),
+        if missing {
+            "missing token"
+        } else {
+            "unexpected text"
+        },
     ))
 }
 /// Block resolution, adapted to Dial's already-linked tree-sitter grammars.
@@ -181,6 +259,9 @@ pub(crate) struct PreparedSource {
 }
 /// Repair is a real controller/model callback; it cannot request tools or expand mutation targets.
 /// Failed/invalid repairs retain the requested edit with an explicit warning.
+/// Repair is a real controller/model callback; it cannot request tools or expand mutation targets.
+/// Failed/invalid repairs retain the requested edit with an explicit warning. With `refuse`, a
+/// result that still adds parser errors is an error before anything is committed.
 pub(crate) fn prepare_edit(
     ws: &crate::tools::Workspace,
     path: &Path,
@@ -188,6 +269,7 @@ pub(crate) fn prepare_edit(
     proposed: &str,
     proposed_seen: Option<&[bool]>,
     repair: Option<RepairCallback<'_>>,
+    refuse: bool,
 ) -> Result<PreparedSource, String> {
     let settings = &ws.edit_settings;
     if settings.auto_repair.enabled && repair.is_none() && ws.edit_repair.0.is_none() {
@@ -203,7 +285,11 @@ pub(crate) fn prepare_edit(
         warnings: Vec::new(),
         blackbox: None,
     };
-    if !settings.auto_repair.enabled && !settings.blackbox.enabled && !ws.syntax_guard_enabled() {
+    if !settings.auto_repair.enabled
+        && !settings.blackbox.enabled
+        && !ws.syntax_guard_enabled()
+        && !refuse
+    {
         return Ok(output);
     }
     let prior = report(path, before);
@@ -250,6 +336,9 @@ pub(crate) fn prepare_edit(
             Ok(_)=>output.warnings.push(format!("Auto-repair for {} was rejected: source was oversized, still invalid, changed unseen source, or changed outside the bounded parser-error region; requested edit retained",ws.rel(path))),
             Err(error)=>output.warnings.push(format!("Auto-repair for {} failed: {error}; requested edit retained",ws.rel(path))),
         }
+    }
+    if refuse && let Some(refused) = refusal(path, &ws.rel(path), before, &output.text) {
+        return Err(refused);
     }
     if let Some(note) = advisory(path, before, &output.text) {
         output.warnings.push(note);

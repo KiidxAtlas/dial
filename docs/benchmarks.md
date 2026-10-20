@@ -59,9 +59,23 @@ null. Latency ratios use only tasks passing every trial in both configurations. 
 means an observed per-task correctness-frequency regression against the named baseline, not a
 statistical significance claim. Existing summary files are never overwritten.
 
-These are descriptive measurements, not independent `pass@k`/`pass^k` estimates or proof that a
-small sample generalizes. Metric-only/manual-review tasks are excluded from checked correctness.
-Keep model/configuration and fixture versions fixed when comparing harness revisions, and inspect
+Consistency is reported per checked task and as a checked-task mean, for every `k` from 1 to the
+repetition count `n`, under `pass_at_k` and `pass_hat_k` (JSON objects keyed by `"1"`…`"n"`):
+
+- `pass_at_k`: chance that at least one of `k` trials passes, using the unbiased estimator
+  `1 - C(n-c, k) / C(n, k)` for `c` passing trials out of `n`.
+- `pass_hat_k`: chance that all `k` trials pass (τ-bench `pass^k`,
+  [arXiv 2406.12045](https://arxiv.org/abs/2406.12045)), using the estimator `C(c, k) / C(n, k)`.
+
+Key `"1"` equals the mean success rate (pass@1). Key `n` equals the empirical any/all-trial
+fractions. A falling `pass_hat_k` curve shows a configuration that sometimes succeeds but is not
+dependable, which matters for local models even when pass@1 looks acceptable. τ-bench reports a
+gpt-4o retail pass^8 below 25% despite a pass@1 above 50%. Unchecked (metric-only/manual-review)
+tasks get `null` curves and are excluded from the means.
+
+Both estimators assume trials are independent and identically distributed, and with 3–10
+repetitions they are imprecise. They are not proof that a small sample generalizes. Keep
+model/configuration and fixture versions fixed when comparing harness revisions, and inspect
 traces and final patches for output quality that executable checks do not capture. The underlying
 runner already isolates each task and repetition; this analyzer does not launch more model calls.
 

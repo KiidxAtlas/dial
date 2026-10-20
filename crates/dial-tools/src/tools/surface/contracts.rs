@@ -20,6 +20,11 @@ pub struct HistoricalCall {
     pub output: String,
 }
 
+/// Optional built-in properties added after release whose absence keeps the old meaning, so
+/// history recorded before them stays valid. Removing a pinned property recovers that identity.
+const ADDITIVE_PROPERTIES: &[(&str, &[&str])] =
+    &[("grep", &["output"]), ("edit", &["allow_syntax_errors"])];
+
 fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> bool {
     if old.revision != 1
         || new.revision != 1
@@ -31,6 +36,10 @@ fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> boo
     // Editor dialects are current-call contracts, not instructions to reinterpret old effects.
     // Recognize their exact identities while leaving old arguments/results as inert history.
     use crate::config::types::EditMode;
+    let additive = ADDITIVE_PROPERTIES
+        .iter()
+        .find(|(name, _)| *name == old.name)
+        .map_or(&[][..], |(_, properties)| *properties);
     let known: Vec<_> = [
         EditMode::Hashline,
         EditMode::Replace,
@@ -40,6 +49,18 @@ fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> boo
     ]
     .into_iter()
     .filter_map(|mode| crate::tools::schema(&old.name, mode))
+    .flat_map(|schema| {
+        let mut before = schema.clone();
+        if let Some(properties) = before
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
+        {
+            for property in additive {
+                properties.remove(*property);
+            }
+        }
+        [schema, before]
+    })
     .filter_map(|schema| identities(&[schema], &Registry::new()).remove(&old.name))
     .collect();
     known.contains(old) && known.contains(new)

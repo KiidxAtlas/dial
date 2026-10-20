@@ -21,6 +21,34 @@ def wilson_interval(successes, trials):
     return [max(0.0, middle - radius), min(1.0, middle + radius)]
 
 
+def pass_at_k(trials, successes, k):
+    """Unbiased chance that at least one of k trials drawn from n passes: 1 - C(n-c,k)/C(n,k)."""
+    if not 1 <= k <= trials or not 0 <= successes <= trials:
+        raise ValueError("pass@k requires 1 <= k <= trials and 0 <= successes <= trials")
+    return 1 - math.comb(trials - successes, k) / math.comb(trials, k)
+
+
+def pass_hat_k(trials, successes, k):
+    """Unbiased chance that all k trials drawn from n pass (tau-bench pass^k): C(c,k)/C(n,k)."""
+    if not 1 <= k <= trials or not 0 <= successes <= trials:
+        raise ValueError("pass^k requires 1 <= k <= trials and 0 <= successes <= trials")
+    return math.comb(successes, k) / math.comb(trials, k)
+
+
+def consistency_curves(trials, successes):
+    """pass@k and pass^k for every k in 1..n, keyed by k as a string for JSON."""
+    ks = range(1, trials + 1)
+    return ({str(k): pass_at_k(trials, successes, k) for k in ks},
+            {str(k): pass_hat_k(trials, successes, k) for k in ks})
+
+
+def mean_curve(curves):
+    """Task-level mean of per-task curves (same keys); None without tasks."""
+    if not curves:
+        return None
+    return {k: sum(curve[k] for curve in curves) / len(curves) for k in curves[0]}
+
+
 def task_contract(case):
     recorded = evidence(case)
     if not recorded:
@@ -77,6 +105,7 @@ def summarize_configuration(entry, repetitions):
         if any(value is not None and (type(value) is not int or value < 0) for value in repairs):
             raise ValueError(f"invalid repair attempts: {task}")
         successful_ms = [case["metrics"]["elapsed_ms"] for case in cases if checked_success(case)]
+        any_curve, all_curve = consistency_curves(repetitions, successes) if eligible else (None, None)
         tasks.append({
             "id": task,
             "checked": eligible,
@@ -94,6 +123,8 @@ def summarize_configuration(entry, repetitions):
             "tool_calls": sum(case["metrics"]["tool_calls"] for case in cases),
             "tool_errors": sum(case["metrics"]["tool_errors"] for case in cases),
             "repair_attempts": sum(repairs) if all(value is not None for value in repairs) else None,
+            "pass_at_k": any_curve,
+            "pass_hat_k": all_curve,
         })
     checked = [task for task in tasks if task["checked"]]
     return {
@@ -105,6 +136,8 @@ def summarize_configuration(entry, repetitions):
         "checked_trial_success_rate": sum(task["checked_successes"] for task in checked) / (len(checked) * repetitions) if checked else None,
         "observed_all_trials_passed_fraction": sum(task["all_trials_passed"] for task in checked) / len(checked) if checked else None,
         "observed_any_trial_passed_fraction": sum(task["any_trial_passed"] for task in checked) / len(checked) if checked else None,
+        "pass_at_k": mean_curve([task["pass_at_k"] for task in checked]),
+        "pass_hat_k": mean_curve([task["pass_hat_k"] for task in checked]),
         "tasks": tasks,
     }, contracts
 
@@ -159,7 +192,7 @@ def summarize(payload):
         "baseline_configuration": baseline_name,
         "configurations": summaries,
         "comparisons": comparisons,
-        "limitations": "Recorded outcome checks only; no model calls or new correctness proof. All/any-trial fractions are empirical task counts, not estimates of independent pass^k/pass@k. Per-task Wilson intervals assume independent trials; few repetitions leave substantial uncertainty. Unavailable checks and agent errors remain in the denominator. Unknown usage is null. Compare real-model measurements separately from scripted harness regressions; inspect traces and manually assess output quality.",
+        "limitations": "Recorded outcome checks only; no model calls or new correctness proof. All/any-trial fractions are empirical task counts. pass_at_k (at least one of k passes) and pass_hat_k (all k pass, tau-bench pass^k) are unbiased per-task estimates from n recorded trials, averaged over checked tasks; key \"1\" is the mean success rate and key n equals the any/all-trial fractions. They assume independent, identically distributed trials; few repetitions leave substantial uncertainty. Per-task Wilson intervals share that assumption. Unavailable checks and agent errors remain in the denominator. Unknown usage is null. Compare real-model measurements separately from scripted harness regressions; inspect traces and manually assess output quality.",
     }
 
 

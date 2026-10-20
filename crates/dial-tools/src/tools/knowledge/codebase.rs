@@ -719,7 +719,11 @@ impl Codebase {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut excess = paths.len().saturating_sub(MAX_FILES);
         for path in paths {
-            if !seen.contains(&path) && (!stats.partial || excess > 0) {
+            // A partial scan keeps unvisited rows, but never ones whose file is gone (a deleted or
+            // moved file, a removed worktree): those can only mislead later retrieval.
+            if !seen.contains(&path)
+                && (!stats.partial || excess > 0 || !self.root.join(&path).is_file())
+            {
                 stats.removed += tx.execute("DELETE FROM codebase_files WHERE path=?1", [path])?;
                 excess = excess.saturating_sub(1);
             }
@@ -1044,12 +1048,20 @@ impl Codebase {
                 }
             }
         }
-        // Name stale topics only, never return their outdated summaries.
+        // Name stale topics only, never return their outdated summaries. When every source is
+        // gone, say so compactly instead of listing paths that no longer exist.
         for (topic, revision, paths) in stale_notes.into_iter().take(if scoped { 2 } else { 8 }) {
-            let row = format!(
-                "Saved finding needs refresh (source or dependency scope changed, contradicted, or unchecked): {}\n",
-                json!({"topic":topic,"revision":revision,"sources":paths})
-            );
+            let row = if !paths.is_empty() && paths.iter().all(|p| !self.root.join(p).is_file()) {
+                format!(
+                    "Saved finding's sources are all gone (deleted or moved); forget it with this expected_revision or remember it again from current sources: {}\n",
+                    json!({"topic":topic,"revision":revision,"missing_sources":paths.len()})
+                )
+            } else {
+                format!(
+                    "Saved finding needs refresh (source or dependency scope changed, contradicted, or unchecked): {}\n",
+                    json!({"topic":topic,"revision":revision,"sources":paths})
+                )
+            };
             if out.len() + row.len() <= max_bytes {
                 out.push_str(&row);
             }

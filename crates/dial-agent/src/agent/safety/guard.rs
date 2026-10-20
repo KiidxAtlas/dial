@@ -617,6 +617,7 @@ const OBSERVING_TOOLS: &[&str] = &[
     "glob",
     "find",
     "ast_search",
+    "dep_source",
     "artifact_read",
     "todo",
     "skill",

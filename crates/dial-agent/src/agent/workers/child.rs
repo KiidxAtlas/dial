@@ -1944,6 +1944,8 @@ fn run_inner(
         if summary_step {
             messages.push(json!({"role":"user","dial_transient":true,"content":"Step budget reached: this is your final request. Reply now with your findings: what you verified and its evidence, what remains unverified, and the exact next step. Call no tools."}));
         }
+        // Same advisory cap as the parent request tail.
+        crate::agent::run::guidance::cap(&mut messages);
         let mut request = Chat {
             messages: std::mem::take(&mut messages),
             tools: if text_only {
@@ -3075,7 +3077,10 @@ fn run_inner(
         }
         if let Some(advice) = narration_warning {
             approver.notice(&advice);
-            messages.push(json!({"role":"user","content":advice,"dial_transient":true}));
+            messages.push(crate::agent::run::guidance::note(
+                crate::agent::run::guidance::Priority::Loop,
+                advice,
+            ));
         }
         if env.interrupt.load(Ordering::SeqCst) {
             return Ok(crate::agent::run::engine::Tick::Finished(Outcome::interrupted(steps)));

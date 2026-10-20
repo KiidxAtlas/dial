@@ -1024,6 +1024,47 @@ fn llama_server_is_recognised_by_props_on_local_hosts_only() {
     ));
 }
 #[test]
+fn llama_props_report_the_templates_native_tool_support() {
+    let parse = |props: serde_json::Value| LlamaProps::parse(&props);
+    assert_eq!(parse(serde_json::json!({"total_slots": 1})), None);
+    let caps = |tools: bool, calls: bool| {
+        serde_json::json!({
+            "default_generation_settings": {"n_ctx": 4096},
+            "chat_template_caps": {"supports_tools": tools, "supports_tool_calls": calls},
+        })
+    };
+    assert_eq!(
+        parse(caps(true, true)).unwrap().native_tool_template,
+        Some(true)
+    );
+    assert_eq!(
+        parse(caps(false, true)).unwrap().native_tool_template,
+        Some(false)
+    );
+    assert_eq!(
+        parse(caps(true, false)).unwrap().native_tool_template,
+        Some(false)
+    );
+    // Older builds report no caps: unknown, not unsupported.
+    let old = parse(serde_json::json!({"default_generation_settings": {}})).unwrap();
+    assert_eq!(old.native_tool_template, None);
+
+    let llama = routed(vec![("/props", caps(false, false).to_string())]);
+    assert!(known_llama_props(&llama).is_none(), "nothing probed yet");
+    assert_eq!(
+        llama_server_props(&llama, None, &[])
+            .unwrap()
+            .native_tool_template,
+        Some(false)
+    );
+    assert_eq!(
+        known_llama_props(&format!("{llama}/"))
+            .unwrap()
+            .native_tool_template,
+        Some(false)
+    );
+}
+#[test]
 fn servers_without_the_native_api_are_listed_unchanged() {
     let url = routed(vec![(
         "/v1/models",

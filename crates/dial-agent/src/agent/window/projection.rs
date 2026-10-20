@@ -96,6 +96,8 @@ impl<'a> Agent<'a> {
             .filter(|m| m["role"] == "tool")
             .filter(|_| packet.is_none())
             .and_then(|_| self.todo.focus());
+        // A bare todo reminder is the lowest-priority advisory note; packets and steering are not.
+        let todo_only = focus.is_some() && control["steering_active"] != true;
         let mut task_context = focus.unwrap_or_default();
         if let Some(packet) = packet {
             task_context.push_str(&format!(
@@ -106,7 +108,14 @@ impl<'a> Agent<'a> {
             task_context.push_str("\n[User steering from Dial] Follow the latest user instruction before taking another action. New user corrections take precedence over conflicting older plans, todos, original goals and summaries. Keep compatible unfinished work, but revise or drop conflicting todos instead of continuing the old task. The user's full messages are authoritative; task packets are context, not permission to ignore them.");
         }
         if !task_context.is_empty() {
-            messages.push(json!({"role":"user","content":task_context,"dial_transient":true,"dial_task_context":true}));
+            let mut message = json!({"role":"user","content":task_context,"dial_transient":true,"dial_task_context":true});
+            if todo_only {
+                crate::agent::run::guidance::tag(
+                    &mut message,
+                    crate::agent::run::guidance::Priority::Todo,
+                );
+            }
+            messages.push(message);
         }
         Ok(sent_messages)
     }

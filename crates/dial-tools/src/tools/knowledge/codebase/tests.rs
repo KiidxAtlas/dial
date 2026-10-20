@@ -714,3 +714,54 @@ fn json_manifests_preserve_check_commands_and_dependencies_in_the_map() {
         "{context}"
     );
 }
+
+#[test]
+fn partial_refresh_drops_index_rows_for_deleted_files_and_recall_names_gone_findings_compactly() {
+    let (_home, project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    cache
+        .remember(
+            "routing",
+            "Routing responsibility lives in the router.",
+            &["src/router.rs".into()],
+            "one",
+            0,
+        )
+        .unwrap();
+    fs::remove_file(project.path().join("src/router.rs")).unwrap();
+    let recall = cache.context("routing", 8000).unwrap();
+    assert!(
+        recall.contains("sources are all gone")
+            && recall.contains("\"missing_sources\":1")
+            && recall.contains("\"revision\":1")
+            && !recall.contains("Routing responsibility lives"),
+        "{recall}"
+    );
+    // A directory deeper than the walk limit makes this scan partial.
+    let mut deep = project.path().join("deep");
+    for _ in 0..crate::tools::fs::walk::MAX_WALK_DEPTH + 1 {
+        deep.push("d");
+    }
+    fs::create_dir_all(&deep).unwrap();
+    let refreshed = cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    assert!(refreshed.partial, "{refreshed:?}");
+    assert_eq!(refreshed.removed, 1, "{refreshed:?}");
+    let rows: Vec<String> = cache
+        .conn
+        .lock()
+        .prepare("SELECT path FROM codebase_files ORDER BY path")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows, ["Cargo.toml"]);
+    // The finding itself is never silently deleted.
+    let count: i64 = cache
+        .conn
+        .lock()
+        .query_row("SELECT COUNT(*) FROM codebase_notes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+}

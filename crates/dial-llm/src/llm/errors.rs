@@ -256,6 +256,8 @@ fn classify_text(
             };
         }
         Some(529) => return ErrorClass::RateLimited { retry_after },
+        // A configuration fault: the same request fails until the server is restarted.
+        Some(_) if LLAMA_NO_JINJA.is_match(text) => return ErrorClass::Fatal,
         Some(500) if LLAMA_TOOL_PARSE.is_match(text) => return ErrorClass::Fatal,
         Some(400) if GENERATION_NAN.is_match(text) => return ErrorClass::Transient,
         Some(408 | 409 | 425 | 500 | 502 | 503 | 504) => return ErrorClass::Transient,
@@ -272,7 +274,10 @@ fn classify_text(
     if THROTTLE.is_match(text) {
         return ErrorClass::RateLimited { retry_after };
     }
-    if TRANSIENT_TEXT.is_match(text) && !LLAMA_TOOL_PARSE.is_match(text) {
+    if TRANSIENT_TEXT.is_match(text)
+        && !LLAMA_TOOL_PARSE.is_match(text)
+        && !LLAMA_NO_JINJA.is_match(text)
+    {
         return ErrorClass::Transient;
     }
     ErrorClass::Fatal
@@ -429,6 +434,10 @@ static TRANSIENT_TEXT: LazyLock<Regex> = LazyLock::new(|| {
 static LLAMA_TOOL_PARSE: LazyLock<Regex> = LazyLock::new(|| {
     one(r"(?i)failed to parse tool call arguments as json|\[json\.exception\.parse_error\.101\]")
 });
+/// llama.cpp `llama-server` started with `--no-jinja` (or an old build where Jinja was opt-in)
+/// refuses `tools`/`tool_choice` with this message (HTTP 500, `tools/server/server-common.cpp`).
+pub(super) static LLAMA_NO_JINJA: LazyLock<Regex> =
+    LazyLock::new(|| one(r"(?i)\b(?:tools|tool_choice) param requires --jinja flag"));
 static GENERATION_NAN: LazyLock<Regex> =
     LazyLock::new(|| one(r"(?is)floating[ _-]?point nan\b.*\bdetected in generation"));
 

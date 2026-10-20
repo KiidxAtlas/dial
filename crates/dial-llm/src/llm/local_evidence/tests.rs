@@ -460,3 +460,85 @@ fn suggestions_come_in_rule_order() {
         ]
     );
 }
+
+/// A local main model that keeps failing rounds, with no coach role and automatic escalation off,
+/// gets the missing `[escalation]` key; choosing the coach is left to /roles.
+#[test]
+fn coach_escalation_is_suggested_only_for_struggling_local_models_without_a_coach() {
+    let local = |coach: CoachEscalation| Current {
+        coach,
+        ..current("ollama")
+    };
+    let off = CoachEscalation {
+        main_local: true,
+        ..CoachEscalation::default()
+    };
+    let failing = Evidence {
+        stage: 1,
+        rounds: tally(10, 6),
+        ..Evidence::default()
+    };
+    let found = suggestions(&failing, &local(off.clone()));
+    assert_eq!(paths(&found), ["escalation.enabled"]);
+    assert!(found[0].global);
+    assert_eq!(found[0].value, json!(true));
+    assert!(
+        found[0]
+            .evidence
+            .starts_with("6 of 16 tool rounds failed; escalation reached stage 1."),
+        "{}",
+        found[0].evidence
+    );
+    assert!(
+        found[0].evidence.contains("/roles"),
+        "{}",
+        found[0].evidence
+    );
+    // Enabled without automatic consultations: the missing key, at its default.
+    let no_rounds = CoachEscalation {
+        enabled: true,
+        max_auto_per_turn: 1,
+        ..off.clone()
+    };
+    let found = suggestions(&failing, &local(no_rounds));
+    assert_eq!(paths(&found), ["escalation.auto_after_failed_rounds"]);
+    assert_eq!(found[0].value, json!(3));
+    let no_budget = CoachEscalation {
+        enabled: true,
+        auto_after_failed_rounds: 3,
+        ..off.clone()
+    };
+    let found = suggestions(&failing, &local(no_budget));
+    assert_eq!(paths(&found), ["escalation.max_auto_per_turn"]);
+    assert_eq!(found[0].value, json!(1));
+    // Hosted main model, an assigned coach, or only the role missing: nothing to apply.
+    for coach in [
+        CoachEscalation::default(),
+        CoachEscalation {
+            coach_assigned: true,
+            ..off.clone()
+        },
+        CoachEscalation {
+            enabled: true,
+            auto_after_failed_rounds: 3,
+            max_auto_per_turn: 1,
+            ..off.clone()
+        },
+    ] {
+        assert!(
+            suggestions(&failing, &local(coach.clone())).is_empty(),
+            "{coach:?}"
+        );
+    }
+    // Too few failed rounds, or too small a share of them.
+    for rounds in [tally(0, 5), tally(20, 6)] {
+        let e = Evidence {
+            rounds,
+            ..Evidence::default()
+        };
+        assert!(
+            suggestions(&e, &local(off.clone())).is_empty(),
+            "{rounds:?}"
+        );
+    }
+}

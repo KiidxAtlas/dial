@@ -213,10 +213,24 @@ limits, reasoning budgets, approvals or verification requirements:
   (default 16384; 0 disables the small tier, otherwise 1024..=1048576), `edit_mode`, `sampling`,
   `reasoning_share` (default 50), `escalate_after` (default 2), and the keys below.
   - Tiers: a lean local route whose planned window is at most `small_window` gets the small tier:
-    a fixed minimal tool set (`read`, `write`, `edit`, `bash`, `grep`, `glob`, `todo`, `finish`,
+    a fixed minimal tool set (`read`, `write`, `edit`, `bash`, `grep`, `glob`, `todo`, `finish`, `check`,
     `tool_search`, `tool_load`) plus loaded and memory tools; everything else loads on demand. A
     pinned `[harness] tools` list keeps its own offer. A lean route above that window gets the lean
     tier (the `lean_local` profile above). Other routes get the full tier.
+  - Small-tier calls: the small tier works one tool call per response through the reliability
+    one-call interface (`parallel_tool_calls: false` where the protocol accepts it, a per-request
+    one-call contract, and a batch of several calls rejected unexecuted), and its prompt says one
+    call per response instead of asking for batches. A saved `dial reliability check` record for
+    this model that passed the two-call batch fixture keeps batching; `reliability.enabled = false`
+    turns the one-call default off. The record is read once per session, so the mode and prompt do
+    not change mid-session. Its offer is not simplified further.
+  - Worked example: the small tier's built-in guidance ends with one compact example loop (a
+    targeted `grep`, a ranged `read`, one `edit` in the active grammar's argument shape, a focused
+    `bash` check, a short answer). It is fixed per grammar, so the prompt stays byte-stable, and is
+    omitted when one of those tools is not offered or a replacement system prompt is configured.
+  - Prompt scope: tool-specific sentences of the fixed guidance (`skill`, saved project maps for
+    `codebase_memory`, the LSP) appear only when that tool is offered, like the preview and
+    delegation sections.
   - Edit mode: local routes default to the `replace` grammar. Precedence is the `--edit-mode`
     override, the model profile `edit_mode`, `[harness] edit_mode`, `[edit] model_variants`, then
     `assistance.local.edit_mode`, then `[edit] mode`. `inherit` makes the local default follow
@@ -239,10 +253,11 @@ limits, reasoning budgets, approvals or verification requirements:
   - Escalation: `escalate_after` consecutive failing rounds (malformed tool calls, or failed `edit`
     or `write` calls) step the session up. Step 1 switches to the minimal tool set and lean prompt;
     step 2 switches to the `replace` edit grammar unless a pin chooses otherwise (it is skipped when
-    the grammar is pinned or already `replace`). A step takes effect from the next request, so the
-    prompt and tool offer change at most twice per session. The reached step is remembered per model
-    in the user directory file `local-profile.json` and applied at the first turn of the next
-    session. 0 disables escalation.
+    the grammar is pinned or already `replace`). A reached step takes effect at the next user turn,
+    so the prompt, tool offer and edit grammar never change within a turn (and at most twice per
+    session). The reached step is remembered per model in the user directory file
+    `local-profile.json` as soon as it is reached and applied at the first turn of the next session.
+    0 disables escalation.
   - Benchmark lever: `ablate-local_profile` in `dial benchmark --ablate-assistance` turns the
     profile off (`assistance.local.enabled = false`) against the `dial` row.
   - Thinking (`assistance.local.thinking`, default `model`): leaves thinking to the model, server
@@ -260,10 +275,12 @@ limits, reasoning budgets, approvals or verification requirements:
     wins. On Ollama, a model that was not loaded when the session started is unloaded when Dial
     exits (`keep_alive: 0`); a model that was already loaded is left alone.
   - Prompt cache (`prompt_cache`, default on, llama.cpp only): requests send `cache_prompt` and an
-    `id_slot`. The main session uses slot 0. When the server reports more than one slot (`/props`
-    `total_slots`), side requests on the main model use the last slot and workers use the others,
-    so neither evicts the main prefix. Prompt tokens served from the cache are counted in the
-    evidence and shown in the status line (`N cached`) while a prompt is processed.
+    `id_slot`. The main session uses slot 0. When the server has more than one slot (`/props`
+    `total_slots`; for a Dial-launched server, the two-slot shared-pool layout it was started with
+    when the installed `llama-server` supports it, see `docs/llm-transport.md`), side requests on
+    the main model use the last slot and workers use the others, so neither evicts the main prefix.
+    Prompt tokens served from the cache are counted in the evidence and shown in the status line
+    (`N cached`) while a prompt is processed.
   - Side models (`side_models`, default `warn`): a side role (`small`, `coach`) assigned to a
     different model on the main model's local server makes the server swap models for summaries,
     ranking and edit repair. `warn` keeps the assignment and says so once per session, with the
@@ -284,8 +301,12 @@ limits, reasoning budgets, approvals or verification requirements:
     its evidence. Enter applies that one change; nothing is applied silently. A speculative-decoding
     draft model is suggested only for MLX models with a smaller installed model whose tokenizer is
     identical. Once one is applied, decode speed with it is recorded against the earlier baseline;
-    after 20 samples each, clearing it is suggested unless it is at least 5% faster. With
-    `suggestions` off only the escalation step is recorded.
+    after 20 samples each, clearing it is suggested unless it is at least 5% faster. When the main
+    model is local, at least 6 tool rounds and 30% of all rounds failed, no `coach` role is assigned
+    and automatic coach escalation is off, the `[escalation]` key that turns it on is suggested
+    (`enabled`, else `auto_after_failed_rounds` or `max_auto_per_turn` at its default); the coach
+    model itself is chosen in `/roles`, never by the suggestion. With `suggestions` off only the
+    escalation step is recorded.
   - Time budget (`time_budget`, default on): when `reasoning_guard.max_pre_action_secs` is 0 and at
     least three decode-speed samples exist, the pre-action time limit for a request is derived from
     the measured prefill and decode speed (1.5x margin plus a minute, within 2 to 60 minutes). While

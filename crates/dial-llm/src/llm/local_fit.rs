@@ -236,7 +236,6 @@ pub fn gguf_serving_context(
     requested: Option<u64>,
     kv_bits: Option<u8>,
 ) -> anyhow::Result<Option<u64>> {
-    static MEMORY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let Some(info) = crate::llm::local_format::gguf_info(path) else {
         return Ok(None);
     };
@@ -246,8 +245,41 @@ pub fn gguf_serving_context(
     let Some(weights) = crate::llm::local_format::gguf_weight_bytes(path) else {
         return Ok(None);
     };
-    let memory = *MEMORY.get_or_init(physical_memory_bytes);
-    serving_context(weights, &arch, requested, kv_bits, memory)
+    serving_context(weights, &arch, requested, kv_bits, cached_memory())
+}
+
+/// Physical memory, read once per process.
+fn cached_memory() -> Option<u64> {
+    static MEMORY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MEMORY.get_or_init(physical_memory_bytes)
+}
+
+/// Whether a KV pool of `tokens` next to the GGUF model's weights stays within the comfortable
+/// memory budget. Not capped by the native window (a shared pool may exceed it); `false` when the
+/// header, weights or memory are unknown.
+pub fn gguf_pool_fits(path: &Path, tokens: u64, kv_bits: Option<u8>) -> bool {
+    let Some(arch) =
+        crate::llm::local_format::gguf_info(path).and_then(|info| Architecture::from_gguf(&info))
+    else {
+        return false;
+    };
+    let (Some(weights), Some(memory)) = (
+        crate::llm::local_format::gguf_weight_bytes(path),
+        cached_memory().filter(|m| *m > 0),
+    ) else {
+        return false;
+    };
+    pool_fits(weights, &arch, tokens, kv_bits, memory)
+}
+
+fn pool_fits(
+    weights: u64,
+    arch: &Architecture,
+    tokens: u64,
+    kv_bits: Option<u8>,
+    memory: u64,
+) -> bool {
+    resident_bytes(weights, arch, tokens, kv_bits) <= (memory as f64 * COMFORTABLE_FRACTION) as u64
 }
 
 /// Smallest context llama-server is started with; a known budget below it is refused.

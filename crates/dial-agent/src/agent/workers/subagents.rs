@@ -117,15 +117,15 @@ pub fn toolset(spec: &AgentSpec, enabled: &[String], ext: &Registry) -> Vec<Stri
         .iter()
         .filter(|tool| enabled.iter().any(|e| e == **tool))
         .map(|tool| (*tool).to_owned());
-    // Read-only agents get recall extensions (codebase, memory, `find`), not integrations such as
-    // browsers or archive inspection, even when those need no approval.
+    // Read-only agents get recall extensions (codebase, memory, `find`, `dep_source`), not
+    // integrations such as browsers or archive inspection, even when those need no approval.
     let extra = ext
         .names()
         .filter(|name| {
             enabled.iter().any(|n| n == *name)
                 && (spec.mutates
                     || (approval::is_read_only(ext, name, &json!({}))
-                        && (*name == "find"
+                        && (matches!(*name, "find" | "dep_source")
                             || !crate::config::tools::integrations::INTEGRATION_TOOLS
                                 .contains(name))))
         })

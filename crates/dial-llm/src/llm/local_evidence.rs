@@ -101,6 +101,23 @@ pub struct Current {
     pub draft_candidate: Option<String>,
     /// `assistance.local.side_models` serialized name.
     pub side_models: String,
+    /// Automatic coach escalation as configured.
+    pub coach: CoachEscalation,
+}
+
+/// What the coach suggestion needs: whether automatic coach escalation (`[escalation]` with an
+/// assigned `coach` role) can run for a local main model. The default (a hosted main model) never
+/// suggests a coach.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CoachEscalation {
+    /// The main model is served locally.
+    pub main_local: bool,
+    /// A `coach` role is assigned (`/roles`).
+    pub coach_assigned: bool,
+    /// `escalation.enabled`, `escalation.auto_after_failed_rounds`, `escalation.max_auto_per_turn`.
+    pub enabled: bool,
+    pub auto_after_failed_rounds: u32,
+    pub max_auto_per_turn: u32,
 }
 
 /// One evidence-backed setting change. `path` is a `/model` settings path (the profile field paths
@@ -143,6 +160,9 @@ const SWAPS_MIN: u64 = 3;
 const DRAFT_SAMPLES_MIN: u64 = 20;
 /// A draft must beat its baseline by this factor to be kept.
 const DRAFT_GAIN: f64 = 1.05;
+/// Failing tool rounds, and their share of all rounds, before a coach is suggested.
+const COACH_FAILED_ROUNDS_MIN: u64 = 6;
+const COACH_FAILURE_SHARE: (u64, u64) = (3, 10);
 
 /// The evidence key for one model: `"{provider}/{model}"`.
 pub fn model_key(provider: &str, model: &str) -> String {
@@ -405,7 +425,56 @@ pub fn suggestions(e: &Evidence, current: &Current) -> Vec<Suggestion> {
             ),
         });
     }
+    out.extend(coach_escalation(e, current));
     out
+}
+
+/// A local main model that keeps failing tool rounds, with no coach role and automatic escalation
+/// off: turn on the missing `[escalation]` key. Choosing the coach model is left to `/roles`; the
+/// suggestion never picks one. When only the role is missing there is no key to apply, so nothing
+/// is suggested (the escalation settings already point to `/roles`).
+fn coach_escalation(e: &Evidence, current: &Current) -> Option<Suggestion> {
+    let coach = &current.coach;
+    if !coach.main_local
+        || coach.coach_assigned
+        || e.rounds.failed < COACH_FAILED_ROUNDS_MIN
+        || !failure_share_at_least(&e.rounds, COACH_FAILURE_SHARE)
+    {
+        return None;
+    }
+    let defaults = crate::config::solve::EscalationConfig::default();
+    let (path, value) = if !coach.enabled {
+        ("escalation.enabled", json!(true))
+    } else if coach.auto_after_failed_rounds == 0 {
+        (
+            "escalation.auto_after_failed_rounds",
+            json!(defaults.auto_after_failed_rounds),
+        )
+    } else if coach.max_auto_per_turn == 0 {
+        (
+            "escalation.max_auto_per_turn",
+            json!(defaults.max_auto_per_turn),
+        )
+    } else {
+        return None;
+    };
+    let stage = if e.stage > 0 {
+        format!("; escalation reached stage {}", e.stage)
+    } else {
+        String::new()
+    };
+    Some(Suggestion {
+        path: path.into(),
+        global: true,
+        value,
+        title: "Turn on automatic coach escalation".into(),
+        evidence: format!(
+            "{} of {} tool rounds failed{stage}. No coach role is assigned: choose a stronger coach \
+             model in /roles, then failed rounds ask it for advice",
+            e.rounds.failed,
+            e.rounds.total()
+        ),
+    })
 }
 
 /// Switch to the grammar that fails clearly less, when the current one fails often.

@@ -1,10 +1,12 @@
 //! Bounded workspace search. Pages use sorted component/depth-first file order.
-//! `skip` counts results (matching lines, or non-overlapping multiline matches).
+//! `skip` counts results (matching lines, or non-overlapping multiline matches); in the
+//! `output="files"`/`"count"` summary modes it counts matching files instead.
 //! Copy `next_cursor` and `remaining_skip` from the footer to continue an unchanged
 //! query/workspace; cursors are inclusive file positions plus consumed match counts.
 //! Coverage is per call; ignored subtrees are explicitly not enumerated.
 //! Grep edit evidence uses immutable UTF-8 source snapshots and only complete
 //! verbatim rows surviving the final 48 KiB page budget, including its footer.
+//! Summary modes show no source rows and so record no edit evidence.
 //! Freshness failures retain the observation but grant no authority for that file.
 
 use super::walk::SearchWalk;
@@ -31,6 +33,45 @@ const MAX_GREP_BYTES: u64 = 64 * 1024 * 1024;
 /// `max_results` lifts it; otherwise the rest of that file is named in the footer.
 const GREP_PER_FILE: usize = 20;
 const GREP_WITNESS_WARNING: &str = "[edit witnesses: some observed files changed or could not be verified; no new edit authority was recorded for those files]\n";
+/// Appended to a capped `lines` page: a summary page names every matching file far more cheaply.
+const GREP_FILES_HINT: &str = "; output=\"files\" lists matching files with match counts";
+
+/// What a grep page reports: matching rows (default), matching files with counts, or totals.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Lines,
+    Files,
+    Count,
+}
+
+impl OutputMode {
+    fn parse(args: &Value) -> Result<Self, String> {
+        match opt_str(args, "output")? {
+            None | Some("lines") => Ok(Self::Lines),
+            Some("files") => Ok(Self::Files),
+            Some("count") => Ok(Self::Count),
+            Some(other) => Err(format!(
+                "output must be \"lines\", \"files\" or \"count\", not {other:?}"
+            )),
+        }
+    }
+}
+
+/// Non-overlapping whole-file matches, advancing past empty matches like the multiline page.
+fn count_multiline(matcher: &Regex, bytes: &[u8]) -> usize {
+    let (mut offset, mut count) = (0, 0);
+    while let Some(found) = matcher.find_at(bytes, offset) {
+        count += 1;
+        if found.end() > found.start() {
+            offset = found.end();
+        } else if found.end() < bytes.len() {
+            offset = found.end() + 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
 
 fn bool_default(args: &Value, key: &str, default: bool) -> Result<bool, String> {
     if args.get(key).is_none_or(Value::is_null) {
@@ -80,7 +121,9 @@ fn scopes(ws: &Workspace, args: &Value) -> Result<Vec<PathBuf>, String> {
         }) {
             return Err("search scopes must not enter .git or workspace scratch".into());
         }
-        fs::metadata(&path).map_err(|e| io_message("searching", input, &e))?;
+        fs::metadata(&path).map_err(|e| {
+            super::suggest::annotate(ws, io_message("searching", input, &e), &[input])
+        })?;
         paths.push(path);
     }
     paths.sort();
@@ -507,6 +550,10 @@ struct GrepState {
     per_file: usize,
     /// Files whose matches were held back by `per_file`, in walk order (one entry per file).
     capped_files: Vec<PathBuf>,
+    mode: OutputMode,
+    /// Summary modes: matching files counted on this page, and the listed `(path, matches)` rows.
+    summary_files: usize,
+    summary_rows: Vec<(PathBuf, usize)>,
 }
 
 impl GrepState {
@@ -646,6 +693,10 @@ impl GrepState {
             self.oversized += 1;
         }
         self.scanned += 1;
+        if self.mode != OutputMode::Lines {
+            self.summarize(ws, path, bytes);
+            return;
+        }
         let rel = ws.rel(path);
         let start = self.out.len();
         let match_start = self.page_matches.len();
@@ -693,6 +744,133 @@ impl GrepState {
         }
     }
 
+    /// Count one file's matches for a summary page. `skip` and the page limits count files.
+    fn summarize(&mut self, ws: &Workspace, path: &Path, bytes: &[u8]) {
+        let count = if self.multiline {
+            count_multiline(&self.matcher, bytes)
+        } else {
+            bytes
+                .split_inclusive(|&b| b == b'\n')
+                .filter(|raw| self.matcher.is_match(trim_eol(raw)))
+                .count()
+        };
+        if count == 0 {
+            return;
+        }
+        if self.skip > 0 {
+            self.skip -= 1;
+            return;
+        }
+        if self.mode == OutputMode::Files {
+            let row = format!(
+                "{} ({count} {})\n",
+                ws.rel(path),
+                if count == 1 { "match" } else { "matches" }
+            );
+            let full = self.summary_rows.len() >= self.max_matches;
+            if full || self.out.len() + row.len() > MAX_GREP_OUTPUT {
+                self.cap = Some(if full {
+                    format!("file limit of {}", self.max_matches)
+                } else {
+                    "output size limit of 48 KiB".to_string()
+                });
+                self.next = Some((path.to_path_buf(), 0));
+                return;
+            }
+            self.out.push_str(&row);
+            self.row_ends.push(self.out.len());
+            self.summary_rows.push((path.to_path_buf(), count));
+        }
+        self.summary_files += 1;
+        self.matches += count;
+    }
+
+    /// Footer for summary modes: the same coverage, cap and continuation semantics as `lines`,
+    /// with files and matches counted instead of rows shown.
+    fn finish_summary(
+        mut self,
+        ws: &Workspace,
+        mut next: Option<(PathBuf, usize)>,
+        walk_coverage: &str,
+        walk_complete: bool,
+    ) -> Result<String, String> {
+        let too_large =
+            || "grep summary and continuation exceed 48 KiB; narrow the scope".to_string();
+        loop {
+            let limited =
+                !walk_complete || next.is_some() || self.unreadable > 0 || self.oversized > 0;
+            let omitted = if next.is_some() {
+                let cap = match &self.cap {
+                    Some(cap) => cap.as_str(),
+                    None if self.bytes + MAX_GREP_FILE > MAX_GREP_BYTES => "byte limit of 64 MiB",
+                    None => "walk limit",
+                };
+                format!(
+                    "; page_capped_by={cap}; files and matches past the cap are omitted from this page and not counted; continue by repeating this grep with cursor=next_cursor and skip=remaining_skip from [page]"
+                )
+            } else {
+                String::new()
+            };
+            let coverage = if limited {
+                format!(
+                    "files={}; matches={}; scanned_files={}; bytes={}; unreadable_files={}; partial_files={}; binary_files={}; file_limit=4MiB; byte_limit=64MiB; {walk_coverage}{omitted}; omitted coverage is not exhaustive",
+                    self.summary_files,
+                    self.matches,
+                    self.scanned,
+                    self.bytes,
+                    self.unreadable,
+                    self.oversized,
+                    self.binary,
+                )
+            } else {
+                format!(
+                    "files={}; matches={}; scanned_files={}; binary_files={}; {walk_coverage}",
+                    self.summary_files, self.matches, self.scanned, self.binary,
+                )
+            };
+            let footer = page_footer(ws, next.as_ref(), self.skip, &coverage)?;
+            let body = if self.summary_files == 0 {
+                "no matches\n".to_string()
+            } else if self.mode == OutputMode::Count {
+                format!(
+                    "{} {} in {} {}\n",
+                    self.matches,
+                    if self.matches == 1 {
+                        "match"
+                    } else {
+                        "matches"
+                    },
+                    self.summary_files,
+                    if self.summary_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    },
+                )
+            } else {
+                std::mem::take(&mut self.out)
+            };
+            if body.len() + footer.len() <= MAX_GREP_OUTPUT {
+                return Ok(body + &footer);
+            }
+            // Only a files page can shrink: drop its last row and resume at that file.
+            self.out = body;
+            let Some((path, count)) = self
+                .summary_rows
+                .pop()
+                .filter(|_| self.mode == OutputMode::Files)
+            else {
+                return Err(too_large());
+            };
+            self.row_ends.pop();
+            self.out
+                .truncate(self.row_ends.last().copied().unwrap_or(0));
+            self.summary_files -= 1;
+            self.matches -= count;
+            self.cap = Some("output size limit of 48 KiB".to_string());
+            next = Some((path, 0));
+        }
+    }
     fn search_lines(
         &mut self,
         path: &Path,
@@ -972,6 +1150,9 @@ impl GrepState {
                     listed.join(", "),
                 ));
             }
+            if next.is_some() || !self.capped_files.is_empty() {
+                omitted.push_str(GREP_FILES_HINT);
+            }
             let walk_coverage = format!("{walk_coverage}{omitted}");
             let coverage = if limited {
                 format!(
@@ -1159,8 +1340,12 @@ pub(in crate::tools) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String
         }
         return Ok(out);
     }
+    let mode = OutputMode::parse(args)?;
     let roots = scopes(ws, args)?;
     let resume = cursor(args, ws)?;
+    if mode != OutputMode::Lines && resume.as_ref().is_some_and(|(_, consumed)| *consumed != 0) {
+        return Err("cursor.match must be 0 for output=\"files\" or \"count\"".into());
+    }
     let context = opt_u64(args, "context")?
         .unwrap_or(0)
         .min(MAX_GREP_CONTEXT as u64) as usize;
@@ -1211,6 +1396,9 @@ pub(in crate::tools) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String
         cap: None,
         per_file,
         capped_files: Vec::new(),
+        mode,
+        summary_files: 0,
+        summary_rows: Vec::new(),
     };
     let mut bytes = Vec::new();
     for root in roots {
@@ -1228,7 +1416,11 @@ pub(in crate::tools) fn grep_tool(ws: &Workspace, args: &Value) -> Result<String
         .next
         .take()
         .or_else(|| walk.next.clone().map(|p| (p, 0)));
-    state.finish(ws, next, &walk.coverage(), walk.is_complete())
+    if mode == OutputMode::Lines {
+        state.finish(ws, next, &walk.coverage(), walk.is_complete())
+    } else {
+        state.finish_summary(ws, next, &walk.coverage(), walk.is_complete())
+    }
 }
 
 #[cfg(test)]

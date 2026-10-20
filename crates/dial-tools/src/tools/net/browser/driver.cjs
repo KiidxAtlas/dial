@@ -45,7 +45,15 @@ const tabs = new Map();
 // UTF-16 slicing that never leaves a lone high surrogate: Rust rejects lone surrogates in JSON strings.
 const cut = (value, limit) => { const text = String(value).slice(0, limit); return /[\uD800-\uDBFF]$/.test(text) ? text.slice(0, -1) : text; };
 const clip = value => cut(value, 2000);
-function record(list, value) { list.push(value); if (list.length > 100) list.shift(); }
+// Every tab event gets a per-tab sequence number so `events` can return only what is new.
+const EVENT_CHANNELS = ['console','network','dialogs','downloads','navigation'];
+function record(tab, channel, value) { value.seq = ++tab.seq; const list = tab[channel]; list.push(value); if (list.length > 100) list.shift(); }
+function tabEvents(tab, after) {
+  if (after !== undefined && after !== null && (!Number.isInteger(after) || after < 0)) throw new Error('after must be a non-negative integer');
+  const since = after ?? 0;
+  const events = EVENT_CHANNELS.flatMap(channel => tab[channel].filter(event => event.seq > since).map(event => ({channel, ...event})));
+  return {events: events.sort((a,b) => a.seq - b.seq), last_seq: tab.seq};
+}
 function http(request) {
   if (!operationId) return Promise.reject(new Error('browser networking is paused between approved operations'));
   if (callbacks.size >= MAX_PENDING) return Promise.reject(new Error('browser pending request budget exceeded'));
@@ -77,27 +85,29 @@ function register(page) {
   for (const [id, tab] of tabs) if (tab.page === page) return id;
   if (tabs.size >= 16) { page.close().catch(() => {}); throw new Error('maximum 16 browser tabs'); }
   const id = nextTab++;
-  const tab = { page, console: [], network: [], dialogs: [], downloads: [], frames: new Map(), nextFrame: 1, dialogPolicy: null, downloadArmed: false };
+  const tab = { page, seq: 0, console: [], network: [], dialogs: [], downloads: [], navigation: [], frames: new Map(), nextFrame: 1, dialogPolicy: null, downloadArmed: false };
   tabs.set(id, tab);
-  page.on('console', message => { const location=message.location(); record(tab.console, { time:Date.now(), operation_id:operationId, type:message.type(), text:clip(message.text()), location:{...location,url:clip(location.url)} }); });
-  page.on('pageerror', error => record(tab.console, { time:Date.now(), operation_id:operationId, type: 'pageerror', text: clip(error.message) }));
-  page.on('request', request => record(tab.network, { time:Date.now(), operation_id:operationId, kind: 'request', method: request.method(), url: clip(request.url()), resource: request.resourceType() }));
-  page.on('response', response => record(tab.network, { time:Date.now(), operation_id:operationId, kind: 'response', status: response.status(), url: clip(response.url()) }));
-  page.on('requestfailed', request => record(tab.network, { time:Date.now(), operation_id:operationId, kind:'failed', url:clip(request.url()), error:clip(request.failure()?.errorText || '') }));
+  page.on('console', message => { const location=message.location(); record(tab, 'console', { time:Date.now(), operation_id:operationId, type:message.type(), text:clip(message.text()), location:{...location,url:clip(location.url)} }); });
+  page.on('pageerror', error => record(tab, 'console', { time:Date.now(), operation_id:operationId, type: 'pageerror', text: clip(error.message) }));
+  page.on('request', request => record(tab, 'network', { time:Date.now(), operation_id:operationId, kind: 'request', method: request.method(), url: clip(request.url()), resource: request.resourceType() }));
+  page.on('response', response => record(tab, 'network', { time:Date.now(), operation_id:operationId, kind: 'response', status: response.status(), url: clip(response.url()) }));
+  page.on('requestfailed', request => record(tab, 'network', { time:Date.now(), operation_id:operationId, kind:'failed', url:clip(request.url()), error:clip(request.failure()?.errorText || '') }));
+  page.on('framenavigated', frame => { if (frame === page.mainFrame()) record(tab, 'navigation', { time:Date.now(), operation_id:operationId, kind:'navigated', url:clip(frame.url()) }); });
+  page.on('load', () => record(tab, 'navigation', { time:Date.now(), operation_id:operationId, kind:'load', url:clip(page.url()) }));
   page.on('close', () => tabs.delete(id));
   page.on('dialog', dialog => {
     const policy = tab.dialogPolicy || {mode:'dismiss'};
     if (policy.once) tab.dialogPolicy = null;
     const event = {time:Date.now(), operation_id:operationId, type:dialog.type(), message:clip(dialog.message()), default_value:clip(dialog.defaultValue()), handling:policy.mode};
-    record(tab.dialogs,event);
+    record(tab,'dialogs',event);
     (policy.mode === 'accept' ? dialog.accept(policy.text) : dialog.dismiss())
       .then(()=>{event.handled=true;},error=>{event.error=clip(error.message);});
   });
   page.on('download', download => {
     const armed = tab.downloadArmed;
     tab.downloadArmed = false;
-    record(tab.downloads,{time:Date.now(), operation_id:operationId, url:clip(download.url()), filename:clip(download.suggestedFilename()), status:armed ? 'approved-transfer' : 'cancelled-unarmed'});
-    if (!armed) download.cancel().then(()=>download.delete()).catch(error=>record(tab.console,{type:'download-cleanup-error',text:clip(error.message)}));
+    record(tab,'downloads',{time:Date.now(), operation_id:operationId, url:clip(download.url()), filename:clip(download.suggestedFilename()), status:armed ? 'approved-transfer' : 'cancelled-unarmed'});
+    if (!armed) download.cancel().then(()=>download.delete()).catch(error=>record(tab,'console',{type:'download-cleanup-error',text:clip(error.message)}));
   });
   page.on('framedetached', frame => tab.frames.delete(frame));
   // CDP Fetch reports every redirect hop. Playwright context.route only intercepts the initial URL.
@@ -114,15 +124,15 @@ function register(page) {
           const response=await http({postDataBuffer:()=>body,url:()=>request.url,method:()=>request.method,headers:()=>request.headers});
           await session.send('Fetch.fulfillRequest',{requestId:event.requestId,responseCode:response.status,responseHeaders:Object.entries(response.headers).flatMap(([name,value])=>(Array.isArray(value)?value:[value]).map(item=>({name,value:String(item)}))),body:response.body});
         } catch (error) {
-          record(tab.network,{kind:'blocked',operation_id:operationId,url:clip(event.request.url),error:clip(error.message)});
+          record(tab,'network',{kind:'blocked',operation_id:operationId,url:clip(event.request.url),error:clip(error.message)});
           await session.send('Fetch.failRequest',{requestId:event.requestId,errorReason:'BlockedByClient'}).catch(()=>{});
         }
-      })().catch(error=>record(tab.console,{type:'bridge-error',text:clip(error.message)}));
+      })().catch(error=>record(tab,'console',{type:'bridge-error',text:clip(error.message)}));
     });
     await session.send('Network.setCacheDisabled',{cacheDisabled:true});
     await session.send('Fetch.enable',{patterns:[{urlPattern:'*',requestStage:'Request'}]});
   });
-  tab.ready.catch(error=>record(tab.console,{type:'bridge-initialize-error',text:clip(error.message)}));
+  tab.ready.catch(error=>record(tab,'console',{type:'bridge-initialize-error',text:clip(error.message)}));
   return id;
 }
 async function initialize(request) {
@@ -399,7 +409,14 @@ async function run(request) {
       if (bytes.length > 5 * 1024 * 1024) throw new Error('screenshot exceeds the provider attachment limit of 5 MiB; use a viewport screenshot');
       return {tab:request.tab,url:clip(page.url()),artifact:{media_type:'image/png',encoding:'base64',data:bytes.toString('base64')}};
     }
-    case 'evidence': return {tab:request.tab,url:clip(page.url()),title:clip(await page.title()),console:tab.console,network:tab.network,dialogs:tab.dialogs,downloads:tab.downloads,frames:frameEntries(tab)};
+    case 'evidence': return {tab:request.tab,url:clip(page.url()),title:clip(await page.title()),console:tab.console,network:tab.network,dialogs:tab.dialogs,downloads:tab.downloads,navigation:tab.navigation,frames:frameEntries(tab)};
+    case 'events': return {tab:request.tab,...tabEvents(tab,request.after)};
+    case 'back': case 'forward': case 'reload': {
+      const options = {waitUntil:'domcontentloaded'};
+      const response = await (request.action === 'back' ? page.goBack(options) : request.action === 'forward' ? page.goForward(options) : page.reload(options));
+      // null: no history entry in that direction, or a same-document navigation without a response.
+      return {tab:request.tab,action:request.action,url:clip(page.url()),title:clip(await page.title()),status:response?.status() ?? null};
+    }
     case 'run': return runModule.runCode({page, code: request.code, timeoutMs: request.timeoutMs});
     case 'call': return runModule.runCall({page, chain: request.chain, timeoutMs: request.timeoutMs});
     case 'close': await page.close(); return {closed:request.tab};

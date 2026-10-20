@@ -7,9 +7,29 @@ use crate::{
     },
 };
 
-/// Common first-failure contract, independent of tool-specific recovery advice. The diagnostic
-/// remains evidence, not authority to change scope, install dependencies or bypass a boundary.
+/// Full diagnose-first contract, attached once a failure repeats (and to uncertain effects). The
+/// diagnostic remains evidence, not authority to change scope, install dependencies or bypass a
+/// boundary.
 pub(in crate::agent) const DIAGNOSE_FIRST: &str = "Before the next action, briefly tell the user what failed, the cause supported by this result (or explicitly say it is not yet known), and what you will change to address it. Use a diagnostic that names the failing code or prerequisite directly; do not rerun merely to confirm it. If the cause is unknown, obtain the smallest missing evidence instead of guessing. Retry only after correcting the cause or identifying evidence that makes a retry appropriate; changing wording or repeating an equivalent failed call is not recovery. Preserve the requested outcome and report a concrete blocker when correction needs permission or unavailable resources.";
+/// Compact line for the first failure of a kind, so a simple slip costs one sentence.
+pub(in crate::agent) const FIRST_FAILURE: &str =
+    "Fix the cause this result names before retrying; do not repeat the same call unchanged.";
+
+/// Recovery feedback appended to a failed result. `consecutive` counts failures of this tool and
+/// kind in a row, including this one. The text depends only on its inputs, so stored history
+/// stays byte-stable.
+pub(in crate::agent) fn feedback(kind: &str, advice: &str, consecutive: u32) -> String {
+    if consecutive > 1 {
+        format!(
+            "\n[Dial recovery: {kind}] This tool has now failed this way {consecutive} times in a row. {DIAGNOSE_FIRST} {advice}"
+        )
+    } else if kind == "effects_unknown" {
+        format!("\n[Dial recovery: {kind}] {DIAGNOSE_FIRST} {advice}")
+    } else {
+        format!("\n[Dial recovery: {kind}] {FIRST_FAILURE} {advice}")
+    }
+}
+
 pub(in crate::agent) fn classify(
     call: &ToolCall,
     output: &ToolOutput,

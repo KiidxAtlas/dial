@@ -189,10 +189,13 @@ fn draft_candidates_among(model: &Path, pool: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// Facts of Dial's own runtime: the template in the model's files decides the thinking switch.
+/// Facts of Dial's own runtime: the template in the model's files decides the thinking switch. A
+/// GGUF model runs on a Dial-launched `llama-server`, whose slot layout is decided by the installed
+/// binary (`server::dial_llama_slots`); MLX servers have no slots.
 fn dial_runtime_facts(model: &str) -> ServerFacts {
     let path = Path::new(model);
-    let template = match local_format::detect(path) {
+    let format = local_format::detect(path);
+    let template = match format {
         Some(LocalFormat::Gguf) => {
             local_format::gguf_info(path).and_then(|info| info.chat_template)
         }
@@ -200,7 +203,9 @@ fn dial_runtime_facts(model: &str) -> ServerFacts {
         _ => None,
     };
     ServerFacts {
-        slots: None,
+        slots: (format == Some(LocalFormat::Gguf))
+            .then(super::server::dial_llama_slots)
+            .flatten(),
         thinking_switch: template.map(|template| template.contains(THINKING_MARKER)),
     }
 }
@@ -216,6 +221,7 @@ fn llama_facts(
     if props.get("total_slots").is_none() && props.get("default_generation_settings").is_none() {
         return None;
     }
+    catalog::record_llama_props(base, &props);
     Some(ServerFacts {
         slots: props["total_slots"]
             .as_u64()

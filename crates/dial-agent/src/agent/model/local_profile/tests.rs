@@ -150,3 +150,80 @@ fn explicit_phase_thinking_still_sets_per_request_controls() {
         }
     });
 }
+
+fn prompt_text(agent: &crate::agent::Agent<'_>) -> String {
+    serde_json::to_string(&agent.system_messages()).unwrap()
+}
+
+/// The small tier defaults to one call per response, stated by a byte-stable prompt that ends with
+/// a worked example in the replace grammar and names no unoffered `skill`. A saved record that
+/// passed the batch fixture keeps batching; larger tiers, a disabled reliability interface and
+/// hosted routes are unchanged.
+#[test]
+fn small_tier_defaults_to_one_call_with_a_worked_example() {
+    with_agent("context_window=16384", |agent| {
+        assert_eq!(agent.local_tier(), Some(Tier::Small));
+        assert!(agent.local_one_call());
+        let text = prompt_text(agent);
+        assert!(text.contains("Make exactly one tool call per response"));
+        assert!(!text.contains("MUST batch"));
+        assert!(text.contains("# Example"));
+        assert!(
+            text.contains(r#"\"old_string\":\"    total / size\""#),
+            "{text}"
+        );
+        assert!(!text.contains("MUST load it with `skill` first"));
+        agent.rebuild_system();
+        assert_eq!(prompt_text(agent), text, "byte-stable");
+    });
+    with_agent("context_window=16384", |agent| {
+        agent.local_session.batch_record_passed = std::cell::OnceCell::from(true);
+        agent.rebuild_system();
+        assert!(!agent.local_one_call());
+        let text = prompt_text(agent);
+        assert!(text.contains("MUST batch"));
+        assert!(text.contains("# Example"));
+    });
+    for overlay in [
+        "context_window=65536",
+        "context_window=16384\n[reliability]\nenabled=false",
+        "context_window=16384\n[endpoint]\nbase_url='https://api.example.com/v1'",
+    ] {
+        with_agent(overlay, |agent| {
+            assert!(!agent.local_one_call(), "{overlay}");
+            assert!(
+                !prompt_text(agent).contains("Make exactly one tool call"),
+                "{overlay}"
+            );
+        });
+    }
+    with_agent("context_window=65536", |agent| {
+        assert!(!prompt_text(agent).contains("# Example"));
+    });
+}
+
+/// The small and lean local tiers make the edit tool refuse new parser errors; the full tier and
+/// hosted routes keep the advisory, as does `assistance.syntax_guard = false`.
+#[test]
+fn lean_local_tiers_block_syntax_regressions_in_edits() {
+    for (overlay, blocking) in [
+        ("context_window=16384", true),
+        ("context_window=65536", true),
+        (
+            "context_window=16384\n[assistance]\nlean_local=false",
+            false,
+        ),
+        (
+            "context_window=16384\n[assistance]\nsyntax_guard=false",
+            false,
+        ),
+        (
+            "context_window=16384\n[endpoint]\nbase_url='https://api.example.com/v1'",
+            false,
+        ),
+    ] {
+        with_agent(overlay, |agent| {
+            assert_eq!(agent.workspace.syntax_blocking(), blocking, "{overlay}");
+        });
+    }
+}

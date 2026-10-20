@@ -22,6 +22,7 @@ fn gguf_launch_maps_runtime_settings_onto_llama_cpp_flags() {
         projector: Some(&projector),
         adapter: Some(&lora),
         context_tokens: Some(32768),
+        shared_pool: None,
         port: 4100,
     };
     let runtime = llm::local_runtime::LocalRuntime {
@@ -39,19 +40,26 @@ fn gguf_launch_maps_runtime_settings_onto_llama_cpp_flags() {
     assert_eq!(flag("--mmproj"), projector.to_string_lossy());
     assert_eq!(flag("--lora"), lora.to_string_lossy());
     assert_eq!(flag("--model-draft"), draft.to_string_lossy());
-    for expected in [
-        "--ctx-size=32768",
-        "--spec-draft-n-max=5",
-        "--cache-type-k=q8_0",
-        "--cache-type-v=q8_0",
-        "--parallel=1",
-        "--jinja",
+    // llama.cpp matches option names exactly: `--opt=value` is rejected as an unknown argument.
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.starts_with("--") && arg.contains('=')),
+        "{args:?}"
+    );
+    for (name, value) in [
+        ("--host", "127.0.0.1"),
+        ("--port", "4100"),
+        ("--ctx-size", "32768"),
+        ("--spec-draft-n-max", "5"),
+        ("--cache-type-k", "q8_0"),
+        ("--cache-type-v", "q8_0"),
+        ("--parallel", "1"),
     ] {
-        assert!(
-            args.iter().any(|arg| arg == expected),
-            "{expected} in {args:?}"
-        );
+        assert_eq!(flag(name), value, "{name} in {args:?}");
     }
+    assert!(args.iter().any(|arg| arg == "--jinja"));
+    assert!(!args.iter().any(|arg| arg.starts_with("--kv-unified")));
 
     let plain = strings(
         LlamaLaunch {
@@ -68,6 +76,124 @@ fn gguf_launch_maps_runtime_settings_onto_llama_cpp_flags() {
         || arg == "--lora"));
 }
 
+/// `llama-server --help` excerpts: a current build lists the shared-pool flags, an older one only
+/// `--kv-unified` (or nothing).
+const NEW_HELP: &str = "\
+-np,   --parallel N                     number of server slots (default: -1, -1 = auto)
+--kv-unified-per-slot N                 context limit per parallel slot (default: unset)
+-kvu,  --kv-unified, -no-kvu, --no-kv-unified
+                                        use single unified KV buffer shared across all sequences
+--cache-idle-slots, --no-cache-idle-slots
+                                        save idle slots to the prompt cache on new task
+";
+const OLD_HELP: &str = "\
+-np,   --parallel N                     number of parallel sequences to decode (default: 1)
+-kvu,  --kv-unified                     use single unified KV buffer for the KV cache of all sequences
+";
+
+#[test]
+fn shared_slots_need_every_flag_as_a_whole_option() {
+    assert!(help_lists_shared_slots(NEW_HELP));
+    assert!(!help_lists_shared_slots(OLD_HELP));
+    assert!(!help_lists_shared_slots(""));
+    // `--kv-unified-per-slot` alone must not count as `--kv-unified`.
+    assert!(!help_lists_shared_slots(
+        "--kv-unified-per-slot N\n--no-cache-idle-slots\n"
+    ));
+}
+
+#[test]
+fn shared_pool_adds_a_bounded_side_reserve_only_when_supported_and_affordable() {
+    assert_eq!(side_reserve(8192), 4096);
+    assert_eq!(side_reserve(32768), 8192);
+    assert_eq!(side_reserve(262144), 16384);
+    assert_eq!(side_reserve(2048), 2048, "never more than the window");
+    assert_eq!(shared_pool(Some(32768), true, |_| true), Some(40960));
+    assert_eq!(shared_pool(Some(32768), false, |_| true), None, "old build");
+    assert_eq!(shared_pool(None, true, |_| true), None, "unknown window");
+    assert_eq!(
+        shared_pool(Some(32768), true, |_| false),
+        None,
+        "a reserve that does not fit never shrinks the main window"
+    );
+    let mut asked = None;
+    shared_pool(Some(8192), true, |pool| {
+        asked = Some(pool);
+        true
+    });
+    assert_eq!(asked, Some(12288));
+}
+
+#[test]
+fn shared_launch_keeps_the_whole_window_per_slot_over_one_pool() {
+    let root = tempfile::tempdir().unwrap();
+    let model = root.path().join("m.gguf");
+    fs::write(&model, b"GGUF\x03\0\0\0").unwrap();
+    let launch = LlamaLaunch {
+        model: &model,
+        projector: None,
+        adapter: None,
+        context_tokens: Some(32768),
+        shared_pool: shared_pool(Some(32768), help_lists_shared_slots(NEW_HELP), |_| true),
+        port: 4100,
+    };
+    let args = strings(launch.args(&Default::default()).unwrap());
+    let flag = |name: &str| {
+        let at = args.iter().position(|arg| arg == name).unwrap();
+        args[at + 1].clone()
+    };
+    assert_eq!(flag("--parallel"), LLAMA_SHARED_SLOTS.to_string());
+    assert_eq!(flag("--kv-unified-per-slot"), "32768");
+    assert_eq!(flag("--ctx-size"), "40960");
+    assert!(args.iter().any(|arg| arg == "--kv-unified"));
+    assert!(args.iter().any(|arg| arg == "--no-cache-idle-slots"));
+    assert_eq!(args.iter().filter(|arg| *arg == "--parallel").count(), 1);
+    assert_eq!(args.iter().filter(|arg| *arg == "--ctx-size").count(), 1);
+
+    // An old build gets exactly the single-slot arguments.
+    let old = strings(
+        LlamaLaunch {
+            shared_pool: shared_pool(Some(32768), help_lists_shared_slots(OLD_HELP), |_| true),
+            ..launch
+        }
+        .args(&Default::default())
+        .unwrap(),
+    );
+    let single = strings(
+        LlamaLaunch {
+            shared_pool: None,
+            ..launch
+        }
+        .args(&Default::default())
+        .unwrap(),
+    );
+    assert_eq!(old, single);
+    assert!(old.windows(2).any(|pair| pair == ["--parallel", "1"]));
+    assert!(old.windows(2).any(|pair| pair == ["--ctx-size", "32768"]));
+}
+
+#[cfg(unix)]
+#[test]
+fn help_probe_reads_a_fake_binary_and_bounds_a_hung_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let script = |name: &str, body: &str| {
+        let path = root.path().join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let new = script("new-server", &format!("cat <<'EOF'\n{NEW_HELP}EOF"));
+    let old = script("old-server", &format!("cat <<'EOF'\n{OLD_HELP}EOF"));
+    let hung = script("hung-server", "exec sleep 30");
+    assert!(shared_slots_supported(&new));
+    assert!(!shared_slots_supported(&old));
+    assert!(!shared_slots_supported(&root.path().join("missing")));
+    let started = Instant::now();
+    assert_eq!(probe_help(&hung, Duration::from_millis(200)), None);
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
 #[test]
 fn gguf_launch_refuses_settings_llama_cpp_cannot_honor() {
     let root = tempfile::tempdir().unwrap();
@@ -81,6 +207,7 @@ fn gguf_launch_refuses_settings_llama_cpp_cannot_honor() {
         projector: None,
         adapter,
         context_tokens: None,
+        shared_pool: None,
         port: 1,
     };
     let error = launch(Some(&mlx_adapter))

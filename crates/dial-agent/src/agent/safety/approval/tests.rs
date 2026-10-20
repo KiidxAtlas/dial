@@ -289,6 +289,16 @@ fn path_rules_match_normalised_project_paths() {
 }
 
 #[test]
+fn conflict_reads_are_judged_by_the_file_they_name() {
+    let root = Path::new("/p");
+    let deny = [rule(Effect::Deny, "read", &["secrets/**"])];
+    let blocked =
+        |path: &str| denied_by_rule(&deny, &file_call("read", json!({"path":path})), root);
+    assert!(blocked("conflict://secrets/key.txt"));
+    assert!(!blocked("conflict://src/main.rs"));
+}
+
+#[test]
 fn path_deny_fails_closed_and_allow_needs_every_file_covered() {
     let root = Path::new("/p");
     let deny = [rule(Effect::Deny, "edit", &["secrets/**"])];

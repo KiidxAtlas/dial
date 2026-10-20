@@ -1993,6 +1993,7 @@ pub(crate) fn targets(input: &str) -> Result<Vec<String>, String> {
 }
 /// Apply a hashline patch. `Ok` text is the tool result; `Err` is an error the
 /// model can act on. Nothing is written unless the whole patch validated.
+#[cfg(test)]
 pub(crate) fn edit(ws: &Workspace, input: &str) -> Result<String, String> {
     edit_with(ws, input, true, &super::editing::Execution::default())
 }
@@ -2290,6 +2291,7 @@ pub(crate) fn edit_with(
                 &p.new_lf,
                 Some(&proposed_flags),
                 execution.repair,
+                execution.refuse_syntax_errors,
             )?;
             if source.text != p.new_lf {
                 let repaired = if source.text.contains("\r\n") {

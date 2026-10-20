@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from reliability import summarize
+from reliability import pass_at_k, pass_hat_k, summarize
 from test_compare import report
 
 
@@ -32,7 +32,65 @@ def machine(outcomes=(True, True, True), candidate=None):
             "baseline_configuration": "baseline", "configurations": entries}
 
 
+def summarize_input_cases(payload):
+    return payload["configurations"][0]["report"]["cases"]
+
+
 class ReliabilityTests(unittest.TestCase):
+    def test_pass_estimators_match_unbiased_definitions(self):
+        # n=5, c=3: pass@2 = 1 - C(2,2)/C(5,2); pass^2 = C(3,2)/C(5,2).
+        self.assertAlmostEqual(pass_at_k(5, 3, 2), 1 - 1 / 10)
+        self.assertAlmostEqual(pass_hat_k(5, 3, 2), 3 / 10)
+        self.assertAlmostEqual(pass_at_k(5, 3, 1), 3 / 5)
+        self.assertAlmostEqual(pass_hat_k(5, 3, 1), 3 / 5)
+        self.assertEqual(pass_at_k(5, 3, 3), 1)  # n - c < k: some draw must pass
+        self.assertEqual(pass_hat_k(5, 3, 4), 0)  # c < k: no all-pass draw exists
+        self.assertEqual((pass_at_k(4, 0, 2), pass_hat_k(4, 4, 4)), (0, 1))
+        for invalid in [(3, 1, 0), (3, 1, 4), (3, 4, 1), (3, -1, 1)]:
+            with self.assertRaises(ValueError):
+                pass_at_k(*invalid)
+            with self.assertRaises(ValueError):
+                pass_hat_k(*invalid)
+
+    def test_pass_estimators_are_unbiased_against_exact_expectation(self):
+        # E[estimator] over Binomial(n, p) successes equals 1-(1-p)^k and p^k.
+        from math import comb
+        n, p = 6, 0.3
+        weights = [comb(n, c) * p ** c * (1 - p) ** (n - c) for c in range(n + 1)]
+        for k in range(1, n + 1):
+            any_mean = sum(w * pass_at_k(n, c, k) for c, w in enumerate(weights))
+            all_mean = sum(w * pass_hat_k(n, c, k) for c, w in enumerate(weights))
+            self.assertAlmostEqual(any_mean, 1 - (1 - p) ** k)
+            self.assertAlmostEqual(all_mean, p ** k)
+
+    def test_consistency_curves_are_reported_per_task_and_overall(self):
+        payload = machine((True, False, True))
+        payload["configurations"][0]["report"]["cases"] += [
+            dict(copy.deepcopy(case), id=case["id"].replace("repair", "other"))
+            for case in summarize_input_cases(machine((True, True, True)))]
+        configuration = summarize(payload)["configurations"][0]
+        repair, other = sorted(configuration["tasks"], key=lambda task: task["id"])[::-1]
+        self.assertEqual(repair["id"], "repair")
+        self.assertEqual(set(repair["pass_at_k"]), {"1", "2", "3"})
+        self.assertAlmostEqual(repair["pass_at_k"]["2"], 1)
+        self.assertAlmostEqual(repair["pass_hat_k"]["2"], 1 / 3)
+        self.assertEqual(repair["pass_hat_k"]["3"], 0)
+        self.assertEqual(other["pass_hat_k"]["3"], 1)
+        self.assertAlmostEqual(configuration["pass_at_k"]["1"], configuration["checked_trial_success_rate"])
+        self.assertAlmostEqual(configuration["pass_hat_k"]["2"], (1 / 3 + 1) / 2)
+        self.assertEqual(configuration["pass_hat_k"]["3"], configuration["observed_all_trials_passed_fraction"])
+        self.assertEqual(configuration["pass_at_k"]["3"], configuration["observed_any_trial_passed_fraction"])
+
+    def test_unchecked_tasks_have_no_consistency_curves(self):
+        payload = machine()
+        for case in payload["configurations"][0]["report"]["cases"]:
+            case["evidence"].update(categories=["informational"], outcome_checks=0)
+        configuration = summarize(payload)["configurations"][0]
+        self.assertIsNone(configuration["tasks"][0]["pass_at_k"])
+        self.assertIsNone(configuration["tasks"][0]["pass_hat_k"])
+        self.assertIsNone(configuration["pass_at_k"])
+        self.assertIsNone(configuration["pass_hat_k"])
+
     def test_repeated_success_measures_consistency_not_best_of_n(self):
         result = summarize(machine((True, False, True)))
         configuration = result["configurations"][0]

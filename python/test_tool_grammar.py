@@ -230,7 +230,7 @@ def drive(name, *chunks):
 
 class FormatTests(unittest.TestCase):
     def test_registry_covers_the_supported_parsers(self):
-        for name in ("json_tools", "gemma4", "function_gemma", "glm47", "mistral"):
+        for name in ("json_tools", "gemma4", "function_gemma", "glm47", "qwen3_coder", "mistral"):
             self.assertIsNotNone(grammar.format_for(ParserTokenizer(name)), name)
             self.assertTrue(grammar.supported(ParserTokenizer(name)), name)
 
@@ -274,6 +274,69 @@ class FormatTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertTrue(matcher.can_end)
 
+    def test_qwen3_coder_accepts_valid_calls_across_chunks(self):
+        matcher, ok = drive("qwen3_coder", "\n<function=read>\n<para", "meter=path>\na.txt\n</param",
+                            "eter>\n<parameter=offset>\n2\n</parameter>\n</function>\n")
+        self.assertTrue(ok)
+        self.assertTrue(matcher.can_end)
+        self.assertFalse(matcher.complete)
+        matcher, ok = drive("qwen3_coder", "<function=todo><parameter=op>done</parameter>"
+                            "<parameter=items>[\"x\"]</parameter></function>")
+        self.assertTrue(ok)
+        self.assertTrue(matcher.can_end)
+
+    def test_qwen3_coder_string_values_are_raw_text(self):
+        matcher, ok = drive("qwen3_coder", "<function=read><parameter=path>\na <b>\n</c>{\n"
+                            "</parameter></function>")
+        self.assertTrue(ok)
+        self.assertTrue(matcher.can_end)
+
+    def test_qwen3_coder_rejects_unknown_name_key_and_duplicate(self):
+        self.assertFalse(drive("qwen3_coder", "<function=reed>")[1])
+        self.assertFalse(drive("qwen3_coder", "<function=read><parameter=file_path>")[1])
+        self.assertFalse(drive("qwen3_coder", "<function=read><parameter=path>a</parameter>"
+                               "<parameter=path>")[1])
+        self.assertFalse(drive("qwen3_coder", "<function=read ><parameter=path ")[1])
+        self.assertTrue(drive("qwen3_coder", "<function=mcp_call><parameter=anything>1"
+                              "</parameter></function>")[1])
+
+    def test_qwen3_coder_checks_value_types_when_the_parameter_closes(self):
+        prefix = "<function=read><parameter=path>a</parameter><parameter=offset>"
+        self.assertFalse(drive("qwen3_coder", prefix + "x")[1])
+        self.assertFalse(drive("qwen3_coder", prefix + "1.5")[1])
+        matcher, ok = drive("qwen3_coder", prefix + "-")
+        self.assertTrue(ok)
+        self.assertFalse(matcher.feed("</parameter>"))
+        self.assertTrue(drive("qwen3_coder", prefix + "\n 12 \n</parameter>")[1])
+        self.assertFalse(drive("qwen3_coder", "<function=todo><parameter=op>add</parameter>"
+                               "<parameter=items>[1]")[1])
+        self.assertFalse(drive("qwen3_coder", "<function=read><parameter=path>\nnull\n"
+                               "</parameter>")[1])  # Would read back as None.
+
+    def test_qwen3_coder_enum_values_are_exact(self):
+        self.assertTrue(drive("qwen3_coder", "<function=todo><parameter=op>\nadd\n</parameter>")[1])
+        self.assertFalse(drive("qwen3_coder", "<function=todo><parameter=op>remove")[1])
+        self.assertFalse(drive("qwen3_coder", "<function=todo><parameter=op> add</parameter>")[1])
+        self.assertFalse(drive("qwen3_coder", "<function=todo><parameter=op>ad</parameter>")[1])
+
+    def test_qwen3_coder_requires_keys_and_one_trailing_newline(self):
+        matcher, ok = drive("qwen3_coder", "<function=read>\n")
+        self.assertTrue(ok)
+        self.assertFalse(matcher.can_end)
+        self.assertFalse(matcher.clone().feed("</function>"))  # path is required
+        matcher, ok = drive("qwen3_coder", "<function=read><parameter=path>a</parameter></function>")
+        self.assertTrue(ok)
+        self.assertFalse(matcher.clone().feed("\n\n"))
+        self.assertFalse(matcher.clone().feed(" "))
+        self.assertTrue(matcher.feed("\n"))
+        self.assertTrue(matcher.can_end)
+        self.assertFalse(drive("qwen3_coder", "<function=read><parameter=path>a</parameter>"
+                               "<parameter=offset>1</parameter><parameter=")[1])  # closed, none left
+
+    def test_qwen3_coder_whitespace_loops_are_cut_off(self):
+        self.assertFalse(drive("qwen3_coder", "\n" * 200)[1])
+        self.assertTrue(drive("qwen3_coder", "\n  <function= read>\n\n  <parameter= path>")[1])
+
     def test_mistral_accepts_both_forms_and_splits_across_chunks(self):
         matcher, ok = drive("mistral", '[{"name": "read", "arguments": {"path": "a.txt"}}]')
         self.assertTrue(ok)
@@ -294,8 +357,9 @@ try:
     from mlx_lm.tool_parsers import glm47 as _glm47
     from mlx_lm.tool_parsers import json_tools as _json_tools
     from mlx_lm.tool_parsers import mistral as _mistral
+    from mlx_lm.tool_parsers import qwen3_coder as _qwen3_coder
     PARSERS = {"json_tools": _json_tools, "gemma4": _gemma4, "function_gemma": _function_gemma,
-               "glm47": _glm47, "mistral": _mistral}
+               "glm47": _glm47, "mistral": _mistral, "qwen3_coder": _qwen3_coder}
 except ImportError:
     PARSERS = {}
 
@@ -310,6 +374,13 @@ ROUND_TRIPS = [
               "<arg_key>offset</arg_key><arg_value>2</arg_value>", READ),
     ("mistral", '[{"name": "read", "arguments": {"path": "a.txt", "offset": 2}}]', READ),
     ("mistral", 'read[ARGS]{"path": "a.txt", "offset": 2}', READ),
+    ("qwen3_coder", "\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n"
+                    "<parameter=offset>\n2\n</parameter>\n</function>\n", READ),
+    ("qwen3_coder", "<function=read><parameter=path>\n a<b>\n\n</parameter></function>",
+     {"name": "read", "arguments": {"path": " a<b>\n"}}),
+    ("qwen3_coder", "<function=todo><parameter=op>done</parameter><parameter=items>\n"
+                    "[\"x\", \"y\"]\n</parameter></function>",
+     {"name": "todo", "arguments": {"op": "done", "items": ["x", "y"]}}),
 ]
 
 
@@ -328,6 +399,11 @@ class RoundTripTests(unittest.TestCase):
             ("gemma4", 'call:read{bogus:1,path:<|"|>a<|"|>}',
              {"name": "read", "arguments": {"bogus": 1, "path": "a"}}),
             ("mistral", 'read[ARGS]{"path": 3}', {"name": "read", "arguments": {"path": 3}}),
+            ("qwen3_coder", "<function=read><parameter=path>null</parameter></function>",
+             {"name": "read", "arguments": {"path": None}}),
+            ("qwen3_coder", "<function=read><parameter=path>a</parameter><parameter=bogus>1"
+                            "</parameter></function>",
+             {"name": "read", "arguments": {"path": "a", "bogus": "1"}}),
         ]
         for fmt, call, parsed in cases:
             with self.subTest(fmt=fmt, call=call):
@@ -348,6 +424,29 @@ class MistralSettleTests(unittest.TestCase):
         self.assertEqual(text(out), script)
         self.assertEqual(sampler.calls, 1)
         self.assertIsNone(sampler.matcher)
+
+
+class QwenCoderSamplerTests(unittest.TestCase):
+    def test_valid_call_is_reproduced_exactly(self):
+        script = ("ok <tool_call>\n<function=read>\n<parameter=path>\na.py\n</parameter>\n"
+                  "</function>\n</tool_call><eos>")
+        out, sampler, _ = run(script, tokenizer=ParserTokenizer("qwen3_coder"))
+        self.assertEqual(text(out), script)
+        self.assertEqual(sampler.calls, 1)
+
+    def test_unknown_key_is_steered_to_a_declared_one(self):
+        script = ("<tool_call>\n<function=read>\n<parameter=file_path>\na.py\n</parameter>\n"
+                  "</function>\n</tool_call><eos>")
+        out, sampler, _ = run(script, steps=300, tokenizer=ParserTokenizer("qwen3_coder"))
+        body = call_body(out)
+        self.assertNotIn("file_path", body)
+        self.assertIn("<parameter=path>", body)
+        self.assertIn(END, out)
+        self.assertIsNone(sampler.matcher)
+        if "qwen3_coder" in PARSERS:
+            call = PARSERS["qwen3_coder"].parse_tool_call(body, TOOLS)
+            self.assertEqual(call["name"], "read")
+            self.assertLessEqual(set(call["arguments"]), {"path", "offset"})
 
 
 class SpecialTokenTests(unittest.TestCase):

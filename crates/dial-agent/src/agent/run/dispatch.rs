@@ -792,6 +792,8 @@ impl<'a> Agent<'a> {
                 },
                 Err(error) => denied(&error),
             },
+            "check" => self.check_tool(args, ui),
+            "revert_edit" => self.revert_edit_tool(call),
             "finish" => {
                 let finish = match crate::agent::verify::completion::Finish::parse(args) {
                     Ok(finish) => finish,

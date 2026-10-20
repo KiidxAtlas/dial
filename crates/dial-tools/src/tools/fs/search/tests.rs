@@ -539,3 +539,104 @@ fn grep_cap_preserves_deterministic_depth_first_order() {
         );
     }
 }
+
+fn page(text: &str) -> Value {
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("[page: ")?.strip_suffix(']'))
+        .unwrap();
+    serde_json::from_str(line).unwrap()
+}
+
+#[test]
+fn grep_files_and_count_modes_summarize_without_edit_evidence() {
+    let (dir, ws) = workspace();
+    fs::write(dir.path().join("a.txt"), "hit\nmiss\nhit\n").unwrap();
+    fs::write(dir.path().join("b.txt"), "hit\n").unwrap();
+    fs::write(dir.path().join("c.txt"), "none\n").unwrap();
+    let files = grep(&ws, json!({"pattern": "hit", "output": "files"}));
+    assert_eq!(
+        body(&files),
+        "a.txt (2 matches)\nb.txt (1 match)\n",
+        "{files}"
+    );
+    assert!(files.contains("[coverage: files=2; matches=3;"), "{files}");
+    assert!(
+        !files.contains('#'),
+        "summary pages carry no edit tags: {files}"
+    );
+    let count = grep(&ws, json!({"pattern": "hit", "output": "count"}));
+    assert_eq!(body(&count), "3 matches in 2 files\n", "{count}");
+    let multiline = grep(&ws, json!({"pattern": "hit\\nmiss", "output": "count"}));
+    assert_eq!(body(&multiline), "1 match in 1 file\n", "{multiline}");
+    let none = grep(&ws, json!({"pattern": "NOPE", "output": "files"}));
+    assert_eq!(body(&none), "no matches\n");
+    assert_eq!(page(&none)["next_cursor"], Value::Null);
+    assert!(run(&ws, "grep", json!({"pattern": "hit", "output": "rows"})).is_error);
+    assert!(
+        run(
+            &ws,
+            "grep",
+            json!({"pattern": "hit", "output": "files", "cursor": {"path": "a.txt", "match": 1}})
+        )
+        .is_error
+    );
+}
+
+#[test]
+fn grep_files_mode_pages_over_files_with_cursor_and_skip() {
+    let (dir, ws) = workspace();
+    for i in 0..5 {
+        fs::write(dir.path().join(format!("f{i}.txt")), "hit\nhit\n").unwrap();
+    }
+    fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
+    fs::create_dir(dir.path().join("ignored")).unwrap();
+    fs::write(dir.path().join("ignored/x.txt"), "hit\n").unwrap();
+    let first = grep(
+        &ws,
+        json!({"pattern": "hit", "output": "files", "max_results": 2}),
+    );
+    assert_eq!(
+        body(&first),
+        "f0.txt (2 matches)\nf1.txt (2 matches)\n",
+        "{first}"
+    );
+    assert!(first.contains("page_capped_by=file limit of 2"), "{first}");
+    let next = page(&first);
+    assert_eq!(next["next_cursor"], json!({"path": "f2.txt", "match": 0}));
+    let second = grep(
+        &ws,
+        json!({"pattern": "hit", "output": "files", "max_results": 2,
+            "cursor": next["next_cursor"], "skip": next["remaining_skip"]}),
+    );
+    assert_eq!(
+        body(&second),
+        "f2.txt (2 matches)\nf3.txt (2 matches)\n",
+        "{second}"
+    );
+    let skipped = grep(&ws, json!({"pattern": "hit", "output": "files", "skip": 4}));
+    assert_eq!(body(&skipped), "f4.txt (2 matches)\n", "{skipped}");
+    let all = grep(&ws, json!({"pattern": "hit", "output": "count"}));
+    assert_eq!(body(&all), "10 matches in 5 files\n", "{all}");
+}
+
+#[test]
+fn capped_lines_pages_suggest_files_mode_and_default_output_is_unchanged() {
+    let (dir, ws) = workspace();
+    fs::write(dir.path().join("a.txt"), "hit\n").unwrap();
+    fs::write(dir.path().join("b.txt"), "hit\n").unwrap();
+    let plain = grep(&ws, json!({"pattern": "hit"}));
+    let explicit = grep(&ws, json!({"pattern": "hit", "output": "lines"}));
+    assert_eq!(plain, explicit);
+    assert_eq!(body(&plain), "a.txt:1:hit\nb.txt:1:hit\n");
+    assert!(!plain.contains("output=\"files\""), "{plain}");
+    let capped = grep(&ws, json!({"pattern": "hit", "max_results": 1}));
+    assert!(
+        capped.contains("; output=\"files\" lists matching files with match counts"),
+        "{capped}"
+    );
+    fs::write(dir.path().join("many.txt"), "hit\n".repeat(30)).unwrap();
+    let per_file = grep(&ws, json!({"pattern": "hit"}));
+    assert!(per_file.contains("per_file_cap="), "{per_file}");
+    assert!(per_file.contains("output=\"files\""), "{per_file}");
+}

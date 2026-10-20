@@ -89,7 +89,12 @@ struct Inner {
     next_turn: u64,
     /// The turn `before_write` currently records into.
     current: Option<Manifest>,
+    /// Latest change per file in `current`, for the agent's single-file revert.
+    journal: revisions::Journal,
 }
+
+mod revisions;
+pub use revisions::RevertPlan;
 
 pub struct Checkpoints {
     dir: PathBuf,
@@ -170,6 +175,7 @@ impl Checkpoints {
             inner: Mutex::new(Inner {
                 next_turn,
                 current: None,
+                journal: Default::default(),
             }),
         })
     }
@@ -193,6 +199,7 @@ impl Checkpoints {
         let mut inner = self.lock();
         let turn = inner.next_turn;
         inner.next_turn += 1;
+        inner.journal.reset(&self.dir, None);
         inner.current = Some(Manifest {
             turn,
             label: one_line(label),
@@ -435,9 +442,22 @@ impl Checkpoints {
     /// Record `abs` as it is now, unless this turn already did. Must be called BEFORE the file is
     /// changed or deleted. A path outside the project root and the added directories is an error
     /// (the write must not proceed); a file over `MAX_FILE_BYTES` is not recorded and is listed as
-    /// skipped.
+    /// skipped. Every call also opens a per-change revision (see [`revisions`]).
     pub fn before_write(&self, abs: &Path) -> Result<()> {
         let (resolved, root, rel) = self.resolve(abs)?;
+        let mut inner = self.lock();
+        self.record_first_write(&mut inner, &resolved, root.clone(), rel.clone())?;
+        self.record_revision(&mut inner, &resolved, root, rel);
+        Ok(())
+    }
+
+    fn record_first_write(
+        &self,
+        inner: &mut Inner,
+        resolved: &Path,
+        root: Option<PathBuf>,
+        rel: String,
+    ) -> Result<()> {
         let shown = Entry {
             rel: rel.clone(),
             root: root.clone(),
@@ -445,7 +465,6 @@ impl Checkpoints {
             mode: 0,
         }
         .display();
-        let mut inner = self.lock();
         if inner.current.is_none() {
             let turn = inner.next_turn;
             inner.next_turn += 1;
@@ -468,7 +487,7 @@ impl Checkpoints {
         }
         let mut manifest = manifest.clone();
 
-        match fs::symlink_metadata(&resolved) {
+        match fs::symlink_metadata(resolved) {
             Ok(meta) if meta.is_file() => {
                 if meta.len() > MAX_FILE_BYTES {
                     manifest.skipped.push(shown);
@@ -476,7 +495,7 @@ impl Checkpoints {
                     inner.current = Some(manifest);
                     return Ok(());
                 }
-                let bytes = fs::read(&resolved)
+                let bytes = fs::read(resolved)
                     .with_context(|| format!("reading {shown} for checkpoint"))?;
                 let blob = turn_dir(&self.dir, manifest.turn)
                     .join("files")
@@ -589,6 +608,7 @@ impl Checkpoints {
             }
         }
         inner.current = None;
+        inner.journal.reset(&self.dir, None);
         Ok(report)
     }
 

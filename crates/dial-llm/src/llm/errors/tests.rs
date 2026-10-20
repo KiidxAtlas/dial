@@ -200,6 +200,15 @@ fn auth_transient_and_fatal_statuses() {
         http(500, "Failed to parse tool call arguments as JSON"),
         ErrorClass::Fatal
     );
+    // llama-server without Jinja refuses tools until restarted: never retried.
+    assert_eq!(
+        http(500, "tools param requires --jinja flag"),
+        ErrorClass::Fatal
+    );
+    assert_eq!(
+        http(500, "tool_choice param requires --jinja flag"),
+        ErrorClass::Fatal
+    );
     assert_eq!(
         http(
             400,

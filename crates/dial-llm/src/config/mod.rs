@@ -218,6 +218,9 @@ pub fn migrate_removed_settings(table: &mut toml::Table) -> bool {
     if let Some(harness) = table_mut(table, "harness") {
         changed |= harness.remove("allow_skill_install_scripts").is_some();
     }
+    if let Some(browser) = table_mut(table, "browser") {
+        changed |= browser.remove("tern").is_some();
+    }
     // `ui.worker_shards` (bool, default on) became `ui.pinned_workers`: on maps to the default
     // `collapsed` block and off to `off`. An explicit `pinned_workers` value wins.
     if let Some(ui) = table_mut(table, "ui")

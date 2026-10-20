@@ -1,7 +1,7 @@
 //! Keep rejected todo updates at the request tail until the plan actually changes.
 use crate::agent::{safety::guard, workflow::todo::TodoList};
 use crate::llm::ToolCall;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 const FAILURE_LIMIT: u32 = 4;
 
@@ -66,7 +66,10 @@ impl TodoRecovery {
 
     pub fn apply(&self, messages: &mut Vec<Value>) {
         if let Some(reminder) = &self.reminder {
-            messages.push(json!({"role":"user","dial_transient":true,"content":reminder}));
+            messages.push(crate::agent::run::guidance::note(
+                crate::agent::run::guidance::Priority::Failure,
+                reminder.as_str(),
+            ));
         }
     }
 }

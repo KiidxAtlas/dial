@@ -1308,32 +1308,95 @@ fn lmstudio_models_with_headers(
     (!found.is_empty()).then_some(found)
 }
 
-/// Whether the OpenAI-compatible server at `base_url` is llama.cpp's `llama-server`, recognised by
-/// the `default_generation_settings` of its native `/props` document. Only loopback/private hosts
-/// are asked (`local_request` refuses others). An answer is cached per base URL; a transport
-/// failure is not, so a server that is still starting is probed again on the next request.
+/// What a llama.cpp `llama-server` reports about itself in `/props`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LlamaProps {
+    /// `chat_template_caps.supports_tools && supports_tool_calls`: the model's chat template
+    /// natively renders tool definitions and tool calls. `None` when the server reports no caps
+    /// (older builds).
+    pub native_tool_template: Option<bool>,
+}
+
+impl LlamaProps {
+    /// The facts in a `/props` document, or `None` when it lacks llama.cpp's
+    /// `default_generation_settings`.
+    pub fn parse(props: &Value) -> Option<Self> {
+        props.get("default_generation_settings")?;
+        let caps = &props["chat_template_caps"];
+        let cap = |name: &str| caps.get(name).and_then(Value::as_bool);
+        let native_tool_template = match (cap("supports_tools"), cap("supports_tool_calls")) {
+            (Some(tools), Some(calls)) => Some(tools && calls),
+            (Some(false), None) | (None, Some(false)) => Some(false),
+            _ => None,
+        };
+        Some(Self {
+            native_tool_template,
+        })
+    }
+}
+
+/// `/props` answers per base URL: `Some` for llama.cpp, `None` for a server that answered as
+/// something else. Transport failures are not stored.
+static LLAMA_PROPS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, Option<LlamaProps>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn llama_props_key(base_url: &str) -> String {
+    base_url.trim_end_matches('/').to_owned()
+}
+
+/// Records a `/props` document fetched elsewhere (`local_server::facts`), so later lookups reuse it.
+pub(crate) fn record_llama_props(base_url: &str, props: &Value) {
+    if let Some(found) = LlamaProps::parse(props)
+        && let Ok(mut known) = LLAMA_PROPS.lock()
+    {
+        known.insert(llama_props_key(base_url), Some(found));
+    }
+}
+
+/// The `/props` facts already known for `base_url`, without contacting it.
+pub fn known_llama_props(base_url: &str) -> Option<LlamaProps> {
+    LLAMA_PROPS
+        .lock()
+        .ok()?
+        .get(&llama_props_key(base_url))
+        .copied()
+        .flatten()
+}
+
+/// The llama.cpp facts of the server at `base_url`, recognised by the `default_generation_settings`
+/// of its native `/props` document. Only loopback/private hosts are asked (`local_request` refuses
+/// others). An answer is cached per base URL; a transport failure is not, so a server that is still
+/// starting is probed again on the next request.
+pub fn llama_server_props(
+    base_url: &str,
+    token: Option<&str>,
+    headers: &[super::model_config::RequestHeader],
+) -> Option<LlamaProps> {
+    let key = llama_props_key(base_url);
+    if let Some(known) = LLAMA_PROPS
+        .lock()
+        .ok()
+        .and_then(|known| known.get(&key).copied())
+    {
+        return known;
+    }
+    let resolved = super::model_config::resolve_headers(headers).ok()?;
+    let props = local_get(base_url, "/props", token, &resolved)?;
+    let found = LlamaProps::parse(&props);
+    if let Ok(mut known) = LLAMA_PROPS.lock() {
+        known.insert(key, found);
+    }
+    found
+}
+
+/// Whether the OpenAI-compatible server at `base_url` is llama.cpp's `llama-server`
+/// ([`llama_server_props`]).
 pub fn is_llama_server(
     base_url: &str,
     token: Option<&str>,
     headers: &[super::model_config::RequestHeader],
 ) -> bool {
-    static KNOWN: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, bool>>> =
-        std::sync::LazyLock::new(Default::default);
-    let key = base_url.trim_end_matches('/').to_owned();
-    if let Some(known) = KNOWN.lock().ok().and_then(|known| known.get(&key).copied()) {
-        return known;
-    }
-    let Ok(resolved) = super::model_config::resolve_headers(headers) else {
-        return false;
-    };
-    let Some(props) = local_get(base_url, "/props", token, &resolved) else {
-        return false;
-    };
-    let llama = props.get("default_generation_settings").is_some();
-    if let Ok(mut known) = KNOWN.lock() {
-        known.insert(key, llama);
-    }
-    llama
+    llama_server_props(base_url, token, headers).is_some()
 }
 
 /// Context window the local server is serving `model` with right now: LM Studio's loaded size,

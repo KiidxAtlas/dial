@@ -6,6 +6,7 @@ pub(in crate::agent) mod dispatch;
 pub(in crate::agent) mod edit_runtime;
 pub(in crate::agent) mod engine;
 pub(in crate::agent) mod failure_guidance;
+pub(in crate::agent) mod guidance;
 pub(in crate::agent) mod steering;
 pub(in crate::agent) mod tool_compat;
 pub(in crate::agent) mod tool_exposure;

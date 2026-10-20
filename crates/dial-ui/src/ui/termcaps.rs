@@ -15,7 +15,6 @@ pub enum TerminalId {
     Warp,
     Otty,
     Rio,
-    Tern,
     Monstar,
     Foot,
     Urxvt,
@@ -82,7 +81,6 @@ fn terminal_id(env: &dyn Fn(&str) -> Option<String>) -> TerminalId {
         "warpterminal" => Some(TerminalId::Warp),
         "otty" => Some(TerminalId::Otty),
         "rio" => Some(TerminalId::Rio),
-        "tern" => Some(TerminalId::Tern),
         "monstar" => Some(TerminalId::Monstar),
         _ => None,
     };
@@ -135,7 +133,7 @@ fn terminal_id(env: &dyn Fn(&str) -> Option<String>) -> TerminalId {
 
 fn notify_protocol(id: TerminalId) -> NotifyProtocol {
     match id {
-        TerminalId::Kitty | TerminalId::Otty | TerminalId::Tern => NotifyProtocol::Osc99,
+        TerminalId::Kitty | TerminalId::Otty => NotifyProtocol::Osc99,
         TerminalId::Ghostty
         | TerminalId::WezTerm
         | TerminalId::Iterm2

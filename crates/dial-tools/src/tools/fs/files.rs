@@ -196,6 +196,24 @@ pub(in crate::tools) fn read_tool_streaming(
     if present(args, "paths") {
         return read_paths(ws, args, &args["paths"], cancel, budget);
     }
+    read_target(ws, args, cancel, budget).map_err(|error| {
+        let Ok(input) = req_str(args, "path") else {
+            return error;
+        };
+        let input = input
+            .strip_suffix(super::outline::SELECTOR)
+            .unwrap_or(input);
+        let plain = select::split_selector(input).map_or(input, |(plain, _)| plain);
+        super::suggest::annotate(ws, error, &[plain])
+    })
+}
+
+fn read_target(
+    ws: &Workspace,
+    args: &Value,
+    cancel: &std::sync::atomic::AtomicBool,
+    budget: usize,
+) -> Result<String, String> {
     let input = req_str(args, "path")?;
     let scheme = crate::tools::integrations::resources::scheme(input)?;
     if !crate::tools::integrations::resources::descriptor(scheme).accepts_line_arguments
@@ -261,6 +279,18 @@ pub(in crate::tools) fn read_tool_streaming(
         } else {
             Ok(output.text)
         };
+    }
+    if scheme == crate::tools::integrations::resources::Scheme::Issue {
+        return crate::tools::vcs::gh_issue::read(ws, input, cancel);
+    }
+    if scheme == crate::tools::integrations::resources::Scheme::Conflict {
+        return super::conflicts::read(ws, input, args, cancel, budget);
+    }
+    if let Some(path_text) = super::outline::target(ws, input) {
+        if present(args, "offset") || present(args, "limit") {
+            return Err("`:outline` does not accept offset/limit".into());
+        }
+        return super::outline::read(ws, path_text, budget);
     }
     let notebook_target = select::split_target(ws, input)
         .ok()

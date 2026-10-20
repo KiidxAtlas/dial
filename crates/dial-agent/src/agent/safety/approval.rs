@@ -427,6 +427,8 @@ pub fn is_read_only(ext: &Registry, name: &str, args: &Value) -> bool {
         "checkpoint" | "rewind" => true,
         "ask" | "finish" | "goal" | "tool_search" | "tool_load" | "artifact_read"
         | "working_state" => true,
+        // Each selected command passes the automatic-check gate itself (`run_focused_check`).
+        "check" => true,
         "recall" | "reflect" => true,
         "retain" => !args["items"]
             .as_array()
@@ -497,7 +499,15 @@ pub struct PermissionRule {
 
 /// Tools whose target files a path rule can judge.
 const PATH_TOOLS: &[&str] = &[
-    "read", "write", "edit", "ast_edit", "git", "notebook", "lsp", "browser",
+    "read",
+    "write",
+    "edit",
+    "ast_edit",
+    "git",
+    "notebook",
+    "lsp",
+    "browser",
+    "revert_edit",
 ];
 
 /// Lexically normalise `input` against `root`: no `.`/`..` components, relative when inside the project.
@@ -549,6 +559,12 @@ fn call_paths(call: &ToolCall, root: &Path) -> Option<Vec<String>> {
     let mut declared = Vec::new();
     collect_declared_paths(args, &mut declared);
     for text in declared {
+        // `conflict://PATH` reads PATH itself, so path rules judge the file it names.
+        let text = if call.name == "read" {
+            text.strip_prefix("conflict://").unwrap_or(text)
+        } else {
+            text
+        };
         let literal = if Path::new(text).is_absolute() {
             PathBuf::from(text)
         } else {
@@ -1108,7 +1124,8 @@ pub fn destructive_bash(command: &str) -> bool {
 /// approval (network, browser, MCP) are outside the workspace and still ask.
 fn workspace_write(call: &ToolCall) -> bool {
     match call.name.as_str() {
-        "write" | "edit" | "ast_edit" | "notebook_edit" | "task" | "todo" | "finish" => true,
+        "write" | "edit" | "ast_edit" | "notebook_edit" | "revert_edit" | "task" | "todo"
+        | "finish" => true,
         "bash" => call.arguments["command"]
             .as_str()
             .is_some_and(|command| !destructive_bash(command)),

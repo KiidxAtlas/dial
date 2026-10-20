@@ -16,13 +16,33 @@ name them:
 
 - llama.cpp `llama-server` (Dial-launched for GGUF models, the `llama-cpp` provider, or a recognised
   endpoint): `cache_prompt` and `id_slot` (`prompt_cache`; main session on slot 0, side requests on
-  the last slot and workers on the others when `/props` reports several `total_slots`),
+  the last slot and workers on the others when the server has several slots: `/props`
+  `total_slots` for endpoints, the launch layout below for Dial-launched servers),
   `return_progress`, `chat_template_kwargs.enable_thinking` (when `/props` `chat_template` reads
   it), and `presence_penalty` / `repeat_penalty` for loop recovery. Source:
   [server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md).
   `cache_prompt`, `id_slot` and `return_progress` are documented under `/completion`; the README
   says `/completion`-specific features are also supported on `/v1/chat/completions`. Replies'
   `timings` and streamed `prompt_progress` supply speed, cache and progress telemetry.
+- Dial-launched `llama-server` layout: Dial runs `llama-server --help` once per binary path and
+  process (offline, 5-second bound, a failure counts as an old build). When it lists
+  `--kv-unified`, `--kv-unified-per-slot` and `--no-cache-idle-slots`, and the memory-fitted window
+  W is known, Dial launches 2 slots over one unified KV pool: `--parallel 2 --kv-unified
+  --kv-unified-per-slot W --no-cache-idle-slots --ctx-size W+R`, where the side reserve R is a
+  quarter of W within 4096..=16384 tokens (never more than W). Each slot may use the whole window W,
+  so the main session keeps its full context; the reserve lets a side request run without evicting
+  the main prefix. If W+R does not fit the comfortable memory budget, or the binary lacks a flag,
+  the launch stays `--parallel 1 --ctx-size W` as before (the main window is never reduced to make
+  room). Why each flag: with `--kv-unified`, llama.cpp sizes every slot's context as the whole
+  `--ctx-size` (without it, `--ctx-size` is divided by `--parallel`); `--kv-unified-per-slot` caps a
+  slot at W; and with idle-slot caching on (the default), unified-KV builds clear every idle slot
+  when a new task starts, so a request pinned to slot 0 would re-prefill each time. When a request
+  needs more pool than is free, llama.cpp purges an idle slot (the side slot first if it is idle),
+  so a main request up to W always fits. Sources: `src/llama-context.cpp` (`n_ctx_seq`) and
+  `tools/server/server-context.cpp` (`n_ctx_slot`, `try_clear_idle_slots`, `cache_idle_slots`) on
+  llama.cpp master, checked against Homebrew `llama-server` 0.7.0 (build 11669). Options and values
+  are passed as separate arguments: llama.cpp matches option names exactly and rejects
+  `--opt=value`.
 - Dial's MLX runtime (`mlx_lm.server`): `chat_template_kwargs.enable_thinking` (when the model's chat
   template reads it), `presence_penalty` and `repetition_penalty`. Source: `mlx_lm/server.py` in
   [mlx-lm v0.32.0](https://github.com/ml-explore/mlx-lm/blob/v0.32.0/mlx_lm/server.py).
@@ -39,6 +59,37 @@ name them:
 
 None of these fields has been measured against a live server by Dial's tests; the tests check the
 request bodies built for each server.
+
+## Tool calls on local servers
+
+- llama.cpp `llama-server`: Dial sends native `tools` on every request and leaves `tool_choice`
+  unset (auto), with no `response_format`, `json_schema` or `grammar` on the first attempt. With
+  Jinja templates on (`--jinja`, the default in current builds; Dial passes it to the servers it
+  launches), llama.cpp parses tool calls itself and, for `tool_choice` auto, builds a lazy grammar
+  that only constrains output once the model emits its tool-call marker, so plain answers stay
+  free. A schema in the request would make that grammar non-lazy and force JSON, which is why
+  `json_schema` is kept for the single repair retry. Sources:
+  [function calling](https://github.com/ggml-org/llama.cpp/blob/master/docs/function-calling.md),
+  [server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md), and
+  the lazy-grammar rule in `common/chat-auto-parser-generator.cpp` (source, not docs).
+- A server with Jinja off answers HTTP 500 `tools param requires --jinja flag`
+  (`tools/server/server-common.cpp`). Dial treats that as fatal, not transient, and the error says
+  to restart with `--jinja`. `/props` does not report whether Jinja is on, so it cannot be detected
+  before a request.
+- When `/props` `chat_template_caps` (see `common/jinja/caps.h`) reports `supports_tools` or
+  `supports_tool_calls` false, Dial shows one notice per conversation suggesting
+  `--chat-template-file` with a tool-use template. It reads only `/props` answers already fetched by
+  local-server detection; this check sends no extra request. Older builds without
+  `chat_template_caps` get no notice.
+- `parallel_tool_calls` is sent only when a profile declares it. llama.cpp keeps it off by default
+  and supports it only for some templates. The function-calling docs also warn that extreme KV-cache
+  quantization (`kv_bits = 4`, q4_0) can substantially degrade tool calling.
+- LM Studio and Ollama document native `tools` but no request field for grammar-constrained tool
+  calls, so they get no first-attempt constraint; their repair retry uses `response_format`
+  (LM Studio) or `format` (Ollama). LM Studio uses "native" tool use for models whose template
+  supports it and a "default" prompt-based format otherwise
+  ([tool use](https://lmstudio.ai/docs/developer/openai-compat/tools)); `GET /api/v1/models`
+  reports `capabilities.trained_for_tool_use`, which Dial does not read yet.
 
 ## Subscription-provider transports
 

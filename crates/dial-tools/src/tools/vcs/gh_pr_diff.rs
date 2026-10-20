@@ -45,7 +45,17 @@ pub struct PrTarget {
 /// `pr://<N>`, `pr://<N>/diff`, `pr://<N>/diff/all`, `pr://<N>/diff/<i>`, and the same four with
 /// `<owner>/<repo>/` before the number. Returns `None` for anything else.
 pub fn parse_pr_url(target: &str) -> Option<PrTarget> {
-    let rest = target.strip_prefix("pr://")?;
+    let (repo, number, tail) = parse_numbered(target.strip_prefix("pr://")?)?;
+    Some(PrTarget {
+        repo,
+        number,
+        view: parse_view(&tail)?,
+    })
+}
+
+/// The `<N>` or `[<host>/]<owner>/<repo>/<N>` head shared by `pr://` and `issue://`, followed by
+/// the remaining path segments. Pure: no `gh` calls.
+pub(super) fn parse_numbered(rest: &str) -> Option<(Option<String>, u64, Vec<&str>)> {
     let segs: Vec<&str> = rest.split('/').collect();
     if segs
         .iter()
@@ -54,11 +64,7 @@ pub fn parse_pr_url(target: &str) -> Option<PrTarget> {
         return None;
     }
     if is_digits(segs[0]) {
-        return Some(PrTarget {
-            repo: None,
-            number: parse_number(segs[0])?,
-            view: parse_view(&segs[1..])?,
-        });
+        return Some((None, parse_number(segs[0])?, segs[1..].to_vec()));
     }
     // A dotted first segment is always a host (GitHub owners cannot contain dots). A single-label
     // host is recognized only when the number sits in the fourth position.
@@ -79,11 +85,7 @@ pub fn parse_pr_url(target: &str) -> Option<PrTarget> {
         }
         None => slug,
     };
-    Some(PrTarget {
-        repo: Some(repo),
-        number,
-        view: parse_view(&segs[base + 3..])?,
-    })
+    Some((Some(repo), number, segs[base + 3..].to_vec()))
 }
 
 /// The diff sub-path after the number: nothing or `diff` (summary), `diff/all`, `diff/<i>`.

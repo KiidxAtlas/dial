@@ -78,6 +78,23 @@ test('network failures lead with the current operation cause, not stale tab fail
   assert(!h.run(`failureMessage(new Error('page crashed'),3)`).startsWith('Browser network failure:'));
 });
 
+test('events merge tab channels in sequence order and return only newer entries', () => {
+  const h=harness();
+  h.run(`tab={seq:0,console:[],network:[],dialogs:[],downloads:[],navigation:[]};
+    record(tab,'navigation',{kind:'navigated',url:'https://example.test/'});
+    record(tab,'network',{kind:'request',url:'https://example.test/'});
+    record(tab,'console',{type:'log',text:'ready'})`);
+  const all=h.run('tabEvents(tab)');
+  assert.deepEqual([...all.events].map(event=>[event.seq,event.channel]),[[1,'navigation'],[2,'network'],[3,'console']]);
+  assert.equal(all.last_seq,3);
+  assert.deepEqual([...h.run('tabEvents(tab,2)').events].map(event=>event.text),['ready']);
+  assert.equal(h.run('tabEvents(tab,3)').events.length,0);
+  assert.throws(()=>h.run('tabEvents(tab,-1)'),/non-negative integer/);
+  h.run(`for (let i=0;i<150;i++) record(tab,'console',{type:'log',text:String(i)})`);
+  assert.equal(h.run('tab.console.length'),100);
+  assert.equal(h.run('tab.seq'),153);
+});
+
 test('run uses DOM globals and assert/sleep in the page realm, not Playwright or Node', async () => {
   const { runCode } = require('./run.cjs');
   const heading = { textContent: 'Page heading' };
