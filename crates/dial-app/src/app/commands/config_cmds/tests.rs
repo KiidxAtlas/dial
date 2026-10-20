@@ -85,3 +85,93 @@ fn fast_off_clears_explicit_fast_tier_only() {
     let plan = fast_plan(&config, "openai", "off").unwrap();
     assert_eq!(written(&plan.changes), vec!["service_tier"]);
 }
+
+#[test]
+fn busy_fast_commands_plan_from_latest_saved_settings_and_can_return_to_base() {
+    use crate::app::shell::notes::{settings_config, stage_settings};
+
+    let (_home, _project, layout, _) = crate::app::tests::config();
+    settings_store::save_config(
+        &layout,
+        Scope::Global,
+        &[
+            set_value("provider", "openai".into()),
+            set_value("model", "gpt-4.1".into()),
+        ],
+    )
+    .unwrap();
+    let active = Config::load(&layout, None).unwrap().for_coding();
+    let mut pending = None;
+    for (args, expected) in [
+        ("on", true),
+        ("off", false),
+        ("toggle", true),
+        ("toggle", false),
+    ] {
+        let config = settings_config(&active, &pending);
+        let plan = fast_plan(config, &config.selection().provider, args).unwrap();
+        assert!(
+            !plan.changes.is_empty(),
+            "{args} must not be planned against stale state"
+        );
+        settings_store::save_config(&layout, Scope::Global, &plan.changes).unwrap();
+        let fresh = Config::load(&layout, None).unwrap().for_coding();
+        assert_eq!(fresh.fast_mode, expected);
+        stage_settings(&active, &mut pending, fresh);
+        assert_eq!(settings_config(&active, &pending).fast_mode, expected);
+        assert_eq!(
+            pending.is_some(),
+            expected,
+            "returning to base clears stale pending settings"
+        );
+        let status = fast_plan(settings_config(&active, &pending), "openai", "status").unwrap();
+        assert_eq!(
+            status.note,
+            format!("Fast mode is {}.", if expected { "on" } else { "off" })
+        );
+    }
+    assert!(
+        !active.fast_mode,
+        "the running agent retains its immutable settings"
+    );
+}
+
+#[test]
+fn busy_settings_lookup_sees_new_entries_without_changing_the_running_config() {
+    use crate::app::shell::notes::{settings_config, stage_settings};
+
+    let (_home, _project, layout, active) = crate::app::tests::config();
+    let (name, host, scope) = parse_ssh_add("newbox --host example.test").unwrap();
+    settings_store::save_config(
+        &layout,
+        scope,
+        &[Change::Set {
+            path: format!("ssh_hosts.{name}"),
+            value: toml::Value::try_from(&host).unwrap(),
+        }],
+    )
+    .unwrap();
+    let mut pending = None;
+    stage_settings(&active, &mut pending, Config::load(&layout, None).unwrap());
+    assert!(
+        settings_config(&active, &pending)
+            .ssh_hosts
+            .contains_key(&name)
+    );
+    assert!(!active.ssh_hosts.contains_key(&name));
+    settings_store::save_config(
+        &layout,
+        scope,
+        &[Change::Remove {
+            path: format!("ssh_hosts.{name}"),
+        }],
+    )
+    .unwrap();
+    stage_settings(&active, &mut pending, Config::load(&layout, None).unwrap());
+    assert!(
+        !settings_config(&active, &pending)
+            .ssh_hosts
+            .contains_key(&name)
+    );
+    assert!(pending.is_none());
+}

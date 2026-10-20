@@ -1615,7 +1615,7 @@ fn subcommand_menu_lists_filters_and_completes_without_submitting() {
     c.set_draft("/improve jo");
     assert_eq!(
         press(&mut c, &env, KeyCode::Enter),
-        ComposerEvent::Submit("/improve jo".into())
+        ComposerEvent::Submit("/improve jobs".into())
     );
     assert_eq!(c.draft(), "");
 }
@@ -1699,7 +1699,7 @@ fn nested_argument_menus_show_only_the_next_word_and_respect_input_controls() {
     c.set_busy(true);
     assert_eq!(
         press(&mut c, &env, KeyCode::Enter),
-        ComposerEvent::Submit("/skills enable review --u".into())
+        ComposerEvent::Submit("/skills enable review --user".into())
     );
     assert_eq!(c.draft(), "");
     assert!(c.take_steering().is_empty());
@@ -1720,7 +1720,7 @@ fn nested_argument_menus_show_only_the_next_word_and_respect_input_controls() {
 }
 
 #[test]
-fn enter_submits_typed_commands_instead_of_selected_suggestions() {
+fn enter_runs_selected_commands_and_subcommands() {
     let env = Env::new();
     let mut c = Composer::new(Vec::new(), 100);
     c.set_commands(vec![
@@ -1728,16 +1728,22 @@ fn enter_submits_typed_commands_instead_of_selected_suggestions() {
         cmd("status", "Status", CommandKind::Builtin),
     ]);
     c.set_argument_completions(vec!["/skills sources".into()]);
-    for draft in ["/s", "/skills", "/skills ", "/skills so", "/skills sources"] {
+    for (draft, expected) in [
+        ("/s", "/status"),
+        ("/skills", "/skills"),
+        ("/skills ", "/skills sources"),
+        ("/skills so", "/skills sources"),
+        ("/skills sources", "/skills sources"),
+    ] {
         c.set_draft(draft);
         assert!(c.menu_open());
         press(&mut c, &env, KeyCode::Down);
         assert_eq!(
             press(&mut c, &env, KeyCode::Enter),
-            ComposerEvent::Submit(draft.into())
+            ComposerEvent::Submit(expected.into())
         );
         assert_eq!(c.draft(), "");
-        assert_eq!(c.history().last().map(String::as_str), Some(draft));
+        assert_eq!(c.history().last().map(String::as_str), Some(expected));
     }
 }
 
@@ -1779,7 +1785,7 @@ fn command_arguments_are_dim_ghosts_without_history_and_complete_without_submitt
     assert_eq!(c.ghost(), Some("urces"));
     assert_eq!(
         press(&mut c, &env, KeyCode::Enter),
-        ComposerEvent::Submit("/skills so".into())
+        ComposerEvent::Submit("/skills sources".into())
     );
     assert_eq!(c.draft(), "");
     c.set_draft("/skills enable ");
@@ -2512,13 +2518,13 @@ fn menu_detail_never_overflows_tiny_widths() {
 }
 
 #[test]
-fn enter_submits_partial_and_complete_names_without_replacing_them() {
+fn enter_runs_matching_commands_and_preserves_unknown_names() {
     let env = Env::new();
     let mut c = with_commands();
     typed(&mut c, &env, "/sett");
     assert_eq!(
         press(&mut c, &env, KeyCode::Enter),
-        ComposerEvent::Submit("/sett".into())
+        ComposerEvent::Submit("/settings".into())
     );
     assert_eq!(c.draft(), "");
     assert!(!c.menu_open());

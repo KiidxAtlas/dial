@@ -35,8 +35,21 @@ pub(super) fn run(
     args: &str,
 ) -> Option<Result<Step>> {
     match name {
-        "computer" => Some(computer_command(shell, app, agent, args)),
         "security" => Some(security::run(shell, app, agent, args)),
+        _ => None,
+    }
+}
+
+/// `/computer on|off`; `agent` is `None` during a turn (see `Shell::save`).
+pub(super) fn run_settings(
+    shell: &mut Shell,
+    app: &App,
+    agent: Option<&mut Agent<'_>>,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    match name {
+        "computer" => Some(computer_command(shell, app, agent, args)),
         _ => None,
     }
 }
@@ -56,8 +69,8 @@ pub(super) fn run_live(
 }
 
 fn computer_status(shell: &mut Shell, app: &App) -> Result<Step> {
-    let enabled_now = app
-        .config
+    let enabled_now = shell
+        .settings_config(app)
         .integrations
         .iter()
         .any(|name| name == computer::NAME);
@@ -89,7 +102,7 @@ fn computer_status(shell: &mut Shell, app: &App) -> Result<Step> {
 fn computer_command(
     shell: &mut Shell,
     app: &App,
-    agent: &mut Agent<'_>,
+    agent: Option<&mut Agent<'_>>,
     args: &str,
 ) -> Result<Step> {
     match args.trim() {
@@ -132,9 +145,14 @@ fn computer_command(
     }
 }
 
-fn set_enabled(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, enabled: bool) -> Result<Step> {
-    let mut names: Vec<String> = app
-        .config
+fn set_enabled(
+    shell: &mut Shell,
+    app: &App,
+    agent: Option<&mut Agent<'_>>,
+    enabled: bool,
+) -> Result<Step> {
+    let mut names: Vec<String> = shell
+        .settings_config(app)
         .integrations
         .iter()
         .filter(|name| name.as_str() != computer::NAME)
@@ -144,7 +162,7 @@ fn set_enabled(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, enabled: boo
         names.push(computer::NAME.to_owned());
     }
     let value = toml::Value::Array(names.into_iter().map(toml::Value::String).collect());
-    shell.persist(
+    shell.save(
         app,
         agent,
         &[Change::Set {

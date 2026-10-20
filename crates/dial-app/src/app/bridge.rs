@@ -124,6 +124,8 @@ impl Bridge<'_> {
         }
         // Lands a finished push-to-talk transcript in the draft while the turn keeps running.
         self.shell.poll_voice();
+        // Background jobs (usage, sign-in, skill installs) report without waiting for the turn.
+        self.shell.pump_jobs_during_turn(self.app);
         // Hosted guests reach a running turn only through here: an abort stops it, prompts wait.
         for notice in crate::collab::room::pump() {
             self.shell.note("Collab", notice);

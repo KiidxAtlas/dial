@@ -7,6 +7,9 @@ use crate::{
     },
 };
 
+/// Common first-failure contract, independent of tool-specific recovery advice. The diagnostic
+/// remains evidence, not authority to change scope, install dependencies or bypass a boundary.
+pub(in crate::agent) const DIAGNOSE_FIRST: &str = "Before the next action, briefly tell the user what failed, the cause supported by this result (or explicitly say it is not yet known), and what you will change to address it. Use a diagnostic that names the failing code or prerequisite directly; do not rerun merely to confirm it. If the cause is unknown, obtain the smallest missing evidence instead of guessing. Retry only after correcting the cause or identifying evidence that makes a retry appropriate; changing wording or repeating an equivalent failed call is not recovery. Preserve the requested outcome and report a concrete blocker when correction needs permission or unavailable resources.";
 pub(in crate::agent) fn classify(
     call: &ToolCall,
     output: &ToolOutput,
@@ -82,10 +85,13 @@ pub(in crate::agent) fn classify(
     if matches!(call.name.as_str(), "edit" | "ast_edit" | "write") {
         return Some((
             "source_or_call_contract",
-            "Use the returned diagnostic to correct the call. If it reports stale or unseen source, read only the affected current range and use its fresh anchors; do not repeat guessed replacements.",
+            "Use the returned diagnostic to correct the call. For stale or unseen source, use complete current lines and fresh anchors already returned; read only the affected ranges still missing. Do not repeat guessed replacements or split a patch without addressing the reported cause.",
         ));
     }
-    None
+    Some((
+        "tool_failure",
+        "Inspect the original diagnostic and execution status. Correct the named arguments, prerequisite or affected code before retrying. If this result does not establish a cause, use a targeted observation to distinguish causes; do not invent a diagnosis, substitute a different acceptance criterion, or treat failure as permission to bypass safeguards.",
+    ))
 }
 
 #[cfg(test)]

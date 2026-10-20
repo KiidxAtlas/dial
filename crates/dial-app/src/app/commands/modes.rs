@@ -155,7 +155,6 @@ pub(super) fn run(
     args: &str,
 ) -> Option<Result<Step>> {
     match name {
-        "effort" => Some(effort(shell, app, agent, args)),
         "vibe" => Some(vibe(shell, app, agent, args)),
         "skillful" => Some(skillful(shell, app, agent, args)),
         "fresh" => Some(fresh::run(shell, app, agent)),
@@ -177,6 +176,20 @@ pub(super) fn run(
     }
 }
 
+/// `/effort`; `agent` is `None` during a turn (see `Shell::save`).
+pub(super) fn run_settings(
+    shell: &mut Shell,
+    app: &App,
+    agent: Option<&mut Agent<'_>>,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    match name {
+        "effort" => Some(effort(shell, app, agent, args)),
+        _ => None,
+    }
+}
+
 pub(super) fn completions(config: &Config) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(Some(profile)) = reasoning_profile(config) {
@@ -191,13 +204,15 @@ pub(super) fn completions(config: &Config) -> Vec<String> {
     out
 }
 
-fn effort(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
+fn effort(shell: &mut Shell, app: &App, agent: Option<&mut Agent<'_>>, args: &str) -> Result<Step> {
     let args = args.trim();
+    let config = shell.settings_config(app).clone();
     if args.is_empty() {
-        if app.config.thinking_auto {
-            let judged = match agent.last_auto_thinking() {
-                Some(choice) => format!("last judged: {choice}"),
-                None => "no prompt judged yet this session".to_owned(),
+        if config.thinking_auto {
+            let judged = match agent.as_ref().map(|agent| agent.last_auto_thinking()) {
+                Some(Some(choice)) => format!("last judged: {choice}"),
+                Some(None) => "no prompt judged yet this session".to_owned(),
+                None => "judging the running turn".to_owned(),
             };
             shell.note(
                 "Thinking",
@@ -205,7 +220,7 @@ fn effort(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Re
             );
             return Ok(Step::Done);
         }
-        match reasoning_profile(&app.config) {
+        match reasoning_profile(&config) {
             Ok(Some(profile)) => {
                 let levels = profile
                     .capabilities
@@ -230,9 +245,9 @@ fn effort(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Re
         }
         return Ok(Step::Done);
     }
-    match reasoning_changes(&app.config, args).and_then(|(changes, effort)| {
+    match reasoning_changes(&config, args).and_then(|(changes, effort)| {
         shell
-            .persist(app, agent, &changes, Scope::Project)
+            .save(app, agent, &changes, Scope::Project)
             .map(|step| (step, effort))
     }) {
         Ok((step, effort)) => {

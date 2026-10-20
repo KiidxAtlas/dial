@@ -397,6 +397,8 @@ fn auto_bool_picker_saves_typed_values_in_selected_scope_only_after_confirmation
     for scope in [Scope::Global, Scope::Project] {
         let mut o = overlay();
         o.scope = scope;
+        // Start explicitly at Auto; the product default may be On or Off.
+        crate::config::schema::set(&mut o.effective, path, Value::String("auto".into()));
         goto(&mut o, &rig.keys, path);
         for expected in [
             Value::Boolean(true),

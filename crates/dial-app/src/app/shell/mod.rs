@@ -34,6 +34,7 @@ pub(in crate::app) mod help;
 pub(in crate::app) mod improve;
 pub(in crate::app) mod input;
 pub(in crate::app) mod lifecycle;
+mod live;
 pub(in crate::app) mod notes;
 pub(in crate::app) mod overlays;
 pub(in crate::app) mod paint;

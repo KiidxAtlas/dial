@@ -88,6 +88,121 @@ fn unseen_anchor_error_shows_the_lines_so_the_retry_needs_no_read() {
 }
 
 #[test]
+fn unread_ranges_across_operations_and_files_are_revealed_in_one_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let a = ws.resolve("a.txt").unwrap();
+    let b = ws.resolve("b.txt").unwrap();
+    let original = "one\ntwo\nthree\nfour\nfive\nsix\n";
+    fs::write(&a, original).unwrap();
+    fs::write(&b, "other\n").unwrap();
+    let tag = ws.store().record(&a, original, &[(1, 1), (3, 3)]);
+    let btag = ws.store().record(&b, "other\n", &[]);
+    // Reverse anchor order, multiple gaps in one range, and a register whose CUT is unread.
+    let patch = format!(
+        "[a.txt#{tag}]\nCUT 6.=6 @saved\nPUT 2.=4:\n+replacement\nPUT >1 @saved\n[b.txt#{btag}]\nPUT 1.=1:\n+OTHER\n"
+    );
+    let error = edit(&ws, &patch).unwrap_err();
+    for row in ["2:two\n", "4:four\n", "6:six\n", "1:other\n"] {
+        assert!(error.contains(row), "{error}");
+    }
+    assert!(!error.contains("5:five"), "{error}");
+    assert_eq!(fs::read_to_string(&a).unwrap(), original);
+    assert_eq!(fs::read_to_string(&b).unwrap(), "other\n");
+    edit(&ws, &patch).unwrap();
+    assert_eq!(
+        fs::read_to_string(&a).unwrap(),
+        "one\nsix\nreplacement\nfive\n"
+    );
+    assert_eq!(fs::read_to_string(&b).unwrap(), "OTHER\n");
+}
+
+#[test]
+fn invalid_anchors_remain_visible_alongside_unread_previews() {
+    for invalid_first in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let path = ws.resolve("a.txt").unwrap();
+        let original = "one\ntwo\nthree\n";
+        fs::write(&path, original).unwrap();
+        let tag = ws.store().record(&path, original, &[(1, 1)]);
+        let invalid = "PUT 99.=99:\n+invalid\n";
+        let unread = "PUT 2.=2:\n+TWO\n";
+        let operations = if invalid_first {
+            format!("{invalid}{unread}")
+        } else {
+            format!("{unread}{invalid}")
+        };
+        let patch = format!("[a.txt#{tag}]\n{operations}");
+        let error = edit(&ws, &patch).unwrap_err();
+        assert!(
+            error.contains("line 99 is beyond the end of the file (3 lines)"),
+            "{error}"
+        );
+        let invalid_line = if invalid_first { 2 } else { 4 };
+        assert!(
+            error.contains(&format!("line {invalid_line}: a.txt#{tag}")),
+            "{error}"
+        );
+        assert!(error.contains("have not been shown by a read"), "{error}");
+        assert!(error.contains("2:two\n"), "{error}");
+        assert!(!error.contains("3:three"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            ws.store().witness_flags(&path, original),
+            vec![true, true, false]
+        );
+        // Previewing the unread line does not make an unchanged retry valid.
+        let retry = edit(&ws, &patch).unwrap_err();
+        assert!(
+            retry.contains("line 99 is beyond the end of the file"),
+            "{retry}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+}
+
+#[test]
+fn unread_preview_does_not_grant_witnesses_to_omitted_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let path = ws.resolve("a.txt").unwrap();
+    let original = (1..=MISMATCH_MAX_ROWS + 2)
+        .map(|n| format!("row {n}\n"))
+        .collect::<String>();
+    fs::write(&path, &original).unwrap();
+    let tag = ws.store().record(&path, &original, &[]);
+    let patch = format!(
+        "[a.txt#{tag}]\nPUT 1.={}:\n+replacement\n",
+        MISMATCH_MAX_ROWS + 2
+    );
+    let error = edit(&ws, &patch).unwrap_err();
+    assert!(error.contains("preview truncated"), "{error}");
+    let flags = ws.store().witness_flags(&path, &original);
+    assert!(flags[..MISMATCH_MAX_ROWS].iter().all(|seen| *seen));
+    assert!(flags[MISMATCH_MAX_ROWS..].iter().all(|seen| !*seen));
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn stale_unread_anchors_do_not_witness_current_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(dir.path()).unwrap();
+    let path = ws.resolve("a.txt").unwrap();
+    fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let tag = ws.store().record(&path, "one\ntwo\nthree\n", &[(1, 1)]);
+    fs::write(&path, "one\nTWO\nTHREE\n").unwrap();
+    let patch = format!("[a.txt#{tag}]\nPUT 2.=2:\n+x\nPUT 3.=3:\n+y\n");
+    assert!(edit(&ws, &patch).is_err());
+    assert_eq!(
+        ws.store().witness_flags(&path, "one\nTWO\nTHREE\n"),
+        vec![false; 3]
+    );
+    assert!(edit(&ws, &patch).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "one\nTWO\nTHREE\n");
+}
+
+#[test]
 fn stale_remove_names_the_fresh_tag_and_the_range_to_read() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.txt");

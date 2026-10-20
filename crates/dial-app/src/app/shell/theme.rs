@@ -11,7 +11,7 @@ impl Shell {
     pub(super) fn theme_command(
         &mut self,
         app: &App,
-        agent: &mut Agent<'_>,
+        agent: Option<&mut Agent<'_>>,
         args: &str,
     ) -> Result<Step> {
         if args.is_empty() {
@@ -64,7 +64,7 @@ impl Shell {
             path: "ui.theme".into(),
             value: args.to_owned().into(),
         }];
-        match self.persist(app, agent, &changes, Scope::Global) {
+        match self.save(app, agent, &changes, Scope::Global) {
             Ok(step) => {
                 self.note("Theme", format!("switched to {args}"));
                 Ok(step)

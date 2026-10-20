@@ -762,15 +762,17 @@ impl Composer {
     }
 
     fn submit(&mut self) -> ComposerEvent {
-        // Enter submits the typed command; suggestions are accepted with Complete.
-        // File mentions keep their existing Enter-to-complete behavior.
-        if self
+        // Enter runs the selected command; file mentions only complete the draft.
+        let file_menu = self
             .menu
             .as_ref()
-            .is_some_and(|menu| menu.file_start.is_some() && !menu.matches.is_empty())
-        {
-            self.complete_menu();
-            return ComposerEvent::None;
+            .is_some_and(|menu| menu.file_start.is_some());
+        if self.complete_menu() {
+            if file_menu {
+                return ComposerEvent::None;
+            }
+            // Command completion adds a space for further typing, not execution.
+            self.editor.set(&self.editor.text.trim_end().to_owned());
         }
         // A second Enter explicitly sends the oldest queued message now. Do not
         // add it to history again: queuing already recorded the original draft.
@@ -1836,6 +1838,18 @@ impl Composer {
                 pieces.push(hint(Action::ClearDraft, "again to exit"));
             } else if self.menu_open() {
                 pieces.extend([
+                    hint(
+                        Action::Submit,
+                        if self
+                            .menu
+                            .as_ref()
+                            .is_some_and(|menu| menu.file_start.is_some())
+                        {
+                            "complete"
+                        } else {
+                            "run command"
+                        },
+                    ),
                     hint(Action::Complete, "complete"),
                     select(),
                     hint(Action::Dismiss, "dismiss"),

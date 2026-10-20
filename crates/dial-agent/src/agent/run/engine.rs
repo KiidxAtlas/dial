@@ -137,6 +137,12 @@ impl Engine {
         task_changed: bool,
         holds_result: impl Fn(&str) -> bool,
     ) -> (Option<String>, Option<String>, Option<String>) {
+        if let Some((kind, advice)) = crate::agent::run::failure_guidance::classify(call, output) {
+            output.text.push_str(&format!(
+                "\n[Dial recovery: {kind}] {} {advice}",
+                crate::agent::run::failure_guidance::DIAGNOSE_FIRST
+            ));
+        }
         if outcome::effects(output) == Effects::Unknown {
             self.uncertain = true;
             return (
@@ -147,11 +153,6 @@ impl Engine {
                     call.name
                 )),
             );
-        }
-        if let Some((kind, advice)) = crate::agent::run::failure_guidance::classify(call, output) {
-            output
-                .text
-                .push_str(&format!("\n[Dial recovery: {kind}] {advice}"));
         }
         let observation = self.cycles.observe(
             workspace,

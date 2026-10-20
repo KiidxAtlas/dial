@@ -7,6 +7,8 @@
 //! - `run`: returns `None` when the name is not handled by the group, otherwise the handler result.
 //! - `run_live` (optional): the commands and subcommands that need only the shell and app, never
 //!   the agent. They run at once even while a turn runs; `run` tries them first.
+//! - `run_settings` (optional): commands whose only use of the agent is adopting saved settings.
+//!   During a turn they get `None`: the write lands at once and the agent adopts it afterwards.
 //! - `completions`: extra composer argument candidates such as `/mcp login <server>`.
 
 use super::{App, Shell, Step};
@@ -77,10 +79,10 @@ pub(super) fn run(
     if let Some(result) = smithery::run(shell, app, agent, name, args) {
         return Some(result);
     }
-    if let Some(result) = extensions::run(shell, app, agent, name, args) {
+    if let Some(result) = run_settings(shell, app, Some(&mut *agent), name, args) {
         return Some(result);
     }
-    if let Some(result) = config_cmds::run(shell, app, agent, name, args) {
+    if let Some(result) = extensions::run(shell, app, agent, name) {
         return Some(result);
     }
     if let Some(result) = commit::run(shell, app, agent, name, args) {
@@ -116,6 +118,28 @@ pub(super) fn run_live(
         .or_else(|| config_cmds::run_live(shell, app, name, args))
         .or_else(|| session::run_live(shell, app, name, args))
         .or_else(|| setup::run_live(shell, app, name, args))
+}
+
+/// Group commands that save settings (see [`Shell::save`]). `agent` is `None` during a turn; the
+/// idle dispatcher passes the agent so the change applies at once.
+pub(super) fn run_settings(
+    shell: &mut Shell,
+    app: &App,
+    mut agent: Option<&mut Agent<'_>>,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    let args = args.trim();
+    if let Some(result) = advanced::run_settings(shell, app, agent.as_deref_mut(), name, args) {
+        return Some(result);
+    }
+    if let Some(result) = extensions::run_settings(shell, app, agent.as_deref_mut(), name, args) {
+        return Some(result);
+    }
+    if let Some(result) = config_cmds::run_settings(shell, app, agent.as_deref_mut(), name, args) {
+        return Some(result);
+    }
+    modes::run_settings(shell, app, agent, name, args)
 }
 
 /// Composer argument candidates: `/<name> <subcommand>` for every static subcommand, plus each

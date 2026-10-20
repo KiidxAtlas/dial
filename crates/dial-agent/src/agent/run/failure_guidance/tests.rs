@@ -79,11 +79,32 @@ fn source_contract_failure_guides_current_range_and_success_is_not_recovery() {
         "source_or_call_contract"
     );
     assert!(classify(&call("edit"), &ToolOutput::ok("updated".into())).is_none());
-    assert!(
+    assert_eq!(
         classify(
             &call("unknown-extension"),
             &ToolOutput::err("unknown cause")
         )
-        .is_none()
+        .unwrap()
+        .0,
+        "tool_failure"
     );
+}
+
+#[test]
+fn every_tool_failure_gets_guidance_on_its_first_result() {
+    for name in [
+        "read",
+        "grep",
+        "web_fetch",
+        "browser",
+        "task",
+        "custom-mcp-tool",
+    ] {
+        let failed = ToolOutput::err("specific diagnostic");
+        assert!(classify(&call(name), &failed).is_some(), "{name}");
+        assert!(
+            classify(&call(name), &ToolOutput::ok("done".into())).is_none(),
+            "{name}"
+        );
+    }
 }
