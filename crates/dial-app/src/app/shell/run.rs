@@ -290,7 +290,7 @@ impl Shell {
             } else {
                 timeout
             };
-            if !poll(timeout)? {
+            if self.held.is_empty() && !poll(timeout)? {
                 dirty = animating;
                 if self.pending_favorite.is_some() {
                     self.catalog.collect();
@@ -311,7 +311,10 @@ impl Shell {
                 continue;
             }
             dirty = true;
-            let event = read()?;
+            let event = match self.held.pop_front() {
+                Some(event) => event,
+                None => read()?,
+            };
             if let Event::Key(key) = &event
                 && self.consume_voice_edge(key)
             {

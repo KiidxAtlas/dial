@@ -78,6 +78,8 @@ pub fn run_interactive(layout: Layout, config: Config, options: Options) -> Resu
         options.add_dirs,
         options.mode_flags,
     )?;
+    // Servers connect while the terminal and home screen are set up; the first agent adopts them.
+    crate::tools::integrations::mcp::prefetch(&app.config);
     #[cfg(unix)]
     let startup_prompt = options.prompt.clone();
     let mut shell = Shell::new(&app, options.prompt)?;

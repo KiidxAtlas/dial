@@ -332,9 +332,56 @@ fn listen(session: &Arc<Session>, signals: mpsc::Receiver<(u64, Signal)>) -> Res
     Ok(())
 }
 
-/// Connects every configured server. Spawns nothing when `config.mcp` is empty.
+/// Connects every configured server. Spawns nothing when `config.mcp` is empty. Takes over a
+/// [`prefetch`] started for the same servers, so startup only waits for what is still connecting.
 pub fn load(config: &Config) -> McpLoad {
+    let started = PREFETCH.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some((key, handle)) = started
+        && Some(key) == prefetch_key(config)
+        && let Ok(loaded) = handle.join()
+    {
+        return loaded;
+    }
     load_with(config, CONNECT_TIMEOUT)
+}
+
+/// A connection pass started before the first agent exists, keyed by the servers it connects.
+type Prefetch = (String, thread::JoinHandle<McpLoad>);
+static PREFETCH: std::sync::Mutex<Option<Prefetch>> = std::sync::Mutex::new(None);
+
+/// Everything `load_with` reads from the config; a prefetch is reused only for an equal key.
+fn prefetch_key(config: &Config) -> Option<String> {
+    serde_json::to_string(&(&config.mcp, &config.project_root, &config.user_dir)).ok()
+}
+
+/// Start connecting the configured servers in the background, so the interface can draw while
+/// slow servers start; the next [`load`] for the same servers adopts the result. A config that
+/// changes first discards the prefetch (dropping its sessions stops those servers).
+pub fn prefetch(config: &Config) {
+    if !config.mcp.values().any(|server| server.enabled) {
+        return;
+    }
+    let Some(key) = prefetch_key(config) else {
+        return;
+    };
+    let config = config.clone();
+    let Ok(handle) = thread::Builder::new()
+        .name("mcp-prefetch".into())
+        .spawn(move || load_with(&config, CONNECT_TIMEOUT))
+    else {
+        return;
+    };
+    *PREFETCH.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, handle));
+}
+
+/// Whether a [`prefetch`] is still connecting, so the interface can keep accepting input
+/// instead of blocking in [`load`].
+pub fn prefetch_pending() -> bool {
+    PREFETCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(_, handle)| !handle.is_finished())
 }
 
 fn load_with(config: &Config, connect_timeout: Duration) -> McpLoad {

@@ -171,9 +171,11 @@ pub struct ImportOrigin {
     pub cwd: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionInfo {
     pub id: String,
+    /// Not cached: the listing fills it from the journal it read.
+    #[serde(skip)]
     pub path: PathBuf,
     pub started: String,
     /// Timestamp of the last accepted journal entry, falling back to `started`.
@@ -1406,67 +1408,88 @@ impl Session {
         Ok(())
     }
 
+    /// Summaries of `paths` in order, up to `limit`; unreadable journals are skipped. Unchanged
+    /// journals come from the listing index instead of being parsed again.
     fn list_paths(paths: Vec<PathBuf>, limit: usize) -> Result<Vec<SessionInfo>> {
+        let mut cache = index::Cache::default();
         let mut out = Vec::new();
         for path in paths {
             if out.len() >= limit {
                 break;
             }
-            let Ok(s) = Self::load(&path) else { continue };
-            let first_message = s.first_message();
-            let updated = s.updated_at();
-            let (mut last_message, mut last_answer, mut user_messages) =
-                (String::new(), String::new(), 0usize);
-            for &i in &s.active.branch {
-                let Kind::Message(message) = &s.entries[i].kind else {
-                    continue;
-                };
-                if !is_conversation_message(message) {
-                    continue;
-                }
-                if role_of(message) == "user" {
-                    user_messages += 1;
-                    last_message = truncate_chars(&content_text(message), PICKER_PREVIEW_CHARS);
-                } else {
-                    let original = message
-                        .get("dial_child_original_response")
-                        .filter(|original| role_of(original) == "assistant")
-                        .unwrap_or(message);
-                    let text = content_text(original);
-                    if !text.trim().is_empty() {
-                        last_answer = truncate_chars(&text, PICKER_PREVIEW_CHARS);
-                    }
+            // Stamped before reading, so a write racing the parse leaves the entry stale.
+            let stamp = index::Stamp::of(&path);
+            if let Some(info) = stamp.and_then(|stamp| cache.get(&path, stamp)) {
+                out.push(info);
+                continue;
+            }
+            let Ok(info) = Self::summarize(path.clone()) else {
+                continue;
+            };
+            if let Some(stamp) = stamp {
+                cache.put(&path, stamp, &info);
+            }
+            out.push(info);
+        }
+        cache.save();
+        Ok(out)
+    }
+
+    /// Parse one journal into its listing summary.
+    fn summarize(path: PathBuf) -> Result<SessionInfo> {
+        let s = Self::load(&path)?;
+        let first_message = s.first_message();
+        let updated = s.updated_at();
+        let (mut last_message, mut last_answer, mut user_messages) =
+            (String::new(), String::new(), 0usize);
+        for &i in &s.active.branch {
+            let Kind::Message(message) = &s.entries[i].kind else {
+                continue;
+            };
+            if !is_conversation_message(message) {
+                continue;
+            }
+            if role_of(message) == "user" {
+                user_messages += 1;
+                last_message = truncate_chars(&content_text(message), PICKER_PREVIEW_CHARS);
+            } else {
+                let original = message
+                    .get("dial_child_original_response")
+                    .filter(|original| role_of(original) == "assistant")
+                    .unwrap_or(message);
+                let text = content_text(original);
+                if !text.trim().is_empty() {
+                    last_answer = truncate_chars(&text, PICKER_PREVIEW_CHARS);
                 }
             }
-            // The header's working directory names the project for display; the directory name is
-            // the fallback for headers that lack one.
-            let project = Self::project_root(&path).map_or_else(
-                || {
-                    path.parent()
-                        .and_then(Path::parent)
-                        .and_then(Path::file_name)
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                },
-                |root| root.display().to_string(),
-            );
-            out.push(SessionInfo {
-                title: s.title(),
-                messages: s.message_count(),
-                first_message,
-                updated,
-                last_message,
-                last_answer,
-                user_messages,
-                project,
-                id: s.id,
-                path,
-                started: s.started,
-                model: s.model,
-                parent_id: s.parent_id,
-            });
         }
-        Ok(out)
+        // The header's working directory names the project for display; the directory name is
+        // the fallback for headers that lack one.
+        let project = Self::project_root(&path).map_or_else(
+            || {
+                path.parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::file_name)
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            },
+            |root| root.display().to_string(),
+        );
+        Ok(SessionInfo {
+            title: s.title(),
+            messages: s.message_count(),
+            first_message,
+            updated,
+            last_message,
+            last_answer,
+            user_messages,
+            project,
+            id: s.id,
+            path,
+            started: s.started,
+            model: s.model,
+            parent_id: s.parent_id,
+        })
     }
 
     fn first_message(&self) -> String {
@@ -3738,6 +3761,7 @@ pub mod session_search_tool {
     }
 }
 
+mod index;
 #[cfg(test)]
 mod tests;
 

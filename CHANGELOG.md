@@ -5,6 +5,17 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-10-19
+
+### Added
+- New conversations open on a centered launch screen: a braille knob and wordmark (the needle turns into place at start-up when `ui.motion` allows) above a compact input card. One line beneath shows the model, current directory and Git branch; setup and unsafe-mode warnings appear only when relevant. `Down` reveals suggested requests or recent sessions, and small windows shed artwork before warnings and selected actions.
+
+### Changed
+- Configured MCP servers connect in the background while the start screen draws, and typing stays live until they are ready, so slow servers no longer hold up the first frame.
+- Session listings are cached per project (`session-index.json`, keyed by each journal's size and modification time), so the start screen and `/resume` parse only journals that changed. The index is refreshed in the background at start-up, and resume-picker previews load off the UI thread.
+- The `band` composer is a tinted card whose accent edge follows the input state, with the status line and key hints beneath it. The Dial dark theme uses a quieter selection background.
+- Picker rows drop a description that only repeats their label; the detail pane still shows it in full. Idle palettes no longer show a `ready` title note.
+
 ## [0.1.12] - 2026-10-19
 
 ### Fixed

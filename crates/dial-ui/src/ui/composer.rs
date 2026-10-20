@@ -1156,6 +1156,14 @@ impl Composer {
         if self.editor.cursor != text.len() || self.dismissed.as_deref() == Some(text) {
             return None;
         }
+        // An unedited history entry is being browsed, not typed: Up/Down keep walking history
+        // instead of landing in the command or file menu. Editing the entry opens it as usual.
+        if self
+            .history_index
+            .is_some_and(|i| self.history.get(i).is_some_and(|entry| *entry == text))
+        {
+            return None;
+        }
         let start = text
             .rfind(char::is_whitespace)
             .map_or(0, |i| i + text[i..].chars().next().unwrap().len_utf8());
@@ -1357,6 +1365,16 @@ impl Composer {
 
     /// The composer box plus the menu or history-search rows below it, and the cursor within them.
     pub fn view(&self, width: u16, ctx: &ComposerCtx) -> ComposerView {
+        self.view_with(width, ctx, false)
+    }
+
+    /// A quiet launch input. Editing, menus, search and notices use the normal composer path,
+    /// without repeating the conversation status line and shortcut catalog on the home screen.
+    pub fn home_view(&self, width: u16, ctx: &ComposerCtx) -> ComposerView {
+        self.view_with(width, ctx, true)
+    }
+
+    fn view_with(&self, width: u16, ctx: &ComposerCtx, landing: bool) -> ComposerView {
         let w = width as usize;
         let theme = ctx.theme;
         let ghost = self.ghost().unwrap_or("");
@@ -1381,8 +1399,8 @@ impl Composer {
             return view;
         }
 
-        let banded = ctx.ui.composer_shape == ComposerShape::Band;
-        let boxed = ctx.ui.composer_shape == ComposerShape::Box;
+        let banded = landing || ctx.ui.composer_shape == ComposerShape::Band;
+        let boxed = !landing && ctx.ui.composer_shape == ComposerShape::Box;
         let inner = if boxed {
             w - 4
         } else if banded {
@@ -1439,41 +1457,28 @@ impl Composer {
         let mut rows: Rows = activity.into_iter().collect();
         let tint = theme.bg(Tok::UserBg);
         let band = |spans: Vec<Span<'static>>| band_row(spans, w, tint);
+        // The band is a tinted card with an accent edge; the edge carries the input mode (accent
+        // when idle, the state color while busy or in shell mode), so no prompt glyph is needed.
+        let edge_style = if self.mode() == InputMode::Shell || self.busy {
+            border
+        } else {
+            theme.fg(Tok::Accent)
+        };
+        let edge = || Span::styled(theme.sym(Sym::Quote).to_owned(), edge_style);
         if banded {
-            rows.push(band(Vec::new()));
+            rows.push(band(vec![edge()]));
         } else {
             rows.push(statusline::border_line_with(
                 header_ui, ctx.status, theme, w as u16, border, bar, top_l, top_r,
             ));
         }
-        let prompt_style = if self.mode() == InputMode::Shell || self.busy {
-            border
-        } else {
-            theme.fg(Tok::Accent)
-        }
-        .add_modifier(Modifier::BOLD);
-        for (i, row) in laid
-            .rows
-            .iter()
-            .skip(start)
-            .take(MAX_INPUT_ROWS)
-            .enumerate()
-        {
+        for row in laid.rows.iter().skip(start).take(MAX_INPUT_ROWS) {
             let mut spans = Vec::new();
             if boxed {
                 spans.push(Span::styled(format!("{side} "), border));
             } else if banded {
-                let mark = if i == 0 && start == 0 {
-                    theme.sym(Sym::Prompt)
-                } else {
-                    ""
-                };
-                let lead = format!(" {mark}");
-                let pad = BAND_LEAD.saturating_sub(text::width(&lead));
-                spans.push(Span::styled(
-                    format!("{lead}{}", " ".repeat(pad)),
-                    prompt_style,
-                ));
+                spans.push(edge());
+                spans.push(Span::raw(" ".repeat(BAND_LEAD - 1)));
             }
             let placeholder = self.editor.text.is_empty();
             let used = if placeholder {
@@ -1528,10 +1533,10 @@ impl Composer {
             hints.insert(0, Hint { key: None, what });
         }
         if banded {
-            // The status line closes the band, aligned with the input; the hints sit under it.
-            rows.push(band(Vec::new()));
-            rows.push(band(
-                statusline::border_line_with(
+            // The card closes on a padded row; the status line and hints sit quietly beneath it.
+            rows.push(band(vec![edge()]));
+            if !landing {
+                rows.push(statusline::border_line_with(
                     header_ui,
                     ctx.status,
                     theme,
@@ -1540,18 +1545,19 @@ impl Composer {
                     " ",
                     " ",
                     " ",
-                )
-                .spans,
-            ));
-            rows.push(bottom_border(
-                w,
-                &hints,
-                " ",
-                " ",
-                " ",
-                Style::default(),
-                theme,
-            ));
+                ));
+            }
+            if !landing || self.recording.is_some() {
+                rows.push(bottom_border(
+                    w,
+                    &hints,
+                    " ",
+                    " ",
+                    " ",
+                    Style::default(),
+                    theme,
+                ));
+            }
         } else {
             rows.push(bottom_border(
                 w, &hints, bottom_l, bottom_r, bar, border, theme,

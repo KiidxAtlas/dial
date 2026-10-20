@@ -10,7 +10,7 @@ use crate::ui::keys::Action;
 use crate::ui::transcript::TranscriptCtx;
 use crate::ui::welcome;
 use anyhow::Result;
-use crossterm::event::{KeyCode, poll};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, poll, read};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,53 @@ impl Shell {
                 home.deselect();
                 None
             }
+        }
+    }
+
+    /// Keep the home and composer live while `busy` (the first agent is still being built):
+    /// typing, editing keys and pastes change the draft at once. Any other input (Enter, a
+    /// shortcut, a resize) stops the wait and is held for the main loop, in order.
+    pub(in crate::app) fn edit_while(&mut self, busy: impl Fn() -> bool) {
+        while self.held.is_empty() && busy() {
+            let animating = self.home.as_ref().is_some_and(welcome::Home::animating);
+            let frame = if animating {
+                crate::ui::fx::FRAME
+            } else {
+                Duration::from_millis(16)
+            };
+            match poll(frame) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if animating {
+                        let _ = self.paint(None);
+                    }
+                    continue;
+                }
+                Err(_) => return,
+            }
+            let Ok(event) = read() else { return };
+            match event {
+                Event::Key(key) if key.kind == KeyEventKind::Release => continue,
+                Event::Key(key)
+                    if (key.modifiers - KeyModifiers::SHIFT).is_empty()
+                        && match key.code {
+                            // A plain character can be rebound to an action; those wait.
+                            KeyCode::Char(_) => self.keys.actions_for(&key).is_empty(),
+                            KeyCode::Backspace | KeyCode::Delete => true,
+                            _ => false,
+                        } =>
+                {
+                    // Typing deselects a picked home row, as it does in the main loop.
+                    let _ = self.home_key(&key);
+                    self.composer_key(key);
+                }
+                Event::Paste(text) => self.composer_paste(&text),
+                other => {
+                    self.held.push_back(other);
+                    return;
+                }
+            }
+            let _ = self.paint(None);
         }
     }
 

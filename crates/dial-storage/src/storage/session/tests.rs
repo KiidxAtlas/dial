@@ -909,6 +909,56 @@ fn list_is_newest_first_with_titles_and_counts() {
 }
 
 #[test]
+fn listing_index_reuses_unchanged_summaries_and_refreshes_changed_ones() {
+    let e = env();
+    let mut s = new_session(&e);
+    s.append(user("first question")).unwrap();
+    let path = s.path().unwrap().to_path_buf();
+    let listed = Session::list_for_picker(&e.layout, 10).unwrap();
+    assert_eq!(listed[0].title, "first question");
+    assert_eq!(listed[0].path, path);
+    let index = e.layout.state_dir.join("session-index.json");
+    assert!(index.is_file(), "the listing saves its summaries");
+    // An append changes the journal's stamp, so the next listing parses it again.
+    s.append(assistant("an answer")).unwrap();
+    s.rename("Renamed").unwrap();
+    let listed = Session::list_for_picker(&e.layout, 10).unwrap();
+    assert_eq!(listed[0].title, "Renamed");
+    assert_eq!(listed[0].last_answer, "an answer");
+    assert_eq!(listed[0].messages, 2);
+    // An unchanged journal is served from the index: a doctored summary shows through.
+    let doctored = fs::read_to_string(&index)
+        .unwrap()
+        .replace("\"Renamed\"", "\"From the index\"");
+    crate::platform::atomic::write_private(&index, doctored.as_bytes()).unwrap();
+    assert_eq!(
+        Session::list_newest(&e.layout, 10).unwrap()[0].title,
+        "From the index"
+    );
+    // Deleted journals drop out of the index on the next save, and a corrupt index is ignored.
+    drop(s);
+    let other = {
+        let mut other = new_session(&e);
+        other.append(user("second")).unwrap();
+        other.id().to_owned()
+    };
+    fs::remove_file(&path).unwrap();
+    let listed = Session::list_for_picker(&e.layout, 10).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, other);
+    assert!(
+        !fs::read_to_string(&index)
+            .unwrap()
+            .contains("From the index")
+    );
+    crate::platform::atomic::write_private(&index, b"not json").unwrap();
+    assert_eq!(
+        Session::list_for_picker(&e.layout, 10).unwrap()[0].id,
+        other
+    );
+}
+
+#[test]
 fn picker_activity_pins_and_separate_empty_budget() {
     let e = env();
     let mut old = new_session(&e);

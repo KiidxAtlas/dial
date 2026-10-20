@@ -22,6 +22,10 @@ use ratatui::{
 };
 use std::time::Instant;
 
+mod landing;
+mod mark;
+pub use landing::{content_width, frame};
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WelcomeInfo {
     pub version: String,
@@ -712,17 +716,48 @@ impl Home {
         !self.settled
     }
 
-    /// The live rows, at most `max_rows`; advances the sweep.
-    pub fn rows(&mut self, width: u16, max_rows: usize, theme: &Theme) -> Rows {
+    /// Compose the centered launch screen with the live input and auxiliary rows.
+    pub fn frame(
+        &mut self,
+        width: u16,
+        height: u16,
+        theme: &Theme,
+        composer: super::composer::ComposerView,
+        auxiliary: Rows,
+    ) -> super::composer::ComposerView {
+        let sweep = self.sweep();
+        frame(
+            &self.info,
+            width,
+            height,
+            theme,
+            View {
+                selected: self.selected,
+                sweep,
+                max_rows: height as usize,
+                live: true,
+            },
+            composer,
+            auxiliary,
+        )
+    }
+
+    fn sweep(&mut self) -> f32 {
         let sweep = if self.motion {
             let started = *self.started.get_or_insert_with(Instant::now);
-            fx::progress(started.elapsed(), fx::SWEEP)
+            fx::progress(started.elapsed(), fx::TURN)
         } else {
             1.0
         };
         if sweep >= 1.0 {
             self.settled = true;
         }
+        sweep
+    }
+
+    /// The live banner rows, at most `max_rows`; advances the sweep.
+    pub fn rows(&mut self, width: u16, max_rows: usize, theme: &Theme) -> Rows {
+        let sweep = self.sweep();
         render(
             &self.info,
             width,

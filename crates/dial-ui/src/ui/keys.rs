@@ -910,7 +910,6 @@ impl Keymap {
     }
 
     /// Every action bound to this key (a chord may legitimately serve several, e.g. Esc).
-    #[cfg(test)]
     pub fn actions_for(&self, key: &KeyEvent) -> Vec<Action> {
         Action::ALL
             .iter()

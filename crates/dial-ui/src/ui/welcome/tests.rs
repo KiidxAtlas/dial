@@ -394,7 +394,7 @@ fn the_sweep_brightens_the_wordmark_once_then_rests_on_the_gradient() {
     let mut moving = Home::new(info(), Vec::new(), true);
     assert!(moving.animating());
     moving.rows(100, 40, &theme);
-    std::thread::sleep(fx::SWEEP);
+    std::thread::sleep(fx::TURN);
     moving.rows(100, 40, &theme);
     assert!(!moving.animating(), "one sweep, then still");
     still.rows(100, 40, &theme);

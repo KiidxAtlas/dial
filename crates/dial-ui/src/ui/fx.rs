@@ -15,6 +15,8 @@ use std::time::Duration;
 
 /// How long the start-up sweep takes to cross the wordmark.
 pub const SWEEP: Duration = Duration::from_millis(700);
+/// How long the launch knob takes to turn into place.
+pub const TURN: Duration = Duration::from_millis(1200);
 /// How long a panel takes to reveal itself when it opens.
 pub const REVEAL: Duration = Duration::from_millis(140);
 /// Frame interval while a motion is running (the idle loop otherwise polls far more slowly).
