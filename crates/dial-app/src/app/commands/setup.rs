@@ -45,18 +45,40 @@ pub(super) fn run_command(
     if parts.first() == Some(&"choose") {
         return Some(guided_command(shell, app, agent, &parts));
     }
+    if parts.first() == Some(&"memory") {
+        return Some(memory_command(shell, app, agent, &parts[1..]));
+    }
+    match parts.as_slice() {
+        [] => {
+            let env = Env::current(&app.layout.user_dir);
+            Some(shell.open(app, agent, Which::Choice(Box::new(setup_choices(&env)))))
+        }
+        ["providers"] => Some(shell.open(app, agent, Which::Providers)),
+        // Everything else was answered by `run_live`, which `commands::run` tries first.
+        _ => None,
+    }
+}
+
+/// Listings, previews, help and the background set-up jobs. They save settings to disk but never
+/// rebuild the agent, so they run at once even during a turn. The picker, `providers`, `choose`
+/// and `memory` open overlays or switch the live agent and stay with [`run_command`].
+pub(super) fn run_live(
+    shell: &mut Shell,
+    app: &App,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    if name != "setup" && name != "doctor" {
+        return None;
+    }
+    let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.first().is_some_and(|id| id.starts_with("embeddings")) {
         embedding_command(shell, app, &parts);
         return Some(Ok(Step::Done));
     }
-    if parts.first() == Some(&"memory") {
-        return Some(memory_command(shell, app, agent, &parts[1..]));
-    }
     let env = Env::current(&app.layout.user_dir);
     match parts.as_slice() {
-        [] => {
-            return Some(shell.open(app, agent, Which::Choice(Box::new(setup_choices(&env)))));
-        }
+        [] | ["providers"] | ["choose" | "memory", ..] => return None,
         ["list"] => {
             let config = app.reload().unwrap_or_else(|_| app.config.clone());
             shell.note(
@@ -69,7 +91,6 @@ pub(super) fn run_command(
             )
         }
         ["help"] => shell.note(TITLE, USAGE),
-        ["providers"] => return Some(shell.open(app, agent, Which::Providers)),
         [id] => shell.note(TITLE, run::preview_text(id, &env)),
         [id, "yes"] => start(shell, app, id),
         _ => shell.note(TITLE, USAGE),

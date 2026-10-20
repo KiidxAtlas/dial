@@ -36,10 +36,19 @@ pub(super) fn run(
         "smithery-search" => search(shell, app, &Resume::new(Op::Search, rest)),
         "smithery-install" => install(shell, app, &Resume::new(Op::Install, rest)),
         "smithery-login" => login(shell, app, rest),
-        "smithery-logout" => logout(shell, app),
         _ => return None,
     };
     Some(result)
+}
+
+/// `/mcp smithery-logout` only deletes the stored key, so it also runs during a turn.
+pub(super) fn run_live(
+    shell: &mut Shell,
+    app: &App,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    (name == "mcp" && args == "smithery-logout").then(|| logout(shell, app))
 }
 
 fn user_dir(app: &App) -> &Path {

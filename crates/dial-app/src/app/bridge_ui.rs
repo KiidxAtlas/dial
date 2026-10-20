@@ -15,6 +15,22 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// Ignore result-only policy updates: only changed request controls warrant a transcript notice.
+fn request_settings_change(
+    status: &mut crate::ui::status::StatusData,
+    previous: &Value,
+    control: &Value,
+) -> Option<String> {
+    let policy = &control["adaptive_policy"];
+    let settings = &policy["selection"]["effective"];
+    status.inference = crate::adaptive::render_request_settings(settings, true).unwrap_or_default();
+    let old = &previous["adaptive_policy"];
+    if old["model"] == policy["model"] && old["selection"]["effective"] == *settings {
+        return None;
+    }
+    crate::adaptive::render_request_settings(settings, false)
+}
+
 impl Ui for Bridge<'_> {
     fn renders_workers(&self) -> bool {
         true
@@ -49,16 +65,19 @@ impl Ui for Bridge<'_> {
             && !self.shell.pending_resource_rebuild
     }
 
-    fn take_steering(&mut self) -> Vec<String> {
+    fn take_pending_messages(&mut self) -> Vec<String> {
         self.pump();
-        let messages = self.shell.composer.take_steering();
-        for message in &messages {
-            self.shell.transcript.push_user(message);
-        }
-        if !messages.is_empty() {
-            self.repaint(true);
-        }
-        messages
+        self.shell.composer.take_steering()
+    }
+
+    fn restore_pending_messages(&mut self, messages: Vec<String>) {
+        self.shell.composer.restore_pending_messages(messages);
+        self.repaint(true);
+    }
+
+    fn pending_message_accepted(&mut self, text: &str) {
+        self.shell.transcript.push_user(text);
+        self.repaint(true);
     }
 
     fn context_usage(&mut self, tokens: u64, estimated: bool) {
@@ -266,7 +285,18 @@ impl Ui for Bridge<'_> {
     }
 
     fn request_policy(&mut self, control: &Value) {
+        let notice = if control["adaptive_policy"]["model"].as_str()
+            == Some(self.app.config.model.as_str())
+        {
+            request_settings_change(&mut self.shell.status, &self.shell.request_policy, control)
+        } else {
+            None
+        };
         self.shell.request_policy = control.clone();
+        if let Some(notice) = notice {
+            self.shell.note("Model settings", notice);
+            self.repaint(true);
+        }
     }
 
     fn notice(&mut self, message: &str) {
@@ -615,5 +645,35 @@ impl Ui for Bridge<'_> {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod request_settings_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_settings_changes_update_status_without_result_notice_spam() {
+        let mut status = crate::ui::status::StatusData::default();
+        let first = json!({"adaptive_policy":{"model":"model-a","selection":{"effective":{
+            "temperature":0.6,"thinking":true,"max_tokens":4096,"sampling_source":"model metadata"
+        }},"result":{"state":"awaiting response"}}});
+        assert!(request_settings_change(&mut status, &Value::Null, &first).is_some());
+        let before = status.inference.clone();
+        let mut received = first.clone();
+        received["adaptive_policy"]["result"] =
+            json!({"state":"response received","prompt_tokens":200});
+        assert!(request_settings_change(&mut status, &first, &received).is_none());
+        assert_eq!(status.inference, before);
+        let mut next = received.clone();
+        next["adaptive_policy"]["selection"]["effective"]["thinking"] = json!(false);
+        assert!(request_settings_change(&mut status, &received, &next).is_some());
+        assert_ne!(status.inference, before);
+        let mut switched = next.clone();
+        switched["adaptive_policy"]["model"] = json!("model-b");
+        assert!(request_settings_change(&mut status, &next, &switched).is_some());
+        assert!(request_settings_change(&mut status, &switched, &Value::Null).is_none());
+        assert!(status.inference.is_empty());
     }
 }

@@ -425,6 +425,15 @@ impl Ui for StateUi<'_> {
     fn take_steering(&mut self) -> Vec<String> {
         self.inner.take_steering()
     }
+    fn take_pending_messages(&mut self) -> Vec<String> {
+        self.inner.take_pending_messages()
+    }
+    fn restore_pending_messages(&mut self, messages: Vec<String>) {
+        self.inner.restore_pending_messages(messages)
+    }
+    fn pending_message_accepted(&mut self, text: &str) {
+        self.inner.pending_message_accepted(text)
+    }
     fn maintenance_ready(&mut self) -> bool {
         self.inner.maintenance_ready()
     }

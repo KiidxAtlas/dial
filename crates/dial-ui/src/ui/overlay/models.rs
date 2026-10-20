@@ -1022,7 +1022,7 @@ impl ModelOverlay {
         self.scroll = 0;
     }
 
-    /// Open on the Memory group (`/models memory`): models for the memory role.
+    /// Open on the Memory group (`/models memory`): local chat models for the memory role.
     pub fn show_memory(&mut self) {
         self.show_roles();
         self.group = Group::Memory;
@@ -1134,7 +1134,7 @@ impl ModelOverlay {
             Group::Favorites => self.favorite_entries.len(),
             Group::Memory => self
                 .all_entries()
-                .filter(|entry| role_accepts("memory", entry))
+                .filter(|entry| self.in_memory_group(entry))
                 .count(),
             Group::Download => self.downloads.installed_count(),
             Group::Provider(id) => self
@@ -1165,7 +1165,7 @@ impl ModelOverlay {
             if self.group == Group::Favorites && !self.is_favorite(&entry.selection) {
                 continue;
             }
-            if self.group == Group::Memory && !role_accepts("memory", entry) {
+            if self.group == Group::Memory && !self.in_memory_group(entry) {
                 continue;
             }
             if !self.kind.accepts(entry) || !self.shows(entry) {
@@ -1236,6 +1236,17 @@ impl ModelOverlay {
         } else {
             "main"
         }
+    }
+
+    /// The Memory group lists local chat models only: extraction and consolidation run on every
+    /// saved turn, so this machine (or its network) is the intended home. The assigned memory model
+    /// always stays listed, even when it is a cloud model, so the current choice is visible.
+    fn in_memory_group(&self, entry: &ModelEntry) -> bool {
+        role_accepts("memory", entry)
+            && (is_local(entry)
+                || self
+                    .role_selection("memory")
+                    .is_some_and(|assigned| same_model(assigned, &entry.selection)))
     }
 
     fn highlighted(&self) -> Option<&ModelEntry> {
@@ -2068,7 +2079,7 @@ impl ModelOverlay {
                     .to_owned()
             }
             Some(_) if self.group == Group::Memory && self.search.is_empty() && self.show == ShowFilter::Any => {
-                " No chat models for the memory role yet. Ctrl+G opens Get models › Memory: small local models suited to memory extraction."
+                " No local chat models for the memory role yet. Ctrl+G opens Get models › Memory: small local models suited to memory extraction; LM Studio and Ollama on this machine are found automatically."
                     .to_owned()
             }
             Some(_) if self.show != ShowFilter::Any && self.search.is_empty() => format!(

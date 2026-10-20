@@ -224,7 +224,8 @@ impl Shell {
             Which::ModelSettings => {
                 let (name, profile) = model_settings_profile(&effective);
                 let mut overlay =
-                    crate::ui::overlay::model_settings::ModelSettingsOverlay::new(name, profile);
+                    crate::ui::overlay::model_settings::ModelSettingsOverlay::new(name, profile)
+                        .with_model_files();
                 if effective.assistance.local.suggestions {
                     overlay = overlay
                         .with_suggestions(&effective.user_dir, local_suggestion_base(&effective));

@@ -87,12 +87,12 @@ fn arrows_start_at_a_sensible_value_then_step_and_clamp() {
         assert_eq!(value["temperature"].as_float(), Some(expected));
         overlay.settled(Ok(()));
     }
-    assert!(overlay.is_override(overlay.fields[overlay.cursor]));
+    assert!(overlay.is_override(&overlay.fields[overlay.cursor]));
     assert!(
         matches!(overlay.event(&ch('r'), &rig.keys), OverlayEvent::Set { value, .. } if value.get("temperature").is_none())
     );
     overlay.settled(Ok(()));
-    assert!(!overlay.is_override(overlay.fields[overlay.cursor]));
+    assert!(!overlay.is_override(&overlay.fields[overlay.cursor]));
 }
 
 #[test]
@@ -195,7 +195,7 @@ fn page_shows_sections_values_and_help_and_survives_tiny_terminals() {
     go(&mut overlay, &rig, "local_sampling.chat_template_kwargs");
     let text = screen(&render(100, 32, |frame| overlay.draw(frame, &ctx)));
     assert!(
-        text.contains("Template arguments") && text.to_lowercase().contains("chat template"),
+        text.contains("All template arguments") && text.to_lowercase().contains("chat template"),
         "{text}"
     );
     if std::env::var_os("DIAL_RENDER_MODEL_SETTINGS").is_some() {
@@ -441,4 +441,175 @@ fn evidence_file_offers_suggestions_for_local_models_only() {
     let hosted =
         ModelSettingsOverlay::new("cloud".into(), hosted).with_suggestions(dir.path(), base);
     assert!(hosted.suggestions.is_empty());
+}
+
+/// Presses `code` on the selected row and returns the saved profile table, committing the save.
+fn press(overlay: &mut ModelSettingsOverlay, rig: &Rig, code: KeyCode) -> toml::Table {
+    match overlay.event(&key(code), &rig.keys) {
+        OverlayEvent::Set { value, .. } => {
+            overlay.settled(Ok(()));
+            value.as_table().unwrap().clone()
+        }
+        _ => panic!("{code:?} did not save; message: {:?}", overlay.message),
+    }
+}
+
+fn kwargs(table: &toml::Table) -> Option<&toml::Table> {
+    crate::config::schema::get(table, "local_sampling.chat_template_kwargs")
+        .and_then(toml::Value::as_table)
+}
+
+#[test]
+fn template_options_get_their_own_rows_and_save_as_template_arguments() {
+    let rig = Rig::new();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("chat_template.jinja"),
+        r#"{%- if enable_thinking is defined and enable_thinking is false %}x{% endif %}
+{%- if mode is defined and mode == "fast" %}f{% elif mode == "slow" %}s{% endif %}
+{%- if not reasoning_effort is defined %}{% set reasoning_effort = "medium" %}{% endif %}"#,
+    )
+    .unwrap();
+    let mut profile = mlx();
+    profile.model = dir.path().to_str().unwrap().into();
+    let mut overlay = ModelSettingsOverlay::new("local".into(), profile).with_model_files();
+    let paths: Vec<&str> = overlay.fields.iter().map(|f| f.path.as_ref()).collect();
+    let at = |path: &str| paths.iter().position(|p| *p == path).unwrap();
+    // The detected options sit together, before the raw table of every template argument.
+    assert_eq!(
+        at("local_sampling.chat_template_kwargs.enable_thinking") + 3,
+        at("local_sampling.chat_template_kwargs")
+    );
+
+    go(
+        &mut overlay,
+        &rig,
+        "local_sampling.chat_template_kwargs.enable_thinking",
+    );
+    let saved = press(&mut overlay, &rig, KeyCode::Right);
+    assert_eq!(
+        kwargs(&saved).unwrap()["enable_thinking"].as_bool(),
+        Some(true)
+    );
+    let saved = press(&mut overlay, &rig, KeyCode::Right);
+    assert_eq!(
+        kwargs(&saved).unwrap()["enable_thinking"].as_bool(),
+        Some(false)
+    );
+
+    go(
+        &mut overlay,
+        &rig,
+        "local_sampling.chat_template_kwargs.mode",
+    );
+    let saved = press(&mut overlay, &rig, KeyCode::Right);
+    assert_eq!(kwargs(&saved).unwrap()["mode"].as_str(), Some("fast"));
+
+    // A free-text option is typed without quotes.
+    go(
+        &mut overlay,
+        &rig,
+        "local_sampling.chat_template_kwargs.reasoning_effort",
+    );
+    overlay.event(&key(KeyCode::Enter), &rig.keys);
+    for c in "high".chars() {
+        overlay.event(&ch(c), &rig.keys);
+    }
+    let saved = press(&mut overlay, &rig, KeyCode::Enter);
+    let args = kwargs(&saved).unwrap();
+    assert_eq!(args["reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(args.len(), 3, "earlier options are kept: {args:?}");
+
+    // Resetting each option leaves no empty argument table behind.
+    for name in ["enable_thinking", "mode", "reasoning_effort"] {
+        go(
+            &mut overlay,
+            &rig,
+            &format!("local_sampling.chat_template_kwargs.{name}"),
+        );
+        let saved = press(&mut overlay, &rig, KeyCode::Char('r'));
+        assert!(kwargs(&saved).is_none_or(|args| !args.contains_key(name)));
+    }
+    assert!(overlay.profile.local_sampling.is_none());
+}
+
+#[test]
+fn mlx_server_rows_pick_draft_models_and_kv_cache_values_without_typing() {
+    let rig = Rig::new();
+    let mut overlay = ModelSettingsOverlay::new("local".into(), mlx());
+    overlay.add_model_rows(
+        Vec::new(),
+        vec!["/models/small".into(), "/models/tiny".into()],
+    );
+
+    go(&mut overlay, &rig, "local_runtime.draft_model");
+    press(&mut overlay, &rig, KeyCode::Right);
+    let runtime = overlay.profile.local_runtime.clone().unwrap();
+    assert_eq!(runtime.draft_model.as_deref(), Some("/models/small"));
+    go(&mut overlay, &rig, "local_runtime.num_draft_tokens");
+    press(&mut overlay, &rig, KeyCode::Right);
+    assert_eq!(
+        overlay
+            .profile
+            .local_runtime
+            .as_ref()
+            .unwrap()
+            .num_draft_tokens,
+        Some(3)
+    );
+
+    // Numeric choices are saved as numbers, which validation accepts.
+    go(&mut overlay, &rig, "local_runtime.kv_bits");
+    press(&mut overlay, &rig, KeyCode::Right);
+    go(&mut overlay, &rig, "local_runtime.kv_group_size");
+    press(&mut overlay, &rig, KeyCode::Left);
+    let runtime = overlay.profile.local_runtime.clone().unwrap();
+    assert_eq!(
+        (runtime.kv_bits, runtime.kv_group_size),
+        (Some(2), Some(128))
+    );
+    runtime.validate().unwrap();
+
+    // A draft model outside the found list can still be typed.
+    go(&mut overlay, &rig, "local_runtime.draft_model");
+    overlay.event(&key(KeyCode::Enter), &rig.keys);
+    let editor = overlay.editor.as_mut().unwrap();
+    assert_eq!(editor.text, "/models/small");
+    editor.set("org/other-draft");
+    press(&mut overlay, &rig, KeyCode::Enter);
+    assert_eq!(
+        overlay
+            .profile
+            .local_runtime
+            .as_ref()
+            .unwrap()
+            .draft_model
+            .as_deref(),
+        Some("org/other-draft")
+    );
+}
+
+#[test]
+fn server_rows_follow_the_provider() {
+    let paths = |provider: &str| {
+        let mut profile = mlx();
+        profile.provider = provider.into();
+        profile.capabilities.seed = false;
+        ModelSettingsOverlay::new("m".into(), profile)
+            .fields
+            .iter()
+            .map(|f| f.path.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert!(paths("mlx").contains(&"local_runtime.kv_bits".to_owned()));
+    assert!(!paths("mlx").contains(&"keep_alive".to_owned()));
+    assert!(paths("ollama").contains(&"keep_alive".to_owned()));
+    for provider in ["ollama", "lm-studio", "anthropic"] {
+        assert!(
+            !paths(provider)
+                .iter()
+                .any(|p| p.starts_with("local_runtime")),
+            "{provider}"
+        );
+    }
 }

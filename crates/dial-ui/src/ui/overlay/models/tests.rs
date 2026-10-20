@@ -1829,16 +1829,37 @@ fn wide_rows_show_price_per_million_and_speed_and_the_numbers_line_shows_use() {
     assert!(!narrow.contains("$3/$15"), "{narrow}");
 }
 
+/// The fixture plus models that run on this machine: an Ollama server on loopback and a local MLX
+/// checkpoint (no URL).
+fn discovery_with_local_models() -> Discovery {
+    let mut d = discovery();
+    let mut loopback = entry("ollama", "gemma-local", "Ollama", true, None);
+    loopback.selection.base_url = Some("http://127.0.0.1:11434/v1".into());
+    let mut mlx = entry("mlx", "qwen-mlx", "Downloaded", true, None);
+    mlx.selection.base_url = None;
+    d.models.extend([loopback, mlx]);
+    d
+}
+
 #[test]
-fn memory_group_lists_chat_models_and_enter_assigns_the_memory_role() {
+fn memory_group_lists_local_chat_models_and_enter_assigns_the_memory_role() {
     let rig = Rig::new();
-    let mut o = overlay();
+    let mut o = ModelOverlay::new(
+        Some(discovery_with_local_models()),
+        roles_with_main(),
+        Scope::Global,
+    );
     o.set_memory_backend("local");
     o.show_memory();
     assert_eq!(o.group, Group::Memory);
-    let shown = names(&o);
-    assert!(!shown.contains(&"nomic-embed".to_owned()), "{shown:?}");
-    assert!(shown.contains(&"qwen-chat".to_owned()), "{shown:?}");
+    let mut shown = names(&o);
+    shown.sort();
+    assert_eq!(
+        shown,
+        ["gemma-local", "qwen-mlx"],
+        "cloud and embedding models are left out"
+    );
+    assert_eq!(o.count_in(&Group::Memory), 2);
     let screen = draw(&mut o, &rig, 140, 24);
     assert!(screen.contains("MEMORY MODELS"), "{screen}");
     assert!(screen.contains("backend local"), "{screen}");
@@ -1846,12 +1867,37 @@ fn memory_group_lists_chat_models_and_enter_assigns_the_memory_role() {
     assert!(screen.contains("set memory"), "{screen}");
     assert!(screen.contains("Ctrl+G get memory models"), "{screen}");
 
-    o.cursor = names(&o).iter().position(|n| n == "qwen-chat").unwrap();
+    o.cursor = names(&o).iter().position(|n| n == "qwen-mlx").unwrap();
     assert!(matches!(
         send(&mut o, &rig, key(KeyCode::Enter)),
         OverlayEvent::AssignModel { role, selection, .. }
-            if role == "memory" && selection.model == "qwen-chat"
+            if role == "memory" && selection.model == "qwen-mlx"
     ));
+}
+
+#[test]
+fn memory_group_keeps_an_assigned_cloud_memory_model_visible() {
+    let d = discovery_with_local_models();
+    let cloud = d.models[0].selection.clone();
+    let mut roles = roles_with_main();
+    let memory = roles.iter_mut().find(|r| r.role == "memory").unwrap();
+    assign(memory, cloud);
+    let mut o = ModelOverlay::new(Some(d), roles, Scope::Global);
+    o.show_memory();
+    let shown = names(&o);
+    assert_eq!(shown[0], "llama3", "the assigned model leads: {shown:?}");
+    assert!(!shown.contains(&"qwen-chat".to_owned()), "{shown:?}");
+    assert_eq!(shown.len(), 3, "{shown:?}");
+}
+
+#[test]
+fn memory_group_without_local_models_points_to_get_models() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    o.show_memory();
+    assert!(names(&o).is_empty());
+    let screen = draw(&mut o, &rig, 160, 24);
+    assert!(screen.contains("No local chat models"), "{screen}");
 }
 
 #[test]

@@ -93,6 +93,24 @@ pub(super) fn run(
         "branch" | "rewind" => branch(shell, app, agent, args),
         "retry" => retry(shell, app, agent),
         "session" => session(shell, app, agent, args),
+        "delete" => delete_current(shell, app, agent),
+        "pin" => pin_current(shell, app, agent),
+        "move" => move_current(shell, agent, args),
+        "restart" => restart(shell),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// Sign-in, sign-out, statistics and the changelog never touch the session, so they run at once
+/// even during a turn.
+pub(super) fn run_live(
+    shell: &mut Shell,
+    app: &App,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    let result = match name {
         "login" => login(shell, app, args),
         "logout" => logout(shell, app, args),
         "stats" => stats_command(shell, app, args),
@@ -100,10 +118,6 @@ pub(super) fn run(
             shell.note("Changelog", crate::changelog::render(args));
             Ok(Step::Done)
         }
-        "delete" => delete_current(shell, app, agent),
-        "pin" => pin_current(shell, app, agent),
-        "move" => move_current(shell, agent, args),
-        "restart" => restart(shell),
         _ => return None,
     };
     Some(result)

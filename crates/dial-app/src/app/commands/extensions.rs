@@ -100,10 +100,8 @@ pub(super) fn run(
     let title = match name {
         "mcp" => "MCP",
         "tools" => "Tools",
-        "extensions" | "status" => "Extensions",
-        "agents" => "Agents",
+        "extensions" => "Extensions",
         "plugins" | "plugin" => "Plugins",
-        "marketplace" => "Marketplace",
         "reload-plugins" => "Plugins",
         _ => return None,
     };
@@ -114,28 +112,49 @@ pub(super) fn run(
             Ok(Step::Done)
         }
         "extensions" => shell.open(app, agent, Which::Extensions),
-        "status" => {
-            shell.note(title, extensions_report(&app.config));
-            Ok(Step::Done)
-        }
-        "agents" => {
-            shell.note(title, agents_report(&app.config));
-            Ok(Step::Done)
-        }
         "plugins" | "plugin" => plugins(shell, app, args),
-        "marketplace" => marketplace(shell, app, args),
         "reload-plugins" => {
             shell.note(title, "Reloading plugins.");
             Ok(Step::Rebuild(Box::new(app.config.clone())))
         }
         _ => return None,
     };
-    Some(match result {
-        Ok(step) => Ok(step),
-        Err(error) => {
-            shell.note(title, format!("{error:#}"));
-            Ok(Step::Done)
+    Some(noted(shell, title, result))
+}
+
+/// Reports, listings, connection tests, sign-in and marketplace file operations. None of them
+/// changes the running agent, so they run at once even during a turn.
+pub(super) fn run_live(
+    shell: &mut Shell,
+    app: &App,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    let (sub, _) = split_subcommand(args);
+    let (title, result) = match name {
+        "status" => {
+            shell.note("Extensions", extensions_report(&app.config));
+            ("Extensions", Ok(Step::Done))
         }
+        "agents" => {
+            shell.note("Agents", agents_report(&app.config));
+            ("Agents", Ok(Step::Done))
+        }
+        "mcp" => ("MCP", mcp_live(shell, app, args)?),
+        "plugins" | "plugin" if !matches!(sub, "enable" | "disable") => {
+            ("Plugins", plugins(shell, app, args))
+        }
+        "marketplace" => ("Marketplace", marketplace(shell, app, args)),
+        _ => return None,
+    };
+    Some(noted(shell, title, result))
+}
+
+/// Shows a command error in the transcript under `title` instead of failing the dispatch.
+fn noted(shell: &mut Shell, title: &str, result: Result<Step>) -> Result<Step> {
+    result.or_else(|error| {
+        shell.note(title, format!("{error:#}"));
+        Ok(Step::Done)
     })
 }
 
@@ -178,14 +197,6 @@ pub(super) fn completions(config: &Config) -> Vec<String> {
 fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Result<Step> {
     let (sub, rest) = split_subcommand(args);
     match sub {
-        "" | "list" => {
-            shell.note("MCP", mcp_list(&app.config));
-            Ok(Step::Done)
-        }
-        "help" => {
-            shell.note("MCP", MCP_HELP);
-            Ok(Step::Done)
-        }
         "add" => {
             let (name, server, scope) = parse_mcp_add(rest)?;
             if app.config.mcp.contains_key(&name) {
@@ -200,16 +211,7 @@ fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
                 "MCP",
                 format!("Added MCP server {name}. It takes effect at the next rebuild; the check below uses a temporary connection."),
             );
-            let root = app.config.project_root.clone();
-            let owned = name;
-            spawn_job(shell, "MCP test", move |_| {
-                let specs = BTreeMap::from([(owned.clone(), server)]);
-                let load = connect_extra(&specs, &root);
-                let mut lines = vec![format!("{owned}: {} tool(s)", load.tools.len())];
-                lines.extend(load.tools.iter().map(|tool| format!("  {}", tool.name())));
-                lines.extend(load.notices);
-                Ok(lines.join("\n"))
-            });
+            test_server(shell, app, name, server);
             Ok(step)
         }
         "remove" => {
@@ -246,23 +248,29 @@ fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
             );
             Ok(step)
         }
-        "test" => {
-            let name = existing_server(&app.config, rest, "test")?;
-            let server = app.config.mcp[name].clone();
-            let root = app.config.project_root.clone();
-            let owned = name.to_owned();
-            spawn_job(shell, "MCP test", move |_| {
-                let specs = BTreeMap::from([(owned.clone(), server)]);
-                let load = connect_extra(&specs, &root);
-                let mut lines = vec![format!("{owned}: {} tool(s)", load.tools.len())];
-                lines.extend(load.tools.iter().map(|tool| format!("  {}", tool.name())));
-                lines.extend(load.notices);
-                Ok(lines.join("\n"))
-            });
+        "reload" | "reconnect" => Ok(reload_runtime(shell, app, agent)),
+        other => bail!("Unknown /mcp subcommand: {other}. Run /mcp help."),
+    }
+}
+
+/// The `/mcp` subcommands that never touch the running agent: listings, help, temporary test
+/// connections, sign-in and sign-out. `None` leaves the subcommand to [`mcp`].
+fn mcp_live(shell: &mut Shell, app: &App, args: &str) -> Option<Result<Step>> {
+    let (sub, rest) = split_subcommand(args);
+    let result = match sub {
+        "" | "list" => {
+            shell.note("MCP", mcp_list(&app.config));
             Ok(Step::Done)
         }
-        "login" => {
-            let name = existing_server(&app.config, rest, "login")?;
+        "help" => {
+            shell.note("MCP", MCP_HELP);
+            Ok(Step::Done)
+        }
+        "test" => existing_server(&app.config, rest, "test").map(|name| {
+            test_server(shell, app, name.to_owned(), app.config.mcp[name].clone());
+            Step::Done
+        }),
+        "login" => existing_server(&app.config, rest, "login").map(|name| {
             let server = app.config.mcp[name].clone();
             let user_dir = app.config.user_dir.clone();
             let owned = name.to_owned();
@@ -270,11 +278,9 @@ fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
                 let ui = BannerInteraction { id: "mcp" };
                 crate::tools::integrations::mcp::login(&user_dir, &owned, &server, &ui, cancel)
             });
-            Ok(Step::Done)
-        }
-        "reload" | "reconnect" => Ok(reload_runtime(shell, app, agent)),
-        "logout" | "unauth" => {
-            let name = existing_server(&app.config, rest, sub)?;
+            Step::Done
+        }),
+        "logout" | "unauth" => existing_server(&app.config, rest, sub).and_then(|name| {
             let removed = crate::tools::integrations::mcp::logout(&app.config.user_dir, name)?;
             shell.note(
                 "MCP",
@@ -285,7 +291,7 @@ fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
                 },
             );
             Ok(Step::Done)
-        }
+        }),
         "resources" | "prompts" | "notifications" => {
             let specs: BTreeMap<String, McpServerConfig> = app
                 .config
@@ -302,8 +308,22 @@ fn mcp(shell: &mut Shell, app: &App, agent: &mut Agent<'_>, args: &str) -> Resul
             });
             Ok(Step::Done)
         }
-        other => bail!("Unknown /mcp subcommand: {other}. Run /mcp help."),
-    }
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// Connects to `server` on a temporary connection in the background and lists its tools.
+fn test_server(shell: &mut Shell, app: &App, name: String, server: McpServerConfig) {
+    let root = app.config.project_root.clone();
+    spawn_job(shell, "MCP test", move |_| {
+        let specs = BTreeMap::from([(name.clone(), server)]);
+        let load = connect_extra(&specs, &root);
+        let mut lines = vec![format!("{name}: {} tool(s)", load.tools.len())];
+        lines.extend(load.tools.iter().map(|tool| format!("  {}", tool.name())));
+        lines.extend(load.notices);
+        Ok(lines.join("\n"))
+    });
 }
 
 /// `/mcp resources|prompts|notifications`: one section per connected server, from its live

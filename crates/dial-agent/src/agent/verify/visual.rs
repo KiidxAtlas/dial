@@ -4,9 +4,8 @@ use std::{collections::HashSet, path::Path};
 pub type Revision = super::evidence::Revision;
 
 pub fn useful(prompt: &str) -> bool {
-    let lower = prompt.to_lowercase();
-    let words: HashSet<_> = lower.split(|c: char| !c.is_alphanumeric()).collect();
-    let any = |terms: &[&str]| terms.iter().any(|term| words.contains(term));
+    let words: HashSet<String> = dial_core::prose::words(prompt).collect();
+    let any = |terms: &[&str]| terms.iter().any(|term| words.contains(*term));
     any(&["screenshot", "visually", "appearance"])
         || (any(&[
             "website", "webpage", "page", "frontend", "ui", "css", "layout", "button", "image",
@@ -41,7 +40,7 @@ fn rendered_file(path: &Path) -> bool {
     )
 }
 
-pub const INITIAL_GUIDANCE: &str = "Visual evidence may help this task. Decide what needs to be seen and inspect it proactively, without waiting for the user to ask for screenshots. For a site, discover/load browser, open the actual relevant page or approved local preview, and capture a baseline before visual edits when available. Inspect supplied images with read when needed. After edits, capture and inspect the updated result. DOM/source text and a passing build do not show appearance. Preserve browser/network approvals and report unavailable rendering or image input honestly.";
+pub const INITIAL_GUIDANCE: &str = "Visual evidence may help this task. Decide what needs to be seen and inspect it proactively, without waiting for the user to ask for screenshots. For a site, discover/load browser, open the actual relevant page or approved local preview, and capture a baseline before visual edits when available. For a desktop GUI program, run its real command. Inspect supplied images with read when needed. After edits, capture and inspect the updated result. DOM/source text and a passing build do not show appearance. Preserve browser/network approvals and report unavailable rendering or image input honestly; NEVER stand in a stubbed GUI library for the real program.";
 
 #[derive(Default)]
 pub struct Review {

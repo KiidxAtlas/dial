@@ -99,12 +99,27 @@ pub(super) fn run(
         "advisor" => advisor(shell, agent, args),
         "external-thinking" => external_thinking(shell, agent, args),
         "plan-yolo" => plan_yolo(shell, agent, args),
+        "anonymize" => anonymize(shell, app, agent, args),
+        "benchmark" => benchmark(shell, app, args),
+        _ => return None,
+    };
+    Some(result.map(|()| Step::Done))
+}
+
+/// The schedule editor, the hook listing, the relay and the `dial` subcommands that run as their
+/// own background process. None uses the agent, so they run at once even during a turn.
+/// `/benchmark` stays deferred: it drives models and would compete with the turn for compute.
+pub(super) fn run_live(
+    shell: &mut Shell,
+    app: &App,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    let result = match name {
         "schedule" => schedule(shell, app, args),
         "gc" => gc(shell, app, args),
-        "anonymize" => anonymize(shell, app, agent, args),
         "images" => images(shell, app, args),
         "update" => update(shell, app, args),
-        "benchmark" => benchmark(shell, app, args),
         "relay" => relay(shell, app, args),
         "hooks" => hooks(shell, app),
         _ => return None,

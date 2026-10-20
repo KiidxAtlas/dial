@@ -41,43 +41,58 @@ pub(super) fn run(
     }
 }
 
+/// `/computer status` and the `/security` operations that need no reviewer model.
+pub(super) fn run_live(
+    shell: &mut Shell,
+    app: &App,
+    name: &str,
+    args: &str,
+) -> Option<Result<Step>> {
+    match (name, args) {
+        ("computer", "" | "status") => Some(computer_status(shell, app)),
+        ("security", args) => security::run_live(shell, app, args),
+        _ => None,
+    }
+}
+
+fn computer_status(shell: &mut Shell, app: &App) -> Result<Step> {
+    let enabled_now = app
+        .config
+        .integrations
+        .iter()
+        .any(|name| name == computer::NAME);
+    let state = if enabled_now { "on" } else { "off" };
+    let mut report = format!(
+        "Computer use    {state}\nScreenshots     active display, scaled to at most {}×{}",
+        computer::MAX_WIDTH,
+        computer::MAX_HEIGHT,
+    );
+    match computer::capabilities() {
+        Ok(caps) => report.push_str(&format!(
+            "\nBackend         {}\nScreen capture  {}\nInput control   {}\nAccessibility   {}",
+            capability_field(&caps, "backend"),
+            capability_field(&caps, "capturePermission"),
+            capability_field(&caps, "inputPermission"),
+            capability_field(&caps, "axPermission"),
+        )),
+        Err(reason) => report.push_str(&format!("\nUnavailable     {reason}")),
+    }
+    report.push_str(if enabled_now {
+        "\n/computer off turns it off."
+    } else {
+        "\n/computer on lets the agent see and control the screen."
+    });
+    shell.note("Computer", report);
+    Ok(Step::Done)
+}
+
 fn computer_command(
     shell: &mut Shell,
     app: &App,
     agent: &mut Agent<'_>,
     args: &str,
 ) -> Result<Step> {
-    let enabled_now = app
-        .config
-        .integrations
-        .iter()
-        .any(|name| name == computer::NAME);
     match args.trim() {
-        "" | "status" => {
-            let state = if enabled_now { "on" } else { "off" };
-            let mut report = format!(
-                "Computer use    {state}\nScreenshots     active display, scaled to at most {}×{}",
-                computer::MAX_WIDTH,
-                computer::MAX_HEIGHT,
-            );
-            match computer::capabilities() {
-                Ok(caps) => report.push_str(&format!(
-                    "\nBackend         {}\nScreen capture  {}\nInput control   {}\nAccessibility   {}",
-                    capability_field(&caps, "backend"),
-                    capability_field(&caps, "capturePermission"),
-                    capability_field(&caps, "inputPermission"),
-                    capability_field(&caps, "axPermission"),
-                )),
-                Err(reason) => report.push_str(&format!("\nUnavailable     {reason}")),
-            }
-            report.push_str(if enabled_now {
-                "\n/computer off turns it off."
-            } else {
-                "\n/computer on lets the agent see and control the screen."
-            });
-            shell.note("Computer", report);
-            Ok(Step::Done)
-        }
         "on" => {
             let caps = match computer::capabilities() {
                 Ok(caps) => caps,

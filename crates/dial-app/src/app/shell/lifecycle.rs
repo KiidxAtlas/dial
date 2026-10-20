@@ -401,6 +401,7 @@ impl Shell {
             let motion = crate::ui::fx::motion(self.ui.motion, self.themes.current());
             self.home = Some(welcome::Home::new(info, sessions, motion));
         }
+        super::paint::update_model_status(&mut self.status, &mut self.home, &app.config);
         if resumed {
             replay_session(&mut self.transcript, session);
             self.note("Resume", Self::resume_note(session));
@@ -408,6 +409,7 @@ impl Shell {
     }
 
     pub(in crate::app) fn after_adopt(&mut self, app: &App) {
+        super::paint::update_model_status(&mut self.status, &mut self.home, &app.config);
         self.teach_changed(app);
         self.ui = app.config.ui.clone();
         self.cfg_approval = app.config.approval;

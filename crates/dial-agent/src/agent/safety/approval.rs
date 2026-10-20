@@ -1003,8 +1003,9 @@ pub(crate) fn edit_preview_allowed(
 }
 
 /// Shell commands the `write` tier still asks about: anything that destroys data outside the
-/// edit it was asked for, rewrites history, escalates privileges or runs downloaded code. The
-/// sandbox already confines writes to the project; this is the second line.
+/// edit it was asked for, rewrites history, escalates privileges, runs downloaded code or changes
+/// system-wide installed software. The sandbox already confines writes to the project; this is the
+/// second line.
 pub fn destructive_bash(command: &str) -> bool {
     // Fetched bytes reaching a shell or interpreter run code nobody reviewed, whatever else the command does.
     if download_to_interpreter(command) {
@@ -1033,6 +1034,41 @@ pub fn destructive_bash(command: &str) -> bool {
             }
             "chmod" | "chown" | "chgrp" => has_flag(&['R']),
             "kill" | "killall" | "pkill" => true,
+            // System package managers: anything but read-only queries changes installed software.
+            "brew" | "port" | "apt" | "apt-get" | "dnf" | "yum" | "zypper" | "apk" | "snap"
+            | "mas" => args.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "install"
+                        | "reinstall"
+                        | "upgrade"
+                        | "update"
+                        | "uninstall"
+                        | "remove"
+                        | "rm"
+                        | "purge"
+                        | "autoremove"
+                        | "tap"
+                        | "untap"
+                        | "link"
+                        | "unlink"
+                        | "cleanup"
+                        | "selfupdate"
+                )
+            }),
+            "pacman" => args.iter().any(|a| {
+                a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a[1..].starts_with(['S', 'R', 'U'])
+                    && !a[1..].contains(['s', 'i', 'l', 'p'])
+            }),
+            // Global installs land outside the project; local ones are ordinary project work.
+            "npm" | "pnpm" | "yarn" | "bun" => args
+                .iter()
+                .any(|a| a == "-g" || a == "--global" || a == "global"),
+            "cargo" | "gem" | "pipx" | "go" => args
+                .first()
+                .is_some_and(|a| matches!(a.as_str(), "install" | "uninstall" | "upgrade")),
             "git" => {
                 args.iter().any(|a| {
                     matches!(

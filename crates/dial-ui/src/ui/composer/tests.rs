@@ -737,7 +737,7 @@ fn primary_hints_follow_context_and_effective_bindings() {
     env.keys.rebind(Action::Interrupt, &["F4"]).unwrap();
     assert_eq!(
         &c.hint(&env.ctx())[..2],
-        ["F4 interrupt", "F2 steer or queue"]
+        ["F4 interrupt", "F2 route or queue"]
     );
     env.keys.rebind(Action::Interrupt, &[]).unwrap();
     assert!(!c.hint(&env.ctx()).iter().any(|h| h.contains("interrupt")));
@@ -793,7 +793,7 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
             hints[1],
             format!(
                 "editing queued {}",
-                if follow_up { "follow-up" } else { "steering" }
+                if follow_up { "follow-up" } else { "auto-route" }
             )
         );
         assert!(hints.iter().any(|h| h == "Esc cancel edit"));
@@ -811,7 +811,7 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
     assert!(
         c.hint(&env.ctx())
             .iter()
-            .any(|h| h == &format!("{} steer or queue", env.keys.label(Action::Submit)))
+            .any(|h| h == &format!("{} route or queue", env.keys.label(Action::Submit)))
     );
     key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
     assert!(
@@ -1213,7 +1213,7 @@ fn busy_hints_follow_the_draft_and_queue() {
         hints(&c)
     );
     typed(&mut c, &env, "later");
-    assert!(hints(&c).contains(&format!("{submit} steer or queue")));
+    assert!(hints(&c).contains(&format!("{submit} route or queue")));
     assert!(hints(&c).contains(&format!("{follow_up} follow-up")));
     c.set_draft("");
     c.queued.push_back(("oldest".into(), false));
@@ -2930,7 +2930,7 @@ fn queued_messages_keep_the_management_entry_visible_in_ascii_and_remapped_submi
 // ---- busy intent chooser ----------------------------------------------------------------
 
 #[test]
-fn busy_enter_offers_steer_or_queue_and_nothing_moves_until_one_is_chosen() {
+fn busy_enter_offers_automatic_routing_or_queue_and_waits_for_a_choice() {
     let env = Env::new();
     let mut c = composer();
     c.set_busy(true);
@@ -2941,7 +2941,7 @@ fn busy_enter_offers_steer_or_queue_and_nothing_moves_until_one_is_chosen() {
     assert!(c.queued_messages().is_empty());
     let rows = screen(&c, &env, 100).join("\n");
     assert!(
-        rows.contains("Add direction now") && rows.contains("Queue for after this turn"),
+        rows.contains("Let Dial decide") && rows.contains("Queue for after this turn"),
         "{rows}"
     );
     assert_eq!(press(&mut c, &env, KeyCode::Up), ComposerEvent::None);
@@ -2955,7 +2955,7 @@ fn busy_enter_offers_steer_or_queue_and_nothing_moves_until_one_is_chosen() {
 }
 
 #[test]
-fn the_default_choice_steers_and_the_selected_choice_routes_as_chosen() {
+fn the_default_choice_routes_automatically_and_explicit_queue_stays_queued() {
     let env = Env::new();
     let mut c = composer();
     c.set_busy(true);
@@ -2970,6 +2970,27 @@ fn the_default_choice_steers_and_the_selected_choice_routes_as_chosen() {
         c.queued_messages(),
         vec![("first".into(), false), ("second".into(), true)]
     );
+}
+
+#[test]
+fn restored_automatic_messages_keep_order_and_do_not_consume_explicit_followups() {
+    let mut c = composer();
+    c.set_busy(true);
+    c.set_draft("first");
+    c.submit_queued(false);
+    c.set_draft("after turn");
+    c.submit_queued(true);
+    c.set_draft("second");
+    c.submit_queued(false);
+    let pending = c.take_steering();
+    assert_eq!(pending, ["first", "second"]);
+    assert_eq!(c.queued_messages(), [("after turn".into(), true)]);
+    c.set_draft("newer");
+    c.submit_queued(false);
+    c.restore_pending_messages(pending);
+    assert_eq!(c.take_steering(), ["first", "second", "newer"]);
+    assert_eq!(c.take_follow_up().as_deref(), Some("after turn"));
+    assert!(c.take_steering().is_empty());
 }
 
 #[test]

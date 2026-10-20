@@ -306,29 +306,7 @@ impl Shell {
                 "Usage: /accounts pin (chooses which ChatGPT account this session uses)",
             ),
             "improve" => return self.improve_command(app, agent, args),
-            "changes" => {
-                let files = self.git.files(&agent.layout().unwrap_or(&app.layout).project_root);
-                let text = if files.is_empty() {
-                    "No changes in the current Git snapshot.".into()
-                } else {
-                    files
-                        .iter()
-                        .map(|file| {
-                            let stats = if file.untracked {
-                                "new".into()
-                            } else {
-                                match (file.added, file.removed) {
-                                    (Some(a), Some(r)) => format!("+{a} −{r}"),
-                                    _ => "binary".into(),
-                                }
-                            };
-                            format!("{}  {stats}", crate::ui::text::one_line(&file.path))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                self.note("Changes", text);
-            }
+            "changes" => self.changes_note(&agent.layout().unwrap_or(&app.layout).project_root),
             "theme" => return self.theme_command(app, agent, args),
             "new" | "clear" => match agent.layout().context("agent has no project layout").and_then(|layout| {
                 Session::create(
@@ -371,20 +349,7 @@ impl Shell {
                 };
                 match result { Ok(text) => self.note("Autoresearch", text), Err(error) => self.note("Autoresearch", format!("{error:#}")) }
             }
-            "archive" => {
-                let archive = crate::storage::archive::Archive::new(&app.layout.user_dir);
-                let result = match args.trim() {
-                    "sessions" => archive.sessions(None, 30).map(|view| view.text),
-                    "prompts" => archive.prompts(None, None, 30).map(|view| view.text),
-                    "projects" | "" => archive.projects(30).map(|view| view.text),
-                    other => archive.prompts(Some(other), None, 30).map(|view| view.text),
-                };
-                match result {
-                    Ok(text) if text.trim().is_empty() => self.note("Archive", "no archived history"),
-                    Ok(text) => self.note("Archive", text),
-                    Err(error) => self.note("Archive", format!("{error:#}")),
-                }
-            }
+            "archive" => self.archive_note(app, args),
             "sessions" | "resume" | "tree" => {
                 match self.pick_session(agent, args, name == "tree", name == "resume") {
                     Ok(Some(session)) => {

@@ -5,7 +5,7 @@ use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
 /// change thinks again.
 #[test]
 fn local_phase_thinking_follows_round_outcomes() {
-    with_agent("", |agent| {
+    with_agent("[assistance.local]\nthinking='phase'", |agent| {
         let ui = &mut crate::agent::NullUi;
         agent.observe_local_round(false, ui);
         assert!(!agent.local_session.think_next);
@@ -105,4 +105,48 @@ fn time_budget_follows_measured_speed_within_bounds() {
     assert_eq!(time_budget_secs(100, 100, Some(5000.0), 200.0), 120);
     assert_eq!(time_budget_secs(0, 1_000_000, None, 1.0), 3600);
     assert_eq!(time_budget_secs(4000, 1000, Some(f64::NAN), 0.0), 3600);
+}
+
+#[test]
+fn local_thinking_defaults_leave_model_settings_unchanged_across_rounds() {
+    assert_eq!(LocalThinking::default(), LocalThinking::Model);
+    for overlay in ["", "[assistance.local]\nthinking='model'"] {
+        with_agent(overlay, |agent| {
+            assert_eq!(agent.config.assistance.local.thinking, LocalThinking::Model);
+            agent.local_session.probed = true;
+            agent.local_session.facts.thinking_switch = Some(true);
+            let mut backend = agent.backend.take().unwrap();
+            let mut profile = None;
+            for failed in [false, true, false] {
+                agent.observe_local_round(failed, &mut crate::agent::NullUi);
+                let controls = agent
+                    .prepare_local_request(&mut backend, &mut profile)
+                    .unwrap();
+                assert!(controls["thinking"].is_null(), "{controls}");
+            }
+            agent.observe_local_plan_change();
+            agent.observe_local_round(false, &mut crate::agent::NullUi);
+            let controls = agent
+                .prepare_local_request(&mut backend, &mut profile)
+                .unwrap();
+            assert!(controls["thinking"].is_null(), "{controls}");
+        });
+    }
+}
+
+#[test]
+fn explicit_phase_thinking_still_sets_per_request_controls() {
+    with_agent("[assistance.local]\nthinking='phase'", |agent| {
+        agent.local_session.probed = true;
+        agent.local_session.facts.thinking_switch = Some(true);
+        let mut backend = agent.backend.take().unwrap();
+        let mut profile = None;
+        for failed in [false, true, false] {
+            agent.observe_local_round(failed, &mut crate::agent::NullUi);
+            let controls = agent
+                .prepare_local_request(&mut backend, &mut profile)
+                .unwrap();
+            assert_eq!(controls["thinking"], json!(failed));
+        }
+    });
 }

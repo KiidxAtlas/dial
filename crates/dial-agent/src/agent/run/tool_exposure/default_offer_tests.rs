@@ -9,10 +9,9 @@ pub(crate) fn with_agent<T>(overlay: &str, f: impl FnOnce(&mut Agent<'_>) -> T) 
     std::fs::create_dir(&project).unwrap();
     let layout =
         crate::config::paths::Layout::with_user_dir(&project, temp.path().join("home")).unwrap();
-    let overlay: toml::Table = toml::from_str(&format!(
-        "model='test'\n{overlay}\n[improve]\nenabled=false"
-    ))
-    .unwrap();
+    let mut overlay: toml::Table =
+        toml::from_str(&format!("{overlay}\n[improve]\nenabled=false")).unwrap();
+    overlay.entry("model").or_insert_with(|| "test".into());
     let config = Config::load(&layout, Some(overlay)).unwrap();
     let backend = Backend::new(
         ProviderKind::Endpoint {
@@ -434,14 +433,14 @@ fn pruning_protects_the_capped_budget_tail_not_the_raw_model_window() {
     );
 }
 
-/// `auto` follows the planned window on local routes only; an explicit value overrides the window, and
-/// hosted routes never lean.
+/// Local routes lean by default at any window; `auto` follows the planned window; an explicit value
+/// overrides the window, and hosted routes never lean.
 #[test]
 fn lean_local_auto_follows_the_planned_window_and_explicit_values_override_it() {
     let lean = |overlay: &str| with_agent(overlay, |agent| agent.lean_local());
-    // Auto is the default: a local route (no endpoint, or loopback) leans at or under 32k only.
+    // On is the default: a local route (no endpoint, or loopback) leans whatever its window.
     assert!(lean("context_window=32768"));
-    assert!(!lean("context_window=32769"));
+    assert!(lean("context_window=262144"));
     assert!(lean(
         "context_window=8192\n[endpoint]\nbase_url='http://127.0.0.1:9/v1'"
     ));
@@ -533,7 +532,11 @@ fn local_small_tier_offers_the_minimal_set_only_where_it_applies() {
     });
     for (overlay, tier) in [
         ("context_window=16385", Some(Tier::Lean)),
-        ("context_window=65536", Some(Tier::Full)),
+        ("context_window=65536", Some(Tier::Lean)),
+        (
+            "context_window=65536\n[assistance]\nlean_local='auto'",
+            Some(Tier::Full),
+        ),
         (
             "context_window=16384\n[assistance.local]\nsmall_window=0",
             Some(Tier::Lean),
@@ -682,13 +685,49 @@ fn local_sampling_defers_to_the_server_unless_pinned() {
     );
 }
 
+#[test]
+fn local_sampling_sends_greedy_for_do_sample_false_unless_pinned() {
+    // Use a real model directory so metadata follows the same path as a local request.
+    let model = tempfile::tempdir().unwrap();
+    std::fs::write(
+        model.path().join("generation_config.json"),
+        r#"{"do_sample":false,"temperature":0.7,"top_k":40}"#,
+    )
+    .unwrap();
+    let overlay = format!(
+        "model={}",
+        toml::Value::String(model.path().to_str().unwrap().into())
+    );
+    with_agent(&overlay, |agent| {
+        let mut profile = None;
+        assert_eq!(
+            agent.apply_local_sampling(&mut profile, 0.2),
+            Some("generation_config.json")
+        );
+        let mut body = serde_json::json!({"temperature":0.2});
+        profile.unwrap().apply_openai(&mut body);
+        assert_eq!(body["temperature"], 0.0);
+
+        let mut profile = None;
+        assert_eq!(agent.apply_local_sampling(&mut profile, 0.7), None);
+        assert!(
+            profile.is_none(),
+            "An explicit harness temperature must win"
+        );
+    });
+}
+
 /// The reasoning cap applies on lean local tiers only and scales with the planned window.
 #[test]
 fn local_reasoning_cap_follows_the_lean_tiers() {
     let cap = |overlay: &str| with_agent(overlay, |agent| agent.local_reasoning_cap());
     assert_eq!(cap("context_window=16384"), Some(16384 * 4 / 2));
     assert_eq!(cap("context_window=32768"), Some(32768 * 4 / 2));
-    assert_eq!(cap("context_window=65536"), None);
+    assert_eq!(cap("context_window=65536"), Some(65536 * 4 / 2));
+    assert_eq!(
+        cap("context_window=65536\n[assistance]\nlean_local='auto'"),
+        None
+    );
     assert_eq!(
         cap("context_window=16384\n[assistance.local]\nreasoning_share=0"),
         None

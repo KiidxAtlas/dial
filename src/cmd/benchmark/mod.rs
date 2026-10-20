@@ -387,14 +387,9 @@ fn assist_configurations(
         kv_group_size: None,
         quantized_kv_start: None,
     };
-    let lean = AssistanceOverrides {
-        lean_local: Some(LeanLocal::On),
-        ..dial.clone()
-    };
     let mut configurations = vec![
         machine("raw".into(), raw),
         machine("dial".into(), dial.clone()),
-        machine("lean".into(), lean),
     ];
     for (name, variant) in ASSIST_VARIANTS {
         let mut overrides = dial.clone();

@@ -300,3 +300,29 @@ fn a_blocked_check_is_classified_as_permission_denied_not_failure() {
         );
     }
 }
+
+#[test]
+fn system_package_changes_ask_but_queries_and_project_installs_do_not() {
+    for command in [
+        "brew install xvfb",
+        "/opt/homebrew/bin/brew upgrade",
+        "env brew install --cask xquartz",
+        "apt-get install -y xvfb",
+        "pacman -Syu",
+        "npm install -g typescript",
+        "cargo install ripgrep",
+        "pipx install black",
+    ] {
+        assert!(destructive_bash(command), "{command}");
+    }
+    for command in [
+        "brew search xvfb",
+        "brew list",
+        "pacman -Ss xvfb",
+        "npm install",
+        "cargo build",
+        "go test ./...",
+    ] {
+        assert!(!destructive_bash(command), "{command}");
+    }
+}

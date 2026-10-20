@@ -227,7 +227,25 @@ impl<'a> Agent<'a> {
         request: &Chat,
         ui: &mut dyn Ui,
     ) -> Result<String> {
-        let timeout_secs = self.config.worker_timeout_secs;
+        self.role_chat_with_timeout(
+            main,
+            role,
+            purpose,
+            request,
+            ui,
+            self.config.worker_timeout_secs,
+        )
+    }
+
+    pub(in crate::agent) fn role_chat_with_timeout(
+        &mut self,
+        main: &mut Backend,
+        role: &str,
+        purpose: llm::usage::Purpose,
+        request: &Chat,
+        ui: &mut dyn Ui,
+        timeout_secs: u64,
+    ) -> Result<String> {
         main.require_session_identity()?;
         let namespace = match &self.active_side_namespace {
             Some(namespace) => namespace.clone(),
@@ -287,7 +305,7 @@ impl<'a> Agent<'a> {
                     main.chat_with_control(
                         self.version.adapter.as_deref(),
                         request,
-                        self.config.worker_timeout_secs,
+                        timeout_secs,
                         None,
                         &mut |_| {},
                         cancel,

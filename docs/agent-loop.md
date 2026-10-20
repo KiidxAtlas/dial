@@ -14,6 +14,8 @@ Session history is append-only; tree navigation selects an abandoned branch with
 
 Duplicate recovery withholds only the exact repeated call, including reads. Different ranges and files remain available, changed source identities clear the affected restriction, and new user steering resets the turn's recovery state. A withheld call is reported explicitly as unexecuted; its cached observation still contributes to the shared repetition bound rather than being misclassified as a new execution failure.
 
+Busy input defaults to **Let Dial decide**: at the next safe request boundary, a bounded auxiliary model request classifies the exact user message as steering or independent work. Changes of approach, corrections, dependent or overlapping work, and ambiguity steer the current task through its existing steering journal. Clearly independent requests start a background worker in an isolated project copy using the existing task authorization, spawn hooks, concurrency limits and result delivery. Splitting leaves the parent's current instruction and completed inference intact. Worker findings are not new user instructions; any copy integration follows the existing worker workflow. Routing failures, invalid decisions, disabled workers or failed admission visibly fall back to steering; cancellation restores unhandled input in order. **Queue after this turn** remains an explicit opt-out. Automatic input does not cancel in-flight inference or tools while awaiting a decision, so a long operation can delay routing. No classifier is run when there is no pending input.
+
 Explicit evaluation/learning runs capture the actual inference request and target. Normal coding launches disable trajectory and recovery-sample recording, learned candidates, automatic Laya/learned-skill capture, project-learning updates and startup evaluations without rewriting saved learning preferences. When exporting a verified example to the training template, valid tool-result error flags are removed as execution metadata while the evidence text is preserved. Malformed flags and unknown fields remain rejectable. An HTTP 200 response to a WebSocket upgrade establishes SSE-only transport for that session, so an unsupported upgrade is not retried at every request.
 
 Stop hooks can resume a completed candidate within their existing three-round bound. Every resumed candidate returns through focused verification before another stop-hook decision; hook resumptions do not reset the repair allowance or turn step budget. Persistent blocking ends with a blocked outcome, and a hook cannot restart a turn that needs user input, has failed, has unknown effects, or was interrupted. Rejected completion reports keep the candidate work summary separately labelled beneath the final verification or hook diagnostic, so callers retain useful work details without mistaking them for accepted completion.
@@ -190,15 +192,16 @@ limits, reasoning budgets, approvals or verification requirements:
   Discovery, lean-local, pinned (`[harness] tools`), hermetic and selection-only offers skip this.
   `assistance.compact_tools=true` switches to discovery mode for small local models: a core set
   bounded by `assistance.initial_tool_limit` (default 16) plus `tool_search`/`tool_load`.
-  `assistance.lean_local` defaults to `auto`, which enables a lean profile when the main model is
-  served locally (no endpoint, or a loopback or LAN host) and its planned context window is at most
-  32,768 tokens. TOML `true` forces it on for every local route and `false` turns it off; hosted
+  `assistance.lean_local` defaults to `true`, which enables a lean profile whenever the main model
+  is served locally (no endpoint, or a loopback or LAN host), whatever its context window: a large
+  window does not make a small model able to use the full prompt and tool offer. `"auto"` enables
+  it only when the planned window is at most 32,768 tokens, and `false` turns it off; hosted
   routes and hermetic runs are unchanged.
   When active, it turns on discovery mode, caps the initial tool budget at 8 (an unlimited
   0 also becomes 8), and omits the visual-verification guidance unless `browser` or `computer` is
   offered and the skills catalog unless `skill` is offered. The resulting prompt stays
-  byte-stable across turns. Measure it with `dial benchmark --ablate-assistance`'s `lean` row
-  before relying on it.
+  byte-stable across turns. Measure it against the full profile with
+  `dial benchmark --ablate-assistance`'s `ablate-lean_local` row.
   Automatic search and compatibility activation retain at most eight discovered tools, oldest
   activation evicted first. Explicit `tool_load` names are pins and are never evicted by discovery;
   unloading clears both sets. Additive `discovered_tools` control state survives resume, and older
@@ -220,7 +223,7 @@ limits, reasoning budgets, approvals or verification requirements:
     `[edit] mode`. Hermetic evaluation ignores the local default.
   - Sampling: `model` (default) leaves sampling to the model. Dial's own runtime (no endpoint)
     applies the model's shipped `temperature`, `top_p`, `top_k` and `min_p` from its
-    `generation_config.json` (a `do_sample: false` file means greedy, so nothing is applied) or GGUF
+    `generation_config.json` (a `do_sample: false` file requests greedy decoding with temperature zero) or GGUF
     `general.sampling.*` metadata, and otherwise keeps the harness temperature. On local servers Dial
     omits `temperature`, so the server's per-model defaults apply. `harness` sends Dial's harness
     temperature instead. A temperature counts as pinned, and Dial keeps sending its own, when
@@ -242,14 +245,15 @@ limits, reasoning budgets, approvals or verification requirements:
     session. 0 disables escalation.
   - Benchmark lever: `ablate-local_profile` in `dial benchmark --ablate-assistance` turns the
     profile off (`assistance.local.enabled = false`) against the `dial` row.
-  - Thinking (`assistance.local.thinking`, default `phase`): where the server exposes a thinking
-    switch for the model (llama.cpp and Dial's MLX runtime: a chat template that reads
-    `enable_thinking`, sent as `chat_template_kwargs.enable_thinking`; Ollama: a model with the
-    `thinking` capability, sent as `think`), reasoning is on for a turn's first request, after a
-    failed round, an intercepted generation or a successful `todo` update, and off after a
-    successful tool round. LM Studio documents no request-level switch, so nothing is sent there.
-    `model` leaves thinking alone. An explicit model-profile `thinking`, `reasoning_effort`,
-    `thinking_budget` or `chat_template_kwargs.enable_thinking` always wins.
+  - Thinking (`assistance.local.thinking`, default `model`): leaves thinking to the model, server
+    and explicit model profile, without automatic phase switching on main or side requests, or
+    disabling thinking during loop-penalty retries. Set `phase` to opt into reasoning on a turn's
+    first request, after failed tool rounds or a successful `todo` update, and off after successful
+    tool rounds or intercepted generations. This opt-in requires a server thinking switch
+    (llama.cpp and Dial's MLX runtime: `chat_template_kwargs.enable_thinking`; Ollama: `think`).
+    LM Studio documents no request-level switch, so nothing is sent there. An explicit model-profile
+    `thinking`, `reasoning_effort`, `thinking_budget` or `chat_template_kwargs.enable_thinking`
+    always wins.
   - Model residency (`keep_loaded_secs`, default 1800, 0 = server default, max 86400): asks the server
     to keep the model loaded this long after each request (Ollama `keep_alive`, LM Studio `ttl`,
     which LM Studio applies to just-in-time loaded models). An explicit model-profile `keep_alive`

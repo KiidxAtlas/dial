@@ -29,6 +29,66 @@ fn choose(
     )
 }
 #[test]
+fn local_request_settings_reports_overrides_and_delegation_without_template_data() {
+    let request = crate::llm::Chat {
+        messages: vec![],
+        tools: vec![],
+        temperature: 0.2,
+        max_tokens: 4096,
+        seed: None,
+    };
+    let mut profile = ModelProfile::minimal("mlx", "test");
+    profile.temperature = Some(0.0);
+    profile.top_p = Some(0.95);
+    profile.local_sampling = Some(crate::llm::local_sampling::LocalSampling {
+        top_k: Some(20),
+        min_p: Some(0.05),
+        chat_template_kwargs: Some(
+            serde_json::from_value(json!({"enable_thinking":true,"private_key":"not-for-ui"}))
+                .unwrap(),
+        ),
+        ..Default::default()
+    });
+    let settings = local_request_settings(
+        &request,
+        Some(&profile),
+        &json!({"thinking":null,"loop_penalty":false}),
+        "model metadata",
+    );
+    assert_eq!(settings["temperature"], 0.0);
+    assert_eq!(settings["top_p"], 0.95);
+    assert_eq!(settings["top_k"], 20);
+    assert_eq!(settings["min_p"], 0.05);
+    assert_eq!(settings["thinking"], true);
+    assert_eq!(settings["max_tokens"], 4096);
+    assert!(!settings.to_string().contains("not-for-ui"));
+    let phase = local_request_settings(
+        &request,
+        None,
+        &json!({"thinking":false,"loop_penalty":true}),
+        "harness",
+    );
+    assert_eq!(phase["temperature"], 0.2);
+    assert_eq!(phase["thinking"], false);
+    assert_eq!(phase["loop_penalty"], true);
+    profile.temperature = None;
+    profile.capabilities.temperature = false;
+    let delegated = local_request_settings(
+        &request,
+        Some(&profile),
+        &json!({}),
+        "local server defaults",
+    );
+    assert!(delegated["temperature"].is_null());
+    assert!(
+        render_request_settings(&delegated, true)
+            .unwrap()
+            .contains("server default")
+    );
+    assert!(render_request_settings(&Value::Null, true).is_none());
+}
+
+#[test]
 fn task_phase_follows_observed_work_and_recovery_is_not_a_quality_label() {
     let mut s = State::begin(Kind::Editing, "Implement change");
     assert_eq!(s.phase, Phase::Investigation);
