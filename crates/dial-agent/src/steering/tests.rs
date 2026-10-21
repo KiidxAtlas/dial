@@ -66,7 +66,23 @@ fn promotion_locks_both_vectors_and_preserves_pending_on_refusal() {
     assert!(promote(&config, "imported-test", false).is_err());
     assert_eq!(fs::read(&active).unwrap(), b"existing vector");
     assert_eq!(fs::read(&pending).unwrap(), bytes);
-    promote(&config, "imported-test", true).unwrap();
+    // Parallel subprocess tests can briefly inherit a lease until exec closes it.
+    // Only wait after the intentional contention checks above; real errors still fail.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match promote(&config, "imported-test", true) {
+            Ok(_) => break,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("promotion after lease release failed: {error:#}"),
+        }
+    }
     assert_eq!(fs::read(&active).unwrap(), bytes);
     assert!(!pending.exists());
 }
