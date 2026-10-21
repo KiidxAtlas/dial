@@ -24,8 +24,12 @@ fn connections_probe_a_silent_peer_and_skip_unusable_addresses() {
     keepalive(&stream).unwrap();
     let socket = SockRef::from(&stream);
     assert!(socket.keepalive().unwrap());
-    assert_eq!(socket.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
-    assert_eq!(socket.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+    // socket2 exposes the keepalive timing setters on Windows, but not these getters.
+    #[cfg(not(windows))]
+    {
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
+        assert_eq!(socket.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+    }
     assert_eq!(socket.tcp_keepalive_retries().unwrap(), KEEPALIVE_PROBES);
 }
 
