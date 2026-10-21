@@ -77,13 +77,7 @@ pub fn expected_checkpoint(config: &Config) -> Option<String> {
 }
 
 pub fn runtime_dir() -> Result<std::path::PathBuf> {
-    let root = match std::env::var_os("DIAL_HOME").filter(|s| !s.is_empty()) {
-        Some(root) => std::path::PathBuf::from(root),
-        None => std::path::PathBuf::from(
-            std::env::var_os("HOME").context("HOME is unavailable; set DIAL_HOME")?,
-        )
-        .join(".dial"),
-    };
+    let root = super::paths::user_dir()?;
     let root = if root.is_absolute() {
         root
     } else {

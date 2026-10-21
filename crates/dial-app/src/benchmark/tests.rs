@@ -25,6 +25,33 @@ fn efficiency_suite_and_fixture_are_valid() {
 }
 
 #[test]
+fn representative_suite_uses_external_outcomes_and_real_projects() {
+    let suite = BenchmarkSuite::parse_toml(include_str!(
+        "../../../../examples/benchmarks/representative.toml"
+    ))
+    .unwrap();
+    assert_eq!(suite.cases.len(), 3);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for case in &suite.cases {
+        assert!(root.join(case.project.as_ref().unwrap()).is_dir());
+        assert!(
+            case.checks
+                .iter()
+                .any(|c| matches!(c, Assertion::Command { .. }))
+        );
+        assert!(
+            !case
+                .checks
+                .iter()
+                .any(|c| matches!(c, Assertion::Metric { .. }))
+        );
+    }
+    let journey = &suite.cases[2];
+    assert_eq!(journey.turns.len(), 6);
+    assert_eq!(journey.turns.iter().filter(|t| t.compact_before).count(), 3);
+}
+
+#[test]
 fn parsing_limits_and_scoring_are_deterministic_and_serializable() {
     let suite = BenchmarkSuite::parse_toml(
         r#"version = 1

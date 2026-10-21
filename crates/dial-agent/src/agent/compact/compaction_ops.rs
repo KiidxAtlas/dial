@@ -68,6 +68,8 @@ impl<'a> Agent<'a> {
         &self,
         template: Option<&Chat>,
     ) -> Result<crate::agent::compact::compaction::CompactionSnapshot> {
+        // Validate lossless carry before spending any summary request.
+        super::critical::message(&self.session.control_state(), &self.todo.snapshot())?;
         let visible_history = self.session.messages();
         let native_request = self.projected_request(&visible_history, template)?;
         let archive_migration = visible_history
@@ -315,16 +317,23 @@ impl<'a> Agent<'a> {
             prepared.summary = notes;
             prepared.prefix = vec![Session::compaction_message(&prepared.summary)];
         } else if prepared.method != crate::config::compaction::CompactionMethod::Shake {
-            // Append new authoritative harness notes; never rewrite the provider's signed block or exact tail.
+            // Append notes without rewriting provider-signed blocks or exact tails.
             prepared.prefix.push(json!({"role":"user","content":format!("<compaction-notes>\n{notes}\n</compaction-notes>"),"dial_compaction_notes":true}));
         }
+        prepared
+            .prefix
+            .retain(|message| message["dial_compaction_critical"] != true);
+        prepared.prefix.push(super::critical::message(
+            &self.session.control_state(),
+            &self.todo.snapshot(),
+        )?);
         let portable_migration =
             snapshot.archive_migration && prepared.outcome.native_usage.is_none();
         let mut candidate = prepared.prefix.clone();
         candidate.extend(
             snapshot.source.messages[prepared.first_kept..]
                 .iter()
-                .filter(|m| crate::storage::transcript::is_history(m))
+                .filter(super::critical::retained)
                 .map(|message| {
                     if portable_migration {
                         crate::agent::compact::compaction::portable_history_message(message)
@@ -401,20 +410,17 @@ impl<'a> Agent<'a> {
         let mut prefix = prepared.prefix;
         let retained_source = snapshot.source.messages[prepared.first_kept..]
             .iter()
-            .filter(|m| crate::storage::transcript::is_history(m));
-        let retained = retained_source.clone().count();
-        let keep = if snapshot.archive_migration {
-            prefix.extend(retained_source.map(|message| {
-                if portable_migration {
-                    crate::agent::compact::compaction::portable_history_message(message)
-                } else {
-                    message.clone()
-                }
-            }));
-            growth.len()
-        } else {
-            retained + growth.len()
-        };
+            .filter(super::critical::retained);
+        // Reinstall the exact selected tail, excluding obsolete machine carry. Counting a filtered
+        // tail as `keep` would retain different source messages when an older carry was in it.
+        prefix.extend(retained_source.map(|message| {
+            if portable_migration {
+                crate::agent::compact::compaction::portable_history_message(message)
+            } else {
+                message.clone()
+            }
+        }));
+        let keep = growth.len();
         self.retire_memory_capture();
         if let Some(memory) = &self.memory_runtime {
             memory.cancel();
@@ -582,22 +588,6 @@ impl<'a> Agent<'a> {
         summary: &str,
         messages: &[Value],
     ) -> String {
-        let control = self.session.control_state();
-        let goal = if control["original_goal"].is_null() {
-            messages
-                .iter()
-                .find(|message| message["role"] == "user")
-                .and_then(|message| message["content"].as_str())
-                .map(|text| {
-                    text.rsplit_once("\nOriginal user goal: ")
-                        .and_then(|(_, rest)| rest.lines().next())
-                        .and_then(|goal| serde_json::from_str::<Value>(goal).ok())
-                        .unwrap_or_else(|| json!(text))
-                })
-                .unwrap_or(Value::Null)
-        } else {
-            control["original_goal"].clone()
-        };
         let evidence = self.evidence_index(messages);
         let omitted = evidence
             .len()
@@ -610,24 +600,13 @@ impl<'a> Agent<'a> {
                 "{omitted} earlier evidence references remain in the session evidence index (`evidence_index`); "
             )
         };
-        let tasks = if self.todo.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\nTask list (todo tool, authoritative):\n{}",
-                self.todo.render()
-            )
-        };
         let history = self
             .session
             .path()
             .map(|path| path.to_string_lossy().into_owned());
         format!(
-            "{}\n\nOriginal user goal: {}\nCurrent user instruction (authoritative runtime record): {}\nDurable decisions/open work: {}{tasks}\nRetained evidence (read and mutation results): {}\nFull conversation archive: session {} ({}); {archived_note}retrieve omitted details with session_search; retrieve evidence with artifact_read. Latest user instructions take precedence over conflicting older goals and plans.",
+            "{}\n\nRetained evidence (read and mutation results): {}\nFull conversation archive: session {} ({}); {archived_note}retrieve omitted details with session_search; retrieve evidence with artifact_read. Exact current request, state and todos are carried separately in the machine contract.",
             summary.trim(),
-            goal,
-            control["current_instruction"],
-            control["working_state"],
             shown,
             self.session.id(),
             history.as_deref().unwrap_or("in-memory session")

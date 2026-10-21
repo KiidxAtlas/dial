@@ -11,6 +11,8 @@ pub struct BrowserConfig {
     pub node: String,
     /// Empty (default) uses the built-in pinned runtime. A non-empty value is an operator-owned Playwright entry override.
     pub playwright_module: String,
+    /// Permit provisioning a missing pinned runtime. Off uses only installed/cached prerequisites.
+    pub allow_install: bool,
     pub chromium_executable: Option<String>,
     pub timeout_secs: u64,
     /// Launch Chromium headless (default). Headed mode keeps the same sandbox and egress bridge.
@@ -38,6 +40,7 @@ impl Default for BrowserConfig {
         Self {
             node: "node".into(),
             playwright_module: String::new(),
+            allow_install: true,
             chromium_executable: None,
             timeout_secs: 0,
             headless: true,

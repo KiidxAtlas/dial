@@ -18,7 +18,19 @@ Pin a version by running the script as a block:
 
 With GitHub CLI signed in, the installer downloads through `gh` instead; this is optional.
 
-Dial finds its state directory from `DIAL_HOME`, or else from `HOME` plus `.dial`. It does not read `USERPROFILE`. If neither variable is set, set `DIAL_HOME` (for example, `setx DIAL_HOME "$env:USERPROFILE\.dial"`) before running Dial. The installer warns when this is needed.
+Dial finds its state directory from a nonempty `DIAL_HOME`, otherwise `HOME\.dial`, falling back to `USERPROFILE\.dial` on Windows when `HOME` is missing or empty. A typical default is `C:\Users\YourName\.dial`. To choose another location in PowerShell, set `$env:DIAL_HOME = 'D:\Dial'` before running `dial`. To keep it for future terminals too, run `[Environment]::SetEnvironmentVariable('DIAL_HOME', 'D:\Dial', 'User')` (this does not update terminals already open). `DIAL_INSTALL_DIR` controls the executable location, not this state directory.
+
+## First run and LM Studio
+
+First run opens Providers. To use a local model without a hosted account, press Esc once to
+open Models. In LM Studio, load a model and start its local API server before selecting it in
+Dial. Dial checks `http://127.0.0.1:1234/v1` by default; set `LM_STUDIO_BASE_URL` if your server
+uses another address.
+
+If you start the server after opening Dial, press F5 or Ctrl+R in Models to rescan. With an
+empty model list, Enter opens Providers, where you can inspect connection details and run
+Test connection. These navigation and test actions keep setup open; Esc from a setup subpage
+returns to Models. Esc again from Models without choosing a model exits setup.
 
 ## Security
 
@@ -30,7 +42,7 @@ Python environment discovery uses Windows layouts: virtualenv packages come from
 
 ## Known limitations
 
-- MLX/local Apple Silicon inference is unavailable; configure a hosted provider.
+- MLX/Apple Silicon inference is unavailable. Use a local server such as LM Studio or Ollama, or a hosted provider instead.
 - PTY terminal behavior and half-close differ from Unix; ConPTY resize is supported, but managed PTY stdin half-close is unavailable.
 - The Windows security boundary is not equivalent to Unix sandboxing; never enable unsandboxed execution for untrusted input.
 - Atomically published private files flush staged file contents before replacement. Windows does not document an unprivileged parent-directory flush or write-through rename equivalent to POSIX `fsync` on a directory, so a successful replacement is atomic for concurrent readers but its directory entry is not guaranteed to survive sudden power loss.

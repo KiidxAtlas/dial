@@ -3,7 +3,7 @@
 use crate::agent::make_backend;
 use crate::app::core::App;
 use crate::app::notices::memory_notice_due;
-use crate::app::overlay::Which;
+use crate::app::overlay::{OverlayOutcome, Which, overlay_destination};
 use crate::app::shell::Shell;
 use crate::config::types::Config;
 use crate::storage::session::{Session, SessionMeta};
@@ -141,19 +141,46 @@ pub(super) fn sign_in_still_pending(warned: &mut bool) -> bool {
     first
 }
 
+/// Only an actual cancellation should leave first-run setup. Navigation and connection tests
+/// close their panel too, but must be handled before considering whether any settings changed.
+pub(super) enum OnboardingFlow {
+    Navigate(Which),
+    TestConnection(String),
+    Unsupported(String),
+    Saved,
+    Cancel,
+}
+
+pub(super) fn onboarding_flow(outcome: &OverlayOutcome) -> OnboardingFlow {
+    if let Some(action) = outcome.next.as_deref() {
+        if let Some(destination) = overlay_destination(action) {
+            OnboardingFlow::Navigate(destination)
+        } else if let Some(id) = action.strip_prefix("test:") {
+            OnboardingFlow::TestConnection(id.to_owned())
+        } else {
+            OnboardingFlow::Unsupported(action.to_owned())
+        }
+    } else if outcome.latest.is_some() {
+        OnboardingFlow::Saved
+    } else {
+        OnboardingFlow::Cancel
+    }
+}
+
 /// First run (or a provider that cannot be used): let the user pick a model before any agent exists.
 fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Result<bool> {
     // First run starts on provider setup (sign in or add a key for a hosted model); Esc there
     // moves to the discovered local model list once before quitting.
     let mut providers_first = app.config.model.trim().is_empty();
     let mut auth_warned = false;
+    let mut destination = None;
     loop {
         let ready = !app.config.model.trim().is_empty()
             && match session {
                 Some(session) => crate::agent::make_session_backend(&app.config, session).is_ok(),
                 None => make_backend(&app.config).is_ok(),
             };
-        if ready {
+        if ready && destination.is_none() {
             return Ok(true);
         }
         shell.note("Welcome to dial", if app.config.model.trim().is_empty() {
@@ -161,18 +188,40 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
         } else {
             "The selected provider cannot be used yet (missing credentials?). Set it up in Providers."
         });
-        let which = if providers_first {
-            Which::Providers
-        } else {
-            Which::Models
-        };
-        let outcome = shell.run_overlay(app, None, which)?;
-        match outcome.latest {
-            Some(config) => {
-                app.adopt(config);
-                shell.after_adopt(app);
+        let which = destination.take().unwrap_or_else(|| {
+            if providers_first {
+                Which::Providers
+            } else {
+                Which::Models
             }
-            None => {
+        });
+        let secondary_panel = !providers_first && !matches!(which, Which::Models);
+        let outcome = shell.run_overlay(app, None, which)?;
+        let flow = onboarding_flow(&outcome);
+        if let Some(config) = outcome.latest {
+            app.adopt(config);
+            shell.after_adopt(app);
+        }
+        match flow {
+            OnboardingFlow::Navigate(which) => {
+                // Once the user explicitly navigates, Esc returns to models rather than
+                // replaying the initial provider prompt or quitting a secondary panel.
+                providers_first = false;
+                destination = Some(which);
+            }
+            OnboardingFlow::TestConnection(id) => {
+                shell.catalog.refresh(app);
+                shell.note(
+                    "Connection test",
+                    format!("Checking {id}. Its status appears in the provider list when the check finishes."),
+                );
+                destination = Some(Which::Providers);
+            }
+            OnboardingFlow::Unsupported(action) => {
+                shell.note("Setup", format!("Select a model before using {action}."));
+            }
+            OnboardingFlow::Saved => {}
+            OnboardingFlow::Cancel => {
                 if shell.auth_job.is_some() {
                     if sign_in_still_pending(&mut auth_warned) {
                         let label = shell.auth_job.as_ref().map_or("Sign-in", |job| job.label);
@@ -182,6 +231,10 @@ fn onboard(app: &mut App, shell: &mut Shell, session: Option<&Session>) -> Resul
                     if let Some(job) = shell.auth_job.take() {
                         job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
+                }
+                if secondary_panel {
+                    destination = Some(Which::Models);
+                    continue;
                 }
                 if providers_first {
                     providers_first = false;

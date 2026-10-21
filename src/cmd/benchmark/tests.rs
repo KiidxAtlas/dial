@@ -1,3 +1,67 @@
+#[test]
+fn policy_overrides_are_isolated_recorded_and_hashed() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::with_user_dir(root.path(), home.path().to_owned()).unwrap();
+    let base: Config =
+        toml::from_str("[providers.local]\nbase_url = 'https://127.0.0.1:8443/v1'\n").unwrap();
+    let mut configuration = requested(Path::new("model"));
+    configuration.provider = "local".into();
+    configuration.quantization_bits = None;
+    let (_, before) = select_configuration(
+        &layout,
+        &base,
+        &mut configuration,
+        &MachineBenchmarkPolicy::default(),
+    )
+    .unwrap();
+    configuration.policy = PolicyOverrides {
+        strict_requirements: Some(true),
+        review_enabled: Some(true),
+        review_min_changed_files: Some(2),
+        review_max_rounds: Some(2),
+        review_sensitive_paths: Some(vec!["src/security".into()]),
+    };
+    let (selected, settings) = select_configuration(
+        &layout,
+        &base,
+        &mut configuration,
+        &MachineBenchmarkPolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(settings["policy_contract_version"], 1);
+    assert_eq!(settings["verification"]["strict_requirements"], true);
+    assert_eq!(settings["verification"]["review"]["enabled"], true);
+    assert_eq!(settings["verification"]["review"]["min_changed_files"], 2);
+    assert_ne!(settings["policy_sha256"], before["policy_sha256"]);
+    let policy_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&shipped_policy(&selected)).unwrap())
+    );
+    assert_eq!(settings["policy_sha256"], policy_hash);
+    assert_eq!(shipped_policy(&base).strict_requirements, Some(false));
+    let frozen = clone_project(root.path()).unwrap();
+    let contract = |config: &Config| {
+        dial::benchmark::records::Contract::new(
+        &BenchmarkSuite::parse_toml("version=1\nname='policy'\n[[cases]]\nid='one'\nprompt='test'\nchecks=[{kind='file_exists',path='ok'}]\n").unwrap(),
+        frozen.path(), &serde_json::to_value(config).unwrap()).unwrap()
+    };
+    assert_ne!(
+        contract(&base).configuration_sha256,
+        contract(&selected).configuration_sha256
+    );
+    configuration.policy.review_max_rounds = Some(4);
+    assert!(
+        select_configuration(
+            &layout,
+            &base,
+            &mut configuration,
+            &MachineBenchmarkPolicy::default()
+        )
+        .is_err()
+    );
+}
+
 use super::*;
 
 fn requested(model: &Path) -> MachineConfiguration {
@@ -15,6 +79,8 @@ fn requested(model: &Path) -> MachineConfiguration {
         kv_group_size: None,
         quantized_kv_start: None,
         efficiency: Default::default(),
+        policy: Default::default(),
+        integration: Default::default(),
     }
 }
 
@@ -110,6 +176,8 @@ fn remote_inference_needs_explicit_opt_in() {
         kv_group_size: None,
         quantized_kv_start: None,
         efficiency: Default::default(),
+        policy: Default::default(),
+        integration: Default::default(),
     };
     let policy = MachineBenchmarkPolicy::default();
     assert!(
@@ -132,17 +200,23 @@ fn assist_variants_change_exactly_one_feature_from_dial() {
     let configurations = assist_configurations(&Config::default(), "openai", "model");
     let names: Vec<_> = configurations.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names[..2], ["raw", "dial"]);
-    assert_eq!(names.len(), 2 + ASSIST_VARIANTS.len());
+    assert_eq!(names.len(), 4 + ASSIST_VARIANTS.len());
     assert_eq!(configurations[1].assistance.lean_local, Some(LeanLocal::On));
-    let dial = serde_json::to_value(&configurations[1].assistance).unwrap();
+    let dial =
+        json!({"assistance": configurations[1].assistance, "policy": configurations[1].policy});
     for variant in &configurations[2..] {
-        let value = serde_json::to_value(&variant.assistance).unwrap();
-        let changed = dial
-            .as_object()
-            .unwrap()
+        let value = json!({"assistance": variant.assistance, "policy": variant.policy});
+        let changed = ["assistance", "policy"]
             .iter()
-            .filter(|(key, before)| value[key.as_str()] != **before)
-            .count();
+            .map(|section| {
+                dial[section]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, before)| value[section][key.as_str()] != **before)
+                    .count()
+            })
+            .sum::<usize>();
         assert_eq!(
             changed, 1,
             "{} must change exactly one feature",
@@ -222,6 +296,8 @@ fn efficiency_overrides_stay_in_the_isolated_config_and_are_bounded() {
         kv_bits: None,
         kv_group_size: None,
         quantized_kv_start: None,
+        policy: Default::default(),
+        integration: Default::default(),
     };
     let policy = MachineBenchmarkPolicy::default();
     let (selected, settings) =
@@ -251,4 +327,57 @@ fn efficiency_overrides_stay_in_the_isolated_config_and_are_bounded() {
         ..Default::default()
     };
     assert!(select_configuration(&layout, &base, &mut configuration, &policy).is_err());
+}
+
+#[test]
+fn machine_case_contract_is_identical_across_strict_variants_and_ignores_ambient_requirements() {
+    let mut base = Config::default();
+    base.verification.requirements.insert(
+        "ambient".into(),
+        dial::config::types::VerificationRequirement {
+            checks: vec!["missing".into()],
+            visual: false,
+        },
+    );
+    assert!(isolated_config(&base).verification.requirements.is_empty());
+    let case = BenchmarkSuite::parse_toml("version=1\nname='contract'\n[[cases]]\nid='one'\nprompt='test'\nchecks=[{kind='command',command='printf checked'}]\n").unwrap().cases.remove(0);
+    let baseline = isolated_config(&base);
+    let mapped = case_contract(&baseline, &case).unwrap();
+    assert_eq!(mapped.verification.commands.len(), 1);
+    assert_eq!(mapped.verification.requirements.len(), 1);
+    let mut strict = baseline.clone();
+    strict.verification.strict_requirements = true;
+    let strict = case_contract(&strict, &case).unwrap();
+    assert_eq!(
+        serde_json::to_value(&strict.verification.commands).unwrap(),
+        serde_json::to_value(&mapped.verification.commands).unwrap()
+    );
+    let mut journey = case.clone();
+    journey.turns.push(dial::benchmark::BenchmarkTurn {
+        prompt: "correction".into(),
+        compact_before: true,
+    });
+    let mut empty_strict = baseline;
+    empty_strict.verification.strict_requirements = true;
+    assert!(
+        case_contract(&empty_strict, &journey)
+            .unwrap_err()
+            .is::<dial::benchmark::AgentUnavailable>()
+    );
+}
+
+#[test]
+fn review_experiment_pins_measured_model_at_both_isolation_points() {
+    let mut config = Config::default();
+    config.model = "measured".into();
+    config.verification.review.enabled = true;
+    config.model_roles.insert(
+        "coach".into(),
+        dial::llm::model_config::ModelSelection::new("mlx", "ambient-coach"),
+    );
+    let selected = integration::isolate(&config, &Default::default()).unwrap();
+    assert_eq!(selected.model_roles["coach"].model, "measured");
+    let second = integration::isolate(&selected, &Default::default()).unwrap();
+    assert_eq!(second.model_roles["coach"], selected.selection());
+    assert_eq!(second.model_roles.len(), 1);
 }

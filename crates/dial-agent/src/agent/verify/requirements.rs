@@ -38,5 +38,28 @@ pub(in crate::agent) fn snapshot(
     })
 }
 
+/// Strict mode checks only the operator's declared contract. No model-generated requirement
+/// or evaluator opinion can create a new completion obligation.
+pub(in crate::agent) fn strict_blocker(
+    config: &VerificationConfig,
+    ledger: &Ledger,
+    revision: Revision,
+    visual: &Review,
+) -> Option<String> {
+    if !config.strict_requirements || config.requirements.is_empty() {
+        return None;
+    }
+    let coverage = snapshot(config, ledger, revision, visual);
+    let missing = coverage["requirements"]
+        .as_array()?
+        .iter()
+        .filter(|requirement| requirement["coverage"] != "observed")
+        .filter_map(|requirement| requirement["id"].as_str())
+        .collect::<Vec<_>>();
+    (!missing.is_empty()).then(|| format!(
+        "Declared outcome evidence is missing, failed or stale for: {}. Run the configured checks and obtain required rendered pixels at the current edits, or report the concrete blocker/incomplete outcome. This contract does not grant execution permission.", missing.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests;

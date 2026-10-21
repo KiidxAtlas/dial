@@ -7,6 +7,44 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// The user's home directory. Keep HOME authoritative; native Windows also supplies USERPROFILE.
+pub fn home_dir() -> Option<PathBuf> {
+    home_dir_from(std::env::var_os("HOME"), cfg!(windows), || {
+        std::env::var_os("USERPROFILE")
+    })
+}
+
+fn home_dir_from(
+    home: Option<std::ffi::OsString>,
+    windows: bool,
+    profile: impl FnOnce() -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    home.filter(|value| !value.is_empty())
+        .or_else(|| {
+            windows
+                .then(profile)
+                .flatten()
+                .filter(|value| !value.is_empty())
+        })
+        .map(PathBuf::from)
+}
+
+/// Dial's private user directory, with an explicit DIAL_HOME taking precedence over the home.
+pub fn user_dir() -> Result<PathBuf> {
+    user_dir_from(std::env::var_os("DIAL_HOME"), home_dir)
+}
+
+fn user_dir_from(
+    dial_home: Option<std::ffi::OsString>,
+    home: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf> {
+    dial_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home().map(|home| home.join(".dial")))
+        .context("home directory is unavailable; set DIAL_HOME (or HOME; USERPROFILE on Windows)")
+}
+
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub project_root: PathBuf,
@@ -17,12 +55,7 @@ pub struct Layout {
 
 impl Layout {
     pub fn discover(cwd: &Path) -> Result<Self> {
-        let user_dir = match std::env::var_os("DIAL_HOME") {
-            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ => PathBuf::from(std::env::var_os("HOME").context("HOME is not set; set DIAL_HOME")?)
-                .join(".dial"),
-        };
-        Self::with_user_dir(cwd, user_dir)
+        Self::with_user_dir(cwd, user_dir()?)
     }
 
     pub fn with_user_dir(cwd: &Path, user_dir: PathBuf) -> Result<Self> {

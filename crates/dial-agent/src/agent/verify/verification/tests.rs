@@ -119,3 +119,49 @@ fn unrelated_paths_produce_no_checks() {
 
     assert!(plan(&root.0, Path::new("python3"), &changed).is_empty());
 }
+
+#[test]
+fn rust_compilation_selects_nondefault_member_and_broadens_manifest_changes() {
+    let root = TempDir::new();
+    fs::write(root.0.join("Cargo.toml"), "[workspace]\nmembers = ['default', 'other']\ndefault-members = ['default']\nresolver = '2'\n").unwrap();
+    for name in ["default", "other"] {
+        fs::create_dir_all(root.0.join(name).join("src")).unwrap();
+        fs::write(
+            root.0.join(name).join("Cargo.toml"),
+            format!("[package]\nname = '{name}'\nversion = '0.1.0'\nedition = '2021'\n"),
+        )
+        .unwrap();
+        fs::write(root.0.join(name).join("src/lib.rs"), "pub fn valid() {}\n").unwrap();
+    }
+    let checks = plan(&root.0, Path::new("python3"), &["other/src/lib.rs".into()]);
+    assert_eq!(checks.len(), 1);
+    assert!(
+        checks[0]
+            .command
+            .contains("--manifest-path 'other/Cargo.toml'")
+    );
+    fs::write(
+        root.0.join("other/src/lib.rs"),
+        "compile_error!(\"nondefault member selected\");\n",
+    )
+    .unwrap();
+    let result = std::process::Command::new("cargo")
+        .args([
+            "check",
+            "--offline",
+            "--all-targets",
+            "--quiet",
+            "--manifest-path",
+            "other/Cargo.toml",
+        ])
+        .current_dir(&root.0)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("nondefault member selected"));
+    for changed in ["Cargo.toml", "other/Cargo.toml", "Cargo.lock"] {
+        let checks = plan(&root.0, Path::new("python3"), &[changed.into()]);
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].command.contains("--workspace"));
+    }
+}

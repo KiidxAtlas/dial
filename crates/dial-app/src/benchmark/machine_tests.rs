@@ -1,3 +1,36 @@
+#[test]
+fn policy_overrides_are_explicit_bounded_and_legacy_compatible() {
+    let old: MachineConfiguration = serde_json::from_value(json!({
+        "name":"old", "provider":"local", "model":"model", "context_window":8192
+    }))
+    .unwrap();
+    assert_eq!(old.policy, PolicyOverrides::default());
+    let valid: PolicyOverrides = serde_json::from_value(json!({
+        "strict_requirements":true, "review_enabled":true,
+        "review_min_changed_files":4, "review_sensitive_paths":["src/security", "Cargo.toml"],
+        "review_max_rounds":1
+    }))
+    .unwrap();
+    valid.validate().unwrap();
+    assert!(serde_json::from_value::<PolicyOverrides>(json!({"routing":"unsafe"})).is_err());
+    for value in [
+        json!({"review_min_changed_files":0}),
+        json!({"review_min_changed_files":1001}),
+        json!({"review_max_rounds":0}),
+        json!({"review_max_rounds":4}),
+        json!({"review_sensitive_paths":["../outside"]}),
+        json!({"review_sensitive_paths":["src/**"]}),
+        json!({"review_sensitive_paths":["/absolute"]}),
+    ] {
+        assert!(
+            serde_json::from_value::<PolicyOverrides>(value)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+}
+
 use super::*;
 use serde_json::json;
 
@@ -16,6 +49,8 @@ fn measured(name: &str, outcomes: &[bool], wall_time_ms: u64) -> MachineConfigur
         kv_group_size: None,
         quantized_kv_start: None,
         efficiency: Default::default(),
+        policy: Default::default(),
+        integration: Default::default(),
     };
     let cases = outcomes
         .iter()

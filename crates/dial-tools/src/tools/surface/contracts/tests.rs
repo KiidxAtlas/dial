@@ -214,3 +214,80 @@ fn edit_history_recorded_before_allow_syntax_errors_stays_valid() {
             .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
     }
 }
+
+// The controller owns this schema (dial-agent cannot be a dial-tools dependency). Keep the
+// predecessor literal so changes to existing fields cannot silently redefine compatibility.
+fn check_schema_before_repro() -> Value {
+    json!({"type":"function","function":{"name":"check","parameters":{
+        "type":"object",
+        "properties":{
+            "names":{"type":"array","maxItems":16,"items":{"type":"string"}},
+            "failed_only":{"type":"boolean"}
+        },
+        "additionalProperties":false
+    }}})
+}
+
+fn check_schema_with_repro() -> Value {
+    let mut schema = check_schema_before_repro();
+    schema["function"]["parameters"]["properties"]["repro"] = json!({
+        "type":"object",
+        "properties":{"name":{"type":"string"},"command":{"type":"string"}},
+        "required":["name","command"],
+        "additionalProperties":false
+    });
+    schema
+}
+
+#[test]
+fn check_history_before_repro_preserves_saved_calls_and_callback_catalogs() {
+    let registry = Registry::new();
+    let old = identities(&[check_schema_before_repro()], &registry)["check"].clone();
+    let histories = [
+        vec![
+            json!({"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"check","arguments":"{\"failed_only\":true}"}}],"dial_tool_contracts":{"call":old}}),
+            json!({"role":"tool","tool_call_id":"call","content":"recorded check result"}),
+        ],
+        vec![json!({"role":"assistant","dial_tool_contracts":{"callback:check":old}})],
+    ];
+    for history in histories {
+        let original = history.clone();
+        assert!(
+            project_history(&history, &[check_schema_with_repro()], &registry)
+                .unwrap()
+                .is_none(),
+            "compatible history needs no projection copy"
+        );
+        assert_eq!(history, original);
+    }
+}
+
+#[test]
+fn check_repro_compatibility_rejects_nonadditive_contract_changes() {
+    let registry = Registry::new();
+    let old = identities(&[check_schema_before_repro()], &registry)["check"].clone();
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"callback:check":old}})];
+    let current = check_schema_with_repro();
+    let mut changes = Vec::new();
+    let mut changed = current.clone();
+    changed["function"]["parameters"]["properties"]["names"]["items"]["type"] = json!("integer");
+    changes.push(changed);
+    let mut changed = current.clone();
+    changed["function"]["parameters"]["required"] = json!(["repro"]);
+    changes.push(changed);
+    let mut changed = current.clone();
+    changed["function"]["parameters"]["additionalProperties"] = json!(true);
+    changes.push(changed);
+    let mut changed = current.clone();
+    changed["function"]["strict"] = json!(true);
+    changes.push(changed);
+    let mut changed = current.clone();
+    changed["function"]["parameters"]["properties"]["another_option"] = json!({"type":"boolean"});
+    changes.push(changed);
+    for changed in changes {
+        assert!(validate_history(&history, &[changed], &registry).is_err());
+    }
+    let mut unknown_revision = history.clone();
+    unknown_revision[0]["dial_tool_contracts"]["callback:check"]["revision"] = json!(2);
+    assert!(validate_history(&unknown_revision, &[current], &registry).is_err());
+}

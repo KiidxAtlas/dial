@@ -39,3 +39,9 @@ toml.workspace = true
 tungstenite.workspace = true
 unicode-width.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+dial-agent = { workspace = true, features = ["test-support"] }
+dial-llm = { workspace = true, features = ["test-support"] }
+dial-storage = { workspace = true, features = ["test-support"] }
+dial-ui = { workspace = true, features = ["test-support"] }

@@ -4,6 +4,10 @@ use crate::config;
 use crate::agent::*;
 use crate::config::types::{LEAN_AUTO_MAX_WINDOW, LeanLocal};
 
+mod task_context;
+mod task_routing;
+pub(in crate::agent) use task_routing::ToolRouting;
+
 impl<'a> Agent<'a> {
     /// Local servers serve a context of their own choosing, often far below Dial's default: LM Studio
     /// loads on demand, llama.cpp splits `-c` across slots, Ollama defaults small and truncates silently.
@@ -197,32 +201,8 @@ impl<'a> Agent<'a> {
         "git",
         "web_fetch",
         "web_search",
+        "mcp_servers",
     ];
-
-    /// An MCP server with at most this many tools is offered up front.
-    const SMALL_MCP_SERVER_TOOLS: usize = 6;
-    /// Cap across all auto-offered MCP tools so many small servers cannot bloat every request.
-    const AUTO_MCP_TOOL_LIMIT: usize = 16;
-
-    /// Tools of MCP servers small enough to offer up front, whole servers only, in server-name
-    /// order, until the overall cap would be exceeded. Names look like `mcp__<server>__<tool>`.
-    fn small_mcp_tools(catalog: &[String]) -> Vec<String> {
-        let mut servers: std::collections::BTreeMap<&str, Vec<&String>> = Default::default();
-        for name in catalog {
-            if let Some((server, _)) = name.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
-                servers.entry(server).or_default().push(name);
-            }
-        }
-        let mut offered: Vec<String> = Vec::new();
-        for tools in servers.values() {
-            if tools.len() <= Self::SMALL_MCP_SERVER_TOOLS
-                && offered.len() + tools.len() <= Self::AUTO_MCP_TOOL_LIMIT
-            {
-                offered.extend(tools.iter().map(|name| (*name).clone()));
-            }
-        }
-        offered
-    }
 
     /// Tools actually offered: the harness selection, explicitly loaded tools and the essential
     /// integrations present in the catalog. The loaders are offered only while the catalog holds
@@ -293,11 +273,17 @@ impl<'a> Agent<'a> {
     pub(in crate::agent) fn offered_with(&self, selection_only: bool) -> Vec<String> {
         let catalog = self.catalog();
         let discovery = self.tool_discovery();
+        let request_tools = if selection_only {
+            &[][..]
+        } else {
+            &self.tool_routing.selected[..]
+        };
         let discovered = self.discovered_tools();
         let loaded: std::collections::HashSet<String> = self
             .enabled_tools
             .iter()
             .chain(discovered.iter())
+            .chain(request_tools.iter())
             .cloned()
             .collect();
         let pinned = self.config.harness.tools != config::tools::default_tools();
@@ -308,6 +294,7 @@ impl<'a> Agent<'a> {
             .iter()
             .chain(self.enabled_tools.iter())
             .chain(discovered.iter())
+            .chain(request_tools.iter())
             .filter(|n| catalog.contains(n))
             .cloned()
             .collect();
@@ -328,11 +315,6 @@ impl<'a> Agent<'a> {
                     .filter(|tool| catalog.iter().any(|name| name == *tool))
                     .map(|tool| (*tool).to_owned()),
             );
-        }
-        // Small MCP servers (a handful of tools) cost little schema and are otherwise invisible
-        // to a model that never thinks to load them; large ones stay loadable on demand.
-        if !(discovery || pinned || self.hermetic || minimal || selection_only) {
-            names.extend(Self::small_mcp_tools(&catalog));
         }
         // `task` and `skill` are offered whenever the harness selects them; explicit profile
         // allowlists still gate them through the profile tool filter.

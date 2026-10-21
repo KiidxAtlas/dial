@@ -1868,7 +1868,7 @@ pub(crate) fn hf_cache() -> Option<PathBuf> {
                 .map(|s| PathBuf::from(s).join("hub"))
         })
         .or_else(|| {
-            std::env::var_os("HOME").map(|s| PathBuf::from(s).join(".cache/huggingface/hub"))
+            crate::config::paths::home_dir().map(|home| home.join(".cache/huggingface/hub"))
         })
 }
 /// The `mlx_lm/models` directory of dial's Python environment (`dial setup` creates it under the user dir).
@@ -1902,7 +1902,7 @@ fn lora_support(architectures: Option<&Path>, model: &Path) -> Option<bool> {
 }
 /// LM Studio's download folder: its `downloadsFolder` setting, else `~/.lmstudio/models`.
 fn lmstudio_folder() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME").filter(|s| !s.is_empty())?);
+    let home = crate::config::paths::home_dir()?;
     let configured = read_json(&home.join(".lmstudio/settings.json")).and_then(|settings| {
         settings["downloadsFolder"]
             .as_str()

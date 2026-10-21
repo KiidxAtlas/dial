@@ -5,7 +5,14 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-10-21
+
 ### Added
+- Task-driven tool routing selects bounded native and MCP specialists from the request and dependency manifests already read, without requiring server names. Successful MCP discovery exposes relevant same-server consumers. Small MCP servers are no longer loaded wholesale; automatic additions share a six-tool/24 KiB budget and explicit unloads stay suppressed for the turn. Tool search also indexes parameter help and enum choices.
+- Verification causality: unchanged bounded nonbehavioral baseline failures remain disclosed without unrelated automatic repair; explicit runner metadata recognizes missing prerequisites conservatively. Rust compilation targets owning packages, including non-default workspace members, and broadens for shared manifest/lock changes.
+- Revision-checked `working_state` patches and addressable unverified claims; compaction carries exact designated critical state outside summaries. Worker handoffs pack priority fields and expose separate acceptance/blocker envelopes without changing custom-schema JSON results.
+- Opt-in strict declared-requirement settlement and selective bounded independent coach review, using existing approvals and evidence. Neither reviewer claims nor model-recorded state become verification proof.
+- Browser runtime provisioning can be disabled with `browser.allow_install = false` for cache-only execution and isolated integration evaluations.
 - Live local-model request settings in the status bar (`inference` in custom layouts), with deduplicated Model settings notices when controls change and full details in `/policy`. Server-controlled values are explicitly unknown rather than guessed.
 - Busy messages default to agent-selected routing: changes of approach steer the current task, while clearly independent requests start isolated background workers. Explicit after-turn queueing remains available.
 - The `browser` tool's `back`, `forward`, `reload` and `events` actions run in Dial's own Chromium driver. Previously they worked only inside an external Tern pane. `events` returns the tab's console, network, dialog, download and navigation events in `seq` order; pass `after` set to the returned `last_seq` to get only newer events. `evidence` also includes the tab's navigation history.
@@ -22,6 +29,8 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - Benchmarks: `reliability.py` reports unbiased per-task and mean `pass_at_k` and `pass_hat_k` (τ-bench pass^k) curves for k = 1..repetitions.
 - `grep` `output = "files"` lists matching files with match counts (paged by file) and `output = "count"` gives totals; capped line pages point to them. Sessions recorded before this addition still resume.
 - MLX: schema-constrained tool calls cover Qwen3-Coder's XML format (`<function=…><parameter=…>`): declared names and keys, required keys, string enums, and typed values checked as each parameter closes.
+- `check` `repro: {name, command}` registers a turn-scoped bug reproduction (at most 4), approved like `bash`; it earns behavioral credit only after it was seen failing before a change and passes at the final edits.
+- Dial-launched llama-server: when the installed build supports `--kv-unified`, `--kv-unified-per-slot` and `--no-cache-idle-slots`, it starts two slots over one shared pool (the full fitted window plus a side reserve, only if that fits memory), so side requests and workers no longer evict the main conversation's cache or halve its window. Older builds keep one slot.
 
 ### Changed
 - Small and lean local tiers: `edit` refuses a change that would add parser errors to a Rust, Python, TypeScript/TSX, JavaScript or Go file and writes nothing; reads stay valid for a corrected retry, and `allow_syntax_errors: true` overrides. The full tier keeps the advisory.
@@ -34,11 +43,14 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 - The Tern integration. Tern is not part of Dial. Removed: its browser-pane backend (`TERN_PANE_SOCKET`/`TERN_PANE`, `DIAL_BROWSER_TERN`), the `browser.tern` setting, the Tern-only `fork` browser action and the `tern` terminal id for notifications. Saved configuration that still sets `browser.tern` is migrated on load.
 
 ### Fixed
+- Windows startup resolves the user directory from `USERPROFILE` when `HOME` is missing; model discovery uses the same fallback. First-run setup follows panel navigation and connection tests instead of treating them as cancellation, and local-server setup explains rescanning and preserves real connection errors.
+- Remote model requests whose connection died while the model was silent (sleep/wake, a Wi-Fi or VPN switch, an expired NAT mapping) no longer wait out the full 300 s idle limit before retrying: TCP keepalive probes detect the dead path within about a minute. A real header timeout now reads "no response before the silence limit" instead of "timeout: receive response", and retry notices say how long the failed attempt ran.
 - Changing models on the welcome screen updates its model label and the status bar together as soon as the new configuration is adopted, without resetting recent-session navigation.
 - Local models that ship `do_sample: false` now request greedy decoding (temperature zero) instead of falling back to the harness temperature. Explicit sampling overrides retain precedence.
 - Local thinking now defaults to `assistance.local.thinking = "model"`, preserving model/server settings instead of automatically switching thinking by request phase. Phase-based switching remains an explicit opt-in.
 - A llama-server started without `--jinja` that rejects `tools` is now a fatal error naming the fix, instead of being retried as transient.
 - `codebase_memory refresh` drops index entries for deleted files even when a scan stops at a limit.
+- Dial-launched llama-server passes each option and its value as separate arguments; current llama.cpp rejects the `--host=127.0.0.1` form, so the launch failed.
 
 ## [0.1.13] - 2026-10-19
 

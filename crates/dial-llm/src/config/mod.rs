@@ -2061,6 +2061,61 @@ impl Config {
             "behavioral_checks must name unique configured verification commands"
         );
         ensure!(
+            self.verification.runners.len() <= 16,
+            "at most 16 verification runner declarations are allowed"
+        );
+        for (name, runner) in &self.verification.runners {
+            ensure!(
+                self.verification
+                    .commands
+                    .iter()
+                    .filter(|check| &check.name == name)
+                    .count()
+                    == 1,
+                "verification runner must name one unique configured command"
+            );
+            ensure!(
+                !runner.program.is_empty()
+                    && runner.program.len() <= 1024
+                    && !runner
+                        .program
+                        .chars()
+                        .any(|c| c.is_control() || c.is_whitespace())
+                    && runner
+                        .module
+                        .as_ref()
+                        .is_none_or(|module| !module.is_empty()
+                            && module.len() <= 256
+                            && module
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))),
+                "verification runner needs an executable path/name and optional dotted module name"
+            );
+        }
+        let review = &self.verification.review;
+        ensure!(
+            (1..=1000).contains(&review.min_changed_files) && (1..=3).contains(&review.max_rounds),
+            "verification.review requires min_changed_files=1..1000 and max_rounds=1..3"
+        );
+        ensure!(
+            review.sensitive_paths.len() <= 32
+                && review.sensitive_paths.iter().all(|path| {
+                    !path.is_empty()
+                        && path.len() <= 256
+                        && !path.starts_with('/')
+                        && !path.contains('\\')
+                        && !path.chars().any(char::is_control)
+                        && path
+                            .split('/')
+                            .all(|part| !part.is_empty() && part != "." && part != "..")
+                }),
+            "verification.review.sensitive_paths must be bounded workspace-relative path prefixes"
+        );
+        ensure!(
+            !self.verification.strict_requirements || self.verification.enabled,
+            "strict requirement settlement requires verification.enabled"
+        );
+        ensure!(
             self.verification.requirements.len() <= 50,
             "at most 50 verification requirements are allowed"
         );

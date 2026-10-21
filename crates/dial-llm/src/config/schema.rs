@@ -920,6 +920,10 @@ static REGISTRY: &[SettingDef] = &[
     tools::DECLARATIONS[39],
     tools::DECLARATIONS[40],
     tools::DECLARATIONS[41],
+    tools::DECLARATIONS[42],
+    tools::DECLARATIONS[43],
+    tools::DECLARATIONS[44],
+    tools::DECLARATIONS[45],
 ];
 const _: () = assert!(
     REGISTRY.len()

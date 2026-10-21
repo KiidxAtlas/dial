@@ -16,6 +16,8 @@
 //! ordering: each works in its own directory and merges back under the workspace's serial lock with
 //! per-file conflict checks. Approval prompts from concurrent children are funnelled
 //! to the calling thread, the only one that owns the [`Ui`].
+mod handoff;
+
 use crate::config::subagents::AGENTS;
 use crate::config::subagents::AgentSpec;
 use crate::config::subagents::builtin;
@@ -371,13 +373,13 @@ impl Handoff {
         Self {
             current_instruction: control["current_instruction"]
                 .as_str()
-                .map(|text| prompt::truncate_chars(text, MAX_HANDOFF_GOAL)),
+                .map(|text| bounded_instruction(text, MAX_HANDOFF_GOAL)),
             goal: control["original_goal"]
                 .as_str()
-                .map(|goal| prompt::truncate_chars(goal, MAX_HANDOFF_GOAL)),
+                .map(|goal| bounded_instruction(goal, MAX_HANDOFF_GOAL)),
             todos,
             working_state: (!state.is_null())
-                .then(|| prompt::truncate_chars(&state.to_string(), MAX_HANDOFF_STATE)),
+                .then(|| handoff::pack_state(state, MAX_HANDOFF_STATE)),
         }
     }
 
@@ -389,6 +391,40 @@ impl Handoff {
             }
         }
     }
+}
+
+fn bounded_instruction(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_owned();
+    }
+    format!(
+        "{}\n[CRITICAL HANDOFF OVERFLOW: current request exceeds snapshot budget; ask parent for complete request before acting on omitted constraints.]",
+        clip(text, budget)
+    )
+}
+
+pub(in crate::agent) fn result_projection(
+    report: &str,
+    payload: Option<&Value>,
+    acceptance: &[String],
+) -> Value {
+    handoff::project(report, payload, acceptance)
+}
+
+/// A complete report must never be advertised through a silently elided artifact.
+pub(in crate::agent) fn retain_report(
+    store: &crate::storage::artifact::ArtifactStore,
+    data: &Value,
+) -> anyhow::Result<String> {
+    use std::io::Write;
+    let mut spool = store.spool()?;
+    serde_json::to_writer_pretty(&mut spool, data)?;
+    spool.flush()?;
+    anyhow::ensure!(
+        spool.elided_bytes() == 0,
+        "complete task report exceeds artifact retention limit"
+    );
+    spool.finish()
 }
 
 /// One validated unit of work.
@@ -602,9 +638,14 @@ impl Job<'_> {
                 packet.scope, packet.interface
             ));
             for (index, condition) in packet.acceptance.iter().enumerate() {
-                out.push_str(&format!("{}. {}\n", index + 1, condition));
+                out.push_str(&format!("acceptance_{}: {}\n", index + 1, condition));
             }
             out.push_str("Keep changes within the scope unless a necessary dependency forces a deviation; explain any deviation. In your final handoff, report each acceptance condition as met, unmet, or not verified, with concrete evidence. Never claim a check or interface contract passed unless you actually verified it.\n");
+            if self.schema.is_none() {
+                out.push_str("Prefer a JSON report with summary, blockers, acceptance keyed by acceptance_N (each with status met|unmet|not_verified), evidence_refs, changed_paths, and integration_risks. Report statuses as claims with evidence, not execution lifecycle. Missing statuses are not_verified.\n");
+            } else {
+                out.push_str("The output_schema remains authoritative for the final answer; do not add fields it forbids. Acceptance coverage absent from that payload remains not_verified in the parent projection.\n");
+            }
         }
         if tools.iter().any(|name| name == "codebase_memory") {
             out.push_str("Use saved codebase context to locate the affected area without rediscovering the whole repository. Reuse current source evidence; inspect only missing or stale context. Save reusable architectural findings as facts with codebase_memory remember and supporting source paths; update findings whose sources changed.\n");
@@ -2695,6 +2736,10 @@ fn run_serial(
     }
 }
 
+pub(in crate::agent) fn structured_result_note(output: &ToolOutput) -> Option<Value> {
+    handoff::structured_note(output)
+}
+
 /// A lone `prompt` returns just the answer; a batch returns one labelled section per task, in input order.
 fn render(
     request: &Request,
@@ -2710,6 +2755,7 @@ fn render(
         let status = outcome.status.wire();
         let text = outcome.status.text.as_str();
         let mut result = json!({"name":job.label,"agent":job.kind,"status":status,"steps":outcome.steps,"result":outcome.data.clone().unwrap_or_else(|| json!(text))});
+        result["projection"] = result_projection(text, outcome.data.as_ref(), job.work_packet.as_ref().map(|p| p.acceptance.as_slice()).unwrap_or_default());
         result["role"] = json!(job.role);
         result["model"] = json!(models.get(&job.index));
         if let Some(route) = &outcome.model_route {
@@ -2723,17 +2769,7 @@ fn render(
     }).collect::<Vec<_>>()});
     // Retain the complete typed report before any presentation clipping, as live tasks do.
     // Without storage (or on failure), keep the full typed outcome rather than lose evidence.
-    let artifact = artifacts.map(|store| -> anyhow::Result<String> {
-        use std::io::Write;
-        let mut spool = store.spool()?;
-        serde_json::to_writer_pretty(&mut spool, &data)?;
-        spool.flush()?;
-        anyhow::ensure!(
-            spool.elided_bytes() == 0,
-            "complete task report exceeds artifact retention limit"
-        );
-        spool.finish()
-    });
+    let artifact = artifacts.map(|store| retain_report(store, &data));
     match &artifact {
         Some(Ok(uri)) => {
             data["artifact"] = json!(uri);
@@ -2760,6 +2796,8 @@ fn render(
         let text = &outcome.status.text;
         let mut answer = if outcome.status.phase == crate::runtime::Phase::Completed {
             if job.schema.is_some() {
+                // The legacy synchronous output-schema contract includes the exact JSON text.
+                // The separate typed projection above must not wrap or mutate that value.
                 return Ok(text.clone());
             }
             if text.trim().is_empty() {

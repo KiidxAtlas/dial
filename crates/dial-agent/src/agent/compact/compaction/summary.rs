@@ -88,6 +88,11 @@ fn previous_summary(message: &Value) -> Option<(&str, FileOps)> {
     let text = text
         .split_once(EVIDENCE_NOTES_MARKER)
         .map_or(text, |(summary, _)| summary);
+    // Current notes no longer duplicate goals/state/todos from the exact machine carry.
+    // Keep the old marker above for historical summaries.
+    let text = text
+        .split_once("\n\nRetained evidence (read and mutation results): ")
+        .map_or(text, |(summary, _)| summary);
     Some(FileOps::take_from(text))
 }
 
@@ -98,6 +103,7 @@ fn is_turn_start(message: &Value) -> bool {
         && [
             "dial_reminder",
             "dial_exploration_reminder",
+            "dial_compaction_critical",
             "dial_generated_user",
             "dial_compaction_summary",
             "dial_compaction_notes",

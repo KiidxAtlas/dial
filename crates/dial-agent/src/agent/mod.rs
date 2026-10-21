@@ -152,6 +152,9 @@ struct StepChecks {
     checked_shell_commands: u64,
     checked_extension_calls: u64,
     uncheckpointed_extension_tools: std::collections::BTreeSet<String>,
+    /// Potentially mutating reproduction attempts. They stale evidence like any shell effect,
+    /// but cannot themselves count as the intervening change that fixes a reproduction.
+    repro_shell_commands: u64,
     /// Exact configured checks whose most recent run failed; retain them across new edits.
     failed_checks: Vec<verify::verification::FocusedCheck>,
     failed: bool,
@@ -164,6 +167,17 @@ impl StepChecks {
             self.uncheckpointed_shell_commands,
             self.uncheckpointed_extension_calls,
         ]
+    }
+    fn fix_revision(&self) -> verify::evidence::Revision {
+        let mut revision = self.revision();
+        revision[1] -= self.repro_shell_commands;
+        revision
+    }
+    /// A model-written reproduction may have effects a checkpoint does not observe.
+    fn note_repro_run(&mut self) {
+        self.repro_shell_commands += 1;
+        self.uncheckpointed_shell_commands += 1;
+        self.disclosed_shell_commands += 1;
     }
     fn clean(&self) -> bool {
         self.checks_current() && !self.uncheckpointed_pending()
@@ -317,6 +331,8 @@ pub struct Agent<'a> {
     reported_messages: usize,
     step_probe: Option<crate::learn::probe::StepProbe>,
     enabled_tools: HashSet<String>,
+    /// Task-scoped specialist selection; never durable pins or execution authority.
+    tool_routing: run::tool_exposure::ToolRouting,
     lean_tools: bool,
     /// `[assistance.local]` escalation reached this session (see `local_profile`).
     local_escalation: model::local_profile::Escalation,

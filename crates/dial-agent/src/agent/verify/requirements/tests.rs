@@ -110,3 +110,32 @@ fn absent_or_invalid_contract_never_claims_coverage() {
         "invalid_contract"
     );
 }
+
+#[test]
+fn strict_settlement_is_opt_in_and_rejects_missing_stale_and_unavailable_evidence() {
+    let mut config = contract();
+    let mut ledger = Ledger::default();
+    let visual = Review::default();
+    let revision = [1, 0, 0];
+    assert!(strict_blocker(&config, &ledger, revision, &visual).is_none());
+    config.strict_requirements = true;
+    assert!(
+        strict_blocker(&config, &ledger, revision, &visual)
+            .unwrap()
+            .contains("input-contract")
+    );
+    ledger.observe("run-boundaries", "a", CheckStatus::Passed, revision, true);
+    ledger.observe(
+        "run-errors",
+        "b",
+        CheckStatus::EnvironmentUnavailable,
+        revision,
+        true,
+    );
+    assert!(strict_blocker(&config, &ledger, revision, &visual).is_some());
+    ledger.observe("run-errors", "c", CheckStatus::Passed, revision, true);
+    assert!(strict_blocker(&config, &ledger, revision, &visual).is_none());
+    assert!(strict_blocker(&config, &ledger, [2, 0, 0], &visual).is_some());
+    config.requirements.clear();
+    assert!(strict_blocker(&config, &ledger, revision, &visual).is_none());
+}

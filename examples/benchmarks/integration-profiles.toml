@@ -1,0 +1,21 @@
+# TEMPLATE: replace the explicit provider/model with an already configured model.
+# Run each integration suite with its corresponding configuration, not all lanes mixed together.
+[machine]
+repetitions = 1
+minimum_correctness = 1.0
+allow_remote = false
+case_timeout_secs = 180
+
+[[configurations]]
+name = "delegation"
+provider = "local"
+model = "operator-model"
+context_window = 32768
+
+[configurations.integration]
+mode = "delegation"
+
+# For integration-browser.toml use mode = "browser" instead.
+# For integration-mcp.toml use mode = "mcp" and mcp_servers = ["fixture"].
+# Browser requires an already cached pinned runtime and external installed Chromium.
+# MCP configuration is retained only for exact named, enabled operator servers.

@@ -971,8 +971,16 @@ fn transport_error(error: ureq::Error, url: &str, auth: Option<&str>) -> anyhow:
         ureq::Error::ConnectionFailed | ureq::Error::HostNotFound | ureq::Error::Timeout(_) => true,
         _ => false,
     };
+    let cause = match &error {
+        // ureq names only the phase ("timeout: receive response"), which reads like a client fault.
+        ureq::Error::Timeout(ureq::Timeout::RecvResponse) => {
+            "no response before the silence limit (the server may be overloaded or the connection was lost)"
+                .to_owned()
+        }
+        error => error.to_string(),
+    };
     let message = redact(
-        &format!("chat request to {} failed: {error}", display_url(url)),
+        &format!("chat request to {} failed: {cause}", display_url(url)),
         auth,
     );
     anyhow::Error::new(TransportError {

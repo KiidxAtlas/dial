@@ -1,0 +1,11 @@
+<!doctype html>
+<title>Checkout fixture</title>
+<label>Quantity <input id="quantity" value="3" type="number"></label>
+<button id="calculate">Calculate</button>
+<output id="total"></output>
+<script type="module">
+import {total} from './price.mjs';
+document.querySelector('#calculate').onclick = () => {
+  document.querySelector('#total').textContent = String(total(14, Number(document.querySelector('#quantity').value)));
+};
+</script>

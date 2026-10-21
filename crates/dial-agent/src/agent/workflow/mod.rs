@@ -12,3 +12,4 @@ pub(in crate::agent) mod recovery_checkpoint;
 pub mod solve;
 pub mod todo;
 pub(in crate::agent) mod todo_recovery;
+pub(in crate::agent) mod working_state;

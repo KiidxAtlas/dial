@@ -1,0 +1,4 @@
+[workspace]
+members = ["housekeeping", "pricing", "checkout"]
+default-members = ["housekeeping"]
+resolver = "2"

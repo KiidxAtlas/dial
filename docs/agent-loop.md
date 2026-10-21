@@ -12,6 +12,8 @@ Background worker findings arrive once in the parent's next request with status,
 
 Session history is append-only; tree navigation selects an abandoned branch without deleting it, and branch summaries are optional context for navigation.
 
+Task-tool routing is local, deterministic and turn-scoped. The first request selects native specialists by workflow intent and MCP tools by indexed capabilities/domain relevance. Successful manifest reads can add dependency-domain signals from the existing result (currently complete single-target `package.json` only). Successful MCP discovery can expose matching same-server consumers for the following model request. Both serial and parallel results feed the same observer. Selection never executes tools or changes permissions; pinned harnesses, lean context profiles, child allowlists and ordinary approval policy remain authoritative. Automatic additions are monotonic within the turn, capped at six tools and 24 KiB of schemas; explicit unloads suppress reactivation until the next external request. Selection introduces no extra inference or project reads.
+
 Duplicate recovery withholds only the exact repeated call, including reads. Different ranges and files remain available, changed source identities clear the affected restriction, and new user steering resets the turn's recovery state. A withheld call is reported explicitly as unexecuted; its cached observation still contributes to the shared repetition bound rather than being misclassified as a new execution failure.
 
 Busy input defaults to **Let Dial decide**: at the next safe request boundary, a bounded auxiliary model request classifies the exact user message as steering or independent work. Changes of approach, corrections, dependent or overlapping work, and ambiguity steer the current task through its existing steering journal. Clearly independent requests start a background worker in an isolated project copy using the existing task authorization, spawn hooks, concurrency limits and result delivery. Splitting leaves the parent's current instruction and completed inference intact. Worker findings are not new user instructions; any copy integration follows the existing worker workflow. Routing failures, invalid decisions, disabled workers or failed admission visibly fall back to steering; cancellation restores unhandled input in order. **Queue after this turn** remains an explicit opt-out. Automatic input does not cancel in-flight inference or tools while awaiting a decision, so a long operation can delay routing. No classifier is run when there is no pending input.
@@ -93,6 +95,8 @@ Dial to use source changes; existing custom/admitted operator guidance is not ov
 ## Focused verification, completion and tool output
 
 After edits, dial derives focused Rust and Python syntax checks from checkpointed changed paths.
+Rust source checks select the owning package manifest, including non-default workspace members;
+manifest, lockfile and shared-root changes intentionally broaden to workspace compilation.
 Python checks find the nearest owning Python metadata/environment boundary within the workspace,
 including nested projects, and run source paths and related tests relative to that root.
 `uv.lock` selects `uv run --offline --no-sync python`; an existing `.venv/bin/python` or Poetry
@@ -116,8 +120,27 @@ Behavioral outcome credit uses the latest controller-observed result for each co
 effect revision (native edits, opaque shell attempts, and extension effects). A failing pre-edit
 baseline is preserved separately and can become a passing repair; it does not permanently poison
 credit. Conversely, a pass before a later effect is stale and cannot earn final-revision credit.
+Bounded exact diagnostic fingerprints distinguish an unchanged nonbehavioral baseline failure
+from new diagnostics. Unchanged unrelated failures stay disclosed but do not request automatic
+scope expansion; changed/absent/oversized fingerprints remain conservative. Declared behavioral
+checks and registered reproductions remain actionable. Configured runner declarations and opt-in
+strict outcome settlement/selective review are described in [requirement-verification.md](requirement-verification.md).
 Recognized manually executed checks are bound after their own call settles. Cancelled, unavailable,
 zero-test, or incomplete-process results never supply passing credit.
+`check` `repro` registers a model-written reproduction (name plus shell command, at most four per
+turn, same name replaces and clears its history) and runs it at once. It is selected by the
+completion gate like any focused check and is lost at turn end. Its command is untrusted model
+text: it runs through the same approval path as a model `bash` call (Ask prompts, Write prompts for
+destructive forms, Readonly and deny rules refuse, `pre_tool_use` hooks may block, never run with
+hook-rewritten text) and with the bash default deadline. Each run is a disclosed opaque shell effect
+and is kept out of the evidence revision, so rerunning a reproduction neither stales other evidence
+nor stands in for a fix. A reproduction earns one behavioral credit only when a controller-run
+`code_failed` result was observed at an earlier effect revision and it passes at the final one.
+One that never failed (or failed only through a model `bash` call, an unavailable environment, or a
+denial) is reported `not_shown_to_reproduce` and earns no behavioral credit, though its pass still
+counts as an ordinary current passing check. A pass with no effect since the failure earns nothing.
+A failing or stale reproduction withholds all behavioral credit, as a failing configured behavioral
+check does. Completion evidence lists each reproduction's state under `checks.reproductions`.
 Executable repair records use that same classified, typed execution evidence, not printed exit
 markers. Unverified runs invalidate a matching failure baseline rather than pairing an old failure
 with a later pass. Related-test planning reuses JS package/runner metadata and Go directory scans

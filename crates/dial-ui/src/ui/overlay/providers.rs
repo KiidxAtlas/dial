@@ -217,16 +217,12 @@ fn is_loopback(base_url: &str) -> bool {
     })
 }
 
-/// Whether an unavailable row is an expected absence, not a failure: a configured local server
-/// that refused the connection is "not running", and so is a row Dial has not configured.
-/// Auth failures, HTTP errors and malformed replies from a configured provider stay red.
+/// A local server that refused the connection is an expected absence, not a failure.
+/// Auth failures, HTTP errors and malformed replies stay red, including built-in providers.
 fn expected_absent(entry: &Entry) -> bool {
-    if entry.state != "unavailable" {
-        return false;
-    }
-    entry.spec.is_none()
-        || (entry.detail == UNREACHABLE_DETAIL
-            && entry.base_url.as_deref().is_some_and(is_loopback))
+    entry.state == "unavailable"
+        && entry.detail == UNREACHABLE_DETAIL
+        && entry.base_url.as_deref().is_some_and(is_loopback)
 }
 
 /// Where a provider's API key comes from: the saved key in credentials.json and/or an

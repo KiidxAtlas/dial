@@ -1,0 +1,17 @@
+version = 1
+name = "integration-delegation-v1"
+
+[[cases]]
+id = "worker-contract-invoice-repair"
+project = "examples/benchmarks/quality-fixture"
+prompt = "Fix invoice_total to multiply prices by quantities, preserving empty input and zero quantities. First delegate a read-only code-location/boundary review to a builtin scout using task with a work_packet: scoped files billing.py and test_billing.py; acceptance items identify production owner and propose quantity/empty/zero boundary checks; do not allow child writes. Inspect its structured evidence/handoff rather than treating a worker's completed status as verification. Then implement the focused repair yourself and run independent behavior checks. Do not change archived implementations or unrelated discounts. No external worker model presets or model roles may be selected."
+categories = ["integration", "delegation", "worker_contract", "verification"]
+checks = [
+ {kind="tool_invoked",tool="task"},
+ {kind="command",command='''python3 -B - <<'PY'
+from billing import invoice_total
+assert invoice_total([])==0
+assert invoice_total([{'price':125,'quantity':3}])==375
+assert invoice_total([{'price':99,'quantity':0},{'price':7,'quantity':2}])==14
+PY'''},
+]
