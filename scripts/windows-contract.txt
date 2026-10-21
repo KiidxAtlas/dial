@@ -24,6 +24,7 @@ test config::paths::tests::
 test app::tests::onboarding_
 test ui::overlay::models::tests::empty_catalog_can_rescan
 test ui::overlay::providers::tests::a_local_server_that_is_not_running
+test llm::cancel::tcp::tests::
 
 # Process-group deadlines and pipe handling are exercised with POSIX `/bin/sh` fixtures. Windows
 # needs its own job-object fixtures before these run here.
