@@ -163,6 +163,70 @@ fn first_esc_during_sign_in_warns_and_the_next_gives_up() {
 }
 
 #[test]
+fn onboarding_navigation_and_connection_tests_are_not_cancellations() {
+    use crate::app::drive::{OnboardingFlow, onboarding_flow};
+    use crate::app::overlay::OverlayOutcome;
+
+    for (action, expected) in [
+        ("open:models", "models"),
+        ("open:providers", "providers"),
+        ("open:model-settings", "settings"),
+    ] {
+        let outcome = OverlayOutcome {
+            next: Some(action.into()),
+            ..Default::default()
+        };
+        let OnboardingFlow::Navigate(which) = onboarding_flow(&outcome) else {
+            panic!("{action} must navigate, not exit setup");
+        };
+        assert!(matches!(
+            (expected, which),
+            ("models", Which::Models)
+                | ("providers", Which::Providers)
+                | ("settings", Which::ModelSettings)
+        ));
+    }
+    let test = OverlayOutcome {
+        next: Some("test:lm-studio".into()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        onboarding_flow(&test),
+        OnboardingFlow::TestConnection(id) if id == "lm-studio"
+    ));
+    assert!(matches!(
+        onboarding_flow(&OverlayOutcome::default()),
+        OnboardingFlow::Cancel
+    ));
+    let unsupported = OverlayOutcome {
+        next: Some("command:help".into()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        onboarding_flow(&unsupported),
+        OnboardingFlow::Unsupported(_)
+    ));
+}
+
+#[test]
+fn onboarding_applies_navigation_even_after_settings_were_saved() {
+    use crate::app::drive::{OnboardingFlow, onboarding_flow};
+    use crate::app::overlay::OverlayOutcome;
+
+    let (_home, _project, _layout, config) = config();
+    let mut outcome = OverlayOutcome {
+        latest: Some(config),
+        ..Default::default()
+    };
+    assert!(matches!(onboarding_flow(&outcome), OnboardingFlow::Saved));
+    outcome.next = Some("open:models".into());
+    assert!(matches!(
+        onboarding_flow(&outcome),
+        OnboardingFlow::Navigate(Which::Models)
+    ));
+}
+
+#[test]
 fn memory_status_names_the_backend_and_the_next_step_in_plain_words() {
     let value = json!({
         "backend": "hindsight",

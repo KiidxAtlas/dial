@@ -82,6 +82,11 @@ pub(super) fn terminal_dark(value: Option<&str>) -> Option<bool> {
 }
 
 pub(super) fn app_home_hint() -> String {
+    if cfg!(windows) {
+        return crate::config::paths::user_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "set DIAL_HOME".into());
+    }
     std::env::var("DIAL_HOME")
         .ok()
         .filter(|v| !v.is_empty())

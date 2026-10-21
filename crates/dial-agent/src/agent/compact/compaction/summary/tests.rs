@@ -247,3 +247,14 @@ fn split_turn_is_detected_only_when_the_cut_lands_inside_a_turn() {
     assert!(!is_turn_start(&reminder));
     assert!(!is_turn_start(&Session::compaction_message("old")));
 }
+
+#[test]
+fn machine_carry_is_not_a_new_user_turn_and_current_notes_do_not_reenter_summary() {
+    assert!(!is_turn_start(
+        &json!({"role":"user", "content":"exact carry", "dial_compaction_critical":true})
+    ));
+    let summary = Session::compaction_message(
+        "model summary\n\nRetained evidence (read and mutation results): artifact://old\nexact state is separate",
+    );
+    assert_eq!(previous_summary(&summary).unwrap().0, "model summary");
+}

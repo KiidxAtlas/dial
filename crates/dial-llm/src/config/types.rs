@@ -821,6 +821,12 @@ pub struct VerificationConfig {
     pub python_command: Vec<String>,
     /// Optional operator-declared requirement -> evidence contract. Check names refer to commands.
     pub requirements: BTreeMap<String, VerificationRequirement>,
+    /// Refuse completion while operator-declared requirement evidence is missing or stale.
+    pub strict_requirements: bool,
+    /// Optional runner identity for configured checks; never an installation or execution grant.
+    pub runners: BTreeMap<String, VerificationRunner>,
+    /// Opt-in, bounded independent review of substantial or explicitly sensitive changes.
+    pub review: IndependentReviewConfig,
 }
 
 impl Default for VerificationConfig {
@@ -833,6 +839,38 @@ impl Default for VerificationConfig {
             behavioral_checks: Vec::new(),
             python_command: Vec::new(),
             requirements: BTreeMap::new(),
+            strict_requirements: false,
+            runners: BTreeMap::new(),
+            review: IndependentReviewConfig::default(),
+        }
+    }
+}
+
+/// The selected executable/module, not arbitrary programs imported by application code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerificationRunner {
+    pub program: String,
+    pub module: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndependentReviewConfig {
+    pub enabled: bool,
+    pub min_changed_files: usize,
+    /// Workspace-relative file or directory prefixes. Empty means only the file-count threshold.
+    pub sensitive_paths: Vec<String>,
+    pub max_rounds: u8,
+}
+
+impl Default for IndependentReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_changed_files: 4,
+            sensitive_paths: Vec::new(),
+            max_rounds: 1,
         }
     }
 }
@@ -1481,14 +1519,10 @@ impl Default for Config {
     }
 }
 
-/// Dial's user directory when no config is loaded: `DIAL_HOME`, else `$HOME/.dial`. Empty only when
-/// neither is set, so a relative `user_dir` never resolves against the current directory.
+/// Dial's user directory when no config is loaded, using the same resolution as Layout.
+/// Empty only when no home is available, never an implicit relative `.dial` directory.
 pub fn default_user_dir() -> PathBuf {
-    match std::env::var_os("DIAL_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => std::env::var_os("HOME")
-            .map_or_else(PathBuf::new, |home| PathBuf::from(home).join(".dial")),
-    }
+    config::paths::user_dir().unwrap_or_default()
 }
 
 /// Default silence limit for remote model streams (Anthropic, ChatGPT, OpenAI-compatible hosts).

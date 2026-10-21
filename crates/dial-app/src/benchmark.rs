@@ -1,4 +1,6 @@
 //! Reproducible, local benchmark suite parsing, workspace isolation, and scoring.
+#[cfg(test)]
+mod integration_tests;
 pub mod records;
 pub mod runtime;
 use crate::config::types::LeanLocal;
@@ -95,6 +97,10 @@ pub enum Assertion {
         min: Option<u64>,
         #[serde(default)]
         max: Option<u64>,
+    },
+    /// Integration-path coverage, not an independent task outcome or tool-count objective.
+    ToolInvoked {
+        tool: String,
     },
 }
 
@@ -237,6 +243,16 @@ impl std::fmt::Display for AgentFailure {
 }
 
 impl std::error::Error for AgentFailure {}
+
+/// An unmet runtime prerequisite, not a failed coding outcome or simulated integration.
+#[derive(Debug, Clone)]
+pub struct AgentUnavailable(pub String);
+impl std::fmt::Display for AgentUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for AgentUnavailable {}
 
 fn floor_boundary(text: &str, mut index: usize) -> usize {
     index = index.min(text.len());
@@ -504,6 +520,12 @@ pub struct MachineConfiguration {
     /// Context-economy overrides (`efficiency.*`, `compaction.*`); unset keeps the configured value.
     #[serde(default)]
     pub efficiency: EfficiencyOverrides,
+    /// Outcome-contract and selective review levers; never changes the operator config.
+    #[serde(default)]
+    pub policy: PolicyOverrides,
+    /// Real service/delegation lane. Core isolation remains the default.
+    #[serde(default)]
+    pub integration: IntegrationOverrides,
 }
 
 /// Per-configuration assistance feature switches for ablation. `None` keeps the configured value.
@@ -571,6 +593,97 @@ impl EfficiencyOverrides {
                 cap == 0 || (8192..=2_000_000).contains(&cap),
                 "configuration efficiency.history_token_cap must be 0 or 8192..=2000000"
             );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationMode {
+    #[default]
+    Core,
+    Mcp,
+    Browser,
+    Delegation,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct IntegrationOverrides {
+    pub mode: IntegrationMode,
+    /// Exact operator-configured server names, never programs, URLs or credentials.
+    pub mcp_servers: Vec<String>,
+}
+
+impl IntegrationOverrides {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.mcp_servers.len() <= 16,
+            "integration MCP allowlist exceeds 16 servers"
+        );
+        ensure!(
+            self.mode == IntegrationMode::Mcp || self.mcp_servers.is_empty(),
+            "integration.mcp_servers is only valid in mcp mode"
+        );
+        ensure!(
+            self.mode != IntegrationMode::Mcp || !self.mcp_servers.is_empty(),
+            "mcp mode requires an exact server allowlist"
+        );
+        let mut names = std::collections::BTreeSet::new();
+        ensure!(
+            self.mcp_servers.iter().all(|name| !name.is_empty()
+                && name.len() <= 128
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                && names.insert(name)),
+            "invalid or duplicate integration MCP server name"
+        );
+        Ok(())
+    }
+}
+
+/// Explicit one-factor experiments, not learned routing or automatic default changes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyOverrides {
+    pub strict_requirements: Option<bool>,
+    pub review_enabled: Option<bool>,
+    pub review_min_changed_files: Option<usize>,
+    pub review_sensitive_paths: Option<Vec<String>>,
+    pub review_max_rounds: Option<u8>,
+}
+
+impl PolicyOverrides {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.review_min_changed_files
+                .is_none_or(|n| (1..=1000).contains(&n)),
+            "policy.review_min_changed_files must be 1..=1000"
+        );
+        ensure!(
+            self.review_max_rounds.is_none_or(|n| (1..=3).contains(&n)),
+            "policy.review_max_rounds must be 1..=3"
+        );
+        if let Some(paths) = &self.review_sensitive_paths {
+            ensure!(
+                paths.len() <= 32,
+                "policy.review_sensitive_paths exceeds 32 paths"
+            );
+            for path in paths {
+                ensure!(
+                    !path.is_empty()
+                        && path.len() <= 256
+                        && !path
+                            .chars()
+                            .any(|c| c.is_control() || matches!(c, '\\' | '*' | '?' | '[' | ']'))
+                        && !path.contains(':')
+                        && path.split('/').all(|part| !matches!(part, "" | "." | "..")),
+                    "policy.review_sensitive_paths requires workspace-relative prefixes"
+                );
+                validate_relative(Path::new(path))?;
+            }
         }
         Ok(())
     }
@@ -653,6 +766,8 @@ impl MachineBenchmarkPolicy {
             );
             configuration.assistance.validate()?;
             configuration.efficiency.validate()?;
+            configuration.policy.validate()?;
+            configuration.integration.validate()?;
         }
         Ok(())
     }
@@ -886,6 +1001,12 @@ impl BenchmarkSuite {
                         !command.trim().is_empty(),
                         "command assertion cannot be empty"
                     ),
+                    Assertion::ToolInvoked { tool } => ensure!(
+                        !tool.is_empty()
+                            && tool.len() <= 256
+                            && !tool.chars().any(char::is_control),
+                        "tool_invoked needs an exact nonempty tool name"
+                    ),
                     Assertion::Metric { min, max, .. } => {
                         ensure!(
                             min.is_some() || max.is_some(),
@@ -952,8 +1073,19 @@ impl BenchmarkSuite {
             };
             let workspace = clone_project(&source)?;
             let started = Instant::now();
+            let mut agent_unavailable = false;
             let (mut metrics, agent_error_detail) = match agent(case, workspace.path()) {
                 Ok(metrics) => (metrics, None),
+                Err(error) if error.is::<AgentUnavailable>() => {
+                    agent_unavailable = true;
+                    (
+                        RunMetrics {
+                            agent_error: true,
+                            ..RunMetrics::default()
+                        },
+                        Some(failure_detail(&error.to_string(), "")),
+                    )
+                }
                 Err(error) => match error.downcast::<AgentFailure>() {
                     Ok(failure) => (
                         RunMetrics {
@@ -979,6 +1111,11 @@ impl BenchmarkSuite {
             let mut failed_check_indices = Vec::new();
             let mut unavailable_check_indices = Vec::new();
             for (index, assertion) in case.checks.iter().enumerate() {
+                if agent_unavailable {
+                    unavailable_check_indices.push(index);
+                    failed_check_indices.push(index);
+                    continue;
+                }
                 let passed = match assertion {
                     Assertion::FileExists { path } => {
                         confined_existing(workspace.path(), path).is_ok_and(|path| path.is_file())
@@ -1017,6 +1154,20 @@ impl BenchmarkSuite {
                         let value = metrics.observed(*metric);
                         min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
                     }
+                    Assertion::ToolInvoked { tool } => {
+                        let invoked = metrics.tool_trace.as_ref().is_some_and(|trace| {
+                            trace.invoked.get(tool).is_some_and(|count| *count > 0)
+                        });
+                        if !invoked
+                            && metrics
+                                .tool_trace
+                                .as_ref()
+                                .is_none_or(|trace| !trace.complete)
+                        {
+                            unavailable_check_indices.push(index);
+                        }
+                        invoked
+                    }
                 };
                 checks_passed += usize::from(passed);
                 if !passed {
@@ -1043,7 +1194,12 @@ impl BenchmarkSuite {
                     outcome_checks: case
                         .checks
                         .iter()
-                        .filter(|check| !matches!(check, Assertion::Metric { .. }))
+                        .filter(|check| {
+                            !matches!(
+                                check,
+                                Assertion::Metric { .. } | Assertion::ToolInvoked { .. }
+                            )
+                        })
                         .count(),
                     failed_check_indices,
                     unavailable_check_indices,

@@ -1412,6 +1412,21 @@ fn refresh_keys_ask_for_a_rescan() {
 }
 
 #[test]
+fn empty_catalog_can_rescan_and_accept_a_newly_started_local_server() {
+    let rig = Rig::new();
+    let mut o = ModelOverlay::new(Some(Discovery::default()), vec![], Scope::Global);
+    for event in [key(KeyCode::F(5)), ctrl('r')] {
+        assert!(matches!(send(&mut o, &rig, event), OverlayEvent::Refresh));
+    }
+    o.set_discovery(discovery());
+    assert!(names(&o).contains(&"qwen-chat".to_owned()));
+    assert!(matches!(
+        send(&mut o, &rig, key(KeyCode::Enter)),
+        OverlayEvent::AssignModel { .. }
+    ));
+}
+
+#[test]
 fn tiny_terminals_never_panic() {
     std::thread::scope(|scope| {
         for w in 0..=30u16 {

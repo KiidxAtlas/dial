@@ -119,6 +119,75 @@ fn mixed_results_send_only_code_failures_to_repair() {
 }
 
 #[test]
+fn unchanged_baseline_is_disclosed_without_repair_but_changed_diagnostic_is_actionable() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut agent = hermetic_agent(&config, root.path());
+    let check = crate::agent::verify::verification::FocusedCheck {
+        name: "unrelated".into(),
+        command: "cat diagnostic; exit 1".into(),
+        timeout_secs: 30,
+    };
+    std::fs::write(
+        root.path().join("diagnostic"),
+        "FAILED old_test: expected 1 got 2\n",
+    )
+    .unwrap();
+    let baseline = agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    assert_eq!(baseline.actionable.len(), 1);
+    agent.step_checks.evidence.capture_baseline();
+    let unchanged = agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    assert_eq!(unchanged.failures.len(), 1);
+    assert!(unchanged.failures[0].contains("Unchanged baseline failure"));
+    assert!(unchanged.actionable.is_empty());
+    std::fs::write(
+        root.path().join("diagnostic"),
+        "FAILED new_test: expected 1 got 3\n",
+    )
+    .unwrap();
+    let changed = agent.run_checks(&[check], &mut NullUi);
+    assert_eq!(changed.actionable.len(), 1);
+    assert!(changed.actionable[0].contains("new_test"));
+}
+
+#[test]
+fn configured_missing_program_uses_shared_environment_verdict_without_repair() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    let program = "dial_test_nonexistent_verification_runner_42";
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "custom runner".into(),
+            command: program.into(),
+            file_extensions: vec![],
+            timeout_secs: 30,
+        });
+    config.verification.runners.insert(
+        "custom runner".into(),
+        crate::config::types::VerificationRunner {
+            program: program.into(),
+            module: None,
+        },
+    );
+    let mut agent = hermetic_agent(&config, root.path());
+    let check = crate::agent::verify::verification::FocusedCheck {
+        name: "custom runner".into(),
+        command: program.into(),
+        timeout_secs: 30,
+    };
+    let run = agent.run_checks(&[check], &mut NullUi);
+    assert_eq!(run.failures.len(), 1);
+    assert!(run.failures[0].contains("Configured verification runner unavailable"));
+    assert!(run.actionable.is_empty());
+    assert_eq!(
+        agent.step_checks.evidence.latest_status(program),
+        Some(crate::agent::verify::verification::CheckStatus::EnvironmentUnavailable)
+    );
+}
+
+#[test]
 fn completion_outcome_does_not_claim_unobserved_deliverable_or_test_coverage() {
     let root = tempfile::tempdir().unwrap();
     let config = Config::default();
@@ -263,4 +332,140 @@ fn declared_requirement_selects_its_check_and_only_current_observed_runs_cover_i
         "stale"
     );
     assert_eq!(evidence["deliverable_coverage"], "requirements_uncovered");
+}
+
+#[test]
+fn strict_completion_requires_observed_current_evidence_and_respects_no_auto_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.verification.strict_requirements = true;
+    config.verification.automatic_checks = false;
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "contract".into(),
+            command: "never-auto-launch".into(),
+            file_extensions: vec![],
+            timeout_secs: 5,
+        });
+    config.verification.requirements.insert(
+        "boundary".into(),
+        crate::config::types::VerificationRequirement {
+            checks: vec!["contract".into()],
+            visual: false,
+        },
+    );
+    let mut agent = hermetic_agent(&config, root.path());
+    assert!(
+        agent
+            .validate_completion(&mut NullUi)
+            .unwrap_err()
+            .contains("boundary")
+    );
+    assert!(
+        agent
+            .step_checks
+            .evidence
+            .latest_status("never-auto-launch")
+            .is_none()
+    );
+    let revision = agent.step_checks.revision();
+    agent.step_checks.evidence.observe(
+        "never-auto-launch",
+        "observed",
+        crate::agent::verify::verification::CheckStatus::Passed,
+        revision,
+        true,
+    );
+    assert!(agent.validate_completion(&mut NullUi).is_ok());
+    agent.step_checks.mutations += 1;
+    assert!(agent.validate_completion(&mut NullUi).is_err());
+}
+
+#[test]
+fn strict_automatic_completion_runs_required_checks_once_and_refuses_permission_denial() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.verification.strict_requirements = true;
+    config.verification.automatic_checks = true;
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "contract".into(),
+            command: "printf checked".into(),
+            file_extensions: vec!["unused".into()],
+            timeout_secs: 5,
+        });
+    config.verification.requirements.insert(
+        "boundary".into(),
+        crate::config::types::VerificationRequirement {
+            checks: vec!["contract".into()],
+            visual: false,
+        },
+    );
+    let mut agent = hermetic_agent(&config, root.path());
+    agent.hermetic = false;
+    assert!(agent.validate_completion(&mut NullUi).is_ok());
+    let observed = agent.verifications.len();
+    assert_eq!(observed, 1);
+    assert!(agent.validate_completion(&mut NullUi).is_ok());
+    assert_eq!(agent.verifications.len(), observed);
+    agent.step_checks.mutations += 1;
+    agent
+        .always
+        .push(crate::agent::safety::approval::PermissionRule {
+            effect: crate::agent::safety::approval::Effect::Deny,
+            tool: "bash".into(),
+            command_prefix: vec!["printf".into()],
+            paths: vec![],
+        });
+    assert!(agent.validate_completion(&mut NullUi).is_err());
+    assert_eq!(
+        agent.step_checks.evidence.latest_status("printf checked"),
+        Some(crate::agent::verify::verification::CheckStatus::PermissionDenied)
+    );
+}
+
+#[test]
+fn requirement_mapped_baseline_failure_stays_actionable_without_behavioral_credit() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    let command = "echo 'assertion failed boundary'; exit 1";
+    config
+        .verification
+        .commands
+        .push(crate::config::types::VerificationCommand {
+            name: "boundary-check".into(),
+            command: command.into(),
+            file_extensions: vec![],
+            timeout_secs: 5,
+        });
+    config.verification.requirements.insert(
+        "boundary".into(),
+        crate::config::types::VerificationRequirement {
+            checks: vec!["boundary-check".into()],
+            visual: false,
+        },
+    );
+    let mut agent = hermetic_agent(&config, root.path());
+    let check = crate::agent::verify::verification::FocusedCheck {
+        name: "boundary-check".into(),
+        command: command.into(),
+        timeout_secs: 5,
+    };
+    agent.run_checks(std::slice::from_ref(&check), &mut NullUi);
+    agent.step_checks.evidence.capture_baseline();
+    let run = agent.run_checks(&[check], &mut NullUi);
+    assert_eq!(run.failures.len(), 1);
+    assert_eq!(run.actionable.len(), 1);
+    assert!(!run.actionable[0].contains("outside declared behavioral scope"));
+    assert_eq!(
+        agent
+            .step_checks
+            .evidence
+            .passing_behavioral(agent.step_checks.revision()),
+        0
+    );
 }

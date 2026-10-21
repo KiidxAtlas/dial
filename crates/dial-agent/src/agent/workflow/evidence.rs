@@ -270,7 +270,7 @@ fn prune(
     }
 }
 pub fn working_schema() -> Value {
-    json!({"type":"function","function":{"name":"working_state","description":"View or replace durable working state. Preserve the user's goal, decisions, constraints and open work across compaction; claims remain unverified unless linked to evidence.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["view","update"]},"goal":{"type":"string"},"decisions":{"type":"array","items":{"type":"string"}},"constraints":{"type":"array","items":{"type":"string"}},"open_work":{"type":"array","items":{"type":"string"}},"evidence":{"type":"array","items":{"type":"string"}}},"required":["action"],"additionalProperties":false}}})
+    super::working_state::schema()
 }
 #[cfg(test)]
 mod tests;

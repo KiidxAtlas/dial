@@ -181,3 +181,23 @@ harness build fixed across configurations, and report infrastructure failures se
 - A declared `declared_not_used` is a review signal, not evidence that a different tool choice would
   have succeeded.
 - Scripted-provider runs test plumbing only. They are not model quality, latency or quota evidence.
+
+## Representative and integration extensions
+
+Use `representative.toml` for dependency-free Rust workspace/non-default-member, native TS/JS caller
+boundaries and a seven-request corrected/retracted journey across three compactions. Its external
+acceptance bodies and exact preservation checks use the same immutable source/task contracts and
+repeated-run analysis as this suite. See [benchmarks.md](benchmarks.md#representative-multi-language-and-long-journey-suite).
+
+Per-model/task experiments can set `[configurations.policy]` (`strict_requirements`, `review_enabled`,
+`review_min_changed_files`, `review_sensitive_paths`, `review_max_rounds`). Effective policy v1/hash and
+full configuration contracts make variants auditable. Change one lever per comparison; fewer tool
+calls or less time never replace checked outcomes, and no setting is automatically adopted.
+
+The separate `integration-{browser,delegation,mcp}.toml` suites require explicit matching machine
+integration modes and real prerequisites. They are not offline model-quality tests. `tool_invoked`
+records admitted dispatch/path coverage only and contributes **zero** independent outcome checks;
+each fixture separately declares a task outcome. Unknown trace/prerequisite evidence must not be
+reported as successful connection or task completion. Offline fixture tests do not start services,
+launch browser UI, call providers or install packages. See the integration lane protocol in
+[benchmarks.md](benchmarks.md#opt-in-integration-evaluations) before deliberately running these suites.

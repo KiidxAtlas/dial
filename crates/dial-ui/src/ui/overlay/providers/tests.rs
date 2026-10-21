@@ -41,15 +41,17 @@ fn a_local_server_that_is_not_running_is_expected_but_real_failures_stay_red() {
         "Endpoint returned HTTP 500; redirects are not followed",
         "Endpoint returned malformed model metadata",
     ] {
-        assert!(
-            !expected_absent(&entry(
-                "http://127.0.0.1:11434",
-                "unavailable",
-                detail,
-                true
-            )),
-            "{detail}"
-        );
+        for configured in [false, true] {
+            assert!(
+                !expected_absent(&entry(
+                    "http://127.0.0.1:11434",
+                    "unavailable",
+                    detail,
+                    configured
+                )),
+                "{detail}, configured={configured}"
+            );
+        }
     }
     // Credential failures are never neutral.
     assert!(!expected_absent(&entry(
@@ -83,7 +85,11 @@ fn provider(
         label: label.into(),
         base_url: url.map(str::to_owned),
         state: state.into(),
-        detail: format!("{label} detail"),
+        detail: if state == "unavailable" {
+            UNREACHABLE_DETAIL.into()
+        } else {
+            format!("{label} detail")
+        },
         models,
     }
 }

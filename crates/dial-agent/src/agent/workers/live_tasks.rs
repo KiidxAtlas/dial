@@ -926,8 +926,11 @@ impl LiveTasks {
                     if let Some(rules) = outcome.portable_rules {
                         value["portable_rules"] = rules;
                     }
+                    let acceptance = value["assignment"]["work_packet"]["acceptance"].as_array()
+                        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
+                    value["projection"] = subagents::result_projection(value["result"].as_str().unwrap_or(""), value.get("data"), &acceptance);
                     if let Some(store) = workspace.artifacts() {
-                        match store.retain(&value.to_string()) {
+                        match subagents::retain_report(store, &value) {
                             Ok(uri) => value["artifact"] = json!(uri),
                             Err(e) => {
                                 value["status"] = json!("failed");
@@ -1309,6 +1312,30 @@ pub(in crate::agent) fn model_summary(value: &Value) -> String {
         let status = job["status"].as_str().unwrap_or("unknown");
         let steps = job["steps"].as_u64().unwrap_or(0);
         let mut text = format!("Worker {id}: {status} ({steps} requests)");
+        let derived;
+        let projection = if let Some(projection) = job.get("projection") {
+            projection
+        } else {
+            let acceptance = job["assignment"]["work_packet"]["acceptance"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            derived = subagents::result_projection(
+                job["result"].as_str().unwrap_or(""),
+                job.get("data"),
+                &acceptance,
+            );
+            &derived
+        };
+        text.push_str(&format!(
+            "\nWorker result projection (claims, not verification):\n{projection}"
+        ));
         if let Some(result) = job.get("result") {
             let report = result
                 .as_str()

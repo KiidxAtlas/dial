@@ -57,20 +57,25 @@ impl<'a> Agent<'a> {
                 })
             });
         // Share the verdict and runner context used by focused-check diagnostics.
-        let verdict = crate::agent::verify::verification::classify_output(
+        let verdict = crate::agent::verify::verification::classify_with_runner(
             check.as_ref(),
+            configured
+                .and_then(|check| self.config.verification.runners.get(&check.name))
+                .map(|runner| (runner.program.as_str(), runner.module.as_deref())),
             output,
             self.interrupt.load(Ordering::SeqCst),
         );
         let exit = verdict.repair_exit_code(output);
         let passed = verdict == crate::agent::verify::verification::CheckStatus::Passed;
-        self.step_checks.evidence.observe(
+        self.step_checks.evidence.observe_with_fix_revision(
             command,
             &call.id,
             verdict,
             self.step_checks.revision(),
             matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral),
+            self.step_checks.fix_revision(),
         );
+        self.step_checks.evidence.diagnose(command, &output.text);
         if !self.hermetic
             && matches!(kind, crate::storage::repair_evidence::CheckKind::Behavioral)
             && let Some(cache) = self.codebase.clone()
@@ -183,12 +188,16 @@ impl<'a> Agent<'a> {
         } else {
             self.approval
         };
-        let configured = self
-            .config
-            .verification
-            .commands
-            .iter()
-            .any(|custom| custom.command == check.command);
+        // Model-registered reproductions are untrusted shell text: they take the approval path a
+        // configured command (and a model `bash` call) takes, never the generated-check boundary.
+        let repro = self.step_checks.evidence.is_repro(&check.command);
+        let configured = repro
+            || self
+                .config
+                .verification
+                .commands
+                .iter()
+                .any(|custom| custom.command == check.command);
         let gate = crate::agent::safety::approval::authorize_automatic_check(
             approval,
             &mut self.always,
@@ -209,10 +218,25 @@ impl<'a> Agent<'a> {
                         "The rule applies to this session but could not be saved: {error:#}"
                     ));
                 }
-                self.run_background_tool("bash", &args, ui, None)
-                    .unwrap_or_else(|| {
-                        tools::execute(&self.workspace, "bash", &args, check.timeout_secs)
-                    })
+                if repro && let Some(reason) = self.repro_hook_refusal(&args, ui) {
+                    ui.notice(&reason);
+                    crate::runtime::tool_output::ToolOutput::err(format!(
+                        "automatic check {} not run: {reason}",
+                        check.name
+                    ))
+                    .with_status(crate::tools::ToolStatus::Blocked)
+                } else {
+                    if repro
+                        && !crate::agent::safety::approval::safe_bash(&check.command)
+                        && !crate::agent::safety::approval::safe_review_batch(&check.command)
+                    {
+                        self.step_checks.note_repro_run();
+                    }
+                    self.run_background_tool("bash", &args, ui, None)
+                        .unwrap_or_else(|| {
+                            tools::execute(&self.workspace, "bash", &args, check.timeout_secs)
+                        })
+                }
             }
             Err(denial) => {
                 ui.notice(denial.message());
@@ -302,6 +326,12 @@ impl<'a> Agent<'a> {
                     command: custom.command.clone(),
                     timeout_secs: custom.timeout_secs,
                 });
+            }
+        }
+        // This turn's registered reproductions are selected like any other check.
+        for repro in self.step_checks.evidence.repros() {
+            if !checks.iter().any(|check| check.command == repro.command) {
+                checks.push(repro.clone());
             }
         }
         checks
@@ -443,8 +473,20 @@ impl<'a> Agent<'a> {
                 break;
             }
             let output = self.run_focused_check(check, ui);
-            let status = crate::agent::verify::verification::classify(
-                check,
+            let runner =
+                self.config
+                    .verification
+                    .runners
+                    .get(&check.name)
+                    .filter(|_| {
+                        self.config.verification.commands.iter().any(|custom| {
+                            custom.name == check.name && custom.command == check.command
+                        })
+                    })
+                    .map(|runner| (runner.program.as_str(), runner.module.as_deref()));
+            let status = crate::agent::verify::verification::classify_with_runner(
+                Some(check),
+                runner,
                 &output,
                 self.interrupt.load(Ordering::SeqCst),
             );
@@ -462,10 +504,25 @@ impl<'a> Agent<'a> {
                     format!("Verification {}: {status:?}", check.name),
                 ));
                 self.step_checks.failed_checks.push(check.clone());
-                let description = crate::agent::verify::verification::environment_problem(
+                // Requirement membership declares task scope without inventing behavioral credit.
+                let required = self
+                    .config
+                    .verification
+                    .requirements
+                    .values()
+                    .any(|requirement| requirement.checks.contains(&check.name));
+                let unchanged = !required
+                    && self
+                        .step_checks
+                        .evidence
+                        .unchanged_unrelated_failure(&check.command);
+                let description = if unchanged {
+                    Some("Unchanged baseline failure outside declared behavioral scope; disclosed without automatic repair.")
+                } else { crate::agent::verify::verification::runner_problem(
                     check,
+                    runner,
                     &output.text,
-                )
+                ) }
                 .unwrap_or(
                     "Check failed; inspect the diagnostics and repair the observed failure.",
                 );
@@ -477,7 +534,7 @@ impl<'a> Agent<'a> {
                 );
                 // Infrastructure, permission, cancellation, timeout and unverified problems are reported
                 // without sending the model into code repair.
-                if status.repairable() {
+                if status.repairable() && !unchanged {
                     actionable.push(message.clone());
                 }
                 failures.push(message);
@@ -608,6 +665,14 @@ impl<'a> Agent<'a> {
         {
             return Err("Cannot complete: focused checks failed and no new edits are awaiting a fresh check. Repair, rerun the failed check, or report a blocker.".into());
         }
+        if let Some(reason) = crate::agent::verify::requirements::strict_blocker(
+            &self.config.verification,
+            &self.step_checks.evidence,
+            self.step_checks.revision(),
+            &self.step_checks.visual,
+        ) {
+            return Err(reason);
+        }
         Ok(())
     }
 
@@ -615,6 +680,42 @@ impl<'a> Agent<'a> {
     /// first, so a worker that already finished is not reported as running.
     pub(in crate::agent) fn validate_completion(&mut self, ui: &mut dyn Ui) -> Result<(), String> {
         self.pump_subagents(ui);
+        if !self.hermetic
+            && !self.plan_mode
+            && self.config.verification.strict_requirements
+            && self.config.verification.automatic_checks
+        {
+            let revision = self.step_checks.revision();
+            let required: Vec<_> = self
+                .config
+                .verification
+                .commands
+                .iter()
+                .filter(|check| {
+                    self.config
+                        .verification
+                        .requirements
+                        .values()
+                        .any(|requirement| requirement.checks.contains(&check.name))
+                })
+                .filter(|check| {
+                    matches!(
+                        self.step_checks
+                            .evidence
+                            .current_status(&check.command, revision),
+                        "missing" | "stale" | "not_observed"
+                    )
+                })
+                .map(|check| crate::agent::verify::verification::FocusedCheck {
+                    name: check.name.clone(),
+                    command: check.command.clone(),
+                    timeout_secs: check.timeout_secs,
+                })
+                .collect();
+            if !required.is_empty() {
+                self.run_checks(&required, ui);
+            }
+        }
         self.completion_blockers()?;
         if !self.hermetic {
             self.disclose_turn_changes(ui);

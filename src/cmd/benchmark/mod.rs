@@ -1,3 +1,4 @@
+mod integration;
 mod rpc;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -5,8 +6,8 @@ use dial::{
     benchmark::{
         AssistanceOverrides, BenchmarkProfile, BenchmarkReport, BenchmarkSuite, CommandCheck,
         EfficiencyOverrides, MachineBenchmarkPolicy, MachineBenchmarkReport, MachineConfiguration,
-        MachineConfigurationReport, MachineIdentity, RunMetrics, clone_project, compare_baseline,
-        named_invalid_runs, rank_machine_configurations, score_report,
+        MachineConfigurationReport, MachineIdentity, PolicyOverrides, RunMetrics, clone_project,
+        compare_baseline, named_invalid_runs, rank_machine_configurations, score_report,
     },
     config::paths::Layout,
     config::types::{Approval, Config, EditMode, LEAN_AUTO_MAX_WINDOW, LeanLocal, SandboxMode},
@@ -59,6 +60,14 @@ pub fn run(
     let source = fs::read_to_string(&manifest)
         .with_context(|| format!("reading benchmark suite {}", manifest.display()))?;
     let suite = BenchmarkSuite::parse_toml(&source)?;
+    ensure!(
+        !suite
+            .cases
+            .iter()
+            .any(|case| case.categories.iter().any(|tag| tag == "integration"))
+            || profiles_path.is_some(),
+        "integration evaluation unavailable: explicit machine configuration with integration mode is required (--profiles)"
+    );
     let user_home = tempfile::tempdir().context("creating isolated benchmark state")?;
     prepare_user_home(layout, config, &user_home)?;
     let executable = std::env::current_exe().context("locating dial executable")?;
@@ -75,13 +84,21 @@ pub fn run(
         let text = fs::read_to_string(resolve_output(layout, path))?;
         let profiles: Profiles = toml::from_str(&text).context("parsing benchmark profiles")?;
         ensure!(
+            !suite
+                .cases
+                .iter()
+                .any(|case| case.categories.iter().any(|tag| tag == "integration"))
+                || !profiles.configurations.is_empty(),
+            "integration evaluation unavailable: explicit machine configurations are required, not legacy named profiles"
+        );
+        ensure!(
             profiles.profiles.is_empty() || profiles.configurations.is_empty(),
             "use profiles or configurations, not both"
         );
         if !profiles.configurations.is_empty() {
             let report = run_machine(
                 layout,
-                &bench_config,
+                config,
                 &suite,
                 &source,
                 profiles.configurations,
@@ -287,6 +304,8 @@ fn isolated_config(config: &Config) -> Config {
     bench_config.subagents.clear();
     bench_config.verification.commands.clear();
     bench_config.verification.behavioral_checks.clear();
+    bench_config.verification.requirements.clear();
+    bench_config.verification.runners.clear();
     bench_config
 }
 
@@ -381,6 +400,8 @@ fn assist_configurations(
         adapter: None,
         assistance,
         efficiency: efficiency.clone(),
+        policy: shipped_policy(&shipped),
+        integration: Default::default(),
         draft_model: None,
         num_draft_tokens: None,
         kv_bits: None,
@@ -395,6 +416,18 @@ fn assist_configurations(
         let mut overrides = dial.clone();
         variant(&mut overrides, default_edit);
         configurations.push(machine(name.into(), overrides));
+    }
+    for (name, strict) in [
+        ("enable-strict_requirements", true),
+        ("enable-independent_review", false),
+    ] {
+        let mut variant = machine(name.into(), dial.clone());
+        if strict {
+            variant.policy.strict_requirements = Some(true);
+        } else {
+            variant.policy.review_enabled = Some(true);
+        }
+        configurations.push(variant);
     }
     configurations
 }
@@ -559,29 +592,66 @@ fn resolve_output(layout: &Layout, path: &Path) -> PathBuf {
 }
 
 fn prepare_user_home(layout: &Layout, config: &Config, user_home: &TempDir) -> Result<()> {
-    let mut isolated = config.clone();
-    isolated.improve.enabled = false;
-    isolated.solve.enabled = false;
-    isolated.escalation.enabled = false;
-    isolated.approval = Approval::Auto;
-    isolated.sandbox.mode = SandboxMode::Dev;
-    isolated.sandbox.allow_network = false;
-    isolated.sandbox.extra_write.clear();
-    isolated
-        .integrations
-        .retain(|name| matches!(name.as_str(), "ast_search" | "ast_edit"));
-    isolated.mcp.clear();
-    isolated.tools.clear();
-    isolated.subagents.clear();
-    isolated.verification.commands.clear();
-    isolated.verification.behavioral_checks.clear();
-    let contents = toml::to_string(&isolated).context("serializing benchmark config")?;
+    prepare_integration_home(layout, config, user_home, &Default::default())
+}
+
+fn prepare_integration_home(
+    layout: &Layout,
+    config: &Config,
+    user_home: &TempDir,
+    lane: &dial::benchmark::IntegrationOverrides,
+) -> Result<()> {
+    let isolated = integration::isolate(config, lane)?;
+    write_benchmark_home(layout, &isolated, user_home)
+}
+
+fn write_benchmark_home(layout: &Layout, isolated: &Config, user_home: &TempDir) -> Result<()> {
+    let contents = toml::to_string(isolated).context("serializing benchmark config")?;
     write_private(&user_home.path().join("config.toml"), contents.as_bytes())?;
     copy_private_if_present(
         &layout.user_dir.join("credentials.json"),
         &user_home.path().join("credentials.json"),
     )?;
     Ok(())
+}
+
+/// Apply identical suite-owned evidence mappings in strict and non-strict machine variants.
+/// Final-only assertions cannot be required of every intermediate request in a journey.
+fn case_contract(config: &Config, case: &dial::benchmark::BenchmarkCase) -> Result<Config> {
+    let mut selected = config.clone();
+    if case.turns.is_empty() {
+        for (index, assertion) in case.checks.iter().enumerate() {
+            if let dial::benchmark::Assertion::Command {
+                command,
+                expect_exit: 0,
+                expect_stdout: None,
+            } = assertion
+            {
+                let name = format!("suite_check_{}", index + 1);
+                selected
+                    .verification
+                    .commands
+                    .push(dial::config::types::VerificationCommand {
+                        name: name.clone(),
+                        command: command.clone(),
+                        file_extensions: vec![],
+                        timeout_secs: 120,
+                    });
+                selected.verification.requirements.insert(
+                    name.clone(),
+                    dial::config::types::VerificationRequirement {
+                        checks: vec![name],
+                        visual: false,
+                    },
+                );
+            }
+        }
+    }
+    if selected.verification.strict_requirements && selected.verification.requirements.is_empty() {
+        return Err(dial::benchmark::AgentUnavailable("strict-contract evaluation unavailable: requires single-turn zero-exit command assertions; journey final assertions are not intermediate obligations".into()).into());
+    }
+    selected.validate()?;
+    Ok(selected)
 }
 
 fn run_agent(
@@ -737,6 +807,61 @@ fn apply_efficiency(config: &mut Config, overrides: &EfficiencyOverrides) {
     }
 }
 
+/// Use the shared config serializer/validator as the authority for policy semantics. This overlay
+/// also keeps the benchmark independent of the concrete review type's module location.
+fn apply_policy(config: &mut Config, overrides: &PolicyOverrides) -> Result<()> {
+    overrides.validate()?;
+    let mut value = serde_json::to_value(&config.verification)?;
+    let verification = value
+        .as_object_mut()
+        .context("verification config object")?;
+    if let Some(strict) = overrides.strict_requirements {
+        verification.insert("strict_requirements".into(), json!(strict));
+    }
+    if overrides.review_enabled.is_some()
+        || overrides.review_min_changed_files.is_some()
+        || overrides.review_sensitive_paths.is_some()
+        || overrides.review_max_rounds.is_some()
+    {
+        let review = verification.entry("review").or_insert_with(|| json!({}));
+        let review = review.as_object_mut().context("review config object")?;
+        for (key, value) in [
+            ("enabled", overrides.review_enabled.map(|v| json!(v))),
+            (
+                "min_changed_files",
+                overrides.review_min_changed_files.map(|v| json!(v)),
+            ),
+            (
+                "sensitive_paths",
+                overrides.review_sensitive_paths.as_ref().map(|v| json!(v)),
+            ),
+            ("max_rounds", overrides.review_max_rounds.map(|v| json!(v))),
+        ] {
+            if let Some(value) = value {
+                review.insert(key.into(), value);
+            }
+        }
+    }
+    config.verification =
+        serde_json::from_value(value).context("applying benchmark policy overrides")?;
+    Ok(())
+}
+
+fn shipped_policy(config: &Config) -> PolicyOverrides {
+    let v = serde_json::to_value(&config.verification).expect("serializable config");
+    PolicyOverrides {
+        strict_requirements: Some(v["strict_requirements"].as_bool().unwrap_or(false)),
+        review_enabled: Some(v["review"]["enabled"].as_bool().unwrap_or(false)),
+        review_min_changed_files: Some(
+            v["review"]["min_changed_files"].as_u64().unwrap_or(4) as usize
+        ),
+        review_sensitive_paths: Some(
+            serde_json::from_value(v["review"]["sensitive_paths"].clone()).unwrap_or_default(),
+        ),
+        review_max_rounds: Some(v["review"]["max_rounds"].as_u64().unwrap_or(1) as u8),
+    }
+}
+
 /// Per-configuration MLX runtime overrides; unset fields keep the user's `local_runtime`.
 fn apply_local_runtime(
     config: &mut Config,
@@ -805,7 +930,7 @@ fn select_configuration(
     requested: &mut MachineConfiguration,
     policy: &MachineBenchmarkPolicy,
 ) -> Result<(Config, serde_json::Value)> {
-    let mut selected = base.clone();
+    let mut selected = integration::isolate(base, &requested.integration)?;
     selected.model_profile = None;
     selected.model_profiles.clear();
     selected.model_roles.clear();
@@ -816,6 +941,7 @@ fn select_configuration(
     selected.harness.max_steps = selected.harness.capped_steps(24);
     apply_assistance(&mut selected, &requested.assistance);
     apply_efficiency(&mut selected, &requested.efficiency);
+    apply_policy(&mut selected, &requested.policy)?;
     apply_local_runtime(&mut selected, requested)?;
     let mut quantization = serde_json::Value::Null;
     let mut adapter_metadata = serde_json::Value::Null;
@@ -899,6 +1025,10 @@ fn select_configuration(
         );
         selected.endpoint = Some(endpoint);
     }
+    if selected.verification.review.enabled {
+        selected.escalation.allow_remote = policy.allow_remote;
+    }
+    integration::configure_review(&mut selected);
     selected.validate()?;
     let settings = json!({
         "context_window": selected.context_window,
@@ -911,11 +1041,16 @@ fn select_configuration(
         "temperature": selected.harness.temperature,
         "verification": selected.verification,
         "case_timeout_secs": policy.case_timeout_secs,
-        "tool_network_allowed": false,
+        "tool_network_allowed": selected.sandbox.allow_network,
+        "integration": requested.integration,
         "automatic_improvement": false,
-        "model_roles": "disabled",
+        "model_roles": if selected.verification.review.enabled { "coach:selected_model_only" } else { "disabled" },
         "assistance": assistance_settings(&selected),
         "efficiency": efficiency_settings(&selected),
+        "policy_contract_version": 1,
+        "policy": shipped_policy(&selected),
+        "policy_sha256": format!("{:x}", Sha256::digest(serde_json::to_vec(&shipped_policy(&selected))?)),
+        "case_requirement_mapping": "single_turn_zero_exit_commands_v1",
         "local_runtime": selected.local_runtime,
     });
     Ok((selected, settings))
@@ -944,7 +1079,7 @@ fn run_machine(
         let contract = dial::benchmark::records::Contract::new(
             suite,
             snapshot.path(),
-            &serde_json::to_value(&selected)?,
+            &json!({"config": selected, "integration": configuration.integration, "policy_contract_version": 1}),
         )?;
         let started = std::time::Instant::now();
         let mut cases = Vec::with_capacity(suite.cases.len() * policy.repetitions);
@@ -957,7 +1092,19 @@ fn run_machine(
                     // No session, provenance memory, adapter state, or learned configuration leaks
                     // from another case. The executable/python paths still reference the installation.
                     let home = tempfile::tempdir()?;
-                    prepare_user_home(layout, &selected, &home)?;
+                    let expected = match configuration.integration.mode {
+                        dial::benchmark::IntegrationMode::Core => "core",
+                        dial::benchmark::IntegrationMode::Mcp => "mcp",
+                        dial::benchmark::IntegrationMode::Browser => "browser",
+                        dial::benchmark::IntegrationMode::Delegation => "delegation",
+                    };
+                    if case.categories.iter().any(|tag| tag == "integration")
+                        && (expected == "core" || !case.categories.iter().any(|tag| tag == expected)) {
+                        return Err(dial::benchmark::AgentUnavailable("integration unavailable: case requires its explicit matching integration mode".into()).into());
+                    }
+                    integration::prerequisite(&selected, &configuration.integration, &layout.project_root)?;
+                    let child = case_contract(&integration::isolate(&selected, &configuration.integration)?, case)?;
+                    write_benchmark_home(layout, &child, &home)?;
                     rpc::run_configured(
                         executable,
                         home.path(),
@@ -967,7 +1114,7 @@ fn run_machine(
                         configuration.adapter.as_deref(),
                     )
                 },
-                |check, workspace| run_command_check(&check_home, &selected, workspace, check),
+                |check, workspace| run_command_check(&check_home, &isolated_config(&selected), workspace, check),
             )?;
             cases.extend(report.cases.into_iter().map(|mut case| {
                 case.id = format!("{repetition}:{}", case.id);

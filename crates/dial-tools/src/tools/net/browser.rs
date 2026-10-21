@@ -59,6 +59,40 @@ pub fn tools(config: &Config) -> Vec<Arc<dyn Tool>> {
         interrupt: Arc::new(AtomicBool::new(false)),
     })]
 }
+
+/// Cache-only benchmark preflight. A successful result establishes installed files, not a working
+/// browser/service connection; actual runtime failures remain failures, never mocked successes.
+pub fn prerequisites(config: &BrowserConfig, workspace: &Path) -> Result<(), String> {
+    resolve_operator_executable(workspace, &config.node, "browser.node")?;
+    let runtime = runtime::cached()?;
+    if !config.playwright_module.trim().is_empty() {
+        let entry = Path::new(&config.playwright_module)
+            .canonicalize()
+            .map_err(
+                |_| "browser prerequisite unavailable: Playwright override is not installed",
+            )?;
+        if !entry.is_file() || entry.starts_with(workspace) {
+            return Err("browser prerequisite unavailable: Playwright override must be an installed external file".into());
+        }
+    }
+    let chromium = config.chromium_executable.as_ref().map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_file())
+        .or_else(|| discover::installed_chromium(&discover::playwright_roots(&runtime.browsers)))
+        .ok_or("browser prerequisite unavailable: Chromium is not installed; benchmark installation is disabled")?;
+    if chromium
+        .canonicalize()
+        .is_ok_and(|path| path.starts_with(workspace))
+    {
+        return Err(
+            "browser prerequisite unavailable: Chromium must be external to the workspace".into(),
+        );
+    }
+    Ok(())
+}
+
+fn installation_allowed(config: &BrowserConfig) -> bool {
+    config.allow_install
+}
 struct BrowserTool {
     config: BrowserConfig,
     session: Mutex<Option<BrowserSession>>,
@@ -602,7 +636,7 @@ fn start(
         None => None,
     };
     let trusted = resolve_operator_executable(ctx.workspace.root(), &config.node, "browser.node")?;
-    let runtime = runtime::provision(interrupt)?;
+    let runtime = runtime::provision(interrupt, installation_allowed(config))?;
     if interrupt.load(Ordering::Acquire) {
         return Err("browser startup cancelled".into());
     }
@@ -613,6 +647,7 @@ fn start(
         .canonicalize()
         .map_err(|e| format!("Node executable: {e}"))?;
     if builtin
+        && installation_allowed(config)
         && config.chromium_executable.is_none()
         && cdp.is_none()
         && !chromium_path(config, &meta)?.is_file()

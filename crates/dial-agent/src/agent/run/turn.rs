@@ -1802,6 +1802,7 @@ impl Agent<'_> {
                     )?;
                     if self.enabled_tools.contains(&call.name)
                         || self.discovered_tools().contains(&call.name)
+                        || self.tool_routing.selected.contains(&call.name)
                     {
                         self.metrics.dynamic_tools_used += 1;
                     }
@@ -1886,6 +1887,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     ui.tool_timing(&call.name, seconds);
                     tool_seconds = seconds;
                     self.settled(call, &out);
+                    self.observe_tool_routing(call, &out);
                     ui.tool_result_with_id(&call.id, &call.name, &out);
                     out
                 };
@@ -2195,6 +2197,10 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     && let Some(data) = &output.data
                 {
                     message["dial_question_result"] = data.clone();
+                }
+                if call.name == "task"
+                    && let Some(note) = crate::agent::workers::subagents::structured_result_note(&output) {
+                    pending_nudges.push(note);
                 }
                 let clipped = output.text.len() > limit
                     || output.text.contains("output omitted")

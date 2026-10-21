@@ -99,3 +99,73 @@ fn repair_exits_use_typed_completion_and_invalidate_unknown_runs() {
         None
     );
 }
+
+#[test]
+fn declared_runner_diagnosis_requires_launch_facts_and_preserves_app_errors() {
+    use crate::runtime::{execution::ProcessOutcome, tool_output::ToolOutput};
+    let check = FocusedCheck {
+        name: "custom".into(),
+        command: "python3 -m pytest tests".into(),
+        timeout_secs: 1,
+    };
+    let runner = Some(("python3", Some("pytest")));
+    let failed = |text: &str| {
+        ToolOutput::err(text).with_process(ProcessOutcome {
+            started: true,
+            exit_code: Some(1),
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            output_complete: true,
+        })
+    };
+    for text in [
+        "python3: No module named pytest",
+        "python3: command not found",
+    ] {
+        assert_eq!(
+            classify_with_runner(Some(&check), runner, &failed(text), false),
+            CheckStatus::EnvironmentUnavailable
+        );
+        assert_eq!(
+            classify_with_runner(Some(&check), runner, &ToolOutput::err(text), false),
+            CheckStatus::Unverified
+        );
+    }
+    for text in [
+        "ModuleNotFoundError: No module named 'app'",
+        "ModuleNotFoundError: No module named 'pytest'",
+        "AssertionError: broken\npython3: command not found",
+    ] {
+        assert_eq!(
+            classify_with_runner(Some(&check), runner, &failed(text), false),
+            CheckStatus::CodeFailed
+        );
+    }
+    let nested = FocusedCheck {
+        command: "echo python3 && python3 -m pytest".into(),
+        ..check.clone()
+    };
+    assert_eq!(
+        classify_with_runner(
+            Some(&nested),
+            runner,
+            &failed("python3: No module named pytest"),
+            false
+        ),
+        CheckStatus::CodeFailed
+    );
+    let app = FocusedCheck {
+        command: "python3 app.py".into(),
+        ..check
+    };
+    assert_eq!(
+        classify_with_runner(
+            Some(&app),
+            runner,
+            &failed("python3: No module named pytest"),
+            false
+        ),
+        CheckStatus::CodeFailed
+    );
+}

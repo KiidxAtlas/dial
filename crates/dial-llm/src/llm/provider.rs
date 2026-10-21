@@ -1610,6 +1610,8 @@ impl Backend {
             if interrupted() {
                 return Err(llm::Interrupted.into());
             }
+            // Reported with a failure: seconds tell a stalled server or dropped path from a refusal.
+            let attempt_started = Instant::now();
             if attempt > 1 && !on_event(&llm::StreamEvent::Retry { waiting: false }) {
                 return Err(llm::Interrupted.into());
             }
@@ -1944,6 +1946,11 @@ impl Backend {
             } else {
                 cause.to_owned()
             };
+            // How long the failed attempt ran, so a full silence limit and a quick refusal read differently.
+            let cause = format!(
+                "{cause} (after {:.1}s)",
+                attempt_started.elapsed().as_secs_f64()
+            );
             on_notice(&format!(
                 "{reason}: {cause}; retrying in {:.1}s (attempt {}/{})",
                 delay.as_secs_f64(),

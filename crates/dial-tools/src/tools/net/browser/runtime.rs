@@ -35,10 +35,27 @@ pub(super) struct Runtime {
 
 /// Provision (or reuse) the pinned runtime. Install and download are bounded by their
 /// caps and abort promptly when `interrupt` is set.
-pub(super) fn provision(interrupt: &AtomicBool) -> Result<Runtime, String> {
-    provision_at(&cache_root()?.join(digest_dir()), interrupt, || {
+pub(super) fn provision(interrupt: &AtomicBool, allow_install: bool) -> Result<Runtime, String> {
+    let root = cache_root()?.join(digest_dir());
+    if !allow_install {
+        return cached();
+    }
+    provision_at(&root, interrupt, || {
         hosts_reachable(&["registry.npmjs.org:443"])
     })
+}
+
+/// Inspect existing files only: never contact a service, require JS, install or launch Chromium.
+pub(super) fn cached() -> Result<Runtime, String> {
+    cached_at(&cache_root()?.join(digest_dir()))
+}
+
+fn cached_at(root: &Path) -> Result<Runtime, String> {
+    let runtime = layout(root);
+    if !dependencies_cached(&runtime) {
+        return Err("browser prerequisite unavailable: pinned JavaScript runtime is not cached; benchmark installation is disabled".into());
+    }
+    Ok(runtime)
 }
 
 // Keep cache selection and network probing injectable without changing process-wide environment.

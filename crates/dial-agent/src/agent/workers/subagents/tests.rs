@@ -746,3 +746,75 @@ fn read_only_agents_get_dependency_source() {
         ["read", "dep_source"]
     );
 }
+
+#[test]
+fn handoff_state_valid_priority_json_and_explicit_overflow() {
+    let state = json!({"revision":7,"constraints":["Never modify credentials"],"evidence":["x".repeat(5000)]});
+    let handoff = Handoff::capture(
+        &json!({"working_state":state,"current_instruction":"z".repeat(6000)}),
+        &[],
+    );
+    let packed = handoff.working_state.unwrap();
+    assert!(packed.len() <= MAX_HANDOFF_STATE);
+    let packed: Value = serde_json::from_str(&packed).unwrap();
+    assert_eq!(packed["constraints"], state["constraints"]);
+    assert_eq!(packed["revision"], 7);
+    assert_eq!(packed["handoff_overflow"], true);
+    assert!(
+        handoff
+            .current_instruction
+            .unwrap()
+            .contains("CRITICAL HANDOFF OVERFLOW")
+    );
+    let huge = Handoff::capture(
+        &json!({"working_state":{"constraints":["x".repeat(5000)]}}),
+        &[],
+    );
+    let packed: Value = serde_json::from_str(huge.working_state.as_deref().unwrap()).unwrap();
+    assert_eq!(packed["critical_context_incomplete"], true);
+    assert!(
+        packed["omitted_fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("constraints"))
+    );
+}
+
+#[test]
+fn acceptance_projection_missing_ids_and_custom_payload() {
+    let payload = json!({"custom":"legacy", "acceptance":{"acceptance_1":{"status":"met"}}});
+    let before = payload.clone();
+    let projection = result_projection("done", Some(&payload), &["one".into(), "two".into()]);
+    assert_eq!(projection["acceptance"]["acceptance_1"]["status"], "met");
+    assert_eq!(
+        projection["acceptance"]["acceptance_2"]["status"],
+        "not_verified"
+    );
+    assert_eq!(payload, before);
+    let projection = result_projection("All done, success", None, &["one".into()]);
+    assert_eq!(
+        projection["acceptance"]["acceptance_1"]["status"],
+        "not_verified"
+    );
+}
+
+#[test]
+fn sync_results_receive_separate_model_visible_acceptance_metadata() {
+    for exact in [r#"{"value":7}"#, "independent findings"] {
+        let projection = result_projection("blocked: missing service", None, &["boundary".into()]);
+        let output = ToolOutput {
+            text: exact.into(),
+            data: Some(
+                json!({"jobs":[{"name":"child","status":"completed","projection":projection}]}),
+            ),
+            is_error: false,
+            execution: Default::default(),
+        };
+        let note = structured_result_note(&output).unwrap();
+        assert_eq!(output.text, exact);
+        let content = note["content"].as_str().unwrap();
+        assert!(content.contains("not_verified"));
+        assert!(content.contains("blocked: missing service"));
+        assert_eq!(note["dial_transient"], true);
+    }
+}

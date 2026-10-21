@@ -2075,11 +2075,11 @@ impl ModelOverlay {
         match &self.discovery {
             None => " Scanning providers and models…".to_owned(),
             Some(d) if d.models.is_empty() => {
-                " No models yet. Press Enter to set up a provider or add an API key, open Get models to download a local model, or start LM Studio or Ollama (found automatically)."
+                " No models yet. Start LM Studio's local API server or Ollama, then press F5 or Ctrl+R to rescan. Press Enter to set up a provider and view connection details, or open Get models to download a model."
                     .to_owned()
             }
             Some(_) if self.group == Group::Memory && self.search.is_empty() && self.show == ShowFilter::Any => {
-                " No local chat models for the memory role yet. Ctrl+G opens Get models › Memory: small local models suited to memory extraction; LM Studio and Ollama on this machine are found automatically."
+                " No local chat models for the memory role yet. Ctrl+G opens Get models › Memory. Start LM Studio's local API server or Ollama, then press F5 or Ctrl+R to rescan."
                     .to_owned()
             }
             Some(_) if self.show != ShowFilter::Any && self.search.is_empty() => format!(

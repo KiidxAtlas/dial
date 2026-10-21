@@ -66,6 +66,16 @@ pub(in crate::agent) fn classify_output(
     output: &crate::runtime::tool_output::ToolOutput,
     cancelled: bool,
 ) -> CheckStatus {
+    classify_with_runner(check, None, output, cancelled)
+}
+
+/// Explicit configured runner facts are separate from command names and application imports.
+pub(in crate::agent) fn classify_with_runner(
+    check: Option<&FocusedCheck>,
+    runner: Option<(&str, Option<&str>)>,
+    output: &crate::runtime::tool_output::ToolOutput,
+    cancelled: bool,
+) -> CheckStatus {
     let process = output.process_outcome();
     let status = crate::tools::ToolStatus::from_output(output);
     if cancelled
@@ -95,8 +105,14 @@ pub(in crate::agent) fn classify_output(
     {
         return CheckStatus::Passed;
     }
+    let runner_launch_observed = runner.is_none()
+        || (complete
+            && process
+                .as_ref()
+                .is_some_and(|p| matches!(p.exit_code, Some(1 | 126 | 127))));
     if output.is_error
-        && check.is_some_and(|check| environment_problem(check, &output.text).is_some())
+        && runner_launch_observed
+        && check.is_some_and(|check| runner_problem(check, runner, &output.text).is_some())
     {
         return CheckStatus::EnvironmentUnavailable;
     }
@@ -296,6 +312,62 @@ fn python_runner(root: &Path, fallback: &Path) -> String {
     }
 }
 
+/// Metadata is useful only for a simple literal launch boundary. Complex shell commands retain
+/// ordinary classification rather than treating an application's missing child/import as setup.
+pub(in crate::agent) fn runner_problem(
+    check: &FocusedCheck,
+    runner: Option<(&str, Option<&str>)>,
+    output: &str,
+) -> Option<&'static str> {
+    let Some((program, module)) = runner else {
+        return environment_problem(check, output);
+    };
+    let words = crate::agent::safety::approval::shell_words(&check.command)?;
+    if words.first().map(String::as_str) != Some(program) {
+        return None;
+    }
+    // A launch failure has one diagnostic, not an application traceback/assertion plus a
+    // missing dependency somewhere in its log. Ambiguous mixed output remains actionable.
+    let diagnostics: Vec<_> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("[exit code: "))
+        .collect();
+    if diagnostics.len() != 1 {
+        return None;
+    }
+    let missing_program = output.lines().any(|line| {
+        let line = line.trim();
+        line == format!("{program}: command not found")
+            || line.ends_with(&format!(": {program}: command not found"))
+            || line.ends_with(&format!(": {program}: not found"))
+            || line == format!("env: {program}: No such file or directory")
+            || line == format!("/usr/bin/env: {program}: No such file or directory")
+    });
+    let missing_module = module.is_some_and(|module| {
+        words.get(1).map(String::as_str) == Some("-m")
+            && words.get(2).map(String::as_str) == Some(module)
+            && output.lines().any(|line| {
+                let line = line.trim();
+                // Python's launch error, not a traceback's ModuleNotFoundError in application code.
+                let Some((executable, missing)) = line.split_once(": No module named ") else {
+                    return false;
+                };
+                let selected = executable == program
+                    || (!program.contains(['/', '\\'])
+                        && Path::new(executable).is_absolute()
+                        && Path::new(executable)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            == Some(program));
+                selected && (missing == module || missing == format!("'{module}'"))
+            })
+    });
+    (missing_program || missing_module).then_some(
+        "Configured verification runner unavailable (not a confirmed application failure). Restore the declared runner/environment and rerun; installation and network access still require approval.",
+    )
+}
+
 /// Diagnose explicit setup failures, never reinterpret an assertion or syntax error
 /// as success. Missing application modules remain code failures, not setup guesses.
 pub(in crate::agent) fn environment_problem(
@@ -378,20 +450,34 @@ pub fn plan_with_runner(
         .iter()
         .filter(|path| {
             path.extension().and_then(|extension| extension.to_str()) == Some("rs")
-                || path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
+                || matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("Cargo.toml" | "Cargo.lock")
+                )
         })
         .collect::<Vec<_>>();
 
     let mut checks = Vec::new();
-    if !rust_paths.is_empty() && root.join("Cargo.toml").is_file() {
+    let root_manifest = root.join("Cargo.toml").is_file();
+    let workspace = config_contains(root, "Cargo.toml", "[workspace]");
+    // Manifest/lock/shared root changes can affect dependents beyond a file's owning package.
+    let broaden = root_manifest
+        && rust_paths.iter().any(|path| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("Cargo.toml" | "Cargo.lock")
+            ) || cargo_owner(root, path).is_none()
+        });
+    if !rust_paths.is_empty() && broaden {
         checks.push(FocusedCheck {
             name: "cargo check".to_owned(),
-            command: "cargo check --offline --all-targets --quiet".to_owned(),
+            command: format!(
+                "cargo check --offline --all-targets --quiet{}",
+                if workspace { " --workspace" } else { "" }
+            ),
             timeout_secs: 0,
         });
     } else {
-        // Without a root manifest, check each nested crate that owns a changed file instead of
-        // silently skipping Rust verification.
         let mut owners = Vec::new();
         for path in rust_paths {
             if let Some(manifest) = cargo_owner(root, path)

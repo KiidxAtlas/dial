@@ -11,7 +11,7 @@ members = [".", "crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 license = "MIT"
 
@@ -38,6 +38,7 @@ clap_complete = "4"
 fs2 = "0.4"
 rand = "0.9"
 libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 ureq = { version = "3", features = ["json"] }

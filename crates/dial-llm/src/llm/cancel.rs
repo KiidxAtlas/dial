@@ -8,9 +8,11 @@ use ureq::unversioned::{
     resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver},
     transport::{
         Buffers, ConnectProxyConnector, ConnectionDetails, Connector, NextTimeout, RustlsConnector,
-        TcpConnector, Transport,
+        Transport,
     },
 };
+
+mod tcp;
 
 // Test seam: scale one-second stall-test limits down without leaking into concurrent tests.
 // Each test drives its model call on its own thread; zero preserves production limits. Backends
@@ -196,7 +198,7 @@ fn build(
 ) -> ureq::Agent {
     let connector = ()
         .chain(ConnectProxyConnector::default())
-        .chain(TcpConnector::default())
+        .chain(tcp::KeepaliveConnector)
         .chain(CancelConnector {
             interrupt: Arc::clone(&interrupt),
             patience,

@@ -1,0 +1,99 @@
+version = 1
+name = "representative-quality-v1"
+
+# All command bodies are part of the frozen suite, not mutable project tests.
+[[cases]]
+id = "rust-workspace-nondefault-member"
+project = "examples/benchmarks/representative-rust"
+prompt = "Fix pricing::line_total so quantities are multiplied by integer-cent prices and checkout::receipt reflects the result. Preserve the public APIs and negative-quantity error. This is a workspace with non-default members: cargo test's housekeeping failure already exists and is unrelated. Do not change housekeeping, the manifests or workspace defaults. Verify the affected packages and write diagnosis.txt containing exactly baseline-unrelated (no newline) after distinguishing the baseline failure from your change."
+categories = ["quality", "rust", "workspace", "package_scoped", "callers", "baseline_diagnosis"]
+checks = [
+  {kind="file_equals",path="diagnosis.txt",content="baseline-unrelated"},
+  {kind="file_equals",path="Cargo.toml",content='''[workspace]
+members = ["housekeeping", "pricing", "checkout"]
+default-members = ["housekeeping"]
+resolver = "2"
+'''},
+  {kind="file_equals",path="housekeeping/src/lib.rs",content='''//! An unrelated, pre-existing test failure. Do not repair it for pricing work.
+#[test]
+fn known_baseline_failure() {
+    panic!("known unrelated baseline failure: migration service unavailable");
+}
+'''},
+  {kind="command",command='''python3 - <<'PY'
+import json, pathlib, subprocess, tempfile
+root = pathlib.Path.cwd()
+with tempfile.TemporaryDirectory() as temp:
+    p = pathlib.Path(temp)
+    (p / "src").mkdir()
+    (p / "Cargo.toml").write_text('[workspace]\n[package]\nname="independent-acceptance"\nversion="0.1.0"\nedition="2021"\n[dependencies]\npricing={path=' + json.dumps(str(root / 'pricing')) + '}\ncheckout={path=' + json.dumps(str(root / 'checkout')) + '}\n')
+    (p / "src/lib.rs").write_text('#[test] fn boundaries() { assert_eq!(pricing::line_total(125,3),Ok(375)); assert_eq!(pricing::line_total(99,0),Ok(0)); assert_eq!(pricing::line_total(0,8),Ok(0)); assert_eq!(pricing::line_total(17,1),Ok(17)); assert!(pricing::line_total(1,-1).is_err()); assert_eq!(checkout::receipt(125,3).unwrap(),"375 cents"); assert_eq!(checkout::receipt(9,0).unwrap(),"0 cents"); assert!(checkout::receipt(2,-1).is_err()); }')
+    result = subprocess.run(["cargo", "test", "--offline", "--manifest-path", str(p / "Cargo.toml"), "--target-dir", str(p / "target")])
+    raise SystemExit(result.returncode)
+PY'''},
+]
+
+[[cases]]
+id = "typescript-boundary-javascript-caller"
+project = "examples/benchmarks/representative-ts"
+prompt = "Rename DEFAULT_PAGE_SIZE to PAGE_SIZE throughout the TypeScript setting and its callers, removing the old export but preserving 25. Make pageCount(null) return 0. Preserve other boundaries and the JavaScript summary API. Node supports native TypeScript stripping here; do not add dependencies or compilation steps. Verify through the JS consumer as well as the TS API."
+categories = ["quality", "typescript", "javascript", "boundary", "callers", "multi_file"]
+checks = [
+  {kind="command",command='''node --input-type=module - <<'JS'
+import assert from 'node:assert/strict';
+import * as settings from './settings.ts';
+import {pageCount} from './pages.ts';
+import {summary} from './summary.mjs';
+assert.equal(settings.PAGE_SIZE,25);
+assert.equal('DEFAULT_PAGE_SIZE' in settings,false);
+for (const [n, pages] of [[0,0],[1,1],[24,1],[25,1],[26,2],[50,2],[51,3]]) {
+  const rows = Array(n).fill(0);
+  assert.equal(pageCount(rows),pages);
+  assert.equal(summary(rows),`${pages} pages`);
+}
+assert.equal(pageCount(null),0);
+assert.equal(summary(null),'0 pages');
+JS'''},
+  {kind="file_equals",path="summary.mjs",content='''import { pageCount } from './pages.ts';
+
+export function summary(rows) {
+    return `${pageCount(rows)} pages`;
+}
+'''},
+]
+
+[[cases]]
+id = "corrected-retracted-compaction-journey"
+project = "examples/benchmarks/quality-fixture"
+prompt = "Rename DEFAULT_PAGE_SIZE to PAGE_SIZE throughout settings and reports, and raise its value to 50. Preserve unrelated billing and checkout code. Verify the callers."
+context_messages = ["Historical planning note: the migration team once wanted 100-row pages and a migration.txt file. This note is not a current requirement."]
+turns = [
+  {prompt="Correction: the final page size must stay 25. Keep the PAGE_SIZE rename; undo only the value change. Verify 25/26-row boundaries."},
+  {prompt="Add page_count(None) returning 0. Preserve all earlier corrected behavior and verify it.",compact_before=true},
+  {prompt="Create migration.txt containing planned, and make page_count accept generators as well as lists. This is a provisional migration request."},
+  {prompt="Retract the provisional migration request: remove migration.txt. Generator support is not required; preserve list behavior, None=0, PAGE_SIZE=25 and no old setting name.",compact_before=true},
+  {prompt="Review current source against the latest corrected requirements. Historical notes and retracted requests must not override them. Do not repair unrelated invoice failures."},
+  {prompt="Final acceptance: verify PAGE_SIZE is 25, old name absent, None and list boundaries correct, migration.txt absent and unrelated billing unchanged. Repair only regressions in this scope.",compact_before=true},
+]
+categories = ["quality", "journey", "multi_turn", "compaction", "correction", "retraction", "goal_preservation"]
+checks = [
+  {kind="command",command='''python3 -B - <<'PY'
+import pathlib, settings
+from reports import page_count
+assert settings.PAGE_SIZE == 25
+assert not hasattr(settings, 'DEFAULT_PAGE_SIZE')
+assert page_count(None) == 0
+assert [page_count(list(range(n))) for n in [0,1,24,25,26,50,51]] == [0,1,1,1,2,2,3]
+assert not pathlib.Path('migration.txt').exists()
+PY'''},
+  {kind="file_equals",path="billing.py",content='''"""Amounts are integer cents; quantities are non-negative integers."""
+
+
+def invoice_total(items):
+    return sum(item["price"] for item in items)
+
+
+def discounted_total(subtotal, fraction):
+    return round(subtotal * (1 - fraction))
+'''},
+]

@@ -88,8 +88,7 @@ impl<'a> Agent<'a> {
         self.request_phase = crate::adaptive::State::begin(self.task_policy.kind, text);
         let mut control = self.session.control_state();
         control["current_instruction_entry_id"] = json!(self.session.branch_leaf());
-        control["current_instruction"] =
-            json!(crate::agent::window::prompt::truncate_chars(text, 4096));
+        control["current_instruction"] = json!(text);
         control["steering_active"] = json!(true);
         self.session.set_control_state(control)
     }

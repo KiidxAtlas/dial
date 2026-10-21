@@ -66,6 +66,55 @@ fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> boo
     known.contains(old) && known.contains(new)
 }
 
+/// Recognize exact additive changes to controller-owned schemas. Historical calls remain inert,
+/// never replayed or rewritten; every other part of the old contract must still match.
+fn controller_compatible(
+    old: &Identity,
+    new: &Identity,
+    schemas: &[Value],
+    registry: &Registry,
+) -> bool {
+    if !matches!(old.name.as_str(), "working_state" | "check")
+        || new.name != old.name
+        || old.revision != 1
+        || new.revision != 1
+        || registry.get(&old.name).is_some()
+    {
+        return false;
+    }
+    let Some(schema) = schemas
+        .iter()
+        .find(|schema| schema["function"]["name"] == old.name)
+    else {
+        return false;
+    };
+    let mut before = schema.clone();
+    let Some(properties) = before
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    match old.name.as_str() {
+        "working_state" => {
+            if properties.remove("expected_revision").is_none()
+                || properties.remove("claims").is_none()
+                || properties["action"]["enum"] != json!(["view", "update", "patch"])
+            {
+                return false;
+            }
+            properties["action"]["enum"] = json!(["view", "update"]);
+        }
+        "check" => {
+            if properties.remove("repro").is_none() {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    identities(&[before], &Registry::new()).get(&old.name) == Some(old)
+}
+
 /// Project settled history onto the current contracts. `None` means no historical call needed a
 /// rewrite, so callers send the borrowed history as-is; the history is copied only on first rewrite.
 pub fn project_history(
@@ -86,6 +135,7 @@ pub fn project_history(
             };
             if old == new
                 || native_compatible(old, new, registry)
+                || controller_compatible(old, new, schemas, registry)
                 || registry
                     .get(&old.name)
                     .is_some_and(|tool| tool.accepts_historical_contract(old))

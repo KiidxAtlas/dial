@@ -252,6 +252,7 @@ impl<'a> Agent<'a> {
         // A step this local model reached in an earlier session applies from the first request.
         self.seed_local_escalation();
         self.begin_local_turn(ui);
+        self.begin_tool_routing(user_text);
         // Offered tools can change with version/harness refresh or skill toggles; rebuild only if content changed.
         self.rebuild_system();
         for notice in self.ext.take_notices() {
@@ -583,9 +584,7 @@ impl<'a> Agent<'a> {
             ));
         }
         state["turn_outcome"] = Value::Null;
-        state["current_instruction"] = json!(crate::agent::window::prompt::truncate_chars(
-            user_text, 4096
-        ));
+        state["current_instruction"] = json!(user_text);
         state["steering_active"] = json!(false);
         self.session.set_control_state(state)?;
         if let Some(advice) = self.laya_advice(user_text, ui) {
@@ -618,12 +617,6 @@ impl<'a> Agent<'a> {
                 .verification
                 .commands
                 .iter()
-                .filter(|check| {
-                    self.config
-                        .verification
-                        .behavioral_checks
-                        .contains(&check.name)
-                })
                 .take(8)
                 .map(|check| crate::agent::verify::verification::FocusedCheck {
                     name: check.name.clone(),
@@ -634,15 +627,15 @@ impl<'a> Agent<'a> {
             if !baseline.is_empty() {
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(
                     crate::agent::ui::ui_event::EventKind::Verification,
-                    "Recording the configured behavioral baseline before edits.",
+                    "Recording the configured check baseline before edits.",
                 ));
                 let failures = self.run_checks(&baseline, ui).failures;
                 self.step_checks.evidence.capture_baseline();
                 let baseline_context = if failures.is_empty() {
-                    "Configured behavioral baseline passed before editing. Preserve these behaviors and rerun relevant checks after the change.".to_owned()
+                    "Configured check baseline passed before editing. Preserve these behaviors and rerun relevant checks after the change.".to_owned()
                 } else {
                     format!(
-                        "Behavioral baseline before editing (these failures predate this turn's edits):\n{}\nReproduce and fix failures within the requested scope; report unrelated failures without broadening the task.",
+                        "Configured baseline before editing (these failures predate this turn's edits):\n{}\nDeclared behavioral checks identify requested scope. Preserve and disclose unchanged unrelated failures; do not broaden the task to repair them.",
                         failures.join("\n")
                     )
                 };
@@ -806,7 +799,7 @@ impl<'a> Agent<'a> {
                         )
                     } else {
                         format!(
-                            "Focused verification failed without a repairable code diagnosis, so no automatic repair ran. Inspect the environment or permissions and rerun the check: {problems}"
+                            "Focused verification has unchanged baseline failures or lacks a repairable new code diagnosis, so no automatic repair ran. Inspect the disclosed causes and rerun relevant checks: {problems}"
                         )
                     };
                     ui.notice(&diagnostic);
@@ -920,6 +913,21 @@ impl<'a> Agent<'a> {
                 }
             }
             result = resumed;
+        }
+        // Hooks and late verification may invalidate an earlier accepted candidate. Strict
+        // requirements are checked again at final settlement without launching extra processes.
+        if let Ok(report) = &mut result
+            && report.outcome == TurnOutcome::Completed
+            && let Some(reason) = crate::agent::verify::requirements::strict_blocker(
+                &self.config.verification,
+                &self.step_checks.evidence,
+                self.step_checks.revision(),
+                &self.step_checks.visual,
+            )
+        {
+            report.outcome = TurnOutcome::Incomplete;
+            report.text = unsettled_report(&report.text, &reason);
+            ui.notice(&reason);
         }
         // Publish only after all hook continuations settle, not for an intermediate candidate.
         if !self.hermetic

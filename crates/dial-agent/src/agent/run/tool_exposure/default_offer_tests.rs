@@ -936,19 +936,3 @@ fn live_job_output_reaches_the_ui_without_a_matching_foreground_tool() {
         assert!(ui.0.contains(&("pty-identity".into(), "screen".into(), true)));
     });
 }
-
-#[test]
-fn only_small_mcp_servers_are_offered_up_front() {
-    let mut catalog: Vec<String> = vec!["read".into()];
-    catalog.extend((0..8).map(|i| format!("mcp__big__t{i}")));
-    catalog.extend(["mcp__small__a".into(), "mcp__small__b".into()]);
-    assert_eq!(
-        Agent::small_mcp_tools(&catalog),
-        ["mcp__small__a", "mcp__small__b"]
-    );
-
-    let many: Vec<String> = (0..10)
-        .flat_map(|s| (0..4).map(move |t| format!("mcp__s{s:02}__t{t}")))
-        .collect();
-    assert!(Agent::small_mcp_tools(&many).len() <= Agent::AUTO_MCP_TOOL_LIMIT);
-}

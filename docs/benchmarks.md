@@ -110,6 +110,89 @@ checked success populations; report missing usage as unknown. Existing assistanc
 is a starting point, not evidence that every feature improves results. No live-model improvement is
 established by the scripted regressions or this integration alone.
 
+### Representative multi-language and long-journey suite
+
+`examples/benchmarks/representative.toml` adds three independently executable contracts:
+
+| case | independent acceptance |
+| --- | --- |
+| Rust non-default workspace member | An external temporary Cargo test crate depends on `pricing` and `checkout`; checks quantity/zero/negative boundaries and the public caller. The default member's unrelated baseline failure and workspace defaults must remain unchanged. |
+| TypeScript API / JavaScript caller | Native Node TypeScript stripping exercises the renamed export, null/empty/exact/over-page boundaries and the JS consumer. No npm install or transpiler. |
+| Corrected/retracted journey | Seven sequential requests, three forced compactions; verifies the corrected 25-row default, rename, null boundary, removal of a retracted artifact and preservation of unrelated billing code. |
+
+Prerequisites are an installed Cargo/Rust toolchain, Python 3.11+ and Node with native TypeScript
+stripping (22.18+ or newer). The offline tests explicitly skip an unavailable language runtime rather
+than install it. Run `python3 -m unittest discover -s examples/benchmarks -p test_representative.py -v`.
+The tests establish that originals fail, reference repairs pass, mutable visible Rust tests cannot
+weaken the external grader, stale corrected values/retracted artifacts fail, and the unrelated Rust
+baseline still fails after an accepted repair. They do not establish live-model journey performance.
+
+### Explicit policy experiments
+
+Machine configurations support `[configurations.policy]`:
+
+```toml
+[configurations.policy]
+strict_requirements = true
+review_enabled = false
+review_min_changed_files = 4
+review_sensitive_paths = ["src/security", "Cargo.toml"]
+review_max_rounds = 1
+```
+
+Unset fields preserve the operator value; explicit fields affect only the isolated child. These map
+to `verification.strict_requirements` and `verification.review.{enabled,min_changed_files,sensitive_paths,max_rounds}`.
+Bounds are 1–1000 files, 1–3 rounds and at most 32 workspace-relative file/directory prefixes (not
+globs, each at most 256 bytes). Unknown keys and invalid bounds are rejected before inference.
+Reports retain requested overrides and effective policy, `policy_contract_version = 1`, and
+`policy_sha256`; the full effective configuration and integration mode also enter the run contract.
+The existing ablation matrix now pins the shipped policy baseline and adds `enable-strict_requirements`
+and `enable-independent_review`, each changing one lever. Review enablement alone does not guarantee
+the trigger threshold is reached or that an independent reviewer is available. Keep the model, task
+suite and all other settings fixed; analyze per-task/category checked success using the existing
+reliability/tool-effectiveness analyzers. No optimizer, automatic default adoption, tool-count objective
+or live improvement claim is introduced.
+
+### Opt-in integration evaluations
+
+Core runs remain offline and remove ambient MCP servers, user tools, custom agents and role fallbacks.
+Builtin task delegation was already available in core; clearing custom presets never disabled it.
+The integration lane is an explicit experiment, not a claim that core forbids builtin delegation.
+Use a **machine** configuration (`--profiles`, not the legacy named-profile format), with one of:
+
+```toml
+[configurations.integration]
+mode = "browser" # or "delegation", "mcp"; default is "core"
+# mcp_servers = ["fixture"] # required only for mcp mode: exact configured server names
+```
+
+Use `integration-browser.toml`, `integration-delegation.toml` or `integration-mcp.toml` with its matching
+mode; `integration-profiles.toml` is a template. This can consume provider quota and **is not run by
+offline tests**. Remote inference still separately requires `machine.allow_remote = true`.
+
+- **Browser:** real headless native browser plus background server support; no attached browser,
+  relay, cmux or stored session profile. Requires an already cached pinned JS runtime, installed Node
+  and external Chromium. The isolated config sets `browser.allow_install = false`; neither dependency
+  provisioning nor Chromium download is allowed. Cache-only preflight inspects files, not connections.
+- **MCP:** retains only the exact named operator servers at both isolation points. Missing/disabled
+  servers, missing executables/bearer environment and known fetch launchers are unavailable before
+  inference. The example expects a real `fixture` service offering `multiply(a,b)`; no mock is supplied.
+  A configured endpoint is not proof of connection: actual handshake/tool failures remain measured failures.
+- **Delegation:** real builtin task agents use the selected model, with custom presets/agents and role
+  routing removed. Work-packet contracts are enabled for the fixture; normal child/tool safety applies.
+
+Missing static prerequisites yield `AgentUnavailable`, all check indices unavailable, no model request,
+and an invalid run rather than a meaningful zero score. A mismatched/core mode cannot silently run an
+integration case. No-profile/legacy-profile integration invocations fail setup before inference.
+Browser/MCP lanes explicitly allow tool network access; **acceptance commands stay network-disabled**.
+Reports expose mode/names, not MCP endpoint/header/env/argument contents.
+
+`tool_invoked` assertions establish admitted integration dispatch only, not successful connection or
+effects. They are not counted as independent outcome checks, and absent/incomplete traces stay
+unavailable. Each integration fixture also has executable/file outcome acceptance. Offline contract
+tests (`test_integration_fixtures.py`) validate those graders with reference repairs but deliberately do
+not claim to exercise services, UI interaction, real workers or provider behavior.
+
 ## Repository benchmark suites
 
 For repeatable repository checks, create a TOML suite and run `dial bench suite.toml --report result.json`.
@@ -213,8 +296,10 @@ adapter = "/absolute/path/to/adapter"
 The first configuration is the baseline. `quantization_bits` validates existing MLX model metadata;
 it does not quantize weights. Adapter metadata must identify the selected base model. Endpoint
 variants use explicit provider/model IDs; non-loopback providers require `machine.allow_remote=true`.
-Each case has fresh state against one source snapshot, with automatic improvement, secondary model
-roles, search and escalation disabled. Reports include machine identity, settings, suite hash, checked
+Each case has fresh state against one source snapshot, with automatic improvement, ambient secondary
+model roles, search and escalation disabled. An explicit independent-review experiment pins the coach
+to the measured model and endpoint (including after child isolation); remote review requires the same
+`machine.allow_remote` opt-in. Reports include machine identity, settings, suite hash, checked
 correctness, wall time including failures/checks, observed tokens and repair rounds, and correctly
 completed cases per second. Unavailable measurements stay null. Recommendations must meet the
 correctness floor and per-case regression limits; reports never apply settings, activate adapters or
@@ -257,6 +342,17 @@ from `dial`:
 - `ablate-initial_tool_limit`, `ablate-tool_grammar`, `ablate-edit_mode`, `ablate-reliability_gate`,
   `ablate-lean_local` and `ablate-local_profile` turn off or change features that ship on.
   `ablate-local_profile` sets `assistance.local.enabled = false`; see the local profile in `agent-loop.md`.
+- `enable-strict_requirements` and `enable-independent_review` turn on the shipped-default-off
+  outcome/review policies; their baseline settings and effective values are recorded as above.
+
+Machine runs map each single-turn case's zero-exit command assertions without stdout expectations to
+suite-owned verification commands and requirements, identically in strict and non-strict variants.
+The frozen suite and executable contract identify this mapping; effective settings record
+`case_requirement_mapping`. Independent acceptance still executes outside the model-editable copy.
+Strict variants without an applicable contract report unavailable rather than measuring a no-op:
+file-only cases and final-only journey assertions are not invented intermediate obligations.
+Selective review still depends on the configured risk/size threshold; enabling it does not force a
+review of every task. These experiments do not adopt settings automatically.
 
 The suite defaults to `examples/benchmarks/efficiency.toml`. The command prints a table with checked
 correctness, tool errors, malformed tool calls (tool contract errors), repair rounds, observed tokens and

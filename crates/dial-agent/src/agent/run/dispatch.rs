@@ -3,6 +3,10 @@ use crate::config;
 
 use crate::agent::*;
 
+pub(in crate::agent::run) mod search_index;
+#[cfg(test)]
+mod search_tests;
+
 /// The request with its history replaced by a contract projection, or `None` when the projection
 /// changed nothing. Unchanged requests stay borrowed, so the common path copies no history.
 pub(in crate::agent) fn projected_request(
@@ -841,6 +845,7 @@ impl<'a> Agent<'a> {
                     Ok(query) => query,
                     Err(error) => return denied(&error),
                 };
+                let mut descriptions = HashMap::new();
                 let candidates = self
                     .catalog()
                     .into_iter()
@@ -853,7 +858,9 @@ impl<'a> Agent<'a> {
                             .as_str()
                             .unwrap_or("")
                             .to_owned();
-                        Some((name, description))
+                        let indexed = search_index::text(&schema);
+                        descriptions.insert(name.clone(), description);
+                        Some((name, indexed))
                     })
                     .collect();
                 let matches = crate::agent::model::assistance::discover(query, candidates);
@@ -866,7 +873,8 @@ impl<'a> Agent<'a> {
                     return denied(&format!("persisting discovered tools: {error:#}"));
                 }
                 let offered = self.offered();
-                let matches: Vec<Value> = matches.into_iter().map(|(name, description, _)| {
+                let matches: Vec<Value> = matches.into_iter().map(|(name, _, _)| {
+                    let description = descriptions.remove(&name).unwrap_or_default();
                     json!({"enabled_next_round":offered.contains(&name),"name":name,"description":description})
                 }).collect();
                 ToolOutput {
@@ -921,6 +929,7 @@ impl<'a> Agent<'a> {
                     return denied(&format!("persisting enabled tools: {e:#}"));
                 }
                 self.enabled_tools = enabled;
+                self.tool_routing.unload(&unload);
                 self.rebuild_system();
                 ToolOutput {
                     execution: Default::default(),
@@ -951,34 +960,23 @@ impl<'a> Agent<'a> {
             },
             "working_state" => {
                 let mut state = self.session.control_state();
-                if args["action"] == "update" {
-                    let given: serde_json::Map<String, Value> = args
-                        .as_object()
-                        .into_iter()
-                        .flatten()
-                        .filter(|(_, value)| !value.is_null())
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect();
-                    let schema = crate::agent::workflow::evidence::working_schema();
-                    if let Err(why) = crate::agent::run::calls::validate(
-                        &schema["function"]["parameters"],
-                        &Value::Object(given.clone()),
-                    ) {
-                        return denied(&why);
-                    }
-                    let working: serde_json::Map<String, Value> = given
-                        .into_iter()
-                        .filter(|(key, _)| key != "action")
-                        .collect();
-                    state["working_state"] = Value::Object(working);
-                    if let Err(e) = self.session.set_control_state(state.clone()) {
+                let working = match crate::agent::workflow::working_state::apply(
+                    &state["working_state"],
+                    args,
+                ) {
+                    Ok(working) => working,
+                    Err(error) => return denied(&format!("{error:#}")),
+                };
+                if args["action"] != "view" {
+                    state["working_state"] = working.clone();
+                    if let Err(e) = self.session.set_control_state(state) {
                         return denied(&format!("{e:#}"));
                     }
                 }
                 ToolOutput {
                     execution: Default::default(),
                     data: None,
-                    text: state["working_state"].to_string(),
+                    text: working.to_string(),
                     is_error: false,
                 }
             }

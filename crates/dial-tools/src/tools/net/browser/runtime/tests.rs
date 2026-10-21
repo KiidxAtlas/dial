@@ -78,3 +78,22 @@ fn uncached_runtime_fails_clearly_when_offline() {
     assert!(error.contains("registry.npmjs.org"), "{error}");
     assert!(error.contains("connect to the network"), "{error}");
 }
+
+#[test]
+fn cache_only_prerequisites_never_create_missing_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        cached_at(dir.path())
+            .unwrap_err()
+            .contains("installation is disabled")
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    let runtime = layout(dir.path());
+    for path in [&runtime.entry, &runtime.readability] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "// existing runtime").unwrap();
+    }
+    assert_eq!(cached_at(dir.path()).unwrap().entry, runtime.entry);
+    assert!(!dir.path().join("package.json").exists());
+    assert!(!runtime.browsers.exists());
+}

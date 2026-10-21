@@ -1,0 +1,14 @@
+version = 1
+name = "integration-mcp-v1"
+
+# Operator must supply a REAL enabled MCP server named fixture with multiply(a,b).
+# This suite never starts a fabricated replacement, installs or fetches a server.
+[[cases]]
+id = "real-mcp-multiply"
+project = "examples/benchmarks/project"
+prompt = "Use the configured real MCP fixture service's multiply tool with a=19, b=23. Write its returned numeric result to service-result.txt as decimal text with no newline. Do not replace an unavailable service with a local calculation or mock. If the configured service cannot be reached, report that prerequisite honestly."
+categories = ["integration", "mcp", "service_contract"]
+checks = [
+ {kind="tool_invoked",tool="mcp__fixture__multiply"},
+ {kind="file_equals",path="service-result.txt",content="437"},
+]

@@ -105,3 +105,20 @@ fn finished_results_are_delivered_once_through_any_model_view() {
     tasks.deliver("task-2");
     assert!(tasks.undelivered().is_empty());
 }
+
+#[test]
+fn immediate_preview_surfaces_trailing_blockers_before_narrative() {
+    let report = format!(
+        "{}BLOCKER: migration needs approval",
+        "ordinary detail ".repeat(2000)
+    );
+    let value = json!({"id":"task-1","status":"done","result":report,"artifact":"artifact://full", "assignment":{"work_packet":{"acceptance":["migration verified"]}}});
+    let result = output(Ok(value.clone()));
+    assert_eq!(result.data, Some(value));
+    assert!(
+        result.text.find("migration needs approval").unwrap()
+            < result.text.find("ordinary detail").unwrap()
+    );
+    assert!(result.text.contains("not_verified"));
+    assert!(result.text.contains("artifact://full"));
+}

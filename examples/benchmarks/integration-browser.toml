@@ -1,0 +1,20 @@
+version = 1
+name = "integration-browser-v1"
+
+# Explicit machine integration.mode='browser' required. No service/runtime is mocked or installed.
+[[cases]]
+id = "real-browser-checkout"
+project = "examples/benchmarks/integration-browser-fixture"
+prompt = "Fix total(price, quantity) to multiply integer price by quantity, preserving zero boundaries. Start a loopback HTTP server for this project on a free port using bash background and stop it when done. Use the real browser tool to open index.html, click Calculate with quantity=3 and verify rendered total 42; also verify quantity=0 renders 0. Do not install browser packages or attach to an operator's browser. Verify application behavior independently too."
+categories = ["integration", "browser", "javascript", "boundary"]
+checks = [
+ {kind="tool_invoked",tool="browser"},
+ {kind="command",command='''node --input-type=module - <<'JS'
+import assert from 'node:assert/strict';
+import {total} from './price.mjs';
+assert.equal(total(14,3),42);
+assert.equal(total(14,0),0);
+assert.equal(total(0,4),0);
+assert.equal(total(19,2),38);
+JS'''},
+]

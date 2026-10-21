@@ -382,8 +382,8 @@ public static class DialInstallerEd25519V1
         Write-Host '       dial config set sandbox.mode off'
         Write-Host '     That runs commands with your normal Windows privileges and no filesystem or network confinement.'
         Write-Host '     Only do this for trusted workspaces. See docs/windows.md.'
-        if (-not $env:HOME -and -not $env:DIAL_HOME) {
-            Write-Host '  Note: HOME is not set, so Dial cannot find its config. Set DIAL_HOME to a directory, for example %USERPROFILE%\.dial.'
+        if (-not $env:HOME -and -not $env:USERPROFILE -and -not $env:DIAL_HOME) {
+            Write-Host '  Note: HOME and USERPROFILE are not set, so Dial cannot find its config. Set $env:DIAL_HOME to a directory before running Dial.'
         }
     } finally {
         if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }

@@ -3491,9 +3491,17 @@ fn compaction_keeps_recent_turns_and_replaces_older_ones_with_a_summary() {
         rendered.contains("two?") && rendered.contains("three?"),
         "recent turns stay verbatim: {rendered}"
     );
-    assert!(
-        messages[0]["content"].as_str().unwrap().contains("one?"),
-        "the original user goal is pinned in the summary"
+    let carried = messages
+        .iter()
+        .find(|m| m["dial_compaction_critical"] == true)
+        .unwrap();
+    assert_eq!(
+        carried["dial_critical_state"]["runtime_user_request"]["original_goal"],
+        "one?"
+    );
+    assert_eq!(
+        carried["dial_critical_state"]["runtime_user_request"]["current_instruction"],
+        "three?"
     );
     assert!(
         !rendered.contains("first answer"),
@@ -7685,7 +7693,11 @@ fn working_state_and_read_evidence_survive_compaction_without_mutation_loss() {
             json!({"path":"evidence.txt","content":"new evidence\n"}),
         ),
         Reply::Call("read", json!({"path":"evidence.txt"})),
-        Reply::Text("first done"),
+        // Enough compressible history to offset the irreducible exact state/constraint carry.
+        Reply::Say(format!(
+            "first done {}",
+            "historical read details ".repeat(100)
+        )),
         Reply::Text("second done"),
         Reply::Text("third done"),
         Reply::Text("compact summary"),

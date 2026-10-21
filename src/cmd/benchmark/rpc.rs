@@ -220,6 +220,9 @@ pub fn run_configured(
         .env("DIAL_HOME", user_home)
         .env("HF_HUB_OFFLINE", "1")
         .env("TRANSFORMERS_OFFLINE", "1")
+        // Integration benchmarks must not attach to an ambient operator browser via env overrides.
+        .env("DIAL_BROWSER_CMUX", "0")
+        .env("DIAL_BROWSER_RELAY", "0")
         .env_remove("DIAL_BENCHMARK_ADAPTER")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
