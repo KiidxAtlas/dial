@@ -410,6 +410,12 @@ impl Accumulator {
             serde_json::from_slice(line).context("Ollama stream line is not valid JSON")?;
         ensure!(event.is_object(), "Ollama stream event is not an object");
         ensure!(!self.done, "Ollama returned data after done");
+        if event["done"] == true {
+            self.reply.prompt_tokens = event["prompt_eval_count"].as_u64();
+            self.reply.cached_prompt_tokens = event["prompt_eval_cached_count"].as_u64();
+            self.reply.completion_tokens = event["eval_count"].as_u64();
+            super::usage::capture_reply(&self.reply);
+        }
         if event.get("error").is_some_and(|error| !error.is_null()) {
             // Native Ollama error strings are not a reliable retry classification.
             // Keep them nonretryable rather than replaying an unknown failure.
@@ -573,9 +579,6 @@ impl Accumulator {
                     Some("load" | "unload") => bail!("Ollama only loaded/unloaded the model instead of generating a reply; include a user turn"),
                     _ => bail!("Ollama terminated with an unsupported done reason; no calls were accepted"),
                 }.to_owned();
-                self.reply.prompt_tokens = event["prompt_eval_count"].as_u64();
-                self.reply.cached_prompt_tokens = event["prompt_eval_cached_count"].as_u64();
-                self.reply.completion_tokens = event["eval_count"].as_u64();
                 // Durations are nanoseconds (Ollama API reference); a zero duration has no rate.
                 let rate = |count: Option<u64>, nanos: Option<u64>| {
                     count

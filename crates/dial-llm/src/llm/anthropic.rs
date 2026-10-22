@@ -197,6 +197,7 @@ impl Accumulator {
                 ensure!(!self.started, "duplicate Anthropic message_start");
                 self.started = true;
                 self.usage = event["message"]["usage"].clone();
+                super::usage::capture(super::provider::anthropic_usage_snapshot(&self.usage));
             }
             "content_block_start" => {
                 ensure!(
@@ -346,6 +347,7 @@ impl Accumulator {
                         }
                     }
                 }
+                super::usage::capture(super::provider::anthropic_usage_snapshot(&self.usage));
             }
             "message_stop" => {
                 if !(self.started && self.open.is_empty() && self.stop_reason.is_some()) {

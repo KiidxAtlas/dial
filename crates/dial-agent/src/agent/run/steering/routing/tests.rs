@@ -225,10 +225,8 @@ fn independent_request_starts_real_worker_without_steering_parent() {
 }
 
 #[test]
-fn disabled_spawning_cannot_be_overridden_by_a_split_decision() {
-    let server = llm::fake::serve(vec![reply(
-        r#"{"route":"split","reason":"Independent request"}"#,
-    )]);
+fn disabled_spawning_routes_exact_input_without_a_classification_request() {
+    let server = llm::fake::serve(vec![]);
     with_agent("[task]\nmax_recursion_depth=0", |agent| {
         active(agent);
         let mut ui = Input {
@@ -245,8 +243,9 @@ fn disabled_spawning_cannot_be_overridden_by_a_split_decision() {
             agent.session.control_state()["current_instruction"],
             "An independent question"
         );
+        assert_eq!(ui.accepted, ["An independent question"]);
     });
-    assert_eq!(server.requests().len(), 1);
+    assert!(server.requests().is_empty());
 }
 
 #[test]
@@ -374,4 +373,57 @@ fn automatic_message_received_during_generation_replans_before_accepting_the_old
             .to_string()
             .contains("Actually, what is 3 + 3?")
     );
+}
+
+#[test]
+fn occupied_worker_capacity_routes_next_input_without_classification() {
+    for overlay in ["subagent_max_live_jobs=1", "[task]\nmax_concurrency=1"] {
+        let server = llm::fake::serve(vec![
+            reply(r#"{"route":"split","reason":"Independent question"}"#),
+            reply("The answer is 4."),
+        ]);
+        with_agent(
+            &format!(
+                "{overlay}\n[endpoint]\nbase_url='{}/v1'\n[assistance.local]\nenabled=false",
+                server.url
+            ),
+            |agent| {
+                active(agent);
+                let mut ui = Input {
+                    pending: vec![
+                        "What is 2 + 2?".into(),
+                        "Another independent question".into(),
+                    ],
+                    ..Default::default()
+                };
+                assert!(
+                    agent
+                        .route_pending_messages(&mut backend(&server.url), &mut ui)
+                        .unwrap()
+                );
+                assert_eq!(
+                    agent.session.control_state()["current_instruction"],
+                    "Another independent question"
+                );
+                assert_eq!(
+                    ui.accepted,
+                    ["What is 2 + 2?", "Another independent question"]
+                );
+                // Settled but unjoined workers retain their admission slot too, so the
+                // second message deterministically steers before pumping the first worker.
+                assert_eq!(agent.live_tasks.running_ids().len(), 1);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !agent.live_tasks.running_ids().is_empty() && Instant::now() < deadline {
+                    agent.pump_subagents(&mut ui);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    agent.live_tasks.running_ids().is_empty(),
+                    "worker did not settle"
+                );
+            },
+        );
+        // One classifier and one child request, never a classifier for the second message.
+        assert_eq!(server.requests().len(), 2);
+    }
 }

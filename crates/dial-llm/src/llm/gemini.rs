@@ -554,15 +554,6 @@ impl Accumulator {
                 envelope
             }
         };
-        if event
-            .pointer("/promptFeedback/blockReason")
-            .and_then(Value::as_str)
-            .is_some()
-        {
-            bail!(
-                "Gemini blocked the request; review its content and the configured model permissions"
-            );
-        }
         if let Some(usage) = event.get("usageMetadata") {
             ensure!(usage.is_object(), "invalid Gemini usage metadata");
             self.reply.prompt_tokens = usage["promptTokenCount"]
@@ -595,6 +586,16 @@ impl Accumulator {
                         .and_then(|output| total.checked_sub(output))
                 });
             }
+            super::usage::capture_reply(&self.reply);
+        }
+        if event
+            .pointer("/promptFeedback/blockReason")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            bail!(
+                "Gemini blocked the request; review its content and the configured model permissions"
+            );
         }
         let Some(candidates) = event.get_mut("candidates") else {
             return Ok(false);

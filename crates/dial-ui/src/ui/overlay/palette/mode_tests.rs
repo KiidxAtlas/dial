@@ -89,6 +89,7 @@ fn picker_applies_the_selected_value_and_marks_the_current_one() {
         verb: "",
         remove: None,
         items: vec![item("ask", false), item("write", true), item("auto", false)],
+        ..Default::default()
     };
     let mut palette = PaletteOverlay::choice(spec);
     assert!(
@@ -116,6 +117,7 @@ fn picker_with_remove_edits_or_removes_the_selected_row() {
         verb: "edit",
         remove: Some("remove"),
         items: vec![item("1", false), item("2", false)],
+        ..Default::default()
     };
     let mut palette = PaletteOverlay::choice(spec);
     palette.handle(&plain(KeyCode::Down), &keys);
@@ -162,6 +164,7 @@ fn empty_picker_search_names_choices_and_drops_selection_keys() {
         verb: "",
         remove: None,
         items: vec![item("ask", false), item("write", true)],
+        ..Default::default()
     };
     let mut palette = PaletteOverlay::choice(spec);
     let footer = rendered(&mut palette, 100).pop().unwrap();
@@ -211,4 +214,92 @@ fn search_header_names_its_scope_and_keeps_the_count_on_narrow_panels() {
         .find(|l| l.contains("Search ·"))
         .expect("search header");
     assert!(header.trim_end().ends_with("· 1/1"), "{header}");
+}
+
+#[test]
+fn empty_search_header_drops_the_position_counter() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), false);
+    palette.handle(&Event::Paste("zzzz".into()), &keys);
+    let lines = rendered(&mut palette, 100);
+    let header = lines.iter().find(|l| l.contains("Search ·")).unwrap();
+    assert!(!header.contains("0/0"), "{header}");
+}
+
+#[test]
+fn picker_copy_comes_from_the_spec_and_labels_use_the_free_width() {
+    let long = "a long label that would have been cut at thirty-two columns END";
+    let spec = ChoiceSpec {
+        title: "Work plan".into(),
+        command: "todo".into(),
+        verb: "show",
+        items: vec![ChoiceItem {
+            value: "1".into(),
+            label: long.into(),
+            detail: "detail".into(),
+            current: true,
+        }],
+        prompt: "Filter steps:".into(),
+        summary: "1 step".into(),
+        current_tag: Some(String::new()),
+        ..Default::default()
+    };
+    let mut palette = PaletteOverlay::choice(spec);
+    let lines = rendered(&mut palette, 120);
+    assert!(
+        lines.iter().any(|l| l.contains("Filter steps:")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.trim() == "1 step · 1/1"),
+        "{lines:?}"
+    );
+    assert!(lines.iter().any(|l| l.contains(long)), "{lines:?}");
+    // An empty tag hides the redundant "current" marker.
+    assert!(!lines.iter().any(|l| l.contains("current")), "{lines:?}");
+}
+
+#[test]
+fn home_and_end_jump_to_the_list_ends_until_a_search_is_typed() {
+    let keys = Keymap::defaults();
+    let spec = ChoiceSpec {
+        title: "Approval".into(),
+        command: "approval".into(),
+        items: vec![
+            item("ask", false),
+            item("write", false),
+            item("auto", false),
+        ],
+        ..Default::default()
+    };
+    let mut palette = PaletteOverlay::choice(spec);
+    palette.handle(&plain(KeyCode::End), &keys);
+    assert_eq!(palette.cursor, 2);
+    palette.handle(&plain(KeyCode::Home), &keys);
+    assert_eq!(palette.cursor, 0);
+    // While searching, Home/End move the caret in the search field instead.
+    palette.handle(&Event::Paste("a".into()), &keys);
+    palette.handle(&plain(KeyCode::Home), &keys);
+    assert_eq!(palette.search.cursor, 0);
+}
+
+#[test]
+fn narrow_panels_wrap_the_empty_message_and_drop_the_busy_note_before_overlap() {
+    let keys = Keymap::defaults();
+    let mut palette = PaletteOverlay::new(entries(), true);
+    palette.handle(&Event::Paste("zzzz".into()), &keys);
+    let lines = rendered(&mut palette, 38).join("\n");
+    assert!(lines.contains("Tab changes category."), "{lines}");
+    let rig = Rig::new();
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: &status_preview,
+    };
+    for width in [12u16, 20, 38, 80] {
+        let top = rows(&render(width, 12, |f| palette.draw(f, &ctx)))[0].clone();
+        assert!(top.starts_with(" Actions"), "{width}: {top}");
+        assert!(!top.contains("Actionsturn"), "{width}: {top}");
+    }
 }

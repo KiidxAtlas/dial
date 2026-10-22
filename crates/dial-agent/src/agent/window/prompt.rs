@@ -24,6 +24,8 @@ pub struct Inputs<'a> {
     /// Lean local profile: omits the visual-verification section unless a browser or computer tool is
     /// offered, and the skills catalog unless `skill` is offered.
     pub lean: bool,
+    /// Use concise delivery/delegation prose without narrowing tools, discovery or workflow rules.
+    pub concise_guidance: bool,
     /// One tool call per response (the small local tier without a passing batch record): the
     /// guidance asks for single calls instead of batches. Implies the lean sections.
     pub one_call: bool,
@@ -144,12 +146,18 @@ impl Offer<'_> {
 /// always does. The edit contract lives only in the `edit` tool description, so it is not repeated.
 pub fn guidance(visual: bool) -> String {
     let every = |_: &str| true;
-    full_guidance(visual, false, false, &every)
+    full_guidance(visual, false, false, false, &every)
 }
 
 /// `lean` swaps the workflow sections for their shorter variants; every safety contract stays in both.
 /// `has` decides which tool-specific sentences are included.
-fn full_guidance(visual: bool, lean: bool, one_call: bool, has: &dyn Fn(&str) -> bool) -> String {
+fn full_guidance(
+    visual: bool,
+    lean: bool,
+    one_call: bool,
+    concise: bool,
+    has: &dyn Fn(&str) -> bool,
+) -> String {
     let visual = if visual { VISUAL_VERIFICATION } else { "" };
     // One-call operation exists only on the small tier, which is lean; the full sections assume
     // batching throughout, so it always uses the lean ones.
@@ -190,24 +198,27 @@ fn full_guidance(visual: bool, lean: bool, one_call: bool, has: &dyn Fn(&str) ->
         };
         (rules, LEAN_DELIVERY)
     } else {
-        (RULES.to_owned(), DELIVERY)
+        (
+            RULES.to_owned(),
+            if concise { LEAN_DELIVERY } else { DELIVERY },
+        )
     };
     format!("{HEADER}{policy}\n\n# Execution\n{FOCUSED_WORK}{rules}{visual}{delivery}")
 }
 
 /// Scope optional workflow prose to the configured catalog, not per-request tool
 /// loading, so the system prefix remains stable throughout a turn.
-fn scoped_guidance(offer: &Offer<'_>) -> String {
+fn scoped_guidance(offer: &Offer<'_>, concise: bool) -> String {
     let has = |name: &str| offer.has(name);
     let lean = offer.lean || offer.one_call;
-    // A lean prompt keeps visual verification only when a renderer is offered to satisfy it.
+    // Concise reporting prose alone must not change tool policy, workflow or visual rules.
     let visual = !lean || has("browser") || has("computer");
-    let mut out = full_guidance(visual, lean, offer.one_call, &has);
+    let mut out = full_guidance(visual, lean, offer.one_call, concise, &has);
     if has("browser") || has("bg") {
         out.push_str(PREVIEW_RULES);
     }
     if has("task") {
-        out.push_str(if lean {
+        out.push_str(if lean || concise {
             LEAN_DELEGATION_RULES
         } else {
             DELEGATION_RULES
@@ -291,7 +302,7 @@ fn policy_prompt(
                     lean: i.lean,
                     one_call: i.one_call,
                 };
-                out.push_str(&scoped_guidance(&offer));
+                out.push_str(&scoped_guidance(&offer, i.concise_guidance));
                 if i.worked_example
                     && let Some(example) = worked_example(&offer, i.edit_mode)
                 {
@@ -328,11 +339,25 @@ fn environment_prompt(i: &Inputs<'_>) -> String {
     ));
     if !i.discoverable.is_empty() {
         out.push_str("- Loadable tools, not in the schema yet: call `tool_load` with the exact name and use the tool next round. NEVER call one before loading it.\n");
-        for (name, description) in i.discoverable {
-            if description.is_empty() {
-                out.push_str(&format!("  - {name}\n"));
-            } else {
-                out.push_str(&format!("  - {name}: {description}\n"));
+        if i.lean || i.one_call {
+            // Discovery still supplies descriptions on demand. Preserve exact names without
+            // spending a small window's response reserve on the entire optional catalog.
+            out.push_str("  Names: ");
+            out.push_str(
+                &i.discoverable
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            out.push('\n');
+        } else {
+            for (name, description) in i.discoverable {
+                if description.is_empty() {
+                    out.push_str(&format!("  - {name}\n"));
+                } else {
+                    out.push_str(&format!("  - {name}: {description}\n"));
+                }
             }
         }
     }

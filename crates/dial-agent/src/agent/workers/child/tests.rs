@@ -253,3 +253,36 @@ fn rewritten_child_reads_recheck_schema_and_path_authority() {
         assert_eq!(reviewer.0.len(), authorized);
     }
 }
+
+#[test]
+fn private_carry_does_not_repeat_retained_assignment_or_coordination() {
+    let brief = "Task: inspect source\nScope: worker only";
+    let mut messages = vec![json!({"role":"user","content":brief,"dial_context_request":true})];
+    assert_eq!(
+        child_instruction_carry(&messages, "inspect source", &json!(brief)),
+        json!({})
+    );
+
+    let coordination = json!("Also inspect request budgets");
+    let carry = child_instruction_carry(&messages, "inspect source", &coordination);
+    assert!(carry.get("original_assignment").is_none());
+    assert_eq!(carry["current_instruction"], coordination);
+    messages.push(json!({"role":"user","content":coordination,"dial_child_coordination":true}));
+    assert_eq!(
+        child_instruction_carry(&messages, "inspect source", &coordination),
+        json!({})
+    );
+}
+
+#[test]
+fn private_carry_restores_instructions_missing_after_history_replacement() {
+    let messages = vec![json!({"role":"assistant","content":"inspect source"})];
+    assert_eq!(
+        child_instruction_carry(&messages, "inspect source", &json!("current coordination")),
+        json!({"original_assignment":"inspect source","current_instruction":"current coordination"})
+    );
+    assert_eq!(
+        child_instruction_carry(&[], "inspect source", &Value::Null),
+        json!({"original_assignment":"inspect source"})
+    );
+}

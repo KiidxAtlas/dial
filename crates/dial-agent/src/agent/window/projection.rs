@@ -189,9 +189,23 @@ impl<'a> Agent<'a> {
             messages,
             tools,
             temperature: 0.0,
-            max_tokens: template.map_or(selection.max_tokens, |r| {
-                r.max_tokens.max(selection.max_tokens)
-            }),
+            max_tokens: template.map_or_else(
+                || {
+                    if selection.max_tokens == 0
+                        && selection
+                            .profile
+                            .as_ref()
+                            .is_none_or(|profile| profile.max_tokens.is_none())
+                    {
+                        // A preview plans useful response headroom, not the model's entire automatic
+                        // output ceiling. The dispatched request resolves its own remaining space.
+                        self.config.compaction.reserve(self.budget_window())
+                    } else {
+                        selection.max_tokens
+                    }
+                },
+                |r| r.max_tokens.max(selection.max_tokens),
+            ),
             seed: None,
         })
     }

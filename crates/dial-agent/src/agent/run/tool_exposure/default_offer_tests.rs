@@ -58,6 +58,32 @@ fn system_text(agent: &Agent<'_>) -> String {
 }
 
 #[test]
+fn efficient_guidance_shrinks_the_prefix_without_changing_capabilities() {
+    let capture = |agent: &mut Agent<'_>| {
+        let offered = agent.offered();
+        (
+            agent.schemas(&offered).unwrap(),
+            agent.discoverable_tools(&offered),
+            offered,
+            system_text(agent),
+        )
+    };
+    let full = with_agent(
+        "[assistance]\nlean_local=false\n[efficiency]\nenabled=false",
+        capture,
+    );
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        let concise = capture(agent);
+        assert_eq!(concise.0, full.0, "callable schemas must not change");
+        assert_eq!(concise.1, full.1, "discovery descriptions must not change");
+        assert_eq!(concise.2, full.2, "the tool offer must not change");
+        assert!(concise.3.len() < full.3.len());
+        agent.rebuild_system();
+        assert_eq!(capture(agent), concise, "prefix must remain cache-stable");
+    });
+}
+
+#[test]
 fn lean_local_profile_shrinks_the_request_and_stays_byte_stable_across_turns() {
     // The bytes a local server prefills: the system messages and the offered tool schemas.
     fn request(agent: &Agent<'_>) -> (String, String, Vec<String>) {
@@ -106,6 +132,25 @@ fn lean_local_profile_leaves_hosted_routes_unchanged() {
         },
     );
     assert_eq!(lean, default);
+}
+
+#[test]
+fn window_overflow_uses_the_lean_prompt_even_without_the_local_profile() {
+    with_agent("[assistance]\nlean_local=false", |agent| {
+        let full = system_text(agent);
+        assert!(full.contains("# Visual verification"));
+        agent.lean_tools = true;
+        agent.rebuild_system();
+        let lean = system_text(agent);
+        assert!(
+            lean.len() < full.len(),
+            "Overflow must reduce instruction overhead as well as schemas"
+        );
+        assert!(!lean.contains("# Visual verification"));
+        for tool in ["read", "edit", "finish", "tool_load"] {
+            assert!(agent.offered().iter().any(|name| name == tool));
+        }
+    });
 }
 
 #[test]

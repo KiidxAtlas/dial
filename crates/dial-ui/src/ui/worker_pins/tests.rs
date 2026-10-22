@@ -174,10 +174,28 @@ fn collapsed_block_lists_three_and_reports_overflow() {
     .collect();
     assert!(lines[0].to_lowercase().contains("workers") && lines[0].contains("5 active"));
     assert_eq!(lines.len(), 5, "header, three workers, overflow: {lines:?}");
-    assert!(lines.last().unwrap().contains("+2 more running"));
+    assert!(lines.last().unwrap().contains("+2 more active"));
 }
 
 #[test]
 fn terminal_rows_gate_is_sixteen() {
     assert_eq!(MIN_TERMINAL_ROWS, 16);
+}
+
+#[test]
+fn tight_budget_keeps_a_worker_and_prioritizes_input_over_previews() {
+    let mut waiting = agent("needs-help", AgentStatus::Waiting);
+    waiting.task = "a very long task description that must not hide the state".into();
+    let board = board(vec![
+        agent("running-1", AgentStatus::Running),
+        agent("running-2", AgentStatus::Running),
+        waiting,
+    ]);
+    for theme in [Theme::dark(), Theme::light()] {
+        let lines = rows(&board, 24, 3, PinnedWorkers::Full, true, 0, &theme);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].to_string().contains(AgentStatus::Waiting.label()));
+        assert!(lines[2].to_string().contains("+2 more active"));
+        assert!(lines.iter().all(|line| line.width() <= 24));
+    }
 }

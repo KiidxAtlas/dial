@@ -129,3 +129,43 @@ fn selection_stages_only_the_marked_line() {
         "one\ntwo\nTWO\nthree\nfour\nfive\n"
     );
 }
+
+#[test]
+fn zz_dump() {
+    use crate::ui::overlay::settings::testkit::{Rig, render, screen, status_preview};
+    use crate::ui::overlay::DrawCtx;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "t"]);
+    std::fs::create_dir_all(root.join("src/ui/overlay")).unwrap();
+    std::fs::write(root.join("f.txt"), "one\ntwo\nthree\nfour\nfive\n").expect("write");
+    std::fs::write(root.join("src/ui/overlay/providers_with_long_name.rs"), "fn a() {}\n").expect("write");
+    git(root, &["add", "."]);
+    git(root, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"]);
+    std::fs::write(root.join("f.txt"), "one\nTWO\nthree\nFOUR\nfive\n").expect("write");
+    std::fs::write(root.join("src/ui/overlay/providers_with_long_name.rs"), "fn a() { println!(\"hello world this is a long line\"); }\n").expect("write");
+    std::fs::write(root.join("new.md"), "new\n").expect("write");
+    git(root, &["add", "f.txt"]);
+    let ascii = Rig::with_theme(crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii));
+    let rig = Rig::new();
+    let mut overlay = GitOverlay::open(crate::git_panel::Repo::new(root, &crate::config::types::Config::default()), None).expect("opens");
+    for (w, h, r) in [(120u16, 30u16, &rig), (100, 24, &rig), (60, 20, &rig), (38, 16, &ascii)] {
+        let ctx = DrawCtx { theme: &r.theme, keys: &r.keys, status: &r.status, preview_status: &status_preview };
+        println!("==== {w}x{h}\n{}", screen(&render(w, h, |f| overlay.draw(f, &ctx))));
+    }
+    std::fs::write(root.join("f.txt"), "one\ntwo\nthree\nfour\nfive\n").expect("write");
+    git(root, &["add", "."]);
+    git(root, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "clean"]);
+    std::fs::write(root.join("src/ui/overlay/providers_with_long_name.rs"), "fn a() {}\n").expect("write");
+    git(root, &["add", "."]);
+    git(root, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "clean2"]);
+    git(root, &["rm", "-q", "--cached", "new.md"]);
+    std::fs::remove_file(root.join("new.md")).unwrap();
+    let mut clean = GitOverlay::open(crate::git_panel::Repo::new(root, &crate::config::types::Config::default()), None).expect("opens");
+    for (w, h, r) in [(100u16, 24u16, &rig), (38, 16, &ascii)] {
+        let ctx = DrawCtx { theme: &r.theme, keys: &r.keys, status: &r.status, preview_status: &status_preview };
+        println!("==== clean {w}x{h}\n{}", screen(&render(w, h, |f| clean.draw(f, &ctx))));
+    }
+}

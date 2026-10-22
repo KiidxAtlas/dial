@@ -101,6 +101,15 @@ pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
     {
         return Vec::new();
     }
+    if let Some((server, action)) = t
+        .name
+        .strip_prefix("mcp__")
+        .and_then(|name| name.split_once("__"))
+        && !server.is_empty()
+        && !action.is_empty()
+    {
+        return mcp_card(t, server, action, w as usize, ctx);
+    }
     if t.presentation.body == crate::runtime::presentation::BodyStyle::Plan
         && t.todo.is_some()
         && t.state == ToolState::Completed
@@ -111,10 +120,25 @@ pub(super) fn tool_rows(t: &Tool, w: u16, ctx: &TranscriptCtx) -> Rows {
     }
 }
 
+/// MCP calls read like every other work row: the service-local action takes the verb column and
+/// the server that answered sits beside it as a quiet source label, so the call stays attributable
+/// without a frame competing with the answer.
+fn mcp_card(t: &Tool, server: &str, action: &str, w: usize, ctx: &TranscriptCtx) -> Rows {
+    card_with(
+        t,
+        w,
+        ctx,
+        text::one_line(action),
+        Some(text::one_line(server)),
+    )
+}
+
 /// Width of the verb column, so targets line up down the transcript.
 const VERB_W: usize = 7;
 /// Cells of the icon gutter: the glyph, then the content column every transcript block shares.
 pub(super) const GUTTER: usize = 3;
+/// Cells of target a header keeps before it gives up optional facts (timing, a redundant status).
+const TARGET_MIN: usize = 16;
 
 /// The glyph padded to the gutter.
 fn gutter_span(glyph: String, style: Style) -> Vec<Span<'static>> {
@@ -144,8 +168,35 @@ fn plural(n: usize, one: &str) -> String {
     format!("{n} {one}{}", if n == 1 { "" } else { "s" })
 }
 
+/// One fact at the header's right edge. `drop` ranks how readily it gives way to the target when
+/// the row is narrow: 0 never, higher first.
+struct Fact {
+    text: String,
+    drop: u8,
+}
+
+/// The `+a −b` totals an edit's change preview reports, when it carries them.
+fn change_totals(t: &Tool, ascii: bool) -> Option<String> {
+    if t.state == ToolState::Failed {
+        return None;
+    }
+    let totals = t.output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("change preview (")?
+            .strip_suffix(" lines)")
+            .map(str::to_owned)
+    })?;
+    let (added, removed) = totals.split_once(' ')?;
+    if !added.starts_with('+') || !removed.starts_with('-') {
+        return None;
+    }
+    let minus = if ascii { "-" } else { "−" };
+    Some(format!("{added} {minus}{}", &removed[1..]))
+}
+
 /// Facts shown at the right edge of the header: size of the change or result, run time, exit code.
-fn facts(t: &Tool) -> Vec<String> {
+fn facts(t: &Tool, theme: &Theme) -> Vec<Fact> {
+    let keep = |text: String| Fact { text, drop: 0 };
     let mut out = Vec::new();
     if t.presentation.body == crate::runtime::presentation::BodyStyle::Workers
         && !t.agents.is_empty()
@@ -161,23 +212,79 @@ fn facts(t: &Tool) -> Vec<String> {
             .filter(|a| a.state == ToolState::Failed)
             .count();
         if running > 0 {
-            out.push(format!("{running} running"));
+            out.push(keep(format!("{running} running")));
         }
         if failed > 0 {
-            out.push(format!("{failed} failed"));
+            out.push(keep(format!("{failed} failed")));
         }
     }
-    out.extend(t.presentation.facts.iter().map(|fact| text::one_line(fact)));
-    if !matches!(t.state, ToolState::Running | ToolState::Completed) {
-        out.push(t.state.label().into());
+    if let Some(totals) = change_totals(t, theme.ascii()) {
+        out.push(keep(totals));
+    }
+    // Tool-owned facts may join parts with `·`; the ASCII preset keeps its own separator.
+    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    out.extend(
+        t.presentation
+            .facts
+            .iter()
+            .map(|fact| keep(text::one_line(fact).replace(" · ", &dot))),
+    );
+    let exit_code = out.iter().any(|f| f.text.starts_with("exit "));
+    if !matches!(t.state, ToolState::Running | ToolState::Completed)
+        // An exit code already says the command failed; the gutter's ✗ says it again.
+        && !(t.state == ToolState::Failed && exit_code)
+    {
+        // Only failure has an unmistakable glyph of its own (✗), so only its word can yield to
+        // the target; interrupted, blocked and incomplete always say what happened.
+        out.push(Fact {
+            text: t.state.label().into(),
+            drop: u8::from(t.state == ToolState::Failed),
+        });
     }
     if let Some(secs) = t
         .elapsed
         .filter(|s| *s >= 0.05 && t.state != ToolState::Running)
     {
-        out.push(elapsed_label(secs));
+        out.push(Fact {
+            text: elapsed_label(secs),
+            drop: 2,
+        });
     }
     out
+}
+
+/// Paths are identified by their end, so they lose their start; prose loses its end.
+fn fit_target(target: &str, room: usize, ascii: bool) -> String {
+    if room == 0 {
+        return String::new();
+    }
+    let path_like = target.contains('/') && !target.contains(char::is_whitespace);
+    if path_like {
+        text::ellipsize_start(target, room, ascii)
+    } else {
+        text::ellipsize(target, room, ascii)
+    }
+}
+
+/// Whether two spellings name the same file (one may be relative to the other).
+fn same_path(a: &str, b: &str) -> bool {
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+
+/// One line of plain output word-wrapped to `max` cells with its indentation kept: continuation
+/// rows hang under the line's own text, so compiler carets and nested output stay aligned.
+fn wrap_indented(line: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let body = line.trim_start_matches(' ');
+    if body.is_empty() {
+        return vec![String::new()];
+    }
+    let indent = (line.len() - body.len()).min(max / 2);
+    let pad = " ".repeat(indent);
+    text::wrap_words(body, max - indent)
+        .into_iter()
+        .map(|row| format!("{pad}{row}"))
+        .collect()
 }
 
 /// Rows previewing what a `write` created: numbered `+` lines from the call's own content.
@@ -199,9 +306,10 @@ fn write_preview(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, u
             Line::from(vec![
                 Span::styled(format!("{:>gutter_w$} ", i + 1), theme.fg(Tok::Dim)),
                 Span::styled(
-                    text::clip(
+                    text::ellipsize(
                         &format!("+ {line}"),
                         inner.saturating_sub(gutter_w + 1).max(1),
+                        theme.ascii(),
                     ),
                     theme.fg(Tok::DiffAdded),
                 ),
@@ -216,10 +324,21 @@ fn write_preview(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, u
 /// right edge), then, when it says something, the body hanging off a `└` under the verb: the diff
 /// for edits, the new lines for writes, output for commands, the first error lines for failures.
 fn card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
+    card_with(t, w, ctx, verb(t), None)
+}
+
+/// A card whose verb column reads `verb_text`; `source` names who answered (an MCP server) in a
+/// quiet label beside it.
+fn card_with(
+    t: &Tool,
+    w: usize,
+    ctx: &TranscriptCtx,
+    verb_text: String,
+    source: Option<String>,
+) -> Rows {
     let theme = ctx.theme;
     let mark = ellipsis(theme);
     let (glyph, glyph_style) = tool_glyph(t, ctx);
-    let verb_text = verb(t);
     let verb_style = if t.state == ToolState::Failed {
         theme.fg(Tok::Error).add_modifier(Modifier::BOLD)
     } else if is_context(t) {
@@ -227,25 +346,55 @@ fn card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     } else {
         theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD)
     };
-    let target_text = target(t);
-    let facts_text = facts(t).join(&format!(" {} ", theme.sym(Sym::Dot)));
+    let full_target = target(t);
+    let sep = format!(" {} ", theme.sym(Sym::Dot));
     let lead = gutter_span(glyph, glyph_style);
     let lead_w: usize = lead.iter().map(|s| text::width(&s.content)).sum();
-    let left_fixed = lead_w + VERB_W.max(text::width(&verb_text)) + 1;
+    let source_w = source.as_deref().map_or(0, |s| text::width(s) + 2);
+    let left_fixed = lead_w + VERB_W.max(text::width(&verb_text)) + 1 + source_w;
+    // Narrow rows give up timing, then a status the gutter glyph already shows, before the target.
+    let mut facts = facts(t, theme);
+    let want = text::width(&full_target).min(TARGET_MIN);
+    let (facts_text, room) = loop {
+        let joined = facts
+            .iter()
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>()
+            .join(&sep);
+        let right_w = text::width(&joined);
+        let room = w.saturating_sub(left_fixed + right_w + if right_w > 0 { 2 } else { 0 });
+        let droppable = facts
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.drop > 0)
+            .max_by_key(|(i, f)| (f.drop, *i))
+            .map(|(i, _)| i);
+        match droppable {
+            Some(i) if room < want => {
+                facts.remove(i);
+            }
+            _ => break (joined, room),
+        }
+    };
     let right_w = text::width(&facts_text);
-    let room = w.saturating_sub(left_fixed + right_w + if right_w > 0 { 2 } else { 0 });
-    let full_target = target_text.clone();
-    let target_text = text::clip(&target_text, room.max(1));
+    let target_text = fit_target(&full_target, room, theme.ascii());
     let target_clipped = full_target != target_text;
-    let gap = w.saturating_sub(left_fixed + text::width(&target_text) + right_w);
     let mut head = lead;
-    head.extend([
-        Span::styled(format!("{verb_text:<width$}", width = VERB_W), verb_style),
-        Span::raw(" "),
-        Span::styled(target_text, theme.fg(Tok::Muted)),
-    ]);
+    head.push(Span::styled(
+        format!("{verb_text:<width$}", width = VERB_W),
+        verb_style,
+    ));
+    head.push(Span::raw(" "));
+    if let Some(source) = source {
+        head.push(Span::styled(source, theme.fg(Tok::Dim)));
+        head.push(Span::raw("  "));
+    }
+    head.push(Span::styled(target_text, theme.fg(Tok::Muted)));
     if right_w > 0 {
-        head.push(Span::raw(" ".repeat(gap)));
+        let used: usize = head.iter().map(|s| text::width(&s.content)).sum();
+        head.push(Span::raw(
+            " ".repeat(w.saturating_sub(used + right_w).max(1)),
+        ));
         let style = if t.state == ToolState::Failed {
             theme.fg(Tok::Error)
         } else {
@@ -418,17 +567,21 @@ fn agent_tree(agents: &[AgentRow], w: usize, ctx: &TranscriptCtx) -> Rows {
             _ => None,
         };
         if let Some((detail, style)) = detail {
-            let lead = format!("   {}  {hook} ", if is_last { "  " } else { pipe });
+            let indent = format!("   {}  ", if is_last { "  " } else { pipe });
+            let lead = format!("{indent}{hook} ");
             let room = w.saturating_sub(text::width(&lead)).max(1);
             let detail = text::sanitize(&detail);
             let lines = if ctx.tools_expanded {
                 text::wrap_words(&detail, room)
             } else {
-                vec![text::clip(&text::one_line(&detail), room)]
+                vec![text::ellipsize(&text::one_line(&detail), room, ascii)]
             };
-            for line in lines {
+            // The hook marks where the report starts; wrapped rows hang under its text.
+            let hang = format!("{indent}{} ", " ".repeat(text::width(hook)));
+            for (n, line) in lines.into_iter().enumerate() {
+                let rail_text = if n == 0 { lead.clone() } else { hang.clone() };
                 rows.push(fitted(
-                    vec![Span::styled(lead.clone(), rail), Span::styled(line, style)],
+                    vec![Span::styled(rail_text, rail), Span::styled(line, style)],
                     w,
                     theme,
                 ));
@@ -450,13 +603,17 @@ fn todo_card(t: &Tool, w: usize, ctx: &TranscriptCtx) -> Rows {
     // Same columns as every other card: status glyph, verb, then what it is about.
     let verb_style = theme.fg(Tok::ToolTitle).add_modifier(Modifier::BOLD);
     let mut spans = gutter_span(glyph, glyph_style);
+    let summary = if tasks.is_empty() {
+        "no tasks".to_owned()
+    } else if closed == tasks.len() {
+        format!("all {} done", tasks.len())
+    } else {
+        format!("{closed}/{} done", tasks.len())
+    };
     spans.extend([
         Span::styled(format!("{:<width$}", "Plan", width = VERB_W), verb_style),
         Span::raw(" "),
-        Span::styled(
-            format!("{closed}/{} done", tasks.len()),
-            theme.fg(Tok::Muted),
-        ),
+        Span::styled(summary, theme.fg(Tok::Muted)),
     ]);
     let mut rows = vec![fitted(spans, w, theme)];
     // The list's own two-cell indent plus one puts each task glyph under the verb.
@@ -563,40 +720,57 @@ fn diff_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx) -> Option<(Rows, usize
     } else {
         ctx.ui.tool_output_lines
     };
-    let mut rows: Rows = Vec::new();
-    let mut total = 0;
+    // The header already names a single edited file and its `+a −b` totals.
+    let header_target = target(t);
+    let single_file = items.iter().filter(|i| matches!(i, Row::File(_))).count() == 1;
+    let totals_in_header = change_totals(t, theme.ascii()).is_some();
+    let code_w = inner.saturating_sub(gutter + 1).max(1);
+    let mut all: Rows = Vec::new();
     for item in items {
-        let spans = match item {
-            Row::File(path) => vec![Span::styled(path.to_owned(), theme.fg(Tok::Accent))],
-            Row::Note(text) => vec![Span::styled(text.to_owned(), theme.fg(Tok::Dim))],
-            Row::Gap => vec![Span::styled(
+        match item {
+            Row::File(path) if single_file && same_path(&header_target, path) => {}
+            Row::Note(text) if totals_in_header && text.starts_with("updated (") => {}
+            Row::File(path) => all.extend(text::wrap(
+                vec![Line::from(Span::styled(
+                    path.to_owned(),
+                    theme.fg(Tok::Accent),
+                ))],
+                inner.max(1),
+            )),
+            Row::Note(text) => all.extend(
+                text::wrap_words(text, inner.max(1))
+                    .into_iter()
+                    .map(|row| Line::from(Span::styled(row, theme.fg(Tok::Dim)))),
+            ),
+            Row::Gap => all.push(Line::from(Span::styled(
                 format!("{:>gutter$}", theme.sym(Sym::Ellipsis)),
                 theme.fg(Tok::Dim),
-            )],
+            ))),
             Row::Line(sign, n, text) => {
                 let style = match sign {
                     '+' => theme.fg(Tok::DiffAdded),
                     '-' => theme.fg(Tok::DiffRemoved),
                     _ => theme.fg(Tok::DiffContext),
                 };
-                vec![
-                    Span::styled(
-                        format!("{:>gutter$} ", n.map_or(String::new(), |n| n.to_string())),
-                        theme.fg(Tok::Dim),
-                    ),
-                    Span::styled(format!("{sign}{text}"), style),
-                ]
-            }
-        };
-        for wrapped in text::wrap(vec![Line::from(spans)], inner.max(1)) {
-            total += 1;
-            if rows.len() < limit {
-                rows.push(wrapped);
+                let number = format!("{:>gutter$} ", n.map_or(String::new(), |n| n.to_string()));
+                let code = vec![Line::from(Span::styled(format!("{sign}{text}"), style))];
+                // Wrapped code hangs under the code column, never under the line numbers.
+                for (k, piece) in text::wrap(code, code_w).into_iter().enumerate() {
+                    let lead = if k == 0 {
+                        number.clone()
+                    } else {
+                        " ".repeat(gutter + 1)
+                    };
+                    let mut spans = vec![Span::styled(lead, theme.fg(Tok::Dim))];
+                    spans.extend(piece.spans);
+                    all.push(Line::from(spans));
+                }
             }
         }
     }
-    let hidden = total - rows.len();
-    Some((rows, hidden))
+    let hidden = all.len().saturating_sub(limit);
+    all.truncate(limit);
+    Some((all, hidden))
 }
 
 /// Diff-aware spans for one line of `edit` / `write` output: `+`/`-` hunks, `@@`, the `[path#TAG]`
@@ -677,13 +851,15 @@ fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx, limit: Option<usize>
                 },
             )]
         };
-        let wrapped_rows = if err {
-            text::wrap_words(line, inner.max(1))
-                .into_iter()
-                .map(|text| Line::from(Span::styled(text, theme.fg(Tok::Error))))
-                .collect()
-        } else {
+        // Output wraps at word boundaries and keeps its indentation; edit previews are code.
+        let wrapped_rows: Rows = if diffy {
             text::wrap(vec![Line::from(spans)], inner.max(1))
+        } else {
+            let style = spans.first().map(|s| s.style).unwrap_or_default();
+            wrap_indented(line, inner)
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, style)))
+                .collect()
         };
         for wrapped in wrapped_rows {
             total += 1;
@@ -696,7 +872,7 @@ fn output_rows(t: &Tool, inner: usize, ctx: &TranscriptCtx, limit: Option<usize>
     (rows, hidden)
 }
 
-fn hidden_hint(hidden: usize, expand_key: &str, theme: &Theme) -> Span<'static> {
+pub(super) fn hidden_hint(hidden: usize, expand_key: &str, theme: &Theme) -> Span<'static> {
     // The shortcut is the user's own binding, so it is named as the keymap shows it.
     Span::styled(
         format!(
@@ -720,3 +896,6 @@ fn elapsed_label(secs: f64) -> String {
 
 /// Rows of a compact (one-line) tool's error shown before Ctrl+O expands it.
 const COMPACT_ERROR_ROWS: usize = 2;
+
+#[cfg(test)]
+mod tests;

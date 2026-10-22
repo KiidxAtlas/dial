@@ -22,9 +22,9 @@ fn categories_are_disjoint_and_preserve_the_total_estimate() {
     let total: usize = request
         .messages
         .iter()
-        .chain(request.tools.iter())
-        .map(|v| v.to_string().len())
-        .sum();
+        .map(wire_message_bytes)
+        .sum::<usize>()
+        + request.tools.iter().map(json_bytes).sum::<usize>();
     assert_eq!(cost.total(), total);
     assert_eq!(
         cost.economy_system_bytes
@@ -35,17 +35,38 @@ fn categories_are_disjoint_and_preserve_the_total_estimate() {
     );
     assert_eq!(
         cost.economy_system_bytes,
-        request.messages[0].to_string().len()
+        request.messages[..2]
+            .iter()
+            .map(wire_message_bytes)
+            .sum::<usize>()
     );
     assert_eq!(
         cost.request_tail_bytes,
-        request.messages[5].to_string().len()
+        wire_message_bytes(&request.messages[5])
     );
     assert_eq!(
         cost.history_bytes,
-        request.messages[1..5]
+        request.messages[2..5]
             .iter()
-            .map(|v| v.to_string().len())
+            .map(wire_message_bytes)
             .sum::<usize>()
     );
+}
+
+#[test]
+fn internal_evidence_metadata_does_not_inflate_request_economy() {
+    let mut request = Chat {
+        messages: vec![json!({"role":"tool","content":"source evidence"})],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: 512,
+        seed: None,
+    };
+    let before = overhead(&request);
+    request.messages[0]["dial_evidence"] =
+        json!({"artifact":"artifact://source", "internal":"x".repeat(40_000)});
+    let after = overhead(&request);
+    assert_eq!(before.total(), after.total());
+    assert_eq!(before.history_bytes, after.history_bytes);
+    assert_eq!(before.tool_result_bytes, after.tool_result_bytes);
 }

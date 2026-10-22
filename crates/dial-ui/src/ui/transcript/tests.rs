@@ -1152,7 +1152,6 @@ fn edit_cards_show_the_numbered_diff_not_the_model_facing_preview() {
         .collect();
     for expected in [
         "src/a.rs",
-        "updated (+1 -1 lines)",
         "1  fn a() {",
         "2 -    old();",
         "2 +    new();",
@@ -1179,6 +1178,10 @@ fn edit_cards_show_the_numbered_diff_not_the_model_facing_preview() {
     assert_eq!(style("+    new();"), env.theme.fg(Tok::DiffAdded).fg);
     assert_eq!(style("-    old();"), env.theme.fg(Tok::DiffRemoved).fg);
     assert!(!text_of(&rows).contains("change preview"));
+    assert!(
+        text[0].contains("+1 −1") && !text_of(&rows).contains("updated ("),
+        "the change size is stated once, in the header: {text:?}"
+    );
 }
 
 #[test]

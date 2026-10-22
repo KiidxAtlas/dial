@@ -26,6 +26,43 @@ fn token_pricing_splits_cache_writes_by_ttl() {
     };
     assert!((pricing.reply_cost(&flat).unwrap() - 3.75).abs() < 1e-9);
 }
+
+#[test]
+fn contradictory_cache_write_buckets_leave_cost_unknown() {
+    let pricing = TokenPricing {
+        prompt: 1e-6,
+        completion: 2e-6,
+        cache_read: Some(1e-7),
+        cache_write: Some(1.25e-6),
+    };
+    let bundled = bundled_model("anthropic", "claude-opus-4-6")
+        .unwrap()
+        .list_price
+        .unwrap();
+    let mut reply = crate::llm::Reply {
+        prompt_tokens: Some(100),
+        completion_tokens: Some(1),
+        cache_creation_tokens: Some(10),
+        cache_creation_5m_tokens: Some(6),
+        cache_creation_1h_tokens: Some(5),
+        ..Default::default()
+    };
+    assert!(pricing.reply_cost(&reply).is_none());
+    assert!(bundled.reply_cost(&reply, 0).is_none());
+    reply.cache_creation_tokens = Some(u64::MAX);
+    reply.prompt_tokens = Some(u64::MAX);
+    reply.cache_creation_5m_tokens = Some(u64::MAX);
+    reply.cache_creation_1h_tokens = Some(1);
+    assert!(pricing.reply_cost(&reply).is_none());
+    assert!(bundled.reply_cost(&reply, 0).is_none());
+    // Partial buckets are valid: the remaining writes retain the default TTL price.
+    reply.prompt_tokens = Some(100);
+    reply.cache_creation_tokens = Some(10);
+    reply.cache_creation_5m_tokens = Some(6);
+    reply.cache_creation_1h_tokens = Some(3);
+    assert!(pricing.reply_cost(&reply).is_some());
+    assert!(bundled.reply_cost(&reply, 0).is_some());
+}
 use std::{
     io::{BufRead, BufReader, Write},
     net::TcpListener,

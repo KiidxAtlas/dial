@@ -324,6 +324,32 @@ impl Accumulator {
         }
         let event: Value =
             serde_json::from_str(data).context("chat stream event is not valid JSON")?;
+        // Preserve provider counters before any callback or late error can reject this event.
+        if let Some(usage) = event.get("usage").filter(|u| u.is_object()) {
+            self.prompt_tokens = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .or(self.prompt_tokens);
+            self.completion_tokens = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .or(self.completion_tokens);
+            self.reasoning_tokens = usage
+                .pointer("/completion_tokens_details/reasoning_tokens")
+                .and_then(Value::as_u64)
+                .or(self.reasoning_tokens);
+            self.cached_prompt_tokens = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .or(self.cached_prompt_tokens);
+            super::usage::capture(super::usage::Snapshot {
+                input: self.prompt_tokens,
+                output: self.completion_tokens,
+                cache_read: self.cached_prompt_tokens,
+                reasoning: self.reasoning_tokens,
+                ..Default::default()
+            });
+        }
         if let Some(error) = event.get("error").filter(|e| !e.is_null()) {
             let message = error
                 .get("message")
@@ -385,24 +411,8 @@ impl Accumulator {
                 .and_then(Value::as_u64)
                 .or(self.timing_cache_n);
         }
-        if let Some(usage) = event.get("usage").filter(|u| u.is_object()) {
+        if event.get("usage").is_some_and(Value::is_object) {
             progress_seen = true;
-            self.prompt_tokens = usage
-                .get("prompt_tokens")
-                .and_then(Value::as_u64)
-                .or(self.prompt_tokens);
-            self.completion_tokens = usage
-                .get("completion_tokens")
-                .and_then(Value::as_u64)
-                .or(self.completion_tokens);
-            self.reasoning_tokens = usage
-                .pointer("/completion_tokens_details/reasoning_tokens")
-                .and_then(Value::as_u64)
-                .or(self.reasoning_tokens);
-            self.cached_prompt_tokens = usage
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(Value::as_u64)
-                .or(self.cached_prompt_tokens);
             if self.completion_tokens.is_some() {
                 let mut progress = super::ModelProgress::new(super::InferencePhase::Generating);
                 progress.prompt_tokens = self.prompt_tokens;

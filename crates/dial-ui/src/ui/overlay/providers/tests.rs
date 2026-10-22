@@ -943,3 +943,34 @@ fn hostile_provider_text_is_sanitized() {
         assert!(!shown.contains('\u{1b}') && !shown.contains('\u{7}'));
     }
 }
+
+#[test]
+fn zz_dump() {
+    let ascii = Rig::with_theme(Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii));
+    let rig = Rig::new();
+    for (name, mk) in [
+        ("full", Box::new(overlay) as Box<dyn Fn() -> ProviderOverlay>),
+        ("none", Box::new(|| ProviderOverlay::new(None, BTreeMap::new(), Box::new(|_| false), Scope::Global))),
+        ("empty-disc", Box::new(|| ProviderOverlay::new(Some(Discovery { models: vec![], providers: vec![] }), BTreeMap::new(), Box::new(|_| false), Scope::Global))),
+    ] {
+        for (w, h, r) in [(120u16, 40u16, &rig), (100, 24, &rig), (60, 20, &rig), (38, 16, &ascii)] {
+            let mut o = mk();
+            println!("==== {name} {w}x{h}\n{}", draw(&mut o, r, w, h));
+        }
+    }
+    let mut o = overlay();
+    select(&mut o, "openai");
+    send(&mut o, &rig, key(KeyCode::Enter));
+    for (w, h) in [(100u16, 24u16), (60, 20), (38, 16)] {
+        println!("==== menu {w}x{h}\n{}", draw(&mut o, &rig, w, h));
+    }
+    send(&mut o, &rig, key(KeyCode::Enter));
+    for (w, h) in [(100u16, 24u16), (60, 20), (38, 16)] {
+        println!("==== after-enter {w}x{h}\n{}", draw(&mut o, &rig, w, h));
+    }
+    let mut o = ProviderOverlay::new(None, BTreeMap::new(), Box::new(|_| false), Scope::Global);
+    send(&mut o, &rig, key(KeyCode::Enter));
+    for (w, h) in [(100u16, 24u16), (60, 20), (38, 16)] {
+        println!("==== wizard {w}x{h}\n{}", draw(&mut o, &rig, w, h));
+    }
+}

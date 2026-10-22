@@ -86,10 +86,22 @@ impl Agent<'_> {
             // Large pastes must not create an unbounded classification request. Preserve the exact
             // message as steering instead of asking a model to classify a truncated assignment.
             let can_split = self.config.task.can_spawn_at(0)
+                && self.live_tasks.running_ids().len()
+                    < self
+                        .config
+                        .subagent_max_live_jobs
+                        .min(self.config.task.max_concurrency)
                 && self.layout.is_some()
                 && self.catalog().iter().any(|name| name == "task")
                 && self.tool_eligible("task");
-            let choice = if text.chars().count() > 16_000 || instruction.trim().is_empty() {
+            let choice = if !can_split {
+                // There is only one admissible route. A classifier cannot change it, so do not
+                // spend a model request (or fail over to one) just to rediscover that boundary.
+                Ok(Decision {
+                    route: Route::Steer,
+                    reason: "Independent workers are unavailable; keeping this as steering".into(),
+                })
+            } else if text.chars().count() > 16_000 || instruction.trim().is_empty() {
                 Err(anyhow::anyhow!(
                     "message too large or active task context unavailable"
                 ))

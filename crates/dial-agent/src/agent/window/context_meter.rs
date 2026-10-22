@@ -1,7 +1,10 @@
 //! Display-only context telemetry. Provider accounting remains separate from estimates.
 use crate::agent::workflow::evidence;
 use crate::{
-    llm::{Chat, wire::json_bytes},
+    llm::{
+        Chat,
+        wire::{json_bytes, wire_message_bytes},
+    },
     storage::session::Session,
 };
 
@@ -14,7 +17,7 @@ pub(in crate::agent) struct ContextMeter {
     anchor: usize,
 }
 
-/// Disjoint serialized byte categories, not tokenizer counts or billed usage.
+/// Disjoint provider-neutral wire byte estimates, not tokenizer counts or billed usage.
 #[derive(Default, serde::Serialize)]
 pub(in crate::agent) struct RequestOverhead {
     pub system_bytes: usize,
@@ -47,8 +50,8 @@ pub(in crate::agent) fn overhead(request: &Chat) -> RequestOverhead {
         ..Default::default()
     };
     for message in &request.messages {
-        let bytes = json_bytes(message);
-        if message["role"] == "system" {
+        let bytes = wire_message_bytes(message);
+        if matches!(message["role"].as_str(), Some("system" | "developer")) {
             out.economy_system_bytes += bytes;
         } else if message["dial_transient"] == true {
             out.request_tail_bytes += bytes;

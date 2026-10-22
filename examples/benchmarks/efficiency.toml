@@ -6,8 +6,8 @@ name = "coding-efficiency"
 id = "simple-question"
 project = "examples/benchmarks/efficiency-fixture"
 prompt = "What is 2 + 2? Answer with just the number; do not use tools."
-categories = ["efficiency", "informational", "answer_requires_manual_review"]
-checks = [{kind="metric",metric="tool_calls",max=0}, {kind="metric",metric="tool_errors",max=0}]
+categories = ["efficiency", "informational"]
+checks = [{kind="response_equals",content="4"}, {kind="metric",metric="tool_calls",max=0}, {kind="metric",metric="tool_errors",max=0}]
 
 [[cases]]
 id = "one-file-fix"

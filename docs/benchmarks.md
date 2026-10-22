@@ -4,15 +4,63 @@ Benchmark suites, efficiency measurement, workflow regression checks, configurat
 
 **Invalid runs.** A benchmark run in which no case shows any model activity (for example, every case fails immediately with an agent error before a model request) is reported as an invalid run and fails the command, instead of being reported as a 0 score. The JSON report records the reason in `invalid_run`, and each case keeps its `evidence.agent_error_detail`; fix the setup problem before comparing results.
 
+## Using an existing subscription sign-in
+
+Add `--share-auth` to explicitly let benchmark inference use the original subscription authentication
+store, for example:
+
+```sh
+dial benchmark examples/benchmarks/efficiency.toml --share-auth --report efficiency-report.json
+```
+
+Configuration, sessions, fixtures and caches still use disposable benchmark homes. ChatGPT/Claude
+subscription credentials are never copied: provider requests use the original store and its existing
+refresh locks. The shared directory remains protected from agent tools and sandboxed commands.
+Without this flag, subscription sign-ins remain unavailable to benchmark children, even if an ambient
+`DIAL_SUBSCRIPTION_AUTH_HOME` override exists. API-key credentials retain their existing behavior.
+Sharing authentication permits real model requests and can consume subscription quota.
+
 ## Measuring efficiency
 
 From this checkout run `dial benchmark examples/benchmarks/efficiency.toml --profiles machine.toml --report efficiency-report.json`
 using the machine/profile configuration described below. The five disposable cases cover a simple
 question, a one-file edit, a failing-test repair, a multi-file rename, and continued-session compaction.
 Compare correctness first, then observed prompt/output/cache/reasoning usage, calls, errors and elapsed
-time. The simple-question case checks tool avoidance only; manually review its answer for correctness.
+time. The simple-question case independently checks that the trimmed final answer is exactly `4`
+as well as tool avoidance. Reports retain only the answer hash, not response prose.
 The continued-session case tests multi-turn compaction, not process restart/resume. No live-model savings
 are claimed by these fixtures, and prompt cache hits need not be free under a subscription limit.
+
+`examples/benchmarks/local-measurement.toml` is a three-repetition, local-only LM Studio
+configuration with a 180-second per-case deadline. Set its model ID to an already loaded model;
+it does not download or load weights. The example command in that file writes a raw JSON report.
+Use the same configuration and fixture revision for before/after measurements.
+
+Journey `compact_before = true` requests a zero-token verbatim tail and requires the RPC to
+confirm an actual compaction. A no-op maintenance response or context reset fails the case;
+successful RPC dispatch alone never counts as compaction. Final counters come from the runtime.
+`examples/benchmarks/compaction.toml` specifically exercises compaction of a short conversation
+below the normal keep-recent budget. Its independent exact-file check verifies the retained goal.
+To exercise this orchestration offline (not measure model quality):
+
+```sh
+python3 examples/benchmarks/smoke.py --dial ./target/debug/dial --suite compaction --machine-repetitions 3
+```
+
+`useful_work` counts only passing cases with independent outcome checks. Its per-completion elapsed,
+token and API-cost numerators include **all** attempted cases, including failures and metric-only
+cases, so dropping failed work cannot improve efficiency. Tokens and cost remain unknown when any
+case has incomplete usage or pricing; zero completions never yields a finite efficiency ratio.
+Elapsed is summed agent-case time, not wall time including external acceptance checks.
+`metrics.runtime_usage` preserves the runtime ledger's total, main/worker and purpose breakdowns,
+including retries, discarded and unreported attempts and pricing coverage. These are orthogonal
+views of the same usage, not quantities to add together. Discarded-attempt counts do not imply
+known discarded-token or dollar costs. Optional `metrics.efficiency.turns` retains each observed
+per-turn report with its send ordinal. A bounded error-recovery state read is separately labelled
+`recovery_observation`, because that state may still describe the preceding turn. These reports
+are not cumulative totals. The runtime records first tool-result/known workspace-change-result
+latency and exact parent/worker inspection overlap, not semantic reuse or wasted work. A useful
+action's latency, missing counters and unavailable reports remain unknown rather than inferred.
 
 For evidence-led quality work, use `dial benchmark examples/benchmarks/quality.toml --report target/quality.json`.
 Its billing fixtures cover locating production code among archival decoys,
@@ -40,6 +88,38 @@ policies with focused harness regressions, not a purported live escalation score
 session recovery and concurrent edits are covered separately by terminal/transaction regressions.
 Provider runs may consume quota. Report infrastructure failures separately, and never infer
 model quality, dollar cost, or a provider cache hit from a scripted run or a missing usage counter.
+
+### Interrupted machine runs
+
+Machine-configuration runs (including assistance ablations) with `--report` also create a unique,
+owner-only `<report-name>.progress-*.jsonl` journal beside the final report. The path is printed
+to stderr. Each checked trial is flushed and synced before the next case starts, including failed
+and unavailable trials. Records identify the configuration and zero-based repetition; configuration
+records retain the hashed run contract without credentials or source contents. Repeated runs do not
+overwrite earlier journals. A final `finished` record means all expected trials were recorded, not
+that their checks passed or that a scored final report was successfully written.
+
+An interrupted journal is diagnostic evidence, **not** a scored report, a baseline, or a resume
+checkpoint. Do not calculate a success rate from only its completed cases. A crash during a write
+can leave an incomplete final line; preceding complete JSON lines remain readable. Existing
+single-configuration `--checkpoint` / `--resume` behavior is unchanged.
+
+### Offline workspace-copy measurements
+
+```sh
+cargo run -p dial-core --release --example workspace_copy_bench -- 9
+```
+
+This benchmarks the actual clone and plain-copy implementations on deterministic small-file,
+nested-source, excluded-dependency and (on Unix) internal-symlink fixtures. It warms both backends,
+alternates execution order and validates the complete copied file manifest outside the timer.
+CSV output records repetitions, file/byte counts and minimum/median/maximum elapsed milliseconds.
+Setup, output verification and temporary-directory cleanup are excluded. These are warm-cache
+filesystem timings, not cold-disk throughput or evidence of agent/model quality. Use repeated
+baseline/candidate/restored-baseline runs before attributing small changes to an optimization.
+
+See [the local measurement batch](benchmark-measurements.md) for observed judgment-budget,
+live-compaction and workspace-copy results, including failed trials and a rejected optimization.
 
 ### Repeated outcomes, not best-run scores
 

@@ -1865,20 +1865,27 @@ fn optional_findings_redirect_duplicate_reads_and_survive_resume() {
             .to_string()
             .contains("Investigation done needs")
     );
-    assert!(
-        requests[5]["messages"]
-            .to_string()
-            .contains("This observation is unchanged")
-    );
+    let duplicate = requests[5]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(duplicate.starts_with("[Unchanged read]"), "{duplicate}");
+    assert!(duplicate.contains("still shown above"));
     assert!(
         !requests[6]["messages"]
             .to_string()
             .contains("Investigation done needs")
     );
     assert!(
-        ui.notices
+        !ui.notices
             .iter()
-            .any(|n| n.contains("unchanged observation"))
+            .any(|n| n.contains("unchanged observation")),
+        "read pointers must not emit a verbose recovery notice"
     );
     let path = a.session().path().unwrap().to_owned();
     drop(a);
@@ -2004,7 +2011,7 @@ fn repeated_reads_across_failed_checks_stop_and_keep_compact_evidence() {
         .filter(|m| {
             m["content"]
                 .as_str()
-                .is_some_and(|s| s.starts_with("[Investigation check"))
+                .is_some_and(|s| s.starts_with("[Unchanged read]"))
         })
         .collect();
     assert_eq!(duplicates.len(), 1);
@@ -2015,7 +2022,16 @@ fn repeated_reads_across_failed_checks_stop_and_keep_compact_evidence() {
                 .unwrap()
                 .contains("ORIGINAL_EVIDENCE")
         );
-        assert!(message["content"].as_str().unwrap().contains("artifact://"));
+        assert!(
+            message["content"]
+                .as_str()
+                .unwrap()
+                .contains("tool call original")
+        );
+        assert!(
+            !message["content"].as_str().unwrap().contains("artifact://"),
+            "the visible original is sufficient; do not add a redundant artifact link"
+        );
     }
     let original_message = a
         .session()
@@ -2210,8 +2226,18 @@ fn user_steering_can_override_a_recovery_checkpoint() {
     }
     let server = serve(vec![
         open_todo(),
-        Reply::IdentifiedCall("read", json!({"path":"marker.txt"}), "original".into()),
-        Reply::IdentifiedCall("read", json!({"path":"marker.txt"}), "duplicate".into()),
+        // A duplicate read is a quiet pointer, not a recovery diagnostic. Use a repeated
+        // search to establish the actual recovery checkpoint this test steers out of.
+        Reply::IdentifiedCall(
+            "grep",
+            json!({"path":"marker.txt", "pattern":"original"}),
+            "original".into(),
+        ),
+        Reply::IdentifiedCall(
+            "grep",
+            json!({"path":"marker.txt", "pattern":"original"}),
+            "duplicate".into(),
+        ),
         Reply::IdentifiedCall("read", json!({"path":"another.txt"}), "steered".into()),
         Reply::Call(
             "finish",
@@ -2278,12 +2304,14 @@ fn recovery_consumes_prefetched_reads_without_relabeling_or_shifting_results() {
         .iter()
         .find(|m| m["tool_call_id"] == "call_2")
         .unwrap();
+    let third_content = third["content"].as_str().unwrap();
     assert!(
-        third["content"]
-            .as_str()
-            .unwrap()
-            .starts_with("[Investigation check")
+        third_content.starts_with("[Unchanged read]"),
+        "{third_content}"
     );
+    assert!(third_content.contains("tool call call_0"));
+    assert!(!third_content.contains("ORIGINAL_SOURCE"));
+    assert!(!third_content.contains("This call was not executed"));
     let fourth = messages
         .iter()
         .find(|m| m["tool_call_id"] == "call_3")
@@ -4262,6 +4290,7 @@ fn compaction_that_cannot_help_says_why_instead_of_summarising_again_and_again()
     );
     let mut e = env(&server.url, "auto");
     e.config.harness.tools = vec!["read".into()];
+    e.config.harness.max_tokens = 4096;
     e.config
         .harness
         .system_prompt
@@ -4281,14 +4310,21 @@ fn compaction_that_cannot_help_says_why_instead_of_summarising_again_and_again()
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None);
     let mut ui = Recorder::default();
-    a.turn("one?", &mut ui).unwrap();
-    a.turn("two?", &mut ui).unwrap();
-    a.last_prompt_tokens = 4700;
-    assert_eq!(
-        a.turn("three?", &mut ui).unwrap().text,
-        "third",
-        "the turn still runs"
+    for instruction in ["one?", "two?", "three?"] {
+        let error = a
+            .turn(instruction, &mut ui)
+            .err()
+            .expect("immutable context cannot leave the requested response reserve");
+        assert!(
+            error.to_string().contains("reserved for a useful response"),
+            "{error:#}"
+        );
+    }
+    assert!(
+        server.requests.lock().is_empty(),
+        "must refuse before inference"
     );
+    assert_eq!(a.session().control_state()["current_instruction"], "three?");
     assert_eq!(
         summary_requests(&side),
         0,
@@ -4318,22 +4354,139 @@ fn servers_without_a_native_context_api_keep_the_configured_window() {
 }
 
 #[test]
+fn automatic_output_ceiling_fits_the_request_window() {
+    let mut script = vec![
+        Reply::Say((0..150).map(|i| format!("detail{i} ")).collect()),
+        Reply::Text("done"),
+        Reply::Text("third answer"),
+    ];
+    script.extend((0..64).map(|_| Reply::Text("SUMMARY: retained the original goal")));
+    let server = serve(script);
+    let mut e = env(&server.url, "auto");
+    e.config.harness.max_tokens = 0;
+    e.config.context_window = 32768;
+    e.config.compaction.keep_recent_tokens = 100;
+    e.config.compaction.enabled = false;
+    e.config.compaction.mid_turn_enabled = false;
+    let backend =
+        make_backend(&e.config)
+            .unwrap()
+            .with_metadata(dial::llm::catalog::ModelMetadata {
+                max_output_tokens: Some(128000),
+                ..Default::default()
+            });
+    assert_eq!(backend.output_budget(0), 128000);
+    let session = Session::create(
+        &e.layout,
+        SessionMeta {
+            model: "scripted".into(),
+        },
+    )
+    .unwrap();
+    let mut a = Agent::interactive(
+        &e.config,
+        backend,
+        e.layout.clone(),
+        session,
+        None,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    a.turn("hello", &mut Recorder::default()).unwrap();
+    let requests = server.requests.lock();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    let output = request
+        .get("max_completion_tokens")
+        .or_else(|| request.get("max_tokens"))
+        .and_then(Value::as_u64)
+        .expect("finite wire output limit");
+    let prompt = dial::llm::wire::estimate_parts(
+        request["messages"].as_array().unwrap(),
+        request["tools"].as_array().unwrap(),
+    );
+    assert!(
+        prompt + output <= u64::from(e.config.context_window),
+        "prompt={prompt}, output={output}"
+    );
+    assert!(output >= u64::from(e.config.compaction.reserve(e.config.context_window)));
+    assert_eq!(
+        e.config.harness.max_tokens, 0,
+        "operator configuration remains unchanged"
+    );
+    drop(requests);
+    a.turn("second", &mut Recorder::default()).unwrap();
+    a.turn("third", &mut Recorder::default()).unwrap();
+    a.compact(&mut Recorder::default())
+        .expect("automatic output also leaves room for explicit compaction");
+    assert!(a.session().messages().iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("SUMMARY"))
+    }));
+}
+
+#[test]
 fn small_window_completes_first_turn_with_on_demand_tools() {
     let server = serve(vec![Reply::Text("done")]);
     let mut e = env(&server.url, "auto");
     e.config.assistance.compact_tools = true;
     e.config.context_window = 8192;
-    let mut backend = make_backend(&e.config).unwrap();
-    let mut a = agent(&e, &mut backend, None);
+    // Unlike the delegation fixture helper, a fresh session has no explicitly pinned task schema.
+    let session = Session::create(
+        &e.layout,
+        SessionMeta {
+            model: "scripted".into(),
+        },
+    )
+    .unwrap();
+    let mut a = Agent::interactive(
+        &e.config,
+        make_backend(&e.config).unwrap(),
+        e.layout.clone(),
+        session,
+        None,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
     let mut ui = Recorder::default();
     let report = a.turn("hello", &mut ui).unwrap();
     assert_eq!(report.text, "done");
-    // The default schema set can fit in 8192 tokens without degradation; the smaller-window
-    // test below separately verifies that overflowing the full set selects lean tools.
+    // A fresh on-demand catalog leaves response headroom without removing required primitives.
     let names = tool_names(&server.requests.lock()[0]);
     for tool in ["read", "edit", "finish", "tool_load"] {
         assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");
     }
+}
+
+#[test]
+fn small_window_refuses_to_spend_response_reserve_or_drop_a_pinned_tool() {
+    let server = serve(vec![Reply::Text("must not be requested")]);
+    let mut e = env(&server.url, "auto");
+    e.config.assistance.compact_tools = true;
+    e.config.context_window = 8192;
+    e.config
+        .harness
+        .system_prompt
+        .push_str(&"immutable project requirement ".repeat(100));
+    let mut backend = make_backend(&e.config).unwrap();
+    let mut a = agent(&e, &mut backend, None); // Explicitly pins task for delegation.
+    let error = a
+        .turn("hello", &mut Recorder::default())
+        .err()
+        .expect("response reserve must be preserved");
+    assert!(
+        error.to_string().contains("reserved for a useful response"),
+        "{error:#}"
+    );
+    assert!(server.requests.lock().is_empty());
+    assert_eq!(
+        a.session().control_state()["enabled_tools"],
+        json!(["task"])
+    );
+    assert_eq!(a.session().control_state()["current_instruction"], "hello");
 }
 
 #[test]
@@ -4365,17 +4518,15 @@ fn window_too_small_for_the_full_set_offers_a_lean_tool_set() {
         )
     };
     e.config.context_window = u32::try_from(full_tokens.checked_sub(256).unwrap()).unwrap();
-    let expected_notice = format!(
-        "Context window {} is small; offering a lean tool set (others load on demand)",
-        e.config.context_window
-    );
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None);
     let mut ui = Recorder::default();
     let report = a.turn("hello", &mut ui).unwrap();
     assert_eq!(report.text, "done");
     assert!(
-        ui.notices.iter().any(|notice| notice == &expected_notice),
+        ui.notices
+            .iter()
+            .any(|notice| notice.contains("needs response headroom")),
         "{:?}",
         ui.notices
     );
@@ -4649,8 +4800,40 @@ fn child_repeated_reads_reuse_evidence_and_stop_before_exhausting_steps() {
             .contains("ORIGINAL_EVIDENCE")
     );
     let duplicate = results[1]["content"].as_str().unwrap();
-    assert!(duplicate.contains("unchanged from tool call read-0"));
+    assert!(duplicate.starts_with("[Unchanged read]"), "{duplicate}");
+    assert!(duplicate.contains("tool call read-0"));
+    assert!(duplicate.contains("still shown above"));
     assert!(!duplicate.contains("ORIGINAL_EVIDENCE"));
+}
+
+#[test]
+fn delegation_efficiency_observes_exact_inspection_overlap_after_report_delivery() {
+    let main = serve(vec![
+        Reply::Call(
+            "task",
+            json!({"task":"Inspect marker.txt and report", "solution_space":"s", "agent":"scout", "max_steps":4}),
+        ),
+        Reply::Call("read", json!({"path":"marker.txt"})),
+        Reply::Text("checked"),
+    ]);
+    let side = serve(vec![
+        Reply::Call("read", json!({"path":"marker.txt"})),
+        Reply::Text("marker.txt contains evidence"),
+    ]);
+    let mut e = env(&main.url, "auto");
+    with_subagent_role(&mut e, &side.url);
+    std::fs::write(e.project.path().join("marker.txt"), "evidence\n").unwrap();
+    let mut backend = make_backend(&e.config).unwrap();
+    let mut a = agent(&e, &mut backend, None);
+    a.turn("delegate the inspection", &mut Recorder::default())
+        .unwrap();
+    let report = a.efficiency_report();
+    assert_eq!(report["projection_bytes"]["delivered_worker_results"], 1);
+    assert_eq!(
+        report["projection_bytes"]["parent_inspections_matching_delivered_workers"],
+        1
+    );
+    assert_eq!(side.requests.lock().len(), 2);
 }
 
 #[test]

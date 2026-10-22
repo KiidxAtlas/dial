@@ -635,6 +635,13 @@ impl<'s> Session<'s> {
                 cache_write: ended.uint(4),
                 reasoning: ended.uint(5),
             });
+            super::usage::capture(super::usage::Snapshot {
+                input: ended.uint_opt(1),
+                output: ended.uint_opt(2),
+                cache_read: ended.uint_opt(3),
+                cache_write: ended.uint_opt(4),
+                reasoning: ended.uint_opt(5),
+            });
         }
         Ok(())
     }

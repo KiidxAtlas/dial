@@ -1330,7 +1330,11 @@ pub fn apply_sandbox_config(
     use crate::config::types::SandboxMode;
     use exec::sandbox::Policy;
     let ws = match protected {
-        Some((state, user)) => ws.with_protected_paths(&[state.to_owned(), user.to_owned()]),
+        Some((state, user)) => ws.with_protected_paths(&[
+            state.to_owned(),
+            user.to_owned(),
+            crate::config::paths::subscription_auth_dir(user)?,
+        ]),
         None => ws,
     };
     Ok(match config.mode {
@@ -1346,6 +1350,7 @@ pub fn apply_sandbox_config(
             if let Some((state, user)) = protected {
                 deny_read.push(state.to_owned());
                 deny_read.push(user.to_owned());
+                deny_read.push(crate::config::paths::subscription_auth_dir(user)?);
             }
             if let Some(home) = &home {
                 for rel in [

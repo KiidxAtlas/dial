@@ -180,7 +180,7 @@ impl ListPrice {
             Some(schedule) if !schedule.is_peak(now_ms) => schedule.off_peak,
             _ => 1.0,
         };
-        let split = CacheWriteSplit::of(reply);
+        let split = CacheWriteSplit::of(reply)?;
         // The 1h write rate is the input rate times the 1h multiplier.
         let cost = (uncached as f64 * rates.input
             + completion as f64 * rates.output

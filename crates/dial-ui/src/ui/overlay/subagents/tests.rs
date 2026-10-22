@@ -538,3 +538,46 @@ fn activity_deep_link_opens_on_the_activity_tab() {
     overlay.show_activity();
     assert_eq!(overlay.tab, Tab::Activity);
 }
+
+#[test]
+fn release_and_held_cancel_do_not_confirm_a_destructive_action() {
+    let keys = keymap();
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(snapshot(vec![agent("task-1", AgentStatus::Running)]));
+    hub.handle(&key(KeyCode::Char('x')), &keys);
+    for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
+        let event = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            kind,
+        ));
+        assert!(matches!(hub.handle(&event, &keys), OverlayEvent::None));
+    }
+    assert!(matches!(
+        hub.handle(&key(KeyCode::Char('x')), &keys),
+        OverlayEvent::Action(action) if action == "subagent-cancel:task-1"
+    ));
+}
+
+#[test]
+fn narrow_roster_page_keys_move_selection_and_backspace_removes_graphemes() {
+    let keys = keymap();
+    let mut hub = SubagentsOverlay::new();
+    hub.set_snapshot(snapshot(
+        (0..8)
+            .map(|i| agent(&i.to_string(), AgentStatus::Running))
+            .collect(),
+    ));
+    hub.body_h.set(9);
+    hub.handle(&key(KeyCode::PageDown), &keys);
+    assert_eq!(hub.selected.as_deref(), Some("3"));
+    hub.handle(&key(KeyCode::PageUp), &keys);
+    assert_eq!(hub.selected.as_deref(), Some("0"));
+    hub.compose = Some("hello 👩‍💻".into());
+    hub.handle(&key(KeyCode::Backspace), &keys);
+    assert_eq!(hub.compose.as_deref(), Some("hello "));
+    hub.compose = None;
+    hub.search = Some("cafe\u{301}".into());
+    hub.handle(&key(KeyCode::Backspace), &keys);
+    assert_eq!(hub.search.as_deref(), Some("caf"));
+}

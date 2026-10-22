@@ -66,12 +66,14 @@ impl GitOverlay {
                     .map(Line::from),
             );
             if stack_h > 0 {
-                out.push(Line::from(pad(
-                    vec![Span::raw(" "), chrome::label(theme, "Changes")],
-                    w,
-                )));
+                // A rule separates the diff from the file list; the branch is already in the
+                // panel title, so the list starts with the files.
+                out.push(Line::from(vec![Span::styled(
+                    theme.sym(Sym::BoxH).repeat(w),
+                    theme.fg(Tok::BorderMuted),
+                )]));
                 out.extend(
-                    self.side_column(w, stack_h - 1, theme)
+                    self.side_column(w, stack_h - 1, true, theme)
                         .into_iter()
                         .map(Line::from),
                 );
@@ -84,7 +86,7 @@ impl GitOverlay {
             ));
 
             let diff_rows = self.diff_column(diff_w, diff_h, theme);
-            let side_rows = self.side_column(side_w, body_h, theme);
+            let side_rows = self.side_column(side_w, body_h, false, theme);
             for index in 0..body_h {
                 out.push(join(
                     diff_rows.get(index).cloned().unwrap_or_default(),
@@ -104,89 +106,155 @@ impl GitOverlay {
         out
     }
 
+    /// Footer hints, most useful first: the way out, then what the focused pane can do, then view
+    /// options. The footer drops hints from the end (keeping the first) when they do not fit.
     fn hints(&self, ctx: &DrawCtx) -> Vec<String> {
         if self.editing {
             return vec![
+                "esc stop editing".to_owned(),
                 "ctrl+s commit".to_owned(),
                 "ctrl+g generate".to_owned(),
                 "ctrl+t amend".to_owned(),
-                "esc stop editing".to_owned(),
             ];
         }
         let mut hints = vec![hint(ctx.keys, Action::SelectCancel, "close")];
-        hints.push("tab focus".to_owned());
-        hints.push("alt+↓/↑ hunk".to_owned());
-        hints.push("]/[ file".to_owned());
-        hints.push("v view".to_owned());
+        let line_hints = self.line_hints();
+        let working_tree = self.commit.is_none();
+        if working_tree && !self.changes.is_empty() {
+            if self.focus == Focus::Diff && !line_hints.is_empty() {
+                hints.extend(line_hints.iter().take(1).cloned());
+            }
+            hints.push(
+                if self.focus == Focus::Diff {
+                    "space stage hunk"
+                } else {
+                    "space stage file"
+                }
+                .to_owned(),
+            );
+            hints.push("c commit".to_owned());
+        }
+        hints.push("? keys".to_owned());
+        if !self.changes.is_empty() {
+            hints.push("tab focus".to_owned());
+            hints.push("]/[ file".to_owned());
+            hints.push("alt+↓/↑ hunk".to_owned());
+            hints.push("v view".to_owned());
+        }
+        if working_tree && !self.changes.is_empty() {
+            hints.push("x discard hunk".to_owned());
+            hints.push("del discard file".to_owned());
+            hints.push("A ai stage".to_owned());
+        }
         hints.push("b whitespace".to_owned());
         hints.push("w wrap".to_owned());
         hints.push("r refresh".to_owned());
-        if self.commit.is_none() {
-            hints.push("s/space stage".to_owned());
-            hints.push("x discard hunk".to_owned());
-            hints.push("del discard file".to_owned());
-            hints.push("c commit".to_owned());
-            hints.push("A ai stage".to_owned());
+        if self.focus == Focus::Diff {
+            hints.extend(line_hints.into_iter().skip(1));
         }
-        hints.extend(self.line_hints());
         hints
     }
 
     fn diff_header(&self, width: usize, theme: &Theme) -> Vec<Span<'static>> {
         let dim = theme.fg(Tok::Dim);
-        let mut spans = Vec::new();
-        match self.shown.as_ref() {
-            Some(shown) => {
-                let change = &shown.change;
-                let (dir, base) = split_path(&change.path);
-                spans.push(Span::styled(format!(" {dir}"), dim));
-                spans.push(Span::styled(
-                    base.to_owned(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-                if let Some(orig) = &change.orig {
-                    spans.push(Span::styled(format!(" ← {orig}"), dim));
-                }
-                if shown.binary.is_some() {
-                    spans.push(Span::styled("  binary", dim));
-                } else {
-                    spans.push(Span::styled(
-                        format!("  +{}", shown.doc.additions),
-                        theme.fg(Tok::Success),
-                    ));
-                    spans.push(Span::styled(
-                        format!(" -{}", shown.doc.deletions),
-                        theme.fg(Tok::Error),
-                    ));
-                }
-                spans.push(Span::styled(
-                    format!("  {}", area_label(change, self.commit.is_some())),
-                    theme.fg(Tok::Muted),
-                ));
-            }
-            None => spans.push(Span::styled(" no file selected", dim)),
-        }
-
         let tabs = [
             (View::File, "1 file"),
             (View::Split, "2 split"),
             (View::Inline, "3 inline"),
             (View::Hunk, "4 hunk"),
         ];
-        let mut right = Vec::new();
-        for (view, label) in tabs {
-            let style = chrome::tab_style(theme, self.view == view);
-            right.push(Span::styled(format!(" {label} "), style));
-        }
+        let mut chips = Vec::new();
         let chip = self.whitespace.chip();
         if !chip.is_empty() {
-            right.push(Span::styled(chip, theme.fg(Tok::Warning)));
+            chips.push(Span::styled(chip, theme.fg(Tok::Warning)));
         }
         if self.wrap {
-            right.push(Span::styled(" wrap", theme.fg(Tok::Warning)));
+            chips.push(Span::styled(" wrap", theme.fg(Tok::Warning)));
         }
-        let right_w: usize = right.iter().map(|s| text::width(&s.content)).sum();
-        let mut line = pad(spans, width.saturating_sub(right_w));
+        let strip = |compact: bool| {
+            let mut right = Vec::new();
+            for (view, label) in tabs {
+                if compact && self.view != view {
+                    continue;
+                }
+                let style = chrome::tab_style(theme, self.view == view);
+                right.push(Span::styled(format!(" {label} "), style));
+            }
+            right.extend(chips.iter().cloned());
+            right
+        };
+        let cells = |spans: &[Span<'static>]| -> usize {
+            spans.iter().map(|s| text::width(&s.content)).sum()
+        };
+        // The file comes first: on a narrow pane its directory, its staging area and finally the
+        // other view tabs give way so the file name stays readable.
+        let parts = self.shown.as_ref().map(|shown| {
+            let change = &shown.change;
+            let (dir, base) = split_path(&change.path);
+            let mut name = vec![Span::styled(
+                format!(" {base}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
+            if let Some(orig) = &change.orig {
+                name.push(Span::styled(format!(" ← {orig}"), dim));
+            }
+            if shown.binary.is_some() {
+                name.push(Span::styled("  binary", dim));
+            } else {
+                name.push(Span::styled(
+                    format!("  +{}", shown.doc.additions),
+                    theme.fg(Tok::Success),
+                ));
+                name.push(Span::styled(
+                    format!(" -{}", shown.doc.deletions),
+                    theme.fg(Tok::Error),
+                ));
+            }
+            let area = Span::styled(
+                format!("  {}", area_label(change, self.commit.is_some())),
+                theme.fg(Tok::Muted),
+            );
+            (dir.to_owned(), name, area)
+        });
+        let Some((dir, name, area)) = parts else {
+            let right = strip(width < 60);
+            let mut line = pad(
+                vec![Span::styled(" no file selected", dim)],
+                width.saturating_sub(cells(&right)),
+            );
+            line.extend(right);
+            return line;
+        };
+        let with_dir = |name: &[Span<'static>]| {
+            let mut spans = Vec::with_capacity(name.len() + 1);
+            let mut name = name.to_vec();
+            if !dir.is_empty() {
+                spans.push(Span::styled(format!(" {dir}"), dim));
+                if let Some(first) = name.first_mut() {
+                    first.content = first.content.trim_start().to_owned().into();
+                }
+            }
+            spans.extend(name);
+            spans
+        };
+        let mut full = with_dir(&name);
+        full.push(area.clone());
+        let mut no_dir = name.clone();
+        no_dir.push(area);
+        let candidates = [
+            (full, false),
+            (no_dir.clone(), false),
+            (name.clone(), false),
+            (no_dir, true),
+            (name.clone(), true),
+        ];
+        let (left, right) = candidates
+            .into_iter()
+            .map(|(left, compact)| (left, strip(compact)))
+            .find(|(left, right)| cells(left) + cells(right) <= width)
+            .unwrap_or_else(|| (name, Vec::new()));
+        let right_w = cells(&right);
+        let mut line = pad(left, width.saturating_sub(right_w));
         line.extend(right);
         line
     }
@@ -468,8 +536,16 @@ impl GitOverlay {
         ]
     }
 
-    /// Sidebar body rows, each exactly `width` wide.
-    fn side_column(&self, width: usize, body_h: usize, theme: &Theme) -> Vec<Vec<Span<'static>>> {
+    /// Sidebar body rows, each exactly `width` wide. `stacked` (the narrow layout, under the diff)
+    /// leaves out the branch rows: the panel title already names the branch, and the few rows
+    /// the stack gets belong to the files.
+    fn side_column(
+        &self,
+        width: usize,
+        body_h: usize,
+        stacked: bool,
+        theme: &Theme,
+    ) -> Vec<Vec<Span<'static>>> {
         let muted = theme.fg(Tok::Muted);
         let bold = |tok: Tok| theme.fg(tok).add_modifier(Modifier::BOLD);
         let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
@@ -490,24 +566,36 @@ impl GitOverlay {
             lines.push(Vec::new());
             vec![(Area::Commit, "Files")]
         } else {
-            let branch = self
-                .branch
-                .clone()
-                .unwrap_or_else(|| "detached HEAD".to_owned());
-            lines.push(vec![Span::styled(
-                format!(" {} {branch}", theme.sym(Sym::IconGit)),
-                bold(Tok::Text),
-            )]);
-            if let Some((sha, subject)) = &self.head {
-                lines.push(vec![Span::styled(format!(" HEAD {sha} {subject}"), muted)]);
+            if !stacked {
+                let branch = self
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| "detached HEAD".to_owned());
+                lines.push(vec![Span::styled(
+                    format!(" {} {branch}", theme.sym(Sym::IconGit)),
+                    bold(Tok::Text),
+                )]);
+                if let Some((sha, subject)) = &self.head {
+                    lines.push(vec![Span::styled(format!(" HEAD {sha} {subject}"), muted)]);
+                }
+                lines.push(Vec::new());
             }
-            lines.push(Vec::new());
+            if self.changes.is_empty() {
+                lines.push(vec![Span::styled(
+                    " Nothing to commit: the working tree is clean.",
+                    muted,
+                )]);
+            }
             vec![(Area::Staged, "Staged"), (Area::Unstaged, "Changes")]
         };
 
         let mut row = 0usize;
         for (area, title) in groups {
             let count = self.changes.iter().filter(|c| c.area == area).count();
+            // An empty "Staged (0)" or "Changes (0)" group only pushes the files down.
+            if count == 0 && self.commit.is_none() {
+                continue;
+            }
             lines.push(vec![
                 Span::raw(" "),
                 chrome::label(theme, &format!("{title} ({count})")),
@@ -522,7 +610,7 @@ impl GitOverlay {
             }
         }
 
-        if self.commit.is_none() {
+        if self.commit.is_none() && !self.changes.is_empty() {
             lines.push(Vec::new());
             let title = if self.amend {
                 "Commit message · amend"
@@ -533,8 +621,10 @@ impl GitOverlay {
             if self.message.is_empty() {
                 let placeholder = if self.editing {
                     "  ▌"
+                } else if self.changes.iter().any(|c| c.area == Area::Staged) {
+                    "  c writes the message for the staged files"
                 } else {
-                    "  press c to write a message"
+                    "  stage files with space, then c writes a message"
                 };
                 lines.push(vec![Span::styled(placeholder, muted)]);
             } else {
@@ -639,8 +729,9 @@ fn footer_line(theme: &Theme, segments: &[String], width: usize) -> Line<'static
             .map(|span| text::width(&span.content))
             .sum()
     };
+    // Hints come most useful first (the way out leads), so the tail gives way.
     while keep.len() > 1 && cells(&keep) > width.saturating_sub(1) {
-        keep.remove(keep.len() - 2);
+        keep.pop();
     }
     let mut spans = vec![Span::raw(" ")];
     spans.extend(chrome::key_hint_spans(theme, &keep));

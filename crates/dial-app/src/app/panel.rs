@@ -119,23 +119,43 @@ pub(super) fn panel_rows_window(
         } else {
             theme.fg(Tok::Text)
         };
-        let label = text::ellipsize(label, inner.saturating_sub(8), theme.ascii());
+        // The hotkey leads in a fixed column, so the keys line up and are read before the
+        // label; options without one keep the column blank instead of showing `( )`.
+        let key = if *hotkey == ' ' {
+            "   ".to_owned()
+        } else {
+            format!("{hotkey}  ")
+        };
+        let label = text::ellipsize(label, inner.saturating_sub(5), theme.ascii());
         rows.push(pad_row(vec![
-            Span::styled(format!("{marker} {label}"), style),
-            Span::styled(format!("  ({hotkey})"), theme.fg(Tok::Muted)),
+            Span::styled(format!("{marker} "), style),
+            Span::styled(
+                key,
+                theme
+                    .fg(Tok::Accent)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::styled(label, style),
         ]));
     }
-    let hint = if lines.len() > body_limit {
-        format!(
-            "Choose · Enter confirm · Esc cancel · Page keys scroll details {}-{} of {}",
+    // Most important first; whole pieces drop at narrow widths instead of being cut mid-word.
+    let mut hints = vec!["Enter confirm".to_owned(), "Esc cancel".to_owned()];
+    if lines.len() > body_limit {
+        hints.push(format!(
+            "PgUp/PgDn details {}-{} of {}",
             offset + 1,
             (offset + body_limit).min(lines.len()),
             lines.len()
-        )
-    } else {
-        "Choose · Enter confirm · Esc cancel · Page keys scroll details".to_owned()
-    };
-    rows.push(pad_row(vec![Span::styled(hint, theme.fg(Tok::Dim))]));
+        ));
+    }
+    let dot = format!(" {} ", theme.sym(Sym::Dot));
+    while hints.len() > 1 && text::width(&hints.join(&dot)) > inner {
+        hints.pop();
+    }
+    rows.push(pad_row(vec![Span::styled(
+        hints.join(&dot),
+        theme.fg(Tok::Dim),
+    )]));
     rows.push(Line::from(Span::styled(
         format!(
             "{}{}{}",

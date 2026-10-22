@@ -510,26 +510,33 @@ impl Picker {
             Some((_, draft)) => ("Rename  ", draft.as_str()),
             None => ("Search  ", self.query.as_str()),
         };
-        let mut body = vec![Line::from(vec![
-            Span::styled(prompt, theme.fg(Tok::Accent)),
-            Span::styled(
-                text::ellipsize(
-                    if draft.is_empty() && self.rename.is_none() {
-                        "type to filter titles and messages"
+        // An empty catalogue has nothing to search: the message and its way forward replace the
+        // search prompt instead of inviting a filter that cannot match anything.
+        let nothing_listed =
+            self.found.is_empty() && self.query.trim().is_empty() && self.rename.is_none();
+        let mut body = Vec::new();
+        if !nothing_listed {
+            body.push(Line::from(vec![
+                Span::styled(prompt, theme.fg(Tok::Accent)),
+                Span::styled(
+                    text::ellipsize(
+                        if draft.is_empty() && self.rename.is_none() {
+                            "type to filter titles and messages"
+                        } else {
+                            draft
+                        },
+                        width.saturating_sub(9),
+                        theme.ascii(),
+                    ),
+                    theme.fg(if draft.is_empty() && self.rename.is_none() {
+                        Tok::Dim
                     } else {
-                        draft
-                    },
-                    width.saturating_sub(9),
-                    theme.ascii(),
+                        Tok::Text
+                    }),
                 ),
-                theme.fg(if draft.is_empty() && self.rename.is_none() {
-                    Tok::Dim
-                } else {
-                    Tok::Text
-                }),
-            ),
-            Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED)),
-        ])];
+                Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED)),
+            ]));
+        }
         // At five rows, a refusal takes priority over search: keep the selected journal,
         // its explanation, the exit hint and both frame edges visible.
         if height == 5 && self.notice.is_some() {
@@ -545,11 +552,11 @@ impl Picker {
         } else {
             "this project"
         };
-        if height >= 7 {
+        if height >= 7 && !nothing_listed {
             let status = if self.show_empty {
                 format!("All sessions · {scope}")
             } else if empty > 0 {
-                format!("Conversations · {empty} empty hidden · Tab includes them · {scope}")
+                format!("Conversations · {scope} · Tab shows {empty} empty")
             } else {
                 format!("Conversations · {scope}")
             };
@@ -563,15 +570,30 @@ impl Picker {
                     self.total
                 )
             } else if !self.query.trim().is_empty() {
-                "No matches. Ctrl+U clears search; Tab includes empty sessions.".into()
+                "No matches. Ctrl+U clears the search; Tab includes empty sessions.".into()
             } else if empty > 0 && !self.show_empty {
-                "No conversations yet. Tab shows empty sessions.".into()
+                format!(
+                    "No conversations {} yet. Tab shows the {empty} empty session{}.",
+                    if self.all_projects {
+                        "in any project"
+                    } else {
+                        "in this project"
+                    },
+                    if empty == 1 { "" } else { "s" }
+                )
             } else if !self.all_projects {
-                "No sessions in this project yet. Ctrl+G lists every project.".into()
+                "No sessions in this project yet. Ctrl+G lists sessions from every project.".into()
             } else {
-                "No sessions yet.".into()
+                "No sessions in any project yet. Conversations appear here once they start.".into()
             };
-            body.push(line(message, Tok::Muted));
+            // The message wraps rather than losing its way forward at narrow widths; it yields
+            // rows only to the frame, the notice and the key hints.
+            let room = height
+                .saturating_sub(2 + body.len() + 1 + usize::from(self.notice.is_some()))
+                .max(1);
+            for row in text::wrap_words(&message, width).into_iter().take(room) {
+                body.push(line(row, Tok::Muted));
+            }
         }
         let now = now_secs();
         let units = self.units(now);
@@ -660,50 +682,81 @@ impl Picker {
             body.push(line(notice.clone(), Tok::Warning));
         }
         let position = if self.found.is_empty() {
-            0
+            String::new()
         } else {
-            self.selected + 1
+            format!("{}/{}", self.selected + 1, self.found.len())
+        };
+        let other_scope = if self.all_projects {
+            "this project"
+        } else {
+            "all projects"
+        };
+        let empties = if self.show_empty {
+            "hide empty"
+        } else {
+            "show empty"
+        };
+        let esc = if self.query.is_empty() {
+            "close"
+        } else {
+            "clear search"
         };
         if self.rename.is_some() {
-            body.push(line(
-                "Enter saves the title · Esc cancels rename".into(),
-                Tok::Muted,
+            body.extend(hint_line(
+                theme,
+                "",
+                &[("Enter", "save title"), ("Esc", "cancel rename")],
+                width,
+                true,
             ));
         } else if self.found.is_empty() {
-            let hint = if loaded < self.total {
-                "Esc back · Ctrl+A load all"
-            } else if self.query.is_empty() {
-                "Esc close · Ctrl+G projects"
-            } else {
-                "Esc clear search · Ctrl+G projects"
-            };
-            body.push(line(hint.into(), Tok::Muted));
+            let mut hints = Vec::new();
+            if loaded < self.total {
+                hints.push(("Ctrl+A", "load all"));
+            }
+            if empty > 0 && !self.show_empty && !self.tree {
+                hints.push(("Tab", empties));
+            }
+            hints.push(("Ctrl+G", other_scope));
+            hints.push(("Esc", esc));
+            body.extend(hint_line(theme, "", &hints, width, true));
         } else if compact {
-            body.push(line(
-                format!(
-                    "{position}/{} · Enter resume · Ctrl+P pin · Esc clear or close",
-                    self.found.len()
-                ),
-                Tok::Muted,
+            body.extend(hint_line(
+                theme,
+                &position,
+                &[("Enter", "resume"), ("Ctrl+P", "pin"), ("Esc", esc)],
+                width,
+                true,
             ));
         } else {
-            let load = if loaded < self.total {
-                " · Ctrl+A load all"
-            } else {
-                ""
-            };
-            body.push(line(
-                format!(
-                    "{position}/{} · ↑↓ move · Enter resume · Esc clear or close{load}",
-                    self.found.len()
-                ),
-                Tok::Muted,
-            ));
-            body.push(line(
-                "Ctrl+P pin · Ctrl+R rename · Ctrl+F fork · Ctrl+D delete · Ctrl+G scope · Tab empty · Ctrl+U clear"
-                    .into(),
-                Tok::Muted,
-            ));
+            let arrows = if theme.ascii() { "Up/Down" } else { "↑↓" };
+            let mut primary = vec![(arrows, "move"), ("Enter", "resume")];
+            if loaded < self.total {
+                primary.push(("Ctrl+A", "load all"));
+            }
+            primary.push(("Esc", esc));
+            body.extend(hint_line(theme, &position, &primary, width, true));
+            // Secondary actions, offered only when they can run on the highlighted session.
+            let selected = self.found.get(self.selected).copied();
+            let allowed = |need| selected.is_some_and(|index| self.blocked(index, need).is_none());
+            let pinned =
+                selected.is_some_and(|index| self.pinned.contains(&self.sessions[index].id));
+            let mut secondary = vec![("Ctrl+P", if pinned { "unpin" } else { "pin" })];
+            if allowed(Need::Rename) {
+                secondary.push(("Ctrl+R", "rename"));
+            }
+            secondary.push(("Ctrl+F", "fork"));
+            if allowed(Need::Delete) {
+                secondary.push(("Ctrl+D", "delete"));
+            }
+            secondary.push(("Ctrl+G", other_scope));
+            if !self.tree {
+                secondary.push(("Tab", empties));
+            }
+            if !self.query.is_empty() {
+                secondary.push(("Ctrl+U", "clear search"));
+            }
+            body.extend(hint_line(theme, "", &secondary, width, false));
         }
         let rows = if wide {
             let pane = self.pane(pane_width, theme);
@@ -714,12 +767,17 @@ impl Picker {
         } else {
             body
         };
-        let extra = if loaded < self.total {
-            format!(
-                "showing {loaded} of {} · {} found",
-                self.total,
-                self.found.len()
-            )
+        let extra = if self.query.trim().is_empty() {
+            if self.found.is_empty() {
+                String::new()
+            } else if loaded < self.total {
+                format!("showing {loaded} of {}", self.total)
+            } else {
+                let n = self.found.len();
+                format!("{n} session{}", if n == 1 { "" } else { "s" })
+            }
+        } else if loaded < self.total {
+            format!("{} found in {loaded} of {}", self.found.len(), self.total)
         } else {
             format!("{} found", self.found.len())
         };
@@ -908,6 +966,49 @@ impl Picker {
 /// Whether the preview pane has room beside the list.
 fn wide(cols: usize, height: usize) -> bool {
     cols >= PREVIEW_MIN_COLS && height >= PREVIEW_MIN_ROWS
+}
+
+/// Key hints on one row of `width` cells after an optional `lead` (the list position). Hints that
+/// do not fit are dropped whole rather than cut mid-word: from the one before the last when
+/// `keep_last` (the way out stays visible), otherwise from the end. `None` when nothing fits.
+fn hint_line(
+    theme: &Theme,
+    lead: &str,
+    hints: &[(&str, &str)],
+    width: usize,
+    keep_last: bool,
+) -> Option<Line<'static>> {
+    let sep = if theme.ascii() { " | " } else { " · " };
+    let cells = |keep: &[(&str, &str)]| {
+        let parts = keep.len() + usize::from(!lead.is_empty());
+        text::width(lead)
+            + keep
+                .iter()
+                .map(|(key, label)| text::width(key) + 1 + text::width(label))
+                .sum::<usize>()
+            + text::width(sep) * parts.saturating_sub(1)
+    };
+    let mut keep = hints.to_vec();
+    while !keep.is_empty() && cells(&keep) > width {
+        let at = if keep_last && keep.len() > 1 {
+            keep.len() - 2
+        } else {
+            keep.len() - 1
+        };
+        keep.remove(at);
+    }
+    if keep.is_empty() && lead.is_empty() {
+        return None;
+    }
+    let mut spans = Vec::new();
+    if !lead.is_empty() {
+        spans.push(Span::styled(lead.to_owned(), theme.fg(Tok::Muted)));
+        if !keep.is_empty() {
+            spans.push(Span::styled(sep, theme.fg(Tok::Dim)));
+        }
+    }
+    spans.extend(chrome::key_hint_spans(theme, &keep));
+    Some(Line::from(spans))
 }
 
 /// Joins a list row with the matching preview row, keeping a separator column in every row.

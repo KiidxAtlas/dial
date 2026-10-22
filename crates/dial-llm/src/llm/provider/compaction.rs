@@ -298,6 +298,7 @@ impl Backend {
                     cause
                 }
             });
+        transport.settle(result.is_ok())?;
         if let Some(scope) = scope {
             scope.finish(
                 result.as_ref().ok().map(|r| &r.reply),

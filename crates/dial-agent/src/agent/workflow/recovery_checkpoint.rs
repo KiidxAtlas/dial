@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 pub(in crate::agent) struct RecoveryCheckpoint {
     withheld: BTreeMap<String, String>,
     cached_observations: BTreeMap<String, u64>,
-    source_versions: BTreeMap<String, [u8; 32]>,
+    source_versions: BTreeMap<String, Vec<Option<[u8; 32]>>>,
 }
 
 fn control(name: &str) -> bool {
@@ -31,9 +31,7 @@ impl RecoveryCheckpoint {
         if call.name == "read"
             && !output.is_error
             && self.withheld.contains_key(&key)
-            && let Some(version) = call.arguments["path"]
-                .as_str()
-                .and_then(|path| ws.read_identity(path))
+            && let Some(version) = Self::read_versions(ws, call)
         {
             self.source_versions.insert(key, version);
         }
@@ -47,11 +45,7 @@ impl RecoveryCheckpoint {
     ) -> Option<String> {
         let key = Self::key(call);
         if let Some(previous) = self.source_versions.get(&key)
-            && call.arguments["path"]
-                .as_str()
-                .and_then(|path| ws.read_identity(path))
-                .as_ref()
-                != Some(previous)
+            && Self::read_versions(ws, call).as_ref() != Some(previous)
         {
             self.withheld.remove(&key);
             self.cached_observations.remove(&key);
@@ -59,6 +53,23 @@ impl RecoveryCheckpoint {
         }
         self.rejection(call)
     }
+    /// Keep every target in a batched read, including unavailable identities: a target becoming
+    /// readable or disappearing must release the stale restriction too. These hashes only expire
+    /// feedback; they never authorize access or establish verification evidence.
+    fn read_versions(
+        ws: &crate::tools::Workspace,
+        call: &ToolCall,
+    ) -> Option<Vec<Option<[u8; 32]>>> {
+        if let Some(path) = call.arguments["path"].as_str() {
+            return Some(vec![ws.read_identity(path)]);
+        }
+        call.arguments["paths"]
+            .as_array()?
+            .iter()
+            .map(|path| path.as_str().map(|path| ws.read_identity(path)))
+            .collect()
+    }
+
     /// Shared main/child decision: normalize once, preserve observation history,
     /// withhold only this call, and leave corrected arguments eligible.
     pub fn observe(
@@ -114,6 +125,7 @@ impl RecoveryCheckpoint {
     pub fn arm(&mut self, call: &ToolCall, advice: &str) {
         if !control(&call.name) {
             if self.withheld.len() >= 32
+                && !self.withheld.contains_key(&Self::key(call))
                 && let Some((key, _)) = self.withheld.pop_first()
             {
                 self.cached_observations.remove(&key);

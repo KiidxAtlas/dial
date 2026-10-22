@@ -3,13 +3,16 @@
 use super::*;
 use crate::ui::composer::ComposerView;
 
-/// A readable measure, with breathing room on either side of the launch composer.
+/// A readable measure, with breathing room on either side of the launch composer. Even a tiny
+/// terminal keeps a one-cell margin, so the input card never sits flush against the window edge.
 pub fn content_width(width: u16) -> u16 {
     width
         .saturating_sub(if width >= 68 {
             16
         } else if width >= 44 {
             8
+        } else if width >= 24 {
+            2
         } else {
             0
         })
@@ -197,13 +200,34 @@ fn place(info: &WelcomeInfo, theme: &Theme, width: usize) -> Vec<Span<'static>> 
         let icon = if icon.is_empty() { "on" } else { icon };
         format!("  {icon} {branch}")
     };
-    let keep = room.saturating_sub(text::width(&sep) + text::width(&branch));
-    if keep >= 6 {
-        spans.push(Span::styled(sep, theme.fg(Tok::Dim)));
-        spans.push(Span::styled(
-            text::ellipsize_start(&project, keep, ascii),
-            theme.fg(Tok::Muted),
-        ));
+    // The tail of the path names the project. When the whole path does not fit, its last
+    // component alone reads better than a path cut mid-word; the branch goes before that does.
+    let fits = |project: &str, branch: &str| {
+        text::width(&sep) + text::width(project) + text::width(branch) <= room
+    };
+    let last = project
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&project)
+        .to_owned();
+    let (project, branch) = if fits(&project, &branch) {
+        (project, branch)
+    } else if fits(&last, &branch) {
+        (last, branch)
+    } else if fits(&last, "") {
+        (last, String::new())
+    } else {
+        let keep = room.saturating_sub(text::width(&sep));
+        if keep < 6 {
+            return spans;
+        }
+        (text::ellipsize_start(&last, keep, ascii), String::new())
+    };
+    spans.push(Span::styled(sep, theme.fg(Tok::Dim)));
+    spans.push(Span::styled(project, theme.fg(Tok::Muted)));
+    if !branch.is_empty() {
         spans.push(Span::styled(branch, theme.fg(Tok::StatusGitClean)));
     }
     spans

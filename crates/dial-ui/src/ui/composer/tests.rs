@@ -39,6 +39,39 @@ impl Env {
 }
 
 #[test]
+fn composer_and_history_search_honor_rebound_editor_keys() {
+    let mut env = Env::new();
+    env.keys
+        .rebind(Action::EditorDeleteBackward, &["F6"])
+        .unwrap();
+    env.keys.rebind(Action::EditorWordLeft, &["F7"]).unwrap();
+    let mut c = Composer::new(Vec::new(), 100);
+    c.set_draft("one two");
+    c.handle_key(
+        KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+        &env.ctx(),
+    );
+    assert_eq!(
+        c.editor.cursor,
+        "one two".len(),
+        "old word binding is disabled"
+    );
+    c.handle_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE), &env.ctx());
+    assert_eq!(c.editor.cursor, 4);
+    c.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), &env.ctx());
+    assert_eq!(c.draft(), "onetwo");
+    c.search = Some(Search {
+        query: Editor::default(),
+        entries: vec![],
+        selected: 0,
+        scroll: 0,
+    });
+    c.handle_paste("cafe\u{301}");
+    c.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), &env.ctx());
+    assert_eq!(c.search.as_ref().unwrap().query.text, "caf");
+}
+
+#[test]
 fn bounded_queue_keeps_overflow_draft_and_manages_only_selected_item() {
     let mut composer = Composer::new(Vec::new(), 100);
     composer.set_busy(true);
@@ -737,7 +770,7 @@ fn primary_hints_follow_context_and_effective_bindings() {
     env.keys.rebind(Action::Interrupt, &["F4"]).unwrap();
     assert_eq!(
         &c.hint(&env.ctx())[..2],
-        ["F4 interrupt", "F2 route or queue"]
+        ["F4 interrupt", "F2 send now or later"]
     );
     env.keys.rebind(Action::Interrupt, &[]).unwrap();
     assert!(!c.hint(&env.ctx()).iter().any(|h| h.contains("interrupt")));
@@ -792,8 +825,8 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
         assert_eq!(
             hints[1],
             format!(
-                "editing queued {}",
-                if follow_up { "follow-up" } else { "auto-route" }
+                "editing queued message ({})",
+                if follow_up { "send after turn" } else { "send now" }
             )
         );
         assert!(hints.iter().any(|h| h == "Esc cancel edit"));
@@ -811,7 +844,7 @@ fn busy_and_queue_edit_hints_respect_literal_control_precedence() {
     assert!(
         c.hint(&env.ctx())
             .iter()
-            .any(|h| h == &format!("{} route or queue", env.keys.label(Action::Submit)))
+            .any(|h| h == &format!("{} send now or later", env.keys.label(Action::Submit)))
     );
     key(&mut c, &env, KeyCode::Enter, KeyModifiers::ALT);
     assert!(
@@ -1213,8 +1246,8 @@ fn busy_hints_follow_the_draft_and_queue() {
         hints(&c)
     );
     typed(&mut c, &env, "later");
-    assert!(hints(&c).contains(&format!("{submit} route or queue")));
-    assert!(hints(&c).contains(&format!("{follow_up} follow-up")));
+    assert!(hints(&c).contains(&format!("{submit} send now or later")));
+    assert!(hints(&c).contains(&format!("{follow_up} send after turn")));
     c.set_draft("");
     c.queued.push_back(("oldest".into(), false));
     c.queued.push_back(("newer".into(), true));
@@ -1226,7 +1259,7 @@ fn busy_hints_follow_the_draft_and_queue() {
     assert!(
         hints(&c)
             .iter()
-            .all(|h| !h.contains("steer") && !h.contains("follow-up")),
+            .all(|h| !h.contains("steer") && !h.contains("after turn")),
         "an empty draft neither steers nor queues"
     );
 }
@@ -1251,8 +1284,9 @@ fn busy_queue_panel_counts_messages_beyond_its_three_rows() {
     );
     assert!(
         rows.contains(&format!(
-            "5 queued · /queue manage · {} choose stop or keep",
-            env.keys.label(Action::Submit)
+            "5 queued · {} stop or keep · {} edit last · /queue manage",
+            env.keys.label(Action::Submit),
+            env.keys.label(Action::SelectUp)
         )),
         "{rows}"
     );
@@ -2928,7 +2962,7 @@ fn queued_messages_keep_the_management_entry_visible_in_ascii_and_remapped_submi
     c.submit_queued(true);
     let rows = screen(&c, &env, 60).join("\n");
     assert!(rows.contains("/queue manage"), "{rows}");
-    assert!(rows.contains("F2 choose stop or keep"), "{rows}");
+    assert!(rows.contains("F2 stop or keep"), "{rows}");
     assert!(rows.is_ascii(), "{rows}");
     assert!(screen(&c, &env, 120).join("\n").contains("F3 edit last"));
 }
@@ -2947,7 +2981,7 @@ fn busy_enter_offers_automatic_routing_or_queue_and_waits_for_a_choice() {
     assert!(c.queued_messages().is_empty());
     let rows = screen(&c, &env, 100).join("\n");
     assert!(
-        rows.contains("Let Dial decide") && rows.contains("Queue for after this turn"),
+        rows.contains("Send now") && rows.contains("Send after this turn"),
         "{rows}"
     );
     assert_eq!(press(&mut c, &env, KeyCode::Up), ComposerEvent::None);

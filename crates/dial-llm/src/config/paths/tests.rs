@@ -67,3 +67,31 @@ fn dial_home_precedence_and_missing_home_are_explicit() {
         assert!(user_dir_from(missing, || None).is_err());
     }
 }
+
+#[test]
+fn subscription_auth_override_is_explicit_absolute_and_separate_from_state() {
+    let isolated = tempfile::tempdir().unwrap();
+    let shared = tempfile::tempdir().unwrap();
+    assert_eq!(
+        subscription_auth_dir_from(isolated.path(), None).unwrap(),
+        isolated.path()
+    );
+    assert_eq!(
+        subscription_auth_dir_from(isolated.path(), Some(shared.path().as_os_str().to_owned()))
+            .unwrap(),
+        fs::canonicalize(shared.path()).unwrap()
+    );
+    for invalid in [
+        PathBuf::new(),
+        PathBuf::from("relative"),
+        shared.path().join("missing"),
+    ] {
+        assert!(
+            subscription_auth_dir_from(isolated.path(), Some(invalid.into_os_string())).is_err()
+        );
+    }
+    let file = shared.path().join("not-a-directory");
+    fs::write(&file, b"not credentials").unwrap();
+    assert!(subscription_auth_dir_from(isolated.path(), Some(file.into_os_string())).is_err());
+    assert_eq!(fs::read_dir(isolated.path()).unwrap().count(), 0);
+}

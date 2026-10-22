@@ -2679,3 +2679,55 @@ fn native_anthropic_interrupt_abandons_one_live_stream() {
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(server.requests().len(), 1);
 }
+
+#[test]
+fn interrupted_openai_usage_chunk_is_retained_but_never_accepted_or_priced() {
+    let server = fake::serve(vec![Script::Sse(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":10}}}\n\n".into(),
+    )]);
+    let mut remote = backend(endpoint(&server.url));
+    remote.set_usage_scope(Some(llm::usage::Scope::default().next_turn(0).unwrap()));
+    let error = remote.chat_with_control_events(
+        None, &request(), llm::Limits { timeout_secs: 5, interrupt: Arc::new(AtomicBool::new(false)) },
+        Some(&mut |_| true), &mut |_| {}, &mut |event| !matches!(event, llm::StreamEvent::Progress(p) if p.output_tokens == Some(7)),
+    ).unwrap_err();
+    assert!(error.downcast_ref::<llm::Interrupted>().is_some());
+    let counts = remote.usage_scope_snapshot().all;
+    assert_eq!(
+        (counts.input, counts.output, counts.cache_read),
+        (42, 7, 10)
+    );
+    assert_eq!(counts.partial_reported_attempts, 1);
+    assert_eq!(counts.failed_requests, 1);
+    assert_eq!(counts.reported_responses, 0);
+    assert_eq!(counts.unreported_attempts, 1);
+    assert_eq!(counts.observed_cost_usd, None);
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn disconnected_anthropic_start_retains_only_reported_usage() {
+    let server = fake::serve(vec![Script::SseDisconnect(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":30}}}\n\n".into(),
+    )]);
+    let mut remote = backend(anthropic_endpoint(&server.url));
+    remote.set_usage_scope(Some(llm::usage::Scope::default().next_turn(0).unwrap()));
+    assert!(
+        remote
+            .chat(None, &request(), 5, Some(&mut |_| true))
+            .is_err()
+    );
+    let counts = remote.usage_scope_snapshot().all;
+    assert_eq!(
+        (counts.input, counts.output, counts.cache_read),
+        (50, 0, 30)
+    );
+    assert_eq!(counts.partial_reported_attempts, 1);
+    assert_eq!(counts.reported_responses, 0);
+    // Disconnect recovery may retry; every attempt still lacks complete terminal usage.
+    assert!(counts.transport_attempts >= 1);
+    assert_eq!(counts.unreported_attempts, counts.transport_attempts);
+    assert_eq!(counts.failed_requests, 1);
+    assert_eq!(counts.observed_cost_usd, None);
+    assert_eq!(server.requests().len(), 1);
+}

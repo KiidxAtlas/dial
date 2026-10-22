@@ -138,7 +138,11 @@ fn only_section_labels_become_headings() {
             .flat_map(|r| r.spans.iter())
             .any(|s| s.content.contains(needle) && s.content == s.content.to_uppercase())
     };
-    assert!(heading("RECENT PROJECTS:"));
+    assert!(heading("RECENT PROJECTS"));
+    assert!(
+        !heading("RECENT PROJECTS:"),
+        "a heading drops its trailing colon"
+    );
     assert!(heading("KEYS"));
     assert!(
         !heading("~/dev/dial"),

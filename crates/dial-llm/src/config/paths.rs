@@ -45,6 +45,34 @@ fn user_dir_from(
         .context("home directory is unavailable; set DIAL_HOME (or HOME; USERPROFILE on Windows)")
 }
 
+/// Subscription authentication may explicitly share a store while all other state stays isolated.
+pub const SUBSCRIPTION_AUTH_HOME: &str = "DIAL_SUBSCRIPTION_AUTH_HOME";
+
+pub fn subscription_auth_dir(user_dir: &Path) -> Result<PathBuf> {
+    subscription_auth_dir_from(user_dir, std::env::var_os(SUBSCRIPTION_AUTH_HOME))
+}
+
+fn subscription_auth_dir_from(
+    user_dir: &Path,
+    shared: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let Some(shared) = shared else {
+        return Ok(user_dir.to_owned());
+    };
+    let path = PathBuf::from(shared);
+    ensure!(
+        path.is_absolute(),
+        "DIAL_SUBSCRIPTION_AUTH_HOME must be an absolute directory"
+    );
+    let path =
+        fs::canonicalize(path).context("opening shared subscription authentication directory")?;
+    ensure!(
+        path.is_dir(),
+        "shared subscription authentication path must be a directory"
+    );
+    Ok(path)
+}
+
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub project_root: PathBuf,

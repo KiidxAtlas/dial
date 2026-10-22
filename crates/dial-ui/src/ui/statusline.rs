@@ -18,8 +18,11 @@ use super::{
 
 /// Segments below this importance are dropped before any text is shortened.
 const SHRINK_BEFORE_DROPPING: u8 = 60;
+/// Segments below this importance (the path) leave whole before the model name is cut.
+const DROP_BEFORE_MODEL_SHRINKS: u8 = 70;
 const MODEL_FLOOR: usize = 10;
-const PATH_FLOOR: usize = 6;
+/// A path cut shorter than this (`…las`) no longer says where Dial works; it is dropped instead.
+const PATH_FLOOR: usize = 12;
 const LAST_RESORT_FLOOR: usize = 2;
 const CONTEXT_BAR_CELLS: usize = 6;
 const CONTEXT_HOT: f64 = 0.70;
@@ -206,6 +209,8 @@ enum Shrink {
     Tail,
     /// Cut the start, keeping the informative tail (`…ects/dial`).
     Head,
+    /// A `provider/model` label: leading `provider/` parts go first, then the end is cut.
+    Model,
 }
 
 #[derive(Clone)]
@@ -252,6 +257,16 @@ impl Seg {
         }
         part.text = match part.shrink {
             Some(Shrink::Head) => text::ellipsize_start(&part.text, target, ascii),
+            Some(Shrink::Model) => {
+                let mut name = part.text.as_str();
+                while text::width(name) > target
+                    && let Some((_, rest)) = name.split_once('/')
+                    && !rest.is_empty()
+                {
+                    name = rest;
+                }
+                text::ellipsize(name, target, ascii)
+            }
             _ => text::ellipsize(&part.text, target, ascii),
         };
     }
@@ -326,7 +341,7 @@ impl Env<'_> {
                 .theme
                 .fg(Tok::Accent)
                 .add_modifier(ratatui::style::Modifier::BOLD),
-            shrink: Some(Shrink::Tail),
+            shrink: Some(Shrink::Model),
             shimmer: None,
         }
     }
@@ -888,11 +903,17 @@ fn shrink_texts(
     }
 }
 
-/// Make the groups fit `avail` cells: drop the minor segments, shorten path then model, drop the
-/// rest by importance (the model last), and only then squeeze the model below its comfortable size.
+/// Make the groups fit `avail` cells: drop the minor segments, shorten the path while it still
+/// names the project, then drop it whole rather than leave a stub; shorten the model (provider
+/// first), drop the rest by importance (the model last), and only then squeeze the model below its
+/// comfortable size.
 fn fit(left: &mut Vec<Seg>, right: &mut Vec<Seg>, avail: usize, sep: usize, ascii: bool) {
     while needed(left, right, sep) > avail
         && drop_least_important(left, right, false, SHRINK_BEFORE_DROPPING)
+    {}
+    shrink_texts(left, right, avail, sep, ascii, &[("path", PATH_FLOOR)]);
+    while needed(left, right, sep) > avail
+        && drop_least_important(left, right, false, DROP_BEFORE_MODEL_SHRINKS)
     {}
     shrink_texts(
         left,
@@ -900,11 +921,7 @@ fn fit(left: &mut Vec<Seg>, right: &mut Vec<Seg>, avail: usize, sep: usize, asci
         avail,
         sep,
         ascii,
-        &[
-            ("path", PATH_FLOOR),
-            ("model", MODEL_FLOOR),
-            ("spinner", 24),
-        ],
+        &[("model", MODEL_FLOOR), ("spinner", 24)],
     );
     while needed(left, right, sep) > avail && drop_least_important(left, right, true, u8::MAX) {}
     shrink_texts(

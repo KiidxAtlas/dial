@@ -192,12 +192,15 @@ impl Agent<'_> {
 
                 pending = None;
                 engine.recovery.reset();
+                crate::agent::run::guidance::reset_for_steering(&mut pending_nudges);
                 rejected_edit_previews = 0;
                 recovering_output = false;
                 max_tokens = backend.output_budget(h.max_tokens);
                 reasoning_budget = None;
                 planning_notice = false;
                 plan_after_gate = false;
+                compaction_failed = false;
+                compaction_retry_floor = None;
                 reliability.consecutive_contract_failures = 0;
                 names = self.offered();
                 *schemas = self.schemas(&names)?;
@@ -426,14 +429,34 @@ impl Agent<'_> {
                 .context_meter
                 .predict(request_estimate)
                 .max(request_estimate);
+            if h.max_tokens == 0
+                && selection.profile.as_ref().is_none_or(|profile| profile.max_tokens.is_none())
+            {
+                // Unlimited output resolves to a model ceiling, not an allocation that must fit
+                // beside every prompt. Bound that automatic ceiling by this request's remaining
+                // context; the policy reserve below still cannot be consumed by the prompt.
+                let remaining = u64::from(self.context_window()).saturating_sub(request_context);
+                if remaining > 0 {
+                    request.max_tokens = request.max_tokens.min(remaining as u32);
+                }
+            }
             let reason = if step == 0 {
                 crate::config::compaction::CompactionReason::Threshold
             } else {
                 crate::config::compaction::CompactionReason::MidTurn
             };
             self.poll_background_compaction(ui);
+            // Apply the same failed-attempt backoff to speculation and blocking maintenance.
+            // Otherwise each small tool result can relaunch the method chain in the background.
+            let safe_prompt_budget = crate::agent::compact::compaction::prompt_budget(
+                &self.config.compaction,
+                self.context_window(),
+                backend.output_budget(request.max_tokens),
+            );
+            let retry_ready = compaction_retry_floor
+                .is_none_or(|floor| request_context >= floor || request_context > safe_prompt_budget);
             let mut deferred_compaction = false;
-            if !compaction_failed {
+            if !compaction_failed && retry_ready {
                 let action = self.compaction_runtime.speculation_action(
                     crate::agent::compact::compaction_runtime::SpeculationContext {
                         policy: &self.config.compaction,
@@ -457,6 +480,8 @@ impl Agent<'_> {
                             Ok(Some(outcome)) => {
                                 if !outcome.continue_allowed { return self.pause_after_compaction(ui, step).map(crate::agent::run::engine::Tick::Finished); }
                                 compaction_failed = false;
+                                compaction_retry_floor = None;
+                                engine.evidence_compacted();
                                 budget.give_back();
                                 return Ok(crate::agent::run::engine::Tick::Again);
                             }
@@ -484,13 +509,6 @@ impl Agent<'_> {
             }
             // A deferred background summary may finish later, but never let a request through that
             // leaves less than the output reserve: past that budget, compact in the foreground now.
-            let safe_prompt_budget = crate::agent::compact::compaction::prompt_budget(
-                &self.config.compaction,
-                self.context_window(),
-                backend.output_budget(request.max_tokens),
-            );
-            let retry_ready = compaction_retry_floor
-                .is_none_or(|floor| request_context >= floor || request_context > safe_prompt_budget);
             if !compaction_failed
                 && retry_ready
                 && (!deferred_compaction || request_context > safe_prompt_budget)
@@ -540,27 +558,32 @@ impl Agent<'_> {
                     }
                 }
             }
-            if request_context >= u64::from(self.context_window()) && !self.lean_tools {
+            if request_context > safe_prompt_budget && !self.lean_tools {
                 self.lean_tools = true;
                 self.rebuild_system();
                 names = self.offered();
                 *schemas = self.schemas(&names)?;
                 ui.event(&crate::agent::ui::ui_event::UiEvent::new(crate::agent::ui::ui_event::EventKind::Model, format!(
-                    "Context window {} is small; offering a lean tool set (others load on demand)",
+                    "Context window {} needs response headroom; offering lean instructions and tools (others load on demand)",
                     self.context_window()
                 )));
                 budget.give_back();
                 return Ok(crate::agent::run::engine::Tick::Again);
             }
             ensure!(
-                request_context < u64::from(self.context_window()),
-                "the projected request needs about {request_context} tokens, exceeding the {}-token context window{}. Compaction cannot safely make room; reduce system/project instructions or tool schemas, retrieve smaller evidence slices, or select a larger-window model. The session and unfinished work are preserved",
+                request_context <= safe_prompt_budget && request_context < u64::from(self.context_window()),
+                "the projected request needs about {request_context} tokens, exceeding the usable prompt budget of {safe_prompt_budget} tokens in the {}-token context window{} (the remainder is reserved for a useful response). Estimated wire bytes: system={}, tools={}, results={}, task={}, conversation={}. Compaction cannot safely make room; reduce system/project instructions or tool schemas, retrieve smaller evidence slices, or select a larger-window model. The session and unfinished work are preserved",
                 self.context_window(),
                 if self.lean_tools {
                     " even with the lean tool set"
                 } else {
                     ""
-                }
+                },
+                request_overhead.system_bytes,
+                request_overhead.tool_schema_bytes,
+                request_overhead.tool_result_bytes,
+                request_overhead.task_context_bytes,
+                request_overhead.conversation_bytes
             );
             pending_nudges.clear();
             self.efficiency_metrics
@@ -1017,6 +1040,9 @@ impl Agent<'_> {
                     {
                         return self.pause_after_compaction(ui, step).map(crate::agent::run::engine::Tick::Finished);
                     }
+                    compaction_failed = false;
+                    compaction_retry_floor = None;
+                    engine.evidence_compacted();
                     budget.give_back();
                     return Ok(crate::agent::run::engine::Tick::Again);
                 }
@@ -1871,6 +1897,7 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     // Only admitted calls that reached execution count; rejected, skipped and blocked forms do not.
                     if executed {
                         self.metrics.tool_trace.record_invoked(&call.name);
+                        self.efficiency_metrics.tool_result(call, !out.execution.changed_paths.is_empty(), self.workflow_started.elapsed());
                     }
                     if (call.name == "browser" || call.name == "computer") && !out.is_error {
                         match crate::storage::artifact::capture_image(self.workspace.artifacts(), &mut out) {
@@ -1887,6 +1914,11 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     ui.tool_timing(&call.name, seconds);
                     tool_seconds = seconds;
                     self.settled(call, &out);
+                    if call.name == "task" {
+                        if let Some(data) = &out.data {
+                            self.efficiency_metrics.worker_results(data);
+                        }
+                    }
                     self.observe_tool_routing(call, &out);
                     ui.tool_result_with_id(&call.id, &call.name, &out);
                     out
@@ -2331,6 +2363,8 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     names = self.offered();
                     *schemas = self.schemas(&names)?;
                     compaction_failed = true;
+                    compaction_retry_floor = None;
+                    engine.evidence_compacted();
                     return Ok(crate::agent::run::engine::Tick::Again);
                 }
                 Ok(false) => {}
@@ -2349,6 +2383,8 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                 match self.rollover_context_using(backend, ui, requested, Some(&request)) {
                     Ok(_) => {
                         compaction_failed = true;
+                        compaction_retry_floor = None;
+                        engine.evidence_compacted();
                         names = self.offered();
                         *schemas = self.schemas(&names)?;
                         return Ok(crate::agent::run::engine::Tick::Again);

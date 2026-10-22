@@ -84,3 +84,47 @@ fn replacement_bodies_are_never_clipped_and_pointers_carry_no_link() {
     evidence_link(&mut body, "artifact://full", dropped);
     assert_eq!(body, pointer);
 }
+
+#[test]
+fn delivered_inspections_are_bounded_deduplicated_and_observational() {
+    use serde_json::json;
+    let call = crate::llm::ToolCall {
+        id: "read-1".into(),
+        name: "read".into(),
+        arguments: json!({"path":"source.rs"}),
+        malformed_arguments: false,
+    };
+    let mut metrics = Metrics::default();
+    metrics.inspection(&call);
+    assert_eq!(metrics.parent_inspections_matching_delivered_workers, 0);
+    let mut observations = Inspections::default();
+    observations.record(&call);
+    let mut result = json!({"id":"task-1", "execution_id":"first", "status":"running", "inspections":observations});
+    metrics.worker_results(&result);
+    metrics.inspection(&call);
+    assert_eq!(metrics.delivered_worker_results, 0);
+    result["status"] = json!("done");
+    metrics.worker_results(&result);
+    metrics.worker_results(&result);
+    metrics.inspection(&call);
+    assert_eq!(metrics.delivered_worker_results, 1);
+    assert_eq!(metrics.parent_inspections_matching_delivered_workers, 1);
+    result["execution_id"] = json!("resumed");
+    metrics.worker_results(&result);
+    assert_eq!(metrics.delivered_worker_results, 2);
+    for n in 0..=Inspections::LIMIT {
+        observations.record(&crate::llm::ToolCall {
+            id: n.to_string(),
+            name: "read".into(),
+            arguments: json!({"path":format!("{n}.rs")}),
+            malformed_arguments: false,
+        });
+    }
+    assert_eq!(observations.signatures.len(), Inspections::LIMIT);
+    assert!(observations.truncated);
+    metrics.worker_results(&json!({"status":"done", "inspections": observations}));
+    assert!(metrics.worker_inspection_coverage_truncated);
+    let report = serde_json::to_string(&metrics).unwrap();
+    assert!(!report.contains("source.rs"));
+    assert!(!report.contains("signatures"));
+}

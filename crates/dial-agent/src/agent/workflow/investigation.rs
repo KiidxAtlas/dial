@@ -190,7 +190,7 @@ impl ReturnedReads {
         if call.name != "read" || is_error {
             return None;
         }
-        let target = ["path", "offset", "limit"]
+        let target = ["path", "paths", "offset", "limit"]
             .map(|name| call.arguments[name].to_string())
             .join("\0");
         let key = observation_key(call, text);
@@ -239,11 +239,21 @@ impl ReturnedReads {
         for (header, runs) in sections {
             let known = self.shown.get(*header)?;
             for &(first, last) in runs {
-                let (_, id) = known
-                    .iter()
-                    .find(|((from, to), id)| *from <= first && last <= *to && still_full(id))?;
-                if !ids.contains(id) {
-                    ids.push(id.clone());
+                let mut next = first;
+                loop {
+                    // Adjacent/overlapping earlier reads can jointly cover this run. Choose the
+                    // furthest visible end so the pointer needs as few earlier calls as possible.
+                    let ((_, to), id) = known
+                        .iter()
+                        .filter(|((from, to), id)| *from <= next && next <= *to && still_full(id))
+                        .max_by_key(|((_, to), _)| *to)?;
+                    if !ids.contains(id) {
+                        ids.push(id.clone());
+                    }
+                    if *to >= last {
+                        break;
+                    }
+                    next = to + 1;
                 }
             }
         }

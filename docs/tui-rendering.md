@@ -10,9 +10,21 @@ Defaults collapse reasoning, omit per-turn statistics and leave the workspace-ch
 
 Ctrl+P opens goal-first action navigation; typing searches every registered command. The empty slash menu remains a command-oriented shortcut. It opens upward from the input (12 rows by default, `ui.autocomplete_items`); `/` groups everyday commands by category, naming each group once, then lists the rest. Typed queries rank fuzzy matches across all commands. Compute and learning controls stay searchable. The live work summary shows Now, Blocked and Next; `/todo` opens the full read-only plan and recorded evidence. Busy draft submission opens a local intent chooser before any message is routed; empty Enter no longer interrupts queued work without an explicit choice. `/agents`, `/hub` and `/jobs` open the worker panel; `/jobs <id>` still shows status and `/agents definitions` lists definitions. `/bg` remains an alias for the process panel.
 
+Composer and history-search editing use the configured editor bindings, including Unicode-aware
+word movement. The worker panel ignores key-release events; holding the cancellation key cannot
+confirm its own prompt. Page keys navigate the roster in narrow layouts. Worker search and message
+draft backspace remove whole graphemes. Tight pinned summaries put input requests first and keep a
+worker visible before its optional live preview; status comes before long names and task text.
+
 Until the first message, a live home sits in the viewport above the composer (`crates/dial-ui/src/ui/welcome.rs`): a block wordmark over a `┈` axis and its reflection, borderless model, project, approval and sandbox facts, and recent sessions or starters, side by side from 110 columns and in one compact column below 24 rows. Shorter terminals shed the reflection, then the large wordmark, then contextual facts before the selected action, and window the list around that action. Down from an empty draft selects a row, Enter resumes the session or loads the starter into the draft for editing, and Esc returns to the draft. When the conversation gets its first user message, the home is committed to scrollback as one summary line.
 
 The default look (the `dial-dark` and `dial` themes) is frameless: user messages and the composer are full-width shaded bands (`userBg`) with a `›` prompt, and the status line sits inside the composer band (`ui.composer_shape = "band"`; `box` and `line` keep a framed composer). Transcript rows share a three-cell icon gutter (`tool_cards::GUTTER`): the answer starts at a `●`, tool calls show a dim `·` once settled, `✗` on failure and `⊘` when interrupted, with a bold verb, a muted target and result bodies hanging off `└`. Panels and menus are inset surfaces on the optional `panelBg` token (`chrome::framed_lines`, `chrome::panel_block`) with a bold title row and a right-aligned italic hint; the selected row is filled with `selectedBg` and drawn in one bold body color (`chrome::select_spans`), with search matches underlined. Other built-in themes keep their colors and take the same layout.
+
+MCP calls are the exception to the frameless transcript: a connected-service-colored outline and
+`panelBg` surface identify the service boundary, with an `MCP · server` title and the service-local
+action inside. Status glyphs, errors, progress and Ctrl+O evidence expansion keep the same behavior
+as native calls. ASCII themes use `+`, `-` and `|` borders; monochrome themes retain the label and
+outline even when fills are disabled. Native tools and schema discovery keep their existing rows.
 
 Motion is limited to the start-up wordmark sweep (`fx::SWEEP`, 0.7 s) and a 140 ms reveal when any full-screen panel opens; both follow `ui.motion` and are off under `NO_COLOR`, ASCII glyphs and non-truecolor terminals (`fx::motion`). Panels share one footer vocabulary, documented on `chrome::key_hint_spans`, and one tab style, `chrome::tab_style`.
 
@@ -34,7 +46,8 @@ and no model requests. Run with `before` **before editing** to capture a compari
 reconstruct historical code. Serve that directory locally and inspect it in a browser.
 
 The sheet covers home and setup risks, short selections, working input, transcript evidence,
-settings and filtered choices, action search and empty sessions in dark/light, 60-column and
-38-column ASCII layouts. Browser fonts only approximate terminal typography; it does not verify
-native input delivery, screen-reader support, terminal emulators or real provider interactions.
-Regression tests cover selection, search/reset/cancel and zero-size/short layout behavior.
+settings and filtered choices, action search, empty sessions, worker rosters before/after paging
+and tight worker summaries in dark/light, 60-column and 38-column ASCII layouts. Browser fonts only
+approximate terminal typography; it does not verify native input delivery, screen-reader support,
+terminal emulators or real provider interactions. Regression tests cover selection, key rebinding,
+search/reset/cancel, grapheme deletion and zero-size/short layout behavior.

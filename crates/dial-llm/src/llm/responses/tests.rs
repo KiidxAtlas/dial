@@ -463,7 +463,8 @@ fn nested_stream_errors_preserve_classification_without_releasing_calls() {
             "subscription_sharing_usage_limit_exceeded",
             ErrorClass::QuotaExhausted { reset_at: None },
         ),
-        ("private prompt", ErrorClass::Fatal),
+        // Unrecognized provider codes are retried within the bounded budget, never surfaced raw.
+        ("private prompt", ErrorClass::Transient),
     ] {
         let mut accumulator = Accumulator::default();
         accumulator
@@ -485,6 +486,21 @@ fn nested_stream_errors_preserve_classification_without_releasing_calls() {
         assert!(!err.to_string().contains("private prompt"));
         assert!(accumulator.finish().is_err());
     }
+}
+
+#[test]
+fn unclassified_incomplete_responses_are_not_retried() {
+    use super::super::errors::{ErrorClass, classify};
+    let mut accumulator = Accumulator::default();
+    let err = accumulator
+        .feed(
+            &json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"other"}}}).to_string(),
+            &mut |_| true,
+            &mut |_| true,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("unclassified_failure"), "{err}");
+    assert_eq!(classify(&err), ErrorClass::Fatal);
 }
 
 #[test]

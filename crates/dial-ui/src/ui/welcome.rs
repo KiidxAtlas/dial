@@ -119,6 +119,16 @@ fn approval_meaning(mode: &str) -> &'static str {
     }
 }
 
+/// Whether a fact row is a warning the user should act on (rather than reassurance).
+fn fact_warns(info: &WelcomeInfo, name: &str) -> bool {
+    match name {
+        "model" | "next" => info.model.trim().is_empty(),
+        "approval" => info.approval.trim() == "auto",
+        "sandbox" => info.sandbox.trim().eq_ignore_ascii_case("off"),
+        _ => false,
+    }
+}
+
 /// The facts the card shows, as `(label, value spans)` rows.
 fn facts(
     info: &WelcomeInfo,
@@ -307,10 +317,12 @@ fn list_lines(
     let heading = |title: &str| {
         let mut spans = vec![label(theme, title)];
         if shown < total {
-            spans.push(Span::styled(
-                format!("  {}-{}/{total}", start + 1, start + shown),
-                muted,
-            ));
+            let range = if shown == 1 {
+                format!("  {}/{total}", start + 1)
+            } else {
+                format!("  {}-{}/{total}", start + 1, start + shown)
+            };
+            spans.push(Span::styled(range, muted));
         }
         spans
     };
@@ -526,13 +538,17 @@ fn layout(
         }
         let mut facts = facts(info, theme, inner.saturating_sub(9));
         if compact {
-            // Keep a selected action visible even in very short terminals. Shed context before
-            // approval/isolation facts; list navigation windows the remaining rows around selection.
+            // Keep a selected action visible even in very short terminals. When every fact cannot
+            // fit, the reassuring ones (a safe sandbox, a guarded approval mode, the model and
+            // project) leave first and whole, so only warnings compete with the list.
             let room = view
                 .max_rows
                 .saturating_sub(out.len() + usize::from(items(info) > 0));
+            if facts.len() > room {
+                facts.retain(|(name, _)| fact_warns(info, name));
+            }
             while facts.len() > room {
-                let remove = ["project", "next", "model"]
+                let remove = ["next", "model", "approval"]
                     .iter()
                     .find_map(|name| facts.iter().position(|(label, _)| label == name))
                     .unwrap_or(0);

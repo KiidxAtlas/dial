@@ -291,7 +291,7 @@ fn renders_title_tabs_sections_rows_and_footer() {
         "Separator",
         "Powerline thin",
         "Preview: PREVIEW",
-        "Type to search",
+        "Search: ",
         "Esc close",
         "Ctrl+S scope",
     ] {
@@ -911,7 +911,7 @@ fn short_panels_prioritize_search_and_non_appearance_settings_have_no_preview() 
     let rig = Rig::new();
     let mut o = overlay();
     let shown = draw(&mut o, &rig, 60, 8);
-    assert!(shown.contains("Type to search all settings"), "{shown}");
+    assert!(shown.contains("Search: "), "{shown}");
     assert!(
         shown.contains("Enter choose") && shown.contains("Esc close"),
         "{shown}"
@@ -1485,4 +1485,121 @@ fn long_pickers_offer_a_filter_and_each_new_picker_starts_unfiltered() {
     open_theme_picker(&mut o, &rig.keys);
     assert_eq!(filter_text(&o), "");
     assert!(draw(&mut o, &rig, 100, 30).contains("10 options"));
+}
+
+fn draw_with(
+    o: &mut SettingsOverlay,
+    rig: &Rig,
+    w: u16,
+    h: u16,
+    preview: &dyn Fn(&UiConfig, u16) -> Line<'static>,
+) -> String {
+    let ctx = DrawCtx {
+        theme: &rig.theme,
+        keys: &rig.keys,
+        status: &rig.status,
+        preview_status: preview,
+    };
+    screen(&render(w, h, |f| o.draw(f, &ctx)))
+}
+
+#[test]
+fn only_the_selected_row_carries_the_selection_marker() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    let shown = draw(&mut o, &rig, 120, 30);
+    let pointer = rig.theme.sym(Sym::Pointer);
+    assert_eq!(shown.matches(pointer).count(), 1, "{shown}");
+    let marked = shown.lines().find(|l| l.contains(pointer)).unwrap();
+    assert!(
+        !marked.contains("Search"),
+        "the search field is not a selected row: {marked}"
+    );
+}
+
+#[test]
+fn appearance_rows_hide_the_preview_line_when_there_is_nothing_to_preview() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    goto(&mut o, &rig.keys, "ui.theme");
+    let empty = |_: &UiConfig, _: u16| Line::default();
+    assert!(!draw_with(&mut o, &rig, 100, 24, &empty).contains("Preview:"));
+    assert!(draw(&mut o, &rig, 100, 24).contains("Preview: PREVIEW"));
+}
+
+#[test]
+fn narrow_title_sheds_the_scope_label_without_touching_the_title() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    for w in [24u16, 30, 38, 45, 60, 120] {
+        let shown = draw(&mut o, &rig, w, 16);
+        let top = shown.lines().next().unwrap();
+        assert!(top.starts_with(" Settings "), "width {w}: {top}");
+        if w >= 60 {
+            assert!(top.contains("Ctrl+S"), "width {w}: {top}");
+        }
+    }
+    // Switching scope is acknowledged in the body, where every width can see it.
+    send(&mut o, &rig.keys, ctrl('s'));
+    assert!(draw(&mut o, &rig, 38, 16).contains("this project"));
+}
+
+#[test]
+fn clipped_tab_strip_marks_hidden_tabs_and_keeps_the_active_one_whole() {
+    let theme = crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let rig = Rig::with_theme(theme);
+    let mut o = overlay();
+    let names: Vec<&str> = o.tabs.iter().map(|(t, _)| *t).collect();
+    let first = draw(&mut o, &rig, 38, 16);
+    let strip = first.lines().nth(1).unwrap();
+    assert!(strip.trim_end().ends_with("..."), "{strip}");
+    // Every name on the strip is whole: no tab is clipped mid-word.
+    for word in strip.split_whitespace().filter(|w| *w != "...") {
+        assert!(
+            names.contains(&word) || word == PROVIDERS_TAB,
+            "clipped {word:?} in {strip}"
+        );
+    }
+    for _ in 0..names.len() {
+        send(&mut o, &rig.keys, key(KeyCode::Right));
+    }
+    let last = draw(&mut o, &rig, 38, 16);
+    let strip = last.lines().nth(1).unwrap();
+    assert!(strip.trim_start().starts_with("..."), "{strip}");
+    assert!(strip.contains(PROVIDERS_TAB), "{strip}");
+}
+
+#[test]
+fn filtered_choices_show_every_match_that_fits() {
+    let rig = Rig::new();
+    let themes: Vec<String> = (0..12).map(|n| format!("dark-{n}")).collect();
+    let refs: Vec<&str> = themes.iter().map(String::as_str).collect();
+    let mut o = theme_overlay(&refs);
+    open_theme_picker(&mut o, &rig.keys);
+    o.handle(&Event::Paste("dark".into()), &rig.keys);
+    let shown = draw(&mut o, &rig, 100, 40);
+    for theme in &themes {
+        assert!(shown.contains(theme.as_str()), "{theme} missing:\n{shown}");
+    }
+}
+
+#[test]
+fn home_and_end_jump_in_the_list_and_in_pickers() {
+    let rig = Rig::new();
+    let mut o = overlay();
+    let last = o.visible().len() - 1;
+    send(&mut o, &rig.keys, key(KeyCode::End));
+    assert_eq!(o.cursor, last);
+    send(&mut o, &rig.keys, key(KeyCode::Home));
+    assert_eq!(o.cursor, 0);
+    let mut o = theme_overlay(&["dark", "light", "mono", "ember"]);
+    open_theme_picker(&mut o, &rig.keys);
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::End)),
+        OverlayEvent::PreviewTheme(Some(theme)) if theme == "auto"
+    ));
+    assert!(matches!(
+        send(&mut o, &rig.keys, key(KeyCode::Home)),
+        OverlayEvent::PreviewTheme(Some(theme)) if theme == "dark"
+    ));
 }

@@ -217,7 +217,7 @@ impl Engine {
         let pointer =
             self.returned_reads
                 .pointer(call, &output.text, output.is_error, holds_result);
-        (duplicate.or(pointer), repeat, stop)
+        (pointer.or(duplicate), repeat, stop)
     }
 
     /// Compaction rewrote what the model can see. Duplicate memory, pointers, cached observations

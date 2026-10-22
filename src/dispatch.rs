@@ -221,6 +221,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
         resume,
         ablate_assistance,
         allow_remote,
+        share_auth,
     }) = cli.command.as_ref()
     {
         if *ablate_assistance {
@@ -236,6 +237,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
                     .unwrap_or(std::path::Path::new("examples/benchmarks/efficiency.toml")),
                 report.as_deref(),
                 *allow_remote,
+                *share_auth,
             );
         }
         let manifest = manifest.as_deref().ok_or_else(|| {
@@ -250,6 +252,7 @@ pub(crate) fn real_main(mut cli: Cli) -> Result<()> {
             profiles.as_deref(),
             checkpoint.as_deref(),
             *resume,
+            *share_auth,
         );
     }
     if let Some(Command::Improve(cmd)) = cli.command {

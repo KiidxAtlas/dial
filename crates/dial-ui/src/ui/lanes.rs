@@ -122,13 +122,11 @@ fn line(event: &UiEvent, w: usize, ctx: &TranscriptCtx) -> Rows {
                 }
             }
         } else {
+            // Same wording as a tool card's hidden output, so the expand key reads one way.
             rows.push(fitted(
                 vec![
                     Span::raw(" ".repeat(hang)),
-                    Span::styled(
-                        format!("{} more lines · {}", rest.len(), ctx.expand_key),
-                        theme.fg(Tok::Dim),
-                    ),
+                    super::tool_cards::hidden_hint(rest.len(), ctx.expand_key, theme),
                 ],
                 w,
                 theme,
@@ -154,7 +152,7 @@ fn divider(event: &UiEvent, w: usize, ctx: &TranscriptCtx) -> Rows {
     let ascii = theme.ascii();
     let rule = if ascii { "-" } else { "─" };
     let arrow = if ascii { "->" } else { "→" };
-    let dot = if ascii { "|" } else { "·" };
+    let dot = theme.sym(super::theme::Sym::Dot);
     let mut label = format!("{} {}", icon(event.kind, ascii), event.kind.label());
     if let Some((before, after)) = event.tokens {
         label.push_str(&format!(

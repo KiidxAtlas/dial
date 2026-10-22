@@ -4,16 +4,17 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     style::{Modifier, Style},
     text::{Line, Span},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{filled, hint, hint_line, pair_label, panel},
+    settings::{Axis, arrows, filled, hint, hint_line, pair_label, panel},
 };
 use crate::ui::{
     chrome::{self, Section},
@@ -59,6 +60,8 @@ pub struct SubagentsOverlay {
     /// Narrow layouts: the inspector full width instead of the roster.
     inspector: bool,
     inspector_scroll: usize,
+    /// Furthest the inspector can scroll, from the last draw; key scrolling clamps to it.
+    inspector_max: Cell<usize>,
     /// Draft of the active tab's query while `/` is open; the query applies as it is typed.
     search: Option<String>,
     compose: Option<String>,
@@ -117,7 +120,8 @@ impl SubagentsOverlay {
         self.tab = Tab::Activity;
     }
 
-    /// Replaces the roster, feed and totals. Keeps the roster order and the selection.
+    /// Replaces the roster, feed and totals. Keeps the roster order and the selection, except that
+    /// workers needing the operator (input requests, then failures) always float to the top.
     pub fn set_snapshot(&mut self, snapshot: HubSnapshot) {
         self.agents = self.order_agents(snapshot.agents);
         self.activity = snapshot.activity;
@@ -125,16 +129,31 @@ impl SubagentsOverlay {
         self.sync_selection();
     }
 
-    /// Existing workers keep their position; new ones append in snapshot order.
-    fn order_agents(&self, mut incoming: Vec<AgentEntry>) -> Vec<AgentEntry> {
-        let mut out = Vec::with_capacity(incoming.len());
-        for id in self.agents.iter().map(|a| a.id.as_str()) {
-            if let Some(pos) = incoming.iter().position(|a| a.id == id) {
-                out.push(incoming.remove(pos));
+    /// Existing workers keep their position; new ones append in snapshot order. A stable sort by
+    /// [`AgentStatus::attention`] then lifts waiting and failed workers above the rest.
+    fn order_agents(&self, incoming: Vec<AgentEntry>) -> Vec<AgentEntry> {
+        let mut positions: std::collections::HashMap<&str, usize> = incoming
+            .iter()
+            .enumerate()
+            .map(|(index, agent)| (agent.id.as_str(), index))
+            .collect();
+        let mut order = Vec::with_capacity(incoming.len());
+        for agent in &self.agents {
+            if let Some(index) = positions.remove(agent.id.as_str()) {
+                order.push(index);
             }
         }
-        out.extend(incoming);
-        out
+        // The tail follows snapshot order, never hash iteration order.
+        order.extend(incoming.iter().enumerate().filter_map(|(index, agent)| {
+            positions.contains_key(agent.id.as_str()).then_some(index)
+        }));
+        let mut incoming: Vec<Option<AgentEntry>> = incoming.into_iter().map(Some).collect();
+        let mut agents: Vec<AgentEntry> = order
+            .into_iter()
+            .filter_map(|index| incoming[index].take())
+            .collect();
+        agents.sort_by_key(|agent| agent.status.attention());
+        agents
     }
 
     pub fn set_routes(&mut self, routes: Vec<String>) {
@@ -159,6 +178,15 @@ impl SubagentsOverlay {
         let Event::Key(key) = event else {
             return OverlayEvent::None;
         };
+        // Raw character branches below must obey the same release semantics as the keymap.
+        if key.kind == KeyEventKind::Release
+            || (key.kind == KeyEventKind::Repeat
+                && key.code == KeyCode::Char('x')
+                && self.compose.is_none()
+                && self.search.is_none())
+        {
+            return OverlayEvent::None;
+        }
         if self.compose.is_some() {
             return self.handle_compose(key, keys);
         }
@@ -220,6 +248,14 @@ impl SubagentsOverlay {
     }
 
     fn handle_agents(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
+        // In the narrow inspector the paging keys scroll it; wherever the roster is on screen
+        // (wide split or narrow roster) they move the selection, so every layout pages the same.
+        let scrolls_inspector = !self.wide.get() && self.inspector;
+        let page = if scrolls_inspector {
+            usize::from(self.body_h.get()).saturating_sub(1).max(1)
+        } else {
+            self.roster_page()
+        };
         if keys.matches(Action::SelectUp, key)
             || matches!(key.code, KeyCode::Char('k') if plain(key))
         {
@@ -229,9 +265,29 @@ impl SubagentsOverlay {
         {
             self.move_agent(1);
         } else if keys.matches(Action::SelectPageUp, key) {
-            self.inspector_scroll = self.inspector_scroll.saturating_sub(5);
+            if scrolls_inspector {
+                self.scroll_inspector(-(page as isize));
+            } else {
+                self.move_agent(-(page as isize));
+            }
         } else if keys.matches(Action::SelectPageDown, key) {
-            self.inspector_scroll += 5;
+            if scrolls_inspector {
+                self.scroll_inspector(page as isize);
+            } else {
+                self.move_agent(page as isize);
+            }
+        } else if matches!(key.code, KeyCode::Home) && plain(key) {
+            if scrolls_inspector {
+                self.inspector_scroll = 0;
+            } else {
+                self.move_agent(isize::MIN / 2);
+            }
+        } else if matches!(key.code, KeyCode::End) && plain(key) {
+            if scrolls_inspector {
+                self.inspector_scroll = self.inspector_max.get();
+            } else {
+                self.move_agent(isize::MAX / 2);
+            }
         } else if keys.matches(Action::SelectConfirm, key) {
             if let Some(agent) = self.selected_agent() {
                 return OverlayEvent::Action(format!("subagent-open:{}", agent.id));
@@ -261,6 +317,9 @@ impl SubagentsOverlay {
     fn handle_activity(&mut self, key: &KeyEvent, keys: &Keymap) -> OverlayEvent {
         let rows = self.activity_rows();
         let pos = self.activity_pos(rows.len());
+        let last = rows.len().saturating_sub(1);
+        // Event rows on screen: the body minus the status line and the column header.
+        let page = usize::from(self.body_h.get()).saturating_sub(3).max(1);
         if keys.matches(Action::SelectUp, key)
             || matches!(key.code, KeyCode::Char('k') if plain(key))
         {
@@ -270,13 +329,20 @@ impl SubagentsOverlay {
             || matches!(key.code, KeyCode::Char('j') if plain(key))
         {
             self.follow = false;
-            self.activity_cursor = (pos + 1).min(rows.len().saturating_sub(1));
+            self.activity_cursor = (pos + 1).min(last);
         } else if keys.matches(Action::SelectPageUp, key) {
             self.follow = false;
-            self.activity_cursor = pos.saturating_sub(10);
+            self.activity_cursor = pos.saturating_sub(page);
         } else if keys.matches(Action::SelectPageDown, key) {
             self.follow = false;
-            self.activity_cursor = (pos + 10).min(rows.len().saturating_sub(1));
+            self.activity_cursor = (pos + page).min(last);
+        } else if matches!(key.code, KeyCode::Home) && plain(key) {
+            self.follow = false;
+            self.activity_cursor = 0;
+        } else if matches!(key.code, KeyCode::End) && plain(key) {
+            // The newest event, and keep following new ones.
+            self.follow = true;
+            self.activity_cursor = usize::MAX;
         } else if keys.matches(Action::SelectConfirm, key) {
             if let Some(&index) = rows.get(pos) {
                 let event = &self.activity[index];
@@ -375,7 +441,9 @@ impl SubagentsOverlay {
             }
             KeyCode::Backspace => {
                 if let Some(draft) = self.compose.as_mut() {
-                    draft.pop();
+                    if let Some((start, _)) = draft.grapheme_indices(true).next_back() {
+                        draft.truncate(start);
+                    }
                 }
             }
             KeyCode::Char(c) if plain(key) => {
@@ -401,7 +469,9 @@ impl SubagentsOverlay {
                 return;
             }
             KeyCode::Backspace => {
-                draft.pop();
+                if let Some((start, _)) = draft.grapheme_indices(true).next_back() {
+                    draft.truncate(start);
+                }
             }
             KeyCode::Char(c) if plain(key) => draft.push(c),
             _ => {}
@@ -476,11 +546,7 @@ impl SubagentsOverlay {
             Tab::Activity => false,
         };
         if over {
-            self.inspector_scroll = if down {
-                self.inspector_scroll + 3
-            } else {
-                self.inspector_scroll.saturating_sub(3)
-            };
+            self.scroll_inspector(if down { 3 } else { -3 });
         }
         over
     }
@@ -543,6 +609,16 @@ impl SubagentsOverlay {
         hit
     }
 
+    /// Roster cards that fit in the body: the PageUp/PageDown step.
+    fn roster_page(&self) -> usize {
+        (usize::from(self.body_h.get()) / CARD_LINES).max(1)
+    }
+
+    fn scroll_inspector(&mut self, delta: isize) {
+        let next = (self.inspector_scroll as isize).saturating_add(delta);
+        self.inspector_scroll = next.clamp(0, self.inspector_max.get() as isize) as usize;
+    }
+
     fn move_agent(&mut self, delta: isize) {
         let rows = self.rows();
         if rows.is_empty() {
@@ -603,12 +679,7 @@ impl SubagentsOverlay {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
-        let running = self.totals.running;
-        let extra = match (self.agents.len(), running) {
-            (0, _) => "none yet".to_owned(),
-            (n, 0) => format!("{n} total"),
-            (n, r) => format!("{n} total · {r} running"),
-        };
+        let extra = status_counts(&self.agents);
         // The panel's inner area starts one cell inside the border, unless the box is too small.
         let area = frame.area();
         let inset = u16::from(area.width >= 5 && area.height >= 5);
@@ -664,12 +735,10 @@ impl SubagentsOverlay {
         let tab = |label: &str, active: bool| {
             Span::styled(format!(" {label} "), chrome::tab_style(theme, active))
         };
+        // Worker counts live in the panel title; this row carries only the usage totals.
         let t = &self.totals;
         let tokens = t.tokens_in + t.tokens_out;
-        let mut parts = vec![
-            format!("{} workers", t.total),
-            format!("{} running", t.running),
-        ];
+        let mut parts = Vec::new();
         if t.cost_usd > 0.0 {
             parts.push(money(t.cost_usd));
         }
@@ -685,16 +754,19 @@ impl SubagentsOverlay {
         if t.agent_ms > 0 {
             parts.push(duration(t.agent_ms));
         }
-        let totals = text::clip(&parts.join(" · "), w.saturating_sub(24));
-        filled(
-            vec![
-                tab("1 Agents", self.tab == Tab::Agents),
-                tab("2 Activity", self.tab == Tab::Activity),
-                Span::styled(format!("  {totals}"), theme.fg(Tok::Dim)),
-            ],
-            w,
-            Style::default(),
-        )
+        let mut spans = vec![
+            tab("1 Workers", self.tab == Tab::Agents),
+            tab("2 Activity", self.tab == Tab::Activity),
+        ];
+        let used: usize = spans.iter().map(|s| text::width(&s.content)).sum();
+        let room = w.saturating_sub(used + 2);
+        if !parts.is_empty() && room >= 6 {
+            spans.push(Span::styled(
+                format!("  {}", text::ellipsize(&parts.join(" · "), room, theme.ascii())),
+                theme.fg(Tok::Dim),
+            ));
+        }
+        filled(spans, w, Style::default())
     }
 
     fn routes_line(&self, w: usize, theme: &Theme) -> Line<'static> {
@@ -739,28 +811,56 @@ impl SubagentsOverlay {
     }
 
     fn footer(&self, ctx: &DrawCtx) -> Vec<String> {
+        let updown = arrows(ctx.theme, Axis::Vertical);
         let mut segments: Vec<String> = match self.tab {
             Tab::Agents => {
+                let scroll = !self.wide.get() && self.inspector;
                 let mut s = vec![
-                    "↑↓ select".to_owned(),
+                    format!("{updown} select"),
+                    format!("PgUp/PgDn {}", if scroll { "scroll" } else { "page" }),
                     "Enter open".to_owned(),
-                    "x cancel".to_owned(),
-                    "m message".to_owned(),
-                    "t tree".to_owned(),
-                    "/ search".to_owned(),
-                    "r roles".to_owned(),
                 ];
+                // Only offer what the selected worker can do right now.
+                if let Some(agent) = self.selected_agent() {
+                    if agent.cancellable {
+                        s.push("x cancel".to_owned());
+                    }
+                    if agent.steerable {
+                        s.push("m message".to_owned());
+                    } else if agent.resumable {
+                        s.push("m continue".to_owned());
+                    }
+                }
+                if !self.agents.is_empty() {
+                    s.push("t tree".to_owned());
+                    s.push("/ search".to_owned());
+                }
+                s.push("r roles".to_owned());
                 if !self.wide.get() {
-                    s.push("Tab inspector".to_owned());
+                    s.push(
+                        if self.inspector {
+                            "Tab roster"
+                        } else {
+                            "Tab details"
+                        }
+                        .to_owned(),
+                    );
                 }
                 s
             }
             Tab::Activity => vec![
-                "↑↓ select".to_owned(),
+                format!("{updown} select"),
                 "Enter open".to_owned(),
                 "f filter".to_owned(),
                 "s scope".to_owned(),
-                "Space follow".to_owned(),
+                format!(
+                    "Space {}",
+                    if self.follow {
+                        "pause follow"
+                    } else {
+                        "follow"
+                    }
+                ),
                 "/ search".to_owned(),
             ],
         };
@@ -795,7 +895,10 @@ impl SubagentsOverlay {
                     Some(line) => line.spans.clone(),
                     None => filled(Vec::new(), left_w, Style::default()).spans,
                 };
-                spans.push(Span::styled("│", theme.fg(Tok::BorderMuted)));
+                spans.push(Span::styled(
+                    theme.sym(Sym::BoxV).to_owned(),
+                    theme.fg(Tok::BorderMuted),
+                ));
                 match right.get(i) {
                     Some(line) => spans.extend(line.spans.clone()),
                     None => spans.extend(filled(Vec::new(), right_w, Style::default()).spans),
@@ -847,11 +950,17 @@ impl SubagentsOverlay {
         } else {
             " ".to_owned()
         };
+        let ascii = theme.ascii();
         let rail = if self.tree && row.depth > 0 {
+            let (mid, end) = if ascii {
+                ("|- ", "`- ")
+            } else {
+                ("├─ ", "└─ ")
+            };
             format!(
                 "{}{}",
                 "  ".repeat(row.depth - 1),
-                if row.last { "└─ " } else { "├─ " }
+                if row.last { end } else { mid }
             )
         } else {
             String::new()
@@ -862,27 +971,34 @@ impl SubagentsOverlay {
             Span::styled(format!("{glyph} "), theme.fg(glyph_tok)),
             Span::styled(rail, theme.fg(Tok::BorderMuted)),
             Span::styled(
-                text::clip(&agent.name, (w / 2).max(8)),
+                text::ellipsize(&agent.name, (w / 2).max(8), ascii),
                 theme.fg(name_tok).add_modifier(Modifier::BOLD),
             ),
         ];
         if !self.tree
             && let Some(parent) = &agent.parent
         {
+            let arrow = if ascii { "<-" } else { "↳" };
             left.push(Span::styled(
-                format!("  ↳ {}", text::clip(&self.name_of(parent), 16)),
+                format!("  {arrow} {}", text::ellipsize(&self.name_of(parent), 16, ascii)),
                 theme.fg(Tok::Dim),
             ));
         }
         if agent.unread > 0 {
+            let envelope = if ascii { "msg" } else { "✉" };
             left.push(Span::styled(
-                format!("  ✉ {}", agent.unread),
+                format!("  {envelope} {}", agent.unread),
                 theme.fg(Tok::Accent),
             ));
         }
         let badge = badge_of(agent);
         let left_w: usize = left.iter().map(|s| text::width(&s.content)).sum();
-        let badge = text::clip(&badge, w.saturating_sub(left_w + 2));
+        let room = w.saturating_sub(left_w + 2);
+        let badge = if room >= 4 {
+            text::ellipsize(&badge, room, ascii)
+        } else {
+            String::new()
+        };
         let gap = w.saturating_sub(left_w + text::width(&badge) + 1);
         left.push(Span::raw(" ".repeat(gap)));
         left.push(Span::styled(badge, theme.fg(Tok::Dim)));
@@ -895,32 +1011,55 @@ impl SubagentsOverlay {
         };
         let task = filled(
             vec![Span::styled(
-                format!("   {}", text::clip(&task, w.saturating_sub(3))),
+                format!("   {}", text::ellipsize(&task, w.saturating_sub(4), ascii)),
                 theme.fg(Tok::Muted),
             )],
             w,
             Style::default(),
         );
 
+        // What the worker is doing now, or why it stopped; usage numbers otherwise.
         let detail = match (&agent.status, &agent.current, &agent.retry) {
-            (AgentStatus::Running, Some(current), retry) => {
-                let mut d = format!("▸ {current}");
+            (AgentStatus::Running | AgentStatus::Waiting, Some(current), retry) => {
+                let lead = if agent.status == AgentStatus::Waiting {
+                    "needs input:"
+                } else if ascii {
+                    ">"
+                } else {
+                    "▸"
+                };
+                let mut d = format!("{lead} {}", text::one_line(current));
                 if let Some((n, max)) = retry {
                     d.push_str(&format!(" · retry {n}/{max}"));
                 }
                 d
             }
+            (AgentStatus::Failed, Some(current), _) => {
+                format!("failed: {}", text::one_line(current))
+            }
             _ => metrics(agent, epoch_ms()).join(" · "),
+        };
+        let detail_tok = match agent.status {
+            AgentStatus::Waiting => Tok::Warning,
+            AgentStatus::Failed => Tok::Error,
+            _ => Tok::Dim,
         };
         let detail = filled(
             vec![Span::styled(
-                format!("   {}", text::clip(&detail, w.saturating_sub(3))),
-                theme.fg(Tok::Dim),
+                format!("   {}", text::ellipsize(&detail, w.saturating_sub(4), ascii)),
+                theme.fg(detail_tok),
             )],
             w,
             Style::default(),
         );
-        vec![header, task, detail]
+        let mut card = vec![header, task, detail];
+        if selected {
+            for line in &mut card {
+                chrome::select_spans(theme, &mut line.spans);
+                line.style = theme.bg(Tok::SelectedBg);
+            }
+        }
+        card
     }
 
     fn inspector_lines(&self, w: usize, h: usize, theme: &Theme) -> Vec<Line<'static>> {
@@ -935,137 +1074,133 @@ impl SubagentsOverlay {
             )];
         };
         let now = epoch_ms();
+        let ascii = theme.ascii();
         let mut lines: Vec<Line<'static>> = Vec::new();
         let (glyph, glyph_tok) = status_glyph(agent.status, theme);
-        lines.push(filled(
-            vec![
-                Span::styled(
-                    format!(" {}", text::clip(&agent.name, w.saturating_sub(12))),
-                    theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  {}", agent.id), theme.fg(Tok::Dim)),
-            ],
-            w,
-            Style::default(),
-        ));
-        lines.push(filled(
-            vec![
-                Span::styled(format!(" {glyph} "), theme.fg(glyph_tok)),
-                Span::styled(agent.status.label().to_owned(), theme.fg(glyph_tok)),
-            ],
-            w,
-            Style::default(),
-        ));
-        lines.push(filled(
-            vec![Span::styled(
-                format!(" {}", text::clip(&badge_of(agent), w.saturating_sub(1))),
+        let id_w = text::width(&agent.id) + 2;
+        let mut title = vec![Span::styled(
+            format!(
+                " {}",
+                text::ellipsize(&agent.name, w.saturating_sub(id_w + 2).max(8), ascii)
+            ),
+            theme.fg(Tok::Text).add_modifier(Modifier::BOLD),
+        )];
+        // The id only when it adds something the name does not already say.
+        if agent.id != agent.name && w > id_w + 10 {
+            title.push(Span::styled(format!("  {}", agent.id), theme.fg(Tok::Dim)));
+        }
+        lines.push(filled(title, w, Style::default()));
+        let mut status = vec![
+            Span::styled(format!(" {glyph} "), theme.fg(glyph_tok)),
+            Span::styled(status_phrase(agent.status).to_owned(), theme.fg(glyph_tok)),
+        ];
+        let badge = badge_of(agent);
+        if !badge.is_empty() {
+            status.push(Span::styled(
+                format!("  {}", text::ellipsize(&badge, w.saturating_sub(20).max(4), ascii)),
                 theme.fg(Tok::Muted),
-            )],
-            w,
-            Style::default(),
-        ));
+            ));
+        }
+        lines.push(filled(status, w, Style::default()));
 
         lines.push(heading("Task", w, theme));
         let task = text::one_line(&agent.task);
         if task.trim().is_empty() {
-            lines.push(field(" —", w, theme));
+            lines.push(field(" No task text recorded.", w, theme));
         } else {
             for line in text::wrap_words(&task, w.saturating_sub(2).max(1)) {
                 lines.push(field(&format!(" {line}"), w, theme));
             }
         }
 
-        lines.push(heading("Current", w, theme));
-        lines.extend(kv_wrapped(
-            "tool",
-            agent.current.as_deref().unwrap_or("idle"),
-            w,
-            theme,
-        ));
+        // A finished worker has no "current" step; its last recorded step reads as the outcome.
+        let current = agent
+            .current
+            .as_deref()
+            .map(text::one_line)
+            .filter(|c| !c.trim().is_empty());
+        match (agent.status, current) {
+            (AgentStatus::Running, current) => {
+                lines.push(heading("Now", w, theme));
+                lines.extend(kv_wrapped(
+                    "doing",
+                    current.as_deref().unwrap_or("thinking"),
+                    w,
+                    theme,
+                ));
+            }
+            (AgentStatus::Waiting, current) => {
+                lines.push(heading("Needs your input", w, theme));
+                lines.extend(kv_wrapped(
+                    "asks",
+                    current
+                        .as_deref()
+                        .unwrap_or("an approval or an answer to a question"),
+                    w,
+                    theme,
+                ));
+                lines.push(field(" Press Enter to open it and reply.", w, theme));
+            }
+            (_, Some(current)) => {
+                lines.push(heading("Outcome", w, theme));
+                lines.extend(kv_wrapped("last", &current, w, theme));
+            }
+            (_, None) => {}
+        }
         if let Some((n, max)) = agent.retry {
             lines.push(kv("retry", &format!("attempt {n}/{max}"), w, theme));
         }
 
         lines.push(heading("Usage", w, theme));
-        lines.push(kv("steps", &agent.steps.to_string(), w, theme));
-        lines.push(kv("requests", &agent.requests.to_string(), w, theme));
-        lines.push(kv("tool calls", &agent.tool_calls.to_string(), w, theme));
-        let tokens = match (agent.tokens_in, agent.tokens_out) {
-            (None, None) => "unknown".to_owned(),
-            (i, o) => format!(
-                "in {} · out {}",
-                i.map_or("?".into(), compact),
-                o.map_or("?".into(), compact)
-            ),
-        };
-        lines.push(kv("tokens", &tokens, w, theme));
-        lines.push(kv(
-            "cost",
-            &agent.cost_usd.map_or("unknown".into(), money),
-            w,
-            theme,
-        ));
-        lines.push(kv(
-            "elapsed",
-            &agent.elapsed_ms.map_or("unknown".into(), duration),
-            w,
-            theme,
-        ));
-        if let Some((used, window)) = agent.context.filter(|(_, window)| *window > 0) {
-            lines.push(kv("context", &gauge(used, window, w), w, theme));
+        let usage = usage_rows(agent, w);
+        if usage.is_empty() {
+            lines.push(field(" No usage reported yet.", w, theme));
+        }
+        for (label, value) in usage {
+            lines.push(kv(label, &value, w, theme));
         }
 
-        lines.push(heading("Lineage", w, theme));
-        let parent = agent
-            .parent
-            .as_ref()
-            .map_or("main".to_owned(), |id| self.name_of(id));
-        lines.push(kv("parent", &parent, w, theme));
-        lines.push(kv(
-            "transcript",
-            &agent
-                .transcript
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map_or("none".into(), |f| f.to_string_lossy().into_owned()),
-            w,
-            theme,
-        ));
-
-        lines.push(heading("Changes & output", w, theme));
-        if agent.artifacts.is_empty() {
-            lines.push(kv("artifacts", "none yet", w, theme));
+        // Lineage and output: only the facts that exist, so a fresh worker stays short.
+        let mut details: Vec<(String, String)> = Vec::new();
+        if let Some(parent) = &agent.parent {
+            details.push(("parent".into(), self.name_of(parent)));
+        }
+        if let Some(file) = agent.transcript.as_ref().and_then(|p| p.file_name()) {
+            details.push(("transcript".into(), file.to_string_lossy().into_owned()));
+        }
+        if let Some(isolation) = agent.isolation.as_deref().filter(|s| !s.trim().is_empty()) {
+            details.push(("isolation".into(), isolation.to_owned()));
         }
         for (label, path) in &agent.artifacts {
-            lines.push(kv(label, path, w, theme));
+            details.push((label.clone(), path.clone()));
         }
-        lines.push(kv(
-            "isolation",
-            agent.isolation.as_deref().unwrap_or("none"),
-            w,
-            theme,
-        ));
+        if !details.is_empty() {
+            lines.push(heading("Details", w, theme));
+            for (label, value) in &details {
+                lines.push(kv(label, value, w, theme));
+            }
+        }
 
-        lines.push(heading("Recent activity", w, theme));
         let recent: Vec<&ActivityEvent> = self
             .activity
             .iter()
             .filter(|event| event.agent_id == agent.id)
             .collect();
-        if recent.is_empty() {
-            lines.push(field(" nothing recorded yet", w, theme));
+        if !recent.is_empty() {
+            lines.push(heading("Recent activity", w, theme));
         }
         for event in recent.iter().rev().take(RECENT_ACTIVITY).rev() {
             let line = format!(
-                " {:>4} {} {}",
+                " {:>7} {} {}",
                 format!("{} ago", ago(event.at_ms, now)),
                 kind_glyph(event.kind, theme),
-                event.title
+                text::one_line(&event.title)
             );
-            lines.push(field(&line, w, theme));
+            lines.push(field(&text::ellipsize(&line, w, ascii), w, theme));
         }
 
         let max = lines.len().saturating_sub(h);
+        self.inspector_max.set(max);
         let start = self.inspector_scroll.min(max);
         lines.into_iter().skip(start).collect()
     }
@@ -1073,47 +1208,59 @@ impl SubagentsOverlay {
     fn activity_lines(&self, w: usize, h: usize, theme: &Theme) -> Vec<Line<'static>> {
         let rows = self.activity_rows();
         let pos = self.activity_pos(rows.len());
-        let status = format!(
-            " filter {} · scope {} · follow {} · {} events",
+        let mut status = format!(
+            " showing {} · {} · {} event{}",
             self.activity_filter.label(),
             self.activity_scope.label(),
-            if self.follow { "on" } else { "off" },
-            rows.len()
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" }
         );
+        if !self.follow {
+            status.push_str(" · paused");
+        }
         let mut out = vec![filled(
-            vec![Span::styled(text::clip(&status, w), theme.fg(Tok::Muted))],
+            vec![Span::styled(
+                text::ellipsize(&status, w, theme.ascii()),
+                theme.fg(Tok::Muted),
+            )],
             w,
             Style::default(),
         )];
         if rows.is_empty() {
+            let filtered = self.activity_filter != ActivityFilter::All
+                || self.activity_scope != ActivityScope::All
+                || !self.activity_query.is_empty();
+            let message = if filtered {
+                "No events match. Press f or s to widen the view, or Esc to clear the search."
+            } else {
+                "No activity yet. Responses, tool calls, errors and messages appear here."
+            };
             out.extend(
-                text::wrap_words(
-                    "No activity matches. Responses, tool calls, errors, and messages appear here.",
-                    w.saturating_sub(2),
-                )
-                .into_iter()
-                .map(|line| {
-                    filled(
-                        vec![Span::styled(format!(" {line}"), theme.fg(Tok::Dim))],
-                        w,
-                        Style::default(),
-                    )
-                }),
+                text::wrap_words(message, w.saturating_sub(2))
+                    .into_iter()
+                    .map(|line| {
+                        filled(
+                            vec![Span::styled(format!(" {line}"), theme.fg(Tok::Dim))],
+                            w,
+                            Style::default(),
+                        )
+                    }),
             );
             return out;
         }
         let now = epoch_ms();
-        let agent_w = 12;
-        let title_w = 20;
-        let summary_w = w.saturating_sub(2 + 8 + agent_w + 2 + title_w + 1);
+        // Columns shrink with the panel so the event title and summary keep their room.
+        let agent_w = (w / 6).clamp(6, 14);
+        let title_w = (w / 4).clamp(8, 24);
+        let summary_w = w.saturating_sub(2 + 5 + agent_w + 2 + title_w + 1);
         out.push(filled(
             vec![Span::styled(
                 format!(
-                    "  {}{}{}  {}",
-                    cell("time", 8),
-                    cell("agent", agent_w),
+                    "  {}{}{}{}",
+                    cell("time", 5),
+                    cell("worker", agent_w),
                     cell("", 2),
-                    cell("event", title_w + summary_w)
+                    cell("event", title_w + summary_w + 1)
                 ),
                 theme.fg(Tok::Dim),
             )],
@@ -1131,27 +1278,35 @@ impl SubagentsOverlay {
             } else {
                 " ".to_owned()
             };
-            out.push(filled(
-                vec![
-                    Span::styled(format!("{pointer} "), theme.fg(Tok::Accent)),
-                    Span::styled(cell(&ago(event.at_ms, now), 8), theme.fg(Tok::Dim)),
-                    Span::styled(
-                        cell(&self.name_of(&event.agent_id), agent_w),
-                        theme.fg(Tok::Text),
-                    ),
-                    Span::styled(
-                        format!("{} ", kind_glyph(event.kind, theme)),
-                        theme.fg(kind_tok(event.kind)),
-                    ),
-                    Span::styled(
-                        cell(&event.title, title_w),
-                        theme.fg(kind_tok(event.kind)).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(cell(&event.summary, summary_w), theme.fg(Tok::Muted)),
-                ],
-                w,
-                Style::default(),
-            ));
+            let mut spans = vec![
+                Span::styled(format!("{pointer} "), theme.fg(Tok::Accent)),
+                Span::styled(cell(&ago(event.at_ms, now), 5), theme.fg(Tok::Dim)),
+                Span::styled(
+                    cell(&self.name_of(&event.agent_id), agent_w),
+                    theme.fg(Tok::Text),
+                ),
+                Span::styled(
+                    format!("{} ", kind_glyph(event.kind, theme)),
+                    theme.fg(kind_tok(event.kind)),
+                ),
+                Span::styled(
+                    cell(&text::one_line(&event.title), title_w),
+                    theme.fg(kind_tok(event.kind)).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", cell(&text::one_line(&event.summary), summary_w)),
+                    theme.fg(Tok::Muted),
+                ),
+            ];
+            if selected {
+                chrome::select_spans(theme, &mut spans);
+            }
+            let fill = if selected {
+                theme.bg(Tok::SelectedBg)
+            } else {
+                Style::default()
+            };
+            out.push(filled(spans, w, fill));
         }
         out
     }
@@ -1273,6 +1428,7 @@ fn kv(label: &str, value: &str, w: usize, theme: &Theme) -> Line<'static> {
     filled(
         vec![
             Span::styled(cell(&format!(" {label}"), label_w), theme.fg(Tok::Dim)),
+            Span::raw(" "),
             Span::styled(value, theme.fg(Tok::Text)),
         ],
         w,
@@ -1295,7 +1451,7 @@ fn kv_wrapped(label: &str, value: &str, w: usize, theme: &Theme) -> Vec<Line<'st
             } else {
                 filled(
                     vec![Span::styled(
-                        format!("{}{row}", " ".repeat(label_w)),
+                        format!("{}{row}", " ".repeat(label_w + 1)),
                         theme.fg(Tok::Text),
                     )],
                     w,

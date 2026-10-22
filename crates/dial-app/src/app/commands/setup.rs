@@ -162,6 +162,7 @@ fn choice_spec(title: &str, items: Vec<ChoiceItem>) -> ChoiceSpec {
         verb: "choose",
         remove: None,
         items,
+        ..Default::default()
     }
 }
 

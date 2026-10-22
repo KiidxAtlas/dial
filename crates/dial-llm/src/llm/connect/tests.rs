@@ -58,3 +58,11 @@ fn truncated_protobuf_is_an_error_not_a_panic() {
     assert!(Fields::parse(&enc.0[..enc.0.len() - 2]).is_err());
     assert!(take_varint(&mut &[0x80u8, 0x80][..]).is_err());
 }
+
+#[test]
+fn optional_uint_distinguishes_missing_usage_from_explicit_zero() {
+    let fields = Fields::parse(&[8, 0]).unwrap();
+    assert_eq!(fields.uint_opt(1), Some(0));
+    assert_eq!(fields.uint_opt(2), None);
+    assert_eq!(fields.uint(2), 0);
+}

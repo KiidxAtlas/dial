@@ -199,11 +199,13 @@ pub fn rows(
     if mode == PinnedWorkers::Off || width < MIN_WIDTH || max < 2 {
         return Vec::new();
     }
-    let active: Vec<&AgentEntry> = board
+    let mut active: Vec<&AgentEntry> = board
         .agents()
         .iter()
         .filter(|a| !a.status.is_finished())
         .collect();
+    // Input requests must not disappear behind running workers in a collapsed block.
+    active.sort_by_key(|agent| agent.status != AgentStatus::Waiting);
     if active.is_empty() {
         return Vec::new();
     }
@@ -227,7 +229,8 @@ pub fn rows(
         PinnedWorkers::Collapsed => COLLAPSED_WORKERS,
         _ => usize::MAX,
     };
-    let live = live_preview && budget >= 2;
+    // Prefer visible workers to previews when the block cannot fit both a worker and overflow.
+    let live = live_preview && budget >= 2 && (active.len() == 1 || budget >= 3);
     let per_worker = if live { 2 } else { 1 };
     let mut shown = (budget / per_worker).min(limit).min(active.len());
     if active.len() > shown && shown * per_worker + 1 > budget {
@@ -239,7 +242,7 @@ pub fn rows(
     let hidden = active.len() - shown;
     if hidden > 0 {
         rows.push(fit(vec![Span::styled(
-            format!("  +{hidden} more running"),
+            format!("  +{hidden} more active"),
             theme.fg(Tok::Dim),
         )]));
     }
@@ -254,22 +257,32 @@ fn worker_rows(
     theme: &Theme,
 ) -> Rows {
     let elapsed_ms = agent.elapsed_ms.unwrap_or(0);
+    let waiting = agent.status == AgentStatus::Waiting;
+    let state = if waiting { Tok::Warning } else { Tok::Accent };
+    let marker = if waiting { "!" } else { theme.spinner(tick) };
+    // Status comes before free-form names/tasks so requests for input survive narrow widths.
     let mut head = vec![
-        Span::styled(format!("  {} ", theme.spinner(tick)), theme.fg(Tok::Accent)),
+        Span::styled(
+            format!("  {marker} {} · ", agent.status.label()),
+            theme.fg(state),
+        ),
         Span::styled(text::one_line(display_name(agent)), theme.fg(Tok::Accent)),
     ];
+    head.push(Span::styled(
+        format!(" · step {}", agent.steps),
+        theme.fg(Tok::Dim),
+    ));
+    if !live && elapsed_ms >= ELAPSED_MARKER_MS {
+        head.push(Span::styled(
+            format!(" · {}", clock(elapsed_ms)),
+            theme.fg(Tok::Dim),
+        ));
+    }
     if !agent.task.trim().is_empty() {
         head.push(Span::styled(
             format!(" · {}", text::one_line(&agent.task)),
             theme.fg(Tok::Muted),
         ));
-    }
-    head.push(Span::styled(
-        format!(" · {} · step {}", agent.status.label(), agent.steps),
-        theme.fg(Tok::Dim),
-    ));
-    if !live && elapsed_ms >= ELAPSED_MARKER_MS {
-        head.push(Span::styled(clock(elapsed_ms), theme.fg(Tok::Dim)));
     }
     let mut out = vec![fit(head)];
     if live {

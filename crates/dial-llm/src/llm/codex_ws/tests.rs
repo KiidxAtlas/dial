@@ -69,3 +69,66 @@ fn only_plain_user_messages_can_steer() {
     );
     assert!(steer_items(&json!([])).is_none());
 }
+
+#[test]
+fn failed_websocket_usage_is_retained_for_created_and_attached_responses() {
+    use super::super::usage::{Billing, Scope, Transport};
+    for attached in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut socket = tungstenite::accept(listener.accept().unwrap().0).unwrap();
+            if !attached {
+                let request = socket.read().unwrap();
+                assert!(request.into_text().unwrap().contains("response.create"));
+            }
+            socket.send(Message::Text(json!({
+                "type":"response.failed",
+                "response":{"usage":{"input_tokens":19,"output_tokens":2},"error":{"code":"server_error"}}
+            }).to_string().into())).unwrap();
+        });
+        let tcp = TcpStream::connect(address).unwrap();
+        let (mut socket, _) = tungstenite::client(
+            format!("ws://{address}/responses"),
+            MaybeTlsStream::Plain(tcp),
+        )
+        .unwrap();
+        let scope = Scope::default().next_turn(0).unwrap();
+        scope.begin(Billing::Subscription).unwrap();
+        let transport = Transport::enter(Some(scope.clone()));
+        let (_tx, rx) = std::sync::mpsc::sync_channel(STEER_QUEUE);
+        let body = json!({"model":"m","input":[user("hello")]});
+        let mut run = Run {
+            pending: VecDeque::new(),
+            accepted: Vec::new(),
+            tainted: false,
+            response_id: None,
+        };
+        assert!(
+            stream(
+                &mut socket,
+                (!attached).then_some(&body),
+                &body,
+                &HashSet::new(),
+                &rx,
+                &mut run,
+                5,
+                &AtomicBool::new(false),
+                &mut None,
+                &mut |_| true,
+            )
+            .is_err()
+        );
+        transport.settle(false).unwrap();
+        scope
+            .finish(None, None, Billing::Subscription, transport.attempts())
+            .unwrap();
+        let counts = scope.snapshot().1.all;
+        assert_eq!(counts.transport_attempts, 1);
+        assert_eq!(counts.partial_reported_attempts, 1);
+        assert_eq!((counts.input, counts.output), (19, 2));
+        assert_eq!(counts.reported_responses, 0);
+        assert_eq!(counts.observed_cost_usd, None);
+        server.join().unwrap();
+    }
+}

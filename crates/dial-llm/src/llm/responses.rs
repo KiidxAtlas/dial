@@ -13,6 +13,9 @@ pub(super) struct TerminalFailure {
     code: &'static str,
 }
 impl TerminalFailure {
+    /// Unrecognized `error`/`response.failed` codes are retried like server errors: they come from
+    /// mid-stream provider faults far more often than from a request that can never succeed, and
+    /// known permanent codes (auth, quota, missing model) are classified before reaching here.
     pub(super) fn retryable(&self) -> bool {
         self.kind != "response.incomplete"
             && matches!(
@@ -21,6 +24,7 @@ impl TerminalFailure {
                     | "model_error"
                     | "websocket_connection_limit_reached"
                     | "previous_response_not_found"
+                    | "unclassified_failure"
             )
     }
     pub(super) fn class(&self) -> super::errors::ErrorClass {
@@ -38,6 +42,7 @@ impl TerminalFailure {
             | "model_error"
             | "websocket_connection_limit_reached"
             | "previous_response_not_found"
+            | "unclassified_failure"
                 if self.retryable() =>
             {
                 super::errors::ErrorClass::Transient
@@ -501,6 +506,14 @@ impl Accumulator {
     ) -> Result<bool> {
         let event: Value = serde_json::from_str(data)
             .map_err(|_| anyhow::anyhow!("invalid Responses stream event"))?;
+        let usage = &event["response"]["usage"];
+        super::usage::capture(super::usage::Snapshot {
+            input: usage["input_tokens"].as_u64(),
+            output: usage["output_tokens"].as_u64(),
+            cache_read: usage["input_tokens_details"]["cached_tokens"].as_u64(),
+            reasoning: usage["output_tokens_details"]["reasoning_tokens"].as_u64(),
+            ..Default::default()
+        });
         match event["type"].as_str() {
             Some("response.output_text.delta" | "response.refusal.delta") => {
                 let delta = event["delta"]
@@ -1143,6 +1156,14 @@ pub(super) fn compact(
                 }
                 let event: Value =
                     serde_json::from_str(data).context("invalid V2 compaction stream JSON")?;
+                let usage = &event["response"]["usage"];
+                super::usage::capture(super::usage::Snapshot {
+                    input: usage["input_tokens"].as_u64(),
+                    output: usage["output_tokens"].as_u64(),
+                    cache_read: usage["input_tokens_details"]["cached_tokens"].as_u64(),
+                    reasoning: usage["output_tokens_details"]["reasoning_tokens"].as_u64(),
+                    ..Default::default()
+                });
                 let kind = event["type"].as_str().or(name);
                 match kind {
                     Some("response.output_item.done") => {

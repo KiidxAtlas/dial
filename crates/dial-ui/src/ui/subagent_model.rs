@@ -59,14 +59,25 @@ impl AgentStatus {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
 
-    /// Roster order: live work first, then finished work by outcome.
+    /// Roster order: work that needs the operator first (input requests, then failures), then
+    /// live work, then the rest of the finished work.
     pub fn rank(self) -> u8 {
         match self {
-            Self::Running => 0,
-            Self::Waiting => 1,
-            Self::Done => 2,
-            Self::Failed => 3,
+            Self::Waiting => 0,
+            Self::Failed => 1,
+            Self::Running => 2,
+            Self::Done => 3,
             Self::Cancelled => 4,
+        }
+    }
+
+    /// How urgently the operator should look: `0` an input request, `1` a failure, `2` nothing.
+    /// Lists that keep a stable order still float these to the top.
+    pub fn attention(self) -> u8 {
+        match self {
+            Self::Waiting => 0,
+            Self::Failed => 1,
+            _ => 2,
         }
     }
 
