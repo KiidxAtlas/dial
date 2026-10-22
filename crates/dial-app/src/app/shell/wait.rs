@@ -252,9 +252,34 @@ impl Shell {
         }
     }
 
+    /// GGUF models run on Dial's supervised `llama-server`. When none is found, offer the same
+    /// one-time install the MLX runtime gets, into Dial's own folder.
+    fn prepare_llama_cpp(&mut self, app: &App) -> Result<bool> {
+        if crate::llm::local_format::llama_server().is_some() {
+            return Ok(true);
+        }
+        let choice = self.ask(
+            "Set up llama.cpp",
+            "GGUF models run on llama.cpp's llama-server, which is not installed. Dial installs a pinned, checksum-verified build into its own folder (no admin rights needed). Downloads need network access.",
+            &[("Install llama.cpp", 'y'), ("Cancel", 'n')],
+        );
+        if choice != Some(0) {
+            return Ok(false);
+        }
+        self.note("Local models", "installing llama.cpp…");
+        let layout = app.layout.clone();
+        self.wait_local_preparation(app, move |cancel, progress| {
+            crate::setup::deps::run::install_and_save(&layout, "llama-cpp", &cancel, progress)?;
+            Ok(String::new())
+        })
+    }
+
     pub(super) fn prepare_local(&mut self, app: &App) -> Result<bool> {
         if !app.config.runs_dial_mlx() {
             return Ok(true);
+        }
+        if crate::llm::local_format::serves_with_llama_cpp(&app.config.model) {
+            return self.prepare_llama_cpp(app);
         }
         if !app.config.python.is_file() || !app.config.worker.is_file() {
             let choice = self.ask("Set up local models",

@@ -20,13 +20,42 @@ fn every_pinned_asset_has_a_full_digest_and_a_known_platform() {
 
 #[test]
 fn top_folder_is_removed_and_traversal_is_refused() {
-    assert_eq!(inside_top(Path::new("node-v1/")).unwrap(), None);
+    assert_eq!(inside_top(Path::new("node-v1/"), true).unwrap(), None);
     assert_eq!(
-        inside_top(Path::new("node-v1/bin/node")).unwrap(),
+        inside_top(Path::new("node-v1/bin/node"), true).unwrap(),
         Some(PathBuf::from("bin/node"))
     );
-    assert!(inside_top(Path::new("node-v1/../etc/passwd")).is_err());
-    assert!(inside_top(Path::new("/etc/passwd")).is_err());
+    assert!(inside_top(Path::new("node-v1/../etc/passwd"), true).is_err());
+    assert!(inside_top(Path::new("/etc/passwd"), true).is_err());
+}
+
+#[test]
+fn flat_archives_keep_every_member_at_its_path() {
+    assert_eq!(
+        inside_top(Path::new("llama-server.exe"), false).unwrap(),
+        Some(PathBuf::from("llama-server.exe"))
+    );
+    assert_eq!(
+        inside_top(Path::new("llama-b1/llama-server"), true).unwrap(),
+        Some(PathBuf::from("llama-server"))
+    );
+}
+
+#[test]
+fn llama_cpp_pins_each_platform_archive_with_its_layout() {
+    assert_eq!(
+        LLAMA_CPP.asset("win32-x64").unwrap().format,
+        Format::FlatZip
+    );
+    assert_eq!(LLAMA_CPP.asset("linux-x64").unwrap().format, Format::TarGz);
+    for asset in LLAMA_CPP.assets {
+        assert_eq!(asset.sha256.len(), 64, "{}", asset.url);
+        assert!(
+            asset
+                .url
+                .starts_with("https://github.com/ggml-org/llama.cpp/")
+        );
+    }
 }
 
 #[test]
@@ -74,7 +103,7 @@ fn tar_extraction_strips_the_top_folder_and_keeps_modes() {
 
 #[test]
 fn zip_names_with_parent_directories_are_refused() {
-    assert!(inside_top(Path::new("top/../x")).is_err());
+    assert!(inside_top(Path::new("top/../x"), true).is_err());
 }
 
 #[test]
@@ -88,6 +117,21 @@ fn zip_extraction_strips_the_top_folder() {
     writer.finish().unwrap();
     let dest = tmp.path().join("out");
     fs::create_dir_all(&dest).unwrap();
-    extract_zip(&path, &dest).unwrap();
+    extract_zip(&path, &dest, true).unwrap();
     assert!(dest.join("bun").is_file());
+}
+
+#[test]
+fn flat_zip_extraction_keeps_files_at_the_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("runtime.zip");
+    let mut writer = zip::ZipWriter::new(File::create(&path).unwrap());
+    let options = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+    writer.start_file("llama-server.exe", options).unwrap();
+    writer.write_all(b"MZ").unwrap();
+    writer.finish().unwrap();
+    let dest = tmp.path().join("out");
+    fs::create_dir_all(&dest).unwrap();
+    extract_zip(&path, &dest, false).unwrap();
+    assert!(dest.join("llama-server.exe").is_file());
 }
