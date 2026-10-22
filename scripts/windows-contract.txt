@@ -25,6 +25,10 @@ test app::tests::onboarding_
 test ui::overlay::models::tests::empty_catalog_can_rescan
 test ui::overlay::providers::tests::a_local_server_that_is_not_running
 test llm::cancel::tcp::tests::
+# New sessions and header rewrites take the journal writer lock on owner-only files; an append-only
+# handle cannot be locked on Windows (os error 5 on the first `dial` after picking a model).
+test storage::session::tests::listing_helpers_pick_latest_conversation_report_project_and_lock_state
+test storage::session::tests::additional_dirs_round_trip_through_header
 
 # Process-group deadlines and pipe handling are exercised with POSIX `/bin/sh` fixtures. Windows
 # needs its own job-object fixtures before these run here.

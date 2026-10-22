@@ -785,9 +785,14 @@ impl Session {
         if let Some(parent) = forked_from {
             header["forked_from"] = json!(parent);
         }
-        let mut file =
-            platform_fs::open_owner_only(OpenOptions::new().append(true).create_new(true), &path)
-                .with_context(|| format!("creating session {}", path.display()))?;
+        // Read access is required for the writer lock on Windows: an append-only handle lacks
+        // FILE_WRITE_DATA, and LockFileEx refuses a handle without GENERIC_READ or GENERIC_WRITE
+        // with ERROR_ACCESS_DENIED (os error 5).
+        let mut file = platform_fs::open_owner_only(
+            OpenOptions::new().read(true).append(true).create_new(true),
+            &path,
+        )
+        .with_context(|| format!("creating session {}", path.display()))?;
         let created = (|| -> Result<crate::runtime::stream_journal::Journal> {
             FileExt::try_lock_exclusive(&file).context("claiming new session writer")?;
             file.write_all(format!("{header}\n").as_bytes())
@@ -1383,9 +1388,12 @@ impl Session {
             .context("session path has no file name")?
             .to_string_lossy();
         let tmp = dir.join(format!(".{}.{name}.tmp", random_hex(8)));
-        let mut out =
-            platform_fs::open_owner_only(OpenOptions::new().append(true).create_new(true), &tmp)
-                .with_context(|| format!("creating {}", tmp.display()))?;
+        // Read access as in `create_file_at`: Windows cannot lock an append-only handle.
+        let mut out = platform_fs::open_owner_only(
+            OpenOptions::new().read(true).append(true).create_new(true),
+            &tmp,
+        )
+        .with_context(|| format!("creating {}", tmp.display()))?;
         FileExt::try_lock_exclusive(&out).context("claiming rewritten session writer")?;
         let written = (|| -> io::Result<u64> {
             out.write_all(header.to_string().as_bytes())?;
