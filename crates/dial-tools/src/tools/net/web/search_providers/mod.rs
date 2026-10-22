@@ -1,5 +1,5 @@
-//! Search backends for `web_search`: keyed REST APIs, a self-hosted SearXNG, and the keyless
-//! DuckDuckGo HTML fallback.
+//! Search backends for `web_search`: keyed REST APIs, a self-hosted SearXNG, the keyless DuckDuckGo
+//! HTML fallback and the keyless HTML scrapers (Startpage, Mojeek, Ecosia).
 //!
 //! Every provider is a pure request builder plus a pure response parser. [`search`] performs the
 //! single HTTP exchange per attempt through the guarded [`Client`]. API keys are read from
@@ -8,7 +8,9 @@
 
 mod json_apis;
 mod perplexity;
+mod scrapers;
 mod searxng;
+mod xai;
 
 use super::content;
 use super::fetch::{Client, Response, percent_encode};
@@ -34,9 +36,18 @@ pub enum Provider {
     Bing,
     Searxng,
     DuckDuckGo,
+    Firecrawl,
+    Parallel,
+    Zai,
+    Xai,
+    Startpage,
+    Mojeek,
+    Ecosia,
 }
 
-const ALL: [Provider; 11] = [
+/// Every provider, in the order `names()` lists them. Providers added after the first release are
+/// appended after the first [`ORIGINAL_COUNT`].
+const ALL: [Provider; 18] = [
     Provider::Brave,
     Provider::Tavily,
     Provider::Exa,
@@ -48,11 +59,19 @@ const ALL: [Provider; 11] = [
     Provider::Bing,
     Provider::Searxng,
     Provider::DuckDuckGo,
+    Provider::Firecrawl,
+    Provider::Parallel,
+    Provider::Zai,
+    Provider::Xai,
+    Provider::Startpage,
+    Provider::Mojeek,
+    Provider::Ecosia,
 ];
 
-/// Order used by `auto`: the first provider whose environment is configured wins; DuckDuckGo is the
-/// keyless last resort and is always available.
-const AUTO_ORDER: [Provider; 11] = [
+/// Order used by `auto`: configured keyed providers first, then SearXNG, then the keyless DuckDuckGo
+/// HTML endpoint (always available) and the keyless scrapers as further fallbacks. A scraper that hits a
+/// bot wall fails with an error, so the next entry is tried.
+const AUTO_ORDER: [Provider; 18] = [
     Provider::Exa,
     Provider::Brave,
     Provider::Tavily,
@@ -60,10 +79,17 @@ const AUTO_ORDER: [Provider; 11] = [
     Provider::Kagi,
     Provider::Jina,
     Provider::Serper,
+    Provider::Firecrawl,
+    Provider::Parallel,
+    Provider::Zai,
+    Provider::Xai,
     Provider::Bing,
     Provider::Google,
     Provider::Searxng,
     Provider::DuckDuckGo,
+    Provider::Startpage,
+    Provider::Mojeek,
+    Provider::Ecosia,
 ];
 
 impl Provider {
@@ -80,6 +106,13 @@ impl Provider {
             Provider::Bing => "bing",
             Provider::Searxng => "searxng",
             Provider::DuckDuckGo => "duckduckgo",
+            Provider::Firecrawl => "firecrawl",
+            Provider::Parallel => "parallel",
+            Provider::Zai => "zai",
+            Provider::Xai => "xai",
+            Provider::Startpage => "startpage",
+            Provider::Mojeek => "mojeek",
+            Provider::Ecosia => "ecosia",
         }
     }
 
@@ -96,7 +129,11 @@ impl Provider {
             Provider::Google => &["GOOGLE_API_KEY", "GOOGLE_CSE_ID"],
             Provider::Bing => &["BING_API_KEY"],
             Provider::Searxng => &["SEARXNG_URL"],
-            Provider::DuckDuckGo => &[],
+            Provider::Firecrawl => &["FIRECRAWL_API_KEY"],
+            Provider::Parallel => &["PARALLEL_API_KEY"],
+            Provider::Zai => &["ZAI_API_KEY"],
+            Provider::Xai => &["XAI_API_KEY"],
+            Provider::DuckDuckGo | Provider::Startpage | Provider::Mojeek | Provider::Ecosia => &[],
         }
     }
 
@@ -108,8 +145,13 @@ impl Provider {
     /// say so instead of presenting unfiltered results as recent ones.
     pub fn recency_note(self, recency: Recency) -> Option<String> {
         match (self, recency) {
-            (Provider::Jina, _) => Some(format!(
-                "jina does not support the recency filter, so results are not limited to the past {}",
+            (Provider::Jina | Provider::Mojeek | Provider::Ecosia, _) => Some(format!(
+                "{} does not support the recency filter, so results are not limited to the past {}",
+                self.name(),
+                recency.name()
+            )),
+            (Provider::Xai, _) => Some(format!(
+                "xai applies the recency window as an instruction to the model, not a hard filter, so results may fall outside the past {}",
                 recency.name()
             )),
             (Provider::Searxng, Recency::Week) => {
@@ -118,6 +160,17 @@ impl Provider {
             _ => None,
         }
     }
+}
+
+/// Providers that existed when the `web_search` `provider` enum was first released; later ones are
+/// appended to [`ALL`] after them.
+const ORIGINAL_COUNT: usize = 11;
+
+/// The first-release `provider` names, so history recorded against that enum stays valid.
+pub fn original_names() -> Vec<&'static str> {
+    std::iter::once("auto")
+        .chain(ALL.into_iter().take(ORIGINAL_COUNT).map(Provider::name))
+        .collect()
 }
 
 /// Names accepted by `web.search_provider` and the `provider` tool argument, `auto` first.
@@ -327,6 +380,13 @@ pub fn build(provider: Provider, query: &Query, env: Env) -> Result<HttpRequest,
         ),
         Provider::Perplexity => perplexity::build(query, &secret(env, "PERPLEXITY_API_KEY")?),
         Provider::Searxng => searxng::build(query, &searxng_endpoint(env)?),
+        Provider::Firecrawl => json_apis::firecrawl(query, &secret(env, "FIRECRAWL_API_KEY")?),
+        Provider::Parallel => json_apis::parallel(query, &secret(env, "PARALLEL_API_KEY")?),
+        Provider::Zai => json_apis::zai(query, &secret(env, "ZAI_API_KEY")?),
+        Provider::Xai => xai::build(query, &secret(env, "XAI_API_KEY")?),
+        Provider::Startpage => scrapers::startpage(query),
+        Provider::Mojeek => scrapers::mojeek(query),
+        Provider::Ecosia => scrapers::ecosia(query),
         Provider::DuckDuckGo => {
             let mut url =
                 search::DEFAULT_SEARCH_URL.replace("{query}", &percent_encode(query.text));
@@ -344,28 +404,50 @@ pub fn build(provider: Provider, query: &Query, env: Env) -> Result<HttpRequest,
     })
 }
 
-/// Pure: interpret a reply. The keyless provider parses HTML or its JSON variant; the others are JSON.
+/// Pure: interpret a reply. DuckDuckGo parses HTML or its JSON variant, the scrapers parse HTML only,
+/// and the keyed providers are JSON.
 fn parse(provider: Provider, response: &Response) -> Result<Parsed, String> {
+    let json = || -> Result<Value, String> {
+        serde_json::from_slice(&response.body)
+            .map_err(|error| format!("the response is not valid JSON: {error}"))
+    };
     match provider {
         Provider::DuckDuckGo => parse_keyless(response),
-        _ => {
-            let value: Value = serde_json::from_slice(&response.body)
-                .map_err(|error| format!("the response is not valid JSON: {error}"))?;
-            match provider {
-                Provider::Brave => json_apis::parse_brave(&value),
-                Provider::Tavily => json_apis::parse_tavily(&value),
-                Provider::Exa => json_apis::parse_exa(&value),
-                Provider::Serper => json_apis::parse_serper(&value),
-                Provider::Kagi => json_apis::parse_kagi(&value),
-                Provider::Jina => json_apis::parse_jina(&value),
-                Provider::Google => json_apis::parse_google(&value),
-                Provider::Bing => json_apis::parse_bing(&value),
-                Provider::Perplexity => perplexity::parse(&value),
-                Provider::Searxng => searxng::parse(&value),
-                Provider::DuckDuckGo => parse_keyless(response),
-            }
-        }
+        Provider::Startpage | Provider::Mojeek | Provider::Ecosia => Ok(Parsed {
+            answer: None,
+            results: scrapers::parse(provider, &html_page(response, provider)?)?,
+        }),
+        Provider::Brave => json_apis::parse_brave(&json()?),
+        Provider::Tavily => json_apis::parse_tavily(&json()?),
+        Provider::Exa => json_apis::parse_exa(&json()?),
+        Provider::Serper => json_apis::parse_serper(&json()?),
+        Provider::Kagi => json_apis::parse_kagi(&json()?),
+        Provider::Jina => json_apis::parse_jina(&json()?),
+        Provider::Google => json_apis::parse_google(&json()?),
+        Provider::Bing => json_apis::parse_bing(&json()?),
+        Provider::Firecrawl => json_apis::parse_firecrawl(&json()?),
+        Provider::Parallel => json_apis::parse_parallel(&json()?),
+        Provider::Zai => json_apis::parse_zai(&json()?),
+        Provider::Perplexity => perplexity::parse(&json()?),
+        Provider::Xai => xai::parse(&json()?),
+        Provider::Searxng => searxng::parse(&json()?),
     }
+}
+
+/// The decoded HTML body of a scraped search page; any other media type is an error.
+fn html_page(response: &Response, provider: Provider) -> Result<String, String> {
+    let kind = content::classify(response.media_type.as_deref(), &response.body)?;
+    if kind != content::Kind::Html {
+        return Err(format!(
+            "{} returned a non-HTML response, so it cannot be parsed",
+            provider.name()
+        ));
+    }
+    Ok(content::decode(
+        &response.body,
+        response.charset.as_deref(),
+        kind,
+    ))
 }
 
 fn parse_keyless(response: &Response) -> Result<Parsed, String> {

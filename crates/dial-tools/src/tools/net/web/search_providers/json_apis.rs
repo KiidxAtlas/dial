@@ -1,4 +1,5 @@
-//! REST search APIs that answer with JSON: Brave, Tavily, Exa, Serper, Kagi, Jina, Bing and Google CSE.
+//! REST search APIs that answer with JSON: Brave, Tavily, Exa, Serper, Kagi, Jina, Bing, Google CSE,
+//! Firecrawl, Parallel and Z.AI.
 //! Each builder is pure and each parser maps a fixed response shape to [`Parsed`].
 
 use super::super::fetch::percent_encode;
@@ -15,6 +16,9 @@ const KAGI_URL: &str = "https://kagi.com/api/v1/search";
 const JINA_URL: &str = "https://s.jina.ai";
 pub const BING_URL: &str = "https://api.bing.microsoft.com/v7.0/search";
 const GOOGLE_URL: &str = "https://www.googleapis.com/customsearch/v1";
+const FIRECRAWL_URL: &str = "https://api.firecrawl.dev/v2/search";
+const PARALLEL_URL: &str = "https://api.parallel.ai/v1beta/search";
+const ZAI_URL: &str = "https://api.z.ai/api/paas/v4/web_search";
 
 /// Result count within a provider's accepted range.
 fn count(limit: usize, max: usize) -> usize {
@@ -328,6 +332,142 @@ pub fn parse_google(value: &Value) -> Result<Parsed, String> {
                 text(item, "title"),
                 text(item, "link"),
                 text(item, "snippet").unwrap_or_default(),
+            )
+        })
+        .collect();
+    Ok(Parsed {
+        answer: None,
+        results,
+    })
+}
+
+/// Firecrawl search. Recency maps to Google-style `tbs` buckets; results are scraped-free (metadata only).
+pub fn firecrawl(query: &Query, key: &str) -> HttpRequest {
+    let mut body = json!({
+        "query": query.text,
+        "limit": count(query.limit, 20),
+        "sources": ["web"],
+    });
+    if let Some(recency) = query.recency {
+        body["tbs"] = json!(match recency {
+            Recency::Day => "qdr:d",
+            Recency::Week => "qdr:w",
+            Recency::Month => "qdr:m",
+            Recency::Year => "qdr:y",
+        });
+    }
+    HttpRequest::post(
+        FIRECRAWL_URL,
+        vec![("Authorization", format!("Bearer {key}"))],
+        body,
+    )
+}
+
+/// v2 answers `{success, data: {web: [...]}}`; v1 answered `data` as the bare array. A reply with
+/// `success: false` is a failure, not an empty result set.
+pub fn parse_firecrawl(value: &Value) -> Result<Parsed, String> {
+    if value.get("success").and_then(Value::as_bool) == Some(false) {
+        let reason = text(value, "error").unwrap_or_else(|| "no reason given".into());
+        return Err(format!("Firecrawl reported failure: {reason}"));
+    }
+    let items = match value.pointer("/data/web") {
+        Some(web) => web.as_array(),
+        None => value.get("data").and_then(Value::as_array),
+    }
+    .ok_or("the Firecrawl response has no data.web array")?;
+    let results = items
+        .iter()
+        .filter_map(|item| {
+            result(
+                text(item, "title"),
+                text(item, "url"),
+                text(item, "description")
+                    .or_else(|| text(item, "snippet"))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    Ok(Parsed {
+        answer: None,
+        results,
+    })
+}
+
+/// Parallel search (beta). The query doubles as the objective; excerpts supply the snippet.
+pub fn parallel(query: &Query, key: &str) -> HttpRequest {
+    let objective = match query.recency {
+        Some(recency) => format!(
+            "{} (prefer sources from the past {})",
+            query.text,
+            recency.name()
+        ),
+        None => query.text.to_owned(),
+    };
+    HttpRequest::post(
+        PARALLEL_URL,
+        vec![
+            ("x-api-key", key.to_owned()),
+            ("parallel-beta", "search-extract-2025-10-10".into()),
+        ],
+        json!({
+            "objective": objective,
+            "search_queries": [query.text],
+            "max_results": count(query.limit, 20),
+            "excerpts": {"max_chars_per_result": 600},
+        }),
+    )
+}
+
+pub fn parse_parallel(value: &Value) -> Result<Parsed, String> {
+    let results = array(value, "/results", "Parallel")?
+        .iter()
+        .filter_map(|item| {
+            result(
+                text(item, "title"),
+                text(item, "url"),
+                join_parts(strings(item, "excerpts")),
+            )
+        })
+        .collect();
+    Ok(Parsed {
+        answer: None,
+        results,
+    })
+}
+
+/// Z.AI web search (`search-prime` engine).
+pub fn zai(query: &Query, key: &str) -> HttpRequest {
+    let mut body = json!({
+        "search_engine": "search-prime",
+        "search_query": query.text,
+        "count": count(query.limit, 50),
+    });
+    if let Some(recency) = query.recency {
+        body["search_recency_filter"] = json!(match recency {
+            Recency::Day => "oneDay",
+            Recency::Week => "oneWeek",
+            Recency::Month => "oneMonth",
+            Recency::Year => "oneYear",
+        });
+    }
+    HttpRequest::post(
+        ZAI_URL,
+        vec![("Authorization", format!("Bearer {key}"))],
+        body,
+    )
+}
+
+pub fn parse_zai(value: &Value) -> Result<Parsed, String> {
+    if let Some(message) = text(value, "/error/message") {
+        return Err(format!("Z.AI reported an error: {message}"));
+    }
+    let results = array(value, "/search_result", "Z.AI")?
+        .iter()
+        .filter_map(|item| {
+            result(
+                text(item, "title"),
+                text(item, "link"),
+                text(item, "content").unwrap_or_default(),
             )
         })
         .collect();
