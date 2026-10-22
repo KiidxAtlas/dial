@@ -3,6 +3,8 @@
 All notable changes to Dial are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Entries are taken from the git history (commit subjects, shown by short hash) and tags `v0.1.0` through `v0.1.7`.
 
+## [Unreleased]
+
 ## [0.1.19] - 2026-10-22
 
 ### Added
