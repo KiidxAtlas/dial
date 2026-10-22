@@ -107,7 +107,15 @@ fn promotion_revalidates_pending_after_evaluation_releases_its_lock() {
     assert!(promote(&config, "imported-test", false).is_err());
     assert_eq!(fs::read(&pending).unwrap(), bytes);
     assert!(!vector_path(&config).exists());
-    assert!(lock_vector(&pending).is_ok(), "refusal releases its leases");
+    // As above, a concurrently forked subprocess can briefly inherit the released lease.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while lock_vector(&pending).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "refusal releases its leases"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn at(strength: f64) -> Value {
