@@ -1580,8 +1580,12 @@ pub(in crate::agent) fn run(
                 .with_edit_mode(pinned.resolved_edit_mode(env.harness));
             // Direct workers write the real project, so their edits stay checkpointed. An
             // isolated copy has no observer of its own and gets none here.
+            // Writes are attributed to this worker so /review can group them.
             match env.workspace.observer() {
-                Some(observer) => workspace.with_observer(observer),
+                Some(observer) => {
+                    let observer = observer.scoped(&job.label).unwrap_or(observer);
+                    workspace.with_observer(observer)
+                }
                 None => workspace,
             }
         }

@@ -3325,7 +3325,7 @@ fn the_band_send_choice_is_its_own_panel_with_whole_labels_at_every_width() {
             // A blank surface row separates the panel from the activity/input rows below it.
             let last_option = rows
                 .iter()
-                .rposition(|row| row.contains(BusyChoice::AfterTurn.label()))
+                .rposition(|row| row.contains(BusyChoice::Independent.label()))
                 .unwrap();
             let gap = rows[last_option + 1..]
                 .iter()
@@ -3361,4 +3361,51 @@ fn the_queue_footer_keeps_its_keys_before_the_management_command_when_narrow() {
     let rows = screen(&c, &env, 40).join("\n");
     assert!(rows.contains(&format!("{submit} stop or keep")), "{rows}");
     assert!(rows.contains("queued to send after turn: later"), "{rows}");
+}
+
+#[test]
+fn explicit_steer_is_separate_from_the_queue_and_reports_stages() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "use the v2 API");
+    press(&mut c, &env, KeyCode::Enter);
+    let rows = screen(&c, &env, 100).join("\n");
+    assert!(rows.contains("Steer now") && rows.contains("Independent worker"), "{rows}");
+    press(&mut c, &env, KeyCode::Down);
+    press(&mut c, &env, KeyCode::Down);
+    press(&mut c, &env, KeyCode::Enter);
+    assert!(c.queued_messages().is_empty(), "explicit steer never joins the queue");
+    assert!(c.take_steering().is_empty(), "automatic routing does not see it");
+    assert!(screen(&c, &env, 100).join("\n").contains("steer pending"));
+    assert_eq!(c.take_explicit_steering(), ["use the v2 API"]);
+    assert!(c.take_explicit_steering().is_empty());
+    assert!(c.mark_explicit("use the v2 API", SteerStage::Received));
+    assert!(screen(&c, &env, 100).join("\n").contains("received: stale reply cancelled"));
+    assert!(c.mark_explicit("use the v2 API", SteerStage::Applied));
+    assert!(!c.mark_explicit("use the v2 API", SteerStage::Received), "stages never go back");
+    assert!(!c.mark_explicit("unrelated", SteerStage::Applied));
+}
+
+#[test]
+fn independent_messages_are_taken_separately_and_unread_ones_survive_the_turn() {
+    let env = Env::new();
+    let mut c = composer();
+    c.set_busy(true);
+    typed(&mut c, &env, "write the changelog");
+    press(&mut c, &env, KeyCode::Enter);
+    for _ in 0..3 {
+        press(&mut c, &env, KeyCode::Down);
+    }
+    press(&mut c, &env, KeyCode::Enter);
+    assert!(c.take_explicit_steering().is_empty());
+    typed(&mut c, &env, "never read");
+    press(&mut c, &env, KeyCode::Enter);
+    press(&mut c, &env, KeyCode::Down);
+    press(&mut c, &env, KeyCode::Down);
+    press(&mut c, &env, KeyCode::Enter);
+    assert_eq!(c.take_explicit_independent(), ["write the changelog"]);
+    c.mark_explicit("write the changelog", SteerStage::Applied);
+    c.set_busy(false);
+    assert_eq!(c.queued_messages(), [("never read".into(), true)]);
 }

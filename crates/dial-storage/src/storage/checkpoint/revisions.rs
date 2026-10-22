@@ -170,6 +170,7 @@ impl Checkpoints {
             root: root.clone(),
             existed: false,
             mode: 0,
+            writers: Vec::new(),
         }
         .display();
         let mut inner = self.lock();

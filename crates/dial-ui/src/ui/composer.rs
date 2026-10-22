@@ -160,6 +160,35 @@ enum BusyChoice {
     KeepWorking,
     /// Stop the running turn and send the oldest queued message.
     StopAndSend,
+    /// Redirect this task now: the stale model reply is cancelled, running tools finish.
+    SteerNow,
+    /// Start separate work in a worker while this task continues.
+    Independent,
+}
+
+/// Where an explicit message is in its journey. Only states the agent actually reported are shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SteerStage {
+    /// Typed here; the agent has not taken it yet (it acts at the next safe point).
+    Pending,
+    /// The agent took it. Any stale model reply is being cancelled; running tools finish.
+    Received,
+    /// Recorded as the current instruction (steering) or a worker was started (independent).
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SteerKind {
+    Steer,
+    Independent,
+}
+
+struct Explicit {
+    text: String,
+    kind: SteerKind,
+    stage: SteerStage,
+    /// Not yet handed to the agent through `take_explicit_*`.
+    untaken: bool,
 }
 
 impl BusyChoice {
@@ -169,15 +198,19 @@ impl BusyChoice {
             BusyChoice::AfterTurn => "Send after this turn",
             BusyChoice::KeepWorking => "Keep working",
             BusyChoice::StopAndSend => "Stop and send oldest",
+            BusyChoice::SteerNow => "Steer now",
+            BusyChoice::Independent => "Independent worker",
         }
     }
 
     fn detail(self) -> &'static str {
         match self {
-            BusyChoice::Auto => "joins this task or a new worker",
+            BusyChoice::Auto => "Dial decides: steer or worker",
             BusyChoice::AfterTurn => "waits until Dial finishes",
             BusyChoice::KeepWorking => "the queue waits for this turn",
             BusyChoice::StopAndSend => "ends this turn now",
+            BusyChoice::SteerNow => "cancels the stale reply; running tools finish",
+            BusyChoice::Independent => "separate task; this one keeps going",
         }
     }
 }
@@ -199,7 +232,12 @@ const PLACEHOLDERS: [&str; 3] = [
 ];
 
 /// Offered for a non-empty draft while busy. Automatic routing is the default.
-const DRAFT_CHOICES: &[BusyChoice] = &[BusyChoice::Auto, BusyChoice::AfterTurn];
+const DRAFT_CHOICES: &[BusyChoice] = &[
+    BusyChoice::Auto,
+    BusyChoice::AfterTurn,
+    BusyChoice::SteerNow,
+    BusyChoice::Independent,
+];
 /// Offered for an empty Enter with queued work. Stopping the turn is never the default.
 const QUEUE_CHOICES: &[BusyChoice] = &[BusyChoice::KeepWorking, BusyChoice::StopAndSend];
 
@@ -237,6 +275,8 @@ pub struct Composer {
     search: Option<Search>,
     busy: bool,
     queued: std::collections::VecDeque<(String, bool)>,
+    /// Explicit steer / independent messages sent this turn, shown with their stage. Not part of the queue.
+    explicit: Vec<Explicit>,
     /// The queued message currently loaded into the draft. Cancelling or replacing the draft restores it
     /// unchanged at its original position; only submitting replaces it.
     editing_queue: Option<QueuedEdit>,
@@ -286,6 +326,7 @@ impl Composer {
             paste_count: 0,
             pasted_images: Vec::new(),
             queued: std::collections::VecDeque::new(),
+            explicit: Vec::new(),
             editing_queue: None,
             choice: None,
             queue_notice: None,
@@ -473,6 +514,26 @@ impl Composer {
         if !busy {
             self.choice = None;
         }
+        // Anything the agent never took before the turn ended is not lost: it is sent next, after
+        // the messages already queued ahead of it.
+        let mut leftover = Vec::new();
+        if !busy {
+            for item in self.explicit.drain(..) {
+                // Pending or received but never journaled (the turn ended or was stopped first):
+                // keep it as a follow-up instead of losing it. Applied ones are already recorded.
+                if item.stage != SteerStage::Applied {
+                    leftover.push(item.text);
+                }
+            }
+        }
+        if !leftover.is_empty() {
+            for message in leftover.into_iter().rev() {
+                self.queued.push_front((message, true));
+            }
+            self.queue_notice = Some(
+                "The turn ended before your steering was applied; it is queued to send next.".into(),
+            );
+        }
         self.refresh();
     }
 
@@ -528,6 +589,93 @@ impl Composer {
             }
         }
         steering
+    }
+
+    /// Explicit "Steer now" messages not yet handed to the agent, oldest first.
+    pub fn take_explicit_steering(&mut self) -> Vec<String> {
+        self.take_explicit(SteerKind::Steer)
+    }
+
+    /// Explicit "Independent worker" messages not yet handed to the agent, oldest first.
+    pub fn take_explicit_independent(&mut self) -> Vec<String> {
+        self.take_explicit(SteerKind::Independent)
+    }
+
+    fn take_explicit(&mut self, kind: SteerKind) -> Vec<String> {
+        self.explicit
+            .iter_mut()
+            .filter(|item| item.kind == kind && item.untaken)
+            .map(|item| {
+                item.untaken = false;
+                item.text.clone()
+            })
+            .collect()
+    }
+
+    /// Advance the oldest matching explicit message to `stage`. Unknown text (automatically routed
+    /// input) is ignored, and a stage never moves backwards.
+    pub fn mark_explicit(&mut self, text: &str, stage: SteerStage) -> bool {
+        let found = if let Some(item) = self
+            .explicit
+            .iter_mut()
+            .find(|item| item.text == text && item.stage < stage)
+        {
+            item.stage = stage;
+            item.untaken = false;
+            true
+        } else {
+            false
+        };
+        // Keep the strip short: only the newest finished ones stay visible.
+        while self
+            .explicit
+            .iter()
+            .filter(|item| item.stage == SteerStage::Applied)
+            .count()
+            > 2
+        {
+            if let Some(index) = self
+                .explicit
+                .iter()
+                .position(|item| item.stage == SteerStage::Applied)
+            {
+                self.explicit.remove(index);
+            }
+        }
+        found
+    }
+
+    /// Put messages the agent could not start as separate work back as follow-ups for after the
+    /// turn; they are never turned into steering of the running task.
+    pub fn defer_messages(&mut self, messages: Vec<String>) {
+        for message in messages.into_iter().rev() {
+            self.queued.push_front((message, true));
+        }
+    }
+
+    fn send_explicit(&mut self, kind: SteerKind) -> ComposerEvent {
+        if self.editor.text.trim().is_empty() {
+            return ComposerEvent::None;
+        }
+        let sent = expand_pastes(&self.editor.text, &self.pastes);
+        if sent.len() > 256 * 1024 || self.explicit.len() >= 16 {
+            self.queue_notice =
+                Some("Too many unsent steering messages. Draft kept; wait for Dial.".into());
+            return ComposerEvent::None;
+        }
+        self.learn_words(&sent);
+        self.push_history(sent.clone());
+        // An edited queue item sent explicitly leaves the queue: the explicit route replaces it.
+        self.editing_queue = None;
+        self.explicit.push(Explicit {
+            text: sent,
+            kind,
+            stage: SteerStage::Pending,
+            untaken: true,
+        });
+        self.clear();
+        self.queue_notice = None;
+        ComposerEvent::None
     }
 
     /// Return unhandled automatic input in submission order; it already passed queue admission.
@@ -888,6 +1036,8 @@ impl Composer {
                 BusyChoice::AfterTurn => self.submit_queued(true),
                 BusyChoice::KeepWorking => ComposerEvent::None,
                 BusyChoice::StopAndSend => self.send_oldest_queued(),
+                BusyChoice::SteerNow => self.send_explicit(SteerKind::Steer),
+                BusyChoice::Independent => self.send_explicit(SteerKind::Independent),
             };
             return Some(event);
         }
@@ -1588,6 +1738,44 @@ impl Composer {
                 )),
             );
             cursor.0 += 1;
+        }
+        if !self.explicit.is_empty() {
+            let mut strip = Vec::new();
+            for item in &self.explicit {
+                let (what, stage, tok) = match (item.kind, item.stage) {
+                    (SteerKind::Steer, SteerStage::Pending) => {
+                        ("steer", "pending: acts at the next safe point", Tok::Warning)
+                    }
+                    (SteerKind::Steer, SteerStage::Received) => (
+                        "steer",
+                        "received: stale reply cancelled, running tools finish",
+                        Tok::Accent,
+                    ),
+                    (SteerKind::Steer, SteerStage::Applied) => {
+                        ("steer", "applied: now the current instruction", Tok::Success)
+                    }
+                    (SteerKind::Independent, SteerStage::Pending) => {
+                        ("worker", "pending: starts at the next safe point", Tok::Warning)
+                    }
+                    (SteerKind::Independent, SteerStage::Received) => {
+                        ("worker", "received: starting", Tok::Accent)
+                    }
+                    (SteerKind::Independent, SteerStage::Applied) => {
+                        ("worker", "started: this task continues", Tok::Success)
+                    }
+                };
+                strip.push(Line::from(Span::styled(
+                    text::ellipsize(
+                        &format!("{what} {stage} {} {}", theme.sym(Sym::Dot), text::one_line(&item.text)),
+                        w,
+                        theme.ascii(),
+                    ),
+                    theme.fg(tok),
+                )));
+            }
+            cursor.0 += strip.len() as u16;
+            strip.extend(rows);
+            rows = strip;
         }
         if !self.queued.is_empty() {
             let mut queued = Vec::new();

@@ -22,8 +22,11 @@ pub struct HistoricalCall {
 
 /// Optional built-in properties added after release whose absence keeps the old meaning, so
 /// history recorded before them stays valid. Removing a pinned property recovers that identity.
-const ADDITIVE_PROPERTIES: &[(&str, &[&str])] =
-    &[("grep", &["output"]), ("edit", &["allow_syntax_errors"])];
+const ADDITIVE_PROPERTIES: &[(&str, &[&str])] = &[
+    ("grep", &["output"]),
+    ("edit", &["allow_syntax_errors"]),
+    ("find", &["related"]),
+];
 
 fn native_compatible(old: &Identity, new: &Identity, registry: &Registry) -> bool {
     if old.revision != 1

@@ -1095,7 +1095,10 @@ impl Outcome {
         }
     }
     pub fn provider_failed(steps: u32, error: &anyhow::Error) -> Self {
-        let mut outcome = Self::failed(steps, format!("{error:#}"));
+        let mut outcome = Self::failed(
+            steps,
+            crate::agent::run::failure_guidance::provider_failure(error),
+        );
         outcome.retryable_provider = crate::llm::fallback::should_fallback(error);
         outcome
     }

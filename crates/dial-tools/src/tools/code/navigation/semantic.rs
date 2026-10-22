@@ -14,6 +14,9 @@ pub struct SemanticRequest {
     candidates: Vec<Evidence>,
     limit: usize,
     coverage: String,
+    workspace: Workspace,
+    scope: std::path::PathBuf,
+    related: bool,
 }
 impl SemanticRequest {
     pub fn has_candidates(&self) -> bool {
@@ -64,6 +67,7 @@ impl SemanticRequest {
             )
         };
         let mut shown = 0;
+        let mut top: Vec<(&str, usize, usize, &str)> = Vec::new();
         let mut current = BTreeMap::new();
         let mut stale = 0usize;
         for hit in selected {
@@ -82,7 +86,7 @@ impl SemanticRequest {
                 continue;
             }
             let row = format!(
-                "{}:{}-{} semantic_rank={} lexical_points={} [{}] source_sha256={} {}\n",
+                "{}:{}-{} semantic_rank={} via=model-rerank lexical_points={} [{}] source_sha256={} {}\n",
                 hit.path,
                 hit.start,
                 hit.end,
@@ -97,6 +101,7 @@ impl SemanticRequest {
                 break;
             }
             out.push_str(&row);
+            top.push((&hit.path, hit.start, hit.end, &hit.source_sha256));
             shown += 1;
         }
         if shown == 0 {
@@ -108,6 +113,16 @@ impl SemanticRequest {
             ));
         }
         out.push_str(&format!("[{shown} results; {} source-grounded candidates submitted; candidates/model input bounded, not exhaustive semantic search]\n{}", self.candidates.len(), self.coverage));
+        // Related evidence is computed locally from the already-selected, revalidated rows: no
+        // extra model request, and attribution stays lexical/syntax rather than model-ranked.
+        if self.related && !top.is_empty() {
+            out.push_str(&super::related_for(
+                &self.workspace,
+                &self.scope,
+                &top,
+                super::MAX_OUTPUT.saturating_sub(out.len()),
+            ));
+        }
         Ok(out)
     }
 }
@@ -147,6 +162,8 @@ pub fn semantic_request(ws: &Workspace, args: &Value) -> Result<Option<SemanticR
         return Ok(None);
     }
     let retrieved = retrieve(ws, args, true)?;
+    let related = super::related_enabled(args, false)?;
+    let scope = ws.resolve(opt_str(args, "path")?.unwrap_or("."))?;
     let query = req_str(args, "query")?;
     let mut candidates = Vec::new();
     let mut payload = Vec::new();
@@ -183,6 +200,9 @@ pub fn semantic_request(ws: &Workspace, args: &Value) -> Result<Option<SemanticR
         candidates,
         limit: retrieved.limit,
         coverage: retrieved.coverage,
+        workspace: ws.clone(),
+        scope,
+        related,
     }))
 }
 

@@ -30,6 +30,59 @@ pub(in crate::agent) fn feedback(kind: &str, advice: &str, consecutive: u32) -> 
     }
 }
 
+/// Render one recovery decision from controller-owned facts, without interpreting diagnostic
+/// prose as proof of rollback or success. The original result remains immediately above it.
+pub(in crate::agent) fn report(
+    call: &ToolCall,
+    output: &ToolOutput,
+    kind: &str,
+    advice: &str,
+    consecutive: u32,
+) -> String {
+    let effects = match output.execution.effects {
+        Effects::None => "No effects recorded for this operation.",
+        Effects::Known => "Recorded effects are known; failure does not undo completed work.",
+        Effects::Unknown => {
+            "Effects are uncertain; partial work may exist. Automatic continuation is stopped."
+        }
+    };
+    let changes = output
+        .execution
+        .changed_paths
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let changed = if changes == 0 {
+        "No committed file paths recorded (not proof that nothing changed).".to_owned()
+    } else {
+        format!(
+            "Committed file paths recorded: {changes}; preserve these changes while resolving the failure."
+        )
+    };
+    let retained = match output.process_outcome() {
+        Some(process) if !process.output_complete => {
+            "Captured output is incomplete; use it as partial evidence, not a complete execution record."
+        }
+        _ => {
+            "The original diagnostic and any captured output remain available above; earlier completed work is retained."
+        }
+    };
+    format!(
+        "\nRecovery state: tool `{}`; status {}. {effects} {changed}\nRetained: {retained}\nNext action:{}",
+        call.name,
+        ToolStatus::from_output(output).as_str(),
+        feedback(kind, advice, consecutive),
+    )
+}
+
+/// Inference failed before the response could enter tool dispatch. This describes only that
+/// response, never earlier operations in the turn or billing at the provider.
+pub(in crate::agent) const PROVIDER_RECOVERY: &str = "Recovery state: inference failed; no tools were dispatched from this failed response. Earlier completed operations are retained, not rolled back. Next action: resolve the provider diagnostic, then continue this session when ready. Do not replay earlier tool operations merely because inference failed.";
+
+pub(in crate::agent) fn provider_failure(error: &anyhow::Error) -> String {
+    format!("{error:#}\n{PROVIDER_RECOVERY}")
+}
+
 pub(in crate::agent) fn classify(
     call: &ToolCall,
     output: &ToolOutput,

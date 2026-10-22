@@ -411,7 +411,7 @@ def main():
             terminal.command("PTY-STREAM")
             terminal.wait("SSE-PREFIX-MARKER")
             terminal.command("PTY-UNSENT-FOLLOW-UP", key="M-Enter")
-            terminal.wait("queued follow-up: PTY-UNSENT-FOLLOW-UP")
+            terminal.wait("queued to send after turn: PTY-UNSENT-FOLLOW-UP")
             terminal.command("/queue remove 1")
             terminal.wait("Removed only the selected queued message")
             terminal.command("/queue")

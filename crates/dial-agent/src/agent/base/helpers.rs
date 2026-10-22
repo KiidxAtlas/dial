@@ -8,6 +8,21 @@ impl tools::WriteObserver for CheckpointObserver {
     fn before_write(&self, abs: &Path) -> Result<()> {
         self.0.before_write(abs)
     }
+    fn scoped(&self, owner: &str) -> Option<Arc<dyn tools::WriteObserver>> {
+        Some(Arc::new(WorkerObserver(self.0.clone(), owner.to_owned())))
+    }
+}
+
+/// Records a worker's writes in the shared checkpoint under the worker's label.
+struct WorkerObserver(Arc<Checkpoints>, String);
+
+impl tools::WriteObserver for WorkerObserver {
+    fn before_write(&self, abs: &Path) -> Result<()> {
+        self.0.before_write_as(abs, &self.1)
+    }
+    fn scoped(&self, owner: &str) -> Option<Arc<dyn tools::WriteObserver>> {
+        Some(Arc::new(WorkerObserver(self.0.clone(), owner.to_owned())))
+    }
 }
 
 pub(in crate::agent) fn result_clone(report: &TurnReport) -> TurnReport {

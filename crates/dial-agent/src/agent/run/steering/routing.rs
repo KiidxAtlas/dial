@@ -61,6 +61,68 @@ fn split_args(text: &str, instruction: &str) -> Value {
 }
 
 impl Agent<'_> {
+    /// Whether a separate worker may be started right now.
+    fn can_split_now(&self) -> bool {
+        self.config.task.can_spawn_at(0)
+            && self.live_tasks.running_ids().len()
+                < self
+                    .config
+                    .subagent_max_live_jobs
+                    .min(self.config.task.max_concurrency)
+            && self.layout.is_some()
+            && self.catalog().iter().any(|name| name == "task")
+            && self.tool_eligible("task")
+    }
+
+    /// Messages the user explicitly sent as independent work. The user already decided, so no model
+    /// classifies them and they never steer the running task: each starts a worker, or, when none
+    /// can start, goes back to the surface as a follow-up for after this turn.
+    fn start_independent_messages(&mut self, ui: &mut dyn Ui) -> Result<()> {
+        let mut messages = ui.take_independent_messages().into_iter();
+        let mut deferred = Vec::new();
+        while let Some(text) = messages.next() {
+            if text.trim().is_empty() {
+                continue;
+            }
+            if self.interrupt.load(Ordering::SeqCst) {
+                deferred.push(text);
+                deferred.extend(messages);
+                break;
+            }
+            let instruction = self.session.control_state()["current_instruction"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            if !self.can_split_now() {
+                ui.notice("An independent worker cannot start now; your message is queued for after this turn.");
+                deferred.push(text);
+                continue;
+            }
+            let before = self.live_tasks.running_ids();
+            match self.start_subagents(&split_args(&text, &instruction), ui) {
+                Ok(result) => {
+                    self.record(self.cur_step, "message_routed", json!({
+                        "route":"split", "message":text, "reason":"user chose an independent worker", "workers":result,
+                    }))?;
+                    ui.pending_message_accepted(&text);
+                    ui.notice("Started an independent worker; the current task continues.");
+                }
+                Err(error) => {
+                    // Persistence may fail after a worker actually started: never replay it.
+                    if self.live_tasks.running_ids().iter().any(|id| !before.contains(id)) {
+                        return Err(error);
+                    }
+                    ui.notice(&format!("Could not start an independent worker ({error:#}); your message is queued for after this turn."));
+                    deferred.push(text);
+                }
+            }
+        }
+        if !deferred.is_empty() {
+            ui.defer_pending_messages(deferred);
+        }
+        Ok(())
+    }
+
     /// Runs only between requests/tools: undecided messages never interrupt an operation. A split
     /// leaves the active instruction and inference result intact; steering uses the existing journal.
     pub(in crate::agent) fn route_pending_messages(
@@ -71,6 +133,7 @@ impl Agent<'_> {
         if self.interrupt.load(Ordering::SeqCst) {
             return Ok(false);
         }
+        self.start_independent_messages(ui)?;
         let mut messages = ui.take_pending_messages().into_iter();
         let mut steered = false;
         while let Some(text) = messages.next() {
@@ -85,15 +148,7 @@ impl Agent<'_> {
             let instruction = control["current_instruction"].as_str().unwrap_or("");
             // Large pastes must not create an unbounded classification request. Preserve the exact
             // message as steering instead of asking a model to classify a truncated assignment.
-            let can_split = self.config.task.can_spawn_at(0)
-                && self.live_tasks.running_ids().len()
-                    < self
-                        .config
-                        .subagent_max_live_jobs
-                        .min(self.config.task.max_concurrency)
-                && self.layout.is_some()
-                && self.catalog().iter().any(|name| name == "task")
-                && self.tool_eligible("task");
+            let can_split = self.can_split_now();
             let choice = if !can_split {
                 // There is only one admissible route. A classifier cannot change it, so do not
                 // spend a model request (or fail over to one) just to rediscover that boundary.

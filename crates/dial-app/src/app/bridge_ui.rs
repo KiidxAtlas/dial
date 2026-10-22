@@ -6,6 +6,7 @@ use crate::app::bridge::Bridge;
 use crate::app::notices::RetryNotice;
 use crate::app::shell::TICK;
 use crate::runtime::tool_output::ToolOutput;
+use crate::ui::composer::SteerStage;
 use crate::ui::status::Phase;
 use crate::ui::theme::Tok;
 use crate::ui::{tasks, text};
@@ -75,7 +76,44 @@ impl Ui for Bridge<'_> {
         self.repaint(true);
     }
 
+    /// Explicit "Steer now" input. Taking it is what lets the agent cancel a stale model reply and
+    /// interrupt only waits that are safe to interrupt; running effects are never torn down here.
+    fn take_steering(&mut self) -> Vec<String> {
+        self.pump();
+        let taken = self.shell.composer.take_explicit_steering();
+        for text in &taken {
+            self.shell.composer.mark_explicit(text, SteerStage::Received);
+        }
+        if !taken.is_empty() {
+            self.repaint(true);
+        }
+        taken
+    }
+
+    fn take_independent_messages(&mut self) -> Vec<String> {
+        self.pump();
+        let taken = self.shell.composer.take_explicit_independent();
+        for text in &taken {
+            self.shell.composer.mark_explicit(text, SteerStage::Received);
+        }
+        taken
+    }
+
+    fn defer_pending_messages(&mut self, messages: Vec<String>) {
+        self.shell.composer.defer_messages(messages);
+        self.repaint(true);
+    }
+
+    fn steering_applied(&mut self, text: &str) {
+        // Automatically routed input is shown by `pending_message_accepted`; only explicit here.
+        if self.shell.composer.mark_explicit(text, SteerStage::Applied) {
+            self.shell.transcript.push_user(text);
+            self.repaint(true);
+        }
+    }
+
     fn pending_message_accepted(&mut self, text: &str) {
+        self.shell.composer.mark_explicit(text, SteerStage::Applied);
         self.shell.transcript.push_user(text);
         self.repaint(true);
     }

@@ -1057,7 +1057,7 @@ impl Agent<'_> {
                         started.elapsed(),
                         &error,
                     );
-                    return Err(error).map(crate::agent::run::engine::Tick::Finished);
+                    return Err(error.context(crate::agent::run::failure_guidance::PROVIDER_RECOVERY)).map(crate::agent::run::engine::Tick::Finished);
                 }
             };
             // Counted when a provider reply is received: its schemas were sent, whether the reply later

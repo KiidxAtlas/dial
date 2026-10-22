@@ -190,6 +190,16 @@ pub trait Ui {
     }
     /// Restore unhandled busy input after cancellation, ahead of later queued messages.
     fn restore_pending_messages(&mut self, _messages: Vec<String>) {}
+    /// Messages the user explicitly sent as separate work ("Independent worker"). The controller
+    /// starts a worker for each; they never steer the running task.
+    fn take_independent_messages(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Independent messages that could not start a worker. Surfaces keep them for after the turn.
+    fn defer_pending_messages(&mut self, _messages: Vec<String>) {}
+    /// A steering message was journaled as the current instruction. Only called once it is
+    /// recorded, so surfaces can show "applied" truthfully.
+    fn steering_applied(&mut self, _text: &str) {}
     /// An undecided message was accepted for routing; surfaces can show it exactly once.
     fn pending_message_accepted(&mut self, _text: &str) {}
     /// Maintenance must yield to queued foreground work without consuming that work.

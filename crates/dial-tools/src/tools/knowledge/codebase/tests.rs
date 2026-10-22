@@ -37,7 +37,8 @@ fn ambient_retrieval_excludes_unrelated_documents_and_inventory() {
     assert!(focused.contains("src/router.rs"));
     assert!(!focused.contains("README.md") && !focused.contains("Indexed areas:"));
     assert!(full.contains("README.md") && full.contains("Indexed areas:"));
-    assert!(focused.len() <= 2000 && focused.len() < full.len());
+    assert!(focused.len() <= 2000, "{focused}");
+    assert!(focused.contains("take precedence"));
     assert!(cache.task_context("unrelatedxyz", 2000).unwrap().is_empty());
 }
 
@@ -764,4 +765,41 @@ fn partial_refresh_drops_index_rows_for_deleted_files_and_recall_names_gone_find
         .query_row("SELECT COUNT(*) FROM codebase_notes", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[test]
+fn ambient_brief_is_bounded_fresh_only_and_links_sources() {
+    let (_home, project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    let long = format!(
+        "Router responsibility. {}",
+        "Routes requests to storage. ".repeat(80)
+    );
+    cache
+        .remember_investigation(
+            "router responsibility",
+            &long,
+            &["src/router.rs:3".into()],
+            "session",
+        )
+        .unwrap();
+    let brief = cache.task_context("router responsibility", 8000).unwrap();
+    assert!(
+        brief.contains("take precedence") && brief.contains("src/router.rs"),
+        "{brief}"
+    );
+    assert!(brief.contains("summary_clipped"), "{brief}");
+    assert!(!brief.contains(&long));
+    assert!(brief.len() <= 8000);
+    // Editing a cited source withholds the old summary; only the stale topic is named.
+    fs::write(
+        project.path().join("src/router.rs"),
+        "pub fn changed() {}\n",
+    )
+    .unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    let after = cache.task_context("router responsibility", 8000).unwrap();
+    assert!(!after.contains("Routes requests to storage."), "{after}");
+    assert!(after.contains("needs refresh"), "{after}");
 }

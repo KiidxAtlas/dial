@@ -63,6 +63,10 @@ struct Entry {
     existed: bool,
     /// Unix permission bits of the original file.
     mode: u32,
+    /// Who wrote the file this turn: `main` or a worker label. Empty when the checkpoint predates
+    /// attribution, so old checkpoints are shown as unattributed rather than guessed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    writers: Vec<String>,
 }
 
 impl Entry {
@@ -93,7 +97,9 @@ struct Inner {
     journal: revisions::Journal,
 }
 
+mod review;
 mod revisions;
+pub use review::{GroupPlan, ReviewFile, TurnReview, UNATTRIBUTED};
 pub use revisions::RevertPlan;
 
 pub struct Checkpoints {
@@ -236,12 +242,17 @@ impl Checkpoints {
     /// Preview a single file. The token binds both saved content and current bytes/mode.
     /// All current changes are shown, including user edits; caller must obtain explicit consent.
     pub fn review_file(&self, turn: u64, path: &str) -> Result<(String, String)> {
+        let manifest = self.manifest(turn)?;
+        self.review_with(&manifest, path)
+    }
+
+    fn review_with(&self, manifest: &Manifest, path: &str) -> Result<(String, String)> {
         use sha2::{Digest, Sha256};
+        let turn = manifest.turn;
         ensure!(
             crate::storage::experience::safe_path(path),
             "private path cannot be reviewed here"
         );
-        let manifest = self.manifest(turn)?;
         let (index, entry) = manifest
             .entries
             .iter()
@@ -302,28 +313,11 @@ impl Checkpoints {
     }
 
     /// Compare-before-restore; other checkpoint files and later unrelated work are untouched.
-    /// The revert itself gets a checkpoint, so the operator can undo it.
+    /// The revert itself gets a checkpoint, so the operator can undo it. The caller has shown the
+    /// overlap signals (see [`ReviewFile::overlap`]) and obtained consent for this one file.
     pub fn restore_file(&self, turn: u64, path: &str, expected: &str) -> Result<()> {
-        let manifest = self.manifest(turn)?;
-        let (index, entry) = manifest
-            .entries
-            .iter()
-            .enumerate()
-            .find(|(_, entry)| entry.display() == path)
-            .context("file is not in this checkpoint")?;
-        ensure!(
-            self.review_file(turn, path)?.1 == expected,
-            "file or saved checkpoint changed after review; nothing restored"
-        );
-        let (target, _) = self.target_of(entry)?;
-        self.begin_turn(&format!("Selective revert: {path}"))?;
-        self.before_write(&target)?;
-        ensure!(
-            self.review_file(turn, path)?.1 == expected,
-            "file changed during review; nothing restored"
-        );
-        self.restore_entry(turn, index, entry)?;
-        Ok(())
+        self.restore_files(turn, &[(path.to_owned(), expected.to_owned())], true)
+            .map(|_| ())
     }
 
     /// Capture exact scoped source states for executable repair evidence. Unlike `changed_files`,
@@ -444,10 +438,28 @@ impl Checkpoints {
     /// (the write must not proceed); a file over `MAX_FILE_BYTES` is not recorded and is listed as
     /// skipped. Every call also opens a per-change revision (see [`revisions`]).
     pub fn before_write(&self, abs: &Path) -> Result<()> {
+        self.before_write_as(abs, "main")
+    }
+
+    /// [`Self::before_write`] that also records `owner` (`main` or a worker label) as a writer of
+    /// the file in this turn, so review can group changes and see files several writers touched.
+    pub fn before_write_as(&self, abs: &Path, owner: &str) -> Result<()> {
         let (resolved, root, rel) = self.resolve(abs)?;
         let mut inner = self.lock();
         self.record_first_write(&mut inner, &resolved, root.clone(), rel.clone())?;
-        self.record_revision(&mut inner, &resolved, root, rel);
+        self.record_revision(&mut inner, &resolved, root.clone(), rel.clone());
+        let owner = one_line(owner);
+        if let Some(manifest) = inner.current.as_mut()
+            && let Some(entry) = manifest
+                .entries
+                .iter_mut()
+                .find(|entry| entry.rel == rel && entry.root == root)
+            && !entry.writers.contains(&owner)
+        {
+            entry.writers.push(owner);
+            let saved = manifest.clone();
+            write_manifest(&self.dir, &saved)?;
+        }
         Ok(())
     }
 
@@ -463,6 +475,7 @@ impl Checkpoints {
             root: root.clone(),
             existed: false,
             mode: 0,
+            writers: Vec::new(),
         }
         .display();
         if inner.current.is_none() {
@@ -506,6 +519,7 @@ impl Checkpoints {
                     root,
                     existed: true,
                     mode: platform_fs::mode(&meta) & 0o7777,
+                    writers: Vec::new(),
                 });
             }
             Ok(_) => bail!("{shown} is not a regular file; refusing to checkpoint it"),
@@ -515,6 +529,7 @@ impl Checkpoints {
                     root,
                     existed: false,
                     mode: 0,
+                    writers: Vec::new(),
                 });
             }
             Err(e) => return Err(e).with_context(|| format!("inspecting {shown}")),

@@ -143,3 +143,96 @@ fn a_failing_language_server_leaves_the_lexical_find_successful() {
         out.text
     );
 }
+
+#[test]
+fn related_bundle_states_provenance_and_is_bounded() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    fs::write(
+        dir.path().join("retry.rs"),
+        "pub struct RetryPolicy {\n    attempts: u32,\n}\npub fn reconnect_network(policy: &RetryPolicy) {\n    retry();\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("caller.rs"),
+        "fn run() {\n    reconnect_network(&policy);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("settings.toml"),
+        "handler = \"reconnect_network\"\n",
+    )
+    .unwrap();
+    let out = find(&ws, &json!({"query":"reconnect network"})).unwrap();
+    assert!(out.contains("via=lexical"), "{out}");
+    assert!(out.contains("Related evidence"), "{out}");
+    assert!(out.contains("NOT edit witnesses"), "{out}");
+    assert!(
+        out.contains("call-site caller.rs:1-3 provenance=lexical"),
+        "{out}"
+    );
+    assert!(
+        out.contains("type-definition retry.rs:1-3 provenance=syntax"),
+        "{out}"
+    );
+    assert!(
+        out.contains("config-reference settings.toml:1-1 provenance=lexical"),
+        "{out}"
+    );
+    assert!(out.len() <= MAX_OUTPUT + 6 * 1024, "{}", out.len());
+    // Opting out restores the plain hit rows; exact mode omits the bundle by default.
+    let plain = find(&ws, &json!({"query":"reconnect network","related":false})).unwrap();
+    assert!(!plain.contains("Related evidence"), "{plain}");
+    let exact = find(&ws, &json!({"query":"reconnect_network(","mode":"exact"})).unwrap();
+    assert!(exact.contains("via=exact-text") && !exact.contains("Related evidence"));
+    assert!(find(&ws, &json!({"query":"reconnect","related":"yes"})).is_err());
+}
+
+#[test]
+fn related_bundle_never_names_protected_or_changed_sources() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    let private = dir.path().join("private");
+    fs::create_dir(&private).unwrap();
+    fs::write(
+        private.join("secret.rs"),
+        "fn x() { reconnect_network(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("retry.rs"),
+        "pub fn reconnect_network() {\n    retry();\n}\n",
+    )
+    .unwrap();
+    let ws = ws.with_protected_paths(&[private]);
+    let out = find(&ws, &json!({"query":"reconnect network"})).unwrap();
+    assert!(!out.contains("secret.rs"), "{out}");
+    assert!(out.contains("none found in scope"), "{out}");
+}
+
+#[test]
+fn related_bundle_never_surfaces_environment_or_credential_files() {
+    let (dir, ws) = crate::tools::testkit::workspace();
+    fs::write(
+        dir.path().join("retry.rs"),
+        "pub fn reconnect_network() {\n    retry();\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join(".env"), "reconnect_network=hunter2\n").unwrap();
+    fs::write(dir.path().join("prod.env"), "reconnect_network=hunter3\n").unwrap();
+    fs::write(
+        dir.path().join("secrets.toml"),
+        "reconnect_network = \"hunter4\"\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("server.pem"), "reconnect_network\n").unwrap();
+    fs::write(
+        dir.path().join("app.toml"),
+        "handler = \"reconnect_network\"\n",
+    )
+    .unwrap();
+    let out = find(&ws, &json!({"query":"reconnect network"})).unwrap();
+    let related = out.split("Related evidence").nth(1).unwrap();
+    for hidden in ["hunter", ".env", "prod.env", "secrets.toml", "server.pem"] {
+        assert!(!related.contains(hidden), "{hidden}: {related}");
+    }
+    assert!(related.contains("config-reference app.toml"), "{related}");
+}

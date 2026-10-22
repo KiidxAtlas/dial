@@ -510,3 +510,98 @@ fn undeletable_checkpoint_directory_stops_the_rollback() {
     );
     assert_eq!(cp.list().len(), 1, "the checkpoint is kept for a retry");
 }
+
+mod grouped_review {
+    use super::super::*;
+
+    fn setup() -> (tempfile::TempDir, tempfile::TempDir, Checkpoints) {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.path().join(name), "original").unwrap();
+        }
+        let cp = Checkpoints::new(state.path().to_owned(), root.path().to_owned()).unwrap();
+        (root, state, cp)
+    }
+
+    fn write(cp: &Checkpoints, root: &Path, name: &str, owner: &str) {
+        cp.before_write_as(&root.join(name), owner).unwrap();
+        fs::write(root.join(name), format!("edited by {owner}")).unwrap();
+    }
+
+    #[test]
+    fn groups_writers_and_flags_shared_and_later_files() {
+        let (root, _state, cp) = setup();
+        let turn = cp.begin_turn("two writers").unwrap();
+        write(&cp, root.path(), "a.txt", "main");
+        write(&cp, root.path(), "b.txt", "worker-1");
+        write(&cp, root.path(), "c.txt", "main");
+        write(&cp, root.path(), "c.txt", "worker-1");
+        let later = cp.begin_turn("later").unwrap();
+        write(&cp, root.path(), "a.txt", "main");
+        let review = cp.review_turn(turn).unwrap();
+        let by = |p: &str| review.files.iter().find(|f| f.path == p).unwrap().clone();
+        assert_eq!(by("a.txt").later_turns, [later]);
+        assert!(by("c.txt").shared() && by("c.txt").overlap().is_some());
+        assert!(by("b.txt").overlap().is_none());
+        let groups = review.groups();
+        assert_eq!(groups[0].0, "main");
+        let plan = cp.group_plan(turn, "worker-1").unwrap();
+        assert_eq!(plan.safe, ["b.txt"]);
+        assert_eq!(plan.held.len(), 1, "shared file is held for individual review");
+        assert_eq!(cp.group_plan(turn, "main").unwrap().safe, Vec::<String>::new());
+    }
+
+    #[test]
+    fn group_revert_is_all_or_nothing_and_undoable() {
+        let (root, _state, cp) = setup();
+        let turn = cp.begin_turn("edits").unwrap();
+        write(&cp, root.path(), "a.txt", "w");
+        write(&cp, root.path(), "b.txt", "w");
+        let items: Vec<_> = ["a.txt", "b.txt"]
+            .iter()
+            .map(|p| (p.to_string(), cp.review_file(turn, p).unwrap().1))
+            .collect();
+        // A concurrent edit of one file cancels the whole revert and keeps that edit.
+        fs::write(root.path().join("b.txt"), "user edit").unwrap();
+        assert!(cp.restore_files(turn, &items, false).is_err());
+        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "edited by w");
+        assert_eq!(fs::read_to_string(root.path().join("b.txt")).unwrap(), "user edit");
+        let items: Vec<_> = ["a.txt", "b.txt"]
+            .iter()
+            .map(|p| (p.to_string(), cp.review_file(turn, p).unwrap().1))
+            .collect();
+        cp.restore_files(turn, &items, false).unwrap();
+        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "original");
+        assert_eq!(fs::read_to_string(root.path().join("b.txt")).unwrap(), "original");
+        cp.rollback(1).unwrap();
+        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "edited by w");
+    }
+
+    #[test]
+    fn overlapping_files_need_explicit_confirmation() {
+        let (root, _state, cp) = setup();
+        let turn = cp.begin_turn("shared").unwrap();
+        write(&cp, root.path(), "a.txt", "main");
+        write(&cp, root.path(), "a.txt", "worker-1");
+        let items = vec![("a.txt".to_string(), cp.review_file(turn, "a.txt").unwrap().1)];
+        let error = cp.restore_files(turn, &items, false).unwrap_err().to_string();
+        assert!(error.contains("overlaps other work"), "{error}");
+        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "edited by worker-1");
+        cp.restore_files(turn, &items, true).unwrap();
+        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "original");
+    }
+
+    #[test]
+    fn old_checkpoints_without_writers_are_unattributed() {
+        let (root, _state, cp) = setup();
+        let turn = cp.begin_turn("legacy").unwrap();
+        cp.before_write(&root.path().join("a.txt")).unwrap();
+        let mut manifest = cp.manifest(turn).unwrap();
+        manifest.entries[0].writers.clear();
+        write_manifest(&cp.dir, &manifest).unwrap();
+        cp.lock().current = None;
+        let review = cp.review_turn(turn).unwrap();
+        assert_eq!(review.files[0].writers, [UNATTRIBUTED]);
+    }
+}

@@ -105,6 +105,16 @@ the execution outcome and never implies undeclared behaviors are covered. Parent
 settlement provide cause-specific safe next actions without automatic installation, permission
 bypasses or replay of uncertain effects.
 
+Tool failures carry a single recovery-state summary from shared parent/worker settlement:
+the observed tool status, effect certainty, count of recorded committed paths, retained output
+coverage, and the cause-specific next action. Zero recorded paths does not assert that nothing
+changed; interrupted output remains partial evidence. The original diagnostic stays intact.
+These summaries neither replay operations nor grant permission. Unknown effects still stop
+automatic continuation, and earlier completed work is not rolled back by a later failure.
+Provider-generation failures separately explain that no tools were dispatched from that failed
+response, while earlier operations in the turn remain retained. The original error chain and
+provider retry classification are preserved; recovery guidance does not automatically replay tools.
+
 Automatic coach consultations retain their failure streak, evidence and attempt cap
 through final-verification repair reentries in the same user turn. A new user turn
 resets that allowance. Attempts count before authorization/routing, so denied or failed
@@ -404,9 +414,12 @@ limits, reasoning budgets, approvals or verification requirements:
     a prompt is processed, the status line shows the time left (`~Ns left`) from the measured
     processing rate.
   Edit these keys in `/improve settings` under Local model assistance.
-- Ambient codebase retrieval is off by default (`codebase.ambient_context`); the model calls
-  `codebase_memory` when it wants the saved understanding. When on, it selects task-relevant
-  sources/findings, prefers fresh evidence, omits the directory inventory and bounds stale notices.
+- Ambient codebase retrieval is on by default (`codebase.ambient_context = false` opts out); the
+  model can still call `codebase_memory` for the complete view. It makes no model request: it
+  selects task-relevant sources/findings whose cited sources still match their saved hashes, clips
+  finding summaries (at most four, with source links), keeps only task-matching outline lines, omits
+  the directory inventory, bounds stale notices to topic names, and states that the user's
+  instructions take precedence and that the brief is not an edit grant.
 - Tool results are shown whole up to the per-model limit (48 KiB for large windows, about an eighth
   of the window for small ones), with the complete output retained in artifacts.
   `efficiency.tool_preview_bytes` can reduce successful inspection results further; errors, read/edit

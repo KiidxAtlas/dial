@@ -123,52 +123,7 @@ impl Shell {
                 self.refresh_status(app, agent);
                 match result { Ok(report) => self.note("Review", report), Err(error) => self.note("Review", format!("{error:#}")) }
             }
-            "review-file" => {
-                let result = (|| -> Result<()> {
-                    let checkpoints = agent.checkpoints().cloned().context("No checkpoints are available for this session")?;
-                    let (turn_text, requested_path) = args.split_once(' ').unwrap_or((args, ""));
-                    let turn = if args.is_empty() {
-                        let turns = checkpoints.list();
-                        if turns.is_empty() { self.note("Review", "No checkpoint changes to review. No files changed."); return Ok(()); }
-                        let labels: Vec<_> = turns.iter().map(|entry| format!("{}: {} ({} files)", entry.turn, entry.label, entry.files)).collect();
-                        let choices: Vec<_> = labels.iter().map(|label| (label.as_str(), ' ')).collect();
-                        let Some(selected) = self.ask("Review checkpoints", "Choose a turn. Esc returns to your draft without changing files.", &choices) else { return Ok(()); };
-                        turns[selected].turn
-                    } else { turn_text.parse::<u64>().context("Expected a checkpoint turn number")? };
-                    let browse = requested_path.trim().is_empty();
-                    loop {
-                        let path = if browse {
-                            let paths = checkpoints.changed_files(turn);
-                            if paths.is_empty() { self.note("Review", "No readable changed-file inventory. No files changed."); break; }
-                            let choices: Vec<_> = paths.iter().map(|path| (path.as_str(), ' ')).collect();
-                            let Some(selected) = self.ask("Changed files", "Choose a file. Reviewed, tested and accepted are separate states; file preview shows recorded checks, not new verification.", &choices) else { break; };
-                            paths[selected].clone()
-                        } else { requested_path.trim().to_owned() };
-                        let (diff, token) = checkpoints.review_file(turn, &path)?;
-                        let state = agent.session().control_state();
-                        let recorded = state["reliability"]["verification_results"].as_array().map(|checks| checks.iter().map(|check| format!("{}: {}", check["name"].as_str().unwrap_or("check"), check["status"].as_str().unwrap_or("unverified"))).collect::<Vec<_>>().join("\n")).unwrap_or_else(|| "No checks recorded.".to_string());
-                        let reviewed = state["reviewed_file"]["identity"].as_str() == Some(token.as_str());
-                        let body = format!("{} · {}\n{}\nRecorded checks (not file-specific proof):\n{}\nRevert includes user edits shown here; comparison is not atomic against external writers. Page keys scroll the diff/details.", path, if reviewed { "reviewed version" } else { "not reviewed" }, diff, recorded);
-                        match self.ask("Review file", &body, &[("Keep", 'k'), ("Revert file", 'r'), ("Cancel", 'n')]) {
-                            Some(0) => {
-                                anyhow::ensure!(checkpoints.review_file(turn, &path)?.1 == token, "File changed after preview. Review the new version before keeping it.");
-                                let mut state = agent.session().control_state();
-                                state["reviewed_file"] = serde_json::json!({"turn":turn,"path":path,"identity":token});
-                                agent.session_mut().set_control_state(state)?;
-                                self.note("Review", "Kept the reviewed version; review is not test verification.");
-                            }
-                            Some(1) => {
-                                checkpoints.restore_file(turn, &path, &token)?;
-                                self.note("Review", "Restored only the selected file. The revert has its own checkpoint for /undo.");
-                            }
-                            _ => {}
-                        }
-                        if !browse { break; }
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = result { self.note("Review", error.to_string()); }
-            }
+            "review-file" => self.review_checkpoints(agent, args),
             "model" if args == "restart" => {
                 if self.ask("Restart managed model?", "Unload only this session's Dial-managed local model. The same model reloads on the next request; files and conversation stay intact. External servers are never restarted.", &[("Restart", 'r'), ("Cancel", 'n')]) == Some(0) {
                     match agent.restart_managed_model() {

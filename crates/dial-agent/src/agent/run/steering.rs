@@ -42,6 +42,7 @@ impl<'a> Agent<'a> {
                 continue;
             };
             self.commit_steering(message, &text)?;
+            ui.steering_applied(&text);
             received = true;
         }
         if received {
@@ -201,9 +202,11 @@ impl<'a> Agent<'a> {
         let mut received = !self.accepted_live_steering.is_empty();
         for (message, text) in std::mem::take(&mut self.accepted_live_steering) {
             self.commit_steering(message, &text)?;
+            ui.steering_applied(&text);
         }
         while let Some(steer) = live.pending.pop_front() {
             self.commit_steering(steer.message, &steer.text)?;
+            ui.steering_applied(&steer.text);
             received = true;
         }
         if received {
@@ -226,6 +229,7 @@ impl<'a> Agent<'a> {
         }
         for (message, text) in std::mem::take(&mut self.accepted_live_steering) {
             self.commit_steering(message, &text)?;
+            ui.steering_applied(&text);
         }
         self.finish_steering(
             ui,
