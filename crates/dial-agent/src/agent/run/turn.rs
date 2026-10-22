@@ -2545,6 +2545,13 @@ text: "finish completed cannot follow a failed call in the same batch; address i
                     }
                 }
             }
+            // Live advisor: the coach reviews this round; its note reaches the next request. A
+            // turn already ending is not charged for a coach-model call.
+            if stop.is_none()
+                && let Some(note) = self.coach_round(&mut coach_turn, backend, user_goal, step, ui)?
+            {
+                pending_nudges.push(note);
+            }
             if let Some(mut message) = stop {
                 if self.hermetic {
                     bail!("{message}");

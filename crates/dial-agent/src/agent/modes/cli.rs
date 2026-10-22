@@ -32,6 +32,8 @@ pub struct Launch {
     pub system_prompt_template: Option<String>,
     /// `--advisor`: evidence-based review and one repair pass with the `coach` role. Never persisted.
     pub advisor: bool,
+    /// `/advisor completion`: keep the advisor to the pre-completion review (no per-round notes).
+    pub advisor_completion_only: bool,
     /// `--external-thinking`: private scratchpad reasoning. Never persisted.
     pub external_thinking: bool,
 }
