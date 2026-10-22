@@ -180,7 +180,8 @@ pub struct ToolConfig {
 /// Which shell runs `bash` commands. `auto` uses bash when one is installed: `/bin/bash` on Unix, and
 /// Git for Windows' `bash.exe` on Windows (WSL's launcher does not count). Without bash it uses the
 /// built-in shell (`embedded`), and on Windows without an embedded build it uses PowerShell.
-/// `system` requires bash. `powershell` runs PowerShell on Windows only.
+/// `system` requires bash. `inprocess` runs the built-in shell inside Dial itself and is refused unless
+/// `sandbox.mode` is `off`. `powershell` runs PowerShell on Windows only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellBackend {
@@ -188,6 +189,9 @@ pub enum ShellBackend {
     Auto,
     System,
     Embedded,
+    /// The built-in shell run inside the Dial process. Allowed only with `sandbox.mode = "off"`.
+    #[serde(rename = "inprocess")]
+    InProcess,
     PowerShell,
 }
 
@@ -200,7 +204,7 @@ pub struct ShellConfig {
     pub auto_background_secs: u64,
     /// `--no-pty`: background commands run without a pseudo-terminal.
     pub no_pty: bool,
-    /// Shell that runs `bash` commands: `auto`, `system`, or `embedded` (built-in POSIX shell).
+    /// Shell that runs `bash` commands: `auto`, `system`, `embedded` (built-in POSIX shell), or `inprocess` (built-in shell inside Dial; sandbox off only).
     pub backend: ShellBackend,
 }
 impl Default for ShellConfig {
@@ -798,9 +802,11 @@ pub struct WebConfig {
     pub reader_chain: Vec<String>,
     /// Allow the `jina` reader, which sends the page URL to r.jina.ai. Off by default.
     pub jina_reader: bool,
-    /// Search backend: `auto` (default; empty also means auto) picks the first provider whose
-    /// environment key is set, else DuckDuckGo. Or name one: brave, tavily, exa, serper, kagi,
-    /// jina, perplexity, google, bing, searxng, duckduckgo. Ignored when `search_url` is set.
+    /// Search backend: `auto` (default; empty also means auto) tries every provider whose
+    /// environment key is set, then the keyless DuckDuckGo, Startpage, Mojeek and Ecosia, falling
+    /// through on failure. Or name one: brave, tavily, exa, serper, kagi, jina, perplexity, google,
+    /// bing, searxng, firecrawl, parallel, zai, xai, duckduckgo, startpage, mojeek, ecosia.
+    /// Ignored when `search_url` is set.
     pub search_provider: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -825,6 +831,9 @@ pub struct VerificationConfig {
     pub strict_requirements: bool,
     /// Optional runner identity for configured checks; never an installation or execution grant.
     pub runners: BTreeMap<String, VerificationRunner>,
+    /// Operator assertion, keyed by configured check name, that a deterministic, side-effect-free
+    /// check's entire workspace inputs are declared; enables dependency-aware reuse of its result.
+    pub inputs: BTreeMap<String, VerificationInputs>,
     /// Opt-in, bounded independent review of substantial or explicitly sensitive changes.
     pub review: IndependentReviewConfig,
 }
@@ -841,6 +850,7 @@ impl Default for VerificationConfig {
             requirements: BTreeMap::new(),
             strict_requirements: false,
             runners: BTreeMap::new(),
+            inputs: BTreeMap::new(),
             review: IndependentReviewConfig::default(),
         }
     }
@@ -852,6 +862,17 @@ impl Default for VerificationConfig {
 pub struct VerificationRunner {
     pub program: String,
     pub module: Option<String>,
+}
+
+/// Declared workspace inputs of one check. Directories include their members recursively.
+/// External tools and toolchains must stay stable; unknown shell or extension effects block reuse.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerificationInputs {
+    /// Workspace-relative files or directories the check reads.
+    pub paths: Vec<String>,
+    /// Environment variable names whose values the check reads.
+    pub environment: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

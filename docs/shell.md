@@ -13,6 +13,7 @@ Set `shell.backend` in Settings (Tools tab) or in `config.toml`:
 - `auto` (default): bash when one is found (`/bin/bash` on Unix; on Windows, Git for Windows' `bash.exe` from `%ProgramFiles%\Git\bin`, `%ProgramFiles(x86)%\Git\bin`, `%LOCALAPPDATA%\Programs\Git\bin`, or PATH). A Git installation is recognized by its `cmd\git.exe` beside `bin\bash.exe`, so WSL's `bash.exe` launcher is never used. Without bash: the built-in shell. On Windows without the built-in shell (a build without `embedded-shell`): PowerShell.
 - `system`: bash only. On Windows this means Git Bash; it fails with an actionable message when no bash is found.
 - `embedded`: Dial's built-in shell. It needs no system bash, so it works on minimal systems and containers.
+- `inprocess`: the same built-in shell, run on a thread inside the Dial process instead of a child process. It is allowed **only when `sandbox.mode = "off"`**: with `dev` or `strict` (or any other mode) the `bash` tool refuses with an error and runs nothing; it never falls back to another shell. A build without `embedded-shell` reports a clear error. See "In-process shell" below.
 - `powershell`: Windows only. Runs commands in Windows PowerShell. Elsewhere it fails with a clear message.
 
 The active shell is shown in the start-up banner (the `shell` row), for example `bash (C:\Program Files\Git\bin\bash.exe)`, `built-in shell`, or `PowerShell`.
@@ -32,6 +33,16 @@ Limits of the built-in shell:
 - Patterns in `grep` and `sed` use Rust regular-expression syntax, not the full POSIX basic/extended grammar.
 - `xargs` runs external programs only. A name that exists only as a shell builtin is not found and exits 127.
 - On Windows, bash, PowerShell, and the built-in shell all run only with the explicit unsandboxed command setting, because native isolation is unavailable there.
+
+## In-process shell
+
+`shell.backend = "inprocess"` runs foreground `bash` commands without a host child process, so there is no isolation between the shell's builtins and Dial. That is why it needs `sandbox.mode = "off"` and fails closed otherwise. Working directory, the secret-scrubbed environment (`is_secret_env`), `TMPDIR`, output capture limits, artifacts, the `timeout` argument and cancellation behave as in the other backends. The banner shows `in-process shell (sandbox off only)`.
+
+Differences and limits:
+
+- Timeout and interrupt abort the script at its next `await` (every external command, pipe or `sleep`) and kill the process groups of external commands the run started (Unix; found with `ps` and a per-run `DIAL_INPROCESS_RUN` marker in the command environment). A command that calls `setsid` or clears its environment escapes the kill.
+- A builtin loop that never yields (for example `while :; do :; done`) cannot be interrupted from outside its thread. Dial reports the timeout, abandons the thread and notes it in the output; the thread keeps using CPU until Dial exits. Use `system` or `embedded` when a hard kill matters.
+- Commands are not handed to `bg` automatically after `auto_background_secs`, and `async`/`background` requests and named `session`s use the child-process built-in shell instead.
 
 ## Named embedded sessions
 

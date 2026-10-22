@@ -133,6 +133,8 @@ context_window = "auto" # defaults to 32768 tokens; serving endpoints may cap to
 mode = "dev"              # dev | strict | off
 allow_network = true
 extra_write = ["~/.cargo", "~/.npm"]
+[shell]
+backend = "auto"         # auto | system | embedded | inprocess (sandbox.mode = "off" only) | powershell
 [endpoint]                # optional: OpenAI-compatible server instead of local MLX
 base_url = "http://127.0.0.1:1234/v1"
 api_key_env = "LMSTUDIO_KEY"
@@ -150,6 +152,9 @@ security = "Focus on injection, authentication and secret-handling bugs."
 [web]
 search_url = "https://search.example/api?q={query}"   # optional; default is DuckDuckGo HTML
 search_api_key_env = "SEARCH_KEY"                    # optional bearer token variable
+search_provider = "auto"                             # auto | brave | tavily | exa | serper | kagi | jina | perplexity
+                                                     # | google | bing | searxng | firecrawl | parallel | zai | xai
+                                                     # | duckduckgo | startpage | mojeek | ecosia (keys come from *_API_KEY env vars)
 [lsp.rust]                                           # override or add a language server
 program = "/opt/homebrew/bin/rust-analyzer"
 extensions = ["rs"]
@@ -172,6 +177,10 @@ name = "focused-tests"
 command = "cargo test --offline --lib"
 file_extensions = ["rs"]
 timeout_secs = 0
+
+[verification.inputs."focused-tests"]   # optional: opt this check into dependency-aware reuse
+paths = ["src", "tests", "Cargo.toml", "Cargo.lock"]
+environment = ["FEATURE_FLAG"]
 
 [improve]
 enabled = true
@@ -200,3 +209,32 @@ rank = 8
 num_layers = 4
 max_seq_length = 8192
 ```
+
+Verification reuse is enabled automatically for the exact built-in isolated Python AST check,
+without an input declaration, when Dial recognizes a conventional Unix CPython installation.
+It hashes the source and inherited environment and snapshots runtime directory membership and
+Unix file identity (inode, size, permissions, modification and change timestamps). The runtime
+scan is bounded to 16,384 entries and one second; workspace content snapshots retain the limits
+below. Site packages are excluded because this check uses `-I -S`. Unknown layouts, wrappers,
+virtual environments, loader/shell injection variables, symlinks or exceeded limits fall back to
+execution. OS libraries are assumed stable within the turn. Other built-in builds/tests and custom
+commands do not have inferred dependency contracts; custom checks still need declarations below.
+
+`[verification.inputs."check-name"]` (keyed by a `[[verification.commands]]` name) is an explicit
+operator assertion that the check is deterministic and side-effect free and that `paths` lists all
+of its workspace inputs; `environment` names environment variables that also affect it. Paths are
+workspace-relative with no globs; a directory is hashed recursively (contents and membership,
+including ignored files); symlinks and special files are unsupported. For configured commands, an
+absent declaration means the inputs are unknown and the check is never reused; empty `paths` is invalid.
+When the declaration holds, a passing
+controller-run result may be reused within the same turn by the default `check` and the completion
+gate (never by `check` with `names`, which always runs, and never for reproductions) if fresh bounded
+snapshots show the inputs unchanged and no shell or extension effect occurred since; the result is
+labeled reused (`ran: false`). Missing, unreadable or oversized inputs disable reuse and the check
+runs normally. Keep toolchains and external resources stable, and do not declare checks that depend
+on network, time, randomness or other inputs you cannot list; Dial cannot detect an incomplete list.
+Snapshots are limited to 4,096 entries, 64 MiB total file content and 250 ms per capture; hitting
+any limit falls back to execution. Checks without a supported input snapshot also invalidate reusable evidence.
+The example is illustrative, not a dependency list for every Cargo project: include build scripts,
+workspace crates, configuration and fixtures that your command consumes. File timestamps and other
+unlisted filesystem metadata are not tracked; do not opt in checks whose results depend on them.
