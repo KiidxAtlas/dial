@@ -531,7 +531,8 @@ impl Composer {
                 self.queued.push_front((message, true));
             }
             self.queue_notice = Some(
-                "The turn ended before your steering was applied; it is queued to send next.".into(),
+                "The turn ended before your steering was applied; it is queued to send next."
+                    .into(),
             );
         }
         self.refresh();
@@ -1743,20 +1744,26 @@ impl Composer {
             let mut strip = Vec::new();
             for item in &self.explicit {
                 let (what, stage, tok) = match (item.kind, item.stage) {
-                    (SteerKind::Steer, SteerStage::Pending) => {
-                        ("steer", "pending: acts at the next safe point", Tok::Warning)
-                    }
+                    (SteerKind::Steer, SteerStage::Pending) => (
+                        "steer",
+                        "pending: acts at the next safe point",
+                        Tok::Warning,
+                    ),
                     (SteerKind::Steer, SteerStage::Received) => (
                         "steer",
                         "received: stale reply cancelled, running tools finish",
                         Tok::Accent,
                     ),
-                    (SteerKind::Steer, SteerStage::Applied) => {
-                        ("steer", "applied: now the current instruction", Tok::Success)
-                    }
-                    (SteerKind::Independent, SteerStage::Pending) => {
-                        ("worker", "pending: starts at the next safe point", Tok::Warning)
-                    }
+                    (SteerKind::Steer, SteerStage::Applied) => (
+                        "steer",
+                        "applied: now the current instruction",
+                        Tok::Success,
+                    ),
+                    (SteerKind::Independent, SteerStage::Pending) => (
+                        "worker",
+                        "pending: starts at the next safe point",
+                        Tok::Warning,
+                    ),
                     (SteerKind::Independent, SteerStage::Received) => {
                         ("worker", "received: starting", Tok::Accent)
                     }
@@ -1766,7 +1773,11 @@ impl Composer {
                 };
                 strip.push(Line::from(Span::styled(
                     text::ellipsize(
-                        &format!("{what} {stage} {} {}", theme.sym(Sym::Dot), text::one_line(&item.text)),
+                        &format!(
+                            "{what} {stage} {} {}",
+                            theme.sym(Sym::Dot),
+                            text::one_line(&item.text)
+                        ),
                         w,
                         theme.ascii(),
                     ),

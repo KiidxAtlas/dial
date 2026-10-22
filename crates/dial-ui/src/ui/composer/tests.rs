@@ -3371,19 +3371,35 @@ fn explicit_steer_is_separate_from_the_queue_and_reports_stages() {
     typed(&mut c, &env, "use the v2 API");
     press(&mut c, &env, KeyCode::Enter);
     let rows = screen(&c, &env, 100).join("\n");
-    assert!(rows.contains("Steer now") && rows.contains("Independent worker"), "{rows}");
+    assert!(
+        rows.contains("Steer now") && rows.contains("Independent worker"),
+        "{rows}"
+    );
     press(&mut c, &env, KeyCode::Down);
     press(&mut c, &env, KeyCode::Down);
     press(&mut c, &env, KeyCode::Enter);
-    assert!(c.queued_messages().is_empty(), "explicit steer never joins the queue");
-    assert!(c.take_steering().is_empty(), "automatic routing does not see it");
+    assert!(
+        c.queued_messages().is_empty(),
+        "explicit steer never joins the queue"
+    );
+    assert!(
+        c.take_steering().is_empty(),
+        "automatic routing does not see it"
+    );
     assert!(screen(&c, &env, 100).join("\n").contains("steer pending"));
     assert_eq!(c.take_explicit_steering(), ["use the v2 API"]);
     assert!(c.take_explicit_steering().is_empty());
     assert!(c.mark_explicit("use the v2 API", SteerStage::Received));
-    assert!(screen(&c, &env, 100).join("\n").contains("received: stale reply cancelled"));
+    assert!(
+        screen(&c, &env, 100)
+            .join("\n")
+            .contains("received: stale reply cancelled")
+    );
     assert!(c.mark_explicit("use the v2 API", SteerStage::Applied));
-    assert!(!c.mark_explicit("use the v2 API", SteerStage::Received), "stages never go back");
+    assert!(
+        !c.mark_explicit("use the v2 API", SteerStage::Received),
+        "stages never go back"
+    );
     assert!(!c.mark_explicit("unrelated", SteerStage::Applied));
 }
 

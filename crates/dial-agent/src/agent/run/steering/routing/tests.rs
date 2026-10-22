@@ -457,7 +457,10 @@ fn explicit_independent_message_never_steers_or_calls_a_classifier() {
                 .unwrap()
         );
         assert_eq!(ui.deferred, ["Write the changelog"]);
-        assert_eq!(agent.session.control_state()["current_instruction"], "Fix the parser");
+        assert_eq!(
+            agent.session.control_state()["current_instruction"],
+            "Fix the parser"
+        );
         assert!(ui.applied.is_empty() && ui.accepted.is_empty());
     });
     assert!(server.requests().is_empty());
@@ -468,8 +471,15 @@ fn committed_steering_reports_applied_only_after_journaling() {
     with_agent("", |agent| {
         active(agent);
         let mut ui = Input::default();
-        assert!(agent.accept_steering(vec!["Use v2".into()], &mut ui).unwrap());
+        assert!(
+            agent
+                .accept_steering(vec!["Use v2".into()], &mut ui)
+                .unwrap()
+        );
         assert_eq!(ui.applied, ["Use v2"]);
-        assert_eq!(agent.session.control_state()["current_instruction"], "Use v2");
+        assert_eq!(
+            agent.session.control_state()["current_instruction"],
+            "Use v2"
+        );
     });
 }

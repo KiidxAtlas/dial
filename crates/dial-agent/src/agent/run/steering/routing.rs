@@ -109,7 +109,12 @@ impl Agent<'_> {
                 }
                 Err(error) => {
                     // Persistence may fail after a worker actually started: never replay it.
-                    if self.live_tasks.running_ids().iter().any(|id| !before.contains(id)) {
+                    if self
+                        .live_tasks
+                        .running_ids()
+                        .iter()
+                        .any(|id| !before.contains(id))
+                    {
                         return Err(error);
                     }
                     ui.notice(&format!("Could not start an independent worker ({error:#}); your message is queued for after this turn."));

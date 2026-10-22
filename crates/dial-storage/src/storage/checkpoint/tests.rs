@@ -548,8 +548,15 @@ mod grouped_review {
         assert_eq!(groups[0].0, "main");
         let plan = cp.group_plan(turn, "worker-1").unwrap();
         assert_eq!(plan.safe, ["b.txt"]);
-        assert_eq!(plan.held.len(), 1, "shared file is held for individual review");
-        assert_eq!(cp.group_plan(turn, "main").unwrap().safe, Vec::<String>::new());
+        assert_eq!(
+            plan.held.len(),
+            1,
+            "shared file is held for individual review"
+        );
+        assert_eq!(
+            cp.group_plan(turn, "main").unwrap().safe,
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -565,17 +572,32 @@ mod grouped_review {
         // A concurrent edit of one file cancels the whole revert and keeps that edit.
         fs::write(root.path().join("b.txt"), "user edit").unwrap();
         assert!(cp.restore_files(turn, &items, false).is_err());
-        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "edited by w");
-        assert_eq!(fs::read_to_string(root.path().join("b.txt")).unwrap(), "user edit");
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "edited by w"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("b.txt")).unwrap(),
+            "user edit"
+        );
         let items: Vec<_> = ["a.txt", "b.txt"]
             .iter()
             .map(|p| (p.to_string(), cp.review_file(turn, p).unwrap().1))
             .collect();
         cp.restore_files(turn, &items, false).unwrap();
-        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "original");
-        assert_eq!(fs::read_to_string(root.path().join("b.txt")).unwrap(), "original");
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("b.txt")).unwrap(),
+            "original"
+        );
         cp.rollback(1).unwrap();
-        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "edited by w");
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "edited by w"
+        );
     }
 
     #[test]
@@ -584,12 +606,24 @@ mod grouped_review {
         let turn = cp.begin_turn("shared").unwrap();
         write(&cp, root.path(), "a.txt", "main");
         write(&cp, root.path(), "a.txt", "worker-1");
-        let items = vec![("a.txt".to_string(), cp.review_file(turn, "a.txt").unwrap().1)];
-        let error = cp.restore_files(turn, &items, false).unwrap_err().to_string();
+        let items = vec![(
+            "a.txt".to_string(),
+            cp.review_file(turn, "a.txt").unwrap().1,
+        )];
+        let error = cp
+            .restore_files(turn, &items, false)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("overlaps other work"), "{error}");
-        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "edited by worker-1");
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "edited by worker-1"
+        );
         cp.restore_files(turn, &items, true).unwrap();
-        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "original");
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "original"
+        );
     }
 
     #[test]
