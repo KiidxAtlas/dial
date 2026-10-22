@@ -1,5 +1,5 @@
 //! Grouped checkpoint review: which writer changed which file, which files overlap with other
-//! writers or later checkpointed turns, and an all-or-nothing multi-file revert.
+//! writers or later checkpointed turns, and a token-checked multi-file revert (not a transaction).
 //!
 //! Overlap is a *risk signal*, never proof of independence or of dependency: two writers touching
 //! one file, or a later turn recording the same path, means reverting may discard work that built on
@@ -76,7 +76,57 @@ pub struct GroupPlan {
     pub held: Vec<(String, String)>,
 }
 
+/// A file this revert wrote: path, manifest index, entry and the hash of what was written.
+type Written<'a> = (&'a str, usize, &'a Entry, Option<[u8; 32]>);
+
 impl Checkpoints {
+    /// Undo files this revert already wrote, newest first, from the revert's own checkpoint. A file
+    /// is put back only if it still holds exactly what the revert wrote, so edits made since are
+    /// never overwritten. Returns the paths left reverted.
+    fn put_back<'a>(&self, inner: &Inner, revert: u64, done: &[Written<'a>]) -> Vec<&'a str> {
+        let undo = inner.current.clone().unwrap_or_default();
+        let mut left = Vec::new();
+        for (written, _, entry, expected) in done.iter().rev() {
+            let restored = undo
+                .entries
+                .iter()
+                .enumerate()
+                .find(|(_, e)| e.display() == *written)
+                .filter(|_| self.disk_hash(entry).ok().as_ref() == Some(expected))
+                .map(|(i, e)| self.restore_entry(revert, i, e));
+            if !matches!(restored, Some(Ok(_))) {
+                left.push(*written);
+            }
+        }
+        left
+    }
+
+    /// SHA-256 of the file as it is on disk now; `None` when it does not exist.
+    fn disk_hash(&self, entry: &Entry) -> Result<Option<[u8; 32]>> {
+        use sha2::{Digest, Sha256};
+        let (target, _) = self.target_of(entry)?;
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.is_file() && meta.len() <= MAX_FILE_BYTES => {
+                Ok(Some(Sha256::digest(fs::read(&target)?).into()))
+            }
+            Ok(_) => bail!("not a regular file within the review limit"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Hash of what restoring `entry` writes: the saved bytes, or `None` for a created file.
+    fn saved_hash(&self, turn: u64, index: usize, entry: &Entry) -> Result<Option<[u8; 32]>> {
+        use sha2::{Digest, Sha256};
+        if !entry.existed {
+            return Ok(None);
+        }
+        let blob = turn_dir(&self.dir, turn)
+            .join("files")
+            .join(index.to_string());
+        Ok(Some(Sha256::digest(fs::read(blob)?).into()))
+    }
+
     fn manifest_in(&self, inner: &Inner, turn: u64) -> Result<Manifest> {
         if let Some(manifest) = inner.current.as_ref().filter(|m| m.turn == turn) {
             return Ok(manifest.clone());
@@ -129,7 +179,7 @@ impl Checkpoints {
         })
     }
 
-    /// Split a writer's files into those safe to revert together and those held for individual
+    /// Split a writer's files into those without recorded overlap and those held for individual
     /// review. Held: other writers, later checkpointed changes, or private paths.
     pub fn group_plan(&self, turn: u64, owner: &str) -> Result<GroupPlan> {
         let review = self.review_turn(turn)?;
@@ -154,11 +204,14 @@ impl Checkpoints {
         Ok(plan)
     }
 
-    /// Revert several files of `turn` all-or-nothing. Every `(path, token)` must match the
-    /// current review token; the checkpoint lock is held from verification through the writes, so
-    /// no other Dial writer can record into the checkpoint in between. A failure part-way restores
-    /// the files already written from the revert's own checkpoint. Edits by programs outside Dial
-    /// cannot be locked out: each file is compared again immediately before it is written.
+    /// Revert several files of `turn`. Every `(path, token)` must match the current review token
+    /// up front (nothing is written otherwise) and again immediately before that file's own write.
+    /// The checkpoint lock only keeps other checkpoint recording out; it does not exclude edit
+    /// tools or other programs, so a change can still land between a compare and its write.
+    ///
+    /// This is not a transaction. If a later file fails, files already written are put back only
+    /// when they still hold exactly what this revert wrote; any that changed since are left as
+    /// they are and the revert checkpoint is kept (`/undo` would overwrite them).
     ///
     /// A file with an overlap signal ([`ReviewFile::overlap`]) is refused unless
     /// `overlap_confirmed`. The revert gets its own checkpoint turn, so `/undo` reverses it.
@@ -239,50 +292,38 @@ impl Checkpoints {
                 return Err(error.context("could not checkpoint the revert; nothing restored"));
             }
         }
-        for (_, _, path, token) in &picked {
-            if self
-                .review_with(&manifest, path)
-                .map(|(_, now)| now)
-                .ok()
-                .as_deref()
-                != Some(*token)
-            {
+        // Each file is compared with its reviewed token immediately before its own write, and
+        // each write is remembered by content hash so a later failure only puts back files that
+        // still hold exactly what this revert wrote.
+        let mut done: Vec<Written<'_>> = Vec::new();
+        for (index, entry, path, token) in &picked {
+            let current = self.review_with(&manifest, path).map(|(_, now)| now).ok();
+            let failure = if current.as_deref() != Some(*token) {
+                Some(anyhow::anyhow!(
+                    "{path} changed after review; it was not written"
+                ))
+            } else {
+                self.saved_hash(turn, *index, entry)
+                    .and_then(|written| {
+                        self.restore_entry(turn, *index, entry)
+                            .map(|_| done.push((path, *index, entry, written)))
+                    })
+                    .err()
+            };
+            let Some(error) = failure else { continue };
+            let left = self.put_back(&inner, revert, &done);
+            if left.is_empty() {
                 abandon(&mut inner);
-                bail!("{path} changed during review; nothing restored");
+                return Err(error.context(
+                    "revert stopped; files it had already written were put back because they still held what it wrote",
+                ));
             }
+            // Retain the revert checkpoint: it holds the pre-revert content for /undo.
+            return Err(error.context(format!(
+                "revert stopped part-way. Left reverted (changed since the revert wrote them, or could not be put back): {}. The revert checkpoint is kept for /undo; review those files before using it, because /undo overwrites them.",
+                left.join(", ")
+            )));
         }
-        let mut done: Vec<&str> = Vec::new();
-        for (index, entry, path, _) in &picked {
-            match self.restore_entry(turn, *index, entry) {
-                Ok(_) => done.push(path),
-                Err(error) => {
-                    let undo = inner.current.clone().unwrap_or_default();
-                    let mut failed = Vec::new();
-                    for written in &done {
-                        let reverted = undo
-                            .entries
-                            .iter()
-                            .enumerate()
-                            .find(|(_, e)| e.display() == *written)
-                            .map(|(i, e)| self.restore_entry(revert, i, e));
-                        if !matches!(reverted, Some(Ok(_))) {
-                            failed.push(*written);
-                        }
-                    }
-                    if failed.is_empty() {
-                        abandon(&mut inner);
-                        return Err(error.context(format!(
-                            "could not restore {path}; files already written were put back"
-                        )));
-                    }
-                    // Keep the revert checkpoint so /undo can finish the job.
-                    return Err(error.context(format!(
-                        "could not restore {path}; {} could not be put back and remain reverted (see /undo)",
-                        failed.join(", ")
-                    )));
-                }
-            }
-        }
-        Ok(done.into_iter().map(str::to_owned).collect())
+        Ok(done.into_iter().map(|(p, ..)| p.to_owned()).collect())
     }
 }

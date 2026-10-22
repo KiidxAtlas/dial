@@ -159,6 +159,20 @@ impl App {
             Some(role) => settings_store::save_model_config(&self.layout, scope, changes, role)?,
             None => settings_store::save_config(&self.layout, scope, changes)?,
         };
+        self.adopt_settings(changes, role)
+    }
+
+    pub(crate) fn save_settings_checked(
+        &self,
+        scope: Scope,
+        changes: &[Change],
+        check: impl Fn(&Config) -> Result<()>,
+    ) -> Result<()> {
+        settings_store::save_config_checked(&self.layout, scope, changes, &self.overlay, check)?;
+        self.adopt_settings(changes, None)
+    }
+
+    fn adopt_settings(&self, changes: &[Change], role: Option<&str>) -> Result<()> {
         if let Some(models) = self.models.borrow_mut().as_mut() {
             let merged = settings_store::load_merged(&self.layout, &self.overlay)
                 .context("settings saved, but this session could not re-read them")?;

@@ -14,8 +14,8 @@ fn choices_only_dispatch_review_and_cover_every_capability() {
     assert_eq!(spec.command, "setup");
     assert_eq!(spec.verb, "choose");
     assert!(spec.remove.is_none());
-    assert_eq!(spec.items.len(), deps::RECIPES.len() + 3);
-    for id in ["providers", "memory", "embeddings"]
+    assert_eq!(spec.items.len(), deps::RECIPES.len() + 4);
+    for id in ["presets", "providers", "memory", "embeddings"]
         .into_iter()
         .chain(deps::RECIPES.iter().map(|r| r.id))
     {

@@ -8,6 +8,10 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 ### Changed
 - Automatic project understanding is on by default (`codebase.ambient_context = false` opts out): each user message gets a bounded, task-relevant brief of fresh saved findings and source outlines, with source links, stale findings named but never summarized, and no extra model request. A persisted `ambient_context = false` stays off.
 - `find` rows state their attribution (`via=lexical`, `via=exact-text`, `via=model-rerank`) and behavior mode appends a bounded related-evidence bundle (owner, type definitions, call-sites, config references; syntax vs lexical provenance, never edit witnesses). New optional `related` argument (`related=false` restores hit rows only).
+- Busy-message controls now offer explicit Steer now, after-turn queueing and Independent worker routing with receipt/application feedback. Steering cancels stale inference without pretending already-running tool effects were rolled back.
+- Checkpoint review groups files by task/worker attribution, previews bounded combined diffs, and permits file/group revert with overlap warnings and per-write content checks. Partial rollback preserves detected intervening edits and retains recovery checkpoints; group revert is not a filesystem transaction.
+- `/setup presets` reviews Local only, Local with approved hosted assistance and Hosted settings bundles, with project/global scope, explicit existing model choices, helper-role routing and pre-save override validation. No automatic downloads or provider probes.
+- Tool and provider failures include consolidated recovery guidance, distinguishing known effects, uncertain effects, retained output and the next safe action.
 
 ## [0.1.18] - 2026-10-22
 

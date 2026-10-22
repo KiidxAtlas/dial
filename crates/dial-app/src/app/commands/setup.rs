@@ -20,15 +20,17 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+mod presets;
+
 const TITLE: &str = "Setup";
 
-const USAGE: &str = "/setup                 guided setup: search, review, then confirm\n/setup list            list capabilities and their status as text\n/setup <id>            preview what would run and where it installs\n/setup <id> yes        set it up (prerequisites first), then save its settings\n/setup providers       connect a model provider\n/setup memory          choose a memory backend: what each needs and whether it is ready\n/setup memory <backend>   switch memory to off, provenance, local, hindsight, sharpshooter or semantic (all projects)\n/setup embeddings      list local embedding models (Ollama)\n/setup embeddings:<model> [yes]   preview, then pull the model and assign it to the embedding role (used by the semantic memory backend)";
+const USAGE: &str = "/setup                 guided setup: search, review, then confirm\n/setup presets [local-only|local-assisted|hosted] [project|global]   review and save a model-routing setup\n/setup list            list capabilities and their status as text\n/setup <id>            preview what would run and where it installs\n/setup <id> yes        set it up (prerequisites first), then save its settings\n/setup providers       connect a model provider\n/setup memory          choose a memory backend: what each needs and whether it is ready\n/setup memory <backend>   switch memory to off, provenance, local, hindsight, sharpshooter or semantic (all projects)\n/setup embeddings      list local embedding models (Ollama)\n/setup embeddings:<model> [yes]   preview, then pull the model and assign it to the embedding role (used by the semantic memory backend)";
 
 pub(super) const COMMANDS: &[super::CommandSpec] = &[super::CommandSpec {
     name: "setup",
     description: "check optional capabilities, set one up, choose memory, or sign in to providers",
     args_hint: "[<id> [yes]]",
-    subcommands: &["providers", "memory", "embeddings", "list"],
+    subcommands: &["presets", "providers", "memory", "embeddings", "list"],
 }];
 
 pub(super) fn run_command(
@@ -42,6 +44,9 @@ pub(super) fn run_command(
         return None;
     }
     let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.first() == Some(&"presets") {
+        return Some(presets::command(shell, app, agent, &parts[1..]));
+    }
     if parts.first() == Some(&"choose") {
         return Some(guided_command(shell, app, agent, &parts));
     }
@@ -78,7 +83,7 @@ pub(super) fn run_live(
     }
     let env = Env::current(&app.layout.user_dir);
     match parts.as_slice() {
-        [] | ["providers"] | ["choose" | "memory", ..] => return None,
+        [] | ["providers"] | ["choose" | "memory" | "presets", ..] => return None,
         ["list"] => {
             let config = app.reload().unwrap_or_else(|_| app.config.clone());
             shell.note(
@@ -101,6 +106,13 @@ pub(super) fn run_live(
 /// The picker emits only review/navigation commands, never the explicit `yes` form.
 fn setup_choices(env: &Env) -> ChoiceSpec {
     let mut items = vec![
+        ChoiceItem {
+            value: "presets".into(),
+            label: "Choose local or hosted setup".into(),
+            detail: "Local only, approved hosted assistance, or hosted; preview before saving"
+                .into(),
+            current: false,
+        },
         ChoiceItem {
             value: "providers".into(),
             label: "Connect a model provider".into(),
@@ -200,6 +212,7 @@ fn guided_command(
         return Ok(Step::Done);
     };
     match *id {
+        "presets" => return presets::command(shell, app, agent, &[]),
         "providers" => return shell.open(app, agent, Which::Providers),
         "embeddings" => {
             return shell.open(app, agent, Which::Choice(Box::new(embedding_choices())));
