@@ -160,7 +160,8 @@ pub fn detect(path: &Path) -> Option<LocalFormat> {
     gguf_file(path).map(|_| LocalFormat::Gguf)
 }
 
-/// The `llama-server` executable: `DIAL_LLAMA_SERVER`, else the first one on `PATH` or in a common
+/// The `llama-server` executable: `DIAL_LLAMA_SERVER`, else Dial's own install (`/setup llama-cpp`,
+/// at `tools/llama-cpp` as `setup::deps::install_dir` lays it out), else `PATH` or a common
 /// package-manager location.
 pub fn llama_server() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("DIAL_LLAMA_SERVER").filter(|v| !v.is_empty()) {
@@ -171,6 +172,13 @@ pub fn llama_server() -> Option<PathBuf> {
     } else {
         "llama-server"
     };
+    let user_dir = crate::config::types::default_user_dir();
+    if !user_dir.as_os_str().is_empty() {
+        let managed = user_dir.join("tools").join("llama-cpp").join(name);
+        if managed.is_file() {
+            return Some(managed);
+        }
+    }
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();

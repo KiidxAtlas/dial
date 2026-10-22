@@ -50,7 +50,7 @@ pub fn ensure_runtime_with(
     );
     ensure!(
         cfg!(target_os = "macos") && cfg!(target_arch = "aarch64"),
-        "local MLX requires macOS on Apple Silicon; use /providers to configure a hosted or OpenAI-compatible provider on Intel Macs or Linux/WSL2"
+        "the Python MLX runtime (for MLX models, training and steering) requires macOS on Apple Silicon; GGUF models run on llama.cpp and need no runtime install. Use /providers to configure a hosted or OpenAI-compatible provider"
     );
     let dir = layout.user_dir.join("python");
     crate::platform::atomic::private_dir(&dir)?;

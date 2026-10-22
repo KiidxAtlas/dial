@@ -109,6 +109,13 @@ macro_rules! brew_lsp {
     };
 }
 
+/// The llama.cpp server binary on this platform (GGUF models run on it).
+const LLAMA_SERVER: &str = if cfg!(windows) {
+    "llama-server.exe"
+} else {
+    "llama-server"
+};
+
 pub const RECIPES: &[Recipe] = &[
     Recipe {
         id: "bun",
@@ -361,6 +368,22 @@ pub const RECIPES: &[Recipe] = &[
         methods: &[
             Method::Brew("ollama"),
             Method::Manual("install Ollama from https://ollama.com/download"),
+        ],
+    },
+    Recipe {
+        id: "llama-cpp",
+        title: "llama.cpp (llama-server)",
+        requires: &[],
+        program: LLAMA_SERVER,
+        base: Base::Install,
+        artifact: LLAMA_SERVER,
+        // Homebrew where it exists; otherwise the pinned release archive (Windows and Linux x64).
+        methods: &[
+            Method::Brew("llama.cpp"),
+            Method::Download(prebuilt::LLAMA_CPP),
+            Method::Manual(
+                "install llama.cpp from https://github.com/ggml-org/llama.cpp/releases and set DIAL_LLAMA_SERVER to its llama-server",
+            ),
         ],
     },
 ];

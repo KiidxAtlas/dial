@@ -759,7 +759,7 @@ fn launch(
         }
         let program = llm::local_format::llama_server().ok_or_else(|| {
             Failure::Fatal(anyhow!(
-                "GGUF models need llama.cpp's `llama-server`: install llama.cpp (for example `brew install llama.cpp`) or set DIAL_LLAMA_SERVER to its path"
+                "GGUF models need llama.cpp's `llama-server`: run `/setup llama-cpp` to install it, or set DIAL_LLAMA_SERVER to an existing install"
             ))
         })?;
         let requested = requested_context(context);

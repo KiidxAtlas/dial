@@ -287,21 +287,21 @@ static FIELDS: &[Field] = &[
     field(
         DRAFT_MODEL,
         "Draft model",
-        "MLX server",
+        "Local runtime",
         Kind::Text,
         "A smaller model with the same tokenizer that drafts tokens for speculative decoding. Enter types a model id or path. Any value on this page replaces the global local_runtime for this model; Dial restarts its MLX server to apply it.",
     ),
     field(
         "local_runtime.num_draft_tokens",
         "Draft tokens",
-        "MLX server",
+        "Local runtime",
         int(1.0, 16.0, 1.0, 3.0),
         "Tokens the draft model proposes per step. Needs a draft model; default 3.",
     ),
     field(
         "local_runtime.kv_bits",
         "KV cache bits",
-        "MLX server",
+        "Local runtime",
         Kind::Choice {
             options: &["2", "3", "4", "6", "8"],
             optional: true,
@@ -312,7 +312,7 @@ static FIELDS: &[Field] = &[
     field(
         "local_runtime.kv_group_size",
         "KV group size",
-        "MLX server",
+        "Local runtime",
         Kind::Choice {
             options: &["32", "64", "128"],
             optional: true,
@@ -323,7 +323,7 @@ static FIELDS: &[Field] = &[
     field(
         "local_runtime.quantized_kv_start",
         "Quantize KV after",
-        "MLX server",
+        "Local runtime",
         int(0.0, 1_048_576.0, 1024.0, 4096.0),
         "Keep the first this-many tokens of the KV cache at full precision. Needs KV cache bits.",
     ),
@@ -358,7 +358,7 @@ fn shown(field: &Field, profile: &ModelProfile) -> bool {
                 _ => false,
             }
         }
-        "Chat template" | "MLX server" => mlx,
+        "Chat template" | "Local runtime" => mlx,
         "Ollama" => profile.provider == "ollama",
         "Caching" => !mlx && profile.provider != "lm-studio",
         "Reasoning" => !mlx || profile.capabilities.reasoning != ReasoningApi::None,

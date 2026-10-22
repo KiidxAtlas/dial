@@ -21,6 +21,8 @@ pub enum Format {
     TarGz,
     /// `.zip`: one top-level folder, then the files.
     Zip,
+    /// `.zip` with the files at its root and no top-level folder (llama.cpp's Windows builds).
+    FlatZip,
 }
 
 /// One release archive for one platform.
@@ -58,6 +60,7 @@ pub fn current_platform() -> Option<&'static str> {
         ("macos", "x86_64") => Some("darwin-x64"),
         ("linux", "x86_64") => Some("linux-x64"),
         ("linux", "aarch64") => Some("linux-arm64"),
+        ("windows", "x86_64") => Some("win32-x64"),
         _ => None,
     }
 }
@@ -158,6 +161,32 @@ pub const UV: Prebuilt = Prebuilt {
     ],
 };
 
+/// llama.cpp b11669 (llama-server), from its GitHub release. Windows x64 ships the server flat at
+/// the archive root; Linux x64 wraps it in one folder. Both digests were checked against the
+/// release's asset digests.
+pub const LLAMA_CPP: Prebuilt = Prebuilt {
+    version: "b11669",
+    binary: if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    },
+    assets: &[
+        Asset {
+            platform: "win32-x64",
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-win-cpu-x64.zip",
+            sha256: "37b3efcf962847ca869745fd4ccf7f5e7e8dacfeff9fa3523b4ca8cdc66d632b",
+            format: Format::FlatZip,
+        },
+        Asset {
+            platform: "linux-x64",
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-ubuntu-x64.tar.gz",
+            sha256: "cf07c1c112d709bd67e522017471de57ed0ec8bea031d732c5422351c07f65ac",
+            format: Format::TarGz,
+        },
+    ],
+};
+
 /// Downloads `asset` into `dest` (the install directory). The archive goes to a `.download` file
 /// beside `dest`, is checked against its pinned digest, unpacked into `<dest>.part`, and only then
 /// replaces `dest`. Any failure leaves no partial install behind.
@@ -190,7 +219,8 @@ pub fn fetch(
         fs::create_dir_all(&staging)?;
         match asset.format {
             Format::TarGz => extract_tar_gz(&archive, &staging)?,
-            Format::Zip => extract_zip(&archive, &staging)?,
+            Format::Zip => extract_zip(&archive, &staging, true)?,
+            Format::FlatZip => extract_zip(&archive, &staging, false)?,
         }
         let _ = fs::remove_dir_all(dest);
         fs::rename(&staging, dest).with_context(|| format!("installing {}", dest.display()))?;
@@ -205,7 +235,7 @@ pub fn fetch(
 
 /// The path inside the archive without its top-level folder. `None` for that folder itself.
 /// Anything that is not a plain name (`..`, absolute paths, prefixes) is an error.
-fn inside_top(raw: &Path) -> Result<Option<PathBuf>> {
+fn inside_top(raw: &Path, top_folder: bool) -> Result<Option<PathBuf>> {
     let mut parts = Vec::new();
     for component in raw.components() {
         match component {
@@ -214,10 +244,18 @@ fn inside_top(raw: &Path) -> Result<Option<PathBuf>> {
             _ => bail!("unsafe path in archive: {}", raw.display()),
         }
     }
-    if parts.len() <= 1 {
+    let rest = if top_folder {
+        if parts.len() <= 1 {
+            return Ok(None);
+        }
+        &parts[1..]
+    } else {
+        &parts[..]
+    };
+    if rest.is_empty() {
         return Ok(None);
     }
-    Ok(Some(parts[1..].iter().collect()))
+    Ok(Some(rest.iter().collect()))
 }
 
 /// Whether a symlink at `link_at` (relative to the install directory) with target `target`
@@ -248,7 +286,7 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
     for entry in tar.entries().context("reading the runtime archive")? {
         let mut entry = entry?;
         let raw = entry.path()?.into_owned();
-        let Some(rel) = inside_top(&raw)? else {
+        let Some(rel) = inside_top(&raw, true)? else {
             continue;
         };
         let target = dest.join(&rel);
@@ -292,7 +330,7 @@ fn symlink(_target: &Path, link: &Path) -> Result<()> {
     bail!("symlinks are not supported here: {}", link.display())
 }
 
-fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
+fn extract_zip(archive: &Path, dest: &Path, top_folder: bool) -> Result<()> {
     let file = File::open(archive).with_context(|| format!("reading {}", archive.display()))?;
     let mut zip = zip::ZipArchive::new(file).context("reading the runtime archive")?;
     let mut total: u64 = 0;
@@ -304,7 +342,7 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
                 .context("the runtime archive has a member name that is not UTF-8")?
                 .as_ref(),
         );
-        let Some(rel) = inside_top(&raw)? else {
+        let Some(rel) = inside_top(&raw, top_folder)? else {
             continue;
         };
         let target = dest.join(&rel);
