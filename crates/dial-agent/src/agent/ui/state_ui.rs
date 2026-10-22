@@ -434,6 +434,15 @@ impl Ui for StateUi<'_> {
     fn pending_message_accepted(&mut self, text: &str) {
         self.inner.pending_message_accepted(text)
     }
+    fn take_independent_messages(&mut self) -> Vec<String> {
+        self.inner.take_independent_messages()
+    }
+    fn defer_pending_messages(&mut self, messages: Vec<String>) {
+        self.inner.defer_pending_messages(messages)
+    }
+    fn steering_applied(&mut self, text: &str) {
+        self.inner.steering_applied(text)
+    }
     fn maintenance_ready(&mut self) -> bool {
         self.inner.maintenance_ready()
     }

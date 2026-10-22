@@ -110,6 +110,11 @@ pub trait WriteObserver: Send + Sync {
     fn before_delete(&self, abs: &Path) -> Result<()> {
         self.before_write(abs)
     }
+    /// An observer that attributes its writes to `owner` (a worker label), for grouped review.
+    /// Observers that do not attribute return `None` and are shared as they are.
+    fn scoped(&self, _owner: &str) -> Option<Arc<dyn WriteObserver>> {
+        None
+    }
 }
 
 #[derive(Clone, Default)]

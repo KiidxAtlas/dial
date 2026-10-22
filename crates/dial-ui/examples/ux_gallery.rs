@@ -13,7 +13,7 @@ use dial_llm::{
 use dial_storage::storage::session::SessionInfo;
 use dial_ui::ui::{
     Rows,
-    composer::{CommandEntry, CommandKind, Composer, ComposerCtx},
+    composer::{CommandEntry, CommandKind, Composer, ComposerCtx, SteerStage},
     keys::Keymap,
     overlay::{
         DrawCtx,
@@ -336,6 +336,39 @@ fn main() -> anyhow::Result<()> {
                 crossterm::event::KeyModifiers::NONE,
             ),
             &working_ctx,
+        );
+        // Explicit steering: Steer now is the third choice; the strip shows only reported stages.
+        let key = |code| {
+            crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+        };
+        composer.handle_key(key(crossterm::event::KeyCode::Enter), &working_ctx);
+        composer.handle_key(key(crossterm::event::KeyCode::Down), &working_ctx);
+        composer.handle_key(key(crossterm::event::KeyCode::Down), &working_ctx);
+        composer.handle_key(key(crossterm::event::KeyCode::Enter), &working_ctx);
+        screen(
+            &mut out,
+            &format!("Steer now: pending / {name}"),
+            &rows_buffer(composer.view(width, &working_ctx).rows, width, 8),
+            light,
+        );
+        let steer = composer.take_explicit_steering();
+        for text in &steer {
+            composer.mark_explicit(text, SteerStage::Received);
+        }
+        screen(
+            &mut out,
+            &format!("Steer now: received / {name}"),
+            &rows_buffer(composer.view(width, &working_ctx).rows, width, 8),
+            light,
+        );
+        for text in &steer {
+            composer.mark_explicit(text, SteerStage::Applied);
+        }
+        screen(
+            &mut out,
+            &format!("Steer now: applied / {name}"),
+            &rows_buffer(composer.view(width, &working_ctx).rows, width, 8),
+            light,
         );
         composer.set_draft("");
         let view = composer.view(

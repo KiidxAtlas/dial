@@ -125,3 +125,22 @@ fn feedback_is_compact_first_and_full_on_repetition_with_the_tag_kept() {
     assert!(feedback("effects_unknown", "Inspect.", 1).contains(DIAGNOSE_FIRST));
     assert_eq!(feedback("timeout", "a", 3), feedback("timeout", "a", 3));
 }
+
+#[test]
+fn recovery_report_preserves_uncertain_effects_and_partial_capture() {
+    let mut observed = process(1);
+    observed.output_complete = false;
+    let output = ToolOutput::err("original diagnostic")
+        .with_process(observed)
+        .with_status(ToolStatus::Timeout)
+        .with_changes(["changed.rs".into()])
+        .with_effects(Effects::Unknown);
+    let facts = output.execution.clone();
+    let (kind, advice) = classify(&call("bash"), &output).unwrap();
+    let rendered = report(&call("bash"), &output, kind, advice, 1);
+    assert_eq!(kind, "effects_unknown");
+    assert_eq!(output.execution, facts);
+    assert!(!output.process_outcome().unwrap().output_complete);
+    assert!(rendered.contains(advice));
+    assert!(rendered.contains(ToolStatus::Timeout.as_str()));
+}

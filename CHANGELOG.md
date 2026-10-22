@@ -5,6 +5,10 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+### Changed
+- Automatic project understanding is on by default (`codebase.ambient_context = false` opts out): each user message gets a bounded, task-relevant brief of fresh saved findings and source outlines, with source links, stale findings named but never summarized, and no extra model request. A persisted `ambient_context = false` stays off.
+- `find` rows state their attribution (`via=lexical`, `via=exact-text`, `via=model-rerank`) and behavior mode appends a bounded related-evidence bundle (owner, type definitions, call-sites, config references; syntax vs lexical provenance, never edit witnesses). New optional `related` argument (`related=false` restores hit rows only).
+
 ## [0.1.18] - 2026-10-22
 
 ### Fixed

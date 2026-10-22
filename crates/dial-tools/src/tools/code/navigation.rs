@@ -1,5 +1,6 @@
 //! Deterministic repository retrieval: lexical evidence and actual syntax declarations, not embeddings.
 mod cache;
+mod related;
 mod semantic;
 use crate::config::types::Config;
 use crate::tools::fs::walk::Walk;
@@ -42,7 +43,7 @@ impl Tool for Find {
     fn schema(&self) -> Value {
         tool_schema(
             "find",
-            "Find implementation evidence from a behavior description. Behavior mode defaults to deterministic local retrieval over lexical/syntax candidates. Set ranking=semantic to have the configured model rerank bounded candidates (one extra model request), which can surface declarations with no matching query terms; evidence stays grounded to indexed paths and spans. Exact mode matches literal text case-sensitively (including multiline) deterministically. Optional lsp_path requests actual language-server metadata.",
+            "Find implementation evidence from a behavior description. Behavior mode defaults to deterministic local retrieval over lexical/syntax candidates; every row states its attribution (via=lexical, via=exact-text or via=model-rerank). By default (related=true in behavior mode) the top hits also get a bounded related-evidence bundle: the enclosing owner and signature type definitions (syntax spans), plus call-sites, mentions and config references found by whole-word lexical match (not a resolved call graph or symbol resolution). Related rows are navigation aids, never edit witnesses: read the lines before editing. Set related=false for hit rows only. Set ranking=semantic to have the configured model rerank bounded candidates (one extra model request), which can surface declarations with no matching query terms; evidence stays grounded to indexed paths and spans. Exact mode matches literal text case-sensitively (including multiline) deterministically and omits the bundle unless related=true. Optional lsp_path requests actual language-server metadata, the only resolved-symbol source.",
             json!({
                 "query": {"type":"string", "description":"Behavior description, quoted mandatory phrases, or exact text"},
                 "path": {"type":"string", "description":"File/directory scope, default workspace"},
@@ -51,6 +52,7 @@ impl Tool for Find {
                 "grep_keywords": {"type":"array", "items":{"type":"string"}, "description":"Optional known literal terms to boost in behavior mode"},
                 "lsp_path": {"type":"string", "description":"Optional source file selecting a real language server for supplementary workspace-symbol metadata; startup needs approval"},
                 "lsp_query": {"type":"string", "description":"Optional exact symbol query for language-server metadata, defaults to query"},
+                "related": {"type":"boolean", "description":"Append bounded related owner/type/call-site/config evidence for the top hits (lexical provenance, not resolved). Defaults to true in behavior mode and false in exact mode."},
                 "limit": {"type":"integer", "minimum":1, "maximum":100}
             }),
             &["query"],
@@ -676,7 +678,7 @@ fn find(ws: &Workspace, args: &Value) -> Result<String, String> {
     let mut out = String::from(
         "Retrieval: deterministic lexical + syntax declarations; scores are relevance points (no embeddings).\n",
     );
-    let mut chosen: Vec<(&str, usize, usize)> = vec![];
+    let mut chosen: Vec<(&str, usize, usize, &str)> = vec![];
     for hit in &retrieved.results {
         if chosen.len() >= retrieved.limit {
             break;
@@ -684,29 +686,88 @@ fn find(ws: &Workspace, args: &Value) -> Result<String, String> {
         if !retrieved.exact
             && chosen
                 .iter()
-                .any(|(p, s, e)| *p == hit.path && *s <= hit.end && hit.start <= *e)
+                .any(|(p, s, e, _)| *p == hit.path && *s <= hit.end && hit.start <= *e)
         {
             continue;
         }
         let row = format!(
-            "{}:{}-{} score={} [{}] source_sha256={} {}\n",
-            hit.path, hit.start, hit.end, hit.score, hit.kind, hit.source_sha256, hit.snippet
+            "{}:{}-{} score={} via={} [{}] source_sha256={} {}\n",
+            hit.path,
+            hit.start,
+            hit.end,
+            hit.score,
+            if retrieved.exact {
+                "exact-text"
+            } else {
+                "lexical"
+            },
+            hit.kind,
+            hit.source_sha256,
+            hit.snippet
         );
         if out.len() + row.len() > MAX_OUTPUT {
             break;
         }
         out.push_str(&row);
-        chosen.push((&hit.path, hit.start, hit.end));
+        chosen.push((&hit.path, hit.start, hit.end, &hit.source_sha256));
     }
     if chosen.is_empty() {
         out.push_str("No matching evidence.\n");
     }
+    let targets: Vec<(&str, usize, usize, &str)> = chosen.clone();
     out.push_str(&format!(
         "[{} results]\n{}",
         chosen.len(),
         retrieved.coverage
     ));
+    out.push_str(&related_section(
+        ws,
+        args,
+        retrieved.exact,
+        &targets,
+        MAX_OUTPUT.saturating_sub(out.len()),
+    )?);
     Ok(out)
+}
+/// `related` defaults to true in behavior mode and false in exact mode; an explicit value wins.
+fn related_enabled(args: &Value, exact: bool) -> Result<bool, String> {
+    match args.get("related") {
+        None | Some(Value::Null) => Ok(!exact),
+        Some(Value::Bool(flag)) => Ok(*flag),
+        Some(_) => Err("argument \"related\" must be a boolean".into()),
+    }
+}
+/// Bounded related-evidence bundle for the top hits; empty when disabled or no room remains.
+fn related_section(
+    ws: &Workspace,
+    args: &Value,
+    exact: bool,
+    hits: &[(&str, usize, usize, &str)],
+    budget: usize,
+) -> Result<String, String> {
+    if !related_enabled(args, exact)? || hits.is_empty() {
+        return Ok(String::new());
+    }
+    let scope = ws.resolve(opt_str(args, "path")?.unwrap_or("."))?;
+    Ok(related_for(ws, &scope, hits, budget))
+}
+fn related_for(
+    ws: &Workspace,
+    scope: &Path,
+    hits: &[(&str, usize, usize, &str)],
+    budget: usize,
+) -> String {
+    let targets: Vec<related::Target> = hits
+        .iter()
+        .take(related::MAX_TARGETS)
+        .map(|(path, start, end, sha)| related::Target {
+            path: (*path).to_owned(),
+            start: *start,
+            end: *end,
+            sha256: (*sha).to_owned(),
+        })
+        .collect();
+    related::render(ws, scope, &targets, budget.min(6 * 1024))
 }
 fn rank(a: &Evidence, b: &Evidence) -> std::cmp::Ordering {
     b.score

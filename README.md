@@ -123,7 +123,7 @@ Useful first commands in the UI:
 | `/settings` | Configuration hub |
 | `Ctrl-P` | Action palette |
 | `/todo` | Browse the current work plan |
-| `/review` | Inspect checkpoint changes, then revert or undo them |
+| `/review-file` | Review checkpoint changes by writer group or file, then keep, revert or undo them |
 | `/help`, `/hotkeys` | Commands and shortcuts |
 
 [docs/terminal-interface.md](docs/terminal-interface.md) covers shortcuts and panels.

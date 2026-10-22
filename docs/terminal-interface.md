@@ -68,12 +68,22 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   complete, `Esc` dismisses without losing the draft. `Enter` sends exactly what you typed, so a full command
   runs at once; accept a highlighted suggestion with `Tab`/`Right` first. File mentions (`@path`) are the
   exception: `Enter` completes the highlighted file. Built-ins win over a custom command with the same name.
-- While a turn runs, submitting a non-command draft opens **a message-intent chooser**:
-  **Add direction now** or **Queue for after this turn**. Nothing is sent just by opening it.
-  Choose with the list navigation keys and confirm; Escape returns to the unchanged draft.
-  Adding direction cancels the pending model request or discards its stale response before
-  executing tools. A tool already running may finish; unstarted actions are skipped and completed
-  results retained. The latest instruction takes precedence over conflicting older plans.
+- While a turn runs, submitting a non-command draft opens **a message-intent chooser**. Nothing is
+  sent just by opening it; Escape returns to the unchanged draft. The options are:
+  **Send now** (Dial decides whether it steers this task or starts an independent worker),
+  **Send after this turn** (queued, unchanged), **Steer now** and **Independent worker**.
+  **Steer now** is an explicit redirect: it cancels the pending model request or discards its stale
+  response before any of its tool calls run. A tool already running may finish (only waits that
+  are safe to interrupt are interrupted); unstarted actions are skipped and completed results are
+  retained. The latest instruction takes precedence over conflicting older plans.
+  **Independent worker** starts a separate worker for exactly that message while the current task
+  continues; it never steers the running task and no model classifies it. If a worker cannot
+  start (spawning disabled, capacity, interruption) the message is queued as a follow-up instead.
+  Explicit messages are shown above the composer with the stage Dial actually reported:
+  *pending* (typed, not yet read by the agent; it acts at the next safe point), *received*
+  (the agent took it and is cancelling the stale reply) and *applied* (recorded as the current
+  instruction, or the worker started). If the turn ends before a message was applied it is queued
+  to send next rather than lost. They are not part of `/queue`.
   `Option+Enter` on macOS (`Alt+Enter` elsewhere) still queues a follow-up directly.
   The queue above the composer previews up to three messages and counts the rest.
   Empty Enter with queued work opens a separate choice, defaulting to **Keep working**;
@@ -159,13 +169,23 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   draft in an external editor.
 - Resuming displays durable todos and recorded check statuses; these are history, not fresh test
   results. Completed tools are not replayed automatically. `/review` reviews a frozen local or GitHub
-  PR scope with source-backed findings; `/review-file` lists checkpoint turns, and
-  `/review-file <turn> [path]` previews a turn with **Keep / Revert file / Cancel**.
+  PR scope with source-backed findings; `/review-file` lists checkpoint turns, then groups the turn's changes by writer
+  (`main` or a worker label; checkpoints from before attribution show as `unattributed`).
+  A group offers **Review files** and **Revert safe files**. Safe files were changed only by that
+  writer and in no later checkpointed turn; they revert together all-or-nothing, with one `/undo`
+  checkpoint. A file written by several writers, or changed again in a later turn, is marked
+  *overlap*: that is a risk signal, not proof either way, so it is never part of a group revert and
+  a single-file revert asks for separate confirmation. No signal does not prove a file is
+  independent of other code (a renamed function and its callers). `/review-file <turn> [path]`
+  previews one file with **Keep / Revert file / Cancel**. The review also says how many shell
+  commands and extension calls in the latest turn were not checkpointed: their effects cannot be
+  shown or reverted here. Files too large to checkpoint are listed as not reviewable.
   A revert includes all changes shown for that file, including your own edits: review carefully.
   Changes after preview are refused, other files are untouched, and the revert has its own `/undo`
   checkpoint. Private, binary or oversized interactive diffs require manual review.
-  Comparison and restore are not filesystem-atomic against external writers; avoid editing the
-  selected file concurrently with a revert.
+  Dial's own writers are locked out during a revert and every file is re-compared immediately
+  before it is written, but this is not filesystem-atomic against external programs; avoid editing
+  the selected files concurrently with a revert.
 - Request status distinguishes waiting, model loading, prompt processing, generation, retry and
   cancellation. Time without a worker progress event is separate from total task elapsed time.
   `/model restart` explicitly confirms unloading only Dial's managed local main model, which reloads

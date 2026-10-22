@@ -154,13 +154,14 @@ impl Engine {
                 }
                 let consecutive = self.failures.entry((call.name.clone(), kind)).or_default();
                 *consecutive += 1;
-                output
-                    .text
-                    .push_str(&crate::agent::run::failure_guidance::feedback(
-                        kind,
-                        advice,
-                        *consecutive,
-                    ));
+                let recovery = crate::agent::run::failure_guidance::report(
+                    call,
+                    output,
+                    kind,
+                    advice,
+                    *consecutive,
+                );
+                output.text.push_str(&recovery);
             }
             None => self.failures.retain(|(tool, _), _| *tool != call.name),
         }

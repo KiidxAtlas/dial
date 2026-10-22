@@ -8,6 +8,9 @@ struct Input {
     notices: Vec<String>,
     cancel: Option<Arc<AtomicBool>>,
     during_reply: Option<String>,
+    independent: Vec<String>,
+    deferred: Vec<String>,
+    applied: Vec<String>,
 }
 impl Ui for Input {
     fn request_phase(&mut self, phase: crate::agent::RequestPhase) {
@@ -25,6 +28,15 @@ impl Ui for Input {
     }
     fn pending_message_accepted(&mut self, text: &str) {
         self.accepted.push(text.into());
+    }
+    fn take_independent_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.independent)
+    }
+    fn defer_pending_messages(&mut self, messages: Vec<String>) {
+        self.deferred.extend(messages);
+    }
+    fn steering_applied(&mut self, text: &str) {
+        self.applied.push(text.into());
     }
     fn notice(&mut self, text: &str) {
         self.notices.push(text.into());
@@ -426,4 +438,38 @@ fn occupied_worker_capacity_routes_next_input_without_classification() {
         // One classifier and one child request, never a classifier for the second message.
         assert_eq!(server.requests().len(), 2);
     }
+}
+
+#[test]
+fn explicit_independent_message_never_steers_or_calls_a_classifier() {
+    let server = llm::fake::serve(vec![]);
+    with_agent("[task]\nmax_recursion_depth=0", |agent| {
+        active(agent);
+        let mut ui = Input {
+            independent: vec!["Write the changelog".into()],
+            ..Default::default()
+        };
+        // No worker can start in this fixture: the message is handed back as a follow-up and the
+        // active instruction is untouched.
+        assert!(
+            !agent
+                .route_pending_messages(&mut backend(&server.url), &mut ui)
+                .unwrap()
+        );
+        assert_eq!(ui.deferred, ["Write the changelog"]);
+        assert_eq!(agent.session.control_state()["current_instruction"], "Fix the parser");
+        assert!(ui.applied.is_empty() && ui.accepted.is_empty());
+    });
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn committed_steering_reports_applied_only_after_journaling() {
+    with_agent("", |agent| {
+        active(agent);
+        let mut ui = Input::default();
+        assert!(agent.accept_steering(vec!["Use v2".into()], &mut ui).unwrap());
+        assert_eq!(ui.applied, ["Use v2"]);
+        assert_eq!(agent.session.control_state()["current_instruction"], "Use v2");
+    });
 }

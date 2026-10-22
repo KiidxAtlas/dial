@@ -342,7 +342,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         MO,
         "Project understanding",
         "Ambient codebase context",
-        "Prepend saved architecture notes and source outlines relevant to each user message. Off leaves retrieval to the codebase_memory tool, which the model calls when it needs the saved understanding.",
+        "Attach a bounded brief of fresh saved architecture notes, findings and source outlines relevant to each user message (no extra model request; stale findings are only named). Off leaves retrieval to the codebase_memory tool, which the model calls when it needs the saved understanding.",
         Kind::Bool,
         true
     ),
