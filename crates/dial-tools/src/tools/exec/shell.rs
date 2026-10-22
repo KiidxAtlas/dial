@@ -442,14 +442,7 @@ fn run_bash(
                     .into(),
             );
         }
-        if asynchronous
-            || resolve_runner(
-                ws.shell_backend,
-                find_system_bash(),
-                cfg!(feature = "embedded-shell"),
-                cfg!(windows),
-            )? != Runner::Embedded
-        {
+        if asynchronous || runner_for(ws)? != Runner::Embedded {
             return Err(
                 "named shell state requires the embedded backend and foreground execution".into(),
             );
@@ -501,6 +494,10 @@ fn run_bash(
 
     if cancel.load(Ordering::Acquire) {
         return Ok(ToolOutput::err("[cancelled before command started]\n"));
+    }
+    // Background requests need a child process, so they take the child-host path below.
+    if !asynchronous && session.is_none() && runner_for(ws)? == Runner::InProcess {
+        return inprocess::run(ws, &command, &cwd, timeout_secs, on_output, cancel);
     }
     let mut spool = ws
         .artifacts()
@@ -789,6 +786,8 @@ enum Runner {
     PowerShell,
     /// Dial's built-in shell, hosted by a child Dial process.
     Embedded,
+    /// Dial's built-in shell run inside this process; allowed only with `sandbox.mode = "off"`.
+    InProcess,
 }
 
 /// Maps `shell.backend` to a runner. `auto` prefers bash, then the built-in shell, then PowerShell
@@ -818,12 +817,36 @@ fn resolve_runner(
             "shell.backend is \"powershell\" but PowerShell is only available on Windows; set shell.backend to \"system\" or \"embedded\""
                 .into(),
         ),
+        ShellBackend::InProcess if embedded_built => Ok(Runner::InProcess),
+        ShellBackend::InProcess => Err(
+            "the in-process shell is not in this build (the embedded-shell feature is disabled); set shell.backend to \"system\""
+                .into(),
+        ),
         ShellBackend::Embedded if embedded_built => Ok(Runner::Embedded),
         ShellBackend::Embedded => Err(
             "the built-in shell is not in this build (the embedded-shell feature is disabled); set shell.backend to \"system\""
                 .into(),
         ),
     }
+}
+
+/// The runner for this workspace. The in-process shell shares Dial's address space, credentials
+/// and file access, so it is refused unless the operator turned the OS sandbox off; it never
+/// falls back to another backend or runs beside a configured sandbox.
+fn runner_for(ws: &Workspace) -> Result<Runner, String> {
+    let runner = resolve_runner(
+        ws.shell_backend,
+        find_system_bash(),
+        cfg!(feature = "embedded-shell"),
+        cfg!(windows),
+    )?;
+    if runner == Runner::InProcess && !ws.unsandboxed {
+        return Err(
+            "shell.backend is \"inprocess\", which runs commands inside the Dial process and is allowed only when sandbox.mode is \"off\"; nothing was run. Set sandbox.mode to \"off\", or set shell.backend to \"auto\", \"system\" or \"embedded\""
+                .into(),
+        );
+    }
+    Ok(runner)
 }
 
 /// The bash `auto` and `system` use: `/bin/bash` on Unix; on Windows Git for Windows' `bash.exe`
@@ -876,6 +899,7 @@ pub fn shell_label(backend: ShellBackend) -> String {
         Ok(Runner::Bash(path)) => format!("bash ({})", path.display()),
         Ok(Runner::PowerShell) => "PowerShell".into(),
         Ok(Runner::Embedded) => "built-in shell".into(),
+        Ok(Runner::InProcess) => "in-process shell (sandbox off only)".into(),
         Err(error) => format!("unavailable ({error})"),
     }
 }
@@ -919,12 +943,14 @@ fn shell_command_with_state(
     owned_terminal: Option<i32>,
     state: Option<&Path>,
 ) -> Result<std::process::Command, String> {
-    let runner = resolve_runner(
-        ws.shell_backend,
-        find_system_bash(),
-        cfg!(feature = "embedded-shell"),
-        cfg!(windows),
-    )?;
+    let runner = runner_for(ws)?;
+    // Background jobs and tool helpers need a child process; they run the same shell in a child
+    // host (only reachable with the sandbox off, which `runner_for` verified).
+    let runner = if runner == Runner::InProcess {
+        Runner::Embedded
+    } else {
+        runner
+    };
     #[cfg(windows)]
     {
         if !ws.unsandboxed {
@@ -1009,7 +1035,7 @@ fn shell_command_with_state(
                 bash.to_str().ok_or("bash path is not UTF-8")?.to_owned(),
                 vec!["-c".to_owned(), script.to_owned()],
             ),
-            Runner::Embedded => embedded_invocation(&scratch, script, state)?,
+            Runner::Embedded | Runner::InProcess => embedded_invocation(&scratch, script, state)?,
             Runner::PowerShell => return Err("PowerShell is only available on Windows".into()),
         };
         let mut spawn;
@@ -1061,8 +1087,13 @@ fn shell_command_with_state(
     }
 }
 
+mod inprocess;
+
 #[cfg(test)]
 mod backend_tests;
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod inprocess_tests;

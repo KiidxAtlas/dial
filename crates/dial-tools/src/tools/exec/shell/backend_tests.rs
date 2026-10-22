@@ -105,3 +105,24 @@ fn git_bash_needs_bash_and_git_from_the_same_installation() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn inprocess_resolves_ignoring_installed_bash() {
+    assert_eq!(
+        resolve_runner(ShellBackend::InProcess, Some(bash()), true, false),
+        Ok(Runner::InProcess)
+    );
+}
+
+#[test]
+fn inprocess_without_the_feature_is_a_clear_error() {
+    let err = resolve_runner(ShellBackend::InProcess, Some(bash()), false, false).unwrap_err();
+    assert!(err.contains("embedded-shell"), "{err}");
+}
+
+#[test]
+fn inprocess_config_name_round_trips() {
+    let backend: ShellBackend = serde_json::from_str("\"inprocess\"").unwrap();
+    assert_eq!(backend, ShellBackend::InProcess);
+    assert_eq!(serde_json::to_string(&backend).unwrap(), "\"inprocess\"");
+}

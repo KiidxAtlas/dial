@@ -8,6 +8,7 @@
 
 #[cfg(feature = "embedded-shell")]
 pub mod builtins;
+pub mod inprocess;
 pub mod state;
 
 #[cfg(any(test, feature = "embedded-shell"))]

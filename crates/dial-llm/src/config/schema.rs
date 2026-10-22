@@ -191,6 +191,7 @@ const SHELL_BACKEND: EnumValues = &[
     ("auto", "Auto"),
     ("system", "System"),
     ("embedded", "Embedded"),
+    ("inprocess", "In-process (sandbox off only)"),
     ("powershell", "PowerShell"),
 ];
 const EDIT_MODE: EnumValues = &[
@@ -924,6 +925,7 @@ static REGISTRY: &[SettingDef] = &[
     tools::DECLARATIONS[43],
     tools::DECLARATIONS[44],
     tools::DECLARATIONS[45],
+    tools::DECLARATIONS[46],
 ];
 const _: () = assert!(
     REGISTRY.len()

@@ -46,7 +46,7 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         TO,
         "Shell",
         "Bash backend",
-        "Which shell runs bash commands. Auto: Git Bash or /bin/bash when found, otherwise the built-in shell (on Windows without it: PowerShell). System: bash only (Git for Windows on Windows). Embedded: Dial's built-in shell. PowerShell: Windows only.",
+        "Which shell runs bash commands. Auto: Git Bash or /bin/bash when found, otherwise the built-in shell (on Windows without it: PowerShell). System: bash only (Git for Windows on Windows). Embedded: Dial's built-in shell. In-process: the built-in shell inside Dial itself; refused unless sandbox.mode is off. PowerShell: Windows only.",
         Kind::Enum(SHELL_BACKEND),
         true
     ),
@@ -373,6 +373,15 @@ pub(super) static DECLARATIONS: &[SettingDef] = &[
         "Verification",
         "Configured check runners",
         "Map configured check names to executable program and optional module. Identifies unavailable runners without treating arbitrary application import errors as setup failures.",
+        Kind::Table,
+    ),
+    field!(
+        "verification.inputs",
+        verification.inputs,
+        TO,
+        "Verification",
+        "Declared check inputs",
+        "TOML map of configured check names to paths (workspace-relative files or directories, recursive) and environment names. Operator assertion that the deterministic, side-effect-free check reads no other workspace input, enabling result reuse; external tools and toolchains must stay stable. Unknown shell or extension effects block reuse. Check name and command string must be unique.",
         Kind::Table,
     ),
     field!(
