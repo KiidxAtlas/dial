@@ -967,7 +967,8 @@ fn shell_command_with_state(
                 spawn.args(["-c", script]);
                 spawn
             }
-            Runner::Embedded => {
+            // `InProcess` was mapped to `Embedded` above; both run the child shell host here.
+            Runner::Embedded | Runner::InProcess => {
                 let (program, args) = embedded_invocation(&scratch, script, state)?;
                 let mut spawn = std::process::Command::new(program);
                 spawn.args(args);
