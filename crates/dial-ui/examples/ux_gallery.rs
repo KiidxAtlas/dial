@@ -338,9 +338,8 @@ fn main() -> anyhow::Result<()> {
             &working_ctx,
         );
         // Explicit steering: Steer now is the third choice; the strip shows only reported stages.
-        let key = |code| {
-            crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
-        };
+        let key =
+            |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
         composer.handle_key(key(crossterm::event::KeyCode::Enter), &working_ctx);
         composer.handle_key(key(crossterm::event::KeyCode::Down), &working_ctx);
         composer.handle_key(key(crossterm::event::KeyCode::Down), &working_ctx);

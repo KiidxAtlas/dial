@@ -29,9 +29,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 pub(in crate::app) mod busy;
+mod checkpoint_review;
 pub(in crate::app) mod command;
 pub(in crate::app) mod help;
-mod checkpoint_review;
 pub(in crate::app) mod improve;
 pub(in crate::app) mod input;
 pub(in crate::app) mod lifecycle;

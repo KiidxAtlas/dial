@@ -82,7 +82,9 @@ impl Ui for Bridge<'_> {
         self.pump();
         let taken = self.shell.composer.take_explicit_steering();
         for text in &taken {
-            self.shell.composer.mark_explicit(text, SteerStage::Received);
+            self.shell
+                .composer
+                .mark_explicit(text, SteerStage::Received);
         }
         if !taken.is_empty() {
             self.repaint(true);
@@ -94,7 +96,9 @@ impl Ui for Bridge<'_> {
         self.pump();
         let taken = self.shell.composer.take_explicit_independent();
         for text in &taken {
-            self.shell.composer.mark_explicit(text, SteerStage::Received);
+            self.shell
+                .composer
+                .mark_explicit(text, SteerStage::Received);
         }
         taken
     }
