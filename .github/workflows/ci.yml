@@ -7,6 +7,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same PR supersedes its running checks. Pushes to main each finish.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: fmt, build, test (${{ matrix.os }})

@@ -16,8 +16,9 @@ def checks_pass(case, workspace):
             path = workspace / check["path"]
             results.append(path.is_file() and path.read_bytes() == check["content"].encode())
         elif check["kind"] == "command":
+            # Command checks may run a cold `cargo test`; 15s was too tight on shared CI runners.
             result = subprocess.run(check["command"], cwd=workspace, shell=True,
-                                    capture_output=True, timeout=15)
+                                    capture_output=True, timeout=120)
             results.append(result.returncode == check.get("expect_exit", 0))
         else:
             raise AssertionError("quality cases require executable outcome checks")
