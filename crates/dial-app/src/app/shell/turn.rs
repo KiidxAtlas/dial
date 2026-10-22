@@ -6,6 +6,7 @@ use crate::app::core::App;
 use crate::app::display::local_time;
 use crate::app::drive::Step;
 use crate::app::shell::teach::TEACH_OFF;
+use crate::app::shell::turn_report;
 use crate::app::shell::{PAINT_EVERY, Shell};
 use crate::config::types::Outcome;
 use crate::platform;
@@ -162,6 +163,10 @@ impl Shell {
             Ok(report) => report.outcome,
             Err(_) => crate::agent::TurnOutcome::Failed,
         };
+        let summary = agent.session().control_state()["turn_summary"].clone();
+        if let Some(report) = turn_report::render(&summary) {
+            self.note("Turn report", report);
+        }
         if let Some(notice) =
             crate::ui::termcaps::turn_end_notice(outcome, self.ui.notify, self.ui.notify_errors)
         {
