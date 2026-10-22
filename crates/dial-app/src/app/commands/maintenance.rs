@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex, mpsc};
 pub(super) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "advisor",
-        description: "review turn evidence and request bounded repairs with the coach (on, off, status)",
-        args_hint: "on|off|status",
-        subcommands: &["on", "off", "status"],
+        description: "coach reviews each tool round and the final reply (on, completion, off, status)",
+        args_hint: "on|completion|off|status",
+        subcommands: &["on", "completion", "off", "status"],
     },
     CommandSpec {
         name: "external-thinking",
@@ -139,26 +139,42 @@ fn toggle(args: &str, usage: &str) -> Result<Option<bool>> {
 
 fn advisor(shell: &mut Shell, agent: &mut Agent<'_>, args: &str) -> Result<()> {
     const TITLE: &str = "Advisor";
-    let wanted = match toggle(args, "/advisor on|off|status") {
-        Ok(wanted) => wanted,
-        Err(error) => {
-            shell.note(TITLE, error.to_string());
-            return Ok(());
+    let wanted = if args == "completion" {
+        agent.set_advisor_completion_only();
+        None
+    } else {
+        match toggle(args, "/advisor on|completion|off|status") {
+            Ok(wanted) => wanted,
+            Err(error) => {
+                shell.note(TITLE, error.to_string());
+                return Ok(());
+            }
         }
     };
     if let Some(on) = wanted {
         agent.set_advisor(on);
     }
     let model = agent.advisor_model();
-    let state = if agent.advisor_enabled() { "on" } else { "off" };
+    let state = match (agent.advisor_enabled(), agent.advisor_completion_only()) {
+        (false, _) => "off",
+        (true, true) => "on (completion only)",
+        (true, false) => "on",
+    };
+    let scope = if agent.advisor_completion_only() {
+        "reviews tool evidence before completion"
+    } else {
+        "reviews each tool round (notes reach the next request; an unresolved blocker is re-raised once before completion) and reviews tool evidence before completion"
+    };
     let text = match (agent.advisor_enabled(), model) {
         (true, Some(model)) => format!(
-            "{state}: {model} reviews tool evidence before completion and can request one repair pass, then reviews the result. Normal approvals and limits apply. Remote coaching requires escalation.allow_remote=true. For this process only."
+            "{state}: {model} {scope} and can request one repair pass, then reviews the result. Notes are unverified. Normal approvals and limits apply. Remote coaching requires escalation.allow_remote=true. For this process only."
         ),
         (true, None) => format!(
             "{state}, but no `coach` model role is assigned, so reviews are skipped. Assign one in /models → Roles."
         ),
-        (false, Some(model)) => format!("{state}. /advisor on reviews turns with {model}."),
+        (false, Some(model)) => format!(
+            "{state}. /advisor on reviews turns with {model}; /advisor completion reviews only before completion."
+        ),
         (false, None) => {
             format!("{state}. Assign a `coach` model role in /models → Roles, then /advisor on.")
         }

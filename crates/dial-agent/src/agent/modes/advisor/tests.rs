@@ -93,3 +93,80 @@ fn review_allowance_survives_continuations_but_resets_on_new_instruction() {
     assert_eq!(state.repairs, 0);
     assert!(state.completion_note().is_empty());
 }
+
+#[test]
+fn round_review_parses_severities_and_rejects_malformed_output() {
+    let round =
+        parse_round(r#"{"severity":"concern","note":"  the test was never run  "}"#).unwrap();
+    assert_eq!(round.severity, Severity::Concern);
+    assert_eq!(round.note, "the test was never run");
+    assert_eq!(
+        parse_round(r#"{"severity":"none"}"#).unwrap().severity,
+        Severity::None
+    );
+    assert!(parse_round("looks fine").is_err());
+    assert!(parse_round(r#"{"severity":"fatal","note":"x"}"#).is_err());
+    assert!(parse_round(r#"{"severity":"blocker","note":"  "}"#).is_err());
+    assert!(parse_round(r#"{"severity":"aside","note":"x","extra":1}"#).is_err());
+    let long = format!(r#"{{"severity":"aside","note":"{}"}}"#, "é".repeat(5000));
+    assert!(parse_round(&long).unwrap().note.len() < 2 * MAX_NOTE_CHARS + 64);
+}
+
+#[test]
+fn severity_maps_to_guidance_priority_with_blocker_above_loop_and_todo() {
+    assert_eq!(Severity::None.priority(), None);
+    assert_eq!(Severity::Aside.priority(), Some(Priority::Todo));
+    assert_eq!(Severity::Concern.priority(), Some(Priority::Review));
+    assert_eq!(Severity::Blocker.priority(), Some(Priority::Blocker));
+    assert!(Priority::Safety < Priority::Blocker);
+    assert!(Priority::Blocker < Priority::Loop && Priority::Blocker < Priority::Todo);
+    let mut state = CoachTurn::default();
+    let note = state
+        .apply_round(&parse_round(r#"{"severity":"blocker","note":"wrong file"}"#).unwrap())
+        .unwrap();
+    assert_eq!(note["dial_guidance"], "blocker");
+    assert_eq!(note["dial_transient"], true);
+    assert!(note["content"].as_str().unwrap().contains("wrong file"));
+    assert!(
+        state
+            .apply_round(&parse_round(r#"{"severity":"none"}"#).unwrap())
+            .is_none()
+    );
+}
+
+#[test]
+fn blocker_is_reraised_once_then_reported_and_cleared_when_resolved() {
+    let mut state = CoachTurn::default();
+    assert!(state.reraise_blocker().is_none());
+    state.apply_round(&parse_round(r#"{"severity":"blocker","note":"wrong file"}"#).unwrap());
+    assert!(state.reraise_blocker().is_some());
+    assert!(state.reraise_blocker().is_none());
+    assert!(
+        state
+            .completion_note()
+            .contains("Unresolved advisor blocker")
+    );
+    assert!(state.completion_note().contains("wrong file"));
+    state.apply_round(&parse_round(r#"{"severity":"none"}"#).unwrap());
+    assert!(state.completion_note().is_empty());
+}
+
+#[test]
+fn round_evidence_is_bounded_and_consumed_per_review() {
+    let mut state = CoachTurn::default();
+    assert!(state.round_question("goal").is_none());
+    for n in 0..20 {
+        state.observe("read", &format!("{n}"), false, false);
+    }
+    let question = state.round_question("goal").unwrap();
+    assert_eq!(
+        question["evidence"].as_array().unwrap().len(),
+        MAX_ROUND_EVIDENCE
+    );
+    assert!(state.round_question("goal").is_none());
+}
+
+#[test]
+fn completion_only_launch_is_off_by_default() {
+    assert!(!crate::agent::modes::cli::Launch::default().advisor_completion_only);
+}

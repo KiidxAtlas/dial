@@ -225,7 +225,19 @@ api_key_env = "OPENAI_API_KEY"
 ```
 
 **Actionable advisor mode** (`--advisor` or `/advisor on`) is a separate, launch-scoped opt-in.
-Before accepting a completed reply or `finish(completed)`, the coach reviews the original goal,
+While it is on, the coach also reviews every main-agent round that ran tool calls (live review):
+it sees the user goal and a bounded summary of that round's tool results and returns
+`{severity: none|aside|concern|blocker, note}`. A non-`none` note is added to the next request as
+one advisory guidance note and shown in the UI labelled by severity. Priorities: a blocker ranks
+just below Safety and above failure, loop and todo reminders; a concern is a review-tier note; an
+aside is a todo-tier note (only the highest-priority advisory note is sent per request). An
+unresolved blocker blocks silent completion: it is re-raised once at the completion review
+(bounded; the turn is not held further) and, if still unresolved, appended to the final reply as
+an unverified advisor blocker. Live review is bounded (at most 24 reviews per user turn), is
+skipped in hermetic and plan mode and for workers, and never aborts a turn: a refused or
+malformed review produces one notice and switches live review off for the rest of the turn with
+no retry. `/advisor completion` keeps the completion-only behaviour described below; with the
+advisor off no extra requests are made. Before accepting a completed reply or `finish(completed)`, the coach reviews the original goal,
 proposed reply and a bounded ledger of recent tool results (including check failures). It must
 identify specific gaps, reference supplied evidence and propose local checks—not just comment
 on the answer. Supported findings return to the active tool loop for one repair opportunity;

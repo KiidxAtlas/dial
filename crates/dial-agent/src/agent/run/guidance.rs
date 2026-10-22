@@ -1,6 +1,6 @@
 //! At most one advisory harness note per model request.
 //!
-//! Advisory notes (loop warnings, failure coaching, review and todo reminders) are tagged with a
+//! Advisory notes (advisor blockers, loop warnings, failure coaching, review and todo reminders) are tagged with a
 //! priority and assembled at the request tail. Several can become due in the same request; small
 //! models follow one clear instruction better than a stack of competing ones, so only the
 //! highest-priority note is sent. Dropping a note only removes model-facing text: refusals,
@@ -22,6 +22,8 @@ pub(in crate::agent) enum Priority {
     /// An uncertain effect or enforced boundary the model must account for. Today's tail has no
     /// such note: uncertain effects stop the turn and refusals arrive as tool results.
     Safety,
+    /// An unresolved advisor blocker: the coach judged the work cannot be correct as it stands.
+    Blocker,
     /// Recovery from failed or rejected calls: failed rounds, rejected todo updates, contract
     /// breaks.
     Failure,
@@ -36,8 +38,9 @@ pub(in crate::agent) enum Priority {
 }
 
 impl Priority {
-    pub(in crate::agent) const ALL: [Self; 6] = [
+    pub(in crate::agent) const ALL: [Self; 7] = [
         Self::Safety,
+        Self::Blocker,
         Self::Failure,
         Self::Repetition,
         Self::Loop,
@@ -48,6 +51,7 @@ impl Priority {
     fn as_str(self) -> &'static str {
         match self {
             Self::Safety => "safety",
+            Self::Blocker => "blocker",
             Self::Failure => "failure",
             Self::Repetition => "repetition",
             Self::Loop => "loop",
