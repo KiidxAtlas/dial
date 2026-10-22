@@ -167,9 +167,19 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
 - `/rename <title>` names a session; `/export [path] [--html]` exports Markdown or self-contained
   HTML without overwriting existing files. `/copy` copies the last answer; `Ctrl-G` opens the
   draft in an external editor.
+- A turn that edited files, was interrupted or failed ends with a **Turn report** note: outcome, changed
+  files, recorded checks (and whether they are current with the final edits), open tasks, what `/undo`
+  can revert, and which shell or extension calls ran outside checkpoints and cannot be undone. Plain
+  answers with no edits show no report. The summary is stored in session control state as `turn_summary`.
 - Resuming displays durable todos and recorded check statuses; these are history, not fresh test
   results. Completed tools are not replayed automatically. `/review` reviews a frozen local or GitHub
-  PR scope with source-backed findings; `/review-file` lists checkpoint turns, then groups the turn's changes by writer
+  PR scope with source-backed findings (the captured diff is split on `diff --git` file boundaries into
+  chunks of at most 20,000 bytes, byte-splitting only a single larger file; chunks run concurrently as
+  read-only `reviewer` tasks up to `task.max_concurrency`, and an interrupt cancels all of them. Findings are
+  merged, exact duplicates (path, range, title) dropped, and sorted by priority then confidence. The report
+  shows target identity, an unchanged/stale line, a verdict (`do not ship` for any P0/P1; else `inconclusive`
+  if any chunk failed or was inconclusive; else `ship with fixes` for P2/P3 only; else `ship`), counts per
+  priority, and findings grouped P0..P3, followed by the same data as machine-readable JSON); `/review-file` lists checkpoint turns, then groups the turn's changes by writer
   (`main` or a worker label; checkpoints from before attribution show as `unattributed`).
   A group offers **Review files** and **Revert unshared files**. Unshared files were changed only
   by that writer and in no later checkpointed turn. Group revert first shows the combined diff
