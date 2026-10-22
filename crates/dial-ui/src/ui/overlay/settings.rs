@@ -304,6 +304,68 @@ pub(super) fn editor_spans(
     )
 }
 
+/// A one-row tab strip of plain names two cells apart. It windows around `active` (drawn in the
+/// active style when `highlight`), and an ellipsis on either side says more tabs are there
+/// instead of clipping a name mid-word.
+pub(super) fn tab_strip(
+    theme: &Theme,
+    names: &[&str],
+    active: usize,
+    highlight: bool,
+    w: usize,
+) -> Line<'static> {
+    if names.is_empty() {
+        return Line::default();
+    }
+    let gap = 2;
+    let mark = theme.sym(Sym::Ellipsis);
+    let mark_w = text::width(mark);
+    let active = active.min(names.len() - 1);
+    let span_w = |from: usize, to: usize| {
+        names[from..=to]
+            .iter()
+            .map(|n| text::width(n))
+            .sum::<usize>()
+            + gap * (to - from)
+    };
+    let needs = |start: usize| {
+        1 + if start > 0 { mark_w + 1 } else { 0 }
+            + span_w(start, active)
+            + if active + 1 < names.len() {
+                gap + mark_w
+            } else {
+                0
+            }
+    };
+    let mut start = 0;
+    while start < active && needs(start) > w {
+        start += 1;
+    }
+    let more = theme.fg(Tok::Dim);
+    let mut spans = vec![Span::raw(" ")];
+    let mut used = 1;
+    if start > 0 {
+        spans.push(Span::styled(format!("{mark} "), more));
+        used += mark_w + 1;
+    }
+    for (i, name) in names.iter().enumerate().skip(start) {
+        let sep = if i > start { gap } else { 0 };
+        let reserve = if i + 1 < names.len() { gap + mark_w } else { 0 };
+        let need = sep + text::width(name);
+        if i > active && used + need + reserve > w {
+            spans.push(Span::styled(format!("{}{mark}", " ".repeat(sep)), more));
+            break;
+        }
+        spans.push(Span::raw(" ".repeat(sep)));
+        spans.push(Span::styled(
+            (*name).to_owned(),
+            tab_style(theme, highlight && i == active),
+        ));
+        used += need;
+    }
+    Line::from(fit(spans, w))
+}
+
 #[cfg(test)]
 pub(super) mod testkit;
 
@@ -1481,6 +1543,14 @@ impl SettingsOverlay {
         self.feedback = None;
         if is_ctrl(key, 's') {
             self.scope = other_scope(self.scope);
+            // The title's scope label is shed on narrow panels, so say what changed here too.
+            self.feedback = Some(
+                match self.scope {
+                    Scope::Global => "Changes now save for all projects",
+                    Scope::Project => "Changes now save for this project only",
+                }
+                .to_owned(),
+            );
             return OverlayEvent::None;
         }
         if is_ctrl(key, 'l') && !keys.matches(Action::TabNext, key) {
@@ -1513,6 +1583,10 @@ impl SettingsOverlay {
             self.cursor = self.cursor.saturating_sub(self.page);
         } else if keys.matches(Action::SelectPageDown, key) {
             self.cursor = (self.cursor + self.page).min(last);
+        } else if key.code == KeyCode::Home {
+            self.cursor = 0;
+        } else if key.code == KeyCode::End {
+            self.cursor = last;
         } else if keys.matches(Action::SelectConfirm, key) {
             return self.activate();
         } else if keys.matches(Action::TabNext, key) {
@@ -1824,6 +1898,7 @@ impl SettingsOverlay {
             _ => return OverlayEvent::None,
         };
         let is_theme = matches!(def.kind_for(&self.effective), Kind::Theme);
+        let page = self.page.max(1);
         let Mode::Pick {
             choices,
             cursor,
@@ -1912,8 +1987,12 @@ impl SettingsOverlay {
         } else if keys.matches(Action::SelectDown, key) {
             Some(if pos >= last { 0 } else { pos + 1 })
         } else if keys.matches(Action::SelectPageUp, key) {
-            Some(0)
+            Some(pos.saturating_sub(page))
         } else if keys.matches(Action::SelectPageDown, key) {
+            Some((pos + page).min(last))
+        } else if filter.text.is_empty() && key.code == KeyCode::Home {
+            Some(0)
+        } else if filter.text.is_empty() && key.code == KeyCode::End {
             Some(last)
         } else {
             None
@@ -2000,7 +2079,15 @@ impl SettingsOverlay {
             Scope::Global => "All projects",
             Scope::Project => "This project",
         };
-        let extra = format!("Save to: {scope} {} Ctrl+S", ctx.theme.sym(Sym::Dot));
+        // Narrow panels shed the key, then the label, so the scope never runs into the title.
+        let full = format!("Save to: {scope} {} Ctrl+S", ctx.theme.sym(Sym::Dot));
+        let short = format!("Save to: {scope}");
+        let extra = super::palette::title_extra(
+            ctx.theme,
+            "Settings",
+            frame.area().width,
+            &[&full, &short, scope, ""],
+        );
         panel(
             frame,
             ctx.theme,
@@ -2018,6 +2105,17 @@ impl SettingsOverlay {
         self.cursor = self.cursor.min(rows.len().saturating_sub(1));
         let cursor_row = rows.get(self.cursor).copied();
         let appearance = matches!(cursor_row, Some(Row::Setting(i)) if crate::config::schema::registry()[i].tab == "Appearance");
+        // The preview row appears only when the status line has something to show for it.
+        let preview_label = " Preview: ";
+        let preview_room = w.saturating_sub(preview_label.len());
+        let preview = (appearance && preview_room > 0)
+            .then(|| {
+                (ctx.preview_status)(
+                    &self.preview_config(),
+                    preview_room.min(usize::from(u16::MAX)) as u16,
+                )
+            })
+            .filter(|line| line.width() > 0);
         let body_min = h.min(3);
         let mut spare = h - body_min;
         let mut grant = || {
@@ -2031,7 +2129,7 @@ impl SettingsOverlay {
         // Keep navigation and search visible before optional details on short terminals.
         let (show_footer, show_search, show_tabs, show_desc, show_desc2) =
             (grant(), grant(), grant(), grant(), grant());
-        let show_preview = appearance && grant();
+        let show_preview = preview.is_some() && grant();
         let body_rows = h - [
             show_tabs,
             show_footer,
@@ -2095,6 +2193,9 @@ impl SettingsOverlay {
                         .map(|choice| self.choice_label(def, choice))
                         .collect();
                     let visible = pick_matches(&labels, choices, &filter.text);
+                    // Show every match the panel has room for (beside the setting row, its
+                    // section header and the filter line); short panels keep the usual window.
+                    let pick_rows = body_rows.saturating_sub(3).max(PICK_ROWS);
                     if choices.len() > PICK_ROWS || !filter.text.is_empty() {
                         items.push(Item::Filter {
                             editor: filter.clone(),
@@ -2110,9 +2211,9 @@ impl SettingsOverlay {
                     }
                     let at = visible.iter().position(|&n| n == *cursor).unwrap_or(0);
                     let first = at
-                        .saturating_sub(3)
-                        .min(visible.len().saturating_sub(PICK_ROWS));
-                    for &n in visible.iter().skip(first).take(PICK_ROWS) {
+                        .saturating_sub(pick_rows / 2)
+                        .min(visible.len().saturating_sub(pick_rows));
+                    for &n in visible.iter().skip(first).take(pick_rows) {
                         if n == *cursor {
                             cursor_item = items.len();
                         }
@@ -2417,17 +2518,9 @@ impl SettingsOverlay {
                 });
             }
         }
-        if show_preview {
-            let label = " Preview: ";
-            let mut spans = vec![Span::styled(label, theme.fg(Tok::Muted))];
-            let room = w.saturating_sub(label.len());
-            if room > 0 {
-                let line = (ctx.preview_status)(
-                    &self.preview_config(),
-                    room.min(usize::from(u16::MAX)) as u16,
-                );
-                spans.extend(fit(line.spans, room));
-            }
+        if show_preview && let Some(preview) = preview {
+            let mut spans = vec![Span::styled(preview_label, theme.fg(Tok::Muted))];
+            spans.extend(fit(preview.spans, preview_room));
             lines.push(Line::from(fit(spans, w)));
         }
         if show_footer {
@@ -2444,37 +2537,23 @@ impl SettingsOverlay {
             .chain(std::iter::once(PROVIDERS_TAB))
             .collect();
         // Plain words, two cells apart: the active tab's accent and underline mark it, so icons
-        // would only add noise. The strip scrolls to keep the active tab in view.
-        let gap = 2;
-        let widths: Vec<usize> = names.iter().map(|n| text::width(n) + gap).collect();
-        let mut start = 0;
-        while start < self.tab && widths[start..=self.tab].iter().sum::<usize>() > w {
-            start += 1;
-        }
-        let mut spans = vec![Span::raw(" ")];
-        for (i, name) in names.iter().enumerate().skip(start) {
-            if i > start {
-                spans.push(Span::raw(" ".repeat(gap)));
-            }
-            let style = tab_style(theme, i == self.tab && self.search.is_empty());
-            spans.push(Span::styled((*name).to_owned(), style));
-        }
-        Line::from(fit(spans, w))
+        // would only add noise.
+        tab_strip(theme, &names, self.tab, self.search.is_empty(), w)
     }
 
+    /// The search field reads as an input: a muted label, then the query with its caret, or a
+    /// placeholder. It carries no selection marker; only the selected row does.
     fn search_line(&self, theme: &Theme, w: usize) -> Line<'static> {
-        let prompt = Span::styled(
-            format!(" {} ", theme.sym(Sym::Prompt)),
-            theme.fg(Tok::Accent),
-        );
+        let label = Span::styled(" Search: ", theme.fg(Tok::Muted));
         let spans = if self.search.is_empty() {
             vec![
-                prompt,
-                Span::styled("Type to search all settings", theme.fg(Tok::Dim)),
+                label,
+                Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED)),
+                Span::styled("type a setting name, path or keyword", theme.fg(Tok::Dim)),
             ]
         } else {
             vec![
-                prompt,
+                label,
                 Span::styled(text::one_line(&self.search), theme.fg(Tok::Text)),
                 Span::styled(" ", theme.fg(Tok::Text).add_modifier(Modifier::REVERSED)),
             ]
@@ -2509,14 +2588,13 @@ impl SettingsOverlay {
         for section in sections {
             let on = Some(section) == active;
             let label = text::ellipsize(section, width.saturating_sub(3), theme.ascii());
+            // The section holding the selection is named in the accent; the selection marker
+            // belongs to the selected row alone.
             out.push(if on {
-                vec![
-                    Span::styled(
-                        format!(" {} ", theme.sym(Sym::Pointer)),
-                        theme.fg(Tok::Accent),
-                    ),
-                    Span::styled(label, theme.fg(Tok::Accent).add_modifier(Modifier::BOLD)),
-                ]
+                vec![Span::styled(
+                    format!("   {label}"),
+                    theme.fg(Tok::Accent).add_modifier(Modifier::BOLD),
+                )]
             } else {
                 vec![Span::styled(format!("   {label}"), theme.fg(Tok::Muted))]
             });

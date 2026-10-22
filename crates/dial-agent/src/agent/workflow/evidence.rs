@@ -1,13 +1,10 @@
 //! Model-context projection leaves append-only evidence untouched on disk.
 use serde_json::{Value, json};
 use std::collections::HashSet;
-/// Estimated tokens of one message (bytes/4): enough to compare against a budget, not to bill.
+/// Provider-neutral wire estimate, never billed usage. Include structured text, tool calls,
+/// native replay and images just as request sizing does; metadata is not model context.
 pub(in crate::agent) fn estimate(message: &Value) -> usize {
-    (message["content"].as_str().map_or(0, str::len)
-        + message["tool_calls"]
-            .as_array()
-            .map_or(0, |calls| calls.iter().map(|c| c.to_string().len()).sum()))
-        / 4
+    usize::try_from(crate::llm::wire::estimate(message)).unwrap_or(usize::MAX)
 }
 
 /// Which results were already replaced, by supersession or by pruning. A result is replaced at most once:
@@ -98,10 +95,10 @@ pub fn project(messages: &mut [Value], memo: &mut Supersession, policy: &Policy)
         }
     }
     let mut suffix = vec![0usize; messages.len()];
-    let mut running = 0;
+    let mut running = 0usize;
     for i in (0..messages.len()).rev() {
         suffix[i] = running;
-        running += estimate(&messages[i]);
+        running = running.saturating_add(estimate(&messages[i]));
     }
     let mut latest: HashSet<String> = HashSet::new();
     let mut stale = vec![false; messages.len()];

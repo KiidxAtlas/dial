@@ -38,6 +38,7 @@ fn rebinding_cancels_old_workers_without_projecting_them_into_the_new_session() 
             interrupt: cancel.clone(),
             worker: None,
             active_tool: Arc::new(Mutex::new(None)),
+            delivered: false,
         },
     );
     let new = crate::runtime::Tree::default();
@@ -121,4 +122,52 @@ fn immediate_preview_surfaces_trailing_blockers_before_narrative() {
     );
     assert!(result.text.contains("not_verified"));
     assert!(result.text.contains("artifact://full"));
+}
+
+#[test]
+fn completion_is_visible_before_pumping_and_an_early_ack_is_not_redelivered() {
+    let mut tasks = LiveTasks::default();
+    let body = tasks.tree.start("worker", "published result", None);
+    body.settle(
+        String::new(),
+        Some(json!({"id":"task-1","status":"running","assignment":{"task":"inspect"},"started_ms":12})),
+        crate::runtime::Phase::Running,
+    );
+    tasks.jobs.insert(
+        "task-1".into(),
+        JobState {
+            body: body.clone(),
+            interrupt: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            active_tool: Arc::default(),
+            delivered: false,
+        },
+    );
+    let value = json!({"id":"task-1","status":"failed","result":"retention failed","data":{"dial_effects":"unknown"}});
+    settle_result(&body, &value);
+    let status = tasks.status(Some("task-1")).unwrap();
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["assignment"]["task"], "inspect");
+    assert_eq!(status["started_ms"], 12);
+    assert_eq!(status["data"]["dial_effects"], "unknown");
+    assert!(tasks.running_ids().is_empty());
+    tasks.acknowledge(&status);
+    tasks.tx.send(Event::Done("task-1".into(), value)).unwrap();
+    struct View;
+    impl Ui for View {}
+    tasks.pump(
+        Approval::Ask,
+        false,
+        &mut Vec::new(),
+        std::path::Path::new("."),
+        &[],
+        None,
+        &mut None,
+        &mut View,
+    );
+    assert!(tasks.undelivered().is_empty());
+    assert_eq!(
+        body.read(|node| node.result.phase),
+        crate::runtime::Phase::Failed
+    );
 }

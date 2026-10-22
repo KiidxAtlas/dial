@@ -115,3 +115,34 @@ fn compaction_releases_withheld_repeats_so_the_same_read_runs_in_full() {
     assert!(duplicate.is_none() && repeat_advice.is_none() && stop.is_none());
     assert_eq!(fresh.text, "alpha body");
 }
+
+#[test]
+fn repeated_reads_prefer_the_short_pointer_and_keep_recovery_enforcement() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path()).unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    let mut engine = Engine::default();
+    for (id, duplicate) in [("first", false), ("second", true)] {
+        let mut result = output("alpha body");
+        let (pointer, _, _) = engine.settle(
+            &workspace,
+            &read(id, "a.txt"),
+            &mut result,
+            false,
+            false,
+            |_| true,
+        );
+        assert_eq!(
+            pointer
+                .as_deref()
+                .is_some_and(investigation::is_unchanged_read),
+            duplicate
+        );
+        assert_eq!(result.text, "alpha body");
+    }
+    assert!(
+        engine
+            .rejection_at(&workspace, &read("third", "a.txt"))
+            .is_some()
+    );
+}

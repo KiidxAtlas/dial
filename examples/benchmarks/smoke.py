@@ -128,6 +128,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if case == "goal-compaction":
             if "phase=finish" in prompt:
                 return write("result.txt", self.goal(transcript))
+            if "phase=remember" in prompt:
+                return self.text("Remembering the original acceptance goal without writing it yet."), "stop"
             if "read" not in names:
                 return call("read", {"path": "context.txt"})
             return self.text("Archival distractors do not override the immutable goal."), "stop"
@@ -197,7 +199,7 @@ def main():
     variants = parser.add_mutually_exclusive_group()
     variants.add_argument("--profiles", type=pathlib.Path, help="operator profile-comparison file; copied unchanged, configurations must exist")
     variants.add_argument("--machine-repetitions", type=int, choices=range(1, 11), help="exercise repeated baseline/compact-tool configurations against the local scripted provider")
-    parser.add_argument("--suite", choices=("capabilities", "recovery"), default="capabilities", help="select executable harness cases; scripted runs are not model-quality evidence")
+    parser.add_argument("--suite", choices=("capabilities", "recovery", "compaction"), default="capabilities", help="select executable harness cases; scripted runs are not model-quality evidence")
     args = parser.parse_args()
     binary = args.dial.resolve(strict=True)
     fixtures = pathlib.Path(__file__).resolve().parent

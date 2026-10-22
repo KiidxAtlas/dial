@@ -61,6 +61,7 @@ struct JobState {
     interrupt: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     active_tool: ActiveTool,
+    delivered: bool,
 }
 impl JobState {
     fn status(&self) -> Value {
@@ -91,6 +92,25 @@ struct ControlJob {
 fn job_status(job: &ControlJob) -> Value {
     job.body
         .read(|n| n.result.data.clone().unwrap_or(Value::Null))
+}
+
+/// Publish the terminal result before exposing completion to control handles or releasing a lease.
+/// Merge rather than replace so assignment, timing and route metadata survive failures too.
+fn settle_result(body: &crate::runtime::Body, value: &Value) {
+    let mut data = body.read(|node| node.result.data.clone().unwrap_or(json!({})));
+    if let (Some(target), Some(fields)) = (data.as_object_mut(), value.as_object()) {
+        target.extend(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    data["phase"] = value["status"].clone();
+    body.settle(
+        value["result"].as_str().unwrap_or("").into(),
+        Some(data),
+        crate::runtime::Phase::from_status(value["status"].as_str().unwrap_or("failed")),
+    );
 }
 #[derive(Clone)]
 pub struct LiveTaskControl {
@@ -226,10 +246,11 @@ impl Drop for WorkerExit {
         if self.reported {
             return;
         }
-        self.team.retire(&self.id);
-        self.control.finished.store(true, Ordering::SeqCst);
         let value =
             json!({"id":self.id,"status":"failed","steps":0,"result":"subagent worker panicked"});
+        settle_result(&self.control.body, &value);
+        self.team.retire(&self.id);
+        self.control.finished.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Event::Done(self.id.clone(), value));
     }
 }
@@ -546,6 +567,12 @@ impl LiveTasks {
     }
     /// Records that one worker result reached the model; it is never queued again.
     pub fn deliver(&mut self, id: &str) {
+        if let Some(job) = self.jobs.get_mut(id)
+            && !job.running()
+        {
+            // A direct status read can deliver a result before its Done event is pumped.
+            job.delivered = true;
+        }
         self.completed
             .retain(|result| result["id"].as_str() != Some(id));
     }
@@ -567,7 +594,7 @@ impl LiveTasks {
     pub fn running_ids(&self) -> Vec<String> {
         self.jobs
             .iter()
-            .filter(|(_, job)| job.running())
+            .filter(|(_, job)| job.running() || job.worker.is_some())
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -610,6 +637,14 @@ impl LiveTasks {
         }
         let config = subagents::with_file_agents(config);
         let mut resume = if args["action"] == "resume" {
+            let id = args["id"].as_str().unwrap_or("");
+            if let Some(job) = self.jobs.get(id)
+                && (job.running() || job.worker.is_some())
+            {
+                return Err(
+                    "worker is still settling; call task wait or status before resuming".into(),
+                );
+            }
             if !config.task.persist {
                 return Err("worker continuation is disabled by task.persist".into());
             }
@@ -629,7 +664,12 @@ impl LiveTasks {
         };
         let effective = resume.as_ref().map_or(args, |resume| &resume.task).clone();
         let request = subagents::parse(&effective, &config)?;
-        if self.jobs.values().filter(|j| j.running()).count() + request.jobs.len()
+        if self
+            .jobs
+            .values()
+            .filter(|j| j.running() || j.worker.is_some())
+            .count()
+            + request.jobs.len()
             > config
                 .subagent_max_live_jobs
                 .min(config.task.max_concurrency)
@@ -649,13 +689,34 @@ impl LiveTasks {
             let job_harness = role
                 .effective_harness(harness)
                 .map_err(|e| format!("subagent model profile: {e:#}"))?;
+            if let Some(saved) = &resume
+                && (role.selection().display_name() != saved.model
+                    || serde_json::to_value(config.agents.get(job.kind)).unwrap_or(Value::Null)
+                        != saved.definition)
+            {
+                return Err("worker model or agent definition changed; restore its original settings or start a new worker".into());
+            }
             roles.push((role, job_harness));
+        }
+        let workspace_identity =
+            super::worker_resume::identity(workspace.root()).map_err(|error| error.to_string())?;
+        // One directory scan per batch, not per worker. Resume keeps its original identity.
+        if let Some(layout) = layout {
+            for entry in crate::agent::workers::child_transcript::scan(layout, &session_id) {
+                if let Some(number) = entry.header["id"]
+                    .as_str()
+                    .and_then(|id| id.strip_prefix("task-"))
+                    .and_then(|id| id.parse::<u64>().ok())
+                {
+                    self.next = self.next.max(number);
+                }
+            }
         }
         while self.jobs.len() + request.jobs.len() > 256 {
             let oldest = self
                 .jobs
                 .iter()
-                .filter(|(_, j)| !j.running())
+                .filter(|(_, j)| !j.running() && j.worker.is_none())
                 .min_by_key(|(id, _)| id.trim_start_matches("task-").parse::<u64>().unwrap_or(0))
                 .map(|(id, _)| id.clone())
                 .ok_or("live job history is full")?;
@@ -674,24 +735,7 @@ impl LiveTasks {
                 .map(|r| r.messages.clone())
                 .unwrap_or_default();
             if let Some(saved) = &resume {
-                if role.selection().display_name() != saved.model
-                    || serde_json::to_value(config.agents.get(job.kind)).unwrap_or(Value::Null)
-                        != saved.definition
-                {
-                    return Err("worker model or agent definition changed; restore its original settings or start a new worker".into());
-                }
                 harness.tools.retain(|tool| saved.tools.contains(tool));
-            }
-            if let Some(layout) = layout {
-                for entry in crate::agent::workers::child_transcript::scan(layout, &session_id) {
-                    if let Some(number) = entry.header["id"]
-                        .as_str()
-                        .and_then(|id| id.strip_prefix("task-"))
-                        .and_then(|id| id.parse::<u64>().ok())
-                    {
-                        self.next = self.next.max(number);
-                    }
-                }
             }
             self.next += 1;
             let id = if resume.is_some() {
@@ -744,7 +788,7 @@ impl LiveTasks {
                 assignment["work_packet"] = packet.clone();
                 task["work_packet"] = packet;
             }
-            let resume_contract = json!({"version":1,"workspace":super::worker_resume::identity(workspace.root()).map_err(|error| error.to_string())?,"task":task,"model":role.selection().display_name(),"definition":config.agents.get(job.kind)});
+            let resume_contract = json!({"version":1,"workspace":workspace_identity,"task":task,"model":role.selection().display_name(),"definition":config.agents.get(job.kind)});
             let started_ms = epoch_ms();
             let status = json!({"id":id,"status":"running","name":job.label,"agent":job.kind,"model":role.selection().display_name(),"role":job.role,"model_source":job.model_routes[0].source,"phase":"starting","steps":0,"started_ms":started_ms,
                 "assignment":assignment});
@@ -812,9 +856,15 @@ impl LiveTasks {
                 Box::new(move || {
                     wake_signals.request_steering();
                     wake_signals.interrupt_waits();
-                    if wake_interruptible.load(Ordering::SeqCst)
-                        && let Some(tool) = &*wake_active.lock().unwrap_or_else(|e| e.into_inner())
-                    {
+                    let active = if wake_interruptible.load(Ordering::SeqCst) {
+                        wake_active
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                    } else {
+                        None
+                    };
+                    if let Some(tool) = active {
                         tool.cancel_operation();
                     }
                 }),
@@ -899,6 +949,8 @@ impl LiveTasks {
                     let text = outcome.status.text;
                     let mut value =
                         json!({"id":done_id,"status":status,"steps":outcome.steps,"result":text});
+                    value["inspections"] = json!(outcome.inspections);
+                    value["execution_id"] = json!(bridge.body.read(|node| node.id.clone()));
                     value["assignment"] = bridge.body.read(|node| {
                         node.result
                             .data
@@ -943,8 +995,12 @@ impl LiveTasks {
                         let artifacts = value["artifact"]
                             .as_str()
                             .map_or_else(|| json!([]), |uri| json!([["result", uri]]));
-                        let _ = sink.finish(json!({"status":status,"steps":outcome.steps,"finished":agent_timestamp(),"finished_ms":finished_ms,"elapsed_ms":finished_ms.saturating_sub(started_ms),"artifacts":artifacts,"isolation":value.get("isolation_label").cloned(),"role":value["role"],"model":value["model"],"model_source":value["model_source"]}));
+                        if let Err(error) = sink.finish(json!({"status":value["status"],"steps":outcome.steps,"finished":agent_timestamp(),"finished_ms":finished_ms,"elapsed_ms":finished_ms.saturating_sub(started_ms),"artifacts":artifacts,"isolation":value.get("isolation_label").cloned(),"role":value["role"],"model":value["model"],"model_source":value["model_source"]})) {
+                            value["status"] = json!("failed");
+                            value["transcript_error"] = json!(format!("{error:#}"));
+                        }
                     }
+                    settle_result(&control.body, &value);
                     drop(_lease);
                     exit.reported = true;
                     team.retire(&done_id);
@@ -979,6 +1035,7 @@ impl LiveTasks {
                     interrupt,
                     worker: Some(worker),
                     active_tool,
+                    delivered: false,
                 },
             );
             result.push(status);
@@ -1143,24 +1200,16 @@ impl LiveTasks {
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&id);
                     if let Some(job) = self.jobs.get_mut(&id) {
-                        let phase = crate::runtime::Phase::from_status(
-                            value["status"].as_str().unwrap_or("failed"),
-                        );
-                        let mut data = job.status();
-                        if let (Some(target), Some(fields)) =
-                            (data.as_object_mut(), value.as_object())
-                        {
-                            target.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        // Workers normally publish directly; retain this fallback for interrupted
+                        // owners and synthetic events without overwriting an already terminal body.
+                        if job.running() {
+                            settle_result(&job.body, &value);
                         }
-                        data["phase"] = value["status"].clone();
-                        job.body.settle(
-                            value["result"].as_str().unwrap_or("").into(),
-                            Some(data),
-                            phase,
-                        );
                         if self.tree.owns(&job.body) {
                             ui.result_node(&job.body);
-                            self.completed.push(job.status());
+                            if !job.delivered {
+                                self.completed.push(job.status());
+                            }
                         }
                         if let Some(worker) = job.worker.take() {
                             let _ = worker.join();
@@ -1203,12 +1252,12 @@ impl LiveTasks {
             .get(id)
             .ok_or_else(|| format!("unknown job {id}"))?;
         job.interrupt.store(true, Ordering::SeqCst);
-        if let Some(tool) = job
+        let active = job
             .active_tool
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
+            .clone();
+        if let Some(tool) = active {
             tool.cancel_operation();
         }
         Ok(json!({"id":id,"cancellation_requested":true}))

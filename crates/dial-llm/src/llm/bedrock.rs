@@ -505,6 +505,7 @@ impl Accumulator {
                         .context("Bedrock input token count overflow")
                 })
                 .transpose()?;
+            super::usage::capture_reply(&self.reply);
             return Ok(false);
         }
         if !matches!(

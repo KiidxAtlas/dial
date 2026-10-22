@@ -410,7 +410,7 @@ fn the_least_important_segments_leave_first_and_the_model_stays_longest() {
         vanishes_at("main"),
         vanishes_at("projects/dial"),
         vanishes_at("3.9k/32k"),
-        vanishes_at("mlx"),
+        vanishes_at("qwen"),
     );
     assert!(
         git > path && path > context && context > model,
@@ -443,8 +443,8 @@ fn long_texts_are_shortened_with_an_ellipsis_never_wrapped() {
     let text = plain(&line);
     assert_eq!(text::line_width(&line), 50);
     assert!(
-        text.contains("mlx/a-") && text.contains('…'),
-        "the model shrinks to its floor with an ellipsis: {text:?}"
+        text.contains("a-very") && text.contains('…') && !text.contains("mlx/"),
+        "the provider goes first, then the model name shrinks with an ellipsis: {text:?}"
     );
     let ascii = border_line(
         &UiConfig::default(),

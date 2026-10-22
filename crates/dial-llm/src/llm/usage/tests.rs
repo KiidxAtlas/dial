@@ -232,3 +232,105 @@ fn purpose_overflow_does_not_partially_update_any_group() {
     assert!(root.begin(Billing::Api).is_err());
     assert_eq!(serde_json::to_value(root.snapshot()).unwrap(), before);
 }
+
+#[test]
+fn retries_retain_latest_snapshot_once_and_do_not_duplicate_accepted_usage() {
+    let root = Scope::default().next_turn(0).unwrap();
+    let scope = root
+        .worker()
+        .for_model("provider/model".into())
+        .for_purpose(Purpose::Repair);
+    scope.begin(Billing::Api).unwrap();
+    let transport = Transport::enter(Some(scope.clone()));
+    transport_attempt().unwrap();
+    capture(Snapshot {
+        input: Some(20),
+        output: Some(0),
+        ..Default::default()
+    });
+    capture(Snapshot {
+        output: Some(3),
+        cache_read: Some(4),
+        ..Default::default()
+    });
+    transport_attempt().unwrap();
+    let reply = Reply {
+        prompt_tokens: Some(25),
+        completion_tokens: Some(5),
+        ..Default::default()
+    };
+    capture_reply(&reply);
+    transport.settle(true).unwrap();
+    transport.settle(true).unwrap();
+    scope
+        .finish(Some(&reply), Some(0.1), Billing::Api, transport.attempts())
+        .unwrap();
+    let groups = root.snapshot().1;
+    let counts = groups.workers;
+    assert_eq!((counts.input, counts.output, counts.cache_read), (45, 8, 4));
+    assert_eq!(counts.partial_reported_attempts, 1);
+    assert_eq!(counts.reported_responses, 1);
+    assert_eq!(counts.unreported_attempts, 1);
+    assert_eq!(counts.transport_attempts, 2);
+    assert_eq!(counts.retries, 1);
+    assert_eq!(counts.discarded_attempts, 1);
+    assert_eq!(counts.observed_cost_usd, Some(0.1));
+    assert!(matches!(counts.cost_coverage, CostCoverage::Partial));
+    assert_eq!(groups.by_purpose[&Purpose::Repair].input, 45);
+    assert_eq!(groups.by_model["provider/model"].workers.output, 8);
+}
+
+#[test]
+fn failed_partial_usage_stays_unpriced_in_its_original_turn() {
+    let root = Scope::default().next_turn(0).unwrap();
+    root.begin(Billing::Api).unwrap();
+    let transport = Transport::enter(Some(root.clone()));
+    transport_attempt().unwrap();
+    capture(Snapshot {
+        input: Some(12),
+        cache_write: Some(8),
+        ..Default::default()
+    });
+    let next = root.next_turn(0).unwrap();
+    transport.settle(false).unwrap();
+    transport.settle(false).unwrap();
+    root.finish(None, None, Billing::Api, transport.attempts())
+        .unwrap();
+    let counts = root.snapshot().1.all;
+    assert_eq!(
+        (counts.input, counts.output, counts.cache_write),
+        (12, 0, 8)
+    );
+    assert_eq!(counts.partial_reported_attempts, 1);
+    assert_eq!(counts.reported_responses, 0);
+    assert_eq!(counts.unreported_attempts, 1);
+    assert_eq!(counts.failed_requests, 1);
+    assert_eq!(counts.observed_cost_usd, None);
+    assert_eq!(next.snapshot().1.all.input, 0);
+}
+
+#[test]
+fn nested_and_suspended_transports_do_not_cross_attribute_snapshots() {
+    let scope = Scope::default().next_turn(0).unwrap();
+    scope.begin(Billing::Api).unwrap();
+    let outer = Transport::enter(Some(scope.clone()));
+    transport_attempt().unwrap();
+    capture(Snapshot {
+        input: Some(9),
+        ..Default::default()
+    });
+    {
+        let _suspended = Transport::suspend();
+        transport_attempt().unwrap();
+        capture(Snapshot {
+            input: Some(999),
+            ..Default::default()
+        });
+    }
+    outer.settle(false).unwrap();
+    scope
+        .finish(None, None, Billing::Api, outer.attempts())
+        .unwrap();
+    assert_eq!(scope.snapshot().1.all.input, 9);
+    assert_eq!(scope.snapshot().1.all.transport_attempts, 1);
+}

@@ -5,7 +5,7 @@ fn names(list: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn capability_prose_is_byte_identical_when_every_named_tool_is_present() {
+fn capability_prose_includes_guidance_when_every_named_tool_is_present() {
     let offered = names(&[
         "tool_search",
         "working_state",
@@ -16,7 +16,7 @@ fn capability_prose_is_byte_identical_when_every_named_tool_is_present() {
     ]);
     assert_eq!(
         capability_prose(&offered, &[]),
-        "\ntool_search enables up to three strongest matches for the next model round. working_state preserves goals, decisions, constraints and evidence. artifact_read retrieves omitted output; task tasks[] batches independent substantial work, and action=start creates live runs controlled by status/wait/message/cancel. Descendants require explicit role spawn permissions and obey the configured depth limit.\nFor live web research, use web_search and web_fetch; cite source URLs and report actual search/network failures. Never invent results."
+        "\ntool_search enables up to three strongest matches for the next model round. Prefer relevant eligible native or MCP specialists already offered over generic shell/web substitutes. If a needed capability is missing, search by the task and domain, then use the returned next-round schemas. Do not rediscover offered tools or make calls merely to exercise available tools; answer directly when no tool is needed. Discovery does not grant permissions; normal approvals still apply. working_state preserves goals, decisions, constraints and evidence. artifact_read retrieves omitted output; task tasks[] batches independent substantial work, and action=start creates live runs controlled by status/wait/message/cancel. Descendants require explicit role spawn permissions and obey the configured depth limit.\nFor live web research, use web_search and web_fetch; cite source URLs and report actual search/network failures. Never invent results."
     );
 }
 
@@ -53,4 +53,20 @@ fn capability_prose_only_asks_to_discover_web_tools_that_are_not_offered() {
         "{prose}"
     );
     assert!(!prose.contains("discover web_search"), "{prose}");
+}
+
+#[test]
+fn specialist_guidance_does_not_require_an_mcp_inventory() {
+    let prose = capability_prose(&names(&["tool_search"]), &[]);
+    for expected in [
+        "Prefer relevant eligible native or MCP specialists already offered",
+        "If a needed capability is missing, search by the task and domain",
+        "use the returned next-round schemas",
+        "Do not rediscover offered tools",
+        "answer directly when no tool is needed",
+        "Discovery does not grant permissions; normal approvals still apply",
+    ] {
+        assert!(prose.contains(expected), "{expected}: {prose}");
+    }
+    assert!(!prose.contains("mcp_servers"), "{prose}");
 }

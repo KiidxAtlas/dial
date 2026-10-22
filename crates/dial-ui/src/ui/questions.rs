@@ -295,16 +295,20 @@ impl<'a> Dialog<'a> {
     pub fn rows(&self, width: usize, height: usize) -> Vec<String> {
         let question = &self.request.questions[self.page];
         let answer = &self.answers[self.page];
-        // The first row is the panel title; the model's internal question id is not shown.
-        let mut rows = vec![format!(
-            "Question {}/{}{}",
-            self.page + 1,
-            self.request.questions.len(),
-            question
-                .header
-                .as_ref()
-                .map_or(String::new(), |header| format!(" · {header}"))
-        )];
+        // The first row is the panel title; the model's internal question id is not shown. A lone
+        // question needs no `1/1` counter: its header (if any) titles the panel instead.
+        let total = self.request.questions.len();
+        let header = question
+            .header
+            .as_deref()
+            .map(text::one_line)
+            .filter(|header| !header.trim().is_empty());
+        let mut rows = vec![match (total, header) {
+            (1, Some(header)) => header,
+            (1, None) => "Question".to_owned(),
+            (_, Some(header)) => format!("Question {}/{total} · {header}", self.page + 1),
+            (_, None) => format!("Question {}/{total}", self.page + 1),
+        }];
         rows.extend(
             text::wrap_words(&question.question, width.max(1))
                 .into_iter()
@@ -407,7 +411,18 @@ impl<'a> Dialog<'a> {
                 if let Some(note) = &answer.note {
                     rows.push(format!("Note: {}", text::one_line(note)));
                 }
-                rows.push("↑↓ choose · Enter select · ← back · → done · o other · n note · c chat · Esc cancel".into());
+                // Only keys that do something on this page are advertised.
+                let mut keys = vec!["↑↓ choose", "Enter select"];
+                if self.page > 0 {
+                    keys.push("← back");
+                }
+                keys.push(if self.page + 1 == total {
+                    "→ done"
+                } else {
+                    "→ next"
+                });
+                keys.extend(["o other", "n note", "c chat", "Esc cancel"]);
+                rows.push(keys.join(" · "));
             }
         }
         if !self.feedback.is_empty() {
@@ -416,7 +431,10 @@ impl<'a> Dialog<'a> {
         if let Some(deadline) = self.deadline
             && matches!(self.mode, Mode::Choices)
         {
-            rows.push(format!("Configured timeout: {}s remaining; expiration is recorded as automatic, never as human input", deadline.saturating_duration_since(Instant::now()).as_secs()));
+            rows.push(format!(
+                "Answers itself in {}s with your selection or the recommended choice",
+                deadline.saturating_duration_since(Instant::now()).as_secs()
+            ));
         }
         rows
     }

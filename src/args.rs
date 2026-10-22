@@ -296,6 +296,9 @@ pub(crate) enum Command {
         /// Resume only if task, source, configuration and executable fingerprints still match.
         #[arg(long, requires = "checkpoint")]
         resume: bool,
+        /// Share the original subscription authentication store and refresh locks; never copy tokens.
+        #[arg(long)]
+        share_auth: bool,
         /// Measure raw (assistance off), dial (shipped defaults) and one ablation per assistance feature.
         #[arg(long)]
         ablate_assistance: bool,

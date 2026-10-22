@@ -165,8 +165,8 @@ enum BusyChoice {
 impl BusyChoice {
     fn label(self) -> &'static str {
         match self {
-            BusyChoice::Auto => "Let Dial decide",
-            BusyChoice::AfterTurn => "Queue for after this turn",
+            BusyChoice::Auto => "Send now",
+            BusyChoice::AfterTurn => "Send after this turn",
             BusyChoice::KeepWorking => "Keep working",
             BusyChoice::StopAndSend => "Stop and send oldest",
         }
@@ -174,13 +174,29 @@ impl BusyChoice {
 
     fn detail(self) -> &'static str {
         match self {
-            BusyChoice::Auto => "steer this task or start an independent worker",
-            BusyChoice::AfterTurn => "sent when this turn finishes",
-            BusyChoice::KeepWorking => "queued messages stay queued",
-            BusyChoice::StopAndSend => "stops this turn and sends the oldest queued message",
+            BusyChoice::Auto => "joins this task or a new worker",
+            BusyChoice::AfterTurn => "waits until Dial finishes",
+            BusyChoice::KeepWorking => "the queue waits for this turn",
+            BusyChoice::StopAndSend => "ends this turn now",
         }
     }
 }
+
+/// How a queued message will be sent, as shown in the queue preview and while editing it.
+fn queued_route(follow_up: bool) -> &'static str {
+    if follow_up {
+        "send after turn"
+    } else {
+        "send now"
+    }
+}
+
+/// The launch/compose placeholder, longest first; the first that fits is shown whole.
+const PLACEHOLDERS: [&str; 3] = [
+    "Ask anything, or describe what to build",
+    "Ask or describe a task",
+    "Ask anything",
+];
 
 /// Offered for a non-empty draft while busy. Automatic routing is the default.
 const DRAFT_CHOICES: &[BusyChoice] = &[BusyChoice::Auto, BusyChoice::AfterTurn];
@@ -749,15 +765,7 @@ impl Composer {
             self.step_menu(if page_up { -step } else { step }, false, rows);
             return ComposerEvent::None;
         }
-        if matches!(key.code, KeyCode::Left | KeyCode::Right)
-            && key
-                .modifiers
-                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
-        {
-            self.move_word(key.code == KeyCode::Right);
-            return ComposerEvent::None;
-        }
-        self.editor.key(key);
+        self.editor.key_with(key, keys);
         ComposerEvent::None
     }
 
@@ -1036,33 +1044,6 @@ impl Composer {
         menu.scroll = window(menu.selected, menu.scroll, rows, menu.matches.len());
     }
 
-    fn move_word(&mut self, forward: bool) {
-        let text = &self.editor.text;
-        let marks: Vec<(usize, &str)> = text.grapheme_indices(true).collect();
-        let blank = |g: &str| g.chars().all(char::is_whitespace);
-        let mut at = marks
-            .iter()
-            .position(|(i, _)| *i >= self.editor.cursor)
-            .unwrap_or(marks.len());
-        if forward {
-            while at < marks.len() && blank(marks[at].1) {
-                at += 1;
-            }
-            while at < marks.len() && !blank(marks[at].1) {
-                at += 1;
-            }
-        } else {
-            while at > 0 && blank(marks[at - 1].1) {
-                at -= 1;
-            }
-            while at > 0 && !blank(marks[at - 1].1) {
-                at -= 1;
-            }
-        }
-        let cursor = marks.get(at).map_or(text.len(), |(i, _)| *i);
-        self.editor.cursor = cursor;
-    }
-
     /// Up/Down past the first/last line browse history. The unsent draft (and its cursor) is kept and
     /// comes back when browsing past the newest entry; edits to a browsed entry are not saved.
     fn browse_history(&mut self, up: bool) {
@@ -1145,7 +1126,7 @@ impl Composer {
             step(search, -(rows as isize));
         } else if keys.matches(Action::SelectPageDown, &key) {
             step(search, rows as isize);
-        } else if search.query.key(key) {
+        } else if search.query.key_with(key, keys) {
             search.selected = 0;
             search.scroll = 0;
         }
@@ -1491,14 +1472,20 @@ impl Composer {
             }
             let placeholder = self.editor.text.is_empty();
             let used = if placeholder {
-                let label = if self.editing_queue.is_some() {
-                    "Edit the queued message"
+                let options: &[&str] = if self.editing_queue.is_some() {
+                    &["Edit the queued message", "Edit queued message"]
                 } else if self.busy {
-                    "Add direction while Dial works"
+                    &["Add direction while Dial works", "Add direction"]
                 } else {
-                    "Ask anything, or describe what to build"
+                    &PLACEHOLDERS
                 };
-                let label = text::clip(label, inner);
+                let label = options
+                    .iter()
+                    .find(|label| text::width(label) <= inner)
+                    .map_or_else(
+                        || text::ellipsize(options[options.len() - 1], inner, theme.ascii()),
+                        |label| (*label).to_owned(),
+                    );
                 let used = text::width(&label);
                 spans.push(Span::styled(label, theme.fg(Tok::Muted)));
                 used
@@ -1608,12 +1595,8 @@ impl Composer {
                 queued.push(Line::from(Span::styled(
                     text::ellipsize(
                         &format!(
-                            "queued {}: {}",
-                            if *follow_up {
-                                "follow-up"
-                            } else {
-                                "auto-route"
-                            },
+                            "queued to {}: {}",
+                            queued_route(*follow_up),
                             text::one_line(message)
                         ),
                         w,
@@ -1629,22 +1612,27 @@ impl Composer {
                     theme.fg(Tok::Dim),
                 )));
             }
+            // Most useful first, so a narrow terminal cuts `/queue manage` rather than the keys.
+            let submit = ctx.keys.label(Action::Submit);
+            let up = ctx.keys.label(Action::SelectUp);
+            let mut footer = vec![format!("{} queued", self.queued.len())];
+            if !submit.is_empty() {
+                footer.push(format!(
+                    "{submit} {}",
+                    if self.busy {
+                        "stop or keep"
+                    } else {
+                        "send oldest"
+                    }
+                ));
+            }
+            if !up.is_empty() {
+                footer.push(format!("{up} edit last"));
+            }
+            footer.push("/queue manage".to_owned());
             queued.push(Line::from(Span::styled(
                 text::ellipsize(
-                    &format!(
-                        "{} queued {} /queue manage {} {} {} {} {} edit last",
-                        self.queued.len(),
-                        theme.sym(Sym::Dot),
-                        theme.sym(Sym::Dot),
-                        ctx.keys.label(Action::Submit),
-                        if self.busy {
-                            "choose stop or keep"
-                        } else {
-                            "send oldest"
-                        },
-                        theme.sym(Sym::Dot),
-                        ctx.keys.label(Action::SelectUp)
-                    ),
+                    &footer.join(&format!(" {} ", theme.sym(Sym::Dot))),
                     w,
                     theme.ascii(),
                 ),
@@ -1681,27 +1669,47 @@ impl Composer {
         }
     }
 
-    /// The busy chooser: a one-line question and its options above the box, with the selected option
-    /// highlighted. Each option's detail is cut to the width rather than wrapped.
+    /// The busy chooser: what is being decided, its options and the selected option's effect. On the
+    /// band layout it is an inset panel, so it reads as its own menu rather than part of the activity
+    /// row under it. Details sit beside the labels when every one fits whole; otherwise only the
+    /// selected option's detail shows, on its own row, so labels never lose cells to descriptions.
     fn choice_rows(&self, choice: &Choice, w: usize, ctx: &ComposerCtx) -> Rows {
         let theme = ctx.theme;
-        let question = if choice.options.contains(&BusyChoice::StopAndSend) {
+        let queue = choice.options.contains(&BusyChoice::StopAndSend);
+        let title = if queue {
             let queued = self.queued.len();
             format!(
-                "Dial is still working; {queued} queued {}. Stop now?",
+                "{queued} queued {}",
                 if queued == 1 { "message" } else { "messages" }
             )
         } else {
-            "Dial is still working. Choose how this message is sent:".to_owned()
+            "Dial is still working".to_owned()
         };
-        let mut rows = vec![finish_row(
-            vec![Span::styled(question, theme.fg(Tok::Muted))],
-            w,
-        )];
-        let total = choice.options.len();
+        let panel = ctx.ui.composer_shape == ComposerShape::Band && w >= 24;
+        let outer = w;
+        let w = if panel { w - 4 } else { w };
         let pointer = theme.sym(Sym::Pointer);
         let blank_pointer = " ".repeat(text::width(pointer));
+        let prefix = text::width(pointer) + 1;
+        let label_col = choice
+            .options
+            .iter()
+            .map(|option| text::width(option.label()))
+            .max()
+            .unwrap_or(0);
+        let inline = choice
+            .options
+            .iter()
+            .all(|option| prefix + label_col + 2 + text::width(option.detail()) <= w);
         let accent = theme.fg(Tok::Accent);
+        let total = choice.options.len();
+        let mut rows = Vec::new();
+        if !panel {
+            rows.push(finish_row(
+                vec![Span::styled(title.clone(), theme.fg(Tok::Muted))],
+                w,
+            ));
+        }
         rows.extend(render_list(
             theme,
             w,
@@ -1711,10 +1719,8 @@ impl Composer {
             choice.selected,
             |i, budget, selected| {
                 let option = choice.options[i];
-                let prefix = text::width(pointer) + 1;
                 let label =
                     text::ellipsize(option.label(), budget.saturating_sub(prefix), theme.ascii());
-                let used = prefix + text::width(&label);
                 let mut spans = vec![
                     Span::styled(
                         if selected {
@@ -1726,16 +1732,43 @@ impl Composer {
                         accent,
                     ),
                     Span::raw(" "),
-                    Span::styled(label, theme.fg(Tok::Text)),
+                    Span::styled(label.clone(), theme.fg(Tok::Text)),
                 ];
-                let room = budget.saturating_sub(used + 2);
-                if room > 0 {
-                    let detail = text::ellipsize(option.detail(), room, theme.ascii());
-                    spans.push(Span::styled(format!("  {detail}"), theme.fg(Tok::Muted)));
+                if inline {
+                    spans.push(Span::raw(
+                        " ".repeat(label_col.saturating_sub(text::width(&label)) + 2),
+                    ));
+                    spans.push(Span::styled(option.detail(), theme.fg(Tok::Muted)));
                 }
                 spans
             },
         ));
+        if !inline && let Some(option) = choice.options.get(choice.selected) {
+            rows.push(finish_row(
+                vec![Span::styled(
+                    format!(
+                        "{blank_pointer} {}",
+                        text::ellipsize(
+                            option.detail(),
+                            w.saturating_sub(prefix),
+                            theme.ascii()
+                        )
+                    ),
+                    theme.fg(Tok::Muted),
+                )],
+                w,
+            ));
+        }
+        if panel {
+            rows = super::chrome::framed_lines(
+                theme,
+                super::chrome::Section::Dial,
+                &title,
+                "",
+                rows,
+                outer,
+            );
+        }
         rows
     }
 
@@ -1822,8 +1855,8 @@ impl Composer {
             }
             if let Some(QueuedEdit { follow_up, .. }) = self.editing_queue {
                 pieces.push(plain(format!(
-                    "editing queued {}",
-                    if follow_up { "follow-up" } else { "auto-route" }
+                    "editing queued message ({})",
+                    queued_route(follow_up)
                 )));
                 pieces.push(hint(
                     Action::Submit,
@@ -1858,7 +1891,7 @@ impl Composer {
                 let command = self.editor.text.trim_start().starts_with('/');
                 let blank = self.editor.text.trim().is_empty();
                 // Mirrors `submit`: an empty Enter asks to stop (only with queued work); a blank draft
-                // is ignored; otherwise Enter asks whether to route automatically or queue the draft.
+                // is ignored; otherwise Enter asks whether to send now or after the turn.
                 if command {
                     pieces.push(hint(Action::Submit, "run command"));
                 } else if self.editor.text.is_empty() {
@@ -1866,11 +1899,11 @@ impl Composer {
                         pieces.push(hint(Action::Submit, "stop or keep"));
                     }
                 } else if !blank {
-                    pieces.push(hint(Action::Submit, "route or queue"));
+                    pieces.push(hint(Action::Submit, "send now or later"));
                 }
                 // Alt-Enter only queues a non-blank draft.
                 if !command && !blank {
-                    pieces.push(hint(Action::FollowUp, "follow-up"));
+                    pieces.push(hint(Action::FollowUp, "send after turn"));
                 }
             } else if !self.editor.text.is_empty() {
                 pieces.extend([
@@ -2039,12 +2072,17 @@ impl Composer {
             } else {
                 "Commands"
             };
-            let title = format!("{title} ({}/{total})", menu.selected + 1);
-            let hint = if theme.ascii() {
-                "tab complete"
+            // The list draws its own `n/m` counter when it scrolls; the title only names the kind.
+            let title = title.to_owned();
+            let complete = ctx.keys.label(Action::Complete);
+            let hint = if complete.is_empty() {
+                String::new()
+            } else if theme.ascii() {
+                format!("{complete} complete")
             } else {
-                "↑↓ select · tab complete"
+                format!("↑↓ select · {complete} complete")
             };
+            let hint = hint.as_str();
             rows = super::chrome::framed_lines(
                 theme,
                 super::chrome::Section::Dial,

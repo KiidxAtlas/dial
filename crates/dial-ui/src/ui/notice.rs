@@ -148,7 +148,9 @@ fn layout(
         return rows;
     }
     if pad == 0 && is_heading(content, next_lead) {
-        return vec![vec![chrome::tag(theme, section, content)]];
+        // The label's color and case already mark a heading; a trailing colon is noise.
+        let label = content.trim_end_matches(':').trim_end();
+        return vec![vec![chrome::tag(theme, section, label)]];
     }
     hang_wrap(vec![gap(pad)], pairs(content, theme), pad, room)
 }

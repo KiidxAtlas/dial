@@ -1,6 +1,8 @@
 //! Benchmark child protocol: every turn stays in one process/session, with bounded event capture.
 use anyhow::{Context, Result, ensure};
-use dial::benchmark::{AgentFailure, BenchmarkCase, RunMetrics, ToolTrace, failure_detail};
+use dial::benchmark::{
+    AgentFailure, BenchmarkCase, RunMetrics, ToolTrace, failure_detail, response_sha256,
+};
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -64,7 +66,8 @@ fn request(
     input.write_all(b"\n")?;
     input.flush()?;
     loop {
-        let event = receive(rx, deadline)?;
+        let event = receive(rx, deadline)
+            .with_context(|| format!("waiting for benchmark RPC {method} (request {id})"))?;
         observe(metrics, &event);
         if event["id"] == id {
             ensure!(
@@ -86,6 +89,34 @@ fn tool_trace_for_run(
 ) -> Option<ToolTrace> {
     let complete = succeeded && sends > 0 && snapshots == sends;
     ToolTrace::from_snapshot(snapshot?, complete)
+}
+
+/// Journey fixtures require an actual history rewrite, not a successful no-op maintenance call.
+fn require_compaction(result: &Value) -> Result<()> {
+    ensure!(
+        result["compacted"] == true,
+        "benchmark requested compaction but history was not compacted: {}",
+        result["outcome"]
+    );
+    Ok(())
+}
+
+/// Recovery state may describe the previous turn, so retain it separately from send reports.
+fn retain_efficiency(metrics: &mut RunMetrics, state: &Value, send: Option<u64>) {
+    let Some(report) = state.get("efficiency").filter(|value| !value.is_null()) else {
+        return;
+    };
+    let observations = metrics
+        .efficiency
+        .get_or_insert_with(|| json!({"turns":[]}));
+    if let Some(send) = send {
+        observations["turns"]
+            .as_array_mut()
+            .expect("turn observations")
+            .push(json!({"send":send,"report":report}));
+    } else {
+        observations["recovery_observation"] = report.clone();
+    }
 }
 
 fn observe(m: &mut RunMetrics, event: &Value) {
@@ -147,6 +178,7 @@ struct Ledger {
     complete: bool,
     cost: Option<f64>,
     cost_complete: bool,
+    groups: Value,
 }
 
 fn read_ledger(state: &Value) -> Option<Ledger> {
@@ -166,6 +198,7 @@ fn read_ledger(state: &Value) -> Option<Ledger> {
         complete: unreported == 0 && reported >= successful && settled == count("requests")?,
         cost: all.get("observed_cost_usd").and_then(Value::as_f64),
         cost_complete: all.get("cost_coverage").and_then(Value::as_str) == Some("observed_priced"),
+        groups: state.pointer("/usage/total")?.clone(),
     })
 }
 
@@ -181,10 +214,23 @@ fn apply_ledger(metrics: &mut RunMetrics, ledger: Option<Ledger>) {
     metrics.cached_tokens = ledger.cache_read;
     metrics.reasoning_tokens = ledger.reasoning;
     metrics.requests = ledger.requests;
+    metrics.runtime_usage = Some(ledger.groups);
     metrics.observed_cost_usd = ledger.cost;
     metrics.observed_cost_complete = ledger.cost_complete;
     metrics.token_usage_observed = ledger.reported > 0;
     metrics.token_usage_incomplete = !ledger.complete;
+}
+
+fn configure_subscription_auth(command: &mut Command, auth_home: Option<&Path>) -> Result<()> {
+    // An ambient override must never opt a benchmark into shared credentials implicitly.
+    let key = dial::config::paths::SUBSCRIPTION_AUTH_HOME;
+    command.env_remove(key);
+    if let Some(home) = auth_home {
+        let home = std::fs::canonicalize(home)
+            .context("opening benchmark subscription authentication store")?;
+        command.env(key, home);
+    }
+    Ok(())
 }
 
 pub fn run(
@@ -192,8 +238,9 @@ pub fn run(
     user_home: &Path,
     case: &BenchmarkCase,
     workspace: &Path,
+    auth_home: Option<&Path>,
 ) -> Result<RunMetrics> {
-    run_configured(executable, user_home, case, workspace, 600, None)
+    run_configured(executable, user_home, case, workspace, 600, None, auth_home)
 }
 
 /// Runs one case in a persistent child. A failed run returns [`AgentFailure`], carrying the
@@ -205,6 +252,7 @@ pub fn run_configured(
     workspace: &Path,
     timeout_secs: u64,
     adapter: Option<&Path>,
+    auth_home: Option<&Path>,
 ) -> Result<RunMetrics> {
     ensure!(
         timeout_secs <= 600,
@@ -227,6 +275,7 @@ pub fn run_configured(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_subscription_auth(&mut command, auth_home)?;
     if let Some(adapter) = adapter {
         command.env("DIAL_BENCHMARK_ADAPTER", adapter);
     }
@@ -314,18 +363,19 @@ pub fn run_configured(
                 .map(|t| (t.prompt.as_str(), t.compact_before)),
         ) {
             if compact {
-                request(
+                let compacted = request(
                     &mut input,
                     &rx,
                     id,
                     "compact",
-                    json!({}),
+                    json!({"keep_recent_tokens":0}),
                     deadline,
                     &mut metrics,
                 )?;
-                metrics.compactions += 1;
+                require_compaction(&compacted)?;
                 id += 1;
             }
+            trace_sends += 1;
             let report = request(
                 &mut input,
                 &rx,
@@ -335,6 +385,7 @@ pub fn run_configured(
                 deadline,
                 &mut metrics,
             )?;
+            retain_efficiency(&mut metrics, &report, Some(trace_sends));
             id += 1;
             ensure!(
                 report["interrupted"] != true
@@ -358,6 +409,7 @@ pub fn run_configured(
                     .collect::<String>()
             );
             metrics.turns_completed = completed;
+            metrics.response_sha256 = report["text"].as_str().map(response_sha256);
             if let Some(speculation) = report.get("speculation") {
                 for (name, target) in [
                     ("started", &mut metrics.speculative_preparations),
@@ -391,7 +443,6 @@ pub fn run_configured(
             {
                 metrics.repair_attempts = Some(n);
             }
-            trace_sends += 1;
             if let Some(snapshot) = report.pointer("/metrics/tool_trace") {
                 trace_snapshots += 1;
                 trace_snapshot = Some(snapshot.clone());
@@ -423,6 +474,29 @@ pub fn run_configured(
         )?;
         Ok(())
     })();
+    // A turn can fail after paying for inference. When the child still speaks RPC, retain its
+    // settled ledger rather than throwing away worker/auxiliary usage on the error path.
+    // A dead or busy child gets only one bounded recovery read, never another model request.
+    let active_before_snapshot = trace_sends > 0
+        || metrics.token_usage_observed
+        || metrics.tool_calls > 0
+        || metrics.turns_completed > 0
+        || metrics.compactions > 0;
+    if result.is_err() && !ledger_read && active_before_snapshot {
+        if let Ok(state) = request(
+            &mut input,
+            &rx,
+            u64::MAX,
+            "state",
+            json!({}),
+            Some(Instant::now() + Duration::from_secs(2)),
+            &mut metrics,
+        ) {
+            ledger_read = true;
+            apply_ledger(&mut metrics, read_ledger(&state));
+            retain_efficiency(&mut metrics, &state, None);
+        }
+    }
     metrics.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     metrics.agent_succeeded = result.is_ok();
     metrics.agent_error = result.is_err();

@@ -2,6 +2,43 @@
 
 The agent re-evaluates context pressure at request boundaries using the larger of the serialized-request estimate and the calibrated provider-token estimate. Successful compaction returns to the loop and the replacement request is measured again; it is not limited to one proactive compaction per user turn. Failed attempts are associated with the unchanged request snapshot so the same dead end is not retried until history changes.
 
+Failed blocking compaction applies the same growth-based retry floor to speculative launches, so
+small tool results do not restart the failed method chain in the background. New user steering
+clears that backoff. Successful background claims, overflow recovery, investigation rewinds and
+context rollovers release duplicate-evidence restrictions just like blocking compaction: an
+earlier result that left the active history cannot be required as visible evidence.
+
+Context-economy decisions and request-overhead telemetry use the shared provider-neutral wire
+estimate, including structured text, native replay and attached images while excluding internal
+bookkeeping. Large structured/image suffixes therefore protect a warm prefix just like plain text.
+Developer instructions count with system overhead, not conversation history. These estimates are
+not billed token counts. Contradictory cache-write TTL buckets (including arithmetic overflow)
+leave API cost unknown instead of producing a guessed or inflated charge.
+When a request overflows even after ordinary maintenance, the existing lean-tool fallback also
+uses the lean instruction variants. It does not keep paying for full workflow prose after reducing
+the schemas; configured rules, project context, safety boundaries and explicitly loaded tools remain.
+With efficiency enabled, interactive sessions reuse concise delivery and delegation guidance
+on hosted models. Full tool policy and workflow rules remain in place. This reduces repeated
+reporting prose without enabling the lean local tool profile: offered schemas, loadable-tool
+descriptions, visual-verification guidance, operator instructions, custom templates and project
+context are unchanged. Disabling efficiency restores the full built-in delivery/delegation prose.
+For an unlimited foreground output setting, the model's advertised output ceiling is bounded by
+the context remaining beside the current prompt; it is not reserved in full before admission.
+Explicit output limits and the compaction policy's response reserve remain authoritative.
+
+Both foreground and worker admission preserve the configured response reserve, using the effective
+model/profile context cap. The lean fallback runs when the prompt would consume that reserve,
+not only after it fills the entire window. Lean discovery keeps exact loadable names and omits
+their optional descriptions; discovery still supplies those on demand. If immutable instructions
+and pinned schemas still cannot fit, the request fails before inference without silently unloading
+explicit tools or discarding the session's unfinished work.
+
+Streaming accounting retains the latest provider-reported counters from each failed/retried
+attempt, without adding cumulative snapshots together or counting the accepted final reply twice.
+`partial_reported_attempts` distinguishes these observations from complete responses; their
+usage remains incomplete and unpriced. Missing counters and unreported attempts are never
+filled from prompt estimates. Model, purpose, worker and turn attribution remain attached.
+
 Overflow recovery uses a fit-only compaction target: the request only needs to fit the model's context window and output reserve, even when the normal auto-continue threshold would pause the turn. Compaction preserves complete assistant/tool groups while tolerating orphan or duplicated tool-call records in irregular imported history.
 
 Portable summaries update the previous committed summary with newly summarized history instead of summarizing the summary as transcript. A cut within a user turn gets a distinct turn-prefix summary, while the recent suffix remains verbatim. Read and modified file lists carry forward between compactions. Summarizer input is divided at message boundaries, conservatively discounted against the selected summarizer window, and a rejected window is halved and replanned. Single messages too large for a window are clamped with an explicit omission marker.
@@ -10,13 +47,44 @@ Parent and child conversations share reply recovery in `agent/turn_recovery.rs`.
 
 Background worker findings arrive once in the parent's next request with status, a bounded report and a reference to the complete artifact. Typed assignments, rule state and result data remain in the execution journal rather than being repeated in the model-facing summary. Use the delivered findings before repeating a worker's investigation. Todos are optional progress bookkeeping. `done` needs no finding/evidence payload and does not run a verification round. Accepted completion reconciles pending progress; explicit blockers and running work remain completion prerequisites. Plain final replies and explicit `finish` share these prerequisites and the final configured verification/repair pipeline. A failed check cannot become a completed turn, and unfinished replies share bounded reply recovery rather than a separate todo-reminder budget. Routine inspection does not force a separate todo-only request; the configured reasoning-recovery plan gate still applies when it is needed.
 
+Workers publish their terminal runtime result before releasing their lease or exposing completion,
+so status does not wait for the parent's event pump. An early acknowledgement suppresses later
+redelivery of the same execution. A local worker cannot resume until its previous thread has been
+joined; admission retains that thread's slot in the meantime. Batch admission scans persisted task
+identities once and validates workspace/model compatibility before publishing runtime nodes.
+Artifact or transcript publication failures mark the task failed rather than reporting a clean
+success. Cancellation hooks run outside the active-tool mutex.
+
+Experimental child context carry omits the assignment when its protected brief remains visible,
+and omits current coordination already present verbatim in user history. History replacement still
+carries missing instructions forward; rules, identity and safety framing remain. Worker
+output-length recovery honors the same effective profile/inherited context cap as request sizing.
+
+Turn efficiency reports count delivered worker results once per live execution, retain bounded
+hashes of successful worker `read`/`grep`/`glob`/`find` calls, and count exact parent call overlap
+after delivery. They retain at most 256 identities and explicitly flag truncated coverage.
+Call arguments/source are not copied into the metrics. Different arguments/ranges are not matched;
+changed source can make the same inspection necessary. Delivery and overlap do not establish
+whether findings were understood, reused, or wasted, and never block legitimate verification.
+Worker cost/token overhead remains in the usage ledger's worker and purpose views. First tool-result
+and first known workspace-change-result latency are observations, not proof of a useful action;
+tool-free turns leave these fields unknown. Semantic reranking has a bounded index-only response;
+busy-input routing avoids inference when either concurrency limit leaves no worker slot.
+
 Session history is append-only; tree navigation selects an abandoned branch without deleting it, and branch summaries are optional context for navigation.
 
 Task-tool routing is local, deterministic and turn-scoped. The first request selects native specialists by workflow intent and MCP tools by indexed capabilities/domain relevance. Successful manifest reads can add dependency-domain signals from the existing result (currently complete single-target `package.json` only). Successful MCP discovery can expose matching same-server consumers for the following model request. Both serial and parallel results feed the same observer. Selection never executes tools or changes permissions; pinned harnesses, lean context profiles, child allowlists and ordinary approval policy remain authoritative. Automatic additions are monotonic within the turn, capped at six tools and 24 KiB of schemas; explicit unloads suppress reactivation until the next external request. Selection introduces no extra inference or project reads.
 
+When tool discovery is available, model guidance prefers relevant eligible native or MCP specialists already offered over generic shell/web substitutes. If a needed capability is missing, it asks for task/domain discovery and use of the returned next-round schemas, not rediscovery of offered tools. This guidance is not gated on an MCP inventory, does not require calls for tool-free answers and grants no execution permission. It is prompt guidance, not evidence of increased live-model tool use; routing limits and approval policy are unchanged.
+
 Duplicate recovery withholds only the exact repeated call, including reads. Different ranges and files remain available, changed source identities clear the affected restriction, and new user steering resets the turn's recovery state. A withheld call is reported explicitly as unexecuted; its cached observation still contributes to the shared repetition bound rather than being misclassified as a new execution failure.
 
-Busy input defaults to **Let Dial decide**: at the next safe request boundary, a bounded auxiliary model request classifies the exact user message as steering or independent work. Changes of approach, corrections, dependent or overlapping work, and ambiguity steer the current task through its existing steering journal. Clearly independent requests start a background worker in an isolated project copy using the existing task authorization, spawn hooks, concurrency limits and result delivery. Splitting leaves the parent's current instruction and completed inference intact. Worker findings are not new user instructions; any copy integration follows the existing worker workflow. Routing failures, invalid decisions, disabled workers or failed admission visibly fall back to steering; cancellation restores unhandled input in order. **Queue after this turn** remains an explicit opt-out. Automatic input does not cancel in-flight inference or tools while awaiting a decision, so a long operation can delay routing. No classifier is run when there is no pending input.
+Read restrictions track every target in `read.paths`, not just `read.path`; a changed or removed
+target releases that batch's restriction without releasing unrelated calls. Unchanged reads use
+short pointers when their earlier full results remain visible, including adjacent or overlapping
+ranges jointly covered by several reads. Missing lines or pruned results still return full content.
+
+Busy input defaults to **Let Dial decide**: at the next safe request boundary, a bounded auxiliary model request classifies the exact user message as steering or independent work. Changes of approach, corrections, dependent or overlapping work, and ambiguity steer the current task through its existing steering journal. Clearly independent requests start a background worker in an isolated project copy using the existing task authorization, spawn hooks, concurrency limits and result delivery. Splitting leaves the parent's current instruction and completed inference intact. Worker findings are not new user instructions; any copy integration follows the existing worker workflow. Routing failures, invalid decisions or failed admission visibly fall back to steering; cancellation restores unhandled input in order. When spawning is unavailable, steering is the only admissible route and no classifier request is made. Steering discards queued advice about the previous task's failures, repetition and completion, preserving protocol data, worker findings and safety boundaries. **Queue after this turn** remains an explicit opt-out. Automatic input does not cancel in-flight inference or tools while awaiting a decision, so a long operation can delay routing. No classifier is run when there is no pending input.
 
 Explicit evaluation/learning runs capture the actual inference request and target. Normal coding launches disable trajectory and recovery-sample recording, learned candidates, automatic Laya/learned-skill capture, project-learning updates and startup evaluations without rewriting saved learning preferences. When exporting a verified example to the training template, valid tool-result error flags are removed as execution metadata while the evidence text is preserved. Malformed flags and unknown fields remain rejectable. An HTTP 200 response to a WebSocket upgrade establishes SSE-only transport for that session, so an unsupported upgrade is not retried at every request.
 

@@ -1166,6 +1166,7 @@ impl Backend {
         if let Ok(reply) = &mut result {
             reply.wire = self.wire.lock().latest();
         }
+        transport.settle(result.is_ok())?;
         if let Some(scope) = scope {
             let cost = result
                 .as_ref()
@@ -2716,10 +2717,27 @@ pub(super) fn anthropic_cache_writes(
     (total, five_minute, one_hour)
 }
 
+pub(super) fn anthropic_usage_snapshot(usage: &serde_json::Value) -> llm::usage::Snapshot {
+    let cache_read = usage["cache_read_input_tokens"].as_u64();
+    let cache_write = anthropic_cache_writes(usage).0;
+    llm::usage::Snapshot {
+        input: usage["input_tokens"].as_u64().and_then(|input| {
+            input
+                .checked_add(cache_read.unwrap_or(0))?
+                .checked_add(cache_write.unwrap_or(0))
+        }),
+        output: usage["output_tokens"].as_u64(),
+        cache_read,
+        cache_write,
+        ..Default::default()
+    }
+}
+
 pub(super) fn anthropic_reply(value: &serde_json::Value) -> Result<Reply> {
     use serde_json::Value;
     let (cache_writes, cache_writes_5m, cache_writes_1h) =
         anthropic_cache_writes(value.get("usage").unwrap_or(&Value::Null));
+    let usage = anthropic_usage_snapshot(&value["usage"]);
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
@@ -2765,21 +2783,8 @@ pub(super) fn anthropic_reply(value: &serde_json::Value) -> Result<Reply> {
             other => other,
         }
         .into(),
-        prompt_tokens: value
-            .pointer("/usage/input_tokens")
-            .and_then(Value::as_u64)
-            .map(|n| {
-                n.saturating_add(
-                    value
-                        .pointer("/usage/cache_read_input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                )
-                .saturating_add(cache_writes.unwrap_or(0))
-            }),
-        completion_tokens: value
-            .pointer("/usage/output_tokens")
-            .and_then(Value::as_u64),
+        prompt_tokens: usage.input,
+        completion_tokens: usage.output,
         reasoning,
         cached_prompt_tokens: value
             .pointer("/usage/cache_read_input_tokens")

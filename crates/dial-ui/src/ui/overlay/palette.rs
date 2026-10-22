@@ -6,7 +6,7 @@
 //! Typed search always covers every registered command; the category tabs stay one key away.
 use super::{
     DrawCtx, OverlayEvent,
-    settings::{editor_spans, filled, hint_line, panel, pressed, tab_style, typed_char},
+    settings::{editor_spans, filled, hint_line, panel, pressed, tab_strip, typed_char},
 };
 use crate::ui::{
     chrome::Section,
@@ -147,12 +147,27 @@ pub struct ChoiceItem {
 /// A picker over one command's values. Enter runs `/command [verb] value`, where an empty `verb`
 /// applies the value directly. When `remove` is set, Delete, Backspace on an empty search, or `x`
 /// on an empty search runs `/command <remove> value` for the selected item.
+///
+/// The copy fields are optional: an empty `prompt` reads `Filter choices:`, an empty `summary`
+/// describes the list generically, and `current_tag` names the marked item (`None` reads
+/// `current`; an empty string hides the tag and its marker when the label already says it).
+#[derive(Default)]
 pub struct ChoiceSpec {
     pub title: String,
     pub command: String,
     pub verb: &'static str,
     pub remove: Option<&'static str>,
     pub items: Vec<ChoiceItem>,
+    pub prompt: String,
+    pub summary: String,
+    pub current_tag: Option<String>,
+}
+
+impl ChoiceSpec {
+    /// The right-column tag for the current item; empty when the picker hides it.
+    fn current_tag(&self) -> &str {
+        self.current_tag.as_deref().unwrap_or("current")
+    }
 }
 
 /// Which list the panel shows when nothing is typed.
@@ -576,6 +591,10 @@ impl PaletteOverlay {
             if let Some(&Row::Entry(index)) = rows.get(self.cursor) {
                 self.arguments = Some((index, Editor::default()));
             }
+        } else if self.search.text.is_empty() && key.code == KeyCode::Home {
+            self.cursor = 0;
+        } else if self.search.text.is_empty() && key.code == KeyCode::End {
+            self.cursor = rows.len().saturating_sub(1);
         } else if let Some(c) = typed_char(key) {
             self.search.insert(&c.to_string());
             self.reset_selection();
@@ -651,13 +670,18 @@ impl PaletteOverlay {
 
     pub fn draw(&mut self, frame: &mut Frame, ctx: &DrawCtx) {
         // Only a running turn is worth a title note; an idle palette needs no status.
-        let extra = if self.busy { "turn running" } else { "" };
         let title = self
             .choice
             .as_ref()
             .map_or("Actions", |spec| spec.title.as_str())
             .to_owned();
-        panel(frame, ctx.theme, Section::Dial, &title, extra, |w, h| {
+        let extras: &[&str] = if self.busy {
+            &["turn running", ""]
+        } else {
+            &[""]
+        };
+        let extra = title_extra(ctx.theme, &title, frame.area().width, extras);
+        panel(frame, ctx.theme, Section::Dial, &title, &extra, |w, h| {
             self.compose(w, h, ctx)
         });
     }
@@ -754,53 +778,39 @@ impl PaletteOverlay {
             ));
             if let Some(notice) = &self.notice {
                 out.push(line(format!(" {notice}"), Tok::Warning));
-            } else if self.busy {
+            } else if self.busy && !self.entries[*index].during_turn.is_empty() {
+                // What running it now does to the turn in progress.
                 out.push(line(
-                    " Argument forms follow the same rules as slash commands.".into(),
+                    format!(" {}", self.entries[*index].during_turn),
                     Tok::Muted,
                 ));
             }
             out.push(line(
-                " Your chat draft is preserved. Paste edits arguments; Enter runs.".into(),
+                " Type the arguments; Enter runs the command. Your chat draft is kept.".into(),
                 Tok::Muted,
             ));
         } else {
-            let prompt = if !self.search.text.is_empty() {
-                " Search: "
-            } else if self.choice.is_some() {
-                " Filter choices: "
-            } else {
-                " Find an action: "
+            let prompt = match &self.choice {
+                Some(spec) if !spec.prompt.is_empty() => format!(" {} ", spec.prompt.trim()),
+                Some(_) => " Filter choices: ".to_owned(),
+                None if !self.search.text.is_empty() => " Search: ".to_owned(),
+                None => " Find an action: ".to_owned(),
             };
-            let mut spans = vec![Span::styled(prompt, theme.fg(Tok::Accent))];
+            let mut spans = vec![Span::styled(prompt.clone(), theme.fg(Tok::Accent))];
             spans.extend(editor_spans(
                 theme,
                 &self.search,
-                w.saturating_sub(text::width(prompt) + 1),
+                w.saturating_sub(text::width(&prompt) + 1),
                 false,
             ));
             out.push(filled(spans, w, Style::default()));
             if self.shows_tabs() {
-                // Keep the active category visible even when all category names do not fit.
-                let mut first = 0;
-                while first < self.group
-                    && GROUPS[first..=self.group]
-                        .iter()
-                        .map(|name| text::width(name) + 2)
-                        .sum::<usize>()
-                        > w
-                {
-                    first += 1;
-                }
-                let tabs = GROUPS
-                    .iter()
-                    .enumerate()
-                    .skip(first)
-                    .map(|(i, name)| {
-                        Span::styled(format!(" {name} "), tab_style(theme, i == self.group))
-                    })
-                    .collect();
-                out.push(filled(tabs, w, Style::default()));
+                // Windowed around the active category, with an ellipsis where more tabs sit.
+                out.push(filled(
+                    tab_strip(theme, GROUPS, self.group, true, w).spans,
+                    w,
+                    Style::default(),
+                ));
             }
             let rows = self.rows();
             self.cursor = self.cursor.min(rows.len().saturating_sub(1));
@@ -808,7 +818,13 @@ impl PaletteOverlay {
             // where its matches came from instead of repeating the view's purpose.
             let searching = !self.search.text.trim().is_empty();
             let (label, purpose) = match (&self.choice, self.view) {
-                (Some(spec), _) if spec.items.iter().any(|item| item.current) => {
+                (Some(spec), _) if !spec.summary.is_empty() => {
+                    (spec.summary.as_str(), String::new())
+                }
+                (Some(spec), _)
+                    if !spec.current_tag().is_empty()
+                        && spec.items.iter().any(|item| item.current) =>
+                {
                     ("Choose", "the current value is marked".to_owned())
                 }
                 (Some(_), _) => ("Choose", "select an option to continue".to_owned()),
@@ -838,18 +854,29 @@ impl PaletteOverlay {
                 ),
             };
             // The count is what someone scanning the list needs, so the purpose gives way first.
-            let count = format!(
-                "{}/{}",
-                if rows.is_empty() { 0 } else { self.cursor + 1 },
-                rows.len()
-            );
-            let head = format!(" {label} {} ", ctx.theme.sym(Sym::Dot));
-            let tail = format!(" {} {count}", ctx.theme.sym(Sym::Dot));
+            // An empty list has no position to report; the empty message says what to do.
+            let dot = ctx.theme.sym(Sym::Dot);
+            let tail = if rows.is_empty() {
+                String::new()
+            } else {
+                format!(" {dot} {}/{}", self.cursor + 1, rows.len())
+            };
+            let head = if purpose.is_empty() {
+                format!(" {label}")
+            } else {
+                format!(" {label} {dot} ")
+            };
             let room = w.saturating_sub(text::width(&head) + text::width(&tail));
-            out.push(line(
-                format!("{head}{}{tail}", text::ellipsize(&purpose, room, ascii)),
-                Tok::Muted,
-            ));
+            let header = if purpose.is_empty() {
+                // A picker summary is the whole header: it shortens before the count does.
+                format!(
+                    " {}{tail}",
+                    text::ellipsize(label, w.saturating_sub(1 + text::width(&tail)), ascii)
+                )
+            } else {
+                format!("{head}{}{tail}", text::ellipsize(&purpose, room, ascii))
+            };
+            out.push(line(header, Tok::Muted));
             let headers = out.len();
             let list_h = h
                 .saturating_sub(headers + 5)
@@ -864,6 +891,8 @@ impl PaletteOverlay {
             }
             self.scroll = self.scroll.min(rows.len().saturating_sub(list_h));
             let picker = self.choice.is_some();
+            let name_w = self.name_width(&rows, w);
+            let mut pending_empty: Vec<String> = Vec::new();
             for row in 0..list_h {
                 if let Some(&picked) = rows.get(self.scroll + row) {
                     let selected = self.scroll + row == self.cursor;
@@ -872,10 +901,11 @@ impl PaletteOverlay {
                     } else {
                         Style::default()
                     };
-                    let name_w = (w / 2).clamp(1, 32);
                     let (name, description, right, current) = match picked {
                         Row::Goal(goal) => {
-                            let right = format!("{} actions", self.goal_size(goal));
+                            let n = self.goal_size(goal);
+                            let right =
+                                format!("{n} {}", if n == 1 { "action" } else { "actions" });
                             (
                                 GOALS[goal].title.to_owned(),
                                 GOALS[goal].blurb.to_owned(),
@@ -892,9 +922,10 @@ impl PaletteOverlay {
                         Row::Entry(index) => {
                             let entry = &self.entries[index];
                             let (right, current) = match &self.choice {
-                                Some(spec) if spec.items[index].current => {
-                                    ("current".to_owned(), true)
-                                }
+                                Some(spec) if spec.items[index].current => (
+                                    spec.current_tag().to_owned(),
+                                    !spec.current_tag().is_empty(),
+                                ),
                                 Some(_) => (String::new(), false),
                                 None => (
                                     shortcut(&entry.command.name)
@@ -948,7 +979,16 @@ impl PaletteOverlay {
                     }
                     out.push(filled(spans, w, fill));
                 } else if row == 0 {
-                    out.push(line(self.empty_message(), Tok::Muted));
+                    // The empty message names the way out, so it wraps rather than clipping it.
+                    let room = w.saturating_sub(2).max(1);
+                    let wrapped = text::wrap_words(self.empty_message().trim(), room);
+                    let mut wrapped = wrapped.into_iter();
+                    if let Some(first) = wrapped.next() {
+                        out.push(line(format!(" {first}"), Tok::Muted));
+                    }
+                    pending_empty = wrapped.collect();
+                } else if !pending_empty.is_empty() {
+                    out.push(line(format!(" {}", pending_empty.remove(0)), Tok::Muted));
                 } else {
                     out.push(Line::default());
                 }
@@ -1020,6 +1060,61 @@ impl PaletteOverlay {
         out.push(self.footer(ctx.keys, theme, w));
         out
     }
+
+    /// Width of the label column. Action names keep a fixed column; picker labels are the content,
+    /// so they take the room their longest label needs, leaving a readable description column.
+    fn name_width(&self, rows: &[Row], w: usize) -> usize {
+        let fixed = (w / 2).clamp(1, 32);
+        let Some(spec) = &self.choice else {
+            return fixed;
+        };
+        let entries: Vec<&PaletteEntry> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Entry(index) => Some(&self.entries[*index]),
+                _ => None,
+            })
+            .collect();
+        let longest = entries
+            .iter()
+            .map(|entry| text::width(&entry.command.name))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let described = entries
+            .iter()
+            .any(|entry| !entry.command.description.is_empty());
+        let tag = if w < 64 {
+            0
+        } else {
+            text::width(spec.current_tag())
+        };
+        // Narrow panels give the label the row; the detail pane below still shows the rest.
+        let description = if described && w >= 64 {
+            (w / 4).min(24)
+        } else {
+            0
+        };
+        longest.min(
+            w.saturating_sub(tag + description + 6)
+                .max(fixed.min(longest)),
+        )
+    }
+}
+
+/// The longest of `extras` that fits on a `width`-cell panel top row beside `title` without
+/// touching it; the last candidate (usually empty) when none does.
+pub(super) fn title_extra(theme: &Theme, title: &str, width: u16, extras: &[&str]) -> String {
+    let title_w = 1 + crate::ui::chrome::fig_label(theme, Section::Dial, title)
+        .iter()
+        .map(|span| text::width(&span.content))
+        .sum::<usize>();
+    extras
+        .iter()
+        .find(|extra| extra.is_empty() || title_w + 2 + text::width(extra) < usize::from(width))
+        .or(extras.last())
+        .map(|extra| (*extra).to_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -181,6 +181,11 @@ impl<'a> Fields<'a> {
     }
 
     pub(super) fn uint(&self, field: u32) -> u64 {
+        self.uint_opt(field).unwrap_or(0)
+    }
+
+    /// Preserve field presence for partial provider-usage accounting.
+    pub(super) fn uint_opt(&self, field: u32) -> Option<u64> {
         self.0
             .iter()
             .filter_map(|(number, wire)| match wire {
@@ -188,7 +193,6 @@ impl<'a> Fields<'a> {
                 _ => None,
             })
             .next_back()
-            .unwrap_or(0)
     }
 
     /// Last fixed64 value of `field` as a double (`double` in the Devin schema); `0.0` when absent.

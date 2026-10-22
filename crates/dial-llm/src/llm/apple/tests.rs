@@ -113,6 +113,9 @@ fn on_device_model_answers_when_available() {
         max_tokens: 16,
         seed: None,
     };
+    let scope = llm::usage::Scope::default().next_turn(0).unwrap();
+    scope.begin(llm::usage::Billing::Local).unwrap();
+    let transport = llm::usage::Transport::enter(Some(scope.clone()));
     let reply = chat(
         &req,
         60,
@@ -121,5 +124,67 @@ fn on_device_model_answers_when_available() {
         &mut |_| true,
     )
     .unwrap();
+    transport.settle(true).unwrap();
+    scope
+        .finish(
+            Some(&reply),
+            None,
+            llm::usage::Billing::Local,
+            transport.attempts(),
+        )
+        .unwrap();
+    let counts = scope.snapshot().1.all;
+    assert_eq!(counts.transport_attempts, 1);
+    assert_eq!(counts.partial_reported_attempts, 0);
+    assert_eq!(counts.input, reply.prompt_tokens.unwrap_or(0));
+    assert_eq!(counts.output, reply.completion_tokens.unwrap_or(0));
     assert!(reply.text.to_lowercase().contains("pong"), "{reply:?}");
+}
+
+#[test]
+fn helper_usage_is_retained_only_once_and_missing_fields_stay_incomplete() {
+    for accepted in [false, true] {
+        for reported in [false, true] {
+            let scope = llm::usage::Scope::default().next_turn(0).unwrap();
+            scope.begin(llm::usage::Billing::Local).unwrap();
+            let transport = llm::usage::Transport::enter(Some(scope.clone()));
+            llm::usage::transport_attempt().unwrap();
+            let mut events = |_: &llm::StreamEvent| true;
+            let mut fold = Fold {
+                reply: Reply::default(),
+                on_text: None,
+                on_event: &mut events,
+                generating: false,
+            };
+            let event = if reported {
+                r#"{"type":"done","usage":{"prompt_tokens":8,"completion_tokens":2}}"#
+            } else {
+                r#"{"type":"done"}"#
+            };
+            assert!(fold.feed(event).unwrap());
+            assert_eq!(fold.reply.prompt_tokens.is_some(), reported);
+            transport.settle(accepted).unwrap();
+            scope
+                .finish(
+                    accepted.then_some(&fold.reply),
+                    None,
+                    llm::usage::Billing::Local,
+                    transport.attempts(),
+                )
+                .unwrap();
+            let counts = scope.snapshot().1.all;
+            assert_eq!(counts.input, if reported { 8 } else { 0 });
+            assert_eq!(counts.output, if reported { 2 } else { 0 });
+            assert_eq!(
+                counts.partial_reported_attempts,
+                u64::from(reported && !accepted)
+            );
+            assert_eq!(counts.reported_responses, u64::from(reported && accepted));
+            assert_eq!(
+                counts.unreported_attempts,
+                u64::from(!reported || !accepted)
+            );
+            assert_eq!(counts.observed_cost_usd, None);
+        }
+    }
 }

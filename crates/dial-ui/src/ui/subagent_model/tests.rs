@@ -41,17 +41,18 @@ fn status_mapping_covers_every_phase() {
 }
 
 #[test]
-fn sort_puts_live_work_first_then_recent_then_id() {
+fn sort_puts_attention_first_then_live_work_then_recent_then_id() {
     let mut agents = vec![
         entry("c", None, AgentStatus::Done, Some(10)),
         entry("b", None, AgentStatus::Running, Some(1)),
         entry("a", None, AgentStatus::Done, Some(50)),
         entry("d", None, AgentStatus::Waiting, Some(5)),
         entry("e", None, AgentStatus::Done, Some(50)),
+        entry("f", None, AgentStatus::Failed, Some(2)),
     ];
     sort_agents(&mut agents);
     let order: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
-    assert_eq!(order, ["b", "d", "a", "e", "c"]);
+    assert_eq!(order, ["d", "f", "b", "a", "e", "c"]);
 }
 
 #[test]

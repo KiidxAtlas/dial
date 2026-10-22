@@ -423,11 +423,11 @@ fn empty_project_points_to_all_projects_and_search_shows_a_hint() {
     let empty = Picker::new(vec![], vec![], "", "", false).scope(false, 0);
     let rendered = text_of(&empty.rows(80, 24, &theme));
     assert!(
-        rendered.contains("Ctrl+G lists every project"),
+        rendered.contains("Ctrl+G lists sessions from every project"),
         "{rendered}"
     );
     let narrow = text_of(&empty.rows(38, 16, &theme));
-    assert!(narrow.contains("Ctrl+G projects"), "{narrow}");
+    assert!(narrow.contains("Ctrl+G all projects"), "{narrow}");
     assert!(!narrow.contains("Enter resume"), "{narrow}");
     let p = Picker::new(vec![session("one", "Busy", 1)], vec![], "", "", false)
         .with_open_elsewhere(HashSet::from(["one".to_string()]));
@@ -437,4 +437,64 @@ fn empty_project_points_to_all_projects_and_search_shows_a_hint() {
         rendered.contains("Open in another dial process: resume, rename and delete"),
         "{rendered}"
     );
+}
+
+
+#[test]
+fn empty_catalogue_offers_the_way_forward_instead_of_a_search_prompt() {
+    let theme = Theme::dark();
+    let ascii = Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii);
+    let empty = Picker::new(vec![], vec![], "", "", false).scope(false, 0);
+    for (cols, height, theme) in [(120, 40, &theme), (60, 20, &theme), (38, 16, &ascii)] {
+        let rows = empty.rows(cols, height, theme);
+        let shown = text_of(&rows);
+        assert!(!shown.contains("Search"), "{cols}x{height}: {shown}");
+        assert!(!shown.contains("0 found"), "{cols}x{height}: {shown}");
+        // The whole message survives narrow widths by wrapping, never an ellipsis.
+        let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("every project."), "{cols}x{height}: {shown}");
+        assert!(!shown.contains('…') && !shown.contains("..."), "{cols}x{height}: {shown}");
+        assert!(rows.iter().all(|row| text::line_width(row) <= cols));
+    }
+    // A typed query with no hits still keeps the search line so it can be edited.
+    let mut p = Picker::new(vec![session("one", "Title", 1)], vec![], "", "zzz", false);
+    assert!(text_of(&p.rows(80, 24, &theme)).contains("Search"));
+    p.handle(&key(KeyCode::Char('u'), KeyModifiers::CONTROL), 24);
+    assert!(text_of(&p.rows(80, 24, &theme)).contains("1 session"));
+}
+
+#[test]
+fn footer_hints_fit_whole_and_only_offer_actions_the_selection_allows() {
+    let theme = Theme::dark();
+    let mut p = Picker::new(
+        vec![session("cur", "Here", 1), session("busy", "Busy", 1)],
+        vec![],
+        "cur",
+        "",
+        false,
+    )
+    .with_open_elsewhere(HashSet::from(["busy".to_string()]));
+    let actions = |p: &Picker| {
+        text_of(&p.rows(80, 24, &theme))
+            .lines()
+            .find(|row| row.contains("Ctrl+P"))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // The current session cannot be deleted here, so Ctrl+D is not advertised.
+    let shown = actions(&p);
+    assert!(shown.contains("Ctrl+R rename"), "{shown}");
+    assert!(!shown.contains("Ctrl+D"), "{shown}");
+    p.handle(&key(KeyCode::Down, KeyModifiers::NONE), 24);
+    let shown = actions(&p);
+    assert!(!shown.contains("Ctrl+R") && !shown.contains("Ctrl+D"), "{shown}");
+    // Hints never end in a cut-off word: each one is dropped whole when it does not fit.
+    for cols in [38, 44, 60, 80, 100, 120] {
+        for row in p.rows(cols, 24, &theme) {
+            let value: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+            if value.contains("Esc") || value.contains("Ctrl+P") {
+                assert!(!value.contains('…'), "{cols}: {value:?}");
+            }
+        }
+    }
 }

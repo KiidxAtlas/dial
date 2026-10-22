@@ -45,11 +45,16 @@ pub fn session(
             theme.fg(Tok::Muted),
         ),
         Span::styled(
-            format!(
-                " · {} changed file{}",
-                files.len(),
-                if files.len() == 1 { "" } else { "s" }
-            ),
+            if files.is_empty() {
+                format!(" {} no changes", theme.sym(Sym::Dot))
+            } else {
+                format!(
+                    " {} {} changed file{}",
+                    theme.sym(Sym::Dot),
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" }
+                )
+            },
             theme.fg(if files.is_empty() {
                 Tok::Dim
             } else {

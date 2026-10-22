@@ -953,6 +953,13 @@ impl Stream {
                 cache_write: usage.uint(4),
                 cache_read: usage.uint(5),
             });
+            super::usage::capture(super::usage::Snapshot {
+                input: usage.uint_opt(2),
+                output: usage.uint_opt(3),
+                cache_write: usage.uint_opt(4),
+                cache_read: usage.uint_opt(5),
+                ..Default::default()
+            });
         }
         // Each non-zero credit field is recorded; `usage.credits` exists once any is set.
         let cost = message.uint(14) as u32 as i32;

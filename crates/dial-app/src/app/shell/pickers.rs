@@ -23,16 +23,21 @@ impl Shell {
             detail: detail.to_owned(),
             current,
         };
+        // `summary` heads the list and says what choosing does; `prompt` names what is filtered.
         let picker = |title: &str,
                       command: &str,
                       verb: &'static str,
                       remove: Option<&'static str>,
-                      items: Vec<ChoiceItem>| ChoiceSpec {
+                      items: Vec<ChoiceItem>,
+                      (prompt, summary): (&str, String)| ChoiceSpec {
             title: title.to_owned(),
             command: command.to_owned(),
             verb,
             remove,
             items,
+            prompt: prompt.to_owned(),
+            summary,
+            ..Default::default()
         };
         match (name, args) {
             ("approval", "") => {
@@ -45,7 +50,17 @@ impl Shell {
                         pick(value, mode.description(), *value == current)
                     })
                     .collect();
-                Some(picker("Approval", "approval", "", None, items))
+                Some(picker(
+                    "Approval",
+                    "approval",
+                    "",
+                    None,
+                    items,
+                    (
+                        "Filter modes:",
+                        format!("When Dial asks before acting; now {current}"),
+                    ),
+                ))
             }
             ("effort", "") => {
                 let profile = reasoning_profile(&app.config).ok().flatten()?;
@@ -64,7 +79,22 @@ impl Shell {
                     "Dial judges each prompt's thinking level",
                     app.config.thinking_auto,
                 ));
-                Some(picker("Thinking effort", "effort", "", None, items))
+                let now = if app.config.thinking_auto {
+                    "auto"
+                } else {
+                    level
+                };
+                Some(picker(
+                    "Thinking effort",
+                    "effort",
+                    "",
+                    None,
+                    items,
+                    (
+                        "Filter levels:",
+                        format!("How much the model reasons per prompt; now {now}"),
+                    ),
+                ))
             }
             ("profile", "") => {
                 let active = app.config.model_profile.as_deref();
@@ -78,7 +108,17 @@ impl Shell {
                     })
                     .collect();
                 items.push(pick("off", "no profile", active.is_none()));
-                Some(picker("Capability profile", "profile", "", None, items))
+                Some(picker(
+                    "Capability profile",
+                    "profile",
+                    "",
+                    None,
+                    items,
+                    (
+                        "Filter profiles:",
+                        format!("Model preset; now {}", active.unwrap_or("off")),
+                    ),
+                ))
             }
             ("theme", "") => {
                 let active = self.themes.current().name().to_owned();
@@ -89,7 +129,14 @@ impl Shell {
                     .filter(|entry| entry.error.is_none())
                     .map(|entry| pick(&entry.name, "", entry.name == active))
                     .collect();
-                Some(picker("Theme", "theme", "", None, items))
+                Some(picker(
+                    "Theme",
+                    "theme",
+                    "",
+                    None,
+                    items,
+                    ("Filter themes:", format!("Colors and glyphs; now {active}")),
+                ))
             }
             ("queue", "") => {
                 let items: Vec<ChoiceItem> = self
@@ -109,8 +156,20 @@ impl Shell {
                         current: false,
                     })
                     .collect();
-                (!items.is_empty())
-                    .then(|| picker("Queued messages", "queue", "edit", Some("remove"), items))
+                let count = items.len();
+                (!items.is_empty()).then(|| {
+                    picker(
+                        "Queued messages",
+                        "queue",
+                        "edit",
+                        Some("remove"),
+                        items,
+                        (
+                            "Filter messages:",
+                            format!("{count} waiting to send; Enter edits, Delete removes",),
+                        ),
+                    )
+                })
             }
             ("permissions", "remove") => {
                 let items: Vec<ChoiceItem> = agent
@@ -131,6 +190,7 @@ impl Shell {
                         current: false,
                     })
                     .collect();
+                let count = items.len();
                 (!items.is_empty()).then(|| {
                     picker(
                         "Remove a permission rule",
@@ -138,6 +198,13 @@ impl Shell {
                         "remove",
                         None,
                         items,
+                        (
+                            "Filter rules:",
+                            format!(
+                                "{count} saved {}; Enter removes the selected one",
+                                if count == 1 { "rule" } else { "rules" }
+                            ),
+                        ),
                     )
                 })
             }

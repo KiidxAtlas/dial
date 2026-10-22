@@ -206,3 +206,18 @@ fn filtering_the_plan_opens_the_original_task_number_not_the_visible_row_number(
     assert!(matches!(action, OverlayEvent::Action(command) if command == "command:/todo show 3"));
     assert_eq!(todo, before);
 }
+
+#[test]
+fn plan_picker_summarizes_the_plan_and_does_not_repeat_the_status() {
+    let mut todo = list(json!([{"content":"a"},{"content":"b"},{"content":"c"},{"content":"d"}]));
+    todo.call(&json!({"op":"done"}));
+    todo.call(&json!({"op":"block", "index":3, "reason":"waiting"}));
+    let spec = plan_picker(&todo).unwrap();
+    assert_eq!(spec.summary, "4 steps, 1 done, 1 blocked");
+    assert_eq!(spec.prompt, "Filter steps:");
+    let working = &spec.items[0];
+    assert!(working.label.contains("Working: b"), "{}", working.label);
+    assert!(!working.detail.contains("Status:"), "{}", working.detail);
+    // The standalone step view keeps the status, since it has no label beside it.
+    assert!(step_detail(&todo.tasks()[1]).contains("Status: Working"));
+}

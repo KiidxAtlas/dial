@@ -193,3 +193,26 @@ fn a_failed_page_stops_automatic_paging() {
     });
     assert!(!b.catalog(Tab::Mcp).more);
 }
+
+#[test]
+fn zz_dump() {
+    use crate::ui::overlay::settings::testkit::{Rig, render, screen, status_preview};
+    let ascii = Rig::with_theme(crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii));
+    let rig = Rig::new();
+    for (name, filled) in [("empty", false), ("rows", true)] {
+        for (w, h, r) in [(120u16, 30u16, &rig), (100, 24, &rig), (60, 20, &rig), (38, 16, &ascii)] {
+            let ctx = DrawCtx { theme: &r.theme, keys: &r.keys, status: &r.status, preview_status: &status_preview };
+            let mut o = ExtensionsOverlay::new();
+            if filled {
+                let mut a = row("github", Origin::Curated, State::Available);
+                a.summary = "Issues, pull requests and code search on GitHub".into();
+                a.tags = vec!["official".into()];
+                let mut b = row("memory-server-with-long-name", Origin::Installed, State::Failing);
+                b.summary = "Knowledge graph memory".into();
+                o.browser.set_rows(Tab::Mcp, vec![a, b, row("fs", Origin::Installed, State::Enabled)]);
+            }
+            let buf = render(w, h, |f| o.draw(f, &ctx));
+            println!("==== {name} {w}x{h}\n{}", screen(&buf));
+        }
+    }
+}

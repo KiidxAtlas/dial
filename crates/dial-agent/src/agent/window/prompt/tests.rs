@@ -18,6 +18,7 @@ fn template_data_exposes_every_omp_system_prompt_variable() {
         edit_mode: EditMode::default(),
         template: None,
         lean: false,
+        concise_guidance: false,
         one_call: false,
         worked_example: false,
     };
@@ -97,6 +98,7 @@ fn computer_use_block_follows_computer_tool() {
             edit_mode: EditMode::default(),
             template,
             lean: false,
+            concise_guidance: false,
             one_call: false,
             worked_example: false,
         };
@@ -112,11 +114,14 @@ fn computer_use_block_follows_computer_tool() {
 }
 
 fn guidance_for(tools: &[String], lean: bool, one_call: bool) -> String {
-    scoped_guidance(&Offer {
-        tools,
-        lean,
-        one_call,
-    })
+    scoped_guidance(
+        &Offer {
+            tools,
+            lean,
+            one_call,
+        },
+        false,
+    )
 }
 
 fn names(tools: &[&str]) -> Vec<String> {
@@ -286,6 +291,7 @@ fn worked_example_is_appended_to_built_in_guidance_only() {
             edit_mode: EditMode::Replace,
             template: None,
             lean: true,
+            concise_guidance: false,
             one_call: true,
             worked_example,
         };
@@ -294,4 +300,58 @@ fn worked_example_is_appended_to_built_in_guidance_only() {
     assert!(build(None, true).contains("\n\n# Example\n"));
     assert!(!build(None, false).contains("# Example"));
     assert!(!build(Some("CUSTOM".into()), true).contains("# Example"));
+}
+
+#[test]
+fn concise_guidance_preserves_visual_rules_and_operator_owned_content() {
+    let harness: Harness = serde_json::from_value(serde_json::json!({
+        "system_prompt": "operator-owned guidance",
+        "memory": ["operator-owned note"]
+    }))
+    .unwrap();
+    let tools = names(&["read", "edit", "bash", "task", "skill"]);
+    let discoverable = vec![("browser".into(), "Render and inspect the real page".into())];
+    let build = |concise_guidance, replacement, template| {
+        system_messages(Inputs {
+            cwd: Path::new("/work"),
+            harness: &harness,
+            soul: Some("operator-owned identity".into()),
+            overrides: (replacement, Some("operator-owned append".into())),
+            context: &[],
+            skills: "operator-owned skills".into(),
+            memory: "operator-owned memory".into(),
+            tools: &tools,
+            discoverable: &discoverable,
+            edit_mode: EditMode::default(),
+            template,
+            lean: false,
+            concise_guidance,
+            one_call: false,
+            worked_example: false,
+        })
+        .unwrap()
+    };
+    let full = build(false, None, None);
+    let concise = build(true, None, None);
+    // Only the frozen built-in policy band changes; environment, discovery, skills,
+    // operator guidance/notes and memory remain byte-identical in the later bands.
+    assert_eq!(&concise[1..], &full[1..]);
+    assert!(
+        concise[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(VISUAL_VERIFICATION)
+    );
+    assert!(
+        concise[0]["content"].as_str().unwrap().len() < full[0]["content"].as_str().unwrap().len()
+    );
+    assert_eq!(
+        build(true, Some("operator-owned replacement".into()), None),
+        build(false, Some("operator-owned replacement".into()), None)
+    );
+    let template = prompt_template::compile("{{operatorGuidance}}|{{skillsCatalog}}").unwrap();
+    assert_eq!(
+        build(true, None, Some(&template)),
+        build(false, None, Some(&template))
+    );
 }

@@ -83,6 +83,7 @@ impl<'a> Agent<'a> {
                 crate::agent::workers::live_tasks::model_summary(&result)
             )}))?;
             self.live_tasks.deliver(&id);
+            self.efficiency_metrics.worker_results(&result);
         }
         Ok(())
     }

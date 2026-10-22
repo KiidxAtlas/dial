@@ -1,4 +1,5 @@
 mod integration;
+mod progress;
 mod rpc;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -44,6 +45,7 @@ pub fn run(
     profiles_path: Option<&Path>,
     checkpoint_path: Option<&Path>,
     resume: bool,
+    share_auth: bool,
 ) -> Result<()> {
     ensure!(
         checkpoint_path.is_none() || profiles_path.is_none(),
@@ -104,6 +106,10 @@ pub fn run(
                 profiles.configurations,
                 profiles.machine,
                 &executable,
+                share_auth,
+                report_path
+                    .map(|path| resolve_output(layout, path))
+                    .as_deref(),
             )?;
             regressed = report.recommended_configuration.is_none();
             invalid.extend(report.invalid_runs.iter().cloned());
@@ -182,7 +188,14 @@ pub fn run(
                     }
                     let isolated = tempfile::tempdir()?;
                     prepare_user_home(layout, &selected, &isolated)?;
-                    run_agent(&executable, isolated.path(), &selected, case, workspace)
+                    run_agent(
+                        &executable,
+                        isolated.path(),
+                        &selected,
+                        case,
+                        workspace,
+                        share_auth,
+                    )
                 },
                 |check, workspace| run_command_check(&user_home, &bench_config, workspace, check),
             )?;
@@ -217,6 +230,7 @@ pub fn run(
                     &bench_config,
                     case,
                     workspace,
+                    share_auth,
                 )
             },
             |check, workspace| run_command_check(&user_home, &bench_config, workspace, check),
@@ -272,15 +286,16 @@ fn invalid_run_error(layout: &Layout, reasons: &[String]) -> anyhow::Error {
         "benchmark run is invalid; the report was still emitted but its scores are not measurements:\n  {}",
         reasons.join("\n  ")
     );
-    if reasons
+    if reasons.iter().any(|reason| {
+        reason.contains("credentials are missing")
+            || reason.contains("Continue with ChatGPT")
+            || reason.contains("subscription sign-in")
+    }) && UNCOPIED_SIGN_INS
         .iter()
-        .any(|reason| reason.contains("credentials are missing"))
-        && UNCOPIED_SIGN_INS
-            .iter()
-            .any(|file| layout.user_dir.join(file).is_file())
+        .any(|file| layout.user_dir.join(file).is_file())
     {
         message.push_str(
-            "\nhint: benchmark agents run in an isolated DIAL_HOME that receives only config.toml and credentials.json; subscription sign-ins are not copied because refreshing them there could rotate the real login. Store a provider API key (/providers) or export the provider's API key environment variable.",
+            "\nhint: benchmark agents use an isolated DIAL_HOME. Pass --share-auth to use existing subscription sign-ins and their original refresh locks without copying tokens; API-key credentials remain supported.",
         );
     }
     anyhow::anyhow!(message)
@@ -439,6 +454,7 @@ pub fn run_assist(
     manifest: &Path,
     report_path: Option<&Path>,
     allow_remote: bool,
+    share_auth: bool,
 ) -> Result<()> {
     config.require_model()?;
     let manifest = if manifest.is_absolute() {
@@ -466,6 +482,10 @@ pub fn run_assist(
         configurations,
         policy,
         &executable,
+        share_auth,
+        report_path
+            .map(|path| resolve_output(layout, path))
+            .as_deref(),
     )?;
     print_assist_table(&report);
     let bytes = serde_json::to_vec_pretty(&json!({"assistance_ablation": report}))?;
@@ -660,8 +680,15 @@ fn run_agent(
     _config: &Config,
     case: &dial::benchmark::BenchmarkCase,
     workspace: &Path,
+    share_auth: bool,
 ) -> Result<RunMetrics> {
-    rpc::run(executable, user_home, case, workspace)
+    rpc::run(
+        executable,
+        user_home,
+        case,
+        workspace,
+        share_auth.then_some(_config.user_dir.as_path()),
+    )
 }
 
 fn run_command_check(
@@ -677,6 +704,11 @@ fn run_command_check(
         &config.sandbox,
         Some((&layout.state_dir, &layout.user_dir)),
     )?
+    .with_protected_paths(&[
+        layout.state_dir.clone(),
+        layout.user_dir.clone(),
+        config.user_dir.clone(),
+    ])
     .with_shell_backend(config.shell.backend);
     let output: ToolOutput = tools::execute(
         &ws,
@@ -1064,6 +1096,8 @@ fn run_machine(
     mut configurations: Vec<MachineConfiguration>,
     policy: MachineBenchmarkPolicy,
     executable: &Path,
+    share_auth: bool,
+    report_path: Option<&Path>,
 ) -> Result<MachineBenchmarkReport> {
     policy.validate(suite, &configurations)?;
     // Preflight every entry before inference. Misspellings must not become failed task scores.
@@ -1074,6 +1108,15 @@ fn run_machine(
     let baseline_configuration = configurations[0].name.clone();
     // All configurations and repetitions see exactly one snapshot of the source tree.
     let snapshot = clone_project(&layout.project_root)?;
+    let mut progress = report_path
+        .map(|path| {
+            progress::Progress::open(
+                path,
+                &suite.name,
+                configurations.len() * policy.repetitions * suite.cases.len(),
+            )
+        })
+        .transpose()?;
     let mut reports = Vec::with_capacity(configurations.len());
     for (configuration, (selected, settings)) in configurations.into_iter().zip(selected) {
         let contract = dial::benchmark::records::Contract::new(
@@ -1081,12 +1124,15 @@ fn run_machine(
             snapshot.path(),
             &json!({"config": selected, "integration": configuration.integration, "policy_contract_version": 1}),
         )?;
+        if let Some(progress) = progress.as_mut() {
+            progress.configuration(&configuration.name, &contract)?;
+        }
         let started = std::time::Instant::now();
         let mut cases = Vec::with_capacity(suite.cases.len() * policy.repetitions);
         for repetition in 0..policy.repetitions {
             let check_home = tempfile::tempdir()?;
             prepare_user_home(layout, &selected, &check_home)?;
-            let report = suite.run(
+            let report = suite.run_observed(
                 snapshot.path(),
                 |case, workspace| {
                     // No session, provenance memory, adapter state, or learned configuration leaks
@@ -1112,9 +1158,17 @@ fn run_machine(
                         workspace,
                         policy.case_timeout_secs,
                         configuration.adapter.as_deref(),
+                        share_auth.then_some(layout.user_dir.as_path()),
                     )
                 },
                 |check, workspace| run_command_check(&check_home, &isolated_config(&selected), workspace, check),
+                None,
+                |result| {
+                    if let Some(progress) = progress.as_mut() {
+                        progress.case(&configuration.name, repetition, result)?;
+                    }
+                    Ok(())
+                },
             )?;
             cases.extend(report.cases.into_iter().map(|mut case| {
                 case.id = format!("{repetition}:{}", case.id);
@@ -1130,6 +1184,9 @@ fn run_machine(
             aggregate,
             wall_time_ms,
         ));
+    }
+    if let Some(progress) = progress.as_mut() {
+        progress.finish()?;
     }
     let recommended_configuration = rank_machine_configurations(&mut reports, &policy)?;
     let invalid_runs = named_invalid_runs(

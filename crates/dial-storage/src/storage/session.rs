@@ -18,7 +18,6 @@
 //! interior lines, and entries whose parent is missing, are skipped and reported through
 //! `Session::take_recovery_diagnostics`. Loading never rewrites or truncates the file.
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
@@ -45,7 +44,7 @@ const WRITER_CLAIM_WAIT: Duration = Duration::from_secs(2);
 fn claim_writer(file: &File) -> io::Result<()> {
     let deadline = std::time::Instant::now() + WRITER_CLAIM_WAIT;
     loop {
-        match FileExt::try_lock_exclusive(file) {
+        match platform_fs::try_lock_journal(file, true) {
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
                     && std::time::Instant::now() < deadline =>
@@ -785,11 +784,15 @@ impl Session {
         if let Some(parent) = forked_from {
             header["forked_from"] = json!(parent);
         }
-        let mut file =
-            platform_fs::open_owner_only(OpenOptions::new().append(true).create_new(true), &path)
-                .with_context(|| format!("creating session {}", path.display()))?;
+        // Read access is required for the writer lock on Windows: an append-only handle lacks
+        // FILE_WRITE_DATA, and LockFileEx refuses it with ERROR_ACCESS_DENIED (os error 5).
+        let mut file = platform_fs::open_owner_only(
+            OpenOptions::new().read(true).append(true).create_new(true),
+            &path,
+        )
+        .with_context(|| format!("creating session {}", path.display()))?;
         let created = (|| -> Result<crate::runtime::stream_journal::Journal> {
-            FileExt::try_lock_exclusive(&file).context("claiming new session writer")?;
+            platform_fs::try_lock_journal(&file, true).context("claiming new session writer")?;
             file.write_all(format!("{header}\n").as_bytes())
                 .context("writing session header")?;
             Ok(crate::runtime::stream_journal::Journal::create_new(&path)?)
@@ -1167,7 +1170,7 @@ impl Session {
             return false;
         };
         matches!(
-            FileExt::try_lock_shared(&file),
+            platform_fs::try_lock_journal(&file, false),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock
         )
     }
@@ -1383,10 +1386,13 @@ impl Session {
             .context("session path has no file name")?
             .to_string_lossy();
         let tmp = dir.join(format!(".{}.{name}.tmp", random_hex(8)));
-        let mut out =
-            platform_fs::open_owner_only(OpenOptions::new().append(true).create_new(true), &tmp)
-                .with_context(|| format!("creating {}", tmp.display()))?;
-        FileExt::try_lock_exclusive(&out).context("claiming rewritten session writer")?;
+        // Read access as in `create_file_at`: Windows cannot lock an append-only handle.
+        let mut out = platform_fs::open_owner_only(
+            OpenOptions::new().read(true).append(true).create_new(true),
+            &tmp,
+        )
+        .with_context(|| format!("creating {}", tmp.display()))?;
+        platform_fs::try_lock_journal(&out, true).context("claiming rewritten session writer")?;
         let written = (|| -> io::Result<u64> {
             out.write_all(header.to_string().as_bytes())?;
             out.write_all(b"\n")?;

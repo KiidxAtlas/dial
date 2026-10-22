@@ -84,6 +84,11 @@ pub enum Assertion {
         path: PathBuf,
         content: String,
     },
+    /// Exact final answer, ignoring only surrounding whitespace. The runner retains its hash,
+    /// not response prose; missing observations make this check unavailable rather than passing.
+    ResponseEquals {
+        content: String,
+    },
     Command {
         command: String,
         #[serde(default)]
@@ -160,6 +165,18 @@ pub struct RunMetrics {
     /// reports, where tool offers and use stay unknown rather than zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_trace: Option<ToolTrace>,
+    /// Exact runtime ledger groups: `all`, `main`, `workers`, `by_purpose`, and coverage.
+    /// Purpose and ownership are orthogonal views, never additional usage to sum together.
+    /// Absent fields in older runtimes remain absent (unknown), not fabricated zeros.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_usage: Option<serde_json::Value>,
+    /// SHA256 of the trimmed final completed response; never stores response text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_sha256: Option<String>,
+    /// Runtime instrumentation only; unavailable counters must be omitted, not estimated from
+    /// tool results or notices. In particular, a tool dispatch does not establish useful work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efficiency: Option<serde_json::Value>,
 }
 
 /// Main-agent schema offers and admitted executions for one case. Worker, extension and
@@ -207,6 +224,8 @@ impl ToolTrace {
     }
 }
 
+#[cfg(test)]
+mod efficiency_tests;
 #[cfg(test)]
 mod tool_trace_tests;
 
@@ -305,6 +324,13 @@ fn failed_before_model_activity(metrics: &RunMetrics) -> bool {
     metrics.agent_error
         && !metrics.token_usage_observed
         && !metrics.token_usage_incomplete
+        && metrics
+            .runtime_usage
+            .as_ref()
+            .and_then(|usage| usage.pointer("/all/transport_attempts"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            == 0
         && [
             metrics.prompt_tokens,
             metrics.output_tokens,
@@ -380,6 +406,9 @@ pub struct BenchmarkReport {
     /// not results and must not be compared against or ranked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalid_run: Option<String>,
+    /// Outcome-verified work with all attempted-case costs, including failures, in the numerator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub useful_work: Option<UsefulWork>,
 }
 
 impl BenchmarkReport {
@@ -389,6 +418,60 @@ impl BenchmarkReport {
             .clone()
             .or_else(|| invalid_run_reason(&self.cases))
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UsefulWork {
+    pub verified_completed_cases: usize,
+    pub outcome_checked_cases: usize,
+    /// Sum of case runtimes, not benchmark wall time (which includes external verification).
+    pub attempted_elapsed_ms: u64,
+    pub elapsed_ms_per_verified_completion: Option<f64>,
+    /// Unknown unless every attempted case has complete observed token usage.
+    pub tokens_per_verified_completion: Option<f64>,
+    /// Unknown unless every attempted case has complete observed API pricing.
+    pub cost_usd_per_verified_completion: Option<f64>,
+}
+
+impl UsefulWork {
+    fn measured(cases: &[CaseResult]) -> Self {
+        let checked =
+            |case: &&CaseResult| case.evidence.as_ref().is_some_and(|e| e.outcome_checks > 0);
+        let completed = cases.iter().filter(checked).filter(|c| c.passed).count();
+        let elapsed = cases
+            .iter()
+            .fold(0u64, |sum, c| sum.saturating_add(c.metrics.elapsed_ms));
+        let tokens = cases.iter().try_fold(0u64, |sum, c| {
+            (c.metrics.token_usage_observed && !c.metrics.token_usage_incomplete).then(|| {
+                sum.saturating_add(c.metrics.prompt_tokens)
+                    .saturating_add(c.metrics.output_tokens)
+            })
+        });
+        let cost = cases.iter().try_fold(0.0, |sum, c| {
+            c.metrics
+                .observed_cost_complete
+                .then_some(c.metrics.observed_cost_usd)
+                .flatten()
+                .map(|cost| sum + cost)
+        });
+        Self {
+            verified_completed_cases: completed,
+            outcome_checked_cases: cases.iter().filter(checked).count(),
+            attempted_elapsed_ms: elapsed,
+            elapsed_ms_per_verified_completion: (completed > 0 && elapsed > 0)
+                .then(|| elapsed as f64 / completed as f64),
+            tokens_per_verified_completion: tokens
+                .filter(|_| completed > 0)
+                .map(|tokens| tokens as f64 / completed as f64),
+            cost_usd_per_verified_completion: cost
+                .filter(|_| completed > 0)
+                .map(|cost| cost / completed as f64),
+        }
+    }
+}
+
+pub fn response_sha256(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.trim().as_bytes()))
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
@@ -1001,6 +1084,10 @@ impl BenchmarkSuite {
                         !command.trim().is_empty(),
                         "command assertion cannot be empty"
                     ),
+                    Assertion::ResponseEquals { content } => ensure!(
+                        !content.trim().is_empty() && content.len() <= MAX_CONTEXT_BYTES,
+                        "response_equals needs a nonempty bounded answer"
+                    ),
                     Assertion::ToolInvoked { tool } => ensure!(
                         !tool.is_empty()
                             && tool.len() <= 256
@@ -1041,13 +1128,31 @@ impl BenchmarkSuite {
     pub fn run_recorded<A, C>(
         &self,
         source_root: &Path,
-        mut agent: A,
-        mut command_check: C,
-        mut recorder: Option<&mut records::Recorder>,
+        agent: A,
+        command_check: C,
+        recorder: Option<&mut records::Recorder>,
     ) -> Result<BenchmarkReport>
     where
         A: FnMut(&BenchmarkCase, &Path) -> Result<RunMetrics>,
         C: FnMut(&CommandCheck, &Path) -> Result<bool>,
+    {
+        self.run_observed(source_root, agent, command_check, recorder, |_| Ok(()))
+    }
+
+    /// Observe every checked result before starting the next case. Observer failures stop the run;
+    /// failed and unavailable trials are retained just like successes, including resumed results.
+    pub fn run_observed<A, C, O>(
+        &self,
+        source_root: &Path,
+        mut agent: A,
+        mut command_check: C,
+        mut recorder: Option<&mut records::Recorder>,
+        mut observe: O,
+    ) -> Result<BenchmarkReport>
+    where
+        A: FnMut(&BenchmarkCase, &Path) -> Result<RunMetrics>,
+        C: FnMut(&CommandCheck, &Path) -> Result<bool>,
+        O: FnMut(&CaseResult) -> Result<()>,
     {
         self.validate()?;
         let frozen = clone_project(source_root)?;
@@ -1064,6 +1169,7 @@ impl BenchmarkSuite {
         let mut results = Vec::with_capacity(self.cases.len());
         for case in &self.cases {
             if let Some(result) = recorder.as_ref().and_then(|record| record.completed(case)) {
+                observe(&result)?;
                 results.push(result);
                 continue;
             }
@@ -1154,6 +1260,13 @@ impl BenchmarkSuite {
                         let value = metrics.observed(*metric);
                         min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
                     }
+                    Assertion::ResponseEquals { content } => {
+                        if metrics.response_sha256.is_none() {
+                            unavailable_check_indices.push(index);
+                        }
+                        metrics.response_sha256.as_deref()
+                            == Some(response_sha256(content).as_str())
+                    }
                     Assertion::ToolInvoked { tool } => {
                         let invoked = metrics.tool_trace.as_ref().is_some_and(|trace| {
                             trace.invoked.get(tool).is_some_and(|count| *count > 0)
@@ -1210,6 +1323,7 @@ impl BenchmarkSuite {
             if let Some(recorder) = recorder.as_deref_mut() {
                 recorder.record(results.last().expect("just recorded case"))?;
             }
+            observe(results.last().expect("just recorded case"))?;
         }
         let mut report = score_report(&self.name, results);
         report.contract = Some(contract);
@@ -1369,6 +1483,7 @@ pub fn score_report(suite: &str, cases: Vec<CaseResult>) -> BenchmarkReport {
         contract: None,
         execution_build: Some(crate::build_info::report()),
         invalid_run: invalid_run_reason(&cases),
+        useful_work: Some(UsefulWork::measured(&cases)),
         cases,
         pass_rate,
         average_latency_ms,
@@ -1577,3 +1692,6 @@ mod tests;
 
 #[cfg(test)]
 mod machine_tests;
+
+#[cfg(test)]
+mod observer_tests;

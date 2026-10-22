@@ -91,14 +91,28 @@ pub(super) fn split_path(path: &str) -> (&str, &str) {
     }
 }
 
+/// Diff header lines that carry nothing the panel header does not already show.
+fn is_routine_head(line: &str) -> bool {
+    ["diff --git ", "index ", "--- ", "+++ "]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+}
+
 /// Flattens a parsed diff into display rows. `only` restricts the output to one hunk.
 pub(super) fn layout(doc: &Doc, view: View, only: Option<usize>) -> Vec<Row> {
     let mut rows = Vec::new();
     if only.is_none() {
-        rows.extend(doc.head.iter().map(|line| Row {
-            hunk: None,
-            kind: RowKind::Meta(line.clone()),
-        }));
+        // The `diff --git`, `index`, `---` and `+++` lines repeat what the panel header already
+        // says; only notable lines (new, deleted or renamed file, mode changes) are kept.
+        rows.extend(
+            doc.head
+                .iter()
+                .filter(|line| !is_routine_head(line))
+                .map(|line| Row {
+                    hunk: None,
+                    kind: RowKind::Meta(line.clone()),
+                }),
+        );
     }
     for (index, hunk) in doc.hunks.iter().enumerate() {
         if only.is_some_and(|o| o != index) {

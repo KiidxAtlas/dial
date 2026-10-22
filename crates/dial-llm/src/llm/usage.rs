@@ -41,6 +41,8 @@ pub struct Counts {
     pub retries: u64,
     pub successful_requests: u64,
     pub reported_responses: u64,
+    /// Failed/discarded attempts with an exact usage snapshot, not necessarily final usage.
+    pub partial_reported_attempts: u64,
     pub failed_requests: u64,
     pub discarded_attempts: u64,
     pub unreported_attempts: u64,
@@ -73,6 +75,7 @@ impl Counts {
             retries,
             successful_requests,
             reported_responses,
+            partial_reported_attempts,
             failed_requests,
             discarded_attempts,
             unreported_attempts,
@@ -156,7 +159,7 @@ impl Default for Coverage {
             history: "current_agent_runtime_only; prior/resumed accounting unavailable",
             attribution: "original_runtime_turn; late worker results retain their owner",
             cost: "observed accepted-response prices, not invoice totals; caps are observed-cost stop boundaries",
-            attempts: "model and selected-memory service send invocations; known dropped-response usage retained, missing attempt usage unavailable; excludes auth, discovery, server startup and redirects",
+            attempts: "model and selected-memory service send invocations; failed stream snapshots retain exact reported fields but remain incomplete/unpriced; missing attempt usage unavailable; excludes auth, discovery, server startup and redirects",
             turn_id: None,
         }
     }
@@ -580,15 +583,21 @@ fn release_external_reservation(state: &mut State, turn: u64) -> Result<()> {
 // Provider exchanges are synchronous on the calling thread. This guard scopes only model
 // transport sends, including all retries, without threading accounting through every adapter.
 thread_local! {
-    static TRANSPORT: std::cell::RefCell<Option<(Scope, u64)>> = const { std::cell::RefCell::new(None) };
+    static TRANSPORT: std::cell::RefCell<Option<AttemptState>> = const { std::cell::RefCell::new(None) };
 }
 pub(super) struct Transport {
-    previous: Option<(Scope, u64)>,
+    previous: Option<AttemptState>,
 }
 impl Transport {
     pub(super) fn enter(scope: Option<Scope>) -> Self {
         Self {
-            previous: TRANSPORT.with(|slot| slot.replace(scope.map(|scope| (scope, 0)))),
+            previous: TRANSPORT.with(|slot| {
+                slot.replace(scope.map(|scope| AttemptState {
+                    scope,
+                    attempts: 0,
+                    usage: None,
+                }))
+            }),
         }
     }
     pub(super) fn suspend() -> Self {
@@ -597,7 +606,20 @@ impl Transport {
         }
     }
     pub(super) fn attempts(&self) -> u64 {
-        TRANSPORT.with(|slot| slot.borrow().as_ref().map_or(0, |(_, attempts)| *attempts))
+        TRANSPORT.with(|slot| slot.borrow().as_ref().map_or(0, |state| state.attempts))
+    }
+    /// The accepted final Reply owns its usage; only rejected attempts retain snapshots.
+    pub(super) fn settle(&self, accepted: bool) -> Result<()> {
+        TRANSPORT.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                if accepted {
+                    state.usage = None;
+                } else {
+                    state.retain_usage()?;
+                }
+            }
+            Ok(())
+        })
     }
 }
 impl Drop for Transport {
@@ -608,15 +630,104 @@ impl Drop for Transport {
 pub(super) fn transport_attempt() -> Result<()> {
     TRANSPORT.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if let Some((scope, attempts)) = slot.as_mut() {
-            let next = attempts
+        if let Some(state) = slot.as_mut() {
+            let next = state
+                .attempts
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("usage accounting attempt counter overflow"))?;
-            scope.attempt(*attempts > 0)?;
-            *attempts = next;
+            state.retain_usage()?;
+            state.scope.attempt(state.attempts > 0)?;
+            state.attempts = next;
         }
         Ok(())
     })
+}
+
+/// Only five optional counters are retained, never response bodies or a retry history.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Snapshot {
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    pub cache_read: Option<u64>,
+    pub cache_write: Option<u64>,
+    pub reasoning: Option<u64>,
+}
+impl Snapshot {
+    pub(super) fn from_reply(reply: &Reply) -> Self {
+        Self {
+            input: reply.prompt_tokens,
+            output: reply.completion_tokens,
+            cache_read: reply.cached_prompt_tokens,
+            cache_write: reply.cache_creation_tokens,
+            reasoning: reply.reasoning_tokens,
+        }
+    }
+}
+struct AttemptState {
+    scope: Scope,
+    attempts: u64,
+    usage: Option<Snapshot>,
+}
+impl AttemptState {
+    fn retain_usage(&mut self) -> Result<()> {
+        if let Some(usage) = self.usage {
+            self.scope.observe(
+                Counts {
+                    partial_reported_attempts: 1,
+                    input: usage.input.unwrap_or(0),
+                    output: usage.output.unwrap_or(0),
+                    cache_read: usage.cache_read.unwrap_or(0),
+                    cache_write: usage.cache_write.unwrap_or(0),
+                    reasoning: usage.reasoning.unwrap_or(0),
+                    cache_reported_responses: u64::from(
+                        usage.cache_read.is_some() || usage.cache_write.is_some(),
+                    ),
+                    reasoning_reported_responses: u64::from(usage.reasoning.is_some()),
+                    ..Counts::default()
+                },
+                false,
+            )?;
+            // A start/delta snapshot is not proof of complete usage, even with both fields.
+            // Keep the attempt unreported and unpriced rather than inventing final totals.
+            self.usage = None;
+        }
+        Ok(())
+    }
+}
+pub(super) fn capture(usage: Snapshot) {
+    if [
+        usage.input,
+        usage.output,
+        usage.cache_read,
+        usage.cache_write,
+        usage.reasoning,
+    ]
+    .iter()
+    .all(Option::is_none)
+    {
+        return;
+    }
+    TRANSPORT.with(|slot| {
+        if let Some(state) = slot
+            .borrow_mut()
+            .as_mut()
+            .filter(|state| state.attempts > 0)
+        {
+            state.usage = Some(match state.usage {
+                Some(previous) => Snapshot {
+                    input: usage.input.or(previous.input),
+                    output: usage.output.or(previous.output),
+                    cache_read: usage.cache_read.or(previous.cache_read),
+                    cache_write: usage.cache_write.or(previous.cache_write),
+                    reasoning: usage.reasoning.or(previous.reasoning),
+                },
+                None => usage,
+            });
+        }
+    });
+}
+pub(super) fn capture_reply(reply: &Reply) {
+    capture(Snapshot::from_reply(reply));
 }
 #[cfg(test)]
 mod tests;

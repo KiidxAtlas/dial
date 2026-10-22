@@ -246,6 +246,10 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
         timeout_secs: u64,
     ) -> Result<String> {
+        ensure!(
+            !self.interrupt.load(Ordering::SeqCst),
+            "{role} request cancelled"
+        );
         main.require_session_identity()?;
         let namespace = match &self.active_side_namespace {
             Some(namespace) => namespace.clone(),
@@ -432,7 +436,13 @@ pub(in crate::agent) fn semantic_chat(
         ],
         tools: vec![],
         temperature: 0.0,
-        max_tokens,
+        // The complete response is at most 80 two-digit candidate indices, not source text.
+        // Keep lower configured limits; zero means the model default rather than a hard cap.
+        max_tokens: if max_tokens == 0 {
+            512
+        } else {
+            max_tokens.min(512)
+        },
         seed: None,
     }
 }

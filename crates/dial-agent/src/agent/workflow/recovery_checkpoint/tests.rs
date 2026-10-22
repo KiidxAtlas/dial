@@ -90,3 +90,40 @@ fn only_meaningful_recovery_restores_tools() {
     checkpoint.arm(&call("finish"), "invalid outcome");
     assert!(checkpoint.rejection(&call("finish")).is_none());
 }
+
+#[test]
+fn batched_read_feedback_expires_when_any_target_changes_or_disappears() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = crate::tools::Workspace::new(dir.path()).unwrap();
+    let mut read = call("read");
+    read.arguments = json!({"paths":["a.txt:1-1", "b.txt:1-1"]});
+    let mut checkpoint = RecoveryCheckpoint::default();
+    let mut investigation = crate::agent::workflow::investigation::InvestigationGuard::default();
+    let mut repeats = crate::agent::safety::guard::RepeatGuard::default();
+    for remove in [false, true] {
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "beta").unwrap();
+        checkpoint.arm(&read, "unchanged evidence");
+        checkpoint.observe_at(
+            &ws,
+            &read,
+            &crate::runtime::tool_output::ToolOutput {
+                text: "alpha and beta".into(),
+                is_error: false,
+                data: None,
+                execution: Default::default(),
+            },
+            &mut investigation,
+            &mut repeats,
+        );
+        assert!(checkpoint.rejection_at(&ws, &read).is_some());
+        std::fs::write(dir.path().join("unrelated.txt"), "other").unwrap();
+        assert!(checkpoint.rejection_at(&ws, &read).is_some());
+        if remove {
+            std::fs::remove_file(dir.path().join("b.txt")).unwrap();
+        } else {
+            std::fs::write(dir.path().join("b.txt"), "changed").unwrap();
+        }
+        assert!(checkpoint.rejection_at(&ws, &read).is_none());
+    }
+}

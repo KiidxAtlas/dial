@@ -19,7 +19,9 @@ use crate::llm::{Chat, Reply};
 
 /// Model attempts per judgment: the first answer, plus one retry when it is not a listed choice.
 const MAX_ATTEMPTS: usize = 2;
-const MAX_REPLY_TOKENS: u32 = 64;
+/// Includes reasoning tokens on endpoints that count them against the output limit. A 64-token
+/// allowance can be exhausted before even a short JSON answer reaches the visible content.
+const MAX_REPLY_TOKENS: u32 = 512;
 /// Characters of untrusted context sent with a question; longer context is cut at a char boundary.
 const MAX_CONTEXT_CHARS: usize = 4000;
 
@@ -227,6 +229,10 @@ pub fn judge_turn_thinking(
     usage: Option<&crate::llm::usage::Scope>,
     cancel: Arc<AtomicBool>,
 ) -> Result<Judgment> {
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::SeqCst),
+        "thinking judgment cancelled"
+    );
     let cache = match cache::default_path(user_dir) {
         Some(path) => Some(cache::Cache::open(
             &path,
@@ -282,7 +288,13 @@ impl Backend for ProviderBackend<'_> {
             ],
             tools: Vec::new(),
             temperature: 0.0,
-            max_tokens: MAX_REPLY_TOKENS,
+            // Preserve the operator's exact-model output budget, including 0 (provider-resolved).
+            // Do not turn off reasoning: its controls and capabilities belong to the profile.
+            max_tokens: self
+                .config
+                .active_model_profile()
+                .and_then(|profile| profile.max_tokens)
+                .unwrap_or(MAX_REPLY_TOKENS),
             seed: None,
         };
         let mut backend = crate::agent::make_backend(self.config)?;

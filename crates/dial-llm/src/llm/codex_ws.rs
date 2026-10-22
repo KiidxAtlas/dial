@@ -589,6 +589,7 @@ fn stream(
         let wire = Value::Object(request).to_string();
         let prompt = body.get("previous_response_id").is_some().then_some(full);
         super::wire::record_with_prompt(wire.as_bytes(), prompt, "websocket");
+        super::usage::transport_attempt()?;
         socket.send(Message::Text(wire.into())).map_err(|error| {
             match write_error(error).downcast::<super::stream::IncompleteStream>() {
                 Ok(gone) => SocketGone(gone.0).into(),
@@ -670,6 +671,11 @@ fn stream(
                         .pointer("/response/id")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
+                }
+                if outgoing.is_none() && !content_seen {
+                    // A previously accepted steer created this successor server-side. Count
+                    // it when attached output first arrives, not for steer acknowledgments.
+                    super::usage::transport_attempt()?;
                 }
                 content_seen = true;
                 if super::responses::advances_reply(&event.to_string()) {

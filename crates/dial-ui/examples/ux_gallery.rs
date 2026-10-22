@@ -3,22 +3,35 @@
 //! Output: $TMPDIR/dial-ux-review/before.html (use `after` for a separate comparison).
 use dial_agent::agent::workflow::questions::{Question, QuestionOption, QuestionRequest};
 use dial_agent::agent::workflow::todo::TodoList;
-use dial_llm::{config::settings_store::Scope, llm::model_config::UiConfig};
+use dial_llm::{
+    config::settings_store::Scope,
+    llm::{
+        catalog::{Discovery, ModelEntry, ProviderStatus},
+        model_config::{ModelSelection, RoleSource, RoleStatus, UiConfig},
+    },
+};
+use dial_storage::storage::session::SessionInfo;
 use dial_ui::ui::{
     Rows,
     composer::{CommandEntry, CommandKind, Composer, ComposerCtx},
     keys::Keymap,
     overlay::{
         DrawCtx,
+        models::ModelOverlay,
         palette::{PaletteEntry, PaletteOverlay},
+        providers::ProviderOverlay,
         settings::SettingsOverlay,
+        shortcuts::ShortcutOverlay,
+        subagents::SubagentsOverlay,
     },
     questions::Dialog,
     session_picker::Picker,
     status::{Phase, StatusData},
+    subagent_model::{AgentEntry, AgentStatus, HubSnapshot, Totals},
     theme::{Glyphs, Theme},
     transcript::{Transcript, TranscriptCtx},
     welcome::{self, View, WelcomeInfo},
+    worker_pins::WorkerBoard,
 };
 use ratatui::{
     Terminal,
@@ -344,6 +357,25 @@ fn main() -> anyhow::Result<()> {
         transcript.push_user("Keep the existing API compatible.");
         transcript.tool_start("check", "bash", "cargo test", r#"{"command":"cargo test"}"#);
         transcript.tool_end("check", "test result: ok. 18 passed; 0 failed", false, 1.2);
+        transcript.tool_start(
+            "docs",
+            "mcp__context7__query-docs",
+            "Look up API compatibility",
+            r#"{"libraryId":"/example/sdk","query":"compatible API"}"#,
+        );
+        transcript.tool_end("docs", "The SDK retains the existing API.", false, 0.8);
+        transcript.tool_start(
+            "docs-error",
+            "mcp__docs__search",
+            "Search migration guide",
+            r#"{"query":"migration"}"#,
+        );
+        transcript.tool_end(
+            "docs-error",
+            "Service unavailable: request timed out.",
+            true,
+            1.1,
+        );
         transcript.assistant_delta("The existing API is preserved. The focused tests pass.");
         transcript.finish_turn();
         let rows = transcript
@@ -361,7 +393,7 @@ fn main() -> anyhow::Result<()> {
         screen(
             &mut out,
             &format!("Work evidence / {name}"),
-            &rows_buffer(rows, width, 12),
+            &rows_buffer(rows, width, 22),
             light,
         );
         let request = QuestionRequest {
@@ -505,6 +537,101 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
         let mut palette = PaletteOverlay::new(entries, false);
+        // Exercise the real worker projections without adding renderer-only production setters.
+        let snapshot = HubSnapshot {
+            agents: (1..=5)
+                .map(|n| AgentEntry {
+                    id: format!("task-{n}"),
+                    name: if n == 5 {
+                        "Needs your direction".into()
+                    } else {
+                        format!("Worker {n}")
+                    },
+                    agent: "worker".into(),
+                    task: "Preserve public APIs while improving the execution path".into(),
+                    status: if n == 5 {
+                        AgentStatus::Waiting
+                    } else {
+                        AgentStatus::Running
+                    },
+                    current: Some(if n == 5 {
+                        "Approval required before execution".into()
+                    } else {
+                        "Inspecting affected callers".into()
+                    }),
+                    cancellable: true,
+                    steerable: true,
+                    ..Default::default()
+                })
+                .collect(),
+            totals: Totals {
+                running: 5,
+                total: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut workers = SubagentsOverlay::new();
+        workers.set_snapshot(snapshot.clone());
+        terminal.draw(|f| workers.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Worker roster / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
+        workers.handle(
+            &crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageDown,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            &keys,
+        );
+        terminal.draw(|f| workers.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Worker roster after paging / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
+        let fixture = tempfile::tempdir()?;
+        let layout = dial_llm::config::paths::Layout::with_user_dir(
+            fixture.path(),
+            fixture.path().join("state"),
+        )?;
+        let runtime = dial_core::runtime::Tree::default();
+        for agent in snapshot.agents {
+            runtime.start("worker", &agent.name, None).settle(String::new(), Some(serde_json::json!({
+                "id": agent.id,
+                "name": agent.name,
+                "task": agent.task,
+                "status": if agent.status == AgentStatus::Waiting { "needs_input" } else { "running" },
+                "current": agent.current,
+            })), if agent.status == AgentStatus::Waiting { dial_core::runtime::Phase::NeedsInput } else { dial_core::runtime::Phase::Running });
+        }
+        let mut board = WorkerBoard::default();
+        board.refresh(
+            std::time::Instant::now(),
+            &layout,
+            "gallery",
+            &runtime,
+            None,
+        );
+        let pins = dial_ui::ui::worker_pins::rows(
+            &board,
+            width as usize,
+            3,
+            dial_llm::llm::model_config::PinnedWorkers::Collapsed,
+            true,
+            0,
+            &theme,
+        );
+        screen(
+            &mut out,
+            &format!("Tight worker summary / {name}"),
+            &rows_buffer(pins, width, 3),
+            light,
+        );
         terminal.draw(|f| palette.draw(f, &ctx))?;
         screen(
             &mut out,
@@ -521,6 +648,137 @@ fn main() -> anyhow::Result<()> {
             &mut out,
             &format!("Empty action search / {name}"),
             terminal.backend().buffer(),
+            light,
+        );
+        let sessions: Vec<SessionInfo> = [
+            ("a1", "Fix flaky retry in the HTTP client", 6, "2026-01-02T09:00:00Z"),
+            ("b2", "Explain the build pipeline", 2, "2026-01-01T12:00:00Z"),
+            ("c3", "", 0, "2025-12-20T08:00:00Z"),
+            ("d4", "Migrate settings storage to TOML", 14, "2025-11-03T16:00:00Z"),
+        ]
+        .into_iter()
+        .map(|(id, title, requests, updated)| SessionInfo {
+            id: id.into(),
+            path: format!("/{id}.jsonl").into(),
+            started: updated.into(),
+            updated: updated.into(),
+            title: title.into(),
+            messages: requests * 2,
+            user_messages: requests,
+            model: "local/qwen3.5-9b".into(),
+            parent_id: None,
+            first_message: title.into(),
+            last_message: "Keep the public retry API stable".into(),
+            last_answer: "The retry loop now honours the deadline.".into(),
+            project: "~/projects/atlas".into(),
+        })
+        .collect();
+        let picker = Picker::new(sessions, vec!["d4".into()], "b2", "", false);
+        screen(
+            &mut out,
+            &format!("Sessions / {name}"),
+            &rows_buffer(
+                picker.rows(width as usize, height as usize, &theme),
+                width,
+                height,
+            ),
+            light,
+        );
+        let entry = |provider: &str, model: &str, source: &str, available: bool| ModelEntry {
+            selection: ModelSelection {
+                provider: provider.into(),
+                model: model.into(),
+                base_url: Some(format!("http://{provider}/v1")),
+                context_window: Some(32768),
+                ..ModelSelection::default()
+            },
+            label: model.into(),
+            source: source.into(),
+            available,
+            metadata: Default::default(),
+        };
+        let provider_status =
+            |id: &str, label: &str, state: &str, models: usize, detail: &str| ProviderStatus {
+                id: id.into(),
+                label: label.into(),
+                base_url: Some(format!("http://{id}/v1")),
+                state: state.into(),
+                detail: detail.into(),
+                models,
+            };
+        let discovery = Discovery {
+            models: vec![
+                entry("local", "qwen3.5-9b", "Local MLX", true),
+                entry("ollama", "llama3.2", "Ollama", true),
+                entry("lm-studio", "gemma-3-12b", "LM Studio · loads on first use", true),
+                entry("openai", "gpt-5-mini", "OpenAI (cached, unverified)", false),
+            ],
+            providers: vec![
+                provider_status("local", "Local MLX", "cached", 1, "2 models installed"),
+                provider_status("ollama", "Ollama", "reachable", 1, "1 model"),
+                provider_status("lm-studio", "LM Studio", "reachable", 1, "1 model"),
+                provider_status("openai", "OpenAI", "auth-required", 1, "API key required"),
+                provider_status("llama-cpp", "llama.cpp", "unavailable", 0, "Not running"),
+            ],
+        };
+        let main = discovery.models[0].selection.clone();
+        let roles = vec![RoleStatus {
+            role: "main",
+            effective: Some(main.display_name()),
+            assigned: Some(main),
+            source: RoleSource::Main,
+        }];
+        let mut models = ModelOverlay::new(Some(discovery.clone()), roles, Scope::Global);
+        terminal.draw(|f| models.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Models / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
+        let mut providers = ProviderOverlay::new(
+            Some(discovery),
+            Default::default(),
+            Box::new(|_| false),
+            Scope::Global,
+        );
+        terminal.draw(|f| providers.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Providers / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
+        let mut shortcuts = ShortcutOverlay::new();
+        terminal.draw(|f| shortcuts.draw(f, &ctx))?;
+        screen(
+            &mut out,
+            &format!("Keyboard shortcuts / {name}"),
+            terminal.backend().buffer(),
+            light,
+        );
+        let mut markdown_transcript = Transcript::new();
+        markdown_transcript.push_user("Summarize the retry change.");
+        markdown_transcript.assistant_delta(
+            "## Retry change\n\nThe client now **honours the deadline**:\n\n1. `retry()` stops once the budget is spent.\n2. Errors keep their original cause.\n\n| Case | Before | After |\n| --- | --- | --- |\n| timeout | retried forever | stops at deadline |\n\n```rust\nlet left = deadline.saturating_duration_since(now);\n```\n\n> Callers that relied on unlimited retries must pass an explicit budget.",
+        );
+        markdown_transcript.finish_turn();
+        let rows = markdown_transcript
+            .take_settled_with_images(
+                width,
+                &TranscriptCtx {
+                    theme: &theme,
+                    ui: &ui,
+                    tick: 0,
+                    tools_expanded: false,
+                    expand_key: &keys.label(dial_ui::ui::keys::Action::ToolsExpand),
+                },
+            )
+            .0;
+        screen(
+            &mut out,
+            &format!("Answer formatting / {name}"),
+            &rows_buffer(rows, width, 24),
             light,
         );
     }

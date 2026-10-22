@@ -133,3 +133,60 @@ fn auxiliary_output_budget_preserves_endpoint_caps_and_selected_profiles() {
     );
     assert_eq!(backend.model_profile().unwrap().max_tokens, Some(1024));
 }
+
+#[test]
+fn semantic_index_budget_is_bounded_without_raising_configured_caps() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(temp.path()).unwrap();
+    let request = crate::tools::code::navigation::semantic_request(
+        &workspace,
+        &json!({"query":"rank source evidence", "ranking":"semantic"}),
+    )
+    .unwrap()
+    .unwrap();
+    for (configured, expected) in [(0, 512), (32, 32), (512, 512), (32_000, 512)] {
+        let chat = semantic_chat(&request, configured);
+        assert_eq!(chat.max_tokens, expected);
+        assert!(chat.tools.is_empty());
+        assert_eq!(chat.messages[0]["content"], request.system);
+        assert_eq!(chat.messages[1]["content"], request.prompt);
+    }
+}
+
+#[test]
+fn cancelled_role_request_never_initializes_a_backend_or_sends_a_request() {
+    use crate::agent::run::tool_exposure::default_offer_tests::with_agent;
+    let server = llm::fake::serve(vec![]);
+    with_agent("", |agent| {
+        agent.interrupt.store(true, Ordering::SeqCst);
+        // No session identity: cancellation must precede even backend/cache validation.
+        let mut main = Backend::new(
+            ProviderKind::Endpoint {
+                base_url: format!("{}/v1", server.url),
+                model: "test".into(),
+                api_key: None,
+            },
+            Default::default(),
+            5,
+        );
+        let chat = Chat {
+            messages: vec![json!({"role":"user","content":"Decide"})],
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: 64,
+            seed: None,
+        };
+        let error = agent
+            .role_chat(
+                &mut main,
+                "small",
+                llm::usage::Purpose::Judgment,
+                &chat,
+                &mut NullUi,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error:#}");
+        assert!(agent.role_backends.is_empty());
+    });
+    assert!(server.requests().is_empty());
+}

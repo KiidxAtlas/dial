@@ -121,3 +121,19 @@ fn parent_and_worker_sources_share_tags() {
     assert_eq!(parent["dial_transient"], true);
     assert_eq!(parent[KEY], "loop");
 }
+
+#[test]
+fn steering_drops_stale_advice_without_losing_protocol_findings_or_safety() {
+    let result = json!({"role":"user","content":"worker findings", "dial_transient":true});
+    let context = json!({"role":"user","content":"task evidence", "dial_task_context":true, "dial_transient":true});
+    let safety = note(Priority::Safety, "uncertain external effect");
+    let mut pending = vec![
+        note(Priority::Failure, "old task failed"),
+        result.clone(),
+        context.clone(),
+        note(Priority::Review, "finish the old task"),
+        safety.clone(),
+    ];
+    reset_for_steering(&mut pending);
+    assert_eq!(pending, [result, context, safety]);
+}

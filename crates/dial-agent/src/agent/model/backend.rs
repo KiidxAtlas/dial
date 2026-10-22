@@ -46,6 +46,7 @@ impl Default for Runtime {
 
 pub fn make_backend(config: &Config) -> Result<Backend> {
     config.require_model()?;
+    let subscription_auth = crate::config::paths::subscription_auth_dir(&config.user_dir)?;
     let requested_account = config
         .endpoint
         .as_ref()
@@ -61,7 +62,7 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
                 "ChatGPT account_id is not authorized by private global policy"
             );
         }
-        let id = llm::chatgpt::resolve_account(&config.user_dir, requested_account)?;
+        let id = llm::chatgpt::resolve_account(&subscription_auth, requested_account)?;
         ensure!(
             config
                 .chatgpt_allowed_accounts
@@ -91,13 +92,13 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
             }
             ProviderKind::ChatGpt {
                 model: config.model.clone(),
-                user_dir: config.user_dir.clone(),
+                user_dir: subscription_auth.clone(),
             }
         }
         (Some(provider), Some(endpoint))
             if provider == "anthropic"
                 && endpoint.base_url == crate::llm::anthropic::BASE_URL
-                && crate::llm::anthropic_oauth::signed_in(&config.user_dir) =>
+                && crate::llm::anthropic_oauth::signed_in(&subscription_auth) =>
         {
             ensure!(
                 endpoint
@@ -107,7 +108,7 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
             );
             ProviderKind::AnthropicSubscription {
                 model: config.model.clone(),
-                user_dir: config.user_dir.clone(),
+                user_dir: subscription_auth.clone(),
             }
         }
         (Some(provider), Some(endpoint)) if provider == "anthropic" => {
@@ -190,7 +191,7 @@ pub fn make_backend(config: &Config) -> Result<Backend> {
         backend = backend.with_profile(profile.clone());
     } else if config.provider.as_deref() == Some(llm::chatgpt::PROVIDER)
         && let Some(profile) = llm::chatgpt::scoped_model_profile(
-            &config.user_dir,
+            &subscription_auth,
             backend.account_id(),
             &config.model,
         )?

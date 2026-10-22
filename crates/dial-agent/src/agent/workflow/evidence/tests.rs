@@ -393,3 +393,33 @@ fn repeated_errors_never_supersede_success_or_lose_diagnostics() {
         }
     }
 }
+
+#[test]
+fn structured_or_image_suffixes_do_not_look_like_an_empty_warm_prefix() {
+    for suffix in [
+        json!({"role":"user","content":[{"type":"text","text":"x".repeat(40_000)}]}),
+        json!({"role":"user","content":"inspect this", "dial_images":[{"path":"fixture.png"}]}),
+        json!({"role":"assistant","content":"", "dial_provider_content":[{"type":"thinking","thinking":"x".repeat(40_000)}]}),
+    ] {
+        let mut messages = vec![
+            obs("old", "original source", "k"),
+            suffix,
+            obs("new", "updated source", "k"),
+        ];
+        project(
+            &mut messages,
+            &mut Supersession::default(),
+            &Policy {
+                warm_tokens: 1_000,
+                pressure: false,
+                protect_tokens: usize::MAX,
+                supersede_reads: true,
+                drop_useless: true,
+            },
+        );
+        assert_eq!(
+            messages[0]["content"], "original source",
+            "Do not invalidate a large cached suffix outside pressure"
+        );
+    }
+}

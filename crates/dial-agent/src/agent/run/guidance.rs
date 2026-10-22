@@ -80,6 +80,14 @@ pub(in crate::agent) fn is_marker(key: &str) -> bool {
     key == KEY
 }
 
+/// Steering replaces the task's recovery context, not protocol data, worker findings or safety
+/// boundaries. Do not queue the previous task's failure/completion advice for its replacement.
+pub(in crate::agent) fn reset_for_steering(messages: &mut Vec<Value>) {
+    messages.retain(|message| {
+        Priority::of(message).is_none_or(|priority| priority == Priority::Safety)
+    });
+}
+
 /// Keep only the highest-priority advisory note among this request's trailing transient
 /// messages and return the dropped ones. Stored history before the tail is never touched.
 pub(in crate::agent) fn cap(messages: &mut Vec<Value>) -> Vec<Value> {

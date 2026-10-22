@@ -150,3 +150,62 @@ fn directory_cycles_stop_and_external_targets_are_refused() {
         "untouched"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn copies_preserve_file_modes_and_do_not_share_writes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source = tempfile::tempdir().unwrap();
+    let file = source.path().join("script.sh");
+    fs::write(&file, "original").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o751)).unwrap();
+    for copied in [
+        clone_project(source.path()).unwrap(),
+        copy_project_plain(source.path()).unwrap(),
+    ] {
+        let copy = copied.path().join("script.sh");
+        assert_eq!(
+            fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "original");
+        fs::write(copy, "changed").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "original");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn file_symlinks_cannot_escape_and_broken_links_fail_closed() {
+    let source = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let private = outside.path().join("private.txt");
+    fs::write(&private, "private").unwrap();
+    let alias = source.path().join("alias");
+    symlink(&private, &alias).unwrap();
+    assert!(clone_project(source.path()).is_err());
+    assert!(copy_project_plain(source.path()).is_err());
+    fs::remove_file(&alias).unwrap();
+    symlink("missing", &alias).unwrap();
+    assert!(clone_project(source.path()).is_err());
+    assert!(copy_project_plain(source.path()).is_err());
+    assert_eq!(fs::read_to_string(private).unwrap(), "private");
+}
+
+#[cfg(unix)]
+#[test]
+fn aliases_to_excluded_directories_are_not_materialized() {
+    let source = tempfile::tempdir().unwrap();
+    for excluded in ["node_modules", ".ssh"] {
+        fs::create_dir(source.path().join(excluded)).unwrap();
+        fs::write(source.path().join(excluded).join("hidden"), "hidden").unwrap();
+        symlink(excluded, source.path().join(format!("alias-{excluded}"))).unwrap();
+    }
+    for copied in [
+        clone_project(source.path()).unwrap(),
+        copy_project_plain(source.path()).unwrap(),
+    ] {
+        assert_eq!(fs::read_dir(copied.path()).unwrap().count(), 0);
+    }
+}

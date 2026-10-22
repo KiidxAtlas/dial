@@ -204,6 +204,7 @@ fn theme_ascii_selection_scroll_disabled_and_unicode_bounds() {
     let mut rig = Rig::with_theme(theme);
     rig.keys.rebind(Action::Submit, &[]).unwrap();
     let mut overlay = ShortcutOverlay::new();
+    // The selected row is customized (disabled), so restoring its defaults is offered.
     let buffer = draw(&mut overlay, &rig, 100, 16);
     let shown = screen(&buffer);
     assert!(shown.is_ascii());
@@ -255,4 +256,30 @@ fn theme_ascii_selection_scroll_disabled_and_unicode_bounds() {
             draw(&mut overlay, &rig, w, h);
         }
     }
+}
+
+#[test]
+fn delete_on_default_keys_explains_instead_of_saving_and_home_end_jump() {
+    let rig = Rig::new();
+    let mut overlay = ShortcutOverlay::new();
+    select(&mut overlay, Action::Settings);
+    assert!(matches!(
+        overlay.handle(&key(KeyCode::Delete), &rig.keys),
+        OverlayEvent::None
+    ));
+    let shown = screen(&draw(&mut overlay, &rig, 100, 16));
+    assert!(shown.contains("Already using the default keys"), "{shown}");
+    assert!(!shown.contains("Delete restore defaults"), "{shown}");
+    let mut overlay = ShortcutOverlay::new();
+    overlay.handle(&key(KeyCode::End), &rig.keys);
+    assert_eq!(overlay.cursor, Action::ALL.len() - 1);
+    overlay.handle(&key(KeyCode::Home), &rig.keys);
+    assert_eq!(overlay.cursor, 0);
+}
+
+#[test]
+fn clipped_descriptions_end_in_an_ellipsis() {
+    let rig = Rig::new();
+    let shown = screen(&draw(&mut ShortcutOverlay::new(), &rig, 60, 20));
+    assert!(shown.contains('…'), "{shown}");
 }

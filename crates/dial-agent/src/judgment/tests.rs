@@ -354,3 +354,76 @@ fn judge_role_assigned_to_laya_is_recognised() {
     );
     assert!(judge_uses_laya(&config));
 }
+
+#[test]
+fn cancelled_thinking_judgment_does_not_open_the_cache_or_invoke_a_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let user_dir = dir.path().join("not-created");
+    let error = judge_turn_thinking(
+        &Config::default(),
+        &user_dir,
+        "fix the parser",
+        None,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
+    assert!(!user_dir.exists());
+}
+
+#[test]
+fn provider_judgment_budget_preserves_explicit_profiles_and_reasoning() {
+    use crate::llm::{fake, profiles::*};
+
+    for limit in [None, Some(64), Some(1024), Some(0)] {
+        let event = json!({"choices":[{"message":{"role":"assistant","content":"{\"choice\":\"yes\"}"},"finish_reason":"stop"}]});
+        let server = fake::serve(vec![fake::json(200, &event)]);
+        let home = tempfile::tempdir().unwrap();
+        let mut config: Config = serde_json::from_value(json!({
+            "provider": "lm-studio",
+            "model": "test-judge",
+            "endpoint": {"base_url": format!("{}/v1", server.url)},
+            "model_profile": "judge-test"
+        }))
+        .unwrap();
+        config.user_dir = home.path().to_path_buf();
+        config.model_profiles.insert(
+            "judge-test".into(),
+            ModelProfile {
+                provider: "lm-studio".into(),
+                model: "test-judge".into(),
+                max_tokens: limit,
+                reasoning_effort: Some(ReasoningEffort::High),
+                thinking: Some(true),
+                capabilities: ModelCapabilities {
+                    reasoning: ReasoningApi::OpenaiEffort,
+                    reasoning_efforts: vec![ReasoningEffort::High],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let result = judge(
+            None,
+            &mut ProviderBackend {
+                config: &config,
+                usage: None,
+            },
+            "test-judge",
+            &question(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.choice, "yes");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let body = fake::body(&requests[0]);
+        match limit {
+            Some(0) => assert!(body["max_tokens"].as_u64().unwrap() > 0),
+            _ => assert_eq!(body["max_tokens"], limit.unwrap_or(512)),
+        }
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(config.active_model_profile().unwrap().max_tokens, limit);
+        assert_eq!(config.active_model_profile().unwrap().thinking, Some(true));
+    }
+}

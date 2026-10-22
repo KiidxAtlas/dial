@@ -341,6 +341,7 @@ impl Fold<'_, '_> {
                 self.reply.prompt_tokens = usage["prompt_tokens"].as_u64();
                 self.reply.completion_tokens = usage["completion_tokens"].as_u64();
                 self.reply.cached_prompt_tokens = usage["cached_prompt_tokens"].as_u64();
+                super::usage::capture_reply(&self.reply);
                 Ok(true)
             }
             Some("error") => Err(helper_error(
@@ -415,6 +416,7 @@ pub(crate) fn chat(
     });
     // A request larger than the pipe buffer must not block event reading, so it is written on
     // its own thread; closing stdin marks the end of the request.
+    super::usage::transport_attempt()?;
     let writer = std::thread::spawn(move || {
         let mut stdin = stdin;
         stdin.write_all(&body)

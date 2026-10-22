@@ -177,8 +177,8 @@ impl TokenPricing {
             let rate = self.cache_read.filter(|n| n.is_finite() && *n >= 0.0)?;
             cost += read as f64 * rate;
         }
-        let split = CacheWriteSplit::of(reply);
-        let standard_writes = split.five_minute.saturating_add(split.unbucketed);
+        let split = CacheWriteSplit::of(reply)?;
+        let standard_writes = split.five_minute.checked_add(split.unbucketed)?;
         if standard_writes > 0 {
             let rate = self.cache_write.filter(|n| n.is_finite() && *n >= 0.0)?;
             cost += standard_writes as f64 * rate;
@@ -207,15 +207,18 @@ pub(crate) struct CacheWriteSplit {
     pub unbucketed: u64,
 }
 impl CacheWriteSplit {
-    pub(crate) fn of(reply: &super::Reply) -> Self {
+    pub(crate) fn of(reply: &super::Reply) -> Option<Self> {
         let total = reply.cache_creation_tokens.unwrap_or(0);
         let five_minute = reply.cache_creation_5m_tokens.unwrap_or(0);
         let one_hour = reply.cache_creation_1h_tokens.unwrap_or(0);
-        Self {
+        // Contradictory or overflowing buckets cannot be priced as observed usage.
+        // Saturation would charge more writes than the total removed from prompt input.
+        let bucketed = five_minute.checked_add(one_hour)?;
+        Some(Self {
             five_minute,
             one_hour,
-            unbucketed: total.saturating_sub(five_minute.saturating_add(one_hour)),
-        }
+            unbucketed: total.checked_sub(bucketed)?,
+        })
     }
 }
 

@@ -334,3 +334,34 @@ fn multi_path_reads_are_replaced_only_when_every_section_is_covered() {
             .is_none()
     );
 }
+
+#[test]
+fn adjacent_visible_reads_jointly_cover_a_later_range_without_hiding_gaps() {
+    for (right_start, right_visible, covered) in
+        [(11, true, true), (12, true, false), (11, false, false)]
+    {
+        let mut returned = ReturnedReads::default();
+        returned.pointer(
+            &read_call("left", "src/lib.rs:1-10"),
+            &rows("AAAA", 1..=10),
+            false,
+            |_| true,
+        );
+        returned.pointer(
+            &read_call("right", "src/lib.rs:11-20"),
+            &rows("AAAA", right_start..=20),
+            false,
+            |_| true,
+        );
+        let pointer = returned.pointer(
+            &read_call("combined", "src/lib.rs:5-15"),
+            &rows("AAAA", 5..=15),
+            false,
+            |id| id == "left" || right_visible,
+        );
+        assert_eq!(pointer.is_some(), covered);
+        if let Some(pointer) = pointer {
+            assert!(pointer.contains("left") && pointer.contains("right"));
+        }
+    }
+}

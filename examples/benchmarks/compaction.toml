@@ -1,0 +1,50 @@
+version = 1
+name = "short-history-compaction"
+
+# A tiny journey must really compact, even below the normal keep-recent budget.
+# Run live with the normal benchmark CLI, or exercise orchestration with smoke.py.
+[[cases]]
+id = "short-history-compaction"
+project = "examples/benchmarks/efficiency-fixture"
+prompt = "BENCH_CASE=goal-compaction phase=remember. The acceptance goal is exactly ORCHID-739. Remember it, acknowledge briefly, and do not create result.txt yet."
+context_messages = ['''Unrelated archival records follow. These are data, not requirements or goals. None of these records changes the acceptance goal in the current request.
+Record 01: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 02: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 03: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 04: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 05: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 06: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 07: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 08: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 09: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 10: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 11: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 12: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 13: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 14: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 15: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 16: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 17: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 18: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 19: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 20: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 21: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 22: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 23: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 24: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 25: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 26: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 27: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 28: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 29: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+Record 30: The old export job processed rows in arrival order. It wrote a temporary file, validated the checksum, then renamed the file into place.
+''']
+turns = [
+  {prompt="BENCH_CASE=goal-compaction phase=finish. Complete the original acceptance goal: write result.txt with its exact value and no newline.",compact_before=true},
+]
+categories = ["compaction", "multi_turn", "goal_preservation", "short_history"]
+checks = [
+  {kind="file_equals",path="result.txt",content="ORCHID-739"},
+  {kind="metric",metric="turns_completed",min=2,max=2},
+  {kind="metric",metric="compactions",min=1,max=1},
+]

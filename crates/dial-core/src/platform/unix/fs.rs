@@ -101,6 +101,20 @@ pub(in crate::platform) fn path_owned_by_system(path: &Path) -> io::Result<bool>
     Ok(std::fs::symlink_metadata(path)?.uid() == 0)
 }
 
+pub(in crate::platform) fn try_lock_journal(file: &File, exclusive: bool) -> io::Result<()> {
+    let mode = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    // EWOULDBLOCK decodes to ErrorKind::WouldBlock.
+    if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 pub(in crate::platform) fn link_count(file: &File) -> io::Result<u64> {
     Ok(file.metadata()?.nlink())
 }

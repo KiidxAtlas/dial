@@ -36,11 +36,11 @@ impl Contract {
     }
     pub fn instruction(&self, single: bool, examples: bool) -> String {
         let mut out = format!(
-            "[Current executable tool contract]\nOnly these tool names are callable in this request: {}. This snapshot supersedes earlier tool lists. Follow their supplied JSON schemas; never call a tool loaded in this same batch.",
+            "[Tool contract]\nCall only: {}. Follow supplied JSON schemas. Loads apply next request, not this batch.",
             self.names.join(", ")
         );
         if single {
-            out.push_str(" Emit at most one tool call, then wait for its result before choosing the next action.");
+            out.push_str(" Emit at most one tool call; wait for its result.");
         }
         if examples {
             for name in ["read", "grep", "todo"] {

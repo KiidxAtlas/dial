@@ -26,6 +26,19 @@ fn only_actual_usage_is_counted_and_partial_usage_stays_incomplete() {
 }
 
 #[test]
+fn journey_compaction_requires_an_observed_history_rewrite() {
+    assert!(require_compaction(&json!({"compacted":true})).is_ok());
+    for result in [
+        json!({"compacted":false,"outcome":{"kind":"unchanged"}}),
+        json!({"context_reset":true}),
+        json!({}),
+    ] {
+        let error = require_compaction(&result).unwrap_err();
+        assert!(error.to_string().contains("history was not compacted"));
+    }
+}
+
+#[test]
 fn diagnostics_are_bounded_and_drained() {
     let input = vec![b'x'; MAX_DIAGNOSTIC_BYTES * 3];
     let mut cursor = std::io::Cursor::new(input);
@@ -44,6 +57,27 @@ fn closed_rpc_is_not_misreported_as_timeout() {
     let (_tx, rx) = mpsc::channel();
     let error = receive(&rx, Some(Instant::now())).unwrap_err();
     assert_eq!(error.to_string(), "benchmark RPC timed out");
+}
+
+#[test]
+fn request_failures_identify_the_pending_operation_without_logging_params() {
+    let (_tx, rx) = mpsc::channel();
+    let mut input = Vec::new();
+    let error = request(
+        &mut input,
+        &rx,
+        4,
+        "compact",
+        json!({"private_context":"not-for-diagnostics"}),
+        Some(Instant::now()),
+        &mut RunMetrics::default(),
+    )
+    .unwrap_err();
+    let detail = format!("{error:#}");
+    assert!(detail.contains("compact"));
+    assert!(detail.contains("request 4"));
+    assert!(detail.contains("timed out"));
+    assert!(!detail.contains("not-for-diagnostics"));
 }
 #[test]
 fn runtime_ledger_replaces_main_agent_events_across_turns() {
@@ -149,5 +183,99 @@ fn legacy_children_without_snapshots_stay_unknown() {
     assert_eq!(
         tool_trace_for_run(Some(&json!({"offered": {}})), 1, 1, true),
         None
+    );
+}
+
+#[test]
+fn ledger_keeps_orthogonal_scopes_and_unknown_discarded_costs() {
+    let mut state = json!({"usage":{"total":dial::llm::usage::Groups::default()}});
+    let total = &mut state["usage"]["total"];
+    total["all"]["input"] = json!(30);
+    total["all"]["requests"] = json!(2);
+    total["all"]["successful_requests"] = json!(1);
+    total["all"]["failed_requests"] = json!(1);
+    total["all"]["reported_responses"] = json!(1);
+    total["all"]["discarded_attempts"] = json!(1);
+    total["all"]["unreported_attempts"] = json!(1);
+    total["main"]["input"] = json!(10);
+    total["workers"]["input"] = json!(20);
+    total["by_purpose"] = json!({"agent":{"input":10},"repair":{"input":20}});
+    let mut metrics = RunMetrics::default();
+    apply_ledger(&mut metrics, read_ledger(&state));
+    assert_eq!(metrics.prompt_tokens, 30);
+    assert_eq!(
+        metrics.runtime_usage,
+        state.pointer("/usage/total").cloned()
+    );
+    assert!(metrics.token_usage_incomplete);
+    assert_eq!(metrics.observed_cost_usd, None);
+    assert_eq!(
+        metrics.runtime_usage.as_ref().unwrap()["all"].get("discarded_cost_usd"),
+        None
+    );
+}
+
+#[test]
+fn efficiency_retains_each_turn_and_labels_recovery_without_inventing_a_turn() {
+    let mut metrics = RunMetrics::default();
+    retain_efficiency(&mut metrics, &json!({}), Some(1));
+    assert!(metrics.efficiency.is_none());
+    retain_efficiency(
+        &mut metrics,
+        &json!({"efficiency":{"duration_ms":10}}),
+        Some(1),
+    );
+    retain_efficiency(
+        &mut metrics,
+        &json!({"efficiency":{"duration_ms":20}}),
+        Some(2),
+    );
+    retain_efficiency(
+        &mut metrics,
+        &json!({"efficiency":{"completed":false}}),
+        None,
+    );
+    let report = metrics.efficiency.unwrap();
+    assert_eq!(report["turns"].as_array().unwrap().len(), 2);
+    assert_eq!(report["turns"][0]["report"]["duration_ms"], 10);
+    assert_eq!(report["turns"][1]["send"], 2);
+    assert_eq!(report["recovery_observation"]["completed"], false);
+}
+
+#[test]
+fn shared_auth_requires_opt_in_and_does_not_replace_isolated_home() {
+    let isolated = tempfile::tempdir().unwrap();
+    let shared = tempfile::tempdir().unwrap();
+    let key = dial::config::paths::SUBSCRIPTION_AUTH_HOME;
+    let mut command = Command::new("dial");
+    command
+        .env("DIAL_HOME", isolated.path())
+        .env(key, "ambient-override");
+    configure_subscription_auth(&mut command, None).unwrap();
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value),
+        Some(None)
+    );
+    configure_subscription_auth(&mut command, Some(shared.path())).unwrap();
+    let canonical = std::fs::canonicalize(shared.path()).unwrap();
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value),
+        Some(Some(canonical.as_os_str()))
+    );
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(name, _)| *name == "DIAL_HOME")
+            .map(|(_, value)| value),
+        Some(Some(isolated.path().as_os_str()))
+    );
+    assert!(
+        configure_subscription_auth(&mut command, Some(&shared.path().join("missing"))).is_err()
     );
 }

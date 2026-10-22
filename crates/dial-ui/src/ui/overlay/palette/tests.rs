@@ -428,6 +428,7 @@ fn short_panels_keep_cancel_visible_and_clicks_match_drawn_rows() {
                         current: false,
                     })
                     .collect(),
+                ..Default::default()
             })
         } else {
             PaletteOverlay::new(entries(), false)
@@ -490,6 +491,7 @@ fn picker_opens_on_the_current_value_and_click_targets_it() {
                 current: value == "write",
             })
             .collect(),
+        ..Default::default()
     };
     let mut palette = PaletteOverlay::choice(spec);
     assert_eq!(palette.cursor, 1);

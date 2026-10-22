@@ -1,0 +1,14 @@
+# Local LM Studio experiment. Override the model ID to match an already loaded model.
+# dial benchmark examples/benchmarks/efficiency.toml --endpoint http://127.0.0.1:1234/v1 \
+#   --profiles examples/benchmarks/local-measurement.toml --report target/efficiency-local.json
+[machine]
+repetitions = 3
+case_timeout_secs = 180
+minimum_correctness = 1.0
+allow_remote = false
+
+[[configurations]]
+name = "local-baseline"
+provider = "lm-studio"
+model = "qwen3.8-27b-splash"
+context_window = 32768

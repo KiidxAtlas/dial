@@ -1045,6 +1045,8 @@ pub(in crate::agent) struct Outcome {
     pub steps: u32,
     pub retryable_provider: bool,
     pub model_route: Option<Value>,
+    /// Controller-owned exact inspection identities; never part of the worker's validated answer.
+    pub inspections: crate::agent::workflow::efficiency::Inspections,
 }
 impl crate::agent::run::engine::Terminal for Outcome {
     fn prevent_completion(&mut self, reason: &str) {
@@ -1065,6 +1067,7 @@ impl Outcome {
             steps,
             retryable_provider: false,
             model_route: None,
+            inspections: Default::default(),
         }
     }
     pub fn failed(steps: u32, why: impl Into<String>) -> Self {
@@ -1076,6 +1079,7 @@ impl Outcome {
             steps,
             retryable_provider: false,
             model_route: None,
+            inspections: Default::default(),
         }
     }
     pub fn interrupted(steps: u32) -> Self {
@@ -1087,6 +1091,7 @@ impl Outcome {
             steps,
             retryable_provider: false,
             model_route: None,
+            inspections: Default::default(),
         }
     }
     pub fn provider_failed(steps: u32, error: &anyhow::Error) -> Self {
@@ -2031,6 +2036,7 @@ pub(in crate::agent) fn run_child(
         };
         approver.model_route(&route.metadata());
         route_used = Some(route.metadata());
+        let earlier_inspections = outcome.inspections;
         outcome = child::run(
             Env {
                 config: &route.config,
@@ -2043,6 +2049,7 @@ pub(in crate::agent) fn run_child(
             approver,
         );
         alternate.release();
+        outcome.inspections.extend(earlier_inspections);
         attempts = attempts.saturating_add(outcome.steps);
     }
     outcome.steps = attempts;
@@ -2755,6 +2762,7 @@ fn render(
         let status = outcome.status.wire();
         let text = outcome.status.text.as_str();
         let mut result = json!({"name":job.label,"agent":job.kind,"status":status,"steps":outcome.steps,"result":outcome.data.clone().unwrap_or_else(|| json!(text))});
+        result["inspections"] = json!(outcome.inspections);
         result["projection"] = result_projection(text, outcome.data.as_ref(), job.work_packet.as_ref().map(|p| p.acceptance.as_slice()).unwrap_or_default());
         result["role"] = json!(job.role);
         result["model"] = json!(models.get(&job.index));

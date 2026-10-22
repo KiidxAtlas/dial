@@ -61,6 +61,13 @@ pub fn step_detail(task: &Task) -> String {
         task.content.clone(),
         format!("Status: {}", status_label(task.status)),
     ];
+    lines.extend(recorded(task));
+    lines.join("\n\n")
+}
+
+/// Phase, reason, finding and evidence: what a step records beyond its text and status.
+fn recorded(task: &Task) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(phase) = &task.phase {
         lines.push(format!("Phase: {phase}"));
     }
@@ -76,7 +83,29 @@ pub fn step_detail(task: &Task) -> String {
     if !task.evidence.is_empty() {
         lines.push(format!("Recorded evidence:\n{}", task.evidence.join("\n")));
     }
-    lines.join("\n\n")
+    lines
+}
+
+/// `4 steps, 1 done, 1 blocked`: the plan's shape for the picker header. Commas rather than a
+/// glyph separator, so the copy is the same under every glyph preset.
+fn plan_summary(todo: &TodoList) -> String {
+    let count = |status: Status| todo.tasks().iter().filter(|t| t.status == status).count();
+    let total = todo.tasks().len();
+    let mut parts = vec![format!(
+        "{total} {}",
+        if total == 1 { "step" } else { "steps" }
+    )];
+    for (status, word) in [
+        (Status::Completed, "done"),
+        (Status::Blocked, "blocked"),
+        (Status::Abandoned, "dropped"),
+    ] {
+        let n = count(status);
+        if n > 0 {
+            parts.push(format!("{n} {word}"));
+        }
+    }
+    parts.join(", ")
 }
 
 /// Stable task numbers survive priority ordering and filtering. Selecting a row opens details;
@@ -101,6 +130,10 @@ pub fn plan_picker(todo: &TodoList) -> Option<super::overlay::palette::ChoiceSpe
         command: "todo".into(),
         verb: "show",
         remove: None,
+        prompt: "Filter steps:".into(),
+        summary: plan_summary(todo),
+        // Each label already names its status, so the working step needs no extra tag.
+        current_tag: Some(String::new()),
         items: ordered
             .into_iter()
             .map(|(index, task)| ChoiceItem {
@@ -109,9 +142,14 @@ pub fn plan_picker(todo: &TodoList) -> Option<super::overlay::palette::ChoiceSpe
                     "{}. {}: {}",
                     index + 1,
                     status_label(task.status),
-                    task.content
+                    text::one_line(&task.content)
                 ),
-                detail: step_detail(task),
+                // The label carries the text and status; the detail adds what was recorded.
+                detail: [task.content.clone()]
+                    .into_iter()
+                    .chain(recorded(task))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
                 current: task.status == Status::InProgress,
             })
             .collect(),

@@ -1942,3 +1942,21 @@ fn picking_the_memory_role_from_roles_lands_in_the_memory_group() {
     assert_eq!(o.target_role.as_deref(), Some("memory"));
     assert_eq!(o.group, Group::Memory);
 }
+
+#[test]
+fn zz_dump() {
+    let ascii = Rig::with_theme(crate::ui::theme::Theme::dark().with_glyphs(crate::ui::theme::Glyphs::Ascii));
+    let rig = Rig::new();
+    let no_roles = || vec![RoleStatus { role: "main", assigned: None, effective: None, source: RoleSource::Main }];
+    for (name, mk) in [
+        ("full", Box::new(overlay) as Box<dyn Fn() -> ModelOverlay>),
+        ("none", Box::new(move || ModelOverlay::new(None, no_roles(), Scope::Global))),
+        ("empty", Box::new(move || ModelOverlay::new(Some(Discovery { models: vec![], providers: vec![] }), no_roles(), Scope::Global))),
+        ("roles", Box::new(|| { let mut o = overlay(); o.show_roles(); o })),
+    ] {
+        for (w, h, r) in [(120u16, 40u16, &rig), (100, 24, &rig), (60, 20, &rig), (38, 16, &ascii)] {
+            let mut o = mk();
+            println!("==== {name} {w}x{h}\n{}", draw(&mut o, r, w, h));
+        }
+    }
+}

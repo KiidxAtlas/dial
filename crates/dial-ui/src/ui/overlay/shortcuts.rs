@@ -144,6 +144,10 @@ impl ShortcutOverlay {
             self.cursor = self.cursor.saturating_sub(self.page);
         } else if keys.matches(Action::SelectPageDown, key) {
             self.cursor = (self.cursor + self.page).min(rows.len().saturating_sub(1));
+        } else if self.search.text.is_empty() && key.code == KeyCode::Home {
+            self.cursor = 0;
+        } else if self.search.text.is_empty() && key.code == KeyCode::End {
+            self.cursor = rows.len().saturating_sub(1);
         } else if keys.matches(Action::SelectConfirm, key) {
             if let Some(&action) = rows.get(self.cursor) {
                 let mut editor = Editor::default();
@@ -152,6 +156,11 @@ impl ShortcutOverlay {
             }
         } else if key.code == KeyCode::Delete {
             if let Some(&action) = rows.get(self.cursor) {
+                if !keys.is_customized(action) {
+                    // Nothing to restore: say so instead of saving an identical keymap.
+                    self.message = Some(("Already using the default keys".into(), true));
+                    return OverlayEvent::None;
+                }
                 self.message = None;
                 return OverlayEvent::Rebind {
                     action,
@@ -221,13 +230,19 @@ impl ShortcutOverlay {
                 Tok::Muted,
             ));
         } else {
-            let mut spans = vec![Span::styled(" Search: ", theme.fg(Tok::Accent))];
+            let mut spans = vec![Span::styled(" Search: ", theme.fg(Tok::Muted))];
             spans.extend(editor_spans(
                 theme,
                 &self.search,
                 w.saturating_sub(9),
                 false,
             ));
+            if self.search.text.is_empty() {
+                spans.push(Span::styled(
+                    "type an action, key or group",
+                    theme.fg(Tok::Dim),
+                ));
+            }
             out.push(filled(spans, w, Style::default()));
             let rows = self.rows(ctx.keys);
             self.cursor = self.cursor.min(rows.len().saturating_sub(1));
@@ -278,13 +293,18 @@ impl ShortcutOverlay {
                     let key_w = (w / 3).min(27);
                     let description_w =
                         w.saturating_sub(text::width(&prefix) + key_w + text::width(&group) + 2);
-                    let description =
-                        text::pad(&text::clip(action.describe(), description_w), description_w);
+                    let description = text::pad(
+                        &text::ellipsize(action.describe(), description_w, theme.ascii()),
+                        description_w,
+                    );
                     let mut spans = vec![
                         Span::styled(prefix, theme.fg(Tok::Accent).patch(fill)),
                         Span::styled(description, theme.fg(Tok::Text).patch(fill)),
                         Span::styled(
-                            format!(" {}", text::pad(&text::clip(effective, key_w), key_w)),
+                            format!(
+                                " {}",
+                                text::pad(&text::ellipsize(effective, key_w, theme.ascii()), key_w)
+                            ),
                             theme.fg(Tok::Accent).patch(fill),
                         ),
                         Span::styled(group, theme.fg(Tok::Muted).patch(fill)),
@@ -301,16 +321,17 @@ impl ShortcutOverlay {
                 }
             }
             if let Some(&action) = rows.get(self.cursor) {
+                let dot = theme.sym(Sym::Dot);
                 out.push(line(
                     format!(
-                        " {} [{}; {}]",
-                        action.id(),
+                        " {} {dot} {} {dot} {}",
                         action.group(),
                         if ctx.keys.is_customized(action) {
                             "customized"
                         } else {
-                            "default"
-                        }
+                            "default keys"
+                        },
+                        action.id(),
                     ),
                     Tok::Muted,
                 ));
@@ -348,15 +369,26 @@ impl ShortcutOverlay {
             ]
         } else {
             let movement = pair_label(ctx.keys, Action::SelectUp, Action::SelectDown);
+            let rows = self.rows(ctx.keys);
+            let selected = rows.get(self.cursor).copied();
             vec![
-                hint(ctx.keys, Action::SelectConfirm, "edit"),
-                if movement.is_empty() {
+                if selected.is_some() {
+                    hint(ctx.keys, Action::SelectConfirm, "edit")
+                } else {
+                    String::new()
+                },
+                if movement.is_empty() || selected.is_none() {
                     String::new()
                 } else {
                     format!("{movement} move")
                 },
                 "type to search".into(),
-                "Delete restore defaults".into(),
+                // Restoring is only offered where it would change something.
+                if selected.is_some_and(|action| ctx.keys.is_customized(action)) {
+                    "Delete restore defaults".into()
+                } else {
+                    String::new()
+                },
                 hint(
                     ctx.keys,
                     Action::SelectCancel,
