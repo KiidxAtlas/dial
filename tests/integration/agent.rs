@@ -4517,7 +4517,15 @@ fn window_too_small_for_the_full_set_offers_a_lean_tool_set() {
             request["tools"].as_array().unwrap(),
         )
     };
-    e.config.context_window = u32::try_from(full_tokens.checked_sub(256).unwrap()).unwrap();
+    // The usable prompt budget is the window minus the response reserve. Choose the smallest
+    // window whose budget is 256 tokens short of the full request, so the full set overflows
+    // while the lean set (a fraction of the full schemas) still fits on every host.
+    let target = full_tokens.checked_sub(256).unwrap();
+    let mut window = u32::try_from(target).unwrap();
+    while u64::from(window - e.config.compaction.reserve(window)) < target {
+        window += 1;
+    }
+    e.config.context_window = window;
     let mut backend = make_backend(&e.config).unwrap();
     let mut a = agent(&e, &mut backend, None);
     let mut ui = Recorder::default();
