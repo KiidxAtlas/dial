@@ -1,5 +1,6 @@
 //! `/review-file`: review checkpointed changes by writer group (main or a worker) and by file.
-//! Reverts are all-or-nothing, token-checked and get their own checkpoint for `/undo`. Overlap with
+//! Reverts are token-checked per file and get their own checkpoint for `/undo`; they are not
+//! transactions (see `Checkpoints::restore_files`). Overlap with
 //! another writer or a later turn is shown as a risk signal and needs explicit confirmation; its
 //! absence is not proof that files are independent.
 
@@ -41,6 +42,9 @@ fn recorded_checks(agent: &Agent<'_>) -> String {
         })
         .unwrap_or_else(|| "No checks recorded.".to_string())
 }
+
+/// Largest combined diff a group revert will show for one confirmation.
+const GROUP_DIFF_LIMIT: usize = 24 * 1024;
 
 fn file_label(file: &ReviewFile) -> String {
     match file.overlap() {
@@ -135,7 +139,7 @@ impl Shell {
             let (owner, _) = &groups[selected];
             let plan = checkpoints.group_plan(turn, owner)?;
             let mut text = format!(
-                "{owner}: {} file(s) safe to revert together, {} held for individual review.",
+                "{owner}: {} file(s) with no recorded overlap, {} held for individual review.",
                 plan.safe.len(),
                 plan.held.len()
             );
@@ -145,10 +149,10 @@ impl Shell {
             for (path, why) in &plan.held {
                 text.push_str(&format!("\n  held    {path} ({why})"));
             }
-            text.push_str("\nNo overlap signal does not prove files are independent of other code. The revert is one checkpoint for /undo.");
+            text.push_str("\nNo recorded overlap does not prove files are independent of other code. The revert has one checkpoint for /undo.");
             let mut options = vec![("Review files", 'f'), ("Back", 'b')];
             if !plan.safe.is_empty() {
-                options.insert(1, ("Revert safe files", 'r'));
+                options.insert(1, ("Revert unshared files", 'r'));
             }
             let pick = self.ask("Group", &text, &options);
             match pick.map(|i| options[i].0) {
@@ -157,7 +161,7 @@ impl Shell {
                         return Ok(());
                     }
                 }
-                Some("Revert safe files") => self.revert_group(&checkpoints, turn, &plan.safe),
+                Some("Revert unshared files") => self.revert_group(&checkpoints, turn, &plan.safe),
                 _ => {}
             }
         }
@@ -182,11 +186,32 @@ impl Shell {
             );
             return;
         }
-        let names: Vec<_> = items.iter().map(|(p, _)| p.as_str()).collect();
+        // The user must see exactly what changes, including their own later edits to these files.
+        let mut diffs = String::new();
+        for (path, _) in &items {
+            match checkpoints.review_file(turn, path) {
+                Ok((diff, _)) => diffs.push_str(&format!("{path}\n{diff}\n")),
+                Err(error) => {
+                    self.note("Review", format!("Nothing restored. {path} cannot be previewed ({error:#}); review files individually."));
+                    return;
+                }
+            }
+        }
+        if diffs.len() > GROUP_DIFF_LIMIT {
+            self.note(
+                "Review",
+                format!(
+                    "Nothing restored. The combined diff of {} files exceeds the {} KiB group preview limit, so it cannot be confirmed as a whole. Choose Review files and revert them one at a time.",
+                    items.len(),
+                    GROUP_DIFF_LIMIT / 1024
+                ),
+            );
+            return;
+        }
         let body = format!(
-            "Revert {} file(s) to their state before this turn, including any edits you made since:\n{}\nAll or none are restored; a concurrent change cancels the revert.",
-            names.len(),
-            names.join("\n")
+            "Revert {} file(s) to their state before this turn. The diffs below include any edits you made since.\n{}\nEach file is compared again right before it is written; if one changed, the revert stops, files it already wrote are put back only if they are unchanged since, and the revert checkpoint stays for /undo. This is not a transaction.",
+            items.len(),
+            diffs
         );
         if self.ask("Revert group", &body, &[("Revert", 'r'), ("Cancel", 'n')]) != Some(0) {
             return;

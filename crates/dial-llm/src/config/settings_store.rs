@@ -195,6 +195,50 @@ pub fn preview_model_config(
     Ok(config)
 }
 
+/// Preview a multi-setting setup without changing either layer or clearing project overrides.
+pub fn preview_config(
+    layout: &Layout,
+    scope: Scope,
+    changes: &[Change],
+    overlay: &toml::Table,
+) -> Result<crate::config::types::Config> {
+    let (layers, _) = prepare_config(layout, scope, changes, &[])?;
+    crate::config::types::Config::from_layers(layout, &layers[0], &layers[1], overlay)
+}
+
+/// Validate setup invariants in both persisted and session configuration before publishing.
+/// Hold both layer locks so a project override cannot race the checked global save.
+pub fn save_config_checked(
+    layout: &Layout,
+    scope: Scope,
+    changes: &[Change],
+    overlay: &toml::Table,
+    check: impl Fn(&crate::config::types::Config) -> Result<()>,
+) -> Result<()> {
+    layout.ensure_project_outside_storage()?;
+    let files = layout.config_files();
+    let _global = locked(&files[0])?;
+    let _project = locked(&files[1])?;
+    let (layers, config) = prepare_config(layout, scope, changes, &[])?;
+    check(&config)?;
+    if scope == Scope::Global {
+        check(&crate::config::types::Config::from_layers(
+            layout,
+            &layers[0],
+            &toml::Table::new(),
+            &toml::Table::new(),
+        )?)?;
+    }
+    check(&crate::config::types::Config::from_layers(
+        layout, &layers[0], &layers[1], overlay,
+    )?)?;
+    let selected = usize::from(scope == Scope::Project);
+    write_private(
+        &files[selected],
+        toml::to_string_pretty(&layers[selected])?.as_bytes(),
+    )
+}
+
 fn model_project_resets(role: &str) -> Result<Vec<Change>> {
     ensure!(
         crate::llm::model_config::ROLES

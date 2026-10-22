@@ -171,11 +171,17 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   results. Completed tools are not replayed automatically. `/review` reviews a frozen local or GitHub
   PR scope with source-backed findings; `/review-file` lists checkpoint turns, then groups the turn's changes by writer
   (`main` or a worker label; checkpoints from before attribution show as `unattributed`).
-  A group offers **Review files** and **Revert safe files**. Safe files were changed only by that
-  writer and in no later checkpointed turn; they revert together all-or-nothing, with one `/undo`
-  checkpoint. A file written by several writers, or changed again in a later turn, is marked
-  *overlap*: that is a risk signal, not proof either way, so it is never part of a group revert and
-  a single-file revert asks for separate confirmation. No signal does not prove a file is
+  A group offers **Review files** and **Revert unshared files**. Unshared files were changed only
+  by that writer and in no later checkpointed turn. Group revert first shows the combined diff
+  (including your own later edits; above 24 KiB it is refused and files must be reverted one at a
+  time). Each file is compared with its reviewed version right before it is written. This is not a
+  transaction: if one file fails or changed, the revert stops, files it already wrote are put back
+  only if they still hold exactly what it wrote, and anything else is left as is with the revert
+  checkpoint kept for `/undo` (which would overwrite those files, so review them first). One
+  `/undo` checkpoint covers the revert. A file written by several writers, or changed again in a
+  later turn, is marked *overlap*: that is a risk signal, not proof either way, so it is never part
+  of a group revert and a single-file revert asks for separate confirmation. No recorded overlap
+  does not prove a file is
   independent of other code (a renamed function and its callers). `/review-file <turn> [path]`
   previews one file with **Keep / Revert file / Cancel**. The review also says how many shell
   commands and extension calls in the latest turn were not checkpointed: their effects cannot be
@@ -183,9 +189,9 @@ Everyday use of the interactive terminal UI: composer, slash commands, shortcuts
   A revert includes all changes shown for that file, including your own edits: review carefully.
   Changes after preview are refused, other files are untouched, and the revert has its own `/undo`
   checkpoint. Private, binary or oversized interactive diffs require manual review.
-  Dial's own writers are locked out during a revert and every file is re-compared immediately
-  before it is written, but this is not filesystem-atomic against external programs; avoid editing
-  the selected files concurrently with a revert.
+  The checkpoint lock only keeps other checkpoint recording out; edit tools and external programs
+  are not excluded, so a change can still land between a file's compare and its write. This is not
+  filesystem-atomic: avoid editing the selected files concurrently with a revert.
 - Request status distinguishes waiting, model loading, prompt processing, generation, retry and
   cancellation. Time without a worker progress event is separate from total task elapsed time.
   `/model restart` explicitly confirms unloading only Dial's managed local main model, which reloads
@@ -255,6 +261,31 @@ While you search, the category tabs are not offered and `Tab` does nothing; `Esc
 Choice lists also accept typing to filter their labels and stored values. `Esc` clears that filter
 before returning to settings; `Enter` confirms only a visible match. Clearing an override restores
 its inherited value, rather than resetting unrelated settings.
+
+### Local and hosted setup presets
+
+`/setup presets` offers **Local only**, **Local with approved hosted assistance**, and **Hosted**,
+then **This project** or **All projects** scope. You can also open a specific review with
+`/setup presets local-only project`, `local-assisted`, or `hosted`. Nothing is saved until the
+final confirmation. Choose the main model in `/models` first; assisted setup also requires an
+explicitly assigned hosted coach in `/roles`. Setup never picks an unconfigured model, probes a
+provider, downloads weights, or changes credentials.
+
+The main model stays unchanged. Small/compaction, task, tester, planner, memory and judge roles
+use that model; the coach does too except in assisted setup. Local presets require an on-device
+runtime or loopback endpoint, not merely a provider named “local” or a LAN address. They enable
+the lean tool/context profile. The review shows detected physical RAM, context and role choices;
+`dial models recommend` provides weight/KV memory-fit estimates rather than guessing from RAM alone.
+
+All three presets clear automatic fallback chains, select local provenance memory (no embedding
+or memory-model requests), and disable Laya, teacher assistance, distillation and automatic
+escalation. Assisted setup enables the reviewed hosted coach and sets **Ask** approval, preserving
+**Readonly** if selected. Approved coach questions disclose their supplied evidence to that provider.
+The review lists these changes before saving. Sandbox and read-before-edit protections are unchanged.
+Conflicting project/CLI overrides fail before saving; global defaults are also validated without
+the current project's overrides. Presets are durable configuration bundles, **not a network firewall**:
+explicit later model/profile choices, custom agents and network tools retain their own policies,
+and other projects can override global defaults.
 
 `/model settings` (alias `/model-settings`; also `F7` in `/model`) tunes the **current main model**.
 Settings are grouped into sections, with a description and the accepted range for the selected row.

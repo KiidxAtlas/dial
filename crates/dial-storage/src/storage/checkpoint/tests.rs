@@ -560,7 +560,7 @@ mod grouped_review {
     }
 
     #[test]
-    fn group_revert_is_all_or_nothing_and_undoable() {
+    fn group_revert_checks_up_front_and_is_undoable() {
         let (root, _state, cp) = setup();
         let turn = cp.begin_turn("edits").unwrap();
         write(&cp, root.path(), "a.txt", "w");
@@ -637,5 +637,34 @@ mod grouped_review {
         cp.lock().current = None;
         let review = cp.review_turn(turn).unwrap();
         assert_eq!(review.files[0].writers, [UNATTRIBUTED]);
+    }
+}
+
+mod changed_review {
+    use super::super::*;
+
+    #[test]
+    fn changed_file_aborts_group_before_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for n in ["a.txt", "b.txt"] {
+            fs::write(root.path().join(n), "original").unwrap();
+        }
+        let cp = Checkpoints::new(state.path().to_owned(), root.path().to_owned()).unwrap();
+        let turn = cp.begin_turn("edits").unwrap();
+        for n in ["a.txt", "b.txt"] {
+            cp.before_write_as(&root.path().join(n), "w").unwrap();
+            fs::write(root.path().join(n), "edited").unwrap();
+        }
+        let items: Vec<_> = ["a.txt", "b.txt"]
+            .iter()
+            .map(|p| (p.to_string(), cp.review_file(turn, p).unwrap().1))
+            .collect();
+        // Replace the second file after preview but before group validation.
+        fs::remove_file(root.path().join("b.txt")).unwrap();
+        fs::create_dir(root.path().join("b.txt")).unwrap();
+        assert!(cp.restore_files(turn, &items, false).is_err());
+        // Up-front validation refuses the group without changing the first file.
+        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "edited");
     }
 }

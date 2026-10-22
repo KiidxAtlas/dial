@@ -803,3 +803,43 @@ fn ambient_brief_is_bounded_fresh_only_and_links_sources() {
     assert!(!after.contains("Routes requests to storage."), "{after}");
     assert!(after.contains("needs refresh"), "{after}");
 }
+
+#[test]
+fn ambient_findings_are_ranked_before_the_count_cap() {
+    let (_home, _project, layout, ws) = fixture();
+    let cache = Codebase::open(&layout).unwrap();
+    cache.refresh(&ws, &AtomicBool::new(false)).unwrap();
+    for topic in ["alpha", "beta", "delta", "epsilon"] {
+        cache
+            .remember_investigation(
+                topic,
+                "Router responsibility.",
+                &["src/router.rs".into()],
+                "session",
+            )
+            .unwrap();
+    }
+    cache
+        .remember_investigation(
+            "zeta",
+            "Router responsibility cancellation ownership.",
+            &["src/router.rs".into()],
+            "session",
+        )
+        .unwrap();
+    let brief = cache
+        .task_context("router responsibility cancellation ownership", 8000)
+        .unwrap();
+    let findings: Vec<serde_json::Value> = brief
+        .lines()
+        .filter_map(|line| line.strip_prefix("Finding "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(findings.len(), AMBIENT_FINDINGS);
+    assert!(
+        findings[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("cancellation ownership")
+    );
+}
