@@ -17,8 +17,22 @@ struct Observation {
     call_id: String,
     status: CheckStatus,
     revision: Revision,
+    /// Original execution revision never changes on reuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validated_revision: Option<Revision>,
+    invalidated: bool,
+    #[serde(skip)]
+    inputs: Option<super::inputs::Snapshot>,
+    #[serde(skip)]
+    input_check: Option<FocusedCheck>,
     behavioral: bool,
     diagnostic: Option<String>,
+}
+
+impl Observation {
+    fn current(&self, revision: Revision) -> bool {
+        !self.invalidated && self.validated_revision.unwrap_or(self.revision) == revision
+    }
 }
 
 /// Controller-run history of one registered reproduction. Model `bash` runs of the same text are
@@ -113,10 +127,87 @@ impl Ledger {
                 call_id: call_id.to_owned(),
                 status,
                 revision,
+                validated_revision: None,
+                invalidated: false,
+                inputs: None,
+                input_check: None,
                 behavioral,
                 diagnostic: None,
             },
         );
+    }
+
+    pub(super) fn bind_inputs(&mut self, check: &FocusedCheck, inputs: super::inputs::Snapshot) {
+        if let Some(observation) = self.latest.get_mut(&check.command)
+            && observation.status == CheckStatus::Passed
+        {
+            observation.inputs = Some(inputs);
+            observation.input_check = Some(check.clone());
+        }
+    }
+
+    pub(super) fn has_inputs(&self, command: &str) -> bool {
+        self.latest
+            .get(command)
+            .is_some_and(|o| o.inputs.is_some() && !o.invalidated)
+    }
+
+    pub(super) fn invalidate_inputs(&mut self) {
+        for observation in self.latest.values_mut().filter(|o| o.inputs.is_some()) {
+            observation.invalidated = true;
+        }
+    }
+
+    pub(super) fn observed_revision(&self, command: &str) -> Option<Revision> {
+        self.latest.get(command).map(|o| o.revision)
+    }
+
+    pub(super) fn input_checks(&self) -> Vec<FocusedCheck> {
+        self.latest
+            .values()
+            .filter_map(|observation| observation.input_check.clone())
+            .collect()
+    }
+
+    /// A failed/unknown revalidation is sticky until a real execution supplies new evidence.
+    /// Returns whether the observation is invalid, including a prior failed revalidation.
+    pub(super) fn validate_inputs(
+        &mut self,
+        command: &str,
+        inputs: Option<&super::inputs::Snapshot>,
+        revision: Revision,
+    ) -> bool {
+        let Some(observation) = self.latest.get_mut(command) else {
+            return false;
+        };
+        let valid = inputs.is_some()
+            && observation.inputs.as_ref() == inputs
+            && observation.revision[1..] == revision[1..];
+        observation.invalidated |= !valid;
+        observation.invalidated
+    }
+
+    pub(super) fn reuse_inputs(
+        &mut self,
+        command: &str,
+        inputs: &super::inputs::Snapshot,
+        revision: Revision,
+    ) -> bool {
+        if self.is_repro(command) {
+            return false;
+        }
+        self.validate_inputs(command, Some(inputs), revision);
+        let Some(observation) = self.latest.get_mut(command) else {
+            return false;
+        };
+        if observation.invalidated
+            || observation.status != CheckStatus::Passed
+            || observation.inputs.as_ref() != Some(inputs)
+        {
+            return false;
+        }
+        observation.validated_revision = Some(revision);
+        true
     }
 
     /// Keep a bounded, exact diagnostic identity rather than comparing exit status alone.
@@ -211,7 +302,7 @@ impl Ledger {
             .collect();
         if behavioral
             .iter()
-            .any(|o| o.revision != revision || o.status != CheckStatus::Passed)
+            .any(|o| !o.current(revision) || o.status != CheckStatus::Passed)
         {
             return 0;
         }
@@ -237,7 +328,7 @@ impl Ledger {
     pub fn current_status(&self, command: &str, revision: Revision) -> &'static str {
         match self.latest.get(command) {
             None => "not_observed",
-            Some(observation) if observation.revision != revision => "stale",
+            Some(observation) if !observation.current(revision) => "stale",
             Some(observation) => match observation.status {
                 CheckStatus::Passed => "passed",
                 CheckStatus::CodeFailed => "code_failed",
@@ -254,7 +345,7 @@ impl Ledger {
         let current: Vec<_> = self
             .latest
             .values()
-            .filter(|o| o.revision == revision)
+            .filter(|o| o.current(revision))
             .collect();
         let reproductions: Vec<_> = self
             .repros

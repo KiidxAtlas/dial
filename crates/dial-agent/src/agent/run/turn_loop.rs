@@ -58,6 +58,7 @@ impl<'a> Agent<'a> {
         // A failure before finalization must not expose the previous turn's evidence as current.
         let mut control = self.session.control_state();
         control["completion_evidence"] = Value::Null;
+        control["turn_summary"] = Value::Null;
         self.session.set_control_state(control)?;
         let result = self.turn_inner(user_text, &mut observed, reset_interrupt, prepared);
         if let Err(error) = self.flush_local_evidence() {
@@ -138,8 +139,14 @@ impl<'a> Agent<'a> {
             u64::from(steps),
             turn_clock.elapsed(),
         );
-        let summary = json!({"outcome":outcome,"steps":steps,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":state["reliability"]["verification_results"],"checks_current":self.step_checks.checks_current(),"evidence":state["completion_evidence"],"review":"/review-file","undo":"/undo"});
+        let edit = self.step_checks.status();
+        let summary = json!({"outcome":outcome,"steps":steps,"checkpoint_turn":self.step_checks.turn,"changed_files":changed_files,"open_tasks":self.todo.tasks().iter().filter(|task| task.status.is_open()).count(),"recorded_checks":state["reliability"]["verification_results"],"checks_current":self.step_checks.checks_current(),"evidence":state["completion_evidence"],"uncheckpointed_shell_commands":edit["uncheckpointed_shell_commands"],"uncheckpointed_extension_calls":edit["uncheckpointed_extension_calls"],"review":"/review-file","undo":"/undo"});
         observed.completion(&summary);
+        let mut control = self.session.control_state();
+        control["turn_summary"] = summary;
+        if let Err(error) = self.session.set_control_state(control) {
+            observed.diagnostic(&format!("Turn summary not saved: {error:#}"));
+        }
         observed.finish(!result.as_ref().is_ok_and(|turn| !turn.interrupted));
         let result = match (result, self.session.flush_runtime()) {
             (Err(error), Err(journal)) => {
@@ -692,6 +699,7 @@ impl<'a> Agent<'a> {
                     "Interrupted before finalization; completion was not accepted.",
                 );
             }
+            self.refresh_check_inputs();
             let already_verified = self.step_checks.clean();
             // A denied or failed edit leaves nothing to verify; checks then fail on unrelated code.
             if self.config.verification.enabled

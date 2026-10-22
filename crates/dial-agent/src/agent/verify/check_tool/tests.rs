@@ -1,5 +1,7 @@
 use super::*;
 
+mod incremental;
+
 fn hermetic_agent<'a>(config: &'a Config, root: &Path) -> Agent<'a> {
     let backend = Backend::new(
         ProviderKind::Endpoint {

@@ -36,7 +36,7 @@ use crate::config::{
     settings_store::{locked, write_private},
     tools::{BUILTIN, EXTRA_TOOLS, integrations::INTEGRATION_TOOLS},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::BTreeSet,
     fs,
@@ -2090,6 +2090,71 @@ impl Config {
                                 .bytes()
                                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))),
                 "verification runner needs an executable path/name and optional dotted module name"
+            );
+        }
+        ensure!(
+            self.verification.inputs.len() <= 16,
+            "at most 16 verification input declarations are allowed"
+        );
+        for (name, inputs) in &self.verification.inputs {
+            let Some(check) = self
+                .verification
+                .commands
+                .iter()
+                .find(|check| &check.name == name)
+            else {
+                bail!("verification.inputs must name a configured command");
+            };
+            ensure!(
+                self.verification
+                    .commands
+                    .iter()
+                    .filter(|other| &other.name == name || other.command == check.command)
+                    .count()
+                    == 1,
+                "verification.inputs must name one command with a unique name and command string"
+            );
+            ensure!(
+                (1..=64).contains(&inputs.paths.len())
+                    && inputs.paths.iter().all(|path| {
+                        !path.is_empty()
+                            && path.len() <= 1024
+                            && !path.contains('\\')
+                            && std::path::Path::new(path)
+                                .components()
+                                .all(|part| matches!(part, std::path::Component::Normal(_)))
+                            && !path
+                                .chars()
+                                .any(|c| c.is_control() || matches!(c, '*' | '?' | '[' | ']'))
+                            && path
+                                .split('/')
+                                .all(|part| !part.is_empty() && part != "." && part != "..")
+                    })
+                    && inputs
+                        .paths
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        == inputs.paths.len(),
+                "verification.inputs paths must be 1..64 unique workspace-relative normal paths without globs"
+            );
+            ensure!(
+                inputs.environment.len() <= 64
+                    && inputs.environment.iter().all(|var| {
+                        var.len() <= 256
+                            && var
+                                .bytes()
+                                .next()
+                                .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                            && var.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    })
+                    && inputs
+                        .environment
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        == inputs.environment.len(),
+                "verification.inputs environment must be at most 64 unique portable variable names"
             );
         }
         let review = &self.verification.review;

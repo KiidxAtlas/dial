@@ -38,6 +38,30 @@ fn python_checks_share_project_runner_without_sync_or_fallback() {
 }
 
 #[test]
+fn automatic_inputs_require_the_exact_isolated_builtin_and_a_direct_runner() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("app.py"), "value = 1\n").unwrap();
+    let python = Path::new("/runtime/bin/python3.14");
+    let mut check = plan(root.path(), python, &["app.py".into()]).remove(0);
+    assert_eq!(
+        automatic_python_source(root.path(), python, &[], &check),
+        Some("app.py".into())
+    );
+    assert!(automatic_python_source(root.path(), python, &["wrapper".into()], &check).is_none());
+    check.command.push_str("; true");
+    assert!(automatic_python_source(root.path(), python, &[], &check).is_none());
+    fs::write(root.path().join("uv.lock"), "version = 1").unwrap();
+    let wrapped = plan(root.path(), python, &["app.py".into()]).remove(0);
+    assert!(automatic_python_source(root.path(), python, &[], &wrapped).is_none());
+    let cargo = FocusedCheck {
+        name: "cargo check".into(),
+        command: "cargo check".into(),
+        timeout_secs: 0,
+    };
+    assert!(automatic_python_source(root.path(), python, &[], &cargo).is_none());
+}
+
+#[test]
 fn project_venv_executes_ast_and_tests_instead_of_invalid_fallback() {
     let root = tempfile::tempdir().unwrap();
     #[cfg(windows)]

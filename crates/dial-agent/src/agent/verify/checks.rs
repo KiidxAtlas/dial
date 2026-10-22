@@ -10,6 +10,92 @@ pub(in crate::agent) struct CheckRun {
 }
 
 impl<'a> Agent<'a> {
+    /// Explicit contracts and known isolated built-in checks share the same conservative ledger.
+    /// Reproductions and arbitrary model shell calls never acquire a witness from command spelling.
+    fn check_inputs(
+        &self,
+        check: &verify::verification::FocusedCheck,
+    ) -> Option<verify::inputs::Snapshot> {
+        if self.plan_mode
+            || self.step_checks.evidence.is_repro(&check.command)
+            || !self.awaited_background_jobs().is_empty()
+        {
+            return None;
+        }
+        let jobs = self.live_tasks.status(None).ok()?;
+        if jobs
+            .as_array()?
+            .iter()
+            .any(|job| job["status"] == "running")
+        {
+            return None;
+        }
+        let mut configured = self
+            .config
+            .verification
+            .commands
+            .iter()
+            .filter(|custom| custom.command == check.command || custom.name == check.name);
+        if let Some(custom) = configured.next() {
+            if configured.next().is_some()
+                || custom.name != check.name
+                || custom.command != check.command
+                || custom.timeout_secs != check.timeout_secs
+            {
+                return None;
+            }
+            return verify::inputs::capture(
+                &self.workspace,
+                self.config.verification.inputs.get(&check.name)?,
+            );
+        }
+        let python = if self.config.python.is_file() {
+            self.config.python.clone()
+        } else {
+            PathBuf::from("python3")
+        };
+        let source = verify::verification::automatic_python_source(
+            self.workspace.root(),
+            &python,
+            &self.config.verification.python_command,
+            check,
+        )?;
+        verify::inputs::python_snapshot(&self.workspace, &source, &python)
+    }
+
+    pub(in crate::agent) fn reuse_check(
+        &mut self,
+        check: &verify::verification::FocusedCheck,
+    ) -> bool {
+        if self.interrupt.load(Ordering::SeqCst)
+            || !self.step_checks.evidence.has_inputs(&check.command)
+        {
+            return false;
+        }
+        let Some(inputs) = self.check_inputs(check) else {
+            return false;
+        };
+        self.step_checks
+            .evidence
+            .reuse_inputs(&check.command, &inputs, self.step_checks.revision())
+    }
+
+    /// Revalidate even at an unchanged effect epoch: user edits do not advance controller counters.
+    pub(in crate::agent) fn refresh_check_inputs(&mut self) {
+        for check in self.step_checks.evidence.input_checks() {
+            let inputs = self.check_inputs(&check);
+            if self.step_checks.evidence.validate_inputs(
+                &check.command,
+                inputs.as_ref(),
+                self.step_checks.revision(),
+            ) {
+                self.step_checks.checked = 0;
+                self.step_checks.checked_shell_commands = 0;
+                self.step_checks.checked_extension_calls = 0;
+            }
+        }
+    }
+
     pub(in crate::agent) fn note_verification(
         &mut self,
         call: &ToolCall,
@@ -170,6 +256,8 @@ impl<'a> Agent<'a> {
         ui: &mut dyn Ui,
     ) -> ToolOutput {
         let args = json!({"command":check.command,"timeout":check.timeout_secs});
+        let inputs_before = self.check_inputs(check);
+        let revision_before = self.step_checks.revision();
         // Long generated commands (an interpreter path plus inline code) say nothing the check name does not.
         let title = if check.command.len() <= 80 {
             format!("Verify {}: {}", check.name, check.command)
@@ -243,6 +331,10 @@ impl<'a> Agent<'a> {
                 crate::agent::safety::approval::denied_check_output(&check.name, &denial)
             }
         };
+        if inputs_before.is_none() && output.process_outcome().is_some_and(|p| p.started) {
+            // Even harness-launched commands without a complete contract may change hidden inputs.
+            self.step_checks.evidence.invalidate_inputs();
+        }
         ui.tool_timing("bash", started.elapsed().as_secs_f64());
         ui.tool_result_with_id(&call_id, "bash", &output);
         self.note_verification(
@@ -255,6 +347,12 @@ impl<'a> Agent<'a> {
             &output,
             ui,
         );
+        if self.step_checks.revision() == revision_before
+            && let Some(before) = inputs_before
+            && self.check_inputs(check).as_ref() == Some(&before)
+        {
+            self.step_checks.evidence.bind_inputs(check, before);
+        }
         output
     }
 
@@ -472,6 +570,20 @@ impl<'a> Agent<'a> {
                 failures.push(format!("{} not run: verification interrupted", check.name));
                 break;
             }
+            if self.reuse_check(check) {
+                results.push(json!({"name":check.name,"command":check.command,"status":"passed","reused":true,"ran":false}));
+                outcomes.push(crate::agent::verify::verification_receipts::Outcome {
+                    name: check.name.clone(),
+                    command: check.command.clone(),
+                    status: crate::agent::verify::verification::CheckStatus::Passed,
+                    ran: false,
+                });
+                ui.notice(&format!(
+                    "Reused verification {}: declared inputs unchanged (not rerun).",
+                    check.name
+                ));
+                continue;
+            }
             let output = self.run_focused_check(check, ui);
             let runner =
                 self.config
@@ -490,7 +602,7 @@ impl<'a> Agent<'a> {
                 &output,
                 self.interrupt.load(Ordering::SeqCst),
             );
-            results.push(json!({"name":check.name,"command":check.command,"status":status}));
+            results.push(json!({"name":check.name,"command":check.command,"status":status,"reused":false,"ran":true}));
             outcomes.push(crate::agent::verify::verification_receipts::Outcome {
                 name: check.name.clone(),
                 command: check.command.clone(),
@@ -542,9 +654,10 @@ impl<'a> Agent<'a> {
         }
         let passed_count = results
             .iter()
-            .filter(|result| result["status"] == "passed")
+            .filter(|result| result["status"] == "passed" && result["reused"] != true)
             .count() as u64;
-        let failed_check_count = results.len() as u64 - passed_count;
+        let reused_count = results.iter().filter(|r| r["reused"] == true).count() as u64;
+        let failed_check_count = results.len() as u64 - passed_count - reused_count;
         if !failures.is_empty()
             && let Some(paths) = self
                 .step_checks
@@ -594,6 +707,8 @@ impl<'a> Agent<'a> {
                 state["automatic_failing_checks"] = json!(
                     state["automatic_failing_checks"].as_u64().unwrap_or(0) + failed_check_count
                 );
+                state["reused_passing_checks"] =
+                    json!(state["reused_passing_checks"].as_u64().unwrap_or(0) + reused_count);
                 state["edit_loop"] = self.step_checks.status();
                 if let Some(before) = source_before.as_ref().filter(|_| !outcomes.is_empty()) {
                     let after = crate::agent::verify::verification_receipts::source_identity(
@@ -680,6 +795,7 @@ impl<'a> Agent<'a> {
     /// first, so a worker that already finished is not reported as running.
     pub(in crate::agent) fn validate_completion(&mut self, ui: &mut dyn Ui) -> Result<(), String> {
         self.pump_subagents(ui);
+        self.refresh_check_inputs();
         if !self.hermetic
             && !self.plan_mode
             && self.config.verification.strict_requirements

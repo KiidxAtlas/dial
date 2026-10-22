@@ -206,7 +206,8 @@ observed-process verdict; printed success without complete process evidence earn
 Behavioral outcome credit uses the latest controller-observed result for each command at the final
 effect revision (native edits, opaque shell attempts, and extension effects). A failing pre-edit
 baseline is preserved separately and can become a passing repair; it does not permanently poison
-credit. Conversely, a pass before a later effect is stale and cannot earn final-revision credit.
+credit. Conversely, a pass before a later effect is stale and cannot earn final-revision credit,
+except where operator-declared dependency-aware reuse (below) proves the check's inputs unchanged.
 Bounded exact diagnostic fingerprints distinguish an unchanged nonbehavioral baseline failure
 from new diagnostics. Unchanged unrelated failures stay disclosed but do not request automatic
 scope expansion; changed/absent/oversized fingerprints remain conservative. Declared behavioral
@@ -214,6 +215,30 @@ checks and registered reproductions remain actionable. Configured runner declara
 strict outcome settlement/selective review are described in [requirement-verification.md](requirement-verification.md).
 Recognized manually executed checks are bound after their own call settles. Cancelled, unavailable,
 zero-test, or incomplete-process results never supply passing credit.
+
+**Dependency-aware verification reuse.** Reuse is enabled by default for the exact built-in
+isolated Python AST check on recognized Unix CPython installations. Dial tracks the source,
+environment and installed runtime identity; unsupported layouts and unknown dependencies fall
+back to execution (see [configuration.md](configuration.md) for limits and host-runtime assumptions).
+Other built-in checks remain conservative. Operators can enable reuse for configured
+`[[verification.commands]]` checks with `[verification.inputs."check-name"]` (`paths`, optional
+`environment`). This explicitly asserts that the check is deterministic and side-effect free,
+and that the listed paths are its complete workspace inputs. Directories are hashed recursively,
+including ignored files; symlinks and special files are unsupported. A configured command without
+a declaration is never reused. This does not cache arbitrary shell commands.
+
+Reuse is turn-local and applies only to a prior passing, controller-run result of the same check with
+the exact same command and configuration. Dial takes fresh bounded snapshots of the supported or
+declared inputs before and after the earlier run and compares them with the
+current state; reuse also requires that no shell or extension effect epoch changed since that
+result. Reproductions (`check` `repro`) are never reused. Any missing, unreadable, oversized or
+changed input disables reuse for that check and the real check runs; a failed snapshot never
+suppresses a check. A reused result is explicitly labeled reused with `ran: false`, keeps the
+original observation revision, and makes no extra model call. A manual `check` with `names` always
+executes; the default `check` and the completion gate may reuse. Toolchains and external resources
+must be stable: do not declare checks that depend on network, time, randomness or other inputs you
+cannot list. This covers verification only; other subsystems do not yet use it.
+
 `check` `repro` registers a model-written reproduction (name plus shell command, at most four per
 turn, same name replaces and clears its history) and runs it at once. It is selected by the
 completion gate like any focused check and is lost at turn end. Its command is untrusted model

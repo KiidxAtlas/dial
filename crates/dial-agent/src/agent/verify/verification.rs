@@ -525,6 +525,7 @@ pub fn plan_with_runner(
             command: [
                 scoped_python(root, &owner, python, override_argv),
                 shell_quote("-I"),
+                shell_quote("-S"),
                 shell_quote("-c"),
                 shell_quote(python_code),
                 shell_quote(&relative.to_string_lossy()),
@@ -535,6 +536,39 @@ pub fn plan_with_runner(
     }
 
     checks
+}
+
+/// Only the exact generated isolated AST command has automatically known project inputs.
+/// Runner wrappers can read arbitrary configuration or execute hooks, so never infer their inputs.
+pub(in crate::agent) fn automatic_python_source(
+    root: &Path,
+    python: &Path,
+    override_argv: &[String],
+    check: &FocusedCheck,
+) -> Option<PathBuf> {
+    if !override_argv.is_empty() {
+        return None;
+    }
+    let source = PathBuf::from(check.name.strip_prefix("python AST: ")?);
+    if source
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let owner = python_owner(root, &source);
+    if scoped_python(root, &owner, python, &[])
+        != scoped_python(
+            root,
+            &owner,
+            python,
+            &[python.to_string_lossy().into_owned()],
+        )
+    {
+        return None;
+    }
+    let generated = plan_with_runner(root, python, std::slice::from_ref(&source), &[]);
+    (generated.as_slice() == std::slice::from_ref(check)).then_some(source)
 }
 
 /// Whether `path` is confirmed absent from the post-change workspace (renamed away or deleted).

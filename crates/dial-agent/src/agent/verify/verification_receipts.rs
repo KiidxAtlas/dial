@@ -19,7 +19,7 @@ const MAX_IDENTITY_FILES: usize = 256;
 const MAX_HASHED_BYTES: u64 = 64 * 1024 * 1024;
 const CLAIM: &str = "Execution status only: records the observed status of named check commands for one source snapshot. Not proof of correctness, coverage, or absence of defects.";
 
-/// One check's observed result. `ran` is false when interruption skipped the check.
+/// One check's observed result. `ran` is false for reused evidence or an interrupted/skipped check.
 pub(in crate::agent) struct Outcome {
     pub name: String,
     pub command: String,
