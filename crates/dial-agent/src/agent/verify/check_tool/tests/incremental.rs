@@ -246,15 +246,15 @@ fn built_in_python_reuses_without_input_declarations_and_tracks_external_edits()
     let checks =
         crate::agent::verify::verification::plan(root.path(), &config.python, &["app.py".into()]);
     assert_eq!(checks.len(), 1);
-    assert!(
-        crate::agent::verify::inputs::python_snapshot(
-            &agent.workspace,
-            Path::new("app.py"),
-            &config.python
-        )
-        .is_some(),
-        "runtime snapshot unavailable"
-    );
+    // Reuse needs a recognized CPython layout with no loader injection. CI's setup-python sets
+    // LD_LIBRARY_PATH (Linux) or installs a toolcache layout (macOS); there the check must fall
+    // back to running every time, never to reusing an unproven result.
+    let reusable = crate::agent::verify::inputs::python_snapshot(
+        &agent.workspace,
+        Path::new("app.py"),
+        &config.python,
+    )
+    .is_some();
     let first = agent.run_checks(&checks, &mut NullUi);
     assert!(first.failures.is_empty(), "{:?}", first.failures);
     assert_eq!(agent.verifications.len(), 1);
@@ -262,20 +262,35 @@ fn built_in_python_reuses_without_input_declarations_and_tracks_external_edits()
     agent.step_checks.mutations += 1;
     let second = agent.run_checks(&checks, &mut NullUi);
     assert!(second.failures.is_empty(), "{:?}", second.failures);
-    assert_eq!(
-        agent.verifications.len(),
-        1,
-        "default built-in reuse requires no declarations"
-    );
+    if reusable {
+        assert_eq!(
+            agent.verifications.len(),
+            1,
+            "default built-in reuse requires no declarations"
+        );
+    } else {
+        assert_eq!(
+            agent.verifications.len(),
+            2,
+            "without a runtime snapshot the check reruns"
+        );
+    }
+    let before_break = agent.verifications.len();
     std::fs::write(root.path().join("app.py"), "invalid syntax here !!!\n").unwrap();
-    agent.refresh_check_inputs();
-    assert_eq!(
-        agent
-            .step_checks
-            .evidence
-            .current_status(&checks[0].command, agent.step_checks.revision()),
-        "stale"
-    );
+    if reusable {
+        // The input snapshot notices an edit made outside Dial's tools.
+        agent.refresh_check_inputs();
+        assert_eq!(
+            agent
+                .step_checks
+                .evidence
+                .current_status(&checks[0].command, agent.step_checks.revision()),
+            "stale"
+        );
+    } else {
+        // Without a snapshot only Dial's own edits are seen, as before reuse existed.
+        agent.step_checks.mutations += 1;
+    }
     assert!(!agent.run_checks(&checks, &mut NullUi).failures.is_empty());
-    assert_eq!(agent.verifications.len(), 2);
+    assert_eq!(agent.verifications.len(), before_break + 1);
 }
