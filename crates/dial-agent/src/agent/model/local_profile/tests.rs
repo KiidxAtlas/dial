@@ -172,7 +172,7 @@ fn small_tier_defaults_to_one_call_with_a_worked_example() {
             text.contains(r#"\"old_string\":\"    total / size\""#),
             "{text}"
         );
-        assert!(!text.contains("MUST load it with `skill` first"));
+        assert!(!text.contains("load it with `skill` first"));
         agent.rebuild_system();
         assert_eq!(prompt_text(agent), text, "byte-stable");
     });
