@@ -423,24 +423,41 @@ impl Agent<'_> {
             ));
         }
         let mut backend = self.backend.take().context("backend is already in use")?;
-        let result = (|| -> Result<Vec<Value>> {
-            let mut results = Vec::new();
-            // Keep each task inside the runner's prompt bound without dropping target bytes.
-            let mut offset = 0;
-            while offset < captured.len() {
-                if self.interrupt.load(std::sync::atomic::Ordering::SeqCst) {
+        let result = (|| -> Result<Vec<report::ChunkReview>> {
+            // File-boundary chunks keep every task inside the runner's prompt bound without
+            // dropping target bytes; the task batch runs them concurrently up to
+            // `task.max_concurrency`, and the interrupt flag cancels every running chunk.
+            let ranges = report::chunk_diff(&captured, report::CHUNK_BYTES);
+            let count = ranges.len();
+            let mut reviews = Vec::with_capacity(count);
+            for group in ranges.chunks(crate::agent::workers::subagents::MAX_BATCH) {
+                if self.interrupt.load(Ordering::SeqCst) {
                     anyhow::bail!("Review cancelled");
                 }
-                let mut end = (offset + 20_000).min(captured.len());
-                while !captured.is_char_boundary(end) {
-                    end -= 1;
-                }
-                let prompt = format!(
-                    "Review immutable target {identity}, diff bytes {offset}..{end} of {}. Diff fragments can split hunks; never infer an issue from missing fragment context. Read workspace files only as supplementary context, not as replacement for these captured target bytes. No commands, checks, changes, commits or pushes. Return structured findings only for introduced concrete defects. P0=critical, P1=high, P2=normal, P3=low; confidence is a model judgment, not proof. Paths must be target-relative; ranges are inclusive and end >= start. Explicit verdict required. Do not claim tests ran. Additional review guidance: {}\nIMMUTABLE DIFF:\n{}",
-                    captured.len(),
-                    crate::agent::workers::subagents::clip(instructions, 4000),
-                    &captured[offset..end]
-                );
+                let tasks: Vec<Value> = group
+                    .iter()
+                    .enumerate()
+                    .map(|(position, range)| {
+                        let number = reviews.len() + position + 1;
+                        let prompt = format!(
+                            "Review immutable target {identity}, chunk {number} of {count}, diff bytes {}..{} of {}. Diff fragments can split hunks; never infer an issue from missing fragment context. Read workspace files only as supplementary context, not as replacement for these captured target bytes. No commands, checks, changes, commits or pushes. Return structured findings only for introduced concrete defects. P0=critical, P1=high, P2=normal, P3=low; confidence is a model judgment, not proof. Paths must be target-relative; ranges are inclusive and end >= start. Explicit verdict required. Do not claim tests ran. Additional review guidance: {}\nIMMUTABLE DIFF:\n{}",
+                            range.start,
+                            range.end,
+                            captured.len(),
+                            crate::agent::workers::subagents::clip(instructions, 4000),
+                            &captured[range.clone()]
+                        );
+                        let prompt = if remote_revision.is_some() {
+                            format!(
+                                "This is a frozen remote GitHub PR diff, NOT the local checkout. No local file reads are available. Review only supplied exact diff bytes; report inconclusive when missing full-file context prevents a finding. {prompt}"
+                            )
+                        } else {
+                            prompt
+                        };
+                        json!({"agent":"reviewer","name":format!("review {number}/{count}"),"task":prompt,"solution_space":"review of a captured change: the diff is given, findings are open","output_schema":schema()})
+                    })
+                    .collect();
+                let args = json!({ "tasks": tasks });
                 let output = if remote_revision.is_some() {
                     let mut harness = self.version.harness.clone();
                     harness.tools.clear();
@@ -467,60 +484,31 @@ impl Agent<'_> {
                         adapter: self.version.adapter.as_deref(),
                         handoff: Default::default(),
                     };
-                    let remote_prompt = format!(
-                        "This is a frozen remote GitHub PR diff, NOT the local checkout. No local file reads are available. Review only supplied exact diff bytes; report inconclusive when missing full-file context prevents a finding. {prompt}"
-                    );
-                    crate::agent::workers::subagents::run(
-                        parent,
-                        &json!({"agent":"reviewer","task":remote_prompt,"solution_space":"review of a captured change: the diff is given, findings are open","output_schema":schema()}),
-                        ui,
-                    )
+                    crate::agent::workers::subagents::run(parent, &args, ui)
                 } else {
-                    self.run_task(
-                        &mut backend,
-                        &json!({"agent":"reviewer","task":prompt,"solution_space":"review of a captured change: the diff is given, findings are open","output_schema":schema()}),
-                        ui,
-                    )
+                    self.run_task(&mut backend, &args, ui)
                 };
-                anyhow::ensure!(!output.is_error, "{}", output.text);
-                let mut value: Value = serde_json::from_str(&output.text)
-                    .context("Reviewer returned invalid structured output")?;
-                for finding in value["findings"]
-                    .as_array_mut()
-                    .context("Missing findings")?
-                {
-                    let path = finding["path"].as_str().context("Missing finding path")?;
-                    anyhow::ensure!(
-                        !Path::new(path).is_absolute()
-                            && !Path::new(path)
-                                .components()
-                                .any(|c| matches!(c, std::path::Component::ParentDir)),
-                        "Finding path is outside target"
-                    );
-                    anyhow::ensure!(
-                        captured.contains(&format!("+++ b/{path}\n"))
-                            || captured.contains(&format!("--- a/{path}\n")),
-                        "Finding path is not in the captured diff"
-                    );
-                    anyhow::ensure!(
-                        finding["end_line"].as_u64() >= finding["start_line"].as_u64(),
-                        "Finding range is reversed"
-                    );
-                    finding["target_identity"] = json!(identity);
+                let jobs = output
+                    .data
+                    .as_ref()
+                    .and_then(|data| data["jobs"].as_array())
+                    .with_context(|| output.text.clone())?;
+                for (position, range) in group.iter().enumerate() {
+                    reviews.push(report::from_job(
+                        range.clone(),
+                        jobs.get(position).unwrap_or(&Value::Null),
+                        &captured,
+                        &identity,
+                    ));
                 }
-                anyhow::ensure!(
-                    value["verdict"] != "no_findings"
-                        || value["findings"].as_array().is_some_and(Vec::is_empty),
-                    "No-findings verdict conflicts with findings"
-                );
-                value["target_identity"] = json!(identity);
-                results.push(value);
-                offset = end;
+                if self.interrupt.load(Ordering::SeqCst) {
+                    anyhow::bail!("Review cancelled");
+                }
             }
-            Ok(results)
+            Ok(reviews)
         })();
         self.backend = Some(backend);
-        let mut results = result?;
+        let reviews = result?;
         let stale = if let (Some((number, repo)), Some(revision)) = (&remote, &remote_revision) {
             crate::agent::safety::hooks::with_heartbeat(ui, || {
                 pr_revision(&root, number, repo.as_deref(), &interrupt)
@@ -539,20 +527,13 @@ impl Agent<'_> {
                 .unwrap_or_else(|_| "unborn HEAD".to_owned())
                     != head
         };
-        for value in &mut results {
-            value["stale_snapshot"] = json!(stale);
-            for finding in value["findings"].as_array_mut().into_iter().flatten() {
-                finding["stale_snapshot"] = json!(stale);
-            }
-        }
+        let merged = report::Merged::new(&reviews, stale);
         Ok(format!(
-            "Target {identity}\n{}\n{}",
-            if stale {
-                "WARNING: target changed or its current identity could not be rechecked; findings describe the captured snapshot only."
-            } else {
-                "Target identity unchanged at completion; this is review, not test verification."
-            },
-            serde_json::to_string_pretty(&results)?
+            "{}\nMachine-readable report:\n{}",
+            report::render(&identity, stale, &reviews, &merged),
+            serde_json::to_string_pretty(&report::to_json(&identity, stale, &reviews, &merged))?
         ))
     }
 }
+
+mod report;
