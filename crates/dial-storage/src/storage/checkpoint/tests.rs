@@ -665,6 +665,9 @@ mod changed_review {
         fs::create_dir(root.path().join("b.txt")).unwrap();
         assert!(cp.restore_files(turn, &items, false).is_err());
         // Up-front validation refuses the group without changing the first file.
-        assert_eq!(fs::read_to_string(root.path().join("a.txt")).unwrap(), "edited");
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "edited"
+        );
     }
 }
