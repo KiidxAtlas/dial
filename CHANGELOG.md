@@ -5,6 +5,19 @@ Entries are taken from the git history (commit subjects, shown by short hash) an
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-10-22
+
+### Fixed
+- Windows: the first session after picking a model no longer exits with `error claiming new session writer ... access is denied (os error 5)`. Session journals open with read access so they can be locked, and the writer lock now covers one sentinel byte past the data instead of the whole file, so live sessions stay readable to listing, previews and header rewrites (`platform::fs::try_lock_journal`).
+- Responses `error`/`response.failed` events with an unrecognized code (`unclassified_failure`) are retried within the bounded transient budget instead of ending the turn. Unrecognized `response.incomplete` stays final.
+
+### Added
+- Benchmarks: `compaction` suite, `--share-auth` to reuse the subscription sign-in without copying tokens, and resumable progress for interrupted runs.
+- Agent status counts and usage rows in the metrics display, with token usage captured from Responses streams.
+
+### Changed
+- CI cancels superseded runs on the same pull request; benchmark command checks allow 120s.
+
 ## [0.1.17] - 2026-10-21
 
 ### Added
