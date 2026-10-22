@@ -291,3 +291,46 @@ fn check_repro_compatibility_rejects_nonadditive_contract_changes() {
     unknown_revision[0]["dial_tool_contracts"]["callback:check"]["revision"] = json!(2);
     assert!(validate_history(&unknown_revision, &[current], &registry).is_err());
 }
+
+/// `web_search` gained provider names in its `provider` enum; sessions recorded before them resume.
+#[test]
+fn web_search_history_recorded_before_added_providers_stays_valid() {
+    use crate::tools::integrations::ext::Tool;
+    let tool = crate::tools::net::web::search_tool_for_contract_tests();
+    let current = tool.schema();
+    let names: Vec<String> = current["function"]["parameters"]["properties"]["provider"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap().to_owned())
+        .collect();
+    for added in [
+        "firecrawl",
+        "parallel",
+        "zai",
+        "xai",
+        "startpage",
+        "mojeek",
+        "ecosia",
+    ] {
+        assert!(names.iter().any(|name| name == added), "{added}");
+    }
+    let mut before = current.clone();
+    before["function"]["parameters"]["properties"]["provider"]["enum"] = json!(&names[..12]);
+    let mut registry = Registry::new();
+    registry.register(std::sync::Arc::new(tool));
+    let old = identities(&[before.clone()], &Registry::new())["web_search"].clone();
+    assert_ne!(
+        old,
+        identities(&[current.clone()], &Registry::new())["web_search"]
+    );
+    let history = vec![json!({"role":"assistant","dial_tool_contracts":{"id":old}})];
+    validate_history(&history, &[current.clone()], &registry).unwrap();
+
+    let mut changed = before;
+    changed["function"]["parameters"]["properties"]["query"]["type"] = json!("integer");
+    let mut other = history;
+    other[0]["dial_tool_contracts"]["id"] =
+        json!(identities(&[changed], &Registry::new())["web_search"]);
+    assert!(validate_history(&other, &[current], &registry).is_err());
+}

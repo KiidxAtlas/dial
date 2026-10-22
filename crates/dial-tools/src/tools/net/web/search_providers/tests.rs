@@ -21,8 +21,14 @@ fn query() -> Query<'static> {
 #[test]
 fn auto_selects_in_order_and_always_ends_with_keyless_fallback() {
     let none = env_from(&[]);
-    assert_eq!(chain("", &none).unwrap(), vec![Provider::DuckDuckGo]);
-    assert_eq!(chain("auto", &none).unwrap(), vec![Provider::DuckDuckGo]);
+    let keyless = vec![
+        Provider::DuckDuckGo,
+        Provider::Startpage,
+        Provider::Mojeek,
+        Provider::Ecosia,
+    ];
+    assert_eq!(chain("", &none).unwrap(), keyless);
+    assert_eq!(chain("auto", &none).unwrap(), keyless);
 
     let some = env_from(&[
         ("BRAVE_API_KEY", "b"),
@@ -32,7 +38,14 @@ fn auto_selects_in_order_and_always_ends_with_keyless_fallback() {
     // Google needs its CSE id too, so it is skipped.
     assert_eq!(
         chain("auto", &some).unwrap(),
-        vec![Provider::Brave, Provider::Searxng, Provider::DuckDuckGo]
+        vec![
+            Provider::Brave,
+            Provider::Searxng,
+            Provider::DuckDuckGo,
+            Provider::Startpage,
+            Provider::Mojeek,
+            Provider::Ecosia
+        ]
     );
 
     let all = env_from(&[
@@ -43,7 +56,98 @@ fn auto_selects_in_order_and_always_ends_with_keyless_fallback() {
     ]);
     let order = chain("auto", &all).unwrap();
     assert_eq!(order.first(), Some(&Provider::Exa));
-    assert_eq!(order.last(), Some(&Provider::DuckDuckGo));
+    assert_eq!(order.last(), Some(&Provider::Ecosia));
+}
+
+#[test]
+fn new_keyed_providers_are_skipped_by_auto_without_a_key_and_ordered_with_one() {
+    let none = chain("auto", &env_from(&[])).unwrap();
+    for provider in [
+        Provider::Firecrawl,
+        Provider::Parallel,
+        Provider::Zai,
+        Provider::Xai,
+    ] {
+        assert!(!none.contains(&provider), "{provider:?}");
+    }
+    let keyed = env_from(&[
+        ("XAI_API_KEY", "x"),
+        ("ZAI_API_KEY", "z"),
+        ("PARALLEL_API_KEY", "p"),
+        ("FIRECRAWL_API_KEY", "f"),
+        ("SERPER_API_KEY", "s"),
+    ]);
+    let order = chain("auto", &keyed).unwrap();
+    assert_eq!(
+        &order[..5],
+        &[
+            Provider::Serper,
+            Provider::Firecrawl,
+            Provider::Parallel,
+            Provider::Zai,
+            Provider::Xai
+        ]
+    );
+    // A blank key counts as unset.
+    assert!(
+        !chain("auto", &env_from(&[("XAI_API_KEY", "  ")]))
+            .unwrap()
+            .contains(&Provider::Xai)
+    );
+}
+
+#[test]
+fn new_providers_are_selectable_by_name() {
+    let env = env_from(&[
+        ("FIRECRAWL_API_KEY", "f"),
+        ("PARALLEL_API_KEY", "p"),
+        ("ZAI_API_KEY", "z"),
+        ("XAI_API_KEY", "x"),
+    ]);
+    for (name, provider) in [
+        ("firecrawl", Provider::Firecrawl),
+        ("parallel", Provider::Parallel),
+        ("zai", Provider::Zai),
+        ("xai", Provider::Xai),
+        ("startpage", Provider::Startpage),
+        ("mojeek", Provider::Mojeek),
+        ("ecosia", Provider::Ecosia),
+    ] {
+        assert!(names().contains(&name), "{name}");
+        assert_eq!(chain(name, &env).unwrap(), vec![provider]);
+        assert!(build(provider, &query(), &env).is_ok(), "{name}");
+    }
+    let missing = chain("zai", &env_from(&[])).unwrap_err();
+    assert!(missing.contains("ZAI_API_KEY"), "{missing}");
+    assert!(
+        build(Provider::Xai, &query(), &env_from(&[]))
+            .unwrap_err()
+            .contains("XAI_API_KEY")
+    );
+}
+
+#[test]
+fn parse_dispatch_uses_the_scraper_parsers_and_rejects_blocked_pages() {
+    let response = |body: &str, media: &str| Response {
+        url: String::new(),
+        status: 200,
+        media_type: Some(media.into()),
+        charset: None,
+        body: body.as_bytes().to_vec(),
+        truncated: false,
+    };
+    let page = include_str!("scrapers/fixtures/mojeek.html");
+    let parsed = parse(Provider::Mojeek, &response(page, "text/html")).unwrap();
+    assert_eq!(parsed.results.len(), 3);
+    let wall = include_str!("scrapers/fixtures/mojeek_captcha.html");
+    assert!(parse(Provider::Mojeek, &response(wall, "text/html")).is_err());
+    let json = parse(Provider::Mojeek, &response("{}", "application/json")).unwrap_err();
+    assert!(json.contains("non-HTML"), "{json}");
+    let zai = response(
+        r#"{"search_result":[{"title":"t","link":"https://a.example/"}]}"#,
+        "application/json",
+    );
+    assert_eq!(parse(Provider::Zai, &zai).unwrap().results.len(), 1);
 }
 
 #[test]
@@ -140,10 +244,25 @@ fn recency_note_flags_only_providers_that_do_not_honour_the_window() {
     let searxng = Provider::Searxng.recency_note(Recency::Week).unwrap();
     assert!(searxng.contains("past month"), "{searxng}");
     assert_eq!(Provider::Searxng.recency_note(Recency::Day), None);
-    for provider in ALL
-        .into_iter()
-        .filter(|provider| !matches!(provider, Provider::Jina | Provider::Searxng))
-    {
+    for provider in [Provider::Mojeek, Provider::Ecosia] {
+        let note = provider.recency_note(Recency::Day).unwrap();
+        assert!(
+            note.contains(provider.name()) && note.contains("past day"),
+            "{note}"
+        );
+    }
+    let xai = Provider::Xai.recency_note(Recency::Month).unwrap();
+    assert!(xai.contains("xai") && xai.contains("past month"), "{xai}");
+    for provider in ALL.into_iter().filter(|provider| {
+        !matches!(
+            provider,
+            Provider::Jina
+                | Provider::Searxng
+                | Provider::Mojeek
+                | Provider::Ecosia
+                | Provider::Xai
+        )
+    }) {
         for recency in [Recency::Day, Recency::Week, Recency::Month, Recency::Year] {
             assert_eq!(provider.recency_note(recency), None, "{provider:?}");
         }

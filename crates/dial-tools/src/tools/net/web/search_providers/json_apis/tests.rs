@@ -214,3 +214,90 @@ fn google_parses_items() {
     assert_eq!(parsed.results[0].url, "https://g.example/");
     assert!(parse_google(&json!({})).unwrap().results.is_empty());
 }
+
+#[test]
+fn firecrawl_builds_a_bearer_post_with_tbs() {
+    let request = firecrawl(&query(Some(Recency::Month)), "fk");
+    assert_eq!(request.method(), "POST");
+    assert_eq!(request.url, FIRECRAWL_URL);
+    assert_eq!(header(&request, "Authorization"), Some("Bearer fk"));
+    let sent = body(&request);
+    assert_eq!(sent["query"], "rust & async");
+    assert_eq!(sent["limit"], 3);
+    assert_eq!(sent["tbs"], "qdr:m");
+    assert!(body(&firecrawl(&query(None), "fk")).get("tbs").is_none());
+}
+
+#[test]
+fn firecrawl_parses_v2_and_v1_shapes_and_failures() {
+    let v2 = json!({"success": true, "data": {"web": [
+        {"title": "Rust", "url": "https://rust-lang.org/", "description": "A language."},
+        {"title": "bad", "url": "javascript:x"}
+    ]}});
+    let parsed = parse_firecrawl(&v2).unwrap();
+    assert_eq!(parsed.results.len(), 1);
+    assert_eq!(parsed.results[0].snippet, "A language.");
+    let v1 = json!({"success": true, "data": [{"url": "https://a.example/", "description": "d"}]});
+    let parsed = parse_firecrawl(&v1).unwrap();
+    assert_eq!(parsed.results[0].title, "https://a.example/");
+    let failed = parse_firecrawl(&json!({"success": false, "error": "quota"})).unwrap_err();
+    assert!(failed.contains("quota"), "{failed}");
+    assert!(parse_firecrawl(&json!({"success": true})).is_err());
+}
+
+#[test]
+fn parallel_builds_an_api_key_post_with_objective_and_excerpts() {
+    let request = parallel(&query(Some(Recency::Week)), "pk");
+    assert_eq!(request.url, PARALLEL_URL);
+    assert_eq!(header(&request, "x-api-key"), Some("pk"));
+    assert!(header(&request, "parallel-beta").is_some());
+    assert_eq!(header(&request, "Authorization"), None);
+    let sent = body(&request);
+    assert_eq!(sent["search_queries"][0], "rust & async");
+    assert!(sent["objective"].as_str().unwrap().contains("past week"));
+    assert_eq!(sent["max_results"], 3);
+    assert!(body(&parallel(&query(None), "pk"))["objective"] == "rust & async");
+}
+
+#[test]
+fn parallel_parses_excerpts_into_snippets() {
+    let value = json!({"search_id": "s", "results": [
+        {"url": "https://a.example/", "title": "A", "excerpts": ["one", " two "]},
+        {"url": "ftp://b.example/", "title": "B"}
+    ]});
+    let parsed = parse_parallel(&value).unwrap();
+    assert_eq!(parsed.results.len(), 1);
+    assert_eq!(parsed.results[0].snippet, "one two");
+    assert!(parse_parallel(&json!({})).is_err());
+}
+
+#[test]
+fn zai_builds_a_bearer_post_with_recency_bucket() {
+    let request = zai(&query(Some(Recency::Day)), "zk");
+    assert_eq!(request.url, ZAI_URL);
+    assert_eq!(header(&request, "Authorization"), Some("Bearer zk"));
+    let sent = body(&request);
+    assert_eq!(sent["search_engine"], "search-prime");
+    assert_eq!(sent["search_query"], "rust & async");
+    assert_eq!(sent["count"], 3);
+    assert_eq!(sent["search_recency_filter"], "oneDay");
+    assert!(
+        body(&zai(&query(None), "zk"))
+            .get("search_recency_filter")
+            .is_none()
+    );
+}
+
+#[test]
+fn zai_parses_search_results_and_api_errors() {
+    let value = json!({"search_result": [
+        {"title": "Rust", "link": "https://rust-lang.org/", "content": "Fast.", "media": "x"},
+        {"title": "no link"}
+    ]});
+    let parsed = parse_zai(&value).unwrap();
+    assert_eq!(parsed.results.len(), 1);
+    assert_eq!(parsed.results[0].snippet, "Fast.");
+    let error = parse_zai(&json!({"error": {"message": "bad key"}})).unwrap_err();
+    assert!(error.contains("bad key"), "{error}");
+    assert!(parse_zai(&json!({})).is_err());
+}
