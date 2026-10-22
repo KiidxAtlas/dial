@@ -103,12 +103,12 @@ fn shell_quotes_executable_and_path_with_spaces_and_single_quotes() {
     #[cfg(unix)]
     assert_eq!(
         checks[0].command,
-        "'/opt/python'\"'\"'s bin/python' '-I' '-c' 'import ast, pathlib, sys; p = sys.argv[1]; ast.parse(pathlib.Path(p).read_text(encoding='\"'\"'utf-8'\"'\"'), filename=p)' 'dir with space/a'\"'\"'b.py'"
+        "'/opt/python'\"'\"'s bin/python' '-I' '-S' '-c' 'import ast, pathlib, sys; p = sys.argv[1]; ast.parse(pathlib.Path(p).read_text(encoding='\"'\"'utf-8'\"'\"'), filename=p)' 'dir with space/a'\"'\"'b.py'"
     );
     #[cfg(windows)]
     assert_eq!(
         checks[0].command,
-        "& 'C:\\opt\\python''s bin\\python.exe' '-I' '-c' 'import ast, pathlib, sys; p = sys.argv[1]; ast.parse(pathlib.Path(p).read_text(encoding=''utf-8''), filename=p)' 'dir with space\\a''b.py'"
+        "& 'C:\\opt\\python''s bin\\python.exe' '-I' '-S' '-c' 'import ast, pathlib, sys; p = sys.argv[1]; ast.parse(pathlib.Path(p).read_text(encoding=''utf-8''), filename=p)' 'dir with space\\a''b.py'"
     );
 }
 

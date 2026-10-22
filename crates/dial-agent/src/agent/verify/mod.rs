@@ -5,6 +5,7 @@ pub(in crate::agent) mod check_tool;
 pub(in crate::agent) mod checks;
 pub(in crate::agent) mod completion;
 pub(in crate::agent) mod evidence;
+pub(in crate::agent) mod inputs;
 pub(in crate::agent) mod mutation_cycles;
 pub(in crate::agent) mod repair;
 pub(crate) mod repair_evidence;

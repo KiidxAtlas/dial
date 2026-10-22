@@ -2,8 +2,8 @@
 //!
 //! Selection is the gate's (`focused_checks` plus retained failures) and every run goes through
 //! `run_focused_check`, so approvals, the sandbox, classification and the evidence ledger are the
-//! ones final verification reads. There is no separate pass cache: a pass recorded here counts
-//! exactly as a gate run at the same effect revision would, and any later edit makes it stale.
+//! ones final verification reads. Passing controller observations can be reused only with a
+//! complete operator-declared input contract; explicit named requests always execute.
 //!
 //! `repro` registers a model-written reproduction for this turn only. It joins the gate's
 //! selection, is approved like a `bash` call, and earns behavioral credit only after a code
@@ -23,7 +23,7 @@ const REPRO_NAME_BYTES: usize = 64;
 const REPRO_COMMAND_BYTES: usize = 4000;
 
 pub(in crate::agent) fn schema() -> Value {
-    json!({"type":"function","function":{"name":NAME,"description":"Run the checks Dial's completion gate selects for this turn's changes (build/type checks, related tests, configured commands) and report each status, command and key diagnostics. A pass at the current edits counts toward final verification; a later edit makes it stale. `names` runs a subset; `failed_only` reruns checks whose latest result was code_failed. `repro` registers a shell command that reproduces the reported bug and runs it now; it is approved like bash, rerun by the final gate, kept for this turn only (max 4, same name replaces), and earns behavioral credit only if it fails before your fix and passes after it.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":16,"items":{"type":"string"},"description":"Exact check names to run; omit for all."},"failed_only":{"type":"boolean"},"repro":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string","description":"Exits non-zero while the bug is present, zero once fixed."}},"required":["name","command"],"additionalProperties":false}},"additionalProperties":false}}})
+    json!({"type":"function","function":{"name":NAME,"description":"Run focused checks selected for this turn and report statuses, commands and diagnostics. Passes count toward final verification. Default calls may reuse passing evidence only when complete operator-declared inputs are revalidated unchanged; reuse is labeled, not reported as a new execution. `names` forces execution of a subset; `failed_only` reruns code failures. `repro` registers and runs a bug reproduction (nonzero before the fix, zero after), approved like bash and rerun by the final gate; max 4 per turn, same name replaces. Behavioral credit requires observed failure before the fix and passing after it.","parameters":{"type":"object","properties":{"names":{"type":"array","maxItems":16,"items":{"type":"string"},"description":"Exact check names to execute; omit for all, allowing valid evidence reuse."},"failed_only":{"type":"boolean"},"repro":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string","description":"Exits non-zero while the bug is present, zero once fixed."}},"required":["name","command"],"additionalProperties":false}},"additionalProperties":false}}})
 }
 
 /// The reproduction `args` asks to register, if any. Command text is untrusted model input; it
@@ -82,6 +82,7 @@ fn diagnostics(text: &str) -> String {
 
 impl Agent<'_> {
     pub(in crate::agent) fn check_tool(&mut self, args: &Value, ui: &mut dyn Ui) -> ToolOutput {
+        self.refresh_check_inputs();
         let mut names: Option<Vec<String>> = args["names"].as_array().map(|names| {
             names
                 .iter()
@@ -168,6 +169,7 @@ impl Agent<'_> {
         let mut text = Vec::new();
         let mut all_passed = true;
         for check in &selected {
+            let reused = names.is_none() && !failed_only && self.reuse_check(check);
             let (status, output) = if self.interrupt.load(Ordering::SeqCst) {
                 self.step_checks.evidence.observe(
                     &check.command,
@@ -180,6 +182,8 @@ impl Agent<'_> {
                         .contains(&check.name),
                 );
                 (CheckStatus::Cancelled, None)
+            } else if reused {
+                (CheckStatus::Passed, None)
             } else {
                 let output = self.run_focused_check(check, ui);
                 let status = crate::agent::verify::verification::classify(
@@ -195,6 +199,9 @@ impl Agent<'_> {
                 .retain(|failed| failed.command != check.command);
             let name = status_name(status);
             text.push(format!("{name}: {}\n  $ {}", check.name, check.command));
+            if reused {
+                text.push("  reused: declared inputs unchanged; not rerun".into());
+            }
             if status != CheckStatus::Passed {
                 all_passed = false;
                 self.step_checks.failed_checks.push(check.clone());
@@ -207,7 +214,11 @@ impl Agent<'_> {
                     text.push(diagnostics(&output.text));
                 }
             }
-            let mut result = json!({"name":check.name,"command":check.command,"status":name});
+            let mut result = json!({"name":check.name,"command":check.command,"status":name,"reused":reused,"ran":output.is_some()});
+            if reused {
+                result["observed_revision"] =
+                    json!(self.step_checks.evidence.observed_revision(&check.command));
+            }
             if self.step_checks.evidence.is_repro(&check.command) {
                 let state = self
                     .step_checks
@@ -233,7 +244,7 @@ impl Agent<'_> {
             .collect();
         let limits = self.related_test_plan(&changed_paths).limits;
         text.push(if all_passed {
-            "Passes at the current edits count toward final verification; any further edit makes them stale.".into()
+            "Passes count toward final verification. Later changes stale evidence unless complete declared inputs are revalidated unchanged.".into()
         } else if registered.is_some() && selected.len() == 1 {
             "Reproduction registered. Fix the code, then rerun it with `names` or failed_only; the final gate reruns it.".into()
         } else {
