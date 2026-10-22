@@ -55,7 +55,7 @@ const TOOL_POLICY: &str = "
 - Retry an empty, partial or narrow result differently; NEVER settle for plausibility when one more call removes the uncertainty. A failure is a diagnostic: change approach, NEVER repeat an identical failing call.";
 // Each sentence is included only when its tool is offered, so the prompt never names a tool the
 // model cannot call.
-const SKILL_RULE: &str = "When a skill covers the work, MUST load it with `skill` first.";
+const SKILL_RULE: &str = "When a skill covers substantial multi-step work, load it with `skill` first; small or single-file changes need no skill.";
 const PROJECT_MAP_RULE: &str =
     "Saved project maps locate owners and helpers; they are not proof of current code.";
 const LSP_RULE: &str = "Follow definitions and references with the configured LSP.";

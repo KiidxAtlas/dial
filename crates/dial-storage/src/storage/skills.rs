@@ -446,7 +446,7 @@ pub fn catalog_block(skills: &[Skill]) -> String {
         return String::new();
     }
     let mut out = String::from(
-        "## Skills\nReusable procedures. When a task matches one, load it with the `skill` tool before starting. Descriptions below are summaries only.\n",
+        "## Skills\nReusable procedures for substantial work. When a multi-step task matches one, load it with the `skill` tool before starting; small or single-file changes need none. Descriptions below are summaries only.\n",
     );
     let mut shown = 0;
     for skill in skills {
