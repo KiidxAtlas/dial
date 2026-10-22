@@ -47,6 +47,7 @@ pub(in crate::app) mod submit;
 pub(in crate::app) mod teach;
 pub(in crate::app) mod theme;
 pub(in crate::app) mod turn;
+pub(in crate::app) mod turn_report;
 pub(in crate::app) mod voice;
 pub(in crate::app) mod wait;
 
