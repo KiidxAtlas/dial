@@ -3,7 +3,20 @@
 All notable changes to Dial are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Entries are taken from the git history (commit subjects, shown by short hash) and tags `v0.1.0` through `v0.1.7`.
 
-## [Unreleased]
+## [0.1.19] - 2026-10-22
+
+### Added
+- End-of-turn **Turn report**: a turn that edited files, was interrupted or failed ends with outcome, changed files, recorded checks (and whether they are current), open tasks, what `/undo` can revert, and shell or extension calls that cannot be undone. Built from the saved `turn_summary` control state; plain answers show nothing.
+- Live advisor: with `--advisor` or `/advisor on`, the coach reviews each tool-using round and returns `none|aside|concern|blocker`. An unresolved blocker is re-raised once at completion and noted in the final reply. `/advisor completion` keeps the completion-only behaviour.
+- Web search providers: keyed Firecrawl, Parallel, Z.AI and xAI (used by `auto` only when a key is set) and keyless Startpage, Mojeek and Ecosia scrapers. Scrapers report bot walls and unrecognised layouts as errors, never as empty results. `auto` now falls back from DuckDuckGo to Startpage, Mojeek, then Ecosia. Sessions recorded with the earlier `provider` list still resume. Endpoints and selectors are tested against fixtures only, not live services.
+- `shell.backend = "inprocess"` runs foreground `bash` commands with the built-in shell inside the Dial process, without spawning a shell host. It is refused, running nothing, unless `sandbox.mode = "off"`. Limits: a builtin-only loop that never yields cannot be interrupted (the thread is abandoned and reported), stopping external commands is by process group on Unix only, and background jobs and named sessions still use the child-process embedded shell.
+- `/setup llama-cpp` installs llama.cpp's `llama-server` (Homebrew where available, otherwise a pinned, checksum-verified release archive) into Dial's own `tools/llama-cpp` folder, which is found before `PATH`. Picking a GGUF model with no `llama-server` offers this install instead of failing.
+- Dependency-aware verification reuse: within a turn, a passing check can be reused (`ran: false`) instead of rerun when its inputs are provably unchanged and no shell or extension effect occurred since. It is automatic for the built-in isolated Python AST check on recognised Unix CPython installs. Configured commands opt in with `[verification.inputs."name"]` (`paths`, `environment`). Snapshots are bounded (4,096 entries, 64 MiB, 250 ms), and anything unsupported or over a limit runs the check. `check` with `names` and reproductions always run.
+
+### Changed
+- `/review` splits the diff into chunks of at most 20,000 bytes, runs them as one reviewer batch (concurrent for remote endpoints), merges and dedupes findings, and prints a P0–P3 report with a verdict (`do not ship`, `inconclusive`, `ship with fixes`, `ship`) followed by machine-readable JSON. The output format changed: it is no longer a bare JSON array.
+- Skill guidance is narrower: the system prompt and skill catalog ask for `skill` only on substantial multi-step work, so small or single-file edits no longer get a skill nudge (`SKILL_RULE`, `skills::catalog_block`). On the efficiency suite (gpt-6-astra, 3 reps, HEAD vs HEAD+patch) `skill` calls fell from 6 to 0 and tool calls from 39 to 33, prompt tokens per verified result fell 1.2%, and pass count was unchanged at 12/15 (`continued-session` fails on both: its history is too short to compact).
+- The model settings overlay labels its runtime field "Local runtime" (it covers llama.cpp as well as MLX), and the Intel Mac/Linux setup message says GGUF models run on llama.cpp without the Python MLX runtime.
 
 ## [0.1.18] - 2026-10-22
 
