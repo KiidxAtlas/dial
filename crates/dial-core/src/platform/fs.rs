@@ -158,6 +158,14 @@ pub fn path_owned_by_system(path: &Path) -> io::Result<bool> {
     super::imp::fs::path_owned_by_system(path)
 }
 
+/// Non-blocking advisory lock for an append-only journal that other handles must still read.
+/// Unix takes `flock` (compatible with `fs2`); Windows byte-range locks are mandatory, so it
+/// locks one byte at an offset no journal reaches, leaving the data readable. The lock is
+/// released when the handle closes. Contention is reported as `ErrorKind::WouldBlock`.
+pub fn try_lock_journal(file: &File, exclusive: bool) -> io::Result<()> {
+    super::imp::fs::try_lock_journal(file, exclusive)
+}
+
 /// Hard-link count of the open file.
 pub fn link_count(file: &File) -> io::Result<u64> {
     super::imp::fs::link_count(file)

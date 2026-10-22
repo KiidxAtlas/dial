@@ -13,6 +13,9 @@ pub(super) struct TerminalFailure {
     code: &'static str,
 }
 impl TerminalFailure {
+    /// Unrecognized `error`/`response.failed` codes are retried like server errors: they come from
+    /// mid-stream provider faults far more often than from a request that can never succeed, and
+    /// known permanent codes (auth, quota, missing model) are classified before reaching here.
     pub(super) fn retryable(&self) -> bool {
         self.kind != "response.incomplete"
             && matches!(
@@ -21,6 +24,7 @@ impl TerminalFailure {
                     | "model_error"
                     | "websocket_connection_limit_reached"
                     | "previous_response_not_found"
+                    | "unclassified_failure"
             )
     }
     pub(super) fn class(&self) -> super::errors::ErrorClass {
@@ -38,6 +42,7 @@ impl TerminalFailure {
             | "model_error"
             | "websocket_connection_limit_reached"
             | "previous_response_not_found"
+            | "unclassified_failure"
                 if self.retryable() =>
             {
                 super::errors::ErrorClass::Transient

@@ -820,6 +820,37 @@ fn file_info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     }
     Ok(info)
 }
+/// Beyond any journal's data, and non-negative as NtLockFile's signed offset requires.
+const JOURNAL_LOCK_OFFSET: u64 = i64::MAX as u64 - 1;
+pub(in crate::platform) fn try_lock_journal(file: &File, exclusive: bool) -> io::Result<()> {
+    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { mem::zeroed() };
+    overlapped.Anonymous.Anonymous.Offset = JOURNAL_LOCK_OFFSET as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (JOURNAL_LOCK_OFFSET >> 32) as u32;
+    let flags = LOCKFILE_FAIL_IMMEDIATELY
+        | if exclusive {
+            LOCKFILE_EXCLUSIVE_LOCK
+        } else {
+            0
+        };
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle() as HANDLE,
+            flags,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    } != 0
+    {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32) {
+        return Err(io::Error::new(io::ErrorKind::WouldBlock, error));
+    }
+    Err(error)
+}
 pub(in crate::platform) fn link_count(file: &File) -> io::Result<u64> {
     Ok(file_info(file)?.nNumberOfLinks as u64)
 }
